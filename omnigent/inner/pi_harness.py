@@ -435,7 +435,7 @@ def create_app() -> FastAPI:
             return JSONResponse(
                 {"installed": False, "error": PiSdkLoaderUnavailableError.code}, status_code=503
             )
-        except Exception:  # noqa: BLE001 - no prompt may proceed after bootstrap failure
+        except Exception:
             _logger.warning("Pi permission bootstrap failed", exc_info=True)
             installed = False
         return JSONResponse({"installed": installed}, status_code=200 if installed else 503)

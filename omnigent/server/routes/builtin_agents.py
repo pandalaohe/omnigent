@@ -130,7 +130,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         # Joint-Agent roster (lead first, then sub-agents), the same
         # projection custom agents report. None when unloadable.
         members = project_members(loaded.spec)
-    except Exception:  # noqa: BLE001 — spec load failure must not break the list
+    except Exception:
         _logger.debug(
             "Failed to load spec for agent %s; mcp_servers/skills/members will be empty",
             agent.id,

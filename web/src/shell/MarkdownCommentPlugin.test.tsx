@@ -34,6 +34,7 @@ import {
   type CommentDecorationState,
 } from "./TipTapCommentExtension";
 import { encodeRenderedTextAnchor } from "./renderedTextAnchor";
+import { computeSelectionData } from "./TipTapEditorHelpers";
 
 const CONTENT = "The quick brown fox jumps over the lazy dog.";
 
@@ -78,6 +79,7 @@ function makeComment(overrides: Partial<Comment> = {}): Comment {
 }
 
 interface RenderOpts {
+  content?: string;
   comments?: Comment[];
   isDirty?: boolean;
   activeSelection?: ActiveSelection | null;
@@ -94,7 +96,7 @@ function renderPlugin(opts: RenderOpts = {}) {
   const utils = render(
     <MarkdownCommentPlugin
       editor={editor}
-      content={CONTENT}
+      content={opts.content ?? CONTENT}
       commentStateRef={commentStateRef}
       comments={opts.comments ?? []}
       isDirty={opts.isDirty ?? false}
@@ -129,6 +131,24 @@ describe("MarkdownCommentPlugin render", () => {
 });
 
 describe("rendered anchor orphan reporting", () => {
+  it("keeps a source-verified repeated quote out of the orphan set", () => {
+    const repeated = `${"a".repeat(40)} word ${"b".repeat(40)}`;
+    const raw = `${repeated}\n\n${repeated}`;
+    editor = makeEditor();
+    editor.commands.setContent(raw, { contentType: "markdown" });
+    const doc = editor.state.doc;
+    const from = doc.child(0).nodeSize + 1 + repeated.indexOf("word");
+    const captured = computeSelectionData(from, from + 4, doc, raw, editor.markdown)!;
+    expect(captured).not.toBeNull();
+    const onOrphansChange = vi.fn();
+    renderPlugin({
+      content: raw,
+      comments: [makeComment(captured)],
+      onOrphansChange,
+    });
+    expect(onOrphansChange).toHaveBeenLastCalledWith(new Set());
+    expect(editor.view.dom.querySelector('[data-comment-id="c1"]')?.textContent).toBe("word");
+  });
   it("reports stale Markdown context and clears it when the quote resolves", () => {
     editor = makeEditor();
     const onOrphansChange = vi.fn();

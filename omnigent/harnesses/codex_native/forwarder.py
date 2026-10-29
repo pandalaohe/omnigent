@@ -2245,7 +2245,7 @@ class _OutputTextDeltaCoalescer:
                     delta,
                     started=chunk.reasoning_started,
                 )
-            except Exception:  # noqa: BLE001 - preserve the long-lived forwarder.
+            except Exception:
                 _logger.warning("Codex forwarder reasoning delta flush failed", exc_info=True)
             return
         if chunk.tool_call_id is not None:
@@ -2256,7 +2256,7 @@ class _OutputTextDeltaCoalescer:
                     delta,
                     call_id=chunk.tool_call_id,
                 )
-            except Exception:  # noqa: BLE001 - preserve the long-lived forwarder.
+            except Exception:
                 _logger.warning("Codex forwarder tool-output delta flush failed", exc_info=True)
             return
         index: int | None = None
@@ -2274,7 +2274,7 @@ class _OutputTextDeltaCoalescer:
                 index=index,
                 final=final,
             )
-        except Exception:  # noqa: BLE001 - preserve the long-lived forwarder.
+        except Exception:
             _logger.warning("Codex forwarder delta flush failed", exc_info=True)
 
 
@@ -2620,7 +2620,7 @@ class _CodexElicitationTaskTracker:
             )
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 - keep the long-lived forwarder alive.
+        except Exception:
             _logger.warning(
                 "Codex forwarder elicitation hook task failed: method=%s",
                 event.get("method"),
@@ -2831,7 +2831,7 @@ async def supervise_forwarder(
                 ):
                     forwarder_state.terminal_launch_args = launch_args
                     forwarder_state.posted_terminal_launch_args = list(launch_args)
-            except Exception:  # noqa: BLE001 - existing thread-start fallback handles missing args.
+            except Exception:
                 _logger.warning("Failed to read Codex launch stance", exc_info=True)
         snapshots = NativeSubagentSnapshotPublisher(ap_client)
         forwarder_state.snapshot_publisher = snapshots
@@ -2843,7 +2843,7 @@ async def supervise_forwarder(
                 thread_id=thread_id,
                 forwarder_state=forwarder_state,
             )
-        except Exception:  # noqa: BLE001 - live notifications can still recover it.
+        except Exception:
             _logger.warning("Codex Goal startup reconciliation failed", exc_info=True)
         # Released when the live event stream shows the thread became
         # active (its first turn materializes the rollout). Lets the
@@ -2936,7 +2936,7 @@ async def supervise_forwarder(
                                 thread_id=target.thread_id,
                                 forwarder_state=forwarder_state,
                             )
-                        except Exception:  # noqa: BLE001 - notifications can recover it.
+                        except Exception:
                             _logger.warning(
                                 "Codex Goal rotation reconciliation failed",
                                 exc_info=True,
@@ -2976,7 +2976,7 @@ async def supervise_forwarder(
                     )
                     if codex_usage_boundary(event):
                         await _capture_usage_boundary(ap_client, bridge_dir, target, event)
-                except Exception:  # noqa: BLE001 - keep the long-lived mirror alive.
+                except Exception:
                     _logger.warning("Codex forwarder event handling failed", exc_info=True)
         except BaseException as exc:
             stream_error = exc
@@ -3095,7 +3095,7 @@ async def _drive_side_chat_requests(
                         )
                         if child_thread_id is None:
                             raise RuntimeError("thread/fork returned no thread id")
-                    except Exception:  # noqa: BLE001 - one bad request must not drop the rest.
+                    except Exception:
                         _logger.warning(
                             "Codex /side fork failed for %s", request.path, exc_info=True
                         )
@@ -3106,7 +3106,7 @@ async def _drive_side_chat_requests(
                     # done, and a failed one has surfaced a notice — keeping it
                     # would retry the same failure forever.
                     side_chat.discard_side_chat_request(request.path)
-        except Exception:  # noqa: BLE001 - keep the drain loop alive.
+        except Exception:
             _logger.warning("Codex /side drain iteration failed", exc_info=True)
         await _sleep(_SIDE_CHAT_POLL_SECONDS)
 
@@ -3145,7 +3145,7 @@ async def _post_side_chat_failed_notice(
             response_id=marker,
             source_id=marker,
         )
-    except Exception:  # noqa: BLE001 - the notice is best-effort.
+    except Exception:
         _logger.warning("Codex /side failure notice could not be posted", exc_info=True)
 
 
@@ -3211,7 +3211,7 @@ async def _maybe_rotate_session_on_thread_started(
                 await apply_codex_thread_permissions(
                     app_server_url, new_thread_id, bridge_state.permission_profile
                 )
-        except Exception:  # noqa: BLE001 - rotation continues with the thread's legacy permissions.
+        except Exception:
             _logger.warning("Failed to apply Codex rotated thread permissions", exc_info=True)
     old_delta_coalescer = target.delta_coalescer
     await old_delta_coalescer.flush()
@@ -3494,7 +3494,7 @@ async def _subscribe_until_ready_inner(
             response = await client.request("thread/resume", params)
         except asyncio.CancelledError:
             raise
-        except Exception as exc:  # noqa: BLE001 - app-server error envelopes are surfaced as RuntimeError.
+        except Exception as exc:
             if _is_thread_not_ready_error(exc):
                 if not saw_not_ready:
                     _logger.info(
@@ -4784,7 +4784,7 @@ async def _maybe_fail_turn_on_certificate_failure(
             await codex_client.request(
                 "turn/interrupt", {"threadId": thread_id, "turnId": turn_id}
             )
-        except Exception:  # noqa: BLE001 - the failure is surfaced either way.
+        except Exception:
             _logger.warning(
                 "Codex turn interrupt after a certificate failure failed", exc_info=True
             )
@@ -4913,7 +4913,7 @@ async def _maybe_handle_turn_event(
                     compaction_model = await asyncio.to_thread(
                         _failed_compaction_model, bridge_dir, selected_model
                     )
-                except Exception:  # noqa: BLE001 - the failure still posts, undiagnosed.
+                except Exception:
                     _logger.warning("Could not read the Codex rollout's last model", exc_info=True)
             await _post_turn_status_edge(
                 client,
@@ -5015,7 +5015,7 @@ async def _maybe_handle_turn_event(
                 await _persist_codex_compaction_item(
                     client, session_id=session_id, bridge_dir=bridge_dir
                 )
-            except Exception as exc:  # noqa: BLE001 - native adapter boundary preserves its documented fallback
+            except Exception as exc:
                 _logger.warning(
                     "Failed to persist codex compaction item for %s: %s",
                     session_id,
@@ -6879,7 +6879,7 @@ async def _handle_completed_item_inner(
                 await _persist_codex_compaction_item(
                     client, session_id=session_id, bridge_dir=bridge_dir
                 )
-            except Exception as exc:  # noqa: BLE001 - native adapter boundary preserves its documented fallback
+            except Exception as exc:
                 _logger.warning(
                     "Failed to persist codex compaction item for %s: %s",
                     session_id,
@@ -7972,7 +7972,7 @@ async def _ensure_user_message_posted(
         response = await codex_client.request("thread/resume", {"threadId": thread_id})
     except asyncio.CancelledError:
         raise
-    except Exception:  # noqa: BLE001 - degrade to current behavior on resume failure.
+    except Exception:
         _logger.warning(
             "Codex forwarder could not resume to recover user message: thread=%s turn=%s",
             thread_id,
@@ -8992,7 +8992,7 @@ async def _persist_codex_compaction_item(
             rollout = _latest_thread_rollout(state) if state is not None else None
             if rollout is not None:
                 compacted = _read_compacted_history(rollout)
-        except Exception:  # noqa: BLE001 - native adapter boundary preserves its documented fallback
+        except Exception:
             _logger.debug(
                 "Failed to read codex rollout for compaction persist",
                 exc_info=True,
@@ -9606,7 +9606,7 @@ async def _replay_dead_letters_before_resume(
             max_records=_REPLAY_MAX_RECORDS,
             deadline_seconds=_REPLAY_DEADLINE_SECONDS,
         )
-    except Exception:  # noqa: BLE001 - replay must never block resume.
+    except Exception:
         _logger.warning("Codex dead-letter replay before resume failed", exc_info=True)
 
 

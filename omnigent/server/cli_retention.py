@@ -206,7 +206,7 @@ class CliRetentionCoordinator:
                             token,
                         )
                     )
-                except Exception:  # noqa: BLE001 - release failure must not mask the body.
+                except Exception:
                     # Best-effort: a stale claim lapses via claim_cli_retention's
                     # stale_before predicate, so this must not replace the body's
                     # exception — least of all a propagating CancelledError.
@@ -237,7 +237,7 @@ class CliRetentionCoordinator:
                 result = await self.reconcile_host_once(host_id)
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 — a transient DB fault must not retire the policy
+            except Exception:
                 _logger.warning(
                     "CLI retention reconciliation failed for Host %s",
                     host_id,
@@ -273,7 +273,7 @@ class CliRetentionCoordinator:
                     lease.token,
                     claimed_at=int(time.time()),
                 )
-            except Exception:  # noqa: BLE001 - retry before the stale window expires.
+            except Exception:
                 _logger.warning(
                     "Could not renew CLI retention claim for Host %s",
                     lease.host_id,
@@ -785,7 +785,7 @@ class CliRetentionCoordinator:
                     continue
                 payload = response.json()
                 observed_monotonic = time.monotonic()
-            except Exception:  # noqa: BLE001 — unknown is never eligible
+            except Exception:
                 unknown_count += 1
                 _logger.debug(
                     "Could not inspect CLI retention state for session %s",
@@ -1010,7 +1010,7 @@ class CliRetentionCoordinator:
                     )
                 if response.status_code < 400 and response.json().get("status") == "released":
                     released.append(snapshot.session_id)
-            except Exception:  # noqa: BLE001 — next scan retries from fresh truth
+            except Exception:
                 _logger.debug(
                     "Could not release idle CLI for session %s",
                     snapshot.session_id,

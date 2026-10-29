@@ -1,5 +1,6 @@
 import { conversation, conversationPage } from "@/test/sidebarMockHelpers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { useMemo } from "react";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
@@ -38,7 +39,15 @@ vi.mock("@/hooks/useConversations", async () => {
       isSuccess: true,
     }),
     useProjectSessions: (name: string) => {
-      const rows = folderRowsRef.current.get(name) ?? [];
+      const source = folderRowsRef.current.get(name);
+      const rows = useMemo(
+        () =>
+          (source ?? []).map((row) => ({
+            ...(row as ReturnType<typeof conversation>),
+            labels: { omni_project: name },
+          })),
+        [source, name],
+      );
       return {
         data: rows.length ? { pages: [{ data: rows }], pageParams: [undefined] } : undefined,
         isLoading: false,

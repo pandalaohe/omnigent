@@ -2,7 +2,7 @@
 
 import asyncio
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -58,7 +58,7 @@ def _parent(h, host=HOST_A):
 def _report(h, level, *, host=HOST_A, reason="load", workspace=0):
     now = h.clock.now
     _connect(h.hub, host_id=host, now=now, workspace_id=workspace)
-    stamp = datetime.fromtimestamp(now, timezone.utc).isoformat()
+    stamp = datetime.fromtimestamp(now, UTC).isoformat()
     frame = _frame(mem_used=92, mem_total=100)
     h.hub.ingest(
         host_id=host,

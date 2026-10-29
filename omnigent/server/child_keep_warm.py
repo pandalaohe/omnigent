@@ -1003,7 +1003,7 @@ def cold_after_for_session(conv: Conversation) -> int | None:
     )
     try:
         return sweeper.cold_after_for(conv, preferences_store)
-    except Exception:  # noqa: BLE001 — a summary fan-out must never fail here
+    except Exception:
         _logger.warning("Keep-warm cold-after read failed for %s", conv.id, exc_info=True)
         return None
 
@@ -1263,7 +1263,7 @@ class ChildKeepWarmSweeper:
             for key in (ARCHIVE_REASON_LABEL, ARCHIVED_BY_LABEL):
                 try:
                     await asyncio.to_thread(store.delete_label, conv.id, key)
-                except Exception:  # noqa: BLE001 — must not mask the archive failure
+                except Exception:
                     _logger.warning(
                         "Child keep-warm could not clear label %s on session %s",
                         key,
@@ -1400,7 +1400,7 @@ class ChildKeepWarmSweeper:
             owner_by_session = collab_owners_for(
                 convs, self._conversation_store, self._permission_store
             )
-        except Exception:  # noqa: BLE001 — owner lookup must not fail session lists
+        except Exception:
             _logger.warning("Keep-warm cold-after owner batch failed", exc_info=True)
             return {conv.id: None for conv in convs}
         settings_by_owner: dict[str, KeepWarmSettings | None] = {}
@@ -1414,7 +1414,7 @@ class ChildKeepWarmSweeper:
             if owner not in settings_by_owner:
                 try:
                     settings_by_owner[owner] = read_keep_warm_settings(preferences_store, owner)
-                except Exception:  # noqa: BLE001 — one owner must not sink the batch
+                except Exception:
                     _logger.warning(
                         "Keep-warm cold-after settings read failed for %s", owner, exc_info=True
                     )
@@ -1437,7 +1437,7 @@ class ChildKeepWarmSweeper:
                 continue
             try:
                 harness = harness_for_session(conv, harness_cache, bundles=bundles)
-            except Exception:  # noqa: BLE001 — one bundle must not sink the batch
+            except Exception:
                 _logger.warning("Keep-warm harness read failed for %s", conv.id, exc_info=True)
                 harness = None
             by_session[conv.id] = cold_after_for_agent(

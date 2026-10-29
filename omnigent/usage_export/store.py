@@ -9,7 +9,7 @@ import json
 import secrets
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from pydantic import ValidationError
@@ -420,7 +420,7 @@ class UsageEventStore:
                         if candidate["event_id"] == unit.latest_event_id:
                             return candidate
                     raise UsageExportError(422, "corrupt_usage_feed")
-            recorded_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            recorded_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
             previous_ended_at = None
             if unit is not None:
                 previous = session.get(

@@ -101,7 +101,7 @@ class ArchiveCloseCoordinator:
             )
         try:
             self._trigger_all_workspaces()
-        except Exception:  # noqa: BLE001 - periodic recovery remains live.
+        except Exception:
             _logger.warning("Could not start CLI release recovery scan", exc_info=True)
 
     def _trigger_all_workspaces(self) -> None:
@@ -138,7 +138,7 @@ class ArchiveCloseCoordinator:
         try:
             roots = self._conversation_store.list_pending_archive_closes(limit=200)
             intents = self._intent_store.list_due(now=int(time.time()), limit=200)
-        except Exception:  # noqa: BLE001 - periodic retry is the recovery boundary.
+        except Exception:
             _logger.warning("Could not list pending CLI release work", exc_info=True)
             return
         for root in roots:
@@ -160,7 +160,7 @@ class ArchiveCloseCoordinator:
             intents = self._intent_store.list_due_for_root(
                 root_session_id, now=int(time.time()), limit=1
             )
-        except Exception:  # noqa: BLE001 - periodic retry is the recovery boundary.
+        except Exception:
             _logger.warning("Could not list pending CLI release work", exc_info=True)
             return
         for intent in intents:
@@ -206,7 +206,7 @@ class ArchiveCloseCoordinator:
                 self._trigger_all_workspaces()
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 - one DB fault must not retire recovery.
+            except Exception:
                 _logger.warning("CLI release recovery scan failed", exc_info=True)
 
     async def _expand_archive_root(self, key: tuple[int, str]) -> None:
@@ -378,7 +378,7 @@ class ArchiveCloseCoordinator:
                     token,
                     claimed_at=int(time.time()),
                 )
-            except Exception:  # noqa: BLE001 - retry before the stale window expires.
+            except Exception:
                 _logger.warning("Could not renew CLI release intent %s", intent_id, exc_info=True)
                 continue
             if not renewed:
@@ -401,7 +401,7 @@ class ArchiveCloseCoordinator:
                     token,
                     claimed_at=int(time.time()),
                 )
-            except Exception:  # noqa: BLE001 - retry before the stale window expires.
+            except Exception:
                 _logger.warning(
                     "Could not renew archive close claim for %s", root_id, exc_info=True
                 )
@@ -560,7 +560,7 @@ class ArchiveCloseCoordinator:
                 )
             )
             raise
-        except Exception as exc:  # noqa: BLE001 - durable pending retry owns recovery.
+        except Exception as exc:
             _logger.warning("CLI release intent %s failed", intent.id, exc_info=True)
             await asyncio.to_thread(
                 self._intent_store.retry,

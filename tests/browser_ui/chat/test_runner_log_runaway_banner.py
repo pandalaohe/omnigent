@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -26,9 +26,7 @@ def _runaway_labels() -> dict[str, str]:
     return {
         "omnigent.runner_log_runaway": "2026-09-23T09:25:00+00:00",
         "omnigent.runner_log_runaway_mb": "5",
-        "omnigent.runner_log_runaway_seen": datetime.now(timezone.utc).isoformat(
-            timespec="seconds"
-        ),
+        "omnigent.runner_log_runaway_seen": datetime.now(UTC).isoformat(timespec="seconds"),
     }
 
 

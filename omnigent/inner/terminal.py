@@ -2466,7 +2466,7 @@ class TerminalInstance:
             return False
         try:
             interval = pane_probe_interval_s()
-        except Exception:  # noqa: BLE001 - a broken cadence must not stop the watcher.
+        except Exception:
             logger.debug(
                 "Pane probe cadence lookup failed for terminal %s:%s",
                 self.name,

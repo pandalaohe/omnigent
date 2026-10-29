@@ -163,7 +163,7 @@ def collab_owners_for(
             try:
                 fetched = conversation_store.get_conversations(missing)
                 rows.update({sid: fetched.get(sid) for sid in missing})
-            except Exception:  # noqa: BLE001 — isolate a failed row from healthy branches
+            except Exception:
                 _logger.warning(
                     "Collaboration ancestor batch read failed; falling back to individual reads",
                     exc_info=True,
@@ -171,7 +171,7 @@ def collab_owners_for(
                 for sid in missing:
                     try:
                         rows[sid] = conversation_store.get_conversation(sid)
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         rows[sid] = None
                         failed_rows.add(sid)
                         _logger.warning(
@@ -196,7 +196,7 @@ def collab_owners_for(
                 owner_by_root[top.id] = (
                     get_session_owner_id(top.id, permission_store) or RESERVED_USER_LOCAL
                 )
-            except Exception:  # noqa: BLE001 — keep the other roots usable
+            except Exception:
                 owner_by_root[top.id] = None
                 _logger.warning("Collaboration owner read failed for %s", top.id, exc_info=True)
         owners[sid] = owner_by_root[top.id]
@@ -232,7 +232,7 @@ def session_peer_enabled(
     try:
         owner = collab_owner_for(conv, conversation_store, permission_store)
         return read_collab_settings(prefs_store, owner).enabled
-    except Exception:  # noqa: BLE001
+    except Exception:
         _logger.warning(
             "Failed to resolve session collaboration settings for %s", conv.id, exc_info=True
         )

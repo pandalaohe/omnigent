@@ -61,7 +61,7 @@ def open_store(conversation_store: object) -> SessionPullRequestStore | None:
         if store is None:
             try:
                 store = SessionPullRequestStore(location)
-            except Exception:  # noqa: BLE001 — preserve the boundary failure contract
+            except Exception:
                 _logger.warning("Session pull request storage is unavailable", exc_info=True)
                 return None
             _stores[location] = store
@@ -355,7 +355,7 @@ class PullRequestRefresher:
         async with self._semaphore:
             try:
                 await self._refresh(session_id)
-            except Exception:  # noqa: BLE001 — preserve the boundary failure contract
+            except Exception:
                 _logger.debug("Pull request refresh failed", exc_info=True)
 
     async def aclose(self) -> None:

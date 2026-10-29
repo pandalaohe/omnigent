@@ -811,7 +811,7 @@ def codex_workspace_profile(
             tuple(str(Path(root).resolve()) for root in writable_roots),
             sandbox.get("network_access") is True,
         )
-    except Exception:  # noqa: BLE001 - Discovery/config failures must preserve the legacy launch.
+    except Exception:
         _logger.warning("Failed to build Codex workspace permission profile", exc_info=True)
         return None
 

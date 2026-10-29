@@ -16,7 +16,7 @@ import json
 import logging
 import time
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Request
@@ -177,7 +177,7 @@ def create_system_status_router(
         )
         return {
             "text": text,
-            "generated_at": datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
+            "generated_at": datetime.fromtimestamp(now, tz=UTC).isoformat(),
             "attachment_archive_cleanup": _attachment_archive_cleanup_summary(hub),
         }
 

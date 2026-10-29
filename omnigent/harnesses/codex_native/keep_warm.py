@@ -361,7 +361,7 @@ async def _interrupt_keep_warm_turn(
         )
     except asyncio.CancelledError:
         raise
-    except Exception:  # noqa: BLE001 — teardown is best-effort, never masks the outcome
+    except Exception:
         _logger.debug("Codex keep-warm turn interrupt failed", exc_info=True)
 
 

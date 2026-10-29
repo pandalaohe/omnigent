@@ -107,7 +107,13 @@ describe("classifyAttachment", () => {
 
 describe("attachmentAccept", () => {
   it("lists inline types plus the policy's filesystem extensions", () => {
-    expect(attachmentAccept()).toBe(
+    expect(attachmentAccept()).toBeUndefined();
+    expect(
+      attachmentAccept({
+        extensions: [".zip", ".docx", ".xlsx", ".pptx", ".db", ".sqlite", ".sqlite3"],
+        all_types: false,
+      }),
+    ).toBe(
       "image/*,application/pdf,text/*,application/json,.tsv,.zip,.docx,.xlsx,.pptx,.db,.sqlite,.sqlite3",
     );
     expect(attachmentAccept({ extensions: [".gz"], all_types: false })).toBe(
@@ -119,7 +125,6 @@ describe("attachmentAccept", () => {
   it("names .tsv, which the text/* wildcard does not cover in every browser", () => {
     // A browser that maps .tsv to no MIME greys it out in the OS picker, so
     // the filter must name it even though .csv needs no entry.
-    expect(attachmentAccept()?.split(",")).toContain(".tsv");
     expect(attachmentAccept({ extensions: [".gz"], all_types: false })?.split(",")).toContain(
       ".tsv",
     );
@@ -143,7 +148,12 @@ describe("validateAttachments", () => {
 
   it("names the types the server accepts when rejecting", () => {
     const clip = [makeFile("clip.mp4", "video/mp4")];
-    expect(validateAttachments(clip).errors[0]).toContain("archives, office documents");
+    expect(
+      validateAttachments(clip, {
+        extensions: [".zip", ".docx", ".xlsx", ".pptx", ".db", ".sqlite", ".sqlite3"],
+        all_types: false,
+      }).errors[0],
+    ).toContain("archives, office documents");
     expect(
       validateAttachments(clip, { extensions: [".har", ".gz"], all_types: false }).errors[0],
     ).toContain("only images, PDF, text/code, and .gz, .har files are supported");
@@ -154,7 +164,9 @@ describe("validateAttachments", () => {
 
   it("accepts other files under the file limit when the server allows all types", () => {
     const trace = makeFile("trace.gz", "application/gzip", 30 * MB);
-    expect(validateAttachments([trace]).accepted).toHaveLength(0);
+    expect(
+      validateAttachments([trace], { extensions: [".zip"], all_types: false }).accepted,
+    ).toHaveLength(0);
     const { accepted, errors } = validateAttachments([trace], {
       extensions: [".zip"],
       all_types: true,

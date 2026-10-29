@@ -213,7 +213,11 @@ export function AskUserQuestionForm({
   const [selections, setSelections] = useState<Record<string, string | string[]>>(() => {
     const initial: Record<string, string | string[]> = {};
     for (const q of questions) {
-      initial[questionKey(q)] = q.multiSelect ? [] : (q.options[0]?.label ?? "");
+      initial[questionKey(q)] = q.multiSelect
+        ? []
+        : q.isOther === false
+          ? ""
+          : (q.options[0]?.label ?? "");
     }
     return initial;
   });

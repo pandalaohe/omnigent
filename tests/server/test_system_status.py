@@ -8,7 +8,7 @@ import json
 import threading
 import time
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -958,7 +958,7 @@ def test_host_load_report_history_and_change_drain(tmp_path: Path, monkeypatch) 
     frame = _frame()
     frame = replace(
         frame,
-        sampled_at=datetime.fromtimestamp(now, timezone.utc).isoformat(),
+        sampled_at=datetime.fromtimestamp(now, UTC).isoformat(),
         machine=replace(frame.machine, cpu_count=8, load_per_core=0.25, load_equiv=2),
         load_level=report,
     )
@@ -1002,7 +1002,7 @@ def test_load_holds_fail_open(tmp_path: Path, boundary: str) -> None:
     _connect(hub, host_id="host_a", now=now)
     frame = replace(
         _frame(),
-        sampled_at=datetime.fromtimestamp(now, timezone.utc).isoformat(),
+        sampled_at=datetime.fromtimestamp(now, UTC).isoformat(),
         load_level=LoadLevelReport("new_session_hold", "load", "2026-10-25T00:00:00Z", 4, 5, None),
     )
     hub.ingest(host_id="host_a", workspace_id=0, frame=frame, now=now)
@@ -1039,10 +1039,10 @@ def test_load_report_rejects_invalid_sample_time(tmp_path: Path, sample: str) ->
     now = 1_800_000_000.0
     _connect(hub, host_id="host_a", now=now)
     sampled_at = {
-        "stale": datetime.fromtimestamp(now - 181, timezone.utc).isoformat(),
+        "stale": datetime.fromtimestamp(now - 181, UTC).isoformat(),
         "malformed": "not-a-timestamp",
-        "future": datetime.fromtimestamp(now + 1, timezone.utc).isoformat(),
-        "naive": datetime.fromtimestamp(now, timezone.utc).replace(tzinfo=None).isoformat(),
+        "future": datetime.fromtimestamp(now + 1, UTC).isoformat(),
+        "naive": datetime.fromtimestamp(now, UTC).replace(tzinfo=None).isoformat(),
     }[sample]
     frame = replace(
         _frame(),
@@ -1063,7 +1063,7 @@ def test_replayed_load_report_expires_from_original_sample(
     _connect(hub, host_id="host_a", now=sampled)
     frame = replace(
         _frame(),
-        sampled_at=datetime.fromtimestamp(sampled, timezone.utc).isoformat(),
+        sampled_at=datetime.fromtimestamp(sampled, UTC).isoformat(),
         load_level=LoadLevelReport("new_session_hold", "load", "2026-10-25T00:00:00Z", 4, 5, None),
     )
     # Arrival and replays are recent; the original sample still ages out at 181 s.

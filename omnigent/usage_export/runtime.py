@@ -9,6 +9,7 @@ import json
 import os
 import random
 import sqlite3
+import tomllib
 import uuid
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
@@ -18,7 +19,6 @@ from typing import Any, Literal
 from urllib.parse import urlsplit
 
 import httpx
-import tomllib
 from fastapi import APIRouter, FastAPI
 
 from omnigent.process_logging import data_dir

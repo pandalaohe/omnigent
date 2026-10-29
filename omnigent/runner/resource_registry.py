@@ -423,7 +423,7 @@ def _native_input_ready_probe(
         return None
     try:
         return resolve_hook_for_key(agent.key, "input_ready_probe")
-    except Exception:  # noqa: BLE001 - see docstring.
+    except Exception:
         _logger.warning(
             "Native input-ready probe unavailable for %s; native_input_ready will not be logged",
             resource_role,
@@ -1812,7 +1812,7 @@ class SessionResourceRegistry:
                             expected_socket_path=str(instance.socket_path),
                             expected_tmux_target=instance.tmux_target,
                         )
-                except Exception:  # noqa: BLE001 - keep lifecycle observation running.
+                except Exception:
                     _logger.debug(
                         "Claude auto-mode billing notice acknowledgement failed",
                         exc_info=True,

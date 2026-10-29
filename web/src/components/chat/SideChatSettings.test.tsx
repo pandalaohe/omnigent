@@ -511,7 +511,9 @@ it.each(["live", "draft", "nested-draft"] as const)(
     await user.click(await screen.findByRole("button", { name: "Side chat model and effort" }));
     await user.click(screen.getByTestId("side-chat-model-edit"));
     await user.click(screen.getByRole("menuitemcheckbox", { name: "Model B" }));
-    expect(fetch).toHaveBeenCalledWith("/v1/hosts/host/harnesses/devin-native/model-options");
+    expect(fetch).toHaveBeenCalledWith("/v1/hosts/host/harnesses/devin-native/model-options", {
+      signal: expect.any(AbortSignal),
+    });
     if (draft) {
       expect(onChange).toHaveBeenCalledWith({ modelOverride: "model-b", reasoningEffort: null });
       expect(sessionsApi.updateSession).not.toHaveBeenCalled();

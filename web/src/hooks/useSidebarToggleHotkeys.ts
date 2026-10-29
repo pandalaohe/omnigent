@@ -49,8 +49,6 @@ export function useSidebarToggleHotkeys(
         !hasCustomShortcutBindings("toggleWorkspaceSidebar")
       )
         return;
-      // Ignore auto-repeat: holding the chord would flap the panel open/closed.
-      if (e.repeat) return;
       const defaultChord = hasCommandModifier(e, isMac) && e.altKey && !e.shiftKey;
       const toggleLeft = hasCustomShortcutBindings("toggleConversationsSidebar")
         ? eventMatchesShortcutAction(e, "toggleConversationsSidebar")
@@ -61,11 +59,11 @@ export function useSidebarToggleHotkeys(
       if (toggleLeft && latest.current.onToggleLeft) {
         e.preventDefault();
         e.stopPropagation();
-        latest.current.onToggleLeft();
+        if (!e.repeat) latest.current.onToggleLeft();
       } else if (toggleRight && latest.current.onToggleRight) {
         e.preventDefault();
         e.stopPropagation();
-        latest.current.onToggleRight();
+        if (!e.repeat) latest.current.onToggleRight();
       }
     };
 

@@ -1899,7 +1899,7 @@ def _set_sharing(
     *,
     owner: str = _OWNER,
     external: bool | None = None,
-    share_code: str | None | KeepShareCode = KEEP_SHARE_CODE,
+    share_code: str | KeepShareCode | None = KEEP_SHARE_CODE,
     allow_comments: bool | None = None,
 ) -> None:
     """Write an owner's sharing record through the real store."""

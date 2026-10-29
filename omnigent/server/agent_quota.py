@@ -183,6 +183,6 @@ class AgentQuotaService:
         """An advisory-source failure must leave the user's instruction text intact."""
         try:
             return self.context_line(self.context(conversation, owner_hint))
-        except Exception:  # noqa: BLE001
+        except Exception:
             _logger.warning("Quota snapshot unavailable for %s", conversation.id, exc_info=True)
             return ""

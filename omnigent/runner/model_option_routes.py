@@ -137,7 +137,7 @@ def register_model_option_routes(
                     "detail": "Codex-native model options are not ready yet.",
                 },
             )
-        except Exception as exc:  # noqa: BLE001 — surface Codex app-server failures to AP.
+        except Exception as exc:
             _logger.warning(
                 "Codex-native model/list failed for session=%s",
                 session_id,
@@ -160,7 +160,7 @@ def register_model_option_routes(
 
         try:
             models = await asyncio.to_thread(list_kiro_cli_model_options)
-        except Exception as exc:  # noqa: BLE001 — picker failures are retryable.
+        except Exception as exc:
             _logger.warning(
                 "Kiro-native model discovery failed for session=%s",
                 session_id,
@@ -187,7 +187,7 @@ def register_model_option_routes(
 
         try:
             models = await asyncio.to_thread(list_devin_cli_model_options)
-        except Exception as exc:  # noqa: BLE001 — picker failures are retryable.
+        except Exception as exc:
             _logger.warning(
                 "Devin-native model discovery failed for session=%s",
                 session_id,
@@ -231,7 +231,7 @@ def register_model_option_routes(
 
         try:
             models = await asyncio.to_thread(list_cursor_cli_model_options)
-        except Exception as exc:  # noqa: BLE001 — picker failures are retryable.
+        except Exception as exc:
             _logger.warning(
                 "Cursor-native model discovery failed for session=%s",
                 session_id,
@@ -305,7 +305,7 @@ def register_model_option_routes(
                     "detail": exc.message,
                 },
             )
-        except Exception as exc:  # noqa: BLE001 — retryable model-options failure
+        except Exception as exc:
             _logger.warning(
                 "Claude-native model discovery failed for session=%s",
                 session_id,
@@ -376,7 +376,7 @@ def register_model_option_routes(
                 launch_model=None,
                 picker_values=picker_command_values(rows),
             )
-        except Exception:  # noqa: BLE001 — vocabulary refresh is advisory
+        except Exception:
             _logger.debug(
                 "claude-native model options: bridge vocabulary refresh skipped for session=%s",
                 session_id,

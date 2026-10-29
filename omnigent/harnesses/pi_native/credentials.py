@@ -1001,7 +1001,7 @@ def _fetch_pi_model_lists(
     """
     try:
         models = model_catalog.fetch_databricks_model_service_entries(workspace_url, token)
-    except Exception:  # noqa: BLE001
+    except Exception:
         _LOGGER.warning(
             "pi-native: could not fetch Databricks model list; "
             "Pi will show only the selected model",
@@ -1023,7 +1023,7 @@ def _fetch_pi_model_lists(
         models = enrich_databricks_model_catalog(
             models, model_catalog.catalog_model_entries("databricks")
         )
-    except Exception:  # noqa: BLE001
+    except Exception:
         _LOGGER.info(
             "pi-native: could not enrich the live Databricks model list with MLflow metadata",
             exc_info=True,
@@ -1237,7 +1237,7 @@ def _databricks_gateway_pi_provider(
                 claude_models, gpt_models, completions_models, gemini_models = (
                     _fetch_pi_model_lists(workspace_url, list_token)
                 )
-            except Exception:  # noqa: BLE001
+            except Exception:
                 _LOGGER.info(
                     "pi-native: could not fetch workspace model list; showing default model only",
                     exc_info=True,
@@ -1523,7 +1523,7 @@ def _live_family_model_entries(
             listing = model_catalog._fetch_openai_compatible_listing(
                 listing_provider, transport=transport
             )
-    except Exception:  # noqa: BLE001
+    except Exception:
         _LOGGER.info(
             "pi-native: could not list models for provider %s; offering only the "
             "configured default",
@@ -1723,7 +1723,7 @@ def resolve_pi_native_provider(
             base_config = _load_config()
         else:
             base_config = config_loader()
-    except Exception:  # noqa: BLE001
+    except Exception:
         _LOGGER.warning("pi-native: failed to read provider configuration", exc_info=True)
         return None
     config = load_runtime_inference_config(base_config)
@@ -1891,7 +1891,7 @@ def resolve_pi_native_provider(
         if resolved is not None and unmanaged_prefix_notice is not None:
             resolved = replace(resolved, model_notice=unmanaged_prefix_notice)
         return resolved
-    except Exception:  # noqa: BLE001
+    except Exception:
         # Any failure (malformed config, duplicate per-family default, or an
         # unresolved ``api_key: $VAR``) falls back to Pi's own login rather than
         # failing the terminal launch.

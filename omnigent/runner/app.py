@@ -3327,7 +3327,7 @@ def create_runner_app(
                     session_id,
                     resp.status_code,
                 )
-        except Exception:  # noqa: BLE001 — best-effort, but surface it
+        except Exception:
             _logger.warning(
                 "legacy model_override fallback for %s failed; a model-pinned "
                 "first turn may respawn",
@@ -5730,7 +5730,7 @@ def create_runner_app(
                 json={"type": "external_keep_warm_receipt", "data": receipt},
                 timeout=10.0,
             )
-        except Exception:  # noqa: BLE001 — the server's attempt timeout settles a lost receipt
+        except Exception:
             _logger.warning(
                 "keep-warm: receipt delivery to the server failed",
                 exc_info=True,
@@ -5829,7 +5829,7 @@ def create_runner_app(
                 params=_SESSION_METADATA_PARAMS,
                 timeout=10.0,
             )
-        except Exception:  # noqa: BLE001 - a failed read just skips the rotation.
+        except Exception:
             _logger.warning(
                 "Pending rotation could not read session %s",
                 conv_id,
@@ -5929,7 +5929,7 @@ def create_runner_app(
                 return False
         except HTTPException:
             raise
-        except Exception:  # noqa: BLE001 - no retry; the label remains for a manual clear.
+        except Exception:
             _logger.warning(
                 "Pending rotation /clear failed for session %s",
                 conv_id,
@@ -6602,7 +6602,7 @@ def create_runner_app(
                 conv_id,
                 extra={"session_id": conv_id},
             )
-        except Exception:  # noqa: BLE001 — best-effort: harness may have exited
+        except Exception:
             _logger.warning(
                 "Interrupt forward to harness failed for %s",
                 conv_id,
@@ -7289,7 +7289,7 @@ def create_runner_app(
                     status=status,
                     output=output,
                 )
-        except Exception:  # noqa: BLE001 — the polling backstop re-delivers
+        except Exception:
             _logger.warning(
                 "Failed to report an untracked sub-agent terminal status for %s",
                 child_session_id,
@@ -7854,7 +7854,7 @@ def create_runner_app(
                     _publish_event,
                     now=asyncio.get_running_loop().time(),
                 )
-            except Exception:  # noqa: BLE001 — best-effort observer; never fail the hook
+            except Exception:
                 _logger.warning(
                     "native file-change recording failed for session=%s",
                     _captured_session_id,
@@ -12194,7 +12194,7 @@ def create_runner_app(
         if resource_registry is not None:
             try:
                 resource_registry.resync_session_statuses()
-            except Exception:  # noqa: BLE001 — best-effort; never block catch-up.
+            except Exception:
                 _logger.warning(
                     "Session status resync failed after reconnect",
                     exc_info=True,

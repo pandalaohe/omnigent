@@ -195,7 +195,7 @@ def _silently_clear_pending(
                     },
                     track_pending=False,
                 )
-        except Exception:  # noqa: BLE001 - stale UI cleanup is best-effort.
+        except Exception:
             _logger.warning(
                 "Could not silently clear stale elicitation for %s",
                 session_id,
@@ -238,7 +238,7 @@ async def _restore_repair_after_new_activity(
             live_status=restore_live,
             label_updates={key: original_labels.get(key) or "" for key in repair_label_updates},
         )
-    except Exception:  # noqa: BLE001 - race compensation is best-effort and CAS guarded.
+    except Exception:
         _logger.warning(
             "Could not compensate raced native child reconciliation for %s",
             original.conversation_id,
@@ -617,7 +617,7 @@ async def _invalidate_native_subagents_for_missing_parent_terminal_impl(
         current_parent = await asyncio.to_thread(
             conversation_store.get_conversation, parent_session_id
         )
-    except Exception:  # noqa: BLE001 - best-effort self-heal must not break its caller.
+    except Exception:
         _logger.warning(
             "Missing-terminal child reconciliation could not read parent %s",
             parent_session_id,
@@ -650,7 +650,7 @@ async def _invalidate_native_subagents_for_missing_parent_terminal_impl(
             sort_by="created_at",
             include_archived=False,
         )
-    except Exception:  # noqa: BLE001 - best-effort self-heal must not break its caller.
+    except Exception:
         _logger.warning(
             "Missing-terminal child reconciliation could not list children for %s",
             parent_session_id,
@@ -676,7 +676,7 @@ async def _invalidate_native_subagents_for_missing_parent_terminal_impl(
                 child.id,
                 _FINGERPRINT_LABEL_KEYS,
             )
-        except Exception:  # noqa: BLE001 - one child must not abort the response.
+        except Exception:
             _logger.warning(
                 "Missing-terminal reconciliation could not freeze child %s",
                 child.id,
@@ -719,7 +719,7 @@ async def _invalidate_native_subagents_for_missing_parent_terminal_impl(
                 live_status=fingerprint.live_status,
                 label_updates=label_updates,
             )
-        except Exception:  # noqa: BLE001 - one child must not abort the response.
+        except Exception:
             _logger.warning(
                 "Missing-terminal reconciliation could not update child %s",
                 child.id,
@@ -778,7 +778,7 @@ async def invalidate_native_subagents_for_missing_parent_terminal(**kwargs: Any)
             if kwargs["parent"] is None:
                 return 0
         return await _invalidate_native_subagents_for_missing_parent_terminal_impl(**kwargs)
-    except Exception:  # noqa: BLE001 - this is a non-critical self-heal boundary.
+    except Exception:
         parent_id = kwargs.get("parent_session_id")
         _logger.warning(
             "Missing-terminal child reconciliation failed for %s",

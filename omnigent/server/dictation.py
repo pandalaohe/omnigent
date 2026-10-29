@@ -362,7 +362,7 @@ def _optional_punctuation_restorer() -> PunctuationRestorer | None:
         return None
     try:
         return get_punctuation_restorer()
-    except Exception:  # noqa: BLE001 - punctuation must not break transcription
+    except Exception:
         _logger.warning("final dictation punctuation failed to load", exc_info=True)
         return None
 
@@ -470,7 +470,7 @@ class SherpaDictationEngine:
                         )
                     )
                 )
-            except Exception:  # noqa: BLE001 — punctuation is best-effort
+            except Exception:
                 _logger.warning(
                     "dictation punctuation model failed to load from %s; "
                     "emitting raw recognizer output",

@@ -8,7 +8,7 @@ import secrets
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -114,7 +114,7 @@ def runner_boot() -> None:
         spool = outbox()
         spool.register_source(source, session_id, "claude-sdk", claude_physical_identity(source))
         spool.bind_claude_path(session_id, "physical-main", None, str(source.resolve()))
-        stamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        stamp = datetime.now(UTC).isoformat().replace("+00:00", "Z")
         records = [
             {"type": "user", "uuid": "user-1", "timestamp": stamp},
             {
@@ -297,9 +297,7 @@ def test_hold_refuses_input_drains_reads_receipt_and_releases(tmp_path: Path) ->
             assert receipts.json()["receipts"][-1]["digest"] == receipt["digest"]
             cutover_at = ((now // 3600) + 1) * 3600
             clock.write_text(str(cutover_at))
-            stamp = (
-                datetime.fromtimestamp(cutover_at, timezone.utc).isoformat().replace("+00:00", "Z")
-            )
+            stamp = datetime.fromtimestamp(cutover_at, UTC).isoformat().replace("+00:00", "Z")
             consumer = {
                 key: receipt[key]
                 for key in ("owner_scope_id", "feed_id", "feed_epoch", "domain", "generation")

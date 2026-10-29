@@ -305,7 +305,7 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
             or native_codex_launch_base_url(launch) is not None
         )
         defers_to_codex_config = not native_codex_launch_pins_model_provider(launch)
-    except Exception:  # noqa: BLE001 - readiness must never raise; fail onto auth.json.
+    except Exception:
         _logger.debug("codex readiness: launch resolve failed; using auth.json", exc_info=True)
         routes_through_provider = False
     if routes_through_provider and not defers_to_codex_config:
@@ -324,7 +324,7 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
         if not _codex_auth_json_has_available_credential(source.auth_path):
             return HARNESS_NEEDS_AUTH
         return None
-    except Exception:  # noqa: BLE001 - readiness must never raise.
+    except Exception:
         _logger.debug("codex readiness: local auth check failed", exc_info=True)
         return HARNESS_NEEDS_AUTH
 
@@ -674,7 +674,7 @@ def _wrapper_spec_startup_instructions(
 
     try:
         spec = load_agent_spec(spec_path, expand_env=False)
-    except Exception:  # noqa: BLE001 — best-effort; never block the launch
+    except Exception:
         _logger.warning(
             "Could not resolve startup instructions from wrapper spec %s",
             spec_path,
@@ -1540,7 +1540,7 @@ async def _initialize_fresh_terminal_thread(
     if profile is not None:
         try:
             await apply_codex_thread_permissions(app_server_url, thread_id, profile.profile_id)
-        except Exception:  # noqa: BLE001 - permissions are best-effort after discovery.
+        except Exception:
             _logger.warning("Failed to apply Codex thread permissions", exc_info=True)
     from omnigent.cli_auth import open_server_client
 

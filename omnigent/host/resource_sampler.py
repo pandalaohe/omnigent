@@ -21,7 +21,7 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import psutil
@@ -114,7 +114,7 @@ def _load_libproc() -> ctypes.CDLL | None:
         library = ctypes.CDLL(ctypes.util.find_library("proc") or "/usr/lib/libproc.dylib")
         library.proc_listchildpids.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
         library.proc_listchildpids.restype = ctypes.c_int
-    except Exception:  # noqa: BLE001 — any load/bind failure means fallback
+    except Exception:
         _logger.debug("libproc unavailable; resource sampling uses the fallback", exc_info=True)
         _libproc_failed = True
         return None
@@ -198,7 +198,7 @@ class ResourceSampler:
         :param interval_s: Sampling interval this snapshot is taken under.
         :returns: The snapshot frame.
         """
-        sampled_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        sampled_at = datetime.now(UTC).isoformat(timespec="seconds")
         self.sample_load_per_core = None
         try:
             machine = self._machine_metrics()
@@ -219,7 +219,7 @@ class ResourceSampler:
                 sampler_cpu_ms=self.last_cpu_ms,
                 monitor_rss_delta=self._monitor_rss_delta(),
             )
-        except Exception:  # noqa: BLE001 — a monitor must never raise
+        except Exception:
             _logger.debug("resource sample failed; sending an empty snapshot", exc_info=True)
             return HostResourceSnapshotFrame(
                 sampled_at=sampled_at,
@@ -309,7 +309,7 @@ class ResourceSampler:
                 rss=process.memory_info().rss,
                 started_at=create_time,
             )
-        except Exception:  # noqa: BLE001 — skip the pid, keep the sample
+        except Exception:
             _logger.debug("resource sampler skipped pid %s", pid, exc_info=True)
             return None
 
@@ -322,7 +322,7 @@ class ResourceSampler:
         if self._native_supported is None:
             try:
                 supported = child_pids(self._daemon_pid) is not None
-            except Exception:  # noqa: BLE001 — treat a broken probe as unsupported
+            except Exception:
                 _logger.debug("native child-list probe failed; using fallback", exc_info=True)
                 supported = False
             self._native_supported = supported
@@ -337,7 +337,7 @@ class ResourceSampler:
         try:
             for child in psutil.Process(self._daemon_pid).children(recursive=True):
                 mapping.setdefault(child.ppid(), []).append(child.pid)
-        except Exception:  # noqa: BLE001 — an empty tree is a valid answer
+        except Exception:
             _logger.debug("fallback process-tree walk failed", exc_info=True)
             mapping = {}
         self._fallback_tree = (now, mapping)
@@ -369,7 +369,7 @@ class ResourceSampler:
             memory = psutil.virtual_memory()
             mem_total = int(memory.total)
             mem_used = mem_total - int(memory.available)
-        except Exception:  # noqa: BLE001 — one metric must not fail the sample
+        except Exception:
             _logger.debug("resource sampler could not read memory", exc_info=True)
             mem_used = 0
             mem_total = 0
@@ -377,7 +377,7 @@ class ResourceSampler:
             usage = psutil.disk_usage(str(self._data_dir))
             disk_used = int(usage.used)
             disk_total = int(usage.total)
-        except Exception:  # noqa: BLE001
+        except Exception:
             _logger.debug("resource sampler could not read disk", exc_info=True)
             disk_used = 0
             disk_total = 0
@@ -396,7 +396,7 @@ class ResourceSampler:
                     self._loadavg_started_at = now
                 if now - self._loadavg_started_at < _LOADAVG_WARMUP_S:
                     load1 = None
-            except Exception:  # noqa: BLE001 — one metric must not fail the sample
+            except Exception:
                 _logger.debug("resource sampler could not read emulated load", exc_info=True)
                 load1 = None
         equivalent = load_equiv(load1, cpu_minute_pct, cpu_count, windows=not IS_POSIX)
@@ -425,7 +425,7 @@ class ResourceSampler:
         self._cpu_reading_usable = False
         try:
             busy, total = _cpu_busy_total(psutil.cpu_times())
-        except Exception:  # noqa: BLE001
+        except Exception:
             _logger.debug("resource sampler could not read machine CPU", exc_info=True)
             return 0.0
         previous = self._machine_cpu_baseline
@@ -442,7 +442,7 @@ class ResourceSampler:
     def _monitor_rss_delta(self) -> int:
         try:
             rss = int(psutil.Process(self._daemon_pid).memory_info().rss)
-        except Exception:  # noqa: BLE001
+        except Exception:
             _logger.debug("resource sampler could not read its own RSS", exc_info=True)
             return 0
         if self._daemon_rss_baseline is None:

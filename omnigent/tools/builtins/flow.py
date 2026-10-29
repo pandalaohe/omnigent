@@ -94,7 +94,7 @@ class FlowPlan:
     note: str | None
 
 
-def _seconds(args: dict[str, Any], key: str, *, allow_zero: bool) -> float | None | str:
+def _seconds(args: dict[str, Any], key: str, *, allow_zero: bool) -> float | str | None:
     """Validate an optional seconds field; return the value, ``None`` or an error."""
     raw = args.get(key)
     if raw is None:
@@ -111,7 +111,7 @@ def _seconds(args: dict[str, Any], key: str, *, allow_zero: bool) -> float | Non
 
 def _positive_int(
     args: dict[str, Any], key: str, *, ceiling: int | None = None
-) -> int | None | str:
+) -> int | str | None:
     """Validate an optional positive integer field."""
     raw = args.get(key)
     if raw is None:
@@ -145,7 +145,7 @@ def _validate_steps(raw: object) -> tuple[FlowStep, ...] | str:
     return tuple(steps)
 
 
-def _validate_stop_when(raw: object, step_count: int) -> StopWhen | None | str:
+def _validate_stop_when(raw: object, step_count: int) -> StopWhen | str | None:
     """Validate the optional ``stop_when`` object."""
     if raw is None:
         return None

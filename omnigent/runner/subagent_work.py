@@ -1534,7 +1534,7 @@ async def run_subagent_launch_reaper(
                 await reconcile_pending()
             if check_remote_members is not None:
                 await check_remote_members()
-        except Exception:  # noqa: BLE001 — the sweep is a backstop; never die.
+        except Exception:
             _logger.warning("sub-agent launch reaper sweep failed", exc_info=True)
 
 

@@ -1832,7 +1832,7 @@ async def forward_claude_transcript_to_session(
                                 bridge_dir=bridge_dir,
                                 retry_tracker=compaction_retries,
                             )
-                        except Exception:  # noqa: BLE001
+                        except Exception:
                             _logger.warning(
                                 "Failed to persist bounded compaction hook fallback; "
                                 "session=%s bridge_dir=%s",
@@ -6980,7 +6980,7 @@ async def _handle_compact_summary_item_unlocked(
             extra={"session_id": session_id},
         )
         return False
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         # Count every failure for the degraded-sync escalation (#1120), but
         # judge permanence ourselves: routing it through the tracker's
         # decision would derive "permanent" from an HTTP status
@@ -7019,7 +7019,7 @@ async def _handle_compact_summary_item_unlocked(
                     snapshot_source="transcript_degraded",
                     allow_snapshot_fallback=True,
                 )
-            except Exception:  # noqa: BLE001
+            except Exception:
                 # A stalled transcript stream is worse than a lost boundary;
                 # advance the cursor regardless. _note_forward_failure (via
                 # record_failure above) already carries visibility into the
@@ -7644,7 +7644,7 @@ async def _post_forward_side_channel_updates(
             dedupe=dedupe,
             title=result.latest_custom_title,
         )
-    except Exception:  # noqa: BLE001 — must never mask the item batch's own outcome
+    except Exception:
         # Guards the ``finally`` in ``_forward_available_items``: raising
         # here would replace whatever exception (or return value) the item
         # batch already produced.
@@ -9283,7 +9283,7 @@ async def _read_sdk_compaction_snapshot(
                 for uid, message in messages
             ]
             return [message for message in snapshots if message is not None and message["content"]]
-        except Exception:  # noqa: BLE001
+        except Exception:
             _logger.debug(
                 "Failed to read Claude session messages for compaction fallback",
                 exc_info=True,

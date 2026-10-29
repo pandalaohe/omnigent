@@ -903,7 +903,7 @@ async def restore_session_attachments(
                 path = await materialize_file_reference(
                     file_id, row, session_id=session_id, client=client
                 )
-            except Exception:  # noqa: BLE001 — a restore failure is never fatal.
+            except Exception:
                 _logger.warning(
                     "failed to restore file_id=%s for session=%s",
                     file_id,

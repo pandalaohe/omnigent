@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Literal
 
@@ -189,7 +189,7 @@ class UsageObservation(BaseModel):
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError as exc:
             raise ValueError("invalid UTC timestamp") from exc
-        return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        return parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
     @field_validator("cost_usd")
     @classmethod
