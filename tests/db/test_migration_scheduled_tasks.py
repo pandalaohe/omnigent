@@ -785,6 +785,11 @@ def test_occurrence_uniqueness_is_scoped_to_workspace_and_task(
             conn.execute(second)
 
 
+def _stamped_revisions(conn: sa.Connection) -> set[str]:
+    """Return every stamp; CRDB pins below its bootstrapped head, so the custom chain keeps one."""
+    return set(conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalars())
+
+
 @pytest.fixture
 def dispatch_migration_engine(tmp_path: Path) -> Iterator[Engine]:
     """Pin rollback tests without rewinding the shared, head-migrated worker DB."""
@@ -992,6 +997,9 @@ def test_dispatch_downgrade_refuses_out_of_range_timestamps(
             )
         )
     config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
+    with engine.connect() as conn:
+        pinned = _stamped_revisions(conn)
+    assert _DISPATCH_REVISION in pinned
     for table, fields in (
         (tasks, ("created_at", "last_run_at", "updated_at")),
         (runs, ("scheduled_at", "fired_at", "finished_at")),
@@ -1007,10 +1015,7 @@ def test_dispatch_downgrade_refuses_out_of_range_timestamps(
                 command.downgrade(config, _DISPATCH_PREVIOUS)
             with engine.begin() as conn:
                 assert conn.execute(sa.select(table.c[field])).scalar_one() == timestamp
-                assert (
-                    conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
-                    == _DISPATCH_REVISION
-                )
+                assert _stamped_revisions(conn) == pinned
                 conn.execute(table.update().values(**{field: 1}))
             assert "next_run_at" in {
                 c["name"] for c in sa.inspect(engine).get_columns("scheduled_tasks")
@@ -1044,15 +1049,15 @@ def test_dispatch_downgrade_refuses_starting_runs(dispatch_migration_engine: Eng
             )
         )
     config = _build_alembic_config(db_engine.url.render_as_string(hide_password=False))
+    with db_engine.connect() as conn:
+        pinned = _stamped_revisions(conn)
+    assert _DISPATCH_REVISION in pinned
     with pytest.raises(RuntimeError, match="Reconcile starting"), db_engine.begin() as conn:
         config.attributes["connection"] = conn
         command.downgrade(config, _DISPATCH_PREVIOUS)
     with db_engine.connect() as conn:
         assert conn.execute(sa.select(runs.c.status)).scalar_one() == 6
-        assert (
-            conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
-            == _DISPATCH_REVISION
-        )
+        assert _stamped_revisions(conn) == pinned
     assert "trigger_key" in {
         c["name"] for c in sa.inspect(db_engine).get_columns("scheduled_task_runs")
     }
@@ -1113,14 +1118,13 @@ def test_completed_state_migration_round_trips(dispatch_migration_engine: Engine
     with engine.begin() as conn:
         conn.execute(tasks.insert().values(id=b"a" * 16, state=4, **values))
         conn.execute(tasks.insert().values(id=b"b" * 16, state=2, **values))
+        pinned = _stamped_revisions(conn)
+    assert _COMPLETED_STATE_REVISION in pinned
     with pytest.raises(RuntimeError, match="Reconcile completed"), engine.begin() as conn:
         config.attributes["connection"] = conn
         command.downgrade(config, _DISPATCH_REVISION)
     with engine.connect() as conn:
-        assert (
-            conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
-            == _COMPLETED_STATE_REVISION
-        )
+        assert _stamped_revisions(conn) == pinned
     # After reconciling, the downgrade restores the narrower check.
     with engine.begin() as conn:
         conn.execute(tasks.update().where(tasks.c.state == 4).values(state=1, next_run_at=None))
