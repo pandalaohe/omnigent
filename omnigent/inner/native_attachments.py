@@ -36,6 +36,7 @@ from typing import IO, Any, Literal
 import httpx
 
 from omnigent.debug_logging import debug_event
+from omnigent.native import native_bridge_common
 from omnigent.process_logging import data_dir
 
 _logger = logging.getLogger(__name__)
@@ -417,6 +418,17 @@ def materialize_attachment(block: Mapping[str, object], bridge_dir: Path) -> Pat
         return None
 
     attachments_dir = attachment_cache_dir(bridge_dir)
+    try:
+        # Held while placing, so the expired-cache sweep cannot remove the dir mid-write.
+        with native_bridge_common.attachment_dir_lock(attachments_dir):
+            return _materialize_into_cache(attachments_dir, filename, raw_bytes)
+    except OSError:
+        _logger.warning("Refusing to materialize into %s", attachments_dir, exc_info=True)
+        return None
+
+
+def _materialize_into_cache(attachments_dir: Path, filename: str, raw_bytes: bytes) -> Path | None:
+    """Place decoded bytes in *attachments_dir*, reusing an identical file there."""
     if not _dir_fd_supported():
         return _materialize_attachment_by_path(attachments_dir, filename, raw_bytes)
     try:
@@ -502,6 +514,9 @@ def _materialize_attachment_by_path(
                         # A reused file must not stay executable; if the bits
                         # can't be cleared, fall through to the collision name.
                         continue
+                    # Reuse is activity for the expired-cache sweep.
+                    with contextlib.suppress(OSError):
+                        os.utime(target)
                     return target
             continue
         temp_path = attachments_dir / f"{name}.{uuid.uuid4().hex}.tmp"
@@ -685,6 +700,9 @@ async def _materialize_file_reference_no_follow(
                 _logger.warning("Refusing to write through %s", target_dir / local_name)
                 return None
             if info.st_size == expected_bytes:
+                # Reuse is activity for the expired-cache sweep.
+                with contextlib.suppress(OSError):
+                    os.utime(local_name, dir_fd=target_fd, follow_symlinks=False)
                 return target_dir / local_name
 
         temp_name = f"{local_name}.{uuid.uuid4().hex}.tmp"
@@ -790,6 +808,9 @@ async def _materialize_file_reference_by_path(
             _logger.warning("Refusing to write through %s", target)
             return None
         if info.st_size == expected_bytes:
+            # Reuse is activity for the expired-cache sweep.
+            with contextlib.suppress(OSError):
+                os.utime(target)
             return target
 
     temp_path = target_dir / f"{local_name}.{uuid.uuid4().hex}.tmp"
@@ -999,6 +1020,9 @@ def _place_no_follow(
             # A reused file must not stay executable; if the bits can't be
             # cleared, fall through to the collision name instead.
             return "taken"
+        # Reuse is activity for the expired-cache sweep.
+        with contextlib.suppress(OSError):
+            os.utime(fd)
         return "placed"
     finally:
         os.close(fd)

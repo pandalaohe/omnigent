@@ -82,18 +82,20 @@ def _write_file(directory: Path, *, expired: bool) -> Path:
     return path
 
 
-def test_prune_expired_attachment_caches_removes_only_expired_bridge_caches(
+def test_prune_expired_attachment_caches_removes_only_expired_attachment_dirs(
     tmp_path: Path,
 ) -> None:
-    """Only expired bridge-keyed caches go; fresh, session, other and symlinked ones stay."""
+    """Expired bridge and session dirs go; fresh, other and symlinked ones stay."""
     attachments = tmp_path / "attachments"
     expired = attachments / ("a" * 32)
     fresh = attachments / ("b" * 32)
     session_dir = attachments / ("s-" + "c" * 32)
+    fresh_session_dir = attachments / ("s-" + "f" * 32)
     other = attachments / "not-a-cache"
     _write_file(expired, expired=True)
     _write_file(fresh, expired=False)
-    _write_file(session_dir, expired=True)
+    _write_file(session_dir / "file_1", expired=True)
+    _write_file(fresh_session_dir / "file_1", expired=False)
     _write_file(other, expired=True)
     target_file = _write_file(tmp_path / "elsewhere", expired=True)
     link = attachments / ("d" * 32)
@@ -101,13 +103,26 @@ def test_prune_expired_attachment_caches_removes_only_expired_bridge_caches(
 
     removed = native_bridge_common.prune_expired_attachment_caches(attachments)
 
-    assert removed == 1
+    assert removed == 2
     assert not expired.exists()
+    assert not session_dir.exists()
     assert fresh.exists()
-    assert session_dir.exists()
+    assert fresh_session_dir.exists()
     assert other.exists()
     assert link.is_symlink()
     assert target_file.exists()
+
+
+def test_prune_expired_attachment_caches_skips_a_dir_being_written(tmp_path: Path) -> None:
+    """An expired dir whose writer holds the attachment lock is kept."""
+    attachments = tmp_path / "attachments"
+    busy = attachments / ("a" * 32)
+    _write_file(busy, expired=True)
+
+    with native_bridge_common.attachment_dir_lock(busy):
+        assert native_bridge_common.prune_expired_attachment_caches(attachments) == 0
+
+    assert busy.exists()
 
 
 def test_prune_expired_attachment_caches_missing_dir_returns_zero(tmp_path: Path) -> None:

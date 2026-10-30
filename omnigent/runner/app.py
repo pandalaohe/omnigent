@@ -12082,9 +12082,12 @@ def create_runner_app(
         if process_manager is not None:
             await process_manager.release(session_id)
         await resource_registry.cleanup_session(session_id)
+        # The session keeps running here (session delete is DELETE /v1/sessions/{id}),
+        # and its native transcript still reads the cached attachments.
         await _delete_native_bridge_dirs(
             server_client=server_client,
             session_id=session_id,
+            keep_attachment_caches=True,
         )
         if session_id in _session_histories:
             _attachment_restore_pending.add(session_id)

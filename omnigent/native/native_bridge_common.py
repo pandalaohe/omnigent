@@ -64,6 +64,13 @@ def bridge_dir_preparation_lock(bridge_dir: Path) -> Iterator[None]:
 
 
 @contextmanager
+def attachment_dir_lock(attachments_dir: Path) -> Iterator[None]:
+    """Keep the expired-cache sweep off *attachments_dir* while a file is placed there."""
+    with _bridge_dir_lock(attachments_dir):
+        yield
+
+
+@contextmanager
 def _try_bridge_dir_cleanup_lock(bridge_dir: Path) -> Iterator[bool]:
     """Try to exclude bridge preparation without ever blocking cleanup."""
     lock = _bridge_dir_lock(bridge_dir)
@@ -219,14 +226,16 @@ def prune_orphaned_dirs(
     return pruned
 
 
-_ATTACHMENT_CACHE_NAME = re.compile(r"[0-9a-f]{32}")
+_ATTACHMENT_CACHE_NAME = re.compile(r"(?:s-)?[0-9a-f]{32}")
 
 
 def prune_expired_attachment_caches(attachments_dir: Path | None = None) -> int:
     """
-    Remove bridge-keyed attachment caches whose newest file is past the orphan retention.
+    Remove attachment dirs whose newest file is past the orphan retention.
 
-    Session-keyed ``s-*`` dirs, symlinks, files and other names are left alone.
+    Covers bridge-keyed caches and session-keyed ``s-*`` dirs; symlinks, files
+    and other names are left alone. A dir is re-checked under the lock its
+    writers hold, and skipped while one holds it.
 
     :param attachments_dir: The attachments directory to sweep. Defaults to
         ``native_attachments.attachments_root()``.
@@ -245,11 +254,12 @@ def prune_expired_attachment_caches(attachments_dir: Path | None = None) -> int:
                 continue
             if entry.is_symlink() or not entry.is_dir():
                 continue
-            if not orphan_retention_expired(entry):
-                continue
-            shutil.rmtree(entry, ignore_errors=True)
-            if not entry.exists():
-                removed += 1
+            with _try_bridge_dir_cleanup_lock(entry) as acquired:
+                if not acquired or not orphan_retention_expired(entry):
+                    continue
+                shutil.rmtree(entry, ignore_errors=True)
+                if not entry.exists():
+                    removed += 1
     except OSError:
         _logger.warning(
             "Error scanning attachment caches under %s", attachments_dir, exc_info=True

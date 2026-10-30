@@ -10887,8 +10887,10 @@ async def _delete_native_bridge_dirs(
     :param server_client: Omnigent server client used to resolve rotated bridge
         id labels. ``None`` skips label resolution (session_id keys only).
     :param session_id: Omnigent session/conversation id, e.g. ``"conv_abc123"``.
-    :param keep_attachment_caches: Leave the bridge-keyed attachment caches in
-        place for a session that can resume; ``False`` (session delete) removes them.
+    :param keep_attachment_caches: Leave the bridge-keyed caches and the
+        session's by-path dir in place for a session that can resume (a native
+        transcript reads them and nothing restores them); ``False`` (session
+        delete) removes them.
     """
     from omnigent.harnesses.antigravity_native.bridge import (
         ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
@@ -10964,9 +10966,9 @@ async def _delete_native_bridge_dirs(
     if not keep_attachment_caches:
         # A cache can survive a missing bridge directory, including after a reboot.
         targets.update(attachment_cache_dir(target) for target in tuple(targets))
-    # By-path attachments live under a session-keyed dir shared by all
-    # harnesses, independent of any bridge directory.
-    targets.add(session_attachment_dir(session_id))
+        # By-path attachments live under a session-keyed dir shared by all
+        # harnesses, independent of any bridge directory.
+        targets.add(session_attachment_dir(session_id))
     for target in targets:
         try:
             shutil.rmtree(target, ignore_errors=False)

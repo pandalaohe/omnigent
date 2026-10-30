@@ -10,7 +10,11 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from omnigent.harnesses.claude_native.bridge import bridge_dir_for_bridge_id
-from omnigent.inner.native_attachments import attachment_cache_dir, materialize_attachment
+from omnigent.inner.native_attachments import (
+    attachment_cache_dir,
+    materialize_attachment,
+    session_attachment_dir,
+)
 from omnigent.runner import create_runner_app
 from omnigent.terminals.pane_reaper import NativePaneReaper, PaneRef
 from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient
@@ -519,10 +523,11 @@ async def test_runner_idle_release_cleans_up_when_harness_died_first() -> None:
 
 @pytest.mark.asyncio
 async def test_runner_idle_release_keeps_native_attachment_cache() -> None:
-    """An idle release keeps the bridge-keyed attachment cache of a resumable session.
+    """An idle release keeps both attachment dirs of a resumable session.
 
     The session lives on after the runtime is released, and its native
-    transcript still references the cached files by path.
+    transcript still references the cached files by path; a native turn
+    reads them as they are, with no restore step.
     """
     pm = _AbsentHarnessProcessManager(_ScriptedHarnessClient([]))
     pm.retention_snapshot_result = {
@@ -547,6 +552,9 @@ async def test_runner_idle_release_keeps_native_attachment_cache() -> None:
         bridge_dir,
     )
     assert cached is not None
+    by_path = session_attachment_dir(session_id) / "file_1" / "clip.mp4"
+    by_path.parent.mkdir(parents=True)
+    by_path.write_bytes(b"clip")
 
     try:
         async with _runner_client(app) as client:
@@ -574,8 +582,10 @@ async def test_runner_idle_release_keeps_native_attachment_cache() -> None:
         assert released.json()["status"] == "released"
         assert pm.released == [session_id]
         assert cached.exists()
+        assert by_path.exists()
     finally:
         shutil.rmtree(attachment_cache_dir(bridge_dir), ignore_errors=True)
+        shutil.rmtree(session_attachment_dir(session_id), ignore_errors=True)
 
 
 async def _never_busy(pane: PaneRef) -> bool:
