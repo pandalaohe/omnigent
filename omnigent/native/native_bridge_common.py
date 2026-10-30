@@ -158,6 +158,8 @@ def prune_orphaned_dirs(
     so there is no owner to prove dead: it is removed only when *should_prune*
     accepts it, and kept when the harness has no retention policy. A dir with
     an unparseable marker is always kept.
+    The session's attachment cache is left in place because a resumed
+    transcript still reads it; :func:`prune_expired_attachment_caches` retires it.
 
     Reuses ``inner/terminal.py:_process_alive`` as the liveness predicate.
 
@@ -172,7 +174,6 @@ def prune_orphaned_dirs(
     """
     if not bridge_root.exists():
         return 0
-    from omnigent.inner.native_attachments import attachment_cache_dir
     from omnigent.inner.terminal import _process_alive
 
     pruned = 0
@@ -213,12 +214,47 @@ def prune_orphaned_dirs(
                 confirmed_pid is not None and _process_alive(confirmed_pid)
             ):
                 continue
-            cache_dir = attachment_cache_dir(entry)
             shutil.rmtree(entry, ignore_errors=True)
-            if not entry.exists():
-                shutil.rmtree(cache_dir, ignore_errors=True)
             pruned += 1
     return pruned
+
+
+_ATTACHMENT_CACHE_NAME = re.compile(r"[0-9a-f]{32}")
+
+
+def prune_expired_attachment_caches(attachments_dir: Path | None = None) -> int:
+    """
+    Remove bridge-keyed attachment caches whose newest file is past the orphan retention.
+
+    Session-keyed ``s-*`` dirs, symlinks, files and other names are left alone.
+
+    :param attachments_dir: The attachments directory to sweep. Defaults to
+        ``native_attachments.attachments_root()``.
+    :returns: The number of attachment caches removed.
+    """
+    if attachments_dir is None:
+        from omnigent.inner.native_attachments import attachments_root
+
+        attachments_dir = attachments_root()
+    if not attachments_dir.exists():
+        return 0
+    removed = 0
+    try:
+        for entry in attachments_dir.iterdir():
+            if not _ATTACHMENT_CACHE_NAME.fullmatch(entry.name):
+                continue
+            if entry.is_symlink() or not entry.is_dir():
+                continue
+            if not orphan_retention_expired(entry):
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
+            if not entry.exists():
+                removed += 1
+    except OSError:
+        _logger.warning(
+            "Error scanning attachment caches under %s", attachments_dir, exc_info=True
+        )
+    return removed
 
 
 def reap_orphaned_native_bridge_dirs() -> int:
@@ -237,7 +273,7 @@ def reap_orphaned_native_bridge_dirs() -> int:
     standalone runners call this to reclaim dirs leaked by a prior runner that
     died without running the explicit delete path.
 
-    :returns: The total number of orphaned bridge dirs removed.
+    :returns: The total number of orphaned bridge dirs and expired attachment caches removed.
     """
     # Imported lazily to avoid an import cycle: the per-harness bridge
     # modules import this module for the marker/prune helpers.
@@ -277,6 +313,10 @@ def reap_orphaned_native_bridge_dirs() -> int:
                 "Error pruning orphaned bridge dirs for native agent %s",
                 agent.key,
             )
+    try:
+        pruned += prune_expired_attachment_caches()
+    except Exception:
+        _logger.exception("Error pruning expired native attachment caches")
     return pruned
 
 

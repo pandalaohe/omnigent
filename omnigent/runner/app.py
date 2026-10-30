@@ -12483,9 +12483,11 @@ def create_runner_app(
             if await process_manager.release(session_id) is False:
                 raise RuntimeError("harness subprocess did not exit during CLI release")
         await _native_runtime.teardown_codex_native_app_server(session_id)
+        # The session resumes later and its native transcript still reads the cached attachments.
         await _delete_native_bridge_dirs(
             server_client=server_client,
             session_id=session_id,
+            keep_attachment_caches=True,
         )
         if session_id in _session_histories:
             _attachment_restore_pending.add(session_id)

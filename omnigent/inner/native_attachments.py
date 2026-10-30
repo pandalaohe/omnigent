@@ -292,6 +292,11 @@ def _data_uri_mime(data_uri: object) -> str | None:
         return None
 
 
+def attachments_root() -> Path:
+    """Return the host directory holding every attachment cache and session dir."""
+    return data_dir().resolve() / "attachments"
+
+
 def attachment_cache_dir(bridge_dir: Path) -> Path:
     """Return the local attachment cache for a native session's bridge.
 
@@ -299,7 +304,7 @@ def attachment_cache_dir(bridge_dir: Path) -> Path:
     All harnesses share ``~/.omnigent/attachments/`` (or ``OMNIGENT_DATA_DIR``).
     """
     key = hashlib.sha256(os.fsencode(bridge_dir.resolve())).hexdigest()[:32]
-    return data_dir().resolve() / "attachments" / key
+    return attachments_root() / key
 
 
 def session_attachment_dir(session_id: str) -> Path:
@@ -309,7 +314,7 @@ def session_attachment_dir(session_id: str) -> Path:
     every host that runs the session; files live under ``<file_id>/<name>``.
     """
     digest = hashlib.sha256(session_id.encode()).hexdigest()[:32]
-    return data_dir().resolve() / "attachments" / f"s-{digest}"
+    return attachments_root() / f"s-{digest}"
 
 
 # One "[Attached: <path>]" line whose path ends in the per-session layout
