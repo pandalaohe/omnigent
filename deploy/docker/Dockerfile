@@ -96,6 +96,8 @@ RUN npm install -g pnpm@11.15.1
 RUN pnpm install --frozen-lockfile --filter web
 
 COPY web/ ./web/
+# Design-mode prompts import the evidence module shared with the browser extension.
+COPY browsers/shared/ ./browsers/shared/
 ARG VITE_OMNIGENT_HOST_ROUTING=false
 RUN pnpm --filter web run build
 
