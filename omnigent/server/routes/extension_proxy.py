@@ -11,7 +11,7 @@ from fastapi.responses import Response
 from omnigent.extensions import ExtensionPermission, ExtensionPluginState, ExternalPageContribution
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
-from omnigent.server.ws_origin import _origin_matches_wildcard_entry, parse_allowed_origins
+from omnigent.server.ws_origin import origin_allowed, parse_allowed_origins
 
 _REQUEST_HEADERS = ("content-type", "accept")
 _RESPONSE_HEADERS = (
@@ -38,24 +38,13 @@ def _is_same_origin(request: Request, supplied_origin: str | None) -> bool:
     if supplied == httpx.URL(f"{request.url.scheme}://{request.url.netloc}"):
         return True
     configured = set(parse_allowed_origins())
-    if base_url := os.environ.get("OMNIGENT_ACCOUNTS_BASE_URL", "").strip():
+    if base_url := os.environ.get("OMNIGENT_ACCOUNTS_BASE_URL", "").strip().rstrip("/"):
         configured.add(base_url)
-    for entry in configured:
-        if "*" in entry:
-            if _origin_matches_wildcard_entry(supplied_origin, entry):
-                return True
-            continue
-        try:
-            parsed = httpx.URL(entry)
-        except httpx.InvalidURL:
-            continue
-        if (
-            parsed.scheme in {"http", "https"}
-            and parsed.netloc
-            and supplied == httpx.URL(f"{parsed.scheme}://{parsed.netloc.decode('ascii')}")
-        ):
-            return True
-    return False
+    return bool(configured) and origin_allowed(
+        supplied_origin,
+        local_mode=False,
+        extra_allowed=frozenset(configured),
+    )
 
 
 def create_extension_proxy_router(

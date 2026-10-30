@@ -48,6 +48,8 @@ def deployment(request: pytest.FixtureRequest) -> str:
 
 @pytest.fixture
 def proxy_client(monkeypatch: pytest.MonkeyPatch, deployment: str):
+    monkeypatch.delenv("OMNIGENT_WS_ALLOWED_ORIGINS", raising=False)
+    monkeypatch.delenv("OMNIGENT_ACCOUNTS_BASE_URL", raising=False)
     requests: list[httpx.Request] = []
     reply: list[httpx.Response | Exception] = [httpx.Response(200, text="board")]
 
@@ -212,7 +214,13 @@ async def test_proxy_refuses_cross_site_writes(proxy_client, headers: dict[str, 
             "https://node.tailnet.test",
             200,
         ),
-        ("OMNIGENT_ACCOUNTS_BASE_URL", "https://app.test", "https://app.test", 200),
+        ("OMNIGENT_ACCOUNTS_BASE_URL", "https://app.test/", "https://app.test", 200),
+        (
+            "OMNIGENT_WS_ALLOWED_ORIGINS",
+            "https://user:pass@app.test,https://app.test/subpath?x=1#frag",
+            "https://app.test",
+            403,
+        ),
         ("OMNIGENT_WS_ALLOWED_ORIGINS", "https://app.test", "https://other.test", 403),
     ],
 )
@@ -224,8 +232,6 @@ async def test_proxy_writes_behind_https_reverse_proxy(
     origin: str,
     expected: int,
 ) -> None:
-    monkeypatch.delenv("OMNIGENT_WS_ALLOWED_ORIGINS", raising=False)
-    monkeypatch.delenv("OMNIGENT_ACCOUNTS_BASE_URL", raising=False)
     if env_name:
         monkeypatch.setenv(env_name, env_value)
     client, requests, _ = proxy_client
