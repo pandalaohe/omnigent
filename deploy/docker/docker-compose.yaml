@@ -39,10 +39,12 @@ services:
       retries: 5
 
   omnigent:
-    # Pre-built image published to GHCR on every main-branch merge.
-    # `docker compose pull` fetches the latest; pin OMNIGENT_IMAGE_TAG
-    # to a sha-<short> or vX.Y.Z tag for reproducible deploys.
-    image: ${OMNIGENT_IMAGE:-ghcr.io/omnigent-ai/omnigent-server}:${OMNIGENT_IMAGE_TAG:-latest}
+    # This distribution's server image on GHCR, one tag per released version.
+    # Unpinned (`latest`) follows the newest version: `docker compose pull`,
+    # `docker compose up -d`, then `omni up` on each host. Pinned
+    # (OMNIGENT_IMAGE_TAG=<version>): move the pin and the hosts together;
+    # host and server should run the same version.
+    image: ${OMNIGENT_IMAGE:-ghcr.io/pandalaohe/omnigent-wukong-server}:${OMNIGENT_IMAGE_TAG:-latest}
     # Local-build fallback for forks / offline / dev iterations. Used
     # only when the image isn't already pulled AND you run
     # `docker compose up --build` explicitly. The published image in
