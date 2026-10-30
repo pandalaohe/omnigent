@@ -3705,8 +3705,13 @@ def create_app(
         Used by the web UI to include version info in bug reports.
 
         :returns: ``{"version": "<semver string>"}``,
-            e.g. ``{"version": "0.1.0"}``.
+            e.g. ``{"version": "0.1.0"}``; a stamped distribution build adds
+            ``"distribution"``, e.g. ``"0.21.0-wukong.12"``.
         """
+        from omnigent.distribution import DISTRIBUTION_VERSION
+
+        if DISTRIBUTION_VERSION:
+            return {"version": _server_version(), "distribution": DISTRIBUTION_VERSION}
         return {"version": _server_version()}
 
     @app.get("/.well-known/omnigent.json")

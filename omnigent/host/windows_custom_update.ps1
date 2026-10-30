@@ -147,15 +147,20 @@ try {
     Start-Sleep -Milliseconds 500
 
     Write-JsonAtomic ([string]$instruction.rollback_path) ([ordered]@{
-        schema_version = 1
+        schema_version = 2
         commit_sha = $OldCommit
+        source_url = $instruction.rollback_source_url
     })
 
+    # Only an explicit false rebuilds the web UI; a missing field keeps the Host-only skip.
+    # Set either way so an inherited value cannot override the decision.
+    $installEnvironment = @{ OMNIGENT_SKIP_WEB_UI = 'true' }
+    if ($instruction.skip_web_ui -eq $false) {
+        $installEnvironment.OMNIGENT_SKIP_WEB_UI = 'false'
+    }
     $installArguments = @($instruction.install_argv | ForEach-Object { [string]$_ })
     Add-UpdateLog $LogPath "Running custom Host installer."
-    $install = Invoke-CapturedProcess $installArguments @{
-        OMNIGENT_SKIP_WEB_UI = 'true'
-    }
+    $install = Invoke-CapturedProcess $installArguments $installEnvironment
     if ($install.Stdout) { Add-UpdateLog $LogPath $install.Stdout.Trim() }
     if ($install.Stderr) { Add-UpdateLog $LogPath $install.Stderr.Trim() }
     if ($install.ExitCode -ne 0) {

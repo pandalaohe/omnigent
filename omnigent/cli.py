@@ -708,8 +708,13 @@ _HOST_SESSION_ACTIVE_STATUSES = frozenset({"running", "waiting"})
 # How often ``omni upgrade`` re-polls the local server for in-flight
 # (connected) sessions while draining before it stops the server.
 _UPGRADE_DRAIN_POLL_S = 2.0
-_CUSTOM_HOST_VCS_URL = "git+https://github.com/pandalaohe/omnigent.git"
+# Built-in custom channel: the public distribution repository's ``main``.
+_CUSTOM_HOST_VCS_URL = "git+https://github.com/pandalaohe/omnigent-wukong.git"
+_CUSTOM_HOST_DEFAULT_SOURCE = f"{_CUSTOM_HOST_VCS_URL}@main"
+# Branch of a configured ``custom_host_sources`` entry written without ``@<branch>``.
 _CUSTOM_HOST_CHANNEL = "local/host-custom"
+# Earlier home of the channel; installs made from it still count as custom.
+_CUSTOM_HOST_LEGACY_VCS_URL = "git+https://github.com/pandalaohe/omnigent.git"
 _CUSTOM_HOST_SESSION_QUERY_TIMEOUT_S = 60.0
 _CUSTOM_HOST_RECONNECT_TIMEOUT_S = 60.0
 _CUSTOM_HOST_HELPER_START_TIMEOUT_S = 10.0
@@ -1755,14 +1760,19 @@ def _format_version() -> str:
     behavior before this feature shipped.
 
     :returns: Either ``"omnigent 0.1.0"`` (no build info), or
-        ``"omnigent 0.1.0 (010cf77c, built 2026-05-21T14:34:45Z)"``.
+        ``"omnigent 0.1.0 (010cf77c, built 2026-05-21T14:34:45Z)"``. A
+        stamped distribution build names its version after the package
+        version: ``"omnigent 0.21.0.dev0 (omnigent-wukong 0.21.0-wukong.12)"``.
     """
     import datetime
 
+    from omnigent.distribution import DISTRIBUTION_NAME, DISTRIBUTION_VERSION
     from omnigent.update_check import _read_build_info
     from omnigent.version import VERSION
 
     version_str = VERSION
+    if DISTRIBUTION_VERSION:
+        version_str = f"{VERSION} ({DISTRIBUTION_NAME} {DISTRIBUTION_VERSION})"
     info = _read_build_info()
     if info is None:
         return f"omnigent {version_str}"
@@ -6289,8 +6299,8 @@ def upgrade(
         )
     if info.vcs_url and _is_custom_host_vcs_url(info.vcs_url):
         raise click.ClickException(
-            "This Host tracks our fork-only update channel. Use "
-            f"`{cli_invocation(name='omni')} host update custom` so the branch, "
+            "This install tracks the custom update channel. Use "
+            f"`{cli_invocation(name='omni')} up` so the branch, "
             "Host restart, and rollback receipt are preserved."
         )
 
@@ -10061,16 +10071,18 @@ def _custom_host_source_urls() -> list[str]:
     """
     Return the ordered custom Host source repositories from the user config.
 
-    :returns: The configured ``custom_host_sources`` URLs, or
-        ``[_CUSTOM_HOST_VCS_URL]`` when the key is absent, so the default
-        channel is unchanged.
+    An entry may end in ``@<branch>``; without it the entry tracks
+    :data:`_CUSTOM_HOST_CHANNEL`.
+
+    :returns: The configured ``custom_host_sources`` entries, or
+        ``[_CUSTOM_HOST_DEFAULT_SOURCE]`` when the key is absent.
     :raises click.ClickException: When the key is present but is not a
-        non-empty list of ``git+https://``/``git+ssh://`` repository URLs
-        without a pinned ref.
+        non-empty list of ``git+https://``/``git+ssh://`` repository URLs,
+        each optionally ending in ``@<branch>``.
     """
     config = _load_global_config()
     if "custom_host_sources" not in config:
-        return [_CUSTOM_HOST_VCS_URL]
+        return [_CUSTOM_HOST_DEFAULT_SOURCE]
     raw = config["custom_host_sources"]
     sources: list[str] = []
     if isinstance(raw, list):
@@ -10080,10 +10092,7 @@ def _custom_host_source_urls() -> list[str]:
                 break
             entry = source.strip()
             repo_spelling = entry.removeprefix("git+")
-            if (
-                not repo_spelling.lower().startswith(("https://", "ssh://"))
-                or _split_vcs_url(entry)[1] is not None
-            ):
+            if not repo_spelling.lower().startswith(("https://", "ssh://")) or entry.endswith("@"):
                 sources = []
                 break
             sources.append(entry)
@@ -10091,27 +10100,45 @@ def _custom_host_source_urls() -> list[str]:
         raise click.ClickException(
             f"Invalid `custom_host_sources` in "
             f"{_display_path(_effective_global_config_path())}: expected a non-empty "
-            "list of `git+https://…` or `git+ssh://…` repository URLs without `@<ref>`."
+            "list of `git+https://…` or `git+ssh://…` repository URLs, each optionally "
+            "ending in `@<branch>`."
         )
     return sources
 
 
+def _custom_host_install_source(vcs_url: str | None) -> str | None:
+    """
+    Return the custom Host repository an installed build came from.
+
+    :param vcs_url: An installed wheel VCS URL, e.g.
+        ``"git+ssh://****@fn.example.invalid/srv/git/omnigent.git@local/host-custom"``.
+    :returns: ``git+<repository URL>`` spelled as the first matching
+        configured entry, built-in default or legacy repository (installers
+        redact userinfo, so the installed URL itself is not reusable), or
+        ``None`` when no custom repository matches.
+    """
+    identity = _custom_host_repo_identity(vcs_url) if vcs_url else None
+    if identity is None:
+        return None
+    for source in [
+        *_custom_host_source_urls(),
+        _CUSTOM_HOST_VCS_URL,
+        _CUSTOM_HOST_LEGACY_VCS_URL,
+    ]:
+        if _custom_host_repo_identity(source) == identity:
+            return f"git+{_split_vcs_url(source)[0]}"
+    return None
+
+
 def _is_custom_host_vcs_url(vcs_url: str) -> bool:
     """
-    Recognize the default or a configured custom Host repository.
+    Recognize the default, legacy or a configured custom Host repository.
 
     :param vcs_url: An installed wheel VCS URL, e.g.
         ``"git+https://github.com/pandalaohe/omnigent.git@local/host-custom"``.
-    :returns: ``True`` when its repository identity is the default
-        :data:`_CUSTOM_HOST_VCS_URL` or any configured source.
+    :returns: ``True`` when its repository identity is a custom Host source.
     """
-    identity = _custom_host_repo_identity(vcs_url)
-    if identity is None:
-        return False
-    return any(
-        _custom_host_repo_identity(source) == identity
-        for source in [_CUSTOM_HOST_VCS_URL, *_custom_host_source_urls()]
-    )
+    return _custom_host_install_source(vcs_url) is not None
 
 
 def _valid_git_sha(value: object) -> str | None:
@@ -10136,13 +10163,16 @@ def _resolve_custom_host_channel_head(*, allow_fallback: bool = True) -> tuple[s
     unreachable primary does not block an update. A missing ``git`` binary
     stops the search at once because no later source could be reached either.
 
+    Each source resolves its own branch: the entry's ``@<branch>``, else
+    :data:`_CUSTOM_HOST_CHANNEL`.
+
     :param allow_fallback: When ``False``, try only the first configured
         source. Rollback uses this because a lagging fallback may lack the
         saved commit.
     :returns: The winning source repository URL and the exact commit, e.g.
-        ``("git+https://github.com/pandalaohe/omnigent.git", "a" * 40)``.
+        ``("git+https://github.com/pandalaohe/omnigent-wukong.git", "a" * 40)``.
     :raises click.ClickException: When every tried source fails to resolve
-        ``'local/host-custom'``.
+        its branch.
     """
     from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
 
@@ -10151,9 +10181,9 @@ def _resolve_custom_host_channel_head(*, allow_fallback: bool = True) -> tuple[s
         sources = sources[:1]
     failures: list[tuple[str, str]] = []
     for index, source in enumerate(sources):
-        repo_url, _ref = _split_vcs_url(source)
+        repo_url, branch = _split_vcs_url(source)
         install_source = f"git+{repo_url}"
-        label = _CUSTOM_HOST_CHANNEL
+        label = branch or _CUSTOM_HOST_CHANNEL
         failure = ""
         git_missing = False
         for _attempt in range(_CUSTOM_HOST_LOOKUP_ATTEMPTS):
@@ -10181,9 +10211,17 @@ def _resolve_custom_host_channel_head(*, allow_fallback: bool = True) -> tuple[s
                 stderr = result.stderr.strip() or "(no stderr)"
                 failure = f"`git ls-remote` exited with status {result.returncode}: {stderr}"
                 continue
-            first = result.stdout.split("\n", 1)[0].strip()
-            sha = first.split("\t", 1)[0].strip() if first else ""
-            resolved = _valid_git_sha(sha)
+            # The pattern also matches tags and ``refs/heads/<x>/<label>``.
+            resolved = next(
+                (
+                    _valid_git_sha(sha)
+                    for sha, _tab, ref in (
+                        line.strip().partition("\t") for line in result.stdout.splitlines()
+                    )
+                    if ref == f"refs/heads/{label}"
+                ),
+                None,
+            )
             if resolved is not None:
                 if index:
                     reasons = "; ".join(f"{url} ({why})" for url, why in failures)
@@ -10204,7 +10242,7 @@ def _resolve_custom_host_channel_head(*, allow_fallback: bool = True) -> tuple[s
     else:
         scope = "the first custom Host source (rollback uses only the first configured source)"
     exc = click.ClickException(
-        f"Couldn't resolve {_CUSTOM_HOST_CHANNEL!r} from {scope}:\n"
+        f"Couldn't resolve the custom Host channel from {scope}:\n"
         f"{details}\n"
         "Check network/git access, then retry."
     )
@@ -10212,8 +10250,15 @@ def _resolve_custom_host_channel_head(*, allow_fallback: bool = True) -> tuple[s
     raise exc
 
 
-def _write_custom_host_rollback(commit_sha: str) -> None:
-    """Atomically remember the one commit the custom Host can roll back to."""
+def _write_custom_host_rollback(commit_sha: str, source_url: str | None = None) -> None:
+    """
+    Atomically remember the one commit the custom Host can roll back to.
+
+    :param commit_sha: The installed commit, e.g. ``"a" * 40``.
+    :param source_url: The repository that commit came from (see
+        :func:`_custom_host_install_source`), or ``None`` when unknown; a
+        rollback then asks the first configured source.
+    """
     from omnigent.install_ledger import atomic_write_json
 
     normalized = _valid_git_sha(commit_sha)
@@ -10221,12 +10266,17 @@ def _write_custom_host_rollback(commit_sha: str) -> None:
         raise click.ClickException("Cannot save rollback state: installed git commit is invalid.")
     atomic_write_json(
         _custom_host_rollback_path(),
-        {"schema_version": 1, "commit_sha": normalized},
+        {"schema_version": 2, "commit_sha": normalized, "source_url": source_url},
     )
 
 
-def _read_custom_host_rollback() -> str:
-    """Read and validate the saved custom Host rollback commit."""
+def _read_custom_host_rollback() -> tuple[str, str | None]:
+    """
+    Read and validate the saved custom Host rollback receipt.
+
+    :returns: The saved commit and its source repository; the source is
+        ``None`` for a version-1 receipt or an unknown source.
+    """
     path = _custom_host_rollback_path()
     try:
         raw = json.loads(path.read_text())
@@ -10239,9 +10289,17 @@ def _read_custom_host_rollback() -> str:
             f"Cannot read custom Host rollback state at {path}: {exc}"
         ) from exc
     commit_sha = _valid_git_sha(raw.get("commit_sha") if isinstance(raw, dict) else None)
-    if not isinstance(raw, dict) or raw.get("schema_version") != 1 or commit_sha is None:
+    if not isinstance(raw, dict) or commit_sha is None:
         raise click.ClickException(f"Custom Host rollback state is invalid: {path}")
-    return commit_sha
+    if raw.get("schema_version") == 1:
+        return commit_sha, None
+    # Version 2 always carries the key: a URL or an explicit null.
+    source_url = raw.get("source_url", False)
+    if raw.get("schema_version") != 2 or not (
+        source_url is None or (isinstance(source_url, str) and source_url)
+    ):
+        raise click.ClickException(f"Custom Host rollback state is invalid: {path}")
+    return commit_sha, source_url
 
 
 def _windows_host_service_wrapper() -> Path | None:
@@ -10346,6 +10404,8 @@ def _launch_windows_custom_host_update(
     host_id: str,
     previous_records: Sequence[_HostDaemonRecord],
     wrapper: Path,
+    rollback_source_url: str | None = None,
+    skip_web_ui: bool = True,
 ) -> tuple[int, Path, Path]:
     """Start the detached helper that updates after this locked CLI exits."""
     import shlex
@@ -10402,6 +10462,8 @@ def _launch_windows_custom_host_update(
             "status_argv": [cli_executable, "host", "status", "--json"],
             "wrapper_path": str(wrapper),
             "rollback_path": str(_custom_host_rollback_path()),
+            "rollback_source_url": rollback_source_url,
+            "skip_web_ui": skip_web_ui,
             "result_path": str(paths["result"]),
             "log_path": str(paths["log"]),
             "lock_path": str(paths["lock"]),
@@ -10537,6 +10599,40 @@ def _run_windows_host_service(wrapper: Path, action: Literal["start", "stop"]) -
             f"Windows Host supervisor failed to {action} the service "
             f"(status {result.returncode}): {wrapper}"
         )
+
+
+def _custom_host_has_service() -> bool:
+    """
+    Whether a managed Host service will be stopped and restarted around the update.
+
+    Windows always goes through its supervisor wrapper: the running CLI cannot
+    replace its own tool files, so a detached helper installs and restarts.
+    """
+    if IS_WINDOWS:
+        return True
+    from omnigent.host.service import HostServiceError, _service_for_current_platform
+
+    try:
+        return _service_for_current_platform().path.exists()
+    except HostServiceError:
+        return False
+
+
+def _custom_host_installed_web_ui() -> bool:
+    """Whether the running install carries a built web UI bundle."""
+    return (
+        resources.files("omnigent").joinpath("server", "static", "web-ui", "index.html").is_file()
+    )
+
+
+def _custom_host_web_ui_tools_missing() -> list[str]:
+    """Name the build tools ``setup.py`` needs for the web UI that are not on PATH."""
+    missing: list[str] = []
+    if shutil.which("node") is None:
+        missing.append("Node.js 22.13+")
+    if shutil.which("pnpm") is None and shutil.which("corepack") is None:
+        missing.append("pnpm")
+    return missing
 
 
 def _preflight_custom_host_supervisor() -> None:
@@ -10767,13 +10863,20 @@ def host_update() -> None:
     is_flag=True,
     help="Reinstall the commit saved immediately before the previous custom update.",
 )
+@click.option(
+    "--web-ui/--no-web-ui",
+    "web_ui",
+    default=None,
+    help="Rebuild or skip the bundled web UI. Default: keep the install's current shape.",
+)
 def host_update_custom(
     check_only: bool,
     dry_run: bool,
     force: bool,
     rollback: bool,
+    web_ui: bool | None = None,
 ) -> None:
-    """Update this managed Host from our fork-only custom channel."""
+    """Update this Host from the custom channel."""
     # Hold exclusion across preflight, draining, supervisor stop, and receipt
     # handoff. Locking only inside the final helper launch is too late: another
     # caller could stop/restart the Host while the first installer is running.
@@ -10783,7 +10886,7 @@ def host_update_custom(
         else contextlib.nullcontext()
     )
     with guard:
-        _host_update_custom_impl(check_only, dry_run, force, rollback)
+        _host_update_custom_impl(check_only, dry_run, force, rollback, web_ui)
 
 
 # ``update`` stays upstream's alias of ``upgrade`` (installs the upstream
@@ -10806,8 +10909,13 @@ def _host_update_custom_impl(
     dry_run: bool,
     force: bool,
     rollback: bool,
+    web_ui: bool | None = None,
 ) -> None:
-    """Run update checks and the guarded installation workflow."""
+    """Run update checks and the guarded installation workflow.
+
+    :param web_ui: ``True`` / ``False`` from ``--web-ui`` / ``--no-web-ui``;
+        ``None`` keeps the install's shape (rebuild only when it has a bundle).
+    """
     if check_only and rollback:
         raise click.UsageError("--check and --rollback cannot be used together.")
     if _find_repo_root() is not None:
@@ -10846,8 +10954,10 @@ def _host_update_custom_impl(
         )
 
     if rollback:
-        target_sha = _read_custom_host_rollback()
-        source_url = _resolve_custom_host_channel_head(allow_fallback=False)[0]
+        target_sha, saved_source = _read_custom_host_rollback()
+        # A receipt naming its repository survives a source switch; without
+        # one the first configured source must still hold the saved commit.
+        source_url = saved_source or _resolve_custom_host_channel_head(allow_fallback=False)[0]
     else:
         source_url, target_sha = _resolve_custom_host_channel_head()
 
@@ -10870,12 +10980,41 @@ def _host_update_custom_impl(
     if check_only:
         click.echo(f"A custom Host update is available: {current_sha[:9]} → {target_sha[:9]}.")
         raise SystemExit(1)
+
+    has_web_ui = _custom_host_installed_web_ui()
+    build_web_ui = has_web_ui if web_ui is None else web_ui
+    if build_web_ui:
+        missing = _custom_host_web_ui_tools_missing()
+        if missing:
+            reason = "--web-ui was given" if web_ui else "this install has a web UI"
+            raise click.ClickException(
+                f"Rebuilding the web UI needs {' and '.join(missing)} on PATH ({reason}). "
+                "Nothing was changed. Install them, or pass --no-web-ui to update "
+                "without the web UI."
+            )
+        web_ui_plan = "rebuilt" + ("" if web_ui else " (this install has a web UI)")
+    elif web_ui is False:
+        web_ui_plan = "skipped (--no-web-ui)"
+    else:
+        web_ui_plan = "skipped for this Host-only install"
+    has_service = _custom_host_has_service()
+    restart_hint = (
+        f"run `{cli_invocation(name='omnigent')} stop`, then "
+        f"`{cli_invocation(name='omnigent')}` to start the new version"
+    )
+    rollback_source = _custom_host_install_source(info.vcs_url)
+
     if dry_run:
         click.echo(
             f"Custom source: {target_url}\n"
             f"Detected installer: {info.detected_installer}\n"
             f"Detected extras: {', '.join(sorted(info.extras)) if info.extras else '(none)'}\n"
-            "Web UI build: skipped for this Host-only install\n"
+            f"Web UI build: {web_ui_plan}\n"
+            + (
+                "Host restart: managed Host service\n"
+                if has_service
+                else f"Host restart: none (no managed Host service; {restart_hint})\n"
+            )
             + (
                 "Dependencies: target uv.lock (exported before installation)\n"
                 if info.detected_installer == "uv"
@@ -10885,14 +11024,19 @@ def _host_update_custom_impl(
         )
         return
 
-    host_id = _load_existing_host_id()
-    if not host_id:
-        raise click.ClickException(
-            "No existing Host identity was found; start the Host once first."
-        )
-    _preflight_custom_host_supervisor()
-    _drain_custom_host_sessions(host_id, force=force)
-    previous_records = _custom_host_records(host_id)
+    host_id = _load_existing_host_id() or ""
+    if has_service:
+        if not host_id:
+            raise click.ClickException(
+                "No existing Host identity was found; start the Host once first."
+            )
+        _preflight_custom_host_supervisor()
+    # Without a service nothing restarts, but running turns still finish
+    # before their package files are replaced.
+    previous_records: list[_HostDaemonRecord] = []
+    if host_id:
+        _drain_custom_host_sessions(host_id, force=force)
+        previous_records = _custom_host_records(host_id)
 
     paused: object | None = None
     if IS_WINDOWS:
@@ -10913,6 +11057,8 @@ def _host_update_custom_impl(
                 host_id=host_id,
                 previous_records=previous_records,
                 wrapper=paused[1],
+                rollback_source_url=rollback_source,
+                skip_web_ui=not build_web_ui,
             )
         except Exception:
             if paused is not None:
@@ -10927,10 +11073,11 @@ def _host_update_custom_impl(
         return
 
     try:
-        paused = _pause_custom_host_supervisor()
-        _write_custom_host_rollback(current_sha)
-        install_env = dict(os.environ)
-        install_env["OMNIGENT_SKIP_WEB_UI"] = "true"
+        if has_service:
+            paused = _pause_custom_host_supervisor()
+        _write_custom_host_rollback(current_sha, rollback_source)
+        # Set either way so an inherited value cannot override the decision.
+        install_env = {**os.environ, "OMNIGENT_SKIP_WEB_UI": "false" if build_web_ui else "true"}
         code = _run_upgrade_command(suggestion.command, Console(), env=install_env)
         if code != 0:
             raise click.ClickException(
@@ -10959,10 +11106,16 @@ def _host_update_custom_impl(
         actual = installed_sha[:9] if installed_sha else "unknown"
         raise click.ClickException(
             f"The installer exited successfully, but the installed commit is {actual}; "
-            f"expected {target_sha[:9]}. The Host was restarted on the available install."
+            f"expected {target_sha[:9]}."
+            + (" The Host was restarted on the available install." if has_service else "")
         )
-    _wait_for_custom_host_online(host_id, previous_records)
+    if has_service and host_id:
+        _wait_for_custom_host_online(host_id, previous_records)
     click.echo(f"Updated custom Host: {current_sha[:9]} → {target_sha[:9]} from {source_url}")
+    if not has_service:
+        click.echo(
+            f"No managed Host service is installed, so nothing was restarted: {restart_hint}."
+        )
     click.echo(f"Rollback: {cli_invocation(name='omni')} host update custom --rollback")
 
 
