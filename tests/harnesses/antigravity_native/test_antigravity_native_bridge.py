@@ -1323,10 +1323,26 @@ def test_agy_input_region_skips_background_task_panel(rows: str) -> None:
     assert _mod._draft_in_input_region(draft, "Reply with exactly PONG", ">")
 
 
-def test_agy_input_region_keeps_task_shaped_draft() -> None:
-    task_row = _AGY_TASK_ROWS["one_task"].strip()
-    pane = f"{_AGY_RULE}\n> {task_row}\n{_AGY_RULE}\n? for shortcuts"
-    assert _mod._agy_input_region(pane) == f"> {task_row}"
+_AGY_TASK_SHAPED_DRAFT = "> [12:45:28] sleep 600 && echo done... running"
+
+
+@pytest.mark.parametrize(
+    "composer",
+    [
+        _AGY_TASK_SHAPED_DRAFT,
+        f"{_AGY_TASK_SHAPED_DRAFT}\n{_AGY_TASK_ROWS['two_tasks'].splitlines()[1]}",
+        "> Reply with exactly PONG\n  second line of the draft",
+    ],
+)
+@pytest.mark.parametrize("panel", [False, True])
+def test_agy_input_region_keeps_task_shaped_draft(composer: str, panel: bool) -> None:
+    """The composer region is checked as a panel candidate and kept."""
+    below = f"{_AGY_TASK_ROWS['one_task']}\n{_AGY_RULE}\n" if panel else ""
+    pane = (
+        f"{_AGY_RULE}\n  earlier reply\n{_AGY_RULE}\n{composer}\n{_AGY_RULE}\n"
+        f"{below}? for shortcuts"
+    )
+    assert _mod._agy_input_region(pane) == composer
 
 
 @pytest.mark.parametrize("rows", sorted(_AGY_TASK_ROWS))
