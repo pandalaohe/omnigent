@@ -8223,21 +8223,73 @@ async def _runner_online_or_none(
     return online if isinstance(online, bool) else None
 
 
-async def _host_harnesses_or_none(
+async def _host_detail_or_none(
     host_id: str | None,
     server_client: httpx.AsyncClient,
 ) -> _JsonObject | None:
-    """Return the bound host's reported harness readiness, best-effort."""
+    """Return the bound host's ``GET /v1/hosts/{id}`` detail, best-effort."""
     if not host_id:
         return None
     try:
         resp = await server_client.get(f"/v1/hosts/{host_id}", timeout=30.0)
         if resp.status_code != 200:
             return None
-        readiness = resp.json().get("configured_harnesses")
+        detail = resp.json()
     except Exception:  # noqa: BLE001
         return None
+    return detail if isinstance(detail, dict) else None
+
+
+def _configured_harnesses(host: _JsonObject | None) -> _JsonObject | None:
+    """Return a host detail's reported harness readiness map, if any."""
+    readiness = host.get("configured_harnesses") if host is not None else None
     return readiness if isinstance(readiness, dict) else None
+
+
+async def _host_harnesses_or_none(
+    host_id: str | None,
+    server_client: httpx.AsyncClient,
+) -> _JsonObject | None:
+    """Return the bound host's reported harness readiness, best-effort."""
+    return _configured_harnesses(await _host_detail_or_none(host_id, server_client))
+
+
+def _session_info_runner_state(
+    runner_online: bool | None,
+    host_id: str | None,
+    host: _JsonObject | None,
+) -> tuple[str | None, str | None]:
+    """
+    Say whether a session can take its next turn, and why when it cannot.
+
+    A host restart stops every runner on it; a child borrowing its parent's
+    runner keeps the stopped binding until a message reaches it, and that
+    message starts or reattaches a runner on the still-online host.
+
+    :param runner_online: Bound runner connectivity; ``False`` for a stopped
+        runner or a host session with no runner bound, ``None`` when unknown.
+    :param host_id: The session's bound host, or ``None``.
+    :param host: That host's detail, or ``None`` when not read.
+    :returns: ``(state, reason)`` — ``online``, ``relaunchable`` or
+        ``offline`` with a reason for the last two; ``(None, None)`` when
+        the runner or host state is unknown or there is no host.
+    """
+    if runner_online is True:
+        return "online", None
+    if runner_online is None or host_id is None or host is None:
+        return None, None
+    name = _optional_string(host.get("name")) or host_id
+    status = host.get("status")
+    if status == "online":
+        return "relaunchable", (
+            f"Runner stopped (host restart or stop); host {name} is online, so the "
+            "next message starts or reattaches it. No archive needed."
+        )
+    if status == "offline":
+        return "offline", (
+            f"Host {name} is offline; the session cannot take a turn until that host reconnects."
+        )
+    return None, None
 
 
 # Cap on ``sys_session_get_info``'s ``session_ids`` fan-out; 20 parallel
@@ -8284,8 +8336,11 @@ async def _session_get_info_via_rest(
     ``args["include_host_readiness"]`` allows it (default ``True`` for the
     single-session form, ``False`` for the ``session_ids`` form, so a
     supervisor reading many children does not fan out one host-readiness
-    GET per item). The full transcript is intentionally omitted — that is
-    what ``sys_session_get_history`` returns.
+    GET per item). An item whose runner stopped also reads its host's status
+    to report ``runner_state`` (``relaunchable`` when the host is online and
+    the next message brings the runner back, ``offline`` when it is not). The
+    full transcript is intentionally omitted — that is what
+    ``sys_session_get_history`` returns.
 
     Maps a 404 to ``session_not_found`` and 401/403 to ``access_denied``
     (the server denied the read, so from the caller's vantage the target is
@@ -8472,15 +8527,33 @@ async def _session_info_item(
     pending = pending_value if isinstance(pending_value, list) else []
     snap_agent_name = _optional_string(snap.get("agent_name"))
     snap_runner_id = _optional_string(snap.get("runner_id"))
-    configured_harnesses: _JsonObject | None = None
+    snap_host_id = _optional_string(snap.get("host_id"))
+    host: _JsonObject | None = None
     if include_host_readiness:
-        snap_host_id = _optional_string(snap.get("host_id"))
-        runner_online, configured_harnesses = await asyncio.gather(
+        runner_online, host = await asyncio.gather(
             _runner_online_or_none(snap_runner_id, server_client),
-            _host_harnesses_or_none(snap_host_id, server_client),
+            _host_detail_or_none(snap_host_id, server_client),
         )
     else:
         runner_online = await _runner_online_or_none(snap_runner_id, server_client)
+    # A host session with no runner bound starts one on its next message too.
+    runner_running = runner_online if snap_runner_id else False
+    if runner_running is False and not include_host_readiness:
+        # Only a stopped runner needs the host's status, so a batch read of
+        # live children still makes no per-item host lookup.
+        host = await _host_detail_or_none(snap_host_id, server_client)
+    runner_state, runner_state_reason = _session_info_runner_state(
+        runner_running, snap_host_id, host
+    )
+    keep_warm = snap.get("keep_warm")
+    if (
+        runner_state == "relaunchable"
+        and isinstance(keep_warm, dict)
+        and keep_warm.get("blocked_by") == "runner_offline"
+    ):
+        # Keep-warm skipped pings while the runner was down; the session
+        # itself is not lost, so its blocker must not read as offline.
+        keep_warm = {**keep_warm, "blocked_by": "runner_relaunchable"}
     context_tokens = snap.get("last_total_tokens")
     context_window = snap.get("context_window")
     auto_compact_token_limit = snap.get("auto_compact_token_limit")
@@ -8503,6 +8576,10 @@ async def _session_info_item(
         "agent_name": public_agent_name(snap_agent_name),
         "runner_id": snap.get("runner_id"),
         "runner_online": runner_online,
+        # Whether the next message can run: ``relaunchable`` means the runner
+        # stopped on a live host and comes back on that message.
+        "runner_state": runner_state,
+        "runner_state_reason": runner_state_reason,
         "host_id": snap.get("host_id"),
         "parent_session_id": snap.get("parent_session_id"),
         "created_by_session_id": (_string_mapping(snap.get("labels")) or {}).get(
@@ -8539,7 +8616,7 @@ async def _session_info_item(
         # Keep-warm state plus why an auto-archived row was retired.
         "warm_state": snap.get("warm_state"),
         "warm_state_reason": snap.get("warm_state_reason"),
-        "keep_warm": snap.get("keep_warm"),
+        "keep_warm": keep_warm,
         "archive_reason": snap.get("archive_reason"),
         "total_cost_usd": snap.get("total_cost_usd"),
         "context_tokens": context_tokens,
@@ -8552,7 +8629,7 @@ async def _session_info_item(
         "last_error": snap.get("last_task_error"),
     }
     if include_host_readiness:
-        item["configured_harnesses"] = configured_harnesses
+        item["configured_harnesses"] = _configured_harnesses(host)
     return item
 
 

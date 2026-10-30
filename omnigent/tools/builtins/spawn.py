@@ -807,6 +807,12 @@ class SysSessionGetInfoTool(Tool):
             'in one call as {"sessions": [...]} with per-item errors; omit '
             "both to describe your own. The batch form omits "
             "configured_harnesses unless include_host_readiness is true. "
+            "runner_state says whether the next message can run: online; "
+            "relaunchable — the runner stopped (e.g. a host restart) but the "
+            "host is online, so the next message starts or reattaches it and "
+            "no archive is needed (keep_warm.blocked_by then reads "
+            "runner_relaunchable); offline — the host is offline, with "
+            "runner_state_reason saying why. "
             "Each item carries last_message_tail — the end of the newest "
             "assistant reply. Metadata only — "
             "use sys_session_get_history for the conversation transcript, "

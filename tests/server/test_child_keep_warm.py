@@ -107,6 +107,7 @@ class _Liveness:
 
     def __init__(self, runner_online: bool = True) -> None:
         self.runner_online = runner_online
+        self.host_online: bool | None = None
         self.calls: list[list[str]] = []
 
     def __call__(self, session_ids: list[str]) -> dict[str, SessionLiveness]:
@@ -114,7 +115,7 @@ class _Liveness:
         return {
             session_id: SessionLiveness(
                 runner_online=self.runner_online,
-                host_online=None,
+                host_online=self.host_online,
             )
             for session_id in session_ids
         }
@@ -1500,6 +1501,30 @@ async def test_window_passed_while_runner_offline_goes_cold_silently(
     assert state is not None and state.s == "c" and state.why == "exp"
     assert harness.notices.lines == []
     assert (child.id, None) in harness.published
+
+
+async def test_stopped_runner_on_live_host_is_never_pinged(harness: _Harness) -> None:
+    """A host restart stops a warm child's runner; its due pings wait for its next message."""
+    harness.liveness.runner_online = False
+    harness.liveness.host_online = True
+    u = harness.now - _CLAUDE_INTERVAL_S
+    child = _child(
+        harness, _parent(harness).id, labels={KEEP_WARM_LABEL: _warm_label(t=u)}, running_since=u
+    )
+    harness.sweeper._tracked[child.id] = harness.now + _SLACK_S
+
+    for _ in range(4):
+        await _tick(harness)
+        harness.clock.now += 60
+
+    assert harness.forward.pings() == []
+    state = _read_label(harness, child.id)
+    assert state is not None and state.f == 0 and state.q == 0
+    assert harness.notices.lines == []
+    conv = harness.store.get_conversation(child.id)
+    assert conv is not None
+    result = keep_warm_status_from_labels(conv.labels, archived=False, now=harness.clock.now)
+    assert result is not None and result["blocked_by"] == "runner_offline"
 
 
 async def test_archived_mother_child_goes_cold_silently(harness: _Harness) -> None:

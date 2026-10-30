@@ -10375,11 +10375,12 @@ async def test_sys_session_get_info_many_reports_per_item_errors() -> None:
 @pytest.mark.asyncio
 async def test_sys_session_get_info_many_omits_host_readiness_without_flag() -> None:
     """
-    The batch form omits ``configured_harnesses`` and never calls
-    ``GET /v1/hosts/{id}`` unless the caller opts in. A supervisor reading
-    many children must not fan out one readiness probe per item; runner
-    connectivity stays per item. The opt-in path is covered by
-    ``test_sys_session_get_info_many_keeps_each_items_host_readiness``.
+    The batch form omits ``configured_harnesses`` and calls
+    ``GET /v1/hosts/{id}`` only for an item whose runner stopped (to tell a
+    relaunchable session from an offline one) unless the caller opts in. A
+    supervisor reading many live children must not fan out one readiness
+    probe per item; runner connectivity stays per item. The opt-in path is
+    covered by ``test_sys_session_get_info_many_keeps_each_items_host_readiness``.
     """
     from omnigent.runner.tool_dispatch import execute_tool
 
@@ -10434,7 +10435,93 @@ async def test_sys_session_get_info_many_omits_host_readiness_without_flag() -> 
     assert "configured_harnesses" not in by_id["conv_b"]
     assert by_id["conv_a"]["runner_online"] is True
     assert by_id["conv_b"]["runner_online"] is False
-    assert host_calls == []
+    assert host_calls == ["/v1/hosts/host_2"]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_get_info_tells_relaunchable_from_offline_runners() -> None:
+    """
+    After a host restart a child keeps its stopped runner binding until its
+    next message. ``runner_state`` tells a mother whether that message can
+    run — the host is online, so it reattaches — or cannot because the host
+    is offline, and keep-warm's runner blocker follows the same split.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    stopped_keep_warm = {
+        "state": "stopped",
+        "stop_reason": "expired",
+        "blocked_by": "runner_offline",
+    }
+    snapshots = {
+        "conv_live": _session_info_snapshot(
+            "conv_live", host_id="host_up", runner_id="runner_live"
+        ),
+        "conv_restarted": _session_info_snapshot(
+            "conv_restarted",
+            host_id="host_up",
+            runner_id="runner_stopped",
+            warm_state="cold",
+            keep_warm=stopped_keep_warm,
+        ),
+        "conv_unbound": _session_info_snapshot("conv_unbound", host_id="host_up", runner_id=None),
+        "conv_host_down": _session_info_snapshot(
+            "conv_host_down",
+            host_id="host_down",
+            runner_id="runner_gone",
+            warm_state="cold",
+            keep_warm=stopped_keep_warm,
+        ),
+    }
+    hosts = {
+        "host_up": {"name": "studio", "status": "online"},
+        "host_down": {"name": "laptop", "status": "offline"},
+    }
+    host_calls: list[str] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.startswith("/v1/sessions/"):
+            return httpx.Response(200, json=snapshots[path.rsplit("/", 1)[-1]])
+        if path.startswith("/v1/runners/"):
+            return httpx.Response(200, json={"online": path.split("/")[3] == "runner_live"})
+        if path.startswith("/v1/hosts/"):
+            host_calls.append(path)
+            return httpx.Response(200, json=hosts[path.rsplit("/", 1)[-1]])
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_ids": list(snapshots)}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    by_id = {item["session_id"]: item for item in json.loads(output)["sessions"]}
+    assert (by_id["conv_live"]["runner_state"], by_id["conv_live"]["runner_state_reason"]) == (
+        "online",
+        None,
+    )
+    for session_id in ("conv_restarted", "conv_unbound"):
+        assert by_id[session_id]["runner_state"] == "relaunchable"
+        assert "host studio is online" in by_id[session_id]["runner_state_reason"]
+        assert "No archive needed" in by_id[session_id]["runner_state_reason"]
+    assert by_id["conv_restarted"]["runner_online"] is False
+    assert by_id["conv_restarted"]["keep_warm"]["blocked_by"] == "runner_relaunchable"
+    assert by_id["conv_restarted"]["warm_state"] == "cold"
+    assert by_id["conv_host_down"]["runner_state"] == "offline"
+    assert "Host laptop is offline" in by_id["conv_host_down"]["runner_state_reason"]
+    assert by_id["conv_host_down"]["keep_warm"]["blocked_by"] == "runner_offline"
+    # Live sessions make no host lookup; each stopped one makes exactly one.
+    assert sorted(host_calls) == [
+        "/v1/hosts/host_down",
+        "/v1/hosts/host_up",
+        "/v1/hosts/host_up",
+    ]
 
 
 @pytest.mark.asyncio
