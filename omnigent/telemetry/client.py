@@ -253,6 +253,7 @@ def is_disabled() -> bool:
     per-request I/O overhead.
 
     Checks (in order):
+    0. ``OMNIGENT_ENABLE_TELEMETRY`` not set to ``1``/``true``/``yes`` (opt-in)
     1. ``OMNIGENT_ANALYTICS=0``
     2. ``DISABLE_TELEMETRY=true`` or ``OMNIGENT_DISABLE_TELEMETRY=true``
     3. ``DO_NOT_TRACK=1``

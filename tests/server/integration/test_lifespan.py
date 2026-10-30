@@ -30,7 +30,7 @@ async def test_lifespan_usage_telemetry_uses_server_ci_environment(
     tmp_path: Path,
     ci: bool,
 ) -> None:
-    """Server CI suppresses usage telemetry without a runner or host opt-out."""
+    """On an opted-in server, CI suppresses usage telemetry without a runner or host opt-out."""
     import omnigent.telemetry.client as telemetry
     from omnigent.telemetry.environment import CI_ENV_VARS
     from omnigent.telemetry.events import SessionStoppedEvent
@@ -43,6 +43,7 @@ async def test_lifespan_usage_telemetry_uses_server_ci_environment(
     }:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("OMNIGENT_ENABLE_TELEMETRY", "true")
     if ci:
         monkeypatch.setenv("CI", "true")
     monkeypatch.setattr(telemetry, "_CLIENT", None)

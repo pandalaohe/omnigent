@@ -153,7 +153,8 @@ def test_is_disabled_github_actions(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_is_disabled_none_set(monkeypatch: pytest.MonkeyPatch) -> None:
-    """When none of the opt-out vars are set, telemetry is enabled."""
+    """After the opt-in, with none of the opt-out vars set, telemetry is enabled."""
+    monkeypatch.setenv("OMNIGENT_ENABLE_TELEMETRY", "true")
     _ci_vars = [
         "OMNIGENT_ANALYTICS",
         "OMNIGENT_DISABLE_TELEMETRY",
@@ -247,6 +248,7 @@ def test_is_disabled_config_yaml_telemetry_true(
     config_file = tmp_path / "config.yaml"
     config_file.write_text("telemetry: true\n", encoding="utf-8")
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_ENABLE_TELEMETRY", "true")
     for var in _ALL_OPT_OUT_VARS:
         monkeypatch.delenv(var, raising=False)
     from omnigent.telemetry.client import is_disabled
