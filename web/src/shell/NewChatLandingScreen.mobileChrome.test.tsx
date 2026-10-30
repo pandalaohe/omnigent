@@ -162,7 +162,7 @@ describe("NewChatLandingScreen keyboard behaviour", () => {
 
     const composer = screen.getByTestId("new-chat-landing-composer");
     const statusSpace = screen.getByTestId("new-chat-landing-status-space");
-    expect(statusSpace).toHaveClass("h-7", "md:hidden");
+    expect(statusSpace).toHaveClass("h-7", "md:h-0");
     expect(statusSpace.previousElementSibling).toBe(composer.closest("form"));
     expect(statusSpace.parentElement).toBe(screen.getByTestId("new-chat-landing-composer-surface"));
   });
@@ -173,7 +173,7 @@ describe("NewChatLandingScreen keyboard behaviour", () => {
     renderLanding();
 
     expect(screen.getByTestId("new-chat-landing-project-line")).toHaveTextContent("Sample project");
-    expect(screen.getByTestId("new-chat-landing-status-space")).toHaveClass("h-7", "md:hidden");
+    expect(screen.getByTestId("new-chat-landing-status-space")).toHaveClass("h-7", "md:h-0");
   });
 
   it("focuses the composer on desktop so typing can start immediately", () => {

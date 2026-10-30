@@ -27,6 +27,21 @@ _TASK_TIMESTAMPS = ("last_run_at", "created_at", "updated_at")
 _RUN_TIMESTAMPS = ("scheduled_at", "fired_at", "finished_at")
 
 
+def _revision_applied(revision: str) -> bool:
+    """Return whether *revision* is stamped, including by an earlier step of this run."""
+    migration_context = op.get_context()
+    if migration_context.script is None:
+        return False
+    return any(
+        revision
+        in {
+            applied.revision
+            for applied in migration_context.script.iterate_revisions(head, "base")
+        }
+        for head in migration_context.get_current_heads()
+    )
+
+
 def upgrade() -> None:
     """Widen timestamps and add dispatch fields, uniqueness, and scan indexes."""
     task_columns = {
@@ -41,7 +56,8 @@ def upgrade() -> None:
                 existing_nullable=column != "created_at",
             )
         batch.add_column(sa.Column("next_run_at", sa.BigInteger(), nullable=True))
-        if "project_id" not in task_columns:
+        # CRDB hides a column calling defaults added earlier in this transaction.
+        if "project_id" not in task_columns and not _revision_applied("a23c20260928"):
             batch.add_column(sa.Column("project_id", Uuid16(), nullable=True))
         batch.add_column(sa.Column("delegation_ref", sa.String(1024), nullable=True))
         batch.create_index(
