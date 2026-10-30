@@ -74,12 +74,18 @@ def proxy_client(monkeypatch: pytest.MonkeyPatch, deployment: str):
     app.include_router(
         create_extensions_router(ExtensionPluginState(manifests=(_MANIFEST,))), prefix="/v1"
     )
+    if deployment == "http":
+        from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
+        app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="127.0.0.1")
     return (
         original(
             transport=httpx.ASGITransport(
-                app=app, root_path="/proxy/6767" if deployment == "mounted" else ""
+                app=app,
+                client=("198.51.100.7", 50000) if deployment == "http" else ("127.0.0.1", 123),
+                root_path="/proxy/6767" if deployment == "mounted" else "",
             ),
-            base_url="https://app.test",
+            base_url="http://app.test" if deployment == "http" else "https://app.test",
         ),
         requests,
         reply,
@@ -176,6 +182,7 @@ async def test_proxy_refuses_undeclared_routes(proxy_client, method: str, path: 
         {},
         {"origin": "null"},
         {"origin": "https://other.test"},
+        {"origin": "http://app.test", "x-forwarded-proto": "http"},
         {"origin": "https://app.test", "sec-fetch-site": "cross-site"},
         {"origin": "https://app.test", "sec-fetch-site": "same-site"},
     ],
@@ -186,6 +193,60 @@ async def test_proxy_refuses_cross_site_writes(proxy_client, headers: dict[str, 
         response = await client.post(_PREFIX + "api/settings", headers=headers)
     assert response.status_code == 403
     assert requests == []
+
+
+@pytest.mark.parametrize("deployment", ["http"], indirect=True)
+@pytest.mark.parametrize(
+    ("env_name", "env_value", "origin", "expected"),
+    [
+        ("", "", "https://app.test", 403),
+        (
+            "OMNIGENT_WS_ALLOWED_ORIGINS",
+            "https://app.test,https://*.tailnet.test",
+            "https://app.test",
+            200,
+        ),
+        (
+            "OMNIGENT_WS_ALLOWED_ORIGINS",
+            "https://app.test,https://*.tailnet.test",
+            "https://node.tailnet.test",
+            200,
+        ),
+        ("OMNIGENT_ACCOUNTS_BASE_URL", "https://app.test", "https://app.test", 200),
+        ("OMNIGENT_WS_ALLOWED_ORIGINS", "https://app.test", "https://other.test", 403),
+    ],
+)
+async def test_proxy_writes_behind_https_reverse_proxy(
+    proxy_client,
+    monkeypatch: pytest.MonkeyPatch,
+    env_name: str,
+    env_value: str,
+    origin: str,
+    expected: int,
+) -> None:
+    monkeypatch.delenv("OMNIGENT_WS_ALLOWED_ORIGINS", raising=False)
+    monkeypatch.delenv("OMNIGENT_ACCOUNTS_BASE_URL", raising=False)
+    if env_name:
+        monkeypatch.setenv(env_name, env_value)
+    client, requests, _ = proxy_client
+    async with client:
+        response = await client.post(
+            _PREFIX + "api/settings",
+            content=b'{"pin":true}',
+            headers={
+                "origin": origin,
+                "sec-fetch-site": "same-origin",
+                "x-forwarded-proto": "https",
+                "x-forwarded-host": "other.test",
+            },
+        )
+    assert response.status_code == expected
+    if expected == 200:
+        assert len(requests) == 1
+        assert requests[0].headers["x-forwarded-proto"] == "https"
+        assert requests[0].headers["x-forwarded-host"] == "app.test"
+    else:
+        assert requests == []
 
 
 @pytest.mark.parametrize(
