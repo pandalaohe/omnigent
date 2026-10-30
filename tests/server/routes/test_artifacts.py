@@ -26,12 +26,13 @@ from typing import Any, Literal
 
 import httpx
 import pytest
+import sqlalchemy as sa
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from PIL import Image
 
-from omnigent.db.db_models import current_workspace_id
-from omnigent.db.utils import generate_file_id, now_epoch
+from omnigent.db.db_models import SqlPreference, current_workspace_id
+from omnigent.db.utils import generate_file_id, get_or_create_engine, now_epoch
 from omnigent.entities import Conversation, ResolvedAccess, SessionPermission
 from omnigent.entities.element_annotation import ELEMENT_ANCHOR_PREFIX, parse_element_anchor
 from omnigent.errors import ErrorCode, OmnigentError
@@ -308,6 +309,9 @@ def app(runner_globals_reset: None, db_uri: str, tmp_path: Path) -> FastAPI:
         artifact_store=LocalArtifactStore(str(tmp_path / "artifacts")),
     )
     app.state.test_db_uri = db_uri
+    # The owner has turned external access on, as the seed migration leaves
+    # every owner with existing links; the absent-row default has its own tests.
+    ArtifactSharingStore(db_uri).write_sharing(_OWNER, external=True)
     return app
 
 
@@ -1932,16 +1936,44 @@ def _raw_token_url(
     return f"/v1/artifacts/{token}/{urllib.parse.quote(entry.rsplit('/', 1)[-1])}"
 
 
-async def test_artifact_sharing_get_defaults_to_open(client: httpx.AsyncClient) -> None:
-    """No row means external on, no code and visitor comments on."""
+async def test_artifact_sharing_get_defaults_to_closed(
+    client: httpx.AsyncClient, app: FastAPI
+) -> None:
+    """No row means external off, no code and visitor comments on."""
+    app.state.test_auth_provider.user_id = _VIEWER
     resp = await client.get("/v1/artifact-sharing")
 
     assert resp.status_code == 200
     assert resp.json() == {
-        "external": True,
+        "external": False,
         "share_code_set": False,
         "allow_comments": True,
     }
+
+
+async def test_gate_owner_without_a_sharing_row_is_closed(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    asset_dir: Path,
+) -> None:
+    """No row is the default, external off: logged out is refused, a login passes."""
+    with get_or_create_engine(app.state.test_db_uri).begin() as conn:
+        conn.execute(sa.delete(SqlPreference).where(SqlPreference.user_id == _OWNER))
+    assert _sharing_store(app).read_sharing(_OWNER) is None
+    minted = await _mint(client, view="raw")
+    runner = _stub_runner_app(b"plain", content_type="text/plain")
+
+    app.state.test_auth_provider.user_id = None
+    refused = await client.get(minted["url"])
+    app.state.test_auth_provider.user_id = _OWNER
+    async with _use_runner(runner):
+        redirect = await client.get(minted["url"])
+        served = await client.get(redirect.headers["location"])
+
+    assert refused.status_code == 403
+    assert redirect.status_code == 303
+    assert "~" in redirect.headers["location"]
+    assert served.status_code == 200
 
 
 async def test_artifact_sharing_put_round_trip(client: httpx.AsyncClient) -> None:
@@ -3252,6 +3284,7 @@ async def test_visit_shell_without_a_comment_store_disables_comments(
         permission_store=permission_store,
         comment_store=None,
     )
+    ArtifactSharingStore(db_uri).write_sharing(_OWNER, external=True)
     transport = httpx.ASGITransport(app=app)
 
     async with httpx.AsyncClient(transport=transport, base_url="http://server") as client:
@@ -3305,7 +3338,7 @@ async def test_gate_remember_cookie_is_not_an_api_identity(db_uri: str) -> None:
         ),
         permission_store=permission_store,
     )
-    ArtifactSharingStore(db_uri).write_sharing(_OWNER, share_code="open-sesame")
+    ArtifactSharingStore(db_uri).write_sharing(_OWNER, external=True, share_code="open-sesame")
     _conv(app).labels[ARTIFACT_LINK_KEY_LABEL] = generate_session_key()
     url = _raw_token_url(app)
     cookie_name = remember_cookie_name(_OWNER, secure=False)
