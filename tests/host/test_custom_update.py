@@ -1735,6 +1735,49 @@ def test_source_switch_update_records_the_old_repository_for_rollback(
     assert f"Custom source: {_OLD_FN}@{source_line}" in dry_run.output
     assert calls == []
 
+    # Later updates and rollbacks stay inside the distribution mirror.
+    next_snapshot = "c" * 40
+    new_fn_repo = "git+ssh://git@fn.example.invalid/srv/git/omnigent-wukong.git"
+    targets: list[str] = []
+    monkeypatch.setattr(cli_module.subprocess, "run", _answer_ls_remote(calls, next_snapshot))
+    monkeypatch.setattr(
+        cli_module,
+        "_build_upgrade_suggestion",
+        lambda _info, **kwargs: (
+            targets.append(kwargs["target_vcs_url"])
+            or SimpleNamespace(command="uv fake", runnable=True)
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module, "_probe_installed_distribution", lambda: ("0.21.0.dev0", next_snapshot)
+    )
+
+    second = CliRunner().invoke(cli, ["up"])
+
+    assert second.exit_code == 0, second.output
+    assert targets == [f"{new_fn_repo}@{next_snapshot}"]
+    receipt = json.loads((tmp_path / "updates" / "custom-host-rollback.json").read_text())
+    assert receipt == {"schema_version": 2, "commit_sha": snapshot, "source_url": new_fn_repo}
+
+    calls.clear()
+    monkeypatch.setattr(
+        cli_module,
+        "_read_installed_wheel_info",
+        lambda: _uv_info(
+            commit=next_snapshot,
+            vcs_url="git+ssh://****@fn.example.invalid/srv/git/omnigent-wukong.git@main",
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module, "_probe_installed_distribution", lambda: ("0.21.0.dev0", snapshot)
+    )
+
+    rolled_back = CliRunner().invoke(cli, ["up", "--rollback"])
+
+    assert rolled_back.exit_code == 0, rolled_back.output
+    assert targets[-1] == f"{new_fn_repo}@{snapshot}"
+    assert calls == []
+
 
 @pytest.mark.parametrize(
     ("receipt", "expected_source", "looks_up_channel"),
@@ -1953,3 +1996,32 @@ def test_windows_custom_update_hands_receipt_source_and_web_ui_choice_to_helper(
     assert result.exit_code == 0, result.output
     assert launched[0]["rollback_source_url"] == "git+https://github.com/pandalaohe/omnigent.git"
     assert launched[0]["skip_web_ui"] is False
+
+
+@pytest.mark.parametrize(
+    "vcs_url",
+    [
+        "git+https://github.com/pandalaohe/omnigent.git@local/host-custom",
+        "git+https://github.com/pandalaohe/omnigent-wukong.git@main",
+    ],
+)
+def test_plain_update_on_a_custom_install_points_to_omni_up(
+    monkeypatch: pytest.MonkeyPatch, vcs_url: str
+) -> None:
+    """``omni update`` never reinstalls a custom install without the receipt."""
+    import omnigent.cli as cli_module
+
+    monkeypatch.setattr(cli_module, "_load_global_config", dict)
+    monkeypatch.setattr("omnigent.update_check._find_repo_root", lambda: None)
+    monkeypatch.setattr(
+        "omnigent.update_check._read_installed_wheel_info", lambda: _uv_info(vcs_url=vcs_url)
+    )
+    monkeypatch.setattr(
+        "omnigent.update_check._run_upgrade_command",
+        lambda *_a, **_k: pytest.fail("custom installs must not run the upstream upgrade"),
+    )
+
+    result = CliRunner().invoke(cli, ["update"])
+
+    assert result.exit_code != 0
+    assert "This install tracks the custom update channel. Use `omni up`" in result.output
