@@ -133,7 +133,7 @@ def test_upgrade_preserves_all_shared_history_and_dev_downgrade_keeps_it(db_uri:
                     connection.execute(
                         sa.text("SELECT version_num FROM alembic_version")
                     ).scalars()
-                ) == {_MIGRATION, "nf12ab34cd56"}
+                ) == {_MIGRATION, "d0a1f879a01d"}
             assert "scope" not in {
                 column["name"] for column in sa.inspect(engine).get_columns(_TABLE)
             }

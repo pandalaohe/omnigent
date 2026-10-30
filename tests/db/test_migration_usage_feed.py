@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+
 import pytest
 import sqlalchemy as sa
 from alembic import command
@@ -16,7 +18,9 @@ from omnigent.db.utils import (
 )
 
 
-def _migrate(engine: sa.Engine, uri: str, *, downgrade: bool = False) -> None:
+def _migrate(
+    engine: sa.Engine, uri: str, *, downgrade: bool = False, revision: str = "a32c20261020"
+) -> None:
     config = _build_alembic_config(uri)
     with engine.connect() as connection:
         if engine.dialect.name == "cockroachdb":
@@ -25,8 +29,15 @@ def _migrate(engine: sa.Engine, uri: str, *, downgrade: bool = False) -> None:
         if downgrade:
             command.downgrade(config, "a31c20261019")
         else:
-            command.upgrade(config, "a32c20261020")
+            command.upgrade(config, revision)
         connection.commit()
+
+
+@pytest.fixture
+def restore_worker_head(db_uri: str) -> Iterator[None]:
+    """Return the shared worker DB to head after a test rewinds it."""
+    yield
+    _migrate(get_or_create_engine(db_uri), db_uri, revision="head")
 
 
 def _current_heads(engine: sa.Engine) -> set[str]:
@@ -65,6 +76,7 @@ def test_usage_feed_model_creates_and_defaults_progress(db_uri: str) -> None:
             connection.commit()
 
 
+@pytest.mark.usefixtures("restore_worker_head")
 def test_usage_feed_migration_backfills_scope_and_round_trips(db_uri: str) -> None:
     engine = get_or_create_engine(db_uri)
     _migrate(engine, db_uri, downgrade=True)
@@ -106,6 +118,7 @@ def test_usage_feed_migration_backfills_scope_and_round_trips(db_uri: str) -> No
     assert "usage_feeds" in sa.inspect(engine).get_table_names()
 
 
+@pytest.mark.usefixtures("restore_worker_head")
 def test_usage_feed_upgrade_resumes_after_scope_schema_commit(db_uri: str) -> None:
     engine = get_or_create_engine(db_uri)
     if engine.dialect.name != "cockroachdb":
