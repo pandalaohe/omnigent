@@ -3,10 +3,14 @@
 // labels, the measured monitor-overhead footer, and each host's load row with
 // its lines and the admin's per-host edit.
 
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as SystemStatusModule from "@/hooks/useSystemStatus";
+import type { Host } from "@/hooks/useHosts";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { authenticatedFetch } from "@/lib/identity";
+import type * as IdentityModule from "@/lib/identity";
 
 const mocks = vi.hoisted(() => ({
   status: { current: undefined as unknown },
@@ -21,6 +25,7 @@ const mocks = vi.hoisted(() => ({
   },
   settings: { current: { data: null } as { data: unknown } },
   update: { mutate: vi.fn(), isPending: false },
+  hosts: { current: [] as Host[] },
 }));
 
 vi.mock("@/hooks/useSystemStatus", async (importOriginal) => ({
@@ -37,6 +42,11 @@ vi.mock("@/hooks/useSystemStatus", async (importOriginal) => ({
 }));
 
 vi.mock("@/hooks/useIsAdmin", () => ({ useIsAdmin: () => mocks.isAdmin.current }));
+vi.mock("@/hooks/useHosts", () => ({ useHosts: () => ({ data: mocks.hosts.current }) }));
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof IdentityModule>()),
+  authenticatedFetch: vi.fn(),
+}));
 
 vi.mock("@/hooks/useStartHealthCheck", () => ({
   useStartHealthCheck: () => mocks.healthCheck.current,
@@ -216,6 +226,8 @@ function renderPage() {
 }
 
 beforeEach(() => {
+  vi.mocked(authenticatedFetch).mockReset();
+  mocks.hosts.current = [];
   mocks.history.clear();
   mocks.history.set("host_1", [{ t: 0, cpu_avg: 10 }]);
   mocks.history.set("server", [{ t: 0, cpu: 12 }]);
@@ -231,6 +243,108 @@ afterEach(() => {
 });
 
 describe("SystemStatusPage", () => {
+  it("keeps an in-flight restart mounted when the system-status refresh fails", async () => {
+    const data = makeView({ server: false });
+    mocks.status.current = { data, isLoading: false, isError: false };
+    mocks.hosts.current = [
+      {
+        host_id: "host_1",
+        name: "Laptop",
+        owner: "alice",
+        status: "online",
+        supervised: true,
+        capabilities: ["host_restart"],
+      },
+    ];
+    const fetchMock = vi.mocked(authenticatedFetch);
+    fetchMock
+      .mockResolvedValueOnce(
+        Response.json({
+          preview_id: "preview_1",
+          host_id: "host_1",
+          supervisor: "launchd",
+          running_sessions: [],
+          runner_count: 1,
+          caller_on_host: false,
+        }),
+      )
+      .mockResolvedValueOnce(Response.json({ request_id: "request_1", phase: "draining" }))
+      .mockResolvedValue(
+        Response.json({
+          phase: "draining",
+          reason: null,
+          offline_seconds: null,
+          version: null,
+          cut_sessions: [],
+        }),
+      );
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const content = (
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <SystemStatusPage />
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+    const view = render(content);
+    fireEvent.click(screen.getByRole("button", { name: "Restart" }));
+    await screen.findByText("launchd");
+    fireEvent.click(screen.getByRole("button", { name: "Restart host" }));
+    await screen.findByText("Waiting for running turns to finish");
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    mocks.status.current = {
+      data,
+      isLoading: false,
+      isError: true,
+      error: new Error("Network unavailable"),
+    };
+    // A fresh element forces the page to observe the changed query snapshot.
+    view.rerender(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <SystemStatusPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(screen.getByText("Waiting for running turns to finish")).toBeVisible();
+    expect(screen.getByText(/Unable to refresh system status/)).toBeInTheDocument();
+    fireEvent.click(
+      within(screen.getByRole("dialog")).getAllByRole("button", { name: "Close" })[0]!,
+    );
+    expect(screen.getByRole("button", { name: "View restart" })).toBeVisible();
+    expect(fetchMock.mock.calls.filter((call) => call[1]?.method === "POST")).toHaveLength(2);
+    view.unmount();
+    client.clear();
+  });
+  it("offers restart only on an owned capable host, including for a non-admin owner", () => {
+    mocks.isAdmin.current = false;
+    mocks.status.current = { data: makeView({ server: false }), isLoading: false, isError: false };
+    mocks.hosts.current = [
+      {
+        host_id: "host_1",
+        name: "Laptop",
+        owner: "alice",
+        status: "online",
+        supervised: true,
+        capabilities: ["host_restart"],
+      },
+    ];
+    const client = new QueryClient();
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <SystemStatusPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(
+      within(screen.getByTestId("host-card-host_1")).getByRole("button", { name: "Restart" }),
+    ).toBeVisible();
+    expect(
+      within(screen.getByTestId("host-card-host_2")).queryByRole("button", { name: "Restart" }),
+    ).not.toBeInTheDocument();
+    client.clear();
+  });
   it("renders findings, the server card, host states and the overhead footer", () => {
     mocks.status.current = {
       data: makeView({ server: true }),
