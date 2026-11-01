@@ -19,6 +19,7 @@ import {
   useState,
 } from "react";
 import { useLocation, useNavigate, useSearchParams } from "@/lib/routing";
+import { HostTerminalLink } from "@/components/HostTerminalLink";
 import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
 import { CANVAS_QUERY_PARAM, canvasLocation } from "@/canvas/canvasNavigation";
 import {
@@ -7367,39 +7368,41 @@ export function NewChatLandingScreen() {
   const renderHostMenuItem = (host: Host) => {
     const reconnect = isReconnectRow(host);
     return (
-      <DropdownMenuItem
-        key={host.host_id}
-        onSelect={() => {
-          if (reconnect) pendingConnectRef.current = true;
-          else selectHost(host.host_id);
-        }}
-        disabled={reconnect ? connectingThisMachine : host.status !== "online"}
-        data-testid={
-          reconnect
-            ? "new-chat-landing-run-on-this-machine"
-            : `new-chat-landing-host-${host.host_id}`
-        }
-        data-active={!sandboxSelected && host.host_id === selectedHostId ? "true" : undefined}
-        title={`${host.name} — ${host.status}`}
-        className={reconnect ? "group" : undefined}
-      >
-        <HostOption
-          host={host}
-          cloud={isCloudHostEntry(host)}
-          displayName={displayNameForHost(host, thisMachineHostId, navigator.userAgent)}
-          subtitle={host.host_id === arcaHostId ? "Arca instance" : undefined}
-          action={
-            reconnect ? (
-              <span
-                className="inline-flex h-6 shrink-0 items-center rounded-md px-2 text-xs font-medium text-muted-foreground group-hover:text-foreground"
-                data-testid="new-chat-landing-use-this-machine"
-              >
-                {connectingThisMachine ? <ConnectingText /> : "Use this machine"}
-              </span>
-            ) : undefined
+      <div key={host.host_id} className="flex min-w-0 items-center gap-1">
+        <DropdownMenuItem
+          onSelect={() => {
+            if (reconnect) pendingConnectRef.current = true;
+            else selectHost(host.host_id);
+          }}
+          disabled={reconnect ? connectingThisMachine : host.status !== "online"}
+          data-testid={
+            reconnect
+              ? "new-chat-landing-run-on-this-machine"
+              : `new-chat-landing-host-${host.host_id}`
           }
-        />
-      </DropdownMenuItem>
+          data-active={!sandboxSelected && host.host_id === selectedHostId ? "true" : undefined}
+          title={`${host.name} — ${host.status}`}
+          className={cn("min-w-0 flex-1", reconnect && "group")}
+        >
+          <HostOption
+            host={host}
+            cloud={isCloudHostEntry(host)}
+            displayName={displayNameForHost(host, thisMachineHostId, navigator.userAgent)}
+            subtitle={host.host_id === arcaHostId ? "Arca instance" : undefined}
+            action={
+              reconnect ? (
+                <span
+                  className="inline-flex h-6 shrink-0 items-center rounded-md px-2 text-xs font-medium text-muted-foreground group-hover:text-foreground"
+                  data-testid="new-chat-landing-use-this-machine"
+                >
+                  {connectingThisMachine ? <ConnectingText /> : "Use this machine"}
+                </span>
+              ) : undefined
+            }
+          />
+        </DropdownMenuItem>
+        {!reconnect && <HostTerminalLink host={host} inMenu />}
+      </div>
     );
   };
 

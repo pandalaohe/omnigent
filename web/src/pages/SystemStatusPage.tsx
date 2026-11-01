@@ -10,6 +10,8 @@ import { ChevronDownIcon, ChevronRightIcon } from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
 import { Sparkline } from "@/components/Sparkline";
 import { HostRestartControl } from "@/components/HostRestartControl";
+import { HostTerminalLink } from "@/components/HostTerminalLink";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
@@ -825,6 +827,7 @@ export function HostCard({
   controlHost?: Host;
 }) {
   const history = useSystemHistory(host.host_id);
+  const isMobileViewport = useIsMobileViewport();
   const [processesOpen, setProcessesOpen] = useState(false);
   const snapshot = host.last_snapshot;
   const machine = snapshot?.machine ?? null;
@@ -848,7 +851,17 @@ export function HostCard({
         {showFreshness && (
           <Freshness sampledAtMs={sampledAtMs} staleAfterS={staleAfterS} nowMs={nowMs} />
         )}
-        {controlHost && <HostRestartControl host={controlHost} sessionTitles={sessionTitles} />}
+        {controlHost && (
+          <div
+            className={cn(
+              "flex items-center gap-2 [&>button]:ml-0 max-md:[&>button]:min-h-10",
+              isMobileViewport ? "w-full" : "ml-auto",
+            )}
+          >
+            <HostTerminalLink host={controlHost} />
+            <HostRestartControl host={controlHost} sessionTitles={sessionTitles} />
+          </div>
+        )}
       </div>
       {host.state === "offline" && (
         <p className="mb-3 text-sm text-muted-foreground">

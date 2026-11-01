@@ -3244,6 +3244,32 @@ describe("NewChatLandingScreen cached picker preview", () => {
 });
 
 describe("Run on this machine (desktop host enrollment)", () => {
+  it("reaches the row's Terminal action with menu keyboard navigation", async () => {
+    mockHosts([{ ...host("online"), capabilities: ["host_terminals_v1"] }]);
+    renderLanding();
+    const chip = await screen.findByTestId("new-chat-landing-host-chip");
+    fireEvent.keyDown(chip, { key: "ArrowDown" });
+    const hostItem = await screen.findByTestId("new-chat-landing-host-host_1");
+    act(() => hostItem.focus());
+    fireEvent.keyDown(hostItem, { key: "ArrowDown" });
+    await waitFor(() => expect(screen.getByRole("menuitem", { name: "Terminal" })).toHaveFocus());
+    fireEvent.keyDown(document.activeElement!, { key: "Enter" });
+    expect(screen.getByTestId("landing-location")).toHaveTextContent("/hosts/host_1/terminals");
+  });
+  it("opens the capable host's standalone terminal without selecting the host row", async () => {
+    mockHosts([
+      { ...host("online"), capabilities: ["host_terminals_v1"] },
+      host("online", 2),
+      { ...host("offline", 3), capabilities: ["host_terminals_v1"] },
+    ]);
+    renderLanding();
+    await openHostMenu();
+    const link = await screen.findByRole("menuitem", { name: "Terminal" });
+    expect(link).toHaveAttribute("href", "/hosts/host_1/terminals");
+    expect(screen.getAllByRole("menuitem", { name: "Terminal" })).toHaveLength(1);
+    fireEvent.click(link);
+    expect(screen.getByTestId("landing-location")).toHaveTextContent("/hosts/host_1/terminals");
+  });
   beforeEach(() => {
     setupLandingMocks();
     // No hosts connected yet → the picker offers the one-click connect.

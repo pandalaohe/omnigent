@@ -32,6 +32,7 @@ import { subscribeCodeFont } from "@/lib/codeFontPreferences";
 import { useFileViewer, useWorkspacePaths } from "@/shell/FileViewerContext";
 import { resolveInitialAttachUrl, watchDirectUpgrade, withAttachParams } from "@/lib/terminals";
 import { getSessionHost, markHostKeyless, isHostKeyless } from "@/lib/sessionHost";
+import { hostTerminalsPath } from "@/hooks/useHostTerminals";
 import {
   TERMINAL_SOFT_KEY_EVENT,
   type TerminalSoftKeyEventDetail,
@@ -103,9 +104,11 @@ interface TerminalClipboardRequest {
   source: "terminal" | "selection";
 }
 
-interface TerminalViewProps {
-  /** Session/conversation identifier, e.g. ``"conv_abc123"``. */
-  sessionId: string;
+// Host terminals always use the owner-checked relay, never direct attach.
+type TerminalViewProps = (
+  | { sessionId: string; hostId?: never; directAttachUrl?: string }
+  | { hostId: string; sessionId?: never; directAttachUrl?: never }
+) & {
   /** Opaque terminal resource id, e.g. ``"terminal_bash_s1"``. */
   terminalId: string;
   /** If true, drops keyboard input and runs ``tmux attach -r``. */
@@ -150,19 +153,11 @@ interface TerminalViewProps {
    * way. It still grabs focus on the reveal edge and on an explicit open.
    */
   focusOnConnect?: boolean;
-  /**
-   * Loopback attach URL advertised by the session's runner (from the
-   * terminal resource's ``metadata.direct_attach_url``). When set, each
-   * connection attempt probes it first and uses it if the listener
-   * answers — a browser on the runner's machine then attaches with zero
-   * relay legs. Unreachable or absent falls back to the relay URL; the
-   * page URL and all HTTP traffic are unaffected either way.
-   */
-  directAttachUrl?: string;
-}
+};
 
 export function TerminalView({
   sessionId,
+  hostId,
   terminalId,
   readOnly = false,
   onStateChange,
@@ -195,7 +190,12 @@ export function TerminalView({
   const [connectAttempt, setConnectAttempt] = useState(0);
   const [resumeError, setResumeError] = useState<string | null>(null);
   const clipboardServerIdentity = getOmnigentServerIdentity();
-  const clipboardScope = JSON.stringify([clipboardServerIdentity, sessionId, terminalId, readOnly]);
+  const clipboardScope = JSON.stringify([
+    clipboardServerIdentity,
+    hostId ? ["host", hostId] : ["session", sessionId],
+    terminalId,
+    readOnly,
+  ]);
   const [clipboardPrompt, setClipboardPrompt] = useState<
     | (TerminalClipboardRequest & {
         reason: TerminalClipboardPromptReason;
@@ -593,10 +593,15 @@ export function TerminalView({
         const computedHostId = (() => {
           if (!isHostRoutingEnabled()) return undefined;
           if (isDatabricksWorkspace() && keylessRef.current) return undefined;
-          const h = getSessionHost(sessionId);
+          const h = hostId ?? getSessionHost(sessionId!);
           return h && (!isDatabricksWorkspace() || !isHostKeyless(h)) ? h : undefined;
         })();
-        const relayUrl = buildAttachUrl(sessionId, terminalId, readOnly, computedHostId);
+        const relayUrl = hostId
+          ? resolveWebSocketUrl(
+              `${hostTerminalsPath(hostId)}/${encodeURIComponent(terminalId)}/attach` +
+                (computedHostId ? `?omnigent_slice_key=${encodeURIComponent(computedHostId)}` : ""),
+            )
+          : buildAttachUrl(sessionId!, terminalId, readOnly, computedHostId);
         const directUrl = directAttachUrl ? withAttachParams(directAttachUrl, readOnly) : undefined;
         // Never keep the user waiting on the direct path: this resolves
         // direct only when the loopback listener is already known
@@ -641,6 +646,7 @@ export function TerminalView({
     },
     [
       sessionId,
+      hostId,
       terminalId,
       readOnly,
       directAttachUrl,
@@ -725,8 +731,8 @@ export function TerminalView({
         return;
       }
       keylessRef.current = true;
-      const hostId = getSessionHost(sessionId);
-      if (hostId) markHostKeyless(hostId);
+      const routingHostId = hostId ?? getSessionHost(sessionId!);
+      if (routingHostId) markHostKeyless(routingHostId);
       setReconnectPending(true);
       disposeActiveSession();
       setConnectAttempt((attempt) => attempt + 1);
@@ -773,7 +779,7 @@ export function TerminalView({
       window.clearTimeout(timer);
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, [state, disposeActiveSession, sessionId]);
+  }, [state, disposeActiveSession, sessionId, hostId]);
 
   // `isolate` scopes the status overlay's z-index to this surface so it
   // can't paint over body-portaled UI such as the header's session menu.
