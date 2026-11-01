@@ -455,7 +455,11 @@ from omnigent.server.subagent_activity import (
     record_claude_subagent_return,
     record_subagent_activity,
 )
-from omnigent.server.subagent_retry_admission import active_retry_dispatch, claim_retry_forward
+from omnigent.server.subagent_retry_admission import (
+    active_retry_dispatch,
+    claim_retry_forward,
+    native_retry_marker,
+)
 from omnigent.server.user_preferences_store import read_worktree_path_template
 from omnigent.session_default_modes import (
     SPEED_TIER_LABEL_KEY,
@@ -5012,6 +5016,56 @@ async def _persist_external_conversation_item_unlocked(
             raise OmnigentError(
                 "Invalid native child recovery cursor", code=ErrorCode.INVALID_INPUT
             )
+    existing = (
+        await asyncio.to_thread(
+            conversation_store.find_idempotent_item, session_id, item.idempotency_key
+        )
+        if item.idempotency_key is not None
+        else None
+    )
+    saved_marker = (
+        existing.data.auto_retry
+        if existing is not None and isinstance(existing.data, MessageData)
+        else None
+    )
+    correlated_retry = body.data.get("input_id") is not None
+    if saved_marker is not None or correlated_retry:
+        if not (
+            isinstance(item.data, MessageData)
+            and item.data.role == "user"
+            and not item.data.is_meta
+            and item.idempotency_key is not None
+            and _message_text(item.data.content) == "retry"
+        ):
+            raise OmnigentError("Invalid native retry echo", code=ErrorCode.INVALID_INPUT)
+        marker = saved_marker
+        if correlated_retry:
+            if existing is not None and (
+                saved_marker is None or saved_marker.input_id != body.data["input_id"]
+            ):
+                raise OmnigentError("Native source input changed", code=ErrorCode.CONFLICT)
+            marker = await asyncio.to_thread(
+                native_retry_marker,
+                conversation_store,
+                session_id,
+                body.data["input_id"],
+                body.data.get("input_turn_id"),
+                body.data["source_id"].strip(),
+                body.data.get("item_data", {}).get("auto_retry"),
+            )
+            if existing is not None and saved_marker != marker:
+                raise OmnigentError("Native source input changed", code=ErrorCode.CONFLICT)
+        assert marker is not None
+        supplied_marker = body.data.get("item_data", {}).get("auto_retry")
+        if supplied_marker is not None and supplied_marker != marker.model_dump(mode="json"):
+            raise OmnigentError("Native retry marker changed", code=ErrorCode.INVALID_INPUT)
+        item = item.model_copy(
+            update={"data": item.data.model_copy(update={"auto_retry": marker})}
+        )
+        if existing is not None and not existing.matches_native_replay(item, exact_source=True):
+            raise OmnigentError("Native source data changed", code=ErrorCode.CONFLICT)
+    if "recovery_after" in body.data:
+        after = body.data["recovery_after"]
         historical = item.model_copy(update={"native_recovery": True, "recovery_after": after})
         try:
             persisted = (
@@ -5030,9 +5084,6 @@ async def _persist_external_conversation_item_unlocked(
         # NEWER identical queued message and mark everything queued in between
         # as undelivered. Items that never touch the queue skip the lookup; their
         # retries are absorbed by the idempotent append below.
-        existing = await asyncio.to_thread(
-            conversation_store.find_idempotent_item, session_id, item.idempotency_key
-        )
         if existing is not None:
             return existing.id, True
     if _drains_pending_inputs(item):
@@ -5076,7 +5127,19 @@ async def _persist_external_conversation_item_unlocked(
         # to the oldest entry, except for Kiro, whose prompt text is exact.
         text = _message_text(item.data.content) or ""
         agent_message_candidate = body.data.get("agent_message_candidate") is True
-        matched = pending_inputs.resolve_matching_text(session_id, text, hold=True)
+        if item.data.auto_retry is not None:
+            pending_id = pending_inputs.pending_id_for_stable_id(
+                session_id, item.data.auto_retry.input_id
+            )
+            matched = pending_inputs.MatchedDrain(
+                matched=pending_inputs.resolve(session_id, pending_id, hold=True)
+                if pending_id is not None
+                else None,
+                skipped=[],
+                match_method="input_id",
+            )
+        else:
+            matched = pending_inputs.resolve_matching_text(session_id, text, hold=True)
         drained = matched.matched
         match_method = matched.match_method
         original_held = [*matched.skipped, *matched.uncertain]
@@ -5106,6 +5169,7 @@ async def _persist_external_conversation_item_unlocked(
         try:
             if (
                 drained is None
+                and item.data.auto_retry is None
                 and not agent_message_candidate
                 and not _is_kiro_native_session(conv)
             ):

@@ -16,6 +16,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.exc import SQLAlchemyError
 
+from omnigent.entities.conversation import AutoRetryMetadata
 from omnigent.entities.subagent_retry import (
     ControlInputReference,
     InboxOwnerFence,
@@ -25,7 +26,7 @@ from omnigent.entities.subagent_retry import (
     RetryExecutionGuard,
     RetryInput,
 )
-from omnigent.errors import OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.host_registry import HostRegistry
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.host_store import HostStore, host_is_live
@@ -109,6 +110,53 @@ def retry_dispatch_scope(
 def active_retry_dispatch() -> RetryExecutionGuard | None:
     current = _dispatch.get()
     return current.guard if current else None
+
+
+def native_retry_marker(
+    conversations: ConversationStore,
+    session_id: str,
+    input_id: object,
+    turn_id: object,
+    source_id: str,
+    supplied_marker: object,
+) -> AutoRetryMetadata:
+    """Derive a native echo label from the accepted, identity-bound journal input."""
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from omnigent.stores.subagent_retry_store.sqlalchemy_store import SqlAlchemySubagentRetryStore
+
+    if not isinstance(conversations, SqlAlchemyConversationStore) or not isinstance(input_id, str):
+        raise OmnigentError("Native input receipt is unavailable", code=ErrorCode.INVALID_INPUT)
+    journal = SqlAlchemySubagentRetryStore(
+        conversations.storage_location, conversations.conversation_storage_location
+    )
+    receipt = journal.get_input(input_id)
+    if receipt is None or receipt.target_id != session_id or receipt.kind != "retry":
+        raise OmnigentError("Native input receipt does not match", code=ErrorCode.INVALID_INPUT)
+    if receipt.state in {"prepared", "dispatching", "reserved"}:
+        raise OmnigentError(
+            "Native input acceptance is pending", code=ErrorCode.RUNNER_UNAVAILABLE
+        )
+    chain = journal.get_chain(receipt.chain_id) if receipt.chain_id else None
+    if (
+        receipt.state != "accepted"
+        or not isinstance(turn_id, str)
+        or receipt.turn_id != turn_id
+        or (receipt.reason or {}).get("native_turn_id") != turn_id
+        or chain is None
+        or chain.child_id != session_id
+        or receipt.attempt > chain.accepted_attempts
+    ):
+        raise OmnigentError(
+            "Native input was not accepted on this turn", code=ErrorCode.INVALID_INPUT
+        )
+    marker = AutoRetryMetadata(
+        chain_id=chain.chain_id, input_id=receipt.input_id, attempt=receipt.attempt, of=chain.limit
+    )
+    if supplied_marker is not None and supplied_marker != marker.model_dump(mode="json"):
+        raise OmnigentError("Native retry marker changed", code=ErrorCode.INVALID_INPUT)
+    if not journal.bind_native_source(session_id, input_id, turn_id, source_id):
+        raise OmnigentError("Native input already has another source", code=ErrorCode.CONFLICT)
+    return marker
 
 
 async def claim_retry_forward(session_id: str, event: dict[str, Any], *, deadline: float) -> None:

@@ -1,5 +1,8 @@
 """In-process index of un-consumed web-composer user messages.
 
+Automatic retry entries are settled by their admitted input identity and do
+not participate in ordinary text/FIFO matching.
+
 Backs the optimistic "queued message" bubble for native-terminal
 sessions (claude-native / codex-native) so it survives a client
 re-bind. Ordinary native sends are forwarded into the vendor TUI before
@@ -650,7 +653,7 @@ def classify_missing_native_record(entry: DrainedInput) -> DrainedInput:
     return replace(entry, cause_class="unknown", reason_code=reason_code)
 
 
-def resolve(conversation_id: str, pending_id: str) -> DrainedInput | None:
+def resolve(conversation_id: str, pending_id: str, *, hold: bool = False) -> DrainedInput | None:
     """
     Drop a pending entry by id and return it.
 
@@ -669,7 +672,13 @@ def resolve(conversation_id: str, pending_id: str) -> DrainedInput | None:
         entries = _pending.get(conversation_id)
         if entries is None:
             return None
-        entry = entries.pop(pending_id, None)
+        entry = entries.get(pending_id)
+        if entry is not None and hold:
+            if entry.held:
+                return None
+            entry.held = True
+        else:
+            entries.pop(pending_id, None)
         if not entries:
             _pending.pop(conversation_id, None)
         return _drained_input(entry) if entry is not None else None
@@ -778,7 +787,11 @@ def resolve_oldest_for_mirrored_text(
             return None
         # Insertion order = FIFO; the first live, unheld key is the oldest entry.
         oldest_id = next(
-            (pid for pid, entry in entries.items() if not entry.held and not entry.interrupted),
+            (
+                pid
+                for pid, entry in entries.items()
+                if not entry.held and not entry.interrupted and entry.auto_retry is None
+            ),
             None,
         )
         if oldest_id is None:
@@ -957,7 +970,11 @@ def resolve_matching_text(
         entries = _pending.get(conversation_id)
         if entries is None:
             return MatchedDrain(matched=None, skipped=[])
-        ordered = [(pid, entry) for pid, entry in entries.items() if not entry.held]
+        ordered = [
+            (pid, entry)
+            for pid, entry in entries.items()
+            if not entry.held and entry.auto_retry is None
+        ]
         texts = [
             _shell_command_text(entry.content)
             if shell_command

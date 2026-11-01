@@ -1008,6 +1008,10 @@ class ClaudeTranscriptItem:
     subagent_return_id: str | None = None
     agent_message_candidate: bool = False
     failure_context: FailureContext | None = None
+    native_prompt_id: str | None = None
+    native_session_id: str | None = None
+    retry_input_id: str | None = None
+    retry_turn_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1260,6 +1264,9 @@ class ClaudeHookRecord:
     terminal_turn_id: str | None = None
     terminal_input_id: str | None = None
     native_generation: int | None = None
+    prompt_id: str | None = None
+    retry_session_id: str | None = None
+    retry_input_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -3259,6 +3266,7 @@ def record_hook_event(
                 payload = {**payload, "native_generation": input_admission.native_generation}
                 if input_admission.auto_retry:
                     payload["auto_retry"] = input_admission.auto_retry
+                    payload["retry_session_id"] = read_active_session_id(bridge_dir)
         if is_parent and event_name in {"UserPromptSubmit", "Stop", "StopFailure"}:
             payload = {**payload, "terminal_identity": state.get("terminal_identity")}
         envelope = {
@@ -4207,6 +4215,32 @@ def read_hook_events_since_with_position(
     )
 
 
+def correlate_retry_input(
+    bridge_dir: Path, session_id: str, item: ClaudeTranscriptItem
+) -> ClaudeTranscriptItem:
+    """Join an automatic admission to its vendor record using the prompt identity."""
+    if not item.native_prompt_id or not item.native_session_id:
+        return item
+    matches = [
+        record
+        for record in read_hook_events_since_with_position(bridge_dir, 0).records
+        if record.event_name == "UserPromptSubmit"
+        and record.agent_id is None
+        and record.claude_session_id == item.native_session_id
+        and record.prompt_id == item.native_prompt_id
+        and record.retry_session_id == session_id
+        and isinstance(record.retry_input_id, str)
+        and re.fullmatch(r"[0-9a-f]{32}", record.retry_input_id)
+        and record.terminal_turn_id
+    ]
+    if len(matches) != 1:
+        return item
+    record = matches[0]
+    return replace(
+        item, retry_input_id=record.retry_input_id, retry_turn_id=record.terminal_turn_id
+    )
+
+
 def read_hook_events_from_offset(
     bridge_dir: Path,
     byte_offset: int,
@@ -4461,7 +4495,17 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
             _display_text(raw_details, is_api_error=True) if raw_details is not None else None
         )
     identity = payload.get("terminal_identity") if isinstance(payload, dict) else None
+    marker = payload.get("auto_retry") if isinstance(payload, dict) else None
     return ClaudeHookRecord(
+        prompt_id=payload.get("prompt_id") if isinstance(payload, dict) else None,
+        retry_session_id=payload.get("retry_session_id") if isinstance(payload, dict) else None,
+        retry_input_id=(
+            marker.get("input_id")
+            if isinstance(marker, dict)
+            and isinstance(identity, dict)
+            and marker.get("input_id") == identity.get("input_id")
+            else None
+        ),
         native_generation=(
             identity.get("native_generation")
             if isinstance(identity, dict) and type(identity.get("native_generation")) is int
@@ -10597,13 +10641,31 @@ def _transcript_items_from_entry(
         return current_response_id, []
     role = message.get("role")
     if role == "user":
-        return _user_transcript_items_from_entry(
+        response_id, items = _user_transcript_items_from_entry(
             entry,
             line_number=line_number,
             record_offset=record_offset,
             agent_name=agent_name,
             current_response_id=current_response_id,
         )
+        return response_id, [
+            replace(
+                item,
+                native_prompt_id=entry.get("promptId")
+                if isinstance(entry.get("promptId"), str)
+                else None,
+                native_session_id=entry.get("sessionId")
+                if isinstance(entry.get("sessionId"), str)
+                else None,
+            )
+            if item.item_type == "message"
+            and item.data.get("role") == "user"
+            and not item.data.get("is_meta")
+            and isinstance(entry.get("promptId"), str)
+            and isinstance(entry.get("sessionId"), str)
+            else item
+            for item in items
+        ]
     if role == "assistant":
         return _assistant_transcript_items_from_entry(
             entry,

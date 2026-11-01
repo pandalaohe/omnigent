@@ -577,6 +577,32 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
 
         return run_write_transaction(self._session, "retire_reconciled_control", write)
 
+    def bind_native_source(
+        self, child_id: str, input_id: str, turn_id: str, source_id: str
+    ) -> bool:
+        """An accepted input has one durable transcript source across retries."""
+        _identifier(source_id)
+
+        def write(db: Session) -> bool:
+            receipt = _current(db, SqlRetryInput, (current_workspace_id(), input_id))
+            if (
+                receipt is None
+                or receipt.target_id != child_id
+                or receipt.kind != "retry"
+                or receipt.state != "accepted"
+                or receipt.turn_id != turn_id
+                or (receipt.reason or {}).get("native_turn_id") != turn_id
+            ):
+                return False
+            bound = receipt.payload.get("native_source_id")
+            if bound is not None:
+                return bound == source_id
+            receipt.payload = {**receipt.payload, "native_source_id": source_id}
+            receipt.version += 1
+            return True
+
+        return run_write_transaction(self._session, "bind_native_source", write)
+
     def bind_native_turn(
         self,
         child_id: str,

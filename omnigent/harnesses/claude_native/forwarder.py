@@ -41,6 +41,7 @@ from omnigent.harnesses.claude_native.bridge import (
     _transcript_items_from_entry,
     _transcript_timestamp,
     accumulate_transcript_cost,
+    correlate_retry_input,
     price_transcript_cost_ledger,
     read_active_session_id,
     read_bridge_id,
@@ -7344,6 +7345,7 @@ async def _forward_transcript_item_batch(
         if retry_tracker.retry_delay_s(retry_key) is not None:
             return updated
         try:
+            item = await asyncio.to_thread(correlate_retry_input, bridge_dir, session_id, item)
             await _post_external_conversation_item(
                 client,
                 session_id=session_id,
@@ -8036,6 +8038,11 @@ async def _post_external_conversation_item(
                     "item_data": item_data,
                     "response_id": item.response_id,
                     "source_id": item.source_id,
+                    **(
+                        {"input_id": item.retry_input_id, "input_turn_id": item.retry_turn_id}
+                        if item.retry_input_id is not None
+                        else {}
+                    ),
                     **(
                         {"subagent_return_id": item.subagent_return_id}
                         if item.subagent_return_id is not None
