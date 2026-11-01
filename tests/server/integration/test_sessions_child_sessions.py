@@ -4137,9 +4137,12 @@ async def test_child_archive_transition_publishes_to_parent_stream(
         session_stream.close(parent["id"])
 
 
+@pytest.mark.parametrize("can_resume", [True, False])
 async def test_child_snapshot_reports_effective_placement_from_root(
     client: httpx.AsyncClient,
     db_uri: str,
+    app: FastAPI,
+    can_resume: bool,
 ) -> None:
     """A deeply nested child snapshot carries the root's effective placement.
 
@@ -4149,6 +4152,29 @@ async def test_child_snapshot_reports_effective_placement_from_root(
     :param client: The test HTTP client.
     :param db_uri: Per-test SQLite database URI.
     """
+    from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
+    from omnigent.stores.host_store import HostStore
+    from tests.server.helpers import FakeSandboxLauncher
+
+    launcher = FakeSandboxLauncher(can_resume=can_resume)
+    app.state.sandbox_config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://server.example.test",
+            token_ttl_s=3600,
+            launcher_factory=lambda: launcher,
+        )
+    )
+    host_store = HostStore(db_uri)
+    app.state.host_store = host_store
+    host_store.register_managed_host(
+        host_id="3f866cafac81246fb60ae6ceb1a738da",
+        name="sleeping-cloud",
+        user_id="owner@example.test",
+        token="test-host-token",
+        provider="modal",
+        sandbox_id="sandbox-sleeping",
+        token_expires_at=2_000_000_000,
+    )
     agent = await create_test_agent(client, name="header-placement-agent")
     conv_store = SqlAlchemyConversationStore(db_uri)
     root = conv_store.create_conversation(
@@ -4177,6 +4203,9 @@ async def test_child_snapshot_reports_effective_placement_from_root(
     assert snapshot["effective_host_id"] == "3f866cafac81246fb60ae6ceb1a738da"
     assert snapshot["effective_cwd"] == "/srv/header"
     assert snapshot["effective_git_branch"] == "header-branch"
+    assert snapshot["host_resumable"] is False
+    root_snapshot = (await client.get(f"/v1/sessions/{root.id}")).json()
+    assert root_snapshot["host_resumable"] is can_resume
 
 
 async def test_child_sessions_zones_at_scale(

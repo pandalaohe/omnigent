@@ -10591,7 +10591,10 @@ async def test_sys_session_get_info_relaunchable_requires_a_launchable_harness()
 
 
 @pytest.mark.asyncio
-async def test_sys_session_get_info_closed_session_is_never_relaunchable() -> None:
+@pytest.mark.parametrize("runner_online", [True, False, None])
+async def test_sys_session_get_info_closed_session_is_never_relaunchable(
+    runner_online: bool | None,
+) -> None:
     """
     A closed session rejects its next message, so an online host must not
     read as ``relaunchable`` for it — the mother would send a resume that
@@ -10623,7 +10626,7 @@ async def test_sys_session_get_info_closed_session_is_never_relaunchable() -> No
         if path.startswith("/v1/sessions/"):
             return httpx.Response(200, json=snapshots[path.rsplit("/", 1)[-1]])
         if path.startswith("/v1/runners/"):
-            return httpx.Response(200, json={"online": False})
+            return httpx.Response(200, json={"online": runner_online})
         if path.startswith("/v1/hosts/"):
             return httpx.Response(200, json={"name": "studio", "status": "online"})
         return httpx.Response(404, json={"error": str(request.url)})
@@ -10641,9 +10644,17 @@ async def test_sys_session_get_info_closed_session_is_never_relaunchable() -> No
 
     by_id = {item["session_id"]: item for item in json.loads(output)["sessions"]}
     for session_id in ("conv_label_closed", "conv_title_closed"):
-        assert by_id[session_id]["runner_state"] == "offline"
-        assert "closed" in by_id[session_id]["runner_state_reason"]
-    assert by_id["conv_open"]["runner_state"] == "relaunchable"
+        if runner_online is False:
+            assert by_id[session_id]["runner_state"] == "offline"
+            assert "closed" in by_id[session_id]["runner_state_reason"]
+        else:
+            assert by_id[session_id]["runner_state"] == (
+                "online" if runner_online is True else None
+            )
+            assert by_id[session_id]["runner_state_reason"] is None
+    assert by_id["conv_open"]["runner_state"] == (
+        "online" if runner_online is True else "relaunchable" if runner_online is False else None
+    )
 
 
 @pytest.mark.asyncio
@@ -10726,6 +10737,14 @@ async def test_sys_session_get_info_resumable_host_reads_relaunchable() -> None:
             runner_id="runner_gone",
             host_resumable=False,
         ),
+        "conv_hostless_child": _session_info_snapshot(
+            "conv_hostless_child",
+            host_id=None,
+            effective_host_id="host_sleep",
+            parent_session_id="conv_asleep",
+            runner_id="runner_gone",
+            host_resumable=False,
+        ),
     }
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
@@ -10754,6 +10773,10 @@ async def test_sys_session_get_info_resumable_host_reads_relaunchable() -> None:
     assert "resumable" in by_id["conv_asleep"]["runner_state_reason"]
     assert by_id["conv_dead"]["runner_state"] == "offline"
     assert "Host cloud is offline" in by_id["conv_dead"]["runner_state_reason"]
+    child = by_id["conv_hostless_child"]
+    assert child["runner_state"] == "offline"
+    assert "cannot wake" in child["runner_state_reason"]
+    assert "host-bound ancestor" in child["runner_state_reason"]
 
 
 @pytest.mark.asyncio

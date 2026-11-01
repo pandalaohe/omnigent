@@ -8261,6 +8261,7 @@ def _session_info_runner_state(
     *,
     harness: str | None = None,
     host_resumable: bool = False,
+    host_inherited: bool = False,
     closed: bool = False,
 ) -> tuple[str | None, str | None]:
     """
@@ -8280,15 +8281,13 @@ def _session_info_runner_state(
     :param harness: The session's effective harness, when reported.
     :param host_resumable: Whether the bound host is a dormant managed host
         the server wakes in place on the next message.
+    :param host_inherited: Whether only an ancestor is bound to the host;
+        a message to this session cannot wake that ancestor's host.
     :param closed: Whether the session is closed to new input.
     :returns: ``(state, reason)`` — ``online``, ``relaunchable`` or
         ``offline`` with a reason for the last two; ``(None, None)`` when
         the runner or host state is unknown or there is no host.
     """
-    if closed:
-        return "offline", (
-            "Session is closed; a new message is rejected, so no runner is started."
-        )
     if runner_online is True:
         return "online", None
     if runner_online is None or host_id is None or host is None:
@@ -8306,20 +8305,33 @@ def _session_info_runner_state(
                 f"Host {name} is online but cannot launch harness {harness} "
                 f"({unavailable_reason}); install or configure it on that host."
             )
+    elif status == "offline":
+        if host_inherited:
+            return "offline", (
+                f"Host {name} is offline; this session inherits its host and cannot wake it. "
+                "Reconnect the host or wake it through a host-bound ancestor, then retry "
+                "this session."
+            )
+        if not host_resumable:
+            return "offline", (
+                f"Host {name} is offline; the session cannot take a turn until "
+                "that host reconnects."
+            )
+    else:
+        return None, None
+    if closed:
+        return "offline", (
+            "Session is closed; a new message is rejected, so no runner is started."
+        )
+    if status == "online":
         return "relaunchable", (
             f"Runner stopped (host restart or stop); host {name} is online, so the "
             "next message starts or reattaches it. No archive needed."
         )
-    if status == "offline":
-        if host_resumable:
-            return "relaunchable", (
-                f"Host {name} is asleep and resumable; the next message wakes it and "
-                "starts its runner. No archive needed."
-            )
-        return "offline", (
-            f"Host {name} is offline; the session cannot take a turn until that host reconnects."
-        )
-    return None, None
+    return "relaunchable", (
+        f"Host {name} is asleep and resumable; the next message wakes it and "
+        "starts its runner. No archive needed."
+    )
 
 
 # Cap on ``sys_session_get_info``'s ``session_ids`` fan-out; 20 parallel
@@ -8586,6 +8598,7 @@ async def _session_info_item(
         host,
         harness=_optional_string(snap.get("harness")),
         host_resumable=snap.get("host_resumable") is True,
+        host_inherited=snap_host_id is None and resolved_host_id is not None,
         closed=is_session_closed(labels, _optional_string(snap.get("title"))),
     )
     keep_warm = snap.get("keep_warm")
