@@ -3207,6 +3207,61 @@ def _merge_disallowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str
     return args
 
 
+def policy_fallback_marker(bridge_dir: Path, session_id: str, payload: _JsonObject) -> Path:
+    """Identify a call without storing its arguments in the bridge marker."""
+    tool_name = payload.get("tool_name")
+    tool_input = payload.get("tool_input")
+    if tool_name == "Bash" and isinstance(tool_input, dict):
+        tool_input = {"command": tool_input.get("command", "")}
+    identity = [session_id, tool_name, tool_input or {}, payload.get("cwd") or ""]
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+    return bridge_dir / f"policy-fallback-{digest}"
+
+
+def clear_policy_fallback_marker(bridge_dir: Path, session_id: str, payload: _JsonObject) -> Path:
+    """Clear the current call's fallback marker and any expired markers."""
+    marker = policy_fallback_marker(bridge_dir, session_id, payload)
+    with contextlib.suppress(OSError):
+        marker.unlink(missing_ok=True)
+        for stale in bridge_dir.glob("policy-fallback-*"):
+            if time.time() - stale.stat().st_mtime > 600:
+                stale.unlink(missing_ok=True)
+    return marker
+
+
+def record_policy_eval_fallback(
+    bridge_dir: Path,
+    hook_event: str,
+    payload: _JsonObject,
+    output: _JsonObject,
+    marker: Path | None = None,
+) -> None:
+    """Record a fail-closed policy evaluation fallback in the bridge directory."""
+    if hook_event == "PreToolUse" and marker is not None:
+        hook_specific = output.get("hookSpecificOutput")
+        reason = (
+            hook_specific.get("permissionDecisionReason")
+            if isinstance(hook_specific, dict)
+            else None
+        )
+        with contextlib.suppress(OSError):
+            marker.touch(mode=0o600)
+            if isinstance(reason, str) and reason:
+                marker.write_text(reason, encoding="utf-8")
+    elif hook_event == "UserPromptSubmit":
+        reason = output.get("reason")
+        with contextlib.suppress(OSError, RuntimeError):
+            record_hook_event(
+                bridge_dir,
+                {
+                    **payload,
+                    "hook_event_name": "StopFailure",
+                    "error": "policy_evaluation_failed",
+                    "error_details": reason if isinstance(reason, str) else None,
+                },
+            )
+
+
 def record_hook_event(bridge_dir: Path, payload: _JsonObject) -> None:
     """
     Record one Claude Code hook payload in the bridge directory.
@@ -8542,7 +8597,9 @@ def _tool_relay_handler_factory(
                 return
             context = eval_request["event"]["context"]
             context["harness"] = "claude-native"
+            marker: Path | None = None
             if bridge_dir is not None:
+                marker = clear_policy_fallback_marker(bridge_dir, session_id, payload)
                 status_model = read_claude_status_model(bridge_dir)
                 if status_model:
                     context["model"] = status_model
@@ -8624,7 +8681,12 @@ def _tool_relay_handler_factory(
                     last_error,
                     extra={"session_id": session_id},
                 )
-                self._respond_hook_output(fail_ask_hook_output(hook_event, last_error))
+                out = fail_ask_hook_output(hook_event, last_error)
+                if out is not None and bridge_dir is not None and relay_session_active:
+                    record_policy_eval_fallback(
+                        bridge_dir, hook_event, payload, out, marker=marker
+                    )
+                self._respond_hook_output(out)
                 return
             if bridge_dir is not None and relay_session_active:
                 policy_allow_cache.record(bridge_dir, cache_generation, verdict, requested_at)

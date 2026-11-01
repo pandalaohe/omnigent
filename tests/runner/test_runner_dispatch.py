@@ -3988,6 +3988,7 @@ async def test_sys_session_send_reuses_existing_child_session(
     [stamp] = dispatch_stamps
     assert stamp["events_before"] == 0
     assert stamp[subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY].startswith("subagent_")
+    assert stamp[subagent_work.SUBAGENT_TERMINAL_STATUS_LABEL_KEY] == ""
     assert published[-1]["type"] == "session.child_session.updated"
     assert published[-1]["child"]["current_task_status"] == "launching"
     assert published[-1]["child"]["busy"] is False
