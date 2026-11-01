@@ -51,6 +51,7 @@ export function effortLevelsFor(
       return ["low", "medium", "high"].filter((effort) => efforts.includes(effort));
     }
     case "pi-native":
+    case "pi":
       return PI_NATIVE_EFFORT_LEVELS;
     default:
       return null;
