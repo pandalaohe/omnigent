@@ -106,6 +106,7 @@ async def restore_active_children(
 ) -> None:
     """Rebind and initialize interrupted descendants on their recovered parent's runner."""
     from omnigent.runtime import get_runner_router
+    from omnigent.server.routes._sessions.helpers import effective_host_id
     from omnigent.server.routes.sessions import _ensure_runner_relay
 
     if parent.runner_id is None or not _restorable(parent):
@@ -136,6 +137,11 @@ async def restore_active_children(
 
     if not await ownership_allows(parent):
         return
+    parent_host_id = (
+        parent.host_id
+        if parent.host_id is not None or parent.parent_conversation_id is None
+        else await store_call(effective_host_id, store, parent)
+    )
     # Include idle ancestors only when needed to host an interrupted descendant.
     tree: dict[str, Conversation] = {parent.id: parent}
     frontier = [parent.id]
@@ -148,7 +154,7 @@ async def restore_active_children(
         for row in rows.values():
             if (
                 row.id in tree
-                or row.host_id is not None
+                or (row.host_id is not None and row.host_id != parent_host_id)
                 or row.runner_id is None
                 or row.parent_conversation_id not in tree
                 or (
@@ -238,12 +244,13 @@ async def restore_active_children(
             if (
                 owner is None
                 or owner.runner_id != parent.runner_id
+                or (owner.host_id is not None and owner.host_id != parent_host_id)
                 or not _restorable(owner)
                 or child is None
                 or child.runner_id is None
                 or child.runner_id != snapshot.runner_id
                 or child.parent_conversation_id != owner.id
-                or child.host_id is not None
+                or (child.host_id is not None and child.host_id != parent_host_id)
                 or is_side_chat_child(child.labels)
                 or not _restorable(child)
                 or (snapshot.id in active and not _interrupted(child))
