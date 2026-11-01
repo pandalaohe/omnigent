@@ -16079,6 +16079,14 @@ async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
         )
         output = json.loads(body)
         assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
+        marker = claude_native_bridge.policy_fallback_marker(
+            bridge_dir, "conv_hook_eval", _PRE_TOOL_USE_PAYLOAD
+        )
+        assert marker.exists()
+        assert (
+            marker.read_text(encoding="utf-8")
+            == output["hookSpecificOutput"]["permissionDecisionReason"]
+        )
 
         post_body = await asyncio.to_thread(
             _relay_request_raw,
@@ -16087,6 +16095,7 @@ async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
             {**_PRE_TOOL_USE_PAYLOAD, "hook_event_name": "PostToolUse", "tool_output": "x"},
         )
         assert post_body == "", "PostToolUse must fail open (tool already ran)"
+        assert not marker.exists(), "a subsequent hook event clears the previous marker"
     finally:
         relay.close()
 
@@ -16134,6 +16143,14 @@ async def test_hook_evaluate_pre_tool_use_rides_out_an_outage(
         assert output["decision"] == "block", f"UserPromptSubmit must fail closed, got {output!r}"
         assert client.calls == 3, f"UserPromptSubmit keeps the short schedule, saw {client.calls}"
         assert [call.args[0] for call in _policy_retry_clock.sleep.call_args_list] == [0.4, 0.4]
+        hooks = [
+            json.loads(line)["payload"]
+            for line in (bridge_dir / "hooks.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        assert len(hooks) == 1
+        assert hooks[0]["hook_event_name"] == "StopFailure"
+        assert hooks[0]["error"] == "policy_evaluation_failed"
+        assert hooks[0]["error_details"] == output["reason"]
     finally:
         relay.close()
 

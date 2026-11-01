@@ -1520,6 +1520,19 @@ def test_evaluate_policy_pre_tool_use_fails_closed_when_verdict_unavailable(
     assert "_omnigent_approval_origin" not in posted[0]
     assert posted[1]["_omnigent_approval_origin"] == "omnigent-policy-unavailable"
     assert "_omnigent_approval_origin" not in posted[2]
+    hooks = [
+        json.loads(line)["payload"]
+        for line in (bridge_dir / "hooks.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [h["hook_event_name"] for h in hooks] == [
+        "StopFailure",
+        "StopFailure",
+        "StopFailure",
+    ]
+    assert hooks[0]["error"] == "permission_request_failed"
+    assert hooks[1]["error"] == "policy_evaluation_failed"
+    assert hooks[1]["error_details"] == result["hookSpecificOutput"]["permissionDecisionReason"]
+    assert hooks[2]["error"] == "permission_request_failed"
 
 
 def test_evaluate_policy_user_prompt_submit_fails_closed_on_error(
@@ -1554,6 +1567,14 @@ def test_evaluate_policy_user_prompt_submit_fails_closed_on_error(
     result = json.loads(captured.out)
     assert result["decision"] == "block"
     assert result["reason"]
+    hooks = [
+        json.loads(line)["payload"]
+        for line in (bridge_dir / "hooks.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(hooks) == 1
+    assert hooks[0]["hook_event_name"] == "StopFailure"
+    assert hooks[0]["error"] == "policy_evaluation_failed"
+    assert hooks[0]["error_details"] == result["reason"]
 
 
 def test_evaluate_policy_post_tool_use_fails_open_on_error(

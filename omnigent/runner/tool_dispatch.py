@@ -1835,7 +1835,12 @@ async def _session_turn_actor(
 
 
 async def _patch_subagent_label(
-    server_client: httpx.AsyncClient, child_session_id: str, key: str, value: str
+    server_client: httpx.AsyncClient,
+    child_session_id: str,
+    key: str,
+    value: str,
+    *,
+    extra_labels: dict[str, str] | None = None,
 ) -> str | None:
     """
     Write one runner-owned sub-agent label on a child session.
@@ -1844,12 +1849,13 @@ async def _patch_subagent_label(
     :param child_session_id: Child session id, e.g. ``"conv_abc123"``.
     :param key: Label key, e.g. ``"omnigent.subagent.dispatch_id"``.
     :param value: Label value, e.g. ``"subagent_a1b2c3d4e5f6"``.
+    :param extra_labels: Optional companion labels to write in the same patch.
     :returns: A short failure description, or ``None`` on success.
     """
     try:
         resp = await server_client.patch(
             f"{_session_url(child_session_id)}",
-            json={"labels": {key: value}},
+            json={"labels": {**(extra_labels or {}), key: value}},
             timeout=30.0,
         )
     except (httpx.HTTPError, ValueError) as exc:
@@ -1901,7 +1907,11 @@ async def _prepare_child_dispatch(
     except subagent_work._SubagentRecoveryReadError as exc:
         return None, f"failed to read preceding child result: {exc}"
     error = await _patch_subagent_label(
-        server_client, child_session_id, subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY, work_id
+        server_client,
+        child_session_id,
+        subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY,
+        work_id,
+        extra_labels=subagent_work.SUBAGENT_DISPATCH_RESET_LABELS,
     )
     return prior_result[0] if prior_result is not None else None, error
 
@@ -2092,6 +2102,7 @@ async def _send_to_in_flight_child(
                 child_session_id,
                 _subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY,
                 work_id,
+                extra_labels=_subagent_work.SUBAGENT_DISPATCH_RESET_LABELS,
             )
             if stamp_error is not None:
                 _logger.warning(
