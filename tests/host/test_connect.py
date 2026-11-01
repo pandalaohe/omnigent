@@ -2076,6 +2076,109 @@ async def test_live_host_full_refresh_detects_auth_completion(
     _cleanup_host(host)
 
 
+@pytest.mark.parametrize(
+    "harness,binary,path_override",
+    [
+        ("claude-native", "claude", None),
+        ("codex-native", "codex", None),
+        ("pi-native", "pi", None),
+        ("claude-native", "claude", "other-claude"),
+        ("codex-native", "codex", "other-codex"),
+        ("pi-native", "pi", "custom-pi"),
+    ],
+)
+async def test_native_cli_loss_logs_path_once_and_rearms_after_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    harness: str,
+    binary: str,
+    path_override: str | None,
+) -> None:
+    cli = tmp_path / binary
+    cli.write_text("#!/bin/sh\nexit 99\n")
+    cli.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_CLI_FALLBACK_DIRS", "")
+    if path_override:
+        other_cli = tmp_path / path_override
+        other_cli.write_text("#!/bin/sh\nexit 99\n")
+        other_cli.chmod(0o755)
+        monkeypatch.setenv(f"OMNIGENT_{binary.upper()}_PATH", str(other_cli))
+        if binary == "pi":
+            cli = other_cli
+    host = _make_host_process()
+    ready = {harness: True}
+    missing = {harness: "binary-missing"}
+    if harness == "claude-native":
+        ready["native-claude"] = True
+        missing["native-claude"] = "binary-missing"
+    try:
+        with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+            host._replace_capabilities(ready, None)
+            cli.unlink()
+            host._replace_capabilities(missing, None)
+            host._replace_capabilities(None, None)
+            host._replace_capabilities(missing, None)
+            messages = [r.message for r in caplog.records if "Native CLI disappeared" in r.message]
+            assert messages == [f"Native CLI disappeared: cli={binary} last_resolved_path={cli}"]
+            if path_override and binary != "pi":
+                assert (tmp_path / path_override).exists()
+            cli.write_text("#!/bin/sh\nexit 99\n")
+            cli.chmod(0o755)
+            host._replace_capabilities(ready, None)
+            cli.unlink()
+            host._replace_capabilities(missing, None)
+            assert sum("Native CLI disappeared" in r.message for r in caplog.records) == 2
+    finally:
+        _cleanup_host(host)
+
+
+async def test_initially_missing_native_cli_and_sdk_do_not_log_loss(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    host = _make_host_process()
+    try:
+        with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+            host._replace_capabilities(
+                {"claude-native": "binary-missing", "claude-sdk": True}, None
+            )
+            host._replace_capabilities({"claude-sdk": "binary-missing"}, None)
+        assert not any("Native CLI disappeared" in r.message for r in caplog.records)
+    finally:
+        _cleanup_host(host)
+
+
+async def test_periodic_readiness_refresh_reports_native_cli_loss(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    cli = tmp_path / "claude"
+    cli.write_text("#!/bin/sh\nexit 99\n")
+    cli.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_CLI_FALLBACK_DIRS", "")
+    monkeypatch.setattr(
+        "omnigent.host.connect.configured_harness_map", lambda: {"claude-native": "binary-missing"}
+    )
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", dict)
+    monkeypatch.setattr("omnigent.host.connect.HARNESS_READINESS_FULL_REFRESH_INTERVAL_S", 0.01)
+    host = _make_host_process()
+    host._replace_capabilities({"claude-native": True}, {})
+    cli.unlink()
+    ws = _RecordingWS()
+    task = asyncio.create_task(host._harness_readiness_loop(ws))
+    try:
+        with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+            await asyncio.wait_for(ws.first_send.wait(), timeout=2.0)
+        assert f"Native CLI disappeared: cli=claude last_resolved_path={cli}" in caplog.text
+        refresh = decode_host_frame(ws.sent[0])
+        assert isinstance(refresh, HostHarnessReadinessFrame)
+        assert refresh.configured_harnesses == {"claude-native": "binary-missing"}
+    finally:
+        await _cancel(task)
+        _cleanup_host(host)
+
+
 async def test_live_host_publishes_sanitized_codex_rate_limits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
