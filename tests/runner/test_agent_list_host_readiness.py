@@ -201,3 +201,46 @@ async def test_discovery_quota_failure_is_advisory(quota_status):
         )
     quota = result["builtins"][0]["quota"]
     assert (quota["state"] if quota else None) == ("low" if quota_status == 200 else None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["no_report", "stale_report", "empty_report"])
+async def test_agent_list_preserves_unknown_quota_reason(reason):
+    quota = {
+        "state": "unknown",
+        "reason": reason,
+        "pace_pct": None,
+        "deciding_window": None,
+        "windows": [],
+    }
+
+    def handle(request):
+        if request.url.path == "/v1/agents":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "agent",
+                            "name": "Antigravity",
+                            "harness": "antigravity-native",
+                        }
+                    ]
+                },
+            )
+        if request.url.path.endswith("/agent-quota"):
+            return httpx.Response(200, json={"agents": {"antigravity": quota}})
+        return httpx.Response(200, json={"data": []})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_agent_list",
+                arguments="{}",
+                server_client=client,
+                conversation_id="child",
+            )
+        )
+    assert result["builtins"][0]["quota"] == quota
