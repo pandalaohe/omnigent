@@ -7,8 +7,8 @@
 // (read via `useSessionAgent().terminals` — the same gate the server
 // enforces on POST /resources/terminals and that controls the agent's
 // own sys_terminal_* tool surface). An agent without terminal access
-// never sees the button, and a user-created terminal is always one
-// the agent can list/read/close.
+// never sees the button. Admin terminals require separate per-instance
+// consent before the agent can read or type into them.
 //
 // Behavior by declared-terminal shape:
 //   - One declared name → creates it directly on click.
@@ -29,6 +29,8 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useSessionAgent } from "@/hooks/useAgents";
+import { useSessionTerminalAccess } from "@/hooks/useSessionTerminalAccess";
+import { showToast } from "@/components/ui/toast";
 import { terminalTabKey, useCreateTerminal } from "@/hooks/useTerminals";
 import { useTerminalFirst } from "./TerminalFirstContext";
 
@@ -58,22 +60,24 @@ export function NewTerminalButton({
 }: NewTerminalButtonProps) {
   const { data: agent } = useSessionAgent(conversationId);
   const create = useCreateTerminal(conversationId);
+  const { canCreateElevated } = useSessionTerminalAccess(conversationId);
   // Native-wrapper sessions declare the host's installed shells as their
   // terminals (default `$SHELL` first); SDK agents declare distinct-purpose
-  // terminals with no default. Only the native case gets the split-button
-  // shell picker — see the file header.
+  // terminals with no default. A single declaration with admin support also
+  // keeps a primary action while its caret offers the admin option.
   const isNativeWrapper = useTerminalFirst()?.isNativeWrapper ?? false;
   const declared = agent?.terminals ?? [];
   // The iff gate, UI side: no declared terminals → no affordance.
   if (declared.length === 0) return null;
 
-  const launch = (name: string) => {
-    create.mutate(name, {
+  const launch = (name: string, elevated = false) => {
+    create.mutate(elevated ? { terminal: name, elevated: true } : name, {
       onSuccess: (info) => onCreated?.(terminalTabKey(info)),
     });
   };
 
-  const isShellPicker = isNativeWrapper && declared.length > 1;
+  const isShellPicker =
+    (isNativeWrapper && declared.length > 1) || (declared.length === 1 && canCreateElevated);
 
   // Single declared name: create directly on click. Multiple: the
   // DropdownMenuTrigger wrapper below owns the click instead — except the
@@ -127,7 +131,7 @@ export function NewTerminalButton({
       </TooltipProvider>
     );
 
-  if (declared.length === 1) return withTooltip(trigger);
+  if (declared.length === 1 && !canCreateElevated) return withTooltip(trigger);
 
   // Dropdown listing every declared terminal. In the shell-picker case the
   // first entry is the `$SHELL` default, so it is labeled as such.
@@ -138,6 +142,11 @@ export function NewTerminalButton({
           {isShellPicker && i === 0 ? `${name} (default)` : name}
         </DropdownMenuItem>
       ))}
+      {canCreateElevated && (
+        <DropdownMenuItem className="max-md:min-h-11" onSelect={() => launch(declared[0], true)}>
+          Admin (root)
+        </DropdownMenuItem>
+      )}
     </DropdownMenuContent>
   );
 
@@ -179,5 +188,35 @@ export function NewTerminalButton({
       </div>
       {menu}
     </DropdownMenu>
+  );
+}
+
+/** Direct mobile header action; the drawer also retains its existing shell picker. */
+export function NewAdminTerminalMenuItem({
+  conversationId,
+  onCreated,
+}: {
+  conversationId: string;
+  onCreated?: (key: string) => void;
+}) {
+  const { data: agent } = useSessionAgent(conversationId);
+  const { canCreateElevated } = useSessionTerminalAccess(conversationId);
+  const create = useCreateTerminal(conversationId);
+  const name = agent?.terminals?.[0];
+  if (!canCreateElevated || !name) return null;
+  return (
+    <DropdownMenuItem
+      className="min-h-11 gap-2.5 px-2.5 py-2 text-ui"
+      disabled={create.isPending}
+      onSelect={() => {
+        // The menu unmounts on selection; keep completion attached to the promise.
+        void create
+          .mutateAsync({ terminal: name, elevated: true })
+          .then((terminal) => onCreated?.(terminalTabKey(terminal)))
+          .catch((error: Error) => showToast(`Couldn't open an admin terminal: ${error.message}`));
+      }}
+    >
+      Admin (root){create.isError && <span role="alert">{create.error.message}</span>}
+    </DropdownMenuItem>
   );
 }

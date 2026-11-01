@@ -28,6 +28,7 @@ import { ElicitationMessage } from "@/components/blocks/ElicitationMessage";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { authenticatedFetch } from "@/lib/identity";
+import { isTerminalAccessPolicyName, parseTerminalAccess } from "@/lib/terminalAccess";
 import { formatPreview } from "@/lib/previewFormat";
 
 interface ElicitationData {
@@ -222,7 +223,10 @@ export function ApprovePage() {
       )}
 
       {state.kind === "pending" &&
-        (state.data.native_delivery || Boolean(state.data.permission_directories?.length)) && (
+        (state.data.native_delivery ||
+          Boolean(state.data.permission_directories?.length) ||
+          isTerminalAccessPolicyName(state.data.policy_name ?? "") ||
+          parseTerminalAccess(state.data)) && (
           <ApprovalCard
             elicitationId={elicitationId!}
             message={state.data.message ?? ""}
@@ -234,12 +238,16 @@ export function ApprovePage() {
             response={null}
             nativeDelivery={state.data.native_delivery}
             permissionDirectories={state.data.permission_directories}
+            terminalAccess={parseTerminalAccess(state.data)}
+            cardSessionId={sessionId}
             onSubmit={(_id, action, content, meta) => void submit(action, content, meta)}
           />
         )}
       {state.kind === "pending" &&
         !state.data.native_delivery &&
-        !state.data.permission_directories?.length && (
+        !state.data.permission_directories?.length &&
+        !isTerminalAccessPolicyName(state.data.policy_name ?? "") &&
+        !parseTerminalAccess(state.data) && (
           <Alert className="flex flex-col gap-3 py-4 px-5">
             <AlertTitle className="flex items-center gap-2 text-ui">
               <MessageCircleQuestionMark className="size-4 text-yellow-600 dark:text-yellow-400" />

@@ -36,6 +36,8 @@
 
 import type { NativePermissionDelivery } from "@/lib/nativePermissionDelivery";
 import { useContext } from "react";
+import { useViewerId } from "@/hooks/useViewerId";
+import { isTerminalAccessPolicyName, type TerminalAccessRequest } from "@/lib/terminalAccess";
 import {
   CheckIcon,
   ClipboardListIcon,
@@ -188,6 +190,7 @@ function SubagentRequesterLine({ sessionId, ancestorSessionId }: SubagentRequest
 }
 
 interface ApprovalCardProps {
+  terminalAccess?: TerminalAccessRequest | null;
   nativeDelivery?: NativePermissionDelivery;
   elicitationId: string;
   message: string;
@@ -308,7 +311,51 @@ interface ApprovalCardProps {
 
 const EMPTY_CODEX_PERSIST_MODES: CodexPersistMode[] = [];
 
+function TerminalAccessActions({
+  request,
+  onApprove,
+  onReject,
+  sessionId,
+}: {
+  request?: TerminalAccessRequest | null;
+  onApprove: () => void;
+  onReject: () => void;
+  sessionId?: string | null;
+}) {
+  const viewerId = useViewerId();
+  if (!request) {
+    return (
+      <div className="text-sm">
+        <p role="alert">Terminal approval details are unavailable.</p>
+        {sessionId && (
+          <Link to={`/c/${encodeURIComponent(sessionId)}`} className="underline">
+            Open this request in the session
+          </Link>
+        )}
+      </div>
+    );
+  }
+  if (viewerId !== request.owner) {
+    return (
+      <p className="text-sm text-muted-foreground">
+        Only the host owner's signed-in browser can answer this request.
+      </p>
+    );
+  }
+  return (
+    <div className="flex flex-wrap gap-2 pt-1">
+      <Button size="sm" onClick={onApprove}>
+        Approve
+      </Button>
+      <Button size="sm" variant="outline" onClick={onReject}>
+        Reject
+      </Button>
+    </div>
+  );
+}
+
 export function ApprovalCard({
+  terminalAccess,
   nativeDelivery,
   elicitationId,
   message,
@@ -339,6 +386,7 @@ export function ApprovalCard({
   requester,
   className,
 }: ApprovalCardProps) {
+  const isTerminalAccess = Boolean(terminalAccess) || isTerminalAccessPolicyName(policyName);
   // In a side-chat pane this resolves to the child id, so the verdict targets
   // the child's elicitation rather than the main conversation's. null (the main
   // transcript) leaves submitApproval on its active-conversation default.
@@ -475,9 +523,11 @@ export function ApprovalCard({
   // that asked — and show nothing when the stamp names no vendor. A real policy
   // name renders verbatim so users can tell which of their policies asked.
   const isNativePolicy = isNativePolicyName(policyName);
-  const policyLabel = isNativePolicy
-    ? (nativeCodingAgentForPolicyName(policyName)?.displayName ?? "")
-    : policyName;
+  const policyLabel = isTerminalAccess
+    ? ""
+    : isNativePolicy
+      ? (nativeCodingAgentForPolicyName(policyName)?.displayName ?? "")
+      : policyName;
   // Native prompts also stamp a constant, internal-sounding phase
   // ("pre_tool_use", "codex_command_approval", ...). It carries no
   // information the card doesn't already show, so hide it for them.
@@ -976,15 +1026,17 @@ export function ApprovalCard({
         ) : (
           <MessageCircleQuestionMark className="size-4 text-yellow-600 dark:text-yellow-400" />
         )}
-        {isCodexCommandApproval
-          ? "Command approval"
-          : isExitPlanMode
-            ? "Plan review"
-            : isAskUserQuestion
-              ? askUserQuestionTitle
-              : isMultiChoice
-                ? "Choose an option"
-                : "Approval required"}
+        {isTerminalAccess
+          ? "Root terminal access"
+          : isCodexCommandApproval
+            ? "Command approval"
+            : isExitPlanMode
+              ? "Plan review"
+              : isAskUserQuestion
+                ? askUserQuestionTitle
+                : isMultiChoice
+                  ? "Choose an option"
+                  : "Approval required"}
         {policyLabel && !isAskUserQuestion && !isExitPlanMode && (
           <span className="text-muted-foreground text-sm">· {policyLabel}</span>
         )}
@@ -1053,6 +1105,21 @@ export function ApprovalCard({
         ) : (
           <>
             <ElicitationMessage message={message} className="whitespace-pre-line" />
+            {terminalAccess && (
+              <dl
+                className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-sm"
+                data-testid="terminal-access-details"
+              >
+                <dt>Host</dt>
+                <dd className="break-all">{terminalAccess.hostId}</dd>
+                <dt>Terminal</dt>
+                <dd className="break-all">{terminalAccess.terminalId}</dd>
+                <dt>Instance</dt>
+                <dd className="break-all">{terminalAccess.instanceId}</dd>
+                <dt>Owner</dt>
+                <dd className="break-all">{terminalAccess.owner}</dd>
+              </dl>
+            )}
             {agyPermission?.actionDescription && (
               <span className="text-sm text-muted-foreground" data-testid="agy-action-description">
                 {agyPermission.actionDescription}
@@ -1070,7 +1137,14 @@ export function ApprovalCard({
               </pre>
             )}
             {directoryScope}
-            {isExternalUrl ? (
+            {isTerminalAccess ? (
+              <TerminalAccessActions
+                request={terminalAccess}
+                sessionId={cardSessionId ?? targetSessionId ?? scopedConversationId}
+                onApprove={() => submitBinary("accept")}
+                onReject={() => submitBinary("decline")}
+              />
+            ) : isExternalUrl ? (
               <div className="flex flex-wrap gap-2 pt-1">
                 <Button size="sm" asChild>
                   <a href={url!} target="_blank" rel="noopener noreferrer">
@@ -1137,6 +1211,7 @@ export function ElicitationCard({
       message={item.message}
       phase={item.phase}
       policyName={item.policyName}
+      terminalAccess={item.terminalAccess}
       contentPreview={item.contentPreview}
       requestedSchema={item.requestedSchema}
       url={item.url}

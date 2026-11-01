@@ -243,6 +243,43 @@ afterEach(() => {
 });
 
 describe("SystemStatusPage", () => {
+  it.each(["online", "offline", "unsupported"] as const)(
+    "offers Terminal only on the owned online capable card: %s",
+    (state) => {
+      mocks.isAdmin.current = false;
+      mocks.status.current = {
+        data: makeView({ server: false }),
+        isLoading: false,
+        isError: false,
+      };
+      mocks.hosts.current = [
+        {
+          host_id: "host_1",
+          name: "host-a",
+          owner: "alice",
+          status: state === "offline" ? "offline" : "online",
+          capabilities: state === "unsupported" ? [] : ["host_terminals_v1"],
+        },
+      ];
+      const client = new QueryClient();
+      render(
+        <QueryClientProvider client={client}>
+          <MemoryRouter>
+            <SystemStatusPage />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+      const link = within(screen.getByTestId("host-card-host_1")).queryByRole("link", {
+        name: "Terminal",
+      });
+      if (state === "online") expect(link).toHaveAttribute("href", "/hosts/host_1/terminals");
+      else expect(link).toBeNull();
+      expect(
+        within(screen.getByTestId("host-card-host_2")).queryByRole("link", { name: "Terminal" }),
+      ).toBeNull();
+      client.clear();
+    },
+  );
   it("keeps an in-flight restart mounted when the system-status refresh fails", async () => {
     const data = makeView({ server: false });
     mocks.status.current = { data, isLoading: false, isError: false };

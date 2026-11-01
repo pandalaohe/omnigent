@@ -16,6 +16,9 @@ export interface TerminalInfo {
    * unreachable (other machines, Safari, listener down).
    */
   directAttachUrl?: string;
+  instanceId?: string;
+  elevated?: boolean;
+  agentAccess?: boolean;
 }
 
 /**
@@ -246,6 +249,16 @@ export function terminalInfoFromResource(resource: Record<string, unknown>): Ter
           : "",
     session: typeof sessionKey === "string" ? sessionKey : "",
     running: typeof running === "boolean" ? running : false,
-    directAttachUrl: parseDirectAttachUrl(metadata.direct_attach_url),
+    directAttachUrl:
+      metadata.elevated === true ? undefined : parseDirectAttachUrl(metadata.direct_attach_url),
+    ...(typeof metadata.instance_id === "string" && metadata.instance_id
+      ? { instanceId: metadata.instance_id }
+      : {}),
+    ...(typeof metadata.elevated === "boolean"
+      ? {
+          elevated: metadata.elevated,
+          agentAccess: metadata.elevated ? metadata.agent_access === true : true,
+        }
+      : {}),
   };
 }

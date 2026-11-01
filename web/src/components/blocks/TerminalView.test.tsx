@@ -204,6 +204,37 @@ describe("buildAttachPath", () => {
 });
 
 describe("control-mode terminal", () => {
+  it("attaches a host terminal through the shared relay client", async () => {
+    const routing = vi.spyOn(host, "isHostRoutingEnabled").mockReturnValue(true);
+    render(<TerminalView hostId="host-a" terminalId="aaaaaaaa" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const url = new URL(terminalSessionMock.instances[0].url);
+    expect(url.pathname).toBe("/v1/hosts/host-a/terminals/aaaaaaaa/attach");
+    expect(url.searchParams.get("omnigent_slice_key")).toBe("host-a");
+    expect(url.searchParams.has("read_only")).toBe(false);
+    routing.mockRestore();
+  });
+
+  it("redials a host terminal without its slice key after wrong-replica 4400", async () => {
+    const routing = vi.spyOn(host, "isHostRoutingEnabled").mockReturnValue(true);
+    const databricks = vi.spyOn(host, "isDatabricksWorkspace").mockReturnValue(true);
+    render(<TerminalView hostId="host-replica" terminalId="bbbbbbbb" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    act(() =>
+      terminalSessionMock.instances[0].onState({
+        kind: "closed",
+        code: 4400,
+        reason: "wrong_replica",
+      }),
+    );
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
+    expect(
+      new URL(terminalSessionMock.instances[1].url).searchParams.has("omnigent_slice_key"),
+    ).toBe(false);
+    expect(isHostKeyless("host-replica")).toBe(true);
+    routing.mockRestore();
+    databricks.mockRestore();
+  });
   it("routes a mobile assistant soft key to the active writable terminal", async () => {
     render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
     await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));

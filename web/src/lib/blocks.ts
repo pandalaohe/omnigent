@@ -1,5 +1,6 @@
 import type { AssistantMessagePhase } from "./conversationItems";
 import type { NativePermissionDelivery } from "./nativePermissionDelivery";
+import type { TerminalAccessRequest } from "./terminalAccess";
 // Mirrors sdks/python-client/omnigent_client/_blocks.py.
 //
 // Hand-ported. When _blocks.py changes, update this file and the
@@ -621,6 +622,7 @@ export interface ResponseEndBlock {
  * dictates as the next stream events.
  */
 export interface ElicitationBlock {
+  terminalAccess?: TerminalAccessRequest | null;
   nativeDelivery?: NativePermissionDelivery;
   /** Positive native resolution evidence; snapshot absence alone is insufficient. */
   nativeDeliveryResolved?: boolean;

@@ -1,11 +1,12 @@
 import { useEffect, useRef } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { replaceEqualDeep, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { authenticatedFetch } from "../lib/identity";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { isTempConvId } from "@/lib/tempConversationId";
 import { terminalInfoFromResource, terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 import { showToast } from "@/components/ui/toast";
+import { apiErrorFromResponse } from "@/lib/sessionsApi";
 
 export { terminalInfoFromResource, terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 
@@ -84,7 +85,8 @@ export function isAgentTerminalKey(terminalKey: string): boolean {
  */
 /** Display label for a terminal, e.g. ``"zsh · u-abc123"``. */
 export function terminalDisplayLabel(terminal: TerminalInfo): string {
-  return terminal.session ? `${terminal.name} · ${terminal.session}` : terminal.name;
+  const name = terminal.elevated ? "root" : terminal.name;
+  return terminal.session ? `${name} · ${terminal.session}` : name;
 }
 
 export function findAgentTerminal(terminals: TerminalInfo[]): TerminalInfo | null {
@@ -255,6 +257,7 @@ async function fetchTerminalList(conversationId: string): Promise<TerminalInfo[]
 export async function createTerminal(
   conversationId: string,
   terminal: string,
+  elevated = false,
 ): Promise<TerminalInfo> {
   // Random session key so repeated clicks launch fresh terminals —
   // the runner's launch is idempotent per (terminal, session_key), so
@@ -265,7 +268,11 @@ export async function createTerminal(
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ terminal, session_key: sessionKey }),
+      body: JSON.stringify({
+        terminal,
+        session_key: sessionKey,
+        ...(elevated ? { elevated: true } : {}),
+      }),
     },
   );
   if (!res.ok) {
@@ -299,13 +306,55 @@ export async function createTerminal(
 export function useCreateTerminal(conversationId: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (terminal: string) => createTerminal(conversationId, terminal),
+    mutationFn: (value: string | { terminal: string; elevated: boolean }) =>
+      typeof value === "string"
+        ? createTerminal(conversationId, value)
+        : createTerminal(conversationId, value.terminal, value.elevated),
     onSuccess: (info) => {
       const key = terminalsQueryKey(conversationId);
       const current = queryClient.getQueryData<TerminalInfo[]>(key) ?? [];
       if (current.some((t) => t.id === info.id)) return;
       queryClient.setQueryData<TerminalInfo[]>(key, [...current, info]);
     },
+  });
+}
+
+export function useTerminalAgentAccess(conversationId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    onMutate: () => queryClient.cancelQueries({ queryKey: terminalsQueryKey(conversationId) }),
+    mutationFn: async (target: { terminalId: string; instanceId: string; enabled: boolean }) => {
+      const response = await authenticatedFetch(
+        `/v1/sessions/${encodeURIComponent(conversationId)}/resources/terminals/${encodeURIComponent(target.terminalId)}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ agent_access: target.enabled, instance_id: target.instanceId }),
+        },
+      );
+      if (!response.ok) throw await apiErrorFromResponse(response);
+      const info = terminalInfoFromResource(await response.json());
+      if (
+        !info ||
+        info.id !== target.terminalId ||
+        info.instanceId !== target.instanceId ||
+        !info.elevated ||
+        info.agentAccess !== target.enabled
+      ) {
+        throw new Error("The terminal instance changed. Refresh and try again.");
+      }
+      return info;
+    },
+    retry: false,
+    onSuccess: (info) => {
+      queryClient.setQueryData<TerminalInfo[]>(terminalsQueryKey(conversationId), (current) =>
+        current?.map((terminal) =>
+          terminal.id === info.id && terminal.instanceId === info.instanceId ? info : terminal,
+        ),
+      );
+    },
+    onSettled: () =>
+      void queryClient.invalidateQueries({ queryKey: terminalsQueryKey(conversationId) }),
   });
 }
 
@@ -415,18 +464,43 @@ export function useTerminals(
       conversationId === null
         ? ["conversation", null, "terminals"]
         : terminalsQueryKey(conversationId),
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       const key = terminalsQueryKey(conversationId!);
-      const list = await fetchTerminalList(conversationId!);
-      if (list !== null) completeTerminalListAt.set(conversationId!, Date.now());
-      const fetched = list ?? [];
-      // Union with any SSE-written entries already in the cache so a
-      // ``session.resource.created`` that raced the fetch is not lost.
-      // Fetched rows win on id collision (they are the fresher snapshot).
-      const byId = new Map<string, TerminalInfo>();
-      for (const t of queryClient.getQueryData<TerminalInfo[]>(key) ?? []) byId.set(t.id, t);
-      for (const t of fetched) byId.set(t.id, t);
-      return [...byId.values()];
+      const readCache = () =>
+        new Map(
+          (queryClient.getQueryData<TerminalInfo[]>(key) ?? []).map((terminal) => [
+            terminal.id,
+            terminal,
+          ]),
+        );
+      let previous = readCache();
+      const changed = new Set<string>();
+      const queryCache = queryClient.getQueryCache();
+      const query = queryCache.find({ queryKey: key, exact: true });
+      // Remember every live change, even if a later delta restores the old value.
+      const unsubscribe = queryCache.subscribe((event) => {
+        if (event.query !== query || event.type !== "updated" || event.action.type !== "success")
+          return;
+        const current = readCache();
+        for (const id of new Set([...previous.keys(), ...current.keys()])) {
+          const before = previous.get(id);
+          if (replaceEqualDeep(before, current.get(id)) !== before) changed.add(id);
+        }
+        previous = current;
+      });
+      signal.addEventListener("abort", unsubscribe, { once: true });
+      try {
+        const list = await fetchTerminalList(conversationId!);
+        if (list !== null) completeTerminalListAt.set(conversationId!, Date.now());
+        const byId = readCache();
+        for (const terminal of list ?? []) {
+          if (!changed.has(terminal.id)) byId.set(terminal.id, terminal);
+        }
+        return [...byId.values()];
+      } finally {
+        signal.removeEventListener("abort", unsubscribe);
+        unsubscribe();
+      }
     },
     enabled: conversationId !== null,
     staleTime: Infinity,
