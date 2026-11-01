@@ -415,7 +415,7 @@ def test_request_duration_access_formatter_redacts_artifact_token() -> None:
         lineno=0,
         msg='%s - "%s %s HTTP/%s" %d',
         args=(
-            "10.0.0.1:0",
+            "192.0.2.10:0",
             "GET",
             "/v1/artifacts/a1.x.y/index.html",
             "1.1",
@@ -484,7 +484,7 @@ def _make_access_record() -> logging.LogRecord:
         lineno=0,
         msg='%s - "%s %s HTTP/%s" %d',
         args=(
-            "10.0.0.1:0",
+            "192.0.2.10:0",
             "GET",
             "/v1/sessions/conv_abc/events",
             "1.1",

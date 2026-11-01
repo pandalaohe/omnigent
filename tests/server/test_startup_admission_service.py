@@ -81,7 +81,7 @@ async def test_empty_prepared_sdk_defers_context_until_its_first_saved_input(db_
     )
     admission.resolve_harness = AsyncMock(return_value=source)
     conv = conversations.create_conversation()
-    conversations.set_host_id(conv.id, host, "/Users/sample/project")
+    conversations.set_host_id(conv.id, host, "/opt/work/project")
     prepared = []
 
     async def prepare(_app, startup):
@@ -104,7 +104,7 @@ async def test_empty_prepared_sdk_defers_context_until_its_first_saved_input(db_
         conv.id,
         {
             "session_id": conv.id,
-            "workspace": "/Users/sample/project",
+            "workspace": "/opt/work/project",
             "git": None,
             "user_id": None,
             "account_generation": conn.account_generation,
@@ -168,7 +168,7 @@ async def test_prepared_input_waits_for_runner_then_resumes_the_same_attempt(db_
     )
     admission.resolve_harness = AsyncMock(return_value="test")
     conv = conversations.create_conversation()
-    conversations.set_host_id(conv.id, host, "/Users/sample/project")
+    conversations.set_host_id(conv.id, host, "/opt/work/project")
     item = await inputs.enqueue(
         conv.id,
         SessionEventInput(type="message", data={"role": "user", "content": []}),
@@ -201,7 +201,7 @@ async def test_prepared_input_waits_for_runner_then_resumes_the_same_attempt(db_
         conv.id,
         {
             "session_id": conv.id,
-            "workspace": "/Users/sample/project",
+            "workspace": "/opt/work/project",
             "git": None,
             "user_id": None,
             "account_generation": conn.account_generation,
@@ -360,10 +360,10 @@ async def test_child_waits_for_registration_and_the_parents_startup(db_uri):
     )
     admission.resolve_harness = AsyncMock(return_value="test")
     parent = conversations.create_conversation()
-    conversations.set_host_id(parent.id, host, "/Users/sample/project")
+    conversations.set_host_id(parent.id, host, "/opt/work/project")
     parent_startup = await admission.queue_session(conn, parent.id)
     child = conversations.create_conversation(parent_conversation_id=parent.id)
-    conversations.set_host_id(child.id, host, "/Users/sample/project")
+    conversations.set_host_id(child.id, host, "/opt/work/project")
     child_startup = await admission.queue_session(conn, child.id)
     assert not await admission._eligible(child_startup)
     reserved = startups.reserve(host, eligible_ids={parent_startup.id})

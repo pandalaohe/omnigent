@@ -448,15 +448,15 @@ describe("createSession", () => {
         status: "idle",
         created_at: 1704067200,
         items: [],
-        workspace: "/Users/me/project",
-        worktree: "/Users/me/project/.worktrees/repo/feature-x",
+        workspace: "/opt/work/project",
+        worktree: "/opt/work/project/.worktrees/repo/feature-x",
         git_branch: "feature/x",
       }),
     );
 
     const session = await createSession("agent_xyz");
-    expect(session.worktree).toBe("/Users/me/project/.worktrees/repo/feature-x");
-    expect(session.workspace).toBe("/Users/me/project");
+    expect(session.worktree).toBe("/opt/work/project/.worktrees/repo/feature-x");
+    expect(session.workspace).toBe("/opt/work/project");
   });
 
   it("defaults worktree to null when the snapshot omits it", async () => {
@@ -722,7 +722,7 @@ describe("createSideChat", () => {
     status: "idle",
     created_at: 1704067200,
     host_id: "host_mac",
-    workspace: "/Users/alice/project",
+    workspace: "/opt/work/project",
     runner_id: "runner_source",
     runner_online: true,
     host_online: true,

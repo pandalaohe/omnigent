@@ -633,8 +633,8 @@ async def test_import_with_unowned_or_unknown_project_is_404(
 # validation is replaced so a host-bound create can persist, and the create
 # route's launch attempt is skipped by clearing ``host_registry``.
 
-HDS = "a" * 32
-TMB = "b" * 32
+HOST_WORKSTATION = "a" * 32
+HOST_LAPTOP = "b" * 32
 CODEX_AGENT_ID = "587b7cb7ac30abf4debfaa578d052ec6"
 CLAUDE_AGENT_ID = "687b7cb7ac30abf4debfaa578d052ec7"
 
@@ -673,8 +673,8 @@ def calling_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
     hosts = HostStore(db_uri)
     # Upstream #8675's create-time readiness check resolves the host first, so
     # the hosts these tests create sessions on must be registered.
-    hosts.upsert_on_connect(HDS, "hds", ALICE)
-    hosts.upsert_on_connect(TMB, "tmb", ALICE)
+    hosts.upsert_on_connect(HOST_WORKSTATION, "workstation", ALICE)
+    hosts.upsert_on_connect(HOST_LAPTOP, "laptop", ALICE)
     app = create_app(
         agent_store=agents,
         file_store=SqlAlchemyFileStore(db_uri),
@@ -725,14 +725,14 @@ async def test_per_host_set_fills_agent_model_and_effort(
         calling_client,
         {
             "calling_defaults": {
-                HDS: _per_host_set(CODEX_AGENT_ID, "codex", "gpt-6-sol", "high"),
-                TMB: _per_host_set(CLAUDE_AGENT_ID, "claude-native", "opus-5-5", "xhigh"),
+                HOST_WORKSTATION: _per_host_set(CODEX_AGENT_ID, "codex", "gpt-6-sol", "high"),
+                HOST_LAPTOP: _per_host_set(CLAUDE_AGENT_ID, "claude-native", "opus-5-5", "xhigh"),
             }
         },
     )
     for host_id, agent_id, model, effort in (
-        (HDS, CODEX_AGENT_ID, "gpt-6-sol", "high"),
-        (TMB, CLAUDE_AGENT_ID, "opus-5-5", "xhigh"),
+        (HOST_WORKSTATION, CODEX_AGENT_ID, "gpt-6-sol", "high"),
+        (HOST_LAPTOP, CLAUDE_AGENT_ID, "opus-5-5", "xhigh"),
     ):
         response = await calling_client.post(
             "/v1/sessions",
@@ -753,13 +753,17 @@ async def test_explicit_model_wins_and_project_supplies_effort(
     """Scenario 3: resolution is per field — explicit model, project effort."""
     project_id = await _project(
         calling_client,
-        {"calling_defaults": {HDS: _per_host_set(CODEX_AGENT_ID, "codex", "gpt-6-sol", "high")}},
+        {
+            "calling_defaults": {
+                HOST_WORKSTATION: _per_host_set(CODEX_AGENT_ID, "codex", "gpt-6-sol", "high")
+            }
+        },
     )
     response = await calling_client.post(
         "/v1/sessions",
         json={
             "project_id": project_id,
-            "host_id": HDS,
+            "host_id": HOST_WORKSTATION,
             "workspace": "/work",
             "model_override": "gpt-6-luna",
         },
@@ -778,13 +782,17 @@ async def test_explicit_null_effort_stays_null(
     """Scenario 4: an explicit JSON null is never replaced by a default."""
     project_id = await _project(
         calling_client,
-        {"calling_defaults": {HDS: _per_host_set(CODEX_AGENT_ID, "codex", "gpt-6-sol", "high")}},
+        {
+            "calling_defaults": {
+                HOST_WORKSTATION: _per_host_set(CODEX_AGENT_ID, "codex", "gpt-6-sol", "high")
+            }
+        },
     )
     response = await calling_client.post(
         "/v1/sessions",
         json={
             "project_id": project_id,
-            "host_id": HDS,
+            "host_id": HOST_WORKSTATION,
             "workspace": "/work",
             "reasoning_effort": None,
         },
@@ -803,11 +811,11 @@ async def test_library_default_agent_refused_on_json_create(
     """K1: an agent-omitted create refuses a saved joint agent default."""
     project_id = await _project(
         calling_client,
-        {"calling_defaults": {HDS: {"agent_id": "ca_polly"}}},
+        {"calling_defaults": {HOST_WORKSTATION: {"agent_id": "ca_polly"}}},
     )
     response = await calling_client.post(
         "/v1/sessions",
-        json={"project_id": project_id, "host_id": HDS, "workspace": "/work"},
+        json={"project_id": project_id, "host_id": HOST_WORKSTATION, "workspace": "/work"},
         headers=_headers(),
     )
     assert response.status_code == 400, response.text
@@ -824,20 +832,20 @@ async def test_default_agent_unready_harness_refused(
     calling_seams: None,
 ) -> None:
     """K5 readiness: a host-reported unavailable harness refuses the default."""
-    calling_app.state.host_store.upsert_on_connect(HDS, "hds", ALICE)
-    calling_app.state.host_store.update_harness_readiness(HDS, {"codex": False})
+    calling_app.state.host_store.upsert_on_connect(HOST_WORKSTATION, "workstation", ALICE)
+    calling_app.state.host_store.update_harness_readiness(HOST_WORKSTATION, {"codex": False})
     project_id = await _project(
         calling_client,
-        {"calling_defaults": {HDS: {"agent_id": CODEX_AGENT_ID}}},
+        {"calling_defaults": {HOST_WORKSTATION: {"agent_id": CODEX_AGENT_ID}}},
     )
     response = await calling_client.post(
         "/v1/sessions",
-        json={"project_id": project_id, "host_id": HDS, "workspace": "/work"},
+        json={"project_id": project_id, "host_id": HOST_WORKSTATION, "workspace": "/work"},
         headers=_headers(),
     )
     assert response.status_code == 400, response.text
     message = response.json()["error"]["message"]
-    assert "not ready on host 'hds'" in message
+    assert "not ready on host 'workstation'" in message
     assert "harness 'codex' is False" in message
 
 
@@ -847,24 +855,31 @@ async def test_fresh_catalog_missing_default_model_refused(
     calling_seams: None,
 ) -> None:
     """Scenario 11: a fresh catalog that lacks the default model refuses it."""
-    calling_app.state.host_store.upsert_on_connect(HDS, "hds", ALICE)
+    calling_app.state.host_store.upsert_on_connect(HOST_WORKSTATION, "workstation", ALICE)
     calling_app.state.host_model_catalog_cache_store.upsert(
-        HDS, "codex", [{"id": "gpt-5.5", "supportedReasoningEfforts": ["high"]}], 1700000000
+        HOST_WORKSTATION,
+        "codex",
+        [{"id": "gpt-5.5", "supportedReasoningEfforts": ["high"]}],
+        1700000000,
     )
     project_id = await _project(
         calling_client,
-        {"calling_defaults": {HDS: _per_host_set(CODEX_AGENT_ID, "codex", "gpt-6-sol", "high")}},
+        {
+            "calling_defaults": {
+                HOST_WORKSTATION: _per_host_set(CODEX_AGENT_ID, "codex", "gpt-6-sol", "high")
+            }
+        },
     )
     response = await calling_client.post(
         "/v1/sessions",
-        json={"project_id": project_id, "host_id": HDS, "workspace": "/work"},
+        json={"project_id": project_id, "host_id": HOST_WORKSTATION, "workspace": "/work"},
         headers=_headers(),
     )
     assert response.status_code == 400, response.text
     message = response.json()["error"]["message"]
     assert "Default model 'gpt-6-sol'" in message
     assert "project 'project-alice@example.com' host settings" in message
-    assert f"host '{HDS}'" in message
+    assert f"host '{HOST_WORKSTATION}'" in message
     assert "codex" in message
     assert "last sync" in message
     assert "Sync models" in message
@@ -876,9 +891,9 @@ async def test_fresh_catalog_missing_legacy_all_hosts_model_refused(
     calling_seams: None,
 ) -> None:
     """The legacy All hosts row model is refused when the fresh catalog lacks it."""
-    calling_app.state.host_store.upsert_on_connect(HDS, "hds", ALICE)
+    calling_app.state.host_store.upsert_on_connect(HOST_WORKSTATION, "workstation", ALICE)
     calling_app.state.host_model_catalog_cache_store.upsert(
-        HDS, "codex", [{"id": "gpt-5.5"}], 1700000000
+        HOST_WORKSTATION, "codex", [{"id": "gpt-5.5"}], 1700000000
     )
     project_id = await _project(
         calling_client,
@@ -886,7 +901,7 @@ async def test_fresh_catalog_missing_legacy_all_hosts_model_refused(
     )
     response = await calling_client.post(
         "/v1/sessions",
-        json={"project_id": project_id, "host_id": HDS, "workspace": "/work"},
+        json={"project_id": project_id, "host_id": HOST_WORKSTATION, "workspace": "/work"},
         headers=_headers(),
     )
     assert response.status_code == 400, response.text
@@ -903,18 +918,24 @@ async def test_stale_catalog_does_not_block(
     calling_seams: None,
 ) -> None:
     """Scenario 13: a catalog row with an error skips the offered checks."""
-    calling_app.state.host_store.upsert_on_connect(HDS, "hds", ALICE)
+    calling_app.state.host_store.upsert_on_connect(HOST_WORKSTATION, "workstation", ALICE)
     calling_app.state.host_model_catalog_cache_store.upsert(
-        HDS, "codex", [{"id": "gpt-5.5"}], 1700000000
+        HOST_WORKSTATION, "codex", [{"id": "gpt-5.5"}], 1700000000
     )
-    calling_app.state.host_model_catalog_cache_store.mark_error(HDS, "codex", "unsupported")
+    calling_app.state.host_model_catalog_cache_store.mark_error(
+        HOST_WORKSTATION, "codex", "unsupported"
+    )
     project_id = await _project(
         calling_client,
-        {"calling_defaults": {HDS: _per_host_set(CODEX_AGENT_ID, "codex", "gpt-6-sol", "high")}},
+        {
+            "calling_defaults": {
+                HOST_WORKSTATION: _per_host_set(CODEX_AGENT_ID, "codex", "gpt-6-sol", "high")
+            }
+        },
     )
     response = await calling_client.post(
         "/v1/sessions",
-        json={"project_id": project_id, "host_id": HDS, "workspace": "/work"},
+        json={"project_id": project_id, "host_id": HOST_WORKSTATION, "workspace": "/work"},
         headers=_headers(),
     )
     assert response.status_code == 201, response.text
@@ -930,11 +951,15 @@ async def test_child_takes_parent_project_host_default(
     """Scenario 10: a child with no agent takes the parent's host default."""
     project_id = await _project(
         calling_client,
-        {"calling_defaults": {HDS: _per_host_set(CODEX_AGENT_ID, "codex", "gpt-6-sol", "high")}},
+        {
+            "calling_defaults": {
+                HOST_WORKSTATION: _per_host_set(CODEX_AGENT_ID, "codex", "gpt-6-sol", "high")
+            }
+        },
     )
     parent = await calling_client.post(
         "/v1/sessions",
-        json={"project_id": project_id, "host_id": HDS, "workspace": "/work"},
+        json={"project_id": project_id, "host_id": HOST_WORKSTATION, "workspace": "/work"},
         headers=_headers(),
     )
     assert parent.status_code == 201, parent.text
@@ -965,7 +990,7 @@ async def test_sub_agent_child_keeps_an_unset_model(
         calling_client,
         {
             "calling_defaults": {
-                HDS: {
+                HOST_WORKSTATION: {
                     "agent_id": CODEX_AGENT_ID,
                     "harnesses": {
                         "codex": {
@@ -1008,7 +1033,7 @@ async def test_sub_agent_child_keeps_an_unset_model(
             "agent_id": parent_agent.json()["id"],
             "parent_session_id": parent_session_id,
             "sub_agent_name": "impl",
-            "host_id": HDS,
+            "host_id": HOST_WORKSTATION,
             "workspace": "/work",
         },
         headers=_headers(),
@@ -1029,7 +1054,7 @@ async def test_routing_on_create_does_not_fill_default_model(
         calling_client,
         {
             "calling_defaults": {
-                HDS: {
+                HOST_WORKSTATION: {
                     "agent_id": CODEX_AGENT_ID,
                     "harnesses": {
                         "codex": {
@@ -1047,7 +1072,7 @@ async def test_routing_on_create_does_not_fill_default_model(
         "/v1/sessions",
         json={
             "project_id": project_id,
-            "host_id": HDS,
+            "host_id": HOST_WORKSTATION,
             "workspace": "/work",
             "cost_control_mode_override": "on",
         },
@@ -1073,7 +1098,7 @@ async def test_child_without_default_names_the_project_setting(
         "/v1/sessions",
         json={
             "project_id": project_id,
-            "host_id": HDS,
+            "host_id": HOST_WORKSTATION,
             "workspace": "/work",
             "agent_id": CLAUDE_AGENT_ID,
         },
@@ -1088,7 +1113,7 @@ async def test_child_without_default_names_the_project_setting(
     assert child.status_code == 400, child.text
     message = child.json()["error"]["message"]
     # The fixture registers the host, so the error names its friendly host name.
-    assert "has no default agent on host 'hds'" in message
+    assert "has no default agent on host 'workstation'" in message
     assert "Pass agent_id" in message
 
 
@@ -1125,7 +1150,9 @@ async def test_import_ignores_calling_defaults(
         {
             "workspace": "/work/import",
             "model": "gpt-6-sol",
-            "calling_defaults": {HDS: _per_host_set(CODEX_AGENT_ID, "codex", "gpt-6-sol", "high")},
+            "calling_defaults": {
+                HOST_WORKSTATION: _per_host_set(CODEX_AGENT_ID, "codex", "gpt-6-sol", "high")
+            },
         },
     )
     response = await calling_client.post(
@@ -1194,7 +1221,7 @@ async def test_session_create_applies_default_modes_and_persists(
         calling_client,
         {
             "calling_defaults": {
-                HDS: {
+                HOST_WORKSTATION: {
                     "agent_id": CODEX_AGENT_ID,
                     "harnesses": {harness: modes},
                 }
@@ -1205,7 +1232,7 @@ async def test_session_create_applies_default_modes_and_persists(
         "/v1/sessions",
         json={
             "project_id": project_id,
-            "host_id": HDS,
+            "host_id": HOST_WORKSTATION,
             "workspace": "/opt/work/project",
         },
         headers=_headers(),
@@ -1247,13 +1274,20 @@ async def test_claude_child_explicit_speed_wins(
         calling_client,
         {
             "calling_defaults": {
-                HDS: {"agent_id": CODEX_AGENT_ID, "harnesses": {harness: {"speed": "fast"}}}
+                HOST_WORKSTATION: {
+                    "agent_id": CODEX_AGENT_ID,
+                    "harnesses": {harness: {"speed": "fast"}},
+                }
             }
         },
     )
     parent = await calling_client.post(
         "/v1/sessions",
-        json={"project_id": project_id, "host_id": HDS, "workspace": "/opt/work/project"},
+        json={
+            "project_id": project_id,
+            "host_id": HOST_WORKSTATION,
+            "workspace": "/opt/work/project",
+        },
         headers=_headers(),
     )
     assert parent.status_code == 201, parent.text
@@ -1283,7 +1317,7 @@ async def test_explicit_permission_and_speed_win_over_defaults(
         calling_client,
         {
             "calling_defaults": {
-                HDS: {
+                HOST_WORKSTATION: {
                     "agent_id": CODEX_AGENT_ID,
                     "harnesses": {"codex": {"permission": "approve-for-me", "speed": "fast"}},
                 }
@@ -1296,7 +1330,7 @@ async def test_explicit_permission_and_speed_win_over_defaults(
         "/v1/sessions",
         json={
             "project_id": project_id,
-            "host_id": HDS,
+            "host_id": HOST_WORKSTATION,
             "workspace": "/opt/work/project",
             **explicit,
         },
@@ -1316,20 +1350,24 @@ async def test_explicit_speed_skips_catalog_check_for_inherited_fast(
 ) -> None:
     """An explicit Standard speed must not be refused as inherited Fast."""
     calling_app.state.host_model_catalog_cache_store.upsert(
-        HDS, "codex", [{"id": "gpt-6-sol", "isDefault": True}], 1700000000
+        HOST_WORKSTATION, "codex", [{"id": "gpt-6-sol", "isDefault": True}], 1700000000
     )
     project_id = await _project(
         calling_client,
         {
             "calling_defaults": {
-                HDS: {
+                HOST_WORKSTATION: {
                     "agent_id": CODEX_AGENT_ID,
                     "harnesses": {"codex": {"model": "gpt-6-sol", "speed": "fast"}},
                 }
             }
         },
     )
-    base = {"project_id": project_id, "host_id": HDS, "workspace": "/opt/work/project"}
+    base = {
+        "project_id": project_id,
+        "host_id": HOST_WORKSTATION,
+        "workspace": "/opt/work/project",
+    }
     inherited = await calling_client.post("/v1/sessions", json=base, headers=_headers())
     assert inherited.status_code == 400, inherited.text
     explicit = await calling_client.post(
@@ -1368,7 +1406,7 @@ async def test_bundled_session_uses_saved_or_explicit_speed(
     monkeypatch.setattr(
         _session_create_validation, "validate_uploaded_bundle_host_workspace", echo_workspace
     )
-    metadata: dict[str, object] = {"host_id": HDS, "workspace": "/opt/work/project"}
+    metadata: dict[str, object] = {"host_id": HOST_WORKSTATION, "workspace": "/opt/work/project"}
     if explicit_speed is not None:
         metadata["labels"] = {"omnigent.speed_tier": explicit_speed}
     response = await calling_client.post(
@@ -1420,13 +1458,13 @@ async def test_bundled_saved_speed_precedes_inherited_catalog_check(
         _session_create_validation, "validate_uploaded_bundle_host_workspace", echo_workspace
     )
     calling_app.state.host_model_catalog_cache_store.upsert(
-        HDS, "codex", [{"id": "gpt-6-sol", "isDefault": True}], 1700000000
+        HOST_WORKSTATION, "codex", [{"id": "gpt-6-sol", "isDefault": True}], 1700000000
     )
     project_id = await _project(
         calling_client,
         {
             "calling_defaults": {
-                HDS: {
+                HOST_WORKSTATION: {
                     "agent_id": CODEX_AGENT_ID,
                     "harnesses": {"codex": {"model": "gpt-6-sol", "speed": "fast"}},
                 }
@@ -1437,7 +1475,11 @@ async def test_bundled_saved_speed_precedes_inherited_catalog_check(
         "/v1/sessions",
         data={
             "metadata": json.dumps(
-                {"project_id": project_id, "host_id": HDS, "workspace": "/opt/work/project"}
+                {
+                    "project_id": project_id,
+                    "host_id": HOST_WORKSTATION,
+                    "workspace": "/opt/work/project",
+                }
             )
         },
         files={
@@ -1541,7 +1583,7 @@ async def test_native_permission_default_respects_launch_arg_count_bounds(
         calling_client,
         {
             "calling_defaults": {
-                HDS: {
+                HOST_WORKSTATION: {
                     "agent_id": CODEX_AGENT_ID,
                     "harnesses": {"codex-native": {"permission": "approve-for-me"}},
                 }
@@ -1552,7 +1594,7 @@ async def test_native_permission_default_respects_launch_arg_count_bounds(
         "/v1/sessions",
         json={
             "project_id": project_id,
-            "host_id": HDS,
+            "host_id": HOST_WORKSTATION,
             "workspace": "/opt/work/project",
             "terminal_launch_args": ["--verbose"] * _MAX_TERMINAL_LAUNCH_ARGS,
         },

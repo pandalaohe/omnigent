@@ -2956,12 +2956,12 @@ def test_archive_manager_filters_archived_host_cwd_and_dates(
     wanted = conversation_store.create_conversation(
         title="wanted",
         host_id=host_id,
-        workspace="D:/AIProgram/Projects/Omnigent",
+        workspace="D:/work/Projects/Omnigent",
     )
     other = conversation_store.create_conversation(
         title="other",
         host_id=other_host_id,
-        workspace="D:/AIProgram/Projects/Elsewhere",
+        workspace="D:/work/Projects/Elsewhere",
     )
     active = conversation_store.create_conversation(title="active")
     conversation_store.update_conversation(wanted.id, archived=True)
@@ -4574,15 +4574,15 @@ def test_create_conversation_with_host_id(
     _register_host(db_uri, "4f64b6ee625f4e8259185c35c6e63f3d")
     conv = conversation_store.create_conversation(
         host_id="4f64b6ee625f4e8259185c35c6e63f3d",
-        workspace="/Users/corey/projects/myapp",
+        workspace="/opt/work/projects/myapp",
     )
     assert conv.host_id == "4f64b6ee625f4e8259185c35c6e63f3d"
-    assert conv.workspace == "/Users/corey/projects/myapp"
+    assert conv.workspace == "/opt/work/projects/myapp"
 
     fetched = conversation_store.get_conversation(conv.id)
     assert fetched is not None
     assert fetched.host_id == "4f64b6ee625f4e8259185c35c6e63f3d"
-    assert fetched.workspace == "/Users/corey/projects/myapp"
+    assert fetched.workspace == "/opt/work/projects/myapp"
 
 
 def test_create_conversation_with_git_branch(
@@ -4640,10 +4640,10 @@ def test_set_host_id(
     # Pre-set workspace so the host_id update doesn't violate the
     # workspace-required-for-host check constraint.
     conv = conversation_store.create_conversation(
-        workspace="/Users/corey/projects/myapp",
+        workspace="/opt/work/projects/myapp",
     )
     assert conv.host_id is None
-    assert conv.workspace == "/Users/corey/projects/myapp"
+    assert conv.workspace == "/opt/work/projects/myapp"
 
     updated = conversation_store.set_host_id(conv.id, "292dfcdf8a31f1319b469f4fa179ac6b")
     assert updated.host_id == "292dfcdf8a31f1319b469f4fa179ac6b"
@@ -4651,7 +4651,7 @@ def test_set_host_id(
     fetched = conversation_store.get_conversation(conv.id)
     assert fetched is not None
     assert fetched.host_id == "292dfcdf8a31f1319b469f4fa179ac6b"
-    assert fetched.workspace == "/Users/corey/projects/myapp"
+    assert fetched.workspace == "/opt/work/projects/myapp"
 
 
 def test_set_host_id_missing_conversation_raises(
@@ -4694,10 +4694,10 @@ def test_set_host_id_with_workspace_satisfies_constraint(
     updated = conversation_store.set_host_id(
         conv.id,
         "8f48061706cb92d5e7cd7c4aadc56ef0",
-        workspace="/Users/corey/projects/myapp",
+        workspace="/opt/work/projects/myapp",
     )
     assert updated.host_id == "8f48061706cb92d5e7cd7c4aadc56ef0"
-    assert updated.workspace == "/Users/corey/projects/myapp"
+    assert updated.workspace == "/opt/work/projects/myapp"
 
 
 @pytest.mark.parametrize(
@@ -4766,7 +4766,7 @@ def test_clear_host_binding_nulls_all_binding_fields(
     conversation_store.set_host_id(
         conv.id,
         "873f058a4a48002a654a80be0ee09bfb",
-        workspace="/Users/corey/repo-worktrees/feature-x",
+        workspace="/opt/work/repo-worktrees/feature-x",
         git_branch="feature/x",
     )
     assert conversation_store.set_runner_id(conv.id, "runner_token_abc") is True
@@ -4775,7 +4775,7 @@ def test_clear_host_binding_nulls_all_binding_fields(
     # Precondition: every binding field is set (so the assertions below
     # prove clearing, not a no-op on already-empty fields).
     assert bound.host_id == "873f058a4a48002a654a80be0ee09bfb"
-    assert bound.workspace == "/Users/corey/repo-worktrees/feature-x"
+    assert bound.workspace == "/opt/work/repo-worktrees/feature-x"
     assert bound.git_branch == "feature/x"
     assert bound.runner_id == "runner_token_abc"
 
@@ -4823,12 +4823,12 @@ def test_create_session_with_agent_records_workspace(
         agent_name="cli-test-agent",
         agent_bundle_location="28373c2f7c4d68719e6dbc4b9599b9b0/bundle1",
         agent_description=None,
-        workspace="/Users/corey/projects/cli-launch",
+        workspace="/opt/work/projects/cli-launch",
     )
 
     fetched = conversation_store.get_conversation(created.conversation.id)
     assert fetched is not None
-    assert fetched.workspace == "/Users/corey/projects/cli-launch"
+    assert fetched.workspace == "/opt/work/projects/cli-launch"
     assert fetched.host_id is None
 
 
@@ -5198,15 +5198,15 @@ def test_workspace_persists_for_cli_session_without_host_id(
     layer might add a stricter rule than the schema enforces.
     """
     conv = conversation_store.create_conversation(
-        workspace="/Users/corey/projects/cli-launched",
+        workspace="/opt/work/projects/cli-launched",
     )
     assert conv.host_id is None
-    assert conv.workspace == "/Users/corey/projects/cli-launched"
+    assert conv.workspace == "/opt/work/projects/cli-launched"
 
     fetched = conversation_store.get_conversation(conv.id)
     assert fetched is not None
     assert fetched.host_id is None
-    assert fetched.workspace == "/Users/corey/projects/cli-launched"
+    assert fetched.workspace == "/opt/work/projects/cli-launched"
 
 
 @pytest.mark.parametrize(

@@ -145,9 +145,9 @@ def workspace_missing_message(workspace: str | PathLike[str] | None) -> str:
     that rebuilds the client-facing message from its own authorized
     workspace, so the two spellings cannot drift apart.
 
-    :param workspace: Session workspace path, e.g. ``"/home/me/proj"``.
+    :param workspace: Session workspace path, e.g. ``"/opt/work/proj"``.
     :returns: The refusal reason, e.g.
-        ``"workspace path does not exist: /home/me/proj"``.
+        ``"workspace path does not exist: /opt/work/proj"``.
     """
     return f"workspace path does not exist: {workspace}"
 
@@ -414,7 +414,7 @@ class HostLaunchRunnerFrame:
         this via ``token_bound_runner_id()``.
     :param workspace: Absolute path on the host machine to use
         as the runner's working directory, e.g.
-        ``"/Users/corey/projects/frontend"``.
+        ``"/opt/work/projects/frontend"``.
     :param session_id: Conversation/session ID the runner is being
         launched for, e.g. ``"conv_abc123"``. ``None`` means an older
         server did not include it.
@@ -777,7 +777,7 @@ class HostStatFrame:
     :param request_id: Unique ID for correlating the result,
         e.g. ``"req_stat_1"``.
     :param path: Absolute path on the host (e.g.
-        ``"/Users/corey/universe"``) OR a tilde-prefixed path
+        ``"/opt/work/universe"``) OR a tilde-prefixed path
         (``"~/foo"``). The host expands ``~`` against its own
         process owner's home directory before stating. Only the
         host knows its own ``HOME`` — the server never expands
@@ -809,7 +809,7 @@ class HostStatResultFrame:
         a symlink to a directory returns ``"directory"``, never
         ``"symlink"``. ``None`` when ``exists`` is ``False``.
     :param canonical_path: Absolute, normalized realpath, e.g.
-        ``"/Users/corey/universe"``. ``None`` when ``exists`` is
+        ``"/opt/work/universe"``. ``None`` when ``exists`` is
         ``False``. The server stores this on the session row
         instead of the user's input so symlinks cannot smuggle a
         workspace out of an agent's ``os_env.cwd`` boundary.
@@ -836,7 +836,7 @@ class HostListDirEntry:
 
     :param name: Basename of the entry, e.g. ``"src"``.
     :param path: Absolute path on the host, e.g.
-        ``"/Users/corey/universe/src"``. The host returns absolute
+        ``"/opt/work/universe/src"``. The host returns absolute
         paths so the Web UI can address each entry directly via
         the same REST endpoint without re-resolving relatives.
     :param type: ``"directory"``, ``"file"``, or ``"other"``.
@@ -870,7 +870,7 @@ class HostListDirFrame:
     :param request_id: Unique ID for correlating the result, e.g.
         ``"req_list_1"``.
     :param path: Absolute or tilde-prefixed directory path, e.g.
-        ``"/Users/corey/projects"`` or ``"~/projects"``. Same rules
+        ``"/opt/work/projects"`` or ``"~/projects"``. Same rules
         as ``host.stat`` — the host expands ``~`` against its own
         process owner's home.
     :param limit: Maximum entries to return per page,
@@ -926,7 +926,7 @@ class HostCreateWorktreeFrame:
 
     :param request_id: Correlates the result, e.g. ``"req_wt_1"``.
     :param repo_path: Absolute path inside the source repo (the
-        picked dir or a subdir), e.g. ``"/Users/alice/myrepo"``.
+        picked dir or a subdir), e.g. ``"/opt/work/myrepo"``.
     :param branch_name: New branch to create, e.g. ``"feature/login"``.
     :param base_branch: Optional base ref, e.g. ``"main"``. ``None``
         branches from ``HEAD``.
@@ -934,7 +934,7 @@ class HostCreateWorktreeFrame:
         ``branch_name`` into a fresh worktree (the deleted-worktree
         recreate path) instead of creating a new branch.
     :param entry: The project's entry directory on the host, e.g.
-        ``"/Users/alice/project"``. Only fills the ``{entry}`` token of
+        ``"/opt/work/project"``. Only fills the ``{entry}`` token of
         ``path_template``; it no longer decides the layout on its own.
     :param path_template: The user's worktree location template, e.g.
         ``"{entry}/.worktrees/{repo}/{branch}"``. ``None`` keeps the
@@ -963,7 +963,7 @@ class HostCreateWorktreeResultFrame:
         :class:`HostCreateWorktreeFrame`, e.g. ``"req_wt_1"``.
     :param status: ``"ok"`` or ``"failed"``.
     :param worktree_path: Created worktree root directory, e.g.
-        ``"/Users/alice/myrepo-worktrees/feature-login"``. ``None``
+        ``"/opt/work/myrepo-worktrees/feature-login"``. ``None``
         on failure.
     :param branch: Branch checked out, e.g. ``"feature/login"``.
         ``None`` on failure.
@@ -990,7 +990,7 @@ class HostRemoveWorktreeFrame:
     :param request_id: Correlates the result, e.g. ``"req_wt_rm_1"``.
     :param worktree_path: Worktree directory to remove (the stored
         session ``workspace``), e.g.
-        ``"/Users/alice/myrepo-worktrees/feature-login"``.
+        ``"/opt/work/myrepo-worktrees/feature-login"``.
     :param branch: Branch to delete when ``delete_branch`` is
         ``True``, e.g. ``"feature/login"``. ``None`` skips deletion.
     :param delete_branch: When ``True``, ``git branch -D`` after
@@ -1036,7 +1036,7 @@ class HostListWorktreesFrame:
 
     :param request_id: Correlates the result, e.g. ``"req_wt_ls_1"``.
     :param repo_path: Absolute path inside the repo (the picked dir or
-        a subdir), e.g. ``"/Users/alice/myrepo"``.
+        a subdir), e.g. ``"/opt/work/myrepo"``.
     :param for_cleanup: Avoid replacement symlinks in a stored canonical workspace.
     :param for_status: Include filename-only status and merge information
         for the exact requested linked worktree.
@@ -1080,7 +1080,7 @@ class HostFolderFactsFrame:
 
     :param request_id: Correlates the result, e.g. ``"req_ff_1"``.
     :param path: Absolute folder path on the host, e.g.
-        ``"/Users/alice/myrepo"``.
+        ``"/opt/work/myrepo"``.
     """
 
     request_id: str
@@ -1101,7 +1101,7 @@ class HostFolderFactsResultFrame:
     :param exists: Whether the path exists on the host.
     :param is_dir: Whether the path is a directory.
     :param is_repo: Whether the folder lies in a non-bare git work tree.
-    :param toplevel: Work-tree root, e.g. ``"/Users/alice/myrepo"``.
+    :param toplevel: Work-tree root, e.g. ``"/opt/work/myrepo"``.
     :param branch: Checked-out branch, ``None`` when detached or unborn.
     :param default_branch: Repository main branch, ``None`` if unknown.
     :param head: Full HEAD commit sha, or ``None`` when unresolvable.
@@ -1142,7 +1142,7 @@ class HostCreateDirFrame:
 
     :param request_id: Correlates the result, e.g. ``"req_mkdir_1"``.
     :param path: Absolute or tilde-prefixed directory path to create,
-        e.g. ``"/Users/corey/projects/new-app"`` or ``"~/scratch"``.
+        e.g. ``"/opt/work/projects/new-app"`` or ``"~/scratch"``.
         Missing parent directories are created (``os.makedirs``).
     """
 
@@ -1163,7 +1163,7 @@ class HostCreateDirResultFrame:
         ``error`` so the route layer can map it to a 409 rather than a
         500 — same posture as ``host.list_dir`` for a missing path.
     :param path: Absolute path of the created directory, e.g.
-        ``"/Users/corey/projects/new-app"``. ``None`` when the
+        ``"/opt/work/projects/new-app"``. ``None`` when the
         directory was not created.
     :param error: Filesystem error, e.g. ``"directory already
         exists"`` or ``"permission denied"``. ``None`` on success.
@@ -1466,7 +1466,7 @@ class HostFsRequestFrame:
     :param op: Operation name — one of ``"list_or_read"``, ``"changes"``,
         ``"diff"``, ``"search"``.
     :param workspace: Absolute path to the session's workspace on the
-        host, e.g. ``"/Users/alice/project"``.
+        host, e.g. ``"/opt/work/project"``.
     :param session_id: Session id, forwarded to the change registry.
     :param params: Operation-specific arguments (relative path, glob
         filters, pagination cursors), e.g.

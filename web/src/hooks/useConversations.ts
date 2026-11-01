@@ -281,7 +281,7 @@ export interface Conversation {
   /** Host that launched the runner for this session, e.g. ``"host_a1b2"``. */
   host_id?: string | null;
   /**
-   * Absolute path the runner cd's into, e.g. ``"/Users/me/repo"``. For
+   * Absolute path the runner cd's into, e.g. ``"/opt/work/repo"``. For
    * worktree sessions this is the isolated worktree dir, not the picked
    * source repo. Powers the new-session directory-conflict hint. ``null``
    * for sessions not bound to a host workspace.
@@ -290,7 +290,7 @@ export interface Conversation {
   /**
    * Working tree recorded on the session when it differs from the launch
    * directory (a project-entry session's git worktree), e.g.
-   * ``"/Users/me/project/.worktrees/repo/feature-x"``. Git-reading surfaces
+   * ``"/opt/work/project/.worktrees/repo/feature-x"``. Git-reading surfaces
    * use ``worktree ?? workspace``. ``null``/absent when none is recorded.
    */
   worktree?: string | null;

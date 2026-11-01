@@ -3291,10 +3291,10 @@ async def test_fork_of_child_promotes_it_into_the_sidebar(
     )
 
 
-# ── Placement (SCC16): workspace, worktree, cross-project ─────────────
+# ── Placement: workspace, worktree, cross-project ────────────────────
 
 _PLACEMENT_HOST_ID = "2b8753b34a61b09af35a01136d40fadf"
-_PLACEMENT_WORKSPACE = "/Users/alice/myrepo"
+_PLACEMENT_WORKSPACE = "/opt/work/myrepo"
 _PLACEMENT_PROJECT_ID = "bb11cc22dd33ee44ff55667788990011"
 
 

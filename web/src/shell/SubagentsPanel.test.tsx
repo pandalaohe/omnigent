@@ -2015,8 +2015,8 @@ describe("SubagentsPanel", () => {
 
   it("groups active children by host then cwd, newest first, with counts", () => {
     hostsState.hosts = [
-      { host_id: "host-1", name: "TMB" },
-      { host_id: "host-2", name: "fn" },
+      { host_id: "host-1", name: "laptop" },
+      { host_id: "host-2", name: "server" },
     ];
     mockChildTree({
       conv_parent: [
@@ -2054,12 +2054,12 @@ describe("SubagentsPanel", () => {
     const { container } = renderPanel();
 
     expect(screen.getByTestId("subagent-active-zone")).toHaveTextContent("Active · 4");
-    // Hosts by newest child: TMB (40) before fn (20), with their counts.
+    // Hosts by newest child: laptop (40) before server (20), with their counts.
     expect(screen.getAllByTestId("subagent-host-group").map((node) => node.textContent)).toEqual([
-      "TMB3",
-      "fn1",
+      "laptop3",
+      "server1",
     ]);
-    // Cwds by newest child: TMB's /p/one (40), /p/two (30), then fn's /p/one.
+    // Cwds by newest child: laptop's /p/one (40), /p/two (30), then server's /p/one.
     const cwdHeaders = screen.getAllByTestId("subagent-cwd-group");
     expect(cwdHeaders.map((node) => node.textContent)).toEqual(["/p/one", "/p/two", "/p/one"]);
     // Rows newest-created first inside each cwd group.
@@ -2070,7 +2070,7 @@ describe("SubagentsPanel", () => {
   });
 
   it("collapses host and cwd groups independently", () => {
-    hostsState.hosts = [{ host_id: "host-1", name: "TMB" }];
+    hostsState.hosts = [{ host_id: "host-1", name: "laptop" }];
     mockChildTree({
       conv_parent: [
         childInfo({
@@ -2240,7 +2240,7 @@ describe("SubagentsPanel", () => {
   });
 
   it("shows agent, host, full cwd, branch and task summary in the row tooltip", async () => {
-    hostsState.hosts = [{ host_id: "host-1", name: "TMB" }];
+    hostsState.hosts = [{ host_id: "host-1", name: "laptop" }];
     mockChildTree({
       conv_parent: [
         childInfo({
@@ -2249,8 +2249,8 @@ describe("SubagentsPanel", () => {
           session_name: "auth",
           tool: "researcher",
           host_id: "host-1",
-          cwd: "/Users/me/dev/omnigent/fork/rail",
-          git_branch: "feature/scc18",
+          cwd: "/opt/work/dev/omnigent/fork/rail",
+          git_branch: "feature/rail",
           task_summary: "Investigate auth",
         }),
       ],
@@ -2260,9 +2260,9 @@ describe("SubagentsPanel", () => {
 
     fireEvent.focus(childRow(container, "conv_tip"));
     const tooltip = await screen.findByRole("tooltip");
-    expect(tooltip).toHaveTextContent("researcher · TMB");
-    expect(tooltip).toHaveTextContent("/Users/me/dev/omnigent/fork/rail");
-    expect(tooltip).toHaveTextContent("branch feature/scc18");
+    expect(tooltip).toHaveTextContent("researcher · laptop");
+    expect(tooltip).toHaveTextContent("/opt/work/dev/omnigent/fork/rail");
+    expect(tooltip).toHaveTextContent("branch feature/rail");
     expect(tooltip).toHaveTextContent("Investigate auth");
   });
 
@@ -2349,7 +2349,7 @@ describe("SubagentsPanel", () => {
 
   it("keeps the past zone collapsed until expanded, then pages 20 at a time", () => {
     useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
-    hostsState.hosts = [{ host_id: "host-1", name: "TMB" }];
+    hostsState.hosts = [{ host_id: "host-1", name: "laptop" }];
     const pastChild = (id: string): ChildSessionInfo =>
       childInfo({
         id,
@@ -2357,7 +2357,7 @@ describe("SubagentsPanel", () => {
         session_name: id,
         tool: "researcher",
         host_id: "host-1",
-        cwd: "/Users/me/dev/omnigent/fork/rail",
+        cwd: "/opt/work/dev/omnigent/fork/rail",
         archived: true,
         archived_at: 1_700_000_000,
       });
@@ -2384,8 +2384,8 @@ describe("SubagentsPanel", () => {
     expect(screen.getAllByTestId("subagent-past-row")).toHaveLength(20);
     expect(screen.getByTestId("subagent-past-zone")).toHaveTextContent("Past · 20+");
     const firstPastRow = screen.getAllByTestId("subagent-past-row")[0];
-    expect(firstPastRow).toHaveTextContent("TMB");
-    expect(firstPastRow).toHaveTextContent("~/dev/omnigent/fork/rail");
+    expect(firstPastRow).toHaveTextContent("laptop");
+    expect(firstPastRow).toHaveTextContent("/opt/work/dev/omnigent/fork/rail");
     expect(screen.getByTestId("subagent-past-load-more")).toHaveTextContent("Load 20 more");
 
     fireEvent.click(screen.getByTestId("subagent-past-load-more"));
@@ -2398,8 +2398,8 @@ describe("SubagentsPanel", () => {
   });
 
   it("shortens the cwd group header but keeps the full path in its title", () => {
-    hostsState.hosts = [{ host_id: "host-1", name: "TMB" }];
-    const cwd = "/opt/work/omnigent/fork/omnigent-scc18-agents-rail";
+    hostsState.hosts = [{ host_id: "host-1", name: "laptop" }];
+    const cwd = "/opt/work/omnigent/fork/omnigent-agents-rail";
     mockChildTree({
       conv_parent: [childInfo({ id: "a", tool: "researcher", host_id: "host-1", cwd })],
     });

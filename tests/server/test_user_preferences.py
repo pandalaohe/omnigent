@@ -1591,7 +1591,7 @@ async def test_preferences_api_accepts_the_calling_defaults_namespaces(
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         headers = {"x-test-user": "calling@example.com"}
-        master = {"HDS": {"codex": {"model": "gpt-6-sol", "effort": "high"}}}
+        master = {"workstation": {"codex": {"model": "gpt-6-sol", "effort": "high"}}}
         patched = await client.patch(
             "/v1/me/preferences/calling_defaults",
             headers=headers,
@@ -1600,7 +1600,7 @@ async def test_preferences_api_accepts_the_calling_defaults_namespaces(
         assert patched.status_code == 200, patched.text
         assert patched.json()["settings"]["calling_defaults"] == master
 
-        last = {"enabled": True, "p:proj": {"HDS": {"last_agent_id": "codex-sdk"}}}
+        last = {"enabled": True, "p:proj": {"workstation": {"last_agent_id": "codex-sdk"}}}
         patched = await client.patch(
             "/v1/me/preferences/calling_last",
             headers=headers,

@@ -140,7 +140,7 @@ class CreatedWorktree:
 
     :param worktree_path: Absolute path of the created worktree
         directory on the host, e.g.
-        ``"/Users/alice/myrepo-worktrees/feature-login"``. Used for rollback.
+        ``"/opt/work/myrepo-worktrees/feature-login"``. Used for rollback.
     :param branch: The branch checked out in the worktree, e.g.
         ``"feature/login"``.
     :param workspace: Selected directory relocated into the new worktree.
@@ -233,7 +233,7 @@ async def create_worktree_on_host(
     :param host_conn: Live host connection to create the worktree on.
     :param repo_path: Absolute path inside the source repo on the
         host — the canonical picked directory, e.g.
-        ``"/Users/alice/myrepo"``.
+        ``"/opt/work/myrepo"``.
     :param branch_name: New branch to create, e.g. ``"feature/login"``.
     :param base_branch: Optional base ref, e.g. ``"main"``. ``None``
         branches from the repo's current ``HEAD``.
@@ -312,7 +312,7 @@ async def remove_worktree_on_host(
         outbound frame on the host's send queue.
     :param host_conn: Live host connection that owns the worktree.
     :param worktree_path: Absolute path of the worktree to remove on
-        the host, e.g. ``"/Users/alice/myrepo-worktrees/feature-login"``.
+        the host, e.g. ``"/opt/work/myrepo-worktrees/feature-login"``.
     :param branch: Branch to delete when ``delete_branch`` is
         ``True``, e.g. ``"feature/login"``. ``None`` skips branch
         deletion.
@@ -376,7 +376,7 @@ async def list_worktrees_on_host(
     :param host_conn: Live host connection to list worktrees on.
     :param repo_path: Absolute path inside the source repo on the
         host — the canonical picked directory, e.g.
-        ``"/Users/alice/myrepo"``.
+        ``"/opt/work/myrepo"``.
     :param for_cleanup: Recover a canonical workspace without following replacement symlinks.
     :param timeout: Override the listing wait for a latency-sensitive caller.
     :returns: One dict per worktree with keys ``path``, ``branch``,
@@ -535,7 +535,7 @@ async def folder_facts_on_host(
         outbound frame on the host's send queue.
     :param host_conn: Live host connection to read the folder on.
     :param path: Absolute folder path on the host, e.g.
-        ``"/Users/alice/myrepo"``.
+        ``"/opt/work/myrepo"``.
     :returns: The facts dict (``exists``, ``is_dir``, ``is_repo``,
         ``toplevel``, ``branch``, ``head``, ``detached``, ``dirty``,
         ``remotes``, ``setup_command_configured``, ``error``).

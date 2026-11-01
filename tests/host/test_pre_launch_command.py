@@ -90,7 +90,7 @@ def test_not_run_without_its_own_key_or_a_config_file(
 @pytest.mark.parametrize(
     ("command", "message"),
     [
-        ("collab root worktree repair", "must be a non-empty list of strings"),
+        ("git worktree repair", "must be a non-empty list of strings"),
         (["./hook.sh"], "must start with an absolute path"),
         (["/opt/tools/hook.bat"], "must not be a .bat/.cmd file"),
     ],

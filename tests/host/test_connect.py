@@ -5511,7 +5511,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
     """
     base = {
         "PATH": "/usr/bin:/bin",
-        "HOME": "/home/alice",
+        "HOME": "/opt/work",
         "LANG": "en_US.UTF-8",
         "LC_CTYPE": "UTF-8",
         "DATABRICKS_CONFIG_PROFILE": "ambient",
@@ -5524,7 +5524,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
         "SOME_RANDOM_VAR": "x",
         "OMNIGENT_CLAUDE_SDK_NO_SANDBOX": "1",
         "OMNIGENT_CLAUDE_CODE_ENTRYPOINT": "gateway-client",
-        "KUBECONFIG": "/home/alice/.kube/config",
+        "KUBECONFIG": "/opt/work/.kube/config",
         "SSH_AUTH_SOCK": "/private/tmp/com.apple.launchd.7Qk/Listeners",
         "BROWSER": "www-browser",
         "CLAUDE_CODE_SKIP_BEDROCK_AUTH": "1",
@@ -5554,7 +5554,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
 
     # Process essentials + the locale family pass through.
     assert env["PATH"] == "/usr/bin:/bin"
-    assert env["HOME"] == "/home/alice"
+    assert env["HOME"] == "/opt/work"
     assert env["LANG"] == "en_US.UTF-8"
     assert env["LC_CTYPE"] == "UTF-8"
     # Databricks config selectors are allowlisted ambient passthrough —
@@ -5583,7 +5583,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
     assert env["OMNIGENT_CLAUDE_CODE_ENTRYPOINT"] == "gateway-client"
     # KUBECONFIG is a filesystem path (not a secret) — kubectl, helm, k9s
     # need it to resolve the user's cluster contexts and namespaces.
-    assert env["KUBECONFIG"] == "/home/alice/.kube/config"
+    assert env["KUBECONFIG"] == "/opt/work/.kube/config"
     # SSH_AUTH_SOCK is a socket path on the same footing. Dropping it leaves
     # every runner-spawned context without ssh-agent auth, so git-over-SSH and
     # SSH-cert tooling fail with "dial unix: missing address".
@@ -11830,9 +11830,9 @@ async def test_dispatch_create_worktree_passes_entry_to_creator(
     def _fake_create_worktree(**kwargs: object) -> object:
         seen.update(kwargs)
         return SimpleNamespace(
-            worktree_path="/Users/alice/project/.worktrees/myrepo/x",
+            worktree_path="/opt/work/project/.worktrees/myrepo/x",
             branch="x",
-            workspace="/Users/alice/project/.worktrees/myrepo/x/sub",
+            workspace="/opt/work/project/.worktrees/myrepo/x/sub",
         )
 
     monkeypatch.setattr(connect_module, "create_worktree", _fake_create_worktree)
@@ -11842,19 +11842,19 @@ async def test_dispatch_create_worktree_passes_entry_to_creator(
         ws,
         HostCreateWorktreeFrame(
             request_id="req_wt_9",
-            repo_path="/Users/alice/myrepo",
+            repo_path="/opt/work/myrepo",
             branch_name="x",
-            entry="/Users/alice/project",
+            entry="/opt/work/project",
         ),
     )
 
-    assert seen["entry"] == "/Users/alice/project"
-    assert seen["repo_path"] == "/Users/alice/myrepo"
+    assert seen["entry"] == "/opt/work/project"
+    assert seen["repo_path"] == "/opt/work/myrepo"
     result = decode_host_frame(ws.sent[0])
     assert isinstance(result, HostCreateWorktreeResultFrame)
     assert result.request_id == "req_wt_9"
     assert result.status == "ok"
-    assert result.workspace == "/Users/alice/project/.worktrees/myrepo/x/sub"
+    assert result.workspace == "/opt/work/project/.worktrees/myrepo/x/sub"
     _cleanup_host(host)
 
 
@@ -11870,9 +11870,9 @@ async def test_dispatch_create_worktree_passes_path_template_to_creator(
     def _fake_create_worktree(**kwargs: object) -> object:
         seen.update(kwargs)
         return SimpleNamespace(
-            worktree_path="/Users/alice/project/.worktrees/myrepo/x",
+            worktree_path="/opt/work/project/.worktrees/myrepo/x",
             branch="x",
-            workspace="/Users/alice/project/.worktrees/myrepo/x",
+            workspace="/opt/work/project/.worktrees/myrepo/x",
         )
 
     monkeypatch.setattr(connect_module, "create_worktree", _fake_create_worktree)
@@ -11882,15 +11882,15 @@ async def test_dispatch_create_worktree_passes_path_template_to_creator(
         ws,
         HostCreateWorktreeFrame(
             request_id="req_wt_10",
-            repo_path="/Users/alice/myrepo",
+            repo_path="/opt/work/myrepo",
             branch_name="x",
-            entry="/Users/alice/project",
+            entry="/opt/work/project",
             path_template="{entry}/.worktrees/{repo}/{branch}",
         ),
     )
 
     assert seen["path_template"] == "{entry}/.worktrees/{repo}/{branch}"
-    assert seen["entry"] == "/Users/alice/project"
+    assert seen["entry"] == "/opt/work/project"
     result = decode_host_frame(ws.sent[0])
     assert isinstance(result, HostCreateWorktreeResultFrame)
     assert result.request_id == "req_wt_10"
@@ -11956,7 +11956,7 @@ def _post_bind_hook_frame() -> HostPostBindHookFrame:
         binding_id="bind_1",
         revision=2,
         repository_name="root",
-        workspace="/Users/alice/myrepo",
+        workspace="/opt/work/myrepo",
         is_primary=True,
         context_manifest_path=".agents/project/manifest.json",
     )

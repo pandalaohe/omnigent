@@ -62,7 +62,7 @@ def _peer_turn(
         parent_session_id=parent_session_id,
         peer_id="peer_msg_1",
         result_item_id=result_item_id,
-        ref="omn054-hermes-facts",
+        ref="hermes-facts",
         sender_session_id=sender_session_id,
         sender_title="hermes lead",
         sender_origin="agent",

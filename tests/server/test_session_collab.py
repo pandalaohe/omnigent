@@ -1,4 +1,4 @@
-"""Tests for per-owner session-collaboration settings enforcement (SCC15).
+"""Tests for per-owner session-collaboration settings enforcement.
 
 The peer-route cases ride on ``test_peer_messages.py``'s app fixture with a
 real preferences store attached; the initializer cases drive a fake runner

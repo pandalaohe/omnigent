@@ -915,7 +915,7 @@ function AppShellImpl() {
     serverConversationId != null && agentHasInfo(boundAgent, serverConversationId);
   // Whether the mobile three-dot menu has any entry to offer.
   const hasHeaderMenu = canShare || hasAgentInfo;
-  // Held-messages panel entry (SCC01-S1 peer messaging) — gated on the
+  // Held-messages panel entry — gated on the
   // server's feature flag; the panel itself reads the open session, so no
   // owner/permission check here beyond having a session to show it for.
   const showPeerMessages =

@@ -1,4 +1,4 @@
-"""Unit tests for relay-depth derivation and admission slots (SCC09).
+"""Unit tests for relay-depth derivation and admission slots.
 
 ``latest_input_depth`` runs against a real SQLite conversation store and
 peer-message store; the admission slot math runs against ``_PeerAdmission``

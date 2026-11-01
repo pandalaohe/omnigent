@@ -1,7 +1,7 @@
 /**
  * Held / pending / queued peer-message records addressed to the open
  * session (received via `sys_session_send` from another Omnigent session —
- * SCC01-S1 peer messaging). Lets the session's user release or refuse a
+ * peer messaging). Lets the session's user release or refuse a
  * record and set the session's `peer_inbound` policy (accept / hold /
  * refuse). Polls every 5s while open; the sweeper (server-side) can move a
  * record out of these three states between polls, so releasing/refusing an

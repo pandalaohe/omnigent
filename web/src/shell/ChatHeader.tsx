@@ -208,7 +208,7 @@ interface ChatHeaderProps {
   hasAgentInfo: boolean;
   /** Open the mobile agent-info dialog. */
   onAgentInfo: () => void;
-  /** Whether the "Peer messages" menu entry should render (SCC01-S1). */
+  /** Whether the "Peer messages" menu entry should render. */
   showPeerMessages?: boolean;
   /** Open the peer-messages held panel for this session. */
   onPeerMessages?: () => void;

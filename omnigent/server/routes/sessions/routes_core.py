@@ -3760,7 +3760,7 @@ def register_core_routes(
         host_id: str = Query(min_length=1, max_length=128),
     ) -> dict[str, Any]:
         """
-        Resolve a session's branch worktree on a target host (SCC06 F2b).
+        Resolve a session's branch worktree on a target host.
 
         A joint-agent member saved on another host runs there in the checkout
         of the same repository and branch the lead session is working in. The

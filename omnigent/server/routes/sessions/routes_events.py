@@ -1083,7 +1083,7 @@ async def _cross_host_subagent_parent(
     """
     Return the parent when *conv* is a sub-agent running on another host.
 
-    A cross-host member child (SCC06 F2b) runs on its own host's runner, so
+    A cross-host member child runs on its own host's runner, so
     its terminal status cannot be delivered into the parent inbox the way a
     co-located child's is; the parent's runner owns that inbox. ``None`` for a
     top-level session, a hostless child, or a child on its parent's host.
@@ -3908,7 +3908,7 @@ def register_events_routes(
                     turn_completed=data.get("turn_completed"),
                 )
                 if outcome is None:
-                    # The fork's structured terminal edges (MOD-s21) feed the
+                    # The fork's structured terminal edges feed the
                     # same "returned" activity: completed → completed,
                     # stopped / killed → cancelled.
                     outcome = {

@@ -10376,7 +10376,7 @@ def create_runner_app(
                     _cond.notify_all()
 
         if body_type == "interrupt":
-            # Fork mod (MOD-s19): read before the cancel pops it; the Claude idle guard
+            # Fork mod: read before the cancel pops it; the Claude idle guard
             # must not treat a pane parked on a question as an idle composer.
             _prompt_pending = conversation_id in _claude_prompt_waiters
             _cancel_claude_prompt_waiter(conversation_id)

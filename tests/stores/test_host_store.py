@@ -159,15 +159,15 @@ def test_default_workspace_is_persisted_per_host(host_store: HostStore, db_uri: 
     assert before is not None
     updated = host_store.set_default_workspace(
         host_id,
-        "D:\\AIProgram\\Projects",
+        "D:\\work\\Projects",
         expected_user_id="alice@example.com",
     )
 
     assert updated is not None
-    assert updated.default_workspace == "D:\\AIProgram\\Projects"
+    assert updated.default_workspace == "D:\\work\\Projects"
     assert before.updated_at == sentinel_updated_at
     assert updated.updated_at == sentinel_updated_at
-    assert host_store.get_host(host_id).default_workspace == "D:\\AIProgram\\Projects"  # type: ignore[union-attr]
+    assert host_store.get_host(host_id).default_workspace == "D:\\work\\Projects"  # type: ignore[union-attr]
 
 
 def test_default_workspace_update_requires_the_current_owner(host_store: HostStore) -> None:
@@ -448,7 +448,7 @@ def test_reconnect_with_rotated_host_id_repoints_bound_conversations(
     )
     host_store.set_default_workspace(
         "a1ed1ab71de2311e20488a989e61701c",
-        "D:\\AIProgram\\Projects",
+        "D:\\work\\Projects",
         expected_user_id="dana@example.com",
     )
     # Bind a conversation to the old host_id (workspace is required by
@@ -468,7 +468,7 @@ def test_reconnect_with_rotated_host_id_repoints_bound_conversations(
 
     assert updated.host_id == "b1b5efd7dfc33b5a6241f1866ffb00e6"
     assert updated.status == "online"
-    assert updated.default_workspace == "D:\\AIProgram\\Projects"
+    assert updated.default_workspace == "D:\\work\\Projects"
     # The binding followed the rotation — the conversation now points at
     # the new host_id, not the old (dangling) one or NULL.
     rebound = conversations.get_conversation(conv.id)
@@ -479,7 +479,7 @@ def test_reconnect_with_rotated_host_id_repoints_bound_conversations(
     )
     rotated = host_store.get_host("b1b5efd7dfc33b5a6241f1866ffb00e6")
     assert rotated is not None
-    assert rotated.default_workspace == "D:\\AIProgram\\Projects"
+    assert rotated.default_workspace == "D:\\work\\Projects"
     assert rotated.platform == "darwin"
     assert instructions.current() == shared
     assert instructions.current(scope="host", host_id=old_host) is None
@@ -749,11 +749,11 @@ def test_reown_host_id_across_owner_change_preserves_conversation_binding(
     )
     host_store.set_default_workspace(
         "a0c8ab2431b35377abb4232febeded94",
-        "/Users/admin/Projects",
+        "/opt/work/Projects",
         expected_user_id="admin@example.com",
     )
     conv = conversations.create_conversation(
-        host_id="a0c8ab2431b35377abb4232febeded94", workspace="/home/me/proj"
+        host_id="a0c8ab2431b35377abb4232febeded94", workspace="/opt/work/proj"
     )
 
     # Auth flipped to header mode: same machine, same host_id, new owner.
@@ -768,7 +768,7 @@ def test_reown_host_id_across_owner_change_preserves_conversation_binding(
     assert reowned.host_id == "a0c8ab2431b35377abb4232febeded94"
     assert reowned.user_id == "local"
     assert reowned.status == "online"
-    assert reowned.default_workspace == "/Users/admin/Projects"
+    assert reowned.default_workspace == "/opt/work/Projects"
     assert reowned.platform == "linux"
     # The conversation binding survives the owner change (host_id unchanged).
     rebound = conversations.get_conversation(conv.id)

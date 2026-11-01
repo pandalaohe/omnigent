@@ -2572,7 +2572,7 @@ async def test_envelope_worktree_session_uses_worktree_for_changes(
 ) -> None:
     """A session initialized via the envelope routes /changes to its worktree.
 
-    XHO04 batch C: the session-init envelope carries ``worktree`` alongside
+    The session-init envelope carries ``worktree`` alongside
     ``workspace``; ``/changes`` must run ``git status`` in the worktree, not
     the project entry workspace the session displays as its directory.
     """

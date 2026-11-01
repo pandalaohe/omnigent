@@ -690,8 +690,8 @@ export function isValidWorkspace(workspace: string): boolean {
  * or symlink resolution — which suffices because the server stores canonical
  * absolute workspaces, so a freshly typed absolute path matches directly.
  *
- * @param path A host path, e.g. ``"/Users/me/repo/"``.
- * @returns The normalized path, e.g. ``"/Users/me/repo"``; ``null`` for blank.
+ * @param path A host path, e.g. ``"/opt/work/repo/"``.
+ * @returns The normalized path, e.g. ``"/opt/work/repo"``; ``null`` for blank.
  */
 export function normalizeWorkspacePath(path: string): string | null {
   const trimmed = path.trimStart();
@@ -710,7 +710,7 @@ export function normalizeWorkspacePath(path: string): string | null {
  * ``"…/myrepo-worktrees/feature-x"``) instead of a shared prefix that
  * truncates to the same string for every entry.
  *
- * @param path Absolute path, e.g. ``"/Users/me/myrepo-worktrees/feature-x"``.
+ * @param path Absolute path, e.g. ``"/opt/work/myrepo-worktrees/feature-x"``.
  * @returns The tail, prefixed with ``"…/"`` when segments were dropped;
  *   the original path when it already has two or fewer segments.
  */
@@ -834,7 +834,7 @@ export function composerWorktreeHeaderState({
  *
  * @param sessions The caller's sessions from ``useDirectorySessions``.
  * @param hostId The selected host id, or ``null`` when none is picked.
- * @param workspace The picked absolute directory, e.g. ``"/Users/me/repo"``.
+ * @param workspace The picked absolute directory, e.g. ``"/opt/work/repo"``.
  * @param isRunnerOnline Predicate: is this session's runner online right now?
  *   Backed by the shared runner-health poll in the component.
  * @returns Matching connected sessions; callers use ``.length`` for the count.
@@ -2116,7 +2116,7 @@ export function AgentHarnessPicker({
         <WandSparklesIcon className="size-4" aria-hidden="true" />
       ) : (
         // The id lets the SDK mark yield to a user badge set on this row's
-        // Agent (MOD-s25).
+        // Agent.
         <ComposerAgentIcon
           agent={{ ...visibleCachedPreview.agent, id: effectiveAgentId ?? undefined }}
         />
@@ -2747,7 +2747,7 @@ export function NewChatLandingScreen() {
   } = useComposerAttachments({
     initialFiles: restoredDraft?.files ?? [],
     limits: info !== "loading" ? info.attachment_limits : undefined,
-    // MOD-s10: accepted files take their `[image N]` / `[file N]` label and a
+    // Fork mod: accepted files take their `[image N]` / `[file N]` label and a
     // visible token at the caret. Runs before the append commits, so `files`
     // is still the prior list the labels count from.
     onAccepted: (accepted) => {
@@ -2765,7 +2765,7 @@ export function NewChatLandingScreen() {
     },
   });
   const fileInputRef = useRef<HTMLInputElement>(null);
-  // MOD-s10: removing a tile also removes its token from the text.
+  // Fork mod: removing a tile also removes its token from the text.
   const removeFile = (index: number) => {
     const edit = removeFileTokens({ quotes: [], text: message }, index, files)[0];
     if (edit) setMessage(edit.text);

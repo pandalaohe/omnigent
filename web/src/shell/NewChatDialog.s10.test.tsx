@@ -1,4 +1,4 @@
-// MOD-s10 fork tests for the landing composer: attachments live as visible
+// Fork tests for the landing composer: attachments live as visible
 // `[image N]` / `[file N]` tokens in upstream's textarea, and the create path
 // hands their order to ChatPage. Mounted the way the neighbouring landing
 // tests mount it (NewChatDialog.flow.test.tsx), with the same minimum stubs.
@@ -65,7 +65,7 @@ let searchParams = new URLSearchParams();
 let projects: { id: string | null; name: string }[] = [];
 
 const RECENT_KEY = "omnigent:recent-workspaces";
-const SEEDED_WORKSPACE = "/Users/corey/universe/src/foo";
+const SEEDED_WORKSPACE = "/opt/work/universe/src/foo";
 const TEMP_ID = "temp:1234567890abcdef1234567890abcdef";
 
 vi.mock("@/lib/routing", () => ({
@@ -299,7 +299,7 @@ afterEach(() => {
   localStorage.clear();
 });
 
-describe("NewChatLandingScreen MOD-s10 tokens", () => {
+describe("NewChatLandingScreen tokens", () => {
   it("inserts a token at the caret for a picked file", async () => {
     renderLanding();
     const field = landingInput();

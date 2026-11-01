@@ -86,13 +86,13 @@ async def test_open_in_panel_posts_absolute_path_with_host_base() -> None:
     """A leading slash marks an absolute host path: slash stripped, base named."""
     requests, handler = _ok_handler({"viewers": 1})
 
-    output = await _dispatch(handler, path="/Users/x/notes/report.html")
+    output = await _dispatch(handler, path="/opt/work/notes/report.html")
 
     assert output == (
-        "Asked the web UI to open /Users/x/notes/report.html (1 viewer(s) connected)"
+        "Asked the web UI to open /opt/work/notes/report.html (1 viewer(s) connected)"
     )
     assert json.loads(requests[0].content) == {
-        "path": "Users/x/notes/report.html",
+        "path": "opt/work/notes/report.html",
         "base": "host",
     }
 
