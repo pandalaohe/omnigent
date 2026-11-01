@@ -698,11 +698,19 @@ def test_submit_needle_uses_first_substantial_line() -> None:
     assert _mod._submit_needle("hi") == ""
 
 
-def test_submit_needle_uses_last_substantial_line_for_collapsed_draft() -> None:
+def test_submit_needle_uses_suffix_for_collapsed_draft() -> None:
     content = "<omnigent_agent_instructions>\nbe terse\nReply with exactly PONG_FINAL\nhi\n"
     assert _mod._submit_needle(content) == "<omnigent_agent_instruct"
-    assert _mod._submit_needle(content, from_tail=True) == "Reply with exactly PONG_"
+    assert _mod._submit_needle(content, from_tail=True) == "ywithexactlyPONG_FINALhi"
     assert _mod._submit_needle("hi", from_tail=True) == ""
+
+
+@pytest.mark.parametrize(
+    "content", ["archived notes " * 60, "archived notes\n" * 22], ids=["single", "multi"]
+)
+def test_submit_needle_uses_content_suffix_for_wrapped_draft(content: str) -> None:
+    content += "the final observation is recorded."
+    assert _mod._submit_needle(content, from_tail=True) == "alobservationisrecorded."
 
 
 # ---------------------------------------------------------------------------
@@ -1310,6 +1318,93 @@ def _agy_task_panel_pane(composer: str, footer: str, rows: str) -> str:
     """agy with background commands: composer, task panel, footer, each ruled."""
     ruled = f"{_AGY_RULE}\n{composer}\n{_AGY_RULE}\n{rows}\n{_AGY_RULE}\n{footer}\n"
     return f"  earlier reply\n{ruled}"
+
+
+@pytest.fixture(params=["wrapped_single", "wrapped_multi", "char_placeholder", "line_placeholder"])
+def agy_long_draft(request: pytest.FixtureRequest) -> tuple[str, str]:
+    """Neutral text in captured 80-column collapsed/placeholder composer shapes."""
+    rows = [
+        "The archive contains the weekly records and the meeting notes.",
+        "Each record carries a date and the name of the corresponding folder.",
+        "The first section lists the entries collected during the morning.",
+        "The second section records observations from the afternoon review.",
+        "A separate index describes the available documents in date order.",
+        "The catalog includes both complete records and short summaries.",
+        "Entries with matching dates appear together in the same section.",
+        "The final section contains references to the supporting material.",
+        "Every reference includes the document title and its revision date.",
+        "The supporting pages preserve the order used by the main catalog.",
+        "The closing paragraph records the result of the archive review.",
+        "The final entry is identified by archive-evidence-mar",
+        "ker.",
+    ]
+    body = " ".join(rows).replace("mar ker.", "marker.")
+    content = "Archive summary for the current reporting period. " + body
+    if request.param == "wrapped_multi":
+        content = content.replace("period. ", "period.\n")
+    composer = "> ↑ 1 more lines\n" + "\n".join(f"  {row}" for row in rows)
+    if request.param == "char_placeholder":
+        content = "archived observations " * 47
+        composer = "> [Pasted text #3 1034 chars]"
+    elif request.param == "line_placeholder":
+        content = "\n".join(
+            f"Archive record {index}: observations retained." for index in range(22)
+        )
+        composer = "> [Pasted text #4 +22 lines]"
+    footer = "                                            accept-edits · Gemini 4 Argon · high"
+    pane = f"  earlier reply\n{_AGY_RULE}\n{composer}\n{_AGY_RULE}\n{footer}"
+    return content, pane
+
+
+def test_draft_in_input_region_matches_wrapped_suffix(agy_long_draft: tuple[str, str]) -> None:
+    content, pane = agy_long_draft
+    needle = _mod._submit_needle(content)
+    tail_needle = _mod._submit_needle(content, from_tail=True)
+    assert _mod._draft_in_input_region(pane, needle, ">", tail_needle=tail_needle)
+    assert not _mod._draft_in_input_region(
+        pane, needle, _mod._agy_input_region(pane), tail_needle=tail_needle
+    )
+    submitted = f"{content}\n{_AGY_RULE}\n>\n{_AGY_RULE}\n? for shortcuts"
+    assert not _mod._draft_in_input_region(submitted, needle, ">", tail_needle=tail_needle)
+
+
+@pytest.mark.parametrize("submit_clears", [True, False], ids=["accepted", "unchanged"])
+def test_inject_user_message_via_tui_delivers_long_draft(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+    agy_long_draft: tuple[str, str],
+    submit_clears: bool,
+) -> None:
+    write_tmux_target(tmp_path, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    content, draft = agy_long_draft
+    empty = f"{_AGY_RULE}\n>\n{_AGY_RULE}\n? for shortcuts"
+    pane = empty
+    actions: list[str] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        nonlocal pane
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+        if "send-keys" in cmd:
+            actions.append(cmd[-1])
+            if cmd[-1] == "Enter" and submit_clears:
+                pane = f"{content}\n{empty}"
+            elif cmd[-1] == "C-w":
+                pane = empty
+        elif "paste-buffer" in cmd:
+            actions.append("paste")
+            pane = draft
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    if submit_clears:
+        inject_user_message_via_tui(tmp_path, content=content, timeout_s=0.01)
+        assert actions == ["C-a", "C-k", "paste", "Enter"]
+    else:
+        with pytest.raises(RuntimeError, match="did not accept the submitted message"):
+            inject_user_message_via_tui(tmp_path, content=content, timeout_s=0.01)
+        assert actions == ["C-a", "C-k", "paste", *(["Enter"] * _mod._MAX_SUBMIT_ATTEMPTS)]
 
 
 @pytest.mark.parametrize("rows", sorted(_AGY_TASK_ROWS))
