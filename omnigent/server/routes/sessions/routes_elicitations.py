@@ -242,7 +242,14 @@ def register_elicitations_routes(
             "content_preview": params.get("content_preview", ""),
             **{
                 key: params[key]
-                for key in ("native_delivery", "permission_directories")
+                for key in (
+                    "native_delivery",
+                    "permission_directories",
+                    "terminal_access_owner",
+                    "terminal_access_terminal_id",
+                    "terminal_access_instance_id",
+                    "terminal_access_host_id",
+                )
                 if key in params
             },
         }

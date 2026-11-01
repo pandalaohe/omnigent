@@ -191,6 +191,11 @@ async def test_terminal_card_grants_only_after_human_verdict(
     assert fields["terminal_access_terminal_id"] == "terminal_bash_admin"
     assert fields["terminal_access_instance_id"] == env.instance.instance_id
     assert fields["terminal_access_host_id"] == env.conn.host_id
+    page = await env.client.get(f"/v1/sessions/{env.sid}/elicitations/{eid}")
+    assert page.status_code == 200, page.text
+    assert {key: page.json().get(key) for key in fields if key.startswith("terminal_access_")} == {
+        key: value for key, value in fields.items() if key.startswith("terminal_access_")
+    }
     for text in ("consent-test", env.spec.name or "", env.args["reason"], "agent:"):
         assert text in fields["message"]
     assert not env.instance.agent_access

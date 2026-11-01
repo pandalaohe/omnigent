@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
 from playwright.sync_api import Page, Request, WebSocketRoute, expect
 
 from tests._helpers.polling import poll_until
@@ -120,3 +121,44 @@ def test_host_row_opens_working_terminal_page(
     expect(page.get_by_test_id("terminal-view")).to_have_attribute("data-state", "connected")
     assert len(connections) >= 2
     assert len(creates) == 1
+
+
+@pytest.mark.parametrize("width", [1280, 390])
+def test_standalone_admin_terminal_approval_page(
+    page: Page, chat_session_contract: ChatSessionContract, tmp_path: Path, width: int
+) -> None:
+    chat = chat_session_contract
+    path = f"/v1/sessions/{chat.session_id}/elicitations/terminal-access"
+    answers: list[dict[str, Any]] = []
+    chat.contract.json(
+        path,
+        {
+            "status": "pending",
+            "policy_name": "__ask_on_terminal_agent_access",
+            "message": "Allow the agent to repair the requested package",
+            "terminal_access_owner": "local",
+            "terminal_access_terminal_id": "terminal_shell_admin",
+            "terminal_access_instance_id": "admin-instance",
+            "terminal_access_host_id": chat.host_id,
+        },
+    )
+
+    def resolve(request: Request) -> dict[str, bool]:
+        answers.append(request.post_data_json)
+        return {"queued": False}
+
+    chat.contract.json(path + "/resolve", resolve, method="POST", status=202)
+    page.set_viewport_size({"width": width, "height": 844})
+    page.goto(f"{chat.base_url}/approve/{chat.session_id}/terminal-access")
+    details = page.get_by_test_id("terminal-access-details")
+    expect(details).to_contain_text("admin-instance")
+    expect(details).to_contain_text("terminal_shell_admin")
+    expect(details).to_contain_text(chat.host_id)
+    expect(details).to_contain_text("local")
+    expect(page.get_by_text("Allow the agent to repair the requested package")).to_be_visible()
+    approve = page.get_by_role("button", name="Approve", exact=True)
+    expect(approve).to_be_enabled()
+    page.screenshot(path=str(tmp_path / f"admin-approval-{width}.png"))
+    approve.click()
+    expect(page.get_by_text("Approved", exact=True)).to_be_visible()
+    assert answers == [{"action": "accept"}]
