@@ -312,7 +312,7 @@ def build_mcp_config(
                     "--bridge-dir",
                     str(bridge_dir),
                 ],
-                "autoApprove": list(_CURSOR_AUTO_APPROVE_TOOLS),
+                "autoApprove": sorted(_CURSOR_AUTO_APPROVE_TOOLS),
                 "env": {
                     "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
                 },
