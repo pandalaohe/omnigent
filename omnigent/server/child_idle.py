@@ -373,7 +373,7 @@ class ChildIdleSweeper:
                     if self._liveness_lookup
                     else None
                 )
-            except Exception:  # noqa: BLE001 — unknown reachability suppresses this observation
+            except Exception:
                 _logger.warning("Child runner liveness unavailable for %s", conv.id, exc_info=True)
                 return None
             if live is not None and live.runner_online is False:
@@ -769,7 +769,7 @@ class ChildIdleSweeper:
                     hosts = await asyncio.to_thread(child_host_ids, self._store, children)
                     if hosts:
                         host_summary.append(hosts_line(hub, current_workspace_id(), hosts, now))
-                except Exception:  # noqa: BLE001 — optional telemetry must not suppress check-ins
+                except Exception:
                     _logger.warning("Child check-in host summary unavailable", exc_info=True)
             delivered_ids = {sid for sid, _, _ in previous}
             text = build_checkin_text(
@@ -799,7 +799,7 @@ class ChildIdleSweeper:
                 if remaining > 0
                 else "deferred"
             )
-        except Exception:  # noqa: BLE001 — retain the attempt budget after uncertain delivery
+        except Exception:
             _logger.warning("Idle-child notice outcome uncertain for %s", parent_id, exc_info=True)
             outcome = "uncertain"
         await asyncio.to_thread(

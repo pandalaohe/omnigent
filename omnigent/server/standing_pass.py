@@ -9,7 +9,7 @@ import threading
 import time
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal, TypedDict
 from uuid import uuid4
 
@@ -171,7 +171,7 @@ def standing_pass_line(record: StandingPass) -> str:
     )
     if not record["kinds"] and not revoked:
         return ""
-    since = datetime.fromtimestamp(record["since"], timezone.utc).date().isoformat()
+    since = datetime.fromtimestamp(record["since"], UTC).date().isoformat()
     exceptions = "; ".join(json.dumps(s, ensure_ascii=False) for s in record["exceptions"])
     kinds = ", ".join(json.dumps(s, ensure_ascii=False) for s in record["kinds"])
     return (

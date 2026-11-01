@@ -13,7 +13,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
@@ -126,12 +126,12 @@ async def _clock_offset_ms(client: httpx.AsyncClient, base: str) -> int:
         )
     server_time = parsedate_to_datetime(header)
     if server_time.tzinfo is None:
-        server_time = server_time.replace(tzinfo=timezone.utc)
+        server_time = server_time.replace(tzinfo=UTC)
     return int((time.time() - server_time.timestamp()) * 1000)
 
 
 def _iso_now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _local_host_id() -> str | None:

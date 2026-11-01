@@ -3,6 +3,8 @@
 import asyncio
 import hashlib
 import json
+import shutil
+import sys
 from pathlib import Path
 
 import httpx
@@ -562,17 +564,20 @@ def test_pi_rpc_tempdir_is_protected_and_missing_record_denies(tmp_path: Path) -
 
 @pytest.mark.asyncio
 async def test_full_mcp_call_runs_only_with_ready_runtime(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
-    from omnigent.runner import tool_dispatch
+    from omnigent.spec import load
 
     runtime = _runtime(tmp_path, "full")
     runtime._harnesses["session-a"] = "pi"
-    calls: list[str] = []
-
-    async def execute_tool(**kwargs: object) -> str:
-        calls.append(str(kwargs["tool_name"]))
-        return "ran"
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "config.yaml").write_bytes(
+        (
+            Path(__file__).parents[2] / "omnigent" / "resources" / "examples" / "pi-rpc.yaml"
+        ).read_bytes()
+    )
+    spec = load(bundle)
 
     async def none(_session_id: str) -> None:
         return None
@@ -580,7 +585,6 @@ async def test_full_mcp_call_runs_only_with_ready_runtime(
     async def cwd(_session_id: str) -> Path:
         return tmp_path / "workspace"
 
-    monkeypatch.setattr(tool_dispatch, "execute_tool", execute_tool)
     app = FastAPI()
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://runner"
@@ -597,7 +601,7 @@ async def test_full_mcp_call_runs_only_with_ready_runtime(
             _session_harness_name=lambda _session_id: "pi",
             _session_inboxes={},
             _session_runtime_cwd=cwd,
-            _session_spec_cache={},
+            _session_spec_cache={"session-a": spec},
             filesystem_registry=None,
             mcp_execution_registry=McpExecutionRegistry(),
             permission_tiers=runtime,
@@ -609,13 +613,40 @@ async def test_full_mcp_call_runs_only_with_ready_runtime(
             spec_resolver=None,
             terminal_registry=None,
         )
-        request = {"method": "tools/call", "params": {"name": "sys_os_read", "arguments": {}}}
-        allowed = await client.post("/v1/sessions/session-a/mcp/execute", json=request)
-        assert allowed.json() == {"result": {"output": "ran"}}
+
+        async def call(name: str, arguments: dict[str, object]) -> dict:
+            response = await client.post(
+                "/v1/sessions/session-a/mcp/execute",
+                json={"method": "tools/call", "params": {"name": name, "arguments": arguments}},
+            )
+            return response.json()
+
+        written = await call("sys_os_write", {"path": "note.txt", "content": "before"})
+        assert "error" not in json.loads(written["result"]["output"])
+        edited = await call(
+            "sys_os_edit", {"path": "note.txt", "oldText": "before", "newText": "after"}
+        )
+        assert "error" not in json.loads(edited["result"]["output"])
+        assert (tmp_path / "workspace" / "note.txt").read_text() == "after"
+        search = (
+            "dir /s /b note.txt"
+            if sys.platform == "win32" and not (shutil.which("bash") or shutil.which("sh"))
+            else "find . -name note.txt"
+        )
+        found = await call("sys_os_shell", {"command": search})
+        shell = json.loads(found["result"]["output"])
+        assert shell["exit_code"] == 0
+        assert "note.txt" in shell["stdout"]
         runtime.force_block("session-a", "transaction-a")
-        denied = await client.post("/v1/sessions/session-a/mcp/execute", json=request)
-        assert denied.json()["error"]["message"] == "Permission tier unavailable"
-    assert calls == ["sys_os_read"]
+        for name, arguments in (
+            ("sys_os_write", {"path": "blocked.txt", "content": "denied"}),
+            ("sys_os_edit", {"path": "note.txt", "oldText": "after", "newText": "denied"}),
+            ("sys_os_shell", {"command": "echo denied > blocked.txt"}),
+        ):
+            denied = await call(name, arguments)
+            assert denied["error"]["message"] == "Permission tier unavailable"
+        assert not (tmp_path / "workspace" / "blocked.txt").exists()
+        assert (tmp_path / "workspace" / "note.txt").read_text() == "after"
 
 
 @pytest.mark.asyncio

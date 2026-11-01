@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import os
 import stat
+import tomllib
 from pathlib import Path
 
 import pytest
-import tomllib
 
 from omnigent.inner import codex_config_sync
 from omnigent.inner.codex_executor import _populate_codex_home_config

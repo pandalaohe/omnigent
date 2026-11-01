@@ -2,7 +2,7 @@
 // host, and workspace pickers where the backend can persist those fields.
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { FolderOpenIcon, TriangleAlertIcon } from "lucide-react";
+import { ChevronDownIcon, FolderOpenIcon, TriangleAlertIcon } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -12,6 +12,13 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import {
@@ -26,10 +33,14 @@ import { ScheduleFields } from "@/components/scheduled/ScheduleFields";
 import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
 import { WorkspacePickerDialog } from "@/shell/WorkspacePickerDialog";
 import { AgentHarnessPicker } from "@/shell/NewChatDialog";
+import { ProjectPicker, ProjectRowIcon } from "@/shell/ProjectPicker";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
-import { useProjects, useProjectsWithArchived } from "@/hooks/useConversations";
-import { ProjectSinglePicker } from "@/components/ProjectSinglePicker";
+import {
+  useProjects,
+  useProjectsWithArchived,
+  useResolveOrCreateProjectId,
+} from "@/hooks/useConversations";
 import { customAgentForPicker, useCustomAgents } from "@/lib/customAgentsApi";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useHarnessCapabilities } from "@/lib/agentLabels";
@@ -59,6 +70,7 @@ import {
   ScheduledTaskApiError,
   type ScheduledTask,
   type ScheduledTaskExecutionTarget,
+  type ScheduledTaskSessionMode,
 } from "@/lib/scheduledTasksApi";
 import { localTimezone } from "@/lib/timezones";
 
@@ -85,13 +97,21 @@ export function CreateScheduledTaskDialog({
   const { data: agents } = useAvailableAgents({ enabled: open });
   const { data: customAgents } = useCustomAgents(open);
   const { data: hosts } = useHosts({ enabled: open });
-  const { data: projects } = useProjects();
   const { data: allProjects } = useProjectsWithArchived();
   const info = useServerInfo();
   // Gates the "new sandbox each run" option: only servers that can actually
   // serve a managed launch advertise it (same flag New Chat's sandbox option
   // gates on). "loading" → treat as disabled until /v1/info resolves.
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
+  // Older servers reject a task's project fields, so the picker needs the flag.
+  const projectsSupported = info !== "loading" && info.scheduled_task_projects === true;
+  const {
+    data: projects = [],
+    isSuccess: projectsLoaded,
+    isError: projectsFailed,
+  } = useProjects({ enabled: open && projectsSupported });
+  const resolveProjectId = useResolveOrCreateProjectId();
+  const sessionModesSupported = info !== "loading" && info.scheduled_task_session_modes === true;
   // Provider-named label for the sandbox host option (e.g. "Modal Sandbox"),
   // falling back to the generic "New Sandbox" — same helper the New Chat picker uses.
   const sandboxLabel = sandboxOptionLabel(info !== "loading" ? info.sandbox_provider : null);
@@ -276,20 +296,17 @@ export function CreateScheduledTaskDialog({
   // Optional pinned host/workspace. "" = unset (server resolves at fire time).
   const [hostId, setHostId] = useState<string>("");
   const [workspace, setWorkspace] = useState<string>("");
-  // Project whose calling defaults apply at fire time. Until the user touches
-  // the select, the value follows the surrounding context (or the edited
-  // task), so a late projects-list load still pre-fills it.
-  const [projectId, setProjectId] = useState<string>("");
-  const [projectTouched, setProjectTouched] = useState(false);
-  const defaultProjectId =
-    editingTask !== null
-      ? (editingTask.projectId ?? "")
-      : ((projects ?? []).find((project) => project.name === currentProjectName)?.id ?? "");
-  const effectiveProjectId = projectTouched ? projectId : defaultProjectId;
   // When on, each fire runs in a FRESH managed sandbox (execution_target =
   // "managed_sandbox") instead of a connected host; hides the host/workspace
   // pickers. Only offered when the server advertises managed sandboxes.
   const [sandboxMode, setSandboxMode] = useState(false);
+  // Project by name: null = unchanged; "" = no project.
+  const [projectChoice, setProjectChoice] = useState<string | null>(null);
+  // Id of the existing project picked, captured at pick time so a later rename
+  // can't redirect the save; null for a newly typed name.
+  const [pickedProjectId, setPickedProjectId] = useState<string | null>(null);
+  const [sessionMode, setSessionMode] = useState<ScheduledTaskSessionMode>("new");
+  const [startNewSession, setStartNewSession] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [scheduleUnsupported, setScheduleUnsupported] = useState(false);
 
@@ -317,8 +334,10 @@ export function CreateScheduledTaskDialog({
         setHostId(editingTask.hostId ?? "");
         setWorkspace(editingTask.workspace ?? "");
         setSandboxMode(editingTask.executionTarget === "managed_sandbox");
-        setProjectId("");
-        setProjectTouched(false);
+        setProjectChoice(null);
+        setPickedProjectId(null);
+        setSessionMode(editingTask.sessionMode);
+        setStartNewSession(false);
       } else {
         setName(initialName ?? "");
         setPrompt(initialPrompt ?? "");
@@ -327,27 +346,44 @@ export function CreateScheduledTaskDialog({
         setPickedEffort("");
         setPickedSpeed("");
         setPickedPermission("");
+        setSessionMode("new");
+        setStartNewSession(false);
         setSchedule(DEFAULT_SCHEDULE_MODEL);
         setScheduleUnsupported(false);
         setHostId("");
         setWorkspace("");
         setSandboxMode(false);
-        setProjectId("");
-        setProjectTouched(false);
+        setProjectChoice(null);
+        setPickedProjectId(null);
       }
       setError(null);
     }
     wasOpen.current = open;
   }, [open, initialName, initialPrompt, editingTask]);
 
+  const savedProjectId = editingTask?.projectId ?? null;
+  const savedProjectName =
+    savedProjectId !== null
+      ? (allProjects ?? projects).find((p) => p.id === savedProjectId)?.name
+      : "";
+  // A picked project is shown by its id, so a rename elsewhere shows the new name.
+  const pickedProject =
+    pickedProjectId !== null ? projects.find((p) => p.id === pickedProjectId) : undefined;
+  const projectName =
+    pickedProject?.name ?? projectChoice ?? (isEdit ? savedProjectName : currentProjectName) ?? "";
+  const projectIcon = (pickedProject ?? projects.find((p) => p.name === projectName))?.icon;
+  // The saved project has no name while the list loads, if it fails to load,
+  // or once the project is deleted. Only a loaded list proves it is deleted,
+  // and a deleted one reads as "No project": runs already file nothing there.
+  const savedProjectUnresolved = projectChoice === null && savedProjectName === undefined;
+  const savedProjectDeleted = savedProjectUnresolved && projectsLoaded;
+  const unresolvedProjectLabel = unresolvedProjectText(
+    savedProjectUnresolved,
+    savedProjectDeleted,
+    projectsFailed,
+  );
+
   const hostOptions = hosts ?? [];
-  // Label-only folders have no first-class id, so they cannot key a task's
-  // project (the server default-fills those from the creating session).
-  const projectOptions =
-    allProjects ??
-    (projects ?? []).flatMap((project) =>
-      project.id === null ? [] : [{ id: project.id, name: project.name }],
-    );
   const preservePinnedHost = isEdit && editingTask?.hostId != null;
   // The resolved Host for the pinned id, or undefined when none is pinned.
   const selectedHost = hostId === "" ? undefined : hostOptions.find((h) => h.host_id === hostId);
@@ -374,7 +410,9 @@ export function CreateScheduledTaskDialog({
   // Block submit on an invalid schedule (bad interval, empty multi-select) so
   // the form never posts an RRULE the server's validate_rrule would 400.
   const scheduleInvalid = scheduleUnsupported || validateSchedule(schedule) !== null;
-  const mutationPending = createMutation.isPending || updateMutation.isPending;
+  // Set across the whole submit, which may first find or create a project.
+  const [submitting, setSubmitting] = useState(false);
+  const mutationPending = submitting || createMutation.isPending || updateMutation.isPending;
   const canSubmit =
     name.trim() !== "" &&
     prompt.trim() !== "" &&
@@ -397,8 +435,8 @@ export function CreateScheduledTaskDialog({
     setWorkspace("");
     setWorkspaceBrowserOpen(false);
     setSandboxMode(false);
-    setProjectId("");
-    setProjectTouched(false);
+    setProjectChoice(null);
+    setPickedProjectId(null);
     setError(null);
     setScheduleUnsupported(false);
   }
@@ -409,7 +447,9 @@ export function CreateScheduledTaskDialog({
   }
 
   async function handleSubmit() {
+    if (!editingTask && effectiveAgentId === null) return;
     setError(null);
+    setSubmitting(true);
     try {
       // A sandbox task runs hostless (fresh sandbox per fire), so host/workspace
       // are omitted. Only send executionTarget when it's meaningful: on create
@@ -431,14 +471,15 @@ export function CreateScheduledTaskDialog({
         ...(!sandboxMode && hostId !== "" && workspace.trim() !== ""
           ? { workspace: workspace.trim() }
           : {}),
+        ...((editingTask?.sessionMode ?? "new") !== sessionMode ? { sessionMode } : {}),
       };
-      // The task's project is threaded only when it changed (a create with no
-      // project omits it, so the server can pre-fill from the creating
-      // session); a cleared select sends an explicit null.
-      const projectChanged = effectiveProjectId !== (editingTask?.projectId ?? "");
-      const projectPatch = projectChanged
-        ? { projectId: effectiveProjectId === "" ? null : effectiveProjectId }
-        : {};
+      const projectInput = await projectChangeInput(
+        // Saving over a deleted project clears it, matching the "No project" shown.
+        projectChoice ?? (savedProjectDeleted ? "" : !isEdit ? (currentProjectName ?? null) : null),
+        pickedProjectId ?? projects.find((project) => project.name === projectName)?.id ?? null,
+        savedProjectId,
+        resolveProjectId,
+      );
       if (editingTask) {
         // When the agent supports them: a switch resends every non-empty selection
         // (server clears what the PATCH omits); otherwise only changes, `null` when cleared.
@@ -474,7 +515,10 @@ export function CreateScheduledTaskDialog({
           input: {
             ...input,
             ...overrides,
-            ...projectPatch,
+            ...projectInput,
+            ...(sessionMode === "continue" && startNewSession && editingTask.sessionId !== null
+              ? { sessionId: null }
+              : {}),
             // Only on a real switch: sending the unchanged agent is a server-side
             // no-op, but omitting it keeps the PATCH honest about what changed.
             ...(agentChanged && effectiveAgentId !== null ? { agentId: effectiveAgentId } : {}),
@@ -484,8 +528,8 @@ export function CreateScheduledTaskDialog({
         if (effectiveAgentId === null) return;
         await createMutation.mutateAsync({
           ...input,
+          ...projectInput,
           agentId: effectiveAgentId,
-          ...projectPatch,
           // Include an override only when the agent supports model/effort AND the
           // user picked a non-default value; an unselected control is omitted so
           // the create uses the agent's configured defaults.
@@ -508,6 +552,8 @@ export function CreateScheduledTaskDialog({
               ? "Couldn't update the automation."
               : "Couldn't create the automation.",
       );
+    } finally {
+      setSubmitting(false);
     }
   }
 
@@ -604,7 +650,7 @@ export function CreateScheduledTaskDialog({
                 // Match the sibling <Select> fields (Frequency / host): full
                 // width, bordered, h-8, normal foreground text — not the compact
                 // muted ghost styling the composer footer uses.
-                triggerClassName="h-8 w-full justify-between rounded-lg border border-input bg-transparent px-2.5 text-foreground hover:bg-transparent hover:text-foreground dark:bg-input/30"
+                triggerClassName="h-8 w-full justify-between rounded-lg border border-input bg-transparent px-2.5 text-foreground hover:bg-transparent hover:text-foreground dark:bg-input"
                 triggerLabelClassName="max-w-none text-ui"
               />
             </div>
@@ -672,35 +718,109 @@ export function CreateScheduledTaskDialog({
             </p>
           )}
 
+          {sessionModesSupported && (
+            <div className="flex flex-col gap-1.5" data-testid="task-session-mode-field">
+              <Label htmlFor="task-session-mode">Session</Label>
+              <Select
+                value={sessionMode}
+                componentId="tasks.scheduled.session_mode"
+                onValueChange={(v) => setSessionMode(v as ScheduledTaskSessionMode)}
+                onOpenChange={handleSelectOpenChange}
+              >
+                <SelectTrigger
+                  id="task-session-mode"
+                  data-testid="task-session-mode-trigger"
+                  className="w-full"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent position="popper" align="start">
+                  <SelectItem value="new">New session each run</SelectItem>
+                  <SelectItem value="continue" data-testid="task-session-mode-continue">
+                    Continue one session
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="text-sm text-muted-foreground">
+                {sessionMode === "continue"
+                  ? "The first run starts a session, and later runs send their prompt to it so the agent keeps its context, even while an earlier run is still working."
+                  : "Each run starts a new session."}
+              </p>
+              {isEdit && sessionMode === "continue" && editingTask?.sessionId && (
+                <div className="flex items-center gap-2">
+                  <Checkbox
+                    id="task-start-new-session"
+                    checked={startNewSession}
+                    onCheckedChange={(checked) => setStartNewSession(checked === true)}
+                    data-testid="task-start-new-session"
+                    componentId="tasks.scheduled.start_new_session"
+                  />
+                  <label htmlFor="task-start-new-session" className="cursor-pointer text-sm">
+                    Start a new session on the next run
+                  </label>
+                </div>
+              )}
+            </div>
+          )}
+
           {/* Timezone is inferred from the browser (localTimezone via Intl) and
               intentionally has no visible control. It is still sent in the create
               payload so the schedule evaluates in the user's local zone. */}
 
-          {/* Project whose calling defaults apply at each fire. Pre-filled
-              from the surrounding context (or the edited task) until the user
-              changes it; "No project" leaves the master table in charge. */}
-          <div className="flex flex-col gap-1.5" data-testid="task-project-field">
-            <ProjectSinglePicker
-              projects={projectOptions}
-              value={effectiveProjectId || null}
-              onChange={(id) => {
-                setProjectTouched(true);
-                setProjectId(id ?? "");
-              }}
-              label="Project (optional)"
-              testId="task-project-trigger"
-            />
-            <p className="text-sm text-muted-foreground">
-              Runs on this project&apos;s calling defaults for the host; no project uses the master
-              table.
-            </p>
-          </div>
+          {projectsSupported && (
+            <div className="flex flex-col gap-1.5" data-testid="task-project-field">
+              <Label>Project (optional)</Label>
+              <DropdownMenu onOpenChange={handleSelectOpenChange}>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="w-full justify-start gap-2"
+                    data-testid="task-project-trigger"
+                  >
+                    {(projectName !== "" || unresolvedProjectLabel !== null) && (
+                      <ProjectRowIcon icon={projectIcon} />
+                    )}
+                    <span className="flex-1 truncate text-left">
+                      {unresolvedProjectLabel ?? (projectName || "No project")}
+                    </span>
+                    <ChevronDownIcon className="size-4 text-muted-foreground" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="start" className="min-w-56">
+                  {/* The picker's "Remove from" row needs the name; this works without it. */}
+                  {savedProjectUnresolved && !savedProjectDeleted && (
+                    <DropdownMenuItem
+                      className="px-2 py-1"
+                      onSelect={() => {
+                        setProjectChoice("");
+                        setPickedProjectId(null);
+                      }}
+                    >
+                      No project
+                    </DropdownMenuItem>
+                  )}
+                  <ProjectPicker
+                    currentProject={projectName || null}
+                    onSelect={(next) => {
+                      setProjectChoice(next);
+                      setPickedProjectId(projects.find((p) => p.name === next)?.id ?? null);
+                    }}
+                  />
+                </DropdownMenuContent>
+              </DropdownMenu>
+              <p className="text-sm text-muted-foreground">
+                Each run&apos;s session is filed into this project. Type a new name to create one.
+              </p>
+            </div>
+          )}
 
           {/* Host / execution target. When the server offers managed sandboxes,
               a "New Sandbox" entry sits in the same picker (mirroring the New Chat
-              composer): choosing it provisions a FRESH sandbox per fire
-              (execution_target=managed_sandbox, hostless) instead of a connected
-              host. Otherwise the picker is the optional connected-host pin. */}
+              composer): choosing it provisions a FRESH sandbox per fire, or one
+              kept sandbox for a continue task (execution_target=managed_sandbox,
+              hostless), instead of a connected host. Otherwise the picker is the
+              optional connected-host pin. */}
           <div className="flex flex-col gap-1.5" data-testid="task-host-field">
             <Label htmlFor="task-host">Host (optional)</Label>
             <Select
@@ -750,7 +870,9 @@ export function CreateScheduledTaskDialog({
             </Select>
             <p className="text-sm text-muted-foreground">
               {sandboxMode
-                ? "Provisions a fresh sandbox for each run. Shutdown follows the server’s sandbox configuration."
+                ? sessionMode === "continue"
+                  ? "Keeps one sandbox for every run, including a session started after a reset. Shutdown follows the server’s sandbox configuration."
+                  : "Provisions a fresh sandbox for each run. Shutdown follows the server’s sandbox configuration."
                 : "Leave unset to run on your connected host when the automation fires."}
             </p>
             {libraryAgentSelected && (managedSandboxesEnabled || sandboxMode) && (
@@ -833,6 +955,34 @@ export function CreateScheduledTaskDialog({
       </DialogContent>
     </Dialog>
   );
+}
+
+/** Label for a saved project the list can't name yet; `null` once named or deleted. */
+function unresolvedProjectText(
+  unresolved: boolean,
+  deleted: boolean,
+  failed: boolean,
+): string | null {
+  if (!unresolved || deleted) return null;
+  if (failed) return "Project unavailable";
+  return "Loading…";
+}
+
+/**
+ * The project field to send for a pick, and nothing when it is unchanged. An
+ * existing project is sent by the id captured when it was picked; a typed name
+ * is created (or found) first, as moving a session does.
+ */
+async function projectChangeInput(
+  choice: string | null,
+  pickedId: string | null,
+  savedProjectId: string | null,
+  resolveProjectId: (name: string) => Promise<string>,
+): Promise<{ projectId?: string | null }> {
+  if (choice === null) return {};
+  if (choice === "") return savedProjectId !== null ? { projectId: null } : {};
+  if (pickedId !== null) return pickedId === savedProjectId ? {} : { projectId: pickedId };
+  return { projectId: await resolveProjectId(choice) };
 }
 
 /** Sentinel Select value for "no pinned host" — Radix Select disallows "". */

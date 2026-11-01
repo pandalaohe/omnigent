@@ -191,7 +191,7 @@ async def resolve_create_calling_stores(
             return None
         try:
             return agent_store.get(agent_id)
-        except Exception:  # noqa: BLE001
+        except Exception:
             _logger.warning("Agent lookup failed for %s", agent_id, exc_info=True)
             return None
 

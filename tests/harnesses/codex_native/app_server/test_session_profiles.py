@@ -276,6 +276,9 @@ async def test_native_codex_materializes_provider_auth_for_app_server_and_tui(
     assert 'model_provider="omnigent_provider"' in remote_argv
     assert 'approval_policy="never"' in app_server_argv
     assert 'sandbox_mode="danger-full-access"' in app_server_argv
+    # Every override precedes the subcommand, joining a wrapper's top-level -c group.
+    subcommand = app_server_argv.index("app-server")
+    assert all(i < subcommand for i, arg in enumerate(app_server_argv) if arg == "-c")
 
     config_path = codex_home / "config.toml"
     config = tomllib.loads(config_path.read_text(encoding="utf-8"))
@@ -313,13 +316,13 @@ def test_app_server_argv_carries_session_tag_as_config_override() -> None:
     assert argv[tag_index + 1] == needle
     assert argv == [
         "codex",
-        "app-server",
         "-c",
         needle,
-        "--listen",
-        "ws://127.0.0.1:9876",
         "-c",
         'model="probe-model"',
+        "app-server",
+        "--listen",
+        "ws://127.0.0.1:9876",
     ]
 
 

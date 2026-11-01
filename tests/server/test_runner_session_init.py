@@ -140,7 +140,13 @@ def test_permission_init_ack_requires_exact_revision_and_runner_epoch() -> None:
 
 
 @pytest.mark.asyncio
-async def test_initializer_shares_result_for_one_tunnel_generation() -> None:
+async def test_initializer_shares_result_for_one_tunnel_generation(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(
+        "omnigent.server.runner_session_init._read_build_info", lambda: (123.0, "a" * 40)
+    )
+    caplog.set_level(logging.INFO, logger="omnigent.server.runner_session_init")
     registry = _Registry()
     client = _Client()
     initializer = RunnerSessionInitializer(  # type: ignore[arg-type]
@@ -150,10 +156,14 @@ async def test_initializer_shares_result_for_one_tunnel_generation() -> None:
     conversation = _conversation()
 
     assert not initializer.is_initialized(conversation, client)  # type: ignore[arg-type]
-    first = asyncio.create_task(initializer.initialize(conversation, client, timeout=10))  # type: ignore[arg-type]
+    first = asyncio.create_task(
+        initializer.initialize(conversation, client, timeout=10, trigger="web_message")  # type: ignore[arg-type]
+    )
     await client.entered.wait()
     assert not initializer.is_initialized(conversation, client)  # type: ignore[arg-type]
-    second = asyncio.create_task(initializer.initialize(conversation, client, timeout=10))  # type: ignore[arg-type]
+    second = asyncio.create_task(
+        initializer.initialize(conversation, client, timeout=10, trigger="runner_connect")  # type: ignore[arg-type]
+    )
     await asyncio.sleep(0)
     client.release.set()
     first_response, second_response = await asyncio.gather(first, second)
@@ -166,6 +176,35 @@ async def test_initializer_shares_result_for_one_tunnel_generation() -> None:
     cached = await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
     assert cached is first_response
     assert len(client.calls) == 1
+    decisions = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "runner_session_init_decision"
+    ]
+    assert [record.attributes["decision"] for record in decisions] == [
+        "start",
+        "join_in_flight",
+        "reuse_completed",
+    ]
+    assert len({record.attributes["init_attempt_id"] for record in decisions}) == 1
+    assert [record.attributes["init_trigger"] for record in decisions] == [
+        "web_message",
+        "runner_connect",
+        "unspecified",
+    ]
+    for record in decisions:
+        assert record.session_id == conversation.id
+        assert record.attributes["runner_id"] == conversation.runner_id
+        assert record.attributes["runner_generation"] == 1
+        assert record.attributes["server_commit_sha"] == "a" * 40
+    completion = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "runner_session_initialized"
+    )
+    assert completion.attributes["init_attempt_id"] == decisions[0].attributes["init_attempt_id"]
+    assert completion.attributes["duration_ms"] >= 0
+    assert completion.attributes["init_trigger"] == "web_message"
     conversation.inference_snapshot = {"runtime_config": {"providers": {}}}
     assert not initializer.is_initialized(conversation, client)  # type: ignore[arg-type]
     conversation.inference_snapshot = None
@@ -196,7 +235,7 @@ async def test_reconnect_initialization_recovers_a_verified_attempt_without_disp
         runtime_id="runtime",
         host_generation="generation",
     )
-    recovery = AsyncMock(return_value=attempt)
+    recovery = AsyncMock(return_value=(True, attempt))
     initializer = RunnerSessionInitializer(
         registry,
         server_version="0.6.0.dev0",
@@ -207,6 +246,37 @@ async def test_reconnect_initialization_recovers_a_verified_attempt_without_disp
     await initializer.initialize(conversation, client, timeout=10)
     assert client.calls[0]["startup_attempt"] == attempt.model_dump()
     recovery.assert_awaited_once_with(conversation)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_attempt", [False, True])
+async def test_startup_rejection_supports_raise_for_status(missing_attempt):
+    registry, client = _Registry(), _Client()
+    registry.connection.hello = SimpleNamespace(capabilities=[])
+    attempt = StartupAttemptRef(
+        startup_id="a" * 32,
+        attempt_id="b" * 32,
+        input_id=None,
+        runtime_id="runtime",
+        host_generation="generation",
+        mode="startup_only",
+    )
+    initializer = RunnerSessionInitializer(
+        registry,
+        server_version="test",
+        startup_control_resolver=lambda _conversation: (
+            True,
+            None if missing_attempt else attempt,
+        ),
+    )
+    response = await initializer.initialize(_conversation(), client, timeout=2)
+    assert response.status_code == 503
+    assert response.json()["error"] == (
+        "startup_not_admitted" if missing_attempt else "startup_host_update_required"
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        response.raise_for_status()
+    assert client.calls == []
 
 
 @pytest.mark.asyncio
@@ -359,7 +429,10 @@ def test_active_startup_attempt_is_scoped_to_exact_session() -> None:
 
 
 @pytest.mark.asyncio
-async def test_initializer_evicts_rejected_result_for_retry() -> None:
+async def test_initializer_evicts_rejected_result_for_retry(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="omnigent.server.runner_session_init")
     registry = _Registry()
     client = _Client()
     client.release.set()
@@ -376,6 +449,14 @@ async def test_initializer_evicts_rejected_result_for_retry() -> None:
     assert first.status_code == second.status_code == 503
     assert not initializer.is_initialized(conversation, client)  # type: ignore[arg-type]
     assert len(client.calls) == 2
+    failures = [
+        record.attributes
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "runner_session_init_failed"
+    ]
+    assert len(failures) == 2
+    assert len({attrs["init_attempt_id"] for attrs in failures}) == 2
+    assert all(attrs["status_code"] == 503 and attrs["duration_ms"] >= 0 for attrs in failures)
 
 
 @pytest.mark.asyncio
@@ -770,7 +851,17 @@ async def test_init_logs_rejection_retry_and_cached_success_once() -> None:
         client.response_json = {"status": "initialized"}
         await initializer.initialize(conversation, client, timeout=1)  # type: ignore[arg-type]
         await initializer.initialize(conversation, client, timeout=1)  # type: ignore[arg-type]
-    events = [row for row in rows if row["event_name"]]
+    decisions = [row for row in rows if row["event_name"] == "runner_session_init_decision"]
+    assert [row["attributes"]["decision"] for row in decisions] == [
+        "start",
+        "start",
+        "reuse_completed",
+    ]
+    events = [
+        row
+        for row in rows
+        if row["event_name"] and row["event_name"] != "runner_session_init_decision"
+    ]
     assert [row["event_name"] for row in events] == [
         "runner_session_init_started",
         "runner_session_init_failed",
@@ -912,6 +1003,9 @@ async def test_initializer_skips_a_session_whose_agent_was_removed(
     assert client.calls == []
     records = [r for r in caplog.records if r.name == "omnigent.server.runner_session_init"]
     assert [(r.levelname, r.exc_info) for r in records] == [("INFO", None)]
+    assert records[0].event_name == "runner_session_init_decision"
+    assert records[0].attributes["reason"] == "agent_removed"
+    assert records[0].attributes["agent_id"] == conversation.agent_id
 
     present = RunnerSessionInitializer(  # type: ignore[arg-type]
         _Registry(), server_version="test", agent_store=_Agents(conversation.agent_id)

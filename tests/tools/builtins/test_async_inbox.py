@@ -26,6 +26,7 @@ import json
 from typing import Any
 
 import pytest
+from jsonschema import ValidationError, validate
 
 from omnigent.runtime.prompt import SUBAGENT_WAKE_NOTICE_SHAPE
 from omnigent.spec import AgentSpec, BuiltinToolConfig, ExecutorSpec, ToolsConfig
@@ -225,20 +226,18 @@ def test_cancel_async_schema_uses_handle_id(
     cancel_tool: SysCancelAsyncTool,
 ) -> None:
     """
-    Schema declares a single required ``handle_id`` string and
-    rejects extras.
-
-    The parameter rename from ``task_id`` (parent) to ``handle_id``
-    is the one place the schema differs — pin it. A regression
-    that reverted to ``task_id`` would still work (cancel accepts
-    ``task_id`` as a legacy alias), but the LLM's mental model
-    breaks: ``sys_call_async`` returns ``handle_id``, and the
-    cancel parameter must match that vocabulary.
+    Schema accepts the canonical handle and its legacy alias, but no extras.
     """
     schema = cancel_tool.get_schema()["function"]["parameters"]
-    assert schema["required"] == ["handle_id"]
     assert schema["additionalProperties"] is False
-    assert set(schema["properties"].keys()) == {"handle_id"}
+    assert set(schema["properties"].keys()) == {"handle_id", "task_id"}
+    validate({"handle_id": "handle_example"}, schema)
+    validate({"task_id": "handle_example"}, schema)
+    validate({"handle_id": "handle_example", "task_id": "handle_example"}, schema)
+    with pytest.raises(ValidationError):
+        validate({}, schema)
+    with pytest.raises(ValidationError):
+        validate({"handle_id": "handle_example", "unknown": "typo"}, schema)
     handle_desc = schema["properties"]["handle_id"]["description"]
     assert "handle_id" in handle_desc
     assert "task_id field" not in handle_desc

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -386,6 +387,67 @@ async def test_subagent_activity_uses_effective_harness_for_runner_completion(
 
 
 @pytest.mark.asyncio
+async def test_relay_persists_acp_reported_model(db_uri: str) -> None:
+    """An ACP report lands on ``reported_model`` and leaves the user's pinned request alone.
+
+    ``session.model`` is also the first event the relay publishes for the turn.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    sessions_module._runner_relay_tasks.clear()
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation()
+    store.update_conversation(conv.id, harness_override="grok", model_override="claude-opus-5")
+    release = asyncio.Event()
+    fake_runner = _ScriptedRunnerClient(
+        release,
+        [
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_grok_model",
+                    "model": "polly",
+                    "usage": {"model": "grok-4.6"},
+                },
+            }
+        ],
+    )
+
+    collector = None
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            conv.id,
+            "runner_grok_model",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,
+        )
+        assert handle is not None
+        collector = await start_session_stream_collector(conv.id)
+        release.set()
+
+        model_event = await collector.next_event()
+        assert model_event["type"] == "session.model"
+        assert model_event["conversation_id"] == conv.id
+        assert model_event["model"] == "grok-4.6"
+        # Reports and requests are separate roles: the harness's report lands
+        # on ``reported_model`` (the display authority) and must not touch the
+        # user's ``model_override`` request.
+        refreshed = store.get_conversation(conv.id)
+        assert refreshed.reported_model == "grok-4.6"
+        assert refreshed.model_override == "claude-opus-5"
+    finally:
+        release.set()
+        if collector is not None:
+            await collector.stop()
+        handle = sessions_module._runner_relay_tasks.get(conv.id)
+        if handle is not None:
+            await asyncio.wait_for(handle.task, timeout=1.0)
+        sessions_module._runner_relay_tasks.clear()
+        session_stream.close(conv.id)
+
+
+@pytest.mark.asyncio
 async def test_relay_text_flush_publishes_persisted_item(db_uri: str) -> None:
     """
     The relay's text flush publishes the persisted message to live clients.
@@ -535,8 +597,27 @@ def test_context_labels_from_turn_usage_shapes() -> None:
     assert no_model == {"omnigent.last_context_tokens": "42"}
 
 
+@pytest.mark.parametrize("window", [550_000, None, 0, -1, True, "550000"])
+def test_context_labels_prefer_valid_reported_window(
+    monkeypatch: pytest.MonkeyPatch, window: object
+) -> None:
+    from omnigent.server.routes.sessions import _context_labels_from_turn_usage
+
+    monkeypatch.setattr("omnigent.llms.context_window.get_model_context_window", lambda _: 128_000)
+    labels = _context_labels_from_turn_usage(
+        {"context_tokens": 42, "model": "uncatalogued-model", "context_window": window}
+    )
+    assert labels == {
+        "omnigent.last_context_tokens": "42",
+        "omnigent.last_context_window": "550000" if window == 550_000 else "128000",
+    }
+
+
 @pytest.mark.asyncio
-async def test_relay_persists_context_window_labels_for_inprocess_turn(db_uri: str) -> None:
+@pytest.mark.parametrize("reported_window", [None, 550_000])
+async def test_relay_persists_context_window_labels_for_inprocess_turn(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, reported_window: int | None
+) -> None:
     """
     An in-process turn's usage fills the context-window indicator.
 
@@ -549,7 +630,6 @@ async def test_relay_persists_context_window_labels_for_inprocess_turn(db_uri: s
     this, only the claude-native external_session_usage POST wrote those
     labels, leaving a model-unpinned claude-sdk session with no ring.
     """
-    from omnigent.llms.context_window import get_model_context_window
     from omnigent.runtime import session_stream
     from omnigent.server.routes import sessions as sessions_module
 
@@ -558,10 +638,8 @@ async def test_relay_persists_context_window_labels_for_inprocess_turn(db_uri: s
     conv = store.create_conversation()
     session_id = conv.id
 
-    # Denominator is the observed model's catalog window, computed the same way
-    # the relay does (the resolved value varies with catalog availability, so
-    # derive it rather than hard-coding a token count).
-    expected_window = get_model_context_window("claude-sonnet-5")
+    monkeypatch.setattr("omnigent.llms.context_window.get_model_context_window", lambda _: 128_000)
+    expected_window = reported_window or 128_000
 
     response_id = "resp_ctx_ring_1"
     # The observed model (a full id, not a bare alias) is what the SDK reports.
@@ -578,6 +656,7 @@ async def test_relay_persists_context_window_labels_for_inprocess_turn(db_uri: s
                     "total_tokens": 1200,
                     "context_tokens": 45678,
                     "model": "claude-sonnet-5",
+                    **({"context_window": reported_window} if reported_window is not None else {}),
                 },
             },
         },
@@ -1109,9 +1188,12 @@ class _ScriptedThenDropStreamResponse:
         the drop so the collector observes every scripted frame.
     """
 
-    def __init__(self, frames: list[str], gate: asyncio.Event) -> None:
+    def __init__(
+        self, frames: list[str], gate: asyncio.Event, connection: dict[str, object] | None = None
+    ) -> None:
         self._frames = frames
         self._gate = gate
+        self.extensions = {"omnigent_runner_connection": connection}
 
     async def __aenter__(self) -> _ScriptedThenDropStreamResponse:
         return self
@@ -1142,9 +1224,12 @@ class _ScriptedThenDropStreamResponse:
 class _ScriptedThenDropRunnerClient:
     """Fake runner client whose stream replays scripted frames then drops."""
 
-    def __init__(self, frames: list[str], gate: asyncio.Event) -> None:
+    def __init__(
+        self, frames: list[str], gate: asyncio.Event, connection: dict[str, object] | None = None
+    ) -> None:
         self._frames = frames
         self._gate = gate
+        self.extensions = {"omnigent_runner_connection": connection}
 
     def stream(
         self,
@@ -1154,14 +1239,18 @@ class _ScriptedThenDropRunnerClient:
         timeout: Any,
     ) -> _ScriptedThenDropStreamResponse:
         del method, path, timeout
-        return _ScriptedThenDropStreamResponse(self._frames, self._gate)
+        return _ScriptedThenDropStreamResponse(
+            self._frames, self._gate, self.extensions["omnigent_runner_connection"]
+        )
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("intentional", [False, True])
+@pytest.mark.parametrize("bare", [False, True])
 async def test_relay_preserves_failure_reported_during_intentional_teardown(
     monkeypatch: pytest.MonkeyPatch,
     intentional: bool,
+    bare: bool,
 ) -> None:
     """A failure arriving after stop intent keeps its status and durable details."""
     from omnigent.runtime import session_stream
@@ -1182,11 +1271,24 @@ async def test_relay_preserves_failure_reported_during_intentional_teardown(
             "failure_source": "native_terminal_start",
             "exception_type": "RuntimeError",
             "exception_cause_type": "ReadTimeout",
+            "native_launch_code_origin": "omnigent.runner.native.orchestration.launch:42",
             "origin": "forged",
         },
     }
     gate = asyncio.Event()
-    runner = _ScriptedThenDropRunnerClient([f"data: {json.dumps(event)}\n\n"], gate)
+    if bare:
+        event.pop("error")
+        event.pop("failure_context")
+    runner = _ScriptedThenDropRunnerClient(
+        [f"data: {json.dumps(event)}\n\n"],
+        gate,
+        {
+            "runner_id": runner_id,
+            "runner_version": "0.20.0",
+            "connection_id": "conn_old",
+            "generation": 17,
+        },
+    )
     store = _RecordingLabelStore(live_status="running")
     sessions_module._session_status_cache[session_id] = "running"
     collector = None
@@ -1208,19 +1310,29 @@ async def test_relay_preserves_failure_reported_during_intentional_teardown(
         [failure] = [r for r in rows if r["event_name"] == "session_turn_failed"]
         attrs = failure["attributes"]
         assert isinstance(attrs, dict)
-        assert attrs["failure_id"] == "err_synthetic_relay"
-        assert attrs["exception_cause_type"] == "ReadTimeout"
+        if not bare:
+            assert attrs["failure_id"] == "err_synthetic_relay"
+            assert attrs["exception_cause_type"] == "ReadTimeout"
+            assert attrs["native_launch_code_origin"].endswith(".launch:42")
         assert attrs["origin"] == "relayed_runner_status"
+        assert attrs["failure_wire_code"] == ("missing" if bare else "present")
+        assert attrs["failure_wire_message"] == ("missing" if bare else "present")
+        assert attrs["failure_wire_context"] == ("missing" if bare else "present")
+        assert attrs["failure_connection_source"] == "relay_stream"
+        assert attrs["failure_runner_version"] == "0.20.0"
+        assert attrs["failure_connection_id"] == "conn_old"
+        assert attrs["failure_connection_generation"] == "17"
 
         status = await asyncio.wait_for(collector.queue.get(), timeout=_TASK_TIMEOUT_S)
         assert status["type"] == "session.status"
         assert status["status"] == "failed"
-        assert status["error"]["code"] == error["code"]
         assert sessions_module._session_status_cache.get(session_id) == "failed"
-        persisted = sessions_module._last_task_error_from_labels(store.labels[session_id])
-        assert persisted is not None
-        assert persisted["code"] == error["code"]
-        assert persisted["message"] == error["message"]
+        if not bare:
+            assert status["error"]["code"] == error["code"]
+            persisted = sessions_module._last_task_error_from_labels(store.labels[session_id])
+            assert persisted is not None
+            assert persisted["code"] == error["code"]
+            assert persisted["message"] == error["message"]
         assert session_id not in sessions_module._intentional_stop_sessions
     finally:
         gate.set()
@@ -3994,3 +4106,76 @@ def test_runner_disconnect_grace_exceeds_runner_worst_case_reconnect() -> None:
         f"({_MAX_RECONNECT_DELAY_S} * (1 + {_RECONNECT_JITTER_FRACTION}) = "
         f"{worst_case_reconnect_s}s)"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("held", [True, False], ids=["host-offline", "host-online"])
+async def test_relay_leaves_a_turn_on_an_offline_host_to_the_disconnect_hold(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    held: bool,
+) -> None:
+    """
+    A relay that loses a mid-turn runner whose host went offline does not fail it.
+
+    The runner's disconnect task holds that turn until the host returns, so
+    the relay records ``held_host_offline`` and publishes no failure. Otherwise
+    the turn fails as before.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.0,
+    )
+    probed: list[tuple[str, str]] = []
+
+    async def probe(runner_id: str, session_id: str) -> bool:
+        probed.append((runner_id, session_id))
+        return held
+
+    monkeypatch.setattr(orchestration, "_relay_turn_held_for_host", probe)
+    caplog.set_level(logging.INFO)
+    sessions_module._runner_relay_tasks.clear()
+    gate = asyncio.Event()
+    frames = ['data: {"type": "session.status", "status": "running"}\n\n']
+    fake_runner = _ScriptedThenDropRunnerClient(frames, gate)
+    store = _RecordingLabelStore()
+    session_id = "2f3e4d5c6b7a8998a7b6c5d4e3f2a1b0"
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_host_offline",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,  # type: ignore[arg-type]
+        )
+        assert handle is not None
+        gate.set()
+        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+
+        assert probed == [("runner_host_offline", session_id)]
+        record = next(
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "runner_stream_disconnected"
+        )
+        error = sessions_module._last_task_error_from_labels(store.labels.get(session_id, {}))
+        if held:
+            assert record.attributes["decision"] == "held_host_offline"
+            assert sessions_module._session_status_cache.get(session_id) == "running"
+            assert error is None
+        else:
+            assert record.attributes["decision"] == "failed_mid_turn"
+            assert sessions_module._session_status_cache.get(session_id) == "failed"
+    finally:
+        gate.set()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)

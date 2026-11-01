@@ -333,7 +333,7 @@ def _inline_text_file_data(file_data: object) -> str:
         if not mime.startswith("text/"):
             return ""
         return base64.b64decode(b64).decode("utf-8", errors="replace")
-    except Exception:  # noqa: BLE001 — best-effort; never break a turn on a bad URI
+    except Exception:  # noqa: BLE001
         return ""
 
 
@@ -493,6 +493,7 @@ class AcpExecutor(Executor):
         # and the live model value, both learned from ``config_option_update``.
         self._config_option_ids: set[str] = set()
         self._active_model: str | None = None
+        self._model_config_option_id: str | None = None
         self._initial_model: str | None = None
         self._effort_option: _AcpJsonObject | None = None
         self._effort_defaults: dict[str | None, str] = {}
@@ -818,7 +819,7 @@ class AcpExecutor(Executor):
         await self._send({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
         try:
             return await asyncio.wait_for(fut, timeout=timeout)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             self._pending.pop(req_id, None)
             # asyncio.TimeoutError carries no message, so a caller reporting it
             # by str() would surface a blank failure. Name the stalled call.
@@ -1052,7 +1053,8 @@ class AcpExecutor(Executor):
                     if isinstance(model_id, str) and model_id:
                         self._session_model_ids.add(model_id)
         current = models.get("currentModelId")
-        if isinstance(current, str) and current:
+        if isinstance(current, str) and current and self._model_config_option_id is None:
+            # A live config-option notification may precede this legacy snapshot.
             self._active_model = current
             if self._initial_model is None:
                 self._initial_model = current
@@ -1343,7 +1345,7 @@ class AcpExecutor(Executor):
                     "PHASE_TOOL_CALL", {"name": tool_name, "arguments": tool_input}
                 )
                 action = getattr(verdict, "action", None)
-            except Exception as exc:  # noqa: BLE001 — fail open to elicitation
+            except Exception as exc:  # noqa: BLE001
                 logger.warning("acp TOOL_CALL policy eval failed for %s: %s", tool_name, exc)
                 action = None
             if action == "POLICY_ACTION_DENY":
@@ -1752,6 +1754,7 @@ class AcpExecutor(Executor):
         self._config_option_ids = set()
         self._effort_option = None
         model_value: str | None = None
+        model_option: _AcpJsonObject | None = None
         for opt in options:
             if not isinstance(opt, dict):
                 continue
@@ -1761,19 +1764,24 @@ class AcpExecutor(Executor):
             self._config_option_ids.add(opt_id)
             if opt.get("category") == "thought_level" and opt.get("type") == "select":
                 self._effort_option = opt
-            if opt_id == _CONFIG_OPTION_MODEL:
-                current = opt.get("currentValue")
-                if isinstance(current, str) and current:
-                    self._active_model = current
-                    if self._initial_model is None:
-                        self._initial_model = current
-                    model_value = current
-                choices = self._select_choices(opt.get("options"))
-                if choices:
-                    self._model_options = [
-                        {"id": choice["value"], "displayName": choice.get("name", choice["value"])}
-                        for choice in choices
-                    ]
+            if opt_id == _CONFIG_OPTION_MODEL or (
+                model_option is None and opt.get("category") == _CONFIG_OPTION_MODEL
+            ):
+                model_option = opt
+        if model_option is not None:
+            self._model_config_option_id = model_option["id"]
+            current = model_option.get("currentValue")
+            if isinstance(current, str) and current:
+                self._active_model = current
+                if self._initial_model is None:
+                    self._initial_model = current
+                model_value = current
+            choices = self._select_choices(model_option.get("options"))
+            if choices:
+                self._model_options = [
+                    {"id": choice["value"], "displayName": choice.get("name", choice["value"])}
+                    for choice in choices
+                ]
         self._effort_option_model = self._active_model
         current = (self._effort_option or {}).get("currentValue")
         if (
@@ -2016,7 +2024,7 @@ class AcpExecutor(Executor):
             await self._set_model_via_catalog(session_id, model)
             return
         # Before the first config update, the RPC response determines support.
-        if self._config_option_ids and _CONFIG_OPTION_MODEL not in self._config_option_ids:
+        if self._config_option_ids and self._model_config_option_id is None:
             if available:
                 raise _AcpModelSwitchError(
                     f"ACP agent exposes no model option for switching to {model!r}."
@@ -2032,7 +2040,11 @@ class AcpExecutor(Executor):
         response = await self._model_selection_rpc(
             model,
             _AGENT_METHOD_SET_CONFIG_OPTION,
-            {"sessionId": session_id, "configId": _CONFIG_OPTION_MODEL, "value": model},
+            {
+                "sessionId": session_id,
+                "configId": self._model_config_option_id or _CONFIG_OPTION_MODEL,
+                "value": model,
+            },
         )
         if "error" in response:
             if available:
@@ -2120,6 +2132,31 @@ class AcpExecutor(Executor):
             _AGENT_METHOD_SET_MODEL,
         )
 
+    async def _drain_stale_queue(self) -> None:
+        """Drain items queued before the next prompt without losing what they carry.
+
+        Leftover agent requests are answered; a queued ``config_option_update``
+        (agents often report their model right after ``session/new``) is noted
+        rather than lost, so the model it names and its option id are current.
+        """
+        while not self._queue.empty():
+            try:
+                stale = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if not isinstance(stale, dict):
+                continue
+            if stale.get("method") == _CLIENT_NOTIFICATION_SESSION_UPDATE:
+                params = stale.get("params")
+                update = params.get("update") if isinstance(params, dict) else None
+                if (
+                    isinstance(update, dict)
+                    and update.get("sessionUpdate") == _UPDATE_CONFIG_OPTION
+                ):
+                    self._note_config_options(update.get("configOptions"))
+            elif stale.get("id") is not None and stale.get("method"):
+                await self._respond_to_agent_request(stale)
+
     async def run_turn(
         self,
         messages: list[Message],
@@ -2155,8 +2192,10 @@ class AcpExecutor(Executor):
             return
 
         # Apply a ``/model`` pick to the live session before prompting, so the
-        # switch takes effect on this turn with the transcript intact.
+        # switch takes effect on this turn with the transcript intact. Drain first:
+        # a report queued behind ``session/new`` names the option id to target.
         requested_model = config.model if config is not None else None
+        await self._drain_stale_queue()
         try:
             await self._apply_model_override(session_id, requested_model)
         except Exception as exc:  # noqa: BLE001
@@ -2267,14 +2306,8 @@ class AcpExecutor(Executor):
             if not prompt_blocks:
                 prompt_blocks = [{"type": "text", "text": ""}]
 
-        # Drain stale items from a prior turn; answer any leftover server request.
-        while not self._queue.empty():
-            try:
-                stale = self._queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            if isinstance(stale, dict) and stale.get("id") is not None and stale.get("method"):
-                await self._respond_to_agent_request(stale)
+        # Drain stale items from a prior turn, plus anything the switch above queued.
+        await self._drain_stale_queue()
 
         self._rpc_id += 1
         req_id = self._rpc_id
@@ -2326,7 +2359,7 @@ class AcpExecutor(Executor):
                 notification = await asyncio.wait_for(
                     self._queue.get(), timeout=min(remaining, 2.0)
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue
 
             method = notification.get("method", "")
@@ -2364,7 +2397,7 @@ class AcpExecutor(Executor):
                 }
             )
             return True
-        except Exception as exc:  # noqa: BLE001 — interrupt is best-effort
+        except Exception as exc:  # noqa: BLE001
             logger.debug("acp[%s] session/cancel failed: %s", self._config.name, exc)
             return False
 

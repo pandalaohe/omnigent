@@ -14,7 +14,7 @@ import secrets
 import time
 import uuid
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import func, select
@@ -41,11 +41,20 @@ from omnigent.db.utils import (
     make_named_managed_session_maker,
     run_write_transaction,
 )
+from omnigent.server.auth import USAGE_READ_TOKEN_PRINCIPAL
 from omnigent.usage_export.models import AccountHint, thread_key
 from omnigent.usage_export.store import UsageExportError
 
 FEED_HARNESSES = frozenset(
-    {"claude-native", "claude-sdk", "codex-native", "codex-sdk", "pi-native", "pi"}
+    {
+        "claude-native",
+        "claude-sdk",
+        "codex-native",
+        "codex-sdk",
+        "pi-native",
+        "pi",
+        "antigravity-native",
+    }
 )
 ACTIVE_HOLD_STATES = frozenset({"held", "drained", "invalidated"})
 HOLD_STATES = frozenset({"none", "held", "drained", "released", "invalidated", "abandoned"})
@@ -62,7 +71,7 @@ def _now() -> float:
 def _iso(epoch: float | None) -> str | None:
     if epoch is None:
         return None
-    return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.fromtimestamp(epoch, tz=UTC).isoformat().replace("+00:00", "Z")
 
 
 def _epoch(value: str | None) -> float | None:
@@ -1584,6 +1593,7 @@ class UsageCutoverStore:
         consumer_receipt: dict[str, Any],
         cutover_at: str | None,
         rescan: dict[str, Any],
+        config_reader_user: str | None = None,
     ) -> dict[str, Any]:
         canonical_host = _identifier(host_id)
         feed_harness = _harness(harness)
@@ -1663,19 +1673,23 @@ class UsageCutoverStore:
             ):
                 raise UsageExportError(409, "consumer_not_acked")
             grant_id = consumer_receipt.get("usage_read_grant_id")
-            grant = (
-                session.get(SqlDeviceGrant, (workspace_id, grant_id))
-                if isinstance(grant_id, str)
-                else None
-            )
-            if (
-                grant is None
-                or grant.user_id != owner_id
-                or grant.scope != "usage:read"
-                or decode_device_grant_status(grant.status) != "redeemed"
-                or _digest(owner_id, grant.account_generation) != owner_digest
-            ):
-                raise UsageExportError(409, "consumer_not_acked")
+            if grant_id == USAGE_READ_TOKEN_PRINCIPAL:
+                if config_reader_user != owner_id:
+                    raise UsageExportError(409, "consumer_not_acked")
+            else:
+                grant = (
+                    session.get(SqlDeviceGrant, (workspace_id, grant_id))
+                    if isinstance(grant_id, str)
+                    else None
+                )
+                if (
+                    grant is None
+                    or grant.user_id != owner_id
+                    or grant.scope != "usage:read"
+                    or decode_device_grant_status(grant.status) != "redeemed"
+                    or _digest(owner_id, grant.account_generation) != owner_digest
+                ):
+                    raise UsageExportError(409, "consumer_not_acked")
             if last_sequence is not None:
                 positions = json.loads(
                     self.feed_row(session, workspace_id, owner_digest).grant_positions or "{}"

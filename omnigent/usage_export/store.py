@@ -9,7 +9,7 @@ import json
 import secrets
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from pydantic import ValidationError
@@ -265,6 +265,7 @@ class UsageEventStore:
             "claude-sdk",
             "pi-native",
             "pi",
+            "antigravity-native",
         }:
             raise UsageExportError(400, "invalid_producer_binding")
         return result
@@ -322,6 +323,11 @@ class UsageEventStore:
             "claude": ("claude-code/message-id/v1", "claude-code/request-id/v1"),
             "codex": ("codex-responses/response-id/v1",),
             "pi": ("pi/response-id/v1",),
+            "antigravity": (
+                "antigravity/response-id/v1",
+                "antigravity/provider-message-id/v1",
+                "antigravity/message-id/v1",
+            ),
         }[observation.harness_family]
         namespace = next(
             namespace
@@ -414,7 +420,7 @@ class UsageEventStore:
                         if candidate["event_id"] == unit.latest_event_id:
                             return candidate
                     raise UsageExportError(422, "corrupt_usage_feed")
-            recorded_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            recorded_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
             previous_ended_at = None
             if unit is not None:
                 previous = session.get(

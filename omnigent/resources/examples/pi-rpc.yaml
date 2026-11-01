@@ -6,4 +6,9 @@ executor:
   config:
     harness: pi
 spawn: true
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
 instructions: You are a coding assistant. Help the user complete their task.

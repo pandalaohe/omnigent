@@ -8,13 +8,13 @@ import os
 import re
 import stat
 import tempfile
+import tomllib
 from collections.abc import MutableMapping
 from pathlib import Path
 from typing import Literal
 
 import tomlkit
 import tomlkit.exceptions
-import tomllib
 import yaml
 
 from omnigent.config import load_global_config

@@ -29,6 +29,7 @@ class StartupAdmission:
         self._enabled = False
         self._queue_mode = False
         self._recreate_exempt: set[str] = set()
+        self._unrequired: set[str] = set()
         self._control_versions: dict[str, int] = {}
         self._attempts: dict[str, StartupAttemptRef | None] = {}
         self._observations: dict[str, dict[str, StartupObservation]] = {}
@@ -36,6 +37,15 @@ class StartupAdmission:
             if not root_session_id:
                 raise ValueError("Startup attempt requires a bound root session")
             self.register(root_session_id, root_attempt)
+
+    def set_policy(self, enabled: bool) -> None:
+        """Replace process policy from a trusted server initialization snapshot."""
+        if self._enabled == enabled:
+            return
+        for session_id in list(self._control_versions):
+            self.forget(session_id)
+        self._enabled = enabled
+        self._queue_mode = False
 
     def register(
         self,
@@ -50,6 +60,7 @@ class StartupAdmission:
         if required:
             self._control_versions[session_id] = self._control_versions.get(session_id, 0) + 1
             self._recreate_exempt.discard(session_id)
+            self._unrequired.discard(session_id)
             self._enabled = True
             if attempt is not None and attempt.mode == "startup_only":
                 self._queue_mode = True
@@ -58,10 +69,12 @@ class StartupAdmission:
             self._attempts[session_id] = attempt
         else:
             self.forget(session_id)
+            self._unrequired.add(session_id)
 
     def forget(self, session_id: str) -> None:
         self._control_versions[session_id] = self._control_versions.get(session_id, 0) + 1
         self._recreate_exempt.discard(session_id)
+        self._unrequired.discard(session_id)
         self._attempts.pop(session_id, None)
         self.clear_observations(session_id)
 
@@ -127,7 +140,7 @@ class StartupAdmission:
         self._recreate_exempt.discard(session_id)
         version = self._control_versions.get(session_id, 0) + 1
         self._control_versions[session_id] = version
-        if not self._queue_mode:
+        if not self._queue_mode or session_id in self._unrequired:
             return False
         try:
             response = await self._server_client.post(
@@ -147,7 +160,7 @@ class StartupAdmission:
 
     def native_admitter(self, session_id: str) -> Callable[[], Awaitable[None]]:
         async def admit() -> None:
-            if self._enabled:
+            if self._enabled and session_id not in self._unrequired:
                 version = self._control_versions.get(session_id, 0)
                 exempt = await self.refresh_exemption(session_id)
                 if self._control_versions.get(session_id) != version + 1:
@@ -162,6 +175,8 @@ class StartupAdmission:
         return admit
 
     async def admit_harness(self, session_id: str, harness: str) -> None:
+        if not self._enabled or session_id in self._unrequired:
+            return
         version = self._control_versions.get(session_id, 0)
         exempt = await self.refresh_exemption(session_id)
         if self._control_versions.get(session_id) != version + 1:
@@ -216,7 +231,7 @@ class StartupAdmission:
         return settle
 
     async def claim(self, session_id: str, boundary: str) -> None:
-        if not self._enabled:
+        if not self._enabled or session_id in self._unrequired:
             return
         attempt = self._attempts.get(session_id)
         if attempt is None:

@@ -184,6 +184,22 @@ def test_child_summary_cold_after_overrides_the_family_rule() -> None:
     assert archived_summary.warm_state is None
 
 
+def test_agy_child_explains_unsupported_cache_state() -> None:
+    for harness in ("antigravity-native", "antigravity"):
+        for labels in ({}, {"omnigent.keep_warm": '{"s":"w","y":"claude"}'}):
+            summary = _child_session_summary_from_conversation(
+                _child(labels, live_status="running"),
+                "conv_parent",
+                None,
+                harness=harness,
+                cold_after_s=0,
+            )
+            payload = summary.model_dump()
+            assert payload["warm_state"] is None
+            assert payload["warm_state_reason"].startswith("unsupported:")
+            assert "TTL" in payload["warm_state_reason"]
+
+
 def test_child_summary_durable_terminal_precedes_live_status_on_cache_miss() -> None:
     summary = _child_session_summary_from_conversation(
         _child(

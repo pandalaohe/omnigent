@@ -1,7 +1,10 @@
-"""A usage-reader credential is owner-backed and reaches one GET only."""
+"""Usage-reader credentials are owner-backed and reach only two usage GETs."""
 
 from __future__ import annotations
 
+import secrets
+
+import pytest
 from starlette.requests import Request
 
 from omnigent.server.accounts_config import AccountsConfig
@@ -86,3 +89,106 @@ def test_usage_scope_requires_live_owner_grant() -> None:
     provider.set_grant_revocation_check(lambda _: True)
     assert provider.get_user_id(_request(token)) is None
     assert provider.get_user_id(_request(_token(scope="sessions"))) is None
+
+
+@pytest.fixture
+def config_token(monkeypatch: pytest.MonkeyPatch) -> str:
+    token = "fake_usage_" + secrets.token_urlsafe(32)
+    monkeypatch.setenv("OMNIGENT_USAGE_READ_TOKEN", f"owner:{token}")
+    return token
+
+
+def test_config_reader_binds_live_authority_and_never_caches(config_token: str) -> None:
+    from omnigent.db.account_authority import account_authority_scope, account_generation
+
+    provider = _provider()
+    generation = "generation-one"
+    provider.set_usage_read_account_lookup(lambda _: generation)
+    with account_authority_scope(None, None):
+        for path in ("/v1/usage-events", "/v1/usage-cutover/receipts"):
+            request = _request(config_token, path)
+            assert provider.get_user_id(request) == "owner"
+            assert request.state.usage_read_grant_id == "config:usage-read"
+            assert account_generation("owner") == generation
+            generation = "generation-two"
+        provider.set_usage_read_account_lookup(lambda _: None)
+        assert provider.get_user_id(_request(config_token)) is None
+        assert account_generation("owner") is None
+
+
+def test_config_reader_rejects_other_authority(config_token: str) -> None:
+    provider = _provider()
+    assert provider.get_user_id(_request(config_token)) is None  # lookup not wired
+    provider.set_usage_read_account_lookup(lambda _: "generation")
+    for path, method in [
+        ("/v1/usage-events", "POST"),
+        ("/v1/usage-events/child", "GET"),
+        ("/v1/sessions", "GET"),
+        ("/auth/users", "GET"),
+        ("/v1/usage-cutover/holds/host/claude-sdk", "GET"),
+        ("/v1/usage-cutover/receipts", "POST"),
+        ("/health", "GET"),
+        ("/api/version", "GET"),
+        ("/oauth/revoke", "POST"),
+    ]:
+        assert provider.get_user_id(_request(config_token, path, method)) is None
+    assert provider.get_user_id(_request("fake_wrong_" + secrets.token_urlsafe(32))) is None
+    cookie = _request("")
+    cookie.scope["headers"] = [(b"cookie", f"__Host-ap_session={config_token}".encode())]
+    assert provider.get_user_id(cookie) is None
+
+
+@pytest.mark.parametrize("setting", [None, ""])
+def test_config_reader_off(monkeypatch: pytest.MonkeyPatch, setting: str | None) -> None:
+    if setting is None:
+        monkeypatch.delenv("OMNIGENT_USAGE_READ_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("OMNIGENT_USAGE_READ_TOKEN", setting)
+    provider = _provider()
+    assert provider.usage_read_token_user is None
+    assert provider.get_user_id(_request("fake_usage_" + secrets.token_urlsafe(32))) is None
+
+
+@pytest.mark.parametrize("malformed", ["missing", "account", "short", "jwt", "colon"])
+def test_config_reader_bad_config_never_echoed(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, malformed: str
+) -> None:
+    token = "fake_usage_" + secrets.token_urlsafe(32)
+    account = "private-owner"
+    value = {
+        "missing": token,
+        "account": f"PrivateOwner:{token}",
+        "short": f"{account}:" + "x" * 31,
+        "jwt": f"{account}:{token}.jwt",
+        "colon": f"{account}:{token}:extra",
+    }[malformed]
+    monkeypatch.setenv("OMNIGENT_USAGE_READ_TOKEN", value)
+    with pytest.raises(ValueError) as error:
+        _provider()
+    assert str(error.value) == "Invalid OMNIGENT_USAGE_READ_TOKEN"
+    for part in value.split(":"):
+        assert part not in str(error.value) + caplog.text
+
+
+@pytest.mark.parametrize("source", ["header", "oidc"])
+def test_config_reader_ignored_outside_accounts(
+    config_token: str, caplog: pytest.LogCaptureFixture, source: str
+) -> None:
+    provider = UnifiedAuthProvider(source=source, local_single_user=False)
+    assert provider.usage_read_token_user is None
+    assert provider.get_user_id(_request(config_token)) is None
+    assert "OMNIGENT_USAGE_READ_TOKEN" in caplog.text
+    assert "ignored" in caplog.text
+    assert config_token not in caplog.text
+
+
+def test_config_reader_logs_only_validated_account(
+    config_token: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("INFO", logger="omnigent.server.auth"):
+        provider = _provider()
+        assert provider.usage_read_token_user == "owner"
+        provider.get_user_id(_request(config_token))
+        provider.get_user_id(_request(config_token, "/v1/sessions"))
+    assert "usage read token enabled for owner" in caplog.text
+    assert config_token not in caplog.text

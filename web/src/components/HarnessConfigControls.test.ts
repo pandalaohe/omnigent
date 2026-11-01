@@ -3,6 +3,43 @@ import { describe, expect, it } from "vitest";
 // module that holds them. HarnessConfigControls re-points to this branch's
 // advertised-name form while the composer redesign is deferred.
 import { defaultModelLabel, nativeModelLabel } from "@/lib/composerModelLabel";
+import {
+  CLAUDE_NATIVE_EFFORTS,
+  PI_NATIVE_EFFORTS,
+  nativeEffortOptions,
+} from "./HarnessConfigControls";
+
+describe("nativeEffortOptions", () => {
+  const codexCatalog = [
+    {
+      id: "gpt-5.5",
+      isDefault: true,
+      supportedReasoningEfforts: [{ reasoningEffort: "medium" }, { reasoningEffort: "xhigh" }],
+    },
+    { id: "gpt-mini", supportedReasoningEfforts: [{ reasoningEffort: "low" }] },
+  ];
+
+  it("returns the fixed Claude Code and Pi ladders", () => {
+    expect(nativeEffortOptions("claude-native", [], null)).toBe(CLAUDE_NATIVE_EFFORTS);
+    expect(nativeEffortOptions("pi-native", [], "any")).toBe(PI_NATIVE_EFFORTS);
+  });
+
+  it("reads Codex levels from the pinned model, else the catalog default", () => {
+    expect(nativeEffortOptions("codex-native", codexCatalog, "gpt-mini")).toEqual([
+      { value: "low", label: "Low" },
+    ]);
+    expect(nativeEffortOptions("codex-native", codexCatalog, "")).toEqual([
+      { value: "medium", label: "Medium" },
+      { value: "xhigh", label: "xHigh" },
+    ]);
+    expect(nativeEffortOptions("codex-native", [], null)).toEqual([]);
+  });
+
+  it("returns null for harnesses without a create-time effort", () => {
+    expect(nativeEffortOptions("cursor-native", codexCatalog, null)).toBeNull();
+    expect(nativeEffortOptions(null, [], null)).toBeNull();
+  });
+});
 
 describe("nativeModelLabel", () => {
   it.each([

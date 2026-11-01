@@ -26,7 +26,7 @@ import time
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -458,7 +458,7 @@ class SystemStatusHub:
             if usage.total <= 0:
                 return 0.0
             return float(usage.used) / float(usage.total) * 100.0
-        except Exception:  # noqa: BLE001 — a missing volume must not fail a tick
+        except Exception:
             _logger.debug("system status could not read disk usage", exc_info=True)
             return 0.0
 
@@ -1154,7 +1154,7 @@ class SystemStatusHub:
         if since is not None:
             entry.level_since = since
         elif old != level:
-            entry.level_since = datetime.fromtimestamp(now, timezone.utc).isoformat()
+            entry.level_since = datetime.fromtimestamp(now, UTC).isoformat()
         if old == level:
             return
         machine = (entry.last_snapshot or {}).get("machine", {})
@@ -1650,7 +1650,7 @@ def _name_cell(name: str) -> str:
 
 
 def _format_utc(t: float) -> str:
-    return datetime.fromtimestamp(t, tz=timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+    return datetime.fromtimestamp(t, tz=UTC).strftime("%Y-%m-%dT%H:%MZ")
 
 
 def _format_age(seconds: float) -> str:

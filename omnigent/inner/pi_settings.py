@@ -166,6 +166,8 @@ _PI_AGENT_RESOURCE_FILES = (
     "SYSTEM.md",
     "APPEND_SYSTEM.md",
     "mcp.json",
+    "mcp-auth.json",
+    "keybindings.json",
 )
 _PI_SEED_MANIFEST = ".omnigent-resource-seeds.json"
 
@@ -197,7 +199,7 @@ def _resource_path(value: str, agent_root: Path) -> str:
     """Keep SDK-independent paths intact; anchor local paths at their original root."""
     if value.startswith(("npm:", "git:", "github:", "http:", "https:", "ssh:", "builtin:")):
         return value
-    return os.path.join(agent_root, _normalize_pi_path(value))
+    return os.path.normpath(os.path.join(agent_root, _normalize_pi_path(value)))
 
 
 def _relocate_resource_settings(settings: _Settings, agent_root: Path, managed_dir: Path) -> None:
@@ -259,11 +261,11 @@ def default_pi_thinking_level(cwd: str | None, model_selection: str | None = Non
 
 def _read_settings_file(path: Path) -> _Settings:
     """Load a Pi ``settings.json`` file, returning ``{}`` when absent/invalid."""
-    if not path.is_file():
-        return {}
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
         _logger.warning("Ignoring unreadable Pi settings at %s: %s", path, exc)
         return {}
     return cast(_Settings, raw) if isinstance(raw, dict) else {}
@@ -297,10 +299,7 @@ def _seed_agent_resources(
             target.symlink_to(source, target_is_directory=True)
         except OSError as exc:
             _logger.warning(
-                "Could not symlink Pi agent resource %s -> %s: %s",
-                target,
-                source,
-                exc,
+                "Could not symlink Pi agent resource %s -> %s: %s", target, source, exc
             )
 
     manifest_path = managed_dir / _PI_SEED_MANIFEST
@@ -382,6 +381,8 @@ def prepare_managed_pi_agent_dir(
         else (os.environ.get("PI_CODING_AGENT_DIR") or str(DEFAULT_PI_AGENT_DIR))
     )
     agent_root = Path(os.path.abspath(_normalize_pi_path(source)))
+    if managed_dir.resolve() == agent_root.resolve():
+        return
     settings = _read_settings_file(agent_root / "settings.json")
     _relocate_resource_settings(settings, agent_root, managed_dir.absolute())
     if overlay:
@@ -390,6 +391,8 @@ def prepare_managed_pi_agent_dir(
     managed_dir.mkdir(parents=True, exist_ok=True)
     settings_path = managed_dir / "settings.json"
     try:
+        if settings_path.is_symlink():
+            settings_path.unlink()
         settings_path.write_text(
             json.dumps(settings, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",

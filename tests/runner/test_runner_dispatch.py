@@ -2082,13 +2082,31 @@ def test_build_spawn_env_applies_model_override(
         executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
     )
 
-    base = _build_spawn_env_from_spec(spec, "claude-sdk")
-    overridden = _build_spawn_env_from_spec(spec, "claude-sdk", model_override="claude-sonnet-4-6")
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+
+    registry = SessionResourceRegistry()
+    registry.set_client_surface("desktop-session", "desktop")
+    base = _build_spawn_env_from_spec(
+        spec, "claude-sdk", session_id="desktop-session", resource_registry=registry
+    )
+    overridden = _build_spawn_env_from_spec(
+        spec,
+        "claude-sdk",
+        model_override="claude-sonnet-4-6",
+        session_id="desktop-session",
+        resource_registry=registry,
+    )
     assert base is not None and overridden is not None
     # Baseline uses the provider/catalog default (not the override) …
     assert base["HARNESS_CLAUDE_SDK_MODEL"] != "claude-sonnet-4-6"
     # … and the override wins, landing in the model env var the SDK reads.
     assert overridden["HARNESS_CLAUDE_SDK_MODEL"] == "claude-sonnet-4-6"
+    assert base["OMNIGENT_CLIENT_SURFACE"] == overridden["OMNIGENT_CLIENT_SURFACE"] == "desktop"
+    unknown = _build_spawn_env_from_spec(
+        spec, "claude-sdk", session_id="legacy-session", resource_registry=registry
+    )
+    assert unknown is not None
+    assert unknown["OMNIGENT_CLIENT_SURFACE"] == "unknown"
 
 
 def test_build_spawn_env_routes_hermes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4979,17 +4997,15 @@ async def _dispatch_model_send(
         pytest.param(
             "claude-native",
             "claude-sonnet-4-6",
-            "databricks-claude-sonnet-4-6",
+            "system.ai.claude-sonnet-4-6",
             id="canonical-claude-localized",
         ),
-        pytest.param(
-            "codex-native", "gpt-5-4", "databricks-gpt-5-4", id="canonical-gpt-localized"
-        ),
+        pytest.param("codex-native", "gpt-5-4", "system.ai.gpt-5-4", id="canonical-gpt-localized"),
         pytest.param(
             "claude-native",
             "databricks-claude-sonnet-4-6",
-            "databricks-claude-sonnet-4-6",
-            id="already-local-unchanged",
+            "system.ai.claude-sonnet-4-6",
+            id="legacy-local-canonicalized",
         ),
         pytest.param(
             "claude-native",
@@ -5011,9 +5027,9 @@ async def test_sys_session_send_localizes_canonical_model_for_gateway_child(
 
     With a Databricks default provider, a bare canonical vendor id
     (``claude-sonnet-4-6``) would die at the gateway ("model not
-    found"); the gate must persist the ``databricks-``-prefixed
-    spelling as ``model_override`` — and ONLY for mechanical ids:
-    already-local and vendor-prefixed shapes pass through verbatim.
+    found"); the gate must persist the Unity Catalog ``system.ai.`` spelling
+    as ``model_override`` — and ONLY for mechanical ids: legacy-local ids
+    canonicalize and vendor-prefixed shapes pass through.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Per-test temp dir for the isolated provider config.
@@ -8411,6 +8427,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
                             "status": "running",
                             "runner_id": "r1",
                             "parent_session_id": None,
+                            "labels": {"omnigent.created_by_session_id": "conv_x"},
                         },
                         {
                             "id": "s2",
@@ -8461,6 +8478,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
             "last_message_preview": None,
             "archived": None,
             "archived_at": None,
+            "created_by_session_id": "conv_x",
         },
         {
             "session_id": "s2",
@@ -8477,6 +8495,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
             "last_message_preview": None,
             "archived": None,
             "archived_at": None,
+            "created_by_session_id": None,
         },
     ]
     # Connectivity resolved once per UNIQUE runner — two sessions share
@@ -9557,7 +9576,8 @@ async def test_sys_session_get_info_defaults_to_caller_session() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sys_session_get_info_passes_keep_warm_state_through() -> None:
+@pytest.mark.parametrize("unsupported", [False, True])
+async def test_sys_session_get_info_passes_keep_warm_state_through(unsupported: bool) -> None:
     """warm_state / keep_warm / archive_reason ride the snapshot projection."""
     from omnigent.runner.tool_dispatch import execute_tool
 
@@ -9573,7 +9593,8 @@ async def test_sys_session_get_info_passes_keep_warm_state_through() -> None:
                     "updated_at": 42,
                     "runner_id": None,
                     "pending_elicitations": [],
-                    "warm_state": "cold",
+                    "warm_state": None if unsupported else "cold",
+                    "warm_state_reason": "unsupported: no cache TTL" if unsupported else None,
                     "keep_warm": {
                         "state": "stopped",
                         "stop_reason": "cap",
@@ -9604,7 +9625,8 @@ async def test_sys_session_get_info_passes_keep_warm_state_through() -> None:
         )
 
     info = json.loads(output)
-    assert info["warm_state"] == "cold"
+    assert info["warm_state"] == (None if unsupported else "cold")
+    assert info["warm_state_reason"] == ("unsupported: no cache TTL" if unsupported else None)
     assert info["keep_warm"]["state"] == "stopped"
     assert info["keep_warm"]["stop_reason"] == "cap"
     assert info["keep_warm"]["episode"]["cost_usd"] == 0.04
@@ -16567,9 +16589,15 @@ async def test_failed_turn_event_names_the_web_message_it_carried() -> None:
 
 
 @pytest.mark.asyncio
-async def test_turn_lifecycle_events_name_the_web_message_they_settle() -> None:
+@pytest.mark.parametrize("with_client_id", [False, True])
+async def test_turn_lifecycle_events_name_the_web_message_they_settle(
+    with_client_id: bool,
+) -> None:
     conv = "conv_stable_id_on_lifecycle"
     stable_id = "8a4b0d2f6c3e5a7b9d1f2e3c4b5a6d7e"
+    identity = {"pending_id": "pending_" + "a" * 32, "delivery_attempt_id": "b" * 32}
+    if with_client_id:
+        identity["input_stable_id"] = stable_id
 
     async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         del agent_id, session_id
@@ -16602,7 +16630,7 @@ async def test_turn_lifecycle_events_name_the_web_message_they_settle() -> None:
                 "agent_id": "ag_stable",
                 "model": "x",
                 "content": [{"role": "user", "content": "hi"}],
-                "stable_id": stable_id,
+                **identity,
             },
         )
         assert response.status_code == 200
@@ -16611,12 +16639,12 @@ async def test_turn_lifecycle_events_name_the_web_message_they_settle() -> None:
             "event: response.in_progress",
             "event: response.completed",
         ]
-        assert [
-            json.loads(next(line[5:] for line in frame.splitlines() if line.startswith("data:")))[
-                "input_stable_id"
-            ]
-            for frame in direct_frames
-        ] == [stable_id, stable_id]
+        for frame in direct_frames:
+            event = json.loads(
+                next(line[5:] for line in frame.splitlines() if line.startswith("data:"))
+            )
+            assert {key: event.get(key) for key in identity} == identity
+            assert ("input_stable_id" in event) is with_client_id
         events = await _drain_turn_events(
             app.state.session_event_queues,
             conv,
@@ -16629,7 +16657,10 @@ async def test_turn_lifecycle_events_name_the_web_message_they_settle() -> None:
         for event in events
         if event.get("type") in {"response.in_progress", "response.completed"}
     ]
-    assert [event["input_stable_id"] for event in lifecycle] == [stable_id, stable_id]
+    assert len(lifecycle) == 2
+    for event in lifecycle:
+        assert {key: event.get(key) for key in identity} == identity
+        assert ("input_stable_id" in event) is with_client_id
 
 
 @pytest.mark.asyncio

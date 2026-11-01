@@ -100,7 +100,7 @@ def write_owner_entry(*, pid: int, conversation_id: str, kind: OwnerKind) -> Non
                     "entries": kept,
                 },
             )
-    except Exception:  # noqa: BLE001 — the monitor must not break a spawn
+    except Exception:
         _logger.debug("owner-file write failed", exc_info=True)
 
 
@@ -115,7 +115,7 @@ def read_owner_entries(data_dir: Path) -> dict[int, OwnerEntry]:
     """
     try:
         return _read_owner_records(data_dir)
-    except Exception:  # noqa: BLE001 — the monitor must not fail its caller
+    except Exception:
         _logger.debug("owner-file read failed", exc_info=True)
         return {}
 

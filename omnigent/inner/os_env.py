@@ -45,6 +45,7 @@ from .credential_proxy import (
 from .datamodel import CredentialProxySpec, OSEnvSpec
 from .git_ssh import GitSshBroker, apply_git_ssh_env, start_git_ssh_broker
 from .sandbox import (
+    HOST_SANDBOX_BACKEND_ENV,
     ContainmentHandle,
     SandboxPolicy,
     activate_sandbox,
@@ -256,6 +257,7 @@ def build_helper_env(
     # but strip again so a spec author can't re-admit one by naming it
     # in ``sandbox.env_passthrough``.
     env.pop(SHARED_ENVIRONMENT_VAR, None)
+    env.pop(HOST_SANDBOX_BACKEND_ENV, None)
     return strip_runner_auth_secrets(env)
 
 
@@ -1865,6 +1867,7 @@ def _shell_impl(
             cwd=str(cwd),
             env=env,
             text=True,
+            errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             **_proc.spawn_kwargs(),
@@ -1896,6 +1899,9 @@ def _shell_impl(
     except OSError as exc:
         return {"error": f"Failed to run shell command: {exc}"}
 
+    # Windows reader threads can leave a stream unset when reading fails.
+    stdout = stdout or ""
+    stderr = stderr or ""
     detail = stderr.strip() or stdout.strip()
     stdout = _truncate_output(stdout, "stdout", max_output)
     stderr = _truncate_output(stderr, "stderr", max_output)

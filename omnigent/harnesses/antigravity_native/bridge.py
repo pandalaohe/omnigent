@@ -14,7 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -192,9 +192,8 @@ class AntigravityNativeBridgeState:
         There is intentionally no durable read cursor. The retired transcript
         forwarder persisted a ``forwarded_steps`` set (+ a ``forwarded_step_index``
         mirror) so a tail (re)start did not re-mirror the whole JSONL. The RPC read
-        driver that superseded it (:mod:`omnigent.harnesses.antigravity_native.reader`) keeps
-        an *in-memory* seen-set only and is recreated per session by the runner, so
-        no on-disk cursor is needed. Legacy ``forwarded_step_index`` /
+        driver uses an in-memory seen-set within a run and stable item source ids
+        for server-side deduplication across restarts. Legacy ``forwarded_step_index`` /
         ``forwarded_steps`` keys in an on-disk ``state.json`` are tolerated and
         ignored on read.
 
@@ -274,10 +273,12 @@ def prune_orphaned_bridge_dirs() -> int:
     Remove antigravity-native bridge dirs whose owner process is provably dead
     and whose newest file is at least 70 days old.
 
-    Delegates to the shared sweep against this harness's bridge root; the
-    global maintenance calls it (via ``native_bridge_common.reap_orphaned_native_bridge_dirs``)
-    at startup to reclaim dirs leaked by a prior runner that died without
-    running the explicit delete path.
+    agy keeps the session's conversation store inside the bridge dir (see
+    :func:`agy_gemini_dir`), and a runner restart is a normal resume boundary,
+    so owner death alone cannot imply that the bridge is disposable. Keep the
+    whole bridge for 70 days after its newest file activity, then remove it intact.
+    Explicit session deletion remains immediate. Global maintenance calls this via
+    ``native_bridge_common.reap_orphaned_native_bridge_dirs`` at startup.
 
     :returns: The number of orphaned bridge dirs removed.
     """
@@ -384,6 +385,7 @@ _AGY_ENABLED_TOOLS = [
     "sys_session_get_startup_observation_v1",
     "sys_session_handover",
     "sys_session_list",
+    "sys_session_message",
     "sys_session_open",
     "sys_session_rename",
     "sys_session_send",
@@ -397,6 +399,7 @@ _AGY_ENABLED_TOOLS = [
     "sys_terminal_send",
     "sys_timer_cancel",
     "sys_timer_set",
+    "ui_open_file",
     "update_comment",
 ]
 
@@ -996,7 +999,9 @@ _AGY_FEEDBACK_SURVEY_SETTING = "showFeedbackSurvey"
 _AGY_MODEL_PROVIDER_SETTING = "modelProvider"
 
 
-def ensure_agy_feedback_survey_disabled(home: Path) -> None:
+def ensure_agy_feedback_survey_disabled(
+    home: Path, *, launch_env: dict[str, str] | None = None
+) -> None:
     """
     Disable agy's feedback survey in the launch HOME's ``settings.json``.
 
@@ -1018,6 +1023,7 @@ def ensure_agy_feedback_survey_disabled(home: Path) -> None:
     :param home: The HOME agy launches under (the per-session isolated home, or
         the real home when the harness runs agy under it). Settings live at
         ``<home>/.gemini/antigravity-cli/settings.json``.
+    :param launch_env: Resolved child environment; None uses the current process.
     :returns: None.
     """
     # resolve() follows a symlinked settings.json (e.g. a dotfiles-managed file) to
@@ -1068,7 +1074,8 @@ def ensure_agy_feedback_survey_disabled(home: Path) -> None:
             return
         data = loaded
     desired: dict[str, object] = {_AGY_FEEDBACK_SURVEY_SETTING: False}
-    if (os.environ.get("GEMINI_API_KEY") or "").strip():
+    environment = os.environ if launch_env is None else launch_env
+    if (environment.get("GEMINI_API_KEY") or "").strip():
         desired[_AGY_MODEL_PROVIDER_SETTING] = "gemini"
     provider_removed = False
     current_provider = data.get(_AGY_MODEL_PROVIDER_SETTING)
@@ -1766,6 +1773,7 @@ def _submit_and_verify(
     tail_needle: str = "",
     baseline_region: str = "",
     draft_seen: bool = False,
+    before_submit: Callable[[], None] | None = None,
 ) -> None:
     """
     Press Enter to submit the pasted draft, verifying by composer state.
@@ -1797,14 +1805,20 @@ def _submit_and_verify(
         raise RuntimeError(
             "the agy terminal exited before the message could be submitted; restart the session"
         )
+
+    def submit() -> None:
+        if before_submit is not None:
+            before_submit()
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+
     # Mid-turn steer: a turn is already running, so verifying via draft
     # disappearance is unreliable and a re-sent Enter could queue an empty turn.
     # Deliver one best-effort Enter and return (see the docstring).
     if _agy_turn_running(_capture_pane(socket_path, tmux_target)):
-        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+        submit()
         return
     if not draft_seen:
-        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+        submit()
         return
     last_pane = _capture_pane(socket_path, tmux_target)
     for _ in range(_MAX_SUBMIT_ATTEMPTS):
@@ -1817,7 +1831,7 @@ def _submit_and_verify(
                 "the agy terminal exited before the message could be submitted; "
                 "restart the session"
             )
-        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+        submit()
         deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
         while time.monotonic() < deadline:
             if not _session_alive(socket_path, tmux_target):
@@ -1927,6 +1941,7 @@ def _paste_and_submit(
     tmux_target: str,
     *,
     content: str,
+    before_submit: Callable[[], None] | None = None,
 ) -> None:
     """
     Clear the composer, paste *content* through a tmux buffer, and submit it.
@@ -2024,6 +2039,7 @@ def _paste_and_submit(
         tail_needle=tail_needle,
         baseline_region=baseline_region,
         draft_seen=draft_seen,
+        before_submit=before_submit,
     )
 
 
@@ -2187,6 +2203,7 @@ def inject_user_message_via_tui(
     *,
     content: str,
     timeout_s: float = _TMUX_READY_TIMEOUT_S,
+    before_submit: Callable[[], None] | None = None,
 ) -> None:
     """
     Deliver a user message into the agy TUI via a tmux bracketed paste + Enter.
@@ -2217,6 +2234,8 @@ def inject_user_message_via_tui(
         (``tmux.json`` advertised, then the input box mounted) so the worst case
         is one ``timeout_s``, not two stacked. Does NOT cover the
         account-verification re-delivery budget.
+    :param before_submit: Persist a delivery fence immediately before Enter.
+        A failure before this callback has not submitted the input.
     :returns: None.
     :raises RuntimeError: When the tmux target is never advertised, the agy TUI
         has exited, a tmux command fails, the submit never starts a turn, or agy
@@ -2254,7 +2273,13 @@ def inject_user_message_via_tui(
             _logger.warning("Could not record TUI delivery receipt", exc_info=True)
             receipt = None
         try:
-            _paste_and_submit(bridge_dir, socket_path, tmux_target, content=content)
+            _paste_and_submit(
+                bridge_dir,
+                socket_path,
+                tmux_target,
+                content=content,
+                before_submit=before_submit,
+            )
             rejected = _account_verification_rejected(socket_path, tmux_target)
         except BaseException:
             if receipt is not None:

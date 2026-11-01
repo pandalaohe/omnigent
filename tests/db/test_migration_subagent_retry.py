@@ -38,7 +38,7 @@ _MIGRATION = "omnigent.db.migrations.versions.a51c20261029_add_subagent_retry_jo
 def test_upgrade_is_additive_and_matches_registered_metadata(db_uri):
     engine = get_or_create_engine(db_uri)
     config = _build_alembic_config(db_uri)
-    command.downgrade(config, "a50c20261027")
+    command.downgrade(config, "f3c914a721ab")
     before = set(sa.inspect(engine).get_table_names())
     users = sa.Table("users", sa.MetaData(), autoload_with=engine)
     with engine.begin() as connection:
@@ -100,7 +100,7 @@ def test_downgrade_refuses_any_retained_journal_table(db_uri, model):
         count = connection.scalar(sa.select(sa.func.count()).select_from(model))
         assert count > 0
     with pytest.raises(RuntimeError, match="retain its additive schema"):
-        command.downgrade(config, "a50c20261027")
+        command.downgrade(config, "f3c914a721ab")
     assert {entry.__tablename__ for entry in _MODELS} <= set(sa.inspect(engine).get_table_names())
     with engine.connect() as connection:
         assert connection.scalar(sa.select(sa.func.count()).select_from(model)) == count

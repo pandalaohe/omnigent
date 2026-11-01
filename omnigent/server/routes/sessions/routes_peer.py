@@ -44,6 +44,7 @@ from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import pending_elicitations
 from omnigent.sdk_peer_delivery import (
     CLAUDE_SDK_PEER_CAPABILITY,
+    PI_RPC_PEER_CAPABILITY,
     SDK_PEER_CAPABILITY,
     SDKPeerInput,
     sdk_attempt,
@@ -109,11 +110,15 @@ PEER_HOLD_LIFETIME = 24 * 3600
 # an identical resend is still a duplicate while the earlier copy sits here.
 _PEER_UNDELIVERED_STATES = ("pending", "queued", "held", "delivering")
 
-_STEERABLE_NATIVE_HARNESSES = frozenset({"claude-native", "codex-native", "pi-native"})
+_STEERABLE_NATIVE_HARNESSES = frozenset(
+    {"claude-native", "codex-native", "pi-native", "antigravity-native"}
+)
 
 # A dispatched child runs its own terminal turn, so a peer message reaches it;
 # native mirrors and SDK children without a result key remain refused.
-_PEER_REACHABLE_NATIVE_HARNESSES = frozenset({"claude-native", "codex-native", "pi-native"})
+_PEER_REACHABLE_NATIVE_HARNESSES = frozenset(
+    {"claude-native", "codex-native", "pi-native", "antigravity-native"}
+)
 
 _PEER_INBOUND_LABEL = "peer_inbound"
 _PEER_INBOUND_HOLD = "hold"
@@ -431,7 +436,11 @@ def _is_steerable_harness(conv: Conversation) -> bool:
 
 def _needs_native_peer_receipt(conv: Conversation) -> bool:
     try:
-        return _native_terminal_runtime(conv)[2] in {"codex-native", "pi-native"}
+        return _native_terminal_runtime(conv)[2] in {
+            "codex-native",
+            "pi-native",
+            "antigravity-native",
+        }
     except OmnigentError:
         return False
 
@@ -439,8 +448,8 @@ def _needs_native_peer_receipt(conv: Conversation) -> bool:
 def _peer_reachable_child(conv: Conversation) -> bool:
     """Whether a child session may receive peer messages.
 
-    A dispatched Claude Code / Codex / Pi child runs its own terminal turn on the
-    envelope. Native mirrors route input through their parent's runtime, and
+    A dispatched Claude Code / Codex / Pi / Antigravity child runs its own terminal
+    turn on the envelope. Native mirrors route input through their parent's runtime, and
     SDK / other harnesses have no result key, so both stay refused. A read
     error refuses rather than admitting an unreachable child.
 
@@ -1037,11 +1046,13 @@ def register_peer_routes(
             harness = _resolve_harness(conv, agent_store=agent_store)
         except Exception:
             return False
-        if harness not in ("codex", "claude-sdk"):
+        if harness not in ("codex", "claude-sdk", "pi"):
             return False
         has_capability = getattr(runner_router, "runner_has_capability", None)
         if has_capability is None or not has_capability(conv.runner_id, SDK_PEER_CAPABILITY):
             return False
+        if harness == "pi":
+            return has_capability(conv.runner_id, PI_RPC_PEER_CAPABILITY)
         return harness != "claude-sdk" or has_capability(
             conv.runner_id, CLAUDE_SDK_PEER_CAPABILITY
         )
@@ -1078,6 +1089,11 @@ def register_peer_routes(
         Busy is re-read once more after any await above: a turn can start
         concurrently while this coroutine is probing readiness.
         """
+        launches = getattr(app_state, "managed_launches", None)
+        if conv.runner_id is None and launches is not None and launches.get(conv.id) is not None:
+            # Keep durable peer admission asynchronous while provisioning;
+            # ordinary events would wait for the launch to finish.
+            return "not_ready", False
         liveness = _liveness(conv.id)
         runner_online = liveness.runner_online if liveness is not None else None
         host_online = liveness.host_online if liveness is not None else None
@@ -1222,6 +1238,8 @@ def register_peer_routes(
                 return "rejected", f"init_failed: {exc.message}"
             if exc.code == ErrorCode.RUNNER_UNAVAILABLE:
                 return "failed", "offline"
+            if exc.code in {ErrorCode.FORBIDDEN, ErrorCode.UNAUTHORIZED, ErrorCode.INVALID_INPUT}:
+                return "rejected", f"authorization_refused:{exc.message}"
             _logger.warning(
                 "Peer delivery uncertain: %s",
                 exc.message,
@@ -1235,6 +1253,8 @@ def register_peer_routes(
                 extra={"session_id": receiver.id},
             )
             return "uncertain", "not_ready"
+        if isinstance(delivery, dict) and delivery.get("denied") is True:
+            return "rejected", f"policy_denied:{delivery.get('reason') or 'Denied'}"
         if isinstance(delivery, dict) and delivery.get("forwarded") is False:
             return "rejected", "not_forwarded"
         if (
@@ -1475,8 +1495,14 @@ def register_peer_routes(
                 "ref": body.correlation_id or "",
                 "receiver": _receiver_summary(receiver, runner_online=None),
             }
-        if receiver.parent_conversation_id is not None and not await asyncio.to_thread(
-            _peer_reachable_child, receiver
+        sdk_pi_child = (
+            receiver.kind == "sub_agent"
+            and not is_parent_owned_subagent(receiver)
+            and _sdk_capable(receiver)
+            and _resolve_harness(receiver, agent_store=agent_store) == "pi"
+        )
+        if receiver.parent_conversation_id is not None and not (
+            sdk_pi_child or await asyncio.to_thread(_peer_reachable_child, receiver)
         ):
             return {
                 "disposition": "refused",
@@ -1813,7 +1839,11 @@ def register_peer_routes(
                 response = await _queued_response_for_record(record, runner_online)
                 response["reason"] = "uncertain"
                 return response
-            if sdk_identity is not None and result_state in ("failed", "rejected"):
+            if (
+                sdk_identity is not None
+                and result_state in ("failed", "rejected")
+                and not (reason or "").startswith(("policy_denied:", "authorization_refused:"))
+            ):
                 await asyncio.to_thread(
                     peer_message_store.transition,
                     record.id,

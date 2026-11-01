@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC
 from pathlib import Path
 
 import httpx
@@ -243,7 +244,7 @@ async def _skewed_offset(client: object, base: str) -> int:
 def test_drain_records_each_domain_precondition(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
 
     import omnigent.usage_export.cli as usage_cli
     from omnigent.usage_export.runtime import outbox
@@ -252,7 +253,7 @@ def test_drain_records_each_domain_precondition(
     monkeypatch.setattr(usage_cli, "_local_host_id", lambda: _HOST)
     if failure != "capture_off":
         outbox().mark_capture("session", "codex-native")
-    hold_time = (datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat()
+    hold_time = (datetime.now(UTC) + timedelta(seconds=5)).isoformat()
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/usage-cutover/holds":

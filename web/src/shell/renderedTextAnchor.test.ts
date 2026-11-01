@@ -45,6 +45,22 @@ describe("rendered text anchors", () => {
   });
 
   it("rejects malformed typed data and excess payloads", () => {
+    for (const contentHash of ["invalid", "0:0", 42, null]) {
+      expect(
+        decodeRenderedTextAnchor(
+          "__text__" +
+            JSON.stringify({
+              v: 1,
+              kind: "markdown",
+              text: "Code",
+              occ: 0,
+              prefix: "",
+              suffix: "",
+              source: { start_index: 0, end_index: 4, contentHash },
+            }),
+        ),
+      ).toBeNull();
+    }
     expect(
       decodeRenderedTextAnchor(
         '__text__{"v":1,"kind":"html","text":"Code","occ":-1,"prefix":"","suffix":""}',

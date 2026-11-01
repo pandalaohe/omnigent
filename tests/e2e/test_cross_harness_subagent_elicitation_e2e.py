@@ -373,7 +373,7 @@ def test_codex_parent_claude_child_cannot_ask_the_user_directly(
     tmp_path: Path,
 ) -> None:
     """A Claude child runs without AskUserQuestion and mirrors no card to the parent."""
-    client, workspace, runner_id, mock_url = cross_harness_rig
+    client, _workspace, runner_id, mock_url = cross_harness_rig
     name = f"cross-harness-parent-{uuid.uuid4().hex[:8]}"
     parent = {
         "spec_version": 1,
@@ -388,7 +388,7 @@ def test_codex_parent_claude_child_cannot_ask_the_user_directly(
         "async": True,
         "os_env": {
             "type": "caller_process",
-            "cwd": str(workspace),
+            "cwd": ".",
             "sandbox": {"type": "none"},
         },
         "tools": {"agents": ["claude_code"]},

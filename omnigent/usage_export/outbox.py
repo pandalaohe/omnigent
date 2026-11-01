@@ -19,6 +19,7 @@ from filelock import FileLock, Timeout
 
 from omnigent.usage_export.models import UsageObservation
 from omnigent.usage_export.transcripts import (
+    antigravity_measurement,
     claude_measurement,
     claude_physical_identity,
     codex_measurement,
@@ -244,8 +245,12 @@ class UsageOutbox:
         source_position: tuple[str, int] | None = None,
     ) -> None:
         """Associate only explicit terminal records with their physical turn."""
-        if harness in {"pi-native", "pi"}:
-            measurement = pi_measurement(record)
+        if harness in {"pi-native", "pi", "antigravity-native"}:
+            measurement = (
+                antigravity_measurement(record)
+                if harness == "antigravity-native"
+                else pi_measurement(record)
+            )
             if measurement is None:
                 return
             if harness == "pi-native":

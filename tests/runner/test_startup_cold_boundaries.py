@@ -127,7 +127,7 @@ def _attempt() -> StartupAttemptRef:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["new", "same", "forget", "refresh"])
+@pytest.mark.parametrize("change", ["new", "same", "forget", "refresh", "policy_off"])
 async def test_late_exemption_cannot_cross_a_new_control_registration(change):
     entered, release = asyncio.Event(), asyncio.Event()
 
@@ -145,6 +145,8 @@ async def test_late_exemption_cannot_cross_a_new_control_registration(change):
         await entered.wait()
         if change == "forget":
             admission.forget("root")
+        elif change == "policy_off":
+            admission.set_policy(False)
         elif change == "refresh":
             newer = asyncio.create_task(admission.refresh_exemption("root"))
             await asyncio.sleep(0)
@@ -500,6 +502,111 @@ async def test_session_init_registers_missing_required_ref_before_initialization
         with pytest.raises(RuntimeError, match="Startup permission unavailable"):
             await admission.admit_harness("child", "codex")
     assert response.status_code == 501
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_policy", [False, True])
+async def test_initialization_replaces_policy_only_with_explicit_snapshot(explicit_policy):
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        base_url="http://server.test", transport=httpx.MockTransport(respond)
+    ) as server:
+        app = create_runner_app(
+            server_client=server,
+            root_startup_session_id="root",
+            root_startup_attempt=_attempt().model_copy(update={"mode": "startup_only"}),
+        )
+        admission = app.state.startup_admission
+        admission.register("child", None)
+        async with _runner_client(app) as runner:
+            response = await runner.post(
+                "/v1/sessions",
+                json={
+                    "session_id": "root",
+                    **({"startup_policy_enabled": False} if explicit_policy else {}),
+                },
+            )
+        assert response.status_code == 501
+        if not explicit_policy:
+            for session in ("root", "child"):
+                assert admission.required(session)
+                assert admission.suppress_initialization_recovery(session)
+            with pytest.raises(RuntimeError, match="startup_proof_unavailable"):
+                await admission.native_admitter("unregistered-child")()
+            assert len(requests) == 1
+            assert requests[0].url.path.endswith("/startup/recreate-exemption")
+            return
+        for session in ("root", "child", "new-child"):
+            assert not admission.required(session)
+            assert not admission.suppress_initialization_recovery(session)
+            await admission.native_admitter(session)()
+            await admission.admit_harness(session, "acp")
+    assert requests == []
+
+
+@pytest.mark.asyncio
+async def test_pre_queue_initialization_exempts_only_its_session():
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        base_url="http://server.test", transport=httpx.MockTransport(respond)
+    ) as server:
+        app = create_runner_app(
+            server_client=server,
+            root_startup_session_id="root",
+            root_startup_attempt=_attempt().model_copy(update={"mode": "startup_only"}),
+        )
+        admission = app.state.startup_admission
+        async with _runner_client(app) as runner:
+            response = await runner.post(
+                "/v1/sessions",
+                json={"session_id": "legacy", "startup_policy_enabled": True},
+            )
+        assert response.status_code == 501
+        await admission.native_admitter("legacy")()
+        await admission.admit_harness("legacy", "acp")
+        assert requests == []
+        assert admission.required("root")
+        with pytest.raises(RuntimeError, match="startup_proof_unavailable"):
+            await admission.native_admitter("unregistered-child")()
+
+
+@pytest.mark.asyncio
+async def test_queue_reenable_retires_old_exemptions_and_requires_fresh_control():
+    async with httpx.AsyncClient(
+        base_url="http://server.test",
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={})),
+    ) as server:
+        app = create_runner_app(server_client=server)
+        async with _runner_client(app) as runner:
+            await runner.post("/v1/sessions", json={"session_id": "legacy"})
+            admission = app.state.startup_admission
+            await admission.native_admitter("legacy")()
+            await runner.post(
+                "/v1/sessions",
+                json={
+                    "session_id": "new",
+                    "startup_policy_enabled": True,
+                    "startup_required": True,
+                },
+            )
+            for session in ("legacy", "new", "unregistered"):
+                with pytest.raises(RuntimeError, match="startup_proof_unavailable"):
+                    await admission.native_admitter(session)()
+            await runner.post(
+                "/v1/sessions",
+                json={"session_id": "legacy", "startup_policy_enabled": True},
+            )
+            await admission.native_admitter("legacy")()
 
 
 @pytest.mark.asyncio

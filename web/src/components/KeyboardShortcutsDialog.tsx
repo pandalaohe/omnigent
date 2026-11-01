@@ -85,6 +85,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { label: "Find a session by name", keys: [], actionId: "findSession" },
       { label: "Open Settings", keys: [], actionId: "openSettings" },
       { label: "Show keyboard shortcuts", keys: [], actionId: "showShortcuts" },
+      { label: "Rename current session", keys: [], actionId: "renameSession" },
     ],
   },
   {
@@ -97,6 +98,9 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { label: "Focus chat input", keys: [], actionId: "focusComposer" },
       { label: "Toggle voice dictation", keys: [], actionId: "voiceDictation" },
       { label: "Stop response", keys: [], actionId: "stopResponse" },
+      { label: "Cycle model", keys: [], actionId: "cycleModel" },
+      { label: "Cycle reasoning effort", keys: [], actionId: "cycleEffort" },
+      { label: "Cycle permission mode (in session)", keys: [], actionId: "cyclePermissionMode" },
     ],
   },
   {
@@ -121,6 +125,14 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       },
       { label: "Open a new browser tab", keys: [], actionId: "newBrowserTab" },
       { label: "Open a new shell", keys: [], actionId: "newShell" },
+    ],
+  },
+  {
+    title: "Panes",
+    note: "in grids and split terminals",
+    items: [
+      { label: "Focus previous pane", keys: [], actionId: "previousPane" },
+      { label: "Focus next pane", keys: [], actionId: "nextPane" },
     ],
   },
   {
@@ -173,8 +185,10 @@ function shortcutGroupsFor(
   submitWithModEnter: boolean,
   preventsKeyboardSubmit: boolean,
   contentSearch: boolean,
+  grids: boolean,
+  splitTerminal: boolean,
 ): ShortcutGroup[] {
-  return SHORTCUT_GROUPS.map((group) => {
+  const groups = SHORTCUT_GROUPS.map((group) => {
     if (group.title === "In chats" && !preventsKeyboardSubmit) {
       return {
         ...group,
@@ -261,8 +275,27 @@ function shortcutGroupsFor(
           ),
       };
     }
+    if (group.title === "Panes") {
+      return {
+        ...group,
+        items: [
+          ...(grids || splitTerminal ? group.items : []),
+          ...(splitTerminal
+            ? [
+                {
+                  label: "Split terminal right",
+                  keys: [],
+                  actionId: "splitTerminalColumns" as const,
+                },
+                { label: "Split terminal down", keys: [], actionId: "splitTerminalRows" as const },
+              ]
+            : []),
+        ],
+      };
+    }
     return group;
   });
+  return groups.filter((group) => group.items.length > 0);
 }
 
 /**
@@ -288,10 +321,12 @@ export function KeyboardShortcutsList({
     readSubmitWithModEnter(),
     preventsKeyboardSubmit,
     !isMobileViewport && isFeatureEnabled(serverInfo, "workspace_content_search"),
+    !isMobileViewport && isFeatureEnabled(serverInfo, "grid_sessions_display_ui"),
+    !isMobileViewport && isFeatureEnabled(serverInfo, "splittable_terminal_view_ui"),
   );
   const settings = variant === "settings";
   return (
-    <div className={settings ? "flex flex-col gap-6" : undefined}>
+    <div className={settings ? "flex flex-col gap-10" : undefined}>
       {groups.map((group) => (
         <section key={group.title} className={settings ? "" : "mb-4 last:mb-0"}>
           <h3

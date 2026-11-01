@@ -39,8 +39,10 @@ from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from omnigent.telemetry.surface import CLIENT_SURFACE_LABEL_KEY
 from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient
 from tests.runner.helpers import NullServerClient
+from tests.server.helpers import create_test_agent
 
 
 @pytest_asyncio.fixture()
@@ -74,6 +76,43 @@ def _harness_bundle(harness: str) -> bytes:
 
 
 # ── GET /v1/sessions (list) ─────────────────────────────────────────
+
+
+async def test_creating_client_surface_survives_create_child_and_fork(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    client.headers["X-Omnigent-Client"] = "desktop"
+    agent = await create_test_agent(client, name="client-surface")
+    source = store.get_conversation(agent["_session_id"])
+    assert source is not None
+    assert source.labels[CLIENT_SURFACE_LABEL_KEY] == "desktop"
+
+    response = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert response.status_code == 201, response.text
+    source_id = response.json()["id"]
+    source = store.get_conversation(source_id)
+    assert source is not None
+    assert source.labels[CLIENT_SURFACE_LABEL_KEY] == "desktop"
+
+    # A backend spawn's HTTP transport must not turn its desktop parent into CLI traffic.
+    del client.headers["X-Omnigent-Client"]
+    child = await client.post(
+        "/v1/sessions", json={"agent_id": agent["id"], "parent_session_id": source_id}
+    )
+    assert child.status_code == 201, child.text
+    child_row = store.get_conversation(child.json()["id"])
+    assert child_row is not None
+    assert child_row.labels[CLIENT_SURFACE_LABEL_KEY] == "desktop"
+
+    fork = await client.post(
+        f"/v1/sessions/{source_id}/fork", json={}, headers={"X-Omnigent-Client": "web"}
+    )
+    assert fork.status_code == 201, fork.text
+    fork_row = store.get_conversation(fork.json()["id"])
+    assert fork_row is not None
+    assert fork_row.labels[CLIENT_SURFACE_LABEL_KEY] == "web"
 
 
 async def test_list_sessions_empty(client: httpx.AsyncClient) -> None:
@@ -165,6 +204,32 @@ async def test_list_sessions_keep_warm_state_uses_harness_family(
     rows = {row["id"]: row for row in resp.json()["data"]}
     assert rows[supported.id]["warm_state"] == "cold"
     assert rows[unsupported.id].get("warm_state") is None
+
+
+@pytest.mark.parametrize("harness", ["antigravity-native", "antigravity"])
+@pytest.mark.parametrize("stamped", [False, True])
+async def test_agy_cache_state_is_unsupported_on_list_and_detail(
+    client: httpx.AsyncClient, db_uri: str, tmp_path: Path, harness: str, stamped: bool
+) -> None:
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    agent_id = generate_agent_id()
+    location = f"{agent_id}/bundle"
+    artifacts.put(location, _harness_bundle(harness))
+    agent_store.create(agent_id, name="agy-agent", bundle_location=location)
+    conv = conv_store.create_conversation(agent_id=agent_id)
+    if stamped:
+        conv_store.set_labels(conv.id, {"omnigent.keep_warm": '{"s":"w","y":"claude"}'})
+    listed = await client.get("/v1/sessions")
+    detail = await client.get(f"/v1/sessions/{conv.id}")
+    assert listed.status_code == detail.status_code == 200
+    row = next(row for row in listed.json()["data"] if row["id"] == conv.id)
+    for payload in (row, detail.json()):
+        assert payload.get("warm_state") is None
+        assert payload["warm_state_reason"].startswith("unsupported:")
+        assert "TTL" in payload["warm_state_reason"]
+        assert "Cumulative cache hits" in payload["warm_state_reason"]
 
 
 @pytest.mark.parametrize("harness", ["claude-native", "codex-native"])

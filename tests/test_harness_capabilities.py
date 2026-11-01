@@ -388,6 +388,21 @@ def test_every_canonical_harness_declares_instruction_delivery() -> None:
 def test_pi_native_uses_agent_startup_instructions() -> None:
     caps = harness_capabilities()
     assert caps["pi-native"].instruction_delivery is InstructionDelivery.AGENT_STARTUP_ADDITIVE
+    assert caps["hermes"].instruction_delivery is InstructionDelivery.FIRST_USER_PREFIX
+    assert caps["hermes-native"].instruction_delivery is InstructionDelivery.FIRST_USER_PREFIX
+
+
+def test_native_startup_additive_instruction_delivery() -> None:
+    for harness in ("claude-native", "codex-native", "pi-native"):
+        assert (
+            harness_capabilities()[harness].instruction_delivery
+            is InstructionDelivery.AGENT_STARTUP_ADDITIVE
+        )
+
+
+def test_kiro_native_uses_first_user_prefix() -> None:
+    caps = harness_capabilities()
+    assert caps["kiro-native"].instruction_delivery is InstructionDelivery.FIRST_USER_PREFIX
 
 
 def test_sdk_harnesses_only_advertise_effort_their_executor_applies() -> None:

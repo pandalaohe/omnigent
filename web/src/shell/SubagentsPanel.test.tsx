@@ -11,13 +11,15 @@ import {
   ScanSearchIcon,
   SearchIcon,
 } from "lucide-react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
 import { shortenPath } from "./subagentRailGroups";
+import { writeOpenSubagentsInPanel } from "@/lib/subagentPanelPreferences";
+import { SubagentPanelOpenerContext } from "./subagentPanelOpener";
 import { iconForAgentType, SubagentsPanel } from "./SubagentsPanel";
 
 const { stopSessionMutate, stopSessionState, hostsState, pastState } = vi.hoisted(() => {
@@ -218,7 +220,14 @@ beforeEach(() => {
   });
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  localStorage.clear();
+});
+
+function CurrentPath() {
+  return <output data-testid="current-path">{useLocation().pathname}</output>;
+}
 
 describe("SubagentsPanel", () => {
   it("loads each child's own session snapshot only when its actions are requested", () => {
@@ -672,6 +681,33 @@ describe("SubagentsPanel", () => {
     renderPanel({ rootSessionId: "conv_root" });
 
     expect(screen.queryByTestId("stop-subagent")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    [true, "/c/conv_parent"],
+    [false, "/c/conv_child_a"],
+  ])("with the panel setting %s, a child-row click lands on %s", (enabled, pathname) => {
+    writeOpenSubagentsInPanel(enabled);
+    mockChildTree({ conv_parent: [childInfo({ id: "conv_child_a", title: "researcher:auth" })] });
+    const opener = vi.fn(() => true);
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter initialEntries={["/c/conv_parent"]}>
+          <TooltipProvider>
+            <SubagentPanelOpenerContext.Provider value={opener}>
+              <SubagentsPanel conversationId="conv_parent" rootSessionId="conv_parent" />
+            </SubagentPanelOpenerContext.Provider>
+            <CurrentPath />
+          </TooltipProvider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(screen.getByTestId("subagent-row"));
+
+    expect(screen.getByTestId("current-path")).toHaveTextContent(pathname);
+    if (enabled) expect(opener).toHaveBeenCalledWith("conv_child_a");
+    else expect(opener).not.toHaveBeenCalled();
   });
 
   it("uses spawned task titles as the primary child-row labels", () => {

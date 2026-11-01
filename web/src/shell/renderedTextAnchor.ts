@@ -8,7 +8,7 @@ export interface RenderedTextAnchor {
   prefix: string;
   suffix: string;
   selector?: string;
-  source?: { start_index: number; end_index: number };
+  source?: { start_index: number; end_index: number; contentHash?: string };
 }
 
 const utf8 = new TextEncoder();
@@ -71,6 +71,9 @@ export function decodeRenderedTextAnchor(
           typeof a.source !== "object" ||
           !index((a.source as Record<string, unknown>).start_index) ||
           !index((a.source as Record<string, unknown>).end_index) ||
+          ((a.source as Record<string, unknown>).contentHash !== undefined &&
+            (typeof (a.source as Record<string, unknown>).contentHash !== "string" ||
+              !/^[\da-f]+:[\da-f]{16}$/.test((a.source as { contentHash: string }).contentHash))) ||
           (a.source as { start_index: number; end_index: number }).end_index <=
             (a.source as { start_index: number; end_index: number }).start_index))
     )

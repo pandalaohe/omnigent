@@ -241,7 +241,10 @@ async def test_claude_sdk_question_is_recorded_with_its_full_prompt(
 
     adapter = ExecutorAdapter(executor_factory=lambda: None)  # type: ignore[arg-type]
     question = "Which framework? " + "context " * 100
-    params = adapter._permission_card("AskUserQuestion", {"questions": [{"question": question}]})
+    params = adapter._permission_card(
+        "AskUserQuestion",
+        {"questions": [{"question": question, "options": [{"label": "React"}]}]},
+    )
     session_id = await _session(client)
     session_stream.publish(
         session_id,

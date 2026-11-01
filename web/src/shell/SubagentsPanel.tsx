@@ -91,6 +91,7 @@ import { AddAgentDialog } from "./AddAgentDialog";
 import { ReconcileSubagentsButton } from "./ReconcileSubagentsButton";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
 import { useForkDialog } from "./ForkDialogContext";
+import { useOpenSubagentInPanel } from "./subagentPanelOpener";
 
 const SubagentsGraphView = lazy(() =>
   import("./SubagentsGraphView").then((m) => ({ default: m.SubagentsGraphView })),
@@ -1053,6 +1054,7 @@ function SubagentRow({
   const colorPreferences = useHostColorPreferences();
   const hostEntry = hostColor(child.host_id, hostName, colorPreferences);
   const isActive = conversationId === child.id;
+  const openInPanel = useOpenSubagentInPanel();
   // De-emphasize settled rows (done/idle) so working/failed agents dominate
   // — but never the row the user is currently viewing.
   const dim = !isActive && SETTLED_STATE[status.activity];
@@ -1126,6 +1128,9 @@ function SubagentRow({
               to={{ pathname: `/c/${child.id}`, search }}
               data-testid="subagent-row"
               data-child-session-id={child.id}
+              onClick={(event) => {
+                openInPanel(child.id, event);
+              }}
               data-depth={depth}
               style={{
                 paddingLeft: rowPaddingLeft(depth),

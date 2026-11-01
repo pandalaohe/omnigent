@@ -63,6 +63,7 @@ import type { ImageContentBlock, MessageContentBlock } from "@/lib/blocks";
 import {
   attachmentLabel,
   ELICITATION_RESPONSE_PREFIX,
+  hasPendingOwnElicitation,
   imagePreview,
   isTextBlock,
 } from "@/lib/blocks";
@@ -82,6 +83,7 @@ import { CONVERSATION_RESUME_SCROLL_EVENT } from "@/components/ai-elements/conve
 import { isSessionScopedDecision, showsRoutingDecisionChip } from "@/lib/routingDecision";
 import { useWorkingLabelTick } from "@/hooks/useWorkingLabelTick";
 import { useForkDialog } from "@/shell/ForkDialogContext";
+import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { InlineImage, SessionImage } from "@/components/SessionImage";
 import { buildMessageDeepLink } from "@/lib/messageDeepLink";
@@ -89,6 +91,7 @@ import { copyText } from "@/lib/clipboard";
 import { copyMarkdown } from "@/lib/copyMarkdown";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useFoldAssistantNarration } from "@/lib/foldNarrationPreferences";
 import type { SessionStatus } from "@/lib/types";
 import {
   TRANSCRIPT_SCROLLBAR_DRAG_EVENT,
@@ -420,15 +423,27 @@ function useAgentTurnActive(): boolean {
  * The label shown next to the working shimmer. When the agent is parked on a
  * dialog (`blockedOn`) it says so; otherwise it rotates through
  * `WORKING_MESSAGES` by wall-clock `tick`.
+ *
+ * @param options.answerableInChat - A pending chat card can answer the block.
+ * @param options.terminalView - The Chat/Terminal toggle reaches the agent's terminal.
  */
-export function workingIndicatorLabel(tick = 0, blockedOn: string | null = null): string {
+export function workingIndicatorLabel(
+  tick = 0,
+  blockedOn: string | null = null,
+  { answerableInChat = false, terminalView = false } = {},
+): string {
   if (blockedOn) {
     // A "dialog open" block lives only in the terminal tab, so point the user
     // there to respond rather than leaving the session looking hung.
     if (blockedOn === "dialog open") {
       return "Waiting on a dialog in the terminal. Open the terminal tab to respond.";
     }
-    return `Blocked on: ${blockedOn}`;
+    if (answerableInChat) return `Blocked on: ${blockedOn}`;
+    const waiting =
+      blockedOn === "permission prompt"
+        ? "Waiting for your approval in the agent's terminal."
+        : `Waiting for you in the agent's terminal (${blockedOn}).`;
+    return terminalView ? `${waiting} Open the Terminal view to respond.` : waiting;
   }
   return WORKING_MESSAGES[tick % WORKING_MESSAGES.length]!;
 }
@@ -438,9 +453,16 @@ export function WorkingIndicator() {
   const scopedState = useConversationEntryState(scopedConversationId);
   const rootBgCount = useChatStore((s) => s.backgroundTaskCount);
   const rootBlockedOn = useChatStore((s) => s.blockedOn);
+  const rootHasOwnPendingElicitation = useChatStore((s) =>
+    hasPendingOwnElicitation(s.blocks, s.conversationId),
+  );
   const rootAgentWorking = useAgentTurnActive();
+  const terminalFirst = useTerminalFirst();
   const bgCount = scopedConversationId ? scopedState.backgroundTaskCount : rootBgCount;
   const blockedOn = scopedConversationId ? scopedState.blockedOn : rootBlockedOn;
+  const hasOwnPendingElicitation = scopedConversationId
+    ? hasPendingOwnElicitation(scopedState.blocks, scopedConversationId)
+    : rootHasOwnPendingElicitation;
   const agentWorking = scopedConversationId
     ? computeIsTurnActive(scopedState.sessionStatus, scopedState.status === "streaming")
     : rootAgentWorking;
@@ -449,15 +471,17 @@ export function WorkingIndicator() {
   // the state and the shimmer stays off (it would misread as the agent still
   // thinking). While the turn is active the shimmer shows, with the pill beside it.
   if (isBackgroundTasksOnly(bgCount, blockedOn, agentWorking)) return null;
-  const label = workingIndicatorLabel(tick, blockedOn);
+  const label = workingIndicatorLabel(tick, blockedOn, {
+    answerableInChat: hasOwnPendingElicitation,
+    // The toggle switches to the root session's terminal, not a side chat's.
+    terminalView: !scopedConversationId && (terminalFirst?.isTerminalFirst ?? false),
+  });
   return (
     <>
-      {/* Sole aria-live region for the working state. A stable "Working…" (not
-          the rotating label) so screen readers announce the turn once, without
-          re-announcing every few seconds; the visible shimmer below stays
-          aria-hidden. */}
+      {/* Sole aria-live region: a stable "Working…" or block reason, so the rotating
+          label isn't re-announced. The visible shimmer below stays aria-hidden. */}
       <span role="status" aria-live="polite" className="sr-only">
-        Working…
+        {blockedOn ? label : "Working…"}
       </span>
       <Message from="assistant" data-testid="working-indicator" aria-hidden="true">
         <MessageContent>
@@ -1063,6 +1087,7 @@ function AssistantBubble({
   );
   const { isLinkCopied, handleCopyLink } = useCopyMessageLink(bubble.responseId);
   const flashing = useChatStore((s) => s.flashItemId === bubble.responseId);
+  const foldNarration = useFoldAssistantNarration();
   // null outside AppShell's provider (isolated tests) → hide the action.
   const forkDialog = useForkDialog();
   const queryClient = useContext(QueryClientContext);
@@ -1127,6 +1152,7 @@ function AssistantBubble({
     hasPendingElicitation,
     showsWorking,
     defaultExpanded: bubble.defaultExpanded,
+    foldNarration,
   });
 
   // Elicitation cards want full chat-column width to match the composer.
@@ -1141,22 +1167,29 @@ function AssistantBubble({
   // A bubble carrying an error but no prose stands alone as a thread-level
   // element — the hover footer belongs to assistant text, not to the error.
   const errorOnly = hasError && !markdownText;
+  // A bubble whose items are all errors (e.g. an undelivered-message notice) is a
+  // thread-level card, not an assistant reply, so it takes the "error" role; a
+  // failed turn that still produced tool or reasoning output keeps the assistant role.
+  const errorNotice = hasError && bubble.items.every((it) => it.kind === "error");
   const spansFullColumn = isWide || hasError;
+  const hasSubagentNotice = bubble.items.some((it) => it.kind === "subagent_activity");
+  // Shrink-wrapped to a short reply, tool rows would cut their titles off mid-column.
+  const hasToolRows = bubble.items.some((it) => it.kind === "tool" || it.kind === "native_tool");
 
   return (
     <>
       <Message
         from="assistant"
         data-testid="message-bubble"
-        data-role="assistant"
+        data-role={errorNotice ? "error" : "assistant"}
         data-response-stable-id={bubble.stableId}
         data-message-id={bubble.responseId}
         className={spansFullColumn ? "max-w-full" : "max-w-[var(--chat-prose-width)]"}
       >
-        {/* Fold-only rows fill the prose width so their hairlines remain visible. */}
+        {/* Fold-only rows and notices fill the prose width so their hairlines stay visible. */}
         <MessageContent
           className={cn(
-            (spansFullColumn || foldOnly) && "w-full",
+            (spansFullColumn || foldOnly || hasSubagentNotice || hasToolRows) && "w-full",
             flashing && "animate-message-highlight rounded-lg",
           )}
         >
@@ -1171,6 +1204,7 @@ function AssistantBubble({
             lastActivityAtS={bubble.lastActivityAtS}
             showsWorking={showsWorking}
             defaultExpanded={bubble.defaultExpanded}
+            foldNarration={foldNarration}
             onRetryError={readOnly || recoveryDisabled ? undefined : handleRetryError}
           />
         </MessageContent>
@@ -1807,7 +1841,7 @@ export function LatestTurnSpacer({
   // Bounded rAF retries for capturing the anchor when committed blocks exist but
   // their rows haven't mounted yet (windowed transcript, published a frame
   // before the virtualizer fills its window). A resize we could observe isn't
-  // guaranteed — the wrapper height is fixed to the estimate — so we drive the
+  // guaranteed — the wrapper's height tracks the estimate — so we drive the
   // retry ourselves rather than wait for one. When the budget runs out (e.g. a
   // tool-only trailing turn that never has an anchor) capture settles to `null`.
   const captureFrameRef = useRef(0);
@@ -2189,7 +2223,7 @@ export function JumpToTopButton({
       <Button
         type="button"
         variant="outline"
-        size="sm"
+        size="icon-sm"
         disabled={jumping}
         onClick={() => void jumpToTop()}
         aria-label="Jump to the first message"
@@ -2198,7 +2232,7 @@ export function JumpToTopButton({
         tabIndex={visible ? 0 : -1}
         aria-hidden={!visible}
         className={cn(
-          "h-7 gap-1.5 rounded-full px-3 text-sm shadow-sm",
+          "size-7 rounded-full p-0 shadow-sm",
           // Force an OPAQUE background in both themes and on hover, so the faded
           // chat text behind the pill doesn't bleed through.
           "bg-background hover:bg-background hover:brightness-95",
@@ -2211,7 +2245,6 @@ export function JumpToTopButton({
         ) : (
           <ArrowUpIcon className="size-3.5" aria-hidden />
         )}
-        {jumping ? "Loading history…" : "Jump to top"}
       </Button>
     </div>
   );

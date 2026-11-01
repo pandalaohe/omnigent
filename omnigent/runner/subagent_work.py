@@ -1607,7 +1607,7 @@ async def run_subagent_launch_reaper(
                 await reconcile_pending()
             if check_remote_members is not None:
                 await check_remote_members()
-        except Exception:  # noqa: BLE001 — the sweep is a backstop; never die.
+        except Exception:
             _logger.warning("sub-agent launch reaper sweep failed", exc_info=True)
 
 
@@ -1708,7 +1708,7 @@ async def _deliver_subagent_wake_post(
             # failure — httpx does not raise on status by itself.
             resp.raise_for_status()
             return True
-        except (httpx.HTTPError, asyncio.TimeoutError) as exc:
+        except (TimeoutError, httpx.HTTPError) as exc:
             if (
                 attribution_created_by is not None
                 and isinstance(exc, httpx.HTTPStatusError)

@@ -96,6 +96,8 @@ RUN npm install -g pnpm@11.15.1
 RUN pnpm install --frozen-lockfile --filter web
 
 COPY web/ ./web/
+# Design-mode prompts import the evidence module shared with the browser extension.
+COPY browsers/shared/ ./browsers/shared/
 ARG VITE_OMNIGENT_HOST_ROUTING=false
 RUN pnpm --filter web run build
 
@@ -365,9 +367,9 @@ RUN set -eu; \
 # state. Pinned + SHA256-verified per arch, like agy above; to bump, update
 # GH_VERSION and both SHA256s from the release's `gh_<ver>_checksums.txt` at
 # https://github.com/cli/cli/releases.
-ARG GH_VERSION=2.100.0
-ARG GH_SHA256_AMD64=e4d4bb4498e8d007abe545b6568926793ace1b6447da598294a610018cb164be
-ARG GH_SHA256_ARM64=ea4e7a581a32ccad6cc7923cb1576ac5859ba4b9a16ab22eb8f8a96e78e2e961
+ARG GH_VERSION=2.103.0
+ARG GH_SHA256_AMD64=fdd768eb70f6409f80fcfa9f3a1c0adf0fc98d827ab3ce0bed2ac22762c5d786
+ARG GH_SHA256_ARM64=7f322df34e624d14f5ec0c4acb121fd6dfa14392fdbbd1066aa8e0a05ac3721e
 RUN set -eu; \
     arch="$(dpkg --print-architecture)"; \
     case "$arch" in \

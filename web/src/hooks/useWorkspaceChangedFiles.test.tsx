@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useEffect } from "react";
 import type { ReactNode } from "react";
@@ -32,6 +32,7 @@ import {
   resolveChatFilePath,
   runnerOfflineRetryDelay,
   shouldRetryRunnerOffline,
+  useSessionActive,
   useWorkspaceAllFiles,
   useWorkspaceChangedFiles,
   useWorkspaceDirectory,
@@ -39,6 +40,10 @@ import {
   useWorkspaceFileExists,
   useWorkspaceFileSearch,
 } from "./useWorkspaceChangedFiles";
+
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { conversationRegistry } from "@/store/conversationRegistry";
 
 const onlineMock = vi.mocked(useSessionRunnerOnline);
 const hostOnlineMock = vi.mocked(useSessionHostOnline);
@@ -1767,4 +1772,25 @@ describe("fetchWorkspaceAllFiles", () => {
     const whole = await fetchWorkspaceAllFiles("conv_1");
     expect(whole.truncated).toBe(false);
   });
+});
+
+it.each([false, true])("gates background workspace activity on grid flag %s", (enabled) => {
+  stubChatStore(null, "idle");
+  const entry = conversationRegistry.acquire("grid-session");
+  const view = renderHook(() => useSessionActive("grid-session"), {
+    wrapper: ({ children }) => (
+      <CapabilitiesProvider
+        info={{ ...FALLBACK_SERVER_INFO, features: { grid_sessions_display_ui: enabled } }}
+      >
+        {children}
+      </CapabilitiesProvider>
+    ),
+  });
+  expect(view.result.current).toBe(false);
+  act(() => entry.setState({ sessionStatus: "running" }));
+  expect(view.result.current).toBe(enabled);
+  act(() => entry.setState({ sessionStatus: "idle" }));
+  expect(view.result.current).toBe(false);
+  view.unmount();
+  conversationRegistry.clear();
 });

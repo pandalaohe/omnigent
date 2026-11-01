@@ -201,6 +201,9 @@ class _RelayStubRegistry:
     def set_terminal_exit_publisher(self, publisher: object) -> None:
         del publisher
 
+    def set_client_surface(self, session_id: str, surface: str | None) -> None:
+        del session_id, surface
+
     def compute_default_env_root(self, session_id: str, agent_spec: Any) -> str:
         del session_id, agent_spec
         return str(self._tmp_path)

@@ -41,6 +41,21 @@ depends_on: str | Sequence[str] | None = None
 _logger = logging.getLogger(__name__)
 
 
+def _revision_applied(revision: str) -> bool:
+    """Return whether *revision* is stamped, including by an earlier step of this run."""
+    migration_context = op.get_context()
+    if migration_context.script is None:
+        return False
+    return any(
+        revision
+        in {
+            applied.revision
+            for applied in migration_context.script.iterate_revisions(head, "base")
+        }
+        for head in migration_context.get_current_heads()
+    )
+
+
 def upgrade() -> None:
     """Create the catalog cache and add the calling-defaults columns."""
     op.create_table(
@@ -54,8 +69,13 @@ def upgrade() -> None:
         sa.Column("error", sa.Text(), nullable=True),
         sa.PrimaryKeyConstraint("workspace_id", "host_id", "harness"),
     )
+    task_columns = {
+        column["name"] for column in sa.inspect(op.get_bind()).get_columns("scheduled_tasks")
+    }
     with op.batch_alter_table("scheduled_tasks") as batch_op:
-        batch_op.add_column(sa.Column("project_id", Uuid16(), nullable=True))
+        # CRDB hides a column the dispatch branch added earlier in this transaction.
+        if "project_id" not in task_columns and not _revision_applied("c8e4f2a6b901"):
+            batch_op.add_column(sa.Column("project_id", Uuid16(), nullable=True))
         batch_op.add_column(sa.Column("explicit_null_fields", sa.Text(), nullable=True))
     with op.batch_alter_table("assignments") as batch_op:
         batch_op.alter_column("target_agent_id", existing_type=Uuid16(), nullable=True)
@@ -80,7 +100,10 @@ def downgrade() -> None:
             )
         else:
             batch_op.alter_column("target_agent_id", existing_type=Uuid16(), nullable=False)
+    task_columns = {column["name"] for column in sa.inspect(bind).get_columns("scheduled_tasks")}
     with op.batch_alter_table("scheduled_tasks") as batch_op:
         batch_op.drop_column("explicit_null_fields")
-        batch_op.drop_column("project_id")
+        # Dispatch still owns this column while its branch remains applied.
+        if "next_run_at" not in task_columns:
+            batch_op.drop_column("project_id")
     op.drop_table("host_model_catalog_cache")

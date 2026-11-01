@@ -50,6 +50,7 @@ from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 import filelock
 import httpx
@@ -65,6 +66,7 @@ from tests._helpers.compat import (
     server_executable,
 )
 from tests._helpers.native_session import create_native_session
+from tests._helpers.operator_agents import operator_agent_store, post_operator_session
 from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 from tests._helpers.workspace_geometry import (
     workspace_bar_needs_collapse as workspace_bar_needs_collapse,
@@ -90,6 +92,9 @@ from tests.helpers.ui_configuration import (
 )
 from tests.helpers.ui_configuration import (
     pytest_configure as pytest_configure,
+)
+from tests.helpers.ui_configuration import (
+    pytest_unconfigure as pytest_unconfigure,
 )
 from tests.helpers.ui_configuration import (
     temp_omnigent_mock_config as _temp_omnigent_mock_config,
@@ -155,6 +160,24 @@ def open_right_rail(page: Page) -> None:
     if toggle.get_attribute("aria-label") == "Expand right panel":
         toggle.click()
     expect(page.get_by_role("complementary", name="Workspace")).to_be_visible()
+
+
+def stub_session_pull_requests(
+    page: Page, listed: Callable[[], list[dict[str, Any]]], unlink: Callable[[str], None]
+) -> None:
+    """Answer the server's stored PR list for tests that stub the PR resources.
+
+    :param page: Playwright page, before it navigates.
+    :param listed: Returns the session's linked PRs as the stub currently has them.
+    :param unlink: Receives each URL the panel unlinks with ``DELETE``.
+    """
+
+    def respond(route: Route) -> None:
+        if route.request.method == "DELETE":
+            unlink(parse_qs(urlsplit(route.request.url).query)["url"][0])
+        route.fulfill(json={"object": "list", "data": listed(), "synced": True})
+
+    page.route(re.compile(r"/v1/sessions/[^/]+/pull-requests(?:\?|$)"), respond)
 
 
 def switch_markdown_view_mode(page: Page, file_viewer: Locator, mode: str) -> None:
@@ -325,7 +348,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         "--ui-dependency-smoke",
         action="store_true",
         default=False,
-        help="Run compatibility smoke journeys and all Codex sidecar consumers.",
+        help="Deprecated; removal in 0.21.0. Run compatibility smoke and Codex sidecar consumers.",
     )
     parser.addoption(
         "--ui-codex-sidecar-only",
@@ -1258,7 +1281,8 @@ def live_server(
     set_fallback_mock_llm(mock_url, "gpt-4o-mini", "Mock LLM response.")
 
     try:
-        yield base_url
+        with operator_agent_store(base_url, f"sqlite:///{db_path}", artifact_dir):
+            yield base_url
     finally:
         _server_state.clear()
         if runner_proc.poll() is None:
@@ -2588,23 +2612,26 @@ def _bind_session_runner(base_url: str, session_id: str, runner_id: str) -> None
     bind_session_runner(httpx.patch, base_url, session_id, runner_id, timeout=10.0)
 
 
-def _create_bundled_session(base_url: str, runner_id: str, yaml_text: str) -> str:
+def _create_bundled_session(
+    base_url: str, runner_id: str, yaml_text: str, *, operator_authored: bool = False
+) -> str:
     """Register a session-scoped agent from *yaml_text* and bind its session.
 
-    The multipart ``POST /v1/sessions`` both registers the agent and creates
-    the session it is scoped to, returning that ``session_id`` directly — so
-    no separate create call is needed.
+    HTTP uploads validate user-authored specs. Operator fixtures with Python
+    tools or host paths use trusted local registration before creating by id.
 
     :param base_url: Spawned server base URL.
     :param runner_id: The token-bound runner id to bind.
     :param yaml_text: The agent spec body.
+    :param operator_authored: Provision a trusted operator fixture through local stores.
     :returns: The new session/conversation id.
     """
 
     data = yaml_text.encode()
     bundle_bytes = bundle_files({"config.yaml": data})
 
-    create = post_session_bundle(httpx.post, f"{base_url}/v1/sessions", bundle_bytes, timeout=30.0)
+    provision = post_operator_session if operator_authored else post_session_bundle
+    create = provision(httpx.post, f"{base_url}/v1/sessions", bundle_bytes, timeout=30.0)
     create.raise_for_status()
     session_id = str(create.json()["session_id"])
     _bind_session_runner(base_url, session_id, runner_id)

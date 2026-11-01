@@ -417,7 +417,7 @@ class HermesExecutor(Executor):
                 proc.communicate(),
                 timeout=_HERMES_TURN_TIMEOUT_S,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             _logger.warning("Hermes subprocess timed out after %ss", _HERMES_TURN_TIMEOUT_S)
             yield ExecutorError(
                 message=f"Hermes subprocess timed out after {_HERMES_TURN_TIMEOUT_S}s",
@@ -450,7 +450,7 @@ class HermesExecutor(Executor):
                     proc.terminate()
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=2.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     with contextlib.suppress(ProcessLookupError):
                         proc.kill()
                     with contextlib.suppress(Exception):
@@ -554,7 +554,7 @@ class HermesExecutor(Executor):
             proc.terminate()
         try:
             await asyncio.wait_for(proc.wait(), timeout=2.0)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()
         return True

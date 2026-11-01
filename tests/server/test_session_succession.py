@@ -314,7 +314,9 @@ def _succession_notices(store: SqlAlchemyConversationStore, session_id: str) -> 
     return [item for item in page.data if getattr(item.data, "code", None) == "session_succession"]
 
 
-@pytest.mark.parametrize("harness", ["claude-native", "codex-native", "pi", "pi-native"])
+@pytest.mark.parametrize(
+    "harness", ["claude-native", "codex-native", "pi", "pi-native", "antigravity-native"]
+)
 @pytest.mark.parametrize("cap", ["7", "none"])
 async def test_successor_preserves_explicit_child_cap(
     client: httpx.AsyncClient,
@@ -339,7 +341,7 @@ async def test_successor_preserves_explicit_child_cap(
                     **ConfirmedPermissionState("ask", 2, "ready").labels(harness),
                     PERMISSION_CAPABILITY_LABEL_KEY: PERMISSION_CAPABILITY_VALUE,
                 }
-                if harness in {"pi", "pi-native"}
+                if harness in {"pi", "pi-native", "antigravity-native"}
                 else {}
             ),
             CHILD_CAP_LABEL_KEY: cap,
@@ -360,6 +362,43 @@ async def test_successor_preserves_explicit_child_cap(
         "source": "session",
         "open_children": 0,
     }
+
+
+async def test_agy_handover_reparents_children_and_wakes_successor_once(
+    client: httpx.AsyncClient,
+    store: SqlAlchemyConversationStore,
+    runner: _FakeRunnerClient,
+    wake: AsyncMock,
+) -> None:
+    old = store.create_conversation(
+        agent_id="a" * 32,
+        runner_id=RUNNER_ID,
+        harness_override="antigravity-native",
+        labels={
+            **ConfirmedPermissionState("plan", 3, "ready").labels("antigravity-native"),
+            PERMISSION_CAPABILITY_LABEL_KEY: PERMISSION_CAPABILITY_VALUE,
+        },
+    ).id
+    child = _create(store, parent=old, title="worker")
+    note = await client.post(
+        f"/v1/sessions/{old}/handover",
+        json={"handover": "Finish the remaining check.", "rotate": True},
+    )
+    assert note.status_code == 200, note.text
+    created = await client.post(f"/v1/sessions/{old}/successor")
+    assert created.status_code == 200, created.text
+    new = created.json()["id"]
+    for _ in range(2):
+        result = await client.post(
+            f"/v1/sessions/{old}/succession", json={"target_session_id": new, "allow_empty": True}
+        )
+        assert result.status_code == 200 and result.json()["status"] == "done", result.text
+    assert store.get_conversation(child).parent_conversation_id == new
+    assert store.get_conversation(old).archived is True
+    assert len(_succession_notices(store, new)) == 1
+    wake.assert_awaited_once()
+    assert wake.call_args.args[0] == new
+    assert "Finish the remaining check." in wake.call_args.args[1]
 
 
 async def test_succession_reports_dropped_configuration_without_values(

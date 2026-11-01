@@ -210,7 +210,7 @@ async def test_reaping_superseded_pane_keeps_successor_signal_and_pieces(
     )
 
     with pytest.raises(
-        RuntimeError, match="native pane generation changed before retention release"
+        RuntimeError, match="native pane changed or became busy before retention release"
     ):
         await reaper._reap(pane)
 

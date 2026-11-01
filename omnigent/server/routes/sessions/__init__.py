@@ -162,6 +162,7 @@ from omnigent.server.routes._content_type import (
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._origin import require_trusted_origin
+from omnigent.server.session_pull_requests import PullRequestRefresher
 from omnigent.util.cost_plan import (
     reserved_cost_control_keys,
 )
@@ -176,6 +177,7 @@ from omnigent.util.reasoning_effort import (
 # objects. The mutable caches are shared by reference across the package.
 # isort: off
 from omnigent.server.routes._sessions.common import (
+    CLIENT_SESSION_EVENT_TYPES as CLIENT_SESSION_EVENT_TYPES,
     COST_CONTROL_OVERRIDE_VALUES as COST_CONTROL_OVERRIDE_VALUES,
     _ALLOWED_EVENT_TYPES as _ALLOWED_EVENT_TYPES,
     _ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S as _ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S,
@@ -285,6 +287,7 @@ from omnigent.server.routes._sessions.common import (
     _NATIVE_TERMINAL_ENSURE_FAILED_CODE as _NATIVE_TERMINAL_ENSURE_FAILED_CODE,
     _NATIVE_TERMINAL_START_FAILED_CODE as _NATIVE_TERMINAL_START_FAILED_CODE,
     _OPENCODE_NATIVE_WRAPPER_LABEL_VALUE as _OPENCODE_NATIVE_WRAPPER_LABEL_VALUE,
+    _PI_EXTENSION_UI_HOOK_TIMEOUT_S as _PI_EXTENSION_UI_HOOK_TIMEOUT_S,
     _PI_NATIVE_WRAPPER_LABEL_VALUE as _PI_NATIVE_WRAPPER_LABEL_VALUE,
     _RACE_TASK_REAP_TIMEOUT_S as _RACE_TASK_REAP_TIMEOUT_S,
     _RUNNER_CLIENT_RESOLVE_ATTEMPTS as _RUNNER_CLIENT_RESOLVE_ATTEMPTS,
@@ -530,6 +533,7 @@ from omnigent.server.routes._sessions.helpers import (
     _signal_harness_elicitation_resolved_by_id as _signal_harness_elicitation_resolved_by_id,
     _spec_config_flag_explicitly_disabled as _spec_config_flag_explicitly_disabled,
     _spec_harness as _spec_harness,
+    _start_managed_launch_task as _start_managed_launch_task,
     _stop_session_host_runner as _stop_session_host_runner,
     _stop_session_host_runner_outcome as _stop_session_host_runner_outcome,
     _stored_file_to_resource as _stored_file_to_resource,
@@ -614,10 +618,15 @@ from omnigent.server.routes._sessions.helpers import (
 # native-terminal launch, MCP tool calls) live in _sessions.orchestration.
 from omnigent.server.routes._sessions.orchestration import (
     HarnessTimeoutPolicy as HarnessTimeoutPolicy,
+    HOST_OFFLINE_HOLD_S as HOST_OFFLINE_HOLD_S,
+    HOST_OFFLINE_RECHECK_S as HOST_OFFLINE_RECHECK_S,
     RUNNER_DISCONNECT_GRACE_S as RUNNER_DISCONNECT_GRACE_S,
     _ARCHIVE_IDLE_MAX_WAIT_S as _ARCHIVE_IDLE_MAX_WAIT_S,
     _ARCHIVE_IDLE_POLL_S as _ARCHIVE_IDLE_POLL_S,
     _ARCHIVE_IDLE_SETTLE_S as _ARCHIVE_IDLE_SETTLE_S,
+    _MID_TURN_STATUSES as _MID_TURN_STATUSES,
+    _host_row_offline as _host_row_offline,
+    set_relay_host_offline_probe as set_relay_host_offline_probe,
     _accumulate_session_usage as _accumulate_session_usage,
     _archive_idle_deferred as _archive_idle_deferred,
     _best_effort_stop as _best_effort_stop,
@@ -633,6 +642,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _create_session_from_existing_agent as _create_session_from_existing_agent,
     _deliver_with_retry as _deliver_with_retry,
     _drive_terminal_resolved_elicitation as _drive_terminal_resolved_elicitation,
+    _drive_terminal_resolved_elicitation_from_store as _drive_terminal_resolved_elicitation_from_store,
     _enrich_terminal_status_with_subagent_output as _enrich_terminal_status_with_subagent_output,
     _ensure_native_terminal_ready as _ensure_native_terminal_ready,
     _ensure_runner_relay as _ensure_runner_relay,
@@ -842,6 +852,7 @@ def create_sessions_router(
     peer_message_store: PeerMessageStore | None = None,
     app_state: Any | None = None,
     user_preferences_store: SqlAlchemyUserPreferencesStore | None = None,
+    pull_request_refresher: PullRequestRefresher | None = None,
     register_runner_ingest: Callable[..., None] | None = None,
     register_startup_dispatch: Callable[..., None] | None = None,
     register_initial_file_upload: Callable[..., None] | None = None,
@@ -922,6 +933,8 @@ def create_sessions_router(
         preferences, used by the native hook routes to read the
         approval-timeout setting. ``None`` (focused tests, servers
         without preferences) makes every hook take the defaults.
+    :param pull_request_refresher: The app-owned refresher of stored session
+        PRs; ``None`` builds one for this router, as focused router tests do.
     :returns: A configured :class:`APIRouter` exposing the
         ``/sessions`` endpoints.
     """
@@ -934,8 +947,19 @@ def create_sessions_router(
     from omnigent.server.routes.sessions.routes_events import register_events_routes
     from omnigent.server.routes.sessions.routes_hooks import register_hooks_routes
     from omnigent.server.routes.sessions.routes_items import register_items_routes
+    from omnigent.server.routes.sessions.routes_peer import PeerRoutes
     from omnigent.server.routes.sessions.routes_permissions import register_permissions_routes
     from omnigent.server.routes.sessions.routes_resources import register_resources_routes
+    from omnigent.server.routes.sessions.routes_ui import register_ui_routes
+
+    if pull_request_refresher is None:
+        pull_request_refresher = PullRequestRefresher()
+    peer_routes: PeerRoutes | None = None
+
+    async def send_peer_message(**kwargs: Any) -> dict[str, Any]:
+        if peer_routes is None:
+            raise OmnigentError("Peer messaging is not configured", code=ErrorCode.INTERNAL_ERROR)
+        return await peer_routes.send(**kwargs)
 
     register_core_routes(
         router,
@@ -954,6 +978,8 @@ def create_sessions_router(
         host_registry=host_registry,
         project_store=project_store,
         background_title_coordinator=background_title_coordinator,
+        pull_request_refresher=pull_request_refresher,
+        peer_send=send_peer_message,
     )
 
     register_hooks_routes(
@@ -999,6 +1025,14 @@ def create_sessions_router(
         host_registry=host_registry,
         comment_store=comment_store,
         register_initial_file_upload=register_initial_file_upload,
+        pull_request_refresher=pull_request_refresher,
+    )
+
+    register_ui_routes(
+        router,
+        conversation_store=conversation_store,
+        auth_provider=auth_provider,
+        permission_store=permission_store,
     )
 
     register_browser_routes(
@@ -1019,7 +1053,7 @@ def create_sessions_router(
         runner_tunnel_tokens=runner_tunnel_tokens,
     )
 
-    register_events_routes(
+    peer_routes = register_events_routes(
         router,
         conversation_store=conversation_store,
         agent_store=agent_store,

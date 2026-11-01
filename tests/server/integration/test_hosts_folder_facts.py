@@ -140,7 +140,7 @@ async def ff_setup(
         while not stop_drain.is_set():
             try:
                 output = await comm.receive_output(timeout=0.5)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue
             if output.get("type") != "websocket.send":
                 continue
@@ -174,7 +174,7 @@ async def ff_setup(
         stop_drain.set()
         try:
             await asyncio.wait_for(drain_task, timeout=1.0)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             drain_task.cancel()
         # Send an explicit disconnect so the tunnel endpoint's finally-block
         # calls host_store.set_offline() and registry.deregister() before

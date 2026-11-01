@@ -292,7 +292,7 @@ class HostLoadQueue:
                 _logger.warning(
                     "Host-load release outcome uncertain for session %s", session_id, exc_info=True
                 )
-            except Exception:  # noqa: BLE001 — retain the durable hold on a definite failure.
+            except Exception:
                 await asyncio.to_thread(
                     self.conversations.compare_and_set_label,
                     session_id,

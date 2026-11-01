@@ -13,6 +13,7 @@ import pytest
 import pytest_asyncio
 import yaml
 from fastapi import FastAPI
+from pydantic.version import version_short
 
 from omnigent.db.utils import builtin_agent_id
 from omnigent.runtime.agent_cache import AgentCache
@@ -404,7 +405,7 @@ async def test_non_object_json_retains_exact_legacy_422(
             "loc": [],
             "msg": "Input should be a valid dictionary or instance of SessionCreateRequest",
             "input": input_value,
-            "url": "https://errors.pydantic.dev/2.13/v/model_type",
+            "url": f"https://errors.pydantic.dev/{version_short()}/v/model_type",
         }
     ]
 

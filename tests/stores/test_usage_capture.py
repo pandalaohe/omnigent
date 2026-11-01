@@ -54,6 +54,78 @@ def _rows(spool: UsageOutbox) -> list[dict]:
         ]
 
 
+@pytest.mark.parametrize("input_tokens", ["bad", -1, True])
+def test_agy_missing_response_id_preserves_unknown_and_dedups_native_step(
+    tmp_path: Path, input_tokens: object
+) -> None:
+    directory = tmp_path / "spool"
+    spool = UsageOutbox(directory)
+    physical = {
+        "harness_family": "antigravity",
+        "identity_namespace": "antigravity/cascade/v1",
+        "physical_session_id": "cascade-1",
+        "thread_kind": "main",
+    }
+    record = {
+        "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+        "status": "CORTEX_STEP_STATUS_DONE",
+        "metadata": {
+            "executionId": "native-turn",
+            "sourceTrajectoryStepInfo": {"trajectoryId": "trajectory-1", "stepIndex": 2},
+            "modelUsage": {"inputTokens": input_tokens, "outputTokens": "2"},
+        },
+    }
+    spool.append("session", "antigravity-native", physical, record)
+    UsageOutbox(directory).append("session", "antigravity-native", physical, record)
+    rows = _rows(spool)
+    assert len(rows) == 1
+    assert rows[0]["logical_call_id"] is None and rows[0]["source_refs"] == []
+    assert rows[0]["call_identity_coverage"] == "none"
+    assert rows[0]["input_tokens"] is None and rows[0]["cached_input_tokens"] is None
+    assert rows[0]["output_tokens"] == 2 and rows[0]["usage_status"] == "partial"
+    assert rows[0]["turn_id"] == "native-turn"
+
+
+def test_agy_retry_usage_is_content_free_and_stable_across_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.usage_export import runtime
+
+    spool = UsageOutbox(tmp_path / "spool")
+    monkeypatch.setenv("OMNIGENT_USAGE_EXPORT_CAPTURE", "1")
+    monkeypatch.setattr(runtime, "outbox", lambda: spool)
+    usage = {
+        "inputTokens": "10",
+        "cacheReadTokens": "0",
+        "cacheWriteTokens": "0",
+        "outputTokens": "2",
+        "thinkingOutputTokens": "0",
+        "responseId": "final",
+    }
+    record = {
+        "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+        "status": "CORTEX_STEP_STATUS_ERROR",
+        "metadata": {
+            "executionId": "turn",
+            "sourceTrajectoryStepInfo": {"trajectoryId": "native", "stepIndex": 2},
+            "modelUsage": usage,
+            "retryInfos": [{"usage": {**usage, "responseId": "retry", "outputTokens": "1"}}],
+        },
+        "plannerResponse": {"response": "never-retain"},
+    }
+    for _ in range(2):
+        runtime.capture_antigravity_step("session", "cascade", record, thread_kind="subagent")
+    rows = _rows(spool)
+    assert len(rows) == 2
+    assert {row["logical_call_id"] for row in rows} == {"final", "retry"}
+    assert sum(row["output_tokens"] for row in rows) == 3
+    assert all(
+        row["physical_session_id"] == "cascade" and row["thread_kind"] == "subagent"
+        for row in rows
+    )
+    assert b"never-retain" not in spool.path.read_bytes()
+
+
 def test_pi_native_resume_baseline_and_cache_warm_are_content_free(tmp_path: Path) -> None:
     spool = UsageOutbox(tmp_path / "spool")
     root = tmp_path / "pi-sessions"

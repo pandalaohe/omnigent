@@ -28,15 +28,18 @@ and closed over by route factories — no per-request import cost.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import ipaddress
 import logging
 import os
+import re
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from starlette.requests import HTTPConnection
 
@@ -49,6 +52,33 @@ RESERVED_USER_LOCAL = "local"
 RESERVED_USER_PUBLIC = "__public__"
 _RESERVED_USERS = frozenset({RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC})
 _TRUTHY_STRINGS = ("1", "true", "yes")
+USAGE_READ_TOKEN_PRINCIPAL: Final = "config:usage-read"
+
+
+def usage_read_request_allowed(request: HTTPConnection) -> bool:
+    """Confine usage readers to the feed and cutover receipts GETs."""
+    return request.scope.get("method") == "GET" and request.url.path in {
+        "/v1/usage-events",
+        "/v1/usage-cutover/receipts",
+    }
+
+
+def resolve_usage_read_token() -> tuple[str, bytes] | None:
+    """Read the account and opaque token digest without echoing invalid values."""
+    from omnigent.server.routes.accounts_auth import _USERNAME_RE
+
+    value = os.environ.get("OMNIGENT_USAGE_READ_TOKEN", "")
+    if not value:
+        return None
+    account, separator, token = value.partition(":")
+    if (
+        not separator
+        or re.fullmatch(_USERNAME_RE, account) is None
+        or re.fullmatch(r"[A-Za-z0-9_-]{32,256}", token) is None
+    ):
+        raise ValueError("Invalid OMNIGENT_USAGE_READ_TOKEN")
+    return account, hashlib.sha256(token.encode()).digest()
+
 
 # Path prefixes a restricted (device-grant or machine client-credential)
 # access token may reach.
@@ -485,6 +515,8 @@ class UnifiedAuthProvider(AuthProvider):
         back to ``""`` (strip nothing; see
         :func:`resolve_auth_header_strip_prefix`). Only consulted in
         header mode. Tests pass an explicit prefix.
+    :param usage_read_token: Account and opaque token digest for the two usage
+        GETs. None resolves from OMNIGENT_USAGE_READ_TOKEN; accounts mode only.
     """
 
     def __init__(
@@ -495,6 +527,7 @@ class UnifiedAuthProvider(AuthProvider):
         local_single_user: bool | None = None,
         header_name: str | None = None,
         header_strip_prefix: str | None = None,
+        usage_read_token: tuple[str, bytes] | None = None,
     ) -> None:
         self._source = source
         self._oidc_config = oidc_config
@@ -519,6 +552,16 @@ class UnifiedAuthProvider(AuthProvider):
         # Accounts JWTs validate generation and revocation on every request.
         # OIDC and machine principals retain their independent lifecycle.
         self._account_check: Callable[[str, str], bool] | None = None
+        self._usage_read_account_lookup: Callable[[str], str | None] | None = None
+        self._usage_read_token: tuple[str, bytes] | None = None
+        if source == "accounts":
+            self._usage_read_token = (
+                usage_read_token if usage_read_token is not None else resolve_usage_read_token()
+            )
+            if self._usage_read_token is not None:
+                logger.info("usage read token enabled for %s", self._usage_read_token[0])
+        elif usage_read_token is not None or os.environ.get("OMNIGENT_USAGE_READ_TOKEN"):
+            logger.warning("OMNIGENT_USAGE_READ_TOKEN ignored outside accounts mode")
 
     def set_grant_revocation_check(self, check: Callable[[str], bool]) -> None:
         """Wire the device-grant revocation lookup.
@@ -539,6 +582,15 @@ class UnifiedAuthProvider(AuthProvider):
     def set_account_check(self, check: Callable[[str, str], bool]) -> None:
         """Wire uncached generation/revocation validation in accounts mode."""
         self._account_check = check
+
+    def set_usage_read_account_lookup(self, lookup: Callable[[str], str | None]) -> None:
+        """Resolve a configured reader's live account generation on every read."""
+        self._usage_read_account_lookup = lookup
+
+    @property
+    def usage_read_token_user(self) -> str | None:
+        """Configured accounts reader, or None when disabled or ignored."""
+        return self._usage_read_token[0] if self._usage_read_token is not None else None
 
     def accepts_account_generation(self, user_id: str, generation: str | None) -> bool:
         return self._account_check is None or (
@@ -693,6 +745,23 @@ class UnifiedAuthProvider(AuthProvider):
             auth_header = request.headers.get("Authorization", "")
             if auth_header.startswith("Bearer "):
                 token = auth_header[7:]
+                if self._usage_read_token is not None and hmac.compare_digest(
+                    hashlib.sha256(token.encode()).digest(), self._usage_read_token[1]
+                ):
+                    if (
+                        not usage_read_request_allowed(request)
+                        or self._usage_read_account_lookup is None
+                    ):
+                        return None
+                    account = self._usage_read_token[0]
+                    generation = self._usage_read_account_lookup(account)
+                    if generation is None:
+                        return None
+                    from omnigent.db.account_authority import bind_account_authority
+
+                    bind_account_authority(account, generation)
+                    request.state.usage_read_grant_id = USAGE_READ_TOKEN_PRINCIPAL
+                    return account
         if not token:
             return None
 
@@ -755,8 +824,7 @@ class UnifiedAuthProvider(AuthProvider):
                     not isinstance(grant_id, str)
                     or not grant_id
                     or self._grant_revoked is None
-                    or request.scope.get("method") != "GET"
-                    or request.url.path not in {"/v1/usage-events", "/v1/usage-cutover/receipts"}
+                    or not usage_read_request_allowed(request)
                 ):
                     return None
                 # The feed records the highest cursor each grant presented, so

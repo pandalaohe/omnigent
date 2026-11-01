@@ -266,10 +266,30 @@ async def test_run_turn_rejects_stale_session_after_clear(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("command", ["/login", "/logout"])
-async def test_run_turn_points_auth_commands_at_omni_setup(
+@pytest.mark.parametrize(
+    ("in_managed_sandbox", "required_phrases", "unreachable_remedy"),
+    [
+        (False, ("omni setup",), "new session"),
+        (
+            True,
+            (
+                "credentials at launch",
+                "new session",
+                "if sign-in still fails",
+                "sandbox administrator",
+                "refresh its credentials",
+            ),
+            "omni setup",
+        ),
+    ],
+)
+async def test_run_turn_points_auth_commands_at_a_remedy_reachable_from_the_host(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     command: str,
+    in_managed_sandbox: bool,
+    required_phrases: tuple[str, ...],
+    unreachable_remedy: str,
 ) -> None:
     """
     ``/login`` must not be typed into the pane as a prompt.
@@ -279,8 +299,14 @@ async def test_run_turn_points_auth_commands_at_omni_setup(
     the CLI answers it as an ordinary message. On an expired login that
     answer is "Login expired · Please run /login" — the instruction the
     user just followed, so the turn is wasted and the session is stuck.
-    Fail the turn with the host command that does re-authenticate.
+    Fail the turn with a remedy the user can perform: ``omni setup`` on
+    their own host, or a new session (then the sandbox administrator) on a
+    managed sandbox (``IS_SANDBOX=1``), which cannot run it.
     """
+    if in_managed_sandbox:
+        monkeypatch.setenv("IS_SANDBOX", "1")
+    else:
+        monkeypatch.delenv("IS_SANDBOX", raising=False)
 
     def fail_inject_user_message(
         bridge_dir_arg: Path,
@@ -317,7 +343,9 @@ async def test_run_turn_points_auth_commands_at_omni_setup(
 
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
-    assert "omni setup" in events[0].message
+    for phrase in required_phrases:
+        assert phrase in events[0].message
+    assert unreachable_remedy not in events[0].message
     assert events[0].undelivered is True
 
 
@@ -1685,7 +1713,7 @@ async def test_run_turn_reaps_tmux_before_reporting_prompt_timeout(
     monkeypatch.setattr(
         claude_native_executor,
         "kill_session",
-        lambda bridge_dir_arg, *, timeout_s: killed.append(bridge_dir_arg),
+        lambda bridge_dir_arg, *, timeout_s, expected_close=False: killed.append(bridge_dir_arg),
     )
 
     executor = ClaudeNativeExecutor(bridge_dir)
@@ -1701,6 +1729,81 @@ async def test_run_turn_reaps_tmux_before_reporting_prompt_timeout(
     assert killed == [bridge_dir]
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
+
+
+@pytest.mark.asyncio
+async def test_run_turn_marks_its_timeout_reap_as_an_expected_close(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    The runner must read the reap as Omnigent's close, not a terminal crash.
+
+    The pane is alive when the readiness wait times out, and the reap ends it
+    moments before the runner would otherwise report the exit as a failure.
+    The turn's own error is the one failure the person should see.
+    """
+    kill_flags: list[bool] = []
+
+    def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
+        del bridge_dir_arg, content, timeout_s
+        raise ClaudePromptTimeout("terminal did not become ready")
+
+    def record_kill(
+        bridge_dir_arg: Path, *, timeout_s: float, expected_close: bool = False
+    ) -> None:
+        del bridge_dir_arg, timeout_s
+        kill_flags.append(expected_close)
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
+    monkeypatch.setattr(claude_native_executor, "kill_session", record_kill)
+
+    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            system_prompt="",
+        )
+    ]
+
+    assert kill_flags == [True]
+    assert isinstance(events[0], ExecutorError)
+
+
+@pytest.mark.asyncio
+async def test_run_turn_does_not_mark_a_pane_that_exited_on_its_own(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A pane that already exited was not closed by Omnigent, so its exit still counts."""
+    kill_flags: list[bool] = []
+
+    def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
+        del bridge_dir_arg, content, timeout_s
+        raise ClaudeTerminalExited("terminal exited", exit_status="1")
+
+    def record_kill(
+        bridge_dir_arg: Path, *, timeout_s: float, expected_close: bool = False
+    ) -> None:
+        del bridge_dir_arg, timeout_s
+        kill_flags.append(expected_close)
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
+    monkeypatch.setattr(claude_native_executor, "kill_session", record_kill)
+
+    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+    [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            system_prompt="",
+        )
+    ]
+
+    assert kill_flags == [False]
 
 
 @pytest.mark.asyncio
@@ -1730,7 +1833,7 @@ async def test_run_turn_keeps_the_pane_when_a_terminal_dialog_blocks_delivery(
     monkeypatch.setattr(
         claude_native_executor,
         "kill_session",
-        lambda bridge_dir_arg, *, timeout_s: killed.append(bridge_dir_arg),
+        lambda bridge_dir_arg, *, timeout_s, expected_close=False: killed.append(bridge_dir_arg),
     )
 
     executor = ClaudeNativeExecutor(bridge_dir)
@@ -1795,7 +1898,7 @@ async def test_run_turn_reports_a_refused_routed_model_switch_as_undelivered(
     monkeypatch.setattr(
         claude_native_executor,
         "kill_session",
-        lambda bridge_dir_arg, *, timeout_s: killed.append(bridge_dir_arg),
+        lambda bridge_dir_arg, *, timeout_s, expected_close=False: killed.append(bridge_dir_arg),
     )
 
     executor = ClaudeNativeExecutor(bridge_dir)
@@ -1825,9 +1928,10 @@ async def test_run_turn_reports_a_refused_routed_model_switch_as_undelivered(
         (False, "pending_prompt"),
         (True, "pending_prompt"),
         (True, "draft_persisted"),
+        (True, "capture_lost"),
         (False, "missing_target"),
     ],
-    ids=["before_submit", "after_submit", "draft_not_accepted", "missing_target"],
+    ids=["before_submit", "after_submit", "draft_not_accepted", "capture_lost", "missing_target"],
 )
 async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_ambiguous(
     monkeypatch: pytest.MonkeyPatch,
@@ -1850,13 +1954,19 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
     def run_tmux(socket_path: str, *args: str) -> None:
         nonlocal pane, enters, prompt_pending
         del socket_path
-        if args[0] == "paste-buffer":
+        if args[-1] == "Space":
+            pane = "──────\n❯ \n──────\n"
+        elif args[0] == "send-keys" and "-l" in args:
+            pane = "❯ "
+        elif args[0] == "paste-buffer":
             pane = "❯ review this function"
             prompt_pending = not submitted
         elif args[-1] == "Enter":
             # The draft stays visible, so submit verification looks to retry.
             enters += 1
             prompt_pending = refusal == "pending_prompt"
+            if refusal == "capture_lost":
+                pane = ""
 
     if refusal == "missing_target":
         wait_for_target = claude_bridge._wait_for_tmux_info
@@ -1884,7 +1994,7 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
     monkeypatch.setattr(
         claude_native_executor,
         "kill_session",
-        lambda bridge_dir_arg, *, timeout_s: killed.append(bridge_dir_arg),
+        lambda bridge_dir_arg, *, timeout_s, expected_close=False: killed.append(bridge_dir_arg),
     )
 
     executor = ClaudeNativeExecutor(bridge_dir)
@@ -1909,10 +2019,11 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
     expected_detail = {
         "pending_prompt": "waiting for an explicit answer",
         "draft_persisted": "draft is still in the input box",
+        "capture_lost": "delivery could not be confirmed",
         "missing_target": "tmux target is not advertised",
     }[refusal]
     assert expected_detail in error.message
-    assert error.undelivered is (refusal != "pending_prompt" or not submitted)
+    assert error.undelivered is (refusal in {"draft_persisted", "missing_target"} or not submitted)
 
 
 @pytest.mark.asyncio
@@ -1943,7 +2054,7 @@ async def test_run_turn_keeps_the_pane_when_a_sign_in_prompt_blocks_delivery(
     monkeypatch.setattr(
         claude_native_executor,
         "kill_session",
-        lambda bridge_dir_arg, *, timeout_s: killed.append(bridge_dir_arg),
+        lambda bridge_dir_arg, *, timeout_s, expected_close=False: killed.append(bridge_dir_arg),
     )
 
     executor = ClaudeNativeExecutor(bridge_dir)
@@ -2000,7 +2111,9 @@ async def test_run_turn_logs_a_closed_terminal_below_error(
 
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
     monkeypatch.setattr(
-        claude_native_executor, "kill_session", lambda bridge_dir_arg, *, timeout_s: None
+        claude_native_executor,
+        "kill_session",
+        lambda bridge_dir_arg, *, timeout_s, expected_close=False: None,
     )
 
     with caplog.at_level(logging.WARNING, logger="omnigent.inner.claude_native_executor"):
@@ -2052,7 +2165,7 @@ async def test_cancelled_delivery_drains_worker_before_unlocking(
         finally:
             finished.set()
 
-    def reap(bridge_dir: Path, *, timeout_s: float) -> None:
+    def reap(bridge_dir: Path, *, timeout_s: float, expected_close: bool = False) -> None:
         assert finished.is_set()
         claude_bridge._check_injection_cancelled()
         reaped.append(bridge_dir)
@@ -2164,8 +2277,8 @@ async def test_run_turn_reports_reap_failure_with_prompt_timeout(
         del bridge_dir_arg, content, timeout_s
         raise failure("terminal did not become ready")
 
-    def fail_kill(bridge_dir_arg: Path, *, timeout_s: float) -> None:
-        del bridge_dir_arg, timeout_s
+    def fail_kill(bridge_dir_arg: Path, *, timeout_s: float, expected_close: bool = False) -> None:
+        del bridge_dir_arg, timeout_s, expected_close
         raise RuntimeError("tmux kill failed")
 
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
@@ -2198,8 +2311,10 @@ async def test_run_turn_ignores_missing_tmux_during_timeout_reap(
         del bridge_dir_arg, content, timeout_s
         raise ClaudePromptTimeout("terminal did not become ready")
 
-    def absent_kill(bridge_dir_arg: Path, *, timeout_s: float) -> None:
-        del bridge_dir_arg, timeout_s
+    def absent_kill(
+        bridge_dir_arg: Path, *, timeout_s: float, expected_close: bool = False
+    ) -> None:
+        del bridge_dir_arg, timeout_s, expected_close
         raise TmuxSessionNotAdvertised("not advertised")
 
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)

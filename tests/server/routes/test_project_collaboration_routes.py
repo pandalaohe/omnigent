@@ -244,7 +244,7 @@ def _start_stat_drain(
         while True:
             try:
                 output = await comm.receive_output(timeout=30.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue
             if output.get("type") != "websocket.send":
                 continue

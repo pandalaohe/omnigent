@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from dataclasses import dataclass
 from typing import Literal, TypedDict
 
@@ -738,12 +739,12 @@ def _user_input_text(user_input: object) -> str:
     return ""
 
 
-def _user_message_event(*, text: str) -> OutboundEvent:
+def _user_message_event(*, text: str, conversation_id: str, turn_id: str | None) -> OutboundEvent:
     """
     Build a committed user ``message`` conversation item for a USER_INPUT step.
 
     Mirrors :func:`_message_event` but for the user's turn (role ``"user"``,
-    ``input_text`` content, no ``response_id``/``agent``). The web UI reconciles
+    ``input_text`` content, no ``agent``). The web UI reconciles
     its optimistic input bubble against this committed item via
     ``session.input.consumed``; without it the bubble has no committed
     counterpart and renders below the assistant reply (#1155). USER_INPUT steps
@@ -751,6 +752,8 @@ def _user_message_event(*, text: str) -> OutboundEvent:
     ``executionId``), so ``step_index`` is unused here.
 
     :param text: The user's turn text (from :func:`_user_input_text`).
+    :param conversation_id: Native cascade containing this input.
+    :param turn_id: Native per-turn discriminator, or ``None`` when unavailable.
     :returns: One ``external_conversation_item`` event.
     """
     return OutboundEvent(
@@ -761,6 +764,17 @@ def _user_message_event(*, text: str) -> OutboundEvent:
                 "role": "user",
                 "content": [{"type": "input_text", "text": text}],
             },
+            # Native receipt identity must fit conversation_items.response_id (64).
+            **(
+                {
+                    "response_id": "agy-consumed-user-"
+                    + uuid.uuid5(
+                        uuid.NAMESPACE_URL, f"antigravity-user:{conversation_id}:{turn_id}"
+                    ).hex
+                }
+                if turn_id is not None
+                else {}
+            ),
         },
         step_index=0,
     )
@@ -1019,7 +1033,13 @@ def map_step_to_events(
         text = strip_agent_instructions_block(raw_text).strip()
         if not text:
             return []
-        return [_user_message_event(text=text)]
+        return [
+            _user_message_event(
+                text=text,
+                conversation_id=conversation_id,
+                turn_id=_execution_discriminator(step),
+            )
+        ]
 
     status = step.get("status")
 

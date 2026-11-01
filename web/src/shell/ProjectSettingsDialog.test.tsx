@@ -255,7 +255,10 @@ beforeEach(() => {
   });
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  localStorage.clear();
+});
 
 it("retains the first-entry agent initialization when saving the project draft", async () => {
   getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { host_id: "h3" } });
@@ -857,7 +860,7 @@ describe("ProjectSettingsDialog", () => {
     getProjectMock.mockResolvedValue({
       id: "p_1",
       name: "Work",
-      config: { agent_id: "ag_claude", model: "opus" },
+      config: { agent_id: "ag_claude", model: "opus", effort: "high" },
     });
     renderDialog();
     await waitFor(() =>
@@ -867,7 +870,11 @@ describe("ProjectSettingsDialog", () => {
     );
     fireEvent.click(screen.getByTestId("project-settings-save"));
     await waitFor(() =>
-      expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_claude", model: "opus" }),
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        agent_id: "ag_claude",
+        model: "opus",
+        effort: "high",
+      }),
     );
   });
 

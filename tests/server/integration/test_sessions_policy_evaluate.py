@@ -275,6 +275,189 @@ async def test_tool_call_allow_when_no_matching_policy(
     # No policies → ALLOW (the default engine result).
     assert body["result"] == "POLICY_ACTION_ALLOW"
     assert "reason" not in body
+    # The allow cache is opt-in: no window unless the operator configures one.
+    assert "allow_cache_seconds" not in body
+
+
+def _patch_allow_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    resolver: Any,
+    default_policies: list[FunctionPolicySpec] | None = None,
+) -> None:
+    """Install *resolver* as the caps' native hook allow-cache window."""
+    patched_caps = RuntimeCaps(
+        execution_timeout=get_caps().execution_timeout,
+        default_policies=default_policies or [],
+        native_hook_allow_cache_seconds=resolver,
+    )
+    monkeypatch.setattr("omnigent.server.routes.sessions.get_caps", lambda: patched_caps)
+
+
+async def test_no_policy_allow_keeps_mandatory_runtime_checks_on_server(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No optional policy does not exempt later tier, restriction or grant checks."""
+    _patch_allow_cache(monkeypatch, lambda: 30.0)
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_tool_call_request("Read"),
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"result": "POLICY_ACTION_ALLOW"}
+
+
+async def test_cached_read_cannot_skip_a_plan_tier_write_denial(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An allowed read cannot grant a shell shortcut around the next mandatory write gate."""
+    import os
+    import shlex
+    import subprocess
+    import time
+
+    from omnigent.native import policy_allow_cache
+    from omnigent.permission_tiers.host import HostPermissionState, evaluate_host_tool
+    from omnigent.server.permission_tiers import (
+        PERMISSION_CAPABILITY_LABEL_KEY,
+        PERMISSION_CAPABILITY_VALUE,
+        BoundToolCall,
+        ConfirmedPermissionState,
+    )
+
+    _patch_allow_cache(monkeypatch, lambda: 60.0)
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    target = workspace / "a.py"
+    target.write_text("original")
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    host_id = "11111111111111111111111111111111"
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_host_id(session_id, host_id, workspace=str(workspace))
+    store.update_conversation(session_id, harness_override="pi")
+    store.set_labels(
+        session_id,
+        {
+            **ConfirmedPermissionState("plan", 1, "ready").labels("pi"),
+            PERMISSION_CAPABILITY_LABEL_KEY: PERMISSION_CAPABILITY_VALUE,
+        },
+    )
+    state = HostPermissionState(session_id, host_id, str(workspace), "plan", 1, "ready")
+    inspected: list[str] = []
+
+    def runner_response(request: httpx.Request) -> httpx.Response:
+        data = json.loads(request.content)
+        common = {
+            "session_id": session_id,
+            "host_id": host_id,
+            "call_id": data["call_id"],
+            "tier_revision": 1,
+            "permission_tiers_capability": PERMISSION_CAPABILITY_VALUE,
+        }
+        if data["type"] == "permission_tier_authorize":
+            return httpx.Response(200, json={**common, "authorized": True})
+        assert data["type"] == "permission_tier_inspect"
+        inspected.append(data["name"])
+        binding = BoundToolCall.bind(
+            session_id=session_id,
+            host_id=host_id,
+            call_id=data["call_id"],
+            name=data["name"],
+            arguments=data["arguments"],
+            tier_revision=1,
+        )
+        decision = evaluate_host_tool(
+            state, data["name"], data["arguments"], control_paths=(str(bridge),)
+        )
+        return httpx.Response(
+            200,
+            json={
+                **common,
+                "name": data["name"],
+                "arguments_digest": binding.arguments_digest,
+                "verdict": decision.action,
+                "reason": decision.reason,
+            },
+        )
+
+    async with httpx.AsyncClient(
+        base_url="http://runner", transport=httpx.MockTransport(runner_response)
+    ) as runner:
+
+        async def get_runner(*_: Any, **__: Any) -> httpx.AsyncClient:
+            return runner
+
+        monkeypatch.setattr(
+            "omnigent.server.routes._sessions.helpers._get_runner_client", get_runner
+        )
+        read = _tool_call_request("sys_os_read", {"path": str(target)})
+        read["event"]["data"]["call_id"] = "read"
+        response = await client.post(f"/v1/sessions/{session_id}/policies/evaluate", json=read)
+        assert response.status_code == 200, response.text
+        assert response.json()["result"] == "POLICY_ACTION_ALLOW"
+        generation = policy_allow_cache.generation(bridge)
+        policy_allow_cache.record(bridge, generation, response.json(), time.time())
+
+        reached_server_hook = tmp_path / "reached-server-hook"
+        command = policy_allow_cache.guarded_hook_command(
+            bridge, f"printf required > {shlex.quote(str(reached_server_hook))}"
+        )
+        result = subprocess.run(
+            ["/bin/sh", "-c", command],
+            input=json.dumps({"hook_event_name": "PreToolUse", "tool_name": "sys_os_write"}),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env={"PATH": os.defpath},
+        )
+        assert result.returncode == 0, result.stderr
+        assert reached_server_hook.read_text() == "required"
+
+        write = _tool_call_request("sys_os_write", {"path": str(target), "content": "changed"})
+        write["event"]["data"]["call_id"] = "write"
+        response = await client.post(f"/v1/sessions/{session_id}/policies/evaluate", json=write)
+        assert response.status_code == 200, response.text
+        assert response.json()["result"] == "POLICY_ACTION_DENY"
+        assert "Plan tier" in response.json()["reason"]
+        assert inspected == ["sys_os_read", "sys_os_write"]
+        assert target.read_text() == "original"
+
+
+async def test_engine_allow_never_carries_cache_window(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ALLOW decided by real policies must not let the runner skip later calls.
+
+    Read is allowed by the deny-Bash policy, but a cached ALLOW would let the
+    next Bash call through without evaluation.
+    """
+    deny_bash_policy = FunctionPolicySpec(
+        name="admin__deny_bash",
+        on=None,
+        function=FunctionRef(path=f"{__name__}._deny_bash_tool"),
+    )
+    _patch_allow_cache(monkeypatch, lambda: 30.0, default_policies=[deny_bash_policy])
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_tool_call_request("Read"),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["result"] == "POLICY_ACTION_ALLOW"
+    assert "allow_cache_seconds" not in body
 
 
 async def test_tool_call_deny_with_default_policy(
@@ -1087,7 +1270,7 @@ async def test_concurrent_cost_asks_serialize_and_collapse_sibling(
     try:
         await asyncio.wait_for(second_in_gate.wait(), timeout=1.0)
         second_entered = True
-    except asyncio.TimeoutError:
+    except TimeoutError:
         second_entered = False
     assert not second_entered, (
         "A second concurrent cost ask entered the gate while the first was "
@@ -1512,7 +1695,7 @@ async def _seed_authenticated_session(auth_client: httpx.AsyncClient, db_uri: st
                             "allow_all": {
                                 "type": "function",
                                 "on": ["tool_call"],
-                                "function": "tests.runtime.policies.conftest._always_allow",
+                                "function": "omnigent.policies.builtins.safety.ask_on_os_tools",
                             }
                         }
                     },
@@ -1577,7 +1760,7 @@ async def test_authenticated_evaluate_route_sql_budget(
     payload = {
         "event": {
             "type": "PHASE_TOOL_CALL",
-            "data": {"name": "Bash", "arguments": {"command": "ls"}},
+            "data": {"name": "echo", "arguments": {}},
         }
     }
     # Warm the spec / policy / ACL caches so the count is the steady-state one.

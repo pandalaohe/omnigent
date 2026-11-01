@@ -37,6 +37,7 @@ import asyncio
 import base64
 import contextlib
 import hmac
+import itertools
 import json
 import logging
 import os
@@ -59,6 +60,8 @@ from urllib.parse import urlparse as _urlparse
 from uuid import uuid4
 
 from omnigent._platform import IS_WINDOWS, default_shell_argv, resolve_cli_binary
+from omnigent.databricks_ai_gateway import PI_AGENT, gateway_attribution_headers, is_ug_route
+from omnigent.debug_logging import debug_event
 from omnigent.harnesses.pi_cli import pi_cli_argv
 from omnigent.harnesses.pi_native.bridge import (
     PERMISSION_INSTALLATION_FILE,
@@ -73,6 +76,7 @@ from omnigent.harnesses.pi_native.credentials import (
     _databricks_workspace_url_for_gateway,
     _is_databricks_ai_gateway_url,
     _split_pi_native_model_selection,
+    global_pi_agent_dir,
 )
 from omnigent.inner.agent_env import clean_agent_env
 from omnigent.inner.native_attachments import parse_data_uri
@@ -94,7 +98,9 @@ from omnigent.models.pi_model_compatibility import (
 from omnigent.onboarding.provider_config import CHAT_WIRE_API, RESPONSES_WIRE_API
 from omnigent.permission_tiers import plan_visible_tool_names
 from omnigent.permission_tiers.host import HOST_PERMISSION_STATE_FILE, read_host_permission_state
+from omnigent.pi_prompt import pi_prompt_args
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
+from omnigent.sdk_peer_delivery import ReportPeerOutcome, SDKPeerInput, SDKPeerOutcome
 from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 from omnigent.spec.types import RetryPolicy
 from omnigent.startup_protocol import (
@@ -124,6 +130,7 @@ from .async_utils import run_sync_on_thread
 from .databricks_executor import _read_databrickscfg
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .executor import (
+    CompactedMessages,
     CompactionComplete,
     CompactionStarted,
     Executor,
@@ -147,6 +154,9 @@ _GATEWAY_AUTH_REFRESH_MS = 900_000
 _GATEWAY_AUTH_TIMEOUT_S = 7
 _GATEWAY_AUTH_REAP_TIMEOUT_S = 0.5
 _GATEWAY_BRIDGE_TIMEOUT_S = 8
+# Tool arguments can include files; match the other adapters' bounded stream limit.
+_TOOL_REQUEST_LIMIT = 16 * 1024 * 1024
+_TOOL_REQUEST_DRAIN_TIMEOUT_S = 2
 
 
 class PiPermissionBootstrapError(RuntimeError):
@@ -264,6 +274,13 @@ class PiSessionEventReporter(Protocol):
     ) -> Awaitable[dict[str, Any] | None] | dict[str, Any] | None: ...
 
 
+# ExecutorAdapter connects Pi dialogs to ctx.elicit. Return the typed result
+# so the extension can handle a decline without aborting the turn.
+FormElicitationHandler: TypeAlias = Callable[
+    [str, ElicitationRequestParams], Awaitable[ElicitationResult]
+]
+
+
 class _PiProviderConfig(TypedDict):
     baseUrl: str
     apiKey: str
@@ -271,6 +288,7 @@ class _PiProviderConfig(TypedDict):
     models: list[_JsonObject]
     authHeader: NotRequired[bool]
     compat: NotRequired[_JsonObject]
+    headers: NotRequired[dict[str, str]]
 
 
 class _PiModelsConfig(TypedDict):
@@ -288,6 +306,7 @@ class _PiMessageUsage(TypedDict):
 
 class _PiTurnUsage(_PiMessageUsage):
     context_tokens: int
+    context_window: NotRequired[int]
 
 
 # ---------------------------------------------------------------------------
@@ -368,6 +387,7 @@ class _ToolServer:
             self._handle_client,
             "127.0.0.1",
             0,
+            limit=_TOOL_REQUEST_LIMIT,
         )
         addr = self._server.sockets[0].getsockname()
         self.port = addr[1]
@@ -396,7 +416,31 @@ class _ToolServer:
         self._clients.add(task)
         try:
             while True:
-                raw = await reader.readline()
+                try:
+                    raw = await reader.readline()
+                except ValueError:
+                    logger.warning(
+                        "Pi tool request exceeded the frame limit",
+                        extra=debug_event(
+                            "pi_tool_request_rejected",
+                            request_limit_bytes=_TOOL_REQUEST_LIMIT,
+                        ),
+                    )
+                    writer.write(
+                        json.dumps(
+                            {"error": f"tool request exceeds {_TOOL_REQUEST_LIMIT}-byte limit"}
+                        ).encode()
+                        + b"\n"
+                    )
+                    await writer.drain()
+                    writer.write_eof()
+                    # Unread input can reset the socket and discard the error response.
+                    with contextlib.suppress(TimeoutError):
+                        async with asyncio.timeout(_TOOL_REQUEST_DRAIN_TIMEOUT_S):
+                            while chunk := await reader.read(64 * 1024):
+                                if b"\n" in chunk:
+                                    break
+                    break
                 if not raw:
                     break
                 line = raw.decode("utf-8", errors="replace").strip()
@@ -1762,6 +1806,11 @@ def _build_models_json(
                 entry["contextWindow"] = limits["context_window"]
             if "max_output_tokens" in limits:
                 entry["maxTokens"] = limits["max_output_tokens"]
+    for provider_config in config["providers"].values():
+        if _is_databricks_ai_gateway_url(provider_config["baseUrl"]):
+            provider_config["headers"] = gateway_attribution_headers(
+                PI_AGENT, via_ug=is_ug_route(provider_config["baseUrl"])
+            )
     return config
 
 
@@ -2032,14 +2081,7 @@ class _PiRpcSession:
             )
         if thinking:
             args.extend(["--thinking", thinking])
-        if system_prompt_mode == "replace":
-            if not system_prompt or not system_prompt.strip():
-                raise ValueError("system_prompt_mode='replace' requires non-empty instructions")
-            # An explicit empty append input suppresses APPEND_SYSTEM.md discovery.
-            args.extend(["--system-prompt", system_prompt, "--append-system-prompt", ""])
-        elif system_prompt:
-            # Keep Pi's tool snippets and default guidance in append mode.
-            args.extend(["--append-system-prompt", system_prompt])
+        args.extend(pi_prompt_args(system_prompt, system_prompt_mode))
         if extra_args:
             args.extend(extra_args)
 
@@ -2257,7 +2299,7 @@ class _PiRpcSession:
         """
         try:
             return await asyncio.wait_for(self._line_queue.get(), timeout=timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return None
 
     def stdout_at_eof(self) -> bool:
@@ -2332,17 +2374,28 @@ class _PiRpcSession:
 
 
 @dataclass
+class _PiPeerPending:
+    delivery: SDKPeerInput
+    report: ReportPeerOutcome
+    expected_text: str
+
+
+@dataclass
 class _PiSessionState:
     rpc: _PiRpcSession | None = None
     system_prompt: str | None = None
     model: str | None = None
     model_selection: str | None = None
+    context_window: int | None = None
     tool_names: tuple[str, ...] = ()
     # Thinking level (Pi vocabulary) this process is known to be running at,
     # so an unchanged effort costs no RPC and a changed one is applied live.
     applied_thinking: str | None = None
     _has_sent_prompt: bool = False
     owner_incarnation: str = field(default_factory=lambda: uuid4().hex)
+    peer_turn_active: bool = False
+    peer_pending: dict[str, _PiPeerPending] = field(default_factory=dict)
+    peer_commands: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -2428,6 +2481,69 @@ def _extract_latest_user_content(
                 return cast(list[_JsonObject], content)
             return str(content)
     return ""
+
+
+# Pi's own framing for a compaction summary in model context (core/messages.js).
+_PI_COMPACTION_SUMMARY_PREFIX = (
+    "The conversation history before this point was compacted into the following "
+    "summary:\n\n<summary>\n"
+)
+_PI_COMPACTION_SUMMARY_SUFFIX = "\n</summary>"
+
+
+def _pi_compacted_history(pi_messages: list[JsonValue]) -> CompactedMessages:
+    """
+    Convert Pi's post-compaction context into Omnigent replay messages.
+
+    The current turn's text up to its last tool result is persisted before
+    the compaction item, so it is kept. The reply after that result is
+    persisted after the item, so it is left out. Tool calls and results are
+    dropped because Pi replay carries text only.
+
+    :param pi_messages: ``get_messages`` data from Pi after compaction.
+    :returns: Text messages for the runner's compaction item.
+    """
+    messages = [m for m in pi_messages if isinstance(m, dict)]
+    last_prompt = max(
+        (index for index, m in enumerate(messages) if m.get("role") == "user"),
+        default=-1,
+    )
+    persisted_end = max(
+        (
+            index
+            for index, m in enumerate(messages)
+            if index > last_prompt and m.get("role") == "toolResult"
+        ),
+        default=last_prompt,
+    )
+    history: CompactedMessages = []
+    for message in messages[: persisted_end + 1]:
+        role = message.get("role")
+        if role == "compactionSummary":
+            summary = message.get("summary")
+            text = (
+                _PI_COMPACTION_SUMMARY_PREFIX + summary + _PI_COMPACTION_SUMMARY_SUFFIX
+                if isinstance(summary, str)
+                else ""
+            )
+            history_role, block_type = "user", "input_text"
+        elif role in ("user", "custom"):
+            text = _extract_text(message)
+            history_role, block_type = "user", "input_text"
+        elif role == "assistant":
+            text = _extract_text(message)
+            history_role, block_type = "assistant", "output_text"
+        else:
+            continue
+        if text:
+            history.append(
+                {
+                    "type": "message",
+                    "role": history_role,
+                    "content": [{"type": block_type, "text": text}],
+                }
+            )
+    return history
 
 
 def _split_pi_prompt(blocks: list[_JsonObject]) -> tuple[str, list[dict[str, str]]]:
@@ -2562,6 +2678,7 @@ def _try_sandbox_pi(
     cwd: str | None,
     spawn_env_names: Sequence[str] | None = None,
     resource_executable: str | None = None,
+    extra_read_roots: Sequence[pathlib.Path] | None = None,
 ) -> SandboxedPiCli:
     """Wrap the Pi CLI in a sandbox if ``os_env`` requests it.
 
@@ -2576,6 +2693,9 @@ def _try_sandbox_pi(
         anything else its environment picks up — defense in depth
         against host-env leakage into the sandbox. ``None`` skips the
         prune.
+    :param extra_read_roots: Directories granted read-only alongside Pi's
+        own installation, e.g. the bundle resource directories passed to
+        Pi via ``--skill`` / ``--extension``.
     """
     if os_env is None:
         return SandboxedPiCli(launch_path=pi_path, sandboxed=False)
@@ -2604,7 +2724,7 @@ def _try_sandbox_pi(
             (parent for parent in resource_path.parents if parent.name == "node_modules"),
             resource_path.parent,
         )
-        sandbox = with_additional_read_roots(sandbox, [pi_dir])
+        sandbox = with_additional_read_roots(sandbox, [pi_dir, *(extra_read_roots or ())])
         home_pi = pathlib.Path(os.path.expanduser("~/.pi"))
         sandbox = with_additional_write_roots(sandbox, [home_pi])
         sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
@@ -2644,7 +2764,11 @@ def _resolve_pi_skill_args(
       not an error.
 
     Pi's ``--skill`` flag accepts a directory path, not a name, so
-    the resolver looks up named skills under ``<bundle>/skills/``.
+    the resolver looks up named skills under ``<bundle>/skills/`` and
+    Pi's own project layout ``<bundle>/.pi/skills/`` (``skills/`` wins
+    when both ship the same name). Pi would discover ``.pi/skills``
+    itself, but only relative to its cwd — the session workspace, not
+    the bundle — so bundled skills always need the explicit flag.
     Host-installed Pi skills aren't accessible by name without
     knowing Pi's internal extension layout, so the named-list mode
     only resolves bundle skills.
@@ -2661,11 +2785,12 @@ def _resolve_pi_skill_args(
     """
     bundle_skills: dict[str, pathlib.Path] = {}
     if bundle_dir is not None:
-        skills_root = bundle_dir / "skills"
-        if skills_root.is_dir():
+        for skills_root in (bundle_dir / "skills", bundle_dir / ".pi" / "skills"):
+            if not skills_root.is_dir():
+                continue
             for child in sorted(skills_root.iterdir()):
                 if child.is_dir() and (child / "SKILL.md").is_file():
-                    bundle_skills[child.name] = child
+                    bundle_skills.setdefault(child.name, child)
 
     if skills_filter == "all":
         # Pi auto-discovers host skills; we explicitly add bundled
@@ -2689,6 +2814,138 @@ def _resolve_pi_skill_args(
     # no explicit skills). The harness wrap's resolver should
     # have validated upstream, so this branch is belt-and-suspenders.
     return []
+
+
+# Bundle-root context-file candidates, in Pi's own precedence order
+# (mirrors Pi's cwd-based project context loader).
+_PI_BUNDLE_CONTEXT_FILE_CANDIDATES = (
+    "AGENTS.override.md",
+    "AGENTS.md",
+    "AGENTS.MD",
+    "CLAUDE.md",
+    "CLAUDE.MD",
+)
+
+
+def _pi_extension_dir_entries(ext_dir: pathlib.Path) -> list[pathlib.Path]:
+    """Resolve one extension directory to its entry-point file(s)."""
+    manifest_path = ext_dir / "package.json"
+    if manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "PiExecutor: could not read extension manifest %s: %s", manifest_path, exc
+            )
+            manifest = None
+        pi_field = manifest.get("pi") if isinstance(manifest, dict) else None
+        raw_entries = pi_field.get("extensions") if isinstance(pi_field, dict) else None
+        if isinstance(raw_entries, list):
+            root = ext_dir.resolve()
+            entries: list[pathlib.Path] = []
+            for entry in raw_entries:
+                candidate = (ext_dir / entry).resolve() if isinstance(entry, str) else None
+                if (
+                    candidate is not None
+                    and candidate.is_file()
+                    and candidate.is_relative_to(root)
+                ):
+                    entries.append(ext_dir / entry)
+                else:
+                    logger.warning(
+                        "PiExecutor: skipping manifest extension entry %r in %s "
+                        "(not a file inside the extension dir)",
+                        entry,
+                        manifest_path,
+                    )
+            if entries:
+                return entries
+    for name in ("index.ts", "index.js"):
+        entry = ext_dir / name
+        if entry.is_file():
+            return [entry]
+    return []
+
+
+def _resolve_pi_bundle_extension_entries(extensions_dir: pathlib.Path) -> list[pathlib.Path]:
+    """Discover extension entry files under a bundle's ``.pi/extensions``."""
+    root_entries = _pi_extension_dir_entries(extensions_dir)
+    if root_entries:
+        return root_entries
+    entries: list[pathlib.Path] = []
+    try:
+        children = sorted(extensions_dir.iterdir())
+    except OSError as exc:
+        logger.warning(
+            "PiExecutor: could not list bundle extensions dir %s: %s", extensions_dir, exc
+        )
+        return entries
+    for child in children:
+        if child.name.startswith(".") or child.name == "node_modules":
+            continue
+        if child.is_file() and child.suffix in (".ts", ".js"):
+            entries.append(child)
+        elif child.is_dir():
+            entries.extend(_pi_extension_dir_entries(child))
+    return entries
+
+
+def _resolve_pi_bundle_extension_args(bundle_dir: pathlib.Path | None) -> list[str]:
+    """Pass bundled extension entry files explicitly; Pi's cwd is the workspace."""
+    if bundle_dir is None:
+        return []
+    extensions_dir = bundle_dir / ".pi" / "extensions"
+    if not extensions_dir.is_dir():
+        return []
+    args: list[str] = []
+    for entry in _resolve_pi_bundle_extension_entries(extensions_dir):
+        args.extend(["--extension", str(entry)])
+    return args
+
+
+def _pi_bundle_resource_roots(
+    bundle_dir: pathlib.Path | None, args: Sequence[str]
+) -> list[pathlib.Path]:
+    """Grant selected resource roots; sandbox tmpfs hides extracted bundles.
+
+    Granting only the bundle root would leave .pi hidden by the dotfile mask.
+    """
+    if bundle_dir is None:
+        return []
+    passed = {
+        pathlib.Path(value)
+        for flag, value in itertools.pairwise(args)
+        if flag in ("--skill", "--extension")
+    }
+    roots = (
+        bundle_dir / "skills",
+        bundle_dir / ".pi" / "skills",
+        bundle_dir / ".pi" / "extensions",
+    )
+    return [root for root in roots if any(path.is_relative_to(root) for path in passed)]
+
+
+def _squash_ws(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _read_pi_bundle_context(bundle_dir: pathlib.Path | None) -> str | None:
+    """Read the first readable bundle context file in Pi's precedence order."""
+    if bundle_dir is None:
+        return None
+    for candidate in _PI_BUNDLE_CONTEXT_FILE_CANDIDATES:
+        context_file = bundle_dir / candidate
+        if not context_file.is_file():
+            continue
+        try:
+            content = context_file.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError) as exc:
+            logger.warning(
+                "PiExecutor: could not read bundle context file %s: %s", context_file, exc
+            )
+            continue
+        return content or None
+    return None
 
 
 def _extract_pi_turn_usage(
@@ -2736,6 +2993,7 @@ def _extract_pi_turn_usage(
 def _aggregate_pi_turn_usage(
     message_usages: list[_PiMessageUsage],
     fallback_model: str | None,
+    context_window: int | None = None,
 ) -> _PiTurnUsage | None:
     """Aggregate per-message Pi usage into one turn-level usage dict.
 
@@ -2787,7 +3045,7 @@ def _aggregate_pi_turn_usage(
     # message-model-else-fallback precedence, so the last entry's model is
     # the authoritative one to price the turn with.
     model = last["model"] if last["model"] else fallback_model
-    return {
+    usage: _PiTurnUsage = {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": total_tokens or (input_tokens + output_tokens),
@@ -2796,6 +3054,9 @@ def _aggregate_pi_turn_usage(
         "context_tokens": context_tokens,
         "model": model,
     }
+    if context_window is not None:
+        usage["context_window"] = context_window
+    return usage
 
 
 def _pi_thinking_from_config(config: ExecutorConfig | None) -> str | None:
@@ -2850,7 +3111,8 @@ class PiExecutor(Executor):
 
         :param cwd: Working directory for the Pi subprocess.
         :param context_files: Allow Pi to automatically load context files such
-            as AGENTS.md and CLAUDE.md. Explicit agent instructions are unaffected.
+            as AGENTS.md and CLAUDE.md, including the one at the bundle root.
+            Explicit agent instructions are unaffected.
         :param system_prompt_mode: ``append`` retains Pi's base prompt;
             ``replace`` uses Omnigent's composed instructions as the base.
         :param os_env: Optional OS environment / sandbox spec.  When set, the
@@ -2897,9 +3159,15 @@ class PiExecutor(Executor):
             budget. ``None`` resolves to ``RetryPolicy()`` defaults.
             See Phase 1f of ``designs/RETRY_ACROSS_HARNESSES.md``.
         :param bundle_dir: The agent bundle's extracted on-disk path.
-            When set, ``<bundle_dir>/skills/<dir>/SKILL.md`` files
-            are exposed to Pi via ``--skill <path>`` based on
-            *skills_filter*. ``None`` skips bundle-skill wiring.
+            When set, ``<bundle_dir>/skills/<dir>/SKILL.md`` and
+            ``<bundle_dir>/.pi/skills/<dir>/SKILL.md`` files are exposed
+            to Pi via ``--skill <path>`` based on *skills_filter*,
+            ``<bundle_dir>/.pi/extensions`` via ``--extension``, and a
+            bundle-root context file (``AGENTS.md`` et al.) is appended
+            to the composed system prompt when *context_files* allows.
+            A sandboxed Pi is granted read access to the resource
+            directories it is passed. ``None`` skips all bundle-resource
+            wiring.
         :param agent_name: Optional agent display name. Reserved for
             future use; currently unused by Pi.
         :param skills_filter: Host-skill filter (``"all"`` / ``"none"``
@@ -3006,11 +3274,16 @@ class PiExecutor(Executor):
         # ``_build_env_and_dir`` copies ``self._extra_args`` so this
         # extension is read-only after init.
         self._extra_args.extend(_resolve_pi_skill_args(skills_filter, bundle_dir))
+        self._extra_args.extend(_resolve_pi_bundle_extension_args(bundle_dir))
+        # The bundle-root context file is an automatic context file like the
+        # workspace ones Pi discovers, so ``context_files=False`` drops it too.
+        self._bundle_context = _read_pi_bundle_context(bundle_dir) if context_files else None
         # Set by Session._wire_sdk_executor().
         self._tool_executor: ToolExecutor | None = None
         self._raw_elicitation_handler: (
             Callable[[ElicitationRequestParams], Awaitable[ElicitationResult | None]] | None
         ) = None
+        self._form_elicitation_handler: FormElicitationHandler | None = None
 
         self._databricks_host = self._gateway_host_override or ""
         self._databricks_token = ""
@@ -3045,12 +3318,14 @@ class PiExecutor(Executor):
             os_env,
             cwd,
             spawn_env_names=[*self._env, "PI_CODING_AGENT_DIR", "OMNIGENT_PI_EXTENSION_UI"],
+            extra_read_roots=_pi_bundle_resource_roots(bundle_dir, self._extra_args),
         )
         self._pi_launch_path = sandboxed.launch_path
         self._pi_launcher_args = sandboxed.launcher_args
         self._sandboxed = sandboxed.sandboxed
 
         self._session_states: dict[str, _PiSessionState] = {}
+        self._peer_initial: dict[str, _PiPeerPending] = {}
         self._context_incarnation = uuid4().hex
         self._context_records: dict[str, ContextRecordV2] = {}
         self._context_bindings: dict[str, tuple[str, int]] = {}
@@ -3101,6 +3376,7 @@ class PiExecutor(Executor):
             return False
 
     async def close_session(self, session_key: str) -> None:
+        await self.finish_peer_messages(session_key)
         state = self._session_states.get(session_key)
         rpc = state.rpc if state is not None else None
         tool_server = self._tool_server
@@ -3119,6 +3395,49 @@ class PiExecutor(Executor):
             and state.rpc is rpc
         ):
             self._session_states.pop(session_key, None)
+
+    async def prepare_peer_turn(
+        self, session_key: str, delivery: SDKPeerInput, report: ReportPeerOutcome
+    ) -> bool:
+        self._peer_initial[session_key] = _PiPeerPending(delivery, report, delivery.text)
+        return True
+
+    async def submit_peer_message(
+        self, session_key: str, delivery: SDKPeerInput, report: ReportPeerOutcome
+    ) -> None:
+        """Submit once; only Pi's final consumed user event accepts the peer."""
+        state = self._session_states.get(session_key)
+        if state is None or state.rpc is None or not state.peer_turn_active:
+            await report(SDKPeerOutcome.for_input(delivery, "refused", "pi_no_active_turn"))
+            return
+        if delivery.attempt_id in state.peer_commands or delivery.attempt_id in state.peer_pending:
+            return
+        state.peer_pending[delivery.attempt_id] = _PiPeerPending(delivery, report, delivery.text)
+        state.peer_commands.add(delivery.attempt_id)
+        try:
+            await state.rpc.send_command(
+                {"type": "steer", "id": delivery.attempt_id, "message": delivery.text}
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — a partial write has no definitive delivery outcome
+            await report(SDKPeerOutcome.for_input(delivery, "unknown", "pi_steer_write"))
+
+    async def finish_peer_messages(self, session_key: str) -> None:
+        """Drop executable pending input at turn end; never blindly resubmit it."""
+        state = self._session_states.get(session_key)
+        pending = []
+        if state is not None:
+            state.peer_turn_active = False
+            pending.extend(state.peer_pending.values())
+            state.peer_pending.clear()
+        initial = self._peer_initial.pop(session_key, None)
+        if initial is not None:
+            pending.append(initial)
+        for item in pending:
+            await item.report(
+                SDKPeerOutcome.for_input(item.delivery, "unknown", "pi_turn_no_receipt")
+            )
 
     def _register_rpc_context(
         self, session_key: str, state: _PiSessionState, rpc: _PiRpcSession
@@ -3249,6 +3568,7 @@ class PiExecutor(Executor):
         """Drop *rpc* mid-turn so frames it still emits can't reach the next turn."""
         state = self._session_states.get(session_key)
         if state is not None and state.rpc is rpc:
+            await self.finish_peer_messages(session_key)
             self._session_states.pop(session_key, None)
             if self._tool_server is not None:
                 self._tool_server.revoke_pi_usage_token(session_key)
@@ -3411,7 +3731,7 @@ class PiExecutor(Executor):
                 workspace_url,
                 self._databricks_token,
             )
-        except Exception:  # noqa: BLE001 — catalog outage uses conservative routing
+        except Exception:
             logger.warning(
                 "Pi could not fetch Databricks model metadata; "
                 "the picker will show only the selected model",
@@ -3425,13 +3745,14 @@ class PiExecutor(Executor):
                 model_catalog.catalog_model_entries,
                 "databricks",
             )
-        except Exception:  # noqa: BLE001 — live availability remains authoritative
+            models = await run_sync_on_thread(
+                enrich_databricks_model_catalog, models, metadata_models
+            )
+        except Exception:
             logger.info(
                 "Pi could not enrich the live Databricks model list with MLflow metadata",
                 exc_info=True,
             )
-        else:
-            models = enrich_databricks_model_catalog(models, metadata_models)
         self._gateway_model_entries = tuple(models)
         self._gateway_model_wire_apis = _databricks_model_wire_catalog(models)
         return self._gateway_model_wire_apis
@@ -3444,7 +3765,9 @@ class PiExecutor(Executor):
         self._tool_server._tool_executor = self._tool_executor
         self._tool_server._policy_gate = self._gate_native_tool
         self._tool_server._gateway_auth = self._get_gateway_token if self._gateway else None
-        self._tool_server._pi_session_event = self._pi_session_event
+        self._tool_server._pi_session_event = (
+            self._report_pi_session_usage if self._pi_session_event is not None else None
+        )
         if self._permission_controlled and self._permission_session_id:
             self._tool_server._permission_bridge_dir = bridge_dir_for_session_id(
                 self._permission_session_id
@@ -3452,6 +3775,25 @@ class PiExecutor(Executor):
             self._tool_server._permission_session_id = self._permission_session_id
             self._tool_server._permission_finish = self._finish_native_permission_lease
         return self._tool_server.port
+
+    def _report_pi_session_usage(  # type: ignore[explicit-any]
+        self, session_id: str, data: dict[str, Any]
+    ) -> Awaitable[dict[str, Any] | None] | dict[str, Any] | None:
+        """Retain the process's measured window for its terminal usage event."""
+        state = self._session_states.get(session_id)
+        window = data.get("context_window")
+        if (
+            state is not None
+            and isinstance(window, int)
+            and not isinstance(window, bool)
+            and window > 0
+        ):
+            state.context_window = window
+        return (
+            self._pi_session_event(session_id, data)
+            if self._pi_session_event is not None
+            else None
+        )
 
     async def _get_gateway_token(self) -> str:
         """Refresh expired credentials under a lock; never fall back after failure."""
@@ -3605,7 +3947,7 @@ class PiExecutor(Executor):
         if self._gateway and models_json is None:
             raise ValueError("Gateway provider configuration must be resolved before startup")
         env = dict(self._env)
-        if self._raw_elicitation_handler is not None:
+        if self._raw_elicitation_handler is not None or self._form_elicitation_handler is not None:
             env["OMNIGENT_PI_EXTENSION_UI"] = "1"
         else:
             env.pop("OMNIGENT_PI_EXTENSION_UI", None)
@@ -3636,7 +3978,14 @@ class PiExecutor(Executor):
             prepare_managed_pi_agent_dir(
                 pathlib.Path(tmp_dir),
                 overlay={**self._retry_policy.pi.settings(), "cacheWarming": "idle"},
+                global_agent_dir=global_pi_agent_dir(
+                    env=self._env, workspace=pathlib.Path(self._cwd) if self._cwd else None
+                ),
             )
+            from omnigent.inner.pi_gateway import pi_gateway_extension_args
+
+            assert models_json is not None
+            extra_args.extend(pi_gateway_extension_args(pathlib.Path(tmp_dir), models_json))
 
         # Pi natively supports retry config via ``.pi/settings.json``
         # (see ``RetryPolicy.pi.settings()`` for schema). On the non-gateway
@@ -3757,94 +4106,7 @@ class PiExecutor(Executor):
         )
 
     async def _handle_extension_ui(self, rpc: _PiRpcSession, event: CodexEvent) -> None:
-        method = event.get("method")
-        if method == "notify":
-            logger.info(
-                "Pi extension notice (%s): %s",
-                event.get("notifyType", "info"),
-                event.get("message", ""),
-            )
-            return
-        if method not in {"select", "confirm", "input", "editor"}:
-            return
-        request_id = event.get("id")
-        if not isinstance(request_id, str) or not request_id:
-            return
-        response: CodexEvent = {
-            "type": "extension_ui_response",
-            "id": request_id,
-            "cancelled": True,
-        }
-        try:
-            handler = self._raw_elicitation_handler
-            # The shared form currently has no multi-line editor control.
-            if handler is not None and method != "editor":
-                prop: _JsonObject = {"type": "string", "title": str(event.get("title", method))}
-                if method == "select":
-                    options = event.get("options")
-                    if (
-                        not isinstance(options, list)
-                        or not options
-                        or not all(isinstance(option, str) for option in options)
-                    ):
-                        raise ValueError("Pi select requires string options")
-                    prop["enum"] = options
-                elif method == "input" and isinstance(event.get("placeholder"), str):
-                    prop["description"] = event["placeholder"]
-                message = str(event.get("title", method))
-                if isinstance(event.get("message"), str):
-                    message += "\n\n" + event["message"]
-                params = ElicitationRequestParams(
-                    message=message,
-                    requestedSchema={
-                        "type": "object",
-                        "properties": {} if method == "confirm" else {"value": prop},
-                        "required": [] if method == "confirm" else ["value"],
-                    },
-                )
-                timeout = event.get("timeout")
-                timeout_s = (
-                    max(0, timeout / 1000)
-                    if isinstance(timeout, (int, float)) and timeout != 0
-                    else None
-                )
-                deadline = (
-                    asyncio.get_running_loop().time() + timeout_s
-                    if timeout_s is not None
-                    else None
-                )
-                async with asyncio.timeout_at(deadline):
-                    result = await handler(params)
-                # A handler that finishes during timeout cancellation cannot revive the dialog.
-                if deadline is not None and asyncio.get_running_loop().time() >= deadline:
-                    return
-                if result is not None:
-                    if method == "confirm" and result.action != "cancel":
-                        response = {
-                            "type": "extension_ui_response",
-                            "id": request_id,
-                            "confirmed": result.action == "accept",
-                        }
-                    elif result.action == "accept":
-                        value = (result.content or {}).get("value")
-                        if isinstance(value, str) and (
-                            method != "select" or value in event["options"]
-                        ):
-                            response = {
-                                "type": "extension_ui_response",
-                                "id": request_id,
-                                "value": value,
-                            }
-        except TimeoutError:
-            return  # Pi owns the timeout result; do not send a late response.
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001 — a broken UI must not permit an operation
-            logger.warning("Pi extension dialog failed; cancelling", exc_info=True)
-        try:
-            await rpc.send_command(response)
-        except (OSError, RuntimeError):
-            logger.debug("Pi extension dialog process is no longer available")
+        await self._handle_extension_ui_request(event, rpc)
 
     async def _available_thinking_levels(self, rpc: _PiRpcSession) -> list[str] | None:
         """Ask Pi which thinking levels the current model offers.
@@ -3857,7 +4119,7 @@ class PiExecutor(Executor):
                 {"type": "get_available_thinking_levels", "id": "thinking_levels"},
                 "get_available_thinking_levels",
             )
-        except Exception:  # noqa: BLE001 — a probe failure must not sink the turn
+        except Exception:
             logger.debug("PiExecutor: get_available_thinking_levels failed", exc_info=True)
             return None
         data = response.get("data") if response else None
@@ -3865,6 +4127,92 @@ class PiExecutor(Executor):
         if not isinstance(levels, list):
             return None
         return [level for level in levels if isinstance(level, str)]
+
+    async def _compaction_complete(
+        self,
+        rpc: _PiRpcSession | None,
+        result: dict[str, JsonValue],
+        model: str | None,
+    ) -> CompactionComplete:
+        """Report a settled turn's compaction with Pi's compacted context.
+
+        :param rpc: A settled Pi session, or ``None`` for a summary-only fallback.
+        :param result: The ``compaction_end`` result carrying Pi's summary.
+        :param model: The turn's model.
+        :returns: The compaction event; summary-only if Pi did not export its context.
+        """
+        response = None
+        if rpc is not None:
+            try:
+                response = await rpc.request(
+                    {"type": "get_messages", "id": "compacted_messages"},
+                    "get_messages",
+                )
+            except Exception:
+                logger.debug("PiExecutor: get_messages failed after compaction", exc_info=True)
+        data = response.get("data") if response else None
+        pi_messages = data.get("messages") if isinstance(data, dict) else None
+        tokens_after = result.get("estimatedTokensAfter")
+        return CompactionComplete(
+            summary=cast(str, result["summary"]),
+            token_count=tokens_after if isinstance(tokens_after, int) else 0,
+            model=model,
+            compacted_messages=(
+                _pi_compacted_history(pi_messages) or None
+                if isinstance(pi_messages, list)
+                else None
+            ),
+        )
+
+    async def _evict_with_compaction(
+        self,
+        session_key: str,
+        rpc: _PiRpcSession,
+        result: dict[str, JsonValue],
+        model: str | None,
+    ) -> CompactionComplete:
+        """Stop a failed turn and preserve its checkpoint before eviction.
+
+        Discard retry output while abort settles. If settlement fails, retain
+        only the summary rather than exporting context from an active turn.
+
+        :param session_key: Session to evict.
+        :param rpc: The failed turn's Pi process.
+        :param result: Latest successful compaction result.
+        :param model: The turn's model.
+        :returns: A full checkpoint when settled, otherwise its summary only.
+        """
+        settled = False
+        try:
+            try:
+                async with asyncio.timeout(_TURN_STDOUT_ERROR_DRAIN_TIMEOUT_S):
+                    await rpc.send_command({"type": "abort", "id": "compaction_abort"})
+                    while (line := await rpc.read_line()) is not None:
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(event, dict):
+                            continue
+                        if event.get("type") == "agent_settled":
+                            settled = True
+                            break
+                        if event.get("type") == "compaction_end":
+                            latest = event.get("result")
+                            if isinstance(latest, dict) and isinstance(latest.get("summary"), str):
+                                result = latest
+            except Exception:
+                logger.debug(
+                    "PiExecutor: compaction settlement failed before eviction", exc_info=True
+                )
+            if not settled:
+                logger.warning(
+                    "PiExecutor: preserving only the compaction summary before eviction; "
+                    "recent kept context is unavailable"
+                )
+            return await self._compaction_complete(rpc if settled else None, result, model)
+        finally:
+            await self._evict_rpc(session_key, rpc)
 
     async def _apply_thinking_level(
         self,
@@ -3915,6 +4263,13 @@ class PiExecutor(Executor):
         if response is None:
             raise RuntimeError("Pi did not confirm the requested thinking level")
         state.applied_thinking = requested_thinking
+
+    def _with_bundle_context(self, system_prompt: str) -> str:
+        """Append bundle context unless the prompt already starts with it."""
+        context = self._bundle_context
+        if not context or _squash_ws(system_prompt).startswith(_squash_ws(context)):
+            return system_prompt
+        return f"{system_prompt}\n\n{context}" if system_prompt else context
 
     async def _ensure_rpc(
         self,
@@ -3974,8 +4329,18 @@ class PiExecutor(Executor):
             )
 
         if previous_rpc is not None:
+            # The new turn's input does not belong to the process being replaced.
+            initial_peer = self._peer_initial.pop(session_key, None)
+            try:
+                await self.finish_peer_messages(session_key)
+            finally:
+                if initial_peer is not None:
+                    self._peer_initial[session_key] = initial_peer
             await previous_rpc.close()
+        state.peer_commands.clear()
 
+        # A replacement process may use a different model; its own report wins.
+        state.context_window = None
         tool_server_port = await self._ensure_tool_server(tools)
         tool_server = self._tool_server
         tool_server_token = tool_server.token if tool_server is not None else None
@@ -4025,7 +4390,7 @@ class PiExecutor(Executor):
                 env=env,
                 cwd=self._cwd,
                 model=pi_model or None,
-                system_prompt=system_prompt or None,
+                system_prompt=self._with_bundle_context(system_prompt) or None,
                 system_prompt_mode="append" if permission_bootstrap else self._system_prompt_mode,
                 thinking=thinking,
                 session_id=session_key if session_key != "__default__" else None,
@@ -4207,9 +4572,16 @@ class PiExecutor(Executor):
         }
         if images:
             command["images"] = images
+        if turn_state is not None:
+            turn_state.peer_turn_active = True
+            initial = self._peer_initial.pop(session_key, None)
+            if initial is not None:
+                initial.expected_text = message
+                turn_state.peer_pending[initial.delivery.attempt_id] = initial
         try:
             await rpc.send_command(command)
         except Exception as exc:  # noqa: BLE001 — executor boundary surfaces prompt-send errors as ExecutorError
+            await self.finish_peer_messages(session_key)
             yield ExecutorError(message=f"Failed to send prompt to Pi: {exc}")
             return
 
@@ -4236,6 +4608,9 @@ class PiExecutor(Executor):
         # True between an errored ``message_end`` and the ``agent_end`` pi
         # emits right after it; only that gap uses the short drain budget.
         awaiting_error_agent_end = False
+        # Latest successful compaction this turn, reported at settlement so a
+        # restarted Pi process resumes from the compacted context.
+        compaction_result: dict[str, JsonValue] | None = None
 
         while True:
             line = await rpc.read_line(
@@ -4277,8 +4652,11 @@ class PiExecutor(Executor):
                         message=f"Pi process ended without response.{stderr_suffix}"
                     )
                 else:
-                    turn_usage = _aggregate_pi_turn_usage(message_usages, model)
+                    turn_usage = _aggregate_pi_turn_usage(
+                        message_usages, model, turn_state.context_window if turn_state else None
+                    )
                     _notify_usage_from_dict(model=model, usage=turn_usage)
+                    await self.finish_peer_messages(session_key)
                     yield TurnComplete(
                         response=response_text,
                         usage=dict(turn_usage) if turn_usage is not None else None,
@@ -4296,6 +4674,22 @@ class PiExecutor(Executor):
 
             # Skip the command-ack response.
             if event_type == "response":
+                command_id = event.get("id")
+                if (
+                    turn_state is not None
+                    and isinstance(command_id, str)
+                    and command_id in turn_state.peer_commands
+                ):
+                    turn_state.peer_commands.discard(command_id)
+                    if not event.get("success", True):
+                        pending = turn_state.peer_pending.pop(command_id, None)
+                        if pending is not None:
+                            await pending.report(
+                                SDKPeerOutcome.for_input(
+                                    pending.delivery, "refused", "pi_steer_rejected"
+                                )
+                            )
+                    continue
                 if not event.get("success", True):
                     if settled_boundary:
                         await self._evict_rpc(session_key, rpc)
@@ -4461,8 +4855,11 @@ class PiExecutor(Executor):
                 if pending_error is not None:
                     yield ExecutorError(message=pending_error)
                     return
-                turn_usage = _aggregate_pi_turn_usage(message_usages, model)
+                turn_usage = _aggregate_pi_turn_usage(
+                    message_usages, model, turn_state.context_window if turn_state else None
+                )
                 _notify_usage_from_dict(model=model, usage=turn_usage)
+                await self.finish_peer_messages(session_key)
                 yield TurnComplete(
                     response=response_text,
                     usage=dict(turn_usage) if turn_usage is not None else None,
@@ -4472,11 +4869,17 @@ class PiExecutor(Executor):
             # ``agent_settled``: no retry, compaction or queued continuation is
             # left, so the stream is clean for the next turn on this session.
             if event_type == "agent_settled" and settled_boundary:
+                # A failed turn still reports it: the kept pi process stays compacted.
+                if compaction_result is not None:
+                    yield await self._compaction_complete(rpc, compaction_result, model)
                 if pending_error is not None:
                     yield ExecutorError(message=pending_error)
                     return
-                turn_usage = _aggregate_pi_turn_usage(message_usages, model)
+                turn_usage = _aggregate_pi_turn_usage(
+                    message_usages, model, turn_state.context_window if turn_state else None
+                )
                 _notify_usage_from_dict(model=model, usage=turn_usage)
+                await self.finish_peer_messages(session_key)
                 yield TurnComplete(
                     response=response_text,
                     usage=dict(turn_usage) if turn_usage is not None else None,
@@ -4489,6 +4892,19 @@ class PiExecutor(Executor):
             if event_type == "message_end":
                 msg = event.get("message", {})
                 if isinstance(msg, dict):
+                    if msg.get("role") == "user" and turn_state is not None:
+                        content = msg.get("content")
+                        if isinstance(content, list) and len(content) == 1:
+                            block = content[0]
+                            content = block.get("text") if isinstance(block, dict) else None
+                        for attempt_id, pending in list(turn_state.peer_pending.items()):
+                            if content == pending.expected_text:
+                                turn_state.peer_pending.pop(attempt_id, None)
+                                await pending.report(
+                                    SDKPeerOutcome.for_input(
+                                        pending.delivery, "accepted", "pi_user_message_end"
+                                    )
+                                )
                     captured = _extract_pi_turn_usage(msg, model)
                     if captured is not None:
                         message_usages.append(captured)
@@ -4497,21 +4913,21 @@ class PiExecutor(Executor):
                         capture_pi_rpc_message(session_key, msg)
                     raw_stop = msg.get("stopReason")
                     stop: str | None = raw_stop if isinstance(raw_stop, str) else None
-                    if stop == "aborted":
-                        # pi still emits agent_end/agent_settled after an abort;
-                        # drop the session so the next turn cannot read them.
+                    if stop == "aborted" or (
+                        stop == "error" and settled_boundary and message_streamed_text
+                    ):
+                        # Never append regenerated text after a failed streamed reply.
                         if settled_boundary:
-                            await self._evict_rpc(session_key, rpc)
+                            if compaction_result is not None:
+                                yield await self._evict_with_compaction(
+                                    session_key, rpc, compaction_result, model
+                                )
+                            else:
+                                await self._evict_rpc(session_key, rpc)
                         yield ExecutorError(message=str(msg.get("errorMessage", stop)))
                         return
                     if stop == "error":
                         error = str(msg.get("errorMessage", stop))
-                        if settled_boundary and message_streamed_text:
-                            # pi regenerates this message on retry; its partial
-                            # text is already on screen, so stop here.
-                            await self._evict_rpc(session_key, rpc)
-                            yield ExecutorError(message=error)
-                            return
                         # pi emits the run's ``agent_end`` right after an errored
                         # call; consume it (and on pi >= 0.80.4 the retry or
                         # settlement that follows) rather than leave it queued.
@@ -4523,10 +4939,18 @@ class PiExecutor(Executor):
                 continue
 
             if event_type == "compaction_end" and settled_boundary:
+                result = event.get("result")
+                if isinstance(result, dict) and isinstance(result.get("summary"), str):
+                    compaction_result = result
                 if event.get("willRetry") and message_streamed_text:
                     # Overflow recovery re-runs the prompt, replacing a
                     # truncated message whose text already streamed.
-                    await self._evict_rpc(session_key, rpc)
+                    if compaction_result is not None:
+                        yield await self._evict_with_compaction(
+                            session_key, rpc, compaction_result, model
+                        )
+                    else:
+                        await self._evict_rpc(session_key, rpc)
                     yield ExecutorError(
                         message=(
                             "Pi's response was truncated and it compacted the context to "
@@ -4536,4 +4960,68 @@ class PiExecutor(Executor):
                     return
                 continue
 
+            if event_type == "extension_ui_request":
+                try:
+                    await self._handle_extension_ui_request(event, rpc)
+                except Exception as exc:  # noqa: BLE001 — executor boundary
+                    await self._evict_rpc(session_key, rpc)
+                    yield ExecutorError(message=f"Failed to answer Pi extension UI request: {exc}")
+                    return
+                continue
+
             logger.debug("PiExecutor: ignoring event type=%s", event_type)
+
+    async def _handle_extension_ui_request(
+        self,
+        event: dict[str, Any],
+        rpc: _PiRpcSession,
+    ) -> None:
+        """Park a Pi extension dialog on the web UI and write the RPC reply."""
+        from omnigent.pi_extension_ui import (
+            is_dialog_method,
+            is_fire_and_forget_method,
+            timeout_seconds,
+            to_elicitation_params,
+            to_ui_response,
+        )
+
+        request_id = event.get("id")
+        if not isinstance(request_id, str) or not request_id:
+            return
+        method = event.get("method")
+        if is_fire_and_forget_method(method) or not is_dialog_method(method):
+            return
+        try:
+            params = to_elicitation_params(event)
+        except ValueError:
+            logger.debug("PiExecutor: malformed extension_ui_request: %s", event)
+            await rpc.send_command(to_ui_response(event, None))
+            return
+        handler = self._form_elicitation_handler
+        raw_handler = self._raw_elicitation_handler
+        result = None
+        if handler is not None or raw_handler is not None:
+            timeout_s = timeout_seconds(event)
+            deadline = (
+                asyncio.get_running_loop().time() + timeout_s if timeout_s is not None else None
+            )
+            elicitation_id = f"elicit_pi_{request_id}"
+            try:
+                async with asyncio.timeout_at(deadline):
+                    if handler is not None:
+                        result = await handler(elicitation_id, params)
+                    elif raw_handler is not None:
+                        result = await raw_handler(params)
+                if deadline is not None and asyncio.get_running_loop().time() >= deadline:
+                    return
+            except TimeoutError:
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("PiExecutor: form elicitation handler failed")
+                result = None
+        try:
+            await rpc.send_command(to_ui_response(event, result))
+        except (OSError, RuntimeError):
+            logger.debug("Pi extension dialog process is no longer available")

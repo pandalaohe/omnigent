@@ -31,7 +31,7 @@ from omnigent.inner.os_env import (
     build_helper_env,
     create_os_environment,
 )
-from omnigent.inner.sandbox import SandboxPolicy
+from omnigent.inner.sandbox import HOST_SANDBOX_BACKEND_ENV, SandboxPolicy
 from omnigent.runner.identity import (
     OMNIGENT_SESSION_ENV_VALUE,
     OMNIGENT_SESSION_ENV_VAR,
@@ -85,12 +85,14 @@ def test_build_helper_env_inactive_strips_binding_token() -> None:
     """
     parent = {
         "PATH": "/usr/bin",
+        HOST_SANDBOX_BACKEND_ENV: "phoenix-kubernetes",
         RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR: "bug-binding-token-secret",
     }
 
     env = build_helper_env(parent, _inactive_policy())
 
     assert RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR not in env
+    assert env[HOST_SANDBOX_BACKEND_ENV] == "phoenix-kubernetes"
     assert "bug-binding-token-secret" not in env.values()
     assert env["PATH"] == "/usr/bin"
 
@@ -105,12 +107,16 @@ def test_build_helper_env_active_drops_binding_token() -> None:
     """
     parent = {
         "PATH": "/usr/bin",
+        HOST_SANDBOX_BACKEND_ENV: "phoenix-kubernetes",
         RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR: "bug-binding-token-secret",
     }
+    policy = _active_policy()
+    policy.env_passthrough = [HOST_SANDBOX_BACKEND_ENV]
 
-    env = build_helper_env(parent, _active_policy())
+    env = build_helper_env(parent, policy)
 
     assert RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR not in env
+    assert HOST_SANDBOX_BACKEND_ENV not in env
     assert "bug-binding-token-secret" not in env.values()
     assert env["PATH"] == "/usr/bin"  # PATH is in the default allowlist
 
@@ -182,6 +188,71 @@ def test_shell_impl_environment_overrides_are_per_command(tmp_path: Path, monkey
     assert session_id("conv_two") == "conv_two"
     assert session_id(None) == "unset"
     assert os.environ["PI_SESSION_ID"] == "unrelated"
+
+
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_shell_impl_replaces_undecodable_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exit_code: int
+) -> None:
+    popen = subprocess.Popen
+
+    def ascii_popen(*args, **kwargs):
+        return popen(*args, encoding="ascii", **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", ascii_popen)
+    result = _shell_impl(
+        command=(
+            "import sys; "
+            "sys.stdout.buffer.write(b'out\\xff'); "
+            "sys.stderr.buffer.write(b'err\\xff'); "
+            f"sys.exit({exit_code})"
+        ),
+        timeout=10,
+        shell_path=sys.executable,
+        cwd=tmp_path,
+    )
+
+    assert result["stdout"] == "out\ufffd"
+    assert result["stderr"] == "err\ufffd"
+    assert result["exit_code"] == exit_code
+    assert result["timed_out"] is False
+    if exit_code:
+        assert result["error"] == "Command exited with status 7: err\ufffd"
+    else:
+        assert "error" not in result
+
+
+@pytest.mark.parametrize("missing_stream", ["stdout", "stderr", "both"])
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_shell_impl_handles_missing_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing_stream: str, exit_code: int
+) -> None:
+    communicate = subprocess.Popen.communicate
+
+    def missing_output(process, *args, **kwargs):
+        stdout, stderr = communicate(process, *args, **kwargs)
+        return (
+            None if missing_stream in ("stdout", "both") else stdout,
+            None if missing_stream in ("stderr", "both") else stderr,
+        )
+
+    monkeypatch.setattr(subprocess.Popen, "communicate", missing_output)
+    result = _shell_impl(
+        command=f"import sys; print('out'); print('err', file=sys.stderr); sys.exit({exit_code})",
+        timeout=10,
+        shell_path=sys.executable,
+        cwd=tmp_path,
+    )
+
+    assert result["stdout"] == ("out\n" if missing_stream == "stderr" else "")
+    assert result["stderr"] == ("err\n" if missing_stream == "stdout" else "")
+    assert result["exit_code"] == exit_code
+    assert result["timed_out"] is False
+    if exit_code:
+        detail = {"stdout": ": err", "stderr": ": out", "both": ""}[missing_stream]
+        assert result["error"] == f"Command exited with status 7{detail}"
+    else:
+        assert "error" not in result
 
 
 def test_shell_impl_timeout_includes_exit_code(tmp_path: Path) -> None:

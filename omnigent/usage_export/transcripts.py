@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,81 @@ def _counter(usage: Mapping[str, object], name: str) -> int | None:
 
 def _text(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def antigravity_measurement(record: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Read one native model call; billing totals never represent context fill."""
+    if record.get("status") not in {
+        "CORTEX_STEP_STATUS_DONE",
+        "CORTEX_STEP_STATUS_ERROR",
+    }:
+        return None
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    usage = metadata.get("modelUsage")
+    if not isinstance(usage, dict):
+        return None
+
+    def count(name: str) -> int | None:
+        value = usage.get(name)
+        if isinstance(value, str) and len(value) <= 20 and value.isascii() and value.isdigit():
+            value = int(value)
+        return value if type(value) is int and 0 <= value < 2**64 else None
+
+    total, cached, written = (
+        count("inputTokens"),
+        count("cacheReadTokens"),
+        count("cacheWriteTokens"),
+    )
+    counters = {
+        "input_tokens": total - cached - written
+        if total is not None
+        and cached is not None
+        and written is not None
+        and cached + written <= total
+        else None,
+        "cached_input_tokens": cached,
+        "cache_write_input_tokens": written,
+        "output_tokens": count("outputTokens"),
+        "reasoning_tokens": count("thinkingOutputTokens"),
+    }
+    if total is None and all(value is None for value in counters.values()):
+        return None
+    refs = [
+        {"kind": "response", "namespace": namespace, "id": value}
+        for field, namespace in (
+            ("responseId", "antigravity/response-id/v1"),
+            ("providerAssignedMessageId", "antigravity/provider-message-id/v1"),
+            ("messageId", "antigravity/message-id/v1"),
+        )
+        if (value := _text(usage.get(field))) is not None
+    ]
+    source = metadata.get("sourceTrajectoryStepInfo")
+    trajectory = _text(source.get("trajectoryId")) if isinstance(source, dict) else None
+    index = source.get("stepIndex", 0) if isinstance(source, dict) else None
+    if refs:
+        unit = json.dumps([refs[0]["namespace"], refs[0]["id"]], separators=(",", ":"))
+    elif trajectory and type(index) is int and index >= 0:
+        unit = json.dumps(
+            [trajectory, index, record.get("usage_source", "model")], separators=(",", ":")
+        )
+    else:
+        return None
+    return {
+        **counters,
+        "measurement_kind": "request",
+        "producer_unit_id": unit,
+        "logical_call_id": refs[0]["id"] if refs else None,
+        "source_refs": refs,
+        "model_id": _text(usage.get("model")),
+        "turn_id": _text(metadata.get("executionId")),
+        "occurred_at": _text(metadata.get("completedAt")) or _text(metadata.get("createdAt")),
+        "call_identity_coverage": "complete" if refs else "none",
+        "usage_status": "complete"
+        if all(value is not None for value in counters.values())
+        else "partial",
+    }
 
 
 def claude_physical_identity(path: Path) -> dict[str, str | None]:

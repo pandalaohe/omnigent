@@ -58,7 +58,9 @@ from omnigent.stores.permission_store import PermissionStore
 
 #: The only native harnesses whose rotation (a new session taking over the
 #: old one's live children) this fork's runner implements.
-_ROTATION_NATIVE_HARNESSES = frozenset({"claude-native", "codex-native", "pi", "pi-native"})
+_ROTATION_NATIVE_HARNESSES = frozenset(
+    {"claude-native", "codex-native", "pi", "pi-native", "antigravity-native"}
+)
 
 #: Visible notice persisted alongside ``omnigent.rotate_requested``.
 _ROTATE_NOTICE = "This session will continue in a new session when the current turn ends."
@@ -104,15 +106,11 @@ def _successor_labels(
         or key.startswith(MCP_SELECTION_PREFIX)
         or not key.startswith(("omnigent.", "omnigent:", "cost_control."))
     }
-    if harness in {"codex-native", "claude-native"}:
+    if harness in {"codex-native", "claude-native", "antigravity-native"}:
         from omnigent.native._native_session_labels import replacement_session_labels
 
         retained = replacement_session_labels(source.labels)
-        bridge_key = (
-            "omnigent.codex_native.bridge_id"
-            if harness == "codex-native"
-            else "omnigent.claude_native.bridge_id"
-        )
+        bridge_key = f"omnigent.{harness.replace('-', '_')}.bridge_id"
         retained[bridge_key] = source.labels.get(bridge_key, source.id)
     if tier is not None:
         retained.update(ConfirmedPermissionState(tier, 1, "blocked").labels(harness))
@@ -175,7 +173,7 @@ def register_succession_routes(
                 "Harness does not support session succession", code=ErrorCode.CONFLICT
             )
         tier = None
-        if harness in {"pi", "pi-native"}:
+        if harness in {"pi", "pi-native", "antigravity-native"}:
             try:
                 permission = read_permission_state(source.labels, harness=harness)
             except ValueError as exc:
@@ -258,7 +256,7 @@ def register_succession_routes(
         )
         if harness not in _ROTATION_NATIVE_HARNESSES:
             raise OmnigentError(
-                "not_native: handover rotation supports claude-native, codex-native, pi and pi-native sessions",
+                "not_native: handover rotation supports claude-native, codex-native, pi, pi-native and antigravity-native sessions",
                 code=ErrorCode.INVALID_INPUT,
             )
 

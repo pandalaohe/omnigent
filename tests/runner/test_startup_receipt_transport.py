@@ -100,7 +100,13 @@ async def test_shared_runner_initialization_only_suppresses_registered_recovery(
         resume_interrupted_turn=resume,
         recovery_id="old-recovery" if resume else None,
     )
-    body = {"session_id": session_id, "agent_id": AGENT, "session_init": envelope.model_dump()}
+    body = {
+        "session_id": session_id,
+        "agent_id": AGENT,
+        "session_init": envelope.model_dump(),
+        "startup_policy_enabled": True,
+        **({"startup_required": True, "startup_attempt": ref.model_dump()} if registered else {}),
+    }
     async with _runner_client(app, permission_harness=source) as client:
         result = await client.post("/v1/sessions", json=body)
         assert result.status_code == 201, result.text
@@ -395,7 +401,7 @@ async def test_failed_receipt_can_be_requeried_only_for_current_attempt(source):
             TunnelRegistry(),
             server_version="0.6.0.dev0",
             startup_control_resolver=lambda _conversation: (True, None),
-            startup_recovery_resolver=AsyncMock(return_value=ref),
+            startup_recovery_resolver=AsyncMock(return_value=(True, ref)),
         )
         initialized = await initializer.initialize(
             Conversation(

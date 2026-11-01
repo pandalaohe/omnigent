@@ -825,7 +825,10 @@ async def test_codex_refused_attempt_requeues_without_trusting_failed_user_item(
     assert _row(harness.store, record.id).state == "queued"
 
 
-@pytest.mark.parametrize("native_response_id", ["codex_turn_accepted", "pi-consumed-user-123"])
+@pytest.mark.parametrize(
+    "native_response_id",
+    ["codex_turn_accepted", "pi-consumed-user-123", "agy-consumed-user-cascade:turn-123"],
+)
 async def test_native_ambiguous_attempt_waits_for_mirror_or_expiry(
     harness: _Harness, native_response_id: str
 ) -> None:

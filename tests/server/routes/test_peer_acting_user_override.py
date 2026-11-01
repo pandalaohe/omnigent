@@ -13,7 +13,9 @@ auth, no override) is exercised in the same test to show it is unchanged.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -33,15 +35,18 @@ from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.peer_message_store.sqlalchemy_store import SqlAlchemyPeerMessageStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from tests.server.helpers import build_agent_bundle
 
 AGENT_ID = generate_agent_id()
 ALICE = "alice@example.com"
 
 
 @pytest.fixture()
-def env(runtime_init: None, db_uri: str, tmp_path: Any) -> dict[str, Any]:
+async def env(
+    runtime_init: None, db_uri: str, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[dict[str, Any]]:
     agent_store = SqlAlchemyAgentStore(db_uri)
-    agent_store.create(agent_id=AGENT_ID, name="test-agent", bundle_location="test:///bundle")
+    agent_store.create(agent_id=AGENT_ID, name="test-agent", bundle_location="agents/test/bundle")
     conv_store = SqlAlchemyConversationStore(db_uri)
     perm_store = SqlAlchemyPermissionStore(db_uri)
     perm_store.ensure_user(ALICE)
@@ -54,6 +59,7 @@ def env(runtime_init: None, db_uri: str, tmp_path: Any) -> dict[str, Any]:
     perm_store.grant(ALICE, sender.id, LEVEL_OWNER)
     perm_store.grant(ALICE, receiver.id, LEVEL_OWNER)
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    artifact_store.put("agents/test/bundle", build_agent_bundle("test-agent"))
     app = create_app(
         agent_store=SqlAlchemyAgentStore(db_uri),
         file_store=SqlAlchemyFileStore(db_uri),
@@ -66,14 +72,22 @@ def env(runtime_init: None, db_uri: str, tmp_path: Any) -> dict[str, Any]:
         feature_flags=resolve_feature_flags({"OMNIGENT_FEATURES": "session_peer_messaging"}),
         peer_message_store=SqlAlchemyPeerMessageStore(db_uri),
     )
-    return {
-        "app": app,
-        "sender": sender,
-        "receiver": receiver,
-        "sender_token": sender_token,
-        "conv_store": conv_store,
-        "peer_store": SqlAlchemyPeerMessageStore(db_uri),
-    }
+    from omnigent.server.routes import sessions
+
+    async with httpx.AsyncClient(
+        base_url="http://runner",
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"queued": True})),
+    ) as runner:
+        monkeypatch.setattr(sessions, "_get_runner_client", AsyncMock(return_value=runner))
+        monkeypatch.setattr(sessions, "_ensure_runner_relay_ready", AsyncMock())
+        yield {
+            "app": app,
+            "sender": sender,
+            "receiver": receiver,
+            "sender_token": sender_token,
+            "conv_store": conv_store,
+            "peer_store": SqlAlchemyPeerMessageStore(db_uri),
+        }
 
 
 async def test_sweeper_delivery_succeeds_without_auth_headers_via_override(

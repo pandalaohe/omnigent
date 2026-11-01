@@ -7,7 +7,7 @@ from alembic import op
 from sqlalchemy.dialects import mysql
 
 revision: str = "a51c20261029"
-down_revision: str = "a50c20261027"
+down_revision: str = "f3c914a721ab"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

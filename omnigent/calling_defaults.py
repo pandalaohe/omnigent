@@ -15,7 +15,7 @@ import asyncio
 import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from omnigent.errors import ErrorCode, OmnigentError
@@ -427,7 +427,7 @@ def _format_sync_time(fetched_at: object) -> str:
     """Render a catalog's ``fetched_at`` epoch seconds for an error message."""
     if isinstance(fetched_at, bool) or not isinstance(fetched_at, (int, float)):
         return "never"
-    return datetime.fromtimestamp(fetched_at, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return datetime.fromtimestamp(fetched_at, tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def _setting_phrase(setting: str, project_name: str | None) -> str:
@@ -794,7 +794,7 @@ async def load_master(user_id: str | None, store: _PreferencesReader | None) -> 
         user_id = RESERVED_USER_LOCAL
     try:
         envelope = await asyncio.to_thread(store.get, user_id)
-    except Exception:  # noqa: BLE001 — a preference read must never fail a create
+    except Exception:
         _logger.warning("Failed to read calling_defaults preferences", exc_info=True)
         return {}
     if not isinstance(envelope, dict):

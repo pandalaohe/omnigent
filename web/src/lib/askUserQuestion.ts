@@ -52,6 +52,8 @@ export interface ClaudeQuestion {
   multiSelect: boolean;
   isOther?: boolean;
   isSecret?: boolean;
+  /** Editable text whose exact contents, including empty text, are the answer. */
+  textInput?: { default: string };
 }
 
 export interface AskUserQuestionPayload {
@@ -92,6 +94,13 @@ export function castAskUserQuestionPayload(
       header: typeof rec.header === "string" ? rec.header : "",
       options: Array.isArray(rec.options) ? (rec.options as ClaudeQuestionOption[]) : [],
       multiSelect: rec.multiSelect === true,
+      ...(typeof rec.isOther === "boolean" ? { isOther: rec.isOther } : {}),
+      ...(rec.textInput &&
+      typeof rec.textInput === "object" &&
+      "default" in rec.textInput &&
+      typeof rec.textInput.default === "string"
+        ? { textInput: { default: rec.textInput.default } }
+        : {}),
     });
   }
   return {

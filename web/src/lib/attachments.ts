@@ -10,6 +10,8 @@
  * are fallbacks for older servers that do not publish attachment limits.
  */
 
+import type { FilesystemAttachmentsInfo } from "@/lib/capabilities";
+
 /**
  * Fallback per-type upload size limits, in megabytes. Mirrors server defaults.
  *
@@ -55,6 +57,16 @@ export interface AttachmentLimits {
   text_bytes?: number | null;
 }
 
+export function clipboardFiles(data: DataTransfer | null | undefined): File[] {
+  const files: File[] = [];
+  for (const item of data?.items ?? []) {
+    if (item.kind !== "file") continue;
+    const file = item.getAsFile();
+    if (file !== null) files.push(file);
+  }
+  return files;
+}
+
 /** Keep unnamed clipboard images consistent before and after upload. */
 export function attachmentFilename(file: File): string {
   return file.name || "image.png";
@@ -91,6 +103,7 @@ const TEXT_CODE_EXTENSIONS = new Set([
   ".md",
   ".markdown",
   ".csv",
+  ".tsv",
   ".json",
   ".jsonl",
   ".ndjson",
@@ -153,9 +166,10 @@ const TEXT_CODE_EXTENSIONS = new Set([
   ".ipynb",
 ]);
 
-// Archives, Office documents, and databases require filesystem tools.
-// Mirrors _FILESYSTEM_ATTACHMENT_EXTENSIONS in omnigent/inner/native_attachments.py.
-const FILESYSTEM_ATTACHMENT_EXTENSIONS = new Set([
+// Archives, Office documents, and databases require filesystem tools unless the
+// server reports its own policy. Mirrors DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS
+// in omnigent/inner/native_attachments.py.
+const DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS = new Set([
   ".zip",
   ".docx",
   ".xlsx",
@@ -164,6 +178,28 @@ const FILESYSTEM_ATTACHMENT_EXTENSIONS = new Set([
   ".sqlite",
   ".sqlite3",
 ]);
+
+// Text/code extensions a browser may not map to a `text/*` type, which then
+// greys the file out in the OS picker. `.csv` rides `text/*` everywhere; `.tsv`
+// does not, so the filter has to name it.
+const UNMAPPED_TEXT_EXTENSIONS = [".tsv"];
+
+/**
+ * The attach button's file-picker filter for *policy*, or `undefined` to
+ * offer every file when the server delivers all types as files.
+ */
+export function attachmentAccept(policy?: FilesystemAttachmentsInfo | null): string | undefined {
+  if (!policy || policy.all_types) return undefined;
+  const extensions = policy ? policy.extensions : [...DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS];
+  return [
+    "image/*",
+    "application/pdf",
+    "text/*",
+    "application/json",
+    ...UNMAPPED_TEXT_EXTENSIONS,
+    ...extensions,
+  ].join(",");
+}
 
 function extensionOf(filename: string): string {
   const dot = filename.lastIndexOf(".");
@@ -175,12 +211,20 @@ function extensionOf(filename: string): string {
  * server detects animated GIFs and delivers those by path. Files requiring
  * local tools are identified by extension; other types also use browser MIME.
  */
-export function classifyAttachment(file: File): AttachmentCategory {
+export function classifyAttachment(
+  file: File,
+  policy?: FilesystemAttachmentsInfo | null,
+): AttachmentCategory | null {
   const type = file.type || "";
   const ext = extensionOf(file.name || "");
+  const filesystemExtensions = policy
+    ? new Set(policy.extensions)
+    : DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS;
 
   // Match the server even when a browser mislabels a ZIP as text/plain.
-  if (FILESYSTEM_ATTACHMENT_EXTENSIONS.has(ext)) return "file";
+  if (filesystemExtensions.has(ext)) return "file";
+  // A default filesystem type the server leaves out is refused, not inlined.
+  if (DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS.has(ext) && !policy?.all_types) return null;
   if (type.startsWith("image/") || ext === ".gif") return "image";
   if (type === "application/pdf" || ext === ".pdf") return "pdf";
   if (
@@ -190,8 +234,21 @@ export function classifyAttachment(file: File): AttachmentCategory {
   ) {
     return "text";
   }
-  // Everything else (video, audio, unrecognised binaries) is delivered by path.
-  return "file";
+  return !policy || policy.all_types ? "file" : null;
+}
+
+/** The attachment types *policy* accepts, for rejection messages. */
+function supportedAttachmentTypes(policy?: FilesystemAttachmentsInfo | null): string {
+  const extensions = policy ? [...policy.extensions].sort() : null;
+  const isDefault =
+    extensions === null ||
+    (extensions.length === DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS.size &&
+      extensions.every((ext) => DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS.has(ext)));
+  if (isDefault) {
+    return "images, PDF, text/code, archives, office documents, and databases";
+  }
+  if (extensions.length === 0) return "images, PDF, and text/code files";
+  return `images, PDF, text/code, and ${extensions.join(", ")} files`;
 }
 
 export interface AttachmentValidation {
@@ -223,8 +280,11 @@ function formatLimitBytes(bytes: number): string {
  * absent means that dimension is not checked. Without ``limits`` (an older
  * server), the fixed client ceilings apply.
  */
-function limitBytesFor(file: File, limits: AttachmentLimits | undefined): number | null {
-  const category = classifyAttachment(file);
+function limitBytesFor(
+  file: File,
+  limits: AttachmentLimits | undefined,
+  category: AttachmentCategory,
+): number | null {
   const gif = file.type === "image/gif" || extensionOf(file.name || "") === ".gif";
   const compressible = COMPRESSIBLE_IMAGE_MIMES.has(file.type || "") || gif;
   if (limits === undefined) {
@@ -264,15 +324,26 @@ function limitBytesFor(file: File, limits: AttachmentLimits | undefined): number
  */
 export function validateAttachments(
   files: File[],
-  limits?: AttachmentLimits,
+  policyOrLimits?: FilesystemAttachmentsInfo | AttachmentLimits | null,
+  explicitLimits?: AttachmentLimits,
 ): AttachmentValidation {
+  const policy = policyOrLimits && "extensions" in policyOrLimits ? policyOrLimits : null;
+  const limits =
+    explicitLimits ??
+    (policyOrLimits && !("extensions" in policyOrLimits) ? policyOrLimits : undefined);
   const accepted: File[] = [];
   const errors: string[] = [];
 
   for (const file of files) {
     const name = file.name || "file";
-    const category = classifyAttachment(file);
-    const limitBytes = limitBytesFor(file, limits);
+    const category = classifyAttachment(file, policy);
+    if (category === null) {
+      errors.push(
+        `"${name}" can't be attached: only ${supportedAttachmentTypes(policy)} are supported.`,
+      );
+      continue;
+    }
+    const limitBytes = limitBytesFor(file, limits, category);
     if (limitBytes !== null && file.size > limitBytes) {
       const limitLabel = category === "file" ? "files" : `${category} files`;
       errors.push(

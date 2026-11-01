@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import shlex
 from dataclasses import replace
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from omnigent.permission_tiers import (
     PI_PERMISSION_TIER_LABEL_KEY,
     RelaxedRules,
     ResolvedPath,
+    ToolKind,
     TrustedHostContext,
     Verdict,
     adapt_tool_call,
@@ -46,6 +48,29 @@ def posix_host(**changes: object) -> TrustedHostContext:
         resolver=resolve,
     )
     return replace(base, **changes)
+
+
+def windows_host(**changes: object) -> TrustedHostContext:
+    def resolve(path: str) -> ResolvedPath:
+        return ResolvedPath(
+            path, "directory" if path.lower() == "c:\\work\\project" else "new-file"
+        )
+
+    return replace(
+        TrustedHostContext(
+            host_id="windows-host",
+            platform="windows",
+            cwd=r"C:\work\project",
+            workspace=r"C:\work\project",
+            home=r"C:\Users\sample",
+            shell="pwsh",
+            control_paths=(r"C:\work\control",),
+            resolver=resolve,
+            drive_cwds={"C:": r"C:\work\project"},
+            environment={"SystemRoot": r"C:\Windows"},
+        ),
+        **changes,
+    )
 
 
 def decision(tier: str, name: str, args: dict, host: TrustedHostContext | None = None):
@@ -79,6 +104,259 @@ def test_read_plan_edit_and_single_call_ask() -> None:
     first = decision("ask", "write", {"path": "src/a.py", "content": "x"})
     second = decision("ask", "write", {"path": "src/a.py", "content": "x"})
     assert first.action == second.action == Verdict.ASK
+
+
+@pytest.mark.parametrize(
+    "name,args,kind,target",
+    [
+        ("read_file", {"Path": "src/a.py"}, ToolKind.READ, "src/a.py"),
+        ("grep_search", {"SearchPath": "src", "Query": "TODO"}, ToolKind.READ, "src"),
+        ("find_by_name", {"SearchDirectory": "src", "Pattern": "*.py"}, ToolKind.READ, "src"),
+        ("view_file", {"AbsolutePath": "src/a.py"}, ToolKind.READ, "src/a.py"),
+        ("list_dir", {"DirectoryPath": "src"}, ToolKind.READ, "src"),
+        ("write_file", {"Path": "src/a.py", "Content": "x"}, ToolKind.EDIT, "src/a.py"),
+        (
+            "edit_file",
+            {"Path": "src/a.py", "Target": "x", "Replacement": "y"},
+            ToolKind.EDIT,
+            "src/a.py",
+        ),
+        (
+            "edit_file",
+            {"Path": "src/a.py", "Edits": [{"Target": "x", "Replacement": "y"}]},
+            ToolKind.EDIT,
+            "src/a.py",
+        ),
+        ("multi_replace_file_content", {"TargetFile": "src/a.py"}, ToolKind.EDIT, "src/a.py"),
+        ("notebook_edit", {"NotebookPath": "a.ipynb", "Action": "get"}, ToolKind.READ, "a.ipynb"),
+        ("notebook_edit", {"NotebookPath": "a.ipynb", "Action": "add"}, ToolKind.EDIT, "a.ipynb"),
+    ],
+)
+def test_agy_file_schemas_use_real_path_fields_and_existing_tiers(name, args, kind, target):
+    # Installed CLI schemas use Path for the newer read/write/edit tools.
+    intent = adapt_tool_call(name, args, posix_host())
+    assert intent.kind == kind
+    assert intent.target == ResolvedPath("/opt/work/project/" + target, "new-file")
+    expected = (
+        (Verdict.ALLOW,) * 5
+        if kind == ToolKind.READ
+        else (Verdict.ASK, Verdict.DENY, Verdict.ALLOW, Verdict.ALLOW, Verdict.ALLOW)
+    )
+    assert tuple(decision(tier, name, args).action for tier in PERMISSION_TIERS) == expected
+    for tier in NON_FULL_TIERS:
+        protected_args = {**args}
+        path_key = next(key for key in args if args[key] == target)
+        protected_args[path_key] = "/opt/work/control/settings.json"
+        assert decision(tier, name, protected_args).action == Verdict.DENY
+    if kind == ToolKind.EDIT:
+        protected_args[path_key] = "/etc/profile"
+        assert decision("auto", name, protected_args).rule_id == "protected-path"
+        protected_args[path_key] = "/opt/elsewhere/a.py"
+        assert decision("accept-edits", name, protected_args).action == Verdict.ASK
+
+
+@pytest.mark.parametrize(
+    "name,key",
+    [
+        ("read_file", "Path"),
+        ("write_file", "Path"),
+        ("edit_file", "Path"),
+        ("grep_search", "SearchPath"),
+        ("find_by_name", "SearchDirectory"),
+    ],
+)
+def test_agy_file_calls_without_the_schema_path_fail_closed(name, key):
+    for value in (None, "", 1, "\x00"):
+        for tier in PERMISSION_TIERS:
+            assert decision(tier, name, {key: value}).action == Verdict.DENY
+
+
+@pytest.mark.parametrize(
+    "name,args",
+    [
+        ("command_status", {"CommandId": "task-1"}),
+        ("search_web", {"query": "Python docs"}),
+        ("search_marketplace", {"queries": ["calendar"]}),
+        ("list_permissions", {}),
+        ("manage_task", {"Action": "status", "TaskId": "task-1"}),
+        ("manage_subagents", {"Action": "list"}),
+        ("manage_inbox", {"Action": "list"}),
+        ("read_url_content", {"Url": "https://example.test/docs"}),
+        ("webview_browser", {"action": "snapshot"}),
+    ],
+)
+def test_agy_non_file_reads_allow_read_tiers(name, args):
+    for tier in PERMISSION_TIERS:
+        assert decision(tier, name, args).action == Verdict.ALLOW
+
+
+@pytest.mark.parametrize(
+    "name", ["ask_question", "finish", "wait", "wait_5_seconds", "report_browser_outcome"]
+)
+def test_agy_question_and_control_tools_allow_every_tier(name):
+    for tier in PERMISSION_TIERS:
+        assert decision(tier, name, {}).action == Verdict.ALLOW
+
+
+@pytest.mark.parametrize(
+    "name,args",
+    [
+        ("define_subagent", {"Name": "reader"}),
+        ("schedule", {"DurationSeconds": 10, "Prompt": "check"}),
+        ("send_message", {"Recipient": "worker", "Message": "result"}),
+        ("manage_task", {"Action": "kill", "TaskId": "task-1"}),
+        ("manage_subagents", {"Action": "kill_all"}),
+        ("webview_browser", {"action": "click", "uid": "button"}),
+        ("webview_browser", {"action": "open", "url": "https://example.test/docs"}),
+        ("webview_browser", {"action": "navigate", "url": "https://example.test/docs"}),
+        ("webview_browser", {"action": "new-tab", "url": "https://example.test/docs"}),
+    ],
+)
+def test_agy_operations_keep_existing_operational_tiers(name, args):
+    expected = (Verdict.ASK, Verdict.DENY, Verdict.ASK, Verdict.ALLOW, Verdict.ALLOW)
+    assert tuple(decision(tier, name, args).action for tier in PERMISSION_TIERS) == expected
+
+
+@pytest.mark.parametrize(
+    "name,args,reason",
+    [
+        ("send_command_input", {"CommandId": "task-1", "Input": "pwd\n"}, "terminal input"),
+        (
+            "manage_task",
+            {"Action": "send_input", "TaskId": "task-1", "Input": "pwd\n"},
+            "terminal input",
+        ),
+        ("run_workflow", {"Script": "print('hello')"}, "Workflow"),
+        ("sed_file", {"target_file": "a.py", "expressions": ["s/x/y/"]}, "Sed"),
+        (
+            "notebook_execution",
+            {"NotebookPath": "a.ipynb", "CellIDs": ["1"]},
+            "Notebook execution",
+        ),
+        ("invoke_subagent", {"TypeName": "worker", "Prompt": "read a.py"}, "Subagent"),
+        ("generate_image", {"ImageName": "diagram", "Prompt": "diagram"}, "Image output"),
+        ("read_resource", {"ServerName": "other", "Uri": "custom:item"}, "MCP resource"),
+        ("list_resources", {"ServerName": "other"}, "MCP resource"),
+        ("ask_permission", {"Action": "command", "Target": "git"}, "Native permission"),
+        ("ask_custom_permission", {"Grant": "custom"}, "Native permission"),
+        ("webview_browser", {"script": "await page.click('button')"}, "Browser script"),
+        ("future_agy_tool", {}, "Unknown tool schema"),
+    ],
+)
+def test_uncheckable_agy_tools_keep_fail_closed_tiers_and_explain_why(name, args, reason):
+    result = decision("auto", name, args)
+    assert result.action == Verdict.DENY
+    assert reason in result.reason
+    assert decision("ask", name, args).action == Verdict.ASK
+    assert decision("plan", name, args).action == Verdict.DENY
+    assert decision("accept-edits", name, args).action == Verdict.ASK
+    assert decision("full", name, args).action == Verdict.ALLOW
+
+
+def test_agy_shell_cwd_binds_relative_destinations_and_control_paths():
+    def resolve(path):
+        return ResolvedPath(
+            path,
+            "directory"
+            if path in ("/opt/work/project", "/etc", "/opt/work/control")
+            else "new-file",
+        )
+
+    host = posix_host(resolver=resolve)
+    args = {"CommandLine": "echo x > profile", "Cwd": "/etc"}
+    assert decision("auto", "run_command", args, host).rule_id == "protected-path"
+    args["Cwd"] = "/opt/work/control"
+    assert decision("auto", "run_command", args, host).rule_id == "control-path"
+    args["Cwd"] = "/opt/work/project"
+    assert decision("auto", "run_command", args, host).action == Verdict.ALLOW
+    args["RunPersistent"] = True
+    assert decision("auto", "run_command", args, host).action == Verdict.DENY
+
+
+def test_agy_command_cwd_does_not_relocate_trusted_control_paths():
+    def resolve(path):
+        return ResolvedPath(
+            path, "directory" if path in ("/opt/work/project", "/tmp") else "new-file"
+        )
+
+    host = posix_host(control_paths=("bridge",), resolver=resolve)
+    args = {"Cwd": "/tmp", "CommandLine": "echo x > /opt/work/project/bridge/settings.json"}
+    assert decision("auto", "run_command", args, host).rule_id == "control-path"
+
+
+@pytest.mark.parametrize(
+    "name,args",
+    [
+        ("read_url_content", {"Url": "file:///opt/work/control/state"}),
+        ("read_url_content", {"Url": "https:///missing-host"}),
+        ("manage_task", {"Action": "future_action"}),
+        ("webview_browser", {"action": "future_action"}),
+        ("notebook_edit", {"Action": "execute", "NotebookPath": "a.ipynb"}),
+        ("run_command", {"CommandLine": "pwd", "Cwd": "not-a-directory"}),
+    ],
+)
+def test_agy_unsupported_actions_and_unbound_targets_fail_closed(name, args):
+    for tier in PERMISSION_TIERS:
+        assert decision(tier, name, args).action == Verdict.DENY
+
+
+@pytest.mark.parametrize(
+    "name,args",
+    [
+        (
+            "grep_search",
+            {
+                "SearchPath": "/opt/work/project",
+                "Query": "secret",
+                "Includes": ["bridge/state.json"],
+                "MatchPerLine": True,
+            },
+        ),
+        ("find_by_name", {"SearchDirectory": "/opt/work/project", "Pattern": "state.json"}),
+    ],
+)
+def test_agy_recursive_search_cannot_cover_a_control_directory(name, args):
+    host = posix_host(control_paths=("/opt/work/project/bridge",))
+    for tier in NON_FULL_TIERS:
+        assert decision(tier, name, args, host).rule_id == "control-path"
+    assert decision("full", name, args, host).action == Verdict.ALLOW
+
+
+@pytest.mark.parametrize(
+    "name,args",
+    [
+        ("read_file", {"Path": "a.py", "path": "/opt/work/control/state"}),
+        ("write_file", {"Path": "a.py", "path": "/etc/profile", "Content": "x"}),
+        ("run_command", {"CommandLine": "pwd", "commandline": "mkfs.ext4 /dev/disk4"}),
+        (
+            "run_command",
+            {"CommandLine": "echo x > profile", "Cwd": "/opt/work/project", "cwd": "/etc"},
+        ),
+        ("run_command", {"CommandLine": "pwd", "runpersistent": True}),
+        ("manage_task", {"Action": "list", "action": "send_input", "Input": "pwd\n"}),
+        ("notebook_edit", {"Action": "get", "action": "add", "NotebookPath": "a.ipynb"}),
+        ("webview_browser", {"action": "snapshot", "Script": "await page.click('button')"}),
+        ("webview_browser", {"action": "snapshot", "Action": "click", "uid": "button"}),
+        (
+            "webview_browser",
+            {"action": "navigate", "url": "https://example.test", "Url": "https://other.test"},
+        ),
+        (
+            "call_mcp_tool",
+            {
+                "ServerName": "omnigent",
+                "servername": "other",
+                "ToolName": "sys_session_list",
+                "Arguments": {},
+            },
+        ),
+    ],
+)
+def test_agy_permission_fields_reject_ambiguous_or_noncanonical_casing(name, args):
+    for tier in PERMISSION_TIERS:
+        result = decision(tier, name, args)
+        assert result.action == Verdict.DENY
+        assert "native argument" in result.reason
 
 
 def test_plan_visible_tools_only_include_registered_known_safe_names() -> None:
@@ -962,23 +1240,7 @@ def test_supported_shell_wrappers_bind_inner_control_paths(command: str) -> None
     ],
 )
 def test_windows_drive_unc_ads_device_and_system(option_command: str, expected: Verdict) -> None:
-    def resolve(path: str) -> ResolvedPath:
-        return ResolvedPath(
-            path, "directory" if path.lower() == "c:\\work\\project" else "new-file"
-        )
-
-    host = TrustedHostContext(
-        host_id="windows-host",
-        platform="windows",
-        cwd=r"C:\work\project",
-        workspace=r"C:\work\project",
-        home=r"C:\Users\sample",
-        shell="pwsh",
-        control_paths=(r"C:\work\control",),
-        resolver=resolve,
-        drive_cwds={"C:": r"C:\work\project"},
-        environment={"SystemRoot": r"C:\Windows"},
-    )
+    host = windows_host()
     assert (
         decision("accept-edits", "write", {"path": r"c:src\a.py", "content": "x"}, host).action
         == Verdict.ALLOW
@@ -1037,6 +1299,125 @@ def test_windows_drive_unc_ads_device_and_system(option_command: str, expected: 
     )
 
 
+@pytest.mark.parametrize("platform", ["windows", "linux", "darwin"])
+@pytest.mark.parametrize(
+    "tool,key", [("bash", "command"), ("sys_os_shell", "command"), ("run_command", "CommandLine")]
+)
+@pytest.mark.parametrize(
+    "command",
+    [
+        'git commit -m "task: probe"',
+        'git commit --message "100%: ready"',
+        'git commit -m "file.txt:stream"',
+        'git commit -m "task:"probe',
+        'echo "task: probe"',
+        'echo "file.txt:stream" "100%"',
+        'Write-Output "key: value"',
+        'echo "task: > literal | text"',
+        'curl "https://example.test/a%20b"',
+        'curl --url "https://example.test/resource" -o local.txt',
+        r'find . -printf "%s\t%p\n"',
+        'echo "task: probe" > local.txt',
+        'echo "task: probe"; echo "100%"',
+        'echo "task: probe" && echo "100%"',
+        'echo "task: probe" | Write-Output "100%"',
+        'echo "task: probe"\necho "100%"',
+        "pwsh -Command 'echo task: probe'",
+        'cmd /c "echo task: probe"',
+    ],
+)
+def test_windows_shell_data_roles_keep_normal_tier_policy(platform, tool, key, command):
+    host = windows_host() if platform == "windows" else posix_host(platform=platform)
+    expected = (Verdict.ASK, Verdict.DENY, Verdict.ASK, Verdict.ALLOW, Verdict.ALLOW)
+    assert (
+        tuple(decision(tier, tool, {key: command}, host).action for tier in PERMISSION_TIERS)
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        r"Get-Content C:\x\file.txt:stream",
+        "Get-Content file.txt:stream",
+        r"Get-Content %MISSING%\file.txt",
+        "Get-Content 100%",
+        'git commit -m "task: probe" -F file.txt:stream',
+        'git commit --file "https://example.test/file" -m "task: probe"',
+        'git commit --file=file.txt:stream -m "task: probe"',
+        'git commit -F-file.txt:stream -m "task: probe"',
+        'git commit -F -file.txt:stream -m "task: probe"',
+        'curl -o file.txt:stream "https://example.test/resource"',
+        'curl --output "https://example.test/file" "https://example.test/resource"',
+        'curl -T %MISSING% "https://example.test/resource"',
+        'curl --config file.txt:stream "https://example.test/resource"',
+        'curl --output=file=%MISSING% "https://example.test/resource"',
+        'curl -ofile.txt:stream "https://example.test/resource"',
+        'find . -fprint file.txt:stream -printf "%p"',
+        'find . -fprintf file.txt:stream "%p"',
+        'echo "task: probe" > file.txt:stream',
+        'echo "task: probe" < file.txt:stream',
+        'echo "task: probe" > %MISSING%',
+        'echo "task: probe" > -file.txt:stream',
+        'echo "task: probe" > file=%MISSING%',
+        'echo "task: probe" > ; Get-Content file.txt:stream',
+        'echo "task: probe"; Get-Content file.txt:stream',
+        'echo "task: probe" && Get-Content file.txt:stream',
+        'echo "task: probe" | Get-Content file.txt:stream',
+        'echo "task: probe"\nGet-Content file.txt:stream',
+        'runner "https://example.test/resource"',
+        'echo.exe "file.txt:stream"',
+        'git log -m "task: probe"',
+        'git commit --unknown -m "task: probe"',
+        'curl --unknown "https://example.test/resource"',
+        "find . -exec other -printf file.txt:stream",
+        "pwsh -Command 'Get-Content file.txt:stream'",
+        'cmd /c "echo ok > file.txt:stream"',
+        'cmd /c "echo %MISSING%"',
+        "cmd /c \"echo 'task: & type file.txt:stream'\"",
+        "cmd /c cmd /c cmd /c cmd /c echo task: probe",
+    ],
+)
+def test_windows_shell_data_roles_do_not_exempt_file_operands(command):
+    for tier in PERMISSION_TIERS:
+        assert (
+            decision(tier, "sys_os_shell", {"command": command}, windows_host()).action
+            == Verdict.DENY
+        )
+
+
+@pytest.mark.parametrize(
+    "shell,command",
+    [
+        ("bash", "echo ok;>file.txt:stream"),
+        ("bash", "echo ok|<file.txt:stream cat"),
+        ("cmd", "echo ok&<file.txt:stream more"),
+        ("bash", "echo ok;>100%"),
+        ("pwsh", "echo ok;>-file.txt:stream"),
+        ("pwsh", "echo ok&&>%MISSING%"),
+        ("pwsh", "echo ok;>file=%MISSING%"),
+    ],
+)
+def test_windows_shell_adjacent_operators_preserve_redirection_paths(shell, command):
+    for tier in PERMISSION_TIERS:
+        assert (
+            decision(tier, "sys_os_shell", {"command": command}, windows_host(shell=shell)).action
+            == Verdict.DENY
+        )
+
+
+@pytest.mark.parametrize(
+    "command,rule",
+    [
+        (r'echo "task: probe" > C:\work\control\tier', "control-path"),
+        (r'echo "task: probe" > C:\Windows\report', "protected-path"),
+        (r'echo "task: probe" | Set-Content C:\Windows\report', "protected-path"),
+    ],
+)
+def test_windows_shell_data_roles_preserve_path_protections(command, rule):
+    assert decision("auto", "sys_os_shell", {"command": command}, windows_host()).rule_id == rule
+
+
 def test_terminal_and_malformed_calls_fail_closed() -> None:
     for args in (
         {"terminal": "t", "session": "s", "keys": "Up Enter"},
@@ -1084,3 +1465,343 @@ def test_rule_errors_deny_and_signature_errors_keep_rule_reason() -> None:
     assert result.action == Verdict.DENY
     assert result.rule_id == "disk-destroy"
     assert "Formats or wipes" in result.reason
+
+
+_SED_WRAPPERS = [
+    "{}",
+    "command {}",
+    "X=1 {}",
+    "env {}",
+    "env X=1 {}",
+    "sudo {}",
+    "sudo -u root {}",
+    "nohup {}",
+    "exec {}",
+    "nice {}",
+    "nice -n 5 {}",
+    "timeout 5 {}",
+    "xargs {}",
+    "xargs -0 {}",
+    "time {}",
+    "if true; then {}; fi",
+    "for f in a; do {}; done",
+    "! {}",
+    "find . -exec {} \\;",
+    "sh -c {q}",
+    "bash -c {q}",
+]
+_SED_CONTEXTS = [
+    "{}",
+    "cat in | {}",
+    "true; {}",
+    "true && {}",
+    "false || {}",
+    "echo `{}`",
+    "echo $({})",
+    'echo "$({})"',
+    "x=`{}`",
+    "( {} )",
+]
+
+
+@pytest.mark.parametrize(
+    "form,writing",
+    [
+        ("sed -n '1w /usr/local/x' in", True),
+        ("sed -n 'w out.txt' in", True),
+        ("sed 's/a/b/w /usr/local/x' in", True),
+        ("sed -n '/x/W /usr/local/x' in", True),
+        ("sed '1e id' in", True),
+        ("sed 's/a/b/e' in", True),
+        ("sed -f s.sed in", True),
+        ("sed -nf s.sed in", True),
+        ("sed --file=s.sed in", True),
+        ("sed --fi s.sed in", True),
+        ("sed -e p -e 'w o' in", True),
+        ("sed --expression='w o' in", True),
+        ("sed -i 's/a/b/;w o' f.txt", True),
+        ("gsed -n 'w o' in", True),
+        ("/usr/bin/sed -n 'w o' in", True),
+        ("sed -n -- 'w o' in", True),
+        ("sed 's/a/b/' f.txt", False),
+        ("sed -n '1,80p' f.txt", False),
+        ('sed -n "${s},${e}p" f.txt', False),
+        ("rg sed file.py", False),
+        ("cat sed", False),
+    ],
+)
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_sed_write_policy_across_wrappers_and_substitutions(
+    form: str, writing: bool, platform: str
+) -> None:
+    host = posix_host(platform=platform)
+    expected = (
+        (Verdict.DENY,) * 4 + (Verdict.ALLOW,)
+        if writing
+        else (Verdict.ASK, Verdict.DENY, Verdict.ASK, Verdict.ALLOW, Verdict.ALLOW)
+    )
+    for wrapper in _SED_WRAPPERS:
+        inner = wrapper.format(form, q=shlex.quote(form))
+        for context in _SED_CONTEXTS:
+            if "`" in context and "`" in inner:
+                continue
+            command = context.format(inner)
+            intent = adapt_tool_call("bash", {"command": command}, host)
+            for tier, action in zip(PERMISSION_TIERS, expected, strict=True):
+                result = decide_tier(tier, intent, RULES)
+                assert result.action == action, (command, tier, result)
+                if writing and tier != "full":
+                    assert result.rule_id == "unbound-write", (command, tier, result)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "find . -exec cp a b \\; -exec sed -f s.sed in \\;",
+        "find . -exec rm x \\; -exec sed -n 'w /usr/local/x' in \\;",
+        "sed -n '\x0bw /usr/local/x' in",
+        "sed -n '1\x0cw /usr/local/x' in",
+        "sed 's/a/b/\x0bw /usr/local/x' in",
+        '# don\'t skip this\necho "$(sed -f s.sed in)"',
+        'echo "$(case x in x) sed -f s.sed in;; esac)"',
+        "echo \"$(sh <<'EOF'\nsed -n 'w /usr/local/x' in\nEOF\n)\"",
+        "bash <<'EOF'\necho \"$(sed -f s.sed in)\"\nEOF",
+        "sed -n \"# $TAG\n\"'${w /usr/local/x\n}' in",
+        "cat <<EOF\nit's $(sed -f s.sed in) it's\nEOF",
+        "sed $'p\\nw /usr/local/x' in",
+        r"sed $'\x77 /usr/local/x' in",
+        r"sed $'\167 /usr/local/x' in",
+        r"sed $'s/a/b/\145' in",
+        r"sed $'\u0077 /usr/local/x' in",
+        r"sed $'\U00000077 /usr/local/x' in",
+        r"sed $'\cKw /usr/local/x' in",
+        "echo \"$(<<'EOF' sh\nsed -f s.sed in\nEOF\n)\"",
+        "echo \"$('sh' <<'EOF'\nsed -f s.sed in\nEOF\n)\"",
+        'echo "$(/bin/"sh" <<\'EOF\'\nsed -f s.sed in\nEOF\n)"',
+        'echo "$(<<\'EOF\' /bin/"sh"\nsed -f s.sed in\nEOF\n)"',
+        "echo `echo \\`sed -f s.sed in\\``",
+        "sed -n '7210,${end}p' f",
+        "sed -n '${w /usr/local/x\n}' f",
+        'sed -n "1,5p;w $OUT" f',
+    ],
+)
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_sed_writes_are_never_approvable(command: str, platform: str) -> None:
+    host = posix_host(platform=platform)
+    for tier in NON_FULL_TIERS:
+        result = decision(tier, "bash", {"command": command}, host)
+        assert result.action == Verdict.DENY
+        assert result.rule_id == "unbound-write"
+    assert decision("full", "bash", {"command": command}, host).action == Verdict.ALLOW
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "find sed -exec cp a /usr/local/x \\;",
+        "xargs -a sed cp a /usr/local/x",
+        "echo `cp a /usr/local/x`",
+        'echo "$(cp a /usr/local/x)"',
+        "x=`cp a /usr/local/x`",
+        "sed -Ei 's/a/b/' /usr/local/x",
+        "sed -ni 's/a/b/p' /usr/local/x",
+        "sed --in-pl 's/a/b/' /usr/local/x",
+    ],
+)
+def test_adjacent_shell_write_gaps_keep_existing_protected_path_policy(command: str) -> None:
+    assert decision("auto", "bash", {"command": command}).rule_id == "protected-path"
+    assert decision("ask", "bash", {"command": command}).action == Verdict.ASK
+    assert decision("accept-edits", "bash", {"command": command}).action == Verdict.ASK
+    assert decision("full", "bash", {"command": command}).action == Verdict.ALLOW
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sed 's/a/b/' f.txt",
+        "sed -n '1,80p' f.txt",
+        "sed -n '$p' f.txt",
+        "sed '$d' f.txt",
+        "sed '/^$/d' f.txt",
+        "sed -n '/a/,$p' f.txt",
+        'sed "s/a$/b/" f.txt',
+        "sed -e :a -e '$!N;ba' f",
+        "echo sed",
+        "cat sed",
+        "rg sed file.py",
+        "rg -n sed omnigent/permission_tiers",
+        "printf 'f\\n' | xargs grep sed",
+        "printf 'f\\n' | xargs grep cp",
+        "find . -name sed",
+        'sed -n p "$f"',
+        'for f in *.py; do sed -n 1p "$f"; done',
+        "git log --oneline | sed -n 1,5p",
+        "echo $(date) > out.txt",
+        'x=$(mktemp); sed -n p "$x"',
+        "cd /opt/work && sed -n 1p f",
+        "sed -E 's/(a)/\\1/' f",
+        "sed -n 's/a/b/p' f",
+        "sed 'y/abc/xyz/' f",
+        "sed '1i\\\\header' f",
+        "sed '$a footer w e' f",
+        'sed -n "7210,${end}p" f',
+        'sed -n "${wt},$((wt+28))p" f',
+        'sed -n "${start},${end}p" f',
+        'sed -n "$n,$((n+45))p" f',
+        'sed "s/^/$t rows: /" f',
+        'sed "s/a/$X/" f',
+        'sed "`cat s`" f',
+        "X=cp; $X a /usr/local/x",
+        "# $(sed -f s.sed in)\necho ok",
+        "# sed -f s.sed in\necho ok",
+        "x=$(grep -c case f.txt); echo $x",
+        "case $x in a) sed -n 1p f;; esac",
+        'echo "$(case $x in a) echo a;; esac)"',
+        "echo $'a\\tb' \"$(sed -n 1p f)\"",
+        "python3 - <<'EOF'\nx = '`<label>`'\nEOF",
+        "echo \"$(cat <<'sh'\nsed -f s.sed in\nsh\n)\"",
+        "echo \"$(cat <<'EOF' # sh\nsed -f s.sed in\nEOF\n)\"",
+        "echo \"$(cat <<'EOF' >&sh\nsed -f s.sed in\nEOF\n)\"",
+        "echo \"$(cat <<'EOF' &>sh\nsed -f s.sed in\nEOF\n)\"",
+        "echo \"$(cat <<'EOF'\n# a literal comment\nit's fine\nEOF\n)\"",
+        "echo \"$(cat <<'EOF'\n\n# a literal comment\nit's fine\nEOF\n)\"",
+        "git commit -m \"$(cat <<'EOF'\nfix: `install` to /usr/local\nEOF\n)\"",
+    ],
+)
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_read_only_sed_and_literal_shell_data_keep_existing_tiers(
+    command: str, platform: str
+) -> None:
+    expected = (Verdict.ASK, Verdict.DENY, Verdict.ASK, Verdict.ALLOW, Verdict.ALLOW)
+    assert (
+        tuple(
+            decision(tier, "bash", {"command": command}, posix_host(platform=platform)).action
+            for tier in PERMISSION_TIERS
+        )
+        == expected
+    )
+
+
+def test_sed_platform_option_readings_and_control_priority() -> None:
+    for command in ("sed -i '' 'w /usr/local/x' f", "sed -i 's/a/b/' web/x.ts"):
+        for tier in NON_FULL_TIERS:
+            assert (
+                decision(tier, "bash", {"command": command}, posix_host(platform="darwin")).rule_id
+                == "unbound-write"
+            )
+    assert (
+        decision("auto", "bash", {"command": "sed -i 's/a/b/' web/x.ts"}).action == Verdict.ALLOW
+    )
+    assert (
+        decision(
+            "auto",
+            "bash",
+            {"command": "sed -I '' 's/a/b/' /usr/local/x"},
+            posix_host(platform="darwin"),
+        ).rule_id
+        == "protected-path"
+    )
+    for tier in NON_FULL_TIERS:
+        assert (
+            decision(tier, "bash", {"command": "sed -n 'w /opt/work/control/x' in"}).rule_id
+            == "control-path"
+        )
+
+
+def test_sed_invalid_calls_and_existing_unbound_targets_stay_closed() -> None:
+    # The outer tokenizer already rejects this literal heredoc's unmatched apostrophe.
+    literal = "cat > notes.md <<'EOF'\nuse `sed -f s.sed` here, it's fine\nEOF"
+    for tier in PERMISSION_TIERS:
+        assert decision(tier, "bash", {"command": literal}).action == Verdict.DENY
+    # An unparseable substitution is skipped; it must not invalidate the outer call.
+    expected = (Verdict.ASK, Verdict.DENY, Verdict.ASK, Verdict.ALLOW, Verdict.ALLOW)
+    for command in ('echo "`a <b`"', "echo `sed -n 'w /x' in"):
+        assert (
+            tuple(decision(tier, "bash", {"command": command}).action for tier in PERMISSION_TIERS)
+            == expected
+        )
+    command = "echo x > `printf /usr/local/r`"
+    intent = adapt_tool_call("bash", {"command": command}, posix_host())
+    assert intent.status == "unknown"
+    assert "expansion" in intent.detail
+    assert decision("auto", "bash", {"command": command}).action == Verdict.DENY
+
+    def failed_resolution(path: str) -> ResolvedPath:
+        raise OSError("Cannot resolve target")
+
+    for tier in PERMISSION_TIERS:
+        assert (
+            decision(
+                tier,
+                "bash",
+                {"command": "sed -f s.sed in"},
+                posix_host(resolver=failed_resolution),
+            ).action
+            == Verdict.DENY
+        )
+
+
+@pytest.mark.parametrize(
+    "script,writing",
+    [
+        ("s/a/b/", False),
+        ("s/a/b/g", False),
+        ("1,80p", False),
+        ("/a/,/b/p", False),
+        ("$d", False),
+        ("/^$/d", False),
+        ("$!N;s/\\n/ /", False),
+        ("y/abc/xyz/", False),
+        ("1i\\header", False),
+        ("$a footer with e and w", False),
+        ("s|a|b|w /x", True),
+        ("s/a/b/e", True),
+        ("1e touch x", True),
+        ("/x/W /x", True),
+        ("w /x", True),
+        ("1w /usr/local/x", True),
+        ("$!{N;w /x\n}", True),
+        ("s/[/]/x/w /y", True),
+        ("s/x/[/w /y", True),
+        (":a;N;$!ba;s/\\n/ /g", False),
+        ("file.py", False),
+        ("web", True),
+        ("web/", True),
+        ("src/", False),
+        ("docs", False),
+        ("pending", False),
+        ("tests/e2e", False),
+        ("eslint.config.js", True),
+        ("is", False),
+        ("0~3w f", True),
+        ("/a/I,+3 w f", True),
+        ("s/a/b/2gw f", True),
+        ("n;p", False),
+        ("=", False),
+        ("/x/{n;p}", False),
+        ("s/\\(.*\\)/[\\1]/", False),
+        ("1d;w f", True),
+        ("p # w x", False),
+        ("l 5;w f", True),
+        ("q5", False),
+        ("\x0bw f", True),
+        ("1\x0cw f", True),
+        ("s/a/b/\x0bw f", True),
+        ("p\x0bw f", False),
+        ("p\nw f", True),
+        ("}w f", True),
+        ("s/a/b/ ; w f", True),
+    ],
+)
+def test_sed_script_grammar_uses_public_tier_decisions(script: str, writing: bool) -> None:
+    command = "sed -n " + shlex.quote(script) + " in"
+    expected = (
+        (Verdict.DENY,) * 4 + (Verdict.ALLOW,)
+        if writing
+        else (Verdict.ASK, Verdict.DENY, Verdict.ASK, Verdict.ALLOW, Verdict.ALLOW)
+    )
+    for tier, action in zip(PERMISSION_TIERS, expected, strict=True):
+        result = decision(tier, "bash", {"command": command})
+        assert result.action == action
+        if writing and tier != "full":
+            assert result.rule_id == "unbound-write"

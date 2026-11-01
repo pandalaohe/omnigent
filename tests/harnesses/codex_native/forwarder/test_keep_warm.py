@@ -26,6 +26,9 @@ class _QueueEventsClient:
         self.requests: list[tuple[str, dict[str, Any]]] = []
         self.responses: list[tuple[int | str, dict[str, Any]]] = []
 
+    def is_subscribed_to_thread(self, thread_id: str) -> bool:
+        return False
+
     async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         """
         Capture one JSON-RPC request and answer the resume handshake.

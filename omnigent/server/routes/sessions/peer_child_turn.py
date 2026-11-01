@@ -17,6 +17,7 @@ transcript; nothing new is exposed.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -31,6 +32,7 @@ from omnigent.entities.conversation import (
     MessageData,
     ReasoningData,
 )
+from omnigent.sdk_peer_delivery import SDKPeerInput, sdk_attempt
 from omnigent.server.routes._sessions.helpers import _message_text
 from omnigent.server.routes.sessions.routes_peer import (
     _PEER_ENVELOPE_HEADER_RE,
@@ -47,6 +49,7 @@ _logger = logging.getLogger(__name__)
 _EXCERPT_MAX_CHARS = 600
 
 _PAGE_SIZE = 100
+_SDK_PEER_TURN_WAIT_S = 5.0
 
 
 @dataclass(frozen=True)
@@ -301,18 +304,67 @@ def classify_child_turn(
     peer_store: PeerMessageStore,
     child: Conversation,
     output: str | None,
+    *,
+    sdk_delivery: SDKPeerInput | None = None,
+    response_id: str | None = None,
 ) -> PeerTurn | None:
     """Return the peer turn *child*'s settled edge answers, or ``None``.
 
+    SDK identity links independently persisted receipt and answer items.
     Blocking; call through ``asyncio.to_thread``. Any doubt or error returns
     ``None`` so the edge follows today's delivery path.
     """
     try:
         if child.parent_conversation_id is None or child.kind != "sub_agent":
             return None
-        turn = _scan_foreign_turn(
-            conversation_store, peer_store, child, output=output, require_x=True
-        )
+        if sdk_delivery is None:
+            turn = _scan_foreign_turn(
+                conversation_store, peer_store, child, output=output, require_x=True
+            )
+        else:
+            # SDK receipt and output writers can persist in either order.
+            items = list(
+                _iter_items_newest_first(conversation_store, child.id, PEER_INPUT_LOOKBACK_ITEMS)
+            )
+            answer = next(
+                (
+                    item
+                    for item in items
+                    if isinstance(item.data, MessageData)
+                    and item.data.role == "assistant"
+                    and not item.data.is_meta
+                ),
+                None,
+            )
+            receipt = next(
+                (
+                    item
+                    for item in items
+                    if item.response_id == f"peer_{sdk_delivery.attempt_id}"
+                    and isinstance(item.data, MessageData)
+                    and item.data.role == "user"
+                    and not item.data.is_meta
+                    and item.data.peer_message_id == sdk_delivery.peer_id
+                ),
+                None,
+            )
+            if (
+                answer is None
+                or answer.response_id != response_id
+                or not isinstance(answer.data, MessageData)
+                or _message_text(answer.data.content) != output
+                or receipt is None
+                or not isinstance(receipt.data, MessageData)
+            ):
+                return None
+            envelope = _verified_envelope(peer_store, child, receipt.data)
+            if (
+                envelope is None
+                or envelope.record.state != "delivered"
+                or sdk_attempt(envelope.record.reason) != (sdk_delivery.attempt_id, "accepted")
+            ):
+                return None
+            turn = _ForeignTurn(envelope.record, envelope.header, answer)
         if turn is None or turn.x_item is None:
             return None
         record = turn.record
@@ -329,6 +381,66 @@ def classify_child_turn(
     except Exception:
         _logger.warning("Peer turn classification failed", exc_info=True)
         return None
+
+
+async def wait_for_sdk_peer_turn(
+    conversation_store: ConversationStore,
+    peer_store: PeerMessageStore,
+    child: Conversation,
+    delivery: SDKPeerInput,
+    response_id: str,
+    output: str,
+) -> bool:
+    """Wait for the receipt and relay writers before attributing this response."""
+    try:
+        async with asyncio.timeout(_SDK_PEER_TURN_WAIT_S):
+            while True:
+                record = await asyncio.to_thread(peer_store.get, delivery.peer_id)
+                attempt = sdk_attempt(record.reason) if record is not None else None
+                if (
+                    record is None
+                    or record.receiver_session_id != child.id
+                    or attempt is None
+                    or attempt[0] != delivery.attempt_id
+                    or attempt[1] == "refused"
+                ):
+                    return False
+                items = await asyncio.to_thread(
+                    lambda: list(
+                        _iter_items_newest_first(
+                            conversation_store, child.id, PEER_INPUT_LOOKBACK_ITEMS
+                        )
+                    )
+                )
+                answer = next(
+                    (
+                        item
+                        for item in items
+                        if isinstance(item.data, MessageData)
+                        and item.data.role == "assistant"
+                        and not item.data.is_meta
+                    ),
+                    None,
+                )
+                if (
+                    record.state == "delivered"
+                    and attempt[1] == "accepted"
+                    and answer is not None
+                    and answer.response_id == response_id
+                    and isinstance(answer.data, MessageData)
+                    and _message_text(answer.data.content) == output
+                    and any(
+                        item.response_id == f"peer_{delivery.attempt_id}"
+                        and isinstance(item.data, MessageData)
+                        and item.data.peer_message_id == delivery.peer_id
+                        for item in items
+                    )
+                ):
+                    return True
+                await asyncio.sleep(0.05)
+    except TimeoutError:
+        _logger.warning("SDK peer child response persistence not confirmed: %s", child.id)
+        return False
 
 
 def foreign_turn_sender(

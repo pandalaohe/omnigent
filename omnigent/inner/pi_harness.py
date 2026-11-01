@@ -58,11 +58,14 @@ Env vars read at startup:
   bundle skill.
 - ``HARNESS_PI_BUNDLE_DIR``: Absolute path to the agent
   bundle's extracted root. When set, the executor sources
-  bundled skills from ``<bundle>/skills/<dir>/`` for the
-  ``"all"`` and named-list cases. Unset for agents without a
-  bundled-skill directory.
+  bundled skills from ``<bundle>/skills/<dir>/`` and
+  ``<bundle>/.pi/skills/<dir>/`` for the ``"all"`` and named-list
+  cases, loads ``<bundle>/.pi/extensions`` via ``--extension``, and
+  appends a bundle-root context file (``AGENTS.md`` et al.) to the
+  system prompt. Unset for agents without a bundle directory.
 - ``HARNESS_PI_CONTEXT_FILES``: Whether Pi automatically loads context files
-  such as ``AGENTS.md`` and ``CLAUDE.md``. Defaults to true.
+  such as ``AGENTS.md`` and ``CLAUDE.md``, including the bundle-root one.
+  Defaults to true.
 - ``HARNESS_PI_SYSTEM_PROMPT_MODE``: ``append`` (default) or ``replace`` Pi's
   base prompt with Omnigent's composed instructions.
 - ``HARNESS_PI_AGENT_NAME``: Agent display name. Reserved for
@@ -432,7 +435,7 @@ def create_app() -> FastAPI:
             return JSONResponse(
                 {"installed": False, "error": PiSdkLoaderUnavailableError.code}, status_code=503
             )
-        except Exception:  # noqa: BLE001 - no prompt may proceed after bootstrap failure
+        except Exception:
             _logger.warning("Pi permission bootstrap failed", exc_info=True)
             installed = False
         return JSONResponse({"installed": installed}, status_code=200 if installed else 503)

@@ -43,12 +43,11 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
-
-import tomllib
 
 from omnigent.git_commands import run_git
 

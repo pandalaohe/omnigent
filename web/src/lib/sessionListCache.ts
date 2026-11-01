@@ -10,7 +10,7 @@
 // the chat store's `session.title` handler (a terminal-side `/rename`).
 
 import type { InfiniteData, QueryClient } from "@tanstack/react-query";
-import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
+import type { Conversation, ConversationsPage, SessionSortBy } from "@/hooks/useConversations";
 import type { Session } from "@/lib/types";
 
 /** Cache value shape for a `useConversations` infinite query. */
@@ -123,8 +123,9 @@ function labelsChanged(current: unknown, next: unknown): boolean {
  *
  * Lets the merge skip rewriting rows that are already up to date, so a
  * snapshot frame (which restates the whole watch-set, mostly unchanged)
- * doesn't churn the cache and re-render the sidebar. `labels` is compared
- * structurally because every parsed frame yields a fresh object reference.
+ * doesn't churn the cache and re-render the sidebar. `labels` and
+ * `pull_request` are compared structurally because every parsed frame yields
+ * a fresh object reference.
  *
  * @param conv - The cached conversation row.
  * @param wire - The incoming wire item overlaying it.
@@ -140,7 +141,7 @@ function changedWireFields(conv: Conversation, wire: SessionListWireItem): Set<s
     const current = row[key];
     if (key === "labels") {
       if (labelsChanged(current, value)) changed.add(key);
-    } else if (key === "keep_warm") {
+    } else if (key === "pull_request" || key === "keep_warm") {
       // Each parsed frame yields a fresh object; compare structurally so an
       // unchanged status doesn't rewrite the row on every snapshot.
       if (JSON.stringify(current ?? null) !== JSON.stringify(value ?? null)) changed.add(key);
@@ -519,12 +520,33 @@ export function collectConversationIds(datas: (ConversationsInfiniteData | undef
   return [...ids];
 }
 
-/**
- * Filters for a project-folder list (`["project-sessions", name]`) — those
- * lists are non-archived and unsearched, the same dimensions the push-delta
- * merge uses when overlaying rows into them.
- */
-export const PROJECT_FOLDER_FILTERS = { searchQuery: "", includeArchived: false } as const;
+/** Decode `["project-sessions", project, sortBy, archived]`. */
+export function parseProjectSessionsQueryKey(key: readonly unknown[]): {
+  project: string;
+  sortBy: SessionSortBy;
+  archived: boolean;
+} {
+  const [prefix, project, sortBy, archived] = key;
+  if (
+    key.length !== 4 ||
+    prefix !== "project-sessions" ||
+    typeof project !== "string" ||
+    (sortBy !== "updated_at" && sortBy !== "created_at") ||
+    typeof archived !== "boolean"
+  )
+    throw new Error("Invalid project sessions query key");
+  return { project, sortBy, archived };
+}
+
+/** Membership filters for an unsearched project-folder query. */
+export function filtersFromProjectQueryKey(key: readonly unknown[]): ConversationListFilters {
+  const { archived } = parseProjectSessionsQueryKey(key);
+  return {
+    searchQuery: "",
+    includeArchived: archived,
+    visibility: archived ? "archived" : "mine",
+  };
+}
 
 /**
  * Overlay a title into every cache that holds a row for one session.
@@ -572,7 +594,7 @@ export function overlayTitleIntoCaches(
   for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
     queryKey: ["project-sessions"],
   })) {
-    const { data: next } = mergeItemsIntoPages(data, itemsById, PROJECT_FOLDER_FILTERS);
+    const { data: next } = mergeItemsIntoPages(data, itemsById, filtersFromProjectQueryKey(key));
     if (next !== data) queryClient.setQueryData(key, next);
   }
   queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
@@ -619,7 +641,7 @@ export function overlayArchivedIntoCaches(
   for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
     queryKey: ["project-sessions"],
   })) {
-    const { data: next } = mergeItemsIntoPages(data, itemsById, PROJECT_FOLDER_FILTERS);
+    const { data: next } = mergeItemsIntoPages(data, itemsById, filtersFromProjectQueryKey(key));
     if (next !== data) queryClient.setQueryData(key, next);
   }
   queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>

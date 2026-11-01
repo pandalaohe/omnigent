@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, Request
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.responses import JSONResponse
 
-from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider, UnifiedAuthProvider
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes._origin import require_trusted_origin
@@ -259,6 +259,9 @@ def create_usage_cutover_router(
                     consumer_receipt,
                     cutover_at,
                     rescan,
+                    config_reader_user=auth_provider.usage_read_token_user
+                    if isinstance(auth_provider, UnifiedAuthProvider)
+                    else None,
                 )
         except UsageExportError as exc:
             return _store_error(exc)

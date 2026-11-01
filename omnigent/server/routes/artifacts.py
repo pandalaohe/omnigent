@@ -1710,7 +1710,7 @@ def register_artifact_routes(
                 "artifact-sharing 'allow_comments' must be a boolean",
                 code=ErrorCode.INVALID_INPUT,
             )
-        share_code: str | None | KeepShareCode = KEEP_SHARE_CODE
+        share_code: str | KeepShareCode | None = KEEP_SHARE_CODE
         if "share_code" in body:
             raw_code = body["share_code"]
             if raw_code is None:
