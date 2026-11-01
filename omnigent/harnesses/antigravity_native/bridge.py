@@ -1350,6 +1350,9 @@ _AGY_MODE_HINT_RE = re.compile(r"^[A-Z][a-z]*(?:-[a-z]+)* mode: .+ \(shift\+tab 
 # appearing and then leaving the composer.
 _AGY_PASTE_PLACEHOLDER_RE = re.compile(r"\[Pasted text #\d+[^\]]*\]")
 _AGY_COLLAPSED_LINES_RE = re.compile(r"↑ \d+ more lines?")
+# A background command row in agy's ruled task panel below the composer
+# (``● [12:45:28] sleep 600… running``; footer ``… · 1 task(s) · /tasks``).
+_AGY_TASK_ROW_RE = re.compile(r"[^\s>] \[\d{1,2}:\d{2}:\d{2}\] .+")
 # agy's notice when a turn is submitted before its startup account-eligibility
 # check settles. The composer footer mounts ~3s after launch but eligibility is
 # not settled for ~7-9s, and a turn landing in that window is CONSUMED (the draft
@@ -1634,10 +1637,15 @@ def _agy_input_region(pane: str) -> str:
     a successful submit, the submitted prompt remains in transcript history
     above a fresh empty composer, so checking the full pane would falsely think
     the draft is still present. The last separator pair scopes matching to the
-    currently editable input box, mirroring Kiro's input-region guard.
+    currently editable input box, mirroring Kiro's input-region guard. A
+    background-task panel ruled below the composer is skipped.
     """
     lines = pane.splitlines()
     separator_indexes = [index for index, line in enumerate(lines) if _agy_separator_line(line)]
+    while len(separator_indexes) >= 3 and _agy_task_panel(
+        lines[separator_indexes[-2] + 1 : separator_indexes[-1]]
+    ):
+        separator_indexes.pop()
     if len(separator_indexes) >= 2:
         start = separator_indexes[-2] + 1
         end = separator_indexes[-1]
@@ -1657,6 +1665,12 @@ def _agy_separator_line(line: str) -> bool:
     if stripped.count(_AGY_SEPARATOR_CHAR) < 8:
         return False
     return all(char in _AGY_BOX_GLYPHS for char in stripped if not char.isspace())
+
+
+def _agy_task_panel(lines: list[str]) -> bool:
+    """Return whether *lines* hold only agy background-task rows (never a composer)."""
+    rows = [line.strip() for line in lines if line.strip()]
+    return bool(rows) and all(_AGY_TASK_ROW_RE.fullmatch(row) for row in rows)
 
 
 def _agy_turn_running(pane: str) -> bool:
