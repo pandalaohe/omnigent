@@ -6299,9 +6299,11 @@ def upgrade(
         )
     if info.vcs_url and _is_custom_host_vcs_url(info.vcs_url):
         raise click.ClickException(
-            "This install tracks the custom update channel. Use "
-            f"`{cli_invocation(name='omni')} up` so the branch, "
-            "Host restart, and rollback receipt are preserved."
+            "This install uses a custom repository. For moving-channel updates, use "
+            f"`{cli_invocation(name='omni')} up` to preserve the branch, "
+            "Host restart, and rollback receipt. For pinned releases, re-run the installer "
+            f"with `--repo {_CUSTOM_HOST_VCS_URL.removeprefix('git+')}@v<ver>`. "
+            f"`{cli_invocation(name='omni')} up` follows the moving channel."
         )
 
     # Nightly channel: resolved from git tags, not the index, and applies to
@@ -10626,9 +10628,21 @@ def _custom_host_installed_web_ui() -> bool:
 
 
 def _custom_host_web_ui_tools_missing() -> list[str]:
-    """Name the build tools ``setup.py`` needs for the web UI that are not on PATH."""
+    """Name the web build tools that are missing or below ``setup.py``'s floor."""
     missing: list[str] = []
-    if shutil.which("node") is None:
+    node = shutil.which("node")
+    supported_node = False
+    if node is not None:
+        try:
+            result = subprocess.run(
+                [node, "--version"], check=True, capture_output=True, text=True, timeout=10
+            )
+            match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", result.stdout.strip())
+            if match is not None:
+                supported_node = tuple(int(part) for part in match.groups()) >= (22, 13, 0)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    if not supported_node:
         missing.append("Node.js 22.13+")
     if shutil.which("pnpm") is None and shutil.which("corepack") is None:
         missing.append("pnpm")
@@ -11077,7 +11091,11 @@ def _host_update_custom_impl(
             paused = _pause_custom_host_supervisor()
         _write_custom_host_rollback(current_sha, rollback_source)
         # Set either way so an inherited value cannot override the decision.
-        install_env = {**os.environ, "OMNIGENT_SKIP_WEB_UI": "false" if build_web_ui else "true"}
+        install_env = {
+            **os.environ,
+            "OMNIGENT_SKIP_WEB_UI": "false" if build_web_ui else "true",
+            "OMNIGENT_BUILD_WEB_UI": "1" if build_web_ui else "0",
+        }
         code = _run_upgrade_command(suggestion.command, Console(), env=install_env)
         if code != 0:
             raise click.ClickException(

@@ -1381,8 +1381,10 @@ def test_windows_custom_helper_reports_preflight_failure_and_recovers_supervisor
 
 
 @windows_pwsh_only
+@pytest.mark.parametrize("skip_web_ui", [True, False])
 def test_windows_custom_helper_survives_launcher_exit_and_completes(
     tmp_path: Path,
+    skip_web_ui: bool,
 ) -> None:
     """The detached helper finishes after its launcher exits and releases tool files."""
     old = "a" * 40
@@ -1405,7 +1407,8 @@ def test_windows_custom_helper_survives_launcher_exit_and_completes(
     wrapper.write_text('@echo off\r\n>>"%~dp0supervisor-started.txt" echo %1\r\nexit /b 0\r\n')
     installer.write_text(
         "import os, pathlib, sys\n"
-        "assert os.environ['OMNIGENT_SKIP_WEB_UI'] == 'true'\n"
+        f"assert os.environ['OMNIGENT_SKIP_WEB_UI'] == {str(skip_web_ui).lower()!r}\n"
+        f"assert os.environ['OMNIGENT_BUILD_WEB_UI'] == {'0' if skip_web_ui else '1'!r}\n"
         "pathlib.Path(sys.argv[1]).write_text('installed')\n"
     )
     status.write_text(
@@ -1422,6 +1425,7 @@ def test_windows_custom_helper_survives_launcher_exit_and_completes(
                 "schema_version": 1,
                 "parent_pid": 0,
                 "install_argv": [sys.executable, str(installer), str(installed)],
+                "skip_web_ui": skip_web_ui,
                 "recovery_command": "synthetic recovery",
                 "old_commit": old,
                 "target_commit": new,
@@ -1874,6 +1878,13 @@ def test_custom_update_keeps_the_install_shape(
     monkeypatch.setattr(cli_module, "_custom_host_installed_web_ui", lambda: has_bundle)
     monkeypatch.setattr(cli_module.shutil, "which", lambda name: f"/opt/tools/bin/{name}")
     monkeypatch.setattr(
+        cli_module.subprocess,
+        "run",
+        lambda *_a, **_k: subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="v22.13.0\n", stderr=""
+        ),
+    )
+    monkeypatch.setattr(
         cli_module,
         "_resolve_custom_host_channel_head",
         lambda: (cli_module._CUSTOM_HOST_VCS_URL, new),
@@ -1887,18 +1898,42 @@ def test_custom_update_keeps_the_install_shape(
     assert plan in preview.output
     assert result.exit_code == 0, result.output
     assert (envs[0].get("OMNIGENT_SKIP_WEB_UI") == "true") is skips_web_ui
+    if not skips_web_ui:
+        assert envs[0].get("OMNIGENT_BUILD_WEB_UI") == "1"
 
 
+@pytest.mark.parametrize(
+    ("tool_dir", "node_version", "expected_missing"),
+    [
+        pytest.param(None, "v22.13.0\n", "Node.js 22.13+ and pnpm", id="missing-tools"),
+        pytest.param("/opt/tools/bin", "v20.11.0\n", "Node.js 22.13+", id="unsupported-node"),
+    ],
+)
 def test_custom_update_refuses_web_ui_rebuild_without_tools(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    tool_dir: str | None,
+    node_version: str,
+    expected_missing: str,
 ) -> None:
-    """A bundled install without Node/pnpm stops before anything changes."""
+    """A bundled install without supported Node/pnpm stops before anything changes."""
     import omnigent.cli as cli_module
 
     new = "b" * 40
     events: list[str] = []
     monkeypatch.setattr(cli_module, "_custom_host_installed_web_ui", lambda: True)
-    monkeypatch.setattr(cli_module.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(
+        cli_module.shutil,
+        "which",
+        (lambda _name: None) if tool_dir is None else (lambda name: f"{tool_dir}/{name}"),
+    )
+    monkeypatch.setattr(
+        cli_module.subprocess,
+        "run",
+        lambda *_a, **_k: subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=node_version, stderr=""
+        ),
+    )
     monkeypatch.setattr(
         cli_module,
         "_resolve_custom_host_channel_head",
@@ -1914,7 +1949,7 @@ def test_custom_update_refuses_web_ui_rebuild_without_tools(
     result = CliRunner().invoke(cli, ["up"])
 
     assert result.exit_code != 0
-    assert "Node.js 22.13+ and pnpm" in result.output
+    assert expected_missing in result.output
     assert "--no-web-ui" in result.output
     assert events == []
     assert not (tmp_path / "updates" / "custom-host-rollback.json").exists()
@@ -1977,6 +2012,13 @@ def test_windows_custom_update_hands_receipt_source_and_web_ui_choice_to_helper(
     monkeypatch.setattr(cli_module, "_custom_host_installed_web_ui", lambda: True)
     monkeypatch.setattr(cli_module.shutil, "which", lambda name: f"/opt/tools/bin/{name}")
     monkeypatch.setattr(
+        cli_module.subprocess,
+        "run",
+        lambda *_a, **_k: subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="v22.13.0\n", stderr=""
+        ),
+    )
+    monkeypatch.setattr(
         cli_module,
         "_resolve_custom_host_channel_head",
         lambda: (cli_module._CUSTOM_HOST_VCS_URL, new),
@@ -2024,4 +2066,39 @@ def test_plain_update_on_a_custom_install_points_to_omni_up(
     result = CliRunner().invoke(cli, ["update"])
 
     assert result.exit_code != 0
-    assert "This install tracks the custom update channel. Use `omni up`" in result.output
+    assert "For moving-channel updates, use `omni up`" in result.output
+
+
+@pytest.mark.parametrize(
+    "vcs_url",
+    [
+        "git+https://github.com/pandalaohe/omnigent-wukong.git@v0.21.0-wukong.12",
+        "git+https://github.com/pandalaohe/omnigent-wukong.git",
+        "git+https://github.com/pandalaohe/omnigent-wukong.git@v2/preview",
+        "git+https://github.com/pandalaohe/omnigent.git@local/host-custom",
+    ],
+    ids=["version-tag", "no-revision", "arbitrary-branch", "legacy"],
+)
+def test_plain_update_on_a_pinned_custom_install_preserves_the_pin(
+    monkeypatch: pytest.MonkeyPatch,
+    vcs_url: str,
+) -> None:
+    """The update hint for a version tag keeps the host on a pinned release."""
+    monkeypatch.setattr("omnigent.cli._load_global_config", dict)
+    monkeypatch.setattr("omnigent.update_check._find_repo_root", lambda: None)
+    monkeypatch.setattr(
+        "omnigent.update_check._read_installed_wheel_info",
+        lambda: _uv_info(vcs_url=vcs_url),
+    )
+    monkeypatch.setattr(
+        "omnigent.update_check._run_upgrade_command",
+        lambda *_a, **_k: pytest.fail("a pinned install must not upgrade automatically"),
+    )
+
+    result = CliRunner().invoke(cli, ["update"])
+
+    assert result.exit_code != 0
+    assert "--repo https://github.com/pandalaohe/omnigent-wukong.git@v<ver>" in result.output
+    assert "For pinned releases, re-run the installer" in result.output
+    assert "`omni up` follows the moving channel" in result.output
+    assert "This install is pinned" not in result.output

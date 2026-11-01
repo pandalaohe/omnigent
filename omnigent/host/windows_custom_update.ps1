@@ -154,9 +154,10 @@ try {
 
     # Only an explicit false rebuilds the web UI; a missing field keeps the Host-only skip.
     # Set either way so an inherited value cannot override the decision.
-    $installEnvironment = @{ OMNIGENT_SKIP_WEB_UI = 'true' }
+    $installEnvironment = @{ OMNIGENT_SKIP_WEB_UI = 'true'; OMNIGENT_BUILD_WEB_UI = '0' }
     if ($instruction.skip_web_ui -eq $false) {
         $installEnvironment.OMNIGENT_SKIP_WEB_UI = 'false'
+        $installEnvironment.OMNIGENT_BUILD_WEB_UI = '1'
     }
     $installArguments = @($instruction.install_argv | ForEach-Object { [string]$_ })
     Add-UpdateLog $LogPath "Running custom Host installer."
