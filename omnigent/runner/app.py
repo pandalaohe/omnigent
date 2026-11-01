@@ -2561,12 +2561,12 @@ def create_runner_app(
     _session_background_task_counts: dict[str, int] = {}
 
     async def _restore_pending_session_attachments(session_id: str) -> None:
-        """Re-materialize by-path files a cleanup removed while history survived.
+        """Re-materialize by-path files after a CLI release or resource cleanup.
 
-        CLI release and resource cleanup delete the session attachment dir but
-        keep ``_session_histories``; the cached ``[Attached: ...]`` lines then
-        point at deleted files, so the next turn restores them before the
-        harness reads the history. A purged row has no bytes to restore, so
+        CLI release and resource cleanup keep ``_session_histories``; the next
+        turn ensures any missing by-path files referenced by cached
+        ``[Attached: ...]`` lines are present before the harness reads the
+        history. A purged row has no bytes to restore, so
         its cached lines are replaced in place with the could-not-load marker.
         Calls are idempotent and non-fatal.
         """
@@ -12082,9 +12082,12 @@ def create_runner_app(
         if process_manager is not None:
             await process_manager.release(session_id)
         await resource_registry.cleanup_session(session_id)
+        # The session keeps running here (session delete is DELETE /v1/sessions/{id}),
+        # and its native transcript still reads the cached attachments.
         await _delete_native_bridge_dirs(
             server_client=server_client,
             session_id=session_id,
+            keep_attachment_caches=True,
         )
         if session_id in _session_histories:
             _attachment_restore_pending.add(session_id)
@@ -12483,9 +12486,11 @@ def create_runner_app(
             if await process_manager.release(session_id) is False:
                 raise RuntimeError("harness subprocess did not exit during CLI release")
         await _native_runtime.teardown_codex_native_app_server(session_id)
+        # The session resumes later and its native transcript still reads the cached attachments.
         await _delete_native_bridge_dirs(
             server_client=server_client,
             session_id=session_id,
+            keep_attachment_caches=True,
         )
         if session_id in _session_histories:
             _attachment_restore_pending.add(session_id)
