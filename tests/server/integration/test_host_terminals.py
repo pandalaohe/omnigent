@@ -355,7 +355,7 @@ async def test_restart_waits_for_verified_redial_without_second_runner(
         assert server.app.state.host_registry.terminal_runner(_HOST) is None
         async with httpx.AsyncClient(base_url=server.url, headers=owner_headers) as client:
             opening = asyncio.create_task(client.post(f"/v1/hosts/{_HOST}/terminals", json={}))
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.05)  # custom-lint: disable=sleep-then-assert -- Paused redial.
             assert not opening.done() and len(host.runner_tasks) == 1
             pause_runner = False
             second = await opening
