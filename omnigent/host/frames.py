@@ -93,6 +93,7 @@ CAP_HARNESS_LOGIN = "harness_login"
 CAP_MCP_REGISTRY = "mcp_registry"
 # The host bounds a whole worktree create by ``HostCreateWorktreeFrame.timeout_s``:
 CAP_WORKTREE_CREATE_BUDGET = "worktree_create_budget"
+CAP_HOST_TERMINALS = "host_terminals_v1"
 
 # The server gates ``raw``/``within`` reads on this: an old host ignores unknown params silently.
 CAP_FS_READ_RAW = "fs_read_raw"
@@ -329,6 +330,7 @@ class HostHelloFrame:
     project_code: bool = False
     capabilities: list[str] = field(default_factory=list)
     connection_id: str | None = None
+    terminal_runner_id: str | None = None
 
 
 @dataclass
@@ -412,6 +414,7 @@ class HostLaunchRunnerFrame:
     startup_required: bool = False
     retain_runner_ids: list[str] | None = None
     superseded_runner_ids: tuple[str, ...] | None = None
+    purpose: Literal["host_terminals"] | None = None
 
 
 @dataclass
@@ -460,6 +463,7 @@ class HostLaunchRunnerResultFrame:
     error: str | None = None
     error_code: str | None = None
     workspace_recreated: bool = False
+    exists: str | None = None
 
 
 @dataclass
@@ -568,6 +572,7 @@ class HostRunnerStatusFrame:
 
     request_id: str
     runner_id: str
+    purpose: Literal["host_terminals"] | None = None
 
 
 @dataclass
@@ -2042,6 +2047,11 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "project_code": frame.project_code,
                 "capabilities": list(frame.capabilities),
                 "connection_id": frame.connection_id,
+                **(
+                    {"terminal_runner_id": frame.terminal_runner_id}
+                    if frame.terminal_runner_id is not None
+                    else {}
+                ),
             }
         )
     if isinstance(frame, HostConnectionErrorFrame):
@@ -2080,6 +2090,7 @@ def encode_host_frame(frame: HostFrame) -> str:
             "inference_config": frame.inference_config,
             "startup": frame.startup.model_dump() if frame.startup else None,
             "startup_required": frame.startup_required,
+            **({"purpose": frame.purpose} if frame.purpose is not None else {}),
         }
         if frame.retain_runner_ids is not None:
             payload["retain_runner_ids"] = frame.retain_runner_ids
@@ -2115,6 +2126,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "error": frame.error,
                 "error_code": frame.error_code,
                 "workspace_recreated": frame.workspace_recreated,
+                **({"exists": frame.exists} if frame.exists is not None else {}),
             }
         )
     if isinstance(frame, HostStopRunnerFrame):
@@ -2159,6 +2171,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.RUNNER_STATUS.value,
                 "request_id": frame.request_id,
                 "runner_id": frame.runner_id,
+                **({"purpose": frame.purpose} if frame.purpose is not None else {}),
             }
         )
     if isinstance(frame, HostRunnerStatusResultFrame):
@@ -3535,6 +3548,7 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         project_code=_required_bool(msg, "project_code") if "project_code" in msg else False,
         capabilities=_optional_str_list(msg, "capabilities"),
         connection_id=_optional_nullable_str(msg, "connection_id"),
+        terminal_runner_id=_optional_nullable_str(msg, "terminal_runner_id"),
     )
 
 
@@ -3600,6 +3614,7 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
             if "superseded_runner_ids" in msg
             else None
         ),
+        purpose=_optional_runner_purpose(msg),
     )
 
 
@@ -3618,6 +3633,7 @@ def _decode_launch_runner_result(
         error=_optional_nullable_str(msg, "error"),
         error_code=_optional_nullable_str(msg, "error_code"),
         workspace_recreated=_optional_bool(msg, "workspace_recreated"),
+        exists=_optional_nullable_str(msg, "exists"),
     )
 
 
@@ -3689,7 +3705,15 @@ def _decode_runner_status(msg: _JsonObject) -> HostRunnerStatusFrame:
     return HostRunnerStatusFrame(
         request_id=_required_str(msg, "request_id"),
         runner_id=_required_str(msg, "runner_id"),
+        purpose=_optional_runner_purpose(msg),
     )
+
+
+def _optional_runner_purpose(msg: _JsonObject) -> Literal["host_terminals"] | None:
+    purpose = msg.get("purpose")
+    if purpose is None or purpose == "host_terminals":
+        return purpose
+    raise ValueError("unsupported runner purpose")
 
 
 def _decode_runner_status_result(

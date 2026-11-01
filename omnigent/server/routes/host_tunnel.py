@@ -1028,6 +1028,7 @@ async def _receive_loop(
                         "error": frame.error,
                         "error_code": frame.error_code,
                         "workspace_recreated": frame.workspace_recreated,
+                        **({"exists": frame.exists} if frame.exists is not None else {}),
                     }
                 )
             continue

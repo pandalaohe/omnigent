@@ -5771,6 +5771,20 @@ def create_app(
         return None
 
     # WS tunnel endpoint for runners (RUNNER.md §2-3).
+    from omnigent.server.host_terminals import HostTerminalService
+
+    host_terminals = (
+        HostTerminalService(
+            host_registry,
+            host_store,
+            tunnel_registry,
+            auth_provider=auth_provider,
+            account_store=runner_account_store,
+        )
+        if host_store is not None
+        else None
+    )
+    app.state.host_terminals = host_terminals
     app.include_router(
         create_runner_tunnel_router(
             tunnel_registry,
@@ -5780,6 +5794,7 @@ def create_app(
             auth_provider=auth_provider,
             runner_exit_reports=runner_exit_reports,
             resolve_managed_runner_owner=_resolve_managed_runner_owner,
+            host_terminals=host_terminals,
             mint_managed_runner_token=(
                 _mint_managed_runner_token if runner_account_store is not None else None
             ),
@@ -5797,6 +5812,7 @@ def create_app(
     if host_store is not None:
         from omnigent.server.admin_list import resolve_data_dir
         from omnigent.server.routes.harness_startup import create_harness_startup_router
+        from omnigent.server.routes.host_terminals import create_host_terminals_router
         from omnigent.server.routes.host_tunnel import create_host_tunnel_router
         from omnigent.server.routes.hosts import create_hosts_router
         from omnigent.server.routes.mcp_servers import create_mcp_servers_router
@@ -5813,6 +5829,17 @@ def create_app(
         system_status = SystemStatusHub(resolve_data_dir(), server_metrics)
         system_status.load()
         app.state.system_status = system_status
+        assert host_terminals is not None
+        app.include_router(
+            create_host_terminals_router(
+                host_terminals,
+                auth_provider=auth_provider,
+                runner_router=runner_router,
+                permission_store=permission_store,
+            ),
+            prefix="/v1",
+            tags=["hosts"],
+        )
 
         async def _on_hosts_changed(host_id: str, owner: str | None) -> None:
             announce_hosts_changed(owner)

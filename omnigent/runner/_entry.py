@@ -1481,6 +1481,16 @@ def create_app(
         rather than "resolve again" (which would re-probe the same endpoints).
     :returns: A runner FastAPI app exposing the harness-contract subset.
     """
+    from omnigent.runner.identity import RUNNER_PURPOSE_ENV_VAR
+
+    if os.environ.get(RUNNER_PURPOSE_ENV_VAR) == "host_terminals":
+        from omnigent.runner.host_terminals import create_host_terminal_app
+
+        return create_host_terminal_app(
+            home=_runner_workspace_from_env() or Path.home(),
+            shells=_host_interactive_shells_from_env(),
+        )
+
     from omnigent.cli_auth import open_server_client
     from omnigent.runner.app import create_runner_app
     from omnigent.runner.identity import (
@@ -1830,7 +1840,7 @@ async def _run_tunnel_from_env() -> None:
     """
     from concurrent.futures import ThreadPoolExecutor
 
-    from omnigent.runner.identity import get_stable_runner_id
+    from omnigent.runner.identity import RUNNER_PURPOSE_ENV_VAR, get_stable_runner_id
     from omnigent.runner.transports.ws_tunnel.serve import serve_tunnel
     from omnigent.util.thread_pool_watchdog import watch_thread_pool
 
@@ -1845,7 +1855,8 @@ async def _run_tunnel_from_env() -> None:
     watch_thread_pool(runner_executor, thread_name_prefix="runner", process_role="runner")
 
     server_url = _server_url_from_env()
-    auth_token_factory = _make_auth_token_factory()
+    terminal_runner = os.environ.get(RUNNER_PURPOSE_ENV_VAR) == "host_terminals"
+    auth_token_factory = None if terminal_runner else _make_auth_token_factory()
     # Write the singleton to the canonical module so it is visible to all
     # importers even when this file runs as __main__ (which Python treats as a
     # separate module object from omnigent.runner._entry). Importing the
@@ -1884,7 +1895,7 @@ async def _run_tunnel_from_env() -> None:
 
     event_dispatcher = RunnerEventDispatcher()
     app.state.runner_event_dispatcher = event_dispatcher
-    idle_timeout_s = _load_runner_idle_timeout_s_from_config()
+    idle_timeout_s = 60.0 if terminal_runner else _load_runner_idle_timeout_s_from_config()
     # starlette 1.x removed Router.startup/shutdown; drive the lifespan manually.
     _lifespan_cm = app.router.lifespan_context(app)
     await _lifespan_cm.__aenter__()
@@ -1917,6 +1928,8 @@ async def _run_tunnel_from_env() -> None:
 
         :returns: Monotonic timestamp from the runner event loop.
         """
+        if terminal_runner:
+            return app.state.host_terminal_idle_since()
         return _runner_last_activity(
             last_activity_at,
             event_dispatcher.last_dispatch_at,
@@ -1968,7 +1981,7 @@ async def _run_tunnel_from_env() -> None:
     # listener is POSIX-only like the bridges themselves.
     direct_attach_listener = None
     direct_attach_token: str | None = None
-    if sys.platform != "win32":
+    if sys.platform != "win32" and not terminal_runner:
         try:
             from omnigent.runner.direct_attach import (
                 allowed_origin_for_server,
@@ -2273,7 +2286,10 @@ def main() -> None:
 
     configure_process_logging("runner", force=True)
     _install_crash_logging()
-    _maybe_prewarm_ambient_detection()
+    from omnigent.runner.identity import RUNNER_PURPOSE_ENV_VAR
+
+    if os.environ.get(RUNNER_PURPOSE_ENV_VAR) != "host_terminals":
+        _maybe_prewarm_ambient_detection()
     try:
         asyncio.run(_run_tunnel_from_env())
     except RuntimeError as exc:

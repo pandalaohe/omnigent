@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -80,6 +81,7 @@ from omnigent.harness_availability import (
 from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
 from omnigent.host.frames import (
+    CAP_HOST_TERMINALS,
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HOST_CAPABILITIES,
     LAUNCH_HANDLER_FAILED_ERROR_CODE,
@@ -1014,6 +1016,7 @@ def _build_runner_env(
     host_owns_global_cleanup: bool = False,
     harness_tmp_parent: Path | None = None,
     inference_config: dict[str, object] | None = None,
+    purpose: Literal["host_terminals"] | None = None,
 ) -> dict[str, str]:
     """
     Build the environment for a spawned runner subprocess.
@@ -1067,7 +1070,11 @@ def _build_runner_env(
     )
 
     try:
-        config_env_vars = provider_credential_env_vars(load_config())
+        config_env_vars = (
+            frozenset()
+            if purpose == "host_terminals"
+            else provider_credential_env_vars(load_config())
+        )
     except (OSError, _OmnigentError):
         config_env_vars = frozenset()
     if inference_config is not None:
@@ -1082,11 +1089,36 @@ def _build_runner_env(
         or key.startswith(_RUNNER_ENV_ALLOWLIST_PREFIXES)
         or key in forwarded
     }
+    if purpose == "host_terminals":
+        from omnigent.runner.identity import RUNNER_PURPOSE_ENV_VAR
+
+        safe_names = {
+            "PATH",
+            "HOME",
+            "USER",
+            "LOGNAME",
+            "SHELL",
+            "LANG",
+            "TERM",
+            "COLORTERM",
+            "TZ",
+            "TMPDIR",
+            "TMP",
+            "TEMP",
+            "PYTHONPATH",
+            "VIRTUAL_ENV",
+        }
+        env = {
+            key: value
+            for key, value in base_env.items()
+            if key in safe_names or key.startswith("LC_")
+        }
+        env[RUNNER_PURPOSE_ENV_VAR] = purpose
     env["RUNNER_SERVER_URL"] = server_url
     env[RUNNER_ID_ENV_VAR] = runner_id
     env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] = binding_token
     env[RUNNER_DELEGATED_AUTH_ENV_VAR] = "1"
-    if initial_auth_token:
+    if initial_auth_token and purpose is None:
         env[RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR] = initial_auth_token
     env[RUNNER_WORKSPACE_ENV_VAR] = workspace
     env[RUNNER_PARENT_PID_ENV_VAR] = str(parent_pid)
@@ -1265,6 +1297,7 @@ class _RunnerHandle:
     connect_marker: Path | None = None
     stop_requested: bool = False
     incarnation_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    purpose: Literal["host_terminals"] | None = None
 
 
 @dataclass(frozen=True)
@@ -1722,6 +1755,19 @@ class HostProcess:
         if dead:
             self._trigger_maintenance("runner_exited_during_reconnect")
         return list(self._runners.keys())
+
+    def _terminal_runner_id(self) -> str | None:
+        return next(
+            (
+                runner_id
+                for runner_id, handle in self._runners.items()
+                if handle.purpose == "host_terminals"
+            ),
+            None,
+        )
+
+    def _host_terminals_supported(self) -> bool:
+        return IS_POSIX and shutil.which("tmux") is not None and bool(self._interactive_shells)
 
     def _owner_inventory_snapshot(self) -> HostOwnerInventorySnapshot:
         """Copy the event-loop-owned registrations without probing or reaping."""
@@ -2183,6 +2229,23 @@ class HostProcess:
             ``"failed"`` result. Deterministic preflight refusals
             include a machine-readable ``error_code``.
         """
+        terminal_runner = frame.purpose == "host_terminals"
+        if terminal_runner:
+            if frame.session_id or frame.harness or frame.inference_config or frame.startup:
+                return self._launch_failed(frame, "terminal runners cannot host sessions")
+            if not self._host_terminals_supported():
+                return self._launch_failed(frame, "host terminals are not supported")
+            for existing_id, handle in list(self._runners.items()):
+                if (
+                    handle.purpose == "host_terminals"
+                    and await asyncio.to_thread(handle.proc.poll) is None
+                ):
+                    return HostLaunchRunnerResultFrame(
+                        request_id=frame.request_id,
+                        status="exists",
+                        runner_id=existing_id,
+                        exists=existing_id,
+                    )
         if not await self._claim_startup(frame):
             return self._launch_failed(
                 frame, "Startup permission is no longer current", error_code="startup_not_admitted"
@@ -2243,7 +2306,7 @@ class HostProcess:
                 error_code=HARNESS_NOT_CONFIGURED_ERROR_CODE,
             )
 
-        workspace = Path(frame.workspace).expanduser()
+        workspace = Path.home() if terminal_runner else Path(frame.workspace).expanduser()
         workspace_recreated = False
         if not workspace.is_dir():
             # Recreate a vanished leaf (pruned worktree, an agent's rm -rf) so the
@@ -2284,17 +2347,22 @@ class HostProcess:
 
         # The host's own pre-launch command prepares the workspace; it never
         # blocks the launch.
-        try:
-            await self._run_host_subprocess_in_thread(
-                functools.partial(run_pre_launch_command, self._config_path, workspace)
-            )
-        except Exception:
-            _logger.exception("Pre-launch command crashed for %s", workspace)
+        if not terminal_runner:
+            try:
+                await self._run_host_subprocess_in_thread(
+                    functools.partial(run_pre_launch_command, self._config_path, workspace)
+                )
+            except Exception:
+                _logger.exception("Pre-launch command crashed for %s", workspace)
 
         runner_id = token_bound_runner_id(frame.binding_token)
-        initial_auth_token = await asyncio.to_thread(
-            self._current_auth_token,
-            initialize=False,
+        initial_auth_token = (
+            None
+            if terminal_runner
+            else await asyncio.to_thread(
+                self._current_auth_token,
+                initialize=False,
+            )
         )
         env = _build_runner_env(
             os.environ,
@@ -2310,6 +2378,7 @@ class HostProcess:
             host_owns_global_cleanup=self._maintenance_janitor is not None,
             harness_tmp_parent=self._harness_tmp_parent,
             inference_config=frame.inference_config,
+            purpose=frame.purpose,
         )
         if frame.inference_config is not None:
             try:
@@ -2426,6 +2495,7 @@ class HostProcess:
             log_path=log_path,
             session_id=frame.session_id or None,
             connect_marker=_connect_marker_path(log_path),
+            purpose=frame.purpose,
         )
         watcher = asyncio.create_task(self._watch_runner(runner_id))
         self._watcher_tasks.add(watcher)
@@ -2781,7 +2851,8 @@ class HostProcess:
             await asyncio.shield(asyncio.gather(*pending, return_exceptions=True))
         handle = self._runners.get(frame.runner_id)
         if handle is None:
-            status = "unknown"
+            # Pending launches were joined above; no owned process remains for this purpose.
+            status = "dead" if frame.purpose == "host_terminals" else "unknown"
         else:
             # poll() is a lock-free waitpid for a direct-Popen runner, but a
             # blocking control-socket round-trip (bounded only by the 30s
@@ -5929,8 +6000,12 @@ class HostProcess:
             filesystem_roots=True,
             post_bind_hook=True,
             project_code=True,
-            capabilities=list(HOST_CAPABILITIES),
+            capabilities=[
+                *HOST_CAPABILITIES,
+                *([CAP_HOST_TERMINALS] if self._host_terminals_supported() else []),
+            ],
             connection_id=connection_id,
+            terminal_runner_id=self._terminal_runner_id(),
         )
         try:
             encoded_hello = encode_host_frame(hello)
