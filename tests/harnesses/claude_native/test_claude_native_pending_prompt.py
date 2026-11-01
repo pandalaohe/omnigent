@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -321,3 +322,51 @@ def test_submit_retry_respects_a_hook_even_when_the_draft_is_still_visible(
             bridge_dir=native_bridge,
         )
     assert sent == []
+
+
+def test_dead_owner_approval_wait_marker_expires_after_orphan_grace(
+    native_bridge: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hook killed before its finally block should not block sending for 7 minutes."""
+    wait_root = native_bridge.parent / bridge._APPROVAL_WAIT_DIR_NAME
+    wait_root.mkdir(parents=True, exist_ok=True)
+    digest = bridge._approval_wait_digest("session-question")
+    marker = wait_root / f"{digest}.999999999.wait"
+    marker.write_text("999999999\n", encoding="utf-8")
+    now = 10_000.0
+    os.utime(marker, (now - 120.0, now - 120.0))
+    monkeypatch.setattr(bridge.time, "time", lambda: now)
+
+    assert not bridge.approval_wait_is_fresh("session-question", bridge_dir=native_bridge)
+    assert not marker.exists()
+
+
+def test_dead_owner_approval_wait_marker_within_orphan_grace_is_fresh(
+    native_bridge: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Markers inside the refresh+grace window stay fresh even if PID probing races."""
+    wait_root = native_bridge.parent / bridge._APPROVAL_WAIT_DIR_NAME
+    wait_root.mkdir(parents=True, exist_ok=True)
+    digest = bridge._approval_wait_digest("session-question")
+    marker = wait_root / f"{digest}.999999999.wait"
+    marker.write_text("999999999\n", encoding="utf-8")
+    now = 10_000.0
+    os.utime(marker, (now - 10.0, now - 10.0))
+    monkeypatch.setattr(bridge.time, "time", lambda: now)
+
+    assert bridge.approval_wait_is_fresh("session-question", bridge_dir=native_bridge)
+    assert marker.exists()
+
+
+def test_live_owner_approval_wait_marker_survives_past_orphan_grace(
+    native_bridge: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A live hook owner keeps its marker valid up to the full TTL."""
+    marker = _park_hook(native_bridge)
+    now = 10_000.0
+    os.utime(marker, (now - 120.0, now - 120.0))
+    monkeypatch.setattr(bridge.time, "time", lambda: now)
+
+    assert bridge.approval_wait_is_fresh("session-question", bridge_dir=native_bridge)
+    assert marker.exists()
+

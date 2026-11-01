@@ -236,6 +236,10 @@ APPROVAL_WAIT_MARKER_REFRESH_S = 60.0
 # Several refresh intervals of slack, so a hook that is slow to wake never
 # reads stale; a hook killed mid-wait leaves a marker that expires on its own.
 APPROVAL_WAIT_MARKER_TTL_S = 420.0
+# Adapted from omnigent-ae-public (Copyright 2026 Analytic Endeavors LLC, Apache-2.0):
+# Once a marker is older than one refresh interval plus slack, verify the hook
+# subprocess PID encoded in the marker name is still alive before trusting it.
+APPROVAL_WAIT_ORPHAN_GRACE_S = APPROVAL_WAIT_MARKER_REFRESH_S + 30.0
 _CONFIG_FILE = "bridge.json"
 _SERVER_FILE = "server.json"
 # Control socket of one ``serve-mcp`` process under the harness socket root,
@@ -1847,6 +1851,17 @@ def clear_approval_wait_marker(marker: Path) -> None:
         marker.unlink(missing_ok=True)
 
 
+def _approval_wait_owner_alive(marker: Path) -> bool:
+    """Return whether the hook process encoded in *marker*'s filename is alive."""
+    try:
+        pid = int(marker.name.split(".")[-2])
+    except (IndexError, ValueError):
+        return True
+    from omnigent.inner._proc import process_alive
+
+    return process_alive(pid)
+
+
 def approval_wait_is_fresh(session_id: str, *, bridge_dir: Path | None = None) -> bool:
     """
     Whether a permission hook is parked on this session's verdict right now.
@@ -1858,7 +1873,8 @@ def approval_wait_is_fresh(session_id: str, *, bridge_dir: Path | None = None) -
         ``"conv_abc123"``.
     :param bridge_dir: Derive the marker root from this bridge, matching the hook writer.
     :returns: ``True`` when any marker was touched within
-        :data:`APPROVAL_WAIT_MARKER_TTL_S`; ``False`` when none exists, all
+        :data:`APPROVAL_WAIT_MARKER_TTL_S` by a live owner (or within
+        :data:`APPROVAL_WAIT_ORPHAN_GRACE_S`); ``False`` when none exists, all
         are stale, or the root is unreadable.
     """
     root = bridge_dir.parent / _APPROVAL_WAIT_DIR_NAME if bridge_dir else _APPROVAL_WAIT_ROOT
@@ -1873,7 +1889,10 @@ def approval_wait_is_fresh(session_id: str, *, bridge_dir: Path | None = None) -
             touched_at = marker.stat().st_mtime
         except OSError:
             continue
-        if now - touched_at < APPROVAL_WAIT_MARKER_TTL_S:
+        age = now - touched_at
+        if age < APPROVAL_WAIT_ORPHAN_GRACE_S or (
+            age < APPROVAL_WAIT_MARKER_TTL_S and _approval_wait_owner_alive(marker)
+        ):
             fresh = True
         else:
             clear_approval_wait_marker(marker)
