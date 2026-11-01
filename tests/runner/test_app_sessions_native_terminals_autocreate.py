@@ -197,6 +197,12 @@ class _ResumeSnapshotServerClient(NullServerClient):
         self._session_url = session_url
         self._snapshot = snapshot
         self._items = items
+        self.patches: list[tuple[str, dict[str, Any]]] = []
+
+    async def patch(self, url: str, **kwargs: Any) -> NullServerClient._Response:
+        """Record session label patches and return a stub 200 response."""
+        self.patches.append((url, kwargs))
+        return await super().patch(url, **kwargs)
 
     async def get(self, url: str, **kwargs: Any) -> NullServerClient._Response:
         """Return empty labels (so the bridge id is the session id), items or the snapshot."""
@@ -3566,6 +3572,118 @@ async def test_auto_create_claude_terminal_resumes_in_place_when_the_registry_ch
     launched_args = list(captured["spec"].args)
     assert synth_calls == [session_external_id]
     assert launched_args[launched_args.index("--resume") + 1] == session_external_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reused_local", "synthesized", "prior_labels", "expected_mode", "expected_count"),
+    [
+        (True, False, {"omnigent.claude_native.resume_count": "2"}, "kept", "3"),
+        (False, True, {}, "rebuilt", "1"),
+    ],
+)
+async def test_auto_create_claude_terminal_records_cold_resume_transcript_outcome(
+    reused_local: bool,
+    synthesized: bool,
+    prior_labels: dict[str, str],
+    expected_mode: str,
+    expected_count: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Cold relaunch logs whether the local transcript was kept or rebuilt and stamps labels."""
+    from omnigent.harnesses.claude_native.main import (
+        CLAUDE_RESUME_COUNT_LABEL_KEY,
+        CLAUDE_RESUME_TRANSCRIPT_LABEL_KEY,
+        ClaudeResumeTranscriptResolution,
+    )
+
+    absent = ClaudeResumeTranscriptResolution(None, reused_local=False, synthesized=False)
+    assert absent.mode is None
+    assert (
+        ClaudeResumeTranscriptResolution(
+            tmp_path / "kept.jsonl",
+            reused_local=True,
+            synthesized=False,
+        ).mode
+        == "kept"
+    )
+    assert (
+        ClaudeResumeTranscriptResolution(
+            tmp_path / "rebuilt.jsonl",
+            reused_local=False,
+            synthesized=True,
+        ).mode
+        == "rebuilt"
+    )
+
+    session_id = "5cdbea97a2fb0c659bc09605401e2bb2"
+    session_external_id = "02857840-6362-408f-b41f-309e396ed7c6"
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+    (tmp_path / "workspace").mkdir()
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+
+    async def _fake_synth(
+        client: Any,
+        *,
+        session_id: str,
+        external_session_id: str,
+        workspace: Path,
+        bridge_dir: Path,
+        resume_copy: bool,
+    ) -> ClaudeResumeTranscriptResolution:
+        del client, session_id, workspace, bridge_dir, resume_copy
+        transcript = tmp_path / f"{external_session_id}.jsonl"
+        transcript.write_text('{"type":"user"}\n', encoding="utf-8")
+        return ClaudeResumeTranscriptResolution(
+            transcript,
+            reused_local=reused_local,
+            synthesized=synthesized,
+        )
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main._ensure_local_claude_resume_transcript",
+        _fake_synth,
+    )
+    captured: dict[str, Any] = {}
+    client = _ResumeSnapshotServerClient(
+        f"/v1/sessions/{session_id}",
+        {"external_session_id": session_external_id, "labels": prior_labels},
+    )
+
+    with caplog.at_level(logging.INFO, logger="omnigent.harnesses.claude_native.main"):
+        await _auto_create_claude_terminal(
+            session_id,
+            _RecordingClaudeRegistry(captured),
+            lambda _sid, _evt: None,
+            server_client=client,  # type: ignore[arg-type]
+        )
+
+    assert (
+        f"claude-native: cold resume of {session_id} used the {expected_mode} transcript; "
+        f"resume={expected_count}"
+    ) in caplog.text
+    assert (
+        f"/v1/sessions/{session_id}",
+        {
+            "json": {
+                "labels": {
+                    CLAUDE_RESUME_TRANSCRIPT_LABEL_KEY: expected_mode,
+                    CLAUDE_RESUME_COUNT_LABEL_KEY: expected_count,
+                }
+            },
+            "params": {"include_usage": "false"},
+            "timeout": 10.0,
+        },
+    ) in client.patches
 
 
 @pytest.mark.asyncio

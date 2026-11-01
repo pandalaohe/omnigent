@@ -9507,6 +9507,7 @@ class _ClaudeSessionLaunchMetadata:
     external_session_id: str | None = None
     fork_source_external_id: str | None = None
     fork_carry_history: bool = False
+    labels: Mapping[str, str] | None = None
     #: Both routing fields come from ``routing_class_from_snapshot``, so an
     #: auto-harness session always reads as routing-enabled too. Deriving them
     #: separately was the bug: a sub-agent child of a routed parent carries the
@@ -9555,6 +9556,7 @@ def _claude_launch_metadata_from_envelope(
             fork_source if isinstance(fork_source, str) and fork_source else None
         ),
         fork_carry_history=snapshot.labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1",
+        labels=dict(snapshot.labels),
     )
 
 
@@ -9623,6 +9625,7 @@ async def _load_legacy_claude_launch_metadata(
             fork_source if isinstance(fork_source, str) and fork_source else None
         ),
         fork_carry_history=labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1",
+        labels={str(key): str(value) for key, value in labels.items()},
     )
     permission_mode = _claude_launch_permission_mode(metadata.terminal_launch_args)
     _logger.info(
@@ -9957,6 +9960,7 @@ async def _auto_create_claude_terminal(
             _claude_resume_session_id,
             _ensure_local_claude_resume_transcript,
             _prepare_cold_resume_forward_state,
+            record_cold_resume_transcript_outcome,
         )
 
         resume_session_id = _claude_resume_session_id(session_external_id, session_id=session_id)
@@ -9974,6 +9978,12 @@ async def _auto_create_claude_terminal(
                 bridge_dir=bridge_dir,
                 resolution=resolution,
                 session_id=session_id,
+            )
+            await record_cold_resume_transcript_outcome(
+                server_client,
+                session_id=session_id,
+                resolution=resolution,
+                labels=launch_metadata.labels,
             )
             if degraded_sync:
                 await _post_claude_degraded_sync_notice(
