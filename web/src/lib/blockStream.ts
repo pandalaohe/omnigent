@@ -943,6 +943,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         interruptible: event.interruptible,
         allowAutoMode: event.allowAutoMode,
         permissionDirectories: event.permissionDirectories,
+        terminalAccess: event.terminalAccess,
         rememberScope: event.rememberScope,
         codexPersistModes: event.codexPersistModes,
         asyncKind: event.asyncKind,

@@ -58,6 +58,8 @@ def _make_hello(
     filesystem_roots: bool = False,
     harness_accounts: dict[str, dict[str, object]] | None = None,
     capabilities: list[str] | None = None,
+    supervised: str | None = None,
+    started_at: int | None = None,
 ) -> str:
     """Encode a HostHelloFrame for tests.
 
@@ -81,6 +83,8 @@ def _make_hello(
             filesystem_roots=filesystem_roots,
             harness_accounts=harness_accounts,
             capabilities=capabilities or [],
+            supervised=supervised,
+            started_at=started_at,
         )
     )
 
@@ -160,6 +164,8 @@ async def _connect_host(
     filesystem_roots: bool = False,
     harness_accounts: dict[str, dict[str, object]] | None = None,
     capabilities: list[str] | None = None,
+    supervised: str | None = None,
+    started_at: int | None = None,
 ) -> ApplicationCommunicator:
     """Connect a mock host via WebSocket tunnel.
 
@@ -190,6 +196,8 @@ async def _connect_host(
                 filesystem_roots=filesystem_roots,
                 harness_accounts=harness_accounts,
                 capabilities=capabilities,
+                supervised=supervised,
+                started_at=started_at,
             ),
         },
     )
@@ -1125,6 +1133,286 @@ async def test_launch_runner_404_unknown_host(
             json={"session_id": conv.id, "workspace": "/tmp"},
         )
     assert resp.status_code == 404
+
+
+async def test_restart_round_trip_over_fake_tunnel(host_api_app):
+    from unittest.mock import AsyncMock
+
+    from omnigent.host.frames import CAP_HOST_RESTART, HostRestartFrame, HostRestartResultFrame
+    from omnigent.runner.host_restart import HOST_RESTART_TOOL_HEADER
+
+    app, registry, _store, conversations = host_api_app
+    requester = conversations.create_conversation(
+        agent_id=None, host_id=_HOST_ID, workspace="/opt/work/project"
+    )
+    comm = await _connect_host(
+        app, registry, capabilities=[CAP_HOST_RESTART], supervised="launchd", started_at=1
+    )
+    options = {"requested_by_session_id": requester.id}
+    app.state.host_restart_post_event = post_event = AsyncMock(return_value={"forwarded": True})
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+
+        async def request(body, headers=None):
+            task = asyncio.create_task(
+                client.post(f"/v1/hosts/{_HOST_ID}/restart", json=body, headers=headers)
+            )
+            while True:
+                output = await comm.receive_output(timeout=budget(2))
+                try:
+                    frame = decode_host_frame(output["text"])
+                except ValueError:
+                    continue
+                if isinstance(frame, HostRestartFrame):
+                    break
+            await comm.send_input(
+                {
+                    "type": "websocket.receive",
+                    "text": encode_host_frame(
+                        HostRestartResultFrame(
+                            frame.request_id,
+                            True,
+                            supervisor="launchd",
+                            running_sessions=[requester.id],
+                            runner_count=1,
+                        )
+                    ),
+                }
+            )
+            return frame, await task
+
+        frame, preview = await request(options)
+        assert frame.dry_run is True
+        assert preview.status_code == 200
+        assert preview.json()["caller_on_host"] is True
+        assert registry.restarts.active == {}
+        headers = {HOST_RESTART_TOOL_HEADER: "1"}
+        missing = await client.post(
+            f"/v1/hosts/{_HOST_ID}/restart", json={"dry_run": False}, headers=headers
+        )
+        assert missing.status_code == 409
+        registry.restarts.previews[preview.json()["preview_id"]].tool_approved = True
+        frame, response = await request(
+            {**options, "dry_run": False, "preview_id": preview.json()["preview_id"]},
+            headers=headers,
+        )
+        assert frame.dry_run is False
+        assert response.status_code == 200
+        request_id = response.json()["request_id"]
+        status_path = f"/v1/hosts/{_HOST_ID}/restart/{request_id}"
+        assert (await client.get(status_path)).json()["phase"] == "draining"
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_host_frame(
+                    HostRestartResultFrame(frame.request_id, True, phase="stopping")
+                ),
+            }
+        )
+        for _ in range(100):
+            if (await client.get(status_path)).json()["phase"] == "stopping":
+                break
+            await asyncio.sleep(0.01)
+        assert (await client.get(status_path)).json()["phase"] == "stopping"
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await comm.wait(timeout=budget(2))
+        assert (await client.get(status_path)).json()["phase"] == "waiting_reconnect"
+        new_comm = await _connect_host(
+            app, registry, capabilities=[CAP_HOST_RESTART], supervised="launchd", started_at=2
+        )
+        assert (await client.get(status_path)).json()["phase"] == "done"
+        for _ in range(100):
+            if post_event.await_count:
+                break
+            await asyncio.sleep(0.01)
+        assert post_event.await_args.kwargs["acting_user_id"] is None
+        assert post_event.await_args.args[1] == requester.id
+        assert "done" in post_event.await_args.args[2].data["content"][0]["text"]
+        await new_comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await new_comm.wait(timeout=budget(2))
+    await registry.restarts.shutdown()
+
+
+async def test_restart_owner_offline_supervisor_and_requester_guards(multi_user_app):
+    from unittest.mock import AsyncMock
+
+    from omnigent.host.frames import CAP_HOST_RESTART
+
+    app, registry, hosts, conversations = multi_user_app
+
+    @app.exception_handler(OmnigentError)
+    async def restart_error_response(_request, error):
+        return JSONResponse(
+            status_code=error.http_status,
+            content={"error": {"code": error.code, "message": error.message}},
+        )
+
+    hosts.upsert_on_connect(_HOST_ID, "test", "owner@test.com")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        path = f"/v1/hosts/{_HOST_ID}/restart"
+        response = await client.post(path, json={}, headers={"x-test-user": "other@test.com"})
+        assert response.status_code == 403
+        headers = {"x-test-user": "owner@test.com"}
+        assert (await client.post(path, json={}, headers=headers)).status_code == 409
+        conn = registry.register(
+            _HOST_ID, AsyncMock(), HostHelloFrame("test", 1, "test"), "owner@test.com"
+        )
+        assert (await client.post(path, json={}, headers=headers)).status_code == 409
+        conn.hello.capabilities = [CAP_HOST_RESTART]
+        conn.hello.supervised = "launchd"
+        foreign = conversations.create_conversation(agent_id=None)
+        assert (
+            await client.post(path, json={"requested_by_session_id": foreign.id}, headers=headers)
+        ).status_code == 403
+        assert (
+            await client.post(path, json={"dry_run": False}, headers=headers)
+        ).status_code == 403
+
+
+@pytest.mark.parametrize(
+    "credential", ["runner", "forged-tool", "browser", "missing-origin", "untrusted-origin"]
+)
+async def test_restart_execution_requires_browser_or_approved_tool(
+    auth_app, auth_client, db_uri, monkeypatch, credential
+):
+    from unittest.mock import AsyncMock
+
+    from omnigent.host.frames import CAP_HOST_RESTART, HostRestartResultFrame
+    from omnigent.runner.host_restart import HOST_RESTART_TOOL_HEADER
+    from omnigent.server.accounts_config import AccountsConfig
+    from omnigent.server.oidc import mint_session_cookie
+
+    owner = "owner@example.test"
+    provider = auth_app.state.mcp_registry_auth
+    config = AccountsConfig(b"a" * 32, 8, "http://test", None, 3600, 300)
+    monkeypatch.setattr(provider, "_source", "accounts")
+    monkeypatch.setattr(provider, "_accounts_config", config)
+    registry = auth_app.state.host_registry
+    hosts = HostStore(db_uri)
+    hosts.upsert_on_connect(_HOST_ID, "test", owner)
+    auth_app.include_router(
+        create_hosts_router(
+            registry, hosts, SqlAlchemyConversationStore(db_uri), auth_provider=provider
+        ),
+        prefix="/v1",
+    )
+    registry.register(
+        _HOST_ID,
+        AsyncMock(),
+        HostHelloFrame("test", 1, "test", capabilities=[CAP_HOST_RESTART], supervised="launchd"),
+        owner,
+    )
+    frames = []
+
+    def reply(connection, raw):
+        frame = decode_host_frame(raw)
+        frames.append(frame)
+        connection.pending_restarts[frame.request_id].set_result(
+            HostRestartResultFrame(frame.request_id, True, supervisor="launchd")
+        )
+
+    monkeypatch.setattr(registry, "send_text", reply)
+    runner_token = provider.mint_runner_token(owner, 60)
+    assert runner_token is not None
+    bearer = {"Authorization": f"Bearer {runner_token}"}
+    path = f"/v1/hosts/{_HOST_ID}/restart"
+    try:
+        preview = await auth_client.post(path, json={"dry_run": True}, headers=bearer)
+        assert preview.status_code == 200, preview.text
+        assert len(frames) == 1 and frames[0].dry_run
+        preview_id = preview.json()["preview_id"]
+        registry.restarts.previews[preview_id].tool_approval_id = "elicit_unanswered_restart"
+        frames.clear()
+        if credential in ("runner", "forged-tool"):
+            headers = {**bearer, "Origin": "http://test"}
+            if credential == "forged-tool":
+                headers[HOST_RESTART_TOOL_HEADER] = "1"
+        else:
+            auth_client.cookies.set(
+                config.session_cookie_name,
+                mint_session_cookie(
+                    owner, config.cookie_secret, 8, "accounts", browser_session=True
+                ),
+            )
+            headers = (
+                {}
+                if credential == "missing-origin"
+                else {
+                    "Origin": "https://untrusted.example.test"
+                    if credential == "untrusted-origin"
+                    else "http://test"
+                }
+            )
+        response = await auth_client.post(
+            path, json={"dry_run": False, "preview_id": preview_id}, headers=headers
+        )
+        if credential == "browser":
+            assert response.status_code == 200, response.text
+            assert len(registry.restarts.records) == 1
+            assert len(frames) == 1 and not frames[0].dry_run
+            auth_client.cookies.clear()
+            status = await auth_client.get(
+                f"{path}/{response.json()['request_id']}", headers=bearer
+            )
+            assert status.status_code == 200 and status.json()["phase"] == "draining"
+        else:
+            assert response.status_code == (409 if credential == "forged-tool" else 403), (
+                response.text
+            )
+            assert not registry.restarts.records and not registry.restarts.active
+            assert not frames
+            assert preview_id in registry.restarts.previews
+    finally:
+        await registry.restarts.shutdown()
+
+
+async def test_restart_tool_requires_approved_preview_and_never_refreshes_it(
+    host_api_app, monkeypatch
+):
+    from unittest.mock import AsyncMock
+
+    from omnigent.host.frames import CAP_HOST_RESTART, HostRestartResultFrame
+    from omnigent.runner.host_restart import HOST_RESTART_TOOL_HEADER
+
+    app, registry, hosts, conversations = host_api_app
+    hosts.upsert_on_connect(_HOST_ID, "test", "local")
+    requester = conversations.create_conversation(agent_id=None)
+    registry.register(
+        _HOST_ID,
+        AsyncMock(),
+        HostHelloFrame("test", 1, "test", capabilities=[CAP_HOST_RESTART], supervised="launchd"),
+        None,
+    )
+    frames = []
+
+    def reply(connection, raw):
+        frame = decode_host_frame(raw)
+        frames.append(frame)
+        connection.pending_restarts[frame.request_id].set_result(
+            HostRestartResultFrame(frame.request_id, True, supervisor="launchd")
+        )
+
+    monkeypatch.setattr(registry, "send_text", reply)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        path = f"/v1/hosts/{_HOST_ID}/restart"
+        body = {"requested_by_session_id": requester.id}
+        preview = (await client.post(path, json=body)).json()
+        headers = {HOST_RESTART_TOOL_HEADER: "1"}
+        assert (await client.post(path, json=body, headers=headers)).status_code == 409
+        assert (
+            await client.post(
+                path,
+                json={**body, "dry_run": False, "preview_id": preview["preview_id"]},
+                headers=headers,
+            )
+        ).status_code == 409
+        stored = registry.restarts.previews[preview["preview_id"]]
+        stored.tool_approved = True
+        claimed = await client.post(path, json=body, headers=headers)
+        assert claimed.json() == preview
+        assert len(frames) == 1
+        stored.expires = registry.restarts.clock() - 1
+        assert (await client.post(path, json=body, headers=headers)).status_code == 409
+        assert len(frames) == 1
 
 
 # ── Multi-user ownership tests ────────────────────────

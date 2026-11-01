@@ -34,6 +34,7 @@ import { cn } from "@/lib/utils";
 import { NewTerminalButton } from "./NewTerminalButton";
 import { TerminalStatusBadge } from "./terminalStatus";
 import { useTerminalSplit } from "./useTerminalSplit";
+import { TerminalAgentAccess } from "./TerminalAgentAccess";
 
 const TerminalView = lazy(() =>
   import("@/components/blocks/TerminalView").then((m) => ({ default: m.TerminalView })),
@@ -227,7 +228,9 @@ export function TerminalsPanel({
               >
                 <TerminalIcon className="size-3.5 shrink-0 text-muted-foreground" />
                 {t.session && <span className="shrink-0 text-sm font-medium">{t.session}</span>}
-                <span className="truncate text-sm text-muted-foreground/70">{t.name}</span>
+                <span className="truncate text-sm text-muted-foreground/70">
+                  {t.elevated ? "root" : t.name}
+                </span>
                 <span className="flex-1" />
                 <TerminalStatusBadge status={getStatus(t)} />
               </button>
@@ -241,7 +244,13 @@ export function TerminalsPanel({
             // Scope the key to the session: agent terminals share a fixed id
             // across same-shape sessions (e.g. `terminal_claude_main`), so id
             // alone reuses the xterm mount and shows stale scrollback.
-            <div key={`${conversationId}:${activeTerminal.id}`} className="flex h-full flex-col">
+            <div
+              key={`${conversationId}:${activeTerminal.id}:${activeTerminal.instanceId ?? ""}`}
+              className="flex h-full flex-col"
+            >
+              {activeTerminal.elevated && (
+                <TerminalAgentAccess conversationId={conversationId} terminal={activeTerminal} />
+              )}
               <Suspense fallback={null}>
                 <TerminalView
                   sessionId={conversationId}

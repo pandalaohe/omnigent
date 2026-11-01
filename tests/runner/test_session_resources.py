@@ -1731,6 +1731,7 @@ class _LaunchReturningRegistry:
         cwd_override: str | None = None,
         sandbox_override: str | None = None,
         program_status_app: str | None = None,
+        elevated: bool = False,
     ) -> TerminalInstance:
         """Return the fixed instance, ignoring the launch spec.
 
@@ -1754,6 +1755,7 @@ class _LaunchReturningRegistry:
             sandbox_override,
         )
         self._instance.program_status_app = program_status_app
+        self._instance.elevated = elevated
         return self._instance
 
 

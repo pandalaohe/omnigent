@@ -2958,6 +2958,8 @@ def create_runner_app(
         if registry is None:
             return None
         for entry in registry.list_for_conversation(conv_id):
+            if entry.instance.elevated:
+                continue
             try:
                 pane = trim_terminal_output(entry.instance.last_pane_text())
             except Exception:
@@ -3024,6 +3026,7 @@ def create_runner_app(
                 "type": "session.resource.deleted",
                 "resource_id": event.terminal_id,
                 "resource_type": "terminal",
+                "instance_id": event.terminal_instance_id,
                 "session_id": event.session_id,
             },
         )
@@ -7778,6 +7781,7 @@ def create_runner_app(
             peer_messaging_enabled=peer_for_relay,
             session_open_enabled=open_for_relay,
             skill_registry=skill_registry,
+            terminal_access_requests_enabled=server_client is not None,
         )
         if relay_spec is not None and relay_spec.mcp_servers:
             # Native terminals consume the persistent relay, not per-turn schemas.
@@ -8444,6 +8448,7 @@ def create_runner_app(
                         session_open_enabled=_session_open_enabled.get(conv, False),
                         os_env_schema_only=True,
                         skill_registry=_tmgr_registry,
+                        terminal_access_requests_enabled=server_client is not None,
                     )
                     all_tools.extend(_tmgr.get_tool_schemas())
                 except (

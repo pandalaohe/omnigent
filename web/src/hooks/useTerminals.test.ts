@@ -19,6 +19,8 @@ import {
   isAgentTerminalKey,
   PENDING_RECONCILE_INTERVAL_MS,
   terminalInfoFromResource,
+  terminalDisplayLabel,
+  terminalsQueryKey,
   terminalsReconcileInterval,
   terminalTabKey,
   useTerminals,
@@ -55,6 +57,22 @@ function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): 
 const fetchMock = vi.fn();
 
 describe("terminalInfoFromResource", () => {
+  it("keeps root identity, denies missing agent consent and strips direct attach", () => {
+    const info = terminalInfoFromResource({
+      id: "root-a",
+      metadata: {
+        terminal_name: "shell",
+        session_key: "key-a",
+        instance_id: "instance-a",
+        elevated: true,
+        running: true,
+        direct_attach_url: "ws://127.0.0.1:1234/attach",
+      },
+    });
+    expect(info).toMatchObject({ elevated: true, instanceId: "instance-a", agentAccess: false });
+    expect(info?.directAttachUrl).toBeUndefined();
+    expect(terminalDisplayLabel(info!)).toBe("root · key-a");
+  });
   it("lifts id, metadata.terminal_name, metadata.session_key, metadata.running", () => {
     const info = terminalInfoFromResource({
       id: "terminal_bash_s1",
@@ -583,7 +601,21 @@ describe("useTerminals — SSE-primary list, poll corrects on edges", () => {
     return { client, wrapper };
   }
 
-  const TERMINAL = { id: "terminal_claude_main", name: "claude", session: "main", running: true };
+  const TERMINAL: TerminalInfo = {
+    id: "terminal_claude_main",
+    name: "claude",
+    session: "main",
+    running: true,
+  };
+  const ROOT: TerminalInfo = {
+    id: "terminal_shell_root",
+    name: "shell",
+    session: "root",
+    running: true,
+    elevated: true,
+    instanceId: "instance-a",
+    agentAccess: false,
+  };
   const emptyList = () => mockResponse({ object: "list", data: [] });
   const oneTerminal = () =>
     mockResponse({
@@ -598,6 +630,68 @@ describe("useTerminals — SSE-primary list, poll corrects on edges", () => {
         },
       ],
     });
+
+  it.each<[string, TerminalInfo | null, TerminalInfo, (TerminalInfo | null)[]]>([
+    ["grant", ROOT, ROOT, [{ ...ROOT, agentAccess: true }]],
+    ["revoke", { ...ROOT, agentAccess: true }, { ...ROOT, agentAccess: true }, [ROOT]],
+    ["replacement", ROOT, ROOT, [{ ...ROOT, instanceId: "instance-b" }]],
+    ["deletion", ROOT, ROOT, [null]],
+    ["unchanged cache", ROOT, { ...ROOT, agentAccess: true }, []],
+    ["regrant", { ...ROOT, agentAccess: true }, ROOT, [ROOT, { ...ROOT, agentAccess: true }]],
+    ["creation followed by deletion", null, ROOT, [ROOT, null]],
+  ])(
+    "preserves a live %s against an older terminal GET",
+    async (_label, initial, fetched, updates) => {
+      const { client, wrapper } = makeClientWrapper();
+      const key = terminalsQueryKey("conv_root_race");
+      client.setQueryData<TerminalInfo[]>(key, [
+        ...(initial ? [initial] : []),
+        { ...TERMINAL, running: false },
+      ]);
+      let finish!: (response: Response) => void;
+      fetchMock.mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            finish = resolve;
+          }),
+      );
+      const { result } = renderHook(() => useTerminals("conv_root_race"), { wrapper });
+      let refetch!: Promise<void>;
+      await act(async () => {
+        refetch = client.invalidateQueries({ queryKey: key });
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        for (const live of updates) {
+          client.setQueryData<TerminalInfo[]>(key, [
+            ...(live ? [live] : []),
+            { ...TERMINAL, running: false },
+          ]);
+        }
+        finish(
+          mockResponse({
+            data: [fetched, TERMINAL].map((terminal) => ({
+              id: terminal.id,
+              metadata: {
+                terminal_name: terminal.name,
+                session_key: terminal.session,
+                running: terminal.running,
+                elevated: terminal.elevated,
+                instance_id: terminal.instanceId,
+                agent_access: terminal.agentAccess,
+              },
+            })),
+          }),
+        );
+        await refetch;
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      const expected = updates.length ? updates[updates.length - 1] : fetched;
+      expect(result.current.terminals).toEqual([...(expected ? [expected] : []), TERMINAL]);
+    },
+  );
 
   it("shows a cached terminal immediately even while the poll still reads offline (boot lag)", async () => {
     // SSE-primary: a terminal in the cache (here via the mount seed; in

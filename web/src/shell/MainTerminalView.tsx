@@ -40,6 +40,7 @@ import { updateTerminalSplit, useTerminalSplitPanes } from "./terminalSplitPanes
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { TerminalStatusBadge } from "./terminalStatus";
 import { useTerminalStatuses } from "./useTerminalStatuses";
+import { TerminalAgentAccess } from "./TerminalAgentAccess";
 
 const TerminalView = lazy(() =>
   import("@/components/blocks/TerminalView").then((m) => ({ default: m.TerminalView })),
@@ -370,7 +371,9 @@ export function MainTerminalView({
               <div className="flex shrink-0 items-center gap-1.5 border-b border-border px-2 pt-1 pb-2">
                 <span className="flex items-center gap-1.5 rounded-sm bg-muted px-2 py-1 text-foreground text-sm">
                   <TerminalIcon className="size-3 shrink-0" />
-                  <span className="max-w-[8rem] truncate">{activeTerminal.name}</span>
+                  <span className="max-w-[8rem] truncate">
+                    {activeTerminal.elevated ? "root" : activeTerminal.name}
+                  </span>
                   <span className="shrink-0 text-muted-foreground/60">
                     · {activeTerminal.session}
                   </span>
@@ -394,7 +397,7 @@ export function MainTerminalView({
                 return (
                   // Flat siblings keyed by session+terminal, so splits never remount a live xterm.
                   <div
-                    key={`${conversationId}:${terminal?.id ?? pane.key}`}
+                    key={`${conversationId}:${terminal?.id ?? pane.key}:${terminal?.instanceId ?? ""}`}
                     data-terminal-pane={pane.key}
                     style={{
                       left: `${pane.left}%`,
@@ -409,22 +412,30 @@ export function MainTerminalView({
                     onFocusCapture={split ? () => focusPane(pane.key) : undefined}
                   >
                     {terminal ? (
-                      <Suspense fallback={null}>
-                        <TerminalView
-                          sessionId={conversationId}
-                          terminalId={terminal.id}
-                          readOnly={readOnly}
-                          active={visible && active && focused}
-                          directAttachUrl={terminal.directAttachUrl}
-                          onResume={runnerOffline && onResume ? handleResume : undefined}
-                          resumeTarget={resumeTarget}
-                          resumePending={resumePending}
-                          onStateChange={(state) => {
-                            setTerminalConnectionState(terminal.id, state);
-                          }}
-                          onActivity={() => markTerminalActive(terminal.id)}
-                        />
-                      </Suspense>
+                      <>
+                        {terminal.elevated && (
+                          <TerminalAgentAccess
+                            conversationId={conversationId}
+                            terminal={terminal}
+                          />
+                        )}
+                        <Suspense fallback={null}>
+                          <TerminalView
+                            sessionId={conversationId}
+                            terminalId={terminal.id}
+                            readOnly={readOnly}
+                            active={visible && active && focused}
+                            directAttachUrl={terminal.directAttachUrl}
+                            onResume={runnerOffline && onResume ? handleResume : undefined}
+                            resumeTarget={resumeTarget}
+                            resumePending={resumePending}
+                            onStateChange={(state) => {
+                              setTerminalConnectionState(terminal.id, state);
+                            }}
+                            onActivity={() => markTerminalActive(terminal.id)}
+                          />
+                        </Suspense>
+                      </>
                     ) : (
                       <div className="flex flex-1 items-center justify-center text-muted-foreground text-ui">
                         Terminal unavailable.

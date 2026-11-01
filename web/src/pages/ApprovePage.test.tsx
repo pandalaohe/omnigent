@@ -13,6 +13,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApprovePage } from "./ApprovePage";
 import * as identity from "@/lib/identity";
 
+vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => "alice" }));
+
 vi.mock("@/lib/identity", () => ({
   authenticatedFetch: vi.fn(),
 }));
@@ -43,6 +45,46 @@ afterEach(() => {
 });
 
 describe("ApprovePage states", () => {
+  it("fails closed when the backend omits the terminal card fields", async () => {
+    vi.mocked(identity.authenticatedFetch).mockResolvedValue(
+      jsonResponse({
+        status: "pending",
+        policy_name: "__ask_on_terminal_agent_access",
+        message: "Allow root terminal access",
+      }),
+    );
+    renderPage();
+    expect(await screen.findByText("Terminal approval details are unavailable.")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
+    expect(screen.getByRole("link", { name: "Open this request in the session" })).toHaveAttribute(
+      "href",
+      "/c/sess_1",
+    );
+  });
+  it("renders and resolves root approval when the backend forwards the frozen fields", async () => {
+    vi.mocked(identity.authenticatedFetch)
+      .mockResolvedValueOnce(
+        jsonResponse({
+          status: "pending",
+          policy_name: "__ask_on_terminal_agent_access",
+          message: "Allow Agent A root access. Reason: repair",
+          terminal_access_owner: "alice",
+          terminal_access_terminal_id: "terminal-a",
+          terminal_access_instance_id: "instance-a",
+          terminal_access_host_id: "host-a",
+        }),
+      )
+      .mockResolvedValue(jsonResponse({ status: "resolved" }));
+    renderPage();
+    expect(await screen.findByTestId("terminal-access-details")).toHaveTextContent("instance-a");
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+    await waitFor(() =>
+      expect(identity.authenticatedFetch).toHaveBeenCalledWith(
+        "/v1/sessions/sess_1/elicitations/eli_1/resolve",
+        expect.objectContaining({ method: "POST", body: '{"action":"accept"}' }),
+      ),
+    );
+  });
   beforeEach(() => {
     // Default: a never-resolving fetch so the initial render is observable
     // before any test overrides the resolution.

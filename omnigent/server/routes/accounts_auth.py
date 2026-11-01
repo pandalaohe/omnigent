@@ -275,6 +275,7 @@ def create_accounts_auth_router(
             ttl_hours=config.session_ttl_hours,
             provider="accounts",
             account_generation=generation,
+            browser_session=True,
         )
         _set_session_cookie(
             response,
@@ -346,6 +347,7 @@ def create_accounts_auth_router(
             ttl_hours=config.session_ttl_hours,
             provider="accounts",
             account_generation=generation,
+            browser_session=not body.issue_refresh,
         )
 
         user = account_store.get_user(username)
@@ -421,7 +423,7 @@ def create_accounts_auth_router(
     @router.post("/invite")
     async def invite(request: Request, body: InviteRequest) -> Response:
         """Mint a single-use invite URL (admin only)."""
-        admin_id = auth_provider.get_user_id(request)
+        admin_id = auth_provider.browser_session_user_id(request)
         if admin_id is None or not account_store.is_admin(admin_id):
             return JSONResponse(status_code=403, content={"error": "admin only"})
 
@@ -515,6 +517,7 @@ def create_accounts_auth_router(
             ttl_hours=config.session_ttl_hours,
             provider="accounts",
             account_generation=user.account_generation,
+            browser_session=True,
         )
         resp = JSONResponse(
             status_code=200,
@@ -618,6 +621,7 @@ def create_accounts_auth_router(
             ttl_hours=config.session_ttl_hours,
             provider="accounts",
             account_generation=user.account_generation,
+            browser_session=True,
         )
         resp = JSONResponse(
             status_code=200,
@@ -764,7 +768,7 @@ def create_accounts_auth_router(
           ``AccountStore.delete_user``) so two concurrent deletes of
           two different admins can't both slip past the check.
         """
-        admin_id = auth_provider.get_user_id(request)
+        admin_id = auth_provider.browser_session_user_id(request)
         if admin_id is None or not account_store.is_admin(admin_id):
             return JSONResponse(status_code=403, content={"error": "admin only"})
         if user_id == admin_id:
@@ -804,7 +808,7 @@ def create_accounts_auth_router(
         then DMs it to the user out-of-band. No SMTP needed.
         Also revokes the user's existing sessions and CLI logins.
         """
-        admin_id = auth_provider.get_user_id(request)
+        admin_id = auth_provider.browser_session_user_id(request)
         if admin_id is None or not account_store.is_admin(admin_id):
             return JSONResponse(status_code=403, content={"error": "admin only"})
 

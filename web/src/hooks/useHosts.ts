@@ -50,6 +50,9 @@ export interface Host {
   default_workspace?: string | null;
   /** Whether the connected Host can enumerate platform filesystem roots. */
   filesystem_roots?: boolean;
+  supervised?: boolean;
+  started_at?: number | null;
+  capabilities?: string[];
 }
 
 export interface CodexRateLimitWindow {

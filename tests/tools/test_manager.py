@@ -46,6 +46,7 @@ _TEST_CTX = ToolContext(task_id="task_test", agent_id="agent_test")
 _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
     {
         "sys_cancel_task",
+        "sys_host_restart",
         "sys_call_async",
         "sys_read_inbox",
         "sys_cancel_async",

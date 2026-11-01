@@ -4119,6 +4119,7 @@ def register_core_routes(
         archived_after: int | None = Query(default=None, ge=0),
         archived_before: int | None = Query(default=None, ge=0),
         kind: str = Query(default="default", pattern="^(default|sub_agent|any)$"),
+        include_side_chats: bool = Query(default=False),
         project: str | None = Query(default=None),
         pinned: bool = Query(default=False),
         visibility: str = Query(default="all", pattern="^(all|mine|shared|archived)$"),
@@ -4303,7 +4304,7 @@ def register_core_routes(
             page,
             user_id=user_id,
             include_preview=include_preview,
-            include_side_chats=host_id is not None and kind == "any",
+            include_side_chats=kind == "any" and (host_id is not None or include_side_chats),
         )
 
     # ── GET /me/recent-sessions ─────────────────────────────────

@@ -194,6 +194,7 @@ def create_direct_attach_app(
         if not _authorized(websocket):
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
+        websocket.scope["omnigent.direct_attach"] = True
         await attach_handler(
             websocket,
             session_id,

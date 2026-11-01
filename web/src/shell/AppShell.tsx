@@ -2801,6 +2801,7 @@ function AppShellImpl() {
                       onOpenChanges: openChangesPanel,
                       onOpenArchive: openArchivePanel,
                       onOpenShells: openShellsPanel,
+                      onCreatedTerminal: openTerminalsPanel,
                       onOpenSubagents: openSubagentsPanel,
                       onOpenGithub: openGithubPanel,
                       onOpenSideChats: openSideChatsPanel,

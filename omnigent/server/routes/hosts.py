@@ -1002,6 +1002,12 @@ def create_hosts_router(
     )
     router = APIRouter()
 
+    from omnigent.server.routes._host_restart import register_host_restart_routes
+
+    register_host_restart_routes(
+        router, host_registry, host_store, conversation_store, auth_provider, permission_store
+    )
+
     def require_harness_install() -> None:
         if not harness_install_enabled(harness_install_gate):
             raise HTTPException(status_code=404, detail="not found")
@@ -1084,6 +1090,9 @@ def create_hosts_router(
                 "platform": host.platform,
                 "default_workspace": host.default_workspace,
                 "filesystem_roots": bool(conn and conn.hello.filesystem_roots),
+                "supervised": conn.hello.supervised if conn else None,
+                "started_at": conn.hello.started_at if conn else None,
+                "capabilities": list(conn.hello.capabilities) if conn else [],
                 # Held in memory from the host's connect handshake, not the
                 # hosts row. ``None`` means this replica has no report yet —
                 # emitted as-is so a client can tell "unknown" from "not
@@ -1155,7 +1164,10 @@ def create_hosts_router(
             # memory, so ``None`` is "no report on this replica yet".
             "gateway_inference": host_registry.gateway_inference(host.host_id),
             "interactive_shells": host_registry.interactive_shells(host.host_id),
+            "capabilities": list(conn.hello.capabilities) if conn else [],
             "runners": [],
+            "supervised": conn.hello.supervised if conn else None,
+            "started_at": conn.hello.started_at if conn else None,
         }
         if (
             harness_setup_enabled

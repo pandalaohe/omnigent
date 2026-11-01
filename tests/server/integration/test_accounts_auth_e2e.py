@@ -20,6 +20,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
+import jwt
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI
@@ -200,6 +201,8 @@ async def test_setup_creates_first_admin(
     assert body["user"]["id"] == "alice"
     assert body["user"]["is_admin"] is True
     assert "token" in body
+    claims = jwt.decode(body["token"], bytes.fromhex(_COOKIE_SECRET_HEX), algorithms=["HS256"])
+    assert claims["browser_session"] is True
     assert "expires_in" in body
     # A session cookie was set.
     assert any("session" in h.lower() for h in resp.headers.get_list("set-cookie"))
@@ -225,19 +228,27 @@ async def test_setup_409_after_first_admin(
 # ── 2. Login (success) ───────────────────────────────────
 
 
+@pytest.mark.parametrize("issue_refresh", [False, True])
 async def test_login_returns_session_cookie(
     client: httpx.AsyncClient,
+    issue_refresh: bool,
 ) -> None:
-    """POST /auth/login with valid creds returns 200 and sets a cookie."""
+    """Password login marks browser cookies while CLI refresh logins stay unmarked."""
     resp = await client.post(
         "/auth/login",
-        json={"username": _ADMIN_USERNAME, "password": _ADMIN_PASSWORD},
+        json={
+            "username": _ADMIN_USERNAME,
+            "password": _ADMIN_PASSWORD,
+            "issue_refresh": issue_refresh,
+        },
     )
     assert resp.status_code == 200
     body = resp.json()
     assert body["user"]["id"] == _ADMIN_USERNAME
     assert body["user"]["is_admin"] is True
     assert "token" in body
+    claims = jwt.decode(body["token"], bytes.fromhex(_COOKIE_SECRET_HEX), algorithms=["HS256"])
+    assert claims.get("browser_session", False) is not issue_refresh
     # Session cookie present.
     set_cookie_headers = resp.headers.get_list("set-cookie")
     assert any("session" in h.lower() for h in set_cookie_headers)

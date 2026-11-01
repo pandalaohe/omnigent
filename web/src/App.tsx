@@ -67,6 +67,10 @@ const SystemStatusPage = withPageView(
   "system_status",
   lazy(() => import("@/pages/SystemStatusPage").then((m) => ({ default: m.SystemStatusPage }))),
 );
+const HostTerminalsPage = withPageView(
+  "host_terminals",
+  lazy(() => import("@/pages/HostTerminalsPage").then((m) => ({ default: m.HostTerminalsPage }))),
+);
 const TaskDetailPage = withPageView(
   "tasks.detail",
   lazy(() => import("@/pages/TaskDetailPage").then((m) => ({ default: m.TaskDetailPage }))),
@@ -225,6 +229,7 @@ function AppRoutes({ basename }: AppProps) {
             }
           />
           <Route path={`${prefix}/system`} element={<SystemStatusPage />} />
+          <Route path={`${prefix}/hosts/:hostId/terminals`} element={<HostTerminalsPage />} />
           {/* Settings renders into the chat outlet so the conversations
               sidebar stays put — entering settings only swaps the card's
               content (the section nav) and the main area. The active section

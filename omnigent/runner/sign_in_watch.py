@@ -89,7 +89,11 @@ def build_sign_in_watch(
             entries = registry.list_for_conversation(conv_id) if registry is not None else []
             screens: list[str] = []
             for entry in entries:
-                if entry.terminal_name not in pane_names or not entry.instance.running:
+                if (
+                    entry.instance.elevated
+                    or entry.terminal_name not in pane_names
+                    or not entry.instance.running
+                ):
                     continue
                 result = await entry.instance.read(join_wrapped=True)
                 screen = result.get("screen") if isinstance(result, dict) else None
