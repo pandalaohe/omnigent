@@ -1,4 +1,5 @@
 import type { NativePermissionDelivery } from "./nativePermissionDelivery";
+import type { TerminalAccessRequest } from "./terminalAccess";
 // Block walker — converts a flat `AnyBlock[]` into a list of bubble
 // groups for the JSX layer to map over.
 //
@@ -135,6 +136,7 @@ export type RenderItem =
     }
   | {
       kind: "elicitation";
+      terminalAccess?: TerminalAccessRequest | null;
       nativeDelivery?: NativePermissionDelivery;
       itemId: string | null;
       elicitationId: string;
@@ -1770,6 +1772,7 @@ function buildAssistantItems(
         message: b.message,
         phase: b.phase,
         policyName: b.policyName,
+        terminalAccess: b.terminalAccess,
         contentPreview: b.contentPreview,
         requestedSchema: b.requestedSchema,
         url: b.url,

@@ -9,7 +9,17 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { NewTerminalButton } from "./NewTerminalButton";
+import { NewTerminalButton, NewAdminTerminalMenuItem } from "./NewTerminalButton";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+
+const elevated = vi.hoisted(() => ({ allowed: false }));
+vi.mock("@/hooks/useSessionTerminalAccess", () => ({
+  useSessionTerminalAccess: () => ({ canCreateElevated: elevated.allowed }),
+}));
 import type { TerminalFirstContextValue } from "./TerminalFirstContext";
 import { TerminalFirstContextProvider } from "./TerminalFirstContext";
 
@@ -62,6 +72,7 @@ function renderButton(
 }
 
 beforeEach(() => {
+  elevated.allowed = false;
   fetchMock.mockReset();
   vi.stubGlobal("fetch", fetchMock);
 });
@@ -72,6 +83,71 @@ afterEach(() => {
 });
 
 describe("NewTerminalButton access gate", () => {
+  it("keeps the phone header's root creation callback after its menu closes", async () => {
+    elevated.allowed = true;
+    fetchMock.mockImplementation(async (_url, init) =>
+      mockResponse(
+        init?.method === "POST"
+          ? {
+              id: "terminal_root",
+              metadata: {
+                terminal_name: "shell",
+                session_key: "root-key",
+                running: true,
+                elevated: true,
+                instance_id: "instance-a",
+                agent_access: false,
+              },
+            }
+          : agentWire(["shell"]),
+      ),
+    );
+    const created = vi.fn();
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <DropdownMenu>
+          <DropdownMenuTrigger>Session menu</DropdownMenuTrigger>
+          <DropdownMenuContent>
+            <NewAdminTerminalMenuItem conversationId="conv_abc" onCreated={created} />
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </QueryClientProvider>,
+    );
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Session menu" }), { button: 0 });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Admin (root)" }));
+    await waitFor(() => expect(created).toHaveBeenCalledWith("terminal:terminal_root"));
+    expect(screen.queryByRole("menu")).toBeNull();
+    client.clear();
+  });
+  it("adds Admin (root) and sends elevated true for a capable owner", async () => {
+    elevated.allowed = true;
+    fetchMock.mockImplementation(async (_url, init) =>
+      mockResponse(
+        init?.method === "POST"
+          ? {
+              id: "terminal_root",
+              metadata: {
+                terminal_name: "shell",
+                session_key: "root-key",
+                running: true,
+                elevated: true,
+                instance_id: "instance-a",
+                agent_access: false,
+              },
+            }
+          : agentWire(["shell"]),
+      ),
+    );
+    const created = vi.fn();
+    renderButton(created);
+    await screen.findByRole("button", { name: "Choose shell" });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Choose shell" }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Admin (root)" }));
+    await waitFor(() => expect(created).toHaveBeenCalledWith("terminal:terminal_root"));
+    const post = fetchMock.mock.calls.find(([, init]) => init?.method === "POST");
+    expect(JSON.parse(post?.[1].body)).toMatchObject({ terminal: "shell", elevated: true });
+  });
   it("renders nothing when the agent declares no terminals", async () => {
     fetchMock.mockResolvedValue(mockResponse(agentWire([])));
 

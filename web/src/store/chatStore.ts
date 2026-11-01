@@ -9636,7 +9636,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       return;
     case "session_resource_deleted":
       if (event.resourceType === "terminal") {
-        applyTerminalDeleted(event.sessionId, event.resourceId);
+        applyTerminalDeleted(event.sessionId, event.resourceId, event.instanceId);
       }
       return;
     case "session_child_session_updated":
@@ -9794,8 +9794,12 @@ function applyTerminalCreated(resource: Record<string, unknown>): void {
   if (queryClient === null) return;
   const key = terminalsQueryKey(sessionId);
   const current = queryClient.getQueryData<TerminalInfo[]>(key) ?? [];
-  if (current.some((t) => t.id === info.id)) return;
-  queryClient.setQueryData<TerminalInfo[]>(key, [...current, info]);
+  queryClient.setQueryData<TerminalInfo[]>(
+    key,
+    current.some((t) => t.id === info.id)
+      ? current.map((t) => (t.id === info.id ? info : t))
+      : [...current, info],
+  );
 }
 
 /**
@@ -9803,12 +9807,14 @@ function applyTerminalCreated(resource: Record<string, unknown>): void {
  *
  * Idempotent: a delete for an unknown id is a no-op.
  */
-function applyTerminalDeleted(sessionId: string, resourceId: string): void {
+function applyTerminalDeleted(sessionId: string, resourceId: string, instanceId?: string): void {
   if (queryClient === null) return;
   const key = terminalsQueryKey(sessionId);
   const current = queryClient.getQueryData<TerminalInfo[]>(key);
   if (current === undefined) return;
-  const next = current.filter((t) => t.id !== resourceId);
+  const next = current.filter(
+    (t) => t.id !== resourceId || (instanceId !== undefined && t.instanceId !== instanceId),
+  );
   if (next.length === current.length) return;
   queryClient.setQueryData<TerminalInfo[]>(key, next);
 }

@@ -10,11 +10,78 @@ import { parseEventLines } from "@/lib/sse";
 import { useChatStore } from "@/store/chatStore";
 import { ApprovalCard, ElicitationCard } from "./ApprovalCard";
 
+const terminalViewer = vi.hoisted(() => ({ id: "alice" as string | null }));
+vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => terminalViewer.id }));
+
 afterEach(() => {
   cleanup();
 });
 
 describe("ApprovalCard — binary approve/reject", () => {
+  it("transports the frozen terminal-access fields through SSE, block stream and renderer", () => {
+    const events = [
+      ...parseEventLines([
+        JSON.stringify({
+          event: "response.elicitation_request",
+          data: {
+            elicitation_id: "root-access",
+            params: {
+              message: "Agent A requests root access. Reason: repair permissions",
+              policy_name: "__ask_on_terminal_agent_access",
+              requestedSchema: {},
+              terminal_access_owner: "alice",
+              terminal_access_terminal_id: "terminal-a",
+              terminal_access_instance_id: "instance-a",
+              terminal_access_host_id: "host-a",
+            },
+          },
+        }),
+      ]),
+    ];
+    const bubbles = buildBubbles(new BlockStream().reduceSync(events), null);
+    const card = bubbles[0]?.kind === "assistant" ? bubbles[0].items[0] : null;
+    expect(card).toMatchObject({
+      kind: "elicitation",
+      terminalAccess: {
+        owner: "alice",
+        terminalId: "terminal-a",
+        instanceId: "instance-a",
+        hostId: "host-a",
+      },
+    });
+  });
+  it("shows root approval scope only to its owner and submits the standard verdict", () => {
+    const submit = vi.fn();
+    terminalViewer.id = "alice";
+    const props = {
+      elicitationId: "root-access",
+      message: "Agent A requests root access. Reason: repair permissions",
+      phase: "tool_call",
+      policyName: "__ask_on_terminal_agent_access",
+      contentPreview: "",
+      requestedSchema: {},
+      status: "pending" as const,
+      response: null,
+      terminalAccess: {
+        owner: "alice",
+        terminalId: "terminal-a",
+        instanceId: "instance-a",
+        hostId: "host-a",
+      },
+      onSubmit: submit,
+    };
+    const view = render(<ApprovalCard {...props} />);
+    expect(screen.getByTestId("terminal-access-details")).toHaveTextContent(
+      "host-aTerminalterminal-aInstanceinstance-aOwneralice",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+    expect(submit).toHaveBeenCalledWith("root-access", "accept");
+    terminalViewer.id = "bob";
+    view.rerender(<ApprovalCard {...props} />);
+    expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
+    expect(screen.getByText(/Only the host owner's/)).toBeVisible();
+    terminalViewer.id = "alice";
+  });
   it("renders Approve and Reject buttons when requestedSchema has no enum", () => {
     // Policy-ASK and PermissionRequest cards arrive with an empty
     // schema (binary decision). The card should render the
