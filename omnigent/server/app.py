@@ -5377,11 +5377,27 @@ def create_app(
             conversation_store.list_conversations_by_runner_id, runner_id
         )
         bound_ids = {conv.id for conv in convs}
+        by_id = {conv.id: conv for conv in convs}
+
+        def _tree_host_id(conv_id: str | None) -> str | None:
+            seen: set[str] = set()
+            while conv_id is not None and conv_id not in seen:
+                seen.add(conv_id)
+                ancestor = by_id.get(conv_id)
+                if ancestor is None:
+                    return None
+                if ancestor.host_id is not None:
+                    return ancestor.host_id
+                conv_id = ancestor.parent_conversation_id
+            return None
 
         def is_independent(conv: Conversation) -> bool:
             return not (
                 is_parent_owned_subagent(conv)
-                or (conv.parent_conversation_id in bound_ids and conv.host_id is None)
+                or (
+                    conv.parent_conversation_id in bound_ids
+                    and conv.host_id in (None, _tree_host_id(conv.parent_conversation_id))
+                )
             )
 
         def needs_eager_recovery(conv: Conversation) -> bool:
@@ -5403,8 +5419,6 @@ def create_app(
                 or pending > 0
                 or _last_task_error_from_labels(conv.labels) is not None
             )
-
-        by_id = {conv.id: conv for conv in convs}
 
         def independent_root_id(conv: Conversation) -> str | None:
             seen: set[str] = set()
@@ -5507,6 +5521,7 @@ def create_app(
             for conv, _ in roots
             if conv.agent_id is not None and _restorable(conv) and conv.id not in eager_root_ids
         }
+        root_host_ids = {conv.id: _tree_host_id(conv.id) for conv, _ in roots}
         idle_root_ids = set(frontier.values())
         try:
             while frontier:
@@ -5536,7 +5551,10 @@ def create_app(
                             row = rows.get(child_id)
                             if (
                                 row is None
-                                or row.host_id is not None
+                                or (
+                                    row.host_id is not None
+                                    and row.host_id != root_host_ids.get(root_id)
+                                )
                                 or row.runner_id is None
                                 or not _restorable(row)
                                 or is_side_chat_child(row.labels)

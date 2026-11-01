@@ -2965,14 +2965,26 @@ async def test_on_runner_connect_defers_idle_tree_initialization_until_demand(
     store.set_session_live_status(archived.id, "running")
     store.update_conversation(archived.id, archived=True)
     store.set_session_live_status(active_parent.id, "idle")
+    store.set_host_id(
+        active_parent.id,
+        "55555555555555555555555555555555",
+        workspace="/opt/work/omnigent/fork/main",
+    )
     active_child = store.create_conversation(
         agent_id=active_parent.agent_id,
         runner_id=runner_id,
         kind="sub_agent",
         parent_conversation_id=active_parent.id,
+        host_id="55555555555555555555555555555555",
+        workspace="/opt/work/omnigent/fork/wt",
     )
     store.set_session_live_status(active_child.id, "running")
     store.set_session_live_status(orphan_parent.id, "idle")
+    store.set_host_id(
+        orphan_parent.id,
+        "55555555555555555555555555555555",
+        workspace="/opt/work/omnigent/fork/main",
+    )
     idle_child = store.create_conversation(
         agent_id=orphan_parent.agent_id,
         runner_id=runner_id,
@@ -2985,6 +2997,8 @@ async def test_on_runner_connect_defers_idle_tree_initialization_until_demand(
         runner_id="offline_runner",
         kind="sub_agent",
         parent_conversation_id=idle_child.id,
+        host_id="55555555555555555555555555555555",
+        workspace="/opt/work/omnigent/fork/orphan",
     )
     store.set_session_live_status(orphan.id, "running")
     connection = _attach_live_connection(app, monkeypatch, runner_id)
