@@ -124,6 +124,11 @@ export class TerminalImeInput {
     return true;
   }
 
+  /** Forward explicit soft-key or phrase payloads without treating them as IME commit diffs. */
+  sendSoftInput(data: string): void {
+    this.send(data);
+  }
+
   private send(data: string): void {
     this.forwarding = true;
     try {

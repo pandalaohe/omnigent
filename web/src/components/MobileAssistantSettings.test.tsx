@@ -197,4 +197,15 @@ describe("MobileAssistantSettings", () => {
       repeat: true,
     });
   });
+
+  it("shows the Poll sessions hint on the Poll row and in the button editor", () => {
+    render(<MobileAssistantSettings />);
+
+    expect(screen.getByText("Jumps to the next session waiting for your answer.")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit Poll" }));
+    expect(
+      screen.getAllByText("Jumps to the next session waiting for your answer.").length,
+    ).toBeGreaterThanOrEqual(2);
+  });
 });

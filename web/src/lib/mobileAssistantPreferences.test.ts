@@ -3,11 +3,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { POLL_SESSIONS_ACTION_EVENT } from "@/hooks/useSessionPollingHotkeys";
 import { SELECT_WORKSPACE_TAB_ACTION_EVENT } from "@/hooks/useWorkspaceTabHotkeys";
 import {
+  MOBILE_ASSISTANT_ACTIONS,
   MOBILE_ASSISTANT_STORAGE_KEY,
   TERMINAL_SOFT_KEY_EVENT,
   dispatchMobileAssistantAction,
   dispatchMobileAssistantButton,
   readMobileAssistantPreferences,
+  terminalDataForChord,
   writeMobileAssistantDeviceState,
   writeMobileAssistantPreferences,
   type TerminalSoftKeyEventDetail,
@@ -362,5 +364,83 @@ describe("mobileAssistantPreferences", () => {
     expect(listener).toHaveBeenCalledOnce();
     expect(listener.mock.calls[0]?.[0]).toMatchObject({ code: "KeyT", ctrlKey: true });
     textarea.remove();
+  });
+
+  it("carries the Poll sessions hint on the mobile assistant action definition", () => {
+    expect(
+      MOBILE_ASSISTANT_ACTIONS.find((action) => action.id === "pollSessions")?.description,
+    ).toBe("Jumps to the next session waiting for your answer.");
+  });
+
+  it("routes phrases and modified key chords to the active terminal when no DOM input is targeted", () => {
+    const received: { action: string; data?: string }[] = [];
+    const collect = (event: Event) => {
+      const detail = (event as CustomEvent<TerminalSoftKeyEventDetail>).detail;
+      (detail.candidates ??= []).push({
+        focused: false,
+        ownsPreferredTarget: false,
+        send: () => received.push({ action: detail.action, data: detail.data }),
+      });
+    };
+    const staleWarmContainer = document.createElement("div");
+    staleWarmContainer.className = "invisible";
+    staleWarmContainer.setAttribute("aria-hidden", "true");
+    const staleXtermTextarea = document.createElement("textarea");
+    staleXtermTextarea.className = "xterm-helper-textarea";
+    staleWarmContainer.appendChild(staleXtermTextarea);
+    document.body.appendChild(staleWarmContainer);
+    staleXtermTextarea.focus();
+
+    window.addEventListener(TERMINAL_SOFT_KEY_EVENT, collect);
+
+    dispatchMobileAssistantButton(
+      {
+        id: "cp",
+        label: "Cp",
+        binding: { kind: "text", text: "/compact", submit: true },
+      },
+      staleXtermTextarea,
+    );
+    dispatchMobileAssistantButton(
+      {
+        id: "stop",
+        label: "Stop",
+        binding: { kind: "key", chord: { code: "KeyC", modifiers: ["primary"] } },
+      },
+      staleXtermTextarea,
+    );
+    dispatchMobileAssistantButton(
+      {
+        id: "newline",
+        label: "Newline",
+        binding: { kind: "shortcut", actionId: "newLine" },
+      },
+      staleXtermTextarea,
+    );
+
+    expect(received).toEqual([
+      { action: "enter", data: "/compact" },
+      { action: "enter", data: undefined },
+      { action: "enter", data: "\x03" },
+      { action: "enter", data: "\x1b[13;2u" },
+    ]);
+
+    window.removeEventListener(TERMINAL_SOFT_KEY_EVENT, collect);
+    staleWarmContainer.remove();
+  });
+
+  it.each([
+    [{ code: "BracketLeft", modifiers: ["control"] as const }, "\x1b"],
+    [{ code: "Slash", modifiers: ["shift"] as const }, "?"],
+    [{ code: "Digit1", modifiers: ["shift"] as const }, "!"],
+    [{ code: "F2", modifiers: [] as const }, "\x1bOQ"],
+    [{ code: "ArrowLeft", modifiers: ["control"] as const }, "\x1b[1;5D"],
+    [{ code: "ArrowRight", modifiers: ["control"] as const }, "\x1b[1;5C"],
+    [{ code: "ArrowLeft", modifiers: ["meta"] as const }, "\x01"],
+    [{ code: "ArrowRight", modifiers: ["meta"] as const }, "\x05"],
+  ])("translates recordable terminal chord %o to %j", (chord, expected) => {
+    expect(terminalDataForChord({ code: chord.code, modifiers: [...chord.modifiers] })).toBe(
+      expected,
+    );
   });
 });

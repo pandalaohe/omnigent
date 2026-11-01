@@ -35,6 +35,7 @@ import { getSessionHost, markHostKeyless, isHostKeyless } from "@/lib/sessionHos
 import { hostTerminalsPath } from "@/hooks/useHostTerminals";
 import {
   TERMINAL_SOFT_KEY_EVENT,
+  isDomTargetVisible,
   type TerminalSoftKeyEventDetail,
 } from "@/lib/mobileAssistantPreferences";
 import {
@@ -301,12 +302,16 @@ export function TerminalView({
       if (detail.handled || !activeRef.current || readOnly || !sessionRef.current) return;
       const session = sessionRef.current;
       const node = terminalNodeRef.current;
+      if (!isDomTargetVisible(node)) return;
       (detail.candidates ??= []).push({
         focused: Boolean(node?.contains(document.activeElement)),
         ownsPreferredTarget: Boolean(
           detail.preferredTarget && node?.contains(detail.preferredTarget),
         ),
-        send: () => session.sendSoftKey(detail.action),
+        send: () =>
+          detail.data !== undefined
+            ? session.sendSoftKey(detail.action, detail.data)
+            : session.sendSoftKey(detail.action),
       });
     };
     window.addEventListener(TERMINAL_SOFT_KEY_EVENT, handleSoftKey);

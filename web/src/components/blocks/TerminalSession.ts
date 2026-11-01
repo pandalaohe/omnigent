@@ -997,13 +997,17 @@ export class TerminalSession {
     return this.codexPalette ? codexTerminalTheme(theme, isDark) : theme;
   }
 
-  /** Feed a mobile assistant key through xterm's normal onData path. */
-  sendSoftKey(action: TerminalSoftKeyEventDetail["action"]): void {
+  /** Feed a mobile assistant key or text payload through xterm's normal onData path. */
+  sendSoftKey(action: TerminalSoftKeyEventDetail["action"], data?: string): void {
     if (!this.imeInput.beforeSoftKey()) return;
-    this.term.input(
-      terminalSoftKeyPayload(action, this.term.modes.applicationCursorKeysMode),
-      true,
-    );
+    if (data !== undefined) {
+      this.imeInput.sendSoftInput(data);
+    } else {
+      this.term.input(
+        terminalSoftKeyPayload(action, this.term.modes.applicationCursorKeysMode),
+        true,
+      );
+    }
     this.term.focus();
   }
 

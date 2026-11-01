@@ -30,6 +30,7 @@ import {
   type ShortcutChord,
 } from "@/lib/keyboardShortcutPreferences";
 import {
+  MOBILE_ASSISTANT_ACTIONS,
   MOBILE_ASSISTANT_CHANGED_EVENT,
   MOBILE_ASSISTANT_ICONS,
   MOBILE_ASSISTANT_MAX_BUTTONS,
@@ -98,6 +99,14 @@ function bindingFromDraft(draft: ButtonDraft): MobileAssistantButtonBinding {
 
 function bindingSummary(button: MobileAssistantButton): string {
   return mobileAssistantBindingLabel(button.binding);
+}
+
+function bindingDescription(binding: MobileAssistantButtonBinding): string | undefined {
+  if (binding.kind !== "shortcut") return undefined;
+  return (
+    MOBILE_ASSISTANT_ACTIONS.find((action) => action.id === binding.actionId)?.description ??
+    DEFAULT_SHORTCUT_DEFINITIONS[binding.actionId]?.note
+  );
 }
 
 function moveButtonToSlot(
@@ -405,9 +414,16 @@ export function MobileAssistantSettings() {
                 <span className="w-16 shrink-0 truncate text-sm font-medium text-foreground">
                   {button.label}
                 </span>
-                <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
-                  {bindingSummary(button)}
-                </span>
+                <div className="min-w-0 flex-1">
+                  <span className="block truncate text-xs text-muted-foreground">
+                    {bindingSummary(button)}
+                  </span>
+                  {bindingDescription(button.binding) ? (
+                    <span className="block truncate text-xs text-muted-foreground">
+                      {bindingDescription(button.binding)}
+                    </span>
+                  ) : null}
+                </div>
                 <Button
                   type="button"
                   variant="ghost"
@@ -572,6 +588,11 @@ export function MobileAssistantSettings() {
                       ))}
                     </select>
                   </label>
+                  {bindingDescription({ kind: "shortcut", actionId: draft.actionId }) ? (
+                    <span className="text-xs text-muted-foreground">
+                      {bindingDescription({ kind: "shortcut", actionId: draft.actionId })}
+                    </span>
+                  ) : null}
                   <span className="text-xs text-muted-foreground">
                     Switch recent sessions is keyboard-only: it needs a held key.
                   </span>
