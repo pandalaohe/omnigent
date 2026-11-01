@@ -16,6 +16,9 @@ reattach when the session moves to another host.
 - `admin-terminal`: on an opted-in host, the host owner who is also an app
   admin opens a root terminal. The human uses its relay connection; the session
   agent needs explicit consent for that terminal instance.
+- `standalone-host-terminal`: owner-only terminals live on a host without a
+  conversation; reconnect through the host's terminal runner, independently of
+  session archival. Admin launch is unavailable until enabled by the host.
 - `scrollback`: scroll back with the mouse wheel (including programs that track
   the mouse), by touch on phones, and by keyboard.
 - `reconnect`: after the terminal connection drops, the terminal shows that it
@@ -76,6 +79,10 @@ unsupported explanation.
 **Local terminal:** a native harness launched from the CLI runs in the user's
 own terminal; see [native harnesses](./native-harnesses.md).
 
+**Standalone host terminals:** clients use the host's terminal collection and
+attach path. The host must advertise `host_terminals_v1`. The web entry and page
+are delivered separately; a session shell does not exercise this backend.
+
 ## Driving it with the repro environment
 
 Preconditions: a running instance (`verify-env start`, then `verify-env
@@ -133,6 +140,15 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   wrong passwords should end sudo and remove the terminal without a root shell.
   Record the failing step, HTTP/WS result and redacted screenshot or log;
   never record passwords. Plain terminals keep their existing behavior.
+- **`standalone-host-terminal` (own environment, no vendor model):**
+  `tests/server/integration/test_host_terminals.py` drives the full server with
+  a fake host tunnel and real runner/tmux transport: cold concurrent opens,
+  full startup admission queue, session archival, server reconstruction and
+  two-replica HTTP/WS re-addressing. `tests/server/test_host_terminal_bindings.py`
+  checks current host/account authority, token purposes and auth-mode restart
+  boundaries. `tests/runner/test_host_terminals.py` exercises terminal-only
+  startup, create/attach/close and the 60-second empty-runner clock. Run these
+  as ordinary component/integration tests, without browser flags.
 - **`agent-terminal-view`, `user-shell`, `split-panes`, keyboard:** no e2e
   coverage; component tests `web/src/hooks/useViewModeToggleHotkey.test.tsx`,
   `web/src/hooks/useNewShellHotkey.test.tsx`,
@@ -198,6 +214,10 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   login; header/no-auth deployments cannot approve it.
 - The terminal strip and the agent terminal behind the Chat/Terminal switcher
   are different surfaces. A reattach or reconnect fix must be checked on both.
+- Standalone terminals have no session or agent. The host owner can attach;
+  collaborators and read-only watchers cannot. Header/no-auth deployments lose
+  standalone terminals after a server restart because admission records are
+  in memory; accounts/OIDC deployments re-verify the signed runner binding.
 - A host switch updates the host badge immediately. The badge changing is not
   proof the terminal reattached; look for the new host's terminal content.
 - The ⌘/Ctrl+Alt chords use ⌘ on macOS and Ctrl elsewhere, and they match the

@@ -4849,6 +4849,63 @@
         "title": "HostRestartRequest",
         "type": "object"
       },
+      "HostTerminalCreate": {
+        "additionalProperties": false,
+        "properties": {
+          "elevated": {
+            "default": false,
+            "title": "Elevated",
+            "type": "boolean"
+          }
+        },
+        "title": "HostTerminalCreate",
+        "type": "object"
+      },
+      "HostTerminalList": {
+        "properties": {
+          "terminals": {
+            "items": {
+              "$ref": "#/components/schemas/HostTerminalResource"
+            },
+            "title": "Terminals",
+            "type": "array"
+          }
+        },
+        "required": [
+          "terminals"
+        ],
+        "title": "HostTerminalList",
+        "type": "object"
+      },
+      "HostTerminalResource": {
+        "properties": {
+          "attach_path": {
+            "title": "Attach Path",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "elevated": {
+            "title": "Elevated",
+            "type": "boolean"
+          },
+          "terminal_id": {
+            "title": "Terminal Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "terminal_id",
+          "elevated",
+          "created_at",
+          "attach_path"
+        ],
+        "title": "HostTerminalResource",
+        "type": "object"
+      },
       "ImportFailureRef": {
         "description": "One session that could not be imported, with a user-facing reason.\n\n`external_session_id` / `source` name the source session when known (a\nhost that reports only a count leaves them `None`); `reason` explains the\nfailure so the UI can show it instead of an anonymous \"N failed\". Also the\nshape of each `{\"event\": \"failed\", ...}` line on the stream endpoint.",
         "properties": {
@@ -17901,6 +17958,101 @@
         "summary": "Release Startups",
         "tags": [
           "sessions"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/terminals": {
+      "get": {
+        "operationId": "list_terminals_v1_hosts__host_id__terminals_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostTerminalList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Terminals",
+        "tags": [
+          "hosts"
+        ]
+      },
+      "post": {
+        "operationId": "create_v1_hosts__host_id__terminals_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HostTerminalCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostTerminalResource"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/terminals/{terminal_id}": {
+      "delete": {
+        "operationId": "delete_v1_hosts__host_id__terminals__terminal_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "terminal_id",
+            "required": true,
+            "schema": {
+              "title": "Terminal Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete",
+        "tags": [
+          "hosts"
         ]
       }
     },

@@ -1492,6 +1492,22 @@ async def _send_hello(
     except Exception:  # noqa: BLE001 — telemetry errors must not abort hello
         pass
 
+    if getattr(getattr(app, "state", None), "runner_purpose", None) == "host_terminals":
+        await send_text(
+            encode_frame(
+                HelloFrame(
+                    runner_version=runner_version,
+                    frame_protocol_version=1,
+                    harnesses=[],
+                    envs=[],
+                    capabilities=[],
+                    connection_id=connection_id,
+                    telemetry_opt_out=_tel_opt_out,
+                )
+            )
+        )
+        return
+
     from omnigent.harnesses.codex_native.side_chat import CAP_SIDE_CHAT_SETTINGS
     from omnigent.host.frames import CAP_MCP_REGISTRY
     from omnigent.inner.claude_sdk_executor import claude_peer_receipts_supported

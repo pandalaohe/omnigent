@@ -1099,6 +1099,7 @@ def create_hosts_router(
                 # gateway-backed".
                 "gateway_inference": host_registry.gateway_inference(host.host_id),
                 "interactive_shells": host_registry.interactive_shells(host.host_id),
+                "capabilities": list(conn.hello.capabilities) if conn else [],
             }
             if (
                 harness_setup_enabled
@@ -1164,6 +1165,7 @@ def create_hosts_router(
             # memory, so ``None`` is "no report on this replica yet".
             "gateway_inference": host_registry.gateway_inference(host.host_id),
             "interactive_shells": host_registry.interactive_shells(host.host_id),
+            "capabilities": list(conn.hello.capabilities) if conn else [],
             "runners": [],
             "supervised": conn.hello.supervised if conn else None,
             "started_at": conn.hello.started_at if conn else None,

@@ -56,6 +56,7 @@ from omnigent.runner.transports.ws_tunnel.registry import (
 from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.host_registry import RunnerExitReports
+from omnigent.server.host_terminals import HOST_TERMINAL_TOKEN_PREFIX, HostTerminalService
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.tunnel_handshake import receive_tunnel_hello
 
@@ -236,6 +237,7 @@ def create_runner_tunnel_router(
     runner_exit_reports: RunnerExitReports | None = None,
     resolve_managed_runner_owner: Callable[[str], str | None] | None = None,
     mint_managed_runner_token: Callable[[str, int], str | None] | None = None,
+    host_terminals: HostTerminalService | None = None,
 ) -> APIRouter:
     """Build the router hosting the ``/runners/{id}/tunnel`` WS endpoint.
 
@@ -312,6 +314,8 @@ def create_runner_tunnel_router(
         user_id = _get_user_id_from_request(request)
         data: list[dict[str, object]] = []
         for runner_id in registry.online_runner_ids():
+            if host_terminals is not None and host_terminals.is_terminal_runner(runner_id):
+                continue
             session = registry.get(runner_id)
             if session is None:
                 continue
@@ -442,10 +446,15 @@ def create_runner_tunnel_router(
         8. On disconnect: deregister, abort in-flight.
         """
         is_loopback = _is_loopback_websocket_client(ws)
+        binding_token = ws.headers.get(RUNNER_TUNNEL_TOKEN_HEADER, "").strip()
         try:
             expected_runner_id = _expected_runner_id_from_headers(
                 ws.headers,
-                allowed_tunnel_tokens=allowed_tunnel_tokens,
+                allowed_tunnel_tokens=(
+                    None
+                    if binding_token.startswith(HOST_TERMINAL_TOKEN_PREFIX)
+                    else allowed_tunnel_tokens
+                ),
             )
         except ValueError as exc:
             if not is_loopback:
@@ -495,10 +504,29 @@ def create_runner_tunnel_router(
         # session-binding check each skip enforcement when the runner's
         # ``owner is None``, so an owner-less runner becomes visible to —
         # and bindable by — every other tenant.
-        tunnel_owner = _resolve_tunnel_owner(
-            ws,
-            auth_provider=auth_provider,
-            is_loopback=is_loopback,
+        terminal_binding = None
+        if binding_token.startswith(HOST_TERMINAL_TOKEN_PREFIX):
+            try:
+                if host_terminals is None:
+                    raise ValueError("host terminals unavailable")
+                terminal_binding = await asyncio.to_thread(host_terminals.admit, binding_token)
+            except ValueError as exc:
+                _logger.warning("Terminal runner admission rejected: %s", exc)
+                # A permanent purpose-binding rejection must reach the runner as
+                # a fatal close, rather than a retryable HTTP upgrade rejection.
+                await ws.accept()
+                await ws.close(
+                    code=RUNNER_ID_MISMATCH_CLOSE_CODE, reason="invalid terminal binding"
+                )
+                return
+        tunnel_owner = (
+            terminal_binding.owner
+            if terminal_binding is not None
+            else _resolve_tunnel_owner(
+                ws,
+                auth_provider=auth_provider,
+                is_loopback=is_loopback,
+            )
         )
         if tunnel_owner is None and auth_provider is not None:
             # A server-managed sandbox runner authenticates with a
@@ -649,7 +677,7 @@ def create_runner_tunnel_router(
                 ):
                     await registry.send_text(session, encode_frame(EventReadyFrame()))
 
-                if on_runner_connect is not None:
+                if on_runner_connect is not None and terminal_binding is None:
                     owned.append(
                         asyncio.create_task(
                             _run_connect_hook(on_runner_connect, session),
@@ -769,7 +797,7 @@ def create_runner_tunnel_router(
                     server_code=session.close_code,
                 )
                 await registry.deregister_async(runner_id, session, retire=False)
-                if on_runner_disconnect is not None:
+                if on_runner_disconnect is not None and terminal_binding is None:
                     try:
                         await on_runner_disconnect(runner_id, session)
                     except Exception:

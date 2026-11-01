@@ -445,6 +445,11 @@ class AuthProvider(ABC):
         """Return the authenticated user ID, or ``None``."""
         ...
 
+    @property
+    def host_terminal_signing_secret(self) -> bytes | None:
+        """Key for persistent host-terminal bindings; external identity modes have none."""
+        return None
+
     def mint_runner_token(self, user_id: str, ttl_seconds: int) -> str | None:  # noqa: ARG002
         """
         Mint a short-lived bearer a managed-sandbox runner presents as *user_id*.
@@ -743,6 +748,11 @@ class UnifiedAuthProvider(AuthProvider):
         ):
             return None
         return self.get_user_id(request)
+
+    @property
+    def host_terminal_signing_secret(self) -> bytes | None:
+        config = self._oidc_config if self._source == "oidc" else self._accounts_config
+        return config.cookie_secret if self._source in {"oidc", "accounts"} and config else None
 
     def _check_cookie(self, request: HTTPConnection) -> str | None:
         """Validate the session cookie or Bearer token and return the
