@@ -1827,5 +1827,34 @@ describe("TerminalSession", () => {
         restoreTouchInput();
       }
     });
+
+    it("forwards mobile assistant phrase and control payloads after an IME composition", async () => {
+      vi.useFakeTimers();
+      const restoreTouchInput = enableTouchInput();
+      const { container, session, socket } = makeSession();
+      try {
+        socket.open();
+        socket.sent = [];
+        const textarea = terminalTextarea(container);
+
+        textarea.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+        setTextareaState(textarea, "你", 1);
+        textarea.dispatchEvent(
+          new CompositionEvent("compositionend", { data: "你", bubbles: true }),
+        );
+        textarea.dispatchEvent(inputEvent("insertCompositionText", "你"));
+
+        session.sendSoftKey("enter", "/compact");
+        session.sendSoftKey("enter");
+        session.sendSoftKey("enter", "\x03");
+        await vi.advanceTimersByTimeAsync(0);
+
+        expect(sentInput(socket)).toEqual(["你", "/compact", "\r", "\x03"]);
+      } finally {
+        session.dispose();
+        restoreTouchInput();
+        vi.useRealTimers();
+      }
+    });
   });
 });

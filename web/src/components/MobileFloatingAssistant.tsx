@@ -279,7 +279,11 @@ export function MobileFloatingAssistant() {
   const repeatingPointerRef = useRef<{ buttonId: string; pointerId: number } | null>(null);
   const assistantRef = useRef<HTMLDivElement>(null);
   const lastInputFocusRef = useRef<HTMLElement | null>(
-    typeof document !== "undefined" && document.activeElement instanceof HTMLElement
+    typeof document !== "undefined" &&
+      document.activeElement instanceof HTMLElement &&
+      (document.activeElement instanceof HTMLInputElement ||
+        document.activeElement instanceof HTMLTextAreaElement ||
+        document.activeElement.isContentEditable)
       ? document.activeElement
       : null,
   );

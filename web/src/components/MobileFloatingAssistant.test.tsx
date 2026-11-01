@@ -428,4 +428,112 @@ describe("MobileFloatingAssistant", () => {
     expect(readMobileAssistantPreferences().dock).toBeUndefined();
     expect(screen.getByRole("button", { name: "Open floating assistant" })).toBeTruthy();
   });
+
+  it("routes soft keys, phrases, custom chords, and global shortcuts in CLI terminal view", () => {
+    writeMobileAssistantPreferences({
+      version: 2,
+      enabled: true,
+      buttons: [
+        {
+          id: "esc",
+          label: "Esc",
+          binding: { kind: "key", chord: { code: "Escape", modifiers: [] } },
+        },
+        {
+          id: "cp",
+          label: "Cp",
+          binding: { kind: "text", text: "/compact", submit: true },
+        },
+        {
+          id: "stop",
+          label: "Stop",
+          binding: { kind: "key", chord: { code: "KeyC", modifiers: ["primary"] } },
+        },
+        {
+          id: "mode",
+          label: "Mode",
+          binding: { kind: "shortcut", actionId: "cyclePermissionMode" },
+        },
+        {
+          id: "prev",
+          label: "Prev",
+          binding: { kind: "shortcut", actionId: "previousSession" },
+        },
+      ],
+    });
+
+    const warmSurface = document.createElement("div");
+    warmSurface.className = "invisible opacity-0";
+    warmSurface.setAttribute("aria-hidden", "true");
+    const warmXterm = document.createElement("div");
+    warmXterm.className = "xterm";
+    const warmTextarea = document.createElement("textarea");
+    warmTextarea.className = "xterm-helper-textarea";
+    warmXterm.appendChild(warmTextarea);
+    warmSurface.appendChild(warmXterm);
+
+    const activeSurface = document.createElement("div");
+    activeSurface.dataset.testid = "main-terminal-view";
+    const activeXterm = document.createElement("div");
+    activeXterm.className = "xterm";
+    const activeTextarea = document.createElement("textarea");
+    activeTextarea.className = "xterm-helper-textarea";
+    activeXterm.appendChild(activeTextarea);
+    activeSurface.appendChild(activeXterm);
+
+    const switcher = document.createElement("button");
+    switcher.textContent = "Terminal";
+    document.body.append(warmSurface, activeSurface, switcher);
+
+    const received: { action: string; data?: string }[] = [];
+    const onSoftKey = (event: Event) => {
+      const detail = (event as CustomEvent<TerminalSoftKeyEventDetail>).detail;
+      (detail.candidates ??= []).push({
+        focused: activeSurface.contains(document.activeElement),
+        ownsPreferredTarget: Boolean(
+          detail.preferredTarget && activeSurface.contains(detail.preferredTarget),
+        ),
+        send: () => {
+          received.push({ action: detail.action, data: detail.data });
+          activeTextarea.focus();
+        },
+      });
+    };
+    window.addEventListener(TERMINAL_SOFT_KEY_EVENT, onSoftKey);
+
+    let activeInXtermDuringGlobalShortcut = true;
+    const onGlobalKeyDown = (event: KeyboardEvent) => {
+      if (event.code === "BracketLeft" && (event.metaKey || event.ctrlKey)) {
+        activeInXtermDuringGlobalShortcut = Boolean(document.activeElement?.closest(".xterm"));
+      }
+    };
+    window.addEventListener("keydown", onGlobalKeyDown);
+
+    render(<MobileFloatingAssistant />);
+    // Simulate a previous session's terminal input holding focus before switching to this CLI session's Terminal view.
+    warmTextarea.focus();
+    switcher.focus();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open floating assistant" }));
+    fireEvent.click(screen.getByRole("button", { name: "Esc" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cp" }));
+    fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+    fireEvent.click(screen.getByRole("button", { name: "Mode" }));
+    fireEvent.click(screen.getByRole("button", { name: "Prev" }));
+
+    expect(received).toEqual([
+      { action: "escape", data: undefined },
+      { action: "enter", data: "/compact" },
+      { action: "enter", data: undefined },
+      { action: "enter", data: "\x03" },
+      { action: "enter", data: "\x1b[Z" },
+    ]);
+    expect(activeInXtermDuringGlobalShortcut).toBe(false);
+
+    window.removeEventListener(TERMINAL_SOFT_KEY_EVENT, onSoftKey);
+    window.removeEventListener("keydown", onGlobalKeyDown);
+    warmSurface.remove();
+    activeSurface.remove();
+    switcher.remove();
+  });
 });
