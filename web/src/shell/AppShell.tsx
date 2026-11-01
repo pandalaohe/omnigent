@@ -165,6 +165,7 @@ import { MobileFloatingAssistant } from "@/components/MobileFloatingAssistant";
 import { ImportReviewGate } from "@/components/onboarding/HostImportReview";
 import { CommandPalette } from "./CommandPalette";
 import { RecentSessionsSwitcher } from "./RecentSessionsSwitcher";
+import { ReloadNotice } from "@/components/ReloadNotice";
 import { Toaster } from "@/components/ui/sonner";
 import { CloseShellDialog } from "./CloseShellDialog";
 import { ForkSessionDialog } from "./ForkSessionDialog";
@@ -3099,6 +3100,7 @@ function AppShellImpl() {
           {!isEmbedded && <ImportReviewGate />}
           {/* Keep this after Outlet so a visible chat banner wins before the toast effect runs. */}
           {isFeatureEnabled(serverInfo, "arca_shutdown_warnings") && <ArcaShutdownToast />}
+          <ReloadNotice />
           {/* Dev-only `?import-preview` for the post-setup import modal. */}
           {ImportContextPreview && (
             <Suspense fallback={null}>
