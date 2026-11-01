@@ -95,6 +95,20 @@ def test_canonical_values_and_legacy_migration() -> None:
         normalize_permission_tier({}, harness="antigravity-native", legacy=True)
 
 
+def test_host_restart_preview_is_read_but_real_call_is_operational():
+    assert (
+        adapt_tool_call("sys_host_restart", {"host": "test"}, posix_host()).kind == ToolKind.READ
+    )
+    assert (
+        adapt_tool_call("sys_host_restart", {"host": "test", "dry_run": False}, posix_host()).kind
+        == ToolKind.OTHER
+    )
+    assert (
+        decision("plan", "sys_host_restart", {"host": "test", "dry_run": False}).action
+        == Verdict.DENY
+    )
+
+
 def test_read_plan_edit_and_single_call_ask() -> None:
     assert decision("ask", "read", {"path": "src/a.py"}).action == Verdict.ALLOW
     assert decision("plan", "write", {"path": "src/a.py", "content": "x"}).action == Verdict.DENY

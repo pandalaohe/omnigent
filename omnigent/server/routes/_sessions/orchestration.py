@@ -985,6 +985,18 @@ async def _publish_and_wait_for_harness_elicitation(
     """
     if elicitation_id is None:
         elicitation_id = f"elicit_{secrets.token_hex(16)}"
+    from omnigent.server.host_restart_approval import restart_card_fields
+
+    try:
+        restart_fields = await restart_card_fields(
+            session_id, elicitation_id, tool_name, tool_input, conversation_store
+        )
+    except OmnigentError:
+        if published is not None:
+            published.set()
+        return ElicitationResult(action="decline")
+    if restart_fields:
+        params = params.model_copy(update=restart_fields)
     future: asyncio.Future[ElicitationResult] = asyncio.get_running_loop().create_future()
 
     def approved_verdict(verdict: ElicitationResult | None) -> ElicitationResult | None:
@@ -12429,6 +12441,9 @@ async def _register_policy_elicitation(
     result: PolicyResult,
     arguments_preview: str,
     conversation_store: ConversationStore,
+    *,
+    tool_name: str | None = None,
+    tool_input: dict[str, Any] | None = None,
 ) -> str:
     """
     Publish an elicitation request event on the session stream.
@@ -12466,6 +12481,13 @@ async def _register_policy_elicitation(
     # runner which resolves it. No server-side state needed.
     _elicit_event = build_elicitation_request_event(
         elicitation_id, elicitation, session_id=session_id
+    )
+    from omnigent.server.host_restart_approval import restart_card_fields
+
+    _elicit_event["params"].update(
+        await restart_card_fields(
+            session_id, elicitation_id, tool_name, tool_input, conversation_store
+        )
     )
     session_stream.publish(session_id, _elicit_event)
     await asyncio.to_thread(
@@ -12678,12 +12700,17 @@ async def _evaluate_independent_tool_call_policy(
 
     # ASK — publish elicitation event. Approval state lives
     # on the runner (_pending_approvals dict).
-    elicitation_id = await _register_policy_elicitation(
-        session_id=session_id,
-        result=result,
-        arguments_preview=arguments_str,
-        conversation_store=conversation_store,
-    )
+    try:
+        elicitation_id = await _register_policy_elicitation(
+            session_id=session_id,
+            result=result,
+            arguments_preview=arguments_str,
+            conversation_store=conversation_store,
+            tool_name=tool_name,
+            tool_input=args_payload if isinstance(args_payload, dict) else None,
+        )
+    except OmnigentError as exc:
+        return {"verdict": "deny", "reason": exc.message}
     # The deciding policy's writes (e.g. a cost-budget checkpoint via
     # ``state_updates``) must land ONLY on approve. This relay path returns
     # ``pending`` and the verdict arrives later off-request, so stash them to
@@ -15861,6 +15888,13 @@ async def _handle_mcp_tools_call(
             if approval.get("action") != "accept":
                 return _mcp_error_response(rpc_id, -32000, "Tool call denied by user")
             _pending = _pending_policy_ask_writes.get(elicitation_id_from_state)
+            if namespaced_name == "sys_host_restart":
+                from omnigent.server.host_restart_approval import require_restart_card_approval
+
+                try:
+                    require_restart_card_approval(session_id, elicitation_id_from_state)
+                except OmnigentError as exc:
+                    return _mcp_error_response(rpc_id, -32000, exc.message)
             identity = (session_id, namespaced_name, (actor or {}).get("run_as"), credential_user)
             if _pending is not None and _pending.mcp_call_identity not in (None, identity):
                 return _mcp_error_response(rpc_id, -32000, "Approval does not match this call")
@@ -15927,12 +15961,17 @@ async def _handle_mcp_tools_call(
             # Emit elicitation SSE event (for REPL approval UI) and return
             # InputRequiredResult per the MCP MRTR spec so the runner can
             # park on the approval Future and retry when the user decides.
-            elicitation_id = await _register_policy_elicitation(
-                session_id,
-                call_result,
-                json.dumps(arguments)[:1024],
-                conversation_store,
-            )
+            try:
+                elicitation_id = await _register_policy_elicitation(
+                    session_id,
+                    call_result,
+                    json.dumps(arguments)[:1024],
+                    conversation_store,
+                    tool_name=namespaced_name,
+                    tool_input=arguments,
+                )
+            except OmnigentError as exc:
+                return _mcp_error_response(rpc_id, -32000, exc.message)
             # Keep the reviewed call and deferred writes together until approval.
             _pending_policy_ask_writes[elicitation_id] = _PendingPolicyAskWrites(
                 state_updates=call_result.state_updates,

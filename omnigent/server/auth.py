@@ -710,6 +710,34 @@ class UnifiedAuthProvider(AuthProvider):
             account_generation=account_generation(user_id),
         )
 
+    @property
+    def browser_session_origin(self) -> str | None:
+        """Configured public origin for cookie-authenticated browser actions."""
+        from urllib.parse import urlsplit
+
+        config = self._oidc_config if self._source == "oidc" else self._accounts_config
+        if config is None:
+            return None
+        parts = urlsplit(config.base_url)
+        return f"{parts.scheme}://{parts.netloc}"
+
+    def browser_session_user_id(self, request: HTTPConnection) -> str | None:
+        """Validate an explicitly browser-issued cookie, including live account checks."""
+        import jwt
+
+        if self._source not in ("oidc", "accounts"):
+            return None
+        config = self._oidc_config if self._source == "oidc" else self._accounts_config
+        if config is None or not (token := request.cookies.get(config.session_cookie_name)):
+            return None
+        try:
+            claims = jwt.decode(token, config.cookie_secret, algorithms=["HS256"])
+        except jwt.InvalidTokenError:
+            return None
+        if claims.get("browser_session") is not True or "scope" in claims or "grant_id" in claims:
+            return None
+        return self.get_user_id(request)
+
     def _check_cookie(self, request: HTTPConnection) -> str | None:
         """Validate the session cookie or Bearer token and return the
         user ID.

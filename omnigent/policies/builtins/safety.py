@@ -372,6 +372,19 @@ def ask_on_instruction_layer_update(event: PolicyEvent) -> PolicyResponse:
     }
 
 
+def ask_on_host_restart(event: PolicyEvent) -> PolicyResponse:
+    """Require application approval for each real host restart."""
+    if event.get("type") != "tool_call":
+        return _ALLOW
+    data = event.get("data")
+    if not isinstance(data, dict) or data.get("name") != "sys_host_restart":
+        return _ALLOW
+    args = data.get("arguments")
+    if isinstance(args, dict) and args.get("dry_run", True) is True:
+        return _ALLOW
+    return {"result": "ASK", "reason": "Restart this host and end its runners and terminals?"}
+
+
 def ask_on_standing_pass_grant(event: PolicyEvent) -> PolicyResponse:
     """Ask for the exact delta before an agent widens its mother's pass."""
     if event.get("type") != "tool_call" or event.get("target") != "sys_standing_pass":

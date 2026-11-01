@@ -362,6 +362,7 @@ _AGY_ENABLED_TOOLS = [
     "sys_flow_list",
     "sys_flow_start",
     "sys_host_load",
+    "sys_host_restart",
     "sys_instruction_layer_update",
     "sys_instruction_layers_read",
     "sys_list_models",

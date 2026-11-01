@@ -2515,6 +2515,7 @@ def create_app(
             if host_load_notices is not None:
                 await host_load_notices.shutdown()
             await app_inst.state.host_load_queue.shutdown()
+            await host_registry.restarts.shutdown()
             if system_status_hub is not None:
                 await system_status_hub.save_history()
                 system_status_hub.close()

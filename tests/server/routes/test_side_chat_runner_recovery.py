@@ -89,6 +89,46 @@ async def test_side_chat_rebinds_to_source_runner(
     assert saved.host_id is None
 
 
+async def test_restart_inventory_reads_running_side_chat_through_sessions_api(
+    app, client, db_uri, monkeypatch
+):
+    from omnigent.host.connect import HostProcess
+    from omnigent.host.identity import HostIdentity
+
+    store = SqlAlchemyConversationStore(db_uri)
+    source, side = _source_and_side_chat(store, db_uri)
+    rebound = store.replace_runner_id(side.id, source.runner_id)
+    assert rebound.runner_id == source.runner_id
+    sessions._session_status_cache[source.id] = "idle"
+    sessions._session_status_cache[side.id] = "running"
+    ordinary = await client.get("/v1/sessions", params={"kind": "any"})
+    assert side.id not in {row["id"] for row in ordinary.json()["data"]}
+    host = HostProcess(HostIdentity(_HOST_ID, "test"), "http://test")
+    host._runners[source.runner_id] = Mock()
+    client_type = httpx.AsyncClient
+    inventory_responses = []
+
+    async def capture_inventory(response):
+        await response.aread()
+        inventory_responses.extend(
+            {key: row.get(key) for key in ("id", "status", "runner_id", "host_id")}
+            for row in response.json()["data"]
+        )
+
+    monkeypatch.setattr(
+        "omnigent.host.connect.httpx.AsyncClient",
+        lambda: client_type(
+            transport=httpx.ASGITransport(app=app),
+            event_hooks={"response": [capture_inventory]},
+        ),
+    )
+    monkeypatch.setattr(host, "_build_connect_headers", dict)
+    assert await host._restart_running_sessions() == [side.id], inventory_responses
+    host._runners.clear()
+    sessions._session_status_cache.pop(source.id, None)
+    sessions._session_status_cache.pop(side.id, None)
+
+
 @pytest.mark.parametrize("source_level", [None, LEVEL_READ])
 async def test_side_chat_recovery_requires_edit_access_to_source(
     db_uri: str, monkeypatch: pytest.MonkeyPatch, source_level: int | None

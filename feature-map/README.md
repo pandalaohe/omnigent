@@ -113,6 +113,8 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 
 ## Features
 
+- [Host restart](./host-restart.md) covers restart previews, ownership, draining, reconnect deadlines and result notices.
+
 - [Session orchestration](./session-orchestration.md) covers private-owner
   messaging, top-level worker creation, polling results and sharing restrictions.
 
