@@ -29,6 +29,7 @@ from omnigent.entities.session_resources import (
     resolve_terminal_entry_by_resource_id,
     session_resource_view_to_dict,
     terminal_resource_id,
+    terminal_resource_view,
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import native_terminal_name
@@ -986,11 +987,15 @@ def register_resource_routes(
     async def get_session_terminal(
         session_id: str,
         terminal_id: str,
+        include_stopped: bool = False,
     ) -> JSONResponse:
-        resource = await resource_registry.get_terminal_resource(
-            session_id,
-            terminal_id,
-        )
+        if include_stopped:
+            entry = resolve_terminal_entry_by_resource_id(
+                session_id, terminal_id, resource_registry.terminal_registry, include_stopped=True
+            )
+            resource = terminal_resource_view(session_id, entry) if entry is not None else None
+        else:
+            resource = await resource_registry.get_terminal_resource(session_id, terminal_id)
         if resource is None:
             _log_terminal_lookup_miss(resource_registry, session_id, terminal_id)
             return JSONResponse(
@@ -1148,12 +1153,12 @@ def register_resource_routes(
     async def delete_session_terminal(
         session_id: str,
         terminal_id: str,
+        instance_id: str | None = None,
     ) -> JSONResponse:
-        closed = await resource_registry.close_terminal(
-            session_id,
-            terminal_id,
+        entry = resolve_terminal_entry_by_resource_id(
+            session_id, terminal_id, resource_registry.terminal_registry, include_stopped=True
         )
-        if not closed:
+        if entry is None:
             return JSONResponse(
                 status_code=404,
                 content={
@@ -1162,6 +1167,18 @@ def register_resource_routes(
                         "message": (f"Terminal {terminal_id!r} not found"),
                     }
                 },
+            )
+        if instance_id is not None and entry.instance.instance_id != instance_id:
+            return JSONResponse(
+                status_code=409, content={"error": {"message": "Terminal instance changed"}}
+            )
+        outcome = await resource_registry.close_terminal_detailed(
+            session_id, terminal_id, expected_instance=entry.instance
+        )
+        if outcome != "closed":
+            return JSONResponse(
+                status_code=409,
+                content={"error": {"message": "Terminal instance changed or could not be closed"}},
             )
         return JSONResponse(
             status_code=200,

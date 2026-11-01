@@ -25,10 +25,17 @@ from omnigent.runner.native.orchestration import (
 )
 from omnigent.runner.resource_registry import SessionResourceRegistry, _terminal_exit_diagnostics
 from omnigent.runner.sign_in_watch import build_sign_in_watch
-from omnigent.runner.tool_dispatch import _execute_terminal_tool
+from omnigent.runner.tool_dispatch import (
+    _execute_terminal_tool,
+    _spawn_async_tool,
+    build_native_relay_tool_schemas,
+)
 from omnigent.spec.types import AgentSpec
 from omnigent.terminals import TerminalRegistry
 from omnigent.terminals.elevation import ELEVATED_TERMINALS_ENV
+from omnigent.tools.base import ToolContext
+from omnigent.tools.builtins.sys_terminal import SysTerminalRequestAccessTool
+from omnigent.tools.manager import ToolManager
 from tests._helpers.polling import poll_until, poll_until_async
 from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
@@ -43,6 +50,51 @@ def admin(tmp_path: Path):
     registry._by_conversation["session"] = {("bash", "admin"): instance}
     registry._instance_locks[("session", "bash", "admin")] = threading.Lock()
     return registry, instance
+
+
+def test_terminal_access_request_is_discovered_only_with_approval_transport(admin, monkeypatch):
+    registry, instance = admin
+    monkeypatch.setattr("omnigent.runtime.get_terminal_registry", lambda: registry)
+    spec = AgentSpec(spec_version=1, terminals={"bash": TerminalEnvSpec()})
+    name = "sys_terminal_request_access"
+    for available in (False, True):
+        schemas = ToolManager(spec, terminal_access_requests_enabled=available).get_tool_schemas()
+        assert (name in {item["function"]["name"] for item in schemas}) is available
+        relayed = build_native_relay_tool_schemas(spec, terminal_access_requests_enabled=available)
+        assert (name in {item["name"] for item in relayed}) is available
+    tool = SysTerminalRequestAccessTool(registry)
+    args = json.dumps(
+        {
+            "terminal": "bash",
+            "session": "admin",
+            "instance_id": instance.instance_id,
+            "reason": "Requested work",
+        }
+    )
+    context = ToolContext(task_id="test", agent_id="test", conversation_id="session")
+    assert json.loads(tool.invoke(args, context)) == {"status": "rejected"}
+    assert not instance.agent_access
+    registry.set_agent_access("session", "bash", "admin", instance.instance_id, True)
+    assert json.loads(tool.invoke(args, context)) == {"status": "granted"}
+    registry.set_agent_access("session", "bash", "admin", instance.instance_id, False)
+    assert json.loads(tool.invoke(args, context)) == {"status": "rejected"}
+    refusal = _spawn_async_tool(
+        {"tool": name, "args": args},
+        session_inbox=None,
+        session_async_tasks=None,
+        server_client=None,
+        terminal_registry=registry,
+        resource_registry=None,
+        agent_spec=spec,
+        conversation_id="session",
+        task_id="test",
+        agent_id="test",
+        agent_name=None,
+        runner_workspace=None,
+        mcp_manager=None,
+    )
+    assert "interactive application approval" in refusal
+    assert not instance.agent_access
 
 
 @pytest.mark.asyncio
@@ -361,3 +413,50 @@ async def test_agent_input_renews_admin_clock_but_empty_send_does_not(admin, mon
     instance.running = False
     registry.require_agent_access("session", "bash", "admin", instance)
     assert await registry.close("session", "bash", "admin", expected=instance)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("granted", [False, True])
+async def test_native_controls_never_drive_an_admin_name_collision(admin, monkeypatch, granted):
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.native_controls import build_native_controls
+
+    registry, instance = admin
+    instance.agent_access = granted
+    registry._by_conversation["session"] = {
+        ("codex", "main"): instance,
+        ("opencode", "main"): instance,
+    }
+    controls = []
+
+    def capture(**kwargs):
+        result = build_native_controls(**kwargs)
+        controls.append(result)
+        return result
+
+    monkeypatch.setattr(runner_app, "build_native_controls", capture)
+    injection = Mock(side_effect=AssertionError("native control touched admin pane"))
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._run_tmux", injection)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._capture_pane", injection)
+    monkeypatch.setattr("omnigent.native.native_cost_popup.launch_cost_popup", injection)
+    monkeypatch.setattr("omnigent.native.native_cost_popup.launch_blocked_notice", injection)
+    create_runner_app(terminal_registry=registry, server_client=NullServerClient())
+    control = controls[0]
+    assert (
+        await control.handle_codex_native_slash_command(
+            "session", "/help", error_code="unavailable", context="test"
+        )
+    ).status_code == 503
+    assert (
+        await control.handle_codex_native_approval_mode_change("session", "ask-for-approval")
+    ).status_code == 503
+    assert (
+        await control.handle_codex_native_cost_popup("session", "card", "test")
+    ).status_code == 204
+    assert (
+        await control.handle_opencode_native_cost_popup("session", "card", "test")
+    ).status_code == 204
+    assert (
+        await control.handle_opencode_native_blocked_notice("session", "test")
+    ).status_code == 204
+    injection.assert_not_called()

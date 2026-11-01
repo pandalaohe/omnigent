@@ -1872,6 +1872,8 @@ class SessionResourceRegistry:
                 _publish_status("running")
 
         def _on_exit() -> None:
+            if instance.elevated:
+                instance.on_elevated_exit = None
             with contextlib.suppress(Exception):
                 instance.lifecycle_trace.note_exit()
             # The pane's process is gone, which the status file cannot report —

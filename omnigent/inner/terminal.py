@@ -2059,6 +2059,9 @@ class TerminalInstance:
         # Clean up the private dir (contains socket + fork).
         if self.private_dir.exists():
             shutil.rmtree(self.private_dir, ignore_errors=True)
+        observer, self.on_elevated_exit = self.on_elevated_exit, None
+        if self.elevated and observer is not None:
+            observer()
 
     def start_idle_watcher(
         self,

@@ -308,11 +308,13 @@ def resolve_terminal_entry_by_resource_id(
     session_id: str,
     terminal_id: str,
     terminal_registry: TerminalRegistry | None,
+    *,
+    include_stopped: bool = False,
 ) -> TerminalListEntry | None:
     """Find the :class:`TerminalListEntry` matching a terminal resource id.
 
     Scans the registry for the session and computes resource ids to
-    match.  Returns ``None`` if no running terminal matches.
+    match. Stopped registrations are included only for cleanup authorization.
 
     :param session_id: Owning session/conversation id.
     :param terminal_id: Opaque terminal resource id,
@@ -323,7 +325,7 @@ def resolve_terminal_entry_by_resource_id(
     if terminal_registry is None:
         return None
     for entry in terminal_registry.list_for_conversation(session_id):
-        if not entry.instance.running:
+        if not include_stopped and not entry.instance.running:
             continue
         if terminal_resource_id(entry.terminal_name, entry.session_key) == terminal_id:
             return entry

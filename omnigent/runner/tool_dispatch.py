@@ -122,6 +122,7 @@ from omnigent.tools.builtins.sys_terminal import (
     SysTerminalLaunchTool,
     SysTerminalListTool,
     SysTerminalReadTool,
+    SysTerminalRequestAccessTool,
     SysTerminalSendTool,
 )
 from omnigent.tools.builtins.timer import (
@@ -298,6 +299,7 @@ _TERMINAL_TOOLS = frozenset(
         SysTerminalReadTool.name(),
         SysTerminalListTool.name(),
         SysTerminalCloseTool.name(),
+        SysTerminalRequestAccessTool.name(),
     }
 )
 
@@ -686,6 +688,7 @@ def build_native_relay_tool_schemas(
     peer_messaging_enabled: bool = False,
     session_open_enabled: bool = False,
     skill_registry: list[SkillSpec] | None = None,
+    terminal_access_requests_enabled: bool = False,
 ) -> list[_JsonObject]:
     """Build the flat Omnigent tool surface for native harness bridges.
 
@@ -755,6 +758,7 @@ def build_native_relay_tool_schemas(
             session_open_enabled=session_open_enabled,
             os_env_schema_only=True,
             skill_registry=skill_registry,
+            terminal_access_requests_enabled=terminal_access_requests_enabled,
         ).get_tool_schemas():
             function = _string_object_dict(schema.get("function"))
             if function is not None and function.get("name") in _NATIVE_RELAY_BUILTIN_TOOLS:
@@ -1190,7 +1194,7 @@ class _GrantedToolSurface:
 # release flag is part of the key: the same spec advertises a different
 # surface under each flag.
 _granted_tool_surface_cache: dict[
-    tuple[int, str | None, bool, bool], tuple[weakref.ref[AgentSpec], _GrantedToolSurface]
+    tuple[int, str | None, bool, bool, bool], tuple[weakref.ref[AgentSpec], _GrantedToolSurface]
 ] = {}
 _GRANTED_TOOL_NAMES_CACHE_MAX = 256
 
@@ -1221,6 +1225,7 @@ def _granted_tool_names(
     *,
     peer_messaging_enabled: bool = False,
     session_open_enabled: bool = False,
+    terminal_access_requests_enabled: bool = False,
 ) -> frozenset[str]:
     """Return the names in the session's cached, advertised tool surface."""
     return _granted_tool_surface(
@@ -1228,6 +1233,7 @@ def _granted_tool_names(
         harness,
         peer_messaging_enabled=peer_messaging_enabled,
         session_open_enabled=session_open_enabled,
+        terminal_access_requests_enabled=terminal_access_requests_enabled,
     ).names
 
 
@@ -1237,6 +1243,7 @@ def _granted_tool_surface(
     *,
     peer_messaging_enabled: bool = False,
     session_open_enabled: bool = False,
+    terminal_access_requests_enabled: bool = False,
 ) -> _GrantedToolSurface:
     """Return the non-MCP tool metadata advertised for *agent_spec* on *harness*.
 
@@ -1259,7 +1266,13 @@ def _granted_tool_surface(
     :raises Exception: Propagates ``ToolManager`` construction failures so
         callers can fail closed instead of guessing at the surface.
     """
-    cache_key = (id(agent_spec), harness, peer_messaging_enabled, session_open_enabled)
+    cache_key = (
+        id(agent_spec),
+        harness,
+        peer_messaging_enabled,
+        session_open_enabled,
+        terminal_access_requests_enabled,
+    )
     cached = _granted_tool_surface_cache.get(cache_key)
     if cached is not None and cached[0]() is agent_spec:
         return cached[1]
@@ -1267,6 +1280,7 @@ def _granted_tool_surface(
         agent_spec,
         peer_messaging_enabled=peer_messaging_enabled,
         session_open_enabled=session_open_enabled,
+        terminal_access_requests_enabled=terminal_access_requests_enabled,
         os_env_schema_only=True,
         # Keep skill discovery out of the per-call metadata check.
         skill_registry=[],
@@ -1324,6 +1338,7 @@ def _ungranted_tool_reason(
     *,
     peer_messaging_enabled: bool = False,
     session_open_enabled: bool = False,
+    terminal_access_requests_enabled: bool = False,
     arguments: _JsonObject | None = None,
 ) -> str | None:
     """Return why *tool_name* is refused for *agent_spec*, or ``None`` if allowed.
@@ -1360,6 +1375,7 @@ def _ungranted_tool_reason(
             _effective_harness_name(agent_spec, effective_harness),
             peer_messaging_enabled=peer_messaging_enabled,
             session_open_enabled=session_open_enabled,
+            terminal_access_requests_enabled=terminal_access_requests_enabled,
         )
     except Exception as exc:
         _logger.exception("granted tool surface unavailable for %s", tool_name)
@@ -10634,6 +10650,7 @@ async def execute_tool(
             effective_harness,
             peer_messaging_enabled=_peer_messaging_enabled_for(conversation_id),
             session_open_enabled=_session_open_enabled_for(conversation_id),
+            terminal_access_requests_enabled=server_client is not None,
             arguments=args,
         )
         if refusal is not None:
@@ -11748,6 +11765,8 @@ async def _execute_terminal_tool(
         tool_instance = SysTerminalListTool(registry=terminal_registry)
     elif tool_name == SysTerminalCloseTool.name():
         tool_instance = SysTerminalCloseTool(registry=terminal_registry)
+    elif tool_name == SysTerminalRequestAccessTool.name():
+        tool_instance = SysTerminalRequestAccessTool(registry=terminal_registry)
     else:
         return f"Error: unknown terminal tool {tool_name}"
 
@@ -11846,6 +11865,9 @@ async def _emit_terminal_resource_event(
             terminal_name=terminal_name,
             session_key=session_key,
             publish_event=publish_event,
+            instance_id=_optional_string(envelope.get("instance_id"))
+            if envelope.get("elevated")
+            else None,
         )
 
 
@@ -11944,6 +11966,7 @@ def _publish_terminal_deleted_event(
     terminal_name: str,
     session_key: str,
     publish_event: Callable[[str, _JsonObject], None],
+    instance_id: str | None = None,
 ) -> None:
     """Build and publish ``session.resource.deleted`` for a closed terminal.
 
@@ -11966,6 +11989,7 @@ def _publish_terminal_deleted_event(
             "resource_id": terminal_resource_id(terminal_name, session_key),
             "resource_type": "terminal",
             "session_id": conversation_id,
+            **({"instance_id": instance_id} if instance_id is not None else {}),
         },
     )
 
@@ -12643,6 +12667,8 @@ def _spawn_async_tool(
         return 'Error: sys_call_async requires string "args" argument'
     if target_tool == SysCallAsyncTool.name():
         return "Error: sys_call_async cannot dispatch itself"
+    if target_tool == SysTerminalRequestAccessTool.name():
+        return "Error: terminal access requires an interactive application approval card"
     if session_inbox is None or session_async_tasks is None:
         return "Error: async inbox not initialized for this session"
     if mcp_manager is None:

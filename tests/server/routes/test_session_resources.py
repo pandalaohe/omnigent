@@ -390,6 +390,7 @@ class _FakeRunnerClient:
         # the caller sent no params — lets tests assert that a proxy
         # forwarded (or deliberately dropped) the incoming query string.
         self.get_params: list[dict[str, str] | None] = []
+        self.delete_params: list[dict[str, str] | None] = []
 
     def _make_response(
         self,
@@ -491,9 +492,12 @@ class _FakeRunnerClient:
         del json, timeout
         return self._make_response("PATCH", url)
 
-    async def delete(self, url: str, *, timeout: float | None = None) -> httpx.Response:
+    async def delete(
+        self, url: str, *, timeout: float | None = None, params: dict[str, str] | None = None
+    ) -> httpx.Response:
         """Record and return a DELETE response."""
         del timeout
+        self.delete_params.append(params)
         return self._make_response("DELETE", url)
 
 
@@ -1864,6 +1868,7 @@ async def test_delete_terminal_proxies_to_runner(
         "id": "terminal_bash_s1",
         "object": "session.resource.deleted",
         "deleted": True,
+        "metadata": {"instance_id": "instance-one", "elevated": False},
     }
     fake_runner = _FakeRunnerClient(payload=deletion)
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
@@ -1874,7 +1879,13 @@ async def test_delete_terminal_proxies_to_runner(
 
     assert resp.status_code == 200
     assert resp.json()["deleted"] is True
+    assert fake_runner.get_params == [{"include_stopped": "true"}]
+    assert fake_runner.delete_params == [{"instance_id": "instance-one"}]
     assert fake_runner.calls == [
+        (
+            "GET",
+            "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals/terminal_bash_s1",
+        ),
         (
             "DELETE",
             "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals/terminal_bash_s1",

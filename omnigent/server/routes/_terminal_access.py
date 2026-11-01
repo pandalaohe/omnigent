@@ -4,18 +4,18 @@ from __future__ import annotations
 
 import asyncio
 from typing import cast
-from urllib.parse import urlsplit
 
 from fastapi import HTTPException, Request
 from starlette.requests import HTTPConnection
 
 from omnigent.entities import Conversation
+from omnigent.errors import OmnigentError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.runner.routing import routing_host_id
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.browser_approval import require_owner_browser_approval
 from omnigent.server.routes._host_launch import resolve_host_owner
 from omnigent.server.routes._origin import require_trusted_origin
-from omnigent.server.ws_origin import origin_allowed, parse_allowed_origins
 from omnigent.stores import ConversationStore
 
 
@@ -33,27 +33,12 @@ def require_terminal_browser_session(
     user_id = auth_provider.get_user_id(connection)
     if user_id == RESERVED_USER_LOCAL:
         return
-    origin = connection.headers.get("origin")
     try:
-        parts = urlsplit(origin or "")
-        _ = parts.port
-        valid_origin = (
-            parts.scheme in ("http", "https")
-            and bool(parts.netloc)
-            and not (
-                parts.path or parts.query or parts.fragment or parts.username or parts.password
-            )
-        )
-    except ValueError:
-        valid_origin = False
-    scheme = {"ws": "http", "wss": "https"}.get(connection.url.scheme, connection.url.scheme)
-    same_origin = f"{scheme}://{connection.url.netloc}"
-    if not valid_origin or not origin_allowed(
-        origin, local_mode=False, extra_allowed=parse_allowed_origins() | frozenset({same_origin})
-    ):
-        raise HTTPException(status_code=403, detail="a trusted browser origin is required")
-    if not auth_provider.is_browser_session(connection):
-        raise HTTPException(status_code=403, detail="a human browser session is required")
+        require_owner_browser_approval(cast(Request, connection), auth_provider, user_id)
+    except OmnigentError as exc:
+        raise HTTPException(
+            status_code=403, detail="a trusted human browser session is required"
+        ) from exc
 
 
 async def require_terminal_host_owner(

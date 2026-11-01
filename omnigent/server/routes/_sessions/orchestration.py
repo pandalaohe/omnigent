@@ -997,6 +997,18 @@ async def _publish_and_wait_for_harness_elicitation(
         return ElicitationResult(action="decline")
     if restart_fields:
         params = params.model_copy(update=restart_fields)
+    from omnigent.server.terminal_agent_access import terminal_access_card_fields
+
+    try:
+        terminal_fields = await terminal_access_card_fields(
+            session_id, elicitation_id, tool_name, tool_input, conversation_store, timeout_s
+        )
+    except OmnigentError as exc:
+        if published is not None:
+            published.set()
+        return ElicitationResult(action="decline", content={"reason": exc.message})
+    if terminal_fields:
+        params = params.model_copy(update=terminal_fields)
     future: asyncio.Future[ElicitationResult] = asyncio.get_running_loop().create_future()
 
     def approved_verdict(verdict: ElicitationResult | None) -> ElicitationResult | None:
@@ -11886,6 +11898,21 @@ async def _relay_runner_stream_once(
                     # clients.
                     resource_item = _resource_event_item_from_sse(session_id, event)
                     if (
+                        event.get("type") == "session.resource.deleted"
+                        and event.get("resource_type") == "terminal"
+                        and isinstance(event.get("resource_id"), str)
+                    ):
+                        from omnigent.server.terminal_agent_access import (
+                            end_terminal_access_requests,
+                        )
+
+                        await end_terminal_access_requests(
+                            session_id,
+                            event["resource_id"],
+                            event.get("instance_id"),
+                            conversation_store,
+                        )
+                    if (
                         resource_item is not None
                         and event.get("persist_resource_event") is not False
                     ):
@@ -12166,6 +12193,12 @@ async def _relay_runner_stream_once(
                         )
                         continue
                     if evt_type == "response.elicitation_resolved":
+                        from omnigent.server.terminal_agent_access import (
+                            release_terminal_access_request,
+                        )
+
+                        if isinstance(event.get("elicitation_id"), str):
+                            release_terminal_access_request(session_id, event["elicitation_id"])
                         session_stream.publish(session_id, event)
                         elicitation_id = event.get("elicitation_id")
                         if isinstance(elicitation_id, str) and elicitation_id:
@@ -12444,6 +12477,7 @@ async def _register_policy_elicitation(
     *,
     tool_name: str | None = None,
     tool_input: dict[str, Any] | None = None,
+    ask_timeout_s: float = 86400,
 ) -> str:
     """
     Publish an elicitation request event on the session stream.
@@ -12487,6 +12521,13 @@ async def _register_policy_elicitation(
     _elicit_event["params"].update(
         await restart_card_fields(
             session_id, elicitation_id, tool_name, tool_input, conversation_store
+        )
+    )
+    from omnigent.server.terminal_agent_access import terminal_access_card_fields
+
+    _elicit_event["params"].update(
+        await terminal_access_card_fields(
+            session_id, elicitation_id, tool_name, tool_input, conversation_store, ask_timeout_s
         )
     )
     session_stream.publish(session_id, _elicit_event)
@@ -12689,7 +12730,11 @@ async def _evaluate_independent_tool_call_policy(
             tool_input=args_payload if isinstance(args_payload, dict) else None,
         )
         if approval is None or approval.action != "accept":
-            return {"verdict": "deny", "reason": result.reason or "Approval was not granted"}
+            reason = (approval.content or {}).get("reason") if approval is not None else None
+            return {
+                "verdict": "deny",
+                "reason": reason or result.reason or "Approval was not granted",
+            }
         if result.set_labels:
             await asyncio.to_thread(engine.apply_label_writes, result.set_labels)
         if result.state_updates:
@@ -12708,6 +12753,7 @@ async def _evaluate_independent_tool_call_policy(
             conversation_store=conversation_store,
             tool_name=tool_name,
             tool_input=args_payload if isinstance(args_payload, dict) else None,
+            ask_timeout_s=float(resolve_ask_timeout(engine, result)),
         )
     except OmnigentError as exc:
         return {"verdict": "deny", "reason": exc.message}
@@ -15895,6 +15941,13 @@ async def _handle_mcp_tools_call(
                     require_restart_card_approval(session_id, elicitation_id_from_state)
                 except OmnigentError as exc:
                     return _mcp_error_response(rpc_id, -32000, exc.message)
+            if namespaced_name == "sys_terminal_request_access":
+                from omnigent.server.terminal_agent_access import require_terminal_card_approval
+
+                try:
+                    require_terminal_card_approval(session_id, elicitation_id_from_state)
+                except OmnigentError as exc:
+                    return _mcp_error_response(rpc_id, -32000, exc.message)
             identity = (session_id, namespaced_name, (actor or {}).get("run_as"), credential_user)
             if _pending is not None and _pending.mcp_call_identity not in (None, identity):
                 return _mcp_error_response(rpc_id, -32000, "Approval does not match this call")
@@ -15969,6 +16022,7 @@ async def _handle_mcp_tools_call(
                     conversation_store,
                     tool_name=namespaced_name,
                     tool_input=arguments,
+                    ask_timeout_s=float(resolve_ask_timeout(engine, call_result)),
                 )
             except OmnigentError as exc:
                 return _mcp_error_response(rpc_id, -32000, exc.message)

@@ -372,6 +372,13 @@ def ask_on_instruction_layer_update(event: PolicyEvent) -> PolicyResponse:
     }
 
 
+def ask_on_terminal_agent_access(event: PolicyEvent) -> PolicyResponse:
+    """Terminal access consent always comes from the application's human card."""
+    if event.get("type") == "tool_call" and event.get("target") == "sys_terminal_request_access":
+        return {"result": "ASK", "reason": "Allow agent access to this admin terminal instance?"}
+    return _ALLOW
+
+
 def ask_on_host_restart(event: PolicyEvent) -> PolicyResponse:
     """Require application approval for each real host restart."""
     if event.get("type") != "tool_call":

@@ -13,6 +13,9 @@ reattach when the session moves to another host.
   and returns to chat with the terminal's content kept. States: starting up
   (no Resume action), stopped (Resume offered), connected.
 - `user-shell`: open a shell, type into it, and close it.
+- `admin-terminal`: on an opted-in host, the host owner who is also an app
+  admin opens a root terminal. The human uses its relay connection; the session
+  agent needs explicit consent for that terminal instance.
 - `scrollback`: scroll back with the mouse wheel (including programs that track
   the mouse), by touch on phones, and by keyboard.
 - `reconnect`: after the terminal connection drops, the terminal shows that it
@@ -105,6 +108,31 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   `tests/e2e_ui/shells/test_new_shell.py::test_new_shell_accepts_typed_command`.
   Closing a shell has no e2e coverage: close its tab, confirm, and expect the
   tab to disappear.
+- **`admin-terminal`:** backend coverage is in
+  `tests/host/test_elevated_terminals.py`,
+  `tests/runner/test_elevated_terminals.py`,
+  `tests/server/routes/test_terminal_agent_access.py`,
+  `tests/server/routes/test_terminal_attach.py`, and
+  `tests/server/integration/test_terminal_access_approval.py`.
+  The runner process test uses a stand-in password prompt, relays its bytes,
+  sends Ctrl-C and checks instance eviction; it never runs sudo.
+  For a live trial, use a host already enabled with `elevated_terminals: sudo`
+  and sign in to its owner's admin account. Open an admin terminal in a session,
+  check its root label and password prompt, and enter the password yourself.
+  Ask the agent to list, read and send to that terminal: listing shows the
+  instance and `agent_access: false`; read/send are refused. Approve the app's
+  access card, then check read/send succeed and the tab switch shows on.
+  Turn the switch off and expect refusal again. Repeat by switching on directly;
+  a pending access card settles with the switch. Close the terminal and reopen
+  the same name/key: the new instance starts denied and the old card cannot
+  grant it access. Check an editor collaborator and a runner credential cannot
+  answer either approval endpoint or change the switch; even the owner cannot
+  attach read-only or use direct attach to an admin terminal.
+  Finally, leave a granted terminal without input for 15 minutes: it closes
+  despite output or resizes. On a separate new terminal, three deliberately
+  wrong passwords should end sudo and remove the terminal without a root shell.
+  Record the failing step, HTTP/WS result and redacted screenshot or log;
+  never record passwords. Plain terminals keep their existing behavior.
 - **`agent-terminal-view`, `user-shell`, `split-panes`, keyboard:** no e2e
   coverage; component tests `web/src/hooks/useViewModeToggleHotkey.test.tsx`,
   `web/src/hooks/useNewShellHotkey.test.tsx`,
@@ -163,6 +191,11 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 
 ## Gotchas
 
+- Admin consent covers one terminal instance until close or revocation. It is
+  app consent, not OS isolation: other processes of the host's OS user can
+  reach that user's tmux socket. A plain shell elevated manually stays outside
+  the app's admin-terminal gate. The access card requires a verified browser
+  login; header/no-auth deployments cannot approve it.
 - The terminal strip and the agent terminal behind the Chat/Terminal switcher
   are different surfaces. A reattach or reconnect fix must be checked on both.
 - A host switch updates the host badge immediately. The badge changing is not

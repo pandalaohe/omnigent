@@ -1123,8 +1123,71 @@ class SysTerminalCloseTool(Tool):
                 "terminal": terminal_name,
                 "session": session_key,
                 "status": "closed" if closed else "not_found",
+                "instance_id": instance.instance_id if instance is not None else None,
+                "elevated": instance.elevated if instance is not None else False,
             }
         )
+
+
+class SysTerminalRequestAccessTool(Tool):
+    """Confirm consent after the server's human-only card has granted access."""
+
+    def __init__(self, registry: TerminalRegistry) -> None:
+        self._registry = registry
+
+    @classmethod
+    def name(cls) -> str:
+        return "sys_terminal_request_access"
+
+    @classmethod
+    def description(cls) -> str:
+        return (
+            "Ask the host owner to allow agent use of one admin terminal instance. "
+            "Use terminal, session and instance_id from sys_terminal_list and give a reason. "
+            "The application asks the human once; access lasts until this terminal closes "
+            "or the human turns it off. This request cannot be run asynchronously."
+        )
+
+    def get_schema(self) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name(),
+                "description": self.description(),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "terminal": {"type": "string", "minLength": 1},
+                        "session": {"type": "string", "minLength": 1},
+                        "instance_id": {"type": "string", "minLength": 1},
+                        "reason": {"type": "string", "minLength": 1, "maxLength": 4096},
+                    },
+                    "required": ["terminal", "session", "instance_id", "reason"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+    def invoke(self, arguments: str, ctx: ToolContext) -> str:
+        args = _parse_arguments(arguments)
+        if ctx.conversation_id is None or _validate_session_required_args(args) is not None:
+            return json.dumps({"status": "rejected", "error": "terminal session is required"})
+        instance = self._registry.get(ctx.conversation_id, args["terminal"], args["session"])
+        lock = self._registry.get_instance_lock(
+            ctx.conversation_id, args["terminal"], args["session"]
+        )
+        if instance is None or lock is None:
+            return json.dumps({"status": "rejected"})
+        with lock:
+            current = self._registry.get(ctx.conversation_id, args["terminal"], args["session"])
+            granted = (
+                current is instance
+                and instance.instance_id == args.get("instance_id")
+                and instance.running
+                and instance.elevated
+                and instance.agent_access
+            )
+        return json.dumps({"status": "granted" if granted else "rejected"})
 
 
 def _describe_entry(

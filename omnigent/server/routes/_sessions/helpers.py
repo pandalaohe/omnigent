@@ -986,6 +986,8 @@ def _publish_and_persist_resource_event(
     resource_type: str,
     conversation_store: ConversationStore,
     resource: dict[str, Any] | None = None,
+    *,
+    instance_id: str | None = None,
 ) -> None:
     """Publish an SSE event and persist it as a conversation item.
 
@@ -1011,6 +1013,8 @@ def _publish_and_persist_resource_event(
         sse_payload["resource_id"] = resource_id
         sse_payload["resource_type"] = resource_type
         sse_payload["session_id"] = session_id
+        if instance_id is not None:
+            sse_payload["instance_id"] = instance_id
 
     session_stream.publish(session_id, sse_payload)
 
@@ -3847,6 +3851,9 @@ def _publish_elicitation_resolved(
         verdict is present — a verdict and a no-verdict reason are
         mutually exclusive on the wire.
     """
+    from omnigent.server.terminal_agent_access import release_terminal_access_request
+
+    release_terminal_access_request(session_id, elicitation_id)
     payload: dict[str, Any] = {
         "type": "response.elicitation_resolved",
         "elicitation_id": elicitation_id,

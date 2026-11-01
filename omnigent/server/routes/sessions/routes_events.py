@@ -3128,6 +3128,17 @@ def register_events_routes(
                 request=request if isinstance(request, Request) else None,
                 auth_provider=auth_provider,
             )
+            from omnigent.server.terminal_agent_access import authorize_terminal_access_resolution
+
+            await authorize_terminal_access_resolution(
+                session_id,
+                str(body.data.get("elicitation_id", "")),
+                user_id,
+                body.data.get("action"),
+                request=request if isinstance(request, Request) else None,
+                auth_provider=auth_provider,
+                store=conversation_store,
+            )
             # Deliver the verdict through the shared resolver: it
             # sets any server-side harness Future (owner-checked),
             # clears the sidebar badge, and forwards

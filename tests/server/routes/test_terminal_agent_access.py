@@ -104,7 +104,9 @@ async def test_admin_terminal_requires_host_owner_browser(
     )
     set_runner_router(_FakeRunnerRouter(runner))
     user = "other@example.test" if credential == "other_owner" else owner
-    browser_token = mint_session_token(user, cfg.cookie_secret, 60, "accounts")
+    browser_token = mint_session_token(
+        user, cfg.cookie_secret, 60, "accounts", browser_session=True
+    )
     runner_token = auth.mint_runner_token(owner, 60)
     headers = {"origin": "http://server", "cookie": f"{cfg.session_cookie_name}={browser_token}"}
     if credential in ("bearer", "runner_bearer"):
