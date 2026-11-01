@@ -11,8 +11,11 @@ from omnigent.inner.datamodel import TerminalEnvSpec
 from omnigent.terminals.elevation import ELEVATED_TERMINALS_ENV, elevated_terminal_spec
 
 
+@pytest.mark.parametrize("purpose", [None, "host_terminals"])
 @pytest.mark.parametrize("method", [None, "sudo"])
-def test_host_elevation_opt_in_capability_and_runner_environment(tmp_path, monkeypatch, method):
+def test_host_elevation_opt_in_capability_and_runner_environment(
+    tmp_path, monkeypatch, method, purpose
+):
     config = tmp_path / "config.yaml"
     config.write_text("host: {}\n" if method is None else "host:\n  elevated_terminals: sudo\n")
     host = HostProcess(
@@ -32,6 +35,7 @@ def test_host_elevation_opt_in_capability_and_runner_environment(tmp_path, monke
         workspace="/opt/work/project",
         parent_pid=1,
         elevated_terminals=method,
+        purpose=purpose,
     )
     assert env.get(ELEVATED_TERMINALS_ENV) == method
     if method is not None:

@@ -370,7 +370,10 @@ async def test_admin_idle_closes_and_revokes_despite_output_and_resize(admin, mo
     instance.note_client_interaction()
     instance._remember_pane_snapshot("new output does not renew admin input idle")
     registry._watch_elevated("session", "bash", "admin", instance)
-    await poll_until_async(lambda: registry.get("session", "bash", "admin") is None, timeout_s=3)
+    await poll_until_async(
+        lambda: registry.get("session", "bash", "admin") is None and not instance.running,
+        timeout_s=3,
+    )
     assert not instance.agent_access and not instance.running
 
 

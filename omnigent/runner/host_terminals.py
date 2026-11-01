@@ -85,10 +85,10 @@ def create_host_terminal_app(
     app.state.host_terminal_idle_since = lambda: idle_since
     app.state.terminal_registry = registry
 
-    def resource(key: str) -> HostTerminalResource:
+    def resource(key: str, instance: TerminalInstance) -> HostTerminalResource:
         return HostTerminalResource(
             terminal_id=key,
-            elevated=False,
+            elevated=instance.elevated,
             created_at=created[key],
             attach_path=f"/v1/host-terminals/{key}/attach",
         )
@@ -97,24 +97,29 @@ def create_host_terminal_app(
     async def list_terminals() -> HostTerminalList:
         return HostTerminalList(
             terminals=[
-                resource(entry.session_key) for entry in entries() if entry.session_key in created
+                resource(entry.session_key, entry.instance)
+                for entry in entries()
+                if entry.session_key in created
             ]
         )
 
     @app.post("/v1/host-terminals", status_code=201)
     async def create_terminal(body: RunnerHostTerminalCreate) -> HostTerminalResource:
         nonlocal mutations, idle_since
-        if body.elevated:
-            raise HTTPException(409, "admin terminals are not enabled")
         mutations += 1
         try:
-            await registry.launch(_REGISTRY_KEY, "shell", body.session_key, spec)
+            try:
+                instance = await registry.launch(
+                    _REGISTRY_KEY, "shell", body.session_key, spec, elevated=body.elevated
+                )
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from exc
             created.setdefault(body.session_key, int(time.time()))
         finally:
             mutations -= 1
             if not entries() and not mutations:
                 idle_since = time.monotonic()
-        return resource(body.session_key)
+        return resource(body.session_key, instance)
 
     @app.delete("/v1/host-terminals/{terminal_id}", status_code=204)
     async def delete_terminal(terminal_id: str) -> Response:
@@ -136,6 +141,7 @@ def create_host_terminal_app(
             socket_path=str(instance.socket_path),
             tmux_target=instance.tmux_target,
             read_only=False,
+            on_input=instance.note_input,
         )
 
     return app

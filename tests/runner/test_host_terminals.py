@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -172,3 +173,67 @@ async def test_terminal_entry_uses_binding_only_and_no_direct_listener(
     assert received["auth_token"] is None and received["auth_token_factory"] is None
     assert received["direct_attach_port"] is None and received["direct_attach_token"] is None
     assert received["idle_timeout_s"] == 60
+
+
+@pytest.mark.parametrize("end", ["interrupt", "idle"])
+def test_host_admin_terminal_uses_shared_launcher_and_lifecycle(monkeypatch, tmp_path, end):
+    from omnigent.terminals import TerminalRegistry
+    from omnigent.terminals.elevation import ELEVATED_TERMINALS_ENV, elevated_terminal_spec
+
+    monkeypatch.setenv(ELEVATED_TERMINALS_ENV, "sudo")
+    selected = []
+
+    def launcher(spec, *, method):
+        elevated = elevated_terminal_spec(spec, method=method)
+        selected.append((elevated.command, elevated.args))
+        return replace(
+            elevated,
+            command="/bin/sh",
+            args=["-c", "trap 'exit 130' INT; printf 'Password:'; read -r reply; exit 1"],
+        )
+
+    monkeypatch.setattr("omnigent.terminals.registry.elevated_terminal_spec", launcher)
+    registry = TerminalRegistry()
+    app = create_host_terminal_app(home=tmp_path, shells=["sh"], terminal_registry=registry)
+    with TestClient(app) as client:
+        key = uuid.uuid4().hex
+        response = client.post("/v1/host-terminals", json={"session_key": key, "elevated": True})
+        assert response.status_code == 201, response.text
+        body = response.json()
+        assert selected == [("sudo", ["-i"])]
+        assert body["elevated"] is True
+        assert client.get("/v1/host-terminals").json() == {"terminals": [body]}
+        instance = registry.get("host-terminals", "shell", key)
+        assert instance is not None and instance.elevated and not instance.agent_access
+        input_times = []
+        note_input = instance.note_input
+
+        def remember_input():
+            note_input()
+            input_times.append(instance.last_input_at)
+
+        monkeypatch.setattr(instance, "note_input", remember_input)
+        with client.websocket_connect(body["attach_path"]) as websocket:
+            output = b""
+            before = instance.last_input_at
+            while b"Password:" not in output:
+                output += websocket.receive_bytes()
+            assert instance.last_input_at == before
+            websocket.send_text('{"type":"resize","cols":100,"rows":40}')
+            websocket.send_bytes(b"renew")
+            poll_until(lambda: instance.last_input_at > before, timeout_s=3)
+            renewed = instance.last_input_at
+            websocket.send_text('{"type":"resize","cols":90,"rows":30}')
+            websocket.send_bytes(b"input")
+            poll_until(lambda: instance.last_input_at > renewed, timeout_s=3)
+            assert len(input_times) == 2  # Attach and resize must not renew input idle.
+            if end == "interrupt":
+                websocket.send_bytes(b"\x03")
+            else:
+                instance.last_input_at -= 901
+        poll_until(
+            lambda: registry.get("host-terminals", "shell", key) is None and not instance.running,
+            timeout_s=5,
+        )
+        assert not instance.running and not instance.agent_access
+        assert client.get("/v1/host-terminals").json() == {"terminals": []}
