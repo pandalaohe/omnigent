@@ -5199,6 +5199,7 @@ def register_events_routes(
     # The same intake owns persistence and steering for ordinary child messages.
     if app_state is not None:
         app_state.standing_pass_post_event = post_standing_pass_notice
+        app_state.host_restart_post_event = _post_event_impl
 
     # ── GET /sessions/{session_id}/stream ────────────────────────
 

@@ -101,6 +101,7 @@ CAP_FS_READ_RAW = "fs_read_raw"
 # ``host.resource_sampling`` leases; the server gates fast-mode on this.
 CAP_RESOURCE_SNAPSHOT = "resource_snapshot"
 CAP_LOAD_LEVEL_V1 = "load_level_v1"
+CAP_HOST_RESTART = "host_restart"
 
 # The runner answers keep-warm controls (``keep_warm_ping`` / ``keep_warm_touch``)
 # and posts ``external_keep_warm_receipt`` events; the server pings only runners
@@ -183,6 +184,8 @@ class HostFrameKind(str, Enum):
     """All host frame kinds; the value is the JSON wire string."""
 
     HELLO = "host.hello"
+    HOST_RESTART = "host_restart"
+    HOST_RESTART_RESULT = "host_restart_result"
     CONNECTION_ERROR = "host.connection_error"
     HARNESS_READINESS = "host.harness_readiness"
     CODEX_RATE_LIMITS = "host.codex_rate_limits"
@@ -329,6 +332,32 @@ class HostHelloFrame:
     project_code: bool = False
     capabilities: list[str] = field(default_factory=list)
     connection_id: str | None = None
+    supervised: str | None = None
+    started_at: int | None = None
+
+
+@dataclass
+class HostRestartFrame:
+    """Server request to preview or perform an orderly host restart."""
+
+    request_id: str
+    dry_run: bool = True
+    requested_by_session_id: str | None = None
+    drain_timeout_s: int = 120
+    force: bool = False
+
+
+@dataclass
+class HostRestartResultFrame:
+    """Admission result, or the host's transition from draining to stopping."""
+
+    request_id: str
+    accepted: bool
+    reason: str | None = None
+    supervisor: str | None = None
+    running_sessions: list[str] = field(default_factory=list)
+    runner_count: int = 0
+    phase: str = "draining"
 
 
 @dataclass
@@ -1907,6 +1936,8 @@ class HostPostBindHookResultFrame:
 
 HostFrame = (
     HostHelloFrame
+    | HostRestartFrame
+    | HostRestartResultFrame
     | HostConnectionErrorFrame
     | HostHarnessReadinessFrame
     | HostCodexRateLimitsFrame
@@ -2042,6 +2073,17 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "project_code": frame.project_code,
                 "capabilities": list(frame.capabilities),
                 "connection_id": frame.connection_id,
+                "supervised": frame.supervised,
+                "started_at": frame.started_at,
+            }
+        )
+    if isinstance(frame, (HostRestartFrame, HostRestartResultFrame)):
+        return _encode_payload(
+            {
+                "kind": "host_restart"
+                if isinstance(frame, HostRestartFrame)
+                else "host_restart_result",
+                **asdict(frame),
             }
         )
     if isinstance(frame, HostConnectionErrorFrame):
@@ -3224,6 +3266,27 @@ def _decode_known_host_frame(
     match kind:
         case HostFrameKind.HELLO:
             return _decode_host_hello(msg)
+        case HostFrameKind.HOST_RESTART:
+            timeout = _required_int(msg, "drain_timeout_s")
+            if not 0 <= timeout <= 600:
+                raise ValueError("drain_timeout_s must be between 0 and 600")
+            return HostRestartFrame(
+                request_id=_required_str(msg, "request_id"),
+                dry_run=_required_bool(msg, "dry_run"),
+                requested_by_session_id=_optional_nullable_str(msg, "requested_by_session_id"),
+                drain_timeout_s=timeout,
+                force=_required_bool(msg, "force"),
+            )
+        case HostFrameKind.HOST_RESTART_RESULT:
+            return HostRestartResultFrame(
+                request_id=_required_str(msg, "request_id"),
+                accepted=_required_bool(msg, "accepted"),
+                reason=_optional_nullable_str(msg, "reason"),
+                supervisor=_optional_nullable_str(msg, "supervisor"),
+                running_sessions=_optional_str_list(msg, "running_sessions"),
+                runner_count=_required_int(msg, "runner_count"),
+                phase=_required_str(msg, "phase"),
+            )
         case HostFrameKind.CONNECTION_ERROR:
             return HostConnectionErrorFrame(
                 stage=_required_str(msg, "stage"),
@@ -3535,6 +3598,8 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         project_code=_required_bool(msg, "project_code") if "project_code" in msg else False,
         capabilities=_optional_str_list(msg, "capabilities"),
         connection_id=_optional_nullable_str(msg, "connection_id"),
+        supervised=_optional_nullable_str(msg, "supervised"),
+        started_at=_required_int(msg, "started_at") if msg.get("started_at") is not None else None,
     )
 
 

@@ -1032,6 +1032,17 @@ async def _receive_loop(
                 )
             continue
 
+        from omnigent.host.frames import HostRestartResultFrame
+
+        if isinstance(frame, HostRestartResultFrame):
+            if frame.phase == "stopping":
+                host_registry.restarts.stopping(conn, frame)
+            else:
+                future = conn.pending_restarts.pop(frame.request_id, None)
+                if future is not None and not future.done():
+                    future.set_result(frame)
+            continue
+
         if isinstance(frame, HostStopRunnerResultFrame):
             future = conn.pending_stops.pop(frame.request_id, None)
             if future is not None and not future.done():

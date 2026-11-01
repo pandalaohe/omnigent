@@ -7516,6 +7516,130 @@ def _host(
     return HostProcess(identity, server_url)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dry_run,force", [(True, False), (False, False), (False, True)])
+async def test_host_restart_previews_then_drains_without_signals(monkeypatch, dry_run, force):
+    from omnigent.host.frames import HostRestartFrame, HostRestartResultFrame
+
+    host = _host()
+    monkeypatch.setattr("omnigent.host.restart.supervisor_kind", lambda: "launchd")
+    monkeypatch.setattr("omnigent.host.restart.REQUESTER_GRACE_S", 0)
+    inventory = AsyncMock(side_effect=[["requester", "busy"], ["requester"]])
+    monkeypatch.setattr(host, "_restart_running_sessions", inventory)
+    frames = []
+
+    async def send(_ws, raw):
+        frames.append(decode_host_frame(raw))
+
+    monkeypatch.setattr(host, "_send_text", send)
+    abort = Mock()
+    monkeypatch.setattr(host, "_abort_live_tunnel", abort)
+    await host._dispatch_host_frame(
+        object(), HostRestartFrame("restart", dry_run, "requester", 120, force)
+    )
+    assert frames[0] == HostRestartResultFrame(
+        "restart",
+        True,
+        supervisor="launchd",
+        running_sessions=["requester", "busy"],
+        runner_count=0,
+    )
+    assert host.restart_requested is (not dry_run)
+    assert abort.call_count == (0 if dry_run else 1)
+    if not dry_run:
+        assert frames[-1].phase == "stopping"
+    assert inventory.await_count == (2 if not dry_run and not force else 1)
+
+
+@pytest.mark.asyncio
+async def test_restart_ack_failure_releases_admission(monkeypatch):
+    from omnigent.host.frames import HostRestartFrame
+
+    host = _host()
+    monkeypatch.setattr("omnigent.host.restart.supervisor_kind", lambda: "launchd")
+    monkeypatch.setattr(host, "_restart_running_sessions", AsyncMock(return_value=[]))
+    send = AsyncMock(side_effect=ConnectionError("fake tunnel dropped"))
+    monkeypatch.setattr(host, "_send_text", send)
+    with pytest.raises(ConnectionError):
+        await host._dispatch_host_frame(object(), HostRestartFrame("failed", False, force=True))
+    send.side_effect = None
+    abort = Mock()
+    monkeypatch.setattr(host, "_abort_live_tunnel", abort)
+    await host._dispatch_host_frame(object(), HostRestartFrame("retry", False, force=True))
+    assert host.restart_requested
+    abort.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_restart_inventory_includes_hostless_shared_runner(monkeypatch):
+    import httpx
+
+    host = _host()
+    host._runners["local-runner"] = Mock()
+    pages = [
+        {
+            "data": [
+                {
+                    "id": "source",
+                    "host_id": host._identity.host_id,
+                    "runner_id": "local-runner",
+                    "status": "idle",
+                }
+            ],
+            "has_more": True,
+            "last_id": "source",
+        },
+        {
+            "data": [
+                {
+                    "id": "side-chat",
+                    "host_id": None,
+                    "runner_id": "local-runner",
+                    "status": "running",
+                },
+                {
+                    "id": "other",
+                    "host_id": "other-host",
+                    "runner_id": "other-runner",
+                    "status": "running",
+                },
+            ],
+            "has_more": False,
+        },
+    ]
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200, json=pages.pop(0))
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr("omnigent.host.connect.httpx.AsyncClient", lambda: client)
+    monkeypatch.setattr(host, "_build_connect_headers", dict)
+    assert await host._restart_running_sessions() == ["side-chat"]
+    assert "host_id" not in seen[0].url.params
+    assert seen[1].url.params["after"] == "source"
+    host._runners.clear()
+
+
+def test_host_restart_exits_75_after_run_teardown(monkeypatch, tmp_path):
+    from omnigent.host import HOST_RESTART_EXIT_CODE
+
+    calls = []
+
+    async def serve(host):
+        host.restart_requested = True
+
+    monkeypatch.setattr(HostProcess, "_connect_and_serve", serve)
+    monkeypatch.setattr(HostProcess, "_cleanup_runners", lambda _host: calls.append("cleaned"))
+    with pytest.raises(SystemExit) as error:
+        run_host_process(
+            server_url="https://app.example.databricks.com", config_path=tmp_path / "config.yaml"
+        )
+    assert calls == ["cleaned"]
+    assert error.value.code == HOST_RESTART_EXIT_CODE == 75
+
+
 def test_build_connect_headers_adds_org_header(monkeypatch: pytest.MonkeyPatch) -> None:
     """A recorded ?o= selector rides the tunnel handshake.
 

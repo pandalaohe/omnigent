@@ -1562,6 +1562,9 @@ class HostProcess:
         self._lifecycle_lock = lifecycle_lock
         self._lifecycle_task: asyncio.Task[None] | None = None
         self._lifecycle_lost = asyncio.Event()
+        self.restart_requested = False
+        self._restart_pending = False
+        self._started_at = int(time.time())
 
     def _live_runner_log_paths(self) -> set[Path]:
         """Return the log path of every runner this host process owns.
@@ -5290,7 +5293,7 @@ class HostProcess:
             self._ensure_model_options_prewarm()
             self._start_capability_discovery()
             while True:
-                if self._lifecycle_lost.is_set():
+                if self._lifecycle_lost.is_set() or self.restart_requested:
                     break
                 try:
                     await self._connect_and_serve()
@@ -5303,7 +5306,7 @@ class HostProcess:
                     # ``run_host_process`` can fail loud.
                     raise
                 except Exception as exc:
-                    if self._lifecycle_lost.is_set():
+                    if self._lifecycle_lost.is_set() or self.restart_requested:
                         # The lifecycle monitor aborted the tunnel to retire this
                         # stale daemon; the resulting disconnect is expected, so
                         # exit cleanly rather than logging a spurious reconnect.
@@ -5913,6 +5916,9 @@ class HostProcess:
                 _tel_install_id = _get_install_id()
         except Exception:  # noqa: BLE001
             pass
+        from omnigent.host.restart import supervisor_kind
+
+        supervisor = await asyncio.to_thread(supervisor_kind)
         hello = HostHelloFrame(
             version=VERSION,
             frame_protocol_version=1,
@@ -5929,7 +5935,9 @@ class HostProcess:
             filesystem_roots=True,
             post_bind_hook=True,
             project_code=True,
-            capabilities=list(HOST_CAPABILITIES),
+            capabilities=list(HOST_CAPABILITIES) + (["host_restart"] if supervisor else []),
+            supervised=supervisor,
+            started_at=self._started_at,
             connection_id=connection_id,
         )
         try:
@@ -6429,6 +6437,103 @@ class HostProcess:
         with telemetry.consume_frame_span(kind, carrier):
             await self._dispatch_host_frame(ws, frame)
 
+    async def _restart_running_sessions(self) -> list[str]:
+        """Read all host sessions, including children, without changing them."""
+        rows: list[dict[str, Any]] = []
+        async with httpx.AsyncClient() as client:
+            after: str | None = None
+            while True:
+                params: dict[str, str] = {
+                    "kind": "any",
+                    "limit": "200",
+                    "visibility": "all",
+                    "include_archived": "true",
+                    "include_side_chats": "true",
+                }
+                if after is not None:
+                    params["after"] = after
+                response = await client.get(
+                    f"{self._server_url}/v1/sessions",
+                    params=params,
+                    headers=self._build_connect_headers(),
+                    timeout=5,
+                )
+                response.raise_for_status()
+                page = response.json()
+                rows.extend(page["data"])
+                if not page.get("has_more"):
+                    return [
+                        row["id"]
+                        for row in rows
+                        if row.get("status") == "running"
+                        and (
+                            row.get("host_id") == self._identity.host_id
+                            or row.get("runner_id") in self._runners
+                        )
+                    ]
+                cursor = page.get("last_id")
+                if not isinstance(cursor, str) or cursor == after:
+                    raise ValueError("invalid session pagination")
+                after = cursor
+
+    async def _handle_host_restart(self, ws: Any, frame: Any) -> None:
+        """Acknowledge, drain and retire through run()'s normal teardown."""
+        from omnigent.host.frames import HostRestartResultFrame
+        from omnigent.host.restart import REQUESTER_GRACE_S, supervisor_kind
+
+        supervisor = supervisor_kind()
+        reason = "host is not supervised" if supervisor is None else None
+        if self._restart_pending and not frame.dry_run:
+            reason = "restart pending"
+        try:
+            running = await self._restart_running_sessions()
+        except Exception:  # noqa: BLE001 -- refuse admission when the session inventory fails
+            if reason is None:
+                reason = "could not read running sessions"
+            running = []
+        result = HostRestartResultFrame(
+            request_id=frame.request_id,
+            accepted=reason is None,
+            reason=reason,
+            supervisor=supervisor,
+            running_sessions=running,
+            runner_count=len(self._runners),
+        )
+        if frame.dry_run or reason is not None:
+            await self._send_text(ws, encode_host_frame(result))
+            return
+        # Admission is atomic after the preview read, which can yield to another request.
+        if self._restart_pending:
+            result.accepted, result.reason = False, "restart pending"
+            await self._send_text(ws, encode_host_frame(result))
+            return
+        self._restart_pending = True
+        try:
+            await self._send_text(ws, encode_host_frame(result))
+        except BaseException:
+            self._restart_pending = False
+            raise
+        deadline = time.monotonic() + frame.drain_timeout_s
+        while not frame.force and time.monotonic() < deadline:
+            if not set(running) - {frame.requested_by_session_id}:
+                break
+            await asyncio.sleep(min(1, max(0, deadline - time.monotonic())))
+            try:
+                running = await asyncio.wait_for(
+                    self._restart_running_sessions(),
+                    timeout=max(0.01, deadline - time.monotonic()),
+                )
+            except Exception:  # noqa: BLE001 -- an unreadable inventory must keep draining
+                running = ["unknown"]
+        if frame.requested_by_session_id:
+            await asyncio.sleep(REQUESTER_GRACE_S)
+        result.phase = "stopping"
+        result.running_sessions = running
+        with contextlib.suppress(Exception):
+            await self._send_text(ws, encode_host_frame(result))
+        self.restart_requested = True
+        self._abort_live_tunnel()
+
     async def _dispatch_host_frame(
         self,
         ws: websockets.asyncio.client.ClientConnection,
@@ -6442,6 +6547,11 @@ class HostProcess:
             ignored.
         :returns: None.
         """
+        from omnigent.host.frames import HostRestartFrame
+
+        if isinstance(frame, HostRestartFrame):
+            await self._handle_host_restart(ws, frame)
+            return
         if isinstance(frame, HostConnectionErrorFrame):
             # Defensive for direct callers; production handles this inline in
             # _serve_frames so detached request tasks cannot swallow it.
@@ -6975,4 +7085,8 @@ def _serve_host_until_exit(
             stderr=True,
         )
         raise SystemExit(HOST_FATAL_EXIT_CODE) from exc
+    if host.restart_requested:
+        from omnigent.host import HOST_RESTART_EXIT_CODE
+
+        raise SystemExit(HOST_RESTART_EXIT_CODE)
     return host.lifecycle_lost

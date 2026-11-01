@@ -58,6 +58,8 @@ def _make_hello(
     filesystem_roots: bool = False,
     harness_accounts: dict[str, dict[str, object]] | None = None,
     capabilities: list[str] | None = None,
+    supervised: str | None = None,
+    started_at: int | None = None,
 ) -> str:
     """Encode a HostHelloFrame for tests.
 
@@ -81,6 +83,8 @@ def _make_hello(
             filesystem_roots=filesystem_roots,
             harness_accounts=harness_accounts,
             capabilities=capabilities or [],
+            supervised=supervised,
+            started_at=started_at,
         )
     )
 
@@ -160,6 +164,8 @@ async def _connect_host(
     filesystem_roots: bool = False,
     harness_accounts: dict[str, dict[str, object]] | None = None,
     capabilities: list[str] | None = None,
+    supervised: str | None = None,
+    started_at: int | None = None,
 ) -> ApplicationCommunicator:
     """Connect a mock host via WebSocket tunnel.
 
@@ -190,6 +196,8 @@ async def _connect_host(
                 filesystem_roots=filesystem_roots,
                 harness_accounts=harness_accounts,
                 capabilities=capabilities,
+                supervised=supervised,
+                started_at=started_at,
             ),
         },
     )
@@ -1125,6 +1133,131 @@ async def test_launch_runner_404_unknown_host(
             json={"session_id": conv.id, "workspace": "/tmp"},
         )
     assert resp.status_code == 404
+
+
+async def test_restart_round_trip_over_fake_tunnel(host_api_app):
+    from unittest.mock import AsyncMock
+
+    from omnigent.host.frames import CAP_HOST_RESTART, HostRestartFrame, HostRestartResultFrame
+
+    app, registry, _store, conversations = host_api_app
+    requester = conversations.create_conversation(
+        agent_id=None, host_id=_HOST_ID, workspace="/opt/work/project"
+    )
+    comm = await _connect_host(
+        app, registry, capabilities=[CAP_HOST_RESTART], supervised="launchd", started_at=1
+    )
+    options = {"requested_by_session_id": requester.id}
+    app.state.host_restart_post_event = post_event = AsyncMock(return_value={"forwarded": True})
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+
+        async def request(body):
+            task = asyncio.create_task(client.post(f"/v1/hosts/{_HOST_ID}/restart", json=body))
+            while True:
+                output = await comm.receive_output(timeout=budget(2))
+                try:
+                    frame = decode_host_frame(output["text"])
+                except ValueError:
+                    continue
+                if isinstance(frame, HostRestartFrame):
+                    break
+            await comm.send_input(
+                {
+                    "type": "websocket.receive",
+                    "text": encode_host_frame(
+                        HostRestartResultFrame(
+                            frame.request_id,
+                            True,
+                            supervisor="launchd",
+                            running_sessions=[requester.id],
+                            runner_count=1,
+                        )
+                    ),
+                }
+            )
+            return frame, await task
+
+        frame, preview = await request(options)
+        assert frame.dry_run is True
+        assert preview.status_code == 200
+        assert preview.json()["caller_on_host"] is True
+        assert registry.restarts.active == {}
+        missing = await client.post(f"/v1/hosts/{_HOST_ID}/restart", json={"dry_run": False})
+        assert missing.status_code == 409
+        frame, response = await request(
+            {**options, "dry_run": False, "preview_id": preview.json()["preview_id"]}
+        )
+        assert frame.dry_run is False
+        assert response.status_code == 200
+        request_id = response.json()["request_id"]
+        status_path = f"/v1/hosts/{_HOST_ID}/restart/{request_id}"
+        assert (await client.get(status_path)).json()["phase"] == "draining"
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_host_frame(
+                    HostRestartResultFrame(frame.request_id, True, phase="stopping")
+                ),
+            }
+        )
+        for _ in range(100):
+            if (await client.get(status_path)).json()["phase"] == "stopping":
+                break
+            await asyncio.sleep(0.01)
+        assert (await client.get(status_path)).json()["phase"] == "stopping"
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await comm.wait(timeout=budget(2))
+        assert (await client.get(status_path)).json()["phase"] == "waiting_reconnect"
+        new_comm = await _connect_host(
+            app, registry, capabilities=[CAP_HOST_RESTART], supervised="launchd", started_at=2
+        )
+        assert (await client.get(status_path)).json()["phase"] == "done"
+        for _ in range(100):
+            if post_event.await_count:
+                break
+            await asyncio.sleep(0.01)
+        assert post_event.await_args.kwargs["acting_user_id"] is None
+        assert post_event.await_args.args[1] == requester.id
+        assert "done" in post_event.await_args.args[2].data["content"][0]["text"]
+        await new_comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await new_comm.wait(timeout=budget(2))
+    await registry.restarts.shutdown()
+
+
+async def test_restart_owner_offline_supervisor_and_requester_guards(multi_user_app):
+    from unittest.mock import AsyncMock
+
+    from omnigent.host.frames import CAP_HOST_RESTART
+
+    app, registry, hosts, conversations = multi_user_app
+
+    @app.exception_handler(OmnigentError)
+    async def restart_error_response(_request, error):
+        return JSONResponse(
+            status_code=error.http_status,
+            content={"error": {"code": error.code, "message": error.message}},
+        )
+
+    hosts.upsert_on_connect(_HOST_ID, "test", "owner@test.com")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        path = f"/v1/hosts/{_HOST_ID}/restart"
+        response = await client.post(path, json={}, headers={"x-test-user": "other@test.com"})
+        assert response.status_code == 403
+        headers = {"x-test-user": "owner@test.com"}
+        assert (await client.post(path, json={}, headers=headers)).status_code == 409
+        conn = registry.register(
+            _HOST_ID, AsyncMock(), HostHelloFrame("test", 1, "test"), "owner@test.com"
+        )
+        assert (await client.post(path, json={}, headers=headers)).status_code == 409
+        conn.hello.capabilities = [CAP_HOST_RESTART]
+        conn.hello.supervised = "launchd"
+        foreign = conversations.create_conversation(agent_id=None)
+        assert (
+            await client.post(path, json={"requested_by_session_id": foreign.id}, headers=headers)
+        ).status_code == 403
+        assert (
+            await client.post(path, json={"dry_run": False}, headers=headers)
+        ).status_code == 409
 
 
 # ── Multi-user ownership tests ────────────────────────
