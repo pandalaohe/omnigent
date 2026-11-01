@@ -2561,12 +2561,12 @@ def create_runner_app(
     _session_background_task_counts: dict[str, int] = {}
 
     async def _restore_pending_session_attachments(session_id: str) -> None:
-        """Re-materialize by-path files a cleanup removed while history survived.
+        """Re-materialize by-path files after a CLI release or resource cleanup.
 
-        CLI release and resource cleanup delete the session attachment dir but
-        keep ``_session_histories``; the cached ``[Attached: ...]`` lines then
-        point at deleted files, so the next turn restores them before the
-        harness reads the history. A purged row has no bytes to restore, so
+        CLI release and resource cleanup keep ``_session_histories``; the next
+        turn ensures any missing by-path files referenced by cached
+        ``[Attached: ...]`` lines are present before the harness reads the
+        history. A purged row has no bytes to restore, so
         its cached lines are replaced in place with the could-not-load marker.
         Calls are idempotent and non-fatal.
         """

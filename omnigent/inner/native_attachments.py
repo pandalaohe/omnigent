@@ -862,8 +862,8 @@ async def restore_session_attachments(
     """
     Re-materialize every by-path file a session owns on this host.
 
-    The deterministic host copies can be removed by cleanup on another host
-    (or on this one after a CLI release); a transcript that still references
+    The deterministic host copies may be absent (written on another host, or
+    retired after the orphan retention); a transcript that still references
     them needs the files back before the harness resumes. The session file
     listing supplies the by-path rows; a file whose size still matches is
     reused without fetching. Rows the archive cleanup purged (``done``) are

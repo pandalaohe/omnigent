@@ -113,16 +113,38 @@ def test_prune_expired_attachment_caches_removes_only_expired_attachment_dirs(
     assert target_file.exists()
 
 
-def test_prune_expired_attachment_caches_skips_a_dir_being_written(tmp_path: Path) -> None:
-    """An expired dir whose writer holds the attachment lock is kept."""
-    attachments = tmp_path / "attachments"
-    busy = attachments / ("a" * 32)
-    _write_file(busy, expired=True)
+def test_prune_expired_attachment_caches_skips_a_dir_being_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An expired dir is kept while materialize_attachment holds its lock."""
+    from omnigent.inner import native_attachments
 
-    with native_bridge_common.attachment_dir_lock(busy):
-        assert native_bridge_common.prune_expired_attachment_caches(attachments) == 0
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    bridge_dir = tmp_path / "bridge"
+    busy = attachment_cache_dir(bridge_dir)
+    expired_file = _write_file(busy, expired=True)
+    real_into_cache = native_attachments._materialize_into_cache
+    swept_mid_write: list[int] = []
 
-    assert busy.exists()
+    def _sweep_then_place(attachments_dir: Path, filename: str, raw_bytes: bytes) -> Path | None:
+        swept_mid_write.append(
+            native_bridge_common.prune_expired_attachment_caches(attachments_dir.parent)
+        )
+        return real_into_cache(attachments_dir, filename, raw_bytes)
+
+    monkeypatch.setattr(native_attachments, "_materialize_into_cache", _sweep_then_place)
+    placed = materialize_attachment(
+        {
+            "type": "input_file",
+            "filename": "fresh.zip",
+            "file_data": "data:application/zip;base64,UEsDBA==",
+        },
+        bridge_dir,
+    )
+
+    assert swept_mid_write == [0]
+    assert placed is not None and placed.exists()
+    assert expired_file.exists()
 
 
 def test_prune_expired_attachment_caches_missing_dir_returns_zero(tmp_path: Path) -> None:
