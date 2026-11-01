@@ -5391,9 +5391,14 @@ def create_app(
                 and parent_id not in by_id
                 and parent_id not in ancestor_host_ids
             ):
-                ancestor_host_ids[parent_id] = await asyncio.to_thread(
-                    effective_host_id, conversation_store, conv
-                )
+                try:
+                    ancestor_host_ids[parent_id] = await asyncio.to_thread(
+                        effective_host_id, conversation_store, conv
+                    )
+                except Exception:
+                    _logger.exception(
+                        "Failed to resolve inherited host for session %s on reconnect", conv.id
+                    )
 
         def _tree_host_id(conv_id: str | None) -> str | None:
             seen: set[str] = set()

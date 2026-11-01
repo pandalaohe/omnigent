@@ -3158,16 +3158,20 @@ async def test_on_runner_connect_logs_deferred_init_event_for_idle_and_archived(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failed_read", ["list_child_conversation_ids_page", "get_conversations"])
+@pytest.mark.parametrize(
+    "failed_read", ["list_child_conversation_ids_page", "get_conversations", "effective_host_id"]
+)
 async def test_on_runner_connect_attaches_sessions_when_child_scan_fails(
     db_uri: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     failed_read: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     from omnigent.entities import Conversation
     from omnigent.runner.routing import RoutedRunner
     from omnigent.server.routes import sessions as sessions_routes
+    from omnigent.server.routes._sessions import helpers as session_helpers
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
     app, captured = _build_minimal_app(db_uri, tmp_path, monkeypatch)
@@ -3176,6 +3180,24 @@ async def test_on_runner_connect_attaches_sessions_when_child_scan_fails(
     store = SqlAlchemyConversationStore(db_uri)
     store.set_session_live_status(root_id, "idle")
     store.set_session_live_status(other_id, "idle")
+    expected_attached = {root_id, other_id}
+    if failed_read == "effective_host_id":
+        ancestor = store.create_conversation(
+            agent_id=store.get_conversation(root_id).agent_id,  # type: ignore[union-attr]
+            runner_id="other_runner",
+            host_id="55555555555555555555555555555555",
+            workspace="/opt/work/omnigent/fork/ancestor",
+        )
+        inherited = store.create_conversation(
+            agent_id=ancestor.agent_id,
+            runner_id=runner_id,
+            kind="sub_agent",
+            parent_conversation_id=ancestor.id,
+        )
+        store.set_session_live_status(inherited.id, "idle")
+        expected_attached.add(inherited.id)
+        store.set_session_live_status(root_id, "running")
+        store.set_session_live_status(other_id, "running")
     orphan = store.create_conversation(
         agent_id=store.get_conversation(root_id).agent_id,  # type: ignore[union-attr]
         runner_id="offline_runner",
@@ -3198,7 +3220,10 @@ async def test_on_runner_connect_attaches_sessions_when_child_scan_fails(
         return httpx.Response(201, request=httpx.Request("POST", "http://runner/v1/sessions"))
 
     monkeypatch.setattr(app.state.runner_session_initializer, "initialize", _initialize)
-    original = getattr(SqlAlchemyConversationStore, failed_read)
+    read_target = (
+        session_helpers if failed_read == "effective_host_id" else SqlAlchemyConversationStore
+    )
+    original = getattr(read_target, failed_read)
     failed = False
 
     def _fail_once(self: SqlAlchemyConversationStore, *args: object, **kwargs: object) -> object:
@@ -3211,12 +3236,19 @@ async def test_on_runner_connect_attaches_sessions_when_child_scan_fails(
             raise RuntimeError("child scan unavailable")
         return original(self, *args, **kwargs)
 
-    monkeypatch.setattr(SqlAlchemyConversationStore, failed_read, _fail_once)
+    monkeypatch.setattr(read_target, failed_read, _fail_once)
     await captured["callback"](runner_id, connection)  # type: ignore[operator]
 
     assert failed
-    assert set(attached) == {root_id, other_id}
+    assert set(attached) == expected_attached
     assert set(initialized) == {root_id, other_id}
+    if failed_read == "effective_host_id":
+        assert any(
+            record.name == "omnigent.server.app"
+            and record.exc_info is not None
+            and str(record.exc_info[1]) == "child scan unavailable"
+            for record in caplog.records
+        )
 
 
 @pytest.mark.asyncio
