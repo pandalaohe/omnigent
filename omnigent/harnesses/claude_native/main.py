@@ -5398,6 +5398,7 @@ async def _prepare_claude_terminal(
             reused_local=False,
             synthesized=False,
         )
+        labels: dict[str, str] = {}
         bridge_id: str | None = None
         if session_id is not None:
             record_startup_event("session_resolved", session_id=session_id)
@@ -5511,6 +5512,12 @@ async def _prepare_claude_terminal(
             bridge_dir=bridge_dir,
             resolution=cold_resume_resolution,
             session_id=session_id,
+        )
+        await record_cold_resume_transcript_outcome(
+            client,
+            session_id=session_id,
+            resolution=cold_resume_resolution,
+            labels=labels,
         )
         _mark_startup_step(
             startup_profiler,

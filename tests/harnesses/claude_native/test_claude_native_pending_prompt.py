@@ -369,4 +369,3 @@ def test_live_owner_approval_wait_marker_survives_past_orphan_grace(
 
     assert bridge.approval_wait_is_fresh("session-question", bridge_dir=native_bridge)
     assert marker.exists()
-

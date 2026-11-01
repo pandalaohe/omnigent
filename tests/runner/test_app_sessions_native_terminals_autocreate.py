@@ -3671,7 +3671,7 @@ async def test_auto_create_claude_terminal_records_cold_resume_transcript_outcom
         f"claude-native: cold resume of {session_id} used the {expected_mode} transcript; "
         f"resume={expected_count}"
     ) in caplog.text
-    assert (
+    expected_patch = (
         f"/v1/sessions/{session_id}",
         {
             "json": {
@@ -3683,7 +3683,63 @@ async def test_auto_create_claude_terminal_records_cold_resume_transcript_outcom
             "params": {"include_usage": "false"},
             "timeout": 10.0,
         },
-    ) in client.patches
+    )
+    assert expected_patch in client.patches
+
+    from omnigent.harnesses.claude_native import main as claude_native_main
+
+    cli_client = _ResumeSnapshotServerClient(f"/v1/sessions/{session_id}", {})
+
+    @contextlib.asynccontextmanager
+    async def _fake_open_client(*_args: Any, **_kwargs: Any):
+        yield cli_client
+
+    async def _fake_find_running(_c: object, _sid: str) -> str | None:
+        return None
+
+    async def _fake_resolve_args(
+        _c: object, _sid: str
+    ) -> tuple[tuple[str, ...], ClaudeResumeTranscriptResolution]:
+        return (
+            ("--resume", session_external_id),
+            ClaudeResumeTranscriptResolution(
+                tmp_path / f"{session_external_id}.jsonl",
+                reused_local=reused_local,
+                synthesized=synthesized,
+            ),
+        )
+
+    async def _fake_fetch_labels(_c: object, _sid: str) -> dict[str, str]:
+        return dict(prior_labels)
+
+    async def _fake_launch_terminal(*_args: object, **_kwargs: object) -> str:
+        return "terminal_claude_main"
+
+    async def _fake_read_tmux(_c: object, _sid: str) -> SimpleNamespace:
+        return SimpleNamespace(socket=None, target=None)
+
+    monkeypatch.setattr("omnigent.cli_auth.open_server_client", _fake_open_client)
+    monkeypatch.setattr(claude_native_main, "_find_running_claude_terminal", _fake_find_running)
+    monkeypatch.setattr(claude_native_main, "_resolve_cold_resume_args", _fake_resolve_args)
+    monkeypatch.setattr(claude_native_main, "_fetch_claude_session_labels", _fake_fetch_labels)
+    monkeypatch.setattr(claude_native_main, "_launch_claude_terminal", _fake_launch_terminal)
+    monkeypatch.setattr(claude_native_main, "_read_claude_terminal_tmux", _fake_read_tmux)
+    monkeypatch.setattr(
+        claude_native_main,
+        "_prepare_cold_resume_forward_state",
+        lambda **_kw: False,
+    )
+
+    await claude_native_main._prepare_claude_terminal(
+        base_url="http://127.0.0.1:8000",
+        headers={},
+        session_id=session_id,
+        runner_id=None,
+        session_bundle=None,
+        claude_args=(),
+        command="claude",
+    )
+    assert cli_client.patches == [expected_patch]
 
 
 @pytest.mark.asyncio
