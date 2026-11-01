@@ -8258,22 +8258,37 @@ def _session_info_runner_state(
     runner_online: bool | None,
     host_id: str | None,
     host: _JsonObject | None,
+    *,
+    harness: str | None = None,
+    host_resumable: bool = False,
+    closed: bool = False,
 ) -> tuple[str | None, str | None]:
     """
     Say whether a session can take its next turn, and why when it cannot.
 
     A host restart stops every runner on it; a child borrowing its parent's
     runner keeps the stopped binding until a message reaches it, and that
-    message starts or reattaches a runner on the still-online host.
+    message starts or reattaches a runner on the still-online host. A closed
+    session accepts no message at all, and a host that cannot launch the
+    session's harness starts no runner, so neither reads ``relaunchable``.
 
     :param runner_online: Bound runner connectivity; ``False`` for a stopped
         runner or a host session with no runner bound, ``None`` when unknown.
-    :param host_id: The session's bound host, or ``None``.
+    :param host_id: The session's effective host — its own, else its nearest
+        host-bound ancestor's — or ``None``.
     :param host: That host's detail, or ``None`` when not read.
+    :param harness: The session's effective harness, when reported.
+    :param host_resumable: Whether the bound host is a dormant managed host
+        the server wakes in place on the next message.
+    :param closed: Whether the session is closed to new input.
     :returns: ``(state, reason)`` — ``online``, ``relaunchable`` or
         ``offline`` with a reason for the last two; ``(None, None)`` when
         the runner or host state is unknown or there is no host.
     """
+    if closed:
+        return "offline", (
+            "Session is closed; a new message is rejected, so no runner is started."
+        )
     if runner_online is True:
         return "online", None
     if runner_online is None or host_id is None or host is None:
@@ -8281,11 +8296,26 @@ def _session_info_runner_state(
     name = _optional_string(host.get("name")) or host_id
     status = host.get("status")
     if status == "online":
+        from omnigent.harness_availability import harness_launch_availability
+
+        available, unavailable_reason = harness_launch_availability(
+            harness, _configured_harnesses(host)
+        )
+        if available is False:
+            return "offline", (
+                f"Host {name} is online but cannot launch harness {harness} "
+                f"({unavailable_reason}); install or configure it on that host."
+            )
         return "relaunchable", (
             f"Runner stopped (host restart or stop); host {name} is online, so the "
             "next message starts or reattaches it. No archive needed."
         )
     if status == "offline":
+        if host_resumable:
+            return "relaunchable", (
+                f"Host {name} is asleep and resumable; the next message wakes it and "
+                "starts its runner. No archive needed."
+            )
         return "offline", (
             f"Host {name} is offline; the session cannot take a turn until that host reconnects."
         )
@@ -8337,8 +8367,11 @@ async def _session_get_info_via_rest(
     single-session form, ``False`` for the ``session_ids`` form, so a
     supervisor reading many children does not fan out one host-readiness
     GET per item). An item whose runner stopped also reads its host's status
-    to report ``runner_state`` (``relaunchable`` when the host is online and
-    the next message brings the runner back, ``offline`` when it is not). The
+    (the session's effective host: a hostless child borrows its nearest
+    host-bound ancestor's) to report ``runner_state``: ``relaunchable`` when
+    the host is online and can launch the session's harness, or when it is a
+    dormant resumable managed host; ``offline`` when the host is offline and
+    not resumable, cannot launch the harness, or the session is closed. The
     full transcript is intentionally omitted — that is what
     ``sys_session_get_history`` returns.
 
@@ -8528,11 +8561,16 @@ async def _session_info_item(
     snap_agent_name = _optional_string(snap.get("agent_name"))
     snap_runner_id = _optional_string(snap.get("runner_id"))
     snap_host_id = _optional_string(snap.get("host_id"))
+    # A sub-agent row usually carries no host of its own: it runs on the host
+    # its nearest host-bound ancestor is pinned to, which the snapshot reports
+    # as ``effective_host_id``. The raw null must not hide the host that
+    # decides whether the session can take its next turn.
+    resolved_host_id = snap_host_id or _optional_string(snap.get("effective_host_id"))
     host: _JsonObject | None = None
     if include_host_readiness:
         runner_online, host = await asyncio.gather(
             _runner_online_or_none(snap_runner_id, server_client),
-            _host_detail_or_none(snap_host_id, server_client),
+            _host_detail_or_none(resolved_host_id, server_client),
         )
     else:
         runner_online = await _runner_online_or_none(snap_runner_id, server_client)
@@ -8541,9 +8579,14 @@ async def _session_info_item(
     if runner_running is False and not include_host_readiness:
         # Only a stopped runner needs the host's status, so a batch read of
         # live children still makes no per-item host lookup.
-        host = await _host_detail_or_none(snap_host_id, server_client)
+        host = await _host_detail_or_none(resolved_host_id, server_client)
     runner_state, runner_state_reason = _session_info_runner_state(
-        runner_running, snap_host_id, host
+        runner_running,
+        resolved_host_id,
+        host,
+        harness=_optional_string(snap.get("harness")),
+        host_resumable=snap.get("host_resumable") is True,
+        closed=is_session_closed(labels, _optional_string(snap.get("title"))),
     )
     keep_warm = snap.get("keep_warm")
     if (
