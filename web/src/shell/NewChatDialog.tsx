@@ -3676,7 +3676,7 @@ export function NewChatLandingScreen() {
   const sdkHarness =
     !sandboxSelected &&
     effectiveAgentId !== PENDING_AGENT_ID &&
-    (activeSdk === "claude-sdk" || activeSdk === "codex")
+    (activeSdk === "claude-sdk" || activeSdk === "codex" || activeSdk === "pi")
       ? activeSdk
       : null;
   const selectionHarness =
@@ -4142,20 +4142,29 @@ export function NewChatLandingScreen() {
     if (supportsAgyPermissionTier) {
       const skipValue =
         AGY_NATIVE_PERMISSION_TIERS.find((m) => m.value === agySkipMode)?.label ?? agySkipMode;
+      const modelOptions =
+        sdkHarness === "pi"
+          ? sdkModelOptions
+          : selectionHarness === "antigravity-native"
+            ? agyModelOptions
+            : piModelOptions;
       return [
         {
           label: "Model",
           value: pickedModel
             ? nativeModelLabel(
-                (selectionHarness === "antigravity-native" ? agyModelOptions : piModelOptions).find(
-                  (row) => row.id === pickedModel,
-                ) ?? { id: pickedModel },
+                modelOptions.find((row) => row.id === pickedModel) ?? { id: pickedModel },
               )
-            : defaultModelLabel(
-                selectionHarness === "antigravity-native" ? agyModelOptions : piModelOptions,
-              ),
+            : defaultModelLabel(modelOptions),
         },
-        ...(pickedEffort ? [{ label: "Effort", value: normalizeEffortLabel(pickedEffort) }] : []),
+        ...(pickedEffort
+          ? [
+              {
+                label: sdkHarness === "pi" ? "Thinking level" : "Effort",
+                value: normalizeEffortLabel(pickedEffort),
+              },
+            ]
+          : []),
         { label: "Permission mode", value: skipValue },
         ...routingRow,
       ];
@@ -4187,7 +4196,12 @@ export function NewChatLandingScreen() {
                   : "Harness default",
               },
               ...(pickedEffort
-                ? [{ label: "Effort", value: normalizeEffortLabel(pickedEffort) }]
+                ? [
+                    {
+                      label: sdkHarness === "pi" ? "Thinking level" : "Effort",
+                      value: normalizeEffortLabel(pickedEffort),
+                    },
+                  ]
                 : []),
               ...(sdkModes
                 ? [
@@ -4746,7 +4760,10 @@ export function NewChatLandingScreen() {
     pickerEffortOptions.length > 0
       ? {
           testId: "new-chat-landing-agent-efforts",
-          header: selectedNativeHarness === "pi-native" ? "Thinking level" : "Effort",
+          header:
+            selectionHarness === "pi-native" || selectionHarness === "pi"
+              ? "Thinking level"
+              : "Effort",
           choices: [
             {
               key: "__default__",
@@ -4917,7 +4934,7 @@ export function NewChatLandingScreen() {
       ? selectedNativeHarness === "codex-native"
         ? [...declaredPermissionOptions, CODEX_NATIVE_BYPASS_APPROVAL_OPTION]
         : declaredPermissionOptions
-      : sdkHarness !== null
+      : sdkHarness === "claude-sdk" || sdkHarness === "codex"
         ? (sdkPermissionOptions(sdkHarness) ?? [])
         : supportsPermissionMode
           ? CLAUDE_NATIVE_PERMISSION_MODES
@@ -4934,7 +4951,7 @@ export function NewChatLandingScreen() {
                   : [];
   const selectDirectMode = (mode: string) => {
     setPermissionTouched(true);
-    if (sdkHarness !== null) {
+    if (sdkHarness === "claude-sdk" || sdkHarness === "codex") {
       if (sdkHarness === "claude-sdk") setPermissionMode(mode);
       else setApprovalMode(mode);
       rememberPickerOptions(sdkHarness, { mode });
@@ -5036,10 +5053,13 @@ export function NewChatLandingScreen() {
     // model catalog resolves.
     const storedRoutingOn = stored.routing === "on";
     if (sdkHarness !== null) {
-      const sdkModes = sdkPermissionOptions(sdkHarness)!;
-      const sdkMode = seededPermission ?? resolve(sdkModes, sdkInitialPermissionMode(sdkHarness)!);
-      if (sdkHarness === "claude-sdk") setPermissionMode(sdkMode);
-      else setApprovalMode(sdkMode);
+      const sdkModes = sdkPermissionOptions(sdkHarness);
+      const initialMode = sdkInitialPermissionMode(sdkHarness);
+      if (sdkModes && initialMode) {
+        const sdkMode = seededPermission ?? resolve(sdkModes, initialMode);
+        if (sdkHarness === "claude-sdk") setPermissionMode(sdkMode);
+        else setApprovalMode(sdkMode);
+      }
       if (!projectVisit) {
         const model =
           stored.model != null &&

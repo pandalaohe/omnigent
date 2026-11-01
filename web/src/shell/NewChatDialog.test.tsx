@@ -12351,6 +12351,96 @@ describe("NewChatLandingScreen smart routing", () => {
   });
 });
 
+describe("NewChatLandingScreen Pi RPC model catalog", () => {
+  beforeEach(() => {
+    setupLandingMocks();
+    Object.assign(emptyHarnessCapabilities, {
+      pi: { calling_defaults: { model_options: true, inherits_from: "pi-native" } },
+    });
+    mockAgents([
+      testAgent("a_pi_rpc", "pi-rpc", {
+        display_name: "Pi RPC",
+        harness: "pi",
+        builtin: true,
+        product_of: "pi",
+        integration_mode: "cli-subprocess",
+      }),
+    ]);
+    mockModelQueries((harness) => ({
+      ...SUCCESS_QUERY_STATE,
+      data: harness === "pi" ? [{ id: "litellm/model-a", displayName: "Host model A" }] : [],
+    }));
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_pi_rpc" }),
+    } as Response);
+  });
+  afterEach(() => {
+    cleanup();
+    Reflect.deleteProperty(emptyHarnessCapabilities, "pi");
+  });
+
+  it.each(["win32", "darwin"])(
+    "lists host models and sends the selected model and thinking level on %s",
+    async (platform) => {
+      mockHosts([{ ...host("online"), platform, configured_harnesses: { pi: true } }]);
+      renderLanding();
+      fireEvent.keyDown(window, { code: "KeyM", ctrlKey: true, shiftKey: true });
+      expect(screen.queryAllByText("Models unavailable")).toHaveLength(0);
+      pickPrimaryOption("model", "Host model A");
+      pickPrimaryOption("effort", "High");
+      expect(screen.getByTestId("new-chat-landing-agent-efforts")).toHaveTextContent(
+        "Thinking level",
+      );
+      closePrimaryPicker();
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent("Host model A");
+      const { body } = await submitAndReadBody();
+      expect(body).toMatchObject({
+        agent_id: "a_pi_rpc",
+        model_override: "litellm/model-a",
+        reasoning_effort: "high",
+      });
+      expect(body.permission_mode).toBeUndefined();
+      expect(body.approval_mode).toBeUndefined();
+    },
+  );
+
+  it("shows a failed Pi RPC catalog lookup", () => {
+    mockModelQueries(() => ({
+      data: undefined,
+      isLoading: false,
+      error: new Error("Host model lookup failed"),
+      isError: true,
+    }));
+    renderLanding();
+    fireEvent.keyDown(window, { code: "KeyM", ctrlKey: true, shiftKey: true });
+    expect(screen.getByText("Host model lookup failed")).toBeVisible();
+  });
+
+  it.each([false, true])("keeps Pi permissions when declared modes are %s", async (declared) => {
+    if (declared) {
+      Object.assign(emptyHarnessCapabilities, {
+        pi: {
+          calling_defaults: { model_options: true, inherits_from: "pi-native" },
+          session_modes: {
+            permission: {
+              handler: "agy-tier",
+              options: [
+                { value: "auto", label: "Auto", concept: "automatic", contexts: ["create"] },
+                { value: "plan", label: "Plan", concept: "read-only", contexts: ["create"] },
+              ],
+            },
+          },
+        },
+      });
+    }
+    renderLanding();
+    pickPermissionOption("plan");
+    const { body } = await submitAndReadBody();
+    expect(body.permission_tier).toBe("plan");
+  });
+});
+
 describe("NewChatLandingScreen Auto harness", () => {
   beforeEach(() => {
     setupLandingMocks();
