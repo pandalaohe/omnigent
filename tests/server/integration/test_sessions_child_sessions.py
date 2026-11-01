@@ -2924,6 +2924,74 @@ async def test_subagent_message_503s_when_heal_finds_no_live_ancestor(
     assert resp.status_code == 503, resp.text
 
 
+async def test_host_bound_child_message_reattaches_to_parents_rotated_runner(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An idle child placed on its parent's host follows the parent to a new runner token.
+
+    A host restart leaves the child bound to the stopped token while the
+    parent's next message mints a new one. The child's next message must
+    rebind it to the parent's live runner and initialize its terminal there.
+    """
+    from unittest.mock import AsyncMock
+
+    child = await _create_native_child(client, name="msg-heal-rotated-token")
+    store = SqlAlchemyConversationStore(db_uri)
+    host_id = "a" * 32
+    for session_id in (child["parent_session_id"], child["id"]):
+        store.set_host_id(session_id, host_id, workspace="/opt/work/omnigent/fork/wt")
+    store.replace_runner_id(child["id"], "runner_before_restart")
+    store.replace_runner_id(child["parent_session_id"], "runner_after_restart")
+
+    forwarded: list[str] = []
+
+    def _runner_handler(request: httpx.Request) -> httpx.Response:
+        forwarded.append(request.url.path)
+        return httpx.Response(204)
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_runner_handler), base_url="http://runner"
+    )
+
+    async def _client_for_bound_runner(session_id: str, *_args: Any, **_kwargs: Any) -> Any:
+        conv = store.get_conversation(session_id)
+        return fake_runner if conv and conv.runner_id == "runner_after_restart" else None
+
+    async def _wait_for_live_runner(*_args: Any, runner_id: str | None, **_kwargs: Any) -> Any:
+        return fake_runner if runner_id == "runner_after_restart" else None
+
+    initialized: list[str] = []
+
+    async def _record_init(session_id: str, *_args: Any, **_kwargs: Any) -> bool:
+        initialized.append(session_id)
+        return False
+
+    monkeypatch.setattr(routes_events_module, "_get_runner_client", _client_for_bound_runner)
+    monkeypatch.setattr(sessions_module, "_wait_for_runner_client", _wait_for_live_runner)
+    monkeypatch.setattr(routes_events_module, "_ensure_runner_session_initialized", _record_init)
+    # The fake runner has no stream for a relay to subscribe to.
+    monkeypatch.setattr(routes_events_module, "_ensure_runner_relay_ready", AsyncMock())
+
+    resp = await client.post(
+        f"/v1/sessions/{child['id']}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "resume"}]},
+        },
+    )
+
+    assert resp.status_code in {200, 202}, resp.text
+    healed = store.get_conversation(child["id"])
+    assert healed is not None
+    assert healed.runner_id == "runner_after_restart"
+    assert healed.host_id == host_id
+    assert initialized == [child["id"]]
+    assert forwarded, "the message never reached the parent's live runner"
+
+
 @pytest.mark.parametrize(
     ("parent_runner", "expected_status"),
     [("runner_replacement", 409), ("runner_side", 409), ("runner_side", 202)],
@@ -4069,9 +4137,12 @@ async def test_child_archive_transition_publishes_to_parent_stream(
         session_stream.close(parent["id"])
 
 
+@pytest.mark.parametrize("can_resume", [True, False])
 async def test_child_snapshot_reports_effective_placement_from_root(
     client: httpx.AsyncClient,
     db_uri: str,
+    app: FastAPI,
+    can_resume: bool,
 ) -> None:
     """A deeply nested child snapshot carries the root's effective placement.
 
@@ -4081,6 +4152,29 @@ async def test_child_snapshot_reports_effective_placement_from_root(
     :param client: The test HTTP client.
     :param db_uri: Per-test SQLite database URI.
     """
+    from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
+    from omnigent.stores.host_store import HostStore
+    from tests.server.helpers import FakeSandboxLauncher
+
+    launcher = FakeSandboxLauncher(can_resume=can_resume)
+    app.state.sandbox_config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://server.example.test",
+            token_ttl_s=3600,
+            launcher_factory=lambda: launcher,
+        )
+    )
+    host_store = HostStore(db_uri)
+    app.state.host_store = host_store
+    host_store.register_managed_host(
+        host_id="3f866cafac81246fb60ae6ceb1a738da",
+        name="sleeping-cloud",
+        user_id="owner@example.test",
+        token="test-host-token",
+        provider="modal",
+        sandbox_id="sandbox-sleeping",
+        token_expires_at=2_000_000_000,
+    )
     agent = await create_test_agent(client, name="header-placement-agent")
     conv_store = SqlAlchemyConversationStore(db_uri)
     root = conv_store.create_conversation(
@@ -4109,6 +4203,9 @@ async def test_child_snapshot_reports_effective_placement_from_root(
     assert snapshot["effective_host_id"] == "3f866cafac81246fb60ae6ceb1a738da"
     assert snapshot["effective_cwd"] == "/srv/header"
     assert snapshot["effective_git_branch"] == "header-branch"
+    assert snapshot["host_resumable"] is False
+    root_snapshot = (await client.get(f"/v1/sessions/{root.id}")).json()
+    assert root_snapshot["host_resumable"] is can_resume
 
 
 async def test_child_sessions_zones_at_scale(

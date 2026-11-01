@@ -10375,11 +10375,12 @@ async def test_sys_session_get_info_many_reports_per_item_errors() -> None:
 @pytest.mark.asyncio
 async def test_sys_session_get_info_many_omits_host_readiness_without_flag() -> None:
     """
-    The batch form omits ``configured_harnesses`` and never calls
-    ``GET /v1/hosts/{id}`` unless the caller opts in. A supervisor reading
-    many children must not fan out one readiness probe per item; runner
-    connectivity stays per item. The opt-in path is covered by
-    ``test_sys_session_get_info_many_keeps_each_items_host_readiness``.
+    The batch form omits ``configured_harnesses`` and calls
+    ``GET /v1/hosts/{id}`` only for an item whose runner stopped (to tell a
+    relaunchable session from an offline one) unless the caller opts in. A
+    supervisor reading many live children must not fan out one readiness
+    probe per item; runner connectivity stays per item. The opt-in path is
+    covered by ``test_sys_session_get_info_many_keeps_each_items_host_readiness``.
     """
     from omnigent.runner.tool_dispatch import execute_tool
 
@@ -10434,7 +10435,348 @@ async def test_sys_session_get_info_many_omits_host_readiness_without_flag() -> 
     assert "configured_harnesses" not in by_id["conv_b"]
     assert by_id["conv_a"]["runner_online"] is True
     assert by_id["conv_b"]["runner_online"] is False
-    assert host_calls == []
+    assert host_calls == ["/v1/hosts/host_2"]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_get_info_tells_relaunchable_from_offline_runners() -> None:
+    """
+    After a host restart a child keeps its stopped runner binding until its
+    next message. ``runner_state`` tells a mother whether that message can
+    run — the host is online, so it reattaches — or cannot because the host
+    is offline, and keep-warm's runner blocker follows the same split.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    stopped_keep_warm = {
+        "state": "stopped",
+        "stop_reason": "expired",
+        "blocked_by": "runner_offline",
+    }
+    snapshots = {
+        "conv_live": _session_info_snapshot(
+            "conv_live", host_id="host_up", runner_id="runner_live"
+        ),
+        "conv_restarted": _session_info_snapshot(
+            "conv_restarted",
+            host_id="host_up",
+            runner_id="runner_stopped",
+            warm_state="cold",
+            keep_warm=stopped_keep_warm,
+        ),
+        "conv_unbound": _session_info_snapshot("conv_unbound", host_id="host_up", runner_id=None),
+        "conv_host_down": _session_info_snapshot(
+            "conv_host_down",
+            host_id="host_down",
+            runner_id="runner_gone",
+            warm_state="cold",
+            keep_warm=stopped_keep_warm,
+        ),
+    }
+    hosts = {
+        "host_up": {"name": "studio", "status": "online"},
+        "host_down": {"name": "laptop", "status": "offline"},
+    }
+    host_calls: list[str] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.startswith("/v1/sessions/"):
+            return httpx.Response(200, json=snapshots[path.rsplit("/", 1)[-1]])
+        if path.startswith("/v1/runners/"):
+            return httpx.Response(200, json={"online": path.split("/")[3] == "runner_live"})
+        if path.startswith("/v1/hosts/"):
+            host_calls.append(path)
+            return httpx.Response(200, json=hosts[path.rsplit("/", 1)[-1]])
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_ids": list(snapshots)}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    by_id = {item["session_id"]: item for item in json.loads(output)["sessions"]}
+    assert (by_id["conv_live"]["runner_state"], by_id["conv_live"]["runner_state_reason"]) == (
+        "online",
+        None,
+    )
+    for session_id in ("conv_restarted", "conv_unbound"):
+        assert by_id[session_id]["runner_state"] == "relaunchable"
+        assert "host studio is online" in by_id[session_id]["runner_state_reason"]
+        assert "No archive needed" in by_id[session_id]["runner_state_reason"]
+    assert by_id["conv_restarted"]["runner_online"] is False
+    assert by_id["conv_restarted"]["keep_warm"]["blocked_by"] == "runner_relaunchable"
+    assert by_id["conv_restarted"]["warm_state"] == "cold"
+    assert by_id["conv_host_down"]["runner_state"] == "offline"
+    assert "Host laptop is offline" in by_id["conv_host_down"]["runner_state_reason"]
+    assert by_id["conv_host_down"]["keep_warm"]["blocked_by"] == "runner_offline"
+    # Live sessions make no host lookup; each stopped one makes exactly one.
+    assert sorted(host_calls) == [
+        "/v1/hosts/host_down",
+        "/v1/hosts/host_up",
+        "/v1/hosts/host_up",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_get_info_relaunchable_requires_a_launchable_harness() -> None:
+    """
+    A live host does not make every stopped runner relaunchable: when the
+    host reports the session's harness unavailable, the next message cannot
+    start it, so the item reads ``offline`` with a reason naming the harness
+    — while a sibling on a configured harness on the same host still reads
+    ``relaunchable``.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    snapshots = {
+        "conv_missing_codex": _session_info_snapshot(
+            "conv_missing_codex",
+            host_id="host_up",
+            runner_id="runner_stopped",
+            harness="codex-native",
+            warm_state="cold",
+            keep_warm={"state": "stopped", "blocked_by": "runner_offline"},
+        ),
+        "conv_ready_claude": _session_info_snapshot(
+            "conv_ready_claude",
+            host_id="host_up",
+            runner_id="runner_stopped",
+            harness="claude-native",
+        ),
+    }
+    host = {
+        "name": "studio",
+        "status": "online",
+        "configured_harnesses": {
+            "claude-native": True,
+            "codex-native": "binary-missing",
+        },
+    }
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.startswith("/v1/sessions/"):
+            return httpx.Response(200, json=snapshots[path.rsplit("/", 1)[-1]])
+        if path.startswith("/v1/runners/"):
+            return httpx.Response(200, json={"online": False})
+        if path.startswith("/v1/hosts/"):
+            return httpx.Response(200, json=host)
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_ids": list(snapshots)}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    by_id = {item["session_id"]: item for item in json.loads(output)["sessions"]}
+    assert by_id["conv_missing_codex"]["runner_state"] == "offline"
+    reason = by_id["conv_missing_codex"]["runner_state_reason"]
+    assert "codex-native" in reason
+    assert "binary-missing" in reason
+    assert by_id["conv_missing_codex"]["keep_warm"]["blocked_by"] == "runner_offline"
+    assert by_id["conv_ready_claude"]["runner_state"] == "relaunchable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runner_online", [True, False, None])
+async def test_sys_session_get_info_closed_session_is_never_relaunchable(
+    runner_online: bool | None,
+) -> None:
+    """
+    A closed session rejects its next message, so an online host must not
+    read as ``relaunchable`` for it — the mother would send a resume that
+    cannot land. Both closed spellings count: the persisted label new
+    closes write, and the legacy title marker an older row still carries.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    snapshots = {
+        "conv_label_closed": _session_info_snapshot(
+            "conv_label_closed",
+            host_id="host_up",
+            runner_id="runner_stopped",
+            labels={"omnigent.closed": "true"},
+        ),
+        "conv_title_closed": _session_info_snapshot(
+            "conv_title_closed",
+            host_id="host_up",
+            runner_id="runner_stopped",
+            title="helper:auth:closed:conv_title_closed",
+        ),
+        "conv_open": _session_info_snapshot(
+            "conv_open", host_id="host_up", runner_id="runner_stopped"
+        ),
+    }
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.startswith("/v1/sessions/"):
+            return httpx.Response(200, json=snapshots[path.rsplit("/", 1)[-1]])
+        if path.startswith("/v1/runners/"):
+            return httpx.Response(200, json={"online": runner_online})
+        if path.startswith("/v1/hosts/"):
+            return httpx.Response(200, json={"name": "studio", "status": "online"})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_ids": list(snapshots)}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    by_id = {item["session_id"]: item for item in json.loads(output)["sessions"]}
+    for session_id in ("conv_label_closed", "conv_title_closed"):
+        if runner_online is False:
+            assert by_id[session_id]["runner_state"] == "offline"
+            assert "closed" in by_id[session_id]["runner_state_reason"]
+        else:
+            assert by_id[session_id]["runner_state"] == (
+                "online" if runner_online is True else None
+            )
+            assert by_id[session_id]["runner_state_reason"] is None
+    assert by_id["conv_open"]["runner_state"] == (
+        "online" if runner_online is True else "relaunchable" if runner_online is False else None
+    )
+
+
+@pytest.mark.asyncio
+async def test_sys_session_get_info_reads_a_hostless_childs_effective_host() -> None:
+    """
+    A sub-agent row can carry no host of its own while its nearest host-bound
+    ancestor pins it to one. The stopped-runner host read must use that
+    effective host, or the child reads unknown instead of relaunchable; a
+    session with no host anywhere still makes no host lookup.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    snapshots = {
+        "conv_child": _session_info_snapshot(
+            "conv_child",
+            host_id=None,
+            effective_host_id="host_up",
+            parent_session_id="conv_parent",
+            runner_id="runner_stopped",
+        ),
+        "conv_hostless": _session_info_snapshot(
+            "conv_hostless",
+            host_id=None,
+            effective_host_id=None,
+            parent_session_id="conv_parent",
+            runner_id="runner_stopped",
+        ),
+    }
+    host_calls: list[str] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.startswith("/v1/sessions/"):
+            return httpx.Response(200, json=snapshots[path.rsplit("/", 1)[-1]])
+        if path.startswith("/v1/runners/"):
+            return httpx.Response(200, json={"online": False})
+        if path.startswith("/v1/hosts/"):
+            host_calls.append(path)
+            return httpx.Response(200, json={"name": "studio", "status": "online"})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_ids": list(snapshots)}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    by_id = {item["session_id"]: item for item in json.loads(output)["sessions"]}
+    assert by_id["conv_child"]["host_id"] is None
+    assert by_id["conv_child"]["runner_state"] == "relaunchable"
+    assert "host studio is online" in by_id["conv_child"]["runner_state_reason"]
+    assert by_id["conv_hostless"]["runner_state"] is None
+    assert host_calls == ["/v1/hosts/host_up"]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_get_info_resumable_host_reads_relaunchable() -> None:
+    """
+    A dormant managed host answers the next message by resuming its sandbox,
+    so an offline host that is resumable reads ``relaunchable`` — while an
+    offline host that is not stays the terminal ``offline``.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    snapshots = {
+        "conv_asleep": _session_info_snapshot(
+            "conv_asleep",
+            host_id="host_sleep",
+            runner_id="runner_gone",
+            host_resumable=True,
+        ),
+        "conv_dead": _session_info_snapshot(
+            "conv_dead",
+            host_id="host_sleep",
+            runner_id="runner_gone",
+            host_resumable=False,
+        ),
+        "conv_hostless_child": _session_info_snapshot(
+            "conv_hostless_child",
+            host_id=None,
+            effective_host_id="host_sleep",
+            parent_session_id="conv_asleep",
+            runner_id="runner_gone",
+            host_resumable=False,
+        ),
+    }
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.startswith("/v1/sessions/"):
+            return httpx.Response(200, json=snapshots[path.rsplit("/", 1)[-1]])
+        if path.startswith("/v1/runners/"):
+            return httpx.Response(200, json={"online": False})
+        if path.startswith("/v1/hosts/"):
+            return httpx.Response(200, json={"name": "cloud", "status": "offline"})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_ids": list(snapshots)}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    by_id = {item["session_id"]: item for item in json.loads(output)["sessions"]}
+    assert by_id["conv_asleep"]["runner_state"] == "relaunchable"
+    assert "resumable" in by_id["conv_asleep"]["runner_state_reason"]
+    assert by_id["conv_dead"]["runner_state"] == "offline"
+    assert "Host cloud is offline" in by_id["conv_dead"]["runner_state_reason"]
+    child = by_id["conv_hostless_child"]
+    assert child["runner_state"] == "offline"
+    assert "cannot wake" in child["runner_state_reason"]
+    assert "host-bound ancestor" in child["runner_state_reason"]
 
 
 @pytest.mark.asyncio
