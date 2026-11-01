@@ -9,7 +9,7 @@ The owner of an online, supervised host can preview a restart, then restart that
 - `restart-progress`: draining, stopping, waiting for reconnect, done or failed; long draining does not spend the reconnect budget.
 - `restart-notice`: retry the result message until the initiating session accepts it.
 - `restart-supervisor`: refuse hosts without a known supervisor; a clean teardown exits 75 for the supervisor to relaunch.
-- `restart-agent-approval`: preview from an agent without approval; each real restart requires the app's card showing that preview, resolved by the host owner. An editor or a different administrator cannot approve it.
+- `restart-agent-approval`: preview from an agent without approval; each real restart requires the app's card showing that preview, resolved from the host owner's fresh password/OIDC browser login and a trusted origin. Runner, CLI and unmarked legacy cookies cannot answer it. An editor or a different administrator cannot approve it.
 
 ## How to get to it (user POV)
 
@@ -35,3 +35,5 @@ Preconditions: use a disposable server and fake host tunnel. The ordinary isolat
 - Reconnecting the same host process does not complete a restart; its start time must advance.
 - Windows support detects the existing scheduled-task restart loop. Its exit-75 relaunch still needs a real platform trial.
 - A real agent call does not refresh an expired preview after the person approves it. Reissue the tool call for a new card.
+- Restart cards require cookie-based browser authentication. Header/proxy and no-auth deployments fail closed. After an upgrade or magic-link login, sign in again with the owner's password/OIDC login before answering one.
+- Native OIDC token exchange and mobile WebView login do not issue approval credentials. Answer these cards from the owner's browser web app. Account invitations, user deletion and administrator password resets also require a fresh browser cookie, so runner credentials cannot manufacture browser authority through account management.

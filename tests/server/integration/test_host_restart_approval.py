@@ -16,8 +16,10 @@ from omnigent.host.frames import (
 from omnigent.policies.types import PolicyResult
 from omnigent.runner.host_restart import execute_host_restart
 from omnigent.runtime import pending_elicitations
+from omnigent.server.accounts_config import AccountsConfig
 from omnigent.server.auth import LEVEL_EDIT, UnifiedAuthProvider
 from omnigent.server.host_restart_approval import approved_tool_preview
+from omnigent.server.oidc import mint_session_cookie
 from omnigent.server.routes._sessions import orchestration
 from omnigent.server.routes._sessions.orchestration import (
     _handle_mcp_tools_call,
@@ -160,7 +162,58 @@ async def test_restart_card_preview_and_owner_resolution(
     denied = await auth_client.post(url, json=body, headers={"X-Forwarded-Email": collaborator})
     assert denied.status_code == 403, denied.text
     assert not registry.restarts.previews[preview["preview_id"]].tool_approved
-    accepted = await auth_client.post(url, json=body, headers={"X-Forwarded-Email": owner})
+    provider = auth_app.state.mcp_registry_auth
+    config = AccountsConfig(
+        cookie_secret=b"test-browser-approval-key-32-bytes",
+        session_ttl_hours=8,
+        base_url="http://test",
+        init_admin_password=None,
+        invite_ttl_seconds=3600,
+        magic_ttl_seconds=300,
+    )
+    monkeypatch.setattr(provider, "_source", "accounts")
+    monkeypatch.setattr(provider, "_accounts_config", config)
+    auth_client.cookies.set(
+        config.session_cookie_name,
+        mint_session_cookie(
+            collaborator, config.cookie_secret, 8, "accounts", browser_session=True
+        ),
+    )
+    denied = await auth_client.post(url, json=body, headers={"Origin": "http://test"})
+    assert denied.status_code == 403, denied.text
+    auth_client.cookies.clear()
+    runner_token = provider.mint_runner_token(owner, 60)
+    assert runner_token is not None
+    denied = await auth_client.post(
+        url,
+        json=body,
+        headers={"Authorization": f"Bearer {runner_token}", "Origin": "http://test"},
+    )
+    assert denied.status_code == 403, denied.text
+    assert pending_elicitations.lookup(elicitation_id, conversation_id=session_id) is not None
+    assert not registry.restarts.previews[preview["preview_id"]].tool_approved
+    browser_token = mint_session_cookie(
+        owner, config.cookie_secret, 8, "accounts", browser_session=True
+    )
+    for token in (runner_token, mint_session_cookie(owner, config.cookie_secret, 8, "accounts")):
+        auth_client.cookies.set(config.session_cookie_name, token)
+        denied = await auth_client.post(url, json=body, headers={"Origin": "http://test"})
+        assert denied.status_code == 403, denied.text
+        assert not registry.restarts.previews[preview["preview_id"]].tool_approved
+    auth_client.cookies.set(config.session_cookie_name, browser_token)
+    for headers in (
+        {},
+        {"Origin": "https://untrusted.example.test"},
+        {"Origin": "omnigent://internal"},
+        {"Origin": "null"},
+        {"Origin": "http://test", "Authorization": f"Bearer {browser_token}"},
+        {"Origin": "http://test", "X-Omnigent-Runner-Tunnel-Token": "test-runner-binding"},
+    ):
+        denied = await auth_client.post(url, json=body, headers=headers)
+        assert denied.status_code == 403, denied.text
+        assert pending_elicitations.lookup(elicitation_id, conversation_id=session_id) is not None
+        assert not registry.restarts.previews[preview["preview_id"]].tool_approved
+    accepted = await auth_client.post(url, json=body, headers={"Origin": "http://test"})
     assert accepted.status_code in (200, 202), accepted.text
     if action == "accept":
         assert approved_tool_preview(registry, conn, owner, session_id, False).payload == preview

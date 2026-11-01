@@ -6,11 +6,13 @@ import asyncio
 import json
 from typing import Any
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import CAP_HOST_RESTART
 from omnigent.runtime import pending_elicitations
+from omnigent.server.auth import AuthProvider
+from omnigent.server.browser_approval import require_owner_browser_approval
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.host_restart import RestartPreview
 from omnigent.stores import ConversationStore
@@ -143,7 +145,13 @@ async def restart_card_fields(
 
 
 def authorize_restart_resolution(
-    session_id: str, elicitation_id: str, user_id: str | None, action: object
+    session_id: str,
+    elicitation_id: str,
+    user_id: str | None,
+    action: object,
+    *,
+    request: Request | None,
+    auth_provider: AuthProvider | None,
 ) -> None:
     """Both HTTP resolution paths require the host owner, without admin bypass."""
     found = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
@@ -152,6 +160,9 @@ def authorize_restart_resolution(
     params = found[1].get("params")
     if not isinstance(params, dict) or "host_restart_owner" not in params:
         return
+    if request is None:
+        raise OmnigentError("Only a browser may answer this card", code=ErrorCode.FORBIDDEN)
+    require_owner_browser_approval(request, auth_provider, params["host_restart_owner"])
     if params["host_restart_owner"] != user_id:
         raise OmnigentError(
             "Only the host owner may resolve this restart card", code=ErrorCode.FORBIDDEN
