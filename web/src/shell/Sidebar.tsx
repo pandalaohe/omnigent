@@ -431,8 +431,11 @@ const IsMobileContext = createContext<boolean>(false);
 const ViewerIdContext = createContext<string | null>(null);
 const ServerInfoContext = createContext<ReturnType<typeof useServerInfo>>("loading");
 const RowActivationContext = createContext<
-  (id: string, event: MouseEvent<HTMLAnchorElement>) => void
+  (id: string, event: MouseEvent<HTMLAnchorElement>, suppressScroll?: boolean) => void
 >(() => {});
+// Session id activated by a top-area click (Recent / Pinned) whose active-row
+// reveal scroll and folder auto-expand are suppressed for that selection.
+const SuppressedScrollIdContext = createContext<RefObject<string | null>>({ current: null });
 // True while a pin, unpin, or reorder is saving; pin controls are disabled then.
 const PinSavingContext = createContext(false);
 // Set only around the Pinned section, so its rows become drag-to-reorder targets.
@@ -466,6 +469,7 @@ function SidebarRowDataProvider({
   viewerId,
   serverInfo,
   onActivate,
+  suppressedScrollIdRef,
   children,
 }: {
   projectNamesById: Map<string, string>;
@@ -475,7 +479,8 @@ function SidebarRowDataProvider({
   isMobile: boolean;
   viewerId: string | null;
   serverInfo: ReturnType<typeof useServerInfo>;
-  onActivate: (id: string, event: MouseEvent<HTMLAnchorElement>) => void;
+  onActivate: (id: string, event: MouseEvent<HTMLAnchorElement>, suppressScroll?: boolean) => void;
+  suppressedScrollIdRef: RefObject<string | null>;
   children: ReactNode;
 }) {
   return (
@@ -487,7 +492,9 @@ function SidebarRowDataProvider({
               <ViewerIdContext.Provider value={viewerId}>
                 <ServerInfoContext.Provider value={serverInfo}>
                   <RowActivationContext.Provider value={onActivate}>
-                    {children}
+                    <SuppressedScrollIdContext.Provider value={suppressedScrollIdRef}>
+                      {children}
+                    </SuppressedScrollIdContext.Provider>
                   </RowActivationContext.Provider>
                 </ServerInfoContext.Provider>
               </ViewerIdContext.Provider>
@@ -2298,6 +2305,8 @@ interface ConversationRowMeta {
   /** Sessions copy: still drags (to file / unfile) even when non-canonical. */
   moveCopy?: boolean;
   dragDisabled?: boolean;
+  /** Top-area copy (recent): clicking opens the session without scrolling the sidebar. */
+  suppressScrollOnClick?: boolean;
 }
 
 /** A freshly created favorites section; empty, so every pin renders in pin order. */
@@ -2629,13 +2638,24 @@ function ConversationList({
   const activeRootSessionId = useActiveRootSessionId(activeId ?? null);
   const resolvedActiveId = activeRootSessionId ?? activeId ?? null;
   const [optimisticActiveId, setOptimisticActiveId] = useState<string | null>(null);
+  const suppressedScrollIdRef = useRef<string | null>(null);
   useEffect(() => setOptimisticActiveId(null), [activeId]);
-  const activateRow = useCallback((id: string, event: MouseEvent<HTMLAnchorElement>) => {
-    if (event.defaultPrevented || event.button !== 0) return;
-    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-    setOptimisticActiveId(id);
-  }, []);
+  const activateRow = useCallback(
+    (id: string, event: MouseEvent<HTMLAnchorElement>, suppressScroll = false) => {
+      if (event.defaultPrevented || event.button !== 0) return;
+      if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+      suppressedScrollIdRef.current = suppressScroll ? id : null;
+      setOptimisticActiveId(id);
+    },
+    [],
+  );
   const displayedActiveId = optimisticActiveId ?? resolvedActiveId;
+  const currentActiveId = activeId ?? displayedActiveId;
+  useEffect(() => {
+    if (suppressedScrollIdRef.current !== currentActiveId) {
+      suppressedScrollIdRef.current = null;
+    }
+  }, [currentActiveId]);
   const [activeOverride, setActiveOverride] = useState<ActiveChatOverride | null>(null);
   useEffect(() => {
     setActiveOverride((prev) => computeNextActiveOverride(activeId, allConversations, prev));
@@ -3628,9 +3648,9 @@ function ConversationList({
         const expandedKey =
           instanceKeyPrefix !== undefined ? `${instanceKeyPrefix}:${group.name}` : group.name;
         if (!expandedProjects.includes(expandedKey)) continue;
-        // Only the owning section folder outranks other copies; a favorite
-        // folder copy is just the first copy in layout order.
-        const folder = sectionFolder;
+        // Every expanded project folder (including a favorite project copy,
+        // which hides its home folder) outranks flat Recent / Sessions rows.
+        const folder = true;
         for (const conversation of rows) {
           const key =
             instanceKeyPrefix !== undefined
@@ -3769,7 +3789,7 @@ function ConversationList({
   // every time the user clicks the pinned row.
   useEffect(() => {
     if (!activeId || !activeProjectName) return;
-    if (pinnedSet.has(activeId)) return;
+    if (pinnedSet.has(activeId) || suppressedScrollIdRef.current === activeId) return;
     expandProject(activeProjectName);
   }, [activeId, activeProjectName, pinnedSet, expandProject]);
 
@@ -4151,6 +4171,7 @@ function ConversationList({
       viewerId={viewerId}
       serverInfo={serverInfo}
       onActivate={activateRow}
+      suppressedScrollIdRef={suppressedScrollIdRef}
     >
       <SidebarLayoutContext.Provider value={sidebarLayoutContextValue}>
         {pollingArchivePrompt.dialog}
@@ -4496,6 +4517,7 @@ function ConversationList({
                                                       }
                                                       canonical={isCanonical}
                                                       pinReorderCopy
+                                                      suppressScrollOnClick
                                                       favoriteItem={{
                                                         sectionId: section.id,
                                                         index,
@@ -5048,6 +5070,7 @@ function ConversationList({
                                         canonical: isCanonical,
                                         projectLabel: projectLabelFor(conversation),
                                         dragDisabled: true,
+                                        suppressScrollOnClick: true,
                                       };
                                     }}
                                   />
@@ -6072,6 +6095,7 @@ function ConversationSection({
                     pinReorderCopy={meta.pinReorderCopy}
                     moveCopy={meta.moveCopy}
                     dragDisabled={meta.dragDisabled}
+                    suppressScrollOnClick={meta.suppressScrollOnClick}
                     projectLabel={meta.projectLabel}
                     isActive={conv.id === activeConversationId}
                     inActiveGrid={gridMembers.has(conv.id)}
@@ -7022,6 +7046,7 @@ function ConversationRowImpl({
   pinReorderCopy,
   moveCopy,
   dragDisabled,
+  suppressScrollOnClick,
   favoriteItem,
   projectLabel,
   isActive,
@@ -7047,6 +7072,8 @@ function ConversationRowImpl({
   /** Sessions copy: still drags (to file / unfile) even when non-canonical. */
   moveCopy?: boolean;
   dragDisabled?: boolean;
+  /** Top-area copy (recent): clicking opens the session without scrolling the sidebar. */
+  suppressScrollOnClick?: boolean;
   /** Favorites row: its section and index, so it's a `fav-item` reorder target. */
   favoriteItem?: { sectionId: string; index: number };
   /** Trailing muted project name; recent copies only. */
@@ -7090,12 +7117,14 @@ function ConversationRowImpl({
   // project flyout's HoverCard and leave it lingering over the chat. Gate the
   // flyout off below the `md` breakpoint (see `projectFlyoutName`).
   const isMobile = useContext(IsMobileContext);
+  const suppressedScrollIdRef = useContext(SuppressedScrollIdContext);
   // Desktop keeps the active row centered; a phone drawer opens at the top.
   const rowRef = useRef<HTMLLIElement>(null);
   useEffect(() => {
     if (!isActive || !isCanonical || isMobile) return;
+    if (suppressedScrollIdRef.current === conversation.id) return;
     rowRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
-  }, [isActive, isCanonical, isMobile]);
+  }, [isActive, isCanonical, isMobile, conversation.id, suppressedScrollIdRef]);
   const rename = useRenameConversation();
   const del = useStopAndDeleteConversation();
   const archive = useArchiveConversation();
@@ -7639,7 +7668,7 @@ function ConversationRowImpl({
           onToggleSelected(conversation.id, e.shiftKey);
           return;
         }
-        activateRow(conversation.id, e);
+        activateRow(conversation.id, e, Boolean(suppressScrollOnClick));
         onClick(e);
       }}
       onDoubleClick={(e) => {
@@ -8315,6 +8344,7 @@ const ConversationRow = memo(ConversationRowImpl, (prev, next) => {
     prev.pinReorderCopy === next.pinReorderCopy &&
     prev.moveCopy === next.moveCopy &&
     prev.dragDisabled === next.dragDisabled &&
+    prev.suppressScrollOnClick === next.suppressScrollOnClick &&
     prev.favoriteItem?.sectionId === next.favoriteItem?.sectionId &&
     prev.favoriteItem?.index === next.favoriteItem?.index &&
     prev.projectLabel === next.projectLabel &&
