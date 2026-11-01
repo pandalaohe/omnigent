@@ -97,6 +97,61 @@ def test_cache_does_not_cross_workspaces(service):
         assert service.quotas(QuotaContext(OWNER, HOST), now=NOW)[1] == {}
 
 
+@pytest.mark.parametrize(
+    ("report_kind", "reason"),
+    [
+        ("missing", "no_report"),
+        ("fresh", None),
+        ("stale", "stale_report"),
+        ("empty", "empty_report"),
+    ],
+)
+def test_external_quota_payload_explains_unknown_reports(
+    service, monkeypatch, report_kind, reason
+):
+    now = time.time()
+    conv = service.conversations.create_conversation(harness_override="antigravity-native")
+    context = service.context(conv)
+    if report_kind != "missing":
+        report = snapshot(now)
+        assert service.report(context.owner_id, None, "antigravity", report, now=now)
+        if report_kind == "empty":
+            # An explicit retraction replaces the previously usable report.
+            assert service.report(
+                context.owner_id,
+                None,
+                "antigravity",
+                {"captured_at": now + 1, "windows": []},
+                now=now,
+            )
+        elif report_kind == "stale":
+            monkeypatch.setattr(time, "time", lambda: now + 3601)
+    quota = service.payload(conv)["agents"]["antigravity"]
+    assert quota["state"] == ("tight" if report_kind == "fresh" else "unknown")
+    assert quota["reason"] == reason
+    if report_kind != "fresh":
+        assert quota["pace_pct"] is None
+        assert quota["deciding_window"] is None
+        assert not quota["windows"]
+    if report_kind == "missing":
+        assert service.context_line(context) == ""
+
+
+@pytest.mark.parametrize("foreign_scope", ["owner", "host", "workspace"])
+def test_missing_report_projection_does_not_expose_other_scopes(service, foreign_scope):
+    now = time.time()
+    conv = service.conversations.create_conversation(host_id=HOST, workspace="/opt/work/project")
+    context = service.context(conv)
+    owner = "another-owner" if foreign_scope == "owner" else context.owner_id
+    host = "another-host" if foreign_scope == "host" else None
+    with workspace_scope(42 if foreign_scope == "workspace" else 0):
+        assert service.report(owner, host, "antigravity", snapshot(now, used=100), now=now)
+    quota = service.payload(conv)["agents"]["antigravity"]
+    assert quota["state"] == "unknown"
+    assert quota["reason"] == "no_report"
+    assert not quota["windows"]
+
+
 def test_pinned_and_user_selected_period_keep_other_evidence(service):
     report = snapshot()
     report["windows"].append(
@@ -217,6 +272,15 @@ async def test_report_and_session_read_auth_and_bounds(request, db_uri):
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
         path = "/v1/me/agent-quota/opencode"
+        missing = await client.get(f"/v1/sessions/{root.id}/agent-quota", headers=_headers(OWNER))
+        assert missing.status_code == 200
+        assert missing.json()["agents"]["antigravity"] == {
+            "state": "unknown",
+            "reason": "no_report",
+            "pace_pct": None,
+            "deciding_window": None,
+            "windows": [],
+        }
         report = {**snapshot(int(time.time())), "host_id": HOST}
         assert (await client.put(path, json=report)).status_code == 401
         assert (await client.put(path, json=report, headers=_headers(other))).status_code == 404
