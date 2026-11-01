@@ -4019,6 +4019,9 @@ def _parse_external_conversation_item(
             "external_conversation_item requires object data.item_data",
             code=ErrorCode.INVALID_INPUT,
         )
+    if item_type == "message":
+        # Automation labels are derived from verified admission receipts at persistence.
+        item_data = {key: value for key, value in item_data.items() if key != "auto_retry"}
     response_id = body.data.get("response_id")
     if response_id is None:
         response_id = generate_task_id()

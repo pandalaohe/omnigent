@@ -8645,6 +8645,7 @@ def create_runner_app(
         for admission_field in (
             "input_admission_required",
             "retry_guard",
+            "auto_retry",
             "input_admission_deadline",
         ):
             if admission_field in msg_body:

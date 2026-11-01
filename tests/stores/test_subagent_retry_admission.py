@@ -33,6 +33,39 @@ async def test_server_local_child_needs_a_valid_root_but_no_runner_liveness(jour
     assert journal.store.get_chain(chain.chain_id).accepted_attempts == 0
 
 
+async def test_final_forward_derives_marker_from_the_claimed_receipt(journal):
+    from omnigent.entities.subagent_retry import RetryExecutionGuard
+    from omnigent.server.subagent_retry_admission import claim_retry_forward, retry_dispatch_scope
+
+    chain = _open(journal)
+    receipt = journal.store.prepare_attempt(
+        chain.chain_id, owner=journal.owner, expected_version=chain.version, now=160
+    )
+    claimed = journal.store.claim_input(receipt.input_id, owner=journal.owner)
+    assert claimed.claimed
+    guard = RetryExecutionGuard(
+        chain_id=chain.chain_id,
+        input_id=receipt.input_id,
+        owner=journal.owner,
+        expected_turn_id=chain.expected_turn_id,
+        expected_input_generation=chain.expected_input_generation,
+        attempt=1,
+        of=3,
+    )
+    event = {"type": "message", "auto_retry": {"attempt": 999}}
+    with retry_dispatch_scope(_admission(journal), guard, claimed_version=claimed.receipt.version):
+        await claim_retry_forward(journal.child, event, deadline=time.time() + 30)
+    assert event["auto_retry"] == {
+        "chain_id": chain.chain_id,
+        "input_id": receipt.input_id,
+        "attempt": 1,
+        "of": 3,
+    }
+    assert event["input_id"] == receipt.input_id
+    assert event["retry_guard"] == guard.model_dump(mode="json")
+    assert journal.store.get_chain(chain.chain_id).accepted_attempts == 0
+
+
 @pytest.mark.parametrize("local_connection", [False, True])
 @pytest.mark.parametrize("health", ["fresh", "stale", "offline", "missing", "deleted"])
 async def test_nearest_ancestor_host_uses_store_ttl_even_on_its_own_replica(

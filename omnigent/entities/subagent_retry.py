@@ -8,6 +8,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field
 
+from omnigent.entities.conversation import AutoRetryMetadata
 from omnigent.entities.subagent_terminal import TerminalEnvelope
 
 
@@ -101,6 +102,12 @@ class RetryExecutionGuard(BaseModel):
     expected_input_generation: int = Field(strict=True, ge=0)
     attempt: int = Field(strict=True, ge=1)
     of: int = Field(strict=True, ge=1)
+
+    @property
+    def metadata(self) -> AutoRetryMetadata:
+        return AutoRetryMetadata(
+            chain_id=self.chain_id, input_id=self.input_id, attempt=self.attempt, of=self.of
+        )
 
 
 class InputExecutionClaim(BaseModel):

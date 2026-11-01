@@ -132,6 +132,7 @@ async def claim_retry_forward(session_id: str, event: dict[str, Any], *, deadlin
         raise RetryDispatchRefused("input_already_claimed")
     current.forwarded = True
     event["retry_guard"] = guard.model_dump(mode="json")
+    event["auto_retry"] = guard.metadata.model_dump(mode="json")
     event["input_admission_required"] = True
     event["input_id"] = guard.input_id
     event["input_admission_deadline"] = deadline

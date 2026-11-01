@@ -1921,6 +1921,7 @@ def register_events_routes(
         )
         if body.type == "message":
             for key in (
+                "auto_retry",
                 "retry_guard",
                 "input_admission_required",
                 "input_id",
@@ -1929,6 +1930,9 @@ def register_events_routes(
                 "input_admission_deadline",
             ):
                 body.data.pop(key, None)
+            retry_guard = active_retry_dispatch()
+            if retry_guard is not None:
+                body.data["auto_retry"] = retry_guard.metadata.model_dump(mode="json")
             if (
                 conv.parent_conversation_id
                 and getattr(request.app.state, "subagent_retry_admission", None) is not None

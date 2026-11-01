@@ -51,6 +51,7 @@ from fastapi import APIRouter, FastAPI, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from omnigent.entities.conversation import AutoRetryMetadata
 from omnigent.entities.subagent_retry import InputExecutionReceipt
 from omnigent.errors import ErrorCode, HarnessTransportClosedError, OmnigentError
 from omnigent.inner.executor import ExecutorResidentInventory, ExecutorThreadInventorySnapshot
@@ -282,6 +283,9 @@ class MessageEvent(BaseModel):
     content: str | list[dict[str, Any]]
     model: str
     previous_response_id: str | None = None
+    auto_retry: AutoRetryMetadata | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     # Allow runner-side passthrough of CreateResponseRequest fields
     # (instructions, conversation, reasoning, context_management,
     # tools, plus the ignored-but-tolerated controls). Forwarded

@@ -31,6 +31,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from omnigent.entities.conversation import AutoRetryMetadata
 from omnigent.runtime import pending_inputs
 
 
@@ -239,6 +240,43 @@ def test_snapshot_returns_deep_copies() -> None:
 
     # Re-read: the index still holds the original text, not "mutated".
     assert pending_inputs.snapshot_for("conv_a")[0]["content"] == [_text_block("orig")]
+
+
+@pytest.mark.parametrize("hold", [False, True])
+@pytest.mark.parametrize("evicted", [False, True])
+def test_automatic_marker_survives_snapshot_and_restored_drain(
+    hold: bool, evicted: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = 100.0
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now)
+    marker = AutoRetryMetadata(chain_id="a" * 32, input_id="b" * 32, attempt=2, of=5)
+    automatic = pending_inputs.record(
+        "conv", [_text_block("retry")], stable_id=marker.input_id, auto_retry=marker
+    )
+    pending_inputs.record("conv", [_text_block("retry")], stable_id="c" * 32)
+    snapshot = pending_inputs.snapshot_for("conv")
+    assert snapshot[0]["auto_retry"] == marker.model_dump()
+    assert "auto_retry" not in snapshot[1]
+    snapshot[0]["auto_retry"]["attempt"] = 5
+    drained = pending_inputs.resolve_oldest("conv", hold=hold)
+    assert drained is not None and drained.pending_id == automatic
+    assert drained.auto_retry == marker
+    if evicted:
+        now += pending_inputs._TTL_S + 1
+        assert pending_inputs.snapshot_for("conv") == []
+    pending_inputs.restore("conv", drained)
+    restored = pending_inputs.resolve("conv", automatic)
+    assert restored is not None and restored.auto_retry == marker
+
+
+@pytest.mark.parametrize("stable_id", [None, "c" * 32])
+def test_automatic_marker_rejects_another_pending_input(stable_id: str | None) -> None:
+    marker = AutoRetryMetadata(chain_id="a" * 32, input_id="b" * 32, attempt=2, of=5)
+    with pytest.raises(ValueError, match="stable input id"):
+        pending_inputs.record(
+            "conv", [_text_block("retry")], stable_id=stable_id, auto_retry=marker
+        )
+    assert pending_inputs.snapshot_for("conv") == []
 
 
 def test_resolve_oldest_drains_fifo_and_returns_entry() -> None:

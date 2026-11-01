@@ -9,11 +9,12 @@ import pytest
 from fastapi import HTTPException
 from starlette.datastructures import Headers
 
-from omnigent.entities.conversation import MessageData, NewConversationItem
+from omnigent.entities.conversation import AutoRetryMetadata, MessageData, NewConversationItem
+from omnigent.runtime import pending_inputs
 from omnigent.server.routes._sessions import orchestration
 from omnigent.server.routes._sessions.helpers import _dispatch_skill_slash_command_to_runner
 from omnigent.server.schemas import SessionEventInput
-from omnigent.server.startup_inputs import StartupInputContext
+from omnigent.server.startup_inputs import StartupInputContext, restore_pending_inputs
 from omnigent.startup_protocol import StartupAttemptRef
 from omnigent.stores.conversation_store import PENDING_INPUT_RESPONSE_ID
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -184,3 +185,45 @@ async def test_unclaimed_skill_reports_not_forwarded(db_uri):
     assert result.forwarded is False and result.item_id == context.input_id
     assert requests == [f"/v1/sessions/{conv.id}/skills/resolve"]
     assert store.list_items(conv.id).data == []
+
+
+@pytest.mark.asyncio
+async def test_restored_pending_input_retains_retry_marker_after_failed_delivery(db_uri):
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation()
+    marker = AutoRetryMetadata(chain_id="a" * 32, input_id="b" * 32, attempt=2, of=5)
+    store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id=PENDING_INPUT_RESPONSE_ID,
+                status="incomplete",
+                stable_id=marker.input_id,
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "retry"}],
+                    auto_retry=marker,
+                ),
+            )
+        ],
+    )
+    try:
+        for _ in range(2):
+            await restore_pending_inputs(store, conv.id)
+            [snapshot] = pending_inputs.snapshot_for(conv.id)
+            assert snapshot["auto_retry"] == marker.model_dump(mode="json")
+            assert snapshot["content"] == [{"type": "input_text", "text": "retry"}]
+            drained = pending_inputs.resolve(conv.id, snapshot["pending_id"])
+            assert drained is not None and drained.auto_retry == marker
+        assert store.list_pending_inputs(conv.id)[0].id == marker.input_id
+        await orchestration._settle_undelivered_native_input(
+            store, conv.id, "failed-turn", marker.input_id
+        )
+        [saved] = store.list_items(conv.id).data
+        assert saved.id == marker.input_id and saved.status == "completed"
+        assert saved.data.auto_retry == marker
+        assert store.list_pending_inputs(conv.id) == []
+    finally:
+        for pending_id in pending_inputs.pending_ids(conv.id):
+            pending_inputs.resolve(conv.id, pending_id)

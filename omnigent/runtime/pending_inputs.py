@@ -121,6 +121,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
 from omnigent.db.workspace_cache import WorkspaceScopedCache
+from omnigent.entities.conversation import AutoRetryMetadata
 from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
 from omnigent.native.input_diagnostics import input_attributes, log_input_event
 
@@ -255,6 +256,7 @@ class DrainedInput:
     lifecycle_response_id: str | None = None
     admission_id: str | None = None
     uncertain: bool = False
+    auto_retry: AutoRetryMetadata | None = None
 
 
 @dataclass
@@ -333,6 +335,7 @@ class _Entry:
     native_turn_id: str | None = None
     lifecycle_response_id: str | None = None
     admission_id: str | None = None
+    auto_retry: AutoRetryMetadata | None = None
 
 
 # Per-conversation mapping conversation_id → {pending_id: entry}. The
@@ -383,6 +386,7 @@ def record(
     *,
     background_titles_enabled: bool = True,
     admission_id: str | None = None,
+    auto_retry: AutoRetryMetadata | None = None,
 ) -> str:
     """
     Record an un-consumed web-composer user message.
@@ -406,6 +410,8 @@ def record(
         directly as the persisted item's id so the store-level append is
         idempotent across client retries. ``None`` for clients that do not
         send one.
+    :param auto_retry: Trusted marker from retry admission or a saved input;
+        its input id must equal ``stable_id``.
     :returns: The index-assigned pending id, e.g. ``"pending_a1b2c3"``.
 
     Beyond :data:`_MAX_ENTRIES_PER_CONVERSATION` unheld entries the oldest
@@ -413,6 +419,8 @@ def record(
     sized by it) stays bounded without touching entries a persist in progress
     must be able to put back.
     """
+    if auto_retry is not None and auto_retry.input_id != stable_id:
+        raise ValueError("Automatic input metadata requires its stable input id")
     with _lock:
         _evict_stale_locked(conversation_id, _now())
         # If a live entry already carries this stable_id, return its pending_id
@@ -430,6 +438,7 @@ def record(
             stable_id=stable_id,
             background_titles_enabled=background_titles_enabled,
             admission_id=admission_id,
+            auto_retry=auto_retry,
         )
         entries = _pending.setdefault(conversation_id, {})
         entries[pending_id] = entry
@@ -874,6 +883,7 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         native_turn_id=drained.native_turn_id,
         lifecycle_response_id=drained.lifecycle_response_id,
         admission_id=drained.admission_id,
+        auto_retry=drained.auto_retry,
     )
     with _lock:
         entries = _pending.get(conversation_id, {})
@@ -1065,6 +1075,11 @@ def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
                 "pending_id": entry.pending_id,
                 "content": copy.deepcopy(entry.content),
                 **({"created_by": entry.created_by} if entry.created_by is not None else {}),
+                **(
+                    {"auto_retry": entry.auto_retry.model_dump(mode="json")}
+                    if entry.auto_retry is not None
+                    else {}
+                ),
             }
             for entry in entries.values()
             if not entry.interrupted
@@ -1089,6 +1104,7 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         native_turn_id=entry.native_turn_id,
         lifecycle_response_id=entry.lifecycle_response_id,
         admission_id=entry.admission_id,
+        auto_retry=entry.auto_retry,
     )
 
 

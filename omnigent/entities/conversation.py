@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from omnigent.inner.native_attachments import (
     UNRESOLVED_ATTACHMENT_MARKER_PATTERN,
@@ -320,6 +320,23 @@ class StartupInputOptions(BaseModel):
 _MAX_MESSAGE_PHASE_LENGTH = 64
 
 
+class AutoRetryMetadata(BaseModel):
+    """Visible input correlation; execution still requires a trusted admission receipt."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    chain_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    input_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    attempt: int = Field(strict=True, ge=1)
+    of: int = Field(strict=True, ge=1)
+
+    @model_validator(mode="after")
+    def validate_attempt_limit(self) -> Self:
+        if self.attempt > self.of:
+            raise ValueError("Retry attempt exceeds the chain limit")
+        return self
+
+
 class MessageData(BaseModel):
     """
     Data for a message item (user or assistant).
@@ -359,6 +376,9 @@ class MessageData(BaseModel):
     subagent_return_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
     # Peer inputs remain context after restart, never an executable recovery trigger.
     peer_message_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    auto_retry: AutoRetryMetadata | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     interrupted: bool = Field(default=False, exclude_if=lambda value: value is False)
     stream_message_id: str | None = None
     phase: str | None = Field(default=None, exclude_if=lambda value: value is None)

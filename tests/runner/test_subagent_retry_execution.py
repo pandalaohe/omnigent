@@ -203,11 +203,12 @@ async def test_human_buffered_during_retry_admission_executes_on_own_turn(db_uri
     chain, claim = _prepared(journal)
     human_id = uuid4().hex
     entered, release, human_ran = asyncio.Event(), asyncio.Event(), asyncio.Event()
-    executed, admissions = [], []
+    executed, admissions, markers = [], [], []
 
     class Harness(HarnessApp):
         async def run_turn(self, request, ctx):
             executed.append((request.input_id, ctx.response_id))
+            markers.append(request.auto_retry)
             if request.input_id == human_id:
                 human_ran.set()
 
@@ -255,6 +256,7 @@ async def test_human_buffered_during_retry_admission_executes_on_own_turn(db_uri
                             "content": [{"type": "input_text", "text": "retry"}],
                             "input_id": claim.input_id,
                             "retry_guard": claim.retry.model_dump(),
+                            "auto_retry": claim.retry.metadata.model_dump(),
                             "input_admission_required": True,
                             "input_admission_deadline": time.time() + 30,
                         }
@@ -271,6 +273,7 @@ async def test_human_buffered_during_retry_admission_executes_on_own_turn(db_uri
                                     **body,
                                     "input_id": human_id,
                                     "retry_guard": None,
+                                    "auto_retry": None,
                                     "content": [
                                         {"type": "input_text", "text": "new human request"}
                                     ],
@@ -290,6 +293,7 @@ async def test_human_buffered_during_retry_admission_executes_on_own_turn(db_uri
             await asyncio.wait_for(serving, 5)
     assert len(executed) == 2 and executed[0][0] == claim.input_id and executed[1][0] == human_id
     assert executed[0][1] != executed[1][1]
+    assert markers == [claim.retry.metadata, None]
     human = journal.store.get_input(human_id)
     assert human.state == "accepted" and human.turn_id == executed[1][1]
     assert [admission.turn_id for admission in admissions] == [turn_id for _, turn_id in executed]

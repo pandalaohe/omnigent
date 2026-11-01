@@ -73,7 +73,10 @@ class ImportItemInput(BaseModel):
     def to_item(self) -> NewConversationItem:
         """Validate the type-specific payload and return a new item entity."""
         try:
-            data = parse_item_data(self.type, self.data)
+            payload = self.data
+            if self.type == "message":
+                payload = {key: value for key, value in payload.items() if key != "auto_retry"}
+            data = parse_item_data(self.type, payload)
             return NewConversationItem(type=self.type, response_id=self.response_id, data=data)
         except (TypeError, ValueError) as exc:
             raise OmnigentError(

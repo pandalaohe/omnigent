@@ -5570,7 +5570,9 @@ async def _settle_undelivered_native_input(
     item = NewConversationItem(
         type="message",
         response_id=response_id or generate_task_id(),
-        data=MessageData(role="user", content=drained.content, user_authored=True),
+        data=MessageData(
+            role="user", content=drained.content, user_authored=True, auto_retry=drained.auto_retry
+        ),
         created_by=drained.created_by,
         stable_id=drained.stable_id,
         replaces_pending_id=drained.stable_id,
@@ -5683,7 +5685,12 @@ def _build_skipped_native_items(
             NewConversationItem(
                 type="message",
                 response_id=turn_id,
-                data=MessageData(role="user", content=skipped.content, user_authored=True),
+                data=MessageData(
+                    role="user",
+                    content=skipped.content,
+                    user_authored=True,
+                    auto_retry=skipped.auto_retry,
+                ),
                 created_by=skipped.created_by,
                 stable_id=uuid.uuid5(
                     uuid.NAMESPACE_URL,
@@ -8503,6 +8510,8 @@ def _build_native_terminal_message_event(
     }
     if agent_revision is not None:
         event["agent_revision"] = agent_revision
+    if data.auto_retry is not None:
+        event["auto_retry"] = data.auto_retry.model_dump(mode="json")
     # The web's stable id for this message rides along so the runner can name
     # it on a turn that fails before the harness receives it; the relay then
     # settles exactly that queued entry (see _settle_undelivered_native_input).
@@ -10456,6 +10465,9 @@ async def _dispatch_session_event_to_runner_impl(
                 stable_id=web_stable_id,
                 background_titles_enabled=background_titles_enabled,
                 admission_id=usage_admission["admission_id"] if usage_admission else None,
+                auto_retry=(
+                    guard.metadata if (guard := active_retry_dispatch()) is not None else None
+                ),
             )
             if queues_message
             else None

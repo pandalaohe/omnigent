@@ -16,6 +16,40 @@ from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
 
+@pytest.mark.parametrize("harness", ["claude-native", "codex-native", "pi-native"])
+@pytest.mark.parametrize("automatic", [False, True])
+def test_native_message_event_preserves_typed_retry_metadata(harness, automatic):
+    from omnigent.entities.conversation import Conversation
+    from omnigent.server.routes._sessions.orchestration import _build_native_terminal_message_event
+
+    marker = {"chain_id": "a" * 32, "input_id": "b" * 32, "attempt": 2, "of": 5}
+    conv = Conversation(
+        id="child",
+        root_conversation_id="parent",
+        parent_conversation_id="parent",
+        agent_id="agent",
+        created_at=0,
+        updated_at=0,
+        harness_override=harness,
+    )
+    body = SessionEventInput(
+        type="message",
+        data={
+            "role": "user",
+            "content": [{"type": "input_text", "text": "retry"}],
+            "stable_id": "b" * 32,
+            **({"auto_retry": marker} if automatic else {}),
+        },
+    )
+    event = _build_native_terminal_message_event(conv, body)
+    assert event["content"] == [{"type": "input_text", "text": "retry"}]
+    assert event["stable_id"] == "b" * 32
+    if automatic:
+        assert event["auto_retry"] == marker
+    else:
+        assert "auto_retry" not in event
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failed_append", [False, True])
 async def test_skipped_message_logs_committed_ids_once_and_keeps_enqueue_identity(
