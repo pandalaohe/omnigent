@@ -60,6 +60,7 @@ def mint_session_token(
     account_generation: str | None = None,
     cli_login_ticket: str | None = None,
     browser_session: bool = False,
+    purpose: str | None = None,
 ) -> str:
     """
     Mint a signed session JWT with a second-granularity lifetime.
@@ -95,6 +96,8 @@ def mint_session_token(
         payload["cli_login_ticket"] = cli_login_ticket
     if browser_session:
         payload["browser_session"] = True
+    if purpose is not None:
+        payload["purpose"] = purpose
     return jwt.encode(payload, cookie_secret, algorithm="HS256")
 
 

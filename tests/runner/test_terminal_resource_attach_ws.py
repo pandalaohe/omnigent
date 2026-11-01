@@ -78,8 +78,9 @@ def _patch_control_attach(
         tmux_target: str,
         read_only: bool,
         on_client_interaction: object = None,
+        on_input: object = None,
     ) -> None:
-        del websocket, on_client_interaction
+        del websocket, on_client_interaction, on_input
         on_attach(socket_path, tmux_target, read_only)
         raise RuntimeError("bridge stopped")
 
@@ -87,6 +88,54 @@ def _patch_control_attach(
         "omnigent.runner.resource_routes.bridge_tmux_control_to_websocket",
         fake_control,
     )
+
+
+@pytest.mark.parametrize(
+    "name,role", [("qwen", QWEN_NATIVE_TERMINAL_ROLE), ("tui", OMNIGENT_REPL_TERMINAL_ROLE)]
+)
+@pytest.mark.parametrize("direct", [False, True])
+def test_recovery_never_attaches_replacement_admin_terminal(
+    tmp_path, monkeypatch, name, role, direct
+):
+    registry = TerminalRegistry()
+    original = _make_running_instance(name, "main", tmp_path)
+    replacement = _make_running_instance(name, "main", tmp_path / "replacement")
+    replacement.elevated = True
+    _seed_registry(registry, "session", original)
+    resources = SessionResourceRegistry(terminal_registry=registry)
+    asyncio.run(
+        resources.observe_auxiliary_terminal("session", name, "main", original, resource_role=role)
+    )
+
+    async def replaced_during_probe():
+        _seed_registry(registry, "session", replacement)
+        return False
+
+    monkeypatch.setattr(original, "is_alive", replaced_during_probe)
+    calls = []
+    _patch_control_attach(monkeypatch, lambda *args: calls.append(args))
+    runner = create_runner_app(
+        terminal_registry=registry, resource_registry=resources, server_client=NullServerClient()
+    )
+    app = (
+        create_direct_attach_app(
+            runner.state.terminal_attach_handler,
+            token="test-token",
+            allowed_origins=frozenset({"http://localhost"}),
+        )
+        if direct
+        else runner
+    )
+    path = (
+        f"/v1/sessions/session/resources/terminals/terminal_{name}_main/attach"
+        "?read_only=true&token=test-token"
+    )
+    with TestClient(app).websocket_connect(path, headers={"origin": "http://localhost"}) as ws:
+        with pytest.raises(WebSocketDisconnect) as rejected:
+            ws.receive_bytes()
+    assert rejected.value.code in (1008, 4404)
+    assert calls == []
+    assert registry.get("session", name, "main") is replacement and replacement.running
 
 
 def test_runner_resource_attach_ignores_obsolete_transport_query(

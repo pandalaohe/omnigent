@@ -363,7 +363,7 @@ def _terminal_exit_diagnostics(
 
     last_output: str | None = None
     read_last_output = getattr(instance, "last_pane_text", None)
-    if callable(read_last_output):
+    if callable(read_last_output) and not instance.elevated:
         try:
             raw_last_output = read_last_output()
         except Exception:
@@ -1420,6 +1420,7 @@ class SessionResourceRegistry:
         sandbox_override: str | None = None,
         parent_os_env: OSEnvSpec | None = None,
         resource_role: str | None = None,
+        elevated: bool = False,
     ) -> SessionResourceView:
         """Launch a terminal resource attached to the owning session.
 
@@ -1440,6 +1441,7 @@ class SessionResourceRegistry:
             sandbox_override=sandbox_override,
             parent_os_env=parent_os_env,
             resource_role=resource_role,
+            elevated=elevated,
         )
 
     async def _launch_terminal_with_lifecycle(
@@ -1454,6 +1456,7 @@ class SessionResourceRegistry:
         sandbox_override: str | None = None,
         parent_os_env: OSEnvSpec | None = None,
         resource_role: str | None = None,
+        elevated: bool = False,
     ) -> SessionResourceView:
         """Launch a terminal, then observe it with the requested lifecycle."""
         if self._terminal_registry is None:
@@ -1462,11 +1465,11 @@ class SessionResourceRegistry:
         from omnigent.terminals.registry import TerminalExitedDuringLaunch
 
         spec = replace(spec, env={**spec.env, **self.client_surface_env(session_id)})
-        program_status_args = (
-            {"program_status_app": "claude-code"}
+        program_status_app = (
+            "claude-code"
             if resource_role == CLAUDE_NATIVE_TERMINAL_ROLE
             and self._feature_flags.enabled(Feature.CLAUDE_OSC_STATUS)
-            else {}
+            else None
         )
         try:
             instance = await self._terminal_registry.launch(
@@ -1477,7 +1480,8 @@ class SessionResourceRegistry:
                 parent_os_env=parent_os_env,
                 cwd_override=cwd_override,
                 sandbox_override=sandbox_override,
-                **program_status_args,
+                elevated=elevated,
+                program_status_app=program_status_app,
             )
         except TerminalExitedDuringLaunch as exc:
             await self._finalize_terminal_exit(
@@ -1655,7 +1659,12 @@ class SessionResourceRegistry:
         emit_status = (
             status_publisher is not None and resource_role in _STATUS_EMITTING_TERMINAL_ROLES
         )
-        if activity_publisher is None and not emit_status and exit_publisher is None:
+        if (
+            activity_publisher is None
+            and not emit_status
+            and exit_publisher is None
+            and not instance.elevated
+        ):
             return
         resource_id = terminal_resource_id(terminal_name, session_key)
         loop = asyncio.get_running_loop()
@@ -1914,6 +1923,9 @@ class SessionResourceRegistry:
                     session_key,
                 )
 
+        if instance.elevated:
+            instance.on_elevated_exit = _on_exit
+
         if not emit_status:
             needs_tick = (
                 resource_role == CLAUDE_NATIVE_TERMINAL_ROLE or input_ready_probe is not None
@@ -2029,6 +2041,13 @@ class SessionResourceRegistry:
         """
         terminal_id = terminal_resource_id(terminal_name, session_key)
         with self._lock:
+            current = (
+                self._terminal_registry.get(session_id, terminal_name, session_key)
+                if self._terminal_registry is not None
+                else None
+            )
+            if instance is not None and current is not None and current is not instance:
+                return
             observed = self._terminal_lifecycles.pop((session_id, terminal_id), None)
             observed_role = self._terminal_roles.pop((session_id, terminal_id), None)
         if observed is None:
@@ -2130,7 +2149,9 @@ class SessionResourceRegistry:
         if resource_role == CODEX_NATIVE_TERMINAL_ROLE or startup_exit:
             from omnigent.process_logging import harness_stderr_capture_enabled
 
-            output_allowed = not before_observation or harness_stderr_capture_enabled()
+            output_allowed = (instance is None or not instance.elevated) and (
+                not before_observation or harness_stderr_capture_enabled()
+            )
             if output_allowed:
                 raw_output = last_output
                 if instance is not None:

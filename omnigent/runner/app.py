@@ -2958,6 +2958,8 @@ def create_runner_app(
         if registry is None:
             return None
         for entry in registry.list_for_conversation(conv_id):
+            if entry.instance.elevated:
+                continue
             try:
                 pane = trim_terminal_output(entry.instance.last_pane_text())
             except Exception:

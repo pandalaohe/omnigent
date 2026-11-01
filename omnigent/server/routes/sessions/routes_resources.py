@@ -111,6 +111,10 @@ from omnigent.server.routes._sessions.helpers import (
 from omnigent.server.routes._sessions.orchestration import (
     ensure_runner_connected,
 )
+from omnigent.server.routes._terminal_access import (
+    require_terminal_browser_session,
+    require_terminal_host_owner,
+)
 from omnigent.server.schemas import (
     CopiedFile,
     CopyFilesRequest,
@@ -1777,6 +1781,8 @@ def register_resources_routes(
             if not isinstance(metadata, dict):
                 metadata = {}
                 item["metadata"] = metadata
+            if metadata.get("elevated"):
+                continue
             metadata["direct_attach_url"] = (
                 f"ws://127.0.0.1:{endpoint.port}/v1/sessions/{session_id}"
                 f"/resources/terminals/{terminal_id}/attach?token={endpoint.token}"
@@ -1824,6 +1830,28 @@ def register_resources_routes(
         """
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
         body = await request.json()
+        elevated = body.get("elevated", False)
+        if not isinstance(elevated, bool):
+            raise HTTPException(status_code=400, detail="elevated must be a boolean")
+        if elevated:
+            from omnigent.host.frames import CAP_TERMINAL_ELEVATED
+
+            host_id = await require_terminal_host_owner(
+                request, conv, auth_provider, conversation_store
+            )
+            user_id = _get_user_id(request, auth_provider)
+            if permission_store is not None and (
+                not user_id or not await asyncio.to_thread(permission_store.is_admin, user_id)
+            ):
+                raise HTTPException(
+                    status_code=403, detail="admin terminal creation requires an administrator"
+                )
+            conn = host_registry.get(host_id) if host_registry is not None else None
+            if conn is None or CAP_TERMINAL_ELEVATED not in conn.hello.capabilities:
+                raise HTTPException(
+                    status_code=409, detail="admin terminals are not enabled on this host"
+                )
+            require_terminal_browser_session(request, auth_provider)
         is_native_bootstrap = (
             bool(body.get("ensure_native_terminal") or body.get("bridge_inject_dir"))
             and native_coding_agent_for_terminal_name(body.get("terminal")) is not None
@@ -1917,6 +1945,60 @@ def register_resources_routes(
         conv = await _validate_session(session_id, request, LEVEL_READ)
         path = f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}"
         return await _proxy_get_to_runner(session_id, path, conv)
+
+    @router.patch(
+        "/sessions/{session_id}/resources/terminals/{terminal_id}",
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def set_terminal_agent_access(
+        request: Request, session_id: str, terminal_id: str
+    ) -> Any:
+        """Grant or revoke agent use of exactly one elevated terminal instance."""
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        require_terminal_browser_session(request, auth_provider)
+        host_id = await require_terminal_host_owner(
+            request, conv, auth_provider, conversation_store
+        )
+        body = await request.json()
+        if (
+            not isinstance(body, dict)
+            or not isinstance(body.get("agent_access"), bool)
+            or not isinstance(body.get("instance_id"), str)
+            or not body["instance_id"]
+        ):
+            raise HTTPException(
+                status_code=400, detail="agent_access and instance_id are required"
+            )
+        status, payload = await _proxy_patch_to_runner(
+            session_id,
+            f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}",
+            {"agent_access": body["agent_access"], "instance_id": body["instance_id"]},
+            conv,
+        )
+        if status >= 400:
+            raise HTTPException(
+                status_code=status,
+                detail=payload.get("error", {}).get("message", "terminal access change failed"),
+            )
+        _logger.info(
+            "Terminal agent access changed user=%s host=%s session=%s terminal=%s instance=%s enabled=%s route=W",
+            _get_user_id(request, auth_provider),
+            host_id,
+            session_id,
+            terminal_id,
+            body["instance_id"],
+            body["agent_access"],
+        )
+        _publish_and_persist_resource_event(
+            session_id,
+            "session.resource.created",
+            resource_id=terminal_id,
+            resource_type="terminal",
+            conversation_store=conversation_store,
+            resource=payload,
+        )
+        return payload
 
     @router.get("/sessions/{session_id}/sign-in-link", response_model=None)
     async def get_session_sign_in_link(request: Request, session_id: str) -> dict[str, Any]:

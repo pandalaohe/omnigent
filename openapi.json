@@ -25916,6 +25916,54 @@
         "tags": [
           "session_resources"
         ]
+      },
+      "patch": {
+        "description": "Grant or revoke agent use of exactly one elevated terminal instance.",
+        "operationId": "set_terminal_agent_access_v1_sessions__session_id__resources_terminals__terminal_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "terminal_id",
+            "required": true,
+            "schema": {
+              "title": "Terminal Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Terminal Agent Access",
+        "tags": [
+          "session_resources"
+        ]
       }
     },
     "/v1/sessions/{session_id}/resources/{resource_id}": {

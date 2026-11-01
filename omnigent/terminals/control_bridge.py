@@ -630,6 +630,7 @@ async def bridge_tmux_control_to_websocket(
     tmux_target: str,
     read_only: bool,
     on_client_interaction: Callable[[], None] | None = None,
+    on_input: Callable[[], None] | None = None,
     reader_done: asyncio.Event | None = None,
     forward_done: asyncio.Event | None = None,
 ) -> None:
@@ -894,6 +895,8 @@ async def bridge_tmux_control_to_websocket(
                             continue
                         await _send_command(f"refresh-client -C {cols}x{rows}\n".encode())
                 elif data is not None and not read_only:
+                    if data and on_input is not None:
+                        on_input()
                     # Stamp before sending so the next %output (the echo) takes
                     # the small interactive frame cap.
                     last_client_input_at = _monotonic()

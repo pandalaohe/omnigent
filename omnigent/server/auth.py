@@ -445,6 +445,10 @@ class AuthProvider(ABC):
         """Return the authenticated user ID, or ``None``."""
         ...
 
+    def is_browser_session(self, request: HTTPConnection) -> bool:  # noqa: ARG002
+        """Whether a verified human browser cookie supplied this request's identity."""
+        return False
+
     def mint_runner_token(self, user_id: str, ttl_seconds: int) -> str | None:  # noqa: ARG002
         """
         Mint a short-lived bearer a managed-sandbox runner presents as *user_id*.
@@ -708,6 +712,7 @@ class UnifiedAuthProvider(AuthProvider):
             ttl_seconds,
             self._source,
             account_generation=account_generation(user_id),
+            purpose="runner",
         )
 
     @property
@@ -737,6 +742,26 @@ class UnifiedAuthProvider(AuthProvider):
         if claims.get("browser_session") is not True or "scope" in claims or "grant_id" in claims:
             return None
         return self.get_user_id(request)
+
+    def is_browser_session(self, request: HTTPConnection) -> bool:
+        """Reject delegated tokens even when copied into the session cookie."""
+        import jwt
+
+        if request.headers.get("authorization"):
+            return False
+        config = self._oidc_config if self._source == "oidc" else self._accounts_config
+        if config is None:
+            return False
+        token = request.cookies.get(config.session_cookie_name)
+        if not token:
+            return False
+        try:
+            payload = jwt.decode(token, config.cookie_secret, algorithms=["HS256"])
+        except jwt.InvalidTokenError:
+            return False
+        if any(payload.get(key) is not None for key in ("purpose", "scope", "grant_id")):
+            return False
+        return self.get_user_id(request) is not None
 
     def _check_cookie(self, request: HTTPConnection) -> str | None:
         """Validate the session cookie or Bearer token and return the
