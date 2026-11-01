@@ -179,7 +179,12 @@ from omnigent.host.git_worktree import (
     read_worktree_status,
     remove_worktree,
 )
-from omnigent.host.identity import CONFIG_PATH, HostIdentity, load_or_create_host_identity
+from omnigent.host.identity import (
+    CONFIG_PATH,
+    HostIdentity,
+    load_elevated_terminals_method,
+    load_or_create_host_identity,
+)
 from omnigent.host.load_level import FACTORY_LINES, LevelState, LoadLines, utc_iso
 from omnigent.host.maintenance import (
     HostMaintenanceJanitor,
@@ -1014,6 +1019,7 @@ def _build_runner_env(
     host_owns_global_cleanup: bool = False,
     harness_tmp_parent: Path | None = None,
     inference_config: dict[str, object] | None = None,
+    elevated_terminals: str | None = None,
 ) -> dict[str, str]:
     """
     Build the environment for a spawned runner subprocess.
@@ -1109,6 +1115,11 @@ def _build_runner_env(
         env[RUNNER_LAUNCH_HARNESS_ENV_VAR] = harness
     if interactive_shells is not None:
         env[RUNNER_INTERACTIVE_SHELLS_ENV_VAR] = json.dumps(interactive_shells)
+    from omnigent.terminals.elevation import ELEVATED_TERMINALS_ENV
+
+    env.pop(ELEVATED_TERMINALS_ENV, None)
+    if elevated_terminals == "sudo":
+        env[ELEVATED_TERMINALS_ENV] = elevated_terminals
     return env
 
 
@@ -1359,6 +1370,7 @@ class HostProcess:
         # started with; a host launched with an explicit --config must not
         # fall back to the default file.
         self._config_path = config_path or CONFIG_PATH
+        self._elevated_terminals_method = load_elevated_terminals_method(self._config_path)
         self._post_bind_hook_runner = PostBindHookRunner(self._config_path)
         # One reader per workspace, so its registry keeps state between
         # requests (the changed-files snapshot search reuses for untracked
@@ -2313,6 +2325,7 @@ class HostProcess:
             host_owns_global_cleanup=self._maintenance_janitor is not None,
             harness_tmp_parent=self._harness_tmp_parent,
             inference_config=frame.inference_config,
+            elevated_terminals=self._elevated_terminals_method,
         )
         if frame.inference_config is not None:
             try:
@@ -5893,6 +5906,15 @@ class HostProcess:
         else:
             await diagnostics.send(ws.send, data)
 
+    def _terminal_capabilities(self) -> list[str]:
+        """Advertise elevation only when the host explicitly enabled it."""
+        from omnigent.host.frames import CAP_TERMINAL_ELEVATED
+
+        capabilities = list(HOST_CAPABILITIES)
+        if self._elevated_terminals_method is not None:
+            capabilities.append(CAP_TERMINAL_ELEVATED)
+        return capabilities
+
     async def _serve_frames(
         self, ws: websockets.asyncio.client.ClientConnection, *, connection_id: str | None = None
     ) -> None:
@@ -5935,7 +5957,7 @@ class HostProcess:
             filesystem_roots=True,
             post_bind_hook=True,
             project_code=True,
-            capabilities=list(HOST_CAPABILITIES) + (["host_restart"] if supervisor else []),
+            capabilities=self._terminal_capabilities() + (["host_restart"] if supervisor else []),
             supervised=supervisor,
             started_at=self._started_at,
             connection_id=connection_id,

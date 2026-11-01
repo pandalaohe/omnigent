@@ -394,6 +394,7 @@ _AGY_ENABLED_TOOLS = [
     "sys_session_unarchive",
     "sys_standing_pass",
     "sys_terminal_close",
+    "sys_terminal_request_access",
     "sys_terminal_launch",
     "sys_terminal_list",
     "sys_terminal_read",

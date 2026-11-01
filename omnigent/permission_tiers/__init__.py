@@ -171,6 +171,7 @@ _READ_NO_PATH = frozenset(
         "sys_flow_list",
         "sys_host_load",
         "sys_host_restart",
+        "sys_terminal_request_access",
         "list_comments",
         "load_skill",
         "read_skill_file",

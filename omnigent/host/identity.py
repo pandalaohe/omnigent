@@ -14,6 +14,7 @@ import tempfile
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import yaml
 
@@ -83,6 +84,23 @@ def export_configured_slice_key(path: Path) -> None:
 def host_config_path(path: Path | None = None) -> Path:
     """Return the effective config path used for host identity."""
     return path if path is not None else global_config_path(CONFIG_PATH)
+
+
+def load_elevated_terminals_method(path: Path) -> Literal["sudo"] | None:
+    """Read the explicit host opt-in; unknown methods fail closed."""
+    from omnigent._platform import IS_POSIX
+
+    if not path.exists():
+        return None
+    with path.open() as stream:
+        config = yaml.safe_load(stream) or {}
+    host = config.get("host") if isinstance(config, dict) else None
+    method = host.get("elevated_terminals") if isinstance(host, dict) else None
+    if method is None:
+        return None
+    if method != "sudo" or not IS_POSIX:
+        raise ValueError("host.elevated_terminals supports only 'sudo' on macOS/Linux")
+    return "sudo"
 
 
 def _validated_host_id(host_id: str, *, source: str, remedy: str) -> str:

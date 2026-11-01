@@ -708,6 +708,7 @@ class UnifiedAuthProvider(AuthProvider):
             ttl_seconds,
             self._source,
             account_generation=account_generation(user_id),
+            purpose="runner",
         )
 
     @property
@@ -734,7 +735,12 @@ class UnifiedAuthProvider(AuthProvider):
             claims = jwt.decode(token, config.cookie_secret, algorithms=["HS256"])
         except jwt.InvalidTokenError:
             return None
-        if claims.get("browser_session") is not True or "scope" in claims or "grant_id" in claims:
+        if (
+            claims.get("browser_session") is not True
+            or "scope" in claims
+            or "grant_id" in claims
+            or claims.get("purpose") == "runner"
+        ):
             return None
         return self.get_user_id(request)
 

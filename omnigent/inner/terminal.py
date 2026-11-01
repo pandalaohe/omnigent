@@ -1124,6 +1124,11 @@ class TerminalInstance:
     # longer reaps the server and cascades into ``no server running`` (#540).
     keep_alive_after_exit: bool = False
     running: bool = False
+    elevated: bool = False
+    agent_access: bool = False
+    last_input_at: float = field(default_factory=time.monotonic, repr=False)
+    _elevated_watch_stop: threading.Event = field(default_factory=threading.Event, repr=False)
+    on_elevated_exit: Callable[[], None] | None = field(default=None, repr=False)
     launch_cwd: str | None = None
     # Runtime-owned observation; never part of the portable terminal spec.
     program_status_app: str | None = None
@@ -1188,6 +1193,15 @@ class TerminalInstance:
     def tmux_target(self) -> str:
         """The tmux target for send-keys/capture-pane (always 'main')."""
         return "main"
+
+    @property
+    def instance_id(self) -> str:
+        """Immutable identity of this launch, including reused registry keys."""
+        return self.diagnostic_id
+
+    def note_input(self) -> None:
+        """Record input bytes, excluding attach, resize and output activity."""
+        self.last_input_at = time.monotonic()
 
     def note_client_interaction(self) -> None:
         """Record that a web client just interacted with this terminal.
@@ -1258,6 +1272,8 @@ class TerminalInstance:
         It is intentionally a snapshot, not a live tmux query, so callers can
         still retrieve useful context after tmux has already disappeared.
         """
+        if self.elevated:
+            return None
         snapshot = self._last_pane_snapshot
         if snapshot is None:
             return None
@@ -1271,7 +1287,7 @@ class TerminalInstance:
 
     def last_exit_text(self) -> str | None:
         """Return bounded recent exit history without changing the visible-screen cache."""
-        if self._last_exit_snapshot is None:
+        if self.elevated or self._last_exit_snapshot is None:
             return None
         text = _strip_ansi(self._last_exit_snapshot).strip()
         lines = text.splitlines()
@@ -1822,6 +1838,8 @@ class TerminalInstance:
             return {"error": "Terminal is not running"}
 
         try:
+            if text or keys:
+                self.note_input()
             if text:
                 for start in range(0, len(text), _SEND_KEYS_LITERAL_CHARS_PER_CALL):
                     await self._tmux(
@@ -1994,6 +2012,8 @@ class TerminalInstance:
 
     async def close(self) -> None:
         """Kill the tmux session and clean up."""
+        self.agent_access = False
+        self._elevated_watch_stop.set()
         try:
             if self.lifecycle_trace.note_cleanup():
                 logger.info(
@@ -2039,6 +2059,9 @@ class TerminalInstance:
         # Clean up the private dir (contains socket + fork).
         if self.private_dir.exists():
             shutil.rmtree(self.private_dir, ignore_errors=True)
+        observer, self.on_elevated_exit = self.on_elevated_exit, None
+        if self.elevated and observer is not None:
+            observer()
 
     def start_idle_watcher(
         self,

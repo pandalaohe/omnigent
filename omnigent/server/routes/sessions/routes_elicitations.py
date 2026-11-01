@@ -156,6 +156,17 @@ def register_elicitations_routes(
             request=request,
             auth_provider=auth_provider,
         )
+        from omnigent.server.terminal_agent_access import authorize_terminal_access_resolution
+
+        await authorize_terminal_access_resolution(
+            session_id,
+            elicitation_id,
+            user_id,
+            body.action,
+            request=request,
+            auth_provider=auth_provider,
+            store=conversation_store,
+        )
         await _resolve_elicitation(
             session_id, _resolve_data, runner_router, conversation_store, file_store
         )

@@ -440,7 +440,7 @@ def build_native_controls(
         terminal_registry = resource_registry.terminal_registry
         if terminal_registry is not None:
             await _ensure_native_terminal_for_turn(conv_id, "codex-native")
-            if terminal_registry.get(conv_id, "codex", "main") is None:
+            if terminal_registry.get_native(conv_id, "codex", "main") is None:
                 return None
         state, bridge_dir = await _codex_native_bridge_state_and_dir_for_session(
             conv_id, action="settings update", missing_state_log_level=logging.DEBUG
@@ -449,7 +449,7 @@ def build_native_controls(
             return state
         # Fresh launches publish asynchronously. Poll the resolved directory so
         # waiting never repeats the server label lookup or starts another pane.
-        while terminal_registry.get(conv_id, "codex", "main") is not None:
+        while terminal_registry.get_native(conv_id, "codex", "main") is not None:
             state = read_bridge_state(bridge_dir)
             if state is not None:
                 return state if state.session_id == conv_id else None
@@ -889,7 +889,7 @@ def build_native_controls(
                 },
             )
         registry = resource_registry.terminal_registry
-        instance = registry.get(conv_id, "codex", "main") if registry is not None else None
+        instance = registry.get_native(conv_id, "codex", "main") if registry is not None else None
         if instance is None or not instance.running:
             return JSONResponse(
                 status_code=503,
@@ -1275,7 +1275,7 @@ def build_native_controls(
             return
         # This probe duplicates the ensure path's own detection on purpose: its
         # only job is to decide whether the readiness poll below runs at all.
-        instance = terminal_registry.get(conv_id, terminal_name, "main")
+        instance = terminal_registry.get_native(conv_id, terminal_name, "main")
         if instance is not None and await instance.is_alive():
             return
         try:
@@ -1289,7 +1289,7 @@ def build_native_controls(
                 extra={"session_id": conv_id},
             )
             return
-        if terminal_registry.get(conv_id, terminal_name, "main") is None:
+        if terminal_registry.get_native(conv_id, terminal_name, "main") is None:
             # Nothing was registered, so waiting for the pane cannot help.
             return
         deadline = time.monotonic() + _CLAUDE_PANE_READY_TIMEOUT_S
@@ -2058,7 +2058,9 @@ def build_native_controls(
     ) -> Response:
         """Type one slash command into a live native pane."""
         registry = resource_registry.terminal_registry
-        instance = registry.get(conv_id, terminal_name, "main") if registry is not None else None
+        instance = (
+            registry.get_native(conv_id, terminal_name, "main") if registry is not None else None
+        )
         if instance is None or not instance.running:
             return JSONResponse(
                 status_code=503,
@@ -2619,7 +2621,7 @@ def build_native_controls(
         from omnigent.native.native_cost_popup import launch_cost_popup
 
         registry = resource_registry.terminal_registry
-        instance = registry.get(conv_id, "codex", "main") if registry is not None else None
+        instance = registry.get_native(conv_id, "codex", "main") if registry is not None else None
         if instance is None or not instance.running:
             return Response(status_code=204)
         config_file = await _native_cost_popup_config_file(conv_id, "codex-native")
@@ -2653,7 +2655,9 @@ def build_native_controls(
         from omnigent.native.native_cost_popup import launch_cost_popup
 
         registry = resource_registry.terminal_registry
-        instance = registry.get(conv_id, "opencode", "main") if registry is not None else None
+        instance = (
+            registry.get_native(conv_id, "opencode", "main") if registry is not None else None
+        )
         if instance is None or not instance.running:
             return Response(status_code=204)
         config_file = await _native_cost_popup_config_file(conv_id, "opencode-native")
@@ -2686,7 +2690,9 @@ def build_native_controls(
         from omnigent.native.native_cost_popup import launch_blocked_notice
 
         registry = resource_registry.terminal_registry
-        instance = registry.get(conv_id, "opencode", "main") if registry is not None else None
+        instance = (
+            registry.get_native(conv_id, "opencode", "main") if registry is not None else None
+        )
         if instance is None or not instance.running:
             return Response(status_code=204)
         try:

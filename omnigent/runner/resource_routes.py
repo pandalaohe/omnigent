@@ -29,6 +29,7 @@ from omnigent.entities.session_resources import (
     resolve_terminal_entry_by_resource_id,
     session_resource_view_to_dict,
     terminal_resource_id,
+    terminal_resource_view,
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import native_terminal_name
@@ -513,6 +514,29 @@ def register_resource_routes(
         request: Request,
     ) -> JSONResponse:
         body = await request.json()
+        elevated = body.get("elevated", False)
+        if not isinstance(elevated, bool):
+            return JSONResponse(
+                status_code=400, content={"error": {"message": "elevated must be a boolean"}}
+            )
+        if elevated:
+            from omnigent.terminals.elevation import ELEVATED_TERMINALS_ENV
+
+            if os.environ.get(ELEVATED_TERMINALS_ENV) != "sudo":
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": {
+                            "code": ErrorCode.CONFLICT,
+                            "message": "admin terminals are not enabled on this host",
+                        }
+                    },
+                )
+            if body.get("ensure_native_terminal") or body.get("bridge_inject_dir"):
+                return JSONResponse(
+                    status_code=409,
+                    content={"error": {"message": "admin terminal cannot be a harness pane"}},
+                )
         terminal_name = body.get("terminal")
         session_key = body.get("session_key")
         if not terminal_name or not session_key:
@@ -809,12 +833,13 @@ def register_resource_routes(
                 sandbox_override=sandbox_override,
                 parent_os_env=agent_os_env,
                 resource_role=(CLAUDE_NATIVE_TERMINAL_ROLE if bridge_inject else None),
+                **({"elevated": True} if elevated else {}),
             )
-        except RuntimeError as exc:
+        except (RuntimeError, ValueError) as exc:
             if launched_relay is not None:
                 _discard_comment_relay(session_id, launched_relay)
             return JSONResponse(
-                status_code=500,
+                status_code=409 if isinstance(exc, ValueError) else 500,
                 content={
                     "error": {
                         "code": "terminal_launch_failed",
@@ -870,7 +895,7 @@ def register_resource_routes(
         terminal_registry = resource_registry.terminal_registry if resource_registry else None
         if terminal_registry is None:
             return
-        instance = terminal_registry.get(conv_id, terminal_name, "main")
+        instance = terminal_registry.get_native(conv_id, terminal_name, "main")
         if instance is not None and await instance.is_alive():
             if terminal_name != "codex":
                 return
@@ -895,7 +920,7 @@ def register_resource_routes(
             # path may have already replaced this entry with a live pane between
             # our get() and now.  Only close if the registry still points at the
             # same dead instance we just probed.
-            current = terminal_registry.get(conv_id, terminal_name, "main")
+            current = terminal_registry.get_native(conv_id, terminal_name, "main")
             if current is instance:
                 try:
                     await terminal_registry.close(conv_id, terminal_name, "main")
@@ -962,11 +987,15 @@ def register_resource_routes(
     async def get_session_terminal(
         session_id: str,
         terminal_id: str,
+        include_stopped: bool = False,
     ) -> JSONResponse:
-        resource = await resource_registry.get_terminal_resource(
-            session_id,
-            terminal_id,
-        )
+        if include_stopped:
+            entry = resolve_terminal_entry_by_resource_id(
+                session_id, terminal_id, resource_registry.terminal_registry, include_stopped=True
+            )
+            resource = terminal_resource_view(session_id, entry) if entry is not None else None
+        else:
+            resource = await resource_registry.get_terminal_resource(session_id, terminal_id)
         if resource is None:
             _log_terminal_lookup_miss(resource_registry, session_id, terminal_id)
             return JSONResponse(
@@ -981,6 +1010,47 @@ def register_resource_routes(
         return JSONResponse(
             status_code=200,
             content=session_resource_view_to_dict(resource),
+        )
+
+    @app.patch("/v1/sessions/{session_id}/resources/terminals/{terminal_id}")
+    async def set_terminal_agent_access(
+        session_id: str, terminal_id: str, request: Request
+    ) -> JSONResponse:
+        body = await request.json()
+        if (
+            not isinstance(body, dict)
+            or not isinstance(body.get("agent_access"), bool)
+            or not isinstance(body.get("instance_id"), str)
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={"error": {"message": "agent_access and instance_id are required"}},
+            )
+        entry = resolve_terminal_entry_by_resource_id(session_id, terminal_id, terminal_registry)
+        if entry is None or terminal_registry is None:
+            return JSONResponse(
+                status_code=409, content={"error": {"message": "terminal instance not found"}}
+            )
+        try:
+            instance = await asyncio.to_thread(
+                terminal_registry.set_agent_access,
+                session_id,
+                entry.terminal_name,
+                entry.session_key,
+                body["instance_id"],
+                body["agent_access"],
+            )
+        except ValueError as exc:
+            return JSONResponse(status_code=409, content={"error": {"message": str(exc)}})
+        from omnigent.entities.session_resources import terminal_resource_view
+        from omnigent.terminals.registry import TerminalListEntry
+
+        return JSONResponse(
+            content=session_resource_view_to_dict(
+                terminal_resource_view(
+                    session_id, TerminalListEntry(entry.terminal_name, entry.session_key, instance)
+                )
+            )
         )
 
     @app.get("/v1/sessions/{session_id}/sign-in-link")
@@ -1007,7 +1077,11 @@ def register_resource_routes(
         entries = registry.list_for_conversation(session_id) if registry is not None else []
         pane_names = _native_pane_names(session_id)
         for entry in entries:
-            if entry.terminal_name not in pane_names or not entry.instance.running:
+            if (
+                entry.instance.elevated
+                or entry.terminal_name not in pane_names
+                or not entry.instance.running
+            ):
                 continue
             # Wrapped rows joined: the address is far wider than the pane.
             result = await entry.instance.read(join_wrapped=True)
@@ -1079,12 +1153,12 @@ def register_resource_routes(
     async def delete_session_terminal(
         session_id: str,
         terminal_id: str,
+        instance_id: str | None = None,
     ) -> JSONResponse:
-        closed = await resource_registry.close_terminal(
-            session_id,
-            terminal_id,
+        entry = resolve_terminal_entry_by_resource_id(
+            session_id, terminal_id, resource_registry.terminal_registry, include_stopped=True
         )
-        if not closed:
+        if entry is None:
             return JSONResponse(
                 status_code=404,
                 content={
@@ -1093,6 +1167,18 @@ def register_resource_routes(
                         "message": (f"Terminal {terminal_id!r} not found"),
                     }
                 },
+            )
+        if instance_id is not None and entry.instance.instance_id != instance_id:
+            return JSONResponse(
+                status_code=409, content={"error": {"message": "Terminal instance changed"}}
+            )
+        outcome = await resource_registry.close_terminal_detailed(
+            session_id, terminal_id, expected_instance=entry.instance
+        )
+        if outcome != "closed":
+            return JSONResponse(
+                status_code=409,
+                content={"error": {"message": "Terminal instance changed or could not be closed"}},
             )
         return JSONResponse(
             status_code=200,
@@ -1112,6 +1198,8 @@ def register_resource_routes(
         lock = _repl_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
         async with lock:
             existing = registry.get(session_id, _REPL_TERMINAL_NAME, _REPL_TERMINAL_SESSION_KEY)
+            if existing is not None and existing.elevated:
+                return None
             if existing is None or not existing.running or not await existing.is_alive():
                 await registry.close(session_id, _REPL_TERMINAL_NAME, _REPL_TERMINAL_SESSION_KEY)
                 try:
@@ -1143,6 +1231,8 @@ def register_resource_routes(
         lock = _qwen_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
         async with lock:
             existing = registry.get(session_id, "qwen", "main")
+            if existing is not None and existing.elevated:
+                return None
             if existing is None or not existing.running or not await existing.is_alive():
                 if startup_admission.required(session_id):
                     return None
@@ -1171,6 +1261,7 @@ def register_resource_routes(
         session_id: str,
         terminal_id: str,
         read_only: bool = Query(default=False),
+        elevated_instance_id: str | None = Query(default=None),
     ) -> None:
         await websocket.accept()
         entry = resolve_terminal_entry_by_resource_id(
@@ -1196,21 +1287,32 @@ def register_resource_routes(
                     reason="terminal resource not found or not running",
                 )
                 return
-        _repop_task = asyncio.create_task(
-            _repop_pending_cost_popup_on_attach(
-                session_id,
-                str(entry.instance.socket_path),
-                entry.instance.tmux_target,
+        if entry.instance.elevated and (
+            websocket.scope.get("omnigent.direct_attach")
+            or read_only
+            or elevated_instance_id != entry.instance.instance_id
+        ):
+            await websocket.close(
+                code=1008, reason="admin terminals require the host owner's interactive relay"
             )
-        )
-        _COST_POPUP_REPOP_TASKS.add(_repop_task)
-        _repop_task.add_done_callback(_COST_POPUP_REPOP_TASKS.discard)
+            return
+        if not entry.instance.elevated:
+            _repop_task = asyncio.create_task(
+                _repop_pending_cost_popup_on_attach(
+                    session_id,
+                    str(entry.instance.socket_path),
+                    entry.instance.tmux_target,
+                )
+            )
+            _COST_POPUP_REPOP_TASKS.add(_repop_task)
+            _repop_task.add_done_callback(_COST_POPUP_REPOP_TASKS.discard)
         await bridge_tmux_control_to_websocket(
             websocket,
             socket_path=str(entry.instance.socket_path),
             tmux_target=entry.instance.tmux_target,
             read_only=read_only,
             on_client_interaction=entry.instance.note_client_interaction,
+            on_input=entry.instance.note_input,
         )
 
     # Reused by the loopback direct-attach listener (see
