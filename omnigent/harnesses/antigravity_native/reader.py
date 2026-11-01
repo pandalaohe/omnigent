@@ -1453,6 +1453,8 @@ async def _stream_loop(
                 for source, target, minimum in (
                     ("estimatedTokensUsed", "context_tokens", 0),
                     ("maxContextTokens", "context_window", 1),
+                    # agy compacts automatically when its native context budget fills.
+                    ("maxContextTokens", "auto_compact_token_limit", 1),
                 ):
                     value = context.get(source)
                     if type(value) is int and value >= minimum:
