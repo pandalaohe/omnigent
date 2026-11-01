@@ -29,7 +29,14 @@ from omnigent.server.routes.sessions import (
     _pending_policy_ask_writes,
     _PendingPolicyAskWrites,
 )
-from omnigent.spec.types import LabelDef, Phase, PolicyAction, StateUpdate, StateUpdateAction
+from omnigent.spec.types import (
+    DEFAULT_ASK_TIMEOUT,
+    LabelDef,
+    Phase,
+    PolicyAction,
+    StateUpdate,
+    StateUpdateAction,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
 # ---------------------------------------------------------------------------
@@ -152,6 +159,10 @@ class _FixedPolicyEngine:
     """
 
     result: PolicyResult
+    ask_timeout: int = DEFAULT_ASK_TIMEOUT
+
+    def spec_for(self, _policy_name: str | None) -> None:
+        """This fixed-result engine has no per-policy timeout overrides."""
 
     async def evaluate(self, ctx: EvaluationContext) -> PolicyResult:
         """
