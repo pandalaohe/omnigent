@@ -783,6 +783,7 @@ def test_resolve_cli_binary_no_env_var(monkeypatch):
 
 
 def test_cli_fallback_dirs_includes_windows_npm(monkeypatch, tmp_path):
+    monkeypatch.delenv("OMNIGENT_CLI_FALLBACK_DIRS", raising=False)
     monkeypatch.setattr(_platform, "IS_WINDOWS", True)
     monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
     monkeypatch.setenv("PROGRAMFILES", str(tmp_path / "Program Files"))
@@ -811,6 +812,7 @@ def test_cli_fallback_dirs_includes_nvm_version_bins(monkeypatch, tmp_path):
     Ordering is by parsed numeric version, so double-digit majors (v10) beat
     single-digit ones (v9) — a lexicographic sort would get this backwards.
     """
+    monkeypatch.delenv("OMNIGENT_CLI_FALLBACK_DIRS", raising=False)
     nvm = tmp_path / ".nvm" / "versions" / "node"
     for ver in ("v9.11.0", "v10.2.0", "v20.5.0"):
         (nvm / ver / "bin").mkdir(parents=True)
@@ -826,9 +828,75 @@ def test_cli_fallback_dirs_includes_nvm_version_bins(monkeypatch, tmp_path):
 
 def test_cli_fallback_dirs_no_nvm_dir_is_safe(monkeypatch, tmp_path):
     """Absent ~/.nvm, the ladder still returns the static dirs without error."""
+    monkeypatch.delenv("OMNIGENT_CLI_FALLBACK_DIRS", raising=False)
     monkeypatch.setattr(_platform.Path, "home", staticmethod(lambda: tmp_path))
     dirs = _platform._cli_fallback_dirs()
     assert tmp_path / ".local" / "bin" in dirs
+
+
+@pytest.mark.parametrize("override", ["", os.pathsep])
+def test_empty_cli_fallback_override_disables_global_discovery(monkeypatch, tmp_path, override):
+    global_bin = tmp_path / ".local" / "bin"
+    global_bin.mkdir(parents=True)
+    cli = global_bin / "claude"
+    cli.write_text("#!/bin/sh\nexit 99\n")
+    cli.chmod(0o755)
+    monkeypatch.setattr(_platform.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(_platform.shutil, "which", lambda _name: None)
+    monkeypatch.setenv("OMNIGENT_CLI_FALLBACK_DIRS", override)
+
+    assert _platform._cli_fallback_dirs() == ()
+    assert _platform.resolve_cli_binary("claude") is None
+
+
+def test_cli_fallback_override_preserves_order_and_path_priority(monkeypatch, tmp_path):
+    directories = (tmp_path / "first bin", tmp_path / "second bin")
+    for directory in directories:
+        directory.mkdir()
+        cli = directory / "claude"
+        cli.write_text("#!/bin/sh\nexit 99\n")
+        cli.chmod(0o755)
+    monkeypatch.setenv("OMNIGENT_CLI_FALLBACK_DIRS", os.pathsep.join(map(str, directories)))
+    monkeypatch.setattr(_platform.shutil, "which", lambda _name: None)
+
+    assert _platform._cli_fallback_dirs() == directories
+    assert _platform.resolve_cli_binary("claude") == str(directories[0] / "claude")
+    monkeypatch.setattr(_platform.shutil, "which", lambda _name: "/opt/work/pinned/claude")
+    assert _platform.resolve_cli_binary("claude") == "/opt/work/pinned/claude"
+
+
+@pytest.mark.parametrize("value", ["", "/opt/work/isolated/bin"])
+def test_cli_fallback_override_survives_environment_filters(monkeypatch, value):
+    from omnigent.cli import _build_host_daemon_env
+    from omnigent.host.connect import _build_runner_env
+    from omnigent.inner.agent_env import clean_agent_env
+    from omnigent.inner.os_env import build_helper_env
+    from omnigent.inner.sandbox import SandboxPolicy
+
+    source = {"OMNIGENT_CLI_FALLBACK_DIRS": value}
+    runner = _build_runner_env(
+        base_env=source,
+        server_url="http://example.test",
+        runner_id="runner",
+        binding_token="test",
+        workspace=".",
+        parent_pid=os.getpid(),
+    )
+    helper = build_helper_env(
+        source,
+        SandboxPolicy(
+            backend_type="none",
+            active=True,
+            read_roots=None,
+            write_roots=[],
+            write_files=[],
+            allow_network=True,
+        ),
+    )
+    monkeypatch.setenv("OMNIGENT_CLI_FALLBACK_DIRS", value)
+    daemon = _build_host_daemon_env(server_url="https://example.test")
+    for filtered in (daemon, runner, clean_agent_env(source=source), helper):
+        assert filtered["OMNIGENT_CLI_FALLBACK_DIRS"] == value
 
 
 def test_malloc_tuning_env_empty_off_linux(monkeypatch: pytest.MonkeyPatch) -> None:

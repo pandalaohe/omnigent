@@ -41,6 +41,7 @@ import websockets.asyncio.client
 from websockets.exceptions import ConnectionClosed, InvalidStatus, InvalidURI
 
 from omnigent._platform import (
+    CLI_FALLBACK_DIRS_ENV_VAR,
     IS_POSIX,
     WINDOWS_ENV_PASSTHROUGH,
     installed_interactive_shells,
@@ -78,6 +79,7 @@ from omnigent.harness_availability import (
     HARNESS_BINARY_MISSING,
     HarnessAvailability,
 )
+from omnigent.harness_plugins import native_harnesses
 from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
 from omnigent.host.frames import (
@@ -212,6 +214,8 @@ from omnigent.onboarding.harness_install import (
     harness_cli_version,
     harness_setup_hint,
     invalidate_harness_probe_caches,
+    required_cli_binary_for_harness,
+    required_cli_for_harness,
     try_install_harness_cli,
     ui_install_key,
 )
@@ -642,6 +646,7 @@ _HOST_CAPABILITY_INIT_TIMEOUT_S = 15.0
 _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
     {
         "PATH",
+        CLI_FALLBACK_DIRS_ENV_VAR,
         "PYTHONPATH",
         "HOME",
         "USER",
@@ -1455,6 +1460,7 @@ class HostProcess:
         # connection handshake. Reconnects reuse this snapshot while the live
         # refresh task keeps it current.
         self._configured_harnesses: dict[str, HarnessAvailability] | None = None
+        self._ready_native_cli_paths: dict[str, str | None] = {}
         self._harness_accounts: HarnessAccounts | None = None
         self._gateway_inference: dict[str, bool] | None = None
         # Last sanitized Codex subscription snapshot. It is kept across tunnel
@@ -5165,6 +5171,7 @@ class HostProcess:
         """Replace the advisory snapshot and invalidate older probe results."""
         readiness_changed = configured is not None or gateway is not None
         if configured is not None:
+            self._log_missing_native_clis(configured)
             self._configured_harnesses = dict(configured)
         if gateway is not None:
             self._gateway_inference = dict(gateway)
@@ -5173,6 +5180,39 @@ class HostProcess:
             self._account_generation += 1
         if readiness_changed:
             self._capability_generation += 1
+
+    def _log_missing_native_clis(self, configured: Mapping[str, HarnessAvailability]) -> None:
+        """Remember ready CLI paths and report each disappearance once."""
+        ready: dict[str, str] = {}
+        missing: set[str] = set()
+        native = native_harnesses()
+        for harness, availability in configured.items():
+            canonical = canonicalize_harness(harness) or harness
+            if canonical not in native:
+                continue
+            spec = required_cli_for_harness(canonical)
+            if spec is None:
+                continue
+            if availability is True:
+                ready[spec.binary] = canonical
+            elif availability == HARNESS_BINARY_MISSING:
+                missing.add(spec.binary)
+        for binary, harness in ready.items():
+            try:
+                resolved = required_cli_binary_for_harness(harness)
+            except OSError:
+                resolved = None
+            self._ready_native_cli_paths[binary] = resolved or self._ready_native_cli_paths.get(
+                binary
+            )
+        for binary in sorted(missing.difference(ready)):
+            if binary in self._ready_native_cli_paths:
+                last_path = self._ready_native_cli_paths.pop(binary)
+                _logger.warning(
+                    "Native CLI disappeared: cli=%s last_resolved_path=%s",
+                    binary,
+                    last_path or "<unknown>",
+                )
 
     def _start_capability_discovery(self) -> None:
         """Share discovery across reconnects, retrying unexpected initialization errors."""
