@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from omnigent.db.db_models import current_workspace_id
 from omnigent.host.frames import CAP_HOST_RESTART
 from omnigent.server.auth import LEVEL_OWNER, AuthProvider
+from omnigent.server.browser_approval import require_owner_browser_approval
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.host_restart import RestartRecord
 from omnigent.server.peer_sweeper import PeerSweeper
@@ -123,6 +124,8 @@ def register_host_restart_routes(
             preview = registry.restarts.get_preview(body.preview_id, conn, user_id)
             if not preview.tool_approved:
                 raise HTTPException(409, "host restart approval required")
+        else:
+            require_owner_browser_approval(request, auth_provider, user_id)
         record = await registry.restarts.restart(
             body.preview_id,
             conn,

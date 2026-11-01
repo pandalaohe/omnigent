@@ -1139,6 +1139,7 @@ async def test_restart_round_trip_over_fake_tunnel(host_api_app):
     from unittest.mock import AsyncMock
 
     from omnigent.host.frames import CAP_HOST_RESTART, HostRestartFrame, HostRestartResultFrame
+    from omnigent.runner.host_restart import HOST_RESTART_TOOL_HEADER
 
     app, registry, _store, conversations = host_api_app
     requester = conversations.create_conversation(
@@ -1151,8 +1152,10 @@ async def test_restart_round_trip_over_fake_tunnel(host_api_app):
     app.state.host_restart_post_event = post_event = AsyncMock(return_value={"forwarded": True})
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
 
-        async def request(body):
-            task = asyncio.create_task(client.post(f"/v1/hosts/{_HOST_ID}/restart", json=body))
+        async def request(body, headers=None):
+            task = asyncio.create_task(
+                client.post(f"/v1/hosts/{_HOST_ID}/restart", json=body, headers=headers)
+            )
             while True:
                 output = await comm.receive_output(timeout=budget(2))
                 try:
@@ -1182,10 +1185,15 @@ async def test_restart_round_trip_over_fake_tunnel(host_api_app):
         assert preview.status_code == 200
         assert preview.json()["caller_on_host"] is True
         assert registry.restarts.active == {}
-        missing = await client.post(f"/v1/hosts/{_HOST_ID}/restart", json={"dry_run": False})
+        headers = {HOST_RESTART_TOOL_HEADER: "1"}
+        missing = await client.post(
+            f"/v1/hosts/{_HOST_ID}/restart", json={"dry_run": False}, headers=headers
+        )
         assert missing.status_code == 409
+        registry.restarts.previews[preview.json()["preview_id"]].tool_approved = True
         frame, response = await request(
-            {**options, "dry_run": False, "preview_id": preview.json()["preview_id"]}
+            {**options, "dry_run": False, "preview_id": preview.json()["preview_id"]},
+            headers=headers,
         )
         assert frame.dry_run is False
         assert response.status_code == 200
@@ -1257,7 +1265,104 @@ async def test_restart_owner_offline_supervisor_and_requester_guards(multi_user_
         ).status_code == 403
         assert (
             await client.post(path, json={"dry_run": False}, headers=headers)
-        ).status_code == 409
+        ).status_code == 403
+
+
+@pytest.mark.parametrize(
+    "credential", ["runner", "forged-tool", "browser", "missing-origin", "untrusted-origin"]
+)
+async def test_restart_execution_requires_browser_or_approved_tool(
+    auth_app, auth_client, db_uri, monkeypatch, credential
+):
+    from unittest.mock import AsyncMock
+
+    from omnigent.host.frames import CAP_HOST_RESTART, HostRestartResultFrame
+    from omnigent.runner.host_restart import HOST_RESTART_TOOL_HEADER
+    from omnigent.server.accounts_config import AccountsConfig
+    from omnigent.server.oidc import mint_session_cookie
+
+    owner = "owner@example.test"
+    provider = auth_app.state.mcp_registry_auth
+    config = AccountsConfig(b"a" * 32, 8, "http://test", None, 3600, 300)
+    monkeypatch.setattr(provider, "_source", "accounts")
+    monkeypatch.setattr(provider, "_accounts_config", config)
+    registry = auth_app.state.host_registry
+    hosts = HostStore(db_uri)
+    hosts.upsert_on_connect(_HOST_ID, "test", owner)
+    auth_app.include_router(
+        create_hosts_router(
+            registry, hosts, SqlAlchemyConversationStore(db_uri), auth_provider=provider
+        ),
+        prefix="/v1",
+    )
+    registry.register(
+        _HOST_ID,
+        AsyncMock(),
+        HostHelloFrame("test", 1, "test", capabilities=[CAP_HOST_RESTART], supervised="launchd"),
+        owner,
+    )
+    frames = []
+
+    def reply(connection, raw):
+        frame = decode_host_frame(raw)
+        frames.append(frame)
+        connection.pending_restarts[frame.request_id].set_result(
+            HostRestartResultFrame(frame.request_id, True, supervisor="launchd")
+        )
+
+    monkeypatch.setattr(registry, "send_text", reply)
+    runner_token = provider.mint_runner_token(owner, 60)
+    assert runner_token is not None
+    bearer = {"Authorization": f"Bearer {runner_token}"}
+    path = f"/v1/hosts/{_HOST_ID}/restart"
+    try:
+        preview = await auth_client.post(path, json={"dry_run": True}, headers=bearer)
+        assert preview.status_code == 200, preview.text
+        assert len(frames) == 1 and frames[0].dry_run
+        preview_id = preview.json()["preview_id"]
+        registry.restarts.previews[preview_id].tool_approval_id = "elicit_unanswered_restart"
+        frames.clear()
+        if credential in ("runner", "forged-tool"):
+            headers = {**bearer, "Origin": "http://test"}
+            if credential == "forged-tool":
+                headers[HOST_RESTART_TOOL_HEADER] = "1"
+        else:
+            auth_client.cookies.set(
+                config.session_cookie_name,
+                mint_session_cookie(
+                    owner, config.cookie_secret, 8, "accounts", browser_session=True
+                ),
+            )
+            headers = (
+                {}
+                if credential == "missing-origin"
+                else {
+                    "Origin": "https://untrusted.example.test"
+                    if credential == "untrusted-origin"
+                    else "http://test"
+                }
+            )
+        response = await auth_client.post(
+            path, json={"dry_run": False, "preview_id": preview_id}, headers=headers
+        )
+        if credential == "browser":
+            assert response.status_code == 200, response.text
+            assert len(registry.restarts.records) == 1
+            assert len(frames) == 1 and not frames[0].dry_run
+            auth_client.cookies.clear()
+            status = await auth_client.get(
+                f"{path}/{response.json()['request_id']}", headers=bearer
+            )
+            assert status.status_code == 200 and status.json()["phase"] == "draining"
+        else:
+            assert response.status_code == (409 if credential == "forged-tool" else 403), (
+                response.text
+            )
+            assert not registry.restarts.records and not registry.restarts.active
+            assert not frames
+            assert preview_id in registry.restarts.previews
+    finally:
+        await registry.restarts.shutdown()
 
 
 async def test_restart_tool_requires_approved_preview_and_never_refreshes_it(
