@@ -76,7 +76,14 @@ def register_host_restart_routes(
             raise host_absent_error(host)
         if CAP_HOST_RESTART not in conn.hello.capabilities or conn.hello.supervised is None:
             raise HTTPException(409, "host is not supervised; restart it on the machine")
+        from omnigent.runner.host_restart import HOST_RESTART_TOOL_HEADER
+        from omnigent.server.host_restart_approval import approved_tool_preview
+
+        from_tool = request.headers.get(HOST_RESTART_TOOL_HEADER) == "1"
         if body.dry_run:
+            if from_tool:
+                preview = approved_tool_preview(registry, conn, user_id, requester, body.force)
+                return preview.payload
             conv = (
                 await asyncio.to_thread(conversation_store.get_conversation, requester)
                 if requester
@@ -112,6 +119,10 @@ def register_host_restart_routes(
             )
             return not (isinstance(result, dict) and result.get("forwarded") is False)
 
+        if from_tool:
+            preview = registry.restarts.get_preview(body.preview_id, conn, user_id)
+            if not preview.tool_approved:
+                raise HTTPException(409, "host restart approval required")
         record = await registry.restarts.restart(
             body.preview_id,
             conn,

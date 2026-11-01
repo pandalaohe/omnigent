@@ -1260,6 +1260,56 @@ async def test_restart_owner_offline_supervisor_and_requester_guards(multi_user_
         ).status_code == 409
 
 
+async def test_restart_tool_requires_approved_preview_and_never_refreshes_it(
+    host_api_app, monkeypatch
+):
+    from unittest.mock import AsyncMock
+
+    from omnigent.host.frames import CAP_HOST_RESTART, HostRestartResultFrame
+    from omnigent.runner.host_restart import HOST_RESTART_TOOL_HEADER
+
+    app, registry, hosts, conversations = host_api_app
+    hosts.upsert_on_connect(_HOST_ID, "test", "local")
+    requester = conversations.create_conversation(agent_id=None)
+    registry.register(
+        _HOST_ID,
+        AsyncMock(),
+        HostHelloFrame("test", 1, "test", capabilities=[CAP_HOST_RESTART], supervised="launchd"),
+        None,
+    )
+    frames = []
+
+    def reply(connection, raw):
+        frame = decode_host_frame(raw)
+        frames.append(frame)
+        connection.pending_restarts[frame.request_id].set_result(
+            HostRestartResultFrame(frame.request_id, True, supervisor="launchd")
+        )
+
+    monkeypatch.setattr(registry, "send_text", reply)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        path = f"/v1/hosts/{_HOST_ID}/restart"
+        body = {"requested_by_session_id": requester.id}
+        preview = (await client.post(path, json=body)).json()
+        headers = {HOST_RESTART_TOOL_HEADER: "1"}
+        assert (await client.post(path, json=body, headers=headers)).status_code == 409
+        assert (
+            await client.post(
+                path,
+                json={**body, "dry_run": False, "preview_id": preview["preview_id"]},
+                headers=headers,
+            )
+        ).status_code == 409
+        stored = registry.restarts.previews[preview["preview_id"]]
+        stored.tool_approved = True
+        claimed = await client.post(path, json=body, headers=headers)
+        assert claimed.json() == preview
+        assert len(frames) == 1
+        stored.expires = registry.restarts.clock() - 1
+        assert (await client.post(path, json=body, headers=headers)).status_code == 409
+        assert len(frames) == 1
+
+
 # ── Multi-user ownership tests ────────────────────────
 
 

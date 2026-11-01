@@ -146,6 +146,9 @@ def register_elicitations_routes(
             ),
         )
         _resolve_data = {"elicitation_id": elicitation_id, **body.model_dump(exclude_none=True)}
+        from omnigent.server.host_restart_approval import authorize_restart_resolution
+
+        authorize_restart_resolution(session_id, elicitation_id, user_id, body.action)
         await _resolve_elicitation(
             session_id, _resolve_data, runner_router, conversation_store, file_store
         )

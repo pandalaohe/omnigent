@@ -325,6 +325,7 @@ _SESSION_CREATE_TOOLS = frozenset({"sys_session_create"})
 _CHILD_CAP_TOOLS = frozenset({"sys_child_cap"})
 _CHILD_CHECKIN_TOOLS = frozenset({"sys_child_checkin"})
 _HOST_LOAD_TOOLS = frozenset({"sys_host_load"})
+_HOST_RESTART_TOOLS = frozenset({"sys_host_restart"})
 
 # Both sys_session_create create shapes (JSON and config_path multipart)
 # carry the agent-origin marker: the server charges the owner's open-rate
@@ -615,6 +616,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _CHILD_CAP_TOOLS
     | _CHILD_CHECKIN_TOOLS
     | _HOST_LOAD_TOOLS
+    | _HOST_RESTART_TOOLS
     | _SESSION_OPEN_TOOLS
     | _TASK_LIFECYCLE_TOOLS
     | _AGENT_TOOLS
@@ -1101,6 +1103,7 @@ _ALL_LOCAL_TOOLS = (
     | _CHILD_CAP_TOOLS
     | _CHILD_CHECKIN_TOOLS
     | _HOST_LOAD_TOOLS
+    | _HOST_RESTART_TOOLS
     | _SESSION_OPEN_TOOLS
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
@@ -10744,6 +10747,10 @@ async def execute_tool(
             output = await _execute_child_checkin(args, server_client, conversation_id)
         elif tool_name in _HOST_LOAD_TOOLS:
             output = await _execute_host_load(args, server_client)
+        elif tool_name in _HOST_RESTART_TOOLS:
+            from omnigent.runner.host_restart import execute_host_restart
+
+            output = await execute_host_restart(args, server_client, conversation_id)
         elif tool_name == SysSessionMessageTool.name():
             from omnigent.runner.session_message import execute_message_tool
 

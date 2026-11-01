@@ -267,6 +267,9 @@ class ToolManager:
         from omnigent.tools.builtins.standing_pass import SysStandingPassTool
 
         self._tools[SysStandingPassTool.name()] = SysStandingPassTool()
+        from omnigent.tools.builtins.host_restart import SysHostRestartTool
+
+        self._tools[SysHostRestartTool.name()] = SysHostRestartTool()
 
     def _register_scheduled_task_tools(self) -> None:
         """

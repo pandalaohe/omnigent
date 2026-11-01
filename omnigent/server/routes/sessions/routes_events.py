@@ -3118,6 +3118,14 @@ def register_events_routes(
                 pass
             return {"queued": False}
         if body.type == _APPROVAL_TYPE:
+            from omnigent.server.host_restart_approval import authorize_restart_resolution
+
+            authorize_restart_resolution(
+                session_id,
+                str(body.data.get("elicitation_id", "")),
+                user_id,
+                body.data.get("action"),
+            )
             # Deliver the verdict through the shared resolver: it
             # sets any server-side harness Future (owner-checked),
             # clears the sidebar badge, and forwards

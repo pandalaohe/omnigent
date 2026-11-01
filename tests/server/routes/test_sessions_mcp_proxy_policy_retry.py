@@ -642,8 +642,10 @@ async def test_retry_session_mismatch_still_rejected(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("host_restart", [False, True])
 async def test_legitimate_retry_with_pending_entry_proceeds(
     monkeypatch: pytest.MonkeyPatch,
+    host_restart: bool,
 ) -> None:
     """A retry with a server-issued elicitation in the pending map proceeds.
 
@@ -682,16 +684,23 @@ async def test_legitimate_retry_with_pending_entry_proceeds(
     )
 
     try:
+        params = _forged_retry_params(elicitation_id=eid)
+        if host_restart:
+            params.update(name="sys_host_restart", arguments={"host": "test", "dry_run": False})
         response = await _handle_mcp_tools_call(
             rpc_id=5,
             session_id=_SESSION_ID,
-            params=_forged_retry_params(elicitation_id=eid),
+            params=params,
             conversation_store=_StubConversationStore(_make_conversation()),  # type: ignore[arg-type]
             agent_store=_StubAgentStore(),  # type: ignore[arg-type]
             runner_router=None,
         )
 
         payload = json.loads(bytes(response.body))
+        if host_restart:
+            assert "not been approved" in payload["error"]["message"]
+            assert eid in _pending_policy_ask_writes
+            return
         # On accept the handler falls through to execution, which needs
         # a runner.  With runner_router=None it returns a runner error —
         # proving the ASK gate was passed.

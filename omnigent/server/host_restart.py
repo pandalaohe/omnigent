@@ -35,6 +35,8 @@ class RestartPreview:
     drain_timeout_s: int
     expires: float
     payload: dict[str, Any]
+    tool_approval_id: str | None = None
+    tool_approved: bool = False
 
 
 @dataclass
