@@ -1119,8 +1119,12 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
 
         return run_write_transaction(self._session, "prepare_retry_input", write)
 
-    def claim_input(self, input_id: str, *, owner: InboxOwnerFence) -> RetryInputClaim | None:
+    def claim_input(
+        self, input_id: str, *, owner: InboxOwnerFence, admission_deadline: float | None = None
+    ) -> RetryInputClaim | None:
         """A unique logical dispatch claim is not proof the receiver accepted it."""
+        if admission_deadline is not None:
+            _clock(admission_deadline)
 
         def write(db: Session) -> RetryInputClaim | None:
             locked = self._locked_input(db, input_id, owner)
@@ -1151,10 +1155,32 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
                     db, receipt.target_id
                 ).generation
             receipt.state = "dispatching"
+            if admission_deadline is not None:
+                receipt.payload = {**receipt.payload, "admission_deadline": admission_deadline}
             receipt.version += 1
             return RetryInputClaim(receipt=_input(receipt), claimed=True)
 
         return run_write_transaction(self._session, "claim_logical_input_dispatch", write)
+
+    def set_admission_deadline(
+        self, input_id: str, *, owner: InboxOwnerFence, deadline: float
+    ) -> RetryInput | None:
+        """Persist the receiver's narrower execution budget after policy completes."""
+        _clock(deadline)
+
+        def write(db: Session) -> RetryInput | None:
+            locked = self._locked_input(db, input_id, owner)
+            if locked is None:
+                return None
+            receipt, _chain = locked
+            if receipt.state in {"dispatching", "reserved"}:
+                current = receipt.payload.get("admission_deadline")
+                if current is None or deadline < current:
+                    receipt.payload = {**receipt.payload, "admission_deadline": deadline}
+                    receipt.version += 1
+            return _input(receipt)
+
+        return run_write_transaction(self._session, "record_input_admission_deadline", write)
 
     def _accept(
         self,

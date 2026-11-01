@@ -7,13 +7,14 @@ the runner's final admission guard. A healthy snapshot never proves execution.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.exc import SQLAlchemyError
 
 from omnigent.entities.conversation import AutoRetryMetadata
@@ -25,7 +26,9 @@ from omnigent.entities.subagent_retry import (
     RetryChain,
     RetryExecutionGuard,
     RetryInput,
+    RetryOutcome,
 )
+from omnigent.entities.subagent_terminal import TerminalEnvelope
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.host_registry import HostRegistry
 from omnigent.stores.conversation_store import ConversationStore
@@ -179,6 +182,14 @@ async def claim_retry_forward(session_id: str, event: dict[str, Any], *, deadlin
     ):
         raise RetryDispatchRefused("input_already_claimed")
     current.forwarded = True
+    deadline_receipt = await asyncio.to_thread(
+        admission.journal.set_admission_deadline,
+        guard.input_id,
+        owner=guard.owner,
+        deadline=deadline,
+    )
+    if deadline_receipt is None or deadline_receipt.state != "dispatching":
+        raise RetryDispatchRefused("input_already_claimed")
     event["retry_guard"] = guard.model_dump(mode="json")
     event["auto_retry"] = guard.metadata.model_dump(mode="json")
     event["input_admission_required"] = True
@@ -213,6 +224,7 @@ class RetryInputResolution(BaseModel):
     ]
     receipt: RetryInput | None = None
     reason: str | None = None
+    admission_deadline: float | None = None
 
 
 class RetryInputControl(BaseModel):
@@ -221,6 +233,20 @@ class RetryInputControl(BaseModel):
     owner: InboxOwnerFence
     expected_version: int | None = None
     reason: dict[str, Any] | None = None
+
+
+class RetryTerminalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    owner: InboxOwnerFence
+    terminal: TerminalEnvelope
+    limit: int = Field(strict=True, ge=0)
+    observed_at: float = Field(allow_inf_nan=False)
+
+
+class RetryFinalizeRequest(RetryInputControl):
+    outcome: RetryOutcome
+    wake_payload: dict[str, Any]
 
 
 class SubagentRetryAdmission:
@@ -233,11 +259,13 @@ class SubagentRetryAdmission:
         *,
         host_store: HostStore | None,
         host_registry: HostRegistry | None,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         self.journal = journal
         self.conversations = conversations
         self.host_store = host_store
         self.host_registry = host_registry
+        self.clock = clock
         self.control_tasks: set[asyncio.Task[Any]] = set()
 
     async def admit_execution(
@@ -346,6 +374,12 @@ class SubagentRetryAdmission:
             return RetryInputResolution(state="not_found")
         if not self._owns(chain, owner):
             return RetryInputResolution(state="stale_owner", reason="stale_owner")
+        if (
+            expected_version is not None
+            and reason.get("code") == "acceptance_unknown"
+            and receipt.payload.get("admission_deadline", 0) > self.clock()
+        ):
+            expected_version = None
         if expected_version is not None and receipt.state in {
             "prepared",
             "dispatching",
@@ -369,6 +403,7 @@ class SubagentRetryAdmission:
             if receipt.state in {"prepared", "dispatching", "reserved"}
             else receipt.state,
             receipt=receipt,
+            admission_deadline=receipt.payload.get("admission_deadline"),
         )
 
     async def lookup_or_close_input(

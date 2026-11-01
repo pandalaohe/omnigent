@@ -7579,6 +7579,7 @@ def create_runner_app(
         error: Mapping[str, object] | None = None,
         recovered: bool = False,
         terminal: TerminalEnvelope | None = None,
+        _retry_bypass: bool = False,
     ) -> _SubagentDeliveryAck:
         entry = get_subagent_work(child_session_id)
         terminal_error = terminal_data.get("terminal_error") if terminal_data is not None else None
@@ -7599,6 +7600,55 @@ def create_runner_app(
                 recovered=recovered
                 or (identity_data is not None and identity_data.get("recovered") is True),
             )
+        retry_runtime = getattr(app.state, "subagent_retry_runtime", None)
+        if retry_runtime is not None and not _retry_bypass:
+
+            async def accept() -> _SubagentDeliveryAck:
+                if only_if_work_id is not None and (
+                    entry is None or entry.work_id != only_if_work_id
+                ):
+                    return _SubagentDeliveryAck(entry, False, False, "superseded_dispatch")
+                try:
+                    accepted = await retry_runtime.accept_terminal(
+                        terminal,
+                        output,
+                        parent_harness=_session_harness_name(entry.parent_session_id)
+                        if entry
+                        else None,
+                    )
+                except (httpx.HTTPError, ValueError, RuntimeError):
+                    if entry is not None:
+                        entry.recovery_result = (status, result_key, output)
+                        entry.terminal = terminal
+                    _logger.warning(
+                        "Retry terminal acknowledgement unavailable; child=%s", child_session_id
+                    )
+                    return _SubagentDeliveryAck(entry, False, False, "retry_state_unavailable")
+                if accepted is not None:
+                    if accepted.reason == "missing_parent_inbox" and not reported_by_server:
+                        _post_untracked_subagent_terminal_soon(
+                            child_session_id,
+                            status=status,
+                            output=output,
+                            terminal=terminal,
+                            require_parent=True,
+                        )
+                    return accepted
+                return _mark_subagent_terminal_and_wake(
+                    child_session_id,
+                    status=status,
+                    output=output,
+                    result_key=result_key,
+                    reported_by_server=reported_by_server,
+                    only_if_work_id=entry.work_id if entry else only_if_work_id,
+                    terminal=terminal,
+                    _retry_bypass=True,
+                )
+
+            task = asyncio.create_task(accept())
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
+            return _SubagentDeliveryAck(entry, False, False, "pending", pending=task)
         ack = mark_subagent_work_terminal(
             child_session_id,
             status=status,
@@ -11012,7 +11062,17 @@ def create_runner_app(
                         reported_by_server=True,
                         terminal_data=data if isinstance(data, dict) else None,
                     )
+            if delivery_ack is not None and delivery_ack.pending is not None:
+                delivery_ack = await asyncio.shield(delivery_ack.pending)
             if delivery_ack is not None:
+                if delivery_ack.reason == "held":
+                    return JSONResponse(
+                        status_code=200,
+                        content={
+                            "disposition": "held",
+                            "chain_id": delivery_ack.chain_id,
+                        },
+                    )
                 if (
                     delivery_ack.entry is not None
                     and delivery_ack.reason == _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX

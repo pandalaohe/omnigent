@@ -232,6 +232,8 @@ class _SubagentDeliveryAck:
     delivered: bool
     delivered_now: bool
     reason: str
+    chain_id: str | None = None
+    pending: asyncio.Task[_SubagentDeliveryAck] | None = None
 
 
 _subagent_work_by_child: dict[str, _SubagentWorkEntry] = {}
@@ -1767,7 +1769,7 @@ def _subagent_delivery_not_confirmed_response(
     :returns: A 503 JSON response when delivery is not confirmed, or ``None``
         when the status can be acknowledged.
     """
-    if ack.delivered:
+    if ack.delivered or ack.reason in {"held", "superseded"}:
         return None
     if ack.reason == _SUBAGENT_DELIVERY_SUPERSEDED_DISPATCH:
         # A delayed op intentionally dropped because a newer send replaced the
@@ -1786,7 +1788,7 @@ def _subagent_delivery_not_confirmed_response(
             "Sub-agent terminal status arrived, but the parent inbox is missing on this runner."
         ),
     }
-    detail = detail_by_reason[reason]
+    detail = detail_by_reason.get(reason, "Sub-agent terminal delivery is pending reconciliation.")
     return JSONResponse(
         status_code=503,
         content={

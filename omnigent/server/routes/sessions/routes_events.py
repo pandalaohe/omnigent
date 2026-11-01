@@ -49,6 +49,7 @@ from omnigent.entities.subagent_retry import (
     InputExecutionClaim,
     InputExecutionReceipt,
     RetryExecutionGuard,
+    retry_identity,
 )
 from omnigent.entities.subagent_terminal import (
     TERMINAL_IDENTITY_LABEL_PREFIX,
@@ -360,7 +361,9 @@ from omnigent.server.subagent_retry_admission import (
     ControlDeliveryRefused,
     ControlDispatch,
     RetryDispatchRefused,
+    RetryFinalizeRequest,
     RetryInputControl,
+    RetryTerminalRequest,
     SubagentRetryAdmission,
     active_retry_dispatch,
     control_dispatch_scope,
@@ -4173,6 +4176,20 @@ def register_events_routes(
                     status,
                     runner_result,
                 )
+                if runner_result is not None and runner_result.status_code == 200:
+                    try:
+                        acknowledgement = json.loads(runner_result.body)
+                    except ValueError:
+                        acknowledgement = None
+                    if (
+                        isinstance(acknowledgement, dict)
+                        and acknowledgement.get("disposition") == "held"
+                    ):
+                        return {
+                            "queued": False,
+                            "disposition": "held",
+                            "chain_id": acknowledgement.get("chain_id"),
+                        }
             return {"queued": False}
         if body.type == _EXTERNAL_COMPACTION_STATUS_TYPE:
             # Terminal-observed compaction edge (claude-native forwarder):
@@ -5392,6 +5409,146 @@ def register_events_routes(
             raise HTTPException(503, "Retry admission is unavailable")
         return service
 
+    async def _retry_parent(request: Request, parent_id: str):
+        service = _retry_admission(request)
+        parent = await asyncio.to_thread(conversation_store.get_conversation, parent_id)
+        if parent is None or not _has_bound_runner_authority(request, parent):
+            raise HTTPException(403, "Current inbox runner authority required")
+        return service, parent
+
+    @event_router.post("/sessions/{parent_id}/retry-owner", include_in_schema=False)
+    async def retry_claim_owner(request: Request, parent_id: str):
+        service, parent = await _retry_parent(request, parent_id)
+        assert parent.runner_id is not None
+        owner = await asyncio.to_thread(service.journal.get_owner, parent_id)
+        if owner is not None and owner.runner_id == parent.runner_id:
+            return owner
+        owner = await asyncio.to_thread(
+            service.journal.claim_owner,
+            parent_id,
+            parent.runner_id,
+            expected_epoch=owner.epoch if owner else 0,
+        )
+        if owner is None:
+            raise HTTPException(409, "Inbox owner changed")
+        return owner
+
+    @event_router.post("/sessions/{parent_id}/retry-terminals", include_in_schema=False)
+    async def retry_record_terminal(request: Request, parent_id: str, body: RetryTerminalRequest):
+        service, parent = await _retry_parent(request, parent_id)
+        if body.owner.parent_id != parent.id or body.owner.runner_id != parent.runner_id:
+            raise HTTPException(409, "Inbox owner changed")
+        child = await asyncio.to_thread(
+            conversation_store.get_conversation, body.terminal.child_id
+        )
+        if (
+            child is None
+            or child.parent_conversation_id != parent_id
+            or body.terminal.parent_id != parent_id
+        ):
+            raise HTTPException(400, "Terminal belongs to another parent")
+        if (
+            body.terminal.identity_diagnostic
+            or body.terminal.input_generation is None
+            or body.terminal.event_kind != "turn_terminal"
+        ):
+            return None
+        assert body.terminal.input_id is not None
+        receipt = await asyncio.to_thread(service.journal.get_input, body.terminal.input_id)
+        chain_id = (
+            receipt.chain_id
+            if receipt and receipt.chain_id
+            else retry_identity(
+                "subagent-chain", body.terminal.child_id, body.terminal.turn_id or ""
+            )
+        )
+        chain = await asyncio.to_thread(service.journal.get_chain, chain_id)
+        if chain is not None:
+            if not await asyncio.to_thread(service._owns, chain, body.owner):
+                raise HTTPException(409, "Inbox owner changed")
+            return await asyncio.to_thread(
+                service.journal.record_terminal,
+                chain_id,
+                body.terminal,
+                owner=body.owner,
+                observed_at=body.observed_at,
+            )
+        if body.limit == 0 or body.terminal.recovered or body.terminal.status != "failed":
+            return None
+        return await asyncio.to_thread(
+            service.journal.open_chain,
+            body.terminal,
+            owner=body.owner,
+            limit=body.limit,
+            observed_at=body.observed_at,
+        )
+
+    async def _retry_chain_owner(
+        request: Request, parent_id: str, chain_id: str, body: RetryInputControl
+    ):
+        service, _ = await _retry_parent(request, parent_id)
+        chain = await asyncio.to_thread(service.journal.get_chain, chain_id)
+        if chain is None:
+            raise HTTPException(404, "Retry chain not found")
+        if chain.parent_id != parent_id or not await asyncio.to_thread(
+            service._owns, chain, body.owner
+        ):
+            raise HTTPException(409, "Inbox owner changed")
+        return service, chain
+
+    @event_router.post(
+        "/sessions/{parent_id}/retry-chains/{chain_id}/read", include_in_schema=False
+    )
+    async def retry_read_chain(
+        request: Request, parent_id: str, chain_id: str, body: RetryInputControl
+    ):
+        _, chain = await _retry_chain_owner(request, parent_id, chain_id, body)
+        return chain
+
+    @event_router.post(
+        "/sessions/{parent_id}/retry-chains/{chain_id}/check", include_in_schema=False
+    )
+    async def retry_check_chain(
+        request: Request, parent_id: str, chain_id: str, body: RetryInputControl
+    ):
+        service, chain = await _retry_chain_owner(request, parent_id, chain_id, body)
+        return await service.check_before_retry(chain)
+
+    @event_router.post(
+        "/sessions/{parent_id}/retry-chains/{chain_id}/prepare", include_in_schema=False
+    )
+    async def retry_prepare_chain(
+        request: Request, parent_id: str, chain_id: str, body: RetryInputControl
+    ):
+        service, chain = await _retry_chain_owner(request, parent_id, chain_id, body)
+        if body.expected_version != chain.version:
+            raise HTTPException(409, "Retry chain changed")
+        return await asyncio.to_thread(
+            service.journal.prepare_attempt,
+            chain_id,
+            owner=body.owner,
+            expected_version=chain.version,
+            now=service.clock(),
+        )
+
+    @event_router.post(
+        "/sessions/{parent_id}/retry-chains/{chain_id}/finalize", include_in_schema=False
+    )
+    async def retry_finalize_chain(
+        request: Request, parent_id: str, chain_id: str, body: RetryFinalizeRequest
+    ):
+        service, _chain = await _retry_chain_owner(request, parent_id, chain_id, body)
+        if body.expected_version is None:
+            raise HTTPException(400, "Expected chain version required")
+        return await asyncio.to_thread(
+            service.journal.finalize,
+            chain_id,
+            owner=body.owner,
+            expected_version=body.expected_version,
+            outcome=body.outcome,
+            wake_payload=body.wake_payload,
+        )
+
     async def _retry_input_owner(
         request: Request, session_id: str, input_id: str, control: RetryInputControl
     ):
@@ -5445,7 +5602,14 @@ def register_events_routes(
                 expected_version=receipt.version,
                 reason={"code": checked.reason},
             )
-        claimed = await asyncio.to_thread(service.journal.claim_input, input_id, owner=body.owner)
+        from omnigent.runner.policy_proxy import _ASK_GATE_DELIVERY_TIMEOUT
+
+        claimed = await asyncio.to_thread(
+            service.journal.claim_input,
+            input_id,
+            owner=body.owner,
+            admission_deadline=service.clock() + _ASK_GATE_DELIVERY_TIMEOUT.read,
+        )
         if claimed is None or not claimed.claimed:
             return await service.lookup_or_close_input(input_id, owner=body.owner)
         guard = RetryExecutionGuard(

@@ -82,7 +82,13 @@ class SubagentRetryStore(Protocol):
         now: float,
     ) -> RetryInput | None: ...
 
-    def claim_input(self, input_id: str, *, owner: InboxOwnerFence) -> RetryInputClaim | None: ...
+    def claim_input(
+        self, input_id: str, *, owner: InboxOwnerFence, admission_deadline: float | None = None
+    ) -> RetryInputClaim | None: ...
+
+    def set_admission_deadline(
+        self, input_id: str, *, owner: InboxOwnerFence, deadline: float
+    ) -> RetryInput | None: ...
 
     def record_acceptance(
         self,
