@@ -694,7 +694,7 @@ class CreateDirectoryRequest(BaseModel):
     """Request body for ``POST /v1/hosts/{host_id}/directories``.
 
     :param path: Absolute path of the directory to create on the host
-        machine, e.g. ``"/Users/corey/projects/new-app"``, or a
+        machine, e.g. ``"/opt/work/projects/new-app"``, or a
         tilde-prefixed path (``"~/scratch"``) the host expands against
         its own process owner. Missing parents are created.
     """
@@ -852,7 +852,7 @@ class LaunchRunnerRequest(BaseModel):
         ``"conv_abc123"``.
     :param workspace: Absolute path on the host machine to use
         as the runner's working directory, e.g.
-        ``"/Users/corey/projects/frontend"``. When ``git`` is set,
+        ``"/opt/work/projects/frontend"``. When ``git`` is set,
         this is interpreted as the source repository directory and
         the runner starts in the created worktree instead.
     :param git: Optional git worktree options. In create mode the
@@ -2200,7 +2200,7 @@ def create_hosts_router(
             ``"host_a1b2c3d4..."``.
         :param limit: Max entries per page.
         :param after: Optional forward pagination cursor (entry
-            path), e.g. ``"/Users/corey/projects/m"``.
+            path), e.g. ``"/opt/work/projects/m"``.
         :param before: Optional backward pagination cursor.
         :returns: ``{"object": "list", "data": [...], "has_more": bool}``
             mirroring the existing session-scoped filesystem
@@ -2242,7 +2242,7 @@ def create_hosts_router(
         :param request: FastAPI request (for auth).
         :param host_id: Host identifier.
         :param path: Absolute path on the host (e.g.
-            ``"/Users/corey/universe"``) OR a tilde-prefixed
+            ``"/opt/work/universe"``) OR a tilde-prefixed
             path (``"~/foo"``). The host expands ``~`` itself.
             FastAPI's ``:path`` converter strips the leading
             ``/`` from the URL, so we re-add it for absolute paths.
@@ -2257,7 +2257,7 @@ def create_hosts_router(
         # FastAPI's :path converter strips the leading slash from
         # the URL match. Re-add it for POSIX paths; leave tilde,
         # Windows drive-letter, and UNC paths alone (prefixing /
-        # would turn C:/Users/me into /C:/Users/me).
+        # would turn C:/opt/work into /C:/opt/work).
         path = restore_host_filesystem_url_path(path)
         return await _list_host_filesystem(
             request=request,
@@ -3066,7 +3066,7 @@ def create_hosts_router(
         :param request: FastAPI request (for auth).
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
         :param path: Absolute path inside the repo on the host to list
-            worktrees for, e.g. ``"/Users/alice/myrepo"``.
+            worktrees for, e.g. ``"/opt/work/myrepo"``.
         :returns: ``{"object": "list", "data": [{path, branch,
             is_main, detached, updated_at?}, ...]}`` (main first).
         :raises HTTPException: 404 if host not found, 403 if not owned
@@ -3132,7 +3132,7 @@ def create_hosts_router(
         :param request: FastAPI request (for auth).
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
         :param path: Absolute folder path on the host to read facts for,
-            e.g. ``"/Users/alice/myrepo"``.
+            e.g. ``"/opt/work/myrepo"``.
         :returns: ``{"object": "folder_facts", exists, is_dir, is_repo,
             toplevel, branch, head, detached, dirty, remotes,
             setup_command_configured, error}``.

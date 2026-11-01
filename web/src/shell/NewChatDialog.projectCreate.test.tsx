@@ -95,9 +95,9 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 const navigateMock = vi.fn();
 
 const RECENT_KEY = "omnigent:recent-workspaces";
-const RECENT_WORKSPACE = "/Users/corey/universe/src/foo";
-const REPO = "/Users/corey/projects/alpha";
-const EXISTING_WORKTREE = "/Users/corey/worktrees/alpha-feature";
+const RECENT_WORKSPACE = "/opt/work/universe/src/foo";
+const REPO = "/opt/work/projects/alpha";
+const EXISTING_WORKTREE = "/opt/work/worktrees/alpha-feature";
 
 // Mutable so a test can choose a project-driven or plain visit.
 let searchParams = new URLSearchParams("project=Alpha");
@@ -718,8 +718,8 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
 // keeps sending the entry — the server sources the worktree there — and
 // picking an existing worktree sends that path.
 const ENTRY = REPO;
-const ENTRY_CHECKOUT = "/Users/corey/projects/alpha-checkout";
-const CHECKOUT_WORKTREE = "/Users/corey/projects/alpha/.worktrees/alpha/feature-x";
+const ENTRY_CHECKOUT = "/opt/work/projects/alpha-checkout";
+const CHECKOUT_WORKTREE = "/opt/work/projects/alpha/.worktrees/alpha/feature-x";
 
 function entryRoots(checkout: string | null): ProjectHostRoots {
   return {

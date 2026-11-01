@@ -25,7 +25,7 @@ describe("parseSessionMembers", () => {
   it("parses a full member value into the roster shape", () => {
     const members = parseSessionMembers({
       [`${MEMBER_KEY}reviewer`]: snapshot({
-        host: "Desktop-HRF",
+        host: "Studio-Mac",
         harness: "claude-sdk",
         model: "opus-4.8",
         effort: "high",
@@ -35,7 +35,7 @@ describe("parseSessionMembers", () => {
     expect(members).toEqual([
       {
         role: "reviewer",
-        host: "Desktop-HRF",
+        host: "Studio-Mac",
         harness: "claude-sdk",
         model: "opus-4.8",
         effort: "high",

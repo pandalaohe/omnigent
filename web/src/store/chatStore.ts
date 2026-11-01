@@ -400,7 +400,7 @@ export function beginLocalConversation(
   provisional = newTempConversation(),
   project?: LocalConversationProject,
   model?: OptimisticSessionModel,
-  // Fork mod: visual order of an inline-attachment draft (MOD-s10). Last, so
+  // Fork mod: visual order of an inline-attachment draft. Last, so
   // the leading five keep their upstream positions.
   composerParts?: readonly ComposerDraftPart[],
 ): { tempConvId: string; pendingMsgTempId: string; createToken: string } | null {

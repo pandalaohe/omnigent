@@ -70,11 +70,11 @@ describe("shortenPath", () => {
   });
 
   it("keeps only the last two segments when the result is still long", () => {
-    expect(shortenPath("/opt/work/omnigent/fork/omnigent-scc18-agents-rail")).toBe(
-      "…/fork/omnigent-scc18-agents-rail",
+    expect(shortenPath("/opt/work/omnigent/fork/omnigent-agents-rail")).toBe(
+      "…/fork/omnigent-agents-rail",
     );
-    expect(shortenPath("/Users/me/dev/omnigent/fork/omnigent-scc18-agents-rail")).toBe(
-      "…/fork/omnigent-scc18-agents-rail",
+    expect(shortenPath("<home>/workspace/omnigent/fork/omnigent-agents-rail")).toBe(
+      "…/fork/omnigent-agents-rail",
     );
   });
 

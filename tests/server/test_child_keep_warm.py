@@ -4098,7 +4098,7 @@ async def test_parse_rejects_malformed_labels() -> None:
 
 
 async def test_legacy_why_codes_round_trip() -> None:
-    """SCC19's ``mom`` / ``pol`` codes are never written but still parse."""
+    """The legacy ``mom`` / ``pol`` codes are never written but still parse."""
     for why in ("mom", "pol"):
         state = child_keep_warm._WarmState(s="c", why=why, t=1, c=1, u=1, w=1)
         assert child_keep_warm._WarmState.parse(state.to_label()) == state

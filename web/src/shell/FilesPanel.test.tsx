@@ -101,8 +101,8 @@ const TYPED_VIEWER = {
   openGithubTab: () => undefined,
   isChangedPath: () => false,
   conversationId: undefined as string | undefined,
-  workspaceRoot: "/home/user/proj",
-  workspaceHome: "/home/user",
+  workspaceRoot: "/opt/work/proj",
+  workspaceHome: "/opt/work",
 };
 
 function file(path: string, bytes = 10): WorkspaceFile {
@@ -183,7 +183,7 @@ function environmentResult(
   } | null = null,
 ) {
   return {
-    data: { available: true, root, home: "/home/user", reachable },
+    data: { available: true, root, home: "/opt/work", reachable },
     isLoading: false,
     isError: false,
     error: null,
@@ -310,10 +310,10 @@ describe("FilesPanel working folder directory", () => {
     renderPanel({
       conversationId: "conv_wdir_posix",
       files: [],
-      workingDir: "/home/user/my-project",
+      workingDir: "/opt/work/my-project",
     });
     const field = screen.getByTestId("browse-location-path");
-    expect(field).toHaveTextContent("/home/user/my-project");
+    expect(field).toHaveTextContent("/opt/work/my-project");
     expect(field.querySelector("bdi")?.parentElement).toHaveClass("font-medium", "text-ui");
     expect(field.querySelector("bdi")?.parentElement).not.toHaveClass("font-mono");
     expect(screen.queryByRole("button", { name: "Back to working folder" })).toBeNull();
@@ -323,20 +323,20 @@ describe("FilesPanel working folder directory", () => {
     renderPanel({
       conversationId: "conv_wdir_title",
       files: [],
-      workingDir: "/home/user/my-project",
+      workingDir: "/opt/work/my-project",
     });
     const field = screen.getByTestId("browse-location-path");
-    expect(field).toHaveTextContent("/home/user/my-project");
+    expect(field).toHaveTextContent("/opt/work/my-project");
   });
 
   it("handles Windows-style paths correctly", () => {
     renderPanel({
       conversationId: "conv_wdir_win",
       files: [],
-      workingDir: "C:\\Users\\foo\\my-project",
+      workingDir: "C:\\work\\foo\\my-project",
     });
     expect(screen.getByTestId("browse-location-path")).toHaveTextContent(
-      "C:\\Users\\foo\\my-project",
+      "C:\\work\\foo\\my-project",
     );
   });
 
@@ -366,7 +366,7 @@ describe("FilesPanel header role", () => {
       conversationId: "conv_header_changes",
       files: [],
       flatView: true,
-      workingDir: "/home/user/proj",
+      workingDir: "/opt/work/proj",
     });
     const changesHeading = screen.getByRole("heading", { name: "Changes" });
     expect(changesHeading).toBeInTheDocument();
@@ -384,7 +384,7 @@ describe("FilesPanel header role", () => {
     useAllFilesMock.mockReturnValue(allFilesResult([]));
     useChangedFilesMock.mockReturnValue(changedFilesResult([]));
     useDirectoryMock.mockReturnValue(directoryResult());
-    useEnvironmentMock.mockReturnValue(environmentResult("/home/user/workspace"));
+    useEnvironmentMock.mockReturnValue(environmentResult("/opt/work/workspace"));
     useSearchMock.mockReturnValue(searchResult());
 
     render(
@@ -410,7 +410,7 @@ describe("FilesPanel header role", () => {
 
     expect(screen.queryByText("Working folder")).toBeNull();
     const field = screen.getByTestId("browse-location-path");
-    expect(field).toHaveTextContent("/home/user/workspace");
+    expect(field).toHaveTextContent("/opt/work/workspace");
     expect(field.querySelector("bdi")?.parentElement).toHaveClass("font-medium", "text-ui");
     expect(screen.getByRole("searchbox", { name: "Search all files" })).toBeInTheDocument();
   });
@@ -1585,11 +1585,11 @@ describe("FolderTree expanded state across conversation switches", () => {
 describe("FilesPanel browse location", () => {
   const CONFINED = {
     unconfined: false,
-    roots: [{ path: "/home/user/proj", access: "write", origin: "cwd" }],
+    roots: [{ path: "/opt/work/proj", access: "write", origin: "cwd" }],
   };
   const UNCONFINED = {
     unconfined: true,
-    roots: [{ path: "/home/user/proj", access: "write", origin: "cwd" }],
+    roots: [{ path: "/opt/work/proj", access: "write", origin: "cwd" }],
   };
 
   it("keeps the typed field but no picker when the session has nowhere else to go", () => {
@@ -1598,7 +1598,7 @@ describe("FilesPanel browse location", () => {
     renderPanel({
       conversationId: "conv_confined",
       files: [],
-      workingDir: "/home/user/proj",
+      workingDir: "/opt/work/proj",
       reachable: CONFINED,
     });
 
@@ -1611,14 +1611,14 @@ describe("FilesPanel browse location", () => {
     renderPanel({
       conversationId: "conv_unconfined",
       files: [],
-      workingDir: "/home/user/proj",
+      workingDir: "/opt/work/proj",
       reachable: UNCONFINED,
     });
 
     // The whole path, not just the basename -- the point of the control is to
     // tell you where you are before you decide to go elsewhere.
     const trigger = screen.getByTestId("browse-location-path");
-    expect(trigger).toHaveTextContent("/home/user/proj");
+    expect(trigger).toHaveTextContent("/opt/work/proj");
     expect(trigger).toHaveClass("cursor-pointer", "hover:bg-muted");
     expect(trigger).not.toHaveClass("hover:bg-accent");
   });
@@ -1627,7 +1627,7 @@ describe("FilesPanel browse location", () => {
     renderPanel({
       conversationId: "conv_parent_folder",
       files: [],
-      workingDir: "/home/user/proj",
+      workingDir: "/opt/work/proj",
       reachable: UNCONFINED,
     });
 
@@ -1638,7 +1638,7 @@ describe("FilesPanel browse location", () => {
     expect(useAllFilesMock).toHaveBeenLastCalledWith(
       "conv_parent_folder",
       expect.anything(),
-      "/home/user",
+      "/opt/work",
     );
   });
 
@@ -1651,7 +1651,7 @@ describe("FilesPanel browse location", () => {
     renderPanel({
       conversationId: "conv_open_abs",
       files: [],
-      workingDir: "/home/user/proj",
+      workingDir: "/opt/work/proj",
       reachable: UNCONFINED,
       onFileSelect,
     });
@@ -1675,7 +1675,7 @@ describe("FilesPanel browse location", () => {
     renderPanel({
       conversationId: "conv_reroot",
       files: [],
-      workingDir: "/home/user/proj",
+      workingDir: "/opt/work/proj",
       reachable: UNCONFINED,
     });
 
@@ -1710,7 +1710,7 @@ describe("FilesPanel browse location", () => {
     const first = renderPanel({
       conversationId: "conv_viewer_roundtrip",
       files: [],
-      workingDir: "/home/user/proj",
+      workingDir: "/opt/work/proj",
       reachable: UNCONFINED,
     });
     fireEvent.click(screen.getByRole("button", { name: "Browse folders" }));
@@ -1726,7 +1726,7 @@ describe("FilesPanel browse location", () => {
     renderPanel({
       conversationId: "conv_viewer_roundtrip",
       files: [],
-      workingDir: "/home/user/proj",
+      workingDir: "/opt/work/proj",
       reachable: UNCONFINED,
     });
 
@@ -1743,7 +1743,7 @@ describe("FilesPanel browse location", () => {
     const first = renderPanel({
       conversationId: "conv_loc_owner",
       files: [],
-      workingDir: "/home/user/proj",
+      workingDir: "/opt/work/proj",
       reachable: UNCONFINED,
     });
     fireEvent.click(screen.getByRole("button", { name: "Browse folders" }));
@@ -1754,7 +1754,7 @@ describe("FilesPanel browse location", () => {
     renderPanel({
       conversationId: "conv_loc_other",
       files: [],
-      workingDir: "/home/user/proj",
+      workingDir: "/opt/work/proj",
       reachable: UNCONFINED,
     });
 
@@ -1765,7 +1765,7 @@ describe("FilesPanel browse location", () => {
     // An empty tree reads as "this directory is empty", which is a different
     // fact from "you may not look here".
     const err = new PathUnreachableError("Path '/etc' is outside this session's reach", [
-      "/home/user/proj",
+      "/opt/work/proj",
     ]);
     useAllFilesMock.mockReturnValue({
       data: undefined,
@@ -1775,7 +1775,7 @@ describe("FilesPanel browse location", () => {
     } as unknown as ReturnType<typeof useWorkspaceAllFiles>);
     useChangedFilesMock.mockReturnValue(changedFilesResult([]));
     useDirectoryMock.mockReturnValue(directoryResult());
-    useEnvironmentMock.mockReturnValue(environmentResult("/home/user/proj", CONFINED));
+    useEnvironmentMock.mockReturnValue(environmentResult("/opt/work/proj", CONFINED));
     useSearchMock.mockReturnValue(searchResult(undefined, false));
 
     render(
@@ -1801,7 +1801,7 @@ describe("FilesPanel browse location", () => {
     // The refusal rides the location bar's error line even though the
     // confined branch has no picker.
     expect(screen.getByTestId("browse-location-error")).toHaveTextContent(
-      "Path '/etc' is outside this session's reach. Reachable: /home/user/proj",
+      "Path '/etc' is outside this session's reach. Reachable: /opt/work/proj",
     );
   });
 });
@@ -1809,7 +1809,7 @@ describe("FilesPanel browse location", () => {
 describe("FilesPanel browse permission", () => {
   const UNCONFINED_REACH = {
     unconfined: true,
-    roots: [{ path: "/home/user/proj", access: "write", origin: "cwd" }],
+    roots: [{ path: "/opt/work/proj", access: "write", origin: "cwd" }],
   };
 
   afterEach(() => {
@@ -1834,7 +1834,7 @@ describe("FilesPanel browse permission", () => {
     renderPanel({
       conversationId: "conv_collaborator",
       files: [],
-      workingDir: "/home/user/proj",
+      workingDir: "/opt/work/proj",
       reachable: UNCONFINED_REACH,
     });
 
@@ -1850,7 +1850,7 @@ describe("FilesPanel browse permission", () => {
     renderPanel({
       conversationId: "conv_owner",
       files: [],
-      workingDir: "/home/user/proj",
+      workingDir: "/opt/work/proj",
       reachable: UNCONFINED_REACH,
     });
 
@@ -1867,7 +1867,7 @@ describe("FilesPanel browse permission", () => {
     renderPanel({
       conversationId: "conv_single_user",
       files: [],
-      workingDir: "/home/user/proj",
+      workingDir: "/opt/work/proj",
       reachable: UNCONFINED_REACH,
     });
 
@@ -1878,28 +1878,28 @@ describe("FilesPanel browse permission", () => {
 describe("FilesPanel header copy path", () => {
   const UNCONFINED_REACH = {
     unconfined: true,
-    roots: [{ path: "/home/user/proj", access: "write", origin: "cwd" }],
+    roots: [{ path: "/opt/work/proj", access: "write", origin: "cwd" }],
   };
 
   it("copies the working folder's absolute path from the header", () => {
     renderPanel({
       conversationId: "conv_copy_header",
       files: [],
-      workingDir: "/home/user/proj",
+      workingDir: "/opt/work/proj",
     });
 
     fireEvent.click(screen.getByRole("button", { name: "Copy folder path: proj" }));
 
     // The header copies the ABSOLUTE path -- pasting a basename would be
     // useless, and the header is the one place the full path is on screen.
-    expect(copyTextMock).toHaveBeenCalledWith("/home/user/proj");
+    expect(copyTextMock).toHaveBeenCalledWith("/opt/work/proj");
   });
 
   it("refreshes the current tree after the copy control", async () => {
     renderPanel({
       conversationId: "conv_refresh_files",
       files: [dir("src")],
-      workingDir: "/home/user/proj",
+      workingDir: "/opt/work/proj",
     });
 
     const copy = screen.getByRole("button", { name: "Copy folder path: proj" });
@@ -1925,7 +1925,7 @@ describe("FilesPanel header copy path", () => {
     renderPanel({
       conversationId: "conv_copy_browsed",
       files: [],
-      workingDir: "/home/user/proj",
+      workingDir: "/opt/work/proj",
       reachable: UNCONFINED_REACH,
     });
 
@@ -1943,13 +1943,13 @@ describe("FilesPanel double-click navigation", () => {
   it("re-roots from a double-clicked folder and asks the server relatively", () => {
     // The wire form is the point. A subfolder of the workspace must be
     // requested relative, because the server authorizes an absolute location
-    // at OWNER level -- sending "/home/user/proj/src" would 403 every
+    // at OWNER level -- sending "/opt/work/proj/src" would 403 every
     // collaborator browsing a folder they can already list.
     renderPanel({
       conversationId: "conv_dblclick",
       flatView: false,
       files: [file("src/App.tsx")],
-      workingDir: "/home/user/proj",
+      workingDir: "/opt/work/proj",
     });
 
     useAllFilesMock.mockClear();
@@ -1957,7 +1957,7 @@ describe("FilesPanel double-click navigation", () => {
 
     expect(useAllFilesMock).toHaveBeenCalledWith("conv_dblclick", { enabled: true }, "src");
     // The header still names the absolute directory the user is standing in.
-    expect(screen.getByTestId("browse-location-path")).toHaveTextContent("/home/user/proj/src");
+    expect(screen.getByTestId("browse-location-path")).toHaveTextContent("/opt/work/proj/src");
   });
 
   it("re-attaches the browsed folder when opening a file the tree named", () => {
@@ -1969,7 +1969,7 @@ describe("FilesPanel double-click navigation", () => {
       conversationId: "conv_open_after_nav",
       flatView: false,
       files: [file("src/App.tsx")],
-      workingDir: "/home/user/proj",
+      workingDir: "/opt/work/proj",
       onFileSelect,
     });
 
@@ -1991,11 +1991,11 @@ describe("FilesPanel double-click navigation", () => {
 describe("FilesPanel typed location path", () => {
   const UNCONFINED = {
     unconfined: true,
-    roots: [{ path: "/home/user/proj", access: "write", origin: "cwd" }],
+    roots: [{ path: "/opt/work/proj", access: "write", origin: "cwd" }],
   };
   const CONFINED = {
     unconfined: false,
-    roots: [{ path: "/home/user/proj", access: "write", origin: "cwd" }],
+    roots: [{ path: "/opt/work/proj", access: "write", origin: "cwd" }],
   };
 
   function renderTypedPanel({
@@ -2011,7 +2011,7 @@ describe("FilesPanel typed location path", () => {
     useAllFilesMock.mockReturnValue(allFilesResult([]));
     useChangedFilesMock.mockReturnValue(changedFilesResult([]));
     useDirectoryMock.mockReturnValue(directoryResult());
-    useEnvironmentMock.mockReturnValue(environmentResult("/home/user/proj", reachable));
+    useEnvironmentMock.mockReturnValue(environmentResult("/opt/work/proj", reachable));
     useSearchMock.mockReturnValue(searchResult());
 
     return render(
@@ -2065,7 +2065,7 @@ describe("FilesPanel typed location path", () => {
       expect(useAllFilesMock).toHaveBeenLastCalledWith("conv_typed_dir", expect.anything(), "src"),
     );
     expect(typedOpenFileMock).not.toHaveBeenCalled();
-    expect(screen.getByTestId("browse-location-path")).toHaveTextContent("/home/user/proj/src");
+    expect(screen.getByTestId("browse-location-path")).toHaveTextContent("/opt/work/proj/src");
   });
 
   it("browses the filesystem root when the owner types /", async () => {
@@ -2084,7 +2084,7 @@ describe("FilesPanel typed location path", () => {
 
   it.each([
     ["workspace-relative", "conv_typed_slash_rel", "report/sub/"],
-    ["absolute", "conv_typed_slash_abs", "/home/user/proj/report/sub/"],
+    ["absolute", "conv_typed_slash_abs", "/opt/work/proj/report/sub/"],
   ])("browses a %s folder path with a trailing slash", async (_label, conversationId, typed) => {
     renderTypedPanel({ conversationId });
     fetchAllFilesMock.mockResolvedValue({ available: true, data: [dir("sub")], truncated: false });
@@ -2104,7 +2104,7 @@ describe("FilesPanel typed location path", () => {
 
   it.each([
     ["workspace-relative", "src/App.tsx:12"],
-    ["absolute", "/home/user/proj/src/App.tsx:12"],
+    ["absolute", "/opt/work/proj/src/App.tsx:12"],
     ["home-relative", "~/proj/src/App.tsx:12"],
   ])("opens a %s file path at its cited line", async (_label, typed) => {
     renderTypedPanel({ conversationId: "conv_typed_file" });
@@ -2149,14 +2149,14 @@ describe("FilesPanel typed location path", () => {
   it("surfaces the reachable roots when the path is refused", async () => {
     renderTypedPanel({ conversationId: "conv_typed_refused" });
     fetchAllFilesMock.mockRejectedValue(
-      new PathUnreachableError("Path '/etc' is outside this session's reach", ["/home/user/proj"]),
+      new PathUnreachableError("Path '/etc' is outside this session's reach", ["/opt/work/proj"]),
     );
 
     enterPath("/etc/hosts");
 
     await waitFor(() =>
       expect(screen.getByTestId("browse-location-error")).toHaveTextContent(
-        "Path '/etc' is outside this session's reach. Reachable: /home/user/proj",
+        "Path '/etc' is outside this session's reach. Reachable: /opt/work/proj",
       ),
     );
   });

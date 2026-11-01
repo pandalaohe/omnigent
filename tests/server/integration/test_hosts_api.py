@@ -387,13 +387,13 @@ async def test_patch_host_default_workspace_persists_and_surfaces(
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         patched = await client.patch(
             f"/v1/hosts/{_HOST_ID}",
-            json={"default_workspace": "D:\\AIProgram\\Projects"},
+            json={"default_workspace": "D:\\work\\Projects"},
         )
         listed = await client.get("/v1/hosts")
 
     assert patched.status_code == 200
-    assert patched.json()["default_workspace"] == "D:\\AIProgram\\Projects"
-    assert listed.json()["hosts"][0]["default_workspace"] == "D:\\AIProgram\\Projects"
+    assert patched.json()["default_workspace"] == "D:\\work\\Projects"
+    assert listed.json()["hosts"][0]["default_workspace"] == "D:\\work\\Projects"
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         missing = await client.patch(f"/v1/hosts/{_HOST_ID}", json={})

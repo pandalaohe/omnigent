@@ -198,7 +198,7 @@ def _run_git(
         ``["rev-parse", "--show-toplevel"]``. Passed as a list so no
         shell parsing occurs.
     :param cwd: Working directory to run git in, e.g.
-        ``"/Users/alice/myrepo"``.
+        ``"/opt/work/myrepo"``.
     :param timeout: Seconds before the command is killed, e.g.
         ``240.0`` for a fetch that pulls an unbounded object count.
         Defaults to :data:`_GIT_TIMEOUT_S`.
@@ -339,7 +339,7 @@ def _exclude_worktree_dir(worktree_path: Path) -> None:
     files (``.gitignore``) are never touched.
 
     :param worktree_path: Absolute worktree directory about to be
-        created, e.g. ``Path("/Users/alice/project/.worktrees/myrepo/x")``.
+        created, e.g. ``Path("/opt/work/project/.worktrees/myrepo/x")``.
     :raises WorktreeError: If the exclude file cannot be written.
     """
     parent = str(worktree_path.parent)
@@ -393,9 +393,9 @@ def _main_work_tree(repo_path: str) -> str:
 
     :param repo_path: Absolute path inside a git repository — the
         directory the user picked, e.g.
-        ``"/Users/alice/myrepo-worktrees/feature"``.
+        ``"/opt/work/myrepo-worktrees/feature"``.
     :returns: Absolute path of the main work tree, e.g.
-        ``"/Users/alice/myrepo"``.
+        ``"/opt/work/myrepo"``.
     :raises WorktreeError: If ``repo_path`` is not a directory, not
         inside a git work tree, the git command fails, or the main
         repository is bare (a bare repository has no work tree to link
@@ -431,7 +431,7 @@ class WorktreeInfo:
     """One entry from ``git worktree list``.
 
     :param path: Absolute worktree directory, e.g.
-        ``"/Users/alice/myrepo-worktrees/feature-login"``.
+        ``"/opt/work/myrepo-worktrees/feature-login"``.
     :param branch: Checked-out branch without the ``refs/heads/``
         prefix, e.g. ``"feature/login"``. ``None`` when the worktree
         is in detached-HEAD state.
@@ -480,7 +480,7 @@ def list_worktrees(*, repo_path: str, for_cleanup: bool = False) -> list[Worktre
     main work tree; the rest are linked worktrees.
 
     :param repo_path: Absolute path inside a git repository — the
-        directory the user picked, e.g. ``"/Users/alice/myrepo"``.
+        directory the user picked, e.g. ``"/opt/work/myrepo"``.
         If removed or replaced by a file, resolve from a surviving parent.
     :param for_cleanup: Recover a stored canonical workspace without following
         replacement symlinks. The caller must verify the recorded cleanup root.
@@ -600,7 +600,7 @@ class FolderFacts:
     :param is_dir: Whether the path is a directory.
     :param is_repo: Whether the folder lies in a non-bare git work tree.
     :param toplevel: The work tree's root as git reports it, e.g.
-        ``"/Users/alice/myrepo"``.
+        ``"/opt/work/myrepo"``.
     :param branch: The checked-out branch, e.g. ``"main"``. ``None`` when
         HEAD is detached, unborn, or otherwise unresolvable.
     :param default_branch: Locally recorded remote HEAD, then main/master;
@@ -638,7 +638,7 @@ def read_folder_facts(path: str) -> FolderFacts:
     ``status`` leaves ``dirty`` unknown (``None``) instead of guessing.
 
     :param path: Absolute directory path on the host, e.g.
-        ``"/Users/alice/myrepo"``.
+        ``"/opt/work/myrepo"``.
     :returns: The folder's :class:`FolderFacts`.
     """
     if not os.path.exists(path):
@@ -780,7 +780,7 @@ def _local_branch_exists(repo_root: str, branch_name: str) -> bool:
     """Return whether a local branch already exists in the repo.
 
     :param repo_root: Absolute repo work-tree root, e.g.
-        ``"/Users/alice/myrepo"``.
+        ``"/opt/work/myrepo"``.
     :param branch_name: Branch name to check, e.g. ``"feature/login"``.
     :returns: ``True`` if ``refs/heads/<branch_name>`` resolves.
     """
@@ -865,7 +865,7 @@ def _render_worktree_path_template(
     :param template: Validated template, e.g.
         ``"{entry}/.worktrees/{repo}/{branch}"``.
     :param repo_root: Absolute main work-tree root, e.g.
-        ``"/Users/alice/myrepo"``.
+        ``"/opt/work/myrepo"``.
     :param branch_name: Validated branch name, e.g. ``"feature/login"``.
     :param entry: Project entry directory on the host, or ``None``.
     :returns: ``(path, anchor)``, both absolute; ``anchor`` is ``None``
@@ -940,17 +940,17 @@ def _resolve_worktree_path(
     on disk.
 
     :param repo_root: Absolute repo work-tree root, e.g.
-        ``"/Users/alice/myrepo"``.
+        ``"/opt/work/myrepo"``.
     :param branch_name: Validated branch name, e.g.
         ``"feature/login"``.
     :param path_template: Worktree location template, e.g.
         ``"{entry}/.worktrees/{repo}/{branch}"``, or ``None`` for the
         sibling layout.
     :param entry: Project entry directory on the host, e.g.
-        ``"/Users/alice/project"``; only fills the template's
+        ``"/opt/work/project"``; only fills the template's
         ``{entry}`` token.
     :returns: ``(path, anchor)`` — a path that does not yet exist, e.g.
-        ``Path("/Users/alice/project/.worktrees/myrepo/feature-login")``,
+        ``Path("/opt/work/project/.worktrees/myrepo/feature-login")``,
         and the template's anchor directory (``None`` without a
         template or for an absolute-literal template).
     :raises WorktreeError: If the template is invalid, renders a
@@ -993,7 +993,7 @@ def _ensure_base_resolvable(
     subsequent re-check produces the user-facing error.
 
     :param repo_root: Absolute repo work-tree root, e.g.
-        ``"/Users/alice/myrepo"``.
+        ``"/opt/work/myrepo"``.
     :param base_branch: Base ref the user requested, e.g. ``"main"``
         or ``"origin/main"``.
     :param deadline: :func:`time.monotonic` end of the create budget,
@@ -1030,7 +1030,7 @@ class CreatedWorktree:
 
     :param worktree_path: Absolute path of the created worktree
         directory, e.g.
-        ``"/Users/alice/myrepo-worktrees/feature-login"``.
+        ``"/opt/work/myrepo-worktrees/feature-login"``.
     :param branch: The branch checked out in the worktree, e.g.
         ``"feature/login"``.
     :param workspace: Selected directory relocated into the new worktree.
@@ -1062,7 +1062,7 @@ def create_worktree(
     deleted worktree.
 
     :param repo_path: Absolute path inside the source repo — the
-        directory the user picked, e.g. ``"/Users/alice/myrepo"``.
+        directory the user picked, e.g. ``"/opt/work/myrepo"``.
     :param branch_name: New branch to create and check out, e.g.
         ``"feature/login"``. With ``existing_branch``, the pre-existing
         branch to check out instead.
@@ -1073,7 +1073,7 @@ def create_worktree(
         ``branch_name`` into a fresh worktree instead of creating a new
         branch.
     :param entry: The session project's entry directory on the host,
-        e.g. ``"/Users/alice/project"``. Only fills the template's
+        e.g. ``"/opt/work/project"``. Only fills the template's
         ``{entry}`` token.
     :param path_template: The user's worktree location template, e.g.
         ``"{entry}/.worktrees/{repo}/{branch}"``. When set, the
@@ -1294,10 +1294,10 @@ def _main_repo_for_worktree(worktree_path: str, *, timeout: float | None = None)
     resolves correctly.
 
     :param worktree_path: Absolute path of a linked worktree, e.g.
-        ``"/Users/alice/myrepo-worktrees/feature-login"``.
+        ``"/opt/work/myrepo-worktrees/feature-login"``.
     :param timeout: Bound for the git call; ``None`` uses :data:`_GIT_TIMEOUT_S`.
     :returns: Absolute path of the main repo work tree, e.g.
-        ``"/Users/alice/myrepo"``.
+        ``"/opt/work/myrepo"``.
     :raises WorktreeError: If ``worktree_path`` is missing or not part
         of a git repository.
     """
@@ -1332,7 +1332,7 @@ def remove_worktree(
     refuses to remove the main work tree.
 
     :param worktree_path: Canonical absolute root of the worktree to remove,
-        e.g. ``"/Users/alice/myrepo-worktrees/feature-login"``.
+        e.g. ``"/opt/work/myrepo-worktrees/feature-login"``.
     :param branch: Branch to delete when ``delete_branch`` is
         ``True``, e.g. ``"feature/login"``. ``None`` skips branch
         deletion.

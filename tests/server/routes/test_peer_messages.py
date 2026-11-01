@@ -1,4 +1,4 @@
-"""Route tests for session peer messaging (SCC01-S1 T2).
+"""Route tests for session peer messaging.
 
 Builds the full app with the ``session_peer_messaging`` flag on (or off),
 two runner-bound sessions, and a fake ``post_event_impl`` that records

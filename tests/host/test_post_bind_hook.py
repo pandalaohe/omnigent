@@ -292,7 +292,7 @@ def test_string_command_is_never_split(tmp_path: Path, monkeypatch: pytest.Monke
     monkeypatch.setenv(_RECORD_ENV, str(record))
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    config = _write_config(tmp_path / "config.yaml", "collab root join")
+    config = _write_config(tmp_path / "config.yaml", "make check")
 
     result = PostBindHookRunner(config).run(_frame(workspace))
 

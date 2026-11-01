@@ -22,7 +22,7 @@ import {
 
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: () => ({
-    data: [{ host_id: "h1", name: "TMB", owner: "u", status: "online" }],
+    data: [{ host_id: "h1", name: "laptop", owner: "u", status: "online" }],
   }),
 }));
 
@@ -615,7 +615,7 @@ describe("ChatHeader — conversation breadcrumb", () => {
       sidebarOpen: true,
       conversationId: "child-9",
       isChildSession: true,
-      conversationTitle: "SCC10",
+      conversationTitle: "Peer relay",
       titleLinkTo: "/c/parent-123",
       childSession: {
         id: "child-9",
@@ -629,7 +629,7 @@ describe("ChatHeader — conversation breadcrumb", () => {
 
     expect(screen.getByTestId("breadcrumb-child-label")).toHaveTextContent("auth");
     const chip = screen.getByTestId("breadcrumb-child-placement");
-    expect(chip).toHaveTextContent("researcher @ TMB · ~/projects/x/y/z");
+    expect(chip).toHaveTextContent("researcher @ laptop · ~/projects/x/y/z");
     expect(chip).toHaveAttribute("title", "/Users/u/projects/x/y/z");
     expect(screen.queryByTestId("rail-agent-badge")).toBeNull();
   });
@@ -647,7 +647,7 @@ describe("ChatHeader — conversation breadcrumb", () => {
       sidebarOpen: true,
       conversationId: "child-9",
       isChildSession: true,
-      conversationTitle: "SCC10",
+      conversationTitle: "Peer relay",
       titleLinkTo: "/c/parent-123",
       childSession: {
         id: "child-9",
@@ -675,7 +675,7 @@ describe("ChatHeader — conversation breadcrumb", () => {
       sidebarOpen: true,
       conversationId: "child-9",
       isChildSession: true,
-      conversationTitle: "SCC10",
+      conversationTitle: "Peer relay",
       titleLinkTo: "/c/parent-123",
       childSession: {
         id: "child-9",
@@ -695,7 +695,7 @@ describe("ChatHeader — conversation breadcrumb", () => {
       sidebarOpen: true,
       conversationId: "child-9",
       isChildSession: true,
-      conversationTitle: "SCC10",
+      conversationTitle: "Peer relay",
       titleLinkTo: "/c/parent-123",
       childSession: {
         id: "child-9",

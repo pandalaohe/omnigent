@@ -5705,7 +5705,7 @@ describe("chatStore — sending during a model switch", () => {
         files: [],
       },
     });
-    // MOD-s19: no optimistic idle/cancel — the stream and lifecycle state stay
+    // Fork mod: no optimistic idle/cancel — the stream and lifecycle state stay
     // live until the runner confirms the interrupt, so Stop cannot look
     // successful while the vendor process keeps generating.
     expect(useChatStore.getState().sessionStatus).toBe("running");
@@ -12105,7 +12105,7 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
           id: "conv_child1",
           host_id: "host-1",
           cwd: "/work/rail",
-          git_branch: "feature/scc18",
+          git_branch: "feature/rail",
           harness: "codex-native",
           agent_id: "ag_1",
           agent_name: "codex",
@@ -12119,7 +12119,7 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       ).toMatchObject({
         host_id: "host-1",
         cwd: "/work/rail",
-        git_branch: "feature/scc18",
+        git_branch: "feature/rail",
         harness: "codex-native",
         agent_id: "ag_1",
         agent_name: "codex",

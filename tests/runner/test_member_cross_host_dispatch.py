@@ -1,4 +1,4 @@
-"""Runner-side cross-host member dispatch (SCC06 F2b, Step A).
+"""Runner-side cross-host member dispatch, step A.
 
 A member whose snapshot ``host`` differs from the lead session's host runs on
 that host: the runner re-checks the target host online / harness readiness at

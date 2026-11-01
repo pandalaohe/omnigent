@@ -113,7 +113,7 @@ interface HeaderConversationMenuProps {
   onAgentInfo?: () => void;
   /**
    * Whether the "Peer messages" entry should render — the server's
-   * `session_peer_messaging` feature is on (SCC01-S1 peer messaging).
+   * `session_peer_messaging` feature is on.
    */
   showPeerMessages?: boolean;
   /** Open the peer-messages held panel (`PeerHeldPanel`) for this session. */

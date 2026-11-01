@@ -1268,7 +1268,7 @@ async def test_resolve_session_item_file_references_rewrites_string_message_cont
                     "type": "message",
                     "role": "user",
                     "content": (
-                        "[Attached: /home/other/.omnigent/attachments/"
+                        "[Attached: /opt/work/.omnigent/attachments/"
                         f"s-{'a' * 32}/file_mp4/a.mp4] inspect"
                     ),
                 }
@@ -1453,7 +1453,7 @@ def test_rewrite_attached_paths_redirects_both_separator_styles(
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
     key = "a" * 32
     posix = f"[Attached: /opt/work/omnigent/fork/wt/data/attachments/s-{key}/file_1/a.mp4]"
-    windows = "[Attached: C:\\Users\\other\\.omnigent\\attachments\\s-" + key + "\\file_2\\b.mp4]"
+    windows = "[Attached: C:\\work\\other\\.omnigent\\attachments\\s-" + key + "\\file_2\\b.mp4]"
     local = session_attachment_dir("session-a")
 
     assert (
@@ -1493,8 +1493,8 @@ def test_mark_purged_attachments_marks_only_the_purged_line(
     """A purged row's line becomes the marker; a live row's line is untouched."""
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
     key = "b" * 32
-    purged_line = f"[Attached: /home/other/.omnigent/attachments/s-{key}/file_gone/trip.mp4]"
-    live_line = f"[Attached: /home/other/.omnigent/attachments/s-{key}/file_live/clip.mp4]"
+    purged_line = f"[Attached: /opt/work/.omnigent/attachments/s-{key}/file_gone/trip.mp4]"
+    live_line = f"[Attached: /opt/work/.omnigent/attachments/s-{key}/file_live/clip.mp4]"
 
     marked = mark_purged_attachments(
         f"{purged_line} then {live_line}", "session-a", {"file_gone": "trip.mp4"}

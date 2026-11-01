@@ -1757,7 +1757,7 @@ async def test_permission_request_hook_forwards_cwd_and_permission_mode(
     agent = await create_test_agent(client, "test-permission-extras")
     session_id = await _create_session(client, agent["id"])
     payload = await _claude_permission_payload()
-    payload["cwd"] = "/home/user/project"
+    payload["cwd"] = "/opt/work/project"
     payload["permission_mode"] = "default"
 
     drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
@@ -1771,7 +1771,7 @@ async def test_permission_request_hook_forwards_cwd_and_permission_mode(
 
     event = await drain_task
     params = event["params"]
-    assert params["cwd"] == "/home/user/project"
+    assert params["cwd"] == "/opt/work/project"
     assert params["permission_mode"] == "default"
 
     # Resolve so the hook task doesn't time out and stall pytest.
@@ -4310,7 +4310,7 @@ async def test_codex_async_question_ignores_the_timeout_setting(
     S13: async questions keep the 86400 s budget and never stop.
 
     The setting's tiny deadline must not fire while an async question is
-    parked, preserving the BUG12 contract for out-of-turn questions.
+    parked, preserving the contract for out-of-turn questions.
     """
     _patch_approval_timeout(monkeypatch, timeout_s=0.05, stop_turn=True)
     agent = await create_test_agent(client, "test-codex-async-unchanged")

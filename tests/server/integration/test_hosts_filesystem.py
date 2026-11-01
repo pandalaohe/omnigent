@@ -500,18 +500,18 @@ async def test_list_filesystem_returns_paginated_entries(
     from omnigent.host.frames import HostListDirEntry
 
     app, _reg, _comm, replies, _drain = fs_setup
-    replies["/Users/corey/projects"] = {
+    replies["/opt/work/projects"] = {
         "entries": [
             HostListDirEntry(
                 name="src",
-                path="/Users/corey/projects/src",
+                path="/opt/work/projects/src",
                 type="directory",
                 bytes=None,
                 modified_at=1779980000,
             ),
             HostListDirEntry(
                 name="README.md",
-                path="/Users/corey/projects/README.md",
+                path="/opt/work/projects/README.md",
                 type="file",
                 bytes=42,
                 modified_at=1779980100,
@@ -520,7 +520,7 @@ async def test_list_filesystem_returns_paginated_entries(
         "has_more": False,
     }
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        resp = await client.get(f"/v1/hosts/{_HOST_ID}/filesystem/Users/corey/projects")
+        resp = await client.get(f"/v1/hosts/{_HOST_ID}/filesystem/opt/work/projects")
     assert resp.status_code == 200, resp.text
     payload = resp.json()
     assert payload["object"] == "list"
@@ -558,7 +558,7 @@ async def test_list_filesystem_root_forwards_tilde(
         "entries": [
             HostListDirEntry(
                 name="projects",
-                path="/Users/corey/projects",
+                path="/opt/work/projects",
                 type="directory",
                 bytes=None,
                 modified_at=1779980200,
@@ -597,7 +597,7 @@ async def test_list_filesystem_tilde_path_forwards_unchanged(
         "entries": [
             HostListDirEntry(
                 name="myapp",
-                path="/Users/corey/projects/myapp",
+                path="/opt/work/projects/myapp",
                 type="directory",
                 bytes=None,
                 modified_at=1779980300,
@@ -674,7 +674,7 @@ async def test_list_filesystem_missing_path_returns_404(
     # No reply registered for this path → fixture returns the
     # default "path does not exist" reply.
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        resp = await client.get(f"/v1/hosts/{_HOST_ID}/filesystem/Users/corey/missing")
+        resp = await client.get(f"/v1/hosts/{_HOST_ID}/filesystem/opt/work/missing")
     assert resp.status_code == 404
     assert "path does not exist" in resp.text
 
@@ -697,12 +697,12 @@ async def test_list_filesystem_host_io_failure_returns_502(
     error.
     """
     app, _reg, _comm, replies, _drain = fs_setup
-    replies["/Users/corey/io_fail"] = {
+    replies["/opt/work/io_fail"] = {
         "status": "failed",
         "error": "scandir failed: I/O error",
     }
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        resp = await client.get(f"/v1/hosts/{_HOST_ID}/filesystem/Users/corey/io_fail")
+        resp = await client.get(f"/v1/hosts/{_HOST_ID}/filesystem/opt/work/io_fail")
     assert resp.status_code == 502
 
 
@@ -879,13 +879,13 @@ async def test_list_filesystem_query_preserves_windows_path_and_roots(
     connection = _registry.get(_HOST_ID)
     assert connection is not None
     connection.hello.filesystem_roots = True
-    replies["D:\\AIProgram\\Projects"] = {"entries": [], "has_more": False}
+    replies["D:\\work\\Projects"] = {"entries": [], "has_more": False}
     replies[""] = {"entries": [], "has_more": False}
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         windows = await client.get(
             f"/v1/hosts/{_HOST_ID}/filesystem",
-            params={"path": "D:\\AIProgram\\Projects"},
+            params={"path": "D:\\work\\Projects"},
         )
         roots = await client.get(
             f"/v1/hosts/{_HOST_ID}/filesystem",
@@ -934,17 +934,17 @@ async def test_list_filesystem_windows_drive_path_is_not_posixified(
     """Windows drive paths must reach the host without a leading slash.
 
     FastAPI strips the URL leading slash; the handler used to always
-    prepend ``/``, turning ``C:/Users/me/work`` into ``/C:/Users/me/work``
+    prepend ``/``, turning ``C:/opt/work/work`` into ``/C:/opt/work/work``
     which does not exist. The picker then fell through to the drive root.
     """
     from omnigent.host.frames import HostListDirEntry
 
     app, _reg, _comm, replies, _drain = fs_setup
-    replies["C:/Users/alice/work"] = {
+    replies["C:/opt/work/work"] = {
         "entries": [
             HostListDirEntry(
                 name="src",
-                path=r"C:\Users\alice\work\src",
+                path=r"C:\work\alice\work\src",
                 type="directory",
                 bytes=None,
                 modified_at=1779980000,
@@ -953,7 +953,7 @@ async def test_list_filesystem_windows_drive_path_is_not_posixified(
         "has_more": False,
     }
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        resp = await client.get(f"/v1/hosts/{_HOST_ID}/filesystem/C:/Users/alice/work")
+        resp = await client.get(f"/v1/hosts/{_HOST_ID}/filesystem/C:/opt/work/work")
     assert resp.status_code == 200, resp.text
     names = [entry["name"] for entry in resp.json()["data"]]
     assert names == ["src"]

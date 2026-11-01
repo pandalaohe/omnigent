@@ -727,7 +727,7 @@ class ArchiveCloseCoordinator:
 
         The cleanup decision is recorded as a revision-keyed label at archive,
         so it survives a restart or another replica executing the intent. Runs
-        after every target's stop, through MOD-xho04's ``cleanup_worktree`` so
+        after every target's stop, through ``cleanup_worktree`` so
         a project entry is never removed; best-effort, like the direct path.
         """
         from omnigent.server.routes._sessions.helpers import (

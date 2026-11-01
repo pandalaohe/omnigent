@@ -1,9 +1,9 @@
-"""Cross-host member placement: a session's branch worktree on another host (SCC06 F2b).
+"""Cross-host member placement: a session's branch worktree on another host.
 
 A joint-agent member saved on another host runs there, in the checkout of the
 same repository and branch the lead session is working in. The repository is
 resolved on the member's host through the lead session's project (the same
-``project_placement`` resolution SCC01 S2 uses) and the branch is the lead
+``project_placement`` resolution uses) and the branch is the lead
 session's recorded ``git_branch``; the worktree checking that branch out on the
 target host is the member's working directory.
 """
@@ -36,7 +36,7 @@ class MemberWorktree:
     """The repository + branch worktree a remote member runs in.
 
     :param workspace: Absolute worktree path on the target host, e.g.
-        ``"/Users/alice/myrepo/.worktrees/feature-login"``. Stored as the
+        ``"/opt/work/myrepo/.worktrees/feature-login"``. Stored as the
         child session's workspace.
     :param repository: The repository the worktree belongs to on that host.
     :param branch: The branch the worktree has checked out.

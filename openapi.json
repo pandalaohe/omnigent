@@ -3070,7 +3070,7 @@
         "description": "Request body for `POST /v1/hosts/{host_id}/directories`.",
         "properties": {
           "path": {
-            "description": "Absolute path of the directory to create on the host machine, e.g. `\"/Users/corey/projects/new-app\"`, or a tilde-prefixed path (`\"~/scratch\"`) the host expands against its own process owner. Missing parents are created.",
+            "description": "Absolute path of the directory to create on the host machine, e.g. `\"/opt/work/projects/new-app\"`, or a tilde-prefixed path (`\"~/scratch\"`) the host expands against its own process owner. Missing parents are created.",
             "title": "Path",
             "type": "string"
           }
@@ -5297,7 +5297,7 @@
             "type": "string"
           },
           "workspace": {
-            "description": "Absolute path on the host machine to use as the runner's working directory, e.g. `\"/Users/corey/projects/frontend\"`. When `git` is set, this is interpreted as the source repository directory and the runner starts in the created worktree instead.",
+            "description": "Absolute path on the host machine to use as the runner's working directory, e.g. `\"/opt/work/projects/frontend\"`. When `git` is set, this is interpreted as the source repository directory and the runner starts in the created worktree instead.",
             "title": "Workspace",
             "type": "string"
           }
@@ -16596,7 +16596,7 @@
             }
           },
           {
-            "description": "Optional forward pagination cursor (entry path), e.g. `\"/Users/corey/projects/m\"`.",
+            "description": "Optional forward pagination cursor (entry path), e.g. `\"/opt/work/projects/m\"`.",
             "in": "query",
             "name": "after",
             "required": false,
@@ -16676,7 +16676,7 @@
             }
           },
           {
-            "description": "Absolute path on the host (e.g. `\"/Users/corey/universe\"`) OR a tilde-prefixed path (`\"~/foo\"`). The host expands `~` itself. FastAPI's `:path` converter strips the leading `/` from the URL, so we re-add it for absolute paths.",
+            "description": "Absolute path on the host (e.g. `\"/opt/work/universe\"`) OR a tilde-prefixed path (`\"~/foo\"`). The host expands `~` itself. FastAPI's `:path` converter strips the leading `/` from the URL, so we re-add it for absolute paths.",
             "in": "path",
             "name": "path",
             "required": true,
@@ -16779,7 +16779,7 @@
             }
           },
           {
-            "description": "Absolute folder path on the host to read facts for, e.g. `\"/Users/alice/myrepo\"`.",
+            "description": "Absolute folder path on the host to read facts for, e.g. `\"/opt/work/myrepo\"`.",
             "in": "query",
             "name": "path",
             "required": true,
@@ -17766,7 +17766,7 @@
             }
           },
           {
-            "description": "Absolute path inside the repo on the host to list worktrees for, e.g. `\"/Users/alice/myrepo\"`.",
+            "description": "Absolute path inside the repo on the host to list worktrees for, e.g. `\"/opt/work/myrepo\"`.",
             "in": "query",
             "name": "path",
             "required": true,
@@ -22644,7 +22644,7 @@
     },
     "/v1/sessions/{session_id}/member-worktree": {
       "get": {
-        "description": "Resolve a session's branch worktree on a target host (SCC06 F2b).\n\nA joint-agent member saved on another host runs there in the checkout\nof the same repository and branch the lead session is working in. The\nrunner resolving a remote member dispatch calls this before creating\nthe child: the target host is authorized for the caller (same owner\nrule as `GET /v1/hosts/{id}`), the repository is mapped to *host_id*\nthrough the lead session's project, and the lead's recorded branch is\nmatched against that host's worktrees. Every missing fact is a 4xx\nnaming it, so the member dispatch fails loud instead of running\nsomewhere else.\n\n**Returns:** `{session_id, host_id, workspace, repository, branch}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 403/404 without read access to the session; 400/409 when the project, host directory, branch, or worktree is missing.\n- `HTTPException` \u2014 404 if the target host is unknown; 403 if it is owned by a different user.",
+        "description": "Resolve a session's branch worktree on a target host.\n\nA joint-agent member saved on another host runs there in the checkout\nof the same repository and branch the lead session is working in. The\nrunner resolving a remote member dispatch calls this before creating\nthe child: the target host is authorized for the caller (same owner\nrule as `GET /v1/hosts/{id}`), the repository is mapped to *host_id*\nthrough the lead session's project, and the lead's recorded branch is\nmatched against that host's worktrees. Every missing fact is a 4xx\nnaming it, so the member dispatch fails loud instead of running\nsomewhere else.\n\n**Returns:** `{session_id, host_id, workspace, repository, branch}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 403/404 without read access to the session; 400/409 when the project, host directory, branch, or worktree is missing.\n- `HTTPException` \u2014 404 if the target host is unknown; 403 if it is owned by a different user.",
         "operationId": "get_session_member_worktree_v1_sessions__session_id__member_worktree_get",
         "parameters": [
           {

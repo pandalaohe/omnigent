@@ -62,7 +62,7 @@ def windows_host(**changes: object) -> TrustedHostContext:
             platform="windows",
             cwd=r"C:\work\project",
             workspace=r"C:\work\project",
-            home=r"C:\Users\sample",
+            home=r"C:\work\sample",
             shell="pwsh",
             control_paths=(r"C:\work\control",),
             resolver=resolve,
@@ -1265,7 +1265,7 @@ def test_windows_drive_unc_ads_device_and_system(option_command: str, expected: 
         == Verdict.ALLOW
     )
     for path in (
-        r"C:\Users\sample\AppData\Roaming\Microsoft\Credentials\a",
+        r"C:\work\sample\AppData\Roaming\Microsoft\Credentials\a",
         r"C:\Program Files\Application\a",
     ):
         assert (

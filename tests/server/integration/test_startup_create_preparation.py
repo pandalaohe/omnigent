@@ -53,7 +53,7 @@ async def test_create_queues_preparation_before_host_io(
     app, client, conv_store, register_host, form
 ):
     capture = register_host()
-    workspace = "/Users/sample/project"
+    workspace = "/opt/work/project"
     if form == "multipart":
         response = await _multipart_create(client, {"host_id": _HOST_ID, "workspace": workspace})
         session_id = response.json()["session_id"]
@@ -117,7 +117,7 @@ async def test_enabled_create_rejects_unsupported_initial_items_before_insertion
         json={
             "agent_id": uploaded.json()["agent_id"],
             "host_id": _HOST_ID,
-            "workspace": "/Users/sample/project",
+            "workspace": "/opt/work/project",
             "initial_items": [{"type": "interrupt", "data": {}}],
         },
     )
@@ -138,7 +138,7 @@ async def test_git_create_queues_worktree_without_touching_host(
         json={
             "agent_id": uploaded.json()["agent_id"],
             "host_id": _HOST_ID,
-            "workspace": "/Users/sample/project",
+            "workspace": "/opt/work/project",
             "git": {"branch_name": "feature/queued", "base_branch": "main"},
         },
     )
@@ -209,7 +209,7 @@ async def test_agent_child_inherits_effective_host_without_host_io(
 ):
     capture = register_host()
     parent = await _multipart_create(
-        client, {"host_id": _HOST_ID, "workspace": "/Users/sample/project"}
+        client, {"host_id": _HOST_ID, "workspace": "/opt/work/project"}
     )
     assert parent.status_code == 201, parent.text
     parent_id = parent.json()["session_id"]
@@ -248,7 +248,7 @@ async def test_agent_child_inherits_effective_host_without_host_io(
     created = conv_store.get_conversation(child_id)
     assert created.host_id == _HOST_ID
     assert created.runner_id == token_bound_runner_id(binding)
-    assert created.workspace == "/Users/sample/project"
+    assert created.workspace == "/opt/work/project"
     assert created.labels[STARTUP_REGISTRATION_LABEL_KEY] == STARTUP_REGISTRATION_PENDING
     assert child.json()["labels"][STARTUP_REGISTRATION_LABEL_KEY] == (STARTUP_REGISTRATION_PENDING)
     if form == "json":
@@ -315,9 +315,7 @@ async def test_nested_child_inherits_host_through_hostless_parent(
         RESERVED_USER_LOCAL, "session_collab", {"sessionRestrictions": "off"}
     )
     capture = register_host()
-    root = await _multipart_create(
-        client, {"host_id": _HOST_ID, "workspace": "/Users/sample/project"}
-    )
+    root = await _multipart_create(client, {"host_id": _HOST_ID, "workspace": "/opt/work/project"})
     assert root.status_code == 201, root.text
     root_id = root.json()["session_id"]
     binding = "nested-child-inherited-host-binding"
@@ -327,7 +325,7 @@ async def test_nested_child_inherits_host_through_hostless_parent(
         parent_conversation_id=root_id,
         runner_id=token_bound_runner_id(binding),
         kind="sub_agent",
-        workspace="/Users/sample/project",
+        workspace="/opt/work/project",
     )
     child = await client.post(
         "/v1/sessions",
@@ -354,7 +352,7 @@ async def test_agent_child_new_placement_queues_own_runner_preparation(
 ):
     capture = register_host()
     parent = await _multipart_create(
-        client, {"host_id": _HOST_ID, "workspace": "/Users/sample/project"}
+        client, {"host_id": _HOST_ID, "workspace": "/opt/work/project"}
     )
     assert parent.status_code == 201, parent.text
     parent_id = parent.json()["session_id"]
@@ -368,7 +366,7 @@ async def test_agent_child_new_placement_queues_own_runner_preparation(
         client.headers.update(headers)
         child = await _multipart_create(
             client,
-            {"parent_session_id": parent_id, "workspace": "/Users/sample/other"},
+            {"parent_session_id": parent_id, "workspace": "/opt/work/other"},
         )
         child_id = child.json().get("session_id")
     else:
@@ -377,7 +375,7 @@ async def test_agent_child_new_placement_queues_own_runner_preparation(
             "parent_session_id": parent_id,
         }
         if placement == "workspace":
-            body["workspace"] = "/Users/sample/other"
+            body["workspace"] = "/opt/work/other"
         else:
             body["host_id"] = _HOST_ID
             body["git"] = {"branch_name": "feature/child", "base_branch": "main"}
@@ -391,7 +389,7 @@ async def test_agent_child_new_placement_queues_own_runner_preparation(
     assert created.labels[STARTUP_REGISTRATION_LABEL_KEY] == STARTUP_REGISTRATION_PENDING
     assert startup is not None and startup.state == "queued"
     assert startup.preparation["workspace"] == (
-        "/Users/sample/other" if placement != "git" else "/Users/sample/project"
+        "/opt/work/other" if placement != "git" else "/opt/work/project"
     )
     assert (startup.preparation["git"] is not None) == (placement == "git")
     assert capture.stats == [] and capture.launch == []
@@ -412,7 +410,7 @@ async def test_queue_refusal_removes_unissued_create(app, client, conv_store, re
         json={
             "agent_id": uploaded.json()["agent_id"],
             "host_id": _HOST_ID,
-            "workspace": "/Users/sample/project",
+            "workspace": "/opt/work/project",
             "initial_items": [
                 {
                     "type": "message",
@@ -445,7 +443,7 @@ async def test_first_input_refusal_removes_create_before_preparation(
         json={
             "agent_id": uploaded.json()["agent_id"],
             "host_id": _HOST_ID,
-            "workspace": "/Users/sample/project",
+            "workspace": "/opt/work/project",
             "initial_items": [
                 {
                     "type": "message",
@@ -513,7 +511,7 @@ async def test_create_preparation_barrier_holds_interleaved_worker(
             json={
                 "agent_id": uploaded.json()["agent_id"],
                 "host_id": _HOST_ID,
-                "workspace": "/Users/sample/project",
+                "workspace": "/opt/work/project",
                 "initial_items": [
                     {
                         "type": "message",
@@ -562,7 +560,7 @@ async def test_host_native_routing_refused_before_catalog_probe(
     body = {
         "agent_id": agent["id"],
         "host_id": _HOST_ID,
-        "workspace": "/Users/sample/project",
+        "workspace": "/opt/work/project",
         "cost_control_mode_override": "on",
         "smart_routing_message": "route my work",
     }
@@ -587,7 +585,7 @@ async def test_host_joint_bundle_refused_before_catalog_probe(
     monkeypatch.setattr(helpers, "_host_model_options_via_registry", catalog_probe)
     response = await client.post(
         "/v1/sessions",
-        data={"metadata": json.dumps({"host_id": _HOST_ID, "workspace": "/Users/sample/project"})},
+        data={"metadata": json.dumps({"host_id": _HOST_ID, "workspace": "/opt/work/project"})},
         files={"bundle": ("agent.tar.gz", joint_bundle(), "application/gzip")},
     )
     assert response.status_code == 400, response.text

@@ -276,8 +276,8 @@ export const BrandIconsCollapsed: Story = {
 };
 
 const groupedHosts = [
-  { host_id: "host-tmb", name: "TMB", owner: "u", status: "online" as const },
-  { host_id: "host-fn", name: "fn", owner: "u", status: "online" as const },
+  { host_id: "host-laptop", name: "laptop", owner: "u", status: "online" as const },
+  { host_id: "host-server", name: "server", owner: "u", status: "online" as const },
 ];
 
 const groupedTree = {
@@ -287,8 +287,8 @@ const groupedTree = {
       title: "researcher:rail-shots",
       tool: "researcher",
       session_name: "rail-shots",
-      host_id: "host-tmb",
-      cwd: "/opt/work/omnigent/fork/omnigent-scc18-agents-rail",
+      host_id: "host-laptop",
+      cwd: "/opt/work/omnigent/fork/omnigent-agents-rail",
       created_at: 5,
       busy: true,
       last_message_preview: "Checking the grouped rail layout…",
@@ -298,8 +298,8 @@ const groupedTree = {
       title: "codex:api-notes",
       tool: "codex",
       session_name: "api-notes",
-      host_id: "host-tmb",
-      cwd: "/opt/work/omnigent/fork/omnigent-scc18-agents-rail",
+      host_id: "host-laptop",
+      cwd: "/opt/work/omnigent/fork/omnigent-agents-rail",
       created_at: 4,
       current_task_status: "completed",
     }),
@@ -308,8 +308,8 @@ const groupedTree = {
       title: "researcher:async-card",
       tool: "researcher",
       session_name: "async-card",
-      host_id: "host-tmb",
-      cwd: "/opt/work/omnigent/fork/omnigent-scc17-async-card",
+      host_id: "host-laptop",
+      cwd: "/opt/work/omnigent/fork/omnigent-async-card",
       created_at: 3,
       busy: true,
       pending_elicitations_count: 1,
@@ -319,20 +319,20 @@ const groupedTree = {
       title: "pr-test-analyzer:suite",
       tool: "pr-test-analyzer",
       session_name: "suite",
-      host_id: "host-tmb",
-      cwd: "/opt/work/omnigent/fork/omnigent-scc17-async-card",
+      host_id: "host-laptop",
+      cwd: "/opt/work/omnigent/fork/omnigent-async-card",
       created_at: 2,
       warm_state: "warm",
     }),
     child({
-      id: "group-fn",
+      id: "group-server",
       title: "researcher:repro",
       tool: "researcher",
       session_name: "repro",
-      host_id: "host-fn",
+      host_id: "host-server",
       cwd: "/root/omnigent-dev",
       created_at: 1,
-      last_message_preview: "Reproduced on fn.",
+      last_message_preview: "Reproduced on the staging host.",
     }),
   ],
 };
@@ -344,8 +344,8 @@ const groupedPast = [
     title: "researcher:status",
     tool: "researcher",
     session_name: "status",
-    host_id: "host-tmb",
-    cwd: "/opt/work/omnigent/fork/omnigent-scc13-status",
+    host_id: "host-laptop",
+    cwd: "/opt/work/omnigent/fork/omnigent-status",
     archived: true,
     archived_at: archivedAt - 3600,
   }),
@@ -354,7 +354,7 @@ const groupedPast = [
     title: "codex:flow-timer",
     tool: "codex",
     session_name: "flow-timer",
-    host_id: "host-fn",
+    host_id: "host-server",
     cwd: "/root/omnigent-dev",
     archived: true,
     archived_at: archivedAt - 86_400,
@@ -366,7 +366,7 @@ export const GroupedZones: Story = {
   decorators: [
     panelEnvironment({
       activeId: "conversation-root",
-      session: rootSession({ hostId: "host-tmb" }),
+      session: rootSession({ hostId: "host-laptop" }),
       hosts: groupedHosts,
       tree: groupedTree,
       past: groupedPast,
@@ -385,12 +385,12 @@ export const GroupedZones: Story = {
 // running / idle / done rows. Same data in both trees.
 const mixedWrapper = "omnigent.wrapper";
 const MIXED_MAC = "host-mac";
-const MIXED_FN = "host-fn";
+const MIXED_SERVER = "host-server";
 const MIXED_CWD = "/opt/work/omnigent/fork/omnigent-feature";
 
 const mixedHosts = [
-  { host_id: MIXED_MAC, name: "TerrenceMBP.local", owner: "u", status: "online" as const },
-  { host_id: MIXED_FN, name: "fn", owner: "u", status: "online" as const },
+  { host_id: MIXED_MAC, name: "studio-mac.local", owner: "u", status: "online" as const },
+  { host_id: MIXED_SERVER, name: "server", owner: "u", status: "online" as const },
 ];
 
 const mixedTree = {
@@ -450,17 +450,17 @@ const mixedTree = {
       last_message_preview: "Waiting for the next task.",
     }),
     child({
-      id: "real-child-fn",
-      title: "fn-repro",
-      session_name: "fn-repro",
+      id: "real-child-server",
+      title: "server-repro",
+      session_name: "server-repro",
       agent_name: "codex-native-ui",
       harness: "codex-native",
       labels: { [mixedWrapper]: "codex-native-ui" },
-      host_id: MIXED_FN,
+      host_id: MIXED_SERVER,
       cwd: "/root/omnigent-dev",
       warm_state: "cold",
       created_at: 5,
-      last_message_preview: "Reproduced on fn.",
+      last_message_preview: "Reproduced on the staging host.",
     }),
   ],
   "real-child": [

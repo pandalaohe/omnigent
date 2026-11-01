@@ -44,7 +44,7 @@ function listing(paths: string[], truncated = false): Response {
   });
 }
 
-const WORKSPACE = "/home/u/ws";
+const WORKSPACE = "/opt/work/ws";
 
 // Module scope so the provider value is a constant (jsx-no-constructed-context-values).
 const VIEWER = {
@@ -53,7 +53,7 @@ const VIEWER = {
   isChangedPath: () => false,
   conversationId: undefined as string | undefined,
   workspaceRoot: WORKSPACE,
-  workspaceHome: "/home/u",
+  workspaceHome: "/opt/work",
 };
 
 function Probe({ id, text }: { id: string | undefined; text: string }) {

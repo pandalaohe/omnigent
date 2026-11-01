@@ -5335,7 +5335,7 @@ def _new_external_conversation_item(
         item = item.model_copy(
             update={"data": item.data.model_copy(update={"subagent_return_id": return_id})}
         )
-    # Fork dedupe key (MOD-s21): ``_parse_external_conversation_item`` validates
+    # Fork dedupe key: ``_parse_external_conversation_item`` validates
     # ``data.source_id`` and sets ``idempotency_key="external:<source_id>"``; the
     # store derives the row id from it and flags a re-post ``replayed``. Upstream's
     # uuid5 ``stable_id`` would re-id items persisted under the fork key, so the
@@ -5865,7 +5865,7 @@ async def _heal_subagent_runner_binding_via_parent(
     :returns: The live ``httpx.AsyncClient`` for the nearest live ancestor runner
         after healing, or ``None`` when no live ancestor could be found.
     """
-    # A cross-host member child (SCC06 F2b) runs on its OWN host's runner, so
+    # A cross-host member child runs on its OWN host's runner, so
     # the parent's runner is not a valid place to heal it to; leave the binding
     # alone and let the caller fail the forward instead of misrouting it.
     parent_id = child_conv.parent_conversation_id
@@ -14440,7 +14440,7 @@ async def _create_session_from_existing_agent(
         if body.host_id is not None and body.host_id != effective_host_id(
             conversation_store, parent_conv
         ):
-            # Cross-host member child (SCC06 F2b): the parent's runner
+            # Cross-host member child: the parent's runner
             # cannot serve the member's host. Leave it unbound so the
             # create route's host launch starts a runner on that host. The
             # parent's effective host is its nearest host-bound ancestor:

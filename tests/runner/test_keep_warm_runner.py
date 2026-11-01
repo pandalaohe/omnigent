@@ -1,4 +1,4 @@
-"""Runner keep-warm controls: ``keep_warm_touch`` / ``keep_warm_ping`` (SCC28).
+"""Runner keep-warm controls: ``keep_warm_touch`` / ``keep_warm_ping``.
 
 The server's sweeper sends both through the same events route the web's
 ``btw_dismiss`` uses. The runner re-arms both idle reapers on every

@@ -1269,7 +1269,7 @@ class SysSessionCreateTool(Tool):
                             "type": "string",
                             "description": (
                                 "Placement (agent_id mode): a registered "
-                                "host id or its exact name, e.g. 'fn' or "
+                                "host id or its exact name, e.g. 'server' or "
                                 "'host_a1b2c3'. Unknown names are refused "
                                 "with the registered names. Naming another "
                                 "host requires 'workspace' or 'worktree'. "

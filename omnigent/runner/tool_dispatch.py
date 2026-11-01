@@ -2348,7 +2348,7 @@ def _short_cwd(cwd: str) -> str:
     The path under the home directory reads ``~/…``; anything else keeps its
     last two components.
 
-    :param cwd: Absolute directory path, e.g. ``"/home/alice/projects/app"``.
+    :param cwd: Absolute directory path, e.g. ``"/opt/work/projects/app"``.
     :returns: The shortened form, e.g. ``"~/projects/app"`` or ``"b/c"``.
     """
     normalized = cwd.rstrip("/")

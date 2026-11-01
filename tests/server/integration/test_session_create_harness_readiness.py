@@ -212,7 +212,7 @@ async def test_agent_id_child_uses_parent_host_even_if_request_names_another(
             "workspace": "/tmp/workspace",
         },
     )
-    # Fork inversion (MOD-scc06 F2b): the child is a cross-host member launched
+    # Fork inversion: the child is a cross-host member launched
     # on the request-named host, which is offline here, so the create is a 409.
     assert response.status_code == 409, response.text
     assert response.json()["error"]["code"] == "conflict"

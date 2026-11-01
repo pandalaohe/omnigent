@@ -1,4 +1,4 @@
-"""Role routing obligations and visible notices for joint-agent leads (SCC06 F1a-2).
+"""Role routing obligations and visible notices for joint-agent leads.
 
 A user message that names ``@role`` / ``[role]`` members becomes a set of
 dispatch obligations for the lead's turn: the note prepended to the lead's

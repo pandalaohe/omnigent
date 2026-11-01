@@ -1459,7 +1459,7 @@ def test_launch_runner_frame_harness_round_trip() -> None:
     original = HostLaunchRunnerFrame(
         request_id="req_001",
         binding_token="secret_token_xyz",
-        workspace="/Users/corey/projects/frontend",
+        workspace="/opt/work/projects/frontend",
         harness="claude-sdk",
     )
     decoded = decode_host_frame(encode_host_frame(original))
@@ -1941,11 +1941,11 @@ def test_stat_frame_round_trip() -> None:
     If this field name or type drifts, the validation flow can't
     talk to the host.
     """
-    original = HostStatFrame(request_id="req_stat_1", path="/Users/corey/universe")
+    original = HostStatFrame(request_id="req_stat_1", path="/opt/work/universe")
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostStatFrame)
     assert decoded.request_id == "req_stat_1"
-    assert decoded.path == "/Users/corey/universe"
+    assert decoded.path == "/opt/work/universe"
 
 
 def test_stat_frame_accepts_tilde_path() -> None:
@@ -1982,7 +1982,7 @@ def test_stat_result_directory_round_trip() -> None:
         status="ok",
         exists=True,
         type="directory",
-        canonical_path="/Users/corey/universe",
+        canonical_path="/opt/work/universe",
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostStatResultFrame)
@@ -1990,7 +1990,7 @@ def test_stat_result_directory_round_trip() -> None:
     assert decoded.status == "ok"
     assert decoded.exists is True
     assert decoded.type == "directory"
-    assert decoded.canonical_path == "/Users/corey/universe"
+    assert decoded.canonical_path == "/opt/work/universe"
     assert decoded.error is None
 
 
@@ -2077,7 +2077,7 @@ def test_list_dir_frame_round_trip() -> None:
     """
     original = HostListDirFrame(
         request_id="req_list_1",
-        path="/Users/corey/projects",
+        path="/opt/work/projects",
         limit=20,
         after=None,
         before=None,
@@ -2085,7 +2085,7 @@ def test_list_dir_frame_round_trip() -> None:
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostListDirFrame)
     assert decoded.request_id == "req_list_1"
-    assert decoded.path == "/Users/corey/projects"
+    assert decoded.path == "/opt/work/projects"
     assert decoded.limit == 20
     assert decoded.after is None
     assert decoded.before is None
@@ -2141,14 +2141,14 @@ def test_list_dir_result_round_trip() -> None:
         entries=[
             HostListDirEntry(
                 name="src",
-                path="/Users/corey/foo/src",
+                path="/opt/work/foo/src",
                 type="directory",
                 bytes=None,
                 modified_at=1779980000,
             ),
             HostListDirEntry(
                 name="README.md",
-                path="/Users/corey/foo/README.md",
+                path="/opt/work/foo/README.md",
                 type="file",
                 bytes=1234,
                 modified_at=1779980100,
@@ -2243,7 +2243,7 @@ def test_create_worktree_frame_round_trip() -> None:
     """
     original = HostCreateWorktreeFrame(
         request_id="req_wt_1",
-        repo_path="/Users/alice/myrepo",
+        repo_path="/opt/work/myrepo",
         branch_name="feature/login",
         base_branch="main",
         timeout_s=3600.0,
@@ -2302,14 +2302,14 @@ def test_create_worktree_frame_entry_round_trip() -> None:
     """A set entry survives encode → decode (drives the worktree location)."""
     original = HostCreateWorktreeFrame(
         request_id="req_wt_entry",
-        repo_path="/Users/alice/myrepo",
+        repo_path="/opt/work/myrepo",
         branch_name="feature/login",
-        entry="/Users/alice/project",
+        entry="/opt/work/project",
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostCreateWorktreeFrame)
     assert decoded == original
-    assert decoded.entry == "/Users/alice/project"
+    assert decoded.entry == "/opt/work/project"
 
 
 def test_create_worktree_frame_entry_absent_decodes_none() -> None:
@@ -2332,9 +2332,9 @@ def test_create_worktree_frame_path_template_round_trip() -> None:
     """A set path_template survives encode → decode (drives the worktree location)."""
     original = HostCreateWorktreeFrame(
         request_id="req_wt_tpl",
-        repo_path="/Users/alice/myrepo",
+        repo_path="/opt/work/myrepo",
         branch_name="feature/login",
-        entry="/Users/alice/project",
+        entry="/opt/work/project",
         path_template="{entry}/.worktrees/{repo}/{branch}",
     )
     decoded = decode_host_frame(encode_host_frame(original))
@@ -2367,9 +2367,9 @@ def test_create_worktree_frame_path_template_is_additive_for_older_hosts() -> No
     encoded = encode_host_frame(
         HostCreateWorktreeFrame(
             request_id="req_wt_7",
-            repo_path="/Users/alice/myrepo",
+            repo_path="/opt/work/myrepo",
             branch_name="feature/login",
-            entry="/Users/alice/project",
+            entry="/opt/work/project",
             path_template="{entry}/.worktrees/{repo}/{branch}",
         )
     )
@@ -2390,9 +2390,9 @@ def test_create_worktree_frame_path_template_is_additive_for_older_hosts() -> No
     decoded = decode_host_frame(json.dumps(msg))
     assert decoded == HostCreateWorktreeFrame(
         request_id="req_wt_7",
-        repo_path="/Users/alice/myrepo",
+        repo_path="/opt/work/myrepo",
         branch_name="feature/login",
-        entry="/Users/alice/project",
+        entry="/opt/work/project",
     )
 
 
@@ -2432,9 +2432,9 @@ def test_create_worktree_result_frame_round_trip() -> None:
     original = HostCreateWorktreeResultFrame(
         request_id="req_wt_1",
         status="ok",
-        worktree_path="/Users/alice/myrepo-worktrees/feature-login",
+        worktree_path="/opt/work/myrepo-worktrees/feature-login",
         branch="feature/login",
-        workspace="/Users/alice/myrepo-worktrees/feature-login/web",
+        workspace="/opt/work/myrepo-worktrees/feature-login/web",
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostCreateWorktreeResultFrame)
@@ -2463,7 +2463,7 @@ def test_remove_worktree_frame_round_trip() -> None:
     """
     original = HostRemoveWorktreeFrame(
         request_id="req_rm_1",
-        worktree_path="/Users/alice/myrepo-worktrees/feature-login",
+        worktree_path="/opt/work/myrepo-worktrees/feature-login",
         branch="feature/login",
         delete_branch=True,
     )
@@ -2517,7 +2517,7 @@ def test_list_worktrees_frame_round_trip(for_cleanup: bool) -> None:
     """
     original = HostListWorktreesFrame(
         request_id="req_wt_ls_1",
-        repo_path="/Users/alice/myrepo",
+        repo_path="/opt/work/myrepo",
         for_cleanup=for_cleanup,
     )
     decoded = decode_host_frame(encode_host_frame(original))
@@ -2537,7 +2537,7 @@ def test_list_worktrees_result_frame_round_trip(legacy_provider: bool) -> None:
         status="ok",
         worktrees=[
             {
-                "path": "/Users/alice/myrepo",
+                "path": "/opt/work/myrepo",
                 "branch": "main",
                 "is_main": True,
                 "detached": False,
@@ -2545,7 +2545,7 @@ def test_list_worktrees_result_frame_round_trip(legacy_provider: bool) -> None:
                 "updated_at": 1_700_000_000,
             },
             {
-                "path": "/Users/alice/myrepo-worktrees/feature-login",
+                "path": "/opt/work/myrepo-worktrees/feature-login",
                 "branch": "feature/login",
                 "is_main": False,
                 "detached": False,
@@ -2605,7 +2605,7 @@ def test_create_dir_frame_round_trip() -> None:
     """
     original = HostCreateDirFrame(
         request_id="req_mkdir_1",
-        path="/Users/corey/projects/new-app",
+        path="/opt/work/projects/new-app",
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostCreateDirFrame)
@@ -2647,7 +2647,7 @@ def test_create_dir_result_success_round_trip() -> None:
     original = HostCreateDirResultFrame(
         request_id="req_mkdir_2",
         status="ok",
-        path="/Users/corey/projects/new-app",
+        path="/opt/work/projects/new-app",
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostCreateDirResultFrame)
@@ -2952,7 +2952,7 @@ def test_fs_request_round_trip() -> None:
     original = HostFsRequestFrame(
         request_id="req_fs_1",
         op="list_or_read",
-        workspace="/Users/corey/project",
+        workspace="/opt/work/project",
         session_id="conv_abc123",
         params={"path": "src", "limit": 100, "order": "asc"},
     )
@@ -3012,7 +3012,7 @@ def test_fs_write_round_trip() -> None:
     original = HostFsWriteFrame(
         request_id="req_fsw_1",
         op="github_set_preference",
-        workspace="/Users/corey/project",
+        workspace="/opt/work/project",
         session_id="conv_abc123",
         params={"account": "octocat", "remote": "origin"},
     )
@@ -3147,7 +3147,7 @@ def test_post_bind_hook_frame_round_trip() -> None:
         binding_id="bind_abc",
         revision=4,
         repository_name="root",
-        workspace="/Users/alice/myrepo",
+        workspace="/opt/work/myrepo",
         is_primary=True,
         context_manifest_path=".agents/project/manifest.json",
     )
@@ -3166,7 +3166,7 @@ def test_post_bind_hook_frame_missing_revision_raises() -> None:
             binding_id="bind_abc",
             revision=1,
             repository_name="root",
-            workspace="/Users/alice/myrepo",
+            workspace="/opt/work/myrepo",
             is_primary=False,
             context_manifest_path=".agents/project/manifest.json",
         )
@@ -3186,7 +3186,7 @@ def test_post_bind_hook_frame_trigger_entry_round_trip() -> None:
         binding_id="entry:proj_abc",
         revision=0,
         repository_name="",
-        workspace="/Users/alice/myrepo",
+        workspace="/opt/work/myrepo",
         is_primary=True,
         context_manifest_path=".agents/project/manifest.json",
         trigger="entry",
@@ -3206,7 +3206,7 @@ def test_post_bind_hook_frame_trigger_absent_decodes_binding() -> None:
             binding_id="bind_abc",
             revision=2,
             repository_name="root",
-            workspace="/Users/alice/myrepo",
+            workspace="/opt/work/myrepo",
             is_primary=True,
             context_manifest_path=".agents/project/manifest.json",
         )
@@ -3228,7 +3228,7 @@ def test_post_bind_hook_frame_trigger_unknown_raises() -> None:
             binding_id="bind_abc",
             revision=1,
             repository_name="root",
-            workspace="/Users/alice/myrepo",
+            workspace="/opt/work/myrepo",
             is_primary=True,
             context_manifest_path=".agents/project/manifest.json",
         )
