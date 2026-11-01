@@ -961,6 +961,7 @@ async def test_continued_child_turn_cut_by_502_permission_refusal_reports_failed
     import io
     import sys
 
+    from omnigent.entities import Conversation
     from omnigent.harnesses.claude_native import (
         bridge as claude_native_bridge,
     )
@@ -971,6 +972,9 @@ async def test_continued_child_turn_cut_by_502_permission_refusal_reports_failed
         hook as claude_native_hook,
     )
     from omnigent.runner.tool_dispatch import _prepare_child_dispatch
+    from omnigent.server.routes._sessions.helpers import (
+        _child_session_summary_from_conversation,
+    )
 
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
@@ -980,11 +984,14 @@ async def test_continued_child_turn_cut_by_502_permission_refusal_reports_failed
         (0.0,) * len(claude_native_bridge._PRE_TOOL_USE_POLICY_EVAL_RETRY_DELAYS_S),
     )
 
-    # Stage 1: Child completed a previous turn, then is continued for a new turn.
+    # Stage 1: Child completed or failed a previous turn, then is continued for a new turn.
     child_labels: dict[str, str] = {
         subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY: "subagent_prev",
         subagent_work.SUBAGENT_DELIVERED_ID_LABEL_KEY: "subagent_prev",
         subagent_work.SUBAGENT_TERMINAL_STATUS_LABEL_KEY: "completed",
+        subagent_work.SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY: "true",
+        "omnigent.last_task_error_code": "native_turn_error",
+        "omnigent.last_task_error_message": "stale prior error",
     }
     child_status_events: list[dict[str, Any]] = []
     items_path = f"/v1/sessions/{CHILD_SESSION_ID}/items"
@@ -995,11 +1002,8 @@ async def test_continued_child_turn_cut_by_502_permission_refusal_reports_failed
             return httpx.Response(200, json={"data": [prior_item], "has_more": False})
         if request.method == "PATCH" and request.url.path == f"/v1/sessions/{CHILD_SESSION_ID}":
             body = json.loads(request.content)
-            for key, value in body.get("labels", {}).items():
-                if value == "":
-                    child_labels.pop(key, None)
-                else:
-                    child_labels[key] = value
+            # ``ConversationStore.set_labels`` upserts empty strings rather than deleting.
+            child_labels.update(body.get("labels", {}))
             return httpx.Response(200, json={"labels": dict(child_labels)})
         return httpx.Response(404)
 
@@ -1010,7 +1014,28 @@ async def test_continued_child_turn_cut_by_502_permission_refusal_reports_failed
     assert prior_id == "msg_child_final"
     assert stamp_err is None
     assert child_labels.get(subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY) == DISPATCH_ID
-    assert subagent_work.SUBAGENT_TERMINAL_STATUS_LABEL_KEY not in child_labels
+    for key, value in subagent_work.SUBAGENT_DISPATCH_RESET_LABELS.items():
+        assert child_labels.get(key) == value
+
+    # Verify the server summary projection after dispatch reset does not leak
+    # prior completed/failed/quarantined state into the new turn.
+    post_dispatch_summary = _child_session_summary_from_conversation(
+        Conversation(
+            id=CHILD_SESSION_ID,
+            created_at=100,
+            updated_at=200,
+            root_conversation_id=PARENT_SESSION_ID,
+            title="claude-code:reviewer",
+            agent_id="ag_test",
+            labels=dict(child_labels),
+            live_status="running",
+        ),
+        PARENT_SESSION_ID,
+        None,
+        cached_status="running",
+    )
+    assert post_dispatch_summary.current_task_status == "in_progress"
+    assert post_dispatch_summary.last_task_error is None
 
     # Stage 2: Relay PreToolUse hits HTTP 502 -> fail-closed ask + fallback marker;
     # PermissionRequest also hits 502 -> records StopFailure in hooks.jsonl.
@@ -1077,35 +1102,71 @@ async def test_continued_child_turn_cut_by_502_permission_refusal_reports_failed
     )
     assert claude_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)]) == 0
 
-    hook_batch = claude_native_bridge.read_hook_events_from_offset(
-        bridge_dir, 0, start_event_count=0
-    )
-    assert len(hook_batch.records) == 1
-    stop_record = hook_batch.records[0]
-    assert stop_record.event_name == "StopFailure"
-    assert stop_record.failure_category == "policy_evaluation_failed"
-    assert stop_record.failure_message is not None
-    assert "server returned HTTP 502" in stop_record.failure_message
-    failure_detail = claude_native_forwarder._stop_failure_detail(
-        stop_record, session_id=CHILD_SESSION_ID
-    )
-    assert failure_detail is not None
-    assert "server returned HTTP 502" in failure_detail
-    child_status_events.append(
-        {"type": "external_session_status", "status": "failed", "failure_detail": failure_detail}
-    )
+    def _status_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        child_status_events.append(body)
+        if body.get("type") == "external_session_status":
+            data = body.get("data", {})
+            if data.get("status") == "failed":
+                child_labels[subagent_work.SUBAGENT_TERMINAL_STATUS_LABEL_KEY] = "failed"
+                child_labels["omnigent.last_task_error_code"] = "native_turn_error"
+                child_labels["omnigent.last_task_error_message"] = str(
+                    data.get("failure_detail") or data.get("output") or ""
+                )
+        return httpx.Response(200, json={})
 
-    # Stage 3: Recovery after runner restart delivers status="failed" with the
-    # 502 reason to the parent inbox, never "completed" with no output.
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_status_handler), base_url="http://ap"
+    ) as forward_client:
+        hook_state = await claude_native_forwarder._ensure_hook_state(
+            bridge_dir, start_at_end=False, session_id=CHILD_SESSION_ID
+        )
+        await claude_native_forwarder._forward_available_status_events(
+            client=forward_client,
+            session_id=CHILD_SESSION_ID,
+            bridge_dir=bridge_dir,
+            state=hook_state,
+            retry_tracker=claude_native_forwarder._PostRetryTracker(),
+            dedupe=claude_native_forwarder._ForwardDedupeState(),
+            task_subjects={},
+            task_statuses={},
+            task_order=[],
+            response_id="resp_turn_2",
+        )
+
+    assert len(child_status_events) == 1
+    assert child_status_events[0]["type"] == "external_session_status"
+    assert child_status_events[0]["data"]["status"] == "failed"
+    assert "server returned HTTP 502" in child_status_events[0]["data"]["failure_detail"]
+
+    # Stage 3: Project the server summary from the updated labels and verify
+    # recovery after runner restart delivers status="failed" with the 502 reason
+    # to the parent inbox, never "completed" with no output.
+    failed_summary = _child_session_summary_from_conversation(
+        Conversation(
+            id=CHILD_SESSION_ID,
+            created_at=100,
+            updated_at=200,
+            root_conversation_id=PARENT_SESSION_ID,
+            title="claude-code:reviewer",
+            agent_id="ag_test",
+            labels=dict(child_labels),
+            live_status="idle",
+        ),
+        PARENT_SESSION_ID,
+        None,
+        cached_status="idle",
+    )
+    assert failed_summary.current_task_status == "failed"
+    assert failed_summary.last_task_error is not None
+    assert "server returned HTTP 502" in failed_summary.last_task_error["message"]
+
     subagent_work._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
     recovery_client = _RecoveryServerClient(
         [
             _child_summary(
-                current_task_status="failed",
-                last_task_error={
-                    "code": "external_session_failed",
-                    "message": child_status_events[-1]["failure_detail"],
-                },
+                current_task_status=failed_summary.current_task_status,
+                last_task_error=dict(failed_summary.last_task_error),
                 labels=dict(child_labels),
             )
         ],

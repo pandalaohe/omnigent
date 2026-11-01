@@ -1911,7 +1911,7 @@ async def _prepare_child_dispatch(
         child_session_id,
         subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY,
         work_id,
-        extra_labels={subagent_work.SUBAGENT_TERMINAL_STATUS_LABEL_KEY: ""},
+        extra_labels=subagent_work.SUBAGENT_DISPATCH_RESET_LABELS,
     )
     return prior_result[0] if prior_result is not None else None, error
 
@@ -2102,7 +2102,7 @@ async def _send_to_in_flight_child(
                 child_session_id,
                 _subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY,
                 work_id,
-                extra_labels={_subagent_work.SUBAGENT_TERMINAL_STATUS_LABEL_KEY: ""},
+                extra_labels=_subagent_work.SUBAGENT_DISPATCH_RESET_LABELS,
             )
             if stamp_error is not None:
                 _logger.warning(

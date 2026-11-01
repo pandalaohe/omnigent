@@ -3988,7 +3988,8 @@ async def test_sys_session_send_reuses_existing_child_session(
     [stamp] = dispatch_stamps
     assert stamp["events_before"] == 0
     assert stamp[subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY].startswith("subagent_")
-    assert stamp[subagent_work.SUBAGENT_TERMINAL_STATUS_LABEL_KEY] == ""
+    for key, value in subagent_work.SUBAGENT_DISPATCH_RESET_LABELS.items():
+        assert stamp[key] == value
     assert published[-1]["type"] == "session.child_session.updated"
     assert published[-1]["child"]["current_task_status"] == "launching"
     assert published[-1]["child"]["busy"] is False
@@ -14919,6 +14920,7 @@ async def test_send_by_session_id_steers_busy_child_without_work_entry(
     parent_id, child_id = "conv_parent_busy_by_id", "conv_child_busy_by_id"
     event_posts: list[dict[str, Any]] = []
     stamped: list[str] = []
+    stamped_labels: list[dict[str, str]] = []
     inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
@@ -14936,6 +14938,7 @@ async def test_send_by_session_id_steers_busy_child_without_work_entry(
         if request.method == "PATCH" and path == f"/v1/sessions/{child_id}":
             labels = json.loads(request.content)["labels"]
             stamped.append(labels[subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY])
+            stamped_labels.append(labels)
             return httpx.Response(200, json={"ok": True})
         if request.method == "POST" and path == f"/v1/sessions/{child_id}/events":
             event_posts.append(json.loads(request.content))
@@ -14977,6 +14980,8 @@ async def test_send_by_session_id_steers_busy_child_without_work_entry(
     assert len(event_posts) == 1
     assert work_status == "running"
     assert work_id == stamped[0]
+    for key, value in subagent_work.SUBAGENT_DISPATCH_RESET_LABELS.items():
+        assert stamped_labels[0][key] == value
     assert first.delivered_now is True
     assert second.delivered_now is False
     assert inbox.qsize() == 1

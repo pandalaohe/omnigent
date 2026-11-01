@@ -776,9 +776,6 @@ def _post_hook_with_reattach(
                 return None
 
 
-_policy_fallback_marker = policy_fallback_marker
-
-
 def _main_permission_request(argv: list[str]) -> int:
     """
     Forward one Claude ``PermissionRequest`` hook to the active Omnigent session.
@@ -808,7 +805,7 @@ def _main_permission_request(argv: list[str]) -> int:
         return 0
     # This diagnostic only attributes an ask; it never changes its verdict.
     fallback_reason: str | None = None
-    marker = _policy_fallback_marker(bridge_dir, session_id, payload)
+    marker = policy_fallback_marker(bridge_dir, session_id, payload)
     with contextlib.suppress(OSError):
         if time.time() - marker.stat().st_mtime <= 600:
             payload["_omnigent_approval_origin"] = "omnigent-policy-unavailable"
