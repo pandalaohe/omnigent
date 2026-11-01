@@ -5353,7 +5353,10 @@ def create_app(
             _session_sandbox_status_cache,
             _session_status_cache,
         )
-        from omnigent.server.routes._sessions.helpers import _last_task_error_from_labels
+        from omnigent.server.routes._sessions.helpers import (
+            _last_task_error_from_labels,
+            effective_host_id,
+        )
         from omnigent.server.routes.sessions import (
             _ensure_runner_relay,
             _publish_runner_recovered_status,
@@ -5378,6 +5381,19 @@ def create_app(
         )
         bound_ids = {conv.id for conv in convs}
         by_id = {conv.id: conv for conv in convs}
+        ancestor_host_ids: dict[str, str | None] = {}
+        # A hostless tree can inherit its host from an ancestor on another runner.
+        for conv in convs:
+            parent_id = conv.parent_conversation_id
+            if (
+                conv.host_id is None
+                and parent_id is not None
+                and parent_id not in by_id
+                and parent_id not in ancestor_host_ids
+            ):
+                ancestor_host_ids[parent_id] = await asyncio.to_thread(
+                    effective_host_id, conversation_store, conv
+                )
 
         def _tree_host_id(conv_id: str | None) -> str | None:
             seen: set[str] = set()
@@ -5385,7 +5401,7 @@ def create_app(
                 seen.add(conv_id)
                 ancestor = by_id.get(conv_id)
                 if ancestor is None:
-                    return None
+                    return ancestor_host_ids.get(conv_id)
                 if ancestor.host_id is not None:
                     return ancestor.host_id
                 conv_id = ancestor.parent_conversation_id

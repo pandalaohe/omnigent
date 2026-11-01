@@ -459,19 +459,36 @@ async def test_reconnecting_trees_share_store_budget_without_waiting_for_initial
         assert not finished.is_set()
 
 
+@pytest.mark.parametrize("inherited_host", [False, True])
 async def test_hosted_child_recovers_independently_while_parent_is_stalled(
-    app: FastAPI, agent: Agent, monkeypatch: pytest.MonkeyPatch
+    app: FastAPI, agent: Agent, monkeypatch: pytest.MonkeyPatch, inherited_host: bool
 ) -> None:
-    parent = _create_session(app, agent.id)
+    store = app.state.runner_router._conversation_store
+    ancestor = (
+        store.create_conversation(
+            agent_id=agent.id,
+            runner_id="other_runner",
+            host_id="b" * 32,
+            workspace="/opt/work/omnigent/fork/ancestor",
+        )
+        if inherited_host
+        else None
+    )
+    parent = _create_session(
+        app,
+        agent.id,
+        kind="sub_agent" if inherited_host else "default",
+        parent_conversation_id=ancestor.id if ancestor is not None else None,
+    )
     hostless, same_host, hosted = [
         _create_session(app, agent.id, kind="sub_agent", parent_conversation_id=parent.id)
         for _ in range(3)
     ]
-    store = app.state.runner_router._conversation_store
-    store.set_host_id(parent.id, "b" * 32, workspace="/opt/work/omnigent/fork/main")
+    if not inherited_host:
+        store.set_host_id(parent.id, "b" * 32, workspace="/opt/work/omnigent/fork/main")
     store.set_host_id(same_host.id, "b" * 32, workspace="/opt/work/omnigent/fork/wt")
     store.set_host_id(hosted.id, "a" * 32, workspace="/tmp")
-    requested: set[str] = set()
+    requested: list[str] = []
     parent_entered = asyncio.Event()
     release_parent = asyncio.Event()
     resumed: dict[str, bool] = {}
@@ -479,7 +496,7 @@ async def test_hosted_child_recovers_independently_while_parent_is_stalled(
     async def respond(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         sid = body["session_id"]
-        requested.add(sid)
+        requested.append(sid)
         resumed[sid] = body["session_init"]["resume_interrupted_turn"]
         if sid == parent.id:
             parent_entered.set()
@@ -492,7 +509,8 @@ async def test_hosted_child_recovers_independently_while_parent_is_stalled(
 
     async with _recover(app, monkeypatch, respond) as (relays, finished):
         await asyncio.wait_for(asyncio.gather(parent_entered.wait(), hosted_recovers()), budget(5))
-        assert requested == {parent.id, hosted.id}
+        assert set(requested) == {parent.id, hosted.id}
+        assert len(requested) == len(set(requested))
         assert {parent.id, hostless.id, same_host.id, hosted.id} <= set(relays)
         assert sessions._session_status_cache[parent.id] == "failed"
         assert sessions._session_status_cache[hostless.id] == "failed"
@@ -500,7 +518,8 @@ async def test_hosted_child_recovers_independently_while_parent_is_stalled(
         assert not finished.is_set()
         release_parent.set()
         await asyncio.wait_for(finished.wait(), budget(5))
-        assert requested == {parent.id, hosted.id, hostless.id, same_host.id}
+        assert set(requested) == {parent.id, hosted.id, hostless.id, same_host.id}
+        assert len(requested) == len(set(requested))
         assert resumed[hostless.id] is True
         assert resumed[same_host.id] is True
 

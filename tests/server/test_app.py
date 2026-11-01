@@ -2936,10 +2936,12 @@ async def test_runner_reconnect_skips_held_explicit_host_child_then_initializes_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("inherited_host", [False, True])
 async def test_on_runner_connect_defers_idle_tree_initialization_until_demand(
     db_uri: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    inherited_host: bool,
 ) -> None:
     """Idle trees attach on reconnect without starting runner runtimes."""
     from omnigent.entities import Conversation
@@ -2951,25 +2953,47 @@ async def test_on_runner_connect_defers_idle_tree_initialization_until_demand(
 
     app, captured = _build_minimal_app(db_uri, tmp_path, monkeypatch)
     runner_id = "runner_idle_reconnect_test"
-    idle_id, archived_id, active_parent_id, orphan_parent_id = _bind_sessions(
-        db_uri, runner_id, count=4
-    )
+    idle_id, archived_id = _bind_sessions(db_uri, runner_id, count=2)
     store = SqlAlchemyConversationStore(db_uri)
     idle = store.get_conversation(idle_id)
     archived = store.get_conversation(archived_id)
-    active_parent = store.get_conversation(active_parent_id)
-    orphan_parent = store.get_conversation(orphan_parent_id)
     assert idle is not None and archived is not None
-    assert active_parent is not None and orphan_parent is not None
+    host_id = "55555555555555555555555555555555"
+    ancestor = (
+        store.create_conversation(
+            agent_id=idle.agent_id,
+            runner_id="other_runner",
+            host_id=host_id,
+            workspace="/opt/work/omnigent/fork/ancestor",
+        )
+        if inherited_host
+        else None
+    )
+    active_parent, orphan_parent = [
+        store.create_conversation(
+            agent_id=idle.agent_id,
+            runner_id=runner_id,
+            kind="sub_agent" if inherited_host else "default",
+            parent_conversation_id=ancestor.id if ancestor is not None else None,
+            host_id=None if inherited_host else host_id,
+            workspace="/opt/work/omnigent/fork/main",
+        )
+        for _ in range(2)
+    ]
     store.set_session_live_status(idle.id, "idle")
+    store.set_host_id(idle.id, host_id, workspace="/opt/work/omnigent/fork/main")
+    cross_host = store.create_conversation(
+        agent_id=idle.agent_id,
+        runner_id="offline_runner",
+        kind="sub_agent",
+        parent_conversation_id=idle.id,
+        host_id="66666666666666666666666666666666",
+        workspace="/opt/work/omnigent/fork/other",
+    )
+    store.set_session_live_status(cross_host.id, "running")
     store.set_session_live_status(archived.id, "running")
     store.update_conversation(archived.id, archived=True)
     store.set_session_live_status(active_parent.id, "idle")
-    store.set_host_id(
-        active_parent.id,
-        "55555555555555555555555555555555",
-        workspace="/opt/work/omnigent/fork/main",
-    )
     active_child = store.create_conversation(
         agent_id=active_parent.agent_id,
         runner_id=runner_id,
@@ -2980,11 +3004,6 @@ async def test_on_runner_connect_defers_idle_tree_initialization_until_demand(
     )
     store.set_session_live_status(active_child.id, "running")
     store.set_session_live_status(orphan_parent.id, "idle")
-    store.set_host_id(
-        orphan_parent.id,
-        "55555555555555555555555555555555",
-        workspace="/opt/work/omnigent/fork/main",
-    )
     idle_child = store.create_conversation(
         agent_id=orphan_parent.agent_id,
         runner_id=runner_id,
@@ -3033,10 +3052,12 @@ async def test_on_runner_connect_defers_idle_tree_initialization_until_demand(
         (orphan.id, False),
     }
     initialized_ids = [session_id for session_id, _ in initialized]
+    assert len(initialized_ids) == len(set(initialized_ids))
     assert initialized_ids.index(active_parent.id) < initialized_ids.index(active_child.id)
     assert initialized_ids.index(orphan_parent.id) < initialized_ids.index(idle_child.id)
     assert initialized_ids.index(idle_child.id) < initialized_ids.index(orphan.id)
     assert store.get_conversation(orphan.id).runner_id == runner_id  # type: ignore[union-attr]
+    assert store.get_conversation(cross_host.id).runner_id == "offline_runner"  # type: ignore[union-attr]
 
     refreshed_idle = store.get_conversation(idle.id)
     assert refreshed_idle is not None
