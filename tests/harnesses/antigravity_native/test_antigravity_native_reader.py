@@ -3003,18 +3003,52 @@ async def test_agy_context_stream_uses_native_snapshot_and_accepts_compaction(
             "estimatedAfterCompaction": True,
         }
     }
+    resized = {"contextWindowUsage": {"maxContextTokens": 300000}}
     sink = _PostSink()
     await _run_stream(
         bridge_dir=_bridge_dir(tmp_path),
         sink=sink,
-        stream=_FrameScript([first, first, compacted]),
+        stream=_FrameScript([first, first, compacted, resized]),
         poll_steps=_StepScript([[]]),
         monkeypatch=monkeypatch,
         iterations=1,
     )
     assert [data for kind, data in sink.posts if kind == "external_session_usage"] == [
-        {"context_tokens": 3400, "context_window": 200000},
-        {"context_tokens": 1200, "context_window": 200000},
+        {
+            "context_tokens": 3400,
+            "context_window": 200000,
+            "auto_compact_token_limit": 200000,
+        },
+        {
+            "context_tokens": 1200,
+            "context_window": 200000,
+            "auto_compact_token_limit": 200000,
+        },
+        {"context_window": 300000, "auto_compact_token_limit": 300000},
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("window", [None, True, 0, -1, "256000", 256000.0])
+async def test_agy_context_invalid_window_never_invents_compaction_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+    window: object,
+) -> None:
+    sink = _PostSink()
+    await _run_stream(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(
+            [{"contextWindowUsage": {"estimatedTokensUsed": 0, "maxContextTokens": window}}]
+        ),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+    assert [data for kind, data in sink.posts if kind == "external_session_usage"] == [
+        {"context_tokens": 0}
     ]
 
 
@@ -3042,7 +3076,12 @@ async def test_agy_context_unknown_never_uses_billing_input(
     )
     usage = [data for kind, data in sink.posts if kind == "external_session_usage"]
     assert usage and usage[0]["cumulative_input_tokens"] == 99999
-    assert all("context_tokens" not in data and "context_window" not in data for data in usage)
+    assert all(
+        "context_tokens" not in data
+        and "context_window" not in data
+        and "auto_compact_token_limit" not in data
+        for data in usage
+    )
 
 
 @pytest.mark.asyncio
