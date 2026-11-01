@@ -2028,6 +2028,10 @@ def decide_tier(tier: PermissionTier, intent: ToolIntent, rules: RelaxedRules) -
             )
         if tier == "full":
             return TierDecision(Verdict.ALLOW)
+        if intent.name == "subagent":
+            return TierDecision(
+                Verdict.DENY, "Pi subagents are not yet governed by Omnigent permissions"
+            )
         active, _, _, control_reason, protected_reason = _validated_rules(rules)
         context = intent.context
         if context.platform not in ("darwin", "linux", "windows"):
