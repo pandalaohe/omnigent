@@ -76,6 +76,10 @@ def test_host_row_opens_working_terminal_page(
         socket.on_message(receive)
 
     contract.websocket(f"**{collection}/{terminal_id}/attach*", attach)
+    contract.json(
+        f"/v1/hosts/{host_id}/filesystem",
+        {"object": "list", "data": [], "has_more": False},
+    )
     page.goto(chat.base_url)
     page.get_by_test_id("new-chat-landing-host-chip").click()
     page.get_by_role("menuitem", name="Terminal", exact=True).click()
