@@ -6742,6 +6742,21 @@ def register_core_routes(
                 )
             # Preserve the control response/error handling. A successful response
             # is an application receipt, not fresh native settings confirmation.
+            if sdk_approval_mode and _approval_result is not None:
+                try:
+                    approval_payload = json.loads(_approval_result.body)
+                except (TypeError, ValueError):
+                    approval_payload = None
+                if (
+                    isinstance(approval_payload, dict)
+                    and approval_payload.get("error") == "codex_helper_stop_pending"
+                ):
+                    # The next parent turn must still inherit the requested restriction.
+                    await asyncio.to_thread(
+                        conversation_store.set_labels,
+                        session_id,
+                        {CODEX_SDK_APPROVAL_MODE_LABEL_KEY: requested_codex_approval_mode},
+                    )
             _require_codex_approval_mode_forward(
                 session_id,
                 requested_codex_approval_mode,

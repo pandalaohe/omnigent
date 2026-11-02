@@ -90,7 +90,7 @@ from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.runtime.filesystem_registry import detect_git_root, linked_worktree_git_dir
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.sdk_peer_delivery import PeerOutcome, ReportPeerOutcome, SDKPeerInput, SDKPeerOutcome
-from omnigent.sdk_permission_modes import CODEX_SDK_TURN_POLICIES
+from omnigent.sdk_permission_modes import CODEX_SDK_TURN_POLICIES, codex_approval_mode_tightens
 from omnigent.session_default_modes import codex_service_tier, valid_speed_tier
 from omnigent.spec.types import RetryPolicy
 from omnigent.startup_evidence import CodexTurnEvidence, claim_startup_boundary, opening_settled
@@ -134,6 +134,7 @@ from .databricks_executor import (
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .executor import (
     Executor,
+    ExecutorCallbackScope,
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
@@ -151,6 +152,8 @@ from .executor import (
     TurnComplete,
     classify_tool_result,
     describe_exception,
+    executor_callback_scope,
+    executor_turn_context,
 )
 from .hook_scripts.subagent_router import HOOK_TIMEOUT_HEADROOM_S as _ROUTER_HOOK_HEADROOM_S
 from .hook_scripts.subagent_router import REQUEST_TIMEOUT_S as _ROUTER_REQUEST_TIMEOUT_S
@@ -3321,6 +3324,21 @@ class _CodexAppServerSession:
         # retirement would otherwise retire the first ping's live fork queue.
         # Held across the whole ping, including the cleanup retirement.
         self._keep_warm_lock = asyncio.Lock()
+        self._parent_generation = 0
+        self._parent_turn_open = False
+        self._parent_callback_context: object | None = None
+        self._helper_owner: dict[str, int] = {}
+        self._helper_turns: dict[str, str | None] = {}
+        self._helper_stopping = True
+        self._helper_end_pending = False
+        self._helper_tasks: set[asyncio.Task[None]] = set()
+        self._helper_requests: dict[int | str, CodexMessage] = {}
+        self._helper_control_tasks: set[asyncio.Task[None]] = set()
+        self._helper_interrupt_sent: set[tuple[str, str]] = set()
+        self._helper_changed = asyncio.Event()
+        self._helper_stop_lock = asyncio.Lock()
+        self._approval_mode: str | None = None
+        self._requested_approval_mode: str | None = None
         self._resident_maintenance: dict[str, str | None] = {}
         self._resident_maintenance_current: str | None = None
         self._resident_maintenance_unknown = False
@@ -3706,6 +3724,8 @@ class _CodexAppServerSession:
             raise
 
     async def close(self) -> None:
+        self._helper_stopping = True
+        self._parent_turn_open = False
         self._mark_contexts("closing")
         self._resident_connection_generation += 1
         self._resident_established_connection = None
@@ -3756,6 +3776,7 @@ class _CodexAppServerSession:
         readers_done = True
         signer_close_task = asyncio.create_task(self._close_signer())
         try:
+            await self._cancel_helper_requests()
             # Closing this descriptor first also activates the independent
             # parent-death wrapper while direct process teardown proceeds.
             self._close_worker_liveness()
@@ -3830,6 +3851,7 @@ class _CodexAppServerSession:
                 )
                 if task is not None and task is not asyncio.current_task()
             ]
+            tasks.extend(self._helper_control_tasks | self._helper_tasks)
             for task in tasks:
                 task.cancel()
             pending: set[asyncio.Task[None]] = set()
@@ -3928,7 +3950,12 @@ class _CodexAppServerSession:
             _kill_process_tree(signer_proc)
             close_subprocess_transport(signer_proc)
         owner_loop = self._loop
-        tasks = [self._signer_watch_task, self._worker_census_task]
+        tasks = [
+            self._signer_watch_task,
+            self._worker_census_task,
+            *self._helper_tasks,
+            *self._helper_control_tasks,
+        ]
         self._signer_watch_task = None
         for task in tasks:
             if task is not None:
@@ -4123,7 +4150,11 @@ class _CodexAppServerSession:
         return formatted
 
     async def _answer_server_request(
-        self, message: CodexMessage, active_turn_id: str | None
+        self,
+        message: CodexMessage,
+        active_turn_id: str | None,
+        *,
+        helper_thread_id: str | None = None,
     ) -> bool:
         if "id" not in message or "method" not in message or message["method"] == "item/tool/call":
             return False
@@ -4148,11 +4179,16 @@ class _CodexAppServerSession:
             return True
 
         request_turn_id = request.codex_params.get("turnId")
-        if (
-            self._raw_elicitation_handler is None
-            or active_turn_id is None
-            or self.active_turn_id is None
-            or (isinstance(request_turn_id, str) and request_turn_id != active_turn_id)
+        helper_admitted = helper_thread_id is not None and self._admit_helper_request(
+            helper_thread_id
+        )
+        if self._raw_elicitation_handler is None or (
+            not helper_admitted
+            and (
+                active_turn_id is None
+                or self.active_turn_id is None
+                or (isinstance(request_turn_id, str) and request_turn_id != active_turn_id)
+            )
         ):
             result = ElicitationResult(action="decline")
         else:
@@ -4162,6 +4198,8 @@ class _CodexAppServerSession:
                 await self._send_error(request_id, -32603, str(exc))
                 return True
             if result is None:
+                result = ElicitationResult(action="decline")
+            if helper_thread_id is not None and not self._admit_helper_request(helper_thread_id):
                 result = ElicitationResult(action="decline")
         try:
             payload = request.build_response(result)
@@ -4366,6 +4404,7 @@ class _CodexAppServerSession:
             self._mark_contexts("unknown")
             raise
         assert self._proc is not None
+        approval_mode = approval_mode or self._requested_approval_mode
         if self._containment_confirmed:
             sandbox = "danger-full-access"
 
@@ -4581,14 +4620,32 @@ class _CodexAppServerSession:
                 codex_home=self._codex_home_dir,
                 provider=self._thread_model_provider,
             )
-        start_response = await self._request(
-            "turn/start",
-            turn_params,
-        )
+        if self._helper_end_pending or (
+            self._helper_turns
+            and codex_approval_mode_tightens(
+                self._approval_mode, approval_mode or self._approval_mode
+            )
+        ):
+            self._helper_end_pending = not await self._end_helpers()
+        self._parent_generation += 1
+        self._parent_callback_context = executor_turn_context.get()
+        self._helper_stopping = False
+        self._parent_turn_open = True
+        self._approval_mode = approval_mode or self._approval_mode or "default"
+        try:
+            start_response = await self._request("turn/start", turn_params)
+        except BaseException:
+            self._parent_turn_open = False
+            self._helper_stopping = True
+            await self._cancel_helper_requests()
+            raise
         if effort_via_turn_start:
             self._applied_effort = reasoning_effort
         raw_active_turn_id = start_response.get("result", {}).get("turn", {}).get("id")
         if not isinstance(raw_active_turn_id, str) or not raw_active_turn_id:
+            self._parent_turn_open = False
+            self._helper_stopping = True
+            await self._cancel_helper_requests()
             yield ExecutorError(message="Codex App Server did not return a turn id")
             return
         active_turn_id: str = raw_active_turn_id
@@ -4781,7 +4838,10 @@ class _CodexAppServerSession:
                     continue
 
                 if method == "item/tool/call":
-                    if not _event_turn_matches(params):
+                    if params.get("turnId", active_turn_id) != active_turn_id:
+                        await self._send_error(
+                            message["id"], -32600, "Tool request belongs to another turn"
+                        )
                         continue
                     raw_call_id = params.get("callId")
                     raw_tool_name = params.get("tool")
@@ -4790,6 +4850,9 @@ class _CodexAppServerSession:
                     # skip rather than registering a pending result
                     # under an empty key.
                     if not isinstance(raw_call_id, str) or not isinstance(raw_tool_name, str):
+                        await self._send_error(
+                            message["id"], -32602, "Tool request requires callId and tool"
+                        )
                         continue
                     call_id: str = raw_call_id
                     tool_name: str = raw_tool_name
@@ -4928,6 +4991,7 @@ class _CodexAppServerSession:
                             # Codex sends the turn's usage after the final-answer
                             # item; the turn is answered, so release it and drain.
                             self.active_turn_id = None
+                            self._parent_turn_open = False
                             await self._drain_final_answer_tail(
                                 active_turn_id=active_turn_id, model=model
                             )
@@ -4963,6 +5027,7 @@ class _CodexAppServerSession:
                             active_turn_id,
                         )
                         continue
+                    self._parent_turn_open = False
                     if _codex_turn_status(turn) in (None, "completed"):
                         # The model answered, so a certificate failure printed at
                         # launch no longer describes this process's egress.
@@ -5046,6 +5111,9 @@ class _CodexAppServerSession:
                     yield ExecutorError(message=detail, retryable=True)
                     return
         finally:
+            self._parent_turn_open = False
+            self._helper_stopping = True
+            await self._cancel_helper_requests()
             if self.active_turn_id == active_turn_id:
                 self.active_turn_id = None
 
@@ -5113,8 +5181,10 @@ class _CodexAppServerSession:
         return "unknown", "codex_turn_steer_unverified"
 
     async def interrupt_turn(self) -> bool:
+        self._helper_stopping = True
+        helpers_ended = await self._end_helpers()
         if self.thread_id is None or self.active_turn_id is None:
-            return False
+            return helpers_ended and bool(self._helper_owner)
         await self._request(
             "turn/interrupt",
             {
@@ -5122,6 +5192,176 @@ class _CodexAppServerSession:
                 "turnId": self.active_turn_id,
             },
         )
+        return helpers_ended
+
+    def _helper_thread_for(self, message: CodexMessage) -> str | None:
+        params = message.get("params")
+        if not isinstance(params, dict) or self.thread_id is None:
+            return None
+        thread = params.get("thread")
+        thread_id = params.get("threadId") or params.get("conversationId")
+        if thread_id is None and isinstance(thread, dict):
+            thread_id = thread.get("id")
+        return thread_id if isinstance(thread_id, str) and thread_id != self.thread_id else None
+
+    def _admit_helper_request(self, thread_id: str) -> bool:
+        return (
+            self._parent_turn_open
+            and not self._helper_stopping
+            and not self._helper_end_pending
+            and not self._closing
+            and self._helper_owner.get(thread_id) == self._parent_generation
+        )
+
+    def _note_helper_frame(self, message: CodexMessage, thread_id: str) -> None:
+        self._helper_owner.setdefault(
+            thread_id, self._parent_generation if self._parent_turn_open else -1
+        )
+        params = message.get("params", {})
+        method = message.get("method")
+        turn = params.get("turn")
+        turn = turn if isinstance(turn, dict) else {}
+        root_turn = turn.get("rootTurnId")
+        if root_turn and self.active_turn_id and root_turn != self.active_turn_id:
+            self._helper_owner[thread_id] = -1
+        status = params.get("status")
+        status = status.get("type") if isinstance(status, dict) else None
+        if (
+            method == "turn/completed"
+            or (method == "turn/failed" and params.get("willRetry") is not True)
+            or (
+                method == "thread/status/changed"
+                and status in {"idle", "notLoaded", "systemError"}
+            )
+        ):
+            self._helper_turns.pop(thread_id, None)
+        else:
+            turn_id = params.get("turnId") or turn.get("id")
+            if isinstance(turn_id, str) and turn_id:
+                self._helper_turns[thread_id] = turn_id
+            elif status == "active":
+                self._helper_turns.setdefault(thread_id, None)
+        self._helper_changed.set()
+        if self._helper_end_pending:
+            self._schedule_helper_interrupt(thread_id)
+
+    def _schedule_helper_request(self, message: CodexMessage, thread_id: str | None) -> None:
+        self._helper_requests[message["id"]] = message
+        task = asyncio.create_task(self._serve_helper_request(message, thread_id))
+        self._helper_tasks.add(task)
+        task.add_done_callback(self._helper_tasks.discard)
+
+    async def _refuse_helper_request(self, message: CodexMessage) -> None:
+        if message.get("method") == "item/tool/call":
+            await self._send_error(message["id"], -32600, "Delegating turn is no longer active")
+        else:
+            await self._answer_server_request(message, None)
+
+    async def _serve_helper_request(self, message: CodexMessage, thread_id: str | None) -> None:
+        params = message.get("params", {})
+        scope = ExecutorCallbackScope(
+            self._parent_callback_context,
+            lambda: thread_id is not None and self._admit_helper_request(thread_id),
+            params.get("callId") if isinstance(params, dict) else None,
+        )
+        scope_token = executor_callback_scope.set(scope)
+        try:
+            if not scope.current():
+                await self._refuse_helper_request(message)
+            elif message.get("method") == "item/tool/call":
+                tool, args = params.get("tool"), params.get("arguments", {})
+                if (
+                    not isinstance(tool, str)
+                    or not isinstance(params.get("callId"), str)
+                    or not isinstance(args, dict)
+                ):
+                    await self._send_error(message["id"], -32602, "Malformed helper tool request")
+                else:
+                    result = await self._execute_dynamic_tool(tool, args)
+                    if scope.current():
+                        await self._send_response(
+                            message["id"], _dynamic_tool_result_payload(result)
+                        )
+                    else:
+                        await self._refuse_helper_request(message)
+            else:
+                await self._answer_server_request(message, None, helper_thread_id=thread_id)
+        except asyncio.CancelledError:
+            await self._refuse_helper_request(message)
+        except Exception:  # A connection failure leaves no usable reply channel.
+            logger.warning("Codex helper request could not be answered", exc_info=True)
+        finally:
+            self._helper_requests.pop(message["id"], None)
+            executor_callback_scope.reset(scope_token)
+
+    async def _cancel_helper_requests(self) -> bool:
+        tasks = tuple(self._helper_tasks)
+        for task in tasks:
+            task.cancel()
+        pending = set()
+        if tasks:
+            _, pending = await asyncio.wait(tasks, timeout=1)
+        deadline = asyncio.get_running_loop().time() + 0.1
+        for request_id in tuple(self._helper_requests):
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return False
+            message = self._helper_requests.pop(request_id, None)
+            if message is None:
+                continue
+            try:
+                await asyncio.wait_for(self._refuse_helper_request(message), timeout=remaining)
+            except Exception:  # noqa: BLE001 — reply drain is bounded even on a broken connection
+                return False
+        return not pending
+
+    def _schedule_helper_interrupt(self, thread_id: str) -> None:
+        turn_id = self._helper_turns.get(thread_id)
+        if turn_id is None or (thread_id, turn_id) in self._helper_interrupt_sent:
+            return
+        self._helper_interrupt_sent.add((thread_id, turn_id))
+
+        async def interrupt() -> None:
+            try:
+                await asyncio.wait_for(
+                    self._request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id}),
+                    timeout=1,
+                )
+            except Exception:  # An unconfirmed stop stays pending.
+                logger.debug("Codex helper interrupt unconfirmed", exc_info=True)
+
+        task = asyncio.create_task(interrupt())
+        self._helper_control_tasks.add(task)
+        task.add_done_callback(self._helper_control_tasks.discard)
+
+    async def _end_helpers(self) -> bool:
+        self._helper_stopping = True
+        self._helper_end_pending = True
+        async with self._helper_stop_lock:
+            self._helper_interrupt_sent.clear()
+            for thread_id in tuple(self._helper_turns):
+                self._schedule_helper_interrupt(thread_id)
+            drained = await self._cancel_helper_requests()
+            deadline = asyncio.get_running_loop().time() + 1
+            while self._helper_turns:
+                self._helper_changed.clear()
+                for thread_id in tuple(self._helper_turns):
+                    self._schedule_helper_interrupt(thread_id)
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    return False
+                try:
+                    await asyncio.wait_for(self._helper_changed.wait(), timeout=remaining)
+                except TimeoutError:
+                    return False
+            return drained
+
+    async def change_approval_mode(self, mode: str) -> bool:
+        tightening = codex_approval_mode_tightens(self._approval_mode, mode)
+        self._approval_mode = mode
+        self._requested_approval_mode = mode
+        if tightening or self._helper_end_pending:
+            return await self._end_helpers()
         return True
 
     async def _interrupt_failed_turn(self, cause: str) -> None:
@@ -5337,6 +5577,15 @@ class _CodexAppServerSession:
         async with self._stdin_lock:
             if transport_guard is not None and not transport_guard():
                 raise RuntimeError("Codex inventory transport changed before write")
+            if executor_callback_scope.get() is not None and "method" not in payload:
+                # Claim the reply at the write boundary, so cancellation during
+                # drain cannot send a second verdict for the same request.
+                request_id = payload.get("id")
+                if (
+                    not isinstance(request_id, (str, int))
+                    or self._helper_requests.pop(request_id, None) is None
+                ):
+                    return
             self._proc.stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
             await self._proc.stdin.drain()
 
@@ -5617,6 +5866,39 @@ class _CodexAppServerSession:
                     if queue is not None:
                         queue.put_nowait(message)
                     continue
+                helper_thread_id = self._helper_thread_for(message)
+                if helper_thread_id is not None:
+                    self._note_helper_frame(message, helper_thread_id)
+                    if "id" in message and "method" in message:
+                        self._schedule_helper_request(message, helper_thread_id)
+                    continue
+                if "id" in message and "method" in message and not self._parent_turn_open:
+                    self._schedule_helper_request(message, None)
+                    continue
+                params = message.get("params", {})
+                if isinstance(params, dict) and params.get("threadId") == self.thread_id:
+                    item = params.get("item", {})
+                    turn = params.get("turn", {})
+                    turn_id = params.get("turnId") or (
+                        turn.get("id") if isinstance(turn, dict) else None
+                    )
+                    if (
+                        turn_id == self.active_turn_id
+                        and self.active_turn_id is not None
+                        and (
+                            message.get("method") == "turn/completed"
+                            or (
+                                message.get("method") == "turn/failed"
+                                and params.get("willRetry") is not True
+                            )
+                            or (
+                                message.get("method") == "item/completed"
+                                and isinstance(item, dict)
+                                and item.get("phase") == "final_answer"
+                            )
+                        )
+                    ):
+                        self._parent_turn_open = False
                 self._note_native_activity(message)
                 await self._events.put(message)
             self._note_transport_closed("Codex app-server closed stdout", clean_eof=True)
@@ -6384,6 +6666,12 @@ class CodexExecutor(Executor):
                 )
             ):
                 del self._session_states[session_key]
+
+    async def change_approval_mode(self, session_key: str, mode: str) -> bool:
+        state = self._session_states.get(session_key)
+        if state is None or state.app_session is None:
+            return True
+        return await state.app_session.change_approval_mode(mode)
 
     async def close(self) -> None:
         keys = list(self._session_states.keys())

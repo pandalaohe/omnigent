@@ -6,11 +6,13 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from omnigent.codex_approval_modes import (
     CODEX_NATIVE_PERMISSION_PRESETS,
     CODEX_NATIVE_PERMISSION_VALUES,
 )
-from omnigent.sdk_permission_modes import CODEX_SDK_TURN_POLICIES
+from omnigent.sdk_permission_modes import CODEX_SDK_TURN_POLICIES, codex_approval_mode_tightens
 from omnigent.session_default_modes import (
     CODEX_NATIVE_PERMISSION_DEFAULT_ARGS,
     PERMISSION_DEFAULT_VALUES,
@@ -27,6 +29,29 @@ def test_sdk_turn_policies_cover_codex_permission_presets() -> None:
 
 def test_legacy_default_entry_matches_ask_for_approval() -> None:
     assert CODEX_SDK_TURN_POLICIES["default"] == CODEX_SDK_TURN_POLICIES["ask-for-approval"]
+
+
+@pytest.mark.parametrize(
+    "previous",
+    ["read-only", "ask-for-approval", "default", "approve-for-me", "full-access", "unknown"],
+)
+@pytest.mark.parametrize(
+    "requested",
+    ["read-only", "ask-for-approval", "default", "approve-for-me", "full-access", "unknown"],
+)
+def test_codex_helper_mode_tightening_pairs(previous, requested):
+    tighter_modes = {
+        "read-only": set(),
+        "ask-for-approval": {"read-only"},
+        "default": {"read-only"},
+        "approve-for-me": {"read-only", "ask-for-approval", "default"},
+        "full-access": {"read-only", "ask-for-approval", "default", "approve-for-me"},
+    }
+    expected = (
+        previous == "unknown" or requested == "unknown" or requested in tighter_modes[previous]
+    )
+    assert codex_approval_mode_tightens(previous, requested) is expected
+    assert codex_approval_mode_tightens(None, requested)
 
 
 def test_codex_launch_and_calling_defaults_share_permission_presets() -> None:

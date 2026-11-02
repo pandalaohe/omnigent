@@ -325,6 +325,13 @@ class InterruptEvent(BaseModel):
     type: Literal["interrupt"]
 
 
+class CodexApprovalModeEvent(BaseModel):
+    """Apply a Codex mode change to helpers before acknowledging it."""
+
+    type: Literal["codex_approval_mode_change"]
+    approval_mode: str
+
+
 class ToolResultEvent(BaseModel):
     """
     Downward ``tool_result`` event — deliver a server-dispatched
@@ -459,6 +466,7 @@ class StartupClaimResultEvent(BaseModel):
 InboundEventRequest = Annotated[
     MessageEvent
     | InterruptEvent
+    | CodexApprovalModeEvent
     | ToolResultEvent
     | ApprovalEvent
     | PolicyVerdictEvent
@@ -1463,6 +1471,8 @@ class HarnessApp:
             )
         if isinstance(body, InterruptEvent):
             return await self._handle_interrupt_event()
+        if isinstance(body, CodexApprovalModeEvent):
+            return await self._handle_codex_approval_mode_event(body.approval_mode)
         if isinstance(body, ToolResultEvent):
             return await self._handle_tool_result_event(body)
         if isinstance(body, ApprovalEvent):
@@ -1513,6 +1523,9 @@ class HarnessApp:
         async with self._lock:
             self._active_turn_ctx = None
         return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    async def _handle_codex_approval_mode_event(self, mode: str) -> Response:
+        return JSONResponse(status_code=400, content={"error": "unsupported_approval_mode"})
 
     async def _handle_tool_result_event(self, body: ToolResultEvent) -> Response:
         """

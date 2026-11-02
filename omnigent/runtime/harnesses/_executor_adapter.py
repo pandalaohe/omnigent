@@ -22,6 +22,7 @@ from collections.abc import Callable, Sequence
 from typing import Any, Literal
 
 from fastapi import Response
+from fastapi.responses import JSONResponse
 
 from omnigent.debug_logging import phase_scope
 from omnigent.errors import ElicitationDeclinedError, ErrorPhase
@@ -45,6 +46,8 @@ from omnigent.inner.executor import (
     ToolCallRequest,
     TurnCancelled,
     TurnComplete,
+    executor_callback_scope,
+    executor_turn_context,
 )
 from omnigent.inner.tracing import TracingContext, is_tracing_enabled
 from omnigent.native.input_diagnostics import (
@@ -426,6 +429,7 @@ class ExecutorAdapter(HarnessApp):
             self._watch_injections(ctx, executor),
             name=f"executor-adapter-injection-watch:{ctx.response_id}",
         )
+        turn_context_token = executor_turn_context.set(ctx)
         try:
             trace_cm: contextlib.AbstractContextManager[None] = contextlib.nullcontext()
             if tctx:
@@ -669,6 +673,7 @@ class ExecutorAdapter(HarnessApp):
                 agent_span = None
             raise
         finally:
+            executor_turn_context.reset(turn_context_token)
             initial_peer_receipt("unknown", "sdk_turn_ended_without_receipt")
             # Cancel the injection watcher (long-polls a queue; cancellation is the only way out).
             injection_watcher.cancel()
@@ -723,6 +728,20 @@ class ExecutorAdapter(HarnessApp):
         if self._executor is not None:
             await self._executor.interrupt_session(self._session_key)
         return response
+
+    async def _handle_codex_approval_mode_event(self, mode: str) -> Response:
+        from omnigent.inner.codex_executor import CodexExecutor
+        from omnigent.sdk_permission_modes import CODEX_SDK_APPROVAL_MODES
+
+        if mode not in CODEX_SDK_APPROVAL_MODES:
+            return JSONResponse(status_code=400, content={"error": "invalid_approval_mode"})
+        executor = self._executor
+        if executor is None:
+            return JSONResponse(content={"approval_mode": mode, "helpers_stopped": True})
+        if not isinstance(executor, CodexExecutor):
+            return await super()._handle_codex_approval_mode_event(mode)
+        ended = await executor.change_approval_mode(self._session_key, mode)
+        return JSONResponse(content={"approval_mode": mode, "helpers_stopped": ended})
 
     def _resident_inventory_executor(self) -> Executor | None:
         """Detached cleanup leaves coverage unknown even after replacement."""
@@ -1006,6 +1025,14 @@ class ExecutorAdapter(HarnessApp):
         """
         ctx = self._current_ctx
         agent = self._current_agent
+        callback_scope = executor_callback_scope.get()
+        if callback_scope is not None and (
+            ctx is not callback_scope.turn_context
+            or ctx is None
+            or ctx.cancelled.is_set()
+            or not callback_scope.current()
+        ):
+            return {"error": "delegating turn is no longer active"}
         if ctx is None or agent is None:
             # Orphaned callback — safe-fail to avoid parking a Future on a dead ctx.
             # Host-tool orphans are the deterministic respawn-desync signature, so force
@@ -1027,12 +1054,13 @@ class ExecutorAdapter(HarnessApp):
             }
         # Explicit IDs survive callbacks arriving before, or out of order with,
         # stdout observations. SDKs without callback IDs retain FIFO correlation.
-        correlated_call_id = call_id
-        if call_id:
-            with contextlib.suppress(ValueError):
-                self._pending_mcp_call_ids.remove(call_id)
-        elif self._pending_mcp_call_ids:
-            correlated_call_id = self._pending_mcp_call_ids.popleft()
+        correlated_call_id = callback_scope.call_id if callback_scope is not None else call_id
+        if callback_scope is None:
+            if call_id:
+                with contextlib.suppress(ValueError):
+                    self._pending_mcp_call_ids.remove(call_id)
+            elif self._pending_mcp_call_ids:
+                correlated_call_id = self._pending_mcp_call_ids.popleft()
         # Allocate id here to record in _dispatched_call_ids; matching ToolCallComplete
         # is suppressed in _translate_event (dispatch_tool already emits its output).
 
@@ -1164,6 +1192,14 @@ class ExecutorAdapter(HarnessApp):
         self, params: ElicitationRequestParams
     ) -> ElicitationResult | None:
         ctx = self._current_ctx
+        callback_scope = executor_callback_scope.get()
+        if callback_scope is not None and (
+            ctx is not callback_scope.turn_context
+            or ctx is None
+            or ctx.cancelled.is_set()
+            or not callback_scope.current()
+        ):
+            return None
         if ctx is None:
             _logger.error("raw elicitation callback fired with no active turn context; declining")
             return None
