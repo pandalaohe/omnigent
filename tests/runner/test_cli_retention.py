@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
+import json
+import os
 import shutil
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
+import httpx
 import pytest
 
 from omnigent.harnesses.claude_native.bridge import bridge_dir_for_bridge_id
@@ -19,6 +23,184 @@ from omnigent.runner import create_runner_app
 from omnigent.terminals.pane_reaper import NativePaneReaper, PaneRef
 from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient
 from tests.runner.helpers import NullServerClient
+
+
+@pytest.mark.parametrize(
+    "family,history_path,label_key",
+    [
+        (
+            "codex",
+            "codex-home/sessions/2026/11/02/rollout-test-thread.jsonl",
+            "omnigent.codex_native.bridge_id",
+        ),
+        ("pi", "sessions/session.jsonl", None),
+        (
+            "antigravity",
+            "agy-home/.gemini/antigravity/conversations/session.pb",
+            "omnigent.antigravity_native.bridge_id",
+        ),
+        (
+            "opencode",
+            "xdg-data/opencode/opencode.db",
+            "omnigent.opencode_native.bridge_id",
+        ),
+        ("hermes", "hermes_home/state.db", None),
+    ],
+)
+async def test_idle_release_history_still_expires_or_deletes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    family: str,
+    history_path: str,
+    label_key: str | None,
+) -> None:
+    """Kept native histories retain their dead-owner TTL and explicit delete path."""
+    from omnigent.native import native_bridge_common
+    from omnigent.runner.native import orchestration
+
+    bridge = importlib.import_module(f"omnigent.harnesses.{family}_native.bridge")
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / family)
+    session_id = "conv_retained_history"
+    labels = {label_key: "rotated-bridge"} if label_key else {}
+    monkeypatch.setattr(
+        orchestration, "_session_labels_for_runner_spawn", AsyncMock(return_value=labels)
+    )
+    bridge_id = "rotated-bridge" if label_key else session_id
+    if family == "hermes":
+        bridge.build_hermes_native_spawn_env(session_id)
+        bridge_dir = bridge.bridge_dir_for_session_id(session_id)
+    else:
+        bridge_dir = bridge.prepare_bridge_dir(bridge_id)
+    history = bridge_dir / history_path
+    history.parent.mkdir(parents=True, exist_ok=True)
+    history.write_text("native history")
+    app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
+    await app.state.finish_cli_release(session_id)
+    assert history.read_text() == "native history"
+
+    now = 2_000_000_000.0
+    monkeypatch.setattr(native_bridge_common.time, "time", lambda: now)
+    for path in bridge_dir.rglob("*"):
+        if path.is_file():
+            os.utime(path, (now - 69 * 86400, now - 69 * 86400))
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: True)
+    assert bridge.prune_orphaned_bridge_dirs() == 0
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    assert bridge.prune_orphaned_bridge_dirs() == 0
+    assert history.read_text() == "native history"
+    monkeypatch.setattr(native_bridge_common.time, "time", lambda: now + 2 * 86400)
+    assert bridge.prune_orphaned_bridge_dirs() == 1
+    assert not bridge_dir.exists()
+
+    history.parent.mkdir(parents=True)
+    history.write_text("new history")
+    async with _runner_client(app) as client:
+        deleted = await client.delete(f"/v1/sessions/{session_id}")
+    assert deleted.status_code == 200
+    assert not bridge_dir.exists()
+
+
+@pytest.mark.parametrize("release_idle", [False, True])
+@pytest.mark.parametrize("history_available", [False, True])
+async def test_idle_release_preserves_codex_resume_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    release_idle: bool,
+    history_available: bool,
+) -> None:
+    """Resume can replay an undelivered reply or fall back to its local rollout."""
+    from omnigent.harnesses.codex_native import bridge, forwarder, main
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "codex-native")
+    session_id = "conv_idle_resume"
+    thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    bridge_dir = bridge.prepare_bridge_dir(session_id)
+    codex_home = bridge.codex_home_for_bridge_dir(bridge_dir)
+    rollout = main._codex_resume_rollout_path(codex_home, thread_id)
+    rollout.parent.mkdir(parents=True)
+    records = main._codex_rollout_records_from_session_items(
+        [
+            {
+                "id": "reply",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "reply saved during outage"}],
+            }
+        ],
+        session_id=session_id,
+        external_session_id=thread_id,
+        cwd=Path("/opt/work/project"),
+        model_provider="test",
+        cli_version="0.0.0",
+    )
+    rollout.write_text("".join(json.dumps(record) + "\n" for record in records))
+    replay_data = {
+        "item_type": "message",
+        "item_data": {
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "reply saved during outage"}],
+        },
+        "response_id": "turn_recovered",
+        "source_id": "codex:item:recovered",
+    }
+    forwarder.append_dead_letter(
+        bridge_dir,
+        session_id=session_id,
+        event_type="external_conversation_item",
+        payload=replay_data,
+        reason="http 503",
+        http_status=503,
+    )
+    server_items: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/resources/files"):
+            return httpx.Response(200, json={"data": [], "has_more": False})
+        if not history_available:
+            return httpx.Response(503)
+        if request.method == "POST":
+            body = json.loads(request.content)
+            server_items.append(
+                {"id": "recovered", "type": "message", **body["data"]["item_data"]}
+            )
+            return httpx.Response(200)
+        return httpx.Response(200, json={"data": server_items, "has_more": False})
+
+    app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
+    app.state.native_pane_reaper = _FakePaneReaper()
+    if release_idle:
+        async with _runner_client(app) as client:
+            snapshot = await client.get(
+                f"/v1/sessions/{session_id}/cli-retention",
+                params={"idle_threshold_seconds": 60, "host_id": "host-a", "policy_revision": 1},
+            )
+            released = await client.post(
+                f"/v1/sessions/{session_id}/cli-retention/release",
+                json={
+                    "reason": "idle_pool_overflow",
+                    "idle_threshold_seconds": 60,
+                    "expected_activity_token": "pane:activity-1",
+                    "runtime_generation": snapshot.json()["runtime_generation"],
+                    "host_id": "host-a",
+                    "policy_revision": 1,
+                },
+            )
+        assert released.json()["status"] == "released"
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        resumed = await main._ensure_local_codex_resume_rollout(
+            client,
+            session_id=session_id,
+            external_session_id=thread_id,
+            codex_home=codex_home,
+            workspace=Path("/opt/work/project"),
+            model_provider="test",
+            codex_path=None,
+        )
+    assert "reply saved during outage" in resumed.read_text()
+    if history_available:
+        assert server_items, "the undelivered reply must reach server history before resume"
 
 
 class _FakePaneReaper:

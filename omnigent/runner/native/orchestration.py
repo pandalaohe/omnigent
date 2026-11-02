@@ -10881,6 +10881,7 @@ async def _delete_native_bridge_dirs(
     server_client: httpx.AsyncClient | None,
     session_id: str,
     keep_attachment_caches: bool = False,
+    keep_session_history: bool = False,
 ) -> None:
     """
     Remove native-harness bridge directories and attachment caches for a session.
@@ -10905,6 +10906,10 @@ async def _delete_native_bridge_dirs(
         session's by-path dir in place for a session that can resume (a native
         transcript reads them and nothing restores them); ``False`` (session
         delete) removes them.
+    :param keep_session_history: Keep bridges containing native history or
+        Codex's undelivered-item queue during idle release. Their harness
+        orphan sweeps expire them after owner death; session deletion still
+        removes them immediately.
     """
     from omnigent.harnesses.antigravity_native.bridge import (
         ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
@@ -10977,6 +10982,21 @@ async def _delete_native_bridge_dirs(
         pi_bridge_dir(session_id),
         qwen_bridge_dir(session_id),
     }
+    if keep_session_history:
+        targets.difference_update(
+            {
+                antigravity_bridge_dir(
+                    labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id
+                ),
+                antigravity_bridge_dir(session_id),
+                codex_bridge_dir(labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
+                codex_bridge_dir(session_id),
+                opencode_bridge_dir(labels.get(OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
+                opencode_bridge_dir(session_id),
+                pi_bridge_dir(session_id),
+                hermes_bridge_dir(session_id),
+            }
+        )
     if not keep_attachment_caches:
         # A cache can survive a missing bridge directory, including after a reboot.
         targets.update(attachment_cache_dir(target) for target in tuple(targets))
