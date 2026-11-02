@@ -4853,6 +4853,38 @@ async def test_handle_stop_unknown_runner() -> None:
     assert "unknown runner" in (result.error or "")
 
 
+@pytest.mark.parametrize("exit_confirmed", [False, True])
+async def test_runner_status_retains_stopping_process_until_confirmed_exit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, exit_confirmed: bool
+) -> None:
+    host = _make_host_process()
+    proc = Mock(spec=subprocess.Popen, pid=1234)
+    proc.poll.return_value = None
+    host._runners["runner_stopping"] = _RunnerHandle(proc=proc, log_path=tmp_path / "runner.log")
+    started, release = threading.Event(), threading.Event()
+
+    def stop(_proc: object) -> None:
+        started.set()
+        assert release.wait(5.0)
+        if exit_confirmed:
+            proc.poll.return_value = 0
+
+    monkeypatch.setattr(host, "_stop_runner_proc", stop)
+    task = asyncio.create_task(host._handle_stop(HostStopRunnerFrame("stop", "runner_stopping")))
+    try:
+        assert await asyncio.to_thread(started.wait, 5.0)
+        status = await host._handle_runner_status(
+            HostRunnerStatusFrame("during", "runner_stopping")
+        )
+        assert status.status == "alive"
+    finally:
+        release.set()
+        result = await task
+    status = await host._handle_runner_status(HostRunnerStatusFrame("after", "runner_stopping"))
+    assert result.status == ("stopped" if exit_confirmed else "failed")
+    assert status.status == ("unknown" if exit_confirmed else "alive")
+
+
 async def test_stop_trigger_waits_for_termination_after_cancellation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4882,6 +4914,18 @@ async def test_stop_trigger_waits_for_termination_after_cancellation(
         await stop_task
 
     assert maintenance_reasons == ["runner_stopped"]
+
+
+async def test_watcher_keeps_an_exited_intentional_stop_quiet_before_ack(tmp_path: Path) -> None:
+    host = _make_host_process()
+    proc = Mock(spec=subprocess.Popen, pid=1234, returncode=0)
+    proc.poll.return_value = 0
+    handle = _RunnerHandle(proc=proc, log_path=tmp_path / "runner.log", stop_requested=True)
+    host._runners["runner_stopping"] = handle
+    host._report_runner_exit = AsyncMock()
+    await host._watch_runner("runner_stopping")
+    host._report_runner_exit.assert_not_awaited()
+    assert host._runners["runner_stopping"] is handle
 
 
 async def test_handle_runner_status_alive_for_running_process(tmp_path: Path) -> None:

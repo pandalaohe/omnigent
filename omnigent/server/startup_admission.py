@@ -648,16 +648,19 @@ class StartupAdmission:
             if startup.attempt_id is None:
                 continue
             conv = await asyncio.to_thread(self.conversations.get_conversation, startup.session_id)
-            if conv is None or conv.host_id != host_id:
+            if conv is None:
                 continue
             if conv.runner_id is None:
                 if conv.archived:
                     await self.cancel_session(conv.id)
                 continue
+            if conv.host_id != host_id:
+                continue
             if conn is None or not (
                 conv.archived
                 or startup.cancel_requested
                 or startup.host_generation != conn.startup_generation
+                or not await self._runner_available(conv.id)
             ):
                 continue
             status = await _query_host_runner_status(conn, self.hosts, conv.runner_id)

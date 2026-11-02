@@ -1454,7 +1454,20 @@ class SessionStartupStore:
             ):
                 return None
             row.cancel_requested = True
-            if not (set(row.cold_claims) - {"resident_reuse"}):
+            binding = db.get(
+                SqlConversationMetadata,
+                (current_workspace_id(), session_id),
+                with_for_update=True,
+            )
+            # Workspace preparation cannot spawn a runner. Cancellation fences
+            # its later boundaries, so an unbound preparation owns no runtime.
+            unbound_preparation = (
+                row.preparation is not None
+                and not (set(row.cold_claims) - {"workspace_prepare"})
+                and binding is not None
+                and binding.runner_id is None
+            )
+            if not (set(row.cold_claims) - {"resident_reuse"}) or unbound_preparation:
                 row.occupied = row.resident = False
                 row.state = "cancelled"
             else:

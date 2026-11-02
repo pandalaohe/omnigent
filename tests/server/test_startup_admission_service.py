@@ -259,8 +259,11 @@ async def test_prepared_input_waits_for_runner_then_resumes_the_same_attempt(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("trigger", ["archive", "generation", "stop", "stop_expired", "rebind"])
-@pytest.mark.parametrize("status", ["dead", "unknown", "alive", None])
+@pytest.mark.parametrize(
+    "trigger",
+    ["archive", "generation", "stop", "stop_expired", "rebind", "disconnected", "connected"],
+)
+@pytest.mark.parametrize("status", ["dead", "unknown", "alive", "sign_in_pending", None])
 async def test_two_stuck_startups_release_only_proven_dead_runners(
     app, db_uri, monkeypatch, trigger, status
 ):
@@ -307,12 +310,14 @@ async def test_two_stuck_startups_release_only_proven_dead_runners(
         conn = hosts.register(conn.host_id, FakeWebSocket(), conn.hello, owner=None)
         startups.register_host_generation(conn.host_id, conn.startup_generation)
         assert conn.startup_generation != ref.host_generation
-    else:
+    elif trigger.startswith("stop"):
         for conv in (first, second):
             assert startups.cancel_session_current(conv.id).state == "cancelling"
         if trigger == "stop_expired":
             startups.expire_observations(conn.host_id, now=attempt.admitted_at + 210)
             assert startups.for_session(first.id).state == "uncertain"
+
+    admission._runner_available = AsyncMock(return_value=trigger == "connected")
 
     async def query(_conn, _hosts, runner_id):
         if trigger == "rebind":
@@ -329,7 +334,7 @@ async def test_two_stuck_startups_release_only_proven_dead_runners(
     )
     await admission.advance(conn.host_id)
     await admission.coordinator.drain()
-    dead = status in ("dead", "unknown") and trigger != "rebind"
+    dead = status in ("dead", "unknown") and trigger not in ("rebind", "connected")
     assert (startups.get(queued.id).state == "starting") is dead
     for conv in (first, second):
         current = startups.for_session(conv.id)
@@ -338,6 +343,96 @@ async def test_two_stuck_startups_release_only_proven_dead_runners(
             assert current.state == ("cancelled" if trigger.startswith("stop") else "stopped")
             assert not current.resident
     assert admission.coordinator._launch.await_count == int(dead)
+    await admission.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("generation_changed", [False, True])
+@pytest.mark.parametrize("runtime_state", ["unbound", "runner_granted", "bound"])
+@pytest.mark.parametrize("host_bound", [False, True])
+async def test_archive_settles_only_prebinding_preparation_without_runner_grant(
+    app, db_uri, monkeypatch, generation_changed, runtime_state, host_bound
+):
+    conversations, startups = SqlAlchemyConversationStore(db_uri), SessionStartupStore(db_uri)
+    hosts, host = HostRegistry(), uuid4().hex
+    conn = hosts.register(
+        host,
+        FakeWebSocket(),
+        HostHelloFrame(
+            version="test",
+            frame_protocol_version=1,
+            name="sample-host",
+            capabilities=["startup_queue_v1"],
+        ),
+        owner=None,
+    )
+    admission = StartupAdmission(
+        startups, conversations, hosts, StartupAdmissionPolicy(None, None, 2, "startup_only")
+    )
+    admission.bind(app)
+    conv = conversations.create_conversation()
+    if host_bound:
+        conversations.set_host_id(conv.id, host, "/opt/work/project")
+    queued = await admission.queue_preparation(
+        conn,
+        conv.id,
+        {
+            "session_id": conv.id,
+            "workspace": "/opt/work/project",
+            "git": None,
+            "user_id": None,
+            "account_generation": conn.account_generation,
+            "previous_host_id": host if host_bound else None,
+            "previous_runner_id": None,
+        },
+    )
+    attempt = startups.reserve(host)
+    assert startups.claim_boundary(
+        queued.id,
+        attempt.attempt_id,
+        runtime_id="preparation",
+        host_generation=conn.startup_generation,
+        boundary="workspace_prepare",
+        claim_id="workspace",
+    )
+    if runtime_state == "runner_granted":
+        assert startups.claim_boundary(
+            queued.id,
+            attempt.attempt_id,
+            runtime_id="preparation",
+            host_generation=conn.startup_generation,
+            boundary="runner_prepare",
+            claim_id="runner",
+        )
+    if runtime_state == "bound":
+        conversations.set_runner_id(conv.id, "runner_bound")
+        admission._runner_available = AsyncMock(return_value=True)
+    conversations.update_conversation(conv.id, archived=True)
+    if generation_changed:
+        replacement = hosts.register(host, FakeWebSocket(), conn.hello, owner=None)
+        startups.register_host_generation(host, replacement.startup_generation)
+    if runtime_state == "bound":
+        await admission.cancel_session(conv.id)
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.helpers._query_host_runner_status",
+        AsyncMock(return_value="alive"),
+    )
+    await admission.advance(host)
+    current = startups.get(queued.id)
+    assert current.cancel_requested
+    retained = runtime_state != "unbound"
+    assert current.occupied is retained
+    assert current.resident is retained
+    assert current.state == ("cancelling" if retained else "cancelled")
+    assert not startups.claim_boundary(
+        queued.id,
+        attempt.attempt_id,
+        runtime_id="preparation",
+        host_generation=conn.startup_generation,
+        boundary="runner_spawn" if runtime_state == "runner_granted" else "runner_prepare",
+        claim_id="late-launch",
+    )
+    assert not startups.claim(queued.id, attempt.attempt_id, runtime_id="preparation")
     await admission.shutdown()
 
 
