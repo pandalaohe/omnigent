@@ -630,6 +630,8 @@ _TERMINAL_FAILURE_TAIL_LINES = 12
 _TERMINAL_FAILURE_TAIL_CHARS = 800
 _TERMINAL_FAILURE_TAIL_PREFIX = " Last terminal output:\n"
 _INVOCATION_SETTINGS_FILE = "claude-settings.json"
+_APPEND_PROMPT_FLAG = "--append-system-prompt"
+_APPEND_PROMPT_FILE_FLAG = "--append-system-prompt-file"
 
 ToolExecutor = Callable[[str, _JsonObject], Awaitable[object]]
 
@@ -3095,7 +3097,8 @@ def augment_claude_args(
         skills natively — the CLI mirror of the SDK executor's plugin
         wiring. ``None`` (e.g. the ``omnigent claude`` CLI's minimal
         spec) adds no plugin args.
-    :param workspace: Session workspace used to discover portable ``.agents`` skills.
+    :param workspace: Session workspace used to discover portable ``.agents`` skills
+        and to resolve a relative caller ``--append-system-prompt-file``.
     :param agent_name: Agent display name for the bundle's plugin
         manifest, e.g. ``"researcher"``. ``None`` falls back to the
         bundle directory's basename.
@@ -3104,7 +3107,10 @@ def augment_claude_args(
         ``--setting-sources`` exactly as the SDK executor maps it onto
         ``setting_sources``. Defaults to ``"all"``.
     :param append_system_prompt: Composed startup instructions, appended
-        through a private file (``--append-system-prompt-file``).
+        through a private file (``--append-system-prompt-file``). Caller
+        ``--append-system-prompt`` flags in ``claude_args`` are folded into
+        that file ahead of it, since Claude rejects an inline and a file
+        prompt flag together.
     :param allowed_tools: Optional narrowly scoped Claude tool names to merge
         into ``--allowedTools`` without replacing the user's allowlist.
     :param disallowed_tools: Optional Claude tool names to merge into
@@ -3140,6 +3146,7 @@ def augment_claude_args(
         list(claude_args), (*_OMNIGENT_DISALLOWED_TOOLS, *disallowed_tools)
     )
     args = _merge_allowed_tools(args, allowed_tools)
+    args, startup_text = _fold_append_prompts(args, append_system_prompt, workspace)
     settings_path = bridge_dir / _INVOCATION_SETTINGS_FILE
     _write_json_file(settings_path, hook_settings)
     args.extend(
@@ -3152,9 +3159,9 @@ def augment_claude_args(
     )
     prompt_path = bridge_dir / "startup-instructions.txt"
     # tmux rejects a launch command over 16 KB and Linux caps argv, so pass startup text by file.
-    if append_system_prompt:
-        _write_text_file(prompt_path, append_system_prompt)
-        args.extend(["--append-system-prompt-file", str(prompt_path)])
+    if startup_text:
+        _write_text_file(prompt_path, startup_text)
+        args.extend([_APPEND_PROMPT_FILE_FLAG, str(prompt_path)])
     else:
         prompt_path.unlink(missing_ok=True)
     # Imported here: bundle-skills parsing rides the spec graph; launch-only.
@@ -3220,6 +3227,49 @@ def _args_request_bypass_permissions(args: tuple[str, ...]) -> bool:
     return "--dangerously-skip-permissions" in args or (
         _arg_value(args, "--permission-mode") == "bypassPermissions"
     )
+
+
+def _fold_append_prompts(
+    args: list[str], startup_text: str | None, workspace: Path | None
+) -> tuple[list[str], str]:
+    """Fold caller prompt flags and ``startup_text`` into one prompt text.
+
+    Claude rejects an inline and a file prompt flag together, so every caller
+    ``--append-system-prompt`` (spaced or ``=`` form) leaves ``args`` and leads
+    ``startup_text``. A caller ``--append-system-prompt-file`` is read in only
+    when there is other text to fold; otherwise it stays in ``args`` untouched.
+
+    :param args: Caller Claude args, e.g. ``["--append-system-prompt", "Be brief."]``.
+    :param startup_text: Composed startup instructions, or ``None``.
+    :param workspace: Directory a relative caller prompt file resolves against.
+    :returns: ``(args, text)``; ``text`` is the prompt to pass by file, or ``""``.
+    :raises OSError: A caller prompt file to fold cannot be read.
+    """
+    kept: list[str] = []
+    callers: list[tuple[str, str]] = []
+    index = 0
+    while index < len(args):
+        flag, equals, joined_value = args[index].partition("=")
+        if flag in (_APPEND_PROMPT_FLAG, _APPEND_PROMPT_FILE_FLAG):
+            if equals:
+                callers.append((flag, joined_value))
+                index += 1
+                continue
+            if index + 1 < len(args):
+                callers.append((flag, args[index + 1]))
+                index += 2
+                continue
+        kept.append(args[index])
+        index += 1
+    if not startup_text and all(flag == _APPEND_PROMPT_FILE_FLAG for flag, _ in callers):
+        return args, ""
+    parts = [
+        value
+        if flag == _APPEND_PROMPT_FLAG
+        else ((workspace or Path()) / value).read_text(encoding="utf-8")
+        for flag, value in callers
+    ]
+    return kept, "\n\n".join(part for part in (*parts, startup_text) if part)
 
 
 def _merge_allowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
