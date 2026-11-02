@@ -7,7 +7,6 @@ import json
 import math
 import secrets
 import time
-import weakref
 from collections.abc import Awaitable, Callable
 from typing import Any, NamedTuple
 
@@ -461,10 +460,6 @@ _CARD_RETRY_INTERVAL_S = 120.0
 _pending_delivery_tasks: dict[str, asyncio.Task[bool]] = {}
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by server-minted globally unique elicitation IDs
 _grant_delivery_tasks: dict[str, asyncio.Task[None]] = {}
-# custom-lint: disable-next=workspace-scoped-cache -- locks; collision only serializes
-_card_answer_locks: weakref.WeakValueDictionary[tuple[str, tuple[str, ...]], asyncio.Lock] = (
-    weakref.WeakValueDictionary()
-)
 
 
 def _expired_approval_text(card: DetachedCard) -> str:
@@ -682,63 +677,54 @@ def _detached_card_callback(
         :param result: Web verdict, or ``None`` on expiry.
         :returns: None.
         """
-        key = (card.session_id, tuple(card.grant_key or [card.elicitation_id]))
-        lock = _card_answer_locks.get(key)
-        if lock is None:
-            lock = asyncio.Lock()
-            _card_answer_locks[key] = lock
-        # Preserve answer order across record I/O, but never hold up a later
-        # approval while an offline runner waits for verdict delivery.
-        async with lock:
-            pending_task = _pending_delivery_tasks.pop(card.elicitation_id, None)
-            if pending_task is not None:
-                pending_task.cancel()
-                await asyncio.gather(pending_task, return_exceptions=True)
-            if result is None:
-                await _write_card_record(
-                    conversation_store.delete_detached_card, card.elicitation_id
+        answered_at = time.monotonic()
+        expires_at = int(time.time() + _APPROVAL_GRANT_TTL_S)
+        pending_task = _pending_delivery_tasks.pop(card.elicitation_id, None)
+        if pending_task is not None:
+            pending_task.cancel()
+            await asyncio.gather(pending_task, return_exceptions=True)
+        if result is None:
+            await _write_card_record(conversation_store.delete_detached_card, card.elicitation_id)
+            return
+        text = _render_card_verdict(card.kind, card.payload, result)
+        granted = card.grant_key is not None and result.action == "accept"
+        while not await _write_card_record(
+            conversation_store.update_detached_card,
+            card.elicitation_id,
+            state="answered",
+            verdict=result.model_dump(mode="json"),
+            delivery_text=text,
+            expires_at=expires_at,
+        ):
+            await asyncio.sleep(_CARD_RETRY_INTERVAL_S)
+        while True:
+            try:
+                stored = next(
+                    (
+                        row
+                        for row in await asyncio.to_thread(conversation_store.list_detached_cards)
+                        if row.elicitation_id == card.elicitation_id
+                    ),
+                    None,
                 )
-                return
-            text = _render_card_verdict(card.kind, card.payload, result)
-            granted = card.grant_key is not None and result.action == "accept"
-            while not await _write_card_record(
-                conversation_store.update_detached_card,
-                card.elicitation_id,
-                state="answered",
-                verdict=result.model_dump(mode="json"),
-                delivery_text=text,
-                expires_at=int(time.time() + _APPROVAL_GRANT_TTL_S),
-            ):
+                break
+            except Exception:
+                _logger.warning("Could not read an answered detached card", exc_info=True)
                 await asyncio.sleep(_CARD_RETRY_INTERVAL_S)
-            while True:
-                try:
-                    stored = next(
-                        (
-                            row
-                            for row in await asyncio.to_thread(
-                                conversation_store.list_detached_cards
-                            )
-                            if row.elicitation_id == card.elicitation_id
-                        ),
-                        None,
-                    )
-                    break
-                except Exception:
-                    _logger.warning("Could not read an answered detached card", exc_info=True)
-                    await asyncio.sleep(_CARD_RETRY_INTERVAL_S)
-            if stored is None or stored.state != "answered" or stored.expires_at <= time.time():
-                return
-            # Armed only once its record is answered: a consume racing the write
-            # would otherwise find no record to drop, and a restart would re-arm it.
-            if granted:
-                assert card.grant_key is not None
-                approval_grants.put(
-                    card.session_id,
-                    tuple(card.grant_key),
-                    result,
-                    _APPROVAL_GRANT_TTL_S,
-                    source_id=card.elicitation_id,
-                )
+        if stored is None or stored.state != "answered" or stored.expires_at <= time.time():
+            return
+        # Armed only once its record is answered: a consume racing the write
+        # would otherwise find no record to drop, and a restart would re-arm it.
+        if granted:
+            assert card.grant_key is not None
+            approval_grants.put(
+                card.session_id,
+                tuple(card.grant_key),
+                result,
+                stored.expires_at - time.time(),
+                source_id=card.elicitation_id,
+                answered_at=answered_at,
+            )
         await _deliver_card_verdict(
             card,
             text,
@@ -918,7 +904,7 @@ async def restore_detached_cards(
     """
     cards = await asyncio.to_thread(conversation_store.list_detached_cards)
     published: list[asyncio.Event] = []
-    for card in cards:
+    for card in sorted(cards, key=lambda card: card.expires_at):
         remaining = card.expires_at - time.time()
         alive = (
             await asyncio.to_thread(conversation_store.get_conversation, card.session_id)

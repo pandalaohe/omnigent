@@ -636,3 +636,97 @@ async def test_delayed_old_answer_cannot_overwrite_newer_approval(
         assert _pending_record(store, old_id)
         assert not _pending_record(store, new_id)
         assert await _request_bash(client, session_id, "pnpm build") == "deny"
+
+
+async def test_failed_answer_write_does_not_delay_newer_answer(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    deliveries: _Deliveries,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retrying answer cannot keep a later acceptance out of durable storage."""
+    failed = asyncio.Event()
+    old_id = ""
+    write_record = hooks_routes._write_card_record
+
+    async def _fail_old_answer(write: Any, *args: Any, **kwargs: Any) -> bool:
+        if args == (old_id,) and kwargs.get("state") == "answered":
+            failed.set()
+            return False
+        return await write_record(write, *args, **kwargs)
+
+    monkeypatch.setattr(hooks_routes, "_write_card_record", _fail_old_answer)
+    deliveries.hold = True
+    store = SqlAlchemyConversationStore(db_uri)
+    async with _serve(db_uri, tmp_path) as client:
+        session_id = await _new_session(client, "test-independent-answer-writes")
+        assert await _request_bash(client, session_id, "pnpm build") == "deny"
+        (old,) = await _pending(client, session_id)
+        old_id = old["elicitation_id"]
+        assert await _request_bash(client, session_id, "pnpm build") == "deny"
+        new = next(card for card in await _pending(client, session_id) if card != old)
+        await _answer(client, session_id, old_id, "accept")
+        await asyncio.wait_for(failed.wait(), timeout=5)
+        await _answer(client, session_id, new["elicitation_id"], "accept")
+        await _wait_for(
+            lambda: any(
+                row.elicitation_id == new["elicitation_id"] and row.state == "answered"
+                for row in store.list_detached_cards()
+            )
+        )
+
+    async with _serve(db_uri, tmp_path) as client:
+        assert await _request_bash(client, session_id, "pnpm build") == "allow"
+
+
+async def test_restart_uses_answer_order_for_same_command_grants(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An older-created card approved last survives the earlier approval's lapse."""
+    attempted: list[str] = []
+
+    async def _offline(_session_id: str, text: str, **_kwargs: Any) -> bool:
+        attempted.append(text)
+        return False
+
+    monkeypatch.setattr(hooks_routes, "_deliver_with_retry", _offline)
+    monkeypatch.setattr(hooks_routes, "_CARD_RETRY_INTERVAL_S", 0.01)
+    store = SqlAlchemyConversationStore(db_uri)
+    async with _serve(db_uri, tmp_path) as client:
+        session_id = await _new_session(client, "test-restart-answer-order")
+        assert await _request_bash(client, session_id, "pnpm build") == "deny"
+        (first,) = await _pending(client, session_id)
+        assert await _request_bash(client, session_id, "pnpm build") == "deny"
+        second = next(card for card in await _pending(client, session_id) if card != first)
+        for card in (second, first):
+            await _answer(client, session_id, card["elicitation_id"], "accept")
+            await _wait_for(
+                lambda aid=card["params"]["approval_ref"]: any(
+                    f"#{aid} granted" in text for text in attempted
+                )
+            )
+        now = int(time.time())
+        # Pin distinct creation and answer times without a wall-clock sleep.
+        store.update_detached_card(
+            first["elicitation_id"], created_at=now - 2, expires_at=now + 600
+        )
+        store.update_detached_card(
+            second["elicitation_id"], created_at=now - 1, expires_at=now + 300
+        )
+
+    async with _serve(db_uri, tmp_path) as client:
+        store.update_detached_card(second["elicitation_id"], expires_at=int(time.time()) - 1)
+        await _wait_for(
+            lambda: any(
+                row.elicitation_id == second["elicitation_id"] and row.grant_key is None
+                for row in store.list_detached_cards()
+            )
+        )
+        assert await _request_bash(client, session_id, "pnpm build") == "allow"
+        assert not _pending_record(store, first["elicitation_id"])
+        assert _pending_record(store, second["elicitation_id"])
+        assert await _request_bash(client, session_id, "pnpm build") == "deny"

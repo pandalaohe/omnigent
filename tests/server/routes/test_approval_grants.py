@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from omnigent.server.routes._sessions.approval_grants import (
     ApprovalGrants,
     claude_grant_key,
@@ -47,3 +49,19 @@ def test_revoking_old_source_preserves_newer_same_key_grant() -> None:
     grants.put("conv_a", key, new, 60, source_id="elicit_new")
     grants.discard_if_source("conv_a", key, "elicit_old")
     assert grants.consume_with_source("conv_a", key) == (new, "elicit_new")
+
+
+@pytest.mark.parametrize("replacement", ["live", "consumed", "lapsed"])
+def test_late_old_answer_cannot_replace_newer_answer(replacement: str) -> None:
+    grants = ApprovalGrants()
+    key = ("Bash", "pnpm build", "/repo")
+    old = ElicitationResult(action="accept", content={"feedback": "old"})
+    new = ElicitationResult(action="accept", content={"feedback": "new"})
+    grants.put("conv_a", key, new, 60, source_id="elicit_new", answered_at=2)
+    if replacement == "consumed":
+        assert grants.consume_with_source("conv_a", key) == (new, "elicit_new")
+    elif replacement == "lapsed":
+        grants.discard_if_source("conv_a", key, "elicit_new")
+    grants.put("conv_a", key, old, 60, source_id="elicit_old", answered_at=1)
+    expected = (new, "elicit_new") if replacement == "live" else None
+    assert grants.consume_with_source("conv_a", key) == expected
