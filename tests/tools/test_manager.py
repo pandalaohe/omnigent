@@ -90,6 +90,7 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_project_settings_read",
         "sys_project_settings_update",
         "sys_standing_approval",
+        "sys_approval_answer",
         # Scheduled-task management tools are always auto-registered
         # so agents can create, list, update, and delete recurring
         # runs without spec opt-in. They are runner-dispatched via

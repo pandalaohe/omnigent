@@ -485,12 +485,18 @@ def _render_card_verdict(kind: str, payload: dict[str, Any], result: Elicitation
             return _format_async_question_answers(payload["questions"], result.content, qid)
         return f"[System: the user dismissed question card #{qid} without answering.]"
     if result.action == "accept":
-        return _APPROVAL_GRANTED_TEXT.format(aid=payload["aid"], action=payload["action"])
-    return _APPROVAL_DENIED_TEXT.format(
+        text = _APPROVAL_GRANTED_TEXT.format(aid=payload["aid"], action=payload["action"])
+        if (result.meta or {}).get("omnigent_answered_by") is not None:
+            text = text.replace("granted:", "granted by the parent session:")
+        return text
+    text = _APPROVAL_DENIED_TEXT.format(
         aid=payload["aid"],
         action=payload["action"],
         feedback=_approval_feedback_clause(result),
     )
+    if (result.meta or {}).get("omnigent_answered_by") is not None:
+        text = text.replace("denied by the user", "denied by the parent session")
+    return text
 
 
 async def _write_card_record(write: Callable[..., None], *args: Any, **kwargs: Any) -> bool:
@@ -752,9 +758,12 @@ def _park_detached_card(
     :param published: Set once the card is published, mirrors included.
     :returns: None.
     """
+    params = dict(card.params)
+    if isinstance(card.payload.get("triage"), dict):
+        params["triage"] = card.payload["triage"]
     start_detached_elicitation(
         card.session_id,
-        ElicitationRequestParams.model_validate(card.params),
+        ElicitationRequestParams.model_validate(params),
         conversation_store=conversation_store if card.mirror else None,
         on_result=_detached_card_callback(
             card, conversation_store=conversation_store, runner_router=runner_router

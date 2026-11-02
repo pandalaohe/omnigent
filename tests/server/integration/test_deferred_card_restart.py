@@ -193,6 +193,70 @@ async def test_pending_approval_is_answerable_after_restart(
         assert await _pending(client, session_id) == []
 
 
+async def test_parent_handoff_survives_restart_and_cannot_be_taken_back(
+    runtime_init, db_uri, tmp_path, deliveries, monkeypatch
+):
+    from unittest.mock import AsyncMock
+
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+    from omnigent.server.child_approvals import APPROVAL_KIND
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.standing_approval import StandingApprovalService
+
+    store = SqlAlchemyConversationStore(db_uri)
+    service = StandingApprovalService(store)
+    monkeypatch.setattr(orchestration, "_post_system_message", AsyncMock(return_value=True))
+    async with _serve(db_uri, tmp_path) as client:
+        parent_id = await _new_session(client, "parent")
+        parent = store.get_conversation(parent_id)
+        service.change(parent, "grant", [APPROVAL_KIND], "approval:fixture")
+        store.set_runner_id(parent_id, token_bound_runner_id("fixture-binding"))
+        created = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": parent.agent_id,
+                "parent_session_id": parent_id,
+            },
+        )
+        assert created.status_code == 201, created.text
+        child_id = created.json()["id"]
+        assert await _request_bash(client, child_id, "pnpm build") == "deny"
+        (card,) = await _pending(client, child_id)
+        assert card["params"]["triage"]["state"] == "offered"
+        url = f"/v1/sessions/{parent_id}/child-approvals/{child_id}/{card['elicitation_id']}"
+        headers = {RUNNER_TUNNEL_TOKEN_HEADER: "fixture-binding"}
+        response = await client.post(
+            url,
+            headers=headers,
+            json={
+                "decision": "pass_to_user",
+                "reason": "Needs the user's decision",
+                "note": "这次构建需要你决定是否运行。",
+                "recommend": "approve",
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert response.json() == {"status": "passed"}
+
+    async with _serve(db_uri, tmp_path) as client:
+        (restored,) = await _pending(client, child_id)
+        assert restored["params"]["triage"]["state"] == "passed"
+        assert restored["params"]["triage"]["note"] == "这次构建需要你决定是否运行。"
+        response = await client.post(
+            url,
+            headers=headers,
+            json={
+                "decision": "approve",
+                "reason": "Attempting to take it back",
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert response.json() == {"status": "refused", "code": "passed"}
+        await _answer(client, child_id, card["elicitation_id"], "accept")
+        await _wait_for(lambda: bool(deliveries.calls))
+        assert await _request_bash(client, child_id, "pnpm build") == "allow"
+
+
 async def test_grant_survives_a_restart_before_the_rerun(
     runtime_init: None, db_uri: str, tmp_path: Path, deliveries: _Deliveries
 ) -> None:

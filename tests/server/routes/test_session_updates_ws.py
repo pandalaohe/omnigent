@@ -593,6 +593,60 @@ def test_child_pending_elicitations_clear_after_resolve(
         assert changed_items[parent_id]["child_pending_elicitations_count"] == 0
 
 
+@pytest.mark.parametrize("state", ["passed", "unanswered"])
+def test_offered_child_handoff_pushes_counts_without_a_raw_count_change(
+    app, stores, fast_rescan, state
+):
+    parent_id = _seed_session(stores, owner=ALICE, title="parent")
+    child_id = _seed_child_with_pending(stores, parent_id, pending=1)
+    event = {
+        "type": "response.elicitation_request",
+        "elicitation_id": "child-offer",
+        "params": {
+            "triage": {
+                "offer_id": "offer",
+                "root_session_id": parent_id,
+                "mode": "answer",
+                "state": "offered",
+            }
+        },
+    }
+    pending_elicitations.record_publish(child_id, event)
+    pending_elicitations.record_publish(
+        parent_id,
+        {
+            **event,
+            "params": {**event["params"], "target_session_id": child_id},
+        },
+    )
+    assert _list_row(app, parent_id)["pending_elicitations_count"] == 0
+    assert _list_row(app, parent_id)["child_pending_elicitations_count"] == 0
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+    ) as ws:
+        ws.send_text(json.dumps({"type": "watch", "session_ids": [parent_id]}))
+        snapshot = _recv_until(ws, {"snapshot"})
+        (item,) = snapshot["items"]
+        assert item["pending_elicitations_count"] == item["child_pending_elicitations_count"] == 0
+        changed_event = {
+            **event,
+            "params": {"triage": {**event["params"]["triage"], "state": state}},
+        }
+        pending_elicitations.record_publish(child_id, changed_event)
+        pending_elicitations.record_publish(
+            parent_id,
+            {
+                **changed_event,
+                "params": {**changed_event["params"], "target_session_id": child_id},
+            },
+        )
+        assert pending_elicitations.count_for(child_id) == 1
+        assert pending_elicitations.count_for(parent_id) == 1
+        changed = _recv_until(ws, {"changed"})
+        (item,) = changed["items"]
+        assert item["pending_elicitations_count"] == item["child_pending_elicitations_count"] == 1
+
+
 def test_pending_elicitation_key_absent_with_nothing_pending(app: FastAPI, stores) -> None:
     """A row with no outstanding prompts carries no prompt key."""
     session_id = _seed_session(stores, owner=ALICE, title="quiet")

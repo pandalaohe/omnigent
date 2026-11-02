@@ -270,6 +270,23 @@ def count_for(conversation_id: str) -> int:
         return len(ids) if ids is not None else 0
 
 
+def quiet_count_for(conversation_id: str) -> int:
+    """Count indexed cards awaiting their parent's answer, including ancestor mirrors."""
+    with _lock:
+        return sum(
+            1
+            for event in _pending.get(conversation_id, {}).values()
+            if isinstance(params := event.get("params"), dict)
+            and isinstance(triage := params.get("triage"), dict)
+            and triage.get("state") == "offered"
+        )
+
+
+def display_count(conversation_id: str, raw: int) -> int:
+    """Normalize wire counts only; raw counts still mean the session is blocked."""
+    return max(0, raw - quiet_count_for(conversation_id))
+
+
 def counts_for(conversation_ids: list[str]) -> dict[str, int]:
     """
     Batch lookup of pending counts for a list of session ids.

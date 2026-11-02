@@ -17,7 +17,9 @@ class SysStandingApprovalTool(Tool):
             "Children can only read. "
             "The parent can revoke kinds, optionally citing a user message as source. "
             "Granting kinds always requires user approval of that exact delta. "
-            "Standing approval never overrides safety rules or other approval gates."
+            "Standing approval never overrides safety rules. With answer-child-approvals, "
+            "the server may offer single-use child approval gates to the parent through "
+            "sys_approval_answer; other approval gates still apply."
         )
 
     def get_schema(self) -> dict[str, Any]:

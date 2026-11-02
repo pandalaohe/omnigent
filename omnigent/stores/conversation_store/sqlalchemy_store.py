@@ -7627,6 +7627,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         values: dict[str, Any] = dict(fields)
         if values.get("verdict") is not None:
             values["verdict"] = json.dumps(values["verdict"])
+        if values.get("payload") is not None:
+            values["payload"] = json.dumps(values["payload"])
         workspace_id = current_workspace_id()
 
         def write(session: Session) -> None:

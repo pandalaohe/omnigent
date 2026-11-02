@@ -29,6 +29,8 @@ from collections.abc import Awaitable, Callable
 from itertools import islice
 from typing import TYPE_CHECKING, Any
 
+from omnigent.runtime import pending_elicitations
+
 if TYPE_CHECKING:
     from omnigent.entities.conversation import Conversation
     from omnigent.stores import ConversationStore
@@ -313,6 +315,9 @@ class SubagentBlockNotifier:
             if arm is None:
                 return
         await _escalation_sleep(_BLOCK_WAKE_ESCALATION_DELAY_S)
+        current = pending_elicitations.lookup(elicitation_id, conversation_id=conversation_id)
+        if current is not None and current[1].get("params", {}).get("triage") is not None:
+            return
         with self._lock:
             if self._notified.get(key) is not arm:
                 return  # answered within the grace — the parent never needs to know

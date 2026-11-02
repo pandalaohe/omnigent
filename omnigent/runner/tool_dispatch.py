@@ -540,6 +540,7 @@ _INSTRUCTION_LAYER_TOOLS = frozenset(
 )
 _PROJECT_SETTINGS_TOOLS = frozenset({"sys_project_settings_read", "sys_project_settings_update"})
 _STANDING_APPROVAL_TOOLS = frozenset({"sys_standing_approval", "sys_standing_pass"})
+_APPROVAL_ANSWER_TOOLS = frozenset({"sys_approval_answer"})
 
 # Priority 5l.1: Scheduled-task management — the runner proxies the Omnigent
 # server's /v1/scheduled-tasks REST endpoints (same posture as _POLICY_TOOLS).
@@ -626,6 +627,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _INSTRUCTION_LAYER_TOOLS
     | _PROJECT_SETTINGS_TOOLS
     | _STANDING_APPROVAL_TOOLS
+    | _APPROVAL_ANSWER_TOOLS
     | _SCHEDULED_TASK_TOOLS
     | _TERMINAL_TOOLS
     # ``browser_*`` must ride the native relay: the Omnigent desktop app
@@ -1129,6 +1131,7 @@ _ALL_LOCAL_TOOLS = (
     | _INSTRUCTION_LAYER_TOOLS
     | _PROJECT_SETTINGS_TOOLS
     | _STANDING_APPROVAL_TOOLS
+    | _APPROVAL_ANSWER_TOOLS
     | _SCHEDULED_TASK_TOOLS
     # The panel tool executes HERE, including on the ``dispatch=None`` path;
     # relaying it upstream would skip the artifacts/open POST.
@@ -7501,6 +7504,39 @@ async def _execute_standing_approval_tool(
         return json.dumps({"error": f"sys_standing_approval: {exc}"})
 
 
+async def _execute_approval_answer_tool(
+    arguments: str,
+    *,
+    conversation_id: str | None,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    if server_client is None or conversation_id is None:
+        return json.dumps({"error": "sys_approval_answer requires server access and a session"})
+    try:
+        args = json.loads(arguments)
+        if not isinstance(args, dict) or args.keys() - {
+            "session_id",
+            "elicitation_id",
+            "decision",
+            "reason",
+            "note",
+            "recommend",
+        }:
+            raise ValueError("unexpected approval answer arguments")
+        target_id, elicitation_id = args.pop("session_id"), args.pop("elicitation_id")
+        target_id = _route_identifier(target_id, "Session")
+        elicitation_id = _route_identifier(elicitation_id, "Elicitation")
+        url = f"{_session_url(conversation_id)}/child-approvals/{target_id}/{elicitation_id}"
+        response = await server_client.post(url, json=args, timeout=30.0)
+        if response.status_code != 200:
+            return json.dumps(
+                {"error": f"server returned {response.status_code}", "details": response.text}
+            )
+        return json.dumps(response.json())
+    except (KeyError, ValueError, httpx.HTTPError) as exc:
+        return json.dumps({"error": f"sys_approval_answer: {exc}"})
+
+
 async def _execute_project_settings_tool(
     tool_name: str,
     arguments: str,
@@ -11094,6 +11130,10 @@ async def execute_tool(
         elif tool_name in _PROJECT_SETTINGS_TOOLS:
             output = await _execute_project_settings_tool(
                 tool_name, arguments, server_client=server_client
+            )
+        elif tool_name in _APPROVAL_ANSWER_TOOLS:
+            output = await _execute_approval_answer_tool(
+                arguments, conversation_id=conversation_id, server_client=server_client
             )
         elif tool_name in _STANDING_APPROVAL_TOOLS:
             if tool_name == "sys_standing_pass":

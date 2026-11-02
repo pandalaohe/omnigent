@@ -269,6 +269,9 @@ class ToolManager:
         from omnigent.tools.builtins.standing_approval import SysStandingApprovalTool
 
         self._tools[SysStandingApprovalTool.name()] = SysStandingApprovalTool()
+        from omnigent.tools.builtins.approval_answer import SysApprovalAnswerTool
+
+        self._tools[SysApprovalAnswerTool.name()] = SysApprovalAnswerTool()
         from omnigent.tools.builtins.host_restart import SysHostRestartTool
 
         self._tools[SysHostRestartTool.name()] = SysHostRestartTool()

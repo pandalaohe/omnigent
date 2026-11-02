@@ -1690,7 +1690,7 @@ class ConversationStore(ABC):
     @abstractmethod
     def update_detached_card(self, elicitation_id: str, **fields: Any) -> None:
         """Patch one record: ``state`` and ``delivery_text`` verbatim,
-        ``verdict`` as a dict, ``expires_at`` in epoch seconds."""
+        ``verdict`` and ``payload`` as dicts, ``expires_at`` in epoch seconds."""
         ...
 
     @abstractmethod
