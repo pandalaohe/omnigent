@@ -715,7 +715,7 @@ class HostRegistry:
             lock.release()
 
     @asynccontextmanager
-    async def startup_launch(self, session_id: str) -> AsyncIterator[None]:
+    async def startup_launch(self, session_id: str, *, wait: bool = True) -> AsyncIterator[bool]:
         """Keep binding-to-host issuance and process-death queries in causal order."""
         key = (current_workspace_id(), session_id)
         with self._lock:
@@ -724,9 +724,12 @@ class HostRegistry:
                 lock = threading.Lock()
                 self._startup_launches[key] = lock
         while not lock.acquire(blocking=False):
+            if not wait:
+                yield False
+                return
             await asyncio.sleep(0.01)
         try:
-            yield
+            yield True
         finally:
             lock.release()
 

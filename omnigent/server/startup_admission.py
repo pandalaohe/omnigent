@@ -645,7 +645,9 @@ class StartupAdmission:
 
         conn = self.hosts.get(host_id)
         for candidate in await asyncio.to_thread(self.startups.list_occupied, host_id):
-            async with self.hosts.startup_launch(candidate.session_id):
+            async with self.hosts.startup_launch(candidate.session_id, wait=False) as acquired:
+                if not acquired:
+                    continue
                 startup = await asyncio.to_thread(self.startups.get, candidate.id)
                 if startup is None or not startup.occupied:
                     continue

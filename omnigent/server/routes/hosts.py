@@ -2114,7 +2114,10 @@ def create_hosts_router(
             )
         except TimeoutError:
             conn.pending_launches.pop(request_id, None)
-            await _rollback_failed_launch()
+            # An unacknowledged admitted runner may still start. Retain its binding
+            # and workspace until the host can authoritatively reconcile its status.
+            if startup is None:
+                await _rollback_failed_launch()
             raise HTTPException(
                 status_code=504,
                 detail=(
