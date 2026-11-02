@@ -57,7 +57,11 @@ async def _review_event_context():
 async def test_native_permission_frames_revoke_only_on_tightening(tmp_path, tighten):
     state = codex_native_forwarder._CodexForwarderState(parent_session_id="conv_parent")
     full = {"approvalPolicy": "never", "sandboxPolicy": {"type": "dangerFullAccess"}}
-    ask = {"approvalPolicy": "on-request", "sandboxPolicy": {"type": "workspaceWrite"}}
+    ask = {
+        "approvalPolicy": "on-request",
+        "approvalsReviewer": "user",
+        "sandboxPolicy": {"type": "workspaceWrite"},
+    }
     settings = [full, ask, ask] if tighten else [ask, full, full]
     async with _review_event_context() as (client, posted, tracker, usage):
         for fields in settings:
@@ -75,6 +79,14 @@ async def test_native_permission_frames_revoke_only_on_tightening(tmp_path, tigh
                 elicitation_tracker=tracker,
             )
         controls = [body for _, body in posted if body.get("data", {}).get("helper_action")]
+        modes = [
+            body["data"]["approval_mode"]
+            for _, body in posted
+            if "approval_mode" in body.get("data", {})
+        ]
+        assert modes == (
+            ["full-access", "ask-for-approval"] if tighten else ["ask-for-approval", "full-access"]
+        )
         assert len(controls) == int(tighten)
         if tighten:
             assert controls[0]["data"]["helper_action"] == "tightening"
@@ -204,7 +216,7 @@ async def test_reconnect_reconciles_once_without_preloaded_mapping(tmp_path, sce
                 scenario == "consumed"
             )
         count = len(calls)
-        await asyncio.sleep(0.06)
+        await asyncio.sleep(0.06)  # custom-lint: disable=sleep-then-assert -- observe no retries
         assert len(calls) == count, "recovery must not leave a retry task"
         await state.close_child_streams()
 
