@@ -9833,8 +9833,22 @@ def create_runner_app(
         )
         _side_thread_id = body.get("codex_side_thread_id") if isinstance(body, dict) else None
         if body_type == "codex_helpers_stop":
+            children = body.get("children", {})
+            if (
+                not isinstance(children, dict)
+                or len(children) > 512
+                or any(
+                    not isinstance(tid, str)
+                    or not isinstance(info, dict)
+                    or any(
+                        value is not None and not isinstance(value, str) for value in info.values()
+                    )
+                    for tid, info in children.items()
+                )
+            ):
+                return JSONResponse(status_code=400, content={"error": "invalid_helper_inventory"})
             stopped = await _native_controls.stop_codex_native_helpers(
-                conversation_id, str(body.get("reason", "recovery"))
+                conversation_id, str(body.get("reason", "recovery")), children
             )
             return JSONResponse(content={"helpers_stopped": stopped})
         if _side_thread_id:
@@ -11911,17 +11925,18 @@ def create_runner_app(
         reason: str,
         confirmed: bool,
         children: dict[str, dict[str, str | None]],
+        owns_backend: Callable[[], bool],
     ) -> bool:
-        ids = {sid for row in children.values() if (sid := row.get("session_id"))}
-        for entry in list_subagent_work(parent):
-            if (
-                entry.child_session_id in ids
-                and _subagent_work.is_codex_native_subagent_wrapper(entry.wrapper_label)
-                and entry.status in {"launching", "running", "waiting"}
-            ):
-                ids.add(entry.child_session_id)
+        from omnigent.harnesses.codex_native.bridge import read_active_child_turns
+
+        if owns_backend():
+            children.update(read_active_child_turns(bridge_dir))
+            for entry in _subagent_work.list_active_codex_native_work(parent):
+                children.setdefault(entry.child_session_id, {"session_id": entry.child_session_id})
                 entry.parent_turn_consumed = True
                 mark_subagent_work_terminal(entry.child_session_id, status="failed", output="")
+        confirmed &= owns_backend()
+        ids = {sid for row in children.values() if (sid := row.get("session_id"))}
         summary = (
             f"Codex helpers {'stopped' if confirmed else 'stop unconfirmed'} after {reason}: "
             + ", ".join(sorted(ids) or children or {"unknown helpers": {}})
@@ -11940,7 +11955,7 @@ def create_runner_app(
             )
             response.raise_for_status()
 
-        child_ids = sorted(ids)
+        child_ids = sorted(ids) if owns_backend() else []
         receipts = await asyncio.gather(
             *(post_child(child) for child in child_ids), return_exceptions=True
         )
@@ -11955,6 +11970,7 @@ def create_runner_app(
         _session_inboxes.setdefault(parent, asyncio.Queue()).put_nowait(
             {"type": "system_notice", "message": summary}
         )
+        report_id = hashlib.sha256(json.dumps(children, sort_keys=True).encode()).hexdigest()
         try:
             response = await server_client.post(
                 f"/v1/sessions/{parent}/events",
@@ -11962,10 +11978,7 @@ def create_runner_app(
                     "type": "external_conversation_item",
                     "data": {
                         "item_type": "error",
-                        "source_id": "codex-helpers:"
-                        + hashlib.sha256(
-                            (str(bridge_dir) + json.dumps(children, sort_keys=True)).encode()
-                        ).hexdigest(),
+                        "source_id": f"codex-helpers:{report_id}",
                         "item_data": {
                             "source": "execution",
                             "code": "codex_helpers_stopped"

@@ -5080,8 +5080,9 @@ async def test_codex_app_server_teardown_forgets_the_launch_bridge_dir(tmp_path:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("confirmed", [False, True])
+@pytest.mark.parametrize("replacement", [False, True])
 async def test_ordinary_codex_close_clears_helper_state_without_tree_signals(
-    tmp_path, monkeypatch, confirmed
+    tmp_path, monkeypatch, confirmed, replacement
 ):
     from types import SimpleNamespace
 
@@ -5104,17 +5105,29 @@ async def test_ordinary_codex_close_clears_helper_state_without_tree_signals(
     monkeypatch.setitem(orchestration._AUTO_CODEX_BRIDGE_DIRS, session_id, tmp_path)
 
     async def close(*_args):
-        pass
+        if replacement:
+            orchestration._AUTO_CODEX_APP_SERVERS[session_id] = SimpleNamespace(
+                exit_confirmed=False
+            )
+            codex_native_bridge.update_active_child_turn(
+                tmp_path, "new_thread", turn_id="new_turn"
+            )
 
     monkeypatch.setattr(orchestration, "_close_native_backend", close)
     monkeypatch.setattr(
         _proc,
-        "signal_process_snapshot",
+        "_signal_identities",
         lambda *_args, **_kwargs: pytest.fail("ordinary close must not use tightening cleanup"),
     )
     await orchestration.teardown_codex_native_app_server(session_id)
-    assert bool(codex_native_bridge.read_active_child_turns(tmp_path)) == (not confirmed)
-    assert codex_native_bridge.read_bridge_state(tmp_path).helper_stop_pending == (not confirmed)
+    assert bool(codex_native_bridge.read_active_child_turns(tmp_path)) == (
+        replacement or not confirmed
+    )
+    assert codex_native_bridge.read_bridge_state(tmp_path).helper_stop_pending == (
+        replacement or not confirmed
+    )
+    if replacement:
+        assert "new_thread" in codex_native_bridge.read_active_child_turns(tmp_path)
 
 
 @pytest.mark.asyncio

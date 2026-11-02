@@ -338,23 +338,17 @@ def _signal_identities(identities: dict[int, float], *, force: bool) -> None:
             continue
 
 
-def snapshot_process_tree(pid: int) -> dict[int, float]:
+def snapshot_process_tree(pid: int, expected_start_stamp: float | None) -> dict[int, float]:
     """Capture ancestry before teardown; detached processes are outside this snapshot."""
-    try:
-        root = psutil.Process(pid)
-        processes = [root, *root.children(recursive=True)]
-        return {
-            proc.pid: _process_start_stamp(proc)
-            for proc in processes
-            if proc.pid > 1 and proc.pid != os.getpid()
-        }
-    except psutil.NoSuchProcess:
+    root = psutil.Process(pid)
+    if expected_start_stamp is None or _process_start_stamp(root) != expected_start_stamp:
         return {}
-
-
-def signal_process_snapshot(identities: dict[int, float], *, force: bool) -> None:
-    """Signal recorded identities without adopting new descendants or process groups."""
-    _signal_identities(identities, force=force)
+    processes = [root, *root.children(recursive=True)]
+    return {
+        proc.pid: _process_start_stamp(proc)
+        for proc in processes
+        if proc.pid > 1 and proc.pid != os.getpid()
+    }
 
 
 def surviving_process_snapshot(identities: dict[int, float]) -> dict[int, float]:

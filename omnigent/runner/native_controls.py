@@ -875,165 +875,149 @@ def build_native_controls(
             },
         )
 
-    _helper_stop_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
-        weakref.WeakValueDictionary()
-    )
-
-    async def _stop_codex_native_helpers(conv_id: str, reason: str = "tightening") -> bool:
-        lock = _helper_stop_locks.get(conv_id)
-        if lock is None:
-            lock = _helper_stop_locks[conv_id] = asyncio.Lock()
+    async def _stop_codex_native_helpers(
+        conv_id: str,
+        reason: str = "tightening",
+        discovered: dict[str, dict[str, str | None]] | None = None,
+    ) -> bool:
+        discovered = discovered or {}
+        lock = _codex_terminal_ensure_locks.setdefault(conv_id, asyncio.Lock())
         async with lock:
-            return await _stop_codex_native_helpers_inner(conv_id, reason)
-
-    async def _stop_codex_native_helpers_inner(conv_id: str, reason: str) -> bool:
-        from omnigent.harnesses.codex_native.bridge import (
-            clear_active_child_turns,
-            read_active_child_turns,
-        )
-        from omnigent.inner import _proc
-        from omnigent.runner.native.orchestration import (
-            _AUTO_CODEX_APP_SERVERS,
-            teardown_codex_native_app_server,
-        )
-
-        bridge, bridge_dir = await _codex_native_bridge_state_and_dir_for_session(
-            conv_id, action="helper revocation"
-        )
-        inventory_unknown = False
-        try:
-            children = read_active_child_turns(bridge_dir, strict=True)
-        except FileNotFoundError:
-            children = {}
-            inventory_unknown = bool(getattr(bridge, "helper_stop_pending", False))
-        except (OSError, ValueError):
-            children = {}
-            inventory_unknown = True
-        from omnigent.runner.subagent_work import (
-            is_codex_native_subagent_wrapper,
-            list_subagent_work,
-        )
-
-        for entry in list_subagent_work(conv_id):
-            if entry.status in {
-                "launching",
-                "running",
-                "waiting",
-            } and is_codex_native_subagent_wrapper(entry.wrapper_label):
-                if not any(
-                    info.get("session_id") == entry.child_session_id for info in children.values()
-                ):
-                    children[entry.child_session_id] = {
-                        "session_id": entry.child_session_id,
-                        "turn_id": None,
-                    }
-                entry.parent_turn_consumed = True
-        if (
-            not children
-            and not _running_codex_native_work(conv_id)
-            and not getattr(bridge, "helper_stop_pending", False)
-            and not inventory_unknown
-        ):
-            return True
-        try:
-            async with asyncio.timeout(_CODEX_HELPER_STOP_TIMEOUT_S):
-                if await _drain_codex_native_helpers(conv_id):
-                    confirmed = await _finish_codex_native_helpers(
-                        conv_id, bridge_dir, reason, True, children
-                    )
-                    clear_active_child_turns(bridge_dir)
-                    return confirmed
-        except (TimeoutError, OSError, ValueError, RuntimeError):
-            pass
-        # Capture before closing: shell commands may own separate process groups.
-        backend = _AUTO_CODEX_APP_SERVERS.get(conv_id)
-        identities: dict[int, float] = {}
-        confirmed = backend is not None
-        try:
-            if backend is not None and backend.proc is not None:
-                identities = await asyncio.to_thread(_proc.snapshot_process_tree, backend.proc.pid)
-                confirmed = bool(identities)
-            else:
-                confirmed = False
-        except (OSError, RuntimeError, psutil.Error):
-            confirmed = False
-        try:
-            async with asyncio.timeout(_CODEX_HELPER_CLOSE_TIMEOUT_S):
-                await teardown_codex_native_app_server(conv_id)
-        except (TimeoutError, RuntimeError):
-            pass
-        await asyncio.to_thread(_proc.signal_process_snapshot, identities, force=False)
-        await asyncio.sleep(_CODEX_HELPER_PROCESS_GRACE_S)
-        await asyncio.to_thread(_proc.signal_process_snapshot, identities, force=True)
-        await asyncio.sleep(_CODEX_HELPER_PROCESS_GRACE_S)
-        survivors = await asyncio.to_thread(_proc.surviving_process_snapshot, identities)
-        confirmed = confirmed and not survivors
-        if backend is not None and confirmed:
-            # Complete the existing close receipt after the snapshotted survivors exit.
-            with contextlib.suppress(TimeoutError, RuntimeError):
-                async with asyncio.timeout(_CODEX_HELPER_CLOSE_TIMEOUT_S):
-                    await backend.close()
-        if _AUTO_CODEX_APP_SERVERS.get(conv_id) in (None, backend):
+            from omnigent.harnesses.codex_native.app_server import client_for_transport
             from omnigent.harnesses.codex_native.bridge import (
-                record_app_server_stopped,
-                write_bridge_startup_error,
+                clear_active_child_turns,
+                read_active_child_turns,
+            )
+            from omnigent.inner import _proc
+            from omnigent.runner.native.orchestration import (
+                _AUTO_CODEX_APP_SERVERS,
+                teardown_codex_native_app_server,
             )
 
-            if confirmed:
-                record_app_server_stopped(bridge_dir)
-            else:
-                write_bridge_startup_error(
-                    bridge_dir,
-                    "Helper stop is unconfirmed; reconnect the Codex backend.",
-                    code="codex_helpers_stop_unconfirmed",
-                )
-        detail = reason + (f"; unconfirmed process PIDs: {sorted(survivors)}" if survivors else "")
-        confirmed = await _finish_codex_native_helpers(
-            conv_id, bridge_dir, detail, confirmed, children
-        )
-        if _AUTO_CODEX_APP_SERVERS.get(conv_id) in (None, backend):
-            clear_active_child_turns(bridge_dir)
-        return confirmed
+            backend = _AUTO_CODEX_APP_SERVERS.get(conv_id)
+            incarnation = getattr(backend, "resident_incarnation_id", None)
 
-    def _running_codex_native_work(session_id: str) -> bool:
-        from omnigent.runner.subagent_work import (
-            is_codex_native_subagent_wrapper,
-            list_subagent_work,
-        )
+            def owns_backend() -> bool:
+                current = _AUTO_CODEX_APP_SERVERS.get(conv_id)
+                return (current is None or current is backend) and getattr(
+                    backend, "resident_incarnation_id", None
+                ) == incarnation
 
-        return any(
-            entry.status in {"launching", "running", "waiting"}
-            and is_codex_native_subagent_wrapper(entry.wrapper_label)
-            for entry in list_subagent_work(session_id)
-        )
+            bridge, bridge_dir = await _codex_native_bridge_state_and_dir_for_session(
+                conv_id, action="helper revocation"
+            )
+            inventory_unknown = False
+            children = dict(discovered)
+            try:
+                children.update(read_active_child_turns(bridge_dir, strict=True))
+            except FileNotFoundError:
+                inventory_unknown = bool(getattr(bridge, "helper_stop_pending", False))
+            except (OSError, ValueError):
+                inventory_unknown = True
+            if not owns_backend():
+                return False
+            from omnigent.runner.subagent_work import list_active_codex_native_work
 
-    async def _drain_codex_native_helpers(conv_id: str) -> bool:
-        from omnigent.harnesses.codex_native.app_server import client_for_transport
-        from omnigent.harnesses.codex_native.bridge import read_active_child_turns
-
-        bridge, bridge_dir = await _codex_native_bridge_state_and_dir_for_session(
-            conv_id, action="helper stop"
-        )
-        if bridge is None:
-            return False
-        children = read_active_child_turns(bridge_dir, strict=True)
-        client = client_for_transport(
-            bridge.socket_path, client_name="omnigent-codex-native-runner"
-        )
-        try:
-            await client.connect()
-            for tid, info in children.items():
-                if not info.get("turn_id"):
+            for entry in list_active_codex_native_work(conv_id):
+                entry.parent_turn_consumed = True
+            if (
+                not children
+                and not list_active_codex_native_work(conv_id)
+                and not getattr(bridge, "helper_stop_pending", False)
+                and not inventory_unknown
+            ):
+                return True
+            confirmed = False
+            try:
+                async with asyncio.timeout(_CODEX_HELPER_STOP_TIMEOUT_S):
+                    if not inventory_unknown and not discovered and bridge is not None:
+                        client = client_for_transport(
+                            bridge.socket_path, client_name="omnigent-codex-native-runner"
+                        )
+                        try:
+                            await client.connect()
+                            for tid, info in read_active_child_turns(
+                                bridge_dir, strict=True
+                            ).items():
+                                if not info.get("turn_id"):
+                                    break
+                                await client.request(
+                                    "turn/interrupt", {"threadId": tid, "turnId": info["turn_id"]}
+                                )
+                            else:
+                                while read_active_child_turns(
+                                    bridge_dir
+                                ) or list_active_codex_native_work(conv_id):
+                                    await asyncio.sleep(_CODEX_HELPER_STOP_POLL_S)
+                                confirmed = True
+                        finally:
+                            with contextlib.suppress(Exception):
+                                await asyncio.wait_for(
+                                    client.close(), timeout=_CODEX_HELPER_STOP_POLL_S
+                                )
+            except (TimeoutError, OSError, ValueError, RuntimeError):
+                pass
+            if not confirmed:
+                # Capture before closing: shell commands may own separate process groups.
+                identities: dict[int, float] = {}
+                try:
+                    if (
+                        owns_backend()
+                        and backend is not None
+                        and backend.proc is not None
+                        and backend.proc.returncode is None
+                    ):
+                        identities = await asyncio.to_thread(
+                            _proc.snapshot_process_tree,
+                            backend.proc.pid,
+                            backend.process_start_stamp,
+                        )
+                except (OSError, RuntimeError, psutil.Error):
+                    pass
+                if not owns_backend():
                     return False
-                await client.request(
-                    "turn/interrupt", {"threadId": tid, "turnId": info["turn_id"]}
-                )
-            while read_active_child_turns(bridge_dir) or _running_codex_native_work(conv_id):
-                await asyncio.sleep(_CODEX_HELPER_STOP_POLL_S)
-            return True
-        finally:
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(client.close(), timeout=_CODEX_HELPER_STOP_POLL_S)
+                try:
+                    async with asyncio.timeout(_CODEX_HELPER_CLOSE_TIMEOUT_S):
+                        await teardown_codex_native_app_server(conv_id, clear_helpers=False)
+                except (TimeoutError, RuntimeError):
+                    pass
+                await asyncio.to_thread(_proc._signal_identities, identities, force=False)
+                await asyncio.sleep(_CODEX_HELPER_PROCESS_GRACE_S)
+                await asyncio.to_thread(_proc._signal_identities, identities, force=True)
+                await asyncio.sleep(_CODEX_HELPER_PROCESS_GRACE_S)
+                survivors = await asyncio.to_thread(_proc.surviving_process_snapshot, identities)
+                confirmed = bool(identities) and not survivors
+                if backend is not None and confirmed and owns_backend():
+                    # Complete the existing close receipt after the snapshotted survivors exit.
+                    with contextlib.suppress(TimeoutError, RuntimeError):
+                        async with asyncio.timeout(_CODEX_HELPER_CLOSE_TIMEOUT_S):
+                            await backend.close()
+                if owns_backend():
+                    from omnigent.harnesses.codex_native.bridge import (
+                        record_app_server_stopped,
+                        write_bridge_startup_error,
+                    )
+
+                    if confirmed:
+                        record_app_server_stopped(bridge_dir)
+                    else:
+                        write_bridge_startup_error(
+                            bridge_dir,
+                            "Helper stop is unconfirmed; reconnect the Codex backend.",
+                            code="codex_helpers_stop_unconfirmed",
+                        )
+                if survivors:
+                    reason += f"; unconfirmed process PIDs: {sorted(survivors)}"
+            try:
+                async with asyncio.timeout(1.5):
+                    confirmed = await _finish_codex_native_helpers(
+                        conv_id, bridge_dir, reason, confirmed, children, owns_backend
+                    )
+            except TimeoutError:
+                confirmed = False
+            if owns_backend():
+                clear_active_child_turns(bridge_dir)
+            return confirmed
 
     async def _current_codex_native_approval_mode(conv_id: str) -> str | None:
         from omnigent.codex_approval_modes import codex_permission_preset_from_thread_settings
@@ -1046,7 +1030,9 @@ def build_native_controls(
                 bridge, bridge_dir = await _codex_native_bridge_state_and_dir_for_session(
                     conv_id, action="current helper authority"
                 )
-                if not read_active_child_turns(bridge_dir) and not _running_codex_native_work(
+                from omnigent.runner.subagent_work import list_active_codex_native_work
+
+                if not read_active_child_turns(bridge_dir) and not list_active_codex_native_work(
                     conv_id
                 ):
                     return "full-access"

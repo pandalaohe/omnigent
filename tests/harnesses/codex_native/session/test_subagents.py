@@ -78,6 +78,8 @@ async def test_native_permission_frames_revoke_only_on_tightening(tmp_path, tigh
                 usage_coalescer=usage,
                 elicitation_tracker=tracker,
             )
+        if state.helper_control_task is not None:
+            await state.helper_control_task
         controls = [body for _, body in posted if body.get("data", {}).get("helper_action")]
         modes = [
             body["data"]["approval_mode"]
@@ -94,7 +96,18 @@ async def test_native_permission_frames_revoke_only_on_tightening(tmp_path, tigh
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "scenario", ["terminal", "consumed", "deferred", "running", "unreadable", "corrupt", "hung"]
+    "scenario",
+    [
+        "terminal",
+        "consumed",
+        "deferred",
+        "running",
+        "unreadable",
+        "corrupt",
+        "hung",
+        "discovered",
+        "historical",
+    ],
 )
 async def test_reconnect_reconciles_once_without_preloaded_mapping(tmp_path, scenario):
     from omnigent.harnesses.codex_native import bridge
@@ -134,13 +147,34 @@ async def test_reconnect_reconciles_once_without_preloaded_mapping(tmp_path, sce
         )
     calls = []
 
+    parent_turns = [parent_turn]
+    if scenario == "historical":
+        parent_turns.insert(
+            0,
+            {
+                "id": "old_parent",
+                "status": "completed",
+                "items": [
+                    {
+                        "type": "collabAgentToolCall",
+                        "receiverThreadIds": ["thread_child"],
+                        "agentsStates": {"thread_child": {"status": "completed"}},
+                    }
+                ],
+            },
+        )
+    if scenario == "discovered":
+        parent_turn["items"] = [
+            {"type": "collabAgentToolCall", "receiverThreadIds": ["thread_unknown"]}
+        ]
+
     class Client(_FakeCodexAppServerClient):
         async def request(self, method, params):
             calls.append((method, params))
             if method == "thread/resume":
                 return {"result": {"thread": {"id": "thread_parent", "turns": []}}}
             if params["threadId"] == "thread_parent":
-                return {"result": {"thread": {"id": "thread_parent", "turns": [parent_turn]}}}
+                return {"result": {"thread": {"id": "thread_parent", "turns": parent_turns}}}
             if scenario == "hung":
                 await asyncio.Event().wait()
             if scenario == "unreadable":
@@ -188,11 +222,14 @@ async def test_reconnect_reconciles_once_without_preloaded_mapping(tmp_path, sce
                 and body["data"].get("status") == "idle"
             ]
 
-        if scenario in {"running", "unreadable", "corrupt", "hung"}:
+        if scenario in {"running", "unreadable", "corrupt", "hung", "discovered"}:
             assert len(controls) == 1
             assert controls[0]["data"]["helper_action"] == "recovery"
+            if scenario == "discovered":
+                assert "thread_unknown" in controls[0]["data"].get("children", {})
         elif scenario == "deferred":
-            assert not terminal()
+            assert len(terminal()) == 1
+            assert not terminal()[0]["data"].get("parent_turn_consumed", False)
             await codex_native_forwarder._handle_event(
                 client,
                 session_id="conv_parent",
@@ -212,12 +249,126 @@ async def test_reconnect_reconciles_once_without_preloaded_mapping(tmp_path, sce
             assert len(terminal()) == 1
         else:
             assert len(terminal()) == 1
-            assert terminal()[0]["data"].get("parent_turn_consumed", False) == (
-                scenario == "consumed"
-            )
+            assert not terminal()[0]["data"].get("parent_turn_consumed", False)
         count = len(calls)
         await asyncio.sleep(0.06)  # custom-lint: disable=sleep-then-assert -- observe no retries
         assert len(calls) == count, "recovery must not leave a retry task"
+        await state.close_child_streams()
+
+
+@pytest.mark.asyncio
+async def test_native_tightening_keeps_terminal_consumer_responsive(tmp_path):
+    from omnigent.harnesses.codex_native import bridge
+
+    state = codex_native_forwarder._CodexForwarderState(parent_session_id="conv_parent")
+    state.note_child_thread("thread_child", "conv_child")
+    bridge.update_active_child_turn(
+        tmp_path, "thread_child", session_id="conv_child", turn_id="turn_child"
+    )
+    requested, completed = asyncio.Event(), asyncio.Event()
+
+    async def handler(request):
+        body = json.loads(request.content)
+        if body.get("data", {}).get("helper_action"):
+            requested.set()
+            await completed.wait()
+        return httpx.Response(202, json={"queued": False})
+
+    async with httpx.AsyncClient(
+        base_url="http://test", transport=httpx.MockTransport(handler)
+    ) as client:
+        tracker, usage = _elicitation_tracker(), _usage_coalescer(client)
+
+        async def frame(method, params):
+            await codex_native_forwarder._handle_event(
+                client,
+                session_id="conv_parent",
+                bridge_dir=tmp_path,
+                event={"method": method, "params": params},
+                expected_thread_id="thread_parent",
+                forwarder_state=state,
+                usage_coalescer=usage,
+                elicitation_tracker=tracker,
+            )
+
+        try:
+            for policy, sandbox in [
+                ("never", "dangerFullAccess"),
+                ("on-request", "workspaceWrite"),
+            ]:
+                await asyncio.wait_for(
+                    frame(
+                        "thread/settings/updated",
+                        {
+                            "threadId": "thread_parent",
+                            "threadSettings": {
+                                "approvalPolicy": policy,
+                                "approvalsReviewer": "user",
+                                "sandboxPolicy": {"type": sandbox},
+                            },
+                        },
+                    ),
+                    timeout=0.2,
+                )
+            await asyncio.wait_for(requested.wait(), 0.2)
+            await frame(
+                "turn/completed",
+                {
+                    "threadId": "thread_child",
+                    "turn": {"id": "turn_child", "status": "interrupted"},
+                },
+            )
+            assert not bridge.read_active_child_turns(tmp_path)
+        finally:
+            completed.set()
+            await tracker.close()
+            await state.close_child_streams()
+
+
+@pytest.mark.asyncio
+async def test_resume_does_not_restore_an_already_delivered_terminal(tmp_path):
+    from omnigent.harnesses.codex_native import bridge
+
+    state = codex_native_forwarder._CodexForwarderState(
+        parent_session_id="conv_parent", child_usage_baseline_dir=tmp_path
+    )
+    state.note_child_thread("thread_child", "conv_child")
+    bridge.update_active_child_turn(
+        tmp_path, "thread_child", session_id="conv_child", turn_id="turn_child"
+    )
+    turn = {"id": "turn_child", "status": "completed", "items": []}
+    async with _review_event_context() as (client, posted, tracker, usage):
+        await codex_native_forwarder._handle_event(
+            client,
+            session_id="conv_parent",
+            bridge_dir=tmp_path,
+            event={
+                "method": "turn/completed",
+                "params": {"threadId": "thread_child", "turn": turn},
+            },
+            expected_thread_id="thread_parent",
+            forwarder_state=state,
+            usage_coalescer=usage,
+            elicitation_tracker=tracker,
+        )
+        assert not bridge.read_active_child_turns(tmp_path)
+        await codex_native_forwarder._apply_child_resume(
+            client,
+            parent_session_id="conv_parent",
+            child_session_id="conv_child",
+            child_thread_id="thread_child",
+            response={"result": {"thread": {"id": "thread_child", "turns": [turn]}}},
+            forwarder_state=state,
+        )
+        assert not bridge.read_active_child_turns(tmp_path)
+        assert (
+            sum(
+                body.get("type") == "external_session_status"
+                and path.endswith("conv_child/events")
+                for path, body in posted
+            )
+            == 1
+        )
         await state.close_child_streams()
 
 

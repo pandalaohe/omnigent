@@ -243,7 +243,7 @@ async def _cancel_auto_forwarder_task(session_id: str) -> bool:
     return True
 
 
-async def teardown_codex_native_app_server(session_id: str) -> None:
+async def teardown_codex_native_app_server(session_id: str, *, clear_helpers: bool = True) -> None:
     """
     Tear down a host-spawned codex-native session's app-server subprocess.
 
@@ -266,21 +266,27 @@ async def teardown_codex_native_app_server(session_id: str) -> None:
     if app_server is None:
         _AUTO_CODEX_BRIDGE_DIRS.pop(session_id, None)
         return
+    incarnation = getattr(app_server, "resident_incarnation_id", None)
     await _cancel_auto_forwarder_task(session_id)
+    with contextlib.suppress(Exception):
+        await _close_native_backend(session_id, "codex-native", app_server)
     registered_server = _AUTO_CODEX_APP_SERVERS.get(session_id)
     if registered_server is app_server:
         _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
     # Forwarder cleanup can retire its own backend; a newer launch can reuse its path.
-    if (registered_server is None or registered_server is app_server) and (
-        _AUTO_CODEX_BRIDGE_DIRS.get(session_id) is bridge_dir
+    if registered_server in (None, app_server) and (
+        getattr(app_server, "resident_incarnation_id", None) == incarnation
+        and _AUTO_CODEX_BRIDGE_DIRS.get(session_id) is bridge_dir
     ):
-        _AUTO_CODEX_BRIDGE_DIRS.pop(session_id, None)
-    with contextlib.suppress(Exception):
-        await _close_native_backend(session_id, "codex-native", app_server)
-    if bridge_dir is not None and getattr(app_server, "exit_confirmed", False):
-        from omnigent.harnesses.codex_native.bridge import clear_active_child_turns
+        if (
+            clear_helpers
+            and bridge_dir is not None
+            and getattr(app_server, "exit_confirmed", False)
+        ):
+            from omnigent.harnesses.codex_native.bridge import clear_active_child_turns
 
-        clear_active_child_turns(bridge_dir)
+            clear_active_child_turns(bridge_dir)
+        _AUTO_CODEX_BRIDGE_DIRS.pop(session_id, None)
 
 
 async def teardown_all_codex_native_app_servers() -> None:

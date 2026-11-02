@@ -885,6 +885,7 @@ class _CodexForwarderState:
     posted_permission_observation: CodexPermissionObservation | None = None
     posted_permission_session_id: str | None = None
     permission_observation_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    helper_control_task: asyncio.Task[httpx.Response | None] | None = None
     parent_session_id: str | None = None
     codex_client: CodexAppServerClient | None = None
     async_question_tracker: _CodexAsyncQuestionTracker = field(
@@ -1180,6 +1181,10 @@ class _CodexForwarderState:
 
     async def close_child_streams(self) -> None:
         """Drain child output while the forwarder's HTTP client is still open."""
+        if self.helper_control_task is not None:
+            self.helper_control_task.cancel()
+            await asyncio.gather(self.helper_control_task, return_exceptions=True)
+            self.helper_control_task = None
         await asyncio.gather(
             *(stream.delta_coalescer.close() for stream in self.child_streams.values())
         )
@@ -3053,22 +3058,11 @@ async def _reconcile_helpers_once(
     """Recover one bounded snapshot outside the parent's delivery lock."""
     from omnigent.harnesses.codex_native.bridge import set_helper_stop_pending
 
-    bridge = read_bridge_state(bridge_dir)
-    if bridge is None:
-        return
-    children = read_active_child_turns(bridge_dir)
-    if (
-        not children
-        and not bridge.helper_stop_pending
-        and not (bridge_dir / "active_child_turns.json").exists()
-    ):
-        return
+    children: dict[str, dict[str, str | None]] = {}
     unknown = False
     try:
         async with asyncio.timeout(1.0):
             children = read_active_child_turns(bridge_dir, strict=True)
-            if not children and not bridge.helper_stop_pending:
-                return
             parent_response = await client.request(
                 "thread/read", {"threadId": thread_id, "includeTurns": True}
             )
@@ -3077,39 +3071,14 @@ async def _reconcile_helpers_once(
                 parent_result.get("thread") if isinstance(parent_result, dict) else None
             )
             turns = parent_thread.get("turns", []) if isinstance(parent_thread, dict) else []
-            for turn in turns:
-                if not isinstance(turn, dict):
-                    continue
-                if turn.get("status") == "inProgress":
-                    state.active_parent_turn_id = _turn_id_from_payload(turn)
-                for item in turn.get("items", []):
-                    if (
-                        not isinstance(item, dict)
-                        or item.get("type") != _CODEX_COLLAB_AGENT_ITEM_TYPE
-                    ):
-                        continue
-                    for child_tid in _collab_receiver_thread_ids(item):
-                        if child_tid not in children:
-                            children[child_tid] = {"session_id": None, "turn_id": None}
-                    statuses = item.get("agentsStates")
-                    if isinstance(statuses, dict):
-                        for tid, status in statuses.items():
-                            if isinstance(status, dict) and _omnigent_status_from_collab_state(
-                                status
-                            ) in {"idle", "failed"}:
-                                state.consumed_child_threads.add(tid)
-                    if item.get(
-                        "status"
-                    ) == "inProgress" and state.active_parent_turn_id == _turn_id_from_payload(
-                        turn
-                    ):
-                        for tid in _collab_receiver_thread_ids(item):
-                            state.in_flight_collab_calls_by_thread.setdefault(tid, set()).add(
-                                str(item.get("id", "wait"))
-                            )
+            turn = turns[-1] if turns else {}
+            for item in turn.get("items", []) if isinstance(turn, dict) else []:
+                if isinstance(item, dict) and item.get("type") == _CODEX_COLLAB_AGENT_ITEM_TYPE:
+                    for tid in _collab_receiver_thread_ids(item):
+                        children.setdefault(tid, {"session_id": None, "turn_id": None})
             if len(children) > 512:
                 raise ValueError("Helper snapshot exceeds its bound")
-            for tid, info in children.items():
+            for tid, info in list(children.items()):
                 sid = info.get("session_id")
                 if not sid:
                     sid = await _register_child_session(
@@ -3122,6 +3091,7 @@ async def _reconcile_helpers_once(
                 if not sid:
                     unknown = True
                     continue
+                info["session_id"] = sid
                 state.note_child_thread(tid, sid)
                 response = await client.request(
                     "thread/read", {"threadId": tid, "includeTurns": True}
@@ -3146,16 +3116,17 @@ async def _reconcile_helpers_once(
                     response={"result": {"thread": {**thread, "turns": [latest]}}},
                     forwarder_state=state,
                 )
+                children.pop(tid)
     except (TimeoutError, RuntimeError, OSError, ValueError, httpx.HTTPError):
         unknown = True
     if unknown:
         # One control request; no poller, retained candidates or input-admission gate.
-        await ap_client.post(
-            f"/v1/sessions/{url_component(session_id)}/events",
-            json={
-                "type": "external_codex_approval_mode_change",
-                "data": {"helper_action": "recovery"},
-            },
+        await _post_session_event(
+            ap_client,
+            session_id,
+            event_type="external_codex_approval_mode_change",
+            data={"helper_action": "recovery", "children": cast(_JsonObject, children)},
+            max_attempts=1,
             timeout=5.0,
         )
     else:
@@ -3604,7 +3575,6 @@ async def _subscribe_until_ready(
     )
     recover_helpers = bool(
         (bridge_state is not None and bridge_state.helper_stop_pending)
-        or read_active_child_turns(bridge_dir)
         or (bridge_dir / "active_child_turns.json").exists()
     )
     saw_not_ready = False
@@ -4993,14 +4963,21 @@ async def _sync_codex_approval_mode_change(
                 and observed.mode != previous.mode
                 and codex_approval_mode_tightens(previous.mode, observed.mode)
             ):
-                await client.post(
-                    f"/v1/sessions/{url_component(session_id)}/events",
-                    json={
-                        "type": "external_codex_approval_mode_change",
-                        "data": {"helper_action": "tightening"},
-                    },
-                    timeout=5.0,
-                )
+                task = forwarder_state.helper_control_task
+                if task is None or task.done():
+                    if task is not None and not task.cancelled():
+                        task.exception()
+                    forwarder_state.helper_control_task = asyncio.create_task(
+                        _post_session_event(
+                            client,
+                            session_id,
+                            event_type="external_codex_approval_mode_change",
+                            data={"helper_action": "tightening"},
+                            max_attempts=1,
+                            timeout=5.0,
+                        ),
+                        name="codex-helper-tightening",
+                    )
 
 
 async def _maybe_fail_turn_on_certificate_failure(
@@ -8033,7 +8010,10 @@ async def _apply_child_resume(
                     turn_id=turn_id,
                     status="running",
                 )
-            elif status in {"completed", "failed", "interrupted"}:
+            elif (
+                status in {"completed", "failed", "interrupted"}
+                and turn_id not in child_stream.terminal_turn_ids
+            ):
                 update_active_child_turn(
                     bridge_dir, child_thread_id, session_id=child_session_id, turn_id=turn_id
                 )

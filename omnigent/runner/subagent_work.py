@@ -757,6 +757,16 @@ def list_subagent_work(parent_session_id: str) -> list[_SubagentWorkEntry]:
     return sorted(entries, key=lambda entry: entry.created_at)
 
 
+def list_active_codex_native_work(parent_session_id: str) -> list[_SubagentWorkEntry]:
+    """Active work sharing this parent's native Codex backend."""
+    return [
+        entry
+        for entry in list_subagent_work(parent_session_id)
+        if entry.status in {"launching", "running", "waiting"}
+        and is_codex_native_subagent_wrapper(entry.wrapper_label)
+    ]
+
+
 # Harness whose sub-agents live as threads inside the parent's own app-server.
 _CODEX_NATIVE_HARNESS = "codex-native"
 

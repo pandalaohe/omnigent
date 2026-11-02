@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, TypeAlias, cast
 
+import psutil
 import tomlkit
 import websockets
 from cachetools import TTLCache
@@ -2582,6 +2583,7 @@ class CodexNativeAppServer:
     auto_title_relay: asyncio.Server | None = field(default=None, init=False)
     _auto_title_relay_identity: tuple[int, int] | None = field(default=None, init=False)
     agent_pid: int | None = field(default=None, init=False)
+    process_start_stamp: float | None = field(default=None, init=False)
     resident_incarnation_id: str = field(default_factory=lambda: uuid.uuid4().hex, init=False)
     exit_confirmed: bool = field(default=False, init=False)
     process_exit_confirmed: bool = field(default=False, init=False)
@@ -2688,6 +2690,7 @@ class CodexNativeAppServer:
             app_server_env[CODEX_AUTO_TITLE_SOCKET_ENV] = str(self.socket_path)
         proc_env = codex_app_server_diagnostic_env(app_server_env)
         self.process_owner_lock = acquire_codex_native_process_owner_lock()
+        self.process_start_stamp = None
         try:
             self.proc = await asyncio.create_subprocess_exec(
                 *argv,
@@ -2700,6 +2703,10 @@ class CodexNativeAppServer:
                 **_proc.spawn_kwargs(),
             )
             self.resident_incarnation_id = uuid.uuid4().hex
+            with contextlib.suppress(psutil.Error):
+                self.process_start_stamp = _proc._process_start_stamp(
+                    psutil.Process(self.proc.pid)
+                )
             self._resident_spawned = True
             self.exit_confirmed = False
             self.process_exit_confirmed = False

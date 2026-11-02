@@ -350,13 +350,12 @@ def test_killpg_refuses_the_broadcast_group(monkeypatch: pytest.MonkeyPatch) -> 
     assert sent == []
 
 
-@pytest.mark.parametrize("signaler", [_proc._signal_identities, _proc.signal_process_snapshot])
-def test_identity_census_skips_reused_pid(monkeypatch: pytest.MonkeyPatch, signaler) -> None:
+def test_identity_census_skips_reused_pid(monkeypatch: pytest.MonkeyPatch) -> None:
     reused = Mock()
     reused.create_time.return_value = 200.0
     monkeypatch.setattr(_proc.psutil, "Process", lambda pid: reused)
 
-    signaler({43210: 100.0}, force=True)
+    _proc._signal_identities({43210: 100.0}, force=True)
 
     reused.kill.assert_not_called()
 
@@ -457,13 +456,15 @@ def test_kill_tree_reaps_descendant_that_left_process_group(
         child_pid = int(child_pid_path.read_text())
 
         if snapshot:
-            identities = _proc.snapshot_process_tree(proc.pid)
+            identities = _proc.snapshot_process_tree(
+                proc.pid, _proc._process_start_stamp(psutil.Process(proc.pid))
+            )
             assert child_pid in identities
             proc.kill()
             proc.wait(timeout=5)
             assert _proc.process_alive(child_pid)
-            _proc.signal_process_snapshot(identities, force=False)
-            _proc.signal_process_snapshot(identities, force=True)
+            _proc._signal_identities(identities, force=False)
+            _proc._signal_identities(identities, force=True)
         else:
             _proc.kill_tree(proc)
             proc.wait(timeout=5)

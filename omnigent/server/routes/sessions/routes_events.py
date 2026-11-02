@@ -4284,7 +4284,11 @@ def register_events_routes(
                     )
                 result = await runner_client.post(
                     f"/v1/sessions/{session_id}/events",
-                    json={"type": "codex_helpers_stop", "reason": body.data["helper_action"]},
+                    json={
+                        "type": "codex_helpers_stop",
+                        "reason": body.data["helper_action"],
+                        "children": body.data.get("children", {}),
+                    },
                     timeout=5.0,
                 )
                 result.raise_for_status()

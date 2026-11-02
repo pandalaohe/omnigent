@@ -186,6 +186,7 @@ async def test_start_uses_fresh_gateway_catalog_before_debug_models(
     workspace.mkdir()
     monkeypatch.setenv("CODEX_HOME", str(source_home))
     _disable_codex_startup_rpc(monkeypatch)
+    monkeypatch.setattr(codex_native_app_server._proc, "native_server_pid", lambda *_: None)
     probes: list[str] = []
 
     def _debug_catalog(codex_path: str, source: Path, *, timeout: float) -> dict[str, object]:
