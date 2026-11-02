@@ -53,6 +53,163 @@ async def _review_event_context():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tighten", [False, True])
+async def test_native_permission_frames_revoke_only_on_tightening(tmp_path, tighten):
+    state = codex_native_forwarder._CodexForwarderState(parent_session_id="conv_parent")
+    full = {"approvalPolicy": "never", "sandboxPolicy": {"type": "dangerFullAccess"}}
+    ask = {"approvalPolicy": "on-request", "sandboxPolicy": {"type": "workspaceWrite"}}
+    settings = [full, ask, ask] if tighten else [ask, full, full]
+    async with _review_event_context() as (client, posted, tracker, usage):
+        for fields in settings:
+            await codex_native_forwarder._handle_event(
+                client,
+                session_id="conv_parent",
+                bridge_dir=tmp_path,
+                event={
+                    "method": "thread/settings/updated",
+                    "params": {"threadId": "thread_parent", "threadSettings": fields},
+                },
+                expected_thread_id="thread_parent",
+                forwarder_state=state,
+                usage_coalescer=usage,
+                elicitation_tracker=tracker,
+            )
+        controls = [body for _, body in posted if body.get("data", {}).get("helper_action")]
+        assert len(controls) == int(tighten)
+        if tighten:
+            assert controls[0]["data"]["helper_action"] == "tightening"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario", ["terminal", "consumed", "deferred", "running", "unreadable", "corrupt", "hung"]
+)
+async def test_reconnect_reconciles_once_without_preloaded_mapping(tmp_path, scenario):
+    from omnigent.harnesses.codex_native import bridge
+
+    bridge.write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_parent",
+            socket_path="ws://127.0.0.1:1234",
+            thread_id="thread_parent",
+            codex_home=str(tmp_path / "home"),
+        ),
+    )
+    bridge.update_active_child_turn(
+        tmp_path, "thread_child", session_id="conv_child", turn_id="turn_child"
+    )
+    if scenario == "corrupt":
+        (tmp_path / "active_child_turns.json").write_text("{")
+    parent_turn = {"id": "turn_parent", "status": "completed", "items": []}
+    if scenario in {"consumed", "deferred"}:
+        parent_turn.update(
+            status="inProgress",
+            items=[
+                {
+                    "id": "wait",
+                    "type": "collabAgentToolCall",
+                    "tool": "wait",
+                    "status": "completed" if scenario == "consumed" else "inProgress",
+                    "receiverThreadIds": ["thread_child"],
+                    "agentsStates": {
+                        "thread_child": {
+                            "status": "completed" if scenario == "consumed" else "running"
+                        }
+                    },
+                }
+            ],
+        )
+    calls = []
+
+    class Client(_FakeCodexAppServerClient):
+        async def request(self, method, params):
+            calls.append((method, params))
+            if method == "thread/resume":
+                return {"result": {"thread": {"id": "thread_parent", "turns": []}}}
+            if params["threadId"] == "thread_parent":
+                return {"result": {"thread": {"id": "thread_parent", "turns": [parent_turn]}}}
+            if scenario == "hung":
+                await asyncio.Event().wait()
+            if scenario == "unreadable":
+                raise RuntimeError("unavailable")
+            return {
+                "result": {
+                    "thread": {
+                        "id": "thread_child",
+                        "turns": [
+                            {
+                                "id": "turn_child",
+                                "status": "inProgress" if scenario == "running" else "completed",
+                                "items": [],
+                            }
+                        ],
+                    }
+                }
+            }
+
+    state = codex_native_forwarder._CodexForwarderState(
+        parent_session_id="conv_parent", child_usage_baseline_dir=tmp_path
+    )
+    async with _review_event_context() as (client, posted, tracker, usage):
+        await asyncio.wait_for(
+            codex_native_forwarder._subscribe_until_ready(
+                Client(),
+                client,
+                session_id="conv_parent",
+                bridge_dir=tmp_path,
+                thread_id="thread_parent",
+                usage_coalescer=usage,
+                elicitation_tracker=tracker,
+                forwarder_state=state,
+            ),
+            timeout=2,
+        )
+        controls = [body for _, body in posted if body.get("data", {}).get("helper_action")]
+
+        def terminal():
+            return [
+                body
+                for path, body in posted
+                if path.endswith("conv_child/events")
+                and body.get("type") == "external_session_status"
+                and body["data"].get("status") == "idle"
+            ]
+
+        if scenario in {"running", "unreadable", "corrupt", "hung"}:
+            assert len(controls) == 1
+            assert controls[0]["data"]["helper_action"] == "recovery"
+        elif scenario == "deferred":
+            assert not terminal()
+            await codex_native_forwarder._handle_event(
+                client,
+                session_id="conv_parent",
+                bridge_dir=tmp_path,
+                event={
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread_parent",
+                        "turn": {"id": "turn_parent", "status": "completed"},
+                    },
+                },
+                usage_coalescer=usage,
+                elicitation_tracker=tracker,
+                expected_thread_id="thread_parent",
+                forwarder_state=state,
+            )
+            assert len(terminal()) == 1
+        else:
+            assert len(terminal()) == 1
+            assert terminal()[0]["data"].get("parent_turn_consumed", False) == (
+                scenario == "consumed"
+            )
+        count = len(calls)
+        await asyncio.sleep(0.06)
+        assert len(calls) == count, "recovery must not leave a retry task"
+        await state.close_child_streams()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("target", ["parent", "child"])
 async def test_retryable_error_preserves_helper_control_and_wait(
     tmp_path: Path, target: str
@@ -160,66 +317,6 @@ async def test_child_terminal_error_waits_for_parent_consumption(tmp_path: Path)
         )
         assert "thread_child" in state.deferred_child_terminal_edges
         await state.close_child_streams()
-
-
-@pytest.mark.asyncio
-async def test_pending_revocation_retries_surviving_and_new_helpers(tmp_path: Path) -> None:
-    from omnigent.harnesses.codex_native import bridge
-
-    bridge.write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_parent",
-            socket_path="ws://127.0.0.1:1234",
-            thread_id="thread_parent",
-            codex_home=str(tmp_path / "home"),
-            helper_stop_pending=True,
-        ),
-    )
-    bridge.update_active_child_turn(tmp_path, "survivor", turn_id="stale_turn")
-    # A reconnect recreates bridge state; only explicit revocation completion may clear it.
-    bridge.write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_parent",
-            socket_path="ws://127.0.0.1:1234",
-            thread_id="thread_parent",
-            codex_home=str(tmp_path / "home"),
-        ),
-    )
-    calls = []
-    retried = asyncio.Event()
-
-    class Client:
-        async def request(self, method, params):
-            calls.append((method, params))
-            if method == "thread/read":
-                return {
-                    "result": {
-                        "thread": {"turns": [{"id": "current_turn", "status": "inProgress"}]}
-                    }
-                }
-            if params["threadId"] == "new_helper":
-                retried.set()
-            return {"result": {}}
-
-    task = asyncio.create_task(
-        codex_native_forwarder._retry_pending_helper_stops(Client(), tmp_path)
-    )
-    try:
-        async with asyncio.timeout(1):
-            while not any(method == "turn/interrupt" for method, _params in calls):
-                await asyncio.sleep(0)
-            bridge.update_active_child_turn(tmp_path, "new_helper")
-            await retried.wait()
-        assert ("turn/interrupt", {"threadId": "survivor", "turnId": "current_turn"}) in calls
-        assert bridge.read_bridge_state(tmp_path).helper_stop_pending
-    finally:
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-    bridge.set_helper_stop_pending(tmp_path, False)
-    assert not bridge.read_bridge_state(tmp_path).helper_stop_pending
 
 
 @pytest.mark.asyncio

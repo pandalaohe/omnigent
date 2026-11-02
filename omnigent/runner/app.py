@@ -9832,18 +9832,11 @@ def create_runner_app(
             extra={"session_id": conversation_id},
         )
         _side_thread_id = body.get("codex_side_thread_id") if isinstance(body, dict) else None
-        if (
-            body_type in ("message", None)
-            and _session_harness_name(conversation_id) == "codex-native"
-            and not await _native_controls.retry_codex_native_helper_stop(conversation_id)
-        ):
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "error": "codex_helper_stop_pending",
-                    "detail": "Helper revocation is not confirmed; no new work was admitted.",
-                },
+        if body_type == "codex_helpers_stop":
+            stopped = await _native_controls.stop_codex_native_helpers(
+                conversation_id, str(body.get("reason", "recovery"))
             )
+            return JSONResponse(content={"helpers_stopped": stopped})
         if _side_thread_id:
             # Side-chat controls use the parent's bridge but target the child's
             # thread, leaving the parent's turn and message buffer untouched.
@@ -11912,6 +11905,84 @@ def create_runner_app(
     _require_os_env = _resource_routes.require_os_env
     _resolve_conversation_id = _resource_routes.resolve_conversation_id
 
+    async def _finish_codex_native_helpers(
+        parent: str,
+        bridge_dir: Path,
+        reason: str,
+        confirmed: bool,
+        children: dict[str, dict[str, str | None]],
+    ) -> bool:
+        ids = {sid for row in children.values() if (sid := row.get("session_id"))}
+        for entry in list_subagent_work(parent):
+            if (
+                entry.child_session_id in ids
+                and _subagent_work.is_codex_native_subagent_wrapper(entry.wrapper_label)
+                and entry.status in {"launching", "running", "waiting"}
+            ):
+                ids.add(entry.child_session_id)
+                entry.parent_turn_consumed = True
+                mark_subagent_work_terminal(entry.child_session_id, status="failed", output="")
+        summary = (
+            f"Codex helpers {'stopped' if confirmed else 'stop unconfirmed'} after {reason}: "
+            + ", ".join(sorted(ids) or children or {"unknown helpers": {}})
+            + ". Running helper work may be lost. Commands detached before the process "
+            "snapshot are outside this cleanup."
+        )
+
+        async def post_child(child: str) -> None:
+            response = await server_client.post(
+                f"/v1/sessions/{child}/events",
+                json={
+                    "type": "external_session_status",
+                    "data": {"status": "failed", "output": summary, "parent_turn_consumed": True},
+                },
+                timeout=0.5,
+            )
+            response.raise_for_status()
+
+        child_ids = sorted(ids)
+        receipts = await asyncio.gather(
+            *(post_child(child) for child in child_ids), return_exceptions=True
+        )
+        failed = [
+            child
+            for child, result in zip(child_ids, receipts, strict=True)
+            if isinstance(result, BaseException)
+        ]
+        if failed:
+            confirmed = False
+            summary += f" Public helper status unconfirmed: {failed}."
+        _session_inboxes.setdefault(parent, asyncio.Queue()).put_nowait(
+            {"type": "system_notice", "message": summary}
+        )
+        try:
+            response = await server_client.post(
+                f"/v1/sessions/{parent}/events",
+                json={
+                    "type": "external_conversation_item",
+                    "data": {
+                        "item_type": "error",
+                        "source_id": "codex-helpers:"
+                        + hashlib.sha256(
+                            (str(bridge_dir) + json.dumps(children, sort_keys=True)).encode()
+                        ).hexdigest(),
+                        "item_data": {
+                            "source": "execution",
+                            "code": "codex_helpers_stopped"
+                            if confirmed
+                            else "codex_helpers_stop_unconfirmed",
+                            "message": summary,
+                        },
+                    },
+                },
+                timeout=0.5,
+            )
+            response.raise_for_status()
+        except httpx.HTTPError:
+            _logger.warning("Codex helper stop report could not be persisted for %s", parent)
+            return False
+        return confirmed
+
     _native_controls = build_native_controls(
         _active_turns=_active_turns,
         _background_tasks=_background_tasks,
@@ -11949,6 +12020,7 @@ def create_runner_app(
         _session_spec_cache=_session_spec_cache,
         resource_registry=resource_registry,
         server_client=server_client,
+        _finish_codex_native_helpers=_finish_codex_native_helpers,
     )
     _codex_native_model_options = _native_controls.codex_native_model_options
     _handle_antigravity_native_permission_mode_change = (

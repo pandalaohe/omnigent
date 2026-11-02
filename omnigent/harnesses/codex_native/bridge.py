@@ -2181,7 +2181,16 @@ def set_helper_stop_pending(bridge_dir: Path, pending: bool) -> None:
             _write_bridge_state_unlocked(bridge_dir, replace(state, helper_stop_pending=pending))
 
 
-def read_active_child_turns(bridge_dir: Path) -> dict[str, dict[str, str | None]]:
+def clear_active_child_turns(bridge_dir: Path) -> None:
+    """Retire helper inventory after its backend is released or revocation finishes."""
+    with _bridge_state_lock(bridge_dir, _ACTIVE_CHILD_TURNS_LOCK_FILE):
+        _write_active_child_turns_unlocked(bridge_dir, {})
+    set_helper_stop_pending(bridge_dir, False)
+
+
+def read_active_child_turns(
+    bridge_dir: Path, *, strict: bool = False
+) -> dict[str, dict[str, str | None]]:
     """Read active child helper threads and their turn ids from the bridge directory."""
     if bridge_dir == Path():
         return {}
@@ -2189,12 +2198,18 @@ def read_active_child_turns(bridge_dir: Path) -> dict[str, dict[str, str | None]
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, ValueError):
+        if strict:
+            raise
         return {}
     if not isinstance(raw, dict):
+        if strict:
+            raise ValueError("Invalid Codex helper inventory")
         return {}
     result: dict[str, dict[str, str | None]] = {}
     for thread_id, info in raw.items():
         if not isinstance(thread_id, str) or not thread_id or not isinstance(info, dict):
+            if strict:
+                raise ValueError("Invalid Codex helper inventory entry")
             continue
         session_id = info.get("session_id")
         turn_id = info.get("turn_id")
@@ -2235,6 +2250,7 @@ def update_active_child_turn(
     """Record or update an active child helper thread and turn in the bridge directory."""
     if not thread_id or bridge_dir == Path():
         return
+    set_helper_stop_pending(bridge_dir, True)
     with _bridge_state_lock(bridge_dir, _ACTIVE_CHILD_TURNS_LOCK_FILE):
         entries = read_active_child_turns(bridge_dir)
         existing = entries.get(thread_id) or {}
@@ -2268,4 +2284,6 @@ def clear_active_child_turn(
             return False
         entries.pop(thread_id, None)
         _write_active_child_turns_unlocked(bridge_dir, entries)
+        if not entries:
+            set_helper_stop_pending(bridge_dir, False)
         return True

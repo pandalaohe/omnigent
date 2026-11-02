@@ -4674,7 +4674,15 @@ async def test_codex_workspace_switch_selects_generated_profile(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "scenario",
-    ["drained", "pending", "pending-restart", "hung", "native-full", "native-read-only"],
+    [
+        "drained",
+        "pending",
+        "pending-restart",
+        "hung",
+        "native-full",
+        "native-read-only",
+        "full-unknown",
+    ],
 )
 async def test_codex_native_approval_mode_tighten_stops_running_helpers_or_returns_409(
     tmp_path: Path,
@@ -4708,12 +4716,20 @@ async def test_codex_native_approval_mode_tighten_stops_running_helpers_or_retur
     monkeypatch.setattr(bridge, "bridge_dir_for_bridge_id", lambda _: bridge_dir)
     monkeypatch.setattr(native_controls, "_CODEX_HELPER_STOP_TIMEOUT_S", 0.05)
     monkeypatch.setattr(native_controls, "_CODEX_HELPER_STOP_POLL_S", 0.01)
+    monkeypatch.setattr(native_controls, "_CODEX_HELPER_PROCESS_GRACE_S", 0.01)
     selected = ""
 
     def _tmux(_socket: str, *args: str) -> None:
         nonlocal selected
-        if args[-1] in {"1", "2", "4"} and "-l" in args:
-            selected = {"1": "Ask for approval", "2": "Approve for me", "4": "Read Only"}[args[-1]]
+        if selected == "Full Access" and args[-1] == "1":
+            return
+        if args[-1] in {"1", "2", "3", "4"} and "-l" in args:
+            selected = {
+                "1": "Ask for approval",
+                "2": "Approve for me",
+                "3": "Full Access",
+                "4": "Read Only",
+            }[args[-1]]
 
     def _capture(*_args: object) -> str:
         if selected:
@@ -4777,6 +4793,8 @@ async def test_codex_native_approval_mode_tighten_stops_running_helpers_or_retur
 
         async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
             if method == "thread/resume":
+                if scenario == "full-unknown":
+                    raise RuntimeError("temporary read failure")
                 return {
                     "result": {
                         "approvalPolicy": "never" if scenario == "native-full" else "on-request",
@@ -4832,9 +4850,9 @@ async def test_codex_native_approval_mode_tighten_stops_running_helpers_or_retur
                     f"/v1/sessions/{conv_id}/events",
                     json={
                         "type": "codex_approval_mode_change",
-                        "approval_mode": "approve-for-me"
-                        if scenario.startswith("native-")
-                        else "read-only",
+                        "approval_mode": "full-access"
+                        if scenario == "full-unknown"
+                        else ("approve-for-me" if scenario.startswith("native-") else "read-only"),
                     },
                 )
             )
@@ -4862,28 +4880,26 @@ async def test_codex_native_approval_mode_tighten_stops_running_helpers_or_retur
                         "content": [{"type": "input_text", "text": "continue"}],
                     },
                 )
-                assert retry.status_code == 409, retry.text
-                assert len(interrupted) == 2
+                assert retry.status_code != 409, retry.text
+                assert len(interrupted) == 1
         elif scenario == "pending":
             retry = await client.post(
                 f"/v1/sessions/{conv_id}/events",
                 json={"type": "message", "content": [{"type": "input_text", "text": "continue"}]},
             )
-            assert retry.status_code == 409, retry.text
-            assert len(interrupted) == 2, "next work must retry pending revocation"
+            assert retry.status_code != 409, retry.text
+            assert len(interrupted) == 1, "next work must not retry revocation"
     await asyncio.gather(*drain_tasks)
     expected_interrupt = [
         ("turn/interrupt", {"threadId": "thread_helper_t24", "turnId": "turn_helper_t24"})
     ]
     assert interrupted == (
-        []
-        if scenario == "native-read-only"
-        else expected_interrupt * (2 if scenario.startswith("pending") else 1)
+        [] if scenario in {"native-read-only", "full-unknown"} else expected_interrupt
     )
-    assert response.status_code == (200 if scenario in {"drained", "native-read-only"} else 409), (
-        response.text
-    )
-    if scenario not in {"drained", "native-read-only"}:
+    assert response.status_code == (
+        200 if scenario in {"drained", "native-read-only", "full-unknown"} else 409
+    ), response.text
+    if scenario not in {"drained", "native-read-only", "full-unknown"}:
         assert response.json()["error"] == "codex_helper_stop_pending"
 
 

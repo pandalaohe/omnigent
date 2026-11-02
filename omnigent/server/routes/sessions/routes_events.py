@@ -4267,6 +4267,28 @@ def register_events_routes(
             )
             return {"queued": False}
         if body.type == _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE:
+            if isinstance(body.data, dict) and body.data.get("helper_action") in {
+                "recovery",
+                "tightening",
+            }:
+                from omnigent._wrapper_labels import CODEX_NATIVE_WRAPPER_VALUE, WRAPPER_LABEL_KEY
+
+                if conv.labels.get(WRAPPER_LABEL_KEY) != CODEX_NATIVE_WRAPPER_VALUE:
+                    raise OmnigentError(
+                        "Helper control requires Codex native", code=ErrorCode.INVALID_INPUT
+                    )
+                runner_client = await _get_runner_client(session_id, runner_router)
+                if runner_client is None:
+                    raise OmnigentError(
+                        "Runner unavailable for helper control", code=ErrorCode.RUNNER_UNAVAILABLE
+                    )
+                result = await runner_client.post(
+                    f"/v1/sessions/{session_id}/events",
+                    json={"type": "codex_helpers_stop", "reason": body.data["helper_action"]},
+                    timeout=5.0,
+                )
+                result.raise_for_status()
+                return result.json()
             await _persist_external_codex_approval_mode_change(
                 session_id,
                 conv,

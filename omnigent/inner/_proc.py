@@ -338,6 +338,40 @@ def _signal_identities(identities: dict[int, float], *, force: bool) -> None:
             continue
 
 
+def snapshot_process_tree(pid: int) -> dict[int, float]:
+    """Capture ancestry before teardown; detached processes are outside this snapshot."""
+    try:
+        root = psutil.Process(pid)
+        processes = [root, *root.children(recursive=True)]
+        return {
+            proc.pid: _process_start_stamp(proc)
+            for proc in processes
+            if proc.pid > 1 and proc.pid != os.getpid()
+        }
+    except psutil.NoSuchProcess:
+        return {}
+
+
+def signal_process_snapshot(identities: dict[int, float], *, force: bool) -> None:
+    """Signal recorded identities without adopting new descendants or process groups."""
+    _signal_identities(identities, force=force)
+
+
+def surviving_process_snapshot(identities: dict[int, float]) -> dict[int, float]:
+    """Return live or unreadable identities; PID reuse is never a survivor."""
+    surviving = {}
+    for pid, stamp in identities.items():
+        try:
+            proc = psutil.Process(pid)
+            if _process_start_stamp(proc) == stamp and proc.status() != psutil.STATUS_ZOMBIE:
+                surviving[pid] = stamp
+        except psutil.NoSuchProcess:
+            pass
+        except psutil.AccessDenied:
+            surviving[pid] = stamp
+    return surviving
+
+
 def _identity_in_group(identities: dict[int, float], pgid: int) -> bool:
     """Whether the group still contains at least one identity we observed."""
     if _getpgid_fn is None:

@@ -277,6 +277,10 @@ async def teardown_codex_native_app_server(session_id: str) -> None:
         _AUTO_CODEX_BRIDGE_DIRS.pop(session_id, None)
     with contextlib.suppress(Exception):
         await _close_native_backend(session_id, "codex-native", app_server)
+    if bridge_dir is not None and getattr(app_server, "exit_confirmed", False):
+        from omnigent.harnesses.codex_native.bridge import clear_active_child_turns
+
+        clear_active_child_turns(bridge_dir)
 
 
 async def teardown_all_codex_native_app_servers() -> None:
