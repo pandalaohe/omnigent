@@ -366,16 +366,22 @@ def _page_header_geometry(page: Page, heading: str, *, scroll: bool = False) -> 
         }""",
         scroll,
     )
-    menu_box = page.get_by_role("button", name="Open sidebar", exact=True).bounding_box()
+    menu = page.get_by_role("button", name="Open sidebar", exact=True)
+    menu_box = menu.bounding_box() if menu.count() else None
     title_box = title.bounding_box()
-    assert title_box is not None and menu_box is not None
+    assert title_box is not None
     horizontal = (
-        title_box["x"] < menu_box["x"] + menu_box["width"]
+        menu_box is not None
+        and title_box["x"] < menu_box["x"] + menu_box["width"]
         and title_box["x"] + title_box["width"] > menu_box["x"]
     )
-    overlap = horizontal and (
-        title_box["y"] < menu_box["y"] + menu_box["height"]
-        and title_box["y"] + title_box["height"] > menu_box["y"]
+    overlap = (
+        horizontal
+        and menu_box is not None
+        and (
+            title_box["y"] < menu_box["y"] + menu_box["height"]
+            and title_box["y"] + title_box["height"] > menu_box["y"]
+        )
     )
     return {
         "title": title_box,
@@ -403,30 +409,104 @@ def test_scrolled_usage_clears_closed_navigation_at_landscape_widths(
     page.screenshot(path=str(output / f"usage-closed-{width}x{height}.png"))
     (output / f"usage-closed-{width}x{height}.json").write_text(json.dumps(geometry, indent=2))
     assert not geometry["overlap"], geometry
+    expected_top, expected_padding = (56, "24px") if width < 1040 else (0, "80px")
+    violations = []
+    if (
+        geometry["viewport"]["rect"]["top"] != expected_top
+        or geometry["viewport"]["padding_top"] != expected_padding
+    ):
+        violations.append(geometry["viewport"])
     page.get_by_role("button", name="Open sidebar", exact=True).click()
     viewport = page.locator("main[data-shell-header] > div").first
-    expect(viewport).to_have_css("margin-top", "0px")
-    expect(viewport).to_have_css("padding-top", "80px")
+    geometry["sidebar_open"] = viewport.evaluate(
+        """element => ({rect: element.getBoundingClientRect().toJSON(),
+            padding_top: getComputedStyle(element).paddingTop,
+            horizontal_overflow: element.scrollWidth > element.clientWidth})"""
+    )
+    if (
+        geometry["sidebar_open"]["rect"]["top"] != expected_top
+        or geometry["sidebar_open"]["padding_top"] != expected_padding
+    ):
+        violations.append(geometry["sidebar_open"])
+    expect(page.get_by_role("heading", name="Usage", level=1, exact=True)).to_be_visible()
+    assert not geometry["sidebar_open"]["horizontal_overflow"], geometry
+    page.screenshot(path=str(output / f"usage-open-{width}x{height}.png"))
     _settle_closed_sidebar(page, width, height)
     geometry["after_sidebar_cycle"] = _page_header_geometry(page, "Usage", scroll=True)
     (output / f"usage-closed-{width}x{height}.json").write_text(json.dumps(geometry, indent=2))
     assert geometry["after_sidebar_cycle"]["viewport"]["scroll_top"] > 0, geometry
     assert not geometry["after_sidebar_cycle"]["overlap"], geometry
+    assert not violations, violations
     assert not errors, errors
 
 
-@pytest.mark.parametrize(
-    ("route", "heading"),
-    [
-        ("/usage", "Usage"),
-        ("/tasks", "Automations"),
-        ("/inbox", "Inbox"),
-        ("/system", "System status"),
-    ],
-)
-def test_page_clearance_follows_measured_horizontal_boundary(
-    page: Page, pages_url: str, route: str, heading: str, request: pytest.FixtureRequest
+_PAGE_SCROLL_CALLERS = [
+    ("/usage", "Usage", "UsagePage.tsx"),
+    ("/tasks", "Automations", "TasksPage.tsx"),
+    ("/tasks/layout-example", "Example automation", "TaskDetailPage.tsx"),
+    ("/inbox", "Inbox", "InboxPage.tsx"),
+    ("/system", "System status", "SystemStatusPage.tsx"),
+    ("/settings/general", "General", "SettingsPage.tsx"),
+    ("/settings/system-status", "System status", "SettingsPage.tsx"),
+    ("/settings/instructions", "Instructions", "InstructionsPage.tsx"),
+    ("/settings/policies", "Global Policies", "PoliciesPage.tsx"),
+    ("/settings/members", "Members", "MembersPage.tsx"),
+    ("/settings/sharing", "Session sharing", "SharingPage.tsx"),
+]
+
+
+@pytest.mark.parametrize(("route", "heading", "caller"), _PAGE_SCROLL_CALLERS)
+def test_page_clearance_uses_shared_threshold(
+    page: Page,
+    pages_url: str,
+    browser_contract: BrowserContract,
+    route: str,
+    heading: str,
+    caller: str,
+    request: pytest.FixtureRequest,
 ) -> None:
+    # Keep the browser sweep complete when a new routed caller is introduced.
+    source = Path(__file__).resolve().parents[2] / "web/src"
+    callers = {
+        path.name
+        for path in source.rglob("*.tsx")
+        if "<PageScroll" in path.read_text() and path.name != "PageScroll.tsx"
+    }
+    swept = {values[2] for values in _PAGE_SCROLL_CALLERS}
+    assert callers == swept, "Add every new PageScroll caller to the layout sweep"
+    if route in ("/settings/members", "/settings/sharing"):
+        browser_contract.json(
+            "/v1/info",
+            {"accounts_enabled": False, "single_user": False, "features": {}},
+        )
+        browser_contract.json("/auth/users", {"users": []})
+    elif route == "/tasks/layout-example":
+        browser_contract.json(
+            "/v1/scheduled-tasks/layout-example",
+            {
+                "id": "layout-example",
+                "name": "Example automation",
+                "prompt": "Example task",
+                "rrule": "FREQ=DAILY",
+                "timezone": "UTC",
+                "created_at": 1,
+                "updated_at": 1,
+                "agent_id": "example-agent",
+                "execution_target": "connected_host",
+                "state": "active",
+                "host_id": None,
+                "workspace": None,
+                "owner_user_id": None,
+                "model_override": None,
+                "reasoning_effort": None,
+                "permission_mode": None,
+                "last_run_at": None,
+                "last_run_status": None,
+                "last_run_conversation_id": None,
+                "next_run_at": None,
+            },
+        )
+        browser_contract.json("/v1/scheduled-tasks/layout-example/runs", {"runs": []})
     errors: list[str] = []
     page.on("pageerror", lambda error: errors.append(str(error)))
     page.set_viewport_size({"width": 768, "height": 390})
@@ -436,39 +516,51 @@ def test_page_clearance_follows_measured_horizontal_boundary(
         expect(page.get_by_text("Total cost", exact=True)).to_be_visible()
     elif route == "/system":
         expect(page.get_by_text("No hosts connected.", exact=True)).to_be_visible()
-    lower, upper = 768, 1440
-    while lower < upper:
-        width = (lower + upper) // 2
-        _settle_closed_sidebar(page, width, 390)
-        if _page_header_geometry(page, heading)["horizontal"]:
-            lower = width + 1
-        else:
-            upper = width
-    first_disjoint = lower
+    pinned_settings_sidebar = route.startswith("/settings/")
+    first_disjoint = 768
+    if not pinned_settings_sidebar:
+        lower, upper = 768, 1440
+        while lower < upper:
+            width = (lower + upper) // 2
+            _settle_closed_sidebar(page, width, 390)
+            if _page_header_geometry(page, heading)["horizontal"]:
+                lower = width + 1
+            else:
+                upper = width
+        first_disjoint = lower
     measurements = []
     violations = []
-    for width in sorted({768, 844, 1024, 1440, max(768, first_disjoint - 1), first_disjoint}):
-        _settle_closed_sidebar(page, width, 390)
+    for width in sorted(
+        {768, 844, 1024, 1039, 1040, 1041, 1440, max(768, first_disjoint - 1), first_disjoint}
+    ):
+        if pinned_settings_sidebar:
+            page.set_viewport_size({"width": width, "height": 390})
+            expect(page.locator(".app-shell")).to_have_attribute("data-sidebar-open", "true")
+        else:
+            _settle_closed_sidebar(page, width, 390)
         geometry = _page_header_geometry(page, heading)
         geometry["width"] = width
         measurements.append(geometry)
-        if geometry["horizontal"]:
+        if width < 1040:
             if (
-                geometry["viewport"]["rect"]["top"]
-                < geometry["menu"]["y"] + geometry["menu"]["height"]
+                geometry["viewport"]["rect"]["top"] != 56
+                or geometry["viewport"]["padding_top"] != "24px"
             ):
                 violations.append(geometry)
         elif (
             geometry["viewport"]["rect"]["top"] != 0
             or geometry["viewport"]["padding_top"] != "80px"
+            or geometry["horizontal"]
         ):
             violations.append(geometry)
     output = Path(request.config.getoption("output"))
     output.mkdir(parents=True, exist_ok=True)
-    (output / f"{route.strip('/')}-horizontal-boundary.json").write_text(
+    (output / f"{route.strip('/').replace('/', '-')}-horizontal-boundary.json").write_text(
         json.dumps(
             {
-                "first_disjoint": first_disjoint,
+                "first_disjoint": None if pinned_settings_sidebar else first_disjoint,
+                "sidebar_pinned_open": pinned_settings_sidebar,
+                "caller": caller,
                 "measurements": measurements,
             },
             indent=2,
