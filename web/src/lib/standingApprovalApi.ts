@@ -1,7 +1,7 @@
 import { authenticatedFetch } from "./identity";
 import { apiErrorFromResponse } from "./sessionsApi";
 
-export interface StandingPassRecord {
+export interface StandingApprovalRecord {
   kinds: string[];
   exceptions: string[];
   since: number;
@@ -13,30 +13,30 @@ export interface StandingPassRecord {
   }[];
 }
 
-export interface StandingPassState {
+export interface StandingApprovalState {
   root_id: string;
-  record: StandingPassRecord;
+  record: StandingApprovalRecord;
 }
 
-export async function getStandingPass(
+export async function getStandingApproval(
   sessionId: string,
   signal?: AbortSignal,
-): Promise<StandingPassState> {
+): Promise<StandingApprovalState> {
   const response = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(sessionId)}/standing-pass`,
+    `/v1/sessions/${encodeURIComponent(sessionId)}/standing-approval`,
     { signal },
   );
   if (!response.ok) throw await apiErrorFromResponse(response);
   return response.json();
 }
 
-export async function changeStandingPass(
+export async function changeStandingApproval(
   sessionId: string,
   op: "revoke" | "grant",
   kind: string,
-): Promise<StandingPassState> {
+): Promise<StandingApprovalState> {
   const response = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(sessionId)}/standing-pass`,
+    `/v1/sessions/${encodeURIComponent(sessionId)}/standing-approval`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },

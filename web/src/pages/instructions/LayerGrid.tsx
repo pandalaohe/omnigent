@@ -45,7 +45,7 @@ export function LayerGrid({
     (layer) =>
       layer.host_removed &&
       (role === "route"
-        ? layer.scope !== "mother" && layer.scope !== "child"
+        ? layer.scope !== "parent" && layer.scope !== "child"
         : layer.scope === role),
   );
   const cell = (key: LayerKey, title: string) => {
@@ -90,7 +90,7 @@ export function LayerGrid({
       <p className="text-sm text-muted-foreground">
         Shared → Agent → Host.{" "}
         {role === "route"
-          ? "An independent cell replaces all three on its route. Mother and child instructions apply afterwards."
+          ? "An independent cell replaces all three on its route. Parent and child instructions apply afterwards."
           : `An independent cell replaces only these ${role} instructions. Shared instructions still apply.`}
       </p>
       <div className="max-h-[32rem] overflow-auto rounded-lg border">
@@ -98,7 +98,7 @@ export function LayerGrid({
           <caption className="sr-only">
             {role === "route"
               ? "Instruction layers by host and agent"
-              : `${role === "mother" ? "Mother" : "Child"} instruction layers by host and agent`}
+              : `${role === "parent" ? "Parent" : "Child"} instruction layers by host and agent`}
           </caption>
           <thead>
             <tr className="border-b bg-muted/40">

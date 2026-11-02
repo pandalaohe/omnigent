@@ -43,7 +43,7 @@ import type {
   SessionBtwSidechatEvent,
   SessionChangedFilesInvalidatedEvent,
   SessionChildSessionUpdatedEvent,
-  SessionStandingPassEvent,
+  SessionStandingApprovalEvent,
   SessionModelOptionsEvent,
   SessionCreatedEvent,
   SessionInputConsumedEvent,
@@ -1016,10 +1016,13 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       child: child as Record<string, unknown>,
     } satisfies SessionChildSessionUpdatedEvent;
   }
-  if (eventType === "session.standing_pass") {
+  if (eventType === "session.standing_approval") {
     const conversationId = data.conversation_id;
     if (typeof conversationId !== "string" || !conversationId) return null;
-    return { type: "session_standing_pass", conversationId } satisfies SessionStandingPassEvent;
+    return {
+      type: "session_standing_approval",
+      conversationId,
+    } satisfies SessionStandingApprovalEvent;
   }
   if (eventType === "session.changed_files.invalidated") {
     const sessionId = data.session_id;

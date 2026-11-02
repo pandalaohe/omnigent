@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { AgentPicker } from "@/components/AgentPicker";
 import { useHarnessCapabilities } from "@/lib/agentLabels";
 import { PageScroll } from "@/components/PageScroll";
@@ -60,11 +60,27 @@ export function InstructionsPage() {
   const session = params.get("session");
   const roleParam = params.get("role");
   const role: InstructionRole =
-    roleParam === "mother" || roleParam === "child" ? roleParam : "route";
+    roleParam === "parent" || roleParam === "mother"
+      ? "parent"
+      : roleParam === "child"
+        ? "child"
+        : "route";
   const requestedRole = useRef<string>(role);
   useLayoutEffect(() => {
     requestedRole.current = role;
   }, [role]);
+  useEffect(() => {
+    if (roleParam === "mother") {
+      setParams(
+        (previous) => {
+          const next = new URLSearchParams(previous);
+          next.set("role", "parent");
+          return next;
+        },
+        { replace: true },
+      );
+    }
+  }, [roleParam, setParams]);
   const view = session || params.get("view") === "route" ? "route" : "overview";
   const hostId = params.get("host") ?? hosts.data?.[0]?.host_id ?? "";
   const agentKey = params.get("agent") ?? data.data?.agents[0]?.key ?? "";
@@ -251,7 +267,7 @@ export function InstructionsPage() {
               >
                 <TabsList aria-label="Instruction grid">
                   <TabsTrigger value="route">Shared instructions</TabsTrigger>
-                  <TabsTrigger value="mother">Mother</TabsTrigger>
+                  <TabsTrigger value="parent">Parent</TabsTrigger>
                   <TabsTrigger value="child">Child</TabsTrigger>
                 </TabsList>
                 <TabsContent value={role} className="mt-2">
@@ -294,7 +310,7 @@ export function InstructionsPage() {
                         host,
                         agent,
                         ...(role === "route" ? {} : { child: role === "child" ? "1" : "0" }),
-                        ...(role === "mother" ? { spawn: "1" } : {}),
+                        ...(role === "parent" ? { spawn: "1" } : {}),
                       })
                     }
                   />
@@ -411,7 +427,7 @@ export function InstructionsPage() {
             name={removal.name}
             layers={removal.layers.map((layer) => ({
               id: layerId(layer),
-              grid: layer.scope === "mother" || layer.scope === "child" ? layer.scope : "route",
+              grid: layer.scope === "parent" || layer.scope === "child" ? layer.scope : "route",
               label:
                 layerShape(layer) === "agent"
                   ? (data.data?.agents.find((agent) => agent.key === layer.agent_key)

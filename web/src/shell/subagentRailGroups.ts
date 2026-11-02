@@ -68,7 +68,7 @@ function titleLabel(title: string | null | undefined): string | null {
  * description / nickname / role) — their ``session_name`` is an opaque
  * correlation id. A session snapshot has no ``tool``, so the vendor label
  * helpers and the title head stand in for it. Everything else prefers the
- * name the mother gave the child (``session_name``, else the title's
+ * name the parent gave the child (``session_name``, else the title's
  * label) over the auto-generated task summary.
  */
 export function childPrimaryLabel(child: ChildSessionLike): string {

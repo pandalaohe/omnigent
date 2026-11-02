@@ -1,12 +1,12 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { StandingPassChip } from "./StandingPassChip";
+import { StandingApprovalChip } from "./StandingApprovalChip";
 
 const { fetchMock } = vi.hoisted(() => ({ fetchMock: vi.fn() }));
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: fetchMock }));
 const initial = {
-  root_id: "mother",
+  root_id: "parent",
   record: {
     kinds: ["install", "merge"],
     exceptions: ["server release"],
@@ -15,12 +15,12 @@ const initial = {
   },
 };
 const clients: QueryClient[] = [];
-function mount(sessionId = "mother", readOnly = false) {
+function mount(sessionId = "parent", readOnly = false) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   clients.push(client);
   render(
     <QueryClientProvider client={client}>
-      <StandingPassChip sessionId={sessionId} readOnly={readOnly} />
+      <StandingApprovalChip sessionId={sessionId} readOnly={readOnly} />
     </QueryClientProvider>,
   );
   return client;
@@ -32,12 +32,12 @@ afterEach(() => {
   vi.resetAllMocks();
 });
 
-describe("standing pass chip", () => {
+describe("standing approval chip", () => {
   it.each(["before", "during"])(
     "does not let a GET started %s revoke overwrite the successful change",
     async (when) => {
       const client = mount();
-      fireEvent.click(await screen.findByRole("button", { name: "Standing pass: 2 active" }));
+      fireEvent.click(await screen.findByRole("button", { name: "Standing approval: 2 active" }));
       let finishRead!: (value: unknown) => void;
       let finishWrite!: (value: unknown) => void;
       const staleRead = new Promise((done) => {
@@ -49,10 +49,12 @@ describe("standing pass chip", () => {
       fetchMock.mockImplementation((_url: string, init?: RequestInit) =>
         init?.method === "POST" ? mutation : staleRead,
       );
-      if (when === "before") void client.refetchQueries({ queryKey: ["standing-pass", "mother"] });
+      if (when === "before")
+        void client.refetchQueries({ queryKey: ["standing-approval", "parent"] });
       fireEvent.click(screen.getByRole("button", { name: "Revoke install" }));
       await screen.findByText("Revoking…");
-      if (when === "during") void client.refetchQueries({ queryKey: ["standing-pass", "mother"] });
+      if (when === "during")
+        void client.refetchQueries({ queryKey: ["standing-approval", "parent"] });
       finishWrite({
         ok: true,
         json: async () => ({
@@ -70,12 +72,14 @@ describe("standing pass chip", () => {
         await staleRead;
       });
       expect(screen.getByRole("button", { name: "Grant back install" })).toBeInTheDocument();
-      expect(screen.getByRole("button", { name: "Standing pass: 1 active" })).toBeInTheDocument();
+      expect(
+        screen.getByRole("button", { name: "Standing approval: 1 active" }),
+      ).toBeInTheDocument();
     },
   );
   it("revokes a kind and keeps grant pending until the server approval finishes", async () => {
     mount();
-    fireEvent.click(await screen.findByRole("button", { name: "Standing pass: 2 active" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Standing approval: 2 active" }));
     expect(screen.getByText("server release")).toBeInTheDocument();
     const revoked = {
       ...initial,
@@ -89,7 +93,7 @@ describe("standing pass chip", () => {
     fireEvent.click(screen.getByRole("button", { name: "Revoke install" }));
     await screen.findByRole("button", { name: "Grant back install" });
     expect(fetchMock).toHaveBeenLastCalledWith(
-      "/v1/sessions/mother/standing-pass",
+      "/v1/sessions/parent/standing-approval",
       expect.objectContaining({ body: JSON.stringify({ op: "revoke", kinds: ["install"] }) }),
     );
     let resolve!: (value: unknown) => void;
@@ -107,7 +111,7 @@ describe("standing pass chip", () => {
 
   it("shows children and read-only viewers no mutation controls, and refreshes on invalidation", async () => {
     const client = mount("child");
-    fireEvent.click(await screen.findByRole("button", { name: "Standing pass: 2 active" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Standing approval: 2 active" }));
     expect(
       screen.getByText("Inherited from the parent session. Read-only here."),
     ).toBeInTheDocument();
@@ -116,33 +120,33 @@ describe("standing pass chip", () => {
       ok: true,
       json: async () => ({ ...initial, record: { ...initial.record, kinds: [] } }),
     });
-    await client.invalidateQueries({ queryKey: ["standing-pass", "child"] });
+    await client.invalidateQueries({ queryKey: ["standing-approval", "child"] });
     await waitFor(() =>
-      expect(screen.getByRole("button", { name: "Standing pass: none" })).toBeInTheDocument(),
+      expect(screen.getByRole("button", { name: "Standing approval: none" })).toBeInTheDocument(),
     );
   });
 
   it("shows read-only viewers no mutation controls", async () => {
-    mount("mother", true);
-    fireEvent.click(await screen.findByRole("button", { name: "Standing pass: 2 active" }));
+    mount("parent", true);
+    fireEvent.click(await screen.findByRole("button", { name: "Standing approval: 2 active" }));
     expect(screen.queryByRole("button", { name: "Revoke install" })).toBeNull();
   });
 
   it("reports a failed load and retries", async () => {
     fetchMock.mockRejectedValueOnce(new Error("offline"));
     mount();
-    fireEvent.click(await screen.findByRole("button", { name: "Standing pass: unavailable" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Standing approval: unavailable" }));
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     await screen.findByRole("button", { name: "Revoke install" });
   });
 
-  it("keeps the current pass when a mutation fails", async () => {
+  it("keeps the current approval when a mutation fails", async () => {
     mount();
-    fireEvent.click(await screen.findByRole("button", { name: "Standing pass: 2 active" }));
-    fetchMock.mockRejectedValueOnce(new Error("Standing pass grant was not approved"));
+    fireEvent.click(await screen.findByRole("button", { name: "Standing approval: 2 active" }));
+    fetchMock.mockRejectedValueOnce(new Error("Standing approval grant was not approved"));
     fireEvent.click(screen.getByRole("button", { name: "Revoke install" }));
     await screen.findByRole("alert");
     expect(screen.getByRole("button", { name: "Revoke install" })).not.toBeDisabled();
-    expect(screen.getByRole("button", { name: "Standing pass: 2 active" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Standing approval: 2 active" })).toBeInTheDocument();
   });
 });

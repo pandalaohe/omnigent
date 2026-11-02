@@ -5,8 +5,8 @@ import type { HarnessCapability } from "@/lib/agentLabels";
 import type { InstructionGridLayout } from "@/lib/instructionGridPreferences";
 import { authenticatedFetch } from "@/lib/identity";
 
-export type LayerScope = "shared" | "agent" | "host" | "independent" | "mother" | "child";
-export type InstructionRole = "route" | "mother" | "child";
+export type LayerScope = "shared" | "agent" | "host" | "independent" | "parent" | "child";
+export type InstructionRole = "route" | "parent" | "child";
 export interface LayerKey {
   scope: LayerScope;
   agent_key: string;
@@ -16,7 +16,7 @@ export function layerId(key: LayerKey) {
   return JSON.stringify([key.scope, key.agent_key, key.host_id]);
 }
 export function layerShape(key: LayerKey): "shared" | "agent" | "host" | "independent" {
-  if (key.scope !== "mother" && key.scope !== "child") return key.scope;
+  if (key.scope !== "parent" && key.scope !== "child") return key.scope;
   if (key.agent_key) return key.host_id ? "independent" : "agent";
   return key.host_id ? "host" : "shared";
 }

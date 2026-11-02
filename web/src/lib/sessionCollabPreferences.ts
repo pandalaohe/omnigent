@@ -128,6 +128,8 @@ function normalizePreferences(value: unknown): SessionCollabPreferences {
   if (!value || typeof value !== "object" || Array.isArray(value))
     return { ...SESSION_COLLAB_DEFAULTS, quotaPeriods: {} };
   const raw = value as Record<string, unknown>;
+  const standingPassDefault =
+    raw.standingPassDefault !== undefined ? raw.standingPassDefault : raw.standingApprovalDefault;
   const low = normalizePercentage(raw.quotaLowBelowPct, 0, 100);
   const tight = normalizePercentage(raw.quotaTightBelowPct, 0, 100);
   const validThresholds = low !== null && tight !== null && low > 0 && low < tight;
@@ -174,15 +176,15 @@ function normalizePreferences(value: unknown): SessionCollabPreferences {
         ? raw.childCap
         : null,
     standingPassDefault:
-      Array.isArray(raw.standingPassDefault) &&
-      raw.standingPassDefault.length <= 32 &&
-      raw.standingPassDefault.every(
+      Array.isArray(standingPassDefault) &&
+      standingPassDefault.length <= 32 &&
+      standingPassDefault.every(
         (kind: unknown) =>
           typeof kind === "string" && kind.trim().length > 0 && [...kind].length <= 120,
       )
         ? [
             ...new Set(
-              (raw.standingPassDefault as string[]).map((kind) => kind.trim().replace(/\s+/g, " ")),
+              (standingPassDefault as string[]).map((kind) => kind.trim().replace(/\s+/g, " ")),
             ),
           ]
         : [],

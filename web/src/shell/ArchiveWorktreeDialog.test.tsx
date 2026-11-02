@@ -108,7 +108,7 @@ describe("archive policy prompt", () => {
     fireEvent.click(screen.getByRole("button", { name: "Archive" }));
     expect(proceed).toHaveBeenCalledWith(new Set(["one"]), "green_only");
   });
-  it("lists child worktrees when the mother has no worktree and updates keep reasons", async () => {
+  it("lists child worktrees when the parent has no worktree and updates keep reasons", async () => {
     vi.mocked(fetchSessionWorktreeStatus).mockResolvedValue({
       own: {
         state: "none",

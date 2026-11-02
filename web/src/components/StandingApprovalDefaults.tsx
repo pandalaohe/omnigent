@@ -13,7 +13,7 @@ const KINDS = [
   { key: "release", label: "Release" },
 ];
 
-export function StandingPassDefaults() {
+export function StandingApprovalDefaults() {
   const preferences = useSessionCollabPreferences();
   const [extra, setExtra] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -37,7 +37,7 @@ export function StandingPassDefaults() {
   };
   return (
     <div className="mt-5 space-y-3 border-t border-border pt-4">
-      <h3 className="text-sm font-medium">Default standing pass</h3>
+      <h3 className="text-sm font-medium">Default standing approval</h3>
       <p className="text-sm text-muted-foreground">
         Allow these kinds of actions for new parent sessions and their children. Project exceptions
         and actions that always require approval still apply. Changes affect new sessions only.
@@ -81,7 +81,7 @@ export function StandingPassDefaults() {
         ))}
       <div className="flex flex-wrap items-end gap-2">
         <label className="min-w-0 flex-1 text-sm font-medium">
-          Extra standing pass kind
+          Extra standing approval kind
           <Input
             className="mt-1"
             value={extra}

@@ -170,7 +170,7 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("InstructionsPage", () => {
-  it("saves the Mother grid's Codex row with its role key", async () => {
+  it("saves the Parent grid's Codex row with its role key", async () => {
     page();
     const table = screen.getByRole("table", { name: "Instruction layers by host and agent" });
     expect(within(table).getByRole("columnheader", { name: /^Laptop/ })).toBeVisible();
@@ -179,25 +179,25 @@ describe("InstructionsPage", () => {
       table.compareDocumentPosition(screen.getByRole("heading", { name: "Child sessions" })) &
         Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
-    await userEvent.click(screen.getByRole("tab", { name: "Mother" }));
-    expect(screen.getByTestId("location")).toHaveTextContent("role=mother");
+    await userEvent.click(screen.getByRole("tab", { name: "Parent" }));
+    expect(screen.getByTestId("location")).toHaveTextContent("role=parent");
     fireEvent.click(within(screen.getByRole("table")).getByRole("button", { name: "Edit Codex" }));
     fireEvent.change(screen.getByLabelText("Instruction text"), {
-      target: { value: "Codex mother" },
+      target: { value: "Codex parent" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Save layer" }));
     await waitFor(() =>
       expect(mocks.save).toHaveBeenCalledWith({
-        scope: "mother",
+        scope: "parent",
         agent_key: "codex",
         host_id: "",
-        text: "Codex mother",
+        text: "Codex parent",
       }),
     );
   });
 
   it.each(
-    (["mother", "child"] as const).flatMap((role) => [
+    (["parent", "child"] as const).flatMap((role) => [
       { role, name: "Shared", text: "Role shared", agent_key: "", host_id: "" },
       { role, name: "Codex", text: "Role agent", agent_key: "codex", host_id: "" },
       { role, name: "Laptop", text: "Role host", agent_key: "", host_id: "host-a" },
@@ -235,6 +235,38 @@ describe("InstructionsPage", () => {
     expect(screen.getByLabelText("Instruction text")).toHaveValue("Shared text");
   });
 
+  it("redirects ?role=mother to ?role=parent with replace", async () => {
+    mocks.layers!.data.push(layer("parent", "Parent text"));
+    render(
+      <MemoryRouter
+        initialEntries={[
+          "/settings/instructions?view=overview",
+          "/settings/instructions?role=mother&custom=retained",
+        ]}
+        initialIndex={1}
+      >
+        <TooltipProvider>
+          <InstructionsPage />
+        </TooltipProvider>
+        <Location />
+      </MemoryRouter>,
+    );
+    expect(screen.getByRole("tab", { name: "Parent" })).toHaveAttribute("aria-selected", "true");
+    await waitFor(() =>
+      expect(
+        Object.fromEntries(new URLSearchParams(screen.getByTestId("location").textContent!)),
+      ).toEqual({
+        role: "parent",
+        custom: "retained",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Edit Shared" }));
+    expect(screen.getByLabelText("Instruction text")).toHaveValue("Parent text");
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    fireEvent.click(screen.getByRole("button", { name: "History back" }));
+    await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent("?view=overview"));
+  });
+
   it("switches one grid with keyboard tabs, retaining shared axes and URL context without saves", async () => {
     const layout = { hosts: ["host-a", "host-cloud"], agents: ["codex"] };
     localStorage.setItem("omnigent:instruction-grid", JSON.stringify(layout));
@@ -243,7 +275,7 @@ describe("InstructionsPage", () => {
     act(() => screen.getByRole("tab", { name: "Shared instructions" }).focus());
     await userEvent.keyboard("{ArrowRight}");
     await waitFor(() =>
-      expect(screen.getByRole("tab", { name: "Mother" })).toHaveAttribute("aria-selected", "true"),
+      expect(screen.getByRole("tab", { name: "Parent" })).toHaveAttribute("aria-selected", "true"),
     );
     await userEvent.keyboard("{ArrowRight}");
     await waitFor(() =>
@@ -261,7 +293,7 @@ describe("InstructionsPage", () => {
     });
     expect(JSON.parse(localStorage.getItem("omnigent:instruction-grid")!)).toEqual(layout);
     expect(mocks.save).not.toHaveBeenCalled();
-    expect(screen.queryByRole("button", { name: "Edit Mother block" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Edit Parent block" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Edit Child block" })).not.toBeInTheDocument();
   });
 
@@ -269,14 +301,14 @@ describe("InstructionsPage", () => {
     page("/settings/instructions?role=route&host=host-a&agent=codex&peer=0&custom=retained");
     const location = screen.getByTestId("location");
     const sharedHistoryKey = location.getAttribute("data-history-key");
-    const mother = screen.getByRole("tab", { name: "Mother" });
+    const parent = screen.getByRole("tab", { name: "Parent" });
     const child = screen.getByRole("tab", { name: "Child" });
-    await userEvent.click(mother);
+    await userEvent.click(parent);
     await waitFor(() => {
-      expect(new URLSearchParams(location.textContent!).get("role")).toBe("mother");
-      expect(mother).toHaveAttribute("aria-selected", "true");
+      expect(new URLSearchParams(location.textContent!).get("role")).toBe("parent");
+      expect(parent).toHaveAttribute("aria-selected", "true");
     });
-    const motherHistoryKey = location.getAttribute("data-history-key");
+    const parentHistoryKey = location.getAttribute("data-history-key");
     await userEvent.click(child);
     await waitFor(() => {
       expect(new URLSearchParams(location.textContent!).get("role")).toBe("child");
@@ -289,9 +321,9 @@ describe("InstructionsPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "History back" }));
     await waitFor(() => {
       expect(location).not.toHaveAttribute("data-history-key", childHistoryKey);
-      expect(new URLSearchParams(location.textContent!).get("role")).toBe("mother");
-      expect(location).toHaveAttribute("data-history-key", motherHistoryKey);
-      expect(mother).toHaveAttribute("aria-selected", "true");
+      expect(new URLSearchParams(location.textContent!).get("role")).toBe("parent");
+      expect(location).toHaveAttribute("data-history-key", parentHistoryKey);
+      expect(parent).toHaveAttribute("aria-selected", "true");
       expect(child).toHaveAttribute("aria-selected", "false");
     });
     expect(child).toHaveFocus();
@@ -307,9 +339,9 @@ describe("InstructionsPage", () => {
     expect(child).toHaveFocus();
     fireEvent.click(screen.getByRole("button", { name: "History forward" }));
     await waitFor(() => {
-      expect(new URLSearchParams(location.textContent!).get("role")).toBe("mother");
-      expect(location).toHaveAttribute("data-history-key", motherHistoryKey);
-      expect(mother).toHaveAttribute("aria-selected", "true");
+      expect(new URLSearchParams(location.textContent!).get("role")).toBe("parent");
+      expect(location).toHaveAttribute("data-history-key", parentHistoryKey);
+      expect(parent).toHaveAttribute("aria-selected", "true");
     });
     fireEvent.click(screen.getByRole("button", { name: "History forward" }));
     await waitFor(() => {
@@ -328,7 +360,7 @@ describe("InstructionsPage", () => {
     expect(mocks.save).not.toHaveBeenCalled();
   });
 
-  it.each(["mother", "child"] as const)(
+  it.each(["parent", "child"] as const)(
     "previews the %s grid's role while preserving unrelated route context",
     (role) => {
       page(`/settings/instructions?role=${role}&child=0&spawn=0&peer=0&custom=retained`);
@@ -340,7 +372,7 @@ describe("InstructionsPage", () => {
         host: "host-a",
         agent: "codex",
         child: role === "child" ? "1" : "0",
-        spawn: role === "mother" ? "1" : "0",
+        spawn: role === "parent" ? "1" : "0",
         peer: "0",
         custom: "retained",
       });
@@ -348,12 +380,12 @@ describe("InstructionsPage", () => {
         String(role === "child"),
       );
       expect(new URLSearchParams(mocks.previewQuery.mock.lastCall![0]).get("spawn")).toBe(
-        String(role === "mother"),
+        String(role === "parent"),
       );
     },
   );
 
-  it.each(["mother", "child"] as const)(
+  it.each(["parent", "child"] as const)(
     "prefills and saves only the %s role's independent sources",
     async (role) => {
       mocks.layers!.data.push(
@@ -385,7 +417,7 @@ describe("InstructionsPage", () => {
     },
   );
 
-  it.each(["mother", "child"] as const)(
+  it.each(["parent", "child"] as const)(
     "clears a %s independent setting without clearing route layers",
     async (role) => {
       mocks.layers!.data.push(layer(role, "Role cell", "codex", "host-a"));
@@ -404,8 +436,8 @@ describe("InstructionsPage", () => {
   );
 
   it.each([
-    { scope: "mother", agent_key: "codex", host_id: "" },
-    { scope: "mother", agent_key: "codex", host_id: "host-a" },
+    { scope: "parent", agent_key: "codex", host_id: "" },
+    { scope: "parent", agent_key: "codex", host_id: "host-a" },
     { scope: "child", agent_key: "", host_id: "host-a" },
     { scope: "child", agent_key: "codex", host_id: "host-a" },
   ] as const)("edits the original preview role key $scope / $agent_key / $host_id", async (key) => {
@@ -960,7 +992,7 @@ it.each([
   });
 });
 
-it.each(["host", "mother", "child"] as const)(
+it.each(["host", "parent", "child"] as const)(
   "disables removing a column held by %s text for readers",
   (scope) => {
     mocks.admin = false;
@@ -982,7 +1014,7 @@ it.each(["hosts", "agents"] as const)(
         axis === "agents" ? "codex" : "",
         axis === "hosts" ? "host-a" : "",
       ),
-      ...(["mother", "child"] as const).flatMap((scope) => [
+      ...(["parent", "child"] as const).flatMap((scope) => [
         layer(
           scope,
           "Role source",
@@ -994,9 +1026,9 @@ it.each(["hosts", "agents"] as const)(
     ];
     const retained = [
       layer("shared", "All routes"),
-      layer("mother", "All mothers"),
+      layer("parent", "All parents"),
       layer("child", "All children"),
-      { ...layer("mother", "Removed host", "codex", "removed"), host_removed: true },
+      { ...layer("parent", "Removed host", "codex", "removed"), host_removed: true },
       layer("independent", "\u0085", "codex", "host-a"),
     ];
     mocks.layers!.data = [...sources, ...retained];
@@ -1006,14 +1038,14 @@ it.each(["hosts", "agents"] as const)(
       .mockResolvedValueOnce({ over_budget_routes: [] })
       .mockResolvedValueOnce({ over_budget_routes: [] })
       .mockRejectedValueOnce(new Error("Role save failed"));
-    page("/settings/instructions?role=mother");
+    page("/settings/instructions?role=parent");
     fireEvent.click(
       screen.getByRole("button", {
         name: axis === "hosts" ? "Remove Laptop column" : "Remove Codex row",
       }),
     );
     const dialog = screen.getByRole("dialog");
-    for (const name of ["Shared instructions · 1 layer", "Mother · 2 layers", "Child · 2 layers"]) {
+    for (const name of ["Shared instructions · 1 layer", "Parent · 2 layers", "Child · 2 layers"]) {
       expect(within(dialog).getByRole("heading", { name })).toBeInTheDocument();
     }
     expect(within(dialog).getAllByRole("listitem")).toHaveLength(5);
@@ -1033,7 +1065,7 @@ it.each(["hosts", "agents"] as const)(
     expect(
       within(dialog).queryByRole("heading", { name: "Shared instructions · 1 layer" }),
     ).not.toBeInTheDocument();
-    expect(within(dialog).getByRole("heading", { name: "Mother · 1 layer" })).toBeInTheDocument();
+    expect(within(dialog).getByRole("heading", { name: "Parent · 1 layer" })).toBeInTheDocument();
     expect(within(dialog).getByRole("heading", { name: "Child · 2 layers" })).toBeInTheDocument();
     expect(within(dialog).getAllByRole("listitem")).toHaveLength(3);
     expect(JSON.parse(localStorage.getItem("omnigent:instruction-grid")!)).toEqual(layout);

@@ -98,12 +98,12 @@ describe("WorktreeStatusMark", () => {
     expect(screen.queryByRole("img")).not.toBeInTheDocument();
   });
 
-  it("keeps mother's own state and lists only two relevant children without root duplication", async () => {
+  it("keeps parent's own state and lists only two relevant children without root duplication", async () => {
     show("protected", {
       own: { ...base.own, state: "protected", reason: "project entry" },
       aggregate: { state: "dirty", reason: "descendant worktree needs attention" },
       blockers: [
-        { session_id: "one", title: "Mother", state: "protected", reason: "project entry" },
+        { session_id: "one", title: "Parent", state: "protected", reason: "project entry" },
         { session_id: "past", title: "Past child", state: "dirty", reason: "Untracked notes" },
         { session_id: "second", title: "Second child", state: "local", reason: "local files" },
         { session_id: "third", title: "Third child", state: "unknown", reason: "offline" },
@@ -121,7 +121,7 @@ describe("WorktreeStatusMark", () => {
     ).not.toHaveTextContent("Untracked notes");
     expect(screen.getByText("1 more child worktrees")).toBeInTheDocument();
     expect(screen.queryByText(/Third child/)).not.toBeInTheDocument();
-    expect(screen.queryByText(/Mother:/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Parent:/)).not.toBeInTheDocument();
     expect(screen.queryByText(/Branch:/)).not.toBeInTheDocument();
     expect(mark.closest("a")).toHaveAttribute("href", "/sessions/one");
   });
@@ -153,7 +153,7 @@ describe("WorktreeStatusMark", () => {
     expect(screen.getByRole("img")).toHaveAttribute("data-worktree-state", "unknown");
   });
 
-  it("still signals a child problem when the mother has no worktree", () => {
+  it("still signals a child problem when the parent has no worktree", () => {
     show("none", {
       blockers: [{ session_id: "child", title: "Child", state: "dirty", reason: "source changes" }],
     });

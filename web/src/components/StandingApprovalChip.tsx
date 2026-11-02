@@ -3,9 +3,9 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ShieldCheckIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { changeStandingPass, getStandingPass } from "@/lib/standingPassApi";
+import { changeStandingApproval, getStandingApproval } from "@/lib/standingApprovalApi";
 
-export function StandingPassChip({
+export function StandingApprovalChip({
   sessionId,
   readOnly = false,
 }: {
@@ -14,23 +14,25 @@ export function StandingPassChip({
 }) {
   const client = useQueryClient();
   const query = useQuery({
-    queryKey: ["standing-pass", sessionId],
-    queryFn: ({ signal }) => getStandingPass(sessionId, signal),
+    queryKey: ["standing-approval", sessionId],
+    queryFn: ({ signal }) => getStandingApproval(sessionId, signal),
     retry: false,
   });
   const [error, setError] = useState<string | null>(null);
   const change = useMutation({
     mutationFn: ({ op, kind }: { op: "revoke" | "grant"; kind: string }) =>
-      changeStandingPass(sessionId, op, kind),
-    onMutate: () => client.cancelQueries({ queryKey: ["standing-pass", sessionId] }),
+      changeStandingApproval(sessionId, op, kind),
+    onMutate: () => client.cancelQueries({ queryKey: ["standing-approval", sessionId] }),
     onSuccess: async (state) => {
-      await client.cancelQueries({ queryKey: ["standing-pass", sessionId] });
-      client.setQueryData(["standing-pass", sessionId], state);
+      await client.cancelQueries({ queryKey: ["standing-approval", sessionId] });
+      client.setQueryData(["standing-approval", sessionId], state);
       setError(null);
     },
     onError: (reason) =>
       setError(
-        reason instanceof Error ? reason.message : "Could not change the standing pass. Try again.",
+        reason instanceof Error
+          ? reason.message
+          : "Could not change the standing approval. Try again.",
       ),
   });
   const state = query.data;
@@ -56,16 +58,16 @@ export function StandingPassChip({
       <PopoverTrigger asChild>
         <button
           type="button"
-          aria-label={`Standing pass: ${summary}`}
+          aria-label={`Standing approval: ${summary}`}
           className="flex h-7 shrink-0 items-center gap-1 rounded-full border border-border bg-background px-2 text-xs text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
           <ShieldCheckIcon className="size-3.5" />
-          <span className="hidden sm:inline">Pass</span>
+          <span className="hidden sm:inline">Approval</span>
           <span>{record ? record.kinds.length : "…"}</span>
         </button>
       </PopoverTrigger>
       <PopoverContent align="end" className="w-80 max-w-[calc(100vw-1rem)] p-4">
-        <h2 className="font-medium">Standing pass</h2>
+        <h2 className="font-medium">Standing approval</h2>
         <p className="text-xs text-muted-foreground">
           {inherited
             ? "Inherited from the parent session. Read-only here."
@@ -73,13 +75,13 @@ export function StandingPassChip({
         </p>
         {query.isError ? (
           <div role="alert">
-            <p>Could not load the standing pass.</p>
+            <p>Could not load the standing approval.</p>
             <Button type="button" variant="outline" size="sm" onClick={() => void query.refetch()}>
               Retry
             </Button>
           </div>
         ) : !record ? (
-          <p role="status">Loading standing pass…</p>
+          <p role="status">Loading standing approval…</p>
         ) : (
           <>
             {record.kinds.length === 0 && <p>No active kinds.</p>}
