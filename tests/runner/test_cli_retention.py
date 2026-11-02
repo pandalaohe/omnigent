@@ -25,60 +25,182 @@ from tests.runner.conftest import _FakeProcessManager, _runner_client, _Scripted
 from tests.runner.helpers import NullServerClient
 
 
-@pytest.mark.parametrize("family", ["codex", "antigravity", "opencode"])
-async def test_session_delete_finds_bridges_retained_before_label_rotation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, family: str
+@pytest.mark.parametrize(
+    "family,credentials",
+    [
+        (
+            "codex",
+            ("codex-home/auth.json", "codex-home/.credentials.json", "codex-home/config.toml"),
+        ),
+        ("hermes", ("hermes_home/.env", "hermes_home/auth.json", "hermes_home/config.yaml")),
+        ("opencode", ("xdg-data/opencode/auth.json", "xdg-config/opencode/opencode.json")),
+        (
+            "pi",
+            (
+                "pi-agent/models.json",
+                "pi-agent/mcp-auth.json",
+                "pi-agent/mcp.json",
+                "pi-agent/omnigent-auth/auth-test.json",
+                "pi-agent/omnigent-auth/auth-test.result.json",
+                "pi-agent/omnigent-auth/token-test.json",
+            ),
+        ),
+    ],
+)
+async def test_idle_release_scrubs_recreatable_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, family: str, credentials: tuple[str, ...]
 ) -> None:
-    from omnigent.runner.native import orchestration
-
     bridge = importlib.import_module(f"omnigent.harnesses.{family}_native.bridge")
     monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / family)
-    key = f"omnigent.{family}_native.bridge_id"
-    labels = {key: "bridge-a"}
-    monkeypatch.setattr(
-        orchestration,
-        "_session_labels_for_runner_spawn",
-        AsyncMock(side_effect=lambda **_: labels),
-    )
-    old = bridge.prepare_bridge_dir("bridge-a")
-    (old / "history.jsonl").write_text("native history")
+    home = (
+        bridge.bridge_dir_for_session_id
+        if family in {"pi", "hermes"}
+        else bridge.bridge_dir_for_bridge_id
+    )("conv_scrub")
+    for name in credentials:
+        path = home / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}")
+    history = home / "history.jsonl"
+    history.write_text("history")
     app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
-    await app.state.finish_cli_release("conv_rotated")
-    assert old.exists()
+    await app.state.finish_cli_release("conv_scrub")
+    assert history.read_text() == "history"
+    assert all(not (home / name).exists() for name in credentials)
 
-    labels[key] = "bridge-b"
-    new = bridge.prepare_bridge_dir("bridge-b")
+
+@pytest.mark.parametrize("parent_link", [False, True])
+async def test_idle_credential_scrub_never_follows_links_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, parent_link: bool
+) -> None:
+    from omnigent.harnesses.codex_native import bridge
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "codex")
+    home = bridge.prepare_bridge_dir("conv_scrub")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "auth.json").write_text("source")
+    if parent_link:
+        (home / "codex-home").symlink_to(outside, target_is_directory=True)
+    else:
+        (home / "codex-home").mkdir()
+        (home / "codex-home" / "auth.json").symlink_to(outside / "auth.json")
+    app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
+    if parent_link:
+        with pytest.raises(RuntimeError, match="credential scrub"):
+            await app.state.finish_cli_release("conv_scrub")
+    else:
+        await app.state.finish_cli_release("conv_scrub")
+        assert not (home / "codex-home" / "auth.json").is_symlink()
+    assert (outside / "auth.json").read_text() == "source"
+
+
+async def test_idle_credential_scrub_failure_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from omnigent.harnesses.codex_native import bridge
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "codex")
+    home = bridge.prepare_bridge_dir("conv_scrub") / "codex-home"
+    home.mkdir()
+    auth = home / "auth.json"
+    auth.write_text("{}")
+    unlink = Path.unlink
+
+    def fail(path, *args, **kwargs):
+        if path == auth:
+            raise PermissionError("fixture")
+        return unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail)
+    app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="credential scrub"):
+        await app.state.finish_cli_release("conv_scrub")
+    assert "credential scrub" in caplog.text
+
+
+@pytest.mark.parametrize("source_available", [False, True])
+async def test_codex_resume_recopies_scrubbed_stores_and_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source_available: bool
+) -> None:
+    from omnigent.harnesses.codex_native import bridge
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "codex")
+    home = bridge.prepare_bridge_dir("conv_scrub") / "codex-home"
+    source = tmp_path / "source"
+    home.mkdir()
+    source.mkdir()
+    names = ("auth.json", ".credentials.json", "config.toml")
+    for name in names:
+        (source / name).write_text('model = "old"' if name.endswith("toml") else "{}")
+
+    def no_link(*args, **kwargs):
+        raise OSError("fixture: copy fallback")
+
+    monkeypatch.setattr(Path, "symlink_to", no_link)
+    _populate_codex_home_config(home, source)
+    for name in names:
+        replacement = source / "replacement"
+        replacement.write_text('model = "fresh"' if name.endswith("toml") else '{"fresh":true}')
+        replacement.replace(source / name)
+    app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
+    await app.state.finish_cli_release("conv_scrub")
+    assert all(not (home / name).exists() for name in names)
+    if not source_available:
+        source.rename(tmp_path / "unmounted-source")
+    _populate_codex_home_config(home, source)
+    if source_available:
+        assert all((home / name).read_text() == (source / name).read_text() for name in names)
+    else:
+        assert all(not (home / name).exists() for name in names)
+
+
+async def test_session_delete_does_not_trust_old_ownership_markers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.harnesses.codex_native import bridge
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "codex")
     unrelated = bridge.prepare_bridge_dir("unrelated")
+    (unrelated / "session.id").write_text("conv_old")
+    app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
     async with _runner_client(app) as client:
-        response = await client.delete("/v1/sessions/conv_rotated")
-    assert response.status_code == 200
-    assert not old.exists(), (
-        "a live owner must not hide the prior retained bridge from session delete"
-    )
-    assert not new.exists()
+        assert (await client.delete("/v1/sessions/conv_old")).status_code == 200
+    assert unrelated.exists()
+    await app.state.finish_cli_release("unrelated")
     assert unrelated.exists()
 
 
-@pytest.mark.parametrize("family", ["pi", "antigravity", "opencode", "hermes"])
-def test_unmarked_housekeeping_dirs_follow_retention(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, family: str
-) -> None:
-    from omnigent.native import native_bridge_common
+async def test_scrubbed_opencode_read_failure_has_no_old_credential(tmp_path, monkeypatch) -> None:
+    from omnigent.harnesses.opencode_native import bridge
 
-    bridge = importlib.import_module(f"omnigent.harnesses.{family}_native.bridge")
-    root = tmp_path / family
-    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", root)
-    housekeeping = root / ("a" * 32)
-    housekeeping.mkdir(parents=True)
-    launch = housekeeping / "launch.json"
-    launch.write_text("{}")
-    now = 2_000_000_000.0
-    os.utime(launch, (now - 69 * 86400, now - 69 * 86400))
-    monkeypatch.setattr(native_bridge_common.time, "time", lambda: now)
-    assert bridge.prune_orphaned_bridge_dirs() == 0
-    monkeypatch.setattr(native_bridge_common.time, "time", lambda: now + 2 * 86400)
-    assert bridge.prune_orphaned_bridge_dirs() == 1
-    assert not housekeeping.exists()
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "opencode")
+    source = tmp_path / "source-auth.json"
+    source.write_text("{}")
+    monkeypatch.setattr(bridge, "user_opencode_auth_path", lambda: source)
+    home = bridge.prepare_bridge_dir("conv_scrub")
+    target = bridge.seed_opencode_auth(home)
+    assert target is not None
+    app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
+    await app.state.finish_cli_release("conv_scrub")
+    assert not target.exists()
+    monkeypatch.setattr(bridge.shutil, "copyfile", Mock(side_effect=PermissionError("fixture")))
+    assert bridge.seed_opencode_auth(home) is None
+    assert not target.exists()
+
+
+async def test_idle_release_keeps_agy_native_oauth(tmp_path, monkeypatch) -> None:
+    from omnigent.harnesses.antigravity_native import bridge
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "agy")
+    home = bridge.prepare_bridge_dir("conv_oauth")
+    native_oauth = bridge.agy_gemini_dir(home) / "oauth_creds.json"
+    native_oauth.parent.mkdir(parents=True)
+    native_oauth.write_text("{}")
+    app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
+    await app.state.finish_cli_release("conv_oauth")
+    assert native_oauth.exists()
 
 
 @pytest.mark.parametrize(

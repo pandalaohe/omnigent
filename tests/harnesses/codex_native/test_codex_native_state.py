@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -12,6 +14,21 @@ from omnigent.harnesses.codex_native.state import (
     read_launch_state,
     write_launch_state,
 )
+
+
+def test_resume_refreshes_launch_only_retention(tmp_path, monkeypatch) -> None:
+    from omnigent.harnesses.codex_native import bridge
+
+    monkeypatch.setenv("OMNIGENT_CODEX_NATIVE_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path)
+    write_launch_state("session", "/opt/work/project")
+    launch = next(tmp_path.glob("*/launch.json"))
+    old = time.time() - 71 * 86400
+    os.utime(launch, (old, old))
+    os.utime(launch.parent, (old, old))
+    assert read_launch_state("session") is not None
+    assert bridge.prune_orphaned_bridge_dirs() == 0
+    assert launch.exists()
 
 
 def test_write_and_read_launch_state_round_trips(

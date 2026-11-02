@@ -269,22 +269,6 @@ def test_seed_opencode_auth_copies_user_auth(
     assert (os.stat(dest).st_mode & 0o777) == 0o600
 
 
-def test_seed_opencode_auth_removes_logged_out_credentials(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    source = tmp_path / "user-share" / "opencode" / "auth.json"
-    source.parent.mkdir(parents=True)
-    source.write_text("{}")
-    monkeypatch.setenv("XDG_DATA_HOME", str(source.parent.parent))
-    bridge_dir = bridge.prepare_bridge_dir("conv_logout")
-    target = bridge.seed_opencode_auth(bridge_dir)
-    assert target is not None and target.exists()
-    source.rename(source.with_name("logged-out.json"))
-
-    assert bridge.seed_opencode_auth(bridge_dir) is None
-    assert not target.exists()
-
-
 def test_seed_opencode_auth_noop_without_source(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -10876,6 +10876,31 @@ async def _auto_create_repl_terminal(
     return terminal_view
 
 
+def _scrub_native_bridge_credentials(bridge_dir: Path, paths: tuple[str, ...]) -> None:
+    """Unlink reconstructible login snapshots without traversing outside the bridge."""
+    for name in paths:
+        target = bridge_dir / name
+        try:
+            if bridge_dir.is_symlink() or not target.parent.resolve().is_relative_to(
+                bridge_dir.resolve()
+            ):
+                raise ValueError("credential parent leaves bridge")
+            if target.name == "*.json":
+                try:
+                    targets = [path for path in target.parent.iterdir() if path.suffix == ".json"]
+                except FileNotFoundError:
+                    continue
+            else:
+                targets = [target]
+            for path in targets:
+                path.unlink(missing_ok=True)
+        except (OSError, ValueError, RuntimeError) as error:
+            _logger.error(
+                "Native credential scrub failed (%s); release is incomplete", type(error).__name__
+            )
+            raise RuntimeError("native credential scrub failed") from error
+
+
 async def _delete_native_bridge_dirs(
     *,
     server_client: httpx.AsyncClient | None,
@@ -10909,7 +10934,7 @@ async def _delete_native_bridge_dirs(
     :param keep_session_history: Keep bridges containing native history or
         Codex's undelivered-item queue during idle release. Their harness
         orphan sweeps expire them after owner death; session deletion still
-        removes them immediately, including previously retained bridge ids.
+        removes currently labelled/session-keyed bridges immediately.
     """
     from omnigent.harnesses.antigravity_native.bridge import (
         ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
@@ -10957,7 +10982,6 @@ async def _delete_native_bridge_dirs(
         bridge_dir_for_session_id as qwen_bridge_dir,
     )
     from omnigent.inner.native_attachments import attachment_cache_dir, session_attachment_dir
-    from omnigent.native.native_bridge_common import bridge_dirs_for_session, record_bridge_session
 
     labels: dict[str, str] = {}
     if server_client is not None:
@@ -10976,9 +11000,6 @@ async def _delete_native_bridge_dirs(
         opencode_bridge_dir(session_id),
         pi_bridge_dir(session_id),
     }
-    if not keep_session_history:
-        for root in {target.parent for target in history_targets}:
-            history_targets.update(bridge_dirs_for_session(root, session_id))
     targets = history_targets | {
         claude_bridge_dir(labels.get(BRIDGE_ID_LABEL_KEY) or session_id),
         claude_bridge_dir(session_id),
@@ -10989,8 +11010,30 @@ async def _delete_native_bridge_dirs(
         qwen_bridge_dir(session_id),
     }
     if keep_session_history:
+        credentials = {
+            codex_bridge_dir(session_id).parent: (
+                "codex-home/auth.json",
+                "codex-home/.credentials.json",
+                "codex-home/config.toml",
+            ),
+            hermes_bridge_dir(session_id).parent: (
+                "hermes_home/.env",
+                "hermes_home/auth.json",
+                "hermes_home/config.yaml",
+            ),
+            opencode_bridge_dir(session_id).parent: (
+                "xdg-data/opencode/auth.json",
+                "xdg-config/opencode/opencode.json",
+            ),
+            pi_bridge_dir(session_id).parent: (
+                "pi-agent/models.json",
+                "pi-agent/mcp-auth.json",
+                "pi-agent/mcp.json",
+                "pi-agent/omnigent-auth/*.json",
+            ),
+        }
         for target in history_targets:
-            record_bridge_session(target, session_id)
+            _scrub_native_bridge_credentials(target, credentials.get(target.parent, ()))
         targets.difference_update(history_targets)
     if not keep_attachment_caches:
         # A cache can survive a missing bridge directory, including after a reboot.

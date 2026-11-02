@@ -13,6 +13,7 @@ Layout (per conversation):
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -126,7 +127,7 @@ def write_launch_state(conversation_id: str, working_directory: str) -> None:
 
 def read_launch_state(conversation_id: str) -> CodexNativeLaunchState | None:
     """
-    Load a session's launch state, or ``None`` if not recorded.
+    Load launch state and refresh its use clock, or return ``None`` if absent.
 
     Missing, unreadable, or malformed state is treated as absent so
     legacy and cross-machine resumes continue to behave as before.
@@ -160,4 +161,6 @@ def read_launch_state(conversation_id: str) -> CodexNativeLaunchState | None:
     working_directory = payload.get("working_directory")
     if not isinstance(working_directory, str) or not working_directory:
         return None
+    with contextlib.suppress(OSError):
+        os.utime(target, None)
     return CodexNativeLaunchState(working_directory=working_directory)

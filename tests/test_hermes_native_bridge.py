@@ -276,24 +276,6 @@ def test_inject_compress_command_raises_without_target(tmp_path, monkeypatch) ->
 # -- Policy hook config tests --
 
 
-@pytest.mark.parametrize("filename", [".env", "auth.json"])
-def test_resume_removes_logged_out_hermes_credentials(tmp_path, monkeypatch, filename) -> None:
-    user_home = tmp_path / "home"
-    source = user_home / ".hermes" / filename
-    source.parent.mkdir(parents=True)
-    source.write_text("{}")
-    monkeypatch.setattr(b.Path, "home", lambda: user_home)
-    monkeypatch.setattr(b, "_load_user_hermes_config", dict)
-    bridge_dir = tmp_path / "bridge"
-    home = b.write_policy_hook_config(bridge_dir, "http://server", "conv_logout")
-    assert (home / filename).is_file()
-    source.rename(source.with_name(filename + ".logged-out"))
-
-    b.write_policy_hook_config(bridge_dir, "http://server", "conv_logout")
-
-    assert not (home / filename).exists()
-
-
 def test_write_policy_hook_config_creates_expected_files(tmp_path) -> None:
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()

@@ -423,15 +423,11 @@ def write_policy_hook_config(
     user_env = Path.home() / ".hermes" / ".env"
     if user_env.is_file():
         shutil.copy2(user_env, hermes_home / ".env")
-    else:
-        (hermes_home / ".env").unlink(missing_ok=True)
 
     # Copy user's auth.json (provider credentials).
     user_auth = Path.home() / ".hermes" / "auth.json"
     if user_auth.is_file():
         shutil.copy2(user_auth, hermes_home / "auth.json")
-    else:
-        (hermes_home / "auth.json").unlink(missing_ok=True)
 
     # Pre-populate the allowlist so Hermes doesn't prompt for hook consent.
     allowlist_path = hermes_home / "shell-hooks-allowlist.json"
