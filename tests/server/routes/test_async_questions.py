@@ -222,6 +222,22 @@ async def test_async_question_happy_path(
         ("codex", None, "Codex has questions", "omnigent_async_question"),
         ("claude-sdk", None, "Claude SDK has questions", "omnigent_async_question"),
         ("codex-native", None, "Codex has questions", "codex_async_question"),
+        ("goose", None, "Goose has questions", "omnigent_async_question"),
+        ("kimi", None, "Kimi has questions", "omnigent_async_question"),
+        ("qwen", None, "Qwen Code has questions", "omnigent_async_question"),
+        (
+            "openai-agents",
+            None,
+            "OpenAI Agents has questions",
+            "omnigent_async_question",
+        ),
+        ("claude-sdk", "acp", "ACP has questions", "omnigent_async_question"),
+        (
+            "claude-sdk",
+            "open-responses",
+            "OpenResponses has questions",
+            "omnigent_async_question",
+        ),
         (
             "claude-sdk",
             "unregistered-harness",

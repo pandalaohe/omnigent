@@ -53,6 +53,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useDescendantSession } from "@/hooks/useChildSessions";
+import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
 import {
   type AskUserQuestionPayload,
   castAskUserQuestionPayload,
@@ -311,6 +312,14 @@ interface ApprovalCardProps {
 
 const EMPTY_CODEX_PERSIST_MODES: CodexPersistMode[] = [];
 
+const SDK_PERMISSION_SUFFIX = "_sdk_permission";
+
+function sdkAgentNameForPolicyName(policyName: string): string | undefined {
+  if (!policyName.endsWith(SDK_PERMISSION_SUFFIX)) return undefined;
+  const vendor = policyName.slice(0, -SDK_PERMISSION_SUFFIX.length);
+  return BRAIN_HARNESS_LABELS[vendor === "claude" ? "claude-sdk" : vendor];
+}
+
 function TerminalAccessActions({
   request,
   onApprove,
@@ -532,6 +541,10 @@ export function ApprovalCard({
   // ("pre_tool_use", "codex_command_approval", ...). It carries no
   // information the card doesn't already show, so hide it for them.
   const showPhase = phase !== "" && !isNativePolicy;
+  const structuredQuestionAgentName =
+    nativeCodingAgentForPolicyName(policyName)?.displayName ??
+    sdkAgentNameForPolicyName(policyName) ??
+    "Agent";
   const askUserQuestionTitle =
     phase === "async_question"
       ? message.trim() || "Agent has questions"
@@ -543,7 +556,7 @@ export function ApprovalCard({
             ? "Cursor has questions"
             : policyName.startsWith("pi_") || phase.startsWith("pi_")
               ? "Pi needs your input"
-              : `${nativeCodingAgentForPolicyName(policyName)?.displayName ?? "Agent"} has questions`;
+              : `${structuredQuestionAgentName} has questions`;
 
   // Hide the raw JSON preview for AskUserQuestion (the form already
   // renders the questions + options structurally) and for option-

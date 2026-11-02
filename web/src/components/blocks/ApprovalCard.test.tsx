@@ -1414,6 +1414,44 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
 
   it.each([
     {
+      name: "Claude SDK pre-tool",
+      policyName: "claude_sdk_permission",
+      phase: "pre_tool_use",
+      expectedTitle: "Claude SDK has questions",
+    },
+    {
+      name: "Claude SDK tool-call",
+      policyName: "claude_sdk_permission",
+      phase: "tool_call",
+      expectedTitle: "Claude SDK has questions",
+    },
+    {
+      name: "Claude native",
+      policyName: "claude_native_permission",
+      phase: "pre_tool_use",
+      expectedTitle: "Claude Code has questions",
+    },
+  ])("names $name structured questions", ({ policyName, phase, expectedTitle }) => {
+    render(
+      <ApprovalCard
+        elicitationId={`elic_question_title_${policyName}_${phase}`}
+        message="Claude wants to use **AskUserQuestion**"
+        phase={phase}
+        policyName={policyName}
+        contentPreview=""
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+        askUserQuestion={{ questions: [{ question: "Continue?", options: [] }] }}
+      />,
+    );
+
+    expect(screen.getByText(expectedTitle)).toBeDefined();
+    expect(screen.queryByText("Agent has questions")).toBeNull();
+  });
+
+  it.each([
+    {
       name: "select",
       harness: "Pi",
       options: [{ label: "Allow" }, { label: "Block" }],
