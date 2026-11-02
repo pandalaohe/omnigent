@@ -2596,6 +2596,24 @@ html[data-electron-mac] .breadcrumb-folder {
 /* Extension pages sit below the shell header overlay. When AppShell drops that
  * header (sidebar open on an extension route), the page takes the full height.
  * Unlayered on purpose so it beats the responsive inset utilities. */
+.extension-view-host {
+  padding-top: calc(var(--omnigent-header-height) + var(--omnigent-inset-top));
+}
+
+.extension-view-status {
+  top: calc(var(--omnigent-header-height) + var(--omnigent-inset-top));
+}
+
+@media (width >= 48rem) {
+  .extension-view-host {
+    padding-top: calc(3rem + var(--omnigent-inset-top));
+  }
+
+  .extension-view-status {
+    top: calc(3rem + var(--omnigent-inset-top));
+  }
+}
+
 main[data-shell-header="hidden"] .extension-view-host {
   padding-top: 0;
 }

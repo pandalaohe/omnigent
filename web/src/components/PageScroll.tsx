@@ -51,15 +51,14 @@ export function PageScroll({
   className,
   "data-testid": testId,
 }: PageScrollProps) {
-  // Padding is composed from the shared inset vars rather than the old fixed
-  // `pt-14 py-8`, so the bottom always clears the native bar + home indicator
-  // and the top always clears the header + notch — the bug those magic numbers
-  // missed. The padding lives on the scroll container so the last item can
-  // scroll up clear of the bar.
+  // Keep header clearance outside the scroll viewport so swiping cannot move
+  // page content underneath the floating navigation control. Bottom padding
+  // lets the last item scroll clear of the native bar and home indicator.
   const style: CSSProperties = {
-    paddingTop: `calc(${extraTop}${clearHeader ? " + var(--omnigent-header-height)" : ""}${
+    marginTop: `calc(0px${clearHeader ? " + var(--omnigent-header-height)" : ""}${
       insetTop ? " + var(--omnigent-inset-top)" : ""
     })`,
+    paddingTop: extraTop,
     paddingBottom: `calc(${extraBottom}${insetBottom ? " + var(--omnigent-inset-bottom)" : ""})`,
   };
 

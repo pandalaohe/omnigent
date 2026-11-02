@@ -1,0 +1,336 @@
+"""Routed page content must clear the shell's mobile navigation control."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+from playwright.sync_api import Page, expect
+
+from omnigent.server.child_idle import DEFAULT_CHECKIN_INSTRUCTIONS
+from tests.browser_ui.chat.conftest import chat_session_contract as chat_session_contract
+from tests.browser_ui.chat.session_contract import ChatSessionContract
+from tests.browser_ui.conftest import BrowserContract
+from tests.browser_ui.test_sessions_appearance import appearance_url as appearance_url
+
+
+@pytest.fixture
+def pages_url(appearance_url: str, browser_contract: BrowserContract) -> str:
+    browser_contract.json(
+        "/v1/info",
+        {
+            "accounts_enabled": False,
+            "single_user": True,
+            "features": {"usage_page": True, "canvas": True, "automations_v2": True},
+        },
+    )
+    browser_contract.json("/v1/usage", {"daily_costs": [], "sessions": [], "total_cost_usd": 0})
+    browser_contract.json("/v1/scheduled-tasks", {"scheduled_tasks": []})
+    browser_contract.json(
+        "/v1/system/status",
+        {
+            "revision": 0,
+            "level": "ok",
+            "findings": [],
+            "server": None,
+            "hosts": [],
+            "monitor_overhead": {
+                "server": {"cpu_pct": 0, "mem_estimate_bytes": 0, "estimated": True},
+                "hosts": {},
+            },
+        },
+    )
+    browser_contract.json(
+        "/v1/system/settings",
+        {
+            "cpu_pct": 90,
+            "cpu_sustain_min": 5,
+            "mem_pct": 90,
+            "disk_pct": 90,
+            "server_5xx_pct": 5,
+            "health_check": {"project_id": None, "host_id": None, "prompt": None},
+            "default_health_check_prompt": "Example health check",
+        },
+    )
+    browser_contract.json(
+        "/v1/child-checkin/defaults", {"instructions": DEFAULT_CHECKIN_INSTRUCTIONS}
+    )
+    browser_contract.json("/v1/policies", {"data": []})
+    browser_contract.json("/v1/policy-registry", {"data": []})
+    browser_contract.json(
+        "/v1/instruction-layers",
+        {
+            "data": [],
+            "agents": [],
+            "order": ["shared", "agent", "host"],
+            "route_sizes": [],
+            "size_reminder_chars": 10000,
+        },
+    )
+    browser_contract.json(
+        "/v1/sharing",
+        {
+            "sharing_mode": "off",
+            "editable": False,
+            "options": ["off"],
+            "public_sharing_enabled": False,
+            "public_sharing_editable": False,
+            "default_public_sessions": "off",
+            "default_public_sessions_editable": False,
+            "default_public_sessions_options": ["off"],
+        },
+    )
+    return appearance_url
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_usage_clears_mobile_sidebar_control(
+    page: Page,
+    pages_url: str,
+    native: bool,
+    request: pytest.FixtureRequest,
+) -> None:
+    page.set_viewport_size({"width": 390, "height": 844})
+    page.goto(f"{pages_url}/usage")
+    title = page.get_by_role("heading", name="Usage", exact=True)
+    menu = page.get_by_role("button", name="Open sidebar", exact=True)
+    expect(title).to_be_visible()
+    expect(menu).to_be_visible()
+    if native:
+        page.locator(".app-shell").evaluate(
+            """shell => {
+                shell.dataset.iosNative = 'true';
+                document.documentElement.style.setProperty('--omnigent-safe-top', '47px');
+            }"""
+        )
+    # Bring the first row to the top of its own scroll viewport, as a phone
+    # swipe does. Header clearance must survive scrolling the initial padding.
+    title.evaluate(
+        """title => {
+            let scroll = title.parentElement;
+            while (scroll && getComputedStyle(scroll).overflowY !== 'auto') {
+                scroll = scroll.parentElement;
+            }
+            if (!scroll) throw new Error('Page scroll viewport not found');
+            const titleTop = title.getBoundingClientRect().top;
+            scroll.scrollTop = titleTop - scroll.getBoundingClientRect().top;
+        }"""
+    )
+    title_box = title.bounding_box()
+    menu_box = menu.bounding_box()
+    assert title_box is not None and menu_box is not None
+    output = Path(request.config.getoption("output"))
+    output.mkdir(parents=True, exist_ok=True)
+    geometry = {"title": title_box, "menu": menu_box}
+    suffix = "native" if native else "browser"
+    (output / f"usage-geometry-{suffix}.json").write_text(json.dumps(geometry, indent=2))
+    page.screenshot(path=str(output / f"usage-mobile-{suffix}.png"))
+    assert title_box["y"] >= menu_box["y"] + menu_box["height"], geometry
+    menu.click()
+    expect(page.get_by_test_id("usage-nav")).to_be_visible()
+
+
+@pytest.mark.parametrize(
+    ("route", "heading"),
+    [
+        ("/tasks", "Automations"),
+        ("/inbox", "Inbox"),
+        ("/system", "System status"),
+        ("/settings/shortcuts", "Keyboard shortcuts"),
+        ("/settings/general", "General"),
+        ("/settings/appearance", "Appearance"),
+        ("/settings/git", "Git"),
+        ("/settings/harnesses", "Harnesses"),
+        ("/settings/custom-agents", "Custom agents"),
+        ("/settings/import", "Import sessions"),
+        ("/settings/instructions", "Instructions"),
+        ("/settings/policies", "Global Policies"),
+        ("/settings/system-status", "System status"),
+    ],
+)
+def test_sidebar_page_scroll_viewport_clears_mobile_navigation(
+    page: Page,
+    pages_url: str,
+    route: str,
+    heading: str,
+    request: pytest.FixtureRequest,
+) -> None:
+    page.set_viewport_size({"width": 390, "height": 844})
+    page.goto(f"{pages_url}{route}")
+    title = page.get_by_role("heading", name=heading, level=1, exact=True)
+    expect(title).to_be_visible()
+    if page.locator(".app-shell").get_attribute("data-sidebar-open") == "true":
+        page.get_by_role("button", name="Close sidebar", exact=True).click()
+    menu = page.locator(".chat-header-sidebar-toggle")
+    expect(menu).to_be_visible()
+    geometry = page.locator("main[data-shell-header] > div").first.evaluate(
+        """scroll => {
+            const menu = document.querySelector('.chat-header-sidebar-toggle');
+            return {scroll: scroll.getBoundingClientRect().toJSON(),
+                    menu: menu.getBoundingClientRect().toJSON()};
+        }"""
+    )
+    output = Path(request.config.getoption("output"))
+    output.mkdir(parents=True, exist_ok=True)
+    stem = route.strip("/").replace("/", "-")
+    (output / f"{stem}-geometry.json").write_text(json.dumps(geometry, indent=2))
+    page.screenshot(path=str(output / f"{stem}-mobile.png"))
+    assert geometry["scroll"]["top"] >= geometry["menu"]["bottom"], geometry
+
+
+@pytest.mark.parametrize("kind", ["external", "proxied"])
+@pytest.mark.parametrize("native", [False, True])
+def test_extension_page_clears_mobile_navigation(
+    page: Page,
+    pages_url: str,
+    browser_contract: BrowserContract,
+    kind: str,
+    native: bool,
+    request: pytest.FixtureRequest,
+) -> None:
+    board_url = (
+        "/v1/extensions/example.board/proxy/board/"
+        if kind == "proxied"
+        else "https://board.example.test/"
+    )
+    browser_contract.json(
+        "/v1/extensions",
+        {
+            "object": "list",
+            "data": [
+                {
+                    "object": "extension",
+                    "id": "example.board",
+                    "display_name": "Example board",
+                    "distribution": "example-board",
+                    "version": "1",
+                    "extension_api": 1,
+                    "status": "enabled",
+                    "permissions": ["pages.external", "pages.proxy"],
+                    "pages": [
+                        {
+                            "id": "board",
+                            "title": "Usage board",
+                            "route": "board",
+                            "kind": kind,
+                            "view": None,
+                            "url": board_url,
+                        }
+                    ],
+                    "primary_navigation": [
+                        {
+                            "id": "nav",
+                            "label": "Usage board",
+                            "page": "board",
+                            "icon": None,
+                            "order": 0,
+                            "when": None,
+                        }
+                    ],
+                    "browser": {
+                        "declared": False,
+                        "has_styles": False,
+                        "digest": None,
+                        "script_url": None,
+                        "style_url": None,
+                    },
+                }
+            ],
+        },
+    )
+    browser_contract.route(
+        f"{pages_url}{board_url}" if kind == "proxied" else board_url,
+        lambda route: route.fulfill(content_type="text/html", body="<h1>Example usage data</h1>"),
+    )
+    page.set_viewport_size({"width": 390, "height": 844})
+    page.goto(f"{pages_url}/extensions/example.board/board")
+    title = page.get_by_role("heading", name="Usage board", exact=True)
+    menu = page.get_by_role("button", name="Open sidebar", exact=True)
+    expect(title).to_be_visible()
+    expect(menu).to_be_visible()
+    if native:
+        page.locator(".app-shell").evaluate(
+            """shell => {
+                shell.dataset.iosNative = 'true';
+                document.documentElement.style.setProperty('--omnigent-safe-top', '47px');
+            }"""
+        )
+    title_box, menu_box = title.bounding_box(), menu.bounding_box()
+    assert title_box is not None and menu_box is not None
+    output = Path(request.config.getoption("output"))
+    output.mkdir(parents=True, exist_ok=True)
+    geometry = {"title": title_box, "menu": menu_box}
+    suffix = f"{kind}-{'native' if native else 'browser'}"
+    (output / f"extension-geometry-{suffix}.json").write_text(json.dumps(geometry, indent=2))
+    page.screenshot(path=str(output / f"extension-mobile-{suffix}.png"))
+    assert title_box["y"] >= menu_box["y"] + menu_box["height"], geometry
+    menu.click()
+    expect(page.locator("main[data-shell-header]")).to_have_attribute(
+        "data-shell-header", "hidden"
+    )
+    expect(page.locator(".extension-view-host")).to_have_css("padding-top", "0px")
+
+
+@pytest.mark.parametrize("surface", ["chat", "canvas", "host-terminals", "archived"])
+def test_sidebar_surfaces_with_their_own_headers(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    surface: str,
+    request: pytest.FixtureRequest,
+) -> None:
+    chat = chat_session_contract
+    contract = chat.contract
+    page.set_viewport_size({"width": 390, "height": 844})
+    if surface == "canvas":
+        contract.json(
+            "/v1/info",
+            {"accounts_enabled": False, "single_user": True, "features": {"canvas": True}},
+        )
+        page.goto(f"{chat.contract.base_url}/canvas")
+        first_row = page.get_by_role("tab", name="Main", exact=True)
+    elif surface == "host-terminals":
+        contract.json(
+            "/v1/hosts",
+            {
+                "hosts": [
+                    {
+                        "host_id": chat.host_id,
+                        "name": "Example host",
+                        "owner": "local",
+                        "status": "online",
+                        "capabilities": ["host_terminals_v1"],
+                    }
+                ]
+            },
+        )
+        contract.json(f"/v1/hosts/{chat.host_id}/terminals", {"terminals": []})
+        page.goto(f"{chat.contract.base_url}/hosts/{chat.host_id}/terminals")
+        first_row = page.get_by_role("heading", name="Example host · Terminals")
+    elif surface == "archived":
+        contract.json("/v1/sessions/archived-facets", {"hosts": [], "agents": [], "projects": []})
+        page.goto(f"{chat.contract.base_url}/settings/archived")
+        first_row = page.get_by_role("heading", name="Archived sessions", exact=True)
+    else:
+        page.goto(chat.url)
+        first_row = page.get_by_role("navigation", name="Conversation", exact=True)
+    expect(first_row).to_be_visible()
+    menu = (
+        page.get_by_role("link", name="Back to sessions")
+        if surface == "host-terminals"
+        else page.get_by_role(
+            "button",
+            name="Back to settings menu" if surface == "archived" else "Open sidebar",
+            exact=True,
+        )
+    )
+    expect(menu).to_be_visible()
+    row_box, menu_box = first_row.bounding_box(), menu.bounding_box()
+    assert row_box is not None and menu_box is not None
+    assert (
+        row_box["x"] >= menu_box["x"] + menu_box["width"]
+        or row_box["y"] >= menu_box["y"] + menu_box["height"]
+    ), (row_box, menu_box)
+    output = Path(request.config.getoption("output"))
+    output.mkdir(parents=True, exist_ok=True)
+    page.screenshot(path=str(output / f"{surface}-mobile.png"))
