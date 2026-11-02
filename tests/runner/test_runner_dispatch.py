@@ -17057,3 +17057,75 @@ async def test_eager_mcp_cache_keeps_named_child_scope_after_revision_change(mon
             assert response.status_code == 200, response.text
             assert "Worker instructions." in recording.posted_bodies[-1]["instructions"]
             assert "Root instructions." not in recording.posted_bodies[-1]["instructions"]
+
+
+@pytest.mark.asyncio
+async def test_sys_cancel_task_on_paneless_subagent_mirror_never_reports_cancelled() -> None:
+    """T17 / 26BUG-201: sys_cancel_task on a pane-less *-subagent mirror returns false."""
+    from omnigent.runner import subagent_work, tool_dispatch
+
+    parent_id = "conv_parent_t17"
+    child_id = "conv_child_t17"
+    evicted_id = "conv_evicted_t17"
+    stop_posts: list[str] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/stop"):
+            stop_posts.append(request.url.path)
+            return httpx.Response(200, json={"status": "idle"})
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{evicted_id}":
+            return httpx.Response(
+                200,
+                json={
+                    "id": evicted_id,
+                    "parent_session_id": parent_id,
+                    "current_task_status": "in_progress",
+                    "labels": {"omnigent.wrapper": "claude-code-native-ui-subagent"},
+                },
+            )
+        return httpx.Response(200, json={})
+
+    subagent_work.unregister_subagent_work_for_session(parent_id)
+    subagent_work.unregister_subagent_work_for_session(child_id)
+    entry = subagent_work.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="Explore",
+        title="helper",
+        wrapper_label="claude-code-native-ui-subagent",
+    )
+    entry.status = "running"
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_handler),
+            base_url="http://server",
+        ) as server_client:
+            tracked_raw = await tool_dispatch._cancel_subagent_task(
+                {"task_id": child_id},
+                conversation_id=parent_id,
+                server_client=server_client,
+            )
+            evicted_raw = await tool_dispatch._cancel_subagent_task(
+                {"task_id": evicted_id},
+                conversation_id=parent_id,
+                server_client=server_client,
+            )
+
+        assert tracked_raw is not None
+        tracked = json.loads(tracked_raw)
+        assert tracked["cancelled"] is False
+        assert tracked["cancel_confirmed"] is False
+        assert tracked["best_effort"] is True
+        assert tracked["stop_route"] == "parent_session_interrupt"
+        assert entry.status == "running"
+
+        assert evicted_raw is not None
+        evicted = json.loads(evicted_raw)
+        assert evicted["cancelled"] is False
+        assert evicted["cancel_confirmed"] is False
+        assert evicted["stop_route"] == "parent_session_interrupt"
+        assert stop_posts == []
+    finally:
+        subagent_work.unregister_subagent_work_for_session(parent_id)
+        subagent_work.unregister_subagent_work_for_session(child_id)

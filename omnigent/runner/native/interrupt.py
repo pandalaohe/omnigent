@@ -303,6 +303,42 @@ def native_agent_for_cancel(wrapper_label: str | None) -> NativeCodingAgent | No
     return None
 
 
+def is_native_subagent_wrapper_label(wrapper_label: str | None) -> bool:
+    """Return whether *wrapper_label* names a harness's own sub-agent mirror."""
+    if not wrapper_label:
+        return False
+    from omnigent.native.native_coding_agents import NATIVE_CODING_AGENTS
+
+    return any(
+        candidate.subagent_wrapper_label == wrapper_label for candidate in NATIVE_CODING_AGENTS
+    )
+
+
+def subagent_mirror_not_stopped_payload(
+    task_id: str,
+    *,
+    status: str,
+    wrapper_label: str | None = None,
+) -> dict[str, object]:
+    """Return an honest not-stopped payload for a pane-less native sub-agent mirror."""
+    agent = native_agent_for_cancel(wrapper_label)
+    harness_label = agent.harness if agent is not None else "native"
+    return {
+        "cancelled": False,
+        "stopped": False,
+        "cancel_requested": True,
+        "cancel_confirmed": False,
+        "best_effort": True,
+        "task_id": task_id,
+        "status": status,
+        "stop_route": "parent_session_interrupt",
+        "message": (
+            f"Native sub-agent mirror ({harness_label}) has no independent pane to stop; "
+            "interrupt or stop the parent session in its native TUI instead."
+        ),
+    }
+
+
 def native_session_has_active_work(pane_status: str | None, has_active_turn: bool) -> bool:
     """Prefer an observed pane state over a possibly-lagging task slot."""
     if pane_status is not None:
@@ -793,6 +829,22 @@ class NativeInterruptRunner:
         self._defer_parent_wake_after_native_interrupt(conv_id)
         return Response(status_code=204)
 
+    def _is_pane_less_subagent_mirror(
+        self, conv_id: str, *, bridge_id: str
+    ) -> tuple[bool, str, str | None]:
+        """Return whether *conv_id* is a pane-less sub-agent mirror with no tmux session."""
+        terminal_registry = self._resource_registry.terminal_registry
+        if terminal_registry is not None and terminal_registry.list_for_conversation(conv_id):
+            return False, "running", None
+        from omnigent.runner import subagent_work as _subagent_work
+
+        entry = _subagent_work.get_subagent_work(conv_id)
+        if entry is not None and is_native_subagent_wrapper_label(entry.wrapper_label):
+            return True, entry.status, entry.wrapper_label
+        if bridge_id == conv_id:
+            return True, "running", "claude-code-native-ui-subagent"
+        return False, "running", None
+
     async def _claude_stop(self, conv_id: str) -> Response:
         from omnigent.harnesses.claude_native.bridge import (
             TmuxSessionNotAdvertised,
@@ -809,6 +861,16 @@ class NativeInterruptRunner:
             await asyncio.to_thread(kill_session, bridge_dir, timeout_s=1.0)
         except TmuxSessionNotAdvertised:
             self._logger.debug("claude-native stop: no live tmux for %s", conv_id)
+            is_mirror, current_status, wrapper_label = self._is_pane_less_subagent_mirror(
+                conv_id, bridge_id=bridge_id
+            )
+            if is_mirror:
+                return JSONResponse(
+                    status_code=200,
+                    content=subagent_mirror_not_stopped_payload(
+                        conv_id, status=current_status, wrapper_label=wrapper_label
+                    ),
+                )
         except RuntimeError as exc:
             return JSONResponse(
                 status_code=503,
@@ -847,7 +909,9 @@ class NativeInterruptRunner:
         )
         from omnigent.harnesses.codex_native.bridge import (
             cancel_pending_mcp_startup,
+            clear_active_child_turn,
             clear_active_turn_id_if_matches,
+            read_active_child_turns,
             read_mcp_startup,
         )
 
@@ -855,7 +919,12 @@ class NativeInterruptRunner:
         if state is None:
             return None
         pending_mcp = cancel_pending_mcp_startup(bridge_dir)
-        if state.active_turn_id is None and not pending_mcp:
+        active_child_turns = [
+            (child_tid, child_turn_id)
+            for child_tid, info in read_active_child_turns(bridge_dir).items()
+            if isinstance((child_turn_id := info.get("turn_id")), str) and child_turn_id
+        ]
+        if state.active_turn_id is None and not pending_mcp and not active_child_turns:
             self._logger.info(
                 "Codex-native interrupt defers to runner cancellation for %s: "
                 "no active turn or MCP startup.",
@@ -962,7 +1031,19 @@ class NativeInterruptRunner:
                     # The targeted turn ended or was superseded, so skip the
                     # deferred parent-wake cancel. A dropped sub-agent completion
                     # can still leave its parent waiting; reconciled separately.
-                    return Response(status_code=204)
+                    if not active_child_turns:
+                        return Response(status_code=204)
+            for child_tid, child_turn_id in active_child_turns:
+                try:
+                    await codex_client.request(
+                        "turn/interrupt",
+                        {"threadId": child_tid, "turnId": child_turn_id},
+                    )
+                except CodexAppServerResponseError as exc:
+                    if not is_stale_active_turn_error(exc):
+                        raise
+                    if is_no_active_turn_error(exc):
+                        clear_active_child_turn(bridge_dir, child_tid, child_turn_id)
         except Exception as exc:
             self._logger.warning(
                 "Codex-native turn/interrupt failed for session=%s thread=%s turn=%s",

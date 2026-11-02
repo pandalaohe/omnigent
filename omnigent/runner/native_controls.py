@@ -73,6 +73,9 @@ _CLAUDE_MODEL_CONFIRM_TIMEOUT_S = 10.0
 
 _CLAUDE_MODEL_CONFIRM_POLL_S = 0.25
 
+_CODEX_HELPER_STOP_TIMEOUT_S = 1.0
+_CODEX_HELPER_STOP_POLL_S = 0.05
+
 
 # A session woken for a control may still be booting its TUI, so typing waits for
 # the prompt, capped so the rest fits the server's ~20s wait for the control.
@@ -867,6 +870,105 @@ def build_native_controls(
             },
         )
 
+    _codex_native_approval_modes: dict[str, str] = {}
+    _codex_native_helper_stop_pending: set[str] = set()
+
+    def _running_codex_native_work(session_id: str) -> bool:
+        from omnigent.runner.subagent_work import (
+            is_codex_native_subagent_wrapper,
+            list_subagent_work,
+        )
+
+        return any(
+            entry.status in {"launching", "running", "waiting"}
+            and is_codex_native_subagent_wrapper(entry.wrapper_label)
+            for entry in list_subagent_work(session_id)
+        )
+
+    async def _stop_codex_native_helpers_on_tighten(conv_id: str) -> bool:
+        from omnigent.harnesses.codex_native.app_server import (
+            CodexAppServerResponseError,
+            client_for_transport,
+            is_no_active_turn_error,
+        )
+        from omnigent.harnesses.codex_native.bridge import (
+            clear_active_child_turn,
+            read_active_child_turns,
+        )
+
+        has_running_work = _running_codex_native_work(conv_id)
+        try:
+            bridge, bridge_dir = await _codex_native_bridge_state_and_dir_for_session(
+                conv_id,
+                action="helper stop on approval mode tighten",
+            )
+        except Exception:
+            if not has_running_work:
+                return True
+            _logger.warning(
+                "Codex helper revocation could not read bridge state for %s",
+                conv_id,
+                exc_info=True,
+            )
+            return False
+        active_children = read_active_child_turns(bridge_dir)
+        if not active_children and not has_running_work:
+            return True
+        if bridge is None:
+            return False
+        socket_path = bridge.socket_path
+        interrupted_turns: set[tuple[str, str]] = set()
+        interrupt_failed = False
+
+        async def _interrupt_unseen_children() -> None:
+            nonlocal interrupt_failed
+            current = read_active_child_turns(bridge_dir)
+            to_interrupt = [
+                (tid, info.get("turn_id"))
+                for tid, info in current.items()
+                if isinstance(info.get("turn_id"), str)
+                and info.get("turn_id")
+                and (tid, str(info.get("turn_id"))) not in interrupted_turns
+            ]
+            if not to_interrupt:
+                return
+            client = client_for_transport(
+                socket_path,
+                client_name="omnigent-codex-native-runner",
+            )
+            try:
+                await client.connect()
+                for child_tid, child_turn_id in to_interrupt:
+                    assert isinstance(child_turn_id, str)
+                    interrupted_turns.add((child_tid, child_turn_id))
+                    try:
+                        await client.request(
+                            "turn/interrupt",
+                            {"threadId": child_tid, "turnId": child_turn_id},
+                        )
+                    except CodexAppServerResponseError as exc:
+                        if is_no_active_turn_error(exc):
+                            clear_active_child_turn(bridge_dir, child_tid, child_turn_id)
+                        else:
+                            interrupt_failed = True
+                    except Exception:  # noqa: BLE001
+                        interrupt_failed = True
+            except Exception:  # noqa: BLE001
+                interrupt_failed = True
+            finally:
+                with contextlib.suppress(Exception):
+                    await client.close()
+
+        await _interrupt_unseen_children()
+        deadline = time.monotonic() + _CODEX_HELPER_STOP_TIMEOUT_S
+        while True:
+            if not read_active_child_turns(bridge_dir) and not _running_codex_native_work(conv_id):
+                return not interrupt_failed
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(_CODEX_HELPER_STOP_POLL_S)
+            await _interrupt_unseen_children()
+
     async def _handle_codex_native_approval_mode_change(
         conv_id: str,
         mode: str,
@@ -989,6 +1091,26 @@ def build_native_controls(
                     )
                 except Exception:
                     _logger.warning("Failed to apply Codex permission profile", exc_info=True)
+        from omnigent.sdk_permission_modes import codex_approval_mode_tightens
+
+        previous_mode = _codex_native_approval_modes.get(conv_id)
+        tightening = codex_approval_mode_tightens(previous_mode, preset.value)
+        _codex_native_approval_modes[conv_id] = preset.value
+        if tightening or conv_id in _codex_native_helper_stop_pending:
+            helpers_stopped = await _stop_codex_native_helpers_on_tighten(conv_id)
+            if not helpers_stopped:
+                _codex_native_helper_stop_pending.add(conv_id)
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": "codex_helper_stop_pending",
+                        "detail": (
+                            "Mode saved for the next turn; helper stop is not confirmed. "
+                            "Retry the mode change before relying on the tighter permissions."
+                        ),
+                    },
+                )
+            _codex_native_helper_stop_pending.discard(conv_id)
         return JSONResponse(status_code=200, content={"approval_mode": preset.value})
 
     async def _codex_native_model_options(conv_id: str) -> list[_JsonObject]:

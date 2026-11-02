@@ -1107,3 +1107,142 @@ async def test_claude_interrupt_rechecks_pending_prompt_after_bridge_lookup(
         assert resp.body == b'{"interrupted":false,"reason":"idle"}'
         assert injected == []
         assert captured["wakes"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("bridge_id", "wrapper_label"),
+    [
+        pytest.param("conv_sub_mirror", None, id="no-bridge-id-label"),
+        pytest.param("bridge_parent", "claude-code-native-ui-subagent", id="subagent-wrapper"),
+    ],
+)
+async def test_claude_stop_on_paneless_subagent_mirror_returns_honest_not_stopped(
+    monkeypatch: pytest.MonkeyPatch,
+    bridge_id: str,
+    wrapper_label: str | None,
+) -> None:
+    """T17 / 26BUG-201: stopping a pane-less sub-agent mirror never lies ``cancelled: true``."""
+    import omnigent.harnesses.claude_native.bridge as claude_bridge
+    from omnigent.runner import subagent_work
+    from omnigent.runner.native import interrupt as interrupt_mod
+
+    conv_id = "conv_sub_mirror"
+    subagent_work.unregister_subagent_work_for_session(conv_id)
+    subagent_work.unregister_subagent_work_for_session("conv_parent")
+    if wrapper_label is not None:
+        subagent_work.register_subagent_work(
+            parent_session_id="conv_parent",
+            child_session_id=conv_id,
+            agent="Explore",
+            title="helper",
+            wrapper_label=wrapper_label,
+        )
+
+    async def _fake_bridge_id(*, server_client: Any, session_id: str) -> str:
+        del server_client, session_id
+        return bridge_id
+
+    def _absent(bridge_dir: Any, *, timeout_s: float) -> None:
+        del bridge_dir, timeout_s
+        raise claude_bridge.TmuxSessionNotAdvertised("not advertised")
+
+    monkeypatch.setattr(interrupt_mod, "_claude_native_bridge_id_for_session", _fake_bridge_id)
+    monkeypatch.setattr(claude_bridge, "bridge_dir_for_bridge_id", lambda bid: bid)
+    monkeypatch.setattr(claude_bridge, "kill_session", _absent)
+
+    try:
+        runner, captured = _make_runner()
+        resp = await runner.stop("claude-native", conv_id)
+
+        assert resp is not None and resp.status_code == 200
+        body = json.loads(bytes(resp.body))
+        assert body["cancelled"] is False
+        assert body["cancel_confirmed"] is False
+        assert body["best_effort"] is True
+        assert body["stop_route"] == "parent_session_interrupt"
+        assert captured["wakes"] == []
+        assert [e for _, e in captured["published"] if e.get("status") == "idle"] == []
+        if wrapper_label is not None:
+            entry = subagent_work.get_subagent_work(conv_id)
+            assert entry is not None and entry.status == "launching"
+    finally:
+        subagent_work.unregister_subagent_work_for_session(conv_id)
+        subagent_work.unregister_subagent_work_for_session("conv_parent")
+
+
+@pytest.mark.asyncio
+async def test_codex_interrupt_also_interrupts_active_child_turns(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """T31: parent codex-native interrupt also sends turn/interrupt to active child turns."""
+    from omnigent.harnesses.codex_native import app_server, bridge
+    from tests.runner.helpers import NullServerClient
+
+    bridge.update_active_child_turn(
+        tmp_path,
+        "thread_child_1",
+        session_id="conv_child_1",
+        turn_id="turn_child_1",
+        status="running",
+    )
+    bridge.update_active_child_turn(
+        tmp_path,
+        "thread_child_stale",
+        session_id="conv_child_stale",
+        turn_id="turn_child_stale",
+        status="running",
+    )
+
+    requests: list[tuple[str, dict[str, Any]]] = []
+
+    class _FakeClient:
+        async def connect(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            requests.append((method, params))
+            if params.get("threadId") == "thread_child_stale":
+                raise app_server.CodexAppServerResponseError(
+                    {"code": -32600, "message": "no active turn to interrupt"}
+                )
+            return {"result": {}}
+
+    async def active_bridge(*args: Any, **kwargs: Any) -> Any:
+        return (
+            SimpleNamespace(
+                socket_path="unix:///tmp/codex.sock",
+                thread_id="thread_parent",
+                active_turn_id="turn_parent",
+            ),
+            tmp_path,
+        )
+
+    monkeypatch.setattr(
+        app_server,
+        "client_for_transport",
+        lambda _sock, **_kwargs: _FakeClient(),
+    )
+    runner, _ = _make_runner(
+        server_client=NullServerClient(),
+        codex_bridge_state_for_session=active_bridge,
+    )
+
+    resp = await runner.interrupt("codex-native", "conv_cx")
+    assert isinstance(resp, Response) and resp.status_code == 204
+    assert ("turn/interrupt", {"threadId": "thread_parent", "turnId": "turn_parent"}) in requests
+    assert (
+        "turn/interrupt",
+        {"threadId": "thread_child_1", "turnId": "turn_child_1"},
+    ) in requests
+    assert (
+        "turn/interrupt",
+        {"threadId": "thread_child_stale", "turnId": "turn_child_stale"},
+    ) in requests
+    remaining = bridge.read_active_child_turns(tmp_path)
+    assert "thread_child_stale" not in remaining
+    assert "thread_child_1" in remaining

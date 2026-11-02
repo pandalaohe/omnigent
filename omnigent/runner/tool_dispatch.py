@@ -13182,7 +13182,11 @@ async def _cancel_evicted_native_subagent(
     evicted entry means the parent no longer knows the child's state, so
     trusting the caller's task id alone could stop someone else's session.
     """
-    from omnigent.runner.native.interrupt import native_cancel_capability
+    from omnigent.runner.native.interrupt import (
+        is_native_subagent_wrapper_label,
+        native_cancel_capability,
+        subagent_mirror_not_stopped_payload,
+    )
 
     if server_client is None:
         return "Error: sys_cancel_task requires server access for sub-agent tasks"
@@ -13199,8 +13203,23 @@ async def _cancel_evicted_native_subagent(
         not isinstance(snapshot, dict)
         or snapshot.get("parent_session_id") != conversation_id
         or not isinstance(wrapper, str)
-        or native_cancel_capability(wrapper) != "stop"
     ):
+        return f"Error: no in-flight task with task_id {task_id}"
+    if is_native_subagent_wrapper_label(wrapper) and not await _native_child_pane_alive(
+        task_id, wrapper
+    ):
+        snapshot_status = snapshot.get("status")
+        status = (
+            snapshot_status if isinstance(snapshot_status, str) and snapshot_status else "running"
+        )
+        return json.dumps(
+            subagent_mirror_not_stopped_payload(
+                task_id,
+                status=status,
+                wrapper_label=wrapper,
+            )
+        )
+    if native_cancel_capability(wrapper) != "stop":
         return f"Error: no in-flight task with task_id {task_id}"
     # A 503 is a failed kill, not proof the pane is gone. Report an explicit
     # unconfirmed result rather than ``absent`` / a cached terminal status.
@@ -13249,7 +13268,11 @@ async def _cancel_subagent_task(
     :returns: JSON cancellation result.
     """
     from omnigent.runner import subagent_work as _subagent_work
-    from omnigent.runner.native.interrupt import native_cancel_capability
+    from omnigent.runner.native.interrupt import (
+        is_native_subagent_wrapper_label,
+        native_cancel_capability,
+        subagent_mirror_not_stopped_payload,
+    )
 
     task_id = args.get("task_id") or args.get("handle_id")
     if not task_id:
@@ -13278,6 +13301,16 @@ async def _cancel_subagent_task(
     )
     if entry.status not in ("launching", "running", "waiting") and not can_stop_failed:
         return _cached_subagent_cancel_result(str(task_id), entry.status)
+    if is_native_subagent_wrapper_label(
+        entry.wrapper_label
+    ) and not await _native_child_pane_alive(str(task_id), entry.wrapper_label):
+        return json.dumps(
+            subagent_mirror_not_stopped_payload(
+                str(task_id),
+                status=entry.status,
+                wrapper_label=entry.wrapper_label,
+            )
+        )
     if server_client is None:
         return "Error: sys_cancel_task requires server access for sub-agent tasks"
 
@@ -13298,6 +13331,11 @@ async def _cancel_subagent_task(
         return (
             f"Error: sys_cancel_task {event_type} returned {resp.status_code}: {resp.text[:200]}"
         )
+    if resp.status_code == 200 and resp.content:
+        with contextlib.suppress(ValueError):
+            resp_payload = resp.json()
+            if isinstance(resp_payload, dict) and resp_payload.get("cancelled") is False:
+                return json.dumps(resp_payload)
 
     updated = _subagent_work.get_subagent_work(str(task_id)) or entry
     if updated.status == "cancelled":

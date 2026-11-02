@@ -15,7 +15,7 @@ import urllib.request
 from collections import deque
 from collections.abc import AsyncIterator, Callable, Collection
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import cast
 
@@ -49,6 +49,7 @@ from omnigent.harnesses.codex_native.bridge import (
     MCP_STARTUP_STATES,
     CodexNativeBridgeState,
     DeveloperInstructionsReadState,
+    clear_active_child_turn,
     clear_active_turn_id_if_matches,
     clear_certificate_failure,
     codex_config_revision,
@@ -64,6 +65,7 @@ from omnigent.harnesses.codex_native.bridge import (
     record_child_usage_baseline,
     resolve_codex_auto_compact_token_limit,
     settle_pending_mcp_startup,
+    update_active_child_turn,
     update_active_turn_id,
     update_mcp_server_startup,
     update_thread_id,
@@ -894,6 +896,15 @@ class _CodexForwarderState:
     pending_child_threads: dict[str, str | None] = field(default_factory=dict)
     subscribed_child_threads: set[str] = field(default_factory=set)
     child_streams: dict[str, _CodexChildStream] = field(default_factory=dict)
+    active_parent_turn_id: str | None = None
+    completed_parent_turn_ids: set[str] = field(default_factory=set)
+    consumed_child_threads: set[str] = field(default_factory=set)
+    in_flight_collab_calls_by_thread: dict[str, set[str]] = field(default_factory=dict)
+    deferred_child_terminal_edges: dict[str, tuple[str, _CodexTurnStatusEdge]] = field(
+        default_factory=dict
+    )
+    parent_turn_consumed: bool = False
+    defer_terminal_edge_callback: Callable[[str, _CodexTurnStatusEdge], None] | None = None
     synced_item_keys: set[str] = field(default_factory=set)
     surfaced_terminal_error_turns: set[str] = field(default_factory=set)
     posted_user_turns: set[str] = field(default_factory=set)
@@ -1186,6 +1197,11 @@ class _CodexForwarderState:
         self.permission_observation = None
         self.posted_permission_observation = None
         self.posted_permission_session_id = None
+        self.active_parent_turn_id = None
+        self.completed_parent_turn_ids.clear()
+        self.consumed_child_threads.clear()
+        self.in_flight_collab_calls_by_thread.clear()
+        self.deferred_child_terminal_edges.clear()
         self.publish_child_snapshot()
         self.pending_child_threads.clear()
         self.posted_goal_state = None
@@ -1787,6 +1803,7 @@ class _CodexTurnStatusEdge:
     error: _CodexTerminalError | None = None
     compaction_model: str | None = None
     selected_model: str | None = None
+    parent_turn_consumed: bool = False
 
 
 @dataclass(frozen=True)
@@ -4085,18 +4102,91 @@ async def _handle_event(
         observed_status = None
         if method == "turn/started":
             observed_status = "running"
-        elif method in {"turn/completed", "turn/failed"}:
-            observed_status = (
-                "failed"
-                if method == "turn/failed"
-                or _turn_status_is_failed(params)
-                or _terminal_error_from_turn(params) is not None
-                else "idle"
+            child_turn_id = _turn_id_from_payload(params.get("turn")) or _turn_id_from_payload(
+                params
             )
+            if child_thread is not None:
+                forwarder_state.consumed_child_threads.discard(child_thread)
+                _prev_deferred = forwarder_state.deferred_child_terminal_edges.pop(
+                    child_thread, None
+                )
+                if _prev_deferred is not None:
+                    await _post_turn_status_edge(client, _prev_deferred[0], _prev_deferred[1])
+                if event_state is not None:
+                    event_state.parent_turn_consumed = False
+                    event_state.defer_terminal_edge_callback = None
+                if not is_replay and bridge_dir != Path():
+                    update_active_child_turn(
+                        bridge_dir,
+                        child_thread,
+                        session_id=route_session_id,
+                        turn_id=child_turn_id,
+                        status="running",
+                    )
+        elif method in {"turn/completed", "turn/failed", "error"}:
+            if method in {"turn/completed", "turn/failed"}:
+                observed_status = (
+                    "failed"
+                    if method == "turn/failed"
+                    or _turn_status_is_failed(params)
+                    or _terminal_error_from_turn(params) is not None
+                    else "idle"
+                )
+                child_turn_id = _terminal_turn_id_from_params(params)
+            else:
+                observed_status = "failed"
+                child_turn_id = _turn_id_from_payload(params)
+            if child_thread is not None:
+                if not is_replay and bridge_dir != Path():
+                    clear_active_child_turn(bridge_dir, child_thread, child_turn_id)
+                if event_state is not None:
+                    event_state.parent_turn_consumed = (
+                        child_thread in forwarder_state.consumed_child_threads
+                    )
+                    if (
+                        not is_replay
+                        and not event_state.parent_turn_consumed
+                        and forwarder_state.in_flight_collab_calls_by_thread.get(child_thread)
+                        and _has_active_parent_turn(forwarder_state, bridge_dir)
+                    ):
+                        _bound_child_thread = child_thread
+
+                        def _defer_child_edge(sid: str, edge: _CodexTurnStatusEdge) -> None:
+                            forwarder_state.deferred_child_terminal_edges[_bound_child_thread] = (
+                                sid,
+                                edge,
+                            )
+
+                        event_state.defer_terminal_edge_callback = _defer_child_edge
+                    else:
+                        event_state.defer_terminal_edge_callback = None
         if child_thread is not None and observed_status is not None:
             forwarder_state.subagent_status_by_thread[child_thread] = observed_status
             forwarder_state.publish_child_snapshot()
     if not is_child and forwarder_state is not None:
+        if method == "turn/started" and not is_replay:
+            parent_turn_id = _turn_id_from_payload(params.get("turn")) or _turn_id_from_payload(
+                params
+            )
+            if parent_turn_id is not None:
+                forwarder_state.active_parent_turn_id = parent_turn_id
+                forwarder_state.completed_parent_turn_ids.discard(parent_turn_id)
+        elif method in {"turn/completed", "turn/failed", "error"}:
+            parent_turn_id = (
+                _terminal_turn_id_from_params(params)
+                if method in {"turn/completed", "turn/failed"}
+                else _turn_id_from_payload(params)
+            )
+            if parent_turn_id is not None:
+                forwarder_state.completed_parent_turn_ids.add(parent_turn_id)
+                if forwarder_state.active_parent_turn_id == parent_turn_id:
+                    forwarder_state.active_parent_turn_id = None
+            forwarder_state.in_flight_collab_calls_by_thread.clear()
+            for _child_tid, (_child_sid, _deferred_edge) in list(
+                forwarder_state.deferred_child_terminal_edges.items()
+            ):
+                forwarder_state.deferred_child_terminal_edges.pop(_child_tid, None)
+                await _post_turn_status_edge(client, _child_sid, _deferred_edge)
         if method == _CODEX_GOAL_UPDATED_METHOD and "goal" in params:
             await _post_codex_goal_state_if_changed(
                 client,
@@ -4134,7 +4224,15 @@ async def _handle_event(
     if method == "item/started" and forwarder_state is not None:
         item = params.get("item")
         if isinstance(item, dict) and item.get("type") == _CODEX_COLLAB_AGENT_ITEM_TYPE:
-            await _handle_collab_item(client, params, item, forwarder_state)
+            await _handle_collab_item(
+                client,
+                params,
+                item,
+                forwarder_state,
+                bridge_dir=bridge_dir,
+                is_replay=is_replay,
+                is_started=True,
+            )
         elif isinstance(item, dict) and item.get("type") == _CODEX_SUBAGENT_ACTIVITY_ITEM_TYPE:
             await _handle_subagent_activity(client, params, item, forwarder_state)
         elif isinstance(item, dict) and item.get("type") == _CODEX_COMPACTION_ITEM_TYPE:
@@ -4240,6 +4338,7 @@ async def _handle_event(
             bridge_dir=event_bridge_dir,
             file_observer_bridge_dir=bridge_dir,
             async_questions_live=not is_child and not is_replay,
+            is_replay=is_replay,
         )
 
 
@@ -4925,6 +5024,9 @@ async def _maybe_handle_turn_event(
                     error=error,
                     compaction_model=compaction_model,
                     selected_model=selected_model if compaction_model else None,
+                    parent_turn_consumed=bool(
+                        forwarder_state is not None and forwarder_state.parent_turn_consumed
+                    ),
                 ),
             )
             await usage_coalescer.flush()
@@ -5120,6 +5222,7 @@ async def _handle_completed_event(
     bridge_dir: Path | None = None,
     async_questions_live: bool = False,
     file_observer_bridge_dir: Path | None = None,
+    is_replay: bool = False,
 ) -> None:
     """
     Flush pending text and mirror one completed Codex item.
@@ -5134,6 +5237,7 @@ async def _handle_completed_event(
     :param async_questions_live: ``True`` only for a live async-question
         event on the forwarder's own route.
     :param file_observer_bridge_dir: Runner relay directory shared by native children.
+    :param is_replay: Whether this completed item is replayed from ``thread/resume``.
     :returns: None.
     """
     if delta_coalescer is not None:
@@ -5148,6 +5252,7 @@ async def _handle_completed_event(
         bridge_dir=bridge_dir,
         async_questions_live=async_questions_live,
         file_observer_bridge_dir=file_observer_bridge_dir,
+        is_replay=is_replay,
     )
 
 
@@ -5246,7 +5351,14 @@ async def _handle_terminal_turn_boundary_inner(
         forwarder_state.forget_user_message_copies(terminal_turn_id)
     handled = terminal.handled
     if terminal.edge is not None:
-        await _post_turn_status_edge(client, session_id, terminal.edge)
+        defer_cb = (
+            forwarder_state.defer_terminal_edge_callback if forwarder_state is not None else None
+        )
+        if defer_cb is not None and forwarder_state is not None:
+            forwarder_state.defer_terminal_edge_callback = None
+            defer_cb(session_id, terminal.edge)
+        else:
+            await _post_turn_status_edge(client, session_id, terminal.edge)
     if handled:
         await elicitation_tracker.resolve_by_terminal_turn_event(
             client,
@@ -6597,6 +6709,8 @@ def _prepare_terminal_turn_event(
             terminal_turn_id,
         )
         return _PreparedTerminalTurn(handled=False, edge=None)
+    if forwarder_state is not None and forwarder_state.parent_turn_consumed:
+        edge = replace(edge, parent_turn_consumed=True)
     return _PreparedTerminalTurn(handled=True, edge=edge)
 
 
@@ -6799,6 +6913,7 @@ async def _handle_completed_item(
     bridge_dir: Path | None = None,
     async_questions_live: bool = False,
     file_observer_bridge_dir: Path | None = None,
+    is_replay: bool = False,
 ) -> None:
     """Serialize and forward one completed Codex transcript item."""
     async with _conversation_item_delivery_scope(session_id):
@@ -6810,6 +6925,7 @@ async def _handle_completed_item(
             bridge_dir=bridge_dir,
             async_questions_live=async_questions_live,
             file_observer_bridge_dir=file_observer_bridge_dir,
+            is_replay=is_replay,
         )
 
 
@@ -6822,6 +6938,7 @@ async def _handle_completed_item_inner(
     bridge_dir: Path | None = None,
     async_questions_live: bool = False,
     file_observer_bridge_dir: Path | None = None,
+    is_replay: bool = False,
 ) -> None:
     """
     Forward one Codex completed item event when it maps to Omnigent history.
@@ -6861,7 +6978,15 @@ async def _handle_completed_item_inner(
     # root parent, matching ``collabAgentToolCall`` behavior.
     if item_type == _CODEX_COLLAB_AGENT_ITEM_TYPE:
         if forwarder_state is not None:
-            await _handle_collab_item(client, params, item, forwarder_state)
+            await _handle_collab_item(
+                client,
+                params,
+                item,
+                forwarder_state,
+                bridge_dir=file_observer_bridge_dir or bridge_dir,
+                is_replay=is_replay,
+                is_started=False,
+            )
         return
     if item_type == _CODEX_SUBAGENT_ACTIVITY_ITEM_TYPE:
         if forwarder_state is not None:
@@ -7262,14 +7387,57 @@ async def _flush_turn_diff(
         )
 
 
+def _has_active_parent_turn(
+    forwarder_state: _CodexForwarderState,
+    bridge_dir: Path | None = None,
+) -> bool:
+    """Return whether the parent session currently has an active turn."""
+    if (
+        forwarder_state.active_parent_turn_id is not None
+        and forwarder_state.active_parent_turn_id not in forwarder_state.completed_parent_turn_ids
+    ):
+        return True
+    if bridge_dir is not None and bridge_dir != Path():
+        state = read_bridge_state(bridge_dir)
+        if (
+            state is not None
+            and state.active_turn_id is not None
+            and state.active_turn_id not in forwarder_state.completed_parent_turn_ids
+        ):
+            return True
+    return False
+
+
+def _collab_item_in_active_parent_turn(
+    params: _JsonObject,
+    forwarder_state: _CodexForwarderState,
+    bridge_dir: Path | None = None,
+) -> bool:
+    """Return whether a ``collabAgentToolCall`` event belongs to an active parent turn."""
+    parent_turn_id = _turn_id_from_payload(params)
+    if parent_turn_id is None or parent_turn_id in forwarder_state.completed_parent_turn_ids:
+        return False
+    if forwarder_state.active_parent_turn_id is not None:
+        return forwarder_state.active_parent_turn_id == parent_turn_id
+    if bridge_dir is not None and bridge_dir != Path():
+        state = read_bridge_state(bridge_dir)
+        if state is not None and state.active_turn_id is not None:
+            return state.active_turn_id == parent_turn_id
+    return False
+
+
 async def _handle_collab_item(
     client: httpx.AsyncClient,
     params: _JsonObject,
     item: _JsonObject,
     forwarder_state: _CodexForwarderState,
+    *,
+    bridge_dir: Path | None = None,
+    is_replay: bool = False,
+    is_started: bool = False,
 ) -> None:
     """
-    Handle a Codex ``collabAgentToolCall`` completed item.
+    Handle a Codex ``collabAgentToolCall`` started or completed item.
 
     Registers newly discovered child threads and posts Omnigent status updates
     from the collab-agent state snapshot in the item. Does not write
@@ -7277,27 +7445,63 @@ async def _handle_collab_item(
     via that child's own ``item/completed`` stream.
 
     :param client: HTTP client for Omnigent event posts.
-    :param params: Codex ``item/completed`` params.
+    :param params: Codex ``item/started`` or ``item/completed`` params.
     :param item: Codex ``collabAgentToolCall`` item.
     :param forwarder_state: Mutable state for child-thread mappings.
+    :param bridge_dir: Optional root bridge directory.
+    :param is_replay: Whether this event is replayed from ``thread/resume``.
+    :param is_started: ``True`` on ``item/started``, ``False`` on ``item/completed``.
     :returns: None.
     """
-    if item.get("tool") != _CODEX_COLLAB_SPAWN_TOOL:
-        return
     parent_session_id = _parent_session_id_from_forwarder_state(forwarder_state)
     if parent_session_id is None:
         return
-    parent_thread_id = _collab_parent_thread_id(params, item)
-    for child_thread_id in _collab_receiver_thread_ids(item):
-        await _ensure_child_session(
-            client,
-            parent_session_id=parent_session_id,
-            parent_thread_id=parent_thread_id,
-            child_thread_id=child_thread_id,
-            item=item,
-            forwarder_state=forwarder_state,
-        )
-    await _post_collab_agent_statuses(client, item=item, forwarder_state=forwarder_state)
+    call_id = item.get("id")
+    receiver_threads = set(_collab_receiver_thread_ids(item))
+    states = item.get("agentsStates")
+    if isinstance(states, dict):
+        for thread_id in states:
+            if isinstance(thread_id, str) and thread_id:
+                receiver_threads.add(thread_id)
+    if isinstance(call_id, str) and call_id and not is_replay:
+        if is_started and _collab_item_in_active_parent_turn(params, forwarder_state, bridge_dir):
+            for child_thread_id in receiver_threads:
+                forwarder_state.in_flight_collab_calls_by_thread.setdefault(
+                    child_thread_id, set()
+                ).add(call_id)
+        elif not is_started:
+            for child_thread_id in receiver_threads:
+                calls = forwarder_state.in_flight_collab_calls_by_thread.get(child_thread_id)
+                if calls is not None:
+                    calls.discard(call_id)
+                    if not calls:
+                        forwarder_state.in_flight_collab_calls_by_thread.pop(child_thread_id, None)
+    if item.get("tool") == _CODEX_COLLAB_SPAWN_TOOL:
+        parent_thread_id = _collab_parent_thread_id(params, item)
+        for child_thread_id in _collab_receiver_thread_ids(item):
+            await _ensure_child_session(
+                client,
+                parent_session_id=parent_session_id,
+                parent_thread_id=parent_thread_id,
+                child_thread_id=child_thread_id,
+                item=item,
+                forwarder_state=forwarder_state,
+            )
+    await _post_collab_agent_statuses(
+        client,
+        params=params,
+        item=item,
+        forwarder_state=forwarder_state,
+        bridge_dir=bridge_dir,
+        is_replay=is_replay,
+        is_started=is_started,
+    )
+    if not is_started:
+        for child_thread_id in receiver_threads:
+            if not forwarder_state.in_flight_collab_calls_by_thread.get(child_thread_id):
+                deferred = forwarder_state.deferred_child_terminal_edges.pop(child_thread_id, None)
+                if deferred is not None:
+                    await _post_turn_status_edge(client, deferred[0], deferred[1])
 
 
 async def _handle_subagent_activity(
@@ -7704,6 +7908,10 @@ async def _post_collab_agent_statuses(
     *,
     item: _JsonObject,
     forwarder_state: _CodexForwarderState,
+    params: _JsonObject | None = None,
+    bridge_dir: Path | None = None,
+    is_replay: bool = False,
+    is_started: bool = False,
 ) -> None:
     """
     Publish Omnigent status updates from a Codex collab-agent state snapshot.
@@ -7712,11 +7920,21 @@ async def _post_collab_agent_statuses(
     :param item: Codex ``collabAgentToolCall`` item carrying
         ``agentsStates``.
     :param forwarder_state: Mutable state for child-thread mappings.
+    :param params: Optional enclosing notification params carrying ``turnId``.
+    :param bridge_dir: Optional root bridge directory.
+    :param is_replay: Whether this item was replayed from ``thread/resume``.
+    :param is_started: Whether this item came from ``item/started``.
     :returns: None.
     """
     states = item.get("agentsStates")
     if not isinstance(states, dict):
         return
+    in_active_parent_turn = (
+        not is_replay
+        and not is_started
+        and params is not None
+        and _collab_item_in_active_parent_turn(params, forwarder_state, bridge_dir)
+    )
     for thread_id, state in states.items():
         if not isinstance(thread_id, str) or not isinstance(state, dict):
             continue
@@ -7727,7 +7945,44 @@ async def _post_collab_agent_statuses(
         if ap_status is not None:
             forwarder_state.subagent_status_by_thread[thread_id] = ap_status
             forwarder_state.publish_child_snapshot()
-            await _post_status(client, child_session_id, ap_status)
+            consumed = False
+            if ap_status in {"idle", "failed"}:
+                if not is_replay and bridge_dir is not None and bridge_dir != Path():
+                    clear_active_child_turn(bridge_dir, thread_id)
+                if in_active_parent_turn:
+                    consumed = True
+                    forwarder_state.consumed_child_threads.add(thread_id)
+                    child_stream = forwarder_state.child_streams.get(thread_id)
+                    if child_stream is not None:
+                        child_stream.state.parent_turn_consumed = True
+                elif thread_id in forwarder_state.consumed_child_threads:
+                    consumed = True
+                deferred = forwarder_state.deferred_child_terminal_edges.pop(thread_id, None)
+                if deferred is not None:
+                    deferred_sid, deferred_edge = deferred
+                    if consumed:
+                        deferred_edge = replace(deferred_edge, parent_turn_consumed=True)
+                    await _post_turn_status_edge(client, deferred_sid, deferred_edge)
+            elif ap_status == "running":
+                if not is_replay and bridge_dir is not None and bridge_dir != Path():
+                    update_active_child_turn(
+                        bridge_dir,
+                        thread_id,
+                        session_id=child_session_id,
+                        status="running",
+                    )
+                if not is_started and not forwarder_state.in_flight_collab_calls_by_thread.get(
+                    thread_id
+                ):
+                    deferred = forwarder_state.deferred_child_terminal_edges.pop(thread_id, None)
+                    if deferred is not None:
+                        await _post_turn_status_edge(client, deferred[0], deferred[1])
+            await _post_status(
+                client,
+                child_session_id,
+                ap_status,
+                parent_turn_consumed=consumed,
+            )
 
 
 def _codex_native_subagent_snapshot(state: _CodexForwarderState) -> dict[str, str]:
@@ -8682,6 +8937,7 @@ async def _post_status(
     reauth_required: bool = False,
     compaction_model: str | None = None,
     selected_model: str | None = None,
+    parent_turn_consumed: bool = False,
 ) -> None:
     """
     Publish a native Codex status edge.
@@ -8700,6 +8956,9 @@ async def _post_status(
     :param compaction_model: Previous model a failed pre-turn compaction ran
         on, so the server can explain that switching models won't help.
     :param selected_model: The thread's selected model for that failure.
+    :param parent_turn_consumed: When ``True``, mark a terminal child status
+        edge as already consumed inside an active parent Codex turn so the
+        runner does not issue a duplicate inbox wake.
     :returns: None.
     """
     data: _JsonObject = {"status": status}
@@ -8712,6 +8971,8 @@ async def _post_status(
     if compaction_model is not None and selected_model is not None:
         data["compaction_model"] = compaction_model
         data["selected_model"] = selected_model
+    if parent_turn_consumed:
+        data["parent_turn_consumed"] = True
     response = await _post_session_event(
         client,
         session_id,
@@ -8783,6 +9044,7 @@ async def _post_turn_status_edge(
         reauth_required=reauth_required,
         compaction_model=edge.compaction_model,
         selected_model=edge.selected_model,
+        parent_turn_consumed=edge.parent_turn_consumed,
     )
 
 

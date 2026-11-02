@@ -79,6 +79,8 @@ _MCP_STARTUP_FILE = "mcp_startup.json"
 # across forwarder restarts because resumed threads report their totals again.
 _CHILD_USAGE_BASELINES_FILE = "child_usage_baselines.json"
 _CHILD_USAGE_BASELINES_LOCK_FILE = "child_usage_baselines.lock"
+_ACTIVE_CHILD_TURNS_FILE = "active_child_turns.json"
+_ACTIVE_CHILD_TURNS_LOCK_FILE = "active_child_turns.lock"
 
 # Startup states mirrored from Codex's ``McpServerStartupState`` enum.
 MCP_STARTUP_STARTING = "starting"
@@ -1481,6 +1483,7 @@ def clear_bridge_state(bridge_dir: Path) -> None:
             _STARTUP_TIMEOUT_FILE,
             _MCP_STARTUP_FILE,
             _EGRESS_CERTIFICATE_FILE,
+            _ACTIVE_CHILD_TURNS_FILE,
         ):
             try:
                 (bridge_dir / name).unlink()
@@ -2161,4 +2164,94 @@ def clear_active_turn_id_if_matches(
             replace(state, active_turn_id=None),
         )
         _run_on_cleared()
+        return True
+
+
+def read_active_child_turns(bridge_dir: Path) -> dict[str, dict[str, str | None]]:
+    """Read active child helper threads and their turn ids from the bridge directory."""
+    if bridge_dir == Path():
+        return {}
+    path = bridge_dir / _ACTIVE_CHILD_TURNS_FILE
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, dict[str, str | None]] = {}
+    for thread_id, info in raw.items():
+        if not isinstance(thread_id, str) or not thread_id or not isinstance(info, dict):
+            continue
+        session_id = info.get("session_id")
+        turn_id = info.get("turn_id")
+        status = info.get("status")
+        result[thread_id] = {
+            "session_id": session_id if isinstance(session_id, str) and session_id else None,
+            "turn_id": turn_id if isinstance(turn_id, str) and turn_id else None,
+            "status": status if isinstance(status, str) and status else None,
+        }
+    return result
+
+
+def _write_active_child_turns_unlocked(
+    bridge_dir: Path, entries: Mapping[str, dict[str, str | None]]
+) -> None:
+    """Atomically write ``active_child_turns.json`` under the active-child-turns lock."""
+    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = bridge_dir / _ACTIVE_CHILD_TURNS_FILE
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{_ACTIVE_CHILD_TURNS_FILE}.", dir=str(bridge_dir))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(dict(entries), handle, sort_keys=True)
+            handle.write("\n")
+        os.replace(tmp_name, path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+
+
+def update_active_child_turn(
+    bridge_dir: Path,
+    thread_id: str,
+    *,
+    session_id: str | None = None,
+    turn_id: str | None = None,
+    status: str | None = None,
+) -> None:
+    """Record or update an active child helper thread and turn in the bridge directory."""
+    if not thread_id or bridge_dir == Path():
+        return
+    with _bridge_state_lock(bridge_dir, _ACTIVE_CHILD_TURNS_LOCK_FILE):
+        entries = read_active_child_turns(bridge_dir)
+        existing = entries.get(thread_id) or {}
+        entries[thread_id] = {
+            "session_id": session_id if session_id is not None else existing.get("session_id"),
+            "turn_id": turn_id if turn_id is not None else existing.get("turn_id"),
+            "status": status if status is not None else (existing.get("status") or "running"),
+        }
+        _write_active_child_turns_unlocked(bridge_dir, entries)
+
+
+def clear_active_child_turn(
+    bridge_dir: Path,
+    thread_id: str,
+    completed_turn_id: str | None = None,
+) -> bool:
+    """Remove a child helper thread from ``active_child_turns.json`` when its turn ends."""
+    if not thread_id or bridge_dir == Path():
+        return False
+    with _bridge_state_lock(bridge_dir, _ACTIVE_CHILD_TURNS_LOCK_FILE):
+        entries = read_active_child_turns(bridge_dir)
+        existing = entries.get(thread_id)
+        if existing is None:
+            return False
+        current_turn_id = existing.get("turn_id")
+        if (
+            completed_turn_id is not None
+            and current_turn_id is not None
+            and current_turn_id != completed_turn_id
+        ):
+            return False
+        entries.pop(thread_id, None)
+        _write_active_child_turns_unlocked(bridge_dir, entries)
         return True

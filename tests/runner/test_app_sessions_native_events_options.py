@@ -4669,3 +4669,103 @@ async def test_codex_workspace_switch_selects_generated_profile(
             )
         else:
             assert actions[-2:] == ["escape", "update"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("confirmed", [True, False])
+async def test_codex_native_approval_mode_tighten_stops_running_helpers_or_returns_409(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    confirmed: bool,
+) -> None:
+    """T24: tightening codex-native approval mode interrupts active helpers or returns 409."""
+    from types import SimpleNamespace
+
+    from omnigent.harnesses.codex_native import app_server, bridge
+    from tests.runner.helpers import make_test_terminal_instance
+
+    conv_id = "8864122f95f2f013c9599f4014725784"
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    state = bridge.CodexNativeBridgeState(
+        session_id=conv_id,
+        socket_path="ws://127.0.0.1:1234",
+        thread_id="thread_parent",
+        codex_home=str(tmp_path / "home"),
+    )
+    bridge.write_bridge_state(bridge_dir, state)
+    bridge.update_active_child_turn(
+        bridge_dir,
+        "thread_helper_t24",
+        session_id="conv_helper_t24",
+        turn_id="turn_helper_t24",
+        status="running",
+    )
+
+    monkeypatch.setattr(bridge, "bridge_dir_for_bridge_id", lambda _: bridge_dir)
+    monkeypatch.setattr(bridge, "read_bridge_state", lambda _: state)
+    monkeypatch.setattr(native_controls, "_CODEX_HELPER_STOP_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(native_controls, "_CODEX_HELPER_STOP_POLL_S", 0.01)
+    selected = False
+
+    def _tmux(_socket: str, *args: str) -> None:
+        nonlocal selected
+        if args[-1] == "4" and "-l" in args:
+            selected = True
+
+    def _capture(*_args: object) -> str:
+        if selected:
+            return "Permissions updated to Read Only"
+        return "1. Ask for approval\n2. Approve for me\n3. Full Access\n4. Read Only"
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", _tmux)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", _capture)
+    monkeypatch.setattr(
+        native_controls, "time", SimpleNamespace(monotonic=time.monotonic, sleep=lambda _: None)
+    )
+
+    interrupted: list[tuple[str, dict[str, Any]]] = []
+
+    class _FakeClient:
+        async def connect(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            interrupted.append((method, params))
+            if confirmed:
+                bridge.clear_active_child_turn(
+                    bridge_dir,
+                    str(params.get("threadId")),
+                    str(params.get("turnId")),
+                )
+            return {"result": {}}
+
+    monkeypatch.setattr(
+        app_server,
+        "client_for_transport",
+        lambda _sock, **_kwargs: _FakeClient(),
+    )
+    terminals = TerminalRegistry()
+    terminals._by_conversation.setdefault(conv_id, {})[("codex", "main")] = (
+        make_test_terminal_instance("codex", "main", tmp_path)
+    )
+    app, _ = await _build_app_for_spec(_harness_spec("codex-native"), terminal_registry=terminals)
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert created.status_code == 201, created.text
+        response = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "codex_approval_mode_change", "approval_mode": "read-only"},
+        )
+    assert interrupted == [
+        ("turn/interrupt", {"threadId": "thread_helper_t24", "turnId": "turn_helper_t24"})
+    ]
+    assert response.status_code == (200 if confirmed else 409), response.text
+    if not confirmed:
+        assert response.json()["error"] == "codex_helper_stop_pending"

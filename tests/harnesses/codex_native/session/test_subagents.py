@@ -1029,3 +1029,272 @@ def test_forwarder_resolves_child_thread_elicitation_on_child_session(
     assert "/v1/sessions/conv_parent/events" not in posted_paths, (
         f"resolution must not target the parent session; got {posted_paths}"
     )
+
+
+def test_forwarder_marks_child_status_consumed_when_collab_wait_completes_in_active_parent_turn(
+    tmp_path: Path,
+) -> None:
+    """T35: real Codex 0.164.0 spawnAgent + wait sequence marks child terminal edge consumed."""
+    fake_client = _FakeCodexAppServerClient()
+    state = codex_native_forwarder._CodexForwarderState(
+        parent_session_id="conv_parent",
+        codex_client=fake_client,  # type: ignore[arg-type]
+    )
+    child_status_posts: list[dict[str, object]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        if body.get("type") == "external_codex_subagent_start":
+            return httpx.Response(202, json={"child_session_id": "conv_child"})
+        if (
+            request.url.path == "/v1/sessions/conv_child/events"
+            and body.get("type") == "external_session_status"
+        ):
+            child_status_posts.append(body.get("data", {}))
+        return httpx.Response(202, json={"queued": False})
+
+    frames: list[dict[str, object]] = [
+        {
+            "method": "turn/started",
+            "params": {
+                "threadId": "thread_parent",
+                "turn": {"id": "turn_parent_1", "status": "inProgress", "items": []},
+            },
+        },
+        {
+            "method": "item/started",
+            "params": {
+                "threadId": "thread_parent",
+                "turnId": "turn_parent_1",
+                "item": {
+                    "type": "collabAgentToolCall",
+                    "id": "call_spawn_1",
+                    "tool": "spawnAgent",
+                    "status": "inProgress",
+                    "senderThreadId": "thread_parent",
+                    "receiverThreadIds": ["thread_child"],
+                    "prompt": "Compute 2+2",
+                    "agentsStates": {"thread_child": {"status": "pendingInit", "message": None}},
+                },
+            },
+        },
+        {
+            "method": "turn/started",
+            "params": {
+                "threadId": "thread_child",
+                "turn": {
+                    "id": "turn_child_1",
+                    "rootTurnId": "turn_parent_1",
+                    "status": "inProgress",
+                    "items": [],
+                },
+            },
+        },
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread_parent",
+                "turnId": "turn_parent_1",
+                "item": {
+                    "type": "collabAgentToolCall",
+                    "id": "call_spawn_1",
+                    "tool": "spawnAgent",
+                    "status": "completed",
+                    "senderThreadId": "thread_parent",
+                    "receiverThreadIds": ["thread_child"],
+                    "prompt": "Compute 2+2",
+                    "agentsStates": {"thread_child": {"status": "pendingInit", "message": None}},
+                },
+            },
+        },
+        {
+            "method": "item/started",
+            "params": {
+                "threadId": "thread_parent",
+                "turnId": "turn_parent_1",
+                "item": {
+                    "type": "collabAgentToolCall",
+                    "id": "call_wait_1",
+                    "tool": "wait",
+                    "status": "inProgress",
+                    "senderThreadId": "thread_parent",
+                    "receiverThreadIds": ["thread_child"],
+                    "agentsStates": {},
+                },
+            },
+        },
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread_child",
+                "turn": {
+                    "id": "turn_child_1",
+                    "rootTurnId": "turn_parent_1",
+                    "status": "completed",
+                    "items": [],
+                },
+            },
+        },
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread_parent",
+                "turnId": "turn_parent_1",
+                "item": {
+                    "type": "collabAgentToolCall",
+                    "id": "call_wait_1",
+                    "tool": "wait",
+                    "status": "completed",
+                    "senderThreadId": "thread_parent",
+                    "receiverThreadIds": ["thread_child"],
+                    "agentsStates": {"thread_child": {"status": "completed", "message": "4"}},
+                },
+            },
+        },
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread_parent",
+                "turn": {"id": "turn_parent_1", "status": "completed", "items": []},
+            },
+        },
+    ]
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            elicitation_tracker = _elicitation_tracker()
+            usage_coalescer = _usage_coalescer(client)
+            for frame in frames:
+                await codex_native_forwarder._handle_event(
+                    client,
+                    session_id="conv_parent",
+                    bridge_dir=tmp_path,
+                    usage_coalescer=usage_coalescer,
+                    elicitation_tracker=elicitation_tracker,
+                    event=frame,
+                    expected_thread_id="thread_parent",
+                    codex_client=fake_client,  # type: ignore[arg-type]
+                    forwarder_state=state,
+                )
+            await state.close_child_streams()
+            await elicitation_tracker.close()
+
+    asyncio.run(run())
+
+    idle_posts = [post for post in child_status_posts if post.get("status") == "idle"]
+    assert idle_posts, f"expected child idle status posts, got {child_status_posts}"
+    assert all(post.get("parent_turn_consumed") is True for post in idle_posts), (
+        f"every child idle edge in the consumed turn must carry parent_turn_consumed: {idle_posts}"
+    )
+
+
+def test_forwarder_keeps_unconsumed_child_status_when_parent_turn_ended_first(
+    tmp_path: Path,
+) -> None:
+    """T36: when the parent turn ends before the helper finishes, consumed flag is absent."""
+    fake_client = _FakeCodexAppServerClient()
+    state = codex_native_forwarder._CodexForwarderState(
+        parent_session_id="conv_parent",
+        codex_client=fake_client,  # type: ignore[arg-type]
+    )
+    child_status_posts: list[dict[str, object]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        if body.get("type") == "external_codex_subagent_start":
+            return httpx.Response(202, json={"child_session_id": "conv_child"})
+        if (
+            request.url.path == "/v1/sessions/conv_child/events"
+            and body.get("type") == "external_session_status"
+        ):
+            child_status_posts.append(body.get("data", {}))
+        return httpx.Response(202, json={"queued": False})
+
+    frames: list[dict[str, object]] = [
+        {
+            "method": "turn/started",
+            "params": {
+                "threadId": "thread_parent",
+                "turn": {"id": "turn_parent_1", "status": "inProgress", "items": []},
+            },
+        },
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread_parent",
+                "turnId": "turn_parent_1",
+                "item": {
+                    "type": "collabAgentToolCall",
+                    "id": "call_spawn_bg",
+                    "tool": "spawnAgent",
+                    "status": "completed",
+                    "senderThreadId": "thread_parent",
+                    "receiverThreadIds": ["thread_child"],
+                    "prompt": "Background task",
+                    "agentsStates": {"thread_child": {"status": "running", "message": None}},
+                },
+            },
+        },
+        {
+            "method": "turn/started",
+            "params": {
+                "threadId": "thread_child",
+                "turn": {
+                    "id": "turn_child_1",
+                    "rootTurnId": "turn_parent_1",
+                    "status": "inProgress",
+                    "items": [],
+                },
+            },
+        },
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread_parent",
+                "turn": {"id": "turn_parent_1", "status": "completed", "items": []},
+            },
+        },
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread_child",
+                "turn": {
+                    "id": "turn_child_1",
+                    "rootTurnId": "turn_parent_1",
+                    "status": "completed",
+                    "items": [],
+                },
+            },
+        },
+    ]
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            elicitation_tracker = _elicitation_tracker()
+            usage_coalescer = _usage_coalescer(client)
+            for frame in frames:
+                await codex_native_forwarder._handle_event(
+                    client,
+                    session_id="conv_parent",
+                    bridge_dir=tmp_path,
+                    usage_coalescer=usage_coalescer,
+                    elicitation_tracker=elicitation_tracker,
+                    event=frame,
+                    expected_thread_id="thread_parent",
+                    codex_client=fake_client,  # type: ignore[arg-type]
+                    forwarder_state=state,
+                )
+            await state.close_child_streams()
+            await elicitation_tracker.close()
+
+    asyncio.run(run())
+
+    idle_posts = [post for post in child_status_posts if post.get("status") == "idle"]
+    assert len(idle_posts) == 1
+    assert "parent_turn_consumed" not in idle_posts[0]

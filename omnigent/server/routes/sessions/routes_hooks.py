@@ -87,12 +87,14 @@ from omnigent.server.routes._sessions.approval_grants import (
     codex_command_grant_key,
 )
 from omnigent.server.routes._sessions.common import (
+    _CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY,
     _EVALUATE_HOOK_ELICITATION_ID_RE,
     _TURN_ACTOR_LABEL,
     _detached_elicitation_tasks,
     _llm_response_denied_turns,
     _logger,
     _runner_relay_tasks,
+    _session_active_response_cache,
     get_server_runner_router,
     set_server_runner_router,
 )
@@ -108,6 +110,7 @@ from omnigent.server.routes._sessions.helpers import (
     _emit_server_routing_decision,
     _forward_session_change_to_runner,
     _get_runner_client,
+    _is_codex_native_subagent,
     _native_ask_gate_lock,
     _publish_policy_denied,
     _resolve_harness,
@@ -268,8 +271,62 @@ async def _claude_timeout_stop() -> ElicitationResult:
     )
 
 
+async def _forward_codex_elicitation_interrupt(
+    session_id: str,
+    *,
+    codex_params: dict[str, Any] | None = None,
+    conversation_store: ConversationStore | None = None,
+) -> Any:
+    """Forward a Codex elicitation interrupt, targeting a child helper's thread on its parent runner when needed."""
+    target_session_id = session_id
+    payload: dict[str, Any] = {"type": "interrupt"}
+    if conversation_store is not None:
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if (
+            conv is not None
+            and conv.kind == "sub_agent"
+            and _is_codex_native_subagent(conv)
+            and conv.parent_conversation_id
+        ):
+            param_thread = codex_params.get("threadId") if isinstance(codex_params, dict) else None
+            child_thread_id = (
+                param_thread.strip()
+                if isinstance(param_thread, str) and param_thread.strip()
+                else (conv.labels or {})
+                .get(_CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY, "")
+                .strip()
+            )
+            param_turn = codex_params.get("turnId") if isinstance(codex_params, dict) else None
+            response_id = _session_active_response_cache.get(session_id)
+            cached_turn_id = (
+                response_id.removeprefix("codex_")
+                if isinstance(response_id, str)
+                and response_id.startswith("codex_")
+                and response_id not in ("codex_", "codex_native")
+                else ""
+            )
+            child_turn_id = (
+                param_turn.strip()
+                if isinstance(param_turn, str) and param_turn.strip()
+                else cached_turn_id
+            )
+            if child_thread_id:
+                target_session_id = conv.parent_conversation_id
+                payload["codex_side_thread_id"] = child_thread_id
+                if child_turn_id:
+                    payload["codex_side_turn_id"] = child_turn_id
+    return await _forward_session_change_to_runner(
+        target_session_id,
+        get_server_runner_router(),
+        payload,
+    )
+
+
 def _codex_timeout_stop(
     session_id: str,
+    *,
+    codex_params: dict[str, Any] | None = None,
+    conversation_store: ConversationStore | None = None,
 ) -> Callable[[], Awaitable[ElicitationResult | None]]:
     """
     Build the Codex route's stop callback for one session.
@@ -286,10 +343,10 @@ def _codex_timeout_stop(
     """
 
     async def _stop() -> ElicitationResult | None:
-        forward = await _forward_session_change_to_runner(
+        forward = await _forward_codex_elicitation_interrupt(
             session_id,
-            get_server_runner_router(),
-            {"type": "interrupt"},
+            codex_params=codex_params,
+            conversation_store=conversation_store,
         )
         if forward is None or not 200 <= forward.status_code < 300:
             return None
@@ -2794,7 +2851,15 @@ def register_hooks_routes(
             timeout_setting = await _approval_timeout_for_session(session_id)
             timeout_policy = HarnessTimeoutPolicy(
                 timeout_s=timeout_setting.timeout_s,
-                stop=_codex_timeout_stop(session_id) if timeout_setting.stop_turn else None,
+                stop=(
+                    _codex_timeout_stop(
+                        session_id,
+                        codex_params=codex_request.codex_params,
+                        conversation_store=conversation_store,
+                    )
+                    if timeout_setting.stop_turn
+                    else None
+                ),
             )
             timeout_s = timeout_policy.timeout_s
             async_approvals = timeout_setting.async_approvals
@@ -2833,10 +2898,10 @@ def register_hooks_routes(
                 # interrupt (unlike Claude's ``decision.interrupt``), so the
                 # stop is a runner interrupt awaited before the decline result
                 # reaches the model; a plain decline would let the turn go on.
-                await _forward_session_change_to_runner(
+                await _forward_codex_elicitation_interrupt(
                     session_id,
-                    get_server_runner_router(),
-                    {"type": "interrupt"},
+                    codex_params=codex_request.codex_params,
+                    conversation_store=conversation_store,
                 )
         body = codex_request.build_response(result)
         from omnigent.harnesses.codex_native.forwarder import (

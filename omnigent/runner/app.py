@@ -9847,6 +9847,17 @@ def create_runner_app(
             _side_text = ""
             if body_type == "interrupt":
                 if not isinstance(_side_turn_id, str) or not _side_turn_id:
+                    from omnigent.harnesses.codex_native.bridge import read_active_child_turns
+
+                    _, _side_bridge_dir = await _codex_native_bridge_state_and_dir_for_session(
+                        conversation_id, action="side chat turn"
+                    )
+                    _side_turn_id = (
+                        read_active_child_turns(_side_bridge_dir)
+                        .get(str(_side_thread_id), {})
+                        .get("turn_id")
+                    )
+                if not isinstance(_side_turn_id, str) or not _side_turn_id:
                     return JSONResponse(
                         status_code=400,
                         content={
@@ -10554,6 +10565,27 @@ def create_runner_app(
                 recovered_entry = await _ensure_subagent_work_entry(
                     conversation_id, result_key=result_key
                 )
+                if isinstance(data, dict) and data.get("parent_turn_consumed") is True:
+                    _consumed_entry = recovered_entry or get_subagent_work(conversation_id)
+                    if _consumed_entry is not None and _consumed_entry.registered_by is None:
+                        _consumed_entry.parent_turn_consumed = True
+                        _parent_id = _consumed_entry.parent_session_id
+                        _parent_inbox = _session_inboxes.get(_parent_id)
+                        if _parent_inbox is not None and not _parent_inbox.empty():
+                            _kept_items: list[_JsonObject] = []
+                            while not _parent_inbox.empty():
+                                _item = _parent_inbox.get_nowait()
+                                if _item.get("task_id") != conversation_id:
+                                    _kept_items.append(_item)
+                            for _item in _kept_items:
+                                _parent_inbox.put_nowait(_item)
+                        if (
+                            latest_wake_eligible_subagent_work(
+                                list_subagent_work(_parent_id), _session_harness_name(_parent_id)
+                            )
+                            is None
+                        ):
+                            _stranded_wake_parents.discard(_parent_id)
             interrupt_pending = False
             interrupt_work_id: str | None = None
             if status == "idle" and terminal_status is None and turn_completed is not True:
@@ -10626,6 +10658,10 @@ def create_runner_app(
                     recovered_entry = await _ensure_subagent_work_entry(
                         conversation_id, result_key=result_key
                     )
+                    if isinstance(data, dict) and data.get("parent_turn_consumed") is True:
+                        _consumed_entry = recovered_entry or get_subagent_work(conversation_id)
+                        if _consumed_entry is not None and _consumed_entry.registered_by is None:
+                            _consumed_entry.parent_turn_consumed = True
                 if status == "idle" and interrupt_pending:
                     # Interrupt with no confirming edge, resolved to the CURRENT
                     # dispatch (``resolve_pending_interrupt`` only reports pending
@@ -11310,7 +11346,7 @@ def create_runner_app(
                         )
                     except NoLiveHarnessError:
                         pass
-                    except Exception:  # An unconfirmed stop stays pending.
+                    except Exception:
                         helpers_stopped = False
                         _logger.warning(
                             "Codex helper revocation unconfirmed for %s",
