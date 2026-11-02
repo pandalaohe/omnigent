@@ -3116,9 +3116,7 @@ async def _reconcile_helpers_once(
                 statuses = last_call.get("agentsStates")
                 status = statuses.get(tid) if isinstance(statuses, dict) else None
                 if (
-                    turn.get("status") == "inProgress"
-                    and state.active_parent_turn_id in {None, _turn_id_from_payload(turn)}
-                    and _turn_id_from_payload(turn) not in state.completed_parent_turn_ids
+                    state.active_parent_turn_id in {None, _turn_id_from_payload(turn)}
                     and info.get("turn_id") is not None
                     and info.get("turn_id") == _turn_id_from_payload(latest)
                     and last_call.get("tool") == "wait"
@@ -3126,7 +3124,7 @@ async def _reconcile_helpers_once(
                     and isinstance(status, dict)
                     and _omnigent_status_from_collab_state(status) in {"idle", "failed"}
                 ):
-                    # Only the current parent's last observation of this execution counts.
+                    # A consumed child execution stays consumed after its parent completes.
                     state.consumed_child_threads.add(tid)
                 await _apply_child_resume(
                     ap_client,

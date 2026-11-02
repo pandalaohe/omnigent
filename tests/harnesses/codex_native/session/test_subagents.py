@@ -100,6 +100,7 @@ async def test_native_permission_frames_revoke_only_on_tightening(tmp_path, tigh
     [
         "terminal",
         "consumed",
+        "consumed-completed",
         "deferred",
         "running",
         "unreadable",
@@ -130,9 +131,9 @@ async def test_reconnect_reconciles_once_without_preloaded_mapping(tmp_path, sce
     if scenario == "corrupt":
         (tmp_path / "active_child_turns.json").write_text("{")
     parent_turn = {"id": "turn_parent", "status": "completed", "items": []}
-    if scenario in {"consumed", "deferred", "consumed-newer"}:
+    if scenario in {"consumed", "consumed-completed", "deferred", "consumed-newer"}:
         parent_turn.update(
-            status="inProgress",
+            status="completed" if scenario == "consumed-completed" else "inProgress",
             items=[
                 {
                     "id": "wait",
@@ -222,6 +223,8 @@ async def test_reconnect_reconciles_once_without_preloaded_mapping(tmp_path, sce
     state = codex_native_forwarder._CodexForwarderState(
         parent_session_id="conv_parent", child_usage_baseline_dir=tmp_path
     )
+    if scenario == "consumed-completed":
+        state.completed_parent_turn_ids.add("turn_parent")
     async with _review_event_context() as (client, posted, tracker, usage):
         await asyncio.wait_for(
             codex_native_forwarder._subscribe_until_ready(
@@ -284,7 +287,7 @@ async def test_reconnect_reconciles_once_without_preloaded_mapping(tmp_path, sce
         else:
             assert len(terminal()) == 1
             assert terminal()[0]["data"].get("parent_turn_consumed", False) == (
-                scenario == "consumed"
+                scenario in {"consumed", "consumed-completed"}
             )
         count = len(calls)
         await asyncio.sleep(0.06)  # custom-lint: disable=sleep-then-assert -- observe no retries
