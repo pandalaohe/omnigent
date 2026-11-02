@@ -4916,12 +4916,12 @@ class _CodexAppServerSession:
                         if phase == "final_answer" or phase is None:
                             final_response = completed_text
                         if phase == "final_answer":
-                            # Diagnostic: log response head + turn id so
-                            # ghost-events surface in CI logs.
+                            # Diagnostic: log response length + turn id so
+                            # ghost-events surface in CI logs without dumping text.
                             logger.info(
-                                "Codex TurnComplete: turn_id=%s response_head=%r",
+                                "Codex TurnComplete: turn_id=%s response_len=%d",
                                 active_turn_id,
-                                final_response[:120],
+                                len(final_response),
                             )
                             # Codex sends the turn's usage after the final-answer
                             # item; the turn is answered, so release it and drain.

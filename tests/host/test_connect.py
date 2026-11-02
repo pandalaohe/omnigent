@@ -3080,10 +3080,10 @@ def test_runner_exit_error_redacts_credential_values(tmp_path: Path) -> None:
     assert "code 3" in error
 
 
-def test_runner_exit_error_drops_chopped_first_line_and_oversized_single_line(
+async def test_runner_exit_error_drops_chopped_first_line_and_oversized_single_line(
     tmp_path: Path,
 ) -> None:
-    """Mid-line tail slices must not leak chopped lines or cross-session tool dumps."""
+    """Tail reader drops mid-line slices while keeping line-aligned, CRLF, and lossy UTF-8 lines."""
     log = tmp_path / "runner-chopped.log"
     chopped_payload = "sibling-session-text /opt/work/omnigent/fork/wt/other_pretask.md " * 80
     log.write_text(
@@ -3107,6 +3107,57 @@ def test_runner_exit_error_drops_chopped_first_line_and_oversized_single_line(
 
     assert "other_pretask.md" not in single_line_error
     assert "--- runner log tail ---" not in single_line_error
+
+    # Aligned window (byte before offset is \n): a complete 4096-byte ERROR line survives.
+    aligned_prefix = "ERROR 11-02 20:46:56.000 runner.app | fatal aligned cause "
+    aligned_error_line = aligned_prefix + ("x" * (4096 - len(aligned_prefix) - 1)) + "\n"
+    assert len(aligned_error_line.encode("utf-8")) == 4096
+    aligned_log = tmp_path / "runner-aligned.log"
+    aligned_log.write_bytes(
+        b"INFO  11-02 20:46:55.000 runner.app | earlier line\n"
+        + aligned_error_line.encode("utf-8")
+    )
+
+    aligned_error = _runner_exit_error(1, aligned_log)
+    assert "fatal aligned cause" in aligned_error
+    assert "earlier line" not in aligned_error
+
+    # CRLF: mid-line CRLF slice drops the fragment; split between \r and \n also keeps trailing ERROR.
+    crlf_mid_log = tmp_path / "runner-crlf-mid.log"
+    crlf_mid_log.write_bytes(
+        f"INFO  11-02 20:46:55.000 runner.app | {chopped_payload}\r\n"
+        "ERROR 11-02 20:46:56.000 runner.app | crlf error line\r\n".encode("utf-8")
+    )
+    crlf_mid_error = _runner_exit_error(1, crlf_mid_log)
+    assert "other_pretask.md" not in crlf_mid_error
+    assert "crlf error line" in crlf_mid_error
+
+    crlf_tail = b"\nERROR 11-02 20:46:56.000 runner.app | crlf split boundary\r\n"
+    crlf_split_log = tmp_path / "runner-crlf-split.log"
+    crlf_split_log.write_bytes(
+        b"INFO  11-02 20:46:55.000 runner.app | "
+        + (b"z" * (4096 - len(crlf_tail)))
+        + b"\r"
+        + crlf_tail
+    )
+    crlf_split_error = _runner_exit_error(1, crlf_split_log)
+    assert "crlf split boundary" in crlf_split_error
+
+    # Empty file: returns empty tail and summary-only error.
+    empty_log = tmp_path / "runner-empty.log"
+    empty_log.write_bytes(b"")
+    assert "--- runner log tail ---" not in _runner_exit_error(1, empty_log)
+
+    # Invalid UTF-8 bytes: decoded with replacement characters without raising.
+    invalid_utf8_log = tmp_path / "runner-invalid-utf8.log"
+    invalid_utf8_log.write_bytes(
+        b"INFO  11-02 20:46:55.000 runner.app | "
+        + (b"other_pretask.md \xff\xfe " * 250)
+        + b"\nERROR 11-02 20:46:56.000 runner.app | bad bytes \xff\xfe here\n"
+    )
+    invalid_utf8_error = _runner_exit_error(1, invalid_utf8_log)
+    assert "other_pretask.md" not in invalid_utf8_error
+    assert "bad bytes \ufffd\ufffd here" in invalid_utf8_error
 
 
 @pytest.mark.parametrize("console_closed", [False, True])

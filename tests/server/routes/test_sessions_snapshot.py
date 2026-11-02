@@ -3387,7 +3387,7 @@ async def test_persist_error_labels_omits_chopped_cross_session_log_tail(
     from omnigent.server.schemas import ErrorDetail
 
     cross_session_excerpt = (
-        "sibling-brief: /opt/work/omnigent/fork/wt/simple-snapshot-backup_pretask.md " + "x" * 4200
+        "sibling-brief: /opt/work/omnigent/fork/wt/simple-snapshot-backup_pretask.md " * 80
     )
     log_path = tmp_path / "runner.log"
     log_path.write_text(

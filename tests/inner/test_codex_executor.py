@@ -2451,6 +2451,20 @@ class TestCodexExecutor(unittest.TestCase):
                 )
                 session._events.put_nowait(
                     {
+                        "method": "item/completed",
+                        "params": {
+                            "turnId": "turn-1",
+                            "item": {
+                                "id": "msg-1",
+                                "type": "agentMessage",
+                                "phase": "final_answer",
+                                "text": other_session_text,
+                            },
+                        },
+                    }
+                )
+                session._events.put_nowait(
+                    {
                         "method": "turn/completed",
                         "params": {"turn": {"id": "turn-1"}},
                     }
@@ -2479,6 +2493,10 @@ class TestCodexExecutor(unittest.TestCase):
             self.assertIn(
                 "Codex dynamic tool result: turn_id=turn-1 call_id=call_hist1 "
                 "tool=omnigent__sys_session_get_history status=success",
+                joined,
+            )
+            self.assertIn(
+                f"Codex TurnComplete: turn_id=turn-1 response_len={len(other_session_text)}",
                 joined,
             )
             self.assertNotIn(other_session_text, joined)
