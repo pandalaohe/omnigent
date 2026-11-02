@@ -335,6 +335,149 @@ def test_extension_page_keeps_desktop_header_padding(
     expect(host).to_have_css("padding-top", "48px")
 
 
+def _settle_closed_sidebar(page: Page, width: int, height: int) -> None:
+    page.set_viewport_size({"width": width, "height": height})
+    if page.locator(".app-shell").get_attribute("data-sidebar-open") == "true":
+        page.get_by_role("button", name="Close sidebar", exact=True).click()
+    expect(page.get_by_role("button", name="Open sidebar", exact=True)).to_be_visible()
+    expect(page.locator("main[data-shell-header]")).to_have_css("width", f"{width}px")
+    page.evaluate(
+        "() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))"
+    )
+
+
+def _page_header_geometry(page: Page, heading: str, *, scroll: bool = False) -> dict:
+    title = page.get_by_role("heading", name=heading, level=1, exact=True)
+    viewport = title.evaluate(
+        """(title, shouldScroll) => {
+            let viewport = title.parentElement;
+            while (viewport && getComputedStyle(viewport).overflowY !== 'auto') {
+                viewport = viewport.parentElement;
+            }
+            if (!viewport) throw new Error('Page scroll viewport not found');
+            viewport.scrollTop = 0;
+            if (shouldScroll) {
+                viewport.scrollTop = title.getBoundingClientRect().top
+                    - viewport.getBoundingClientRect().top;
+            }
+            return {rect: viewport.getBoundingClientRect().toJSON(),
+                    scroll_top: viewport.scrollTop,
+                    padding_top: getComputedStyle(viewport).paddingTop};
+        }""",
+        scroll,
+    )
+    menu_box = page.get_by_role("button", name="Open sidebar", exact=True).bounding_box()
+    title_box = title.bounding_box()
+    assert title_box is not None and menu_box is not None
+    horizontal = (
+        title_box["x"] < menu_box["x"] + menu_box["width"]
+        and title_box["x"] + title_box["width"] > menu_box["x"]
+    )
+    overlap = horizontal and (
+        title_box["y"] < menu_box["y"] + menu_box["height"]
+        and title_box["y"] + title_box["height"] > menu_box["y"]
+    )
+    return {
+        "title": title_box,
+        "menu": menu_box,
+        "viewport": viewport,
+        "horizontal": horizontal,
+        "overlap": overlap,
+    }
+
+
+@pytest.mark.parametrize(("width", "height"), [(768, 390), (844, 390), (1024, 768), (1440, 900)])
+def test_scrolled_usage_clears_closed_navigation_at_landscape_widths(
+    page: Page, pages_url: str, width: int, height: int, request: pytest.FixtureRequest
+) -> None:
+    errors: list[str] = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+    page.set_viewport_size({"width": width, "height": height})
+    page.goto(f"{pages_url}/usage")
+    expect(page.get_by_text("Total cost", exact=True)).to_be_visible()
+    _settle_closed_sidebar(page, width, height)
+    geometry = _page_header_geometry(page, "Usage", scroll=True)
+    assert geometry["viewport"]["scroll_top"] > 0, geometry
+    output = Path(request.config.getoption("output"))
+    output.mkdir(parents=True, exist_ok=True)
+    page.screenshot(path=str(output / f"usage-closed-{width}x{height}.png"))
+    (output / f"usage-closed-{width}x{height}.json").write_text(json.dumps(geometry, indent=2))
+    assert not geometry["overlap"], geometry
+    page.get_by_role("button", name="Open sidebar", exact=True).click()
+    viewport = page.locator("main[data-shell-header] > div").first
+    expect(viewport).to_have_css("margin-top", "0px")
+    expect(viewport).to_have_css("padding-top", "80px")
+    _settle_closed_sidebar(page, width, height)
+    geometry["after_sidebar_cycle"] = _page_header_geometry(page, "Usage", scroll=True)
+    (output / f"usage-closed-{width}x{height}.json").write_text(json.dumps(geometry, indent=2))
+    assert geometry["after_sidebar_cycle"]["viewport"]["scroll_top"] > 0, geometry
+    assert not geometry["after_sidebar_cycle"]["overlap"], geometry
+    assert not errors, errors
+
+
+@pytest.mark.parametrize(
+    ("route", "heading"),
+    [
+        ("/usage", "Usage"),
+        ("/tasks", "Automations"),
+        ("/inbox", "Inbox"),
+        ("/system", "System status"),
+    ],
+)
+def test_page_clearance_follows_measured_horizontal_boundary(
+    page: Page, pages_url: str, route: str, heading: str, request: pytest.FixtureRequest
+) -> None:
+    errors: list[str] = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+    page.set_viewport_size({"width": 768, "height": 390})
+    page.goto(f"{pages_url}{route}")
+    expect(page.get_by_role("heading", name=heading, level=1, exact=True)).to_be_visible()
+    if route == "/usage":
+        expect(page.get_by_text("Total cost", exact=True)).to_be_visible()
+    elif route == "/system":
+        expect(page.get_by_text("No hosts connected.", exact=True)).to_be_visible()
+    lower, upper = 768, 1440
+    while lower < upper:
+        width = (lower + upper) // 2
+        _settle_closed_sidebar(page, width, 390)
+        if _page_header_geometry(page, heading)["horizontal"]:
+            lower = width + 1
+        else:
+            upper = width
+    first_disjoint = lower
+    measurements = []
+    violations = []
+    for width in sorted({768, 844, 1024, 1440, max(768, first_disjoint - 1), first_disjoint}):
+        _settle_closed_sidebar(page, width, 390)
+        geometry = _page_header_geometry(page, heading)
+        geometry["width"] = width
+        measurements.append(geometry)
+        if geometry["horizontal"]:
+            if (
+                geometry["viewport"]["rect"]["top"]
+                < geometry["menu"]["y"] + geometry["menu"]["height"]
+            ):
+                violations.append(geometry)
+        elif (
+            geometry["viewport"]["rect"]["top"] != 0
+            or geometry["viewport"]["padding_top"] != "80px"
+        ):
+            violations.append(geometry)
+    output = Path(request.config.getoption("output"))
+    output.mkdir(parents=True, exist_ok=True)
+    (output / f"{route.strip('/')}-horizontal-boundary.json").write_text(
+        json.dumps(
+            {
+                "first_disjoint": first_disjoint,
+                "measurements": measurements,
+            },
+            indent=2,
+        )
+    )
+    assert not violations, violations
+    assert not errors, errors
+
+
 @pytest.mark.parametrize("surface", ["chat", "canvas", "host-terminals", "archived"])
 def test_sidebar_surfaces_with_their_own_headers(
     page: Page,
