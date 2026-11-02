@@ -1902,9 +1902,14 @@ def test_turn_outcome_waits_for_history_but_idle_does_not(tmp_path: Path, mode: 
   const rejected = mode.endsWith('rejected');
   const deadline = mode.endsWith('deadline');
   let release;
+  let expireHistory;
   let completionAttempts = 0;
-  global.setTimeout = (callback, delay, ...args) =>
-    originalSetTimeout(callback, delay === 30000 ? 50 : delay, ...args);
+  global.setTimeout = (callback, delay, ...args) => {
+    if (delay !== 30000) return originalSetTimeout(callback, delay, ...args);
+    // Fire the history deadline only after checking the pending barrier.
+    expireHistory = () => callback(...args);
+    return {};
+  };
   global.fetch = async (_url, request) => {
     const body = JSON.parse(request.body);
     posted.push(body);
@@ -1936,6 +1941,8 @@ def test_turn_outcome_waits_for_history_but_idle_does_not(tmp_path: Path, mode: 
   }
   assert.ok(posted.some(e => e.type === 'subagent.status' && e.data.idle === true));
   if (deadline) {
+    assert.equal(typeof expireHistory, 'function');
+    expireHistory();
     await finished;
     release();
   } else {

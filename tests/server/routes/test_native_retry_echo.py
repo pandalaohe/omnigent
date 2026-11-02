@@ -20,11 +20,11 @@ from tests.stores.test_subagent_retry_execution import _prepared
 from tests.stores.test_subagent_retry_store import _journal
 
 
-def prepared_native(db_uri):
+def prepared_native(db_uri, *, harness="claude-native"):
     journal = _journal(db_uri, SqlAlchemyConversationStore(db_uri))
     journal.conversations.update_conversation(
         journal.child,
-        harness_override="claude-native",
+        harness_override=harness,
     )
     journal.conversations.set_labels(
         journal.child, {"omnigent.wrapper": "claude-code-native-ui-subagent"}
@@ -35,6 +35,85 @@ def prepared_native(db_uri):
     reserved = journal.store.admit_execution(journal.child, claim, runner_id="child-runner")
     assert reserved.state == "reserved"
     return journal, chain, claim
+
+
+@pytest.mark.asyncio
+async def test_codex_echo_waits_for_acceptance_and_replays_one_canonical_item(
+    db_uri, tmp_path, client
+):
+    from omnigent.harnesses.codex_native import bridge as codex_bridge
+    from omnigent.harnesses.codex_native import forwarder as codex_forwarder
+
+    journal, _chain, claim = prepared_native(db_uri, harness="codex-native")
+    codex_bridge.write_bridge_state(
+        tmp_path,
+        codex_bridge.CodexNativeBridgeState(
+            session_id=journal.child,
+            socket_path="/opt/work/app.sock",
+            thread_id="thread",
+            codex_home=str(tmp_path / "home"),
+        ),
+    )
+    codex_bridge.record_retry_input(
+        tmp_path,
+        session_id=journal.child,
+        thread_id="thread",
+        input_id=claim.input_id,
+    )
+    pending_inputs.record(
+        journal.child,
+        [{"type": "input_text", "text": "retry"}],
+        stable_id=claim.input_id,
+        auto_retry=claim.retry.metadata,
+    )
+    statuses = []
+
+    async def acknowledge_after_pending(response):
+        if response.request.url.path.endswith("/events"):
+            statuses.append(response.status_code)
+            if response.status_code == 503:
+                assert journal.conversations.list_items(journal.child).data == []
+                codex_bridge.record_retry_input(
+                    tmp_path,
+                    session_id=journal.child,
+                    thread_id="thread",
+                    input_id=claim.input_id,
+                    turn_id="turn",
+                )
+                accept_native(journal, claim, "codex_turn")
+
+    client.event_hooks["response"].append(acknowledge_after_pending)
+    params = {
+        "threadId": "thread",
+        "turnId": "turn",
+        "item": {
+            "id": "vendor-automatic-item",
+            "clientId": claim.input_id,
+            "type": "userMessage",
+            "content": [{"type": "text", "text": "retry"}],
+        },
+    }
+    try:
+        for _ in range(2):
+            await codex_forwarder._handle_completed_item(
+                client,
+                journal.child,
+                params,
+                forwarder_state=codex_forwarder._CodexForwarderState(
+                    parent_session_id=journal.child
+                ),
+                bridge_dir=tmp_path,
+            )
+    finally:
+        client.event_hooks["response"].remove(acknowledge_after_pending)
+    assert statuses[0] == 503 and all(code < 400 for code in statuses[1:])
+    [saved] = journal.conversations.list_items(journal.child).data
+    assert saved.data.auto_retry == claim.retry.metadata
+    assert pending_inputs.pending_id_for_stable_id(journal.child, claim.input_id) is None
+    response = await client.get(f"/v1/sessions/{journal.child}/items")
+    [reloaded] = response.json()["data"]
+    assert reloaded["id"] == saved.id
+    assert reloaded["auto_retry"] == claim.retry.metadata.model_dump()
 
 
 def accept_native(journal, claim, turn_id):

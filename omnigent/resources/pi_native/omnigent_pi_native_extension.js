@@ -3653,6 +3653,7 @@ module.exports = function (pi) {
         {
           response_id: `pi-consumed-user-${identity}:${fingerprint(text)}`,
           item_type: "message",
+          ...(autoRetry ? { input_id: autoRetry.input_id, input_turn_id: turnStatusResponseId } : {}),
           item_data: {
             role: "user",
             content: [{ type: "input_text", text }],

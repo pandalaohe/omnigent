@@ -62,6 +62,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_codex_config_model,
     read_mcp_startup,
     record_child_usage_baseline,
+    record_retry_source,
     resolve_codex_auto_compact_token_limit,
     settle_pending_mcp_startup,
     update_active_turn_id,
@@ -6772,6 +6773,8 @@ def _claim_completed_item(
     params: _JsonObject,
     item: _JsonObject,
     forwarder_state: _CodexForwarderState | None,
+    *,
+    retry_input_id: str | None = None,
 ) -> str | None:
     """
     Claim one completed Codex transcript item for Omnigent posting.
@@ -6800,7 +6803,11 @@ def _claim_completed_item(
     turn_id = turn_id if isinstance(turn_id, str) and turn_id else "turn"
     if is_anon:
         forwarder_state.advance_anon_counter(thread_id, turn_id)
-    elif item.get("type") == "userMessage" and isinstance(item.get("content"), list):
+    elif (
+        item.get("type") == "userMessage"
+        and isinstance(item.get("content"), list)
+        and retry_input_id is None
+    ):
         content = json.dumps(item["content"], sort_keys=True)
         content_digest = hashlib.sha256(content.encode()).hexdigest()
         resumed = _CODEX_RESUME_POSITION_ITEM_ID.fullmatch(str(item.get("id"))) is not None
@@ -6912,16 +6919,19 @@ async def _handle_completed_item_inner(
                 if forwarder_state is not None:
                     forwarder_state.compaction_item_persisted = True
         return
-    source_id = _claim_completed_item(params, item, forwarder_state)
+    retry_input_id = _recorded_retry_input_id(bridge_dir, session_id, params, item)
+    source_id = _claim_completed_item(params, item, forwarder_state, retry_input_id=retry_input_id)
     if source_id is None:
         return
     if item_type == "userMessage":
         await _reconcile_async_question_replies(client, session_id, params, item, forwarder_state)
-        posted = await _post_user_message(client, session_id, params, item, source_id=source_id)
+        posted = await _post_user_message(
+            client, session_id, params, item, source_id=source_id, bridge_dir=bridge_dir
+        )
         if posted and forwarder_state is not None:
             turn_id = _turn_id_from_payload(params)
             if turn_id:
-                forwarder_state.note_user_message_posted(turn_id, source_id)
+                forwarder_state.note_user_message_posted(turn_id, retry_input_id or source_id)
         return
     if item_type == "agentMessage":
         # User-before-assistant ordering guarantee. On a fresh thread the
@@ -8014,7 +8024,12 @@ async def _ensure_user_message_posted(
         "turnId": turn_id,
         "item": user_item,
     }
-    source_id = _claim_completed_item(recovered_params, user_item, forwarder_state)
+    retry_input_id = _recorded_retry_input_id(
+        forwarder_state.child_usage_baseline_dir, session_id, recovered_params, user_item
+    )
+    source_id = _claim_completed_item(
+        recovered_params, user_item, forwarder_state, retry_input_id=retry_input_id
+    )
     if source_id is None:
         return
     await _reconcile_async_question_replies(
@@ -8026,8 +8041,29 @@ async def _ensure_user_message_posted(
         recovered_params,
         user_item,
         source_id=source_id,
+        bridge_dir=forwarder_state.child_usage_baseline_dir,
     ):
-        forwarder_state.note_user_message_posted(turn_id, source_id)
+        forwarder_state.note_user_message_posted(turn_id, retry_input_id or source_id)
+
+
+def _recorded_retry_input_id(
+    bridge_dir: Path | None, session_id: str, params: _JsonObject, item: _JsonObject
+) -> str | None:
+    state = read_bridge_state(bridge_dir) if bridge_dir is not None else None
+    input_id = item.get("clientId")
+    turn_id = _turn_id_from_payload(params)
+    if (
+        state is not None
+        and (state.session_id, state.thread_id) == (session_id, _thread_id_from_params(params))
+        and isinstance(input_id, str)
+        and isinstance(item.get("id"), str)
+        and bool(item["id"])
+        and input_id in state.retry_inputs
+        and turn_id is not None
+        and state.retry_inputs[input_id] in {None, turn_id}
+    ):
+        return input_id
+    return None
 
 
 def _find_turn_user_message(response: CodexMessage, turn_id: str) -> _JsonObject | None:
@@ -8068,6 +8104,7 @@ async def _post_user_message(
     item: _JsonObject,
     *,
     source_id: str | None = None,
+    bridge_dir: Path | None = None,
 ) -> bool:
     """
     Persist a Codex user message observed from the TUI.
@@ -8104,13 +8141,34 @@ async def _post_user_message(
             session_id,
             _source_id(params, item),
         )
+    input_id = _recorded_retry_input_id(bridge_dir, session_id, params, item)
+    if text != "retry" or has_file_block:
+        input_id = None
+    input_turn_id = f"codex_{_turn_id_from_payload(params)}" if input_id is not None else None
+    vendor_source = source_id or _source_id(params, item)
+    if input_id is not None:
+        assert bridge_dir is not None
+        try:
+            vendor_source = record_retry_source(
+                bridge_dir,
+                session_id=session_id,
+                thread_id=_thread_id_from_params(params) or "",
+                input_id=input_id,
+                turn_id=_turn_id_from_payload(params) or "",
+                source_id=vendor_source,
+            )
+        except (OSError, ValueError):
+            _logger.warning("Codex retry source could not be retained", exc_info=True)
+            return False
     return await _post_external_item(
         client,
         session_id,
         item_type="message",
         item_data=item_data,
         response_id=_response_id(params),
-        source_id=source_id or _source_id(params, item),
+        source_id=vendor_source,
+        input_id=input_id,
+        input_turn_id=input_turn_id,
     )
 
 
@@ -8634,6 +8692,8 @@ async def _post_external_item(
     response_id: str,
     message_id: str | None = None,
     source_id: str | None = None,
+    input_id: str | None = None,
+    input_turn_id: str | None = None,
 ) -> bool:
     """
     Post one external conversation item to AP.
@@ -8660,6 +8720,9 @@ async def _post_external_item(
         data["message_id"] = message_id
     if source_id is not None:
         data["source_id"] = _bounded_source_id(source_id)
+    if input_id is not None:
+        data["input_id"] = input_id
+        data["input_turn_id"] = input_turn_id
 
     async def _post() -> httpx.Response | None:
         return await _post_session_event(

@@ -208,6 +208,71 @@ def test_automatic_retry_guard_and_pinned_input_id(draining_client, tmp_path, su
         assert submitted[0]["input"] == [{"type": "text", "text": "retry"}]
         assert isinstance(events[0], TurnComplete)
         assert read_bridge_state(tmp_path).input_id == guard.input_id
+        assert read_bridge_state(tmp_path).retry_inputs == {guard.input_id: "turn_1"}
+
+
+@pytest.mark.parametrize("after_send", [False, True])
+def test_retry_identity_storage_failure_settles_the_actual_delivery_boundary(
+    draining_client, tmp_path, monkeypatch, db_uri, after_send
+):
+    from omnigent.harnesses.codex_native import bridge
+    from omnigent.native.auto_retry import AutoRetryGuard, auto_retry_scope, observe_turn
+    from tests.server.routes.test_native_retry_echo import prepared_native
+
+    journal, chain, claim = prepared_native(db_uri, harness="codex-native")
+    draining_client.delivery_errors = []
+    _seed_bridge(tmp_path)
+    write_bridge_state(tmp_path, replace(read_bridge_state(tmp_path), session_id=journal.child))
+    snapshot = observe_turn(tmp_path, journal.child, "root-turn", idle=True)
+    guard = AutoRetryGuard(
+        session_id=journal.child,
+        chain_id=chain.chain_id,
+        input_id=claim.input_id,
+        expected_turn_id="root-turn",
+        expected_input_generation=1,
+        expected_native_generation=snapshot.generation,
+        admission_deadline=time.time() + 60,
+        attempt=1,
+        of=chain.limit,
+    )
+    record = bridge.record_retry_input
+
+    def storage_failure(*args, **kwargs):
+        if (kwargs.get("turn_id") is not None) is after_send:
+            raise OSError("retry identity storage unavailable")
+        return record(*args, **kwargs)
+
+    monkeypatch.setattr(bridge, "record_retry_input", storage_failure)
+    outcomes = []
+
+    async def settle(outcome, turn_id, reason, detail):
+        outcomes.append(outcome)
+        result = journal.store.admit_execution(
+            journal.child,
+            claim.model_copy(
+                update={
+                    "boundary": "native_accept" if outcome == "accepted" else "native_refuse",
+                    "native_turn_id": turn_id,
+                    "native_reason": reason,
+                    "native_detail": detail,
+                }
+            ),
+            runner_id="child-runner",
+        )
+        return result.accepted if after_send else result.receipt.state == "closed"
+
+    with auto_retry_scope(guard, settle_execution=settle):
+        events = _collect_turn_events(CodexNativeExecutor(tmp_path), "retry")
+    assert isinstance(events[0], ExecutorError)
+    assert events[0].undelivered is not after_send
+    submitted = [method for method, _ in draining_client.requests if method == "turn/start"]
+    assert len(submitted) == int(after_send)
+    receipt = journal.store.get_input(claim.input_id)
+    assert receipt.state == ("accepted" if after_send else "closed")
+    assert outcomes == (["accepted"] if after_send else ["refused"])
+    assert journal.store.get_chain(chain.chain_id).accepted_attempts == int(after_send)
+    if not after_send:
+        assert receipt.reason["code"] == "native_retry_identity_unavailable"
 
 
 @pytest.fixture

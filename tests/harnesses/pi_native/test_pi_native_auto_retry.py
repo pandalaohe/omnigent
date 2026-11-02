@@ -68,7 +68,11 @@ fs.writeFileSync = (name, ...args) => {
 };
 process.env.OMNIGENT_PI_NATIVE_CONFIG = path.join(bridgeDir, 'config.json');
 const handlers = {};
-global.fetch = async () => ({ok: true});
+const events = [];
+global.fetch = async (_url, request) => {
+  events.push(JSON.parse(request.body));
+  return {ok: true, json: async () => ({})};
+};
 require(extensionPath)({registerCommand() {}, on(name, handler) {handlers[name] = handler;}});
 const ctx = {ui: {notify() {}, setStatus() {}}};
 const read = () => JSON.parse(fs.readFileSync(path.join(bridgeDir, 'auto-retry.json'), 'utf8'));
@@ -77,6 +81,25 @@ const read = () => JSON.parse(fs.readFileSync(path.join(bridgeDir, 'auto-retry.j
     assert.notEqual((await handlers.input({text: 'retry'}, ctx))?.action, 'handled');
     assert.equal(read().receipt.state, 'admitted');
     assert.equal(read().receipt.guard.input_id, 'a'.repeat(32));
+    await handlers.agent_start({}, ctx);
+    await handlers.message_end({message: {role: 'user', content: 'retry', timestamp: 1}}, ctx);
+    await new Promise(resolve => setImmediate(resolve));
+    const automatic = events.find(e => e.type === 'external_conversation_item'
+      && e.data.item_type === 'message');
+    const running = events.find(e => e.type === 'external_session_status'
+      && e.data.input_id === 'a'.repeat(32));
+    assert.equal(automatic.data.input_id, 'a'.repeat(32));
+    assert.equal(automatic.data.input_turn_id, running.data.turn_id);
+    assert.equal(automatic.data.item_data.auto_retry.input_id, 'a'.repeat(32));
+    await handlers.input({text: 'retry'}, ctx);
+    await handlers.message_end({message: {role: 'user', content: 'retry', timestamp: 2}}, ctx);
+    await new Promise(resolve => setImmediate(resolve));
+    const echoes = events.filter(e => e.type === 'external_conversation_item'
+      && e.data.item_type === 'message');
+    assert.equal(echoes.length, 2);
+    assert.equal(echoes[1].data.input_id, undefined);
+    assert.equal(echoes[1].data.input_turn_id, undefined);
+    assert.equal(echoes[1].data.item_data.auto_retry, undefined);
   }
   failing = helperFailed === 'true';
   epochFailed = helperFailed === 'epoch';

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
+from omnigent.harnesses.codex_native import bridge
 from omnigent.harnesses.codex_native import forwarder as fwd
 from tests.harnesses.codex_native.forwarder._support import (
     _RecordingClient,
@@ -90,6 +93,198 @@ async def test_post_user_message_truly_empty_is_skipped() -> None:
     await fwd._post_user_message(client, "conv_x", {"turnId": "t1"}, item)
 
     assert client.posts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("accepted", [False, True])
+@pytest.mark.parametrize("source_error", [False, True])
+async def test_automatic_echo_carries_recorded_identity_without_inventing_a_marker(
+    tmp_path, accepted, source_error, monkeypatch
+):
+    state = bridge.CodexNativeBridgeState(
+        session_id="child",
+        socket_path="/opt/work/app.sock",
+        thread_id="thread",
+        codex_home=str(tmp_path / "home"),
+    )
+    bridge.write_bridge_state(tmp_path, state)
+    input_id = "a" * 32
+    bridge.record_retry_input(
+        tmp_path,
+        session_id="child",
+        thread_id="thread",
+        input_id=input_id,
+        turn_id="turn" if accepted else None,
+    )
+    client = _RecordingClient()
+    if source_error:
+
+        def unavailable(*_args, **_kwargs):
+            raise OSError("source record unavailable")
+
+        monkeypatch.setattr(fwd, "record_retry_source", unavailable)
+    params = {"threadId": "thread", "turnId": "turn"}
+    for native_id, client_id in (("vendor-automatic", input_id), ("human-item", None)):
+        posted = await fwd._post_user_message(
+            client,
+            "child",
+            params,
+            {
+                "type": "userMessage",
+                "id": native_id,
+                "clientId": client_id,
+                "content": [{"type": "text", "text": "retry"}],
+            },
+            bridge_dir=tmp_path,
+        )
+        assert posted is (not source_error or client_id is None)
+    if source_error:
+        [(_, human_body)] = client.posts
+        assert "input_id" not in human_body["data"]
+        assert "auto_retry" not in human_body["data"]["item_data"]
+        return
+    automatic, human = [body["data"] for _, body in client.posts]
+    assert automatic["input_id"] == input_id
+    assert automatic["input_turn_id"] == "codex_turn"
+    assert automatic["source_id"] == "thread:turn:vendor-automatic"
+    assert "auto_retry" not in automatic["item_data"]
+    assert "input_id" not in human and "input_turn_id" not in human
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["session", "thread", "turn", "text", "missing", "mismatch"])
+async def test_unverified_echo_keeps_its_vendor_source_without_a_marker(tmp_path, fault):
+    bridge.write_bridge_state(
+        tmp_path,
+        bridge.CodexNativeBridgeState(
+            session_id="child",
+            socket_path="/opt/work/app.sock",
+            thread_id="thread",
+            codex_home=str(tmp_path / "home"),
+            retry_inputs={"a" * 32: "turn"},
+        ),
+    )
+    client = _RecordingClient()
+    posted = await fwd._post_user_message(
+        client,
+        "other" if fault == "session" else "child",
+        {
+            "threadId": "other" if fault == "thread" else "thread",
+            "turnId": "other" if fault == "turn" else "turn",
+        },
+        {
+            "id": "a" * 32,
+            "clientId": None
+            if fault == "missing"
+            else ("b" * 32 if fault == "mismatch" else "a" * 32),
+            "content": [{"type": "text", "text": "other" if fault == "text" else "retry"}],
+        },
+        bridge_dir=tmp_path,
+    )
+    assert posted is True
+    [(_, body)] = client.posts
+    assert "input_id" not in body["data"] and "input_turn_id" not in body["data"]
+    assert "auto_retry" not in body["data"]["item_data"]
+    assert body["data"]["source_id"].endswith(":" + "a" * 32)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pending", [False, True])
+async def test_unrelated_positional_history_is_not_lost_to_an_unbound_retry(tmp_path, pending):
+    bridge.write_bridge_state(
+        tmp_path,
+        bridge.CodexNativeBridgeState(
+            session_id="child",
+            socket_path="/opt/work/app.sock",
+            thread_id="thread",
+            codex_home=str(tmp_path / "home"),
+            retry_inputs={"a" * 32: None if pending else "auto-turn"},
+        ),
+    )
+
+    async def snapshot(method, params):
+        return {
+            "result": {
+                "thread": {
+                    "turns": [
+                        {
+                            "id": "historical-turn",
+                            "items": [
+                                {
+                                    "id": "item-1",
+                                    "type": "userMessage",
+                                    "content": [
+                                        {"type": "text", "text": "Historical human input"}
+                                    ],
+                                },
+                            ],
+                        }
+                    ]
+                }
+            }
+        }
+
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState(
+        codex_client=SimpleNamespace(request=snapshot),
+        child_usage_baseline_dir=tmp_path,
+    )
+    await fwd._ensure_user_message_posted(
+        client,
+        "child",
+        {"threadId": "thread", "turnId": "historical-turn"},
+        state,
+    )
+    [(_, body)] = client.posts
+    assert body["data"]["item_data"]["content"] == [
+        {"type": "input_text", "text": "Historical human input"}
+    ]
+    assert "input_id" not in body["data"]
+
+
+@pytest.mark.asyncio
+async def test_retry_recovery_keeps_vendor_source_and_same_turn_human_retry(tmp_path):
+    bridge.write_bridge_state(
+        tmp_path,
+        bridge.CodexNativeBridgeState(
+            session_id="child",
+            socket_path="/opt/work/app.sock",
+            thread_id="thread",
+            codex_home=str(tmp_path / "home"),
+            retry_inputs={"a" * 32: "auto-turn"},
+        ),
+    )
+    first = {
+        "id": "vendor-item",
+        "clientId": "a" * 32,
+        "type": "userMessage",
+        "content": [{"type": "text", "text": "retry"}],
+    }
+
+    async def snapshot(method, params):
+        return {"result": {"thread": {"turns": [{"id": "auto-turn", "items": [first]}]}}}
+
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState(
+        codex_client=SimpleNamespace(request=snapshot),
+        child_usage_baseline_dir=tmp_path,
+    )
+    params = {"threadId": "thread", "turnId": "auto-turn"}
+    await fwd._ensure_user_message_posted(client, "child", params, state)
+    for item in (first, {**first, "id": "item-2", "clientId": None}):
+        await fwd._handle_completed_item(
+            client,
+            "child",
+            {**params, "item": item},
+            forwarder_state=state,
+            bridge_dir=tmp_path,
+        )
+    automatic, human = [body["data"] for _, body in client.posts]
+    assert automatic["input_id"] == "a" * 32
+    assert automatic["source_id"] == "thread:auto-turn:vendor-item"
+    assert "input_id" not in human
+    assert human["source_id"] == "thread:auto-turn:item-2"
+    assert first["id"] == "vendor-item"
 
 
 @pytest.mark.parametrize(

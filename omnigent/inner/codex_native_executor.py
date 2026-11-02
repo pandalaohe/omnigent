@@ -296,7 +296,13 @@ async def _native_delivery_request_once(
     bridge_dir: Path,
 ) -> CodexMessage:
     """Pair each RPC attempt with its result, including a rejected stale steer."""
-    from omnigent.native.auto_retry import claim_execution, current_guard, prepare_submission
+    from omnigent.harnesses.codex_native.bridge import record_retry_input
+    from omnigent.native.auto_retry import (
+        NativeRetryRejected,
+        claim_execution,
+        current_guard,
+        prepare_submission,
+    )
 
     guard = current_guard()
     if guard is not None:
@@ -312,6 +318,16 @@ async def _native_delivery_request_once(
         # Supported by the checkout's pinned Codex 0.139.0 protocol.
         params = {**params, "clientUserMessageId": guard.input_id}
         await claim_execution()
+
+        try:
+            record_retry_input(
+                bridge_dir,
+                session_id=guard.session_id,
+                thread_id=state.thread_id,
+                input_id=guard.input_id,
+            )
+        except (OSError, ValueError) as exc:
+            raise NativeRetryRejected("native_retry_identity_unavailable") from exc
     attempt_id = uuid.uuid4().hex
     stage = "turn_start" if method == "turn/start" else "turn_steer"
     expected = params.get("expectedTurnId") if method == "turn/steer" else None
@@ -368,7 +384,16 @@ async def _native_delivery_request_once(
     if guard is not None and native_turn_id is not None:
         from omnigent.native.auto_retry import settle_execution
 
-        await settle_execution("accepted", turn_id=f"codex_{native_turn_id}")
+        try:
+            record_retry_input(
+                bridge_dir,
+                session_id=guard.session_id,
+                thread_id=state.thread_id,
+                input_id=guard.input_id,
+                turn_id=native_turn_id,
+            )
+        finally:
+            await settle_execution("accepted", turn_id=f"codex_{native_turn_id}")
     log_input_event(
         _logger,
         "codex_native_delivery_finished",
