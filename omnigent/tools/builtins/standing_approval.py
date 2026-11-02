@@ -1,22 +1,23 @@
-"""Schema for a mother session's advisory standing pass."""
+"""Schema for a parent session's advisory standing approval."""
 
 from typing import Any
 
 from omnigent.tools.base import Tool
 
 
-class SysStandingPassTool(Tool):
+class SysStandingApprovalTool(Tool):
     @classmethod
     def name(cls) -> str:
-        return "sys_standing_pass"
+        return "sys_standing_approval"
 
     @classmethod
     def description(cls) -> str:
         return (
-            "Read the live standing pass before a pass-kind action. Children can only read. "
-            "The mother can revoke kinds, optionally citing a user message as source. "
+            "Read the live standing approval before an approval-kind action. "
+            "Children can only read. "
+            "The parent can revoke kinds, optionally citing a user message as source. "
             "Granting kinds always requires user approval of that exact delta. "
-            "The pass never overrides safety rules or other approval gates."
+            "Standing approval never overrides safety rules or other approval gates."
         )
 
     def get_schema(self) -> dict[str, Any]:

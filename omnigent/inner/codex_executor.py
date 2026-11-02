@@ -280,13 +280,13 @@ _CODEX_HOME_SYMLINK_DIRS = (
 # Dirs copied instead when the symlink fails (Windows without symlink
 # privilege); refreshed on every populate.
 _CODEX_HOME_COPY_FALLBACK_DIRS = frozenset({Path("agents")})
-# Subagent role defaults owned by the host's lane settings.
+# Subagent role defaults owned by the host's subagent settings.
 _CODEX_ROLE_DEFAULT_KEYS = ("default_subagent_model", "default_subagent_reasoning_effort")
 _CODEX_MINIMAL_CONFIG_ENV = "HARNESS_CODEX_MINIMAL_CONFIG"
 _CODEX_PROVIDER_CONFIG_PREFIX = "model_providers."
 _BROKERED_CODEX_PROVIDER_NAME = "omnigent_brokered"
 # Env var naming the native app-server PID for tool processes (read by liveness tooling).
-CODEX_AGENT_PID_ENV = "COLLAB_AGENT_PID"
+CODEX_AGENT_PID_ENV = "OMNIGENT_CODEX_APP_SERVER_PID"
 # Dotted Codex config key placing the app-server pid in a thread's shell env.
 CODEX_AGENT_PID_CONFIG_KEY = f"shell_environment_policy.set.{CODEX_AGENT_PID_ENV}"
 CODEX_PRIMARY_SESSION_ID_CONFIG_KEY = f"shell_environment_policy.set.{PRIMARY_SESSION_ID_ENV_VAR}"
@@ -1247,7 +1247,7 @@ def _mirror_codex_home_dir_copy(source_subdir: Path, link_path: Path) -> None:
 
 
 def _sync_codex_role_defaults(source_config: Path, dest_config: Path) -> None:
-    """Re-sync the lane-owned ``[agents]`` role defaults into an existing copy.
+    """Re-sync the host-configured ``[agents]`` role defaults into an existing copy.
 
     A persistent private home keeps its copied ``config.toml`` across
     launches, so host edits to the subagent role defaults must be mirrored
@@ -1393,7 +1393,7 @@ def _populate_codex_home_config(
       enforcement isolated between concurrent sessions. Source hook approvals
       are inherited through the app-server RPC after initialization. An
       existing private copy keeps its own keys across launches, except the
-      lane-owned ``[agents]`` subagent role defaults, which are re-synced
+      host-configured ``[agents]`` subagent role defaults, which are re-synced
       from the source. Permission defaults also mirror the source on every
       start. On Windows, the source's explicit ``[windows].sandbox``
       choice is also refreshed. User-level ``codex_config_sync`` can opt into
@@ -1600,7 +1600,7 @@ def _populate_codex_home_config(
                 and not dest_path.is_symlink()
             ):
                 # Persistent private homes reuse their copied config across
-                # launches; re-sync the lane-owned role defaults from the host.
+                # launches; re-sync the host-configured role defaults from the host.
                 _sync_codex_role_defaults(source_file, dest_path)
                 if sys.platform == "win32":
                     _sync_codex_windows_sandbox(source_file, dest_path)

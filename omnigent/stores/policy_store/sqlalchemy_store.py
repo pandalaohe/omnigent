@@ -28,6 +28,7 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.entities import Policy
+from omnigent.policies.registry import canonical_policy_handler, persisted_policy_handler
 from omnigent.stores.policy_store import PolicyStore
 
 
@@ -45,7 +46,9 @@ def _to_entity(row: SqlPolicy) -> Policy:
         scope=decode_policy_scope(row.scope),
         created_at=row.created_at,
         type=decode_policy_type(row.type),
-        handler=row.handler,
+        handler=canonical_policy_handler(row.handler)
+        if decode_policy_type(row.type) == "python"
+        else row.handler,
         factory_params=json.loads(row.factory_params) if row.factory_params else None,
         enabled=bool(row.enabled),
         updated_at=row.updated_at,
@@ -133,7 +136,7 @@ class SqlAlchemyPolicyStore(PolicyStore):
                 created_at=created_at,
                 updated_at=None,
                 type=encode_policy_type(type),
-                handler=handler,
+                handler=persisted_policy_handler(handler) if type == "python" else handler,
                 factory_params=encoded_params,
                 enabled=enabled,
             )
@@ -218,9 +221,15 @@ class SqlAlchemyPolicyStore(PolicyStore):
                 # Column defaults don't fire on UPDATE — recompute the digest.
                 row.name_cksum = policy_name_cksum(name)
                 changed = True
-            if handler is not None and row.handler != handler:
-                row.handler = handler
-                changed = True
+            if handler is not None:
+                stored_handler = (
+                    persisted_policy_handler(handler)
+                    if decode_policy_type(row.type) == "python"
+                    else handler
+                )
+                if row.handler != stored_handler:
+                    row.handler = stored_handler
+                    changed = True
             if enabled is not None and bool(row.enabled) != enabled:
                 row.enabled = enabled
                 changed = True
@@ -298,7 +307,7 @@ class SqlAlchemyPolicyStore(PolicyStore):
                 created_at=created_at,
                 updated_at=None,
                 type=encode_policy_type(type),
-                handler=handler,
+                handler=persisted_policy_handler(handler) if type == "python" else handler,
                 factory_params=encoded_params,
                 enabled=enabled,
                 created_by=created_by,
@@ -373,9 +382,15 @@ class SqlAlchemyPolicyStore(PolicyStore):
                 # Column defaults don't fire on UPDATE — recompute the digest.
                 row.name_cksum = policy_name_cksum(name)
                 changed = True
-            if handler is not None and row.handler != handler:
-                row.handler = handler
-                changed = True
+            if handler is not None:
+                stored_handler = (
+                    persisted_policy_handler(handler)
+                    if decode_policy_type(row.type) == "python"
+                    else handler
+                )
+                if row.handler != stored_handler:
+                    row.handler = stored_handler
+                    changed = True
             if enabled is not None and bool(row.enabled) != enabled:
                 row.enabled = enabled
                 changed = True

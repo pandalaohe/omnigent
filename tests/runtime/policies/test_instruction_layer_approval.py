@@ -109,7 +109,7 @@ async def test_child_keeps_default_update_approval(conversation_store, db_uri):
             tool_name="sys_instruction_layer_update",
             content={
                 "name": "sys_instruction_layer_update",
-                "arguments": {"scope": "mother", "text": "New"},
+                "arguments": {"scope": "parent", "text": "New"},
             },
         )
     )

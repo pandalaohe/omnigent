@@ -1454,7 +1454,7 @@ def _rekey_subagent_work_for_succession(
         _subagent_work_by_parent.setdefault(new_parent_id, set()).add(child_id)
     # A drained child left the work index, but its retained result key and
     # fan-out metadata are still owned by the old parent; follow the successor
-    # so a later per-parent teardown cannot drop the new mother's state.
+    # so a later per-parent teardown cannot drop the new parent's state.
     for child_id, parent_id in list(_subagent_retained_state_parents.items()):
         if parent_id == old_parent_id:
             _subagent_retained_state_parents[child_id] = new_parent_id
@@ -7039,8 +7039,8 @@ def create_runner_app(
         # A codex-native internal thread (a /side side chat) is consumed inside
         # the parent's own app-server, so waking the parent would inject a
         # notice into a chat the user is reading. A delegated Codex job is the
-        # exception: its labels prove Codex spawned it for work the mother asked
-        # for, and an Omnigent-registered child of a Codex mother still wakes it
+        # exception: its labels prove Codex spawned it for work the parent asked
+        # for, and an Omnigent-registered child of a Codex parent still wakes it
         # (D12). ``entry_owes_parent_wake`` is the whole rule; the stranded-wake
         # rescue calls it too.
         if not _owes_parent_wake(entry):
@@ -7398,7 +7398,7 @@ def create_runner_app(
         result_key: str | None,
         output: str | None,
     ) -> _JsonObject:
-        """Build the silent-copy payload the mother's inbox drain renders."""
+        """Build the silent-copy payload the parent's inbox drain renders."""
         entry = get_subagent_work(child_session_id)
         if entry is not None:
             agent, title = entry.agent, entry.title
@@ -7432,9 +7432,9 @@ def create_runner_app(
     def _stamp_subagent_result_item_soon(
         child_session_id: str, work_id: str, status: str, result_key: str | None
     ) -> None:
-        """Best-effort pin an undrained mother result's terminal status and item.
+        """Best-effort pin an undrained parent result's terminal status and item.
 
-        Later peer and self-started turns can finish before the mother drains
+        Later peer and self-started turns can finish before the parent drains
         her result. Pin its item when it is delivered, before those turns land.
         """
         from omnigent.runner.tool_dispatch import _patch_subagent_label
@@ -7556,7 +7556,7 @@ def create_runner_app(
         result_key: str | None,
         output: str | None,
     ) -> None:
-        """Record a silent copy, pinning the undrained mother's outcome if needed."""
+        """Record a silent copy, pinning the undrained parent's outcome if needed."""
         if not isinstance(peer_turn, dict):
             return
         parent_id = peer_turn.get("parent_session_id")
@@ -10398,7 +10398,7 @@ def create_runner_app(
             peer_turn = data.get("peer_turn") if isinstance(data, dict) else None
             sdk_peer_turn = isinstance(data, dict) and data.get("sdk_peer_turn") is True
             turn_completed = data.get("turn_completed") if isinstance(data, dict) else None
-            # Native peer turns are copies only without a mother-owned open entry.
+            # Native peer turns are copies only without a parent-owned open entry.
             # An SDK peer turn started idle; an open entry now belongs to a later dispatch.
             _peer_entry = get_subagent_work(conversation_id)
             peer_copy = (
@@ -10510,10 +10510,10 @@ def create_runner_app(
                     return Response(status_code=204)
                 result_key = await _result_key(server_client, conversation_id, output=output)
                 if peer_copy:
-                    # A peer turn is a silent copy on the mother's runner: no
+                    # A peer turn is a silent copy on the parent's runner: no
                     # inbox item, no wake, no work entry and no member settle.
                     # The interrupt resolution below never runs for it: a pending
-                    # interrupt belongs to the mother's dispatch, not the peer
+                    # interrupt belongs to the parent's dispatch, not the peer
                     # turn.
                     if (
                         status == "idle"

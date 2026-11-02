@@ -160,12 +160,12 @@ async def test_start_drops_inherited_agent_pid_and_resolves_native_pid(
         tmp_path / "codex-home",
         tmp_path / "bridge",
         workspace,
-        env={"COLLAB_AGENT_PID": "999", "KEEP_ME": "ok"},
+        env={"OMNIGENT_CODEX_APP_SERVER_PID": "999", "KEEP_ME": "ok"},
     )
 
     await server.start()
     try:
-        assert "COLLAB_AGENT_PID" not in captured["env"]
+        assert "OMNIGENT_CODEX_APP_SERVER_PID" not in captured["env"]
         assert captured["env"]["KEEP_ME"] == "ok"
         assert server.agent_pid == 4242
         assert native_pid_calls == [(_FAKE_PID, "app-server")]

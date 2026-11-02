@@ -26,6 +26,19 @@ from dataclasses import dataclass
 
 _logger = logging.getLogger(__name__)
 
+STANDING_APPROVAL_HANDLER = "omnigent.policies.builtins.safety.ask_on_standing_approval_grant"
+LEGACY_STANDING_APPROVAL_HANDLER = "omnigent.policies.builtins.safety.ask_on_standing_pass_grant"
+
+
+def canonical_policy_handler(handler: str) -> str:
+    """Expose the current handler name when reading older policy rows or input."""
+    return STANDING_APPROVAL_HANDLER if handler == LEGACY_STANDING_APPROVAL_HANDLER else handler
+
+
+def persisted_policy_handler(handler: str) -> str:
+    """Keep policy rows importable by the previous image during the expand release."""
+    return LEGACY_STANDING_APPROVAL_HANDLER if handler == STANDING_APPROVAL_HANDLER else handler
+
 
 @dataclass(frozen=True)
 class PolicyRegistryEntry:
@@ -186,7 +199,7 @@ def get_entry(handler: str) -> PolicyRegistryEntry | None:
     :returns: The :class:`PolicyRegistryEntry`, or ``None`` if
         the handler is not registered.
     """
-    return _registry_by_handler.get(handler)
+    return _registry_by_handler.get(canonical_policy_handler(handler))
 
 
 def is_registered_handler(handler: str) -> bool:
@@ -224,7 +237,9 @@ def is_registered_handler(handler: str) -> bool:
     """
     if not _registry_by_handler:
         load_registry()
-    return handler in _registry_by_handler
+    if handler == LEGACY_STANDING_APPROVAL_HANDLER:
+        _logger.info("legacy name used: ask_on_standing_pass_grant")
+    return canonical_policy_handler(handler) in _registry_by_handler
 
 
 def function_policy_handler_allowed(
@@ -259,7 +274,7 @@ def get_params_schema(handler: str) -> dict[str, object] | None:
     :returns: The JSON Schema dict, or ``None`` if the handler
         is not in the registry or has no schema.
     """
-    entry = _registry_by_handler.get(handler)
+    entry = get_entry(handler)
     if entry is None:
         return None
     return entry.params_schema
@@ -279,7 +294,8 @@ def validate_factory_params(
     :param factory_params: The params to validate.
     :returns: Error message, or ``None`` if valid.
     """
-    entry = _registry_by_handler.get(handler)
+    handler = canonical_policy_handler(handler)
+    entry = get_entry(handler)
     if entry is None:
         # Not in registry — custom policy, skip validation.
         return None

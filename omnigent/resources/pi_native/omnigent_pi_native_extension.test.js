@@ -961,7 +961,7 @@ async function testPiRotation(fault = "none") {
     assert(`${fault}: successor bound before succession`, calls.findIndex(c => c.method === "PATCH" && c.body.runner_id) < calls.findIndex(c => c.pathname.endsWith("/succession")));
     assert(`${fault}: fresh terminal ensured`, calls.some(c => c.body && c.body.ensure_native_terminal === true));
     assert(`${fault}: fresh pane owns its external identity`, !calls.some(c => c.body && c.body.external_session_id === "pi_new_context"));
-    assert(`${fault}: children and empty mother carried`, calls.some(c => c.pathname.endsWith("/succession") && c.body.allow_empty === true));
+    assert(`${fault}: children and empty parent carried`, calls.some(c => c.pathname.endsWith("/succession") && c.body.allow_empty === true));
     assert(`${fault}: old pane eventually retires`, calls.some(c => c.method === "DELETE" && c.pathname.endsWith("/resources/terminals/terminal_pi_main")));
     const config = JSON.parse(fs.readFileSync(path.join(h.bridgeDir, "config.json"), "utf8"));
     assert(`${fault}: pending marker cleared`, !config.pendingRotationSource && !config.pendingSuccessorId);
@@ -971,17 +971,17 @@ async function testPiRotation(fault = "none") {
   }
 }
 
-async function testChildResetDoesNotCreateMother() {
+async function testChildResetDoesNotCreateParent() {
   const h = makeHarness({ captureEvents: true });
   const calls = [];
   const previousFetch = global.fetch;
   global.fetch = async (url, options) => {
     calls.push({ method: options.method, pathname: new URL(url).pathname });
-    return { status: 200, json: async () => ({ parent_session_id: "mother" }) };
+    return { status: 200, json: async () => ({ parent_session_id: "parent" }) };
   };
   try {
     await h.handlers.session_start({ reason: "new" }, makeCtx({ idle: true }));
-    assert("child reset never creates a mother", !calls.some(c => c.pathname.endsWith("/successor")));
+    assert("child reset never creates a parent", !calls.some(c => c.pathname.endsWith("/successor")));
     assert("child reset never reparents or retires itself", !calls.some(c => c.pathname.endsWith("/succession") || c.method === "DELETE"));
     const config = JSON.parse(fs.readFileSync(path.join(h.bridgeDir, "config.json"), "utf8"));
     assert("child remains usable after its own reset", !config.pendingRotationSource && !!h.pi.__omnigentInboxPoller);
@@ -996,7 +996,7 @@ async function testChildResetDoesNotCreateMother() {
     await testQueuedPromptDuringStartupStaysRunningUntilAgentEnd();
     for (const fault of ["none", "lost-response", "bind", "pending", "refused", "startup-recovery", "retired"])
       await testPiRotation(fault);
-    await testChildResetDoesNotCreateMother();
+    await testChildResetDoesNotCreateParent();
     await testRunningIdleShareResponseId();
     await testTaskPlanPublishesTodos();
     await testExistingTaskToolIsMirroredWithoutConflict();

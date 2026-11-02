@@ -7,22 +7,22 @@ from omnigent.tools.base import Tool
 _LAYERS = (
     "shared applies to all routes; agent to one coding-agent product; host to one host; "
     "independent (cell) replaces shared/agent/host for a host + agent pair; "
-    "mother applies to top-level sessions that can spawn; child to child sessions. "
+    "parent applies to top-level sessions that can spawn; child to child sessions. "
     "Each role supports shared (no keys), agent, host, and independent (both keys) cells; "
     "its nonblank independent cell replaces only that role's shared/agent/host cells. "
 )
 _KEYS: dict[str, Any] = {
     "scope": {
         "type": "string",
-        "enum": ["shared", "agent", "host", "independent", "mother", "child"],
+        "enum": ["shared", "agent", "host", "independent", "parent", "child"],
     },
     "agent_key": {
         "type": "string",
-        "description": "Required for agent and independent scopes; optional for mother/child.",
+        "description": "Required for agent and independent scopes; optional for parent/child.",
     },
     "host_id": {
         "type": "string",
-        "description": "Required for host and independent scopes; optional for mother/child.",
+        "description": "Required for host and independent scopes; optional for parent/child.",
     },
 }
 

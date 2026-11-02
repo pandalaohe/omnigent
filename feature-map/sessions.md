@@ -555,7 +555,7 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_worktree_safe_archive_ui.py` drives real preference
   and archive requests with injected host-status responses for dark/light
   sidebar, header, Agents/Past rows, blocking-child hover, details and mobile
-  first-archive coverage, including a mother with no worktree and clean/local/dirty
+  first-archive coverage, including a parent with no worktree and clean/local/dirty
   children. Actual
   Git safety/removal is checked by `tests/host/test_git_worktree.py`; server
   archive, tool and keep-warm policy by

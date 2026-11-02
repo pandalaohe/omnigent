@@ -185,7 +185,7 @@ def register_succession_routes(
                     "Source permission state is not ready", code=ErrorCode.CONFLICT
                 )
             tier = permission.tier
-        await asyncio.to_thread(request.app.state.standing_pass_service.resolve, source)
+        await asyncio.to_thread(request.app.state.standing_approval_service.resolve, source)
         try:
             successor = await asyncio.to_thread(
                 conversation_store.create_session_successor,

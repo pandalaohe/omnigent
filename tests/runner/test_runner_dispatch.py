@@ -10447,7 +10447,7 @@ async def test_sys_session_get_info_many_omits_host_readiness_without_flag() -> 
 async def test_sys_session_get_info_tells_relaunchable_from_offline_runners() -> None:
     """
     After a host restart a child keeps its stopped runner binding until its
-    next message. ``runner_state`` tells a mother whether that message can
+    next message. ``runner_state`` tells a parent whether that message can
     run — the host is online, so it reattaches — or cannot because the host
     is offline, and keep-warm's runner blocker follows the same split.
     """
@@ -10602,7 +10602,7 @@ async def test_sys_session_get_info_closed_session_is_never_relaunchable(
 ) -> None:
     """
     A closed session rejects its next message, so an online host must not
-    read as ``relaunchable`` for it — the mother would send a resume that
+    read as ``relaunchable`` for it — the parent would send a resume that
     cannot land. Both closed spellings count: the persisted label new
     closes write, and the legacy title marker an older row still carries.
     """
@@ -15337,7 +15337,7 @@ async def test_sys_session_create_refused_from_a_child_session() -> None:
     """A child session cannot open long-lived children (D2).
 
     The refusal is structural and runs before any create POST: a child that
-    needs workers uses its harness's own sub-agents, or asks its mother.
+    needs workers uses its harness's own sub-agents, or asks its parent.
     """
     from omnigent.runner.tool_dispatch import execute_tool
 
@@ -15349,7 +15349,7 @@ async def test_sys_session_create_refused_from_a_child_session() -> None:
                 200,
                 json={
                     "id": "conv_child_caller",
-                    "parent_session_id": "conv_mother",
+                    "parent_session_id": "conv_parent",
                     "agent_id": "ag_x",
                 },
             )
@@ -15369,7 +15369,7 @@ async def test_sys_session_create_refused_from_a_child_session() -> None:
 
     info = json.loads(output)
     assert info["error"] == "child_session_create_refused"
-    assert "ask your mother session" in info["message"]
+    assert "ask your parent session" in info["message"]
     assert posts == [], "a refused child create must not reach the server"
 
 
@@ -16402,10 +16402,10 @@ def test_format_async_task_item_renders_placement_label() -> None:
 async def test_sys_session_send_session_id_reaches_descendant(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A grandchild is sendable; the mother tracks nothing and the middle entry stays.
+    """A grandchild is sendable; the parent tracks nothing and the middle entry stays.
 
     One work entry per child id means registering the grandchild on the
-    mother would steal the middle session's entry, so the descendant post is
+    parent would steal the middle session's entry, so the descendant post is
     plain and reports that the result returns to the middle session.
     """
     from omnigent.runner import app as runner_app
@@ -16416,11 +16416,11 @@ async def test_sys_session_send_session_id_reaches_descendant(
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
-        if request.method == "GET" and path == "/v1/sessions/conv_mother":
+        if request.method == "GET" and path == "/v1/sessions/conv_parent":
             return httpx.Response(
-                200, json={"id": "conv_mother", "root_conversation_id": "conv_mother"}
+                200, json={"id": "conv_parent", "root_conversation_id": "conv_parent"}
             )
-        if request.method == "GET" and path == "/v1/sessions/conv_mother/collab-settings":
+        if request.method == "GET" and path == "/v1/sessions/conv_parent/collab-settings":
             return httpx.Response(200, json={"enabled": True})
         if request.method == "GET" and path == "/v1/sessions/conv_grandchild":
             return httpx.Response(
@@ -16429,7 +16429,7 @@ async def test_sys_session_send_session_id_reaches_descendant(
                     "id": "conv_grandchild",
                     "title": "worker:deep",
                     "parent_session_id": "conv_middle",
-                    "root_conversation_id": "conv_mother",
+                    "root_conversation_id": "conv_parent",
                     "status": "idle",
                 },
             )
@@ -16438,8 +16438,8 @@ async def test_sys_session_send_session_id_reaches_descendant(
                 200,
                 json={
                     "id": "conv_middle",
-                    "parent_session_id": "conv_mother",
-                    "root_conversation_id": "conv_mother",
+                    "parent_session_id": "conv_parent",
+                    "root_conversation_id": "conv_parent",
                 },
             )
         if request.method == "POST" and path == "/v1/sessions/conv_grandchild/events":
@@ -16449,7 +16449,7 @@ async def test_sys_session_send_session_id_reaches_descendant(
 
     monkeypatch.setattr(subagent_work, "register_child_session", lambda *a, **k: None)
     middle_entry = subagent_work.register_subagent_work(
-        parent_session_id="conv_mother",
+        parent_session_id="conv_parent",
         child_session_id="conv_middle",
         agent="worker",
         title="middle",
@@ -16465,7 +16465,7 @@ async def test_sys_session_send_session_id_reaches_descendant(
                 tool_name="sys_session_send",
                 arguments=json.dumps({"session_id": "conv_grandchild", "args": "dig deeper"}),
                 server_client=server_client,
-                conversation_id="conv_mother",
+                conversation_id="conv_parent",
                 agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="worker")]),
                 session_inbox=session_inbox,
             )
@@ -16473,7 +16473,7 @@ async def test_sys_session_send_session_id_reaches_descendant(
             intact = runner_app.get_subagent_work("conv_middle")
     finally:
         subagent_work.unregister_subagent_work("conv_middle")
-        runner_app._session_inboxes_ref.pop("conv_mother", None)
+        runner_app._session_inboxes_ref.pop("conv_parent", None)
 
     payload = json.loads(output)
     assert payload["conversation_id"] == "conv_grandchild"
@@ -16481,7 +16481,7 @@ async def test_sys_session_send_session_id_reaches_descendant(
     assert "the result returns to its parent conv_middle" in payload["message"]
     assert len(event_posts) == 1
     assert event_posts[0]["data"]["content"][0]["text"] == "dig deeper"
-    assert grandchild_entry is None, "a descendant send must not register work on the mother"
+    assert grandchild_entry is None, "a descendant send must not register work on the parent"
     assert intact is not None and intact.work_id == middle_work_id
 
 
@@ -16558,11 +16558,11 @@ async def test_sys_session_send_descendant_refused_when_switch_off(
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
-        if request.method == "GET" and path == "/v1/sessions/conv_off_mother":
+        if request.method == "GET" and path == "/v1/sessions/conv_off_parent":
             return httpx.Response(
-                200, json={"id": "conv_off_mother", "root_conversation_id": "conv_off_mother"}
+                200, json={"id": "conv_off_parent", "root_conversation_id": "conv_off_parent"}
             )
-        if request.method == "GET" and path == "/v1/sessions/conv_off_mother/collab-settings":
+        if request.method == "GET" and path == "/v1/sessions/conv_off_parent/collab-settings":
             return httpx.Response(200, json={"enabled": False})
         if request.method == "GET" and path == "/v1/sessions/conv_off_grandchild":
             return httpx.Response(
@@ -16570,7 +16570,7 @@ async def test_sys_session_send_descendant_refused_when_switch_off(
                 json={
                     "id": "conv_off_grandchild",
                     "parent_session_id": "conv_off_middle",
-                    "root_conversation_id": "conv_off_mother",
+                    "root_conversation_id": "conv_off_parent",
                 },
             )
         if request.method == "POST" and path == "/v1/sessions/conv_off_grandchild/events":
@@ -16588,12 +16588,12 @@ async def test_sys_session_send_descendant_refused_when_switch_off(
                 tool_name="sys_session_send",
                 arguments=json.dumps({"session_id": "conv_off_grandchild", "args": "hello"}),
                 server_client=server_client,
-                conversation_id="conv_off_mother",
+                conversation_id="conv_off_parent",
                 agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="worker")]),
                 session_inbox=session_inbox,
             )
     finally:
-        runner_app._session_inboxes_ref.pop("conv_off_mother", None)
+        runner_app._session_inboxes_ref.pop("conv_off_parent", None)
 
     assert json.loads(output)["error"] == "session_out_of_tree"
     assert event_posts == []

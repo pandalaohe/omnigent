@@ -539,7 +539,7 @@ _INSTRUCTION_LAYER_TOOLS = frozenset(
     {"sys_instruction_layers_read", "sys_instruction_layer_update"}
 )
 _PROJECT_SETTINGS_TOOLS = frozenset({"sys_project_settings_read", "sys_project_settings_update"})
-_STANDING_PASS_TOOLS = frozenset({"sys_standing_pass"})
+_STANDING_APPROVAL_TOOLS = frozenset({"sys_standing_approval", "sys_standing_pass"})
 
 # Priority 5l.1: Scheduled-task management — the runner proxies the Omnigent
 # server's /v1/scheduled-tasks REST endpoints (same posture as _POLICY_TOOLS).
@@ -625,7 +625,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _POLICY_TOOLS
     | _INSTRUCTION_LAYER_TOOLS
     | _PROJECT_SETTINGS_TOOLS
-    | _STANDING_PASS_TOOLS
+    | _STANDING_APPROVAL_TOOLS
     | _SCHEDULED_TASK_TOOLS
     | _TERMINAL_TOOLS
     # ``browser_*`` must ride the native relay: the Omnigent desktop app
@@ -1128,7 +1128,7 @@ _ALL_LOCAL_TOOLS = (
     | _POLICY_TOOLS
     | _INSTRUCTION_LAYER_TOOLS
     | _PROJECT_SETTINGS_TOOLS
-    | _STANDING_PASS_TOOLS
+    | _STANDING_APPROVAL_TOOLS
     | _SCHEDULED_TASK_TOOLS
     # The panel tool executes HERE, including on the ``dispatch=None`` path;
     # relaying it upstream would skip the artifacts/open POST.
@@ -1361,6 +1361,8 @@ def _ungranted_tool_reason(
     """
     from omnigent.spec.types import AgentSpec as _AgentSpec
 
+    if tool_name == "sys_standing_pass":
+        tool_name = "sys_standing_approval"
     if not isinstance(agent_spec, _AgentSpec):
         if tool_name == SysSessionCreateTool.name() and arguments is not None:
             return _unknown_tool_argument_reason(
@@ -4904,7 +4906,7 @@ async def _send_to_existing_session(
     snap_data = snap.json()
     if snap_data.get("parent_session_id") != conversation_id:
         # A descendant is reachable before the peer / out-of-tree branch: the
-        # mother drives any session in its own tree, but never a sibling
+        # parent drives any session in its own tree, but never a sibling
         # (D1). The live master switch gates the new surface.
         if await _runner_app._collab_enabled_live(
             server_client, conversation_id
@@ -5901,8 +5903,8 @@ async def _child_session_create_refusal(
 ) -> str | None:
     """Return the tool error when the calling session is itself a child (D2).
 
-    Long-lived children are the mother session's job: a child that needs
-    workers uses its harness's own sub-agents, or asks its mother with
+    Long-lived children are the parent session's job: a child that needs
+    workers uses its harness's own sub-agents, or asks its parent with
     ``sys_session_send``. The check reads the caller's snapshot (one
     metadata-only GET when not already at hand) and runs before any create
     POST; nested named sends create through the server route directly, so
@@ -5931,7 +5933,7 @@ async def _child_session_create_refusal(
             "error": "child_session_create_refused",
             "message": (
                 "a child session cannot open long-lived child sessions; ask "
-                "your mother session (sys_session_send to your parent) — "
+                "your parent session (sys_session_send to your parent) — "
                 "your own harness subagents are unaffected"
             ),
         }
@@ -7473,19 +7475,19 @@ async def _execute_instruction_layer_tool(
         return json.dumps({"error": f"{tool_name}: {exc}"})
 
 
-async def _execute_standing_pass_tool(
+async def _execute_standing_approval_tool(
     arguments: str,
     *,
     conversation_id: str | None,
     server_client: httpx.AsyncClient | None,
 ) -> str:
     if server_client is None or conversation_id is None:
-        return json.dumps({"error": "sys_standing_pass requires server access and a session"})
+        return json.dumps({"error": "sys_standing_approval requires server access and a session"})
     try:
         args = json.loads(arguments)
         if not isinstance(args, dict) or args.keys() - {"op", "kinds", "source"}:
-            raise ValueError("unexpected standing pass arguments")
-        url = f"{_session_url(conversation_id)}/standing-pass"
+            raise ValueError("unexpected standing approval arguments")
+        url = f"{_session_url(conversation_id)}/standing-approval"
         if args.get("op") == "read":
             response = await server_client.get(url, timeout=30.0)
         else:
@@ -7496,7 +7498,7 @@ async def _execute_standing_pass_tool(
             )
         return json.dumps(response.json())
     except (ValueError, httpx.HTTPError) as exc:
-        return json.dumps({"error": f"sys_standing_pass: {exc}"})
+        return json.dumps({"error": f"sys_standing_approval: {exc}"})
 
 
 async def _execute_project_settings_tool(
@@ -11093,8 +11095,10 @@ async def execute_tool(
             output = await _execute_project_settings_tool(
                 tool_name, arguments, server_client=server_client
             )
-        elif tool_name in _STANDING_PASS_TOOLS:
-            output = await _execute_standing_pass_tool(
+        elif tool_name in _STANDING_APPROVAL_TOOLS:
+            if tool_name == "sys_standing_pass":
+                _logger.info("legacy name used: sys_standing_pass")
+            output = await _execute_standing_approval_tool(
                 arguments, conversation_id=conversation_id, server_client=server_client
             )
         elif tool_name in _POLICY_TOOLS:

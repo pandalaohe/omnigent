@@ -392,6 +392,7 @@ _AGY_ENABLED_TOOLS = [
     "sys_session_send",
     "sys_session_share",
     "sys_session_unarchive",
+    "sys_standing_approval",
     "sys_standing_pass",
     "sys_terminal_close",
     "sys_terminal_launch",

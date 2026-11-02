@@ -7981,12 +7981,18 @@ def test_post_tools_changed_preserves_programming_errors(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("result_kind", ["text", "images", "image_error"])
 @pytest.mark.parametrize("cancellable", [False, True])
+@pytest.mark.parametrize(
+    ("advertised_name", "called_name"),
+    [("sys_custom", "sys_custom"), ("sys_standing_approval", "sys_standing_pass")],
+)
 async def test_channel_server_relays_active_omnigent_tools(
     result_kind: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     subprocess_bridge_root: Path,
     cancellable: bool,
+    advertised_name: str,
+    called_name: str,
 ) -> None:
     """
     Active turn tools are advertised to Claude and dispatched through AP.
@@ -8066,7 +8072,7 @@ async def test_channel_server_relays_active_omnigent_tools(
             bridge_dir=bridge_dir,
             tools=[
                 {
-                    "name": "sys_custom",
+                    "name": advertised_name,
                     "description": "Test-only active Omnigent tool.",
                     "parameters": {
                         "type": "object",
@@ -8087,10 +8093,12 @@ async def test_channel_server_relays_active_omnigent_tools(
         )
         listed = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=5.0)
         listed_tools = listed["result"]["tools"]
-        custom_tools = [tool for tool in listed_tools if tool["name"] == "sys_custom"]
+        assert all(tool["name"] != "sys_standing_pass" for tool in listed_tools)
+        assert claude_native_bridge._is_relay_tool_call({"name": called_name}, bridge_dir)
+        custom_tools = [tool for tool in listed_tools if tool["name"] == advertised_name]
         assert custom_tools == [
             {
-                "name": "sys_custom",
+                "name": advertised_name,
                 "description": "Test-only active Omnigent tool.",
                 "inputSchema": {
                     "type": "object",
@@ -8106,7 +8114,7 @@ async def test_channel_server_relays_active_omnigent_tools(
                 "id": 3,
                 "method": "tools/call",
                 "params": {
-                    "name": "sys_custom",
+                    "name": called_name,
                     "arguments": {"value": "hello"},
                 },
             },
@@ -8121,7 +8129,7 @@ async def test_channel_server_relays_active_omnigent_tools(
                 "content": image_blocks,
                 "isError": result_kind == "image_error",
             }
-        assert calls == [{"name": "sys_custom", "arguments": {"value": "hello"}}]
+        assert calls == [{"name": called_name, "arguments": {"value": "hello"}}]
     finally:
         if relay is not None:
             relay.close()
@@ -8131,6 +8139,15 @@ async def test_channel_server_relays_active_omnigent_tools(
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=5.0)
+
+
+def test_standing_approval_alias_requires_active_relay_tool(tmp_path: Path) -> None:
+    """A hidden alias cannot enable a tool absent from the active turn."""
+    params = {"name": "sys_standing_pass", "arguments": {"action": "read"}}
+    assert not claude_native_bridge._is_relay_tool_call(params, tmp_path)
+    result = claude_native_bridge._call_mcp_tool(params, {}, tmp_path)
+    assert result["isError"] is True
+    assert "unknown tool" in result["content"][0]["text"]
 
 
 @pytest.mark.asyncio

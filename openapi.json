@@ -8296,7 +8296,7 @@
             "session.resource.deleted": "#/components/schemas/SessionResourceDeletedEvent",
             "session.sandbox_status": "#/components/schemas/SessionSandboxStatusEvent",
             "session.speed_tier": "#/components/schemas/SessionSpeedTierEvent",
-            "session.standing_pass": "#/components/schemas/SessionStandingPassEvent",
+            "session.standing_approval": "#/components/schemas/SessionStandingApprovalEvent",
             "session.startup": "#/components/schemas/SessionStartupEvent",
             "session.status": "#/components/schemas/SessionStatusEvent",
             "session.superseded": "#/components/schemas/SessionSupersededEvent",
@@ -8390,7 +8390,7 @@
             "$ref": "#/components/schemas/SessionChildSessionUpdatedEvent"
           },
           {
-            "$ref": "#/components/schemas/SessionStandingPassEvent"
+            "$ref": "#/components/schemas/SessionStandingApprovalEvent"
           },
           {
             "$ref": "#/components/schemas/SessionChangedFilesInvalidatedEvent"
@@ -9863,7 +9863,7 @@
                 "type": "null"
               }
             ],
-            "description": "Absolute path on disk where the runner cd's, e.g. `\"/Users/corey/universe/src/foo\"`. `None` for sessions that haven't been bound to a host workspace.",
+            "description": "Absolute path on disk where the runner cd's, e.g. `\"/opt/work/project/src/foo\"`. `None` for sessions that haven't been bound to a host workspace.",
             "title": "Workspace"
           },
           "worktree": {
@@ -11478,7 +11478,7 @@
                 "type": "null"
               }
             ],
-            "description": "Absolute path on disk where the runner cd's, e.g. `\"/Users/corey/universe/src/foo\"`. Set when the session was bound to a host workspace at create-time, or when the CLI captured `os.getcwd()` at session-create. Always `None` when not yet validated against a host. When a git worktree was created for the session, this is the worktree directory path.",
+            "description": "Absolute path on disk where the runner cd's, e.g. `\"/opt/work/project/src/foo\"`. Set when the session was bound to a host workspace at create-time, or when the CLI captured `os.getcwd()` at session-create. Always `None` when not yet validated against a host. When a git worktree was created for the session, this is the worktree directory path.",
             "title": "Workspace"
           },
           "worktree": {
@@ -11660,8 +11660,8 @@
         "title": "SessionSpeedTierEvent",
         "type": "object"
       },
-      "SessionStandingPassEvent": {
-        "description": "The mother's advisory pass changed; descendants share the root record.",
+      "SessionStandingApprovalEvent": {
+        "description": "The parent's advisory pass changed; descendants share the root record.",
         "properties": {
           "conversation_id": {
             "title": "Conversation Id",
@@ -11690,7 +11690,7 @@
             "title": "Sequence Number"
           },
           "type": {
-            "const": "session.standing_pass",
+            "const": "session.standing_approval",
             "title": "Type",
             "type": "string"
           }
@@ -11701,7 +11701,7 @@
           "root_id",
           "record"
         ],
-        "title": "SessionStandingPassEvent",
+        "title": "SessionStandingApprovalEvent",
         "type": "object"
       },
       "SessionStartupEvent": {
@@ -14316,8 +14316,8 @@
             ],
             "title": "Child Cap"
           },
-          "standing_pass": {
-            "$ref": "#/components/schemas/_ProjectStandingPassPatch"
+          "standing_approval": {
+            "$ref": "#/components/schemas/_ProjectStandingApprovalPatch"
           }
         },
         "title": "_OrchestrationPatch",
@@ -14363,7 +14363,7 @@
         "title": "_ProjectPatch",
         "type": "object"
       },
-      "_ProjectStandingPassPatch": {
+      "_ProjectStandingApprovalPatch": {
         "additionalProperties": false,
         "properties": {
           "exceptions": {
@@ -14403,7 +14403,7 @@
             "title": "Remove"
           }
         },
-        "title": "_ProjectStandingPassPatch",
+        "title": "_ProjectStandingApprovalPatch",
         "type": "object"
       },
       "_SettingsPatch": {

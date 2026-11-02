@@ -540,7 +540,7 @@ class ChildCapPatch(BaseModel):
     cap: Annotated[StrictInt, Field(gt=0)] | Literal["none"]
 
 
-class StandingPassChange(BaseModel):
+class StandingApprovalChange(BaseModel):
     model_config = ConfigDict(extra="forbid")
     op: Literal["revoke", "grant"]
     kinds: list[Annotated[str, Field(min_length=1, max_length=120)]] = Field(max_length=32)
@@ -825,7 +825,9 @@ def register_core_routes(
     )
     child_cap_locks = ChildCapLocks()
 
-    async def standing_pass_session(request: Request, session_id: str, level: int) -> Conversation:
+    async def standing_approval_session(
+        request: Request, session_id: str, level: int
+    ) -> Conversation:
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
             user_id, session_id, level, permission_store, conversation_store
@@ -838,26 +840,32 @@ def register_core_routes(
         return conv
 
     @router.get("/sessions/{session_id}/standing-pass", include_in_schema=False)
-    async def get_standing_pass(request: Request, session_id: str) -> dict[str, Any]:
-        from omnigent.server.standing_pass import standing_pass_line
+    @router.get("/sessions/{session_id}/standing-approval", include_in_schema=False)
+    async def get_standing_approval(request: Request, session_id: str) -> dict[str, Any]:
+        from omnigent.server.standing_approval import standing_approval_line
 
-        conv = await standing_pass_session(request, session_id, LEVEL_READ)
-        service = request.app.state.standing_pass_service
+        if request.url.path.endswith("/standing-pass"):
+            _logger.info("legacy name used: /standing-pass")
+        conv = await standing_approval_session(request, session_id, LEVEL_READ)
+        service = request.app.state.standing_approval_service
         record = await asyncio.to_thread(service.resolve, conv)
         root = await asyncio.to_thread(service.root, conv)
-        return {"root_id": root.id, "record": record, "line": standing_pass_line(record)}
+        return {"root_id": root.id, "record": record, "line": standing_approval_line(record)}
 
     @router.post("/sessions/{session_id}/standing-pass", include_in_schema=False)
-    async def change_standing_pass(
-        request: Request, session_id: str, body: StandingPassChange
+    @router.post("/sessions/{session_id}/standing-approval", include_in_schema=False)
+    async def change_standing_approval(
+        request: Request, session_id: str, body: StandingApprovalChange
     ) -> dict[str, Any]:
-        from omnigent.server.standing_pass import consume_grant_approval, pass_strings
+        from omnigent.server.standing_approval import approval_strings, consume_grant_approval
 
-        conv = await standing_pass_session(request, session_id, LEVEL_EDIT)
-        service = request.app.state.standing_pass_service
+        if request.url.path.endswith("/standing-pass"):
+            _logger.info("legacy name used: /standing-pass")
+        conv = await standing_approval_session(request, session_id, LEVEL_EDIT)
+        service = request.app.state.standing_approval_service
         await asyncio.to_thread(service.require_mutable_root, conv)
         try:
-            kinds = pass_strings(body.kinds)
+            kinds = approval_strings(body.kinds)
         except ValueError as exc:
             raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
         source = body.source or ""
@@ -876,9 +884,9 @@ def register_core_routes(
                     request,
                     session_id=session_id,
                     params=ElicitationRequestParams(
-                        message=f"Grant these standing pass kinds: {json.dumps(kinds)}. Approve?",
+                        message=f"Grant these standing approval kinds: {json.dumps(kinds)}. Approve?",
                         requestedSchema={},
-                        policy_name="ask_on_standing_pass_grant",
+                        policy_name="ask_on_standing_approval_grant",
                     ),
                     timeout_s=300,
                     conversation_store=conversation_store,
@@ -886,7 +894,7 @@ def register_core_routes(
                 )
                 if verdict is None or verdict.action != "accept":
                     raise OmnigentError(
-                        "Standing pass grant was not approved", code=ErrorCode.FORBIDDEN
+                        "Standing approval grant was not approved", code=ErrorCode.FORBIDDEN
                     )
             source = f"approval:{approval}"
         record = await asyncio.to_thread(service.change, conv, body.op, kinds, source)
@@ -902,19 +910,19 @@ def register_core_routes(
                 or await _get_runner_client(child_id, runner_router, conversation=child) is None
             ):
                 return False
-            dispatcher = request.app.state.standing_pass_post_event
+            dispatcher = request.app.state.standing_approval_post_event
             await dispatcher(request, child_id, text)
             return True
 
         notices = await service.steer(session_id, record, post)
         from omnigent.runtime import session_stream
-        from omnigent.server.schemas import SessionStandingPassEvent
+        from omnigent.server.schemas import SessionStandingApprovalEvent
 
         for changed_id in [session_id, *notices]:
             session_stream.publish(
                 changed_id,
-                SessionStandingPassEvent(
-                    type="session.standing_pass",
+                SessionStandingApprovalEvent(
+                    type="session.standing_approval",
                     conversation_id=changed_id,
                     root_id=session_id,
                     record=record,
@@ -2068,7 +2076,7 @@ def register_core_routes(
                 quota_service = getattr(request.app.state, "agent_quota_service", None)
                 global_instructions = await session_instructions_text(
                     conv,
-                    standing_pass_resolver=request.app.state.standing_pass_service.line,
+                    standing_approval_resolver=request.app.state.standing_approval_service.line,
                     quota_resolver=(
                         lambda c: quota_service.line(c, _get_user_id(request, auth_provider))
                     )

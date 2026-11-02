@@ -69,7 +69,10 @@ def shared_settings_app(runtime_init: None, db_uri: str, tmp_path: Path) -> Fast
 
 
 @pytest.mark.asyncio
-async def test_orchestration_tool_to_store_requires_approval(settings_app, db_uri):
+@pytest.mark.parametrize("approval_key", ["standing_approval", "standing_pass"])
+async def test_orchestration_tool_to_store_requires_approval(
+    settings_app, db_uri, caplog, approval_key
+):
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=settings_app), base_url="http://test"
     ) as client:
@@ -77,14 +80,14 @@ async def test_orchestration_tool_to_store_requires_approval(settings_app, db_ur
         url = f"/v1/projects/{project_id}/settings"
         initial = (await client.get(url)).json()
         settings_app.state.user_preferences_store.patch_namespace(
-            "local", "session_collab", {"standingPassDefault": ["install", "merge"]}
+            "local", "session_collab", {"standingApprovalDefault": ["install", "merge"]}
         )
         args = {
             "project_id": project_id,
             "expected_revision": initial["revision"],
             "orchestration": {
                 "child_cap": 4,
-                "standing_pass": {"remove": ["install"], "exceptions": ["production release"]},
+                approval_key: {"remove": ["install"], "exceptions": ["production release"]},
             },
         }
         spec = AgentSpec(spec_version=1)
@@ -93,7 +96,9 @@ async def test_orchestration_tool_to_store_requires_approval(settings_app, db_ur
             for row in ToolManager(spec).get_tool_schemas()
             if row["function"]["name"] == "sys_project_settings_update"
         )
-        validate(args, schema)
+        assert "standing_pass" not in schema["properties"]["orchestration"]["properties"]
+        if approval_key == "standing_approval":
+            validate(args, schema)
         conversations = SqlAlchemyConversationStore(db_uri)
         conversation = conversations.create_conversation(project_id=project_id)
         engine = build_policy_engine(
@@ -110,23 +115,30 @@ async def test_orchestration_tool_to_store_requires_approval(settings_app, db_ur
             )
         )
         assert decision.action == PolicyAction.ASK
-        result = json.loads(
-            await execute_tool(
-                tool_name="sys_project_settings_update",
-                arguments=json.dumps(args),
-                server_client=client,
+        with caplog.at_level("INFO"):
+            result = json.loads(
+                await execute_tool(
+                    tool_name="sys_project_settings_update",
+                    arguments=json.dumps(args),
+                    server_client=client,
+                )
             )
-        )
         assert "error" not in result, result
+        assert caplog.messages.count("legacy name used: standing_pass") == (
+            approval_key == "standing_pass"
+        )
         saved = SqlAlchemyProjectStore(db_uri).get(project_id, user_id=None)
-        assert saved.config["orchestration"] == args["orchestration"]
-        record = settings_app.state.standing_pass_service.resolve(conversation)
+        assert saved.config["orchestration"] == {
+            "child_cap": 4,
+            "standing_approval": args["orchestration"][approval_key],
+        }
+        record = settings_app.state.standing_approval_service.resolve(conversation)
         assert record["kinds"] == ["merge"]
         assert record["exceptions"] == ["production release"]
         assert set(result["changed_fields"]) == {
             "orchestration.child_cap",
-            "orchestration.standing_pass.remove",
-            "orchestration.standing_pass.exceptions",
+            "orchestration.standing_approval.remove",
+            "orchestration.standing_approval.exceptions",
         }
         stale = json.loads(
             await execute_tool(
@@ -149,7 +161,7 @@ async def test_orchestration_patches_only_named_leaves(settings_app):
             "orchestration": {
                 "child_cap": 4,
                 "setup": "Saved",
-                "standing_pass": {
+                "standing_approval": {
                     "remove": ["install"],
                     "exceptions": ["production"],
                 },
@@ -159,20 +171,20 @@ async def test_orchestration_patches_only_named_leaves(settings_app):
         url = f"/v1/projects/{project_id}/settings"
         for patch, expected in (
             (
-                {"standing_pass": {"remove": None}},
+                {"standing_approval": {"remove": None}},
                 {
                     "child_cap": 4,
-                    "standing_pass": {"exceptions": ["production"]},
+                    "standing_approval": {"exceptions": ["production"]},
                 },
             ),
             (
                 {"child_cap": "none"},
                 {
                     "child_cap": "none",
-                    "standing_pass": {"exceptions": ["production"]},
+                    "standing_approval": {"exceptions": ["production"]},
                 },
             ),
-            ({"child_cap": None, "standing_pass": {"exceptions": None}}, None),
+            ({"child_cap": None, "standing_approval": {"exceptions": None}}, None),
         ):
             revision = (await client.get(url)).json()["revision"]
             response = await client.put(
@@ -201,17 +213,17 @@ async def test_orchestration_patches_only_named_leaves(settings_app):
         {"setup": "Retired setup"},
         {"setup": None},
         {"unknown": 1},
-        {"standing_pass": None},
-        {"standing_pass": {}},
-        {"standing_pass": {"remove": "install"}},
-        {"standing_pass": {"remove": [True]}},
-        {"standing_pass": {"remove": [""]}},
-        {"standing_pass": {"remove": ["x" * 121]}},
-        {"standing_pass": {"remove": ["x"] * 33}},
-        {"standing_pass": {"exceptions": ["   "]}},
-        {"standing_pass": {"exceptions": ["x"] * 6}},
-        {"standing_pass": {"exceptions": ["x" * 121]}},
-        {"standing_pass": {"extra": []}},
+        {"standing_approval": None},
+        {"standing_approval": {}},
+        {"standing_approval": {"remove": "install"}},
+        {"standing_approval": {"remove": [True]}},
+        {"standing_approval": {"remove": [""]}},
+        {"standing_approval": {"remove": ["x" * 121]}},
+        {"standing_approval": {"remove": ["x"] * 33}},
+        {"standing_approval": {"exceptions": ["   "]}},
+        {"standing_approval": {"exceptions": ["x"] * 6}},
+        {"standing_approval": {"exceptions": ["x" * 121]}},
+        {"standing_approval": {"extra": []}},
     ],
 )
 async def test_invalid_orchestration_is_atomic(settings_app, patch):

@@ -72,6 +72,7 @@ _CURSOR_AUTO_APPROVE_TOOLS = [
     "sys_session_open",
     "sys_session_send",
     "sys_session_unarchive",
+    "sys_standing_approval",
     "sys_standing_pass",
     "sys_host_restart",
     "sys_terminal_close",

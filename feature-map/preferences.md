@@ -227,12 +227,12 @@ For later slices, continue live verification of each newly connected path on an
 isolated deployment. Record the candidate/runtime versions, configuration,
 observed results, any mocked services, and remaining entry-point gaps.
 
-**Standing pass and project orchestration:** component coverage lives in
+**Standing approval and project orchestration:** component coverage lives in
 `web/src/components/StandingPassDefaults.test.tsx`,
 `web/src/components/StandingPassChip.test.tsx`,
 `web/src/components/ProjectOrchestrationView.test.tsx`, and
 `web/src/lib/sessionEvents.test.ts`. Server approval and descendant-event
-coverage lives in `tests/server/test_standing_pass.py`.
+coverage lives in `tests/server/test_standing_approval.py`.
 For a browser drive, choose Install in defaults, create a fresh parent and child,
 and open both chips. Revoke Install on the parent: the child's chip must update
 without a reload and offer no mutation buttons. Grant it back, confirm it stays
@@ -242,7 +242,7 @@ settings and compare Session orchestration with the stored project config.
 
 ## Gotchas
 
-- Standing pass defaults are snapshotted for a new parent; preference edits do
+- Standing approval defaults are snapshotted for a new parent; preference edits do
   not alter an existing parent's pass. Project exceptions and actions requiring
   explicit approval continue to apply. A chip describes advisory permissions,
   not a permission-policy bypass.

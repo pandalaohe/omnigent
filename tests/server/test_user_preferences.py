@@ -924,7 +924,8 @@ def test_read_collab_settings_defaults_on_missing_store_owner_or_namespace(
     assert read_collab_settings(store, "alice@example.com") == default
 
 
-def test_read_collab_settings_reads_all_fields(db_uri: str) -> None:
+@pytest.mark.parametrize("approval_key", ["standingPassDefault", "standingApprovalDefault"])
+def test_read_collab_settings_reads_all_fields(db_uri: str, approval_key: str) -> None:
     """Stored collaboration settings load; unknown keys are ignored."""
     store = SqlAlchemyUserPreferencesStore(db_uri)
     store.patch_namespace(
@@ -948,6 +949,7 @@ def test_read_collab_settings_reads_all_fields(db_uri: str) -> None:
             "childKeepWarmCodexIntervalSeconds": 1200,
             "childKeepWarmMaxSeconds": 14400,
             "childCap": 4,
+            approval_key: ["install", "merge"],
             "quotaTightBelowPct": 45.5,
             "quotaLowBelowPct": 15,
             "quotaFloorPct": 2.5,
@@ -974,12 +976,48 @@ def test_read_collab_settings_reads_all_fields(db_uri: str) -> None:
         keep_warm_codex_interval_s=1200,
         keep_warm_max_s=14400,
         child_cap=4,
+        standing_approval_default=["install", "merge"],
         quota_tight_below_pct=45.5,
         quota_low_below_pct=15,
         quota_floor_pct=2.5,
         quota_period_default="month",
         quota_periods={"claude": "5h", "codex": "7d"},
     )
+
+
+def test_read_collab_settings_old_empty_default_overrides_new_grants(db_uri: str) -> None:
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    store.patch_namespace(
+        "owner@example.test",
+        "session_collab",
+        {"standingApprovalDefault": ["install"], "standingPassDefault": []},
+    )
+    assert read_collab_settings(store, "owner@example.test").standing_approval_default == []
+
+
+@pytest.mark.parametrize("operation", ["initialize", "patch"])
+def test_approval_preference_outputs_new_key_and_persists_rollback_key(
+    db_uri: str, operation: str
+) -> None:
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    owner = "owner@example.test"
+    value = {"standingApprovalDefault": ["install"]}
+    if operation == "initialize":
+        result = store.initialize(owner, {"version": 1, "settings": {"session_collab": value}})
+    else:
+        result = store.patch_namespace(owner, "session_collab", value)
+    assert result["settings"]["session_collab"] == value
+    assert store.get(owner)["settings"]["session_collab"] == value
+    with store._session("read_rollback_preference") as session:
+        persisted = session.scalar(
+            select(SqlPreference.value).where(
+                SqlPreference.user_id == owner,
+                SqlPreference.key == "settings.session_collab",
+            )
+        )
+    assert json.loads(persisted) == {"standingPassDefault": ["install"]}
+    store.patch_namespace(owner, "session_collab", {"standingPassDefault": []})
+    assert store.get(owner)["settings"]["session_collab"] == {"standingApprovalDefault": []}
 
 
 def test_read_collab_settings_defaults_invalid_quota_pair_without_losing_other_fields(

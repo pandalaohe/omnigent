@@ -1,8 +1,11 @@
 """Append-only instruction revisions, scoped by workspace and layer."""
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Literal
+
+_logger = logging.getLogger(__name__)
 
 
 class InstructionRevisionConflict(ValueError):
@@ -18,13 +21,16 @@ class InstructionLayerKey:
     host_id: str = ""
 
     def __post_init__(self) -> None:
+        if self.scope == "mother":
+            _logger.info("legacy name used: mother")
+            object.__setattr__(self, "scope", "parent")
         expected = {
             "shared": (False, False),
             "agent": (True, False),
             "host": (False, True),
             "independent": (True, True),
         }
-        if self.scope not in {"mother", "child"} and expected.get(self.scope) != (
+        if self.scope not in {"parent", "child"} and expected.get(self.scope) != (
             bool(self.agent_key.strip()),
             bool(self.host_id.strip()),
         ):
@@ -54,6 +60,10 @@ class GlobalInstructionRevision:
     agent_key: str = ""
     host_id: str = ""
     created_us: int = 0
+
+    def __post_init__(self) -> None:
+        if self.scope == "mother":
+            object.__setattr__(self, "scope", "parent")
 
 
 class GlobalInstructionsStore(ABC):
@@ -132,7 +142,7 @@ class GlobalInstructionsStore(ABC):
         host_id: str | None,
         agent_key: str | None,
         *,
-        role: Literal["mother", "child"] | None = None,
+        role: Literal["parent", "child", "mother"] | None = None,
     ) -> list[GlobalInstructionRevision]:
         """Read a route and optional role's four keys in one managed session."""
         ...

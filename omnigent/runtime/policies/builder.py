@@ -122,10 +122,10 @@ _REQUIRED_APPROVAL_SPECS: tuple[FunctionPolicySpec, ...] = (
         ),
     ),
     FunctionPolicySpec(
-        name="__ask_on_standing_pass_grant",
+        name="__ask_on_standing_approval_grant",
         on=None,
         function=FunctionRef(
-            path="omnigent.policies.builtins.safety.ask_on_standing_pass_grant",
+            path="omnigent.policies.builtins.safety.ask_on_standing_approval_grant",
             arguments=None,
         ),
     ),
@@ -503,6 +503,7 @@ def any_policies_apply(
             "sys_add_policy",
             "sys_instruction_layer_update",
             "sys_project_settings_update",
+            "sys_standing_approval",
             "sys_standing_pass",
             "sys_host_restart",
             "sys_terminal_request_access",

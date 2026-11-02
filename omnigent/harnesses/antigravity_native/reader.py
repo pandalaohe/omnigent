@@ -3178,7 +3178,7 @@ async def clear_session(
             binding = read_bridge_state(bridge_dir)
             if binding is None or is_placeholder_conversation_id(binding.conversation_id):
                 raise AntigravityClearError("clear_unreadable: agy binding lost during recovery")
-        # A retry after transfer resumes succession without clearing the new mother.
+        # A retry after transfer resumes succession without clearing the new parent.
         if binding.session_id != old_session_id:
             return await _complete_cascade_rotation(
                 client=client,

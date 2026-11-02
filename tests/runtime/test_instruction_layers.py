@@ -14,7 +14,7 @@ from omnigent.runtime.instruction_layers import (
 from omnigent.stores.global_instructions_store import GlobalInstructionRevision
 
 
-@pytest.mark.parametrize("role", ["mother", "child"])
+@pytest.mark.parametrize("role", ["parent", "child"])
 @pytest.mark.parametrize("independent", ["", " \n\t", "  Independent\n"])
 @pytest.mark.parametrize(
     "host_id,agent_key", [(None, None), ("h1", None), (None, "codex"), ("h1", "codex")]
@@ -34,7 +34,7 @@ def test_role_selection_preserves_revisions_order_and_bytes(role, independent, h
         agent,
         revision("Other host", host="h2"),
         shared,
-        revision("Wrong role", scope="child" if role == "mother" else "mother"),
+        revision("Wrong role", scope="child" if role == "parent" else "parent"),
         revision("Route independent", "codex", "h1", "independent"),
     ]
     expected = [shared]
@@ -50,7 +50,7 @@ def test_role_selection_preserves_revisions_order_and_bytes(role, independent, h
     assert compose_role(selected) == "\n\n".join(r.text for r in expected)
 
 
-@pytest.mark.parametrize("role", ["mother", "child"])
+@pytest.mark.parametrize("role", ["parent", "child"])
 def test_role_selection_skips_blank_sources(role):
     rows = [
         GlobalInstructionRevision("s", " \n", 1, None, role),
@@ -105,7 +105,7 @@ def test_blank_layers_skip_without_changing_nonblank_text_or_truncating():
     ("has_parent", "spawn", "expected"),
     [
         (False, False, "I"),
-        (False, True, "I\n\nMother\n\nQuota"),
+        (False, True, "I\n\nParent\n\nQuota"),
         (True, False, "I\n\nChild"),
         (True, True, "I\n\nChild"),
     ],
@@ -116,7 +116,7 @@ def test_role_blocks_are_exclusive_and_survive_independent(has_parent, spawn, ex
             "I",
             has_parent=has_parent,
             spawn=spawn,
-            mother_text="Mother",
+            parent_text="Parent",
             child_text="Child",
             quota_line="Quota",
         )
@@ -124,10 +124,10 @@ def test_role_blocks_are_exclusive_and_survive_independent(has_parent, spawn, ex
     )
 
 
-def test_quota_requires_nonblank_mother_block_and_empty_roles_add_no_separators():
+def test_quota_requires_nonblank_parent_block_and_empty_roles_add_no_separators():
     assert (
         compose_session_text(
-            "S", has_parent=False, spawn=True, mother_text=" \n", quota_line="Quota"
+            "S", has_parent=False, spawn=True, parent_text=" \n", quota_line="Quota"
         )
         == "S"
     )

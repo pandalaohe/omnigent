@@ -44,7 +44,7 @@ def instructions(db_uri, monkeypatch):
     store.save("S", created_by=None)
     store.save("A", created_by=None, scope="agent", agent_key="codex")
     store.save("H", created_by=None, scope="host", host_id="host-a")
-    store.save("Mother", created_by=None, scope="mother")
+    store.save("Parent", created_by=None, scope="parent")
     store.save("Child", created_by=None, scope="child")
     return store
 
@@ -67,7 +67,7 @@ def conversation(**overrides):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("empty_layers", [False, True, None])
 @pytest.mark.parametrize("authenticated_local", [False, True])
-async def test_retired_project_setup_is_ignored_in_mother_init_and_rebind(
+async def test_retired_project_setup_is_ignored_in_parent_init_and_rebind(
     instructions, db_uri, tmp_path, empty_layers, authenticated_local, monkeypatch
 ):
     projects = SqlAlchemyProjectStore(db_uri)
@@ -77,7 +77,7 @@ async def test_retired_project_setup_is_ignored_in_mother_init_and_rebind(
         "orchestration": {
             "setup": "Retired project setup marker",
             "child_cap": 4,
-            "standing_pass": {"remove": ["install"], "exceptions": ["production"]},
+            "standing_approval": {"remove": ["install"], "exceptions": ["production"]},
         }
     }
     with projects._engine.begin() as connection:
@@ -90,7 +90,7 @@ async def test_retired_project_setup_is_ignored_in_mother_init_and_rebind(
             ("shared", "", ""),
             ("agent", "codex", ""),
             ("host", "", "host-a"),
-            ("mother", "", ""),
+            ("parent", "", ""),
             ("child", "", ""),
         ):
             instructions.save("", created_by=None, scope=scope, agent_key=agent, host_id=host)
@@ -102,7 +102,7 @@ async def test_retired_project_setup_is_ignored_in_mother_init_and_rebind(
         permissions=authenticated_local,
     )
     app.state.user_preferences_store.patch_namespace(
-        "local", "session_collab", {"standingPassDefault": ["install", "merge"]}
+        "local", "session_collab", {"standingApprovalDefault": ["install", "merge"]}
     )
     if empty_layers is None:
         monkeypatch.setattr(
@@ -137,7 +137,7 @@ async def test_retired_project_setup_is_ignored_in_mother_init_and_rebind(
     text = payloads[0]["session_init"]["snapshot"]["global_instructions"]
     assert "Retired project setup marker" not in text
     assert "Saved setup for this project" not in text
-    assert text.count("Standing pass (this mother session") == 1
+    assert text.count("Standing approval (this parent session") == 1
     assert '): "merge". Exceptions: "production".' in text
     captured = _stub_runner_client(monkeypatch)
     from omnigent.server.routes import sessions as sessions_mod
@@ -159,7 +159,7 @@ async def test_retired_project_setup_is_ignored_in_mother_init_and_rebind(
     rebound_text = captured["body"]["session_init"]["snapshot"]["global_instructions"]
     assert "Retired project setup marker" not in rebound_text
     assert "Saved setup for this project" not in rebound_text
-    assert rebound_text.count("Standing pass (this mother session") == 1
+    assert rebound_text.count("Standing approval (this parent session") == 1
     assert '): "merge". Exceptions: "production".' in rebound_text
     child = conversations.create_conversation(
         agent_id=agent["id"],
@@ -169,7 +169,7 @@ async def test_retired_project_setup_is_ignored_in_mother_init_and_rebind(
     )
     child_text = await session_instructions_text(
         child,
-        standing_pass_resolver=app.state.standing_pass_service.line,
+        standing_approval_resolver=app.state.standing_approval_service.line,
     )
     assert "Saved setup for this project" not in (child_text or "")
     assert '): "merge". Exceptions: "production".' in child_text
@@ -177,27 +177,27 @@ async def test_retired_project_setup_is_ignored_in_mother_init_and_rebind(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "parent,mother,expected",
+    "parent,role_text,expected",
     [
-        (None, "Mother", "Mother\n\nQuota evidence"),
+        (None, "Parent", "Parent\n\nQuota evidence"),
         (None, "", "S\n\nA\n\nH"),
-        ("parent", "Mother", "Child"),
+        ("parent", "Parent", "Child"),
     ],
 )
-async def test_quota_resolver_runs_only_for_nonblank_mother(
-    instructions, parent, mother, expected
+async def test_quota_resolver_runs_only_for_nonblank_parent(
+    instructions, parent, role_text, expected
 ):
-    instructions.save(mother, created_by=None, scope="mother")
+    instructions.save(role_text, created_by=None, scope="parent")
     resolver = Mock(return_value="Quota evidence")
     result = await session_instructions_text(
         conversation(parent_conversation_id=parent), quota_resolver=resolver
     )
     assert result.endswith(expected)
-    assert resolver.call_count == (1 if parent is None and mother else 0)
+    assert resolver.call_count == (1 if parent is None and role_text else 0)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("role", ["mother", "child"])
+@pytest.mark.parametrize("role", ["parent", "child"])
 @pytest.mark.parametrize("independent", ["", " Role cell "])
 @pytest.mark.parametrize("route_independent", [False, True])
 async def test_scoped_roles_compose_after_route_and_gate_quota(
@@ -221,14 +221,14 @@ async def test_scoped_roles_compose_after_route_and_gate_quota(
     )
     route_text = "Route cell" if route_independent else "S\n\nA\n\nH"
     role_text = independent if independent else " Column \n\n Host "
-    assert result == route_text + "\n\n" + role_text + ("\n\nQuota" if role == "mother" else "")
-    assert resolver.call_count == (1 if role == "mother" else 0)
+    assert result == route_text + "\n\n" + role_text + ("\n\nQuota" if role == "parent" else "")
+    assert resolver.call_count == (1 if role == "parent" else 0)
 
 
 @pytest.mark.asyncio
-async def test_unmatched_mother_column_does_not_trigger_quota(instructions):
-    instructions.save(" \n", created_by=None, scope="mother")
-    instructions.save("Other mother", created_by=None, scope="mother", agent_key="claude")
+async def test_unmatched_parent_column_does_not_trigger_quota(instructions):
+    instructions.save(" \n", created_by=None, scope="parent")
+    instructions.save("Other parent", created_by=None, scope="parent", agent_key="claude")
     resolver = Mock(return_value="Quota")
     assert (
         await session_instructions_text(conversation(), quota_resolver=resolver) == "S\n\nA\n\nH"
@@ -242,18 +242,18 @@ async def test_legacy_role_startup_preserves_exact_padding(instructions, parent)
     instructions.save("  Route\n", created_by=None)
     instructions.save("", created_by=None, scope="agent", agent_key="codex")
     instructions.save("", created_by=None, scope="host", host_id="host-a")
-    instructions.save("  Mother \n", created_by=None, scope="mother")
+    instructions.save("  Parent \n", created_by=None, scope="parent")
     instructions.save("\tChild  ", created_by=None, scope="child")
     result = await session_instructions_text(
         conversation(parent_conversation_id=parent), quota_resolver=lambda _: " Quota \n"
     )
     assert result == (
-        "  Route\n\n\n\tChild  " if parent else "  Route\n\n\n  Mother \n\n\n Quota \n"
+        "  Route\n\n\n\tChild  " if parent else "  Route\n\n\n  Parent \n\n\n Quota \n"
     )
 
 
 @pytest.mark.asyncio
-async def test_initializer_transports_quota_after_mother_block(instructions):
+async def test_initializer_transports_quota_after_parent_block(instructions):
     payloads = []
 
     def receive(request):
@@ -270,7 +270,7 @@ async def test_initializer_transports_quota_after_mother_block(instructions):
     ) as client:
         await initializer.initialize(conversation(), client, timeout=1)
     assert payloads[0]["session_init"]["snapshot"]["global_instructions"].endswith(
-        "Mother\n\nQuota evidence"
+        "Parent\n\nQuota evidence"
     )
 
 
@@ -278,12 +278,12 @@ async def test_initializer_transports_quota_after_mother_block(instructions):
 @pytest.mark.parametrize(
     "scope,agent,host,text,expected",
     [
-        ("shared", "", "", "new S", "new S\n\nA\n\nH\n\nMother"),
-        ("agent", "codex", "", "new A", "S\n\nnew A\n\nH\n\nMother"),
-        ("host", "", "host-a", "new H", "S\n\nA\n\nnew H\n\nMother"),
-        ("independent", "codex", "host-a", "I", "I\n\nMother"),
-        ("mother", "", "", "new Mother", "S\n\nA\n\nH\n\nnew Mother"),
-        ("child", "", "", "new Child", "S\n\nA\n\nH\n\nMother"),
+        ("shared", "", "", "new S", "new S\n\nA\n\nH\n\nParent"),
+        ("agent", "codex", "", "new A", "S\n\nnew A\n\nH\n\nParent"),
+        ("host", "", "host-a", "new H", "S\n\nA\n\nnew H\n\nParent"),
+        ("independent", "codex", "host-a", "I", "I\n\nParent"),
+        ("parent", "", "", "new Parent", "S\n\nA\n\nH\n\nnew Parent"),
+        ("child", "", "", "new Child", "S\n\nA\n\nH\n\nParent"),
     ],
 )
 async def test_each_layer_is_composed_for_its_session(
@@ -319,7 +319,7 @@ async def test_children_take_their_own_route_and_only_the_child_role(instruction
 
 
 @pytest.mark.asyncio
-async def test_unknown_spec_still_receives_shared_and_host_without_mother(
+async def test_unknown_spec_still_receives_shared_and_host_without_parent(
     instructions, monkeypatch
 ):
     monkeypatch.setattr(

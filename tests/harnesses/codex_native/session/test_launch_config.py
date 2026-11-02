@@ -333,7 +333,7 @@ def test_build_codex_remote_args_forwards_agent_pid_override(
         codex_cli_version=codex_cli_version,
         agent_pid=4242,
     )
-    key = 'shell_environment_policy.set.COLLAB_AGENT_PID="4242"'
+    key = 'shell_environment_policy.set.OMNIGENT_CODEX_APP_SERVER_PID="4242"'
     assert args[args.index(key) - 1] == "-c"
     boundary = min(
         (index for index, arg in enumerate(args) if arg in {"--remote", "resume"}),
@@ -358,11 +358,11 @@ def test_build_codex_remote_args_agent_pid_beats_caller_config(
     The runner's pid override wins over a caller-supplied ``-c`` pair.
 
     Codex applies ordered ``-c`` flags last-wins, so the runner must emit
-    its ``shell_environment_policy.set.COLLAB_AGENT_PID`` pair after any
+    its ``shell_environment_policy.set.OMNIGENT_CODEX_APP_SERVER_PID`` pair after any
     caller pass-through args; otherwise a stale caller value would name
     the wrong app-server in tool processes.
     """
-    caller = ("-c", 'shell_environment_policy.set.COLLAB_AGENT_PID="999"')
+    caller = ("-c", 'shell_environment_policy.set.OMNIGENT_CODEX_APP_SERVER_PID="999"')
     args = codex_native_app_server.build_codex_remote_args(
         codex_args=caller,
         thread_id=thread_id,
@@ -371,10 +371,12 @@ def test_build_codex_remote_args_agent_pid_beats_caller_config(
         agent_pid=4242,
     )
     pid_values = [
-        arg for arg in args if arg.startswith("shell_environment_policy.set.COLLAB_AGENT_PID=")
+        arg
+        for arg in args
+        if arg.startswith("shell_environment_policy.set.OMNIGENT_CODEX_APP_SERVER_PID=")
     ]
     assert pid_values
-    assert pid_values[-1] == 'shell_environment_policy.set.COLLAB_AGENT_PID="4242"'
+    assert pid_values[-1] == 'shell_environment_policy.set.OMNIGENT_CODEX_APP_SERVER_PID="4242"'
 
 
 def test_build_codex_remote_args_omits_absent_agent_pid() -> None:
@@ -386,7 +388,7 @@ def test_build_codex_remote_args_omits_absent_agent_pid() -> None:
         agent_pid=None,
     )
 
-    assert not any("COLLAB_AGENT_PID" in arg for arg in args)
+    assert not any("OMNIGENT_CODEX_APP_SERVER_PID" in arg for arg in args)
 
 
 @pytest.mark.parametrize(

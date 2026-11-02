@@ -9390,6 +9390,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 and not key.startswith(f"{_SANDBOX_REPO_LABEL_KEY}.")
                 and not key.startswith(f"{ARCHIVE_CASCADE_LABEL_KEY}.")
                 and not key.startswith(CHECKIN_LABEL_PREFIX)
+                and not key.startswith("omnigent.standing_approval.")
                 and not key.startswith("omnigent.standing_pass.")
                 and key != PROJECT_ARCHIVE_LABEL_KEY
                 and not key.startswith(f"{PROJECT_ARCHIVE_LABEL_KEY}.")
