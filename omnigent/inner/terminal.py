@@ -27,7 +27,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias, cast
 
 from omnigent._platform import IS_WINDOWS
 from omnigent.cli_invocation import cli_invocation
@@ -1124,6 +1124,7 @@ class TerminalInstance:
     # longer reaps the server and cascades into ``no server running`` (#540).
     keep_alive_after_exit: bool = False
     running: bool = False
+    origin: Literal["user", "agent", "harness"] = "harness"
     elevated: bool = False
     agent_access: bool = False
     last_input_at: float = field(default_factory=time.monotonic, repr=False)

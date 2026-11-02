@@ -224,9 +224,11 @@ class _CapturingResourceRegistry:
         sandbox_override: str | None = None,
         parent_os_env: Any | None = None,
         resource_role: str | None = None,
+        origin: str = "harness",
+        elevated: bool = False,
     ) -> SessionResourceView:
         """Capture an auxiliary terminal launch."""
-        return await self._launch(
+        result = await self._launch(
             "auxiliary",
             session_id=session_id,
             terminal_name=terminal_name,
@@ -237,6 +239,9 @@ class _CapturingResourceRegistry:
             parent_os_env=parent_os_env,
             resource_role=resource_role,
         )
+        result.metadata["origin"] = origin
+        result.metadata["elevated"] = elevated
+        return result
 
     async def _launch(
         self,
@@ -1056,6 +1061,23 @@ async def test_create_terminal_uses_runner_workspace_as_default_cwd(
     assert launch.command == "claude"
     assert launch.args == ["--resume", "native"]
     assert launch.log_file is None
+    assert resp.json()["metadata"]["origin"] == "harness"
+
+
+@pytest.mark.parametrize(
+    ("terminal", "key", "marker", "expected"),
+    [
+        ("bash", "user-shell", {}, "user"),
+        ("codex", "main", {}, "harness"),
+        ("claude", "main", {"bridge_inject_dir": "/opt/work/bridge"}, "harness"),
+        ("bash", "main", {"ensure_native_terminal": True}, "harness"),
+    ],
+)
+def test_terminal_origin_uses_creation_shape(terminal, key, marker, expected) -> None:
+    from omnigent.runner.resource_routes import terminal_origin_for_create
+
+    body = {"terminal": terminal, "session_key": key, "origin": "agent", **marker}
+    assert terminal_origin_for_create(body) == expected
 
 
 @pytest.mark.asyncio
@@ -1732,6 +1754,7 @@ class _LaunchReturningRegistry:
         sandbox_override: str | None = None,
         program_status_app: str | None = None,
         elevated: bool = False,
+        origin: str = "harness",
     ) -> TerminalInstance:
         """Return the fixed instance, ignoring the launch spec.
 

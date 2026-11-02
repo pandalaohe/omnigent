@@ -1920,6 +1920,27 @@ def register_resources_routes(
                 error.get("message", f"Terminal launch failed (runner returned HTTP {status})"),
                 code=error.get("code", ErrorCode.INTERNAL_ERROR),
             )
+        from omnigent.server import shell_notes
+        from omnigent.server.routes._sessions.helpers import _resolve_harness_async
+
+        metadata = payload.get("metadata", {})
+        if (
+            metadata.get("origin") == "user"
+            and await _resolve_harness_async(conv) in shell_notes.SHELL_NOTE_HARNESSES
+            and isinstance(metadata.get("instance_id"), str)
+        ):
+            name = f"{metadata.get('terminal_name')} · {metadata.get('session_key')}"
+            detail = (
+                f"admin shell {name} in this session. Ask with sys_terminal_request_access before using it."
+                if metadata.get("elevated")
+                else f"{name} in this session. You can read it, not type into it or close it."
+            )
+            shell_notes.hold(
+                session_id,
+                payload["id"],
+                metadata["instance_id"],
+                f"[System: shell] The user opened {detail}",
+            )
         _publish_and_persist_resource_event(
             session_id,
             "session.resource.created",
@@ -2219,6 +2240,9 @@ def register_resources_routes(
         await end_terminal_access_requests(
             session_id, terminal_id, instance_id, conversation_store
         )
+        from omnigent.server import shell_notes
+
+        shell_notes.drop(session_id, terminal_id)
         _publish_and_persist_resource_event(
             session_id,
             "session.resource.deleted",

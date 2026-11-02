@@ -10,8 +10,9 @@ import os
 import time
 import urllib.parse
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping
+from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.bridge import ClaudeNativeToolRelay
@@ -161,6 +162,17 @@ class ResourceRoutes:
     ensure_native_terminal_for_turn: Callable[..., Coroutine[Any, Any, None]]
     require_os_env: Callable[[str], Coroutine[Any, Any, AgentSpec | None]]
     resolve_conversation_id: Callable[[str], Coroutine[Any, Any, str | None]]
+
+
+def terminal_origin_for_create(body: Mapping[str, Any]) -> Literal["user", "agent", "harness"]:
+    """Classify the creation path without trusting a supplied origin value."""
+    if body.get("ensure_native_terminal") or body.get("bridge_inject_dir"):
+        return "harness"
+    if body.get("session_key") == "main" and native_coding_agent_for_terminal_name(
+        body.get("terminal")
+    ):
+        return "harness"
+    return "user"
 
 
 def _server_tracking_fields(body: Mapping[str, Any]) -> dict[str, Any]:
@@ -822,7 +834,11 @@ def register_resource_routes(
             launch_method = (
                 resource_registry.launch_required_terminal
                 if bridge_inject
-                else resource_registry.launch_auxiliary_terminal
+                else partial(
+                    resource_registry.launch_auxiliary_terminal,
+                    elevated=elevated,
+                    origin=terminal_origin_for_create(body),
+                )
             )
             resource_view = await launch_method(
                 session_id=session_id,
@@ -833,7 +849,6 @@ def register_resource_routes(
                 sandbox_override=sandbox_override,
                 parent_os_env=agent_os_env,
                 resource_role=(CLAUDE_NATIVE_TERMINAL_ROLE if bridge_inject else None),
-                **({"elevated": True} if elevated else {}),
             )
         except (RuntimeError, ValueError) as exc:
             if launched_relay is not None:

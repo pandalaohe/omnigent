@@ -140,8 +140,13 @@ def _format_launch_envelope(
         {
             "terminal": validated.terminal_name,
             "session": validated.session_key,
-            **({} if instance.elevated else {"tmux_socket": str(instance.socket_path)}),
+            **(
+                {}
+                if instance.elevated or instance.origin == "user"
+                else {"tmux_socket": str(instance.socket_path)}
+            ),
             "instance_id": instance.instance_id,
+            "origin": instance.origin,
             "elevated": instance.elevated,
             "agent_access": instance.agent_access if instance.elevated else True,
             "has_os_env": instance.os_env is not None,
@@ -474,6 +479,10 @@ def _resolve_running_instance(
         from omnigent.terminals.elevation import AGENT_ACCESS_REQUIRED
 
         return json.dumps({"error": AGENT_ACCESS_REQUIRED})
+    if tool_name == "sys_terminal_send" and instance.origin == "user" and not instance.elevated:
+        from omnigent.terminals.elevation import USER_SHELL_READ_ONLY
+
+        return json.dumps({"error": USER_SHELL_READ_ONLY})
     return _ResolvedInstance(instance=instance, parsed=parsed, lock=lock)
 
 
@@ -988,7 +997,8 @@ class SysTerminalListTool(Tool):
         """:returns: LLM-facing description."""
         return (
             "List the conversation's active terminal sessions, with their "
-            "running state and tmux socket paths."
+            "running state and available tmux socket paths; includes shells the user opened; "
+            "those can be read, not typed into or closed. Admin shells require access approval."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -1082,6 +1092,11 @@ class SysTerminalCloseTool(Tool):
         terminal_name = parsed["terminal"]
         session_key = parsed["session"]
         instance = self._registry.get(conversation_id, terminal_name, session_key)
+
+        if instance is not None and instance.origin == "user" and not instance.elevated:
+            from omnigent.terminals.elevation import USER_SHELL_READ_ONLY
+
+            return json.dumps({"error": USER_SHELL_READ_ONLY})
 
         # Acquire the per-instance lock BEFORE asking the registry
         # to close. This serializes against any in-flight send/read
@@ -1212,9 +1227,10 @@ def _describe_entry(
         "running": instance.running,
         "has_os_env": instance.os_env is not None,
         "instance_id": instance.instance_id,
+        "origin": instance.origin,
         "elevated": instance.elevated,
         "agent_access": instance.agent_access if instance.elevated else True,
     }
-    if not instance.elevated:
+    if not instance.elevated and instance.origin != "user":
         result["tmux_socket"] = str(instance.socket_path)
     return result

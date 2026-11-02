@@ -12,7 +12,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 from typing import Any
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 from urllib.parse import quote
 
 import httpx
@@ -1535,11 +1535,25 @@ def bash_only_native_host(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> None
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("notes_enabled", [True, False])
 async def test_create_terminal_proxies_to_runner(
     client: httpx.AsyncClient,
     bash_terminal_spec: None,
+    monkeypatch: pytest.MonkeyPatch,
+    notes_enabled: bool,
 ) -> None:
     """POST /resources/terminals validates session then proxies."""
+    from omnigent.server import shell_notes
+
+    monkeypatch.setattr(
+        shell_notes,
+        "SHELL_NOTE_HARNESSES",
+        frozenset({"claude-native"}) if notes_enabled else frozenset(),
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._resolve_harness",
+        lambda *_args, **_kwargs: "claude-native",
+    )
     terminal_resource = {
         "id": "terminal_bash_s1",
         "object": "session.resource",
@@ -1551,6 +1565,8 @@ async def test_create_terminal_proxies_to_runner(
             "terminal_name": "bash",
             "session_key": "s1",
             "running": True,
+            "origin": "user",
+            "instance_id": "instance-user-shell",
         },
     }
     fake_runner = _FakeRunnerClient(payload=terminal_resource)
@@ -1566,6 +1582,15 @@ async def test_create_terminal_proxies_to_runner(
     assert fake_runner.calls == [
         ("POST", "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals"),
     ]
+    taken = shell_notes.take("79b22ebd2309e48fdeb450c65611d51b")
+    if notes_enabled:
+        assert taken is not None
+        assert taken.prefix == (
+            "[System: shell] The user opened bash · s1 in this session. "
+            "You can read it, not type into it or close it.\n\n"
+        )
+    else:
+        assert taken is None
 
 
 @pytest.mark.asyncio
@@ -3970,6 +3995,203 @@ def test_resource_lifecycle_event_schemas_in_union() -> None:
 
 
 # ── Server filesystem proxy tests ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_native_same_stable_id_during_routing_forwards_once(
+    monkeypatch: pytest.MonkeyPatch,
+    runner_globals_reset: None,
+) -> None:
+    from omnigent.runtime import pending_inputs
+    from omnigent.server import smart_routing
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    conv.cost_control_mode_override = "on"
+    runner = _FakeRunnerClient()
+    set_runner_client(runner)
+    set_runner_router(_FakeRunnerRouter(runner))
+    entered, proceed = asyncio.Event(), asyncio.Event()
+
+    async def blocked_route(*_args, **_kwargs):
+        entered.set()
+        await proceed.wait()
+        return None, None, None
+
+    monkeypatch.setattr(smart_routing, "route_turn_or_decline", blocked_route)
+    monkeypatch.setattr(orchestration, "_native_turn_catalog", AsyncMock(return_value={}))
+    body = SessionEventInput(
+        type="message",
+        data={
+            "role": "user",
+            "stable_id": "a" * 32,
+            "content": [{"type": "input_text", "text": "hello"}],
+        },
+    )
+
+    async def dispatch():
+        return await _dispatch_session_event_to_runner(
+            sid,
+            conv,
+            body,
+            store,
+            runner,
+            agent_name="claude-native-ui",
+            file_store=None,
+            artifact_store=None,
+        )
+
+    first = asyncio.create_task(dispatch())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        second = await asyncio.wait_for(dispatch(), timeout=5)
+        proceed.set()
+        original = await first
+        assert second.pending_id == original.pending_id
+        assert (
+            len([path for path, _data in runner.post_json_calls if path.endswith("/events")]) == 1
+        )
+    finally:
+        proceed.set()
+        await first
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pasted", [True, False])
+async def test_native_recorded_prefix_never_enters_the_durable_bubble(pasted: bool) -> None:
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    prefix = "[System: shell] The user opened bash · shell in this session.\n\n"
+    original = prefix + "my own words" if pasted else "my own words"
+    content = [{"type": "input_text", "text": original}]
+    pending_inputs.record(sid, content, injected_prefix=prefix)
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "source_id": "shell-mirror",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": prefix + original}],
+            },
+            "response_id": "native:shell-mirror",
+        },
+    )
+    try:
+        await _persist_external_conversation_item(sid, conv, body, store)
+        assert store.appended_items[-1].data.content == content
+        assert not pending_inputs.has_pending(sid)
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize("pasted", [True, False])
+async def test_native_shell_note_is_recorded_once_and_preserves_user_text(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool, pasted: bool
+) -> None:
+    from omnigent.runtime import pending_inputs
+    from omnigent.server import shell_notes
+    from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
+
+    pending_inputs.reset_for_tests()
+    monkeypatch.setattr(
+        shell_notes,
+        "SHELL_NOTE_HARNESSES",
+        frozenset({"claude-native"}) if enabled else frozenset(),
+    )
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    runner = _FakeRunnerClient()
+    line = "[System: shell] The user opened bash · user-shell in this session."
+    text = line + " my pasted words" if pasted else "hello"
+    content = [{"type": "input_text", "text": text}]
+    body = SessionEventInput(type="message", data={"role": "user", "content": content})
+    shell_notes.hold(sid, "shell", "instance", line)
+    try:
+        for turn in range(2):
+            result = await _dispatch_session_event_to_runner(
+                sid,
+                conv,
+                body,
+                store,
+                runner,
+                agent_name="claude-native-ui",
+                file_store=None,
+                artifact_store=None,
+            )
+            forwarded = runner.post_json_calls[-1][1]["content"]
+            assert forwarded == (
+                [{"type": "input_text", "text": line + "\n\n"}, *content]
+                if enabled and turn == 0
+                else content
+            )
+            assert body.data["content"] == content
+            assert pending_inputs.snapshot_for(sid)[0]["content"] == content
+            mirror = "\n".join(block["text"] for block in forwarded)
+            match = pending_inputs.resolve_matching_text(sid, mirror)
+            assert match.matched is not None and match.matched.pending_id == result.pending_id
+            assert match.match_method == (
+                "injected_prefix_text" if enabled and turn == 0 else "normalized_text"
+            )
+            assert not pending_inputs.has_pending(sid)
+    finally:
+        pending_inputs.reset_for_tests()
+        shell_notes.drop(sid, "shell")
+
+
+@pytest.mark.asyncio
+async def test_native_failed_forward_restores_shell_note(monkeypatch: pytest.MonkeyPatch) -> None:
+    from omnigent.runtime import pending_inputs
+    from omnigent.server import shell_notes
+    from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
+
+    pending_inputs.reset_for_tests()
+    monkeypatch.setattr(shell_notes, "SHELL_NOTE_HARNESSES", frozenset({"claude-native"}))
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    runner = _FakeRunnerClient(
+        exc_paths={f"/v1/sessions/{sid}/events": ConnectionError("refused")}
+    )
+    body = SessionEventInput(
+        type="message", data={"role": "user", "content": [{"type": "input_text", "text": "hello"}]}
+    )
+    shell_notes.hold(sid, "shell", "instance", "shell line")
+    try:
+        with pytest.raises(HTTPException, match="terminal message delivery failed"):
+            await _dispatch_session_event_to_runner(
+                sid,
+                conv,
+                body,
+                store,
+                runner,
+                agent_name="claude-native-ui",
+                file_store=None,
+                artifact_store=None,
+            )
+        assert not pending_inputs.has_pending(sid)
+        taken = shell_notes.take(sid)
+        assert taken is not None and taken.prefix == "shell line\n\n"
+    finally:
+        pending_inputs.reset_for_tests()
+        shell_notes.drop(sid, "shell")
 
 
 def _fs_list_payload() -> dict[str, object]:

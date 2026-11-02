@@ -142,6 +142,35 @@ async def _invoke(tool: Tool, payload: dict[str, object], ctx: ToolContext) -> d
 # ── sys_terminal_launch ──────────────────────────────────────
 
 
+async def test_user_shell_is_read_only_for_agent(
+    registry: TerminalRegistry, ctx: ToolContext, cleanup_registry: None
+) -> None:
+    spec = _make_spec(terminals={"bash": TerminalEnvSpec(command="bash")})
+    target = {"terminal": "bash", "session": "user-shell"}
+    launched = await _invoke(SysTerminalLaunchTool(spec, registry), target, ctx)
+    assert launched["status"] == "launched"
+    instance = registry.get(ctx.conversation_id, "bash", "user-shell")
+    assert instance is not None
+    instance.origin = "user"
+    refusal = {
+        "error": "this shell belongs to the user: you can list and read it, "
+        "not type into it or close it"
+    }
+    assert (
+        await _invoke(SysTerminalSendTool(registry), {**target, "text": "echo marker"}, ctx)
+        == refusal
+    )
+    assert await _invoke(SysTerminalCloseTool(registry), target, ctx) == refusal
+    assert "error" not in await _invoke(SysTerminalReadTool(registry), target, ctx)
+    listed = json.loads(await asyncio.to_thread(SysTerminalListTool(registry).invoke, "{}", ctx))
+    assert listed[0]["origin"] == "user"
+    assert "tmux_socket" not in listed[0]
+    again = await _invoke(SysTerminalLaunchTool(spec, registry), target, ctx)
+    assert again["status"] == "already_running"
+    assert again["origin"] == "user"
+    assert "tmux_socket" not in again
+
+
 def test_launch_unknown_terminal_returns_error(
     registry: TerminalRegistry, ctx: ToolContext
 ) -> None:
