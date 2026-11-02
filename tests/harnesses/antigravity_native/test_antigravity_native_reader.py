@@ -691,23 +691,16 @@ def no_rotation(monkeypatch: pytest.MonkeyPatch) -> None:
     existing reader tests exercise only the stream/poll body. A rotation-specific
     test overrides ``reader.get_all_cascade_trajectories`` itself.
     """
-    monkeypatch.setattr(reader, "get_all_cascade_trajectories", lambda port: {})
-
-
-@pytest.fixture(autouse=True)
-def confirmed_text_finish(monkeypatch: pytest.MonkeyPatch) -> Any:
-    """Mapping scenarios assume their closing text is the confirmed final step.
-
-    The reader-to-runner wake scenarios exercise the real confirmation RPCs.
-    """
-
-    original = reader._text_step_finishes_idle_cascade
-
-    async def confirmed(*args: object) -> bool:
-        return True
-
-    monkeypatch.setattr(reader, "_text_step_finishes_idle_cascade", confirmed)
-    return original
+    monkeypatch.setattr(
+        reader,
+        "get_all_cascade_trajectories",
+        lambda port: {
+            "trajectorySummaries": {
+                _CASCADE_ID: {"status": "CASCADE_RUN_STATUS_RUNNING"},
+                "child-aaa": {"status": "CASCADE_RUN_STATUS_IDLE"},
+            }
+        },
+    )
 
 
 def _bridge_dir(tmp_path: Path) -> Path:
@@ -1657,7 +1650,7 @@ async def test_status_running_then_idle_on_transition(
     monkeypatch: pytest.MonkeyPatch,
     patched_discovery: None,
 ) -> None:
-    """USER_INPUT emits RUNNING; a closing assistant-text step emits IDLE; once each."""
+    """USER_INPUT opens once; text cannot close without an idle observation."""
     user = _load("user_input")
     text = _load("planner_response_text")
     script = _StepScript(
@@ -1677,8 +1670,8 @@ async def test_status_running_then_idle_on_transition(
         iterations=3,
     )
 
-    # RUNNING (user turn) then IDLE (assistant answered, no tool calls), deduped.
-    assert sink.statuses() == ["running", "idle"]
+    # Text commits cannot close a turn while the detector still reports running.
+    assert sink.statuses() == ["running"]
 
 
 @pytest.mark.asyncio
@@ -2714,7 +2707,7 @@ async def test_stream_status_running_then_idle(
     monkeypatch: pytest.MonkeyPatch,
     patched_discovery: None,
 ) -> None:
-    """A user turn then a closing assistant-text step emit RUNNING then IDLE."""
+    """Committed stream text leaves the turn open until the idle detector closes."""
     user = _load("user_input")
     full = "All set."
     frames = [
@@ -2733,7 +2726,7 @@ async def test_stream_status_running_then_idle(
         iterations=1,
     )
 
-    assert sink.statuses() == ["running", "idle"]
+    assert sink.statuses() == ["running"]
     # USER_INPUT commits the user message first, then the assistant message —
     # so the web UI renders the user turn ABOVE the reply (#1155).
     assert sink.item_types() == ["message", "message"]
@@ -3480,17 +3473,9 @@ async def test_two_real_wire_turns_each_emit_running_then_idle(
     monkeypatch: pytest.MonkeyPatch,
     patched_discovery: None,
 ) -> None:
-    """Two turns whose USER_INPUT carries NO stepIndex each fire RUNNING + IDLE.
+    """USER_INPUT without stepIndex remains distinct by per-turn executionId.
 
-    End-to-end regression for Fix I-1. Each turn is a USER_INPUT (opens the
-    turn → RUNNING) followed by a DONE assistant-text planner (closes the turn →
-    IDLE). The USER_INPUT steps are built with the REAL wire shape (per-turn
-    ``executionId``, no ``stepIndex``) — NOT the synthetic-stepIndex helper that
-    masks this bug. Before the fix, turn 2's USER_INPUT collides with turn 1's on
-    ``(trajectory_id, None)``, is treated as already-seen, and its emit block is
-    skipped → no second RUNNING edge (the web spinner never restarts), so the
-    sequence would be ``["running", "idle", "idle"]`` instead of the expected
-    per-turn ``["running", "idle", "running", "idle"]``.
+    Both user messages must survive replay while the idle detector still says running.
     """
     user1 = _user_input_real_wire(execution_id="exec-turn-1")
     user2 = _user_input_real_wire(execution_id="exec-turn-2")
@@ -3515,7 +3500,7 @@ async def test_two_real_wire_turns_each_emit_running_then_idle(
         iterations=1,
     )
 
-    assert sink.statuses() == ["running", "idle", "running", "idle"]
+    assert sink.statuses() == ["running"]
     # Each turn commits a user message (from USER_INPUT) then an assistant
     # message — user-before-assistant ordering, per turn (#1155).
     assert sink.item_types() == ["message", "message", "message", "message"]
@@ -3633,22 +3618,8 @@ async def test_a_streamed_tool_turn_stays_running_until_the_answer(
         iterations=1,
     )
 
-    assert sink.statuses() == ["running", "idle"], (
-        f"the turn must open once and close once; got {sink.statuses()}"
-    )
-    # WHERE the idle edge lands is the whole point — the count alone is
-    # identical whether it fires at dispatch or after the answer, because the
-    # second close is deduped by ``turn_active``. Assert its position.
-    timeline = [
-        f"status:{data['status']}"
-        if event_type == "external_session_status"
-        else f"item:{data.get('item_type')}"
-        for event_type, data in sink.posts
-        if event_type in ("external_session_status", "external_conversation_item")
-    ]
-    assert timeline.index("status:idle") > timeline.index("item:function_call_output"), (
-        f"IDLE fired before the tool finished — the spinner cleared mid-turn: {timeline}"
-    )
+    assert sink.statuses() == ["running"]
+    assert "function_call_output" in sink.item_types()
 
 
 def test_turn_close_false_for_streamed_planner_that_dispatched_a_tool() -> None:
@@ -5135,7 +5106,7 @@ def test_cascade_is_idle_reads_agys_own_run_status() -> None:
 
 
 @pytest.mark.asyncio
-async def test_watch_for_rotation_signals_quiescence_only_after_consecutive_idle(
+async def test_reconciliation_closes_only_after_consecutive_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
@@ -5147,9 +5118,6 @@ async def test_watch_for_rotation_signals_quiescence_only_after_consecutive_idle
     is stranded, not to race the step-based close.
     """
     calls: list[int] = []
-
-    async def _on_quiescent() -> None:
-        calls.append(1)
 
     idle = {"trajectorySummaries": {_BOUND_CASCADE: {"status": "CASCADE_RUN_STATUS_IDLE"}}}
     busy = {"trajectorySummaries": {_BOUND_CASCADE: {"status": "CASCADE_RUN_STATUS_RUNNING"}}}
@@ -5165,6 +5133,14 @@ async def test_watch_for_rotation_signals_quiescence_only_after_consecutive_idle
         return script[i]
 
     monkeypatch.setattr(reader, "get_all_cascade_trajectories", _fetch)
+    monkeypatch.setattr(reader, "get_trajectory_steps", lambda *args: [])
+    state = reader._ReaderState(seen=set(), interacted=set(), turn_active=True)
+
+    async def post(client: Any, session: str, event: Any) -> None:
+        if event.data.get("status") == "idle":
+            calls.append(seen["n"])
+
+    monkeypatch.setattr(reader, "_post_event", post)
 
     async def _noop_sleep(_seconds: float) -> None:
         await asyncio.sleep(0)
@@ -5172,16 +5148,17 @@ async def test_watch_for_rotation_signals_quiescence_only_after_consecutive_idle
     monkeypatch.setattr(reader, "_sleep", _noop_sleep)
 
     with pytest.raises(asyncio.CancelledError):
-        await reader._watch_for_rotation(
-            port=_PORT,
-            bound_cascade_id=_BOUND_CASCADE,
-            interval_s=0.0,
-            skip_cascade_ids=frozenset(),
-            on_rotation=_fail_rotation,
-            on_quiescent=_on_quiescent,
-        )
+        while True:
+            await reader._reconcile_idle_turn(
+                port=_PORT,
+                cascade_id=_BOUND_CASCADE,
+                client=cast(Any, object()),
+                session_id=_SESSION_ID,
+                state=state,
+                on_pending_interaction=cast(Any, object()),
+            )
 
-    assert calls == [1, 1], "expected reconciliation after each tick beyond the idle threshold"
+    assert calls == [4], "close only once, after two consecutive idle observations"
 
 
 @pytest.mark.asyncio
@@ -5190,11 +5167,9 @@ async def test_idle_reconciliation_commits_final_before_one_close(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     patched_discovery: None,
-    confirmed_text_finish: Any,
     snapshot_failure: bool,
 ) -> None:
     """A delayed final frame races idle reconciliation without losing or repeating it."""
-    monkeypatch.setattr(reader, "_text_step_finishes_idle_cascade", confirmed_text_finish)
     monkeypatch.setattr(reader, "get_available_models", lambda port: {})
     user = _load("user_input")
     progress = _load("stream_planner_text_done")
@@ -5256,7 +5231,8 @@ async def test_idle_reconciliation_commits_final_before_one_close(
         await ready.wait()
         idle = True
         finish.set()
-        await asyncio.gather(kwargs["on_quiescent"](), kwargs["on_quiescent"]())
+        for _ in range(3):
+            await kwargs["read_summaries"]()
         done.set()
 
     async def no_interaction(*args: Any) -> None:
@@ -5625,7 +5601,6 @@ async def test_a_child_that_goes_quiet_without_closing_is_closed_from_agy_status
     """
     monkeypatch.setattr(reader, "get_trajectory_steps", lambda _p, _c: [_load("user_input")])
     monkeypatch.setattr(reader, "_sleep", _no_sleep)
-    monkeypatch.setattr(reader, "_SUBAGENT_QUIESCENT_POLLS", 2)
     monkeypatch.setattr(
         reader,
         "get_all_cascade_trajectories",
@@ -5676,11 +5651,20 @@ async def test_a_quiet_child_agy_still_reports_running_is_not_closed(
     def _still_running(_port: int) -> dict[str, Any]:
         nonlocal idle_checks
         idle_checks += 1
-        return {"trajectorySummaries": {"child-aaa": {"status": "CASCADE_RUN_STATUS_RUNNING"}}}
+        return {
+            "trajectorySummaries": {
+                "child-aaa": {
+                    "status": (
+                        "CASCADE_RUN_STATUS_RUNNING"
+                        if polls <= _QUIET_POLLS_BEFORE_FINISHING
+                        else "CASCADE_RUN_STATUS_IDLE"
+                    )
+                }
+            }
+        }
 
     monkeypatch.setattr(reader, "get_trajectory_steps", _steps)
     monkeypatch.setattr(reader, "_sleep", _no_sleep)
-    monkeypatch.setattr(reader, "_SUBAGENT_QUIESCENT_POLLS", 2)
     monkeypatch.setattr(reader, "get_all_cascade_trajectories", _still_running)
     sink = _PostSink()
     monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
@@ -5706,17 +5690,10 @@ async def test_a_quiet_child_agy_still_reports_running_is_not_closed(
     )
 
 
-async def test_the_quiescence_recheck_backs_off_after_agy_vetoes_a_close(
+async def test_running_child_reads_status_once_per_tick_without_closing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    A child agy never calls idle is re-checked ever less often, not every window.
-
-    agy answering "still running" can only veto the close, so the window is a
-    repeating re-check rather than a one-shot grace period. Left flat it would
-    re-ask at the same cadence for the life of the session; doubling keeps a
-    long-lived quiet child cheap while a stalled one is still caught.
-    """
+    """A running child is checked once per poll and keeps its turn open."""
     polls = 0
     idle_checks = 0
     reached_target = asyncio.Event()
@@ -5736,7 +5713,6 @@ async def test_the_quiescence_recheck_backs_off_after_agy_vetoes_a_close(
 
     monkeypatch.setattr(reader, "get_trajectory_steps", _steps)
     monkeypatch.setattr(reader, "_sleep", _no_sleep)
-    monkeypatch.setattr(reader, "_SUBAGENT_QUIESCENT_POLLS", 2)
     monkeypatch.setattr(reader, "get_all_cascade_trajectories", _still_running)
     sink = _PostSink()
     monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
@@ -5759,12 +5735,7 @@ async def test_the_quiescence_recheck_backs_off_after_agy_vetoes_a_close(
                 await mirror
 
     assert polls >= 30, f"the mirror should have kept polling a vetoed child; got {polls}"
-    # Windows of 2, 4, 8, 16 reach poll 30 in four checks; a flat window would
-    # have asked ~15 times by now.
-    assert idle_checks <= 5, (
-        f"the re-check should back off, not repeat every window; got {idle_checks} "
-        f"checks over {polls} polls"
-    )
+    assert idle_checks == polls
     assert sink.statuses() == ["running"], (
         f"a child agy still calls running must not be closed; got {sink.statuses()}"
     )
@@ -5803,7 +5774,10 @@ async def test_a_finished_child_takes_its_own_grandchild_mirrors_down(
         reader,
         "get_all_cascade_trajectories",
         lambda _port: {
-            "trajectorySummaries": {"grand-ccc": {"status": "CASCADE_RUN_STATUS_RUNNING"}}
+            "trajectorySummaries": {
+                "grand-ccc": {"status": "CASCADE_RUN_STATUS_RUNNING"},
+                "child-aaa": {"status": "CASCADE_RUN_STATUS_IDLE"},
+            }
         },
     )
     sink = _PostSink()
@@ -5832,18 +5806,28 @@ async def test_a_finished_child_takes_its_own_grandchild_mirrors_down(
     )
 
 
-async def test_subagent_idle_check_failure_keeps_mirroring(
+async def test_subagent_idle_check_failure_is_bounded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    An RPC hiccup during the idle check must not truncate a sub-agent.
-
-    Fail-safe: a wrong "idle" ends the mirror and loses the rest of the child's
-    transcript, while a wrong "still running" costs only another poll.
-    """
+    """Persistent summary failure ends the mirror with one failed status."""
 
     def _raise(_port: int) -> dict[str, Any]:
         raise httpx.ConnectError("agy went away")
 
     monkeypatch.setattr(reader, "get_all_cascade_trajectories", _raise)
-    assert await reader._subagent_cascade_is_idle(4242, "child-aaa") is False
+    monkeypatch.setattr(reader, "get_trajectory_steps", lambda *args: _child_transcript())
+    monkeypatch.setattr(reader, "_sleep", _no_sleep)
+    sink = _PostSink()
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+    client, _ = _subagent_client()
+    async with client:
+        await asyncio.wait_for(
+            reader._mirror_subagent_cascade(
+                port=_PORT,
+                child_cascade_id="child-aaa",
+                client=client,
+                child_session_id="conv_child_a",
+            ),
+            timeout=2,
+        )
+    assert sink.statuses() == ["running", "failed"]
