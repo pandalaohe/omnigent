@@ -4713,6 +4713,8 @@ async def test_claude_skill_bundle_survives_retries_and_transfer_until_bridge_cl
     materialized_bundle: bool,
 ) -> None:
     """Generated skills share the bridge lifetime; supplied bundles remain caller-owned."""
+    import time
+
     isolate_provider_resolution(monkeypatch, tmp_path / "config-home")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
@@ -4821,6 +4823,13 @@ async def test_claude_skill_bundle_survives_retries_and_transfer_until_bridge_cl
 
     instance.running = False
     monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    assert claude_native_bridge.prune_orphaned_bridge_dirs() == 0
+    assert bridge_dir.exists()
+    eight_days_ago = time.time() - 8 * 24 * 60 * 60
+    os.utime(bridge_dir / "owner.pid", (eight_days_ago, eight_days_ago))
+    forwarder_state = bridge_dir / "transcript_forwarder.json"
+    if forwarder_state.exists():
+        os.utime(forwarder_state, (eight_days_ago, eight_days_ago))
     assert claude_native_bridge.prune_orphaned_bridge_dirs() == 1
     assert not bridge_dir.exists()
     await resource_registry.cleanup_session("skill-lifetime-target")
