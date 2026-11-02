@@ -7,6 +7,7 @@ import json
 import math
 import secrets
 import time
+from collections import Counter
 from collections.abc import Awaitable, Callable
 from typing import Any, NamedTuple
 
@@ -460,6 +461,22 @@ _CARD_RETRY_INTERVAL_S = 120.0
 _pending_delivery_tasks: dict[str, asyncio.Task[bool]] = {}
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by server-minted globally unique elicitation IDs
 _grant_delivery_tasks: dict[str, asyncio.Task[None]] = {}
+# custom-lint: disable-next=workspace-scoped-cache -- server-minted globally unique elicitation IDs
+_resolving_answers: dict[str, tuple[DetachedCard, int, int]] = {}
+_last_answer_stamp = 0
+
+
+def _observe_card_answer(card: DetachedCard, result: ElicitationResult | None) -> None:
+    global _last_answer_stamp
+    if result is None:
+        _resolving_answers.pop(card.elicitation_id, None)
+        return
+    _last_answer_stamp = max(_last_answer_stamp + 1, time.time_ns())
+    _resolving_answers[card.elicitation_id] = (
+        card,
+        _last_answer_stamp,
+        int(time.time() + _APPROVAL_GRANT_TTL_S),
+    )
 
 
 def _expired_approval_text(card: DetachedCard) -> str:
@@ -493,7 +510,7 @@ def _render_card_verdict(kind: str, payload: dict[str, Any], result: Elicitation
     )
 
 
-async def _write_card_record(write: Callable[..., None], *args: Any, **kwargs: Any) -> bool:
+async def _write_card_record(write: Callable[..., Any], *args: Any, **kwargs: Any) -> bool:
     """
     Run one detached-card record write off the loop.
 
@@ -677,8 +694,10 @@ def _detached_card_callback(
         :param result: Web verdict, or ``None`` on expiry.
         :returns: None.
         """
-        answered_at = time.monotonic()
-        expires_at = int(time.time() + _APPROVAL_GRANT_TTL_S)
+        answer = _resolving_answers.get(card.elicitation_id)
+        if result is not None and answer is None:
+            _observe_card_answer(card, result)
+            answer = _resolving_answers[card.elicitation_id]
         pending_task = _pending_delivery_tasks.pop(card.elicitation_id, None)
         if pending_task is not None:
             pending_task.cancel()
@@ -688,13 +707,28 @@ def _detached_card_callback(
             return
         text = _render_card_verdict(card.kind, card.payload, result)
         granted = card.grant_key is not None and result.action == "accept"
+        assert answer is not None
+        _, answered_at, expires_at = answer
+        verdict = {**result.model_dump(mode="json"), "answer_stamp": answered_at}
+        superseded_ids = (
+            [
+                source_id
+                for source_id, (other, stamp, _) in _resolving_answers.items()
+                if other.session_id == card.session_id
+                and other.grant_key == card.grant_key
+                and stamp < answered_at
+            ]
+            if card.grant_key is not None
+            else []
+        )
         while not await _write_card_record(
             conversation_store.update_detached_card,
             card.elicitation_id,
             state="answered",
-            verdict=result.model_dump(mode="json"),
+            verdict=verdict,
             delivery_text=text,
             expires_at=expires_at,
+            superseded_ids=superseded_ids,
         ):
             await asyncio.sleep(_CARD_RETRY_INTERVAL_S)
         while True:
@@ -725,6 +759,9 @@ def _detached_card_callback(
                 source_id=card.elicitation_id,
                 answered_at=answered_at,
             )
+        elif card.grant_key is not None:
+            # The durable supersession committed before changing the cache.
+            approval_grants.discard_older(card.session_id, tuple(card.grant_key), answered_at)
         await _deliver_card_verdict(
             card,
             text,
@@ -762,6 +799,7 @@ def _park_detached_card(
         on_result=_detached_card_callback(
             card, conversation_store=conversation_store, runner_router=runner_router
         ),
+        on_resolved=lambda result: _observe_card_answer(card, result),
         timeout_s=timeout_s,
         elicitation_id=card.elicitation_id,
         published=published,
@@ -833,6 +871,7 @@ async def _consume_grant(
     The record is dropped before the allow is returned, so a restart can
     never re-arm a grant that was already used; when that fails the call is
     asked again (the record keeps its single use for after a restart).
+    The committed deletion is the cutoff; later answers govern the next call.
 
     :param session_id: Session the incoming call belongs to.
     :param grant_key: Match key of the incoming call.
@@ -860,22 +899,24 @@ async def _consume_grant(
         or record.expires_at <= time.time()
     ):
         return None
+    if any(
+        other.session_id == session_id
+        and other.grant_key == list(grant_key)
+        and stamp > record.verdict.get("answer_stamp", 0)
+        for other, stamp, _ in _resolving_answers.values()
+    ):
+        return None
     delivery_task = _grant_delivery_tasks.get(source_id) if source_id is not None else None
     if delivery_task is not None:
         delivery_task.cancel()
         await asyncio.gather(delivery_task, return_exceptions=True)
     try:
-        current = next(
-            (
-                row
-                for row in await asyncio.to_thread(conversation_store.list_detached_cards)
-                if row.elicitation_id == source_id
-            ),
-            None,
-        )
-        if current is None or current != record or current.expires_at <= time.time():
+        if not await asyncio.to_thread(
+            conversation_store.delete_detached_card,
+            source_id,
+            expected_verdict=record.verdict,
+        ):
             return None
-        await asyncio.to_thread(conversation_store.delete_detached_card, source_id)
     except Exception:
         # An allowance fails closed: the call is asked again instead.
         _logger.warning("Could not drop a consumed grant's record", exc_info=True)
@@ -902,9 +943,52 @@ async def restore_detached_cards(
     :param runner_router: Router used to deliver verdicts.
     :returns: None.
     """
+    global _last_answer_stamp
     cards = await asyncio.to_thread(conversation_store.list_detached_cards)
+    _last_answer_stamp = max(
+        _last_answer_stamp, *((card.verdict or {}).get("answer_stamp", 0) for card in cards), 0
+    )
     published: list[asyncio.Event] = []
-    for card in sorted(cards, key=lambda card: card.expires_at):
+    latest: dict[tuple[str, tuple[str, ...]], DetachedCard] = {}
+    for card in sorted(
+        cards, key=lambda card: ((card.verdict or {}).get("answer_stamp", 0), card.expires_at)
+    ):
+        if card.grant_key is not None and card.verdict is not None:
+            latest[(card.session_id, tuple(card.grant_key))] = card
+    legacy_counts = Counter(
+        (card.session_id, tuple(card.grant_key), card.expires_at)
+        for card in cards
+        if card.grant_key is not None
+        and card.verdict is not None
+        and not card.verdict.get("answer_stamp")
+    )
+    ambiguous = {
+        key
+        for key, card in latest.items()
+        if not (card.verdict or {}).get("answer_stamp")
+        and legacy_counts[(*key, card.expires_at)] > 1
+    }
+    for session_id, key in ambiguous:
+        # Drop the entire ambiguous group atomically; a partial deletion
+        # must not turn its last unknown-order survivor into a usable grant.
+        while not await _write_card_record(
+            conversation_store.delete_detached_grants, session_id, list(key)
+        ):
+            await asyncio.sleep(_CARD_RETRY_INTERVAL_S)
+    for card in cards:
+        if (
+            card.grant_key is not None
+            and card.verdict is not None
+            and (card.session_id, tuple(card.grant_key)) in ambiguous
+        ):
+            continue
+        if (
+            card.grant_key is not None
+            and card.verdict is not None
+            and latest[(card.session_id, tuple(card.grant_key))] != card
+        ):
+            await _write_card_record(conversation_store.delete_detached_card, card.elicitation_id)
+            continue
         remaining = card.expires_at - time.time()
         alive = (
             await asyncio.to_thread(conversation_store.get_conversation, card.session_id)
@@ -944,6 +1028,7 @@ async def restore_detached_cards(
                 verdict,
                 remaining,
                 source_id=card.elicitation_id,
+                answered_at=(card.verdict or {}).get("answer_stamp", 0),
             )
         if card.state == "answered" and card.delivery_text is not None:
             task = asyncio.create_task(

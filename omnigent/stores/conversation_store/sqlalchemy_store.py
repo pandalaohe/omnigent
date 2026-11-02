@@ -34,6 +34,7 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy import cast as sql_cast
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import QueryableAttribute, Session, aliased, load_only
 from sqlalchemy.sql.selectable import Subquery
@@ -7624,12 +7625,54 @@ class SqlAlchemyConversationStore(ConversationStore):
 
     def update_detached_card(self, elicitation_id: str, **fields: Any) -> None:
         """Patch one detached card record."""
+        superseded_ids = fields.pop("superseded_ids", ())
         values: dict[str, Any] = dict(fields)
+        stamp = (values.get("verdict") or {}).get("answer_stamp", 0)
         if values.get("verdict") is not None:
             values["verdict"] = json.dumps(values["verdict"])
         workspace_id = current_workspace_id()
 
         def write(session: Session) -> None:
+            if stamp:
+                source_session = (
+                    select(SqlDetachedCard.session_id)
+                    .where(
+                        SqlDetachedCard.workspace_id == workspace_id,
+                        SqlDetachedCard.elicitation_id == elicitation_id,
+                    )
+                    .scalar_subquery()
+                )
+                rows = list(
+                    session.scalars(
+                        select(SqlDetachedCard)
+                        .where(
+                            SqlDetachedCard.workspace_id == workspace_id,
+                            SqlDetachedCard.session_id == source_session,
+                        )
+                        .order_by(SqlDetachedCard.elicitation_id)
+                        .with_for_update()
+                    )
+                )
+                current = next((row for row in rows if row.elicitation_id == elicitation_id), None)
+                if current is None:
+                    return
+                matching = [
+                    row
+                    for row in rows
+                    if row.elicitation_id != elicitation_id
+                    and row.grant_key is not None
+                    and current.grant_key is not None
+                    and json.loads(row.grant_key) == json.loads(current.grant_key)
+                ]
+                if any(
+                    (json.loads(row.verdict).get("answer_stamp", 0) if row.verdict else 0) > stamp
+                    for row in matching
+                ):
+                    session.delete(current)
+                    return
+                for row in matching:
+                    if row.state != "pending" or row.elicitation_id in superseded_ids:
+                        session.delete(row)
             session.execute(
                 update(SqlDetachedCard)
                 .where(
@@ -7641,19 +7684,25 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         run_write_transaction(self._conv_session_immediate, "update_detached_card", write)
 
-    def delete_detached_card(self, elicitation_id: str) -> None:
+    def delete_detached_card(
+        self, elicitation_id: str, *, expected_verdict: dict[str, Any] | None = None
+    ) -> bool:
         """Delete one detached card record."""
         workspace_id = current_workspace_id()
 
-        def write(session: Session) -> None:
-            session.execute(
-                delete(SqlDetachedCard).where(
-                    SqlDetachedCard.workspace_id == workspace_id,
-                    SqlDetachedCard.elicitation_id == elicitation_id,
-                )
+        def write(session: Session) -> bool:
+            stmt = delete(SqlDetachedCard).where(
+                SqlDetachedCard.workspace_id == workspace_id,
+                SqlDetachedCard.elicitation_id == elicitation_id,
             )
+            if expected_verdict is not None:
+                stmt = stmt.where(
+                    SqlDetachedCard.verdict == json.dumps(expected_verdict),
+                    SqlDetachedCard.expires_at > time.time(),
+                )
+            return bool(cast(CursorResult[Any], session.execute(stmt)).rowcount)
 
-        run_write_transaction(self._conv_session_immediate, "delete_detached_card", write)
+        return run_write_transaction(self._conv_session_immediate, "delete_detached_card", write)
 
     def delete_detached_grants(self, session_id: str, grant_key: list[str]) -> None:
         """Delete the session's answered or settled records carrying *grant_key*."""

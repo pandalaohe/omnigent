@@ -1260,12 +1260,23 @@ async def _publish_and_wait_for_harness_elicitation(
                 )
 
 
+# custom-lint: disable-next=workspace-scoped-cache -- server-minted globally unique elicitation IDs
+_detached_result_observers: dict[str, Callable[[ElicitationResult | None], None]] = {}
+
+
+def _observe_detached_result(elicitation_id: str, result: ElicitationResult) -> None:
+    observer = _detached_result_observers.pop(elicitation_id, None)
+    if observer is not None:
+        observer(result)
+
+
 def start_detached_elicitation(
     session_id: str,
     params: ElicitationRequestParams,
     *,
     conversation_store: ConversationStore | None,
     on_result: Callable[[ElicitationResult | None], Awaitable[None]],
+    on_resolved: Callable[[ElicitationResult | None], None] | None = None,
     timeout_s: float = 86400.0,
     elicitation_id: str | None = None,
     published: asyncio.Event | None = None,
@@ -1286,6 +1297,8 @@ def start_detached_elicitation(
         into ancestor streams. ``None`` keeps it scoped to ``session_id``.
     :param on_result: Coroutine invoked with the verdict, or ``None``
         when the wait expired / was severed without one.
+    :param on_resolved: Synchronous observer before the resolved Future wakes;
+        called with ``None`` when the detached task ends for cleanup.
     :param timeout_s: Maximum wait in seconds before
         ``on_result(None)``; defaults to one day.
     :param elicitation_id: Server-minted correlation id the caller
@@ -1297,18 +1310,27 @@ def start_detached_elicitation(
     """
     if elicitation_id is None:
         elicitation_id = f"elicit_{secrets.token_hex(16)}"
+    if on_resolved is not None:
+        _detached_result_observers[elicitation_id] = on_resolved
 
     async def _park_and_report() -> None:
-        result = await _publish_and_wait_for_harness_elicitation(
-            None,
-            session_id=session_id,
-            params=params,
-            timeout_s=timeout_s,
-            conversation_store=conversation_store,
-            elicitation_id=elicitation_id,
-            published=published,
-        )
-        await on_result(result)
+        try:
+            result = await _publish_and_wait_for_harness_elicitation(
+                None,
+                session_id=session_id,
+                params=params,
+                timeout_s=timeout_s,
+                conversation_store=conversation_store,
+                elicitation_id=elicitation_id,
+                published=published,
+            )
+            if result is not None:
+                _observe_detached_result(elicitation_id, result)
+            await on_result(result)
+        finally:
+            _detached_result_observers.pop(elicitation_id, None)
+            if on_resolved is not None:
+                on_resolved(None)
 
     task = asyncio.create_task(_park_and_report())
     _detached_elicitation_tasks.add(task)
@@ -4143,6 +4165,7 @@ async def _resolve_native_delivery(
     if future is not None:
         if _harness_elicitation_owners.get(elicitation_id) != session_id or future.done():
             return True
+    _observe_detached_result(elicitation_id, result)
     if conversation_store is not None:
         await _persist_elicitation_answer(
             session_id, elicitation_id, params, result, conversation_store
@@ -4341,6 +4364,7 @@ async def _resolve_elicitation_locked(
             and params.get("target_session_id") in (None, session_id)
             and _harness_elicitation_owners.get(elicitation_id, session_id) == session_id
         ):
+            _observe_detached_result(elicitation_id, answer_result)
             await _persist_elicitation_answer(
                 session_id, elicitation_id, params, answer_result, conversation_store
             )
@@ -4360,6 +4384,7 @@ async def _resolve_elicitation_locked(
                     exc_info=True,
                 )
             else:
+                _observe_detached_result(elicitation_id, verdict_result)
                 harness_future.set_result(verdict_result)
                 # The waiter may be a zombie: a proxy can sever the
                 # long-poll client-side while holding the backend

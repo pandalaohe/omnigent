@@ -21,12 +21,14 @@ from typing import Any
 import httpx
 import pytest
 from fastapi import FastAPI
+from sqlalchemy import event
 
 from omnigent.runtime import pending_elicitations
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import _elicitation_registry
 from omnigent.server.app import create_app
 from omnigent.server.routes import sessions as sessions_route
+from omnigent.server.routes._sessions import orchestration
 from omnigent.server.routes._sessions.approval_grants import approval_grants
 from omnigent.server.routes.sessions import routes_hooks as hooks_routes
 from omnigent.server.schemas import ElicitationResult
@@ -626,14 +628,9 @@ async def test_delayed_old_answer_cannot_overwrite_newer_approval(
         store.update_detached_card(old_id, expires_at=int(time.time()) - 1)
         release_old.set()
         await asyncio.wait_for(newer_armed.wait(), timeout=5)
-        await _wait_for(
-            lambda: any(
-                row.elicitation_id == old_id and row.grant_key is None
-                for row in store.list_detached_cards()
-            )
-        )
+        await _wait_for(lambda: not _pending_record(store, old_id))
         assert await _request_bash(client, session_id, "pnpm build") == "allow"
-        assert _pending_record(store, old_id)
+        assert not _pending_record(store, old_id)
         assert not _pending_record(store, new_id)
         assert await _request_bash(client, session_id, "pnpm build") == "deny"
 
@@ -699,6 +696,7 @@ async def test_restart_uses_answer_order_for_same_command_grants(
     async with _serve(db_uri, tmp_path) as client:
         session_id = await _new_session(client, "test-restart-answer-order")
         assert await _request_bash(client, session_id, "pnpm build") == "deny"
+
         (first,) = await _pending(client, session_id)
         assert await _request_bash(client, session_id, "pnpm build") == "deny"
         second = next(card for card in await _pending(client, session_id) if card != first)
@@ -720,13 +718,397 @@ async def test_restart_uses_answer_order_for_same_command_grants(
 
     async with _serve(db_uri, tmp_path) as client:
         store.update_detached_card(second["elicitation_id"], expires_at=int(time.time()) - 1)
-        await _wait_for(
-            lambda: any(
-                row.elicitation_id == second["elicitation_id"] and row.grant_key is None
-                for row in store.list_detached_cards()
-            )
-        )
+        assert not _pending_record(store, second["elicitation_id"])
         assert await _request_bash(client, session_id, "pnpm build") == "allow"
         assert not _pending_record(store, first["elicitation_id"])
-        assert _pending_record(store, second["elicitation_id"])
+        assert not _pending_record(store, second["elicitation_id"])
         assert await _request_bash(client, session_id, "pnpm build") == "deny"
+
+
+async def _two_approval_cards(client: httpx.AsyncClient, session_id: str) -> list[dict[str, Any]]:
+    for _ in range(2):
+        assert await _request_bash(client, session_id, "pnpm build") == "deny"
+    return await _pending(client, session_id)
+
+
+async def test_later_denial_supersedes_accepted_grant(
+    runtime_init: None, db_uri: str, tmp_path: Path, deliveries: _Deliveries
+) -> None:
+    async with _serve(db_uri, tmp_path) as client:
+        session_id = await _new_session(client, "test-newer-denial")
+        old, new = await _two_approval_cards(client, session_id)
+        for card, action in ((old, "accept"), (new, "decline")):
+            await _answer(client, session_id, card["elicitation_id"], action)
+            await _wait_for(
+                lambda action=action: len(deliveries.calls) == (1 if action == "accept" else 2)
+            )
+        assert await _request_bash(client, session_id, "pnpm build") == "deny"
+
+
+async def test_consumed_newer_answer_cannot_restore_superseded_grant(
+    runtime_init: None, db_uri: str, tmp_path: Path, deliveries: _Deliveries
+) -> None:
+    async with _serve(db_uri, tmp_path) as client:
+        session_id = await _new_session(client, "test-supersession-restart")
+        for index, card in enumerate(await _two_approval_cards(client, session_id), start=1):
+            await _answer(client, session_id, card["elicitation_id"], "accept")
+            await _wait_for(lambda index=index: len(deliveries.calls) == index)
+        assert await _request_bash(client, session_id, "pnpm build") == "allow"
+    async with _serve(db_uri, tmp_path) as client:
+        assert await _request_bash(client, session_id, "pnpm build") == "deny"
+
+
+async def test_answer_order_precedes_ancestor_cleanup(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    deliveries: _Deliveries,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_blocked, release_old, old_finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    old_id = ""
+    to_thread = asyncio.to_thread
+    callback = hooks_routes._detached_card_callback
+
+    async def _gate_cleanup(write: Any, *args: Any, **kwargs: Any) -> Any:
+        if (
+            write is orchestration._publish_elicitation_resolved_to_ancestors
+            and args[2] == old_id
+            and asyncio.current_task() in orchestration._detached_elicitation_tasks
+        ):
+            old_blocked.set()
+            await release_old.wait()
+        return await to_thread(write, *args, **kwargs)
+
+    def _track_callback(card: Any, **kwargs: Any) -> Any:
+        on_result = callback(card, **kwargs)
+
+        async def _tracked(result: ElicitationResult | None) -> None:
+            try:
+                await on_result(result)
+            finally:
+                if card.elicitation_id == old_id:
+                    old_finished.set()
+
+        return _tracked
+
+    monkeypatch.setattr(asyncio, "to_thread", _gate_cleanup)
+    monkeypatch.setattr(hooks_routes, "_detached_card_callback", _track_callback)
+    async with _serve(db_uri, tmp_path) as client:
+        session_id = await _new_session(client, "test-answer-before-cleanup")
+        old, new = await _two_approval_cards(client, session_id)
+        old_id = old["elicitation_id"]
+        await _answer(client, session_id, old_id, "accept")
+        await asyncio.wait_for(old_blocked.wait(), 5)
+        await _answer(client, session_id, new["elicitation_id"], "accept")
+        await _wait_for(lambda: bool(deliveries.calls))
+        assert await _request_bash(client, session_id, "pnpm build") == "allow"
+        release_old.set()
+        await asyncio.wait_for(old_finished.wait(), 5)
+        assert await _request_bash(client, session_id, "pnpm build") == "deny"
+
+
+async def test_equal_clocks_preserve_latest_verdict(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    deliveries: _Deliveries,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    old_read, release_old, old_finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    old_id = ""
+    answering: set[asyncio.Task[Any]] = set()
+    to_thread = asyncio.to_thread
+    callback = hooks_routes._detached_card_callback
+
+    def _track_callback(card: Any, **kwargs: Any) -> Any:
+        on_result = callback(card, **kwargs)
+
+        async def _tracked(result: ElicitationResult | None) -> None:
+            task = asyncio.current_task()
+            assert task is not None
+            if card.elicitation_id == old_id:
+                answering.add(task)
+            try:
+                await on_result(result)
+            finally:
+                answering.discard(task)
+                if card.elicitation_id == old_id:
+                    old_finished.set()
+
+        return _tracked
+
+    async def _gate_snapshot(write: Any, *args: Any, **kwargs: Any) -> Any:
+        result = await to_thread(write, *args, **kwargs)
+        if (
+            asyncio.current_task() in answering
+            and write.__name__ == "list_detached_cards"
+            and not old_read.is_set()
+        ):
+            old_read.set()
+            await release_old.wait()
+        return result
+
+    monkeypatch.setattr(
+        hooks_routes,
+        "time",
+        SimpleNamespace(monotonic=lambda: 100.0, time=time.time, time_ns=lambda: 100_000_000_000),
+    )
+    monkeypatch.setattr(hooks_routes, "_detached_card_callback", _track_callback)
+    monkeypatch.setattr(asyncio, "to_thread", _gate_snapshot)
+    async with _serve(db_uri, tmp_path) as client:
+        session_id = await _new_session(client, "test-equal-answer-clocks")
+        old, new = await _two_approval_cards(client, session_id)
+        old_id = old["elicitation_id"]
+        await _answer(client, session_id, old_id, "accept")
+        await asyncio.wait_for(old_read.wait(), 5)
+        await _answer(client, session_id, new["elicitation_id"], "accept", {"remember": True})
+        await _wait_for(lambda: bool(deliveries.calls))
+        release_old.set()
+        await asyncio.wait_for(old_finished.wait(), 5)
+        response = await client.post(
+            f"/v1/sessions/{session_id}/hooks/permission-request", json=_bash_payload("pnpm build")
+        )
+        assert response.status_code == 200, response.text
+        decision = response.json()["hookSpecificOutput"]["decision"]
+        assert decision["behavior"] == "allow"
+        assert decision["updatedPermissions"][0]["behavior"] == "allow"
+        assert await _request_bash(client, session_id, "pnpm build") == "deny"
+
+
+@pytest.mark.parametrize("action", ["accept", "decline"])
+async def test_supersession_rollback_and_crash_before_memory_update(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    deliveries: _Deliveries,
+    monkeypatch: pytest.MonkeyPatch,
+    action: str,
+) -> None:
+    """Failed deletion rolls back the answer; committed answers survive a lost callback."""
+    failed, retry, committed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    new_id = old_id = ""
+    injected = False
+    store = SqlAlchemyConversationStore(db_uri)
+    write_record = hooks_routes._write_card_record
+
+    def _fail_old_delete(
+        _conn: Any, _cursor: Any, statement: str, parameters: Any, _context: Any, _many: bool
+    ) -> None:
+        nonlocal injected
+        if (
+            not injected
+            and new_id
+            and statement.startswith("DELETE FROM detached_cards")
+            and old_id in str(parameters)
+        ):
+            injected = True
+            raise RuntimeError("temporary supersession delete failure")
+
+    async def _gate_answer(write: Any, *args: Any, **kwargs: Any) -> bool:
+        ok = await write_record(write, *args, **kwargs)
+        if args == (new_id,) and kwargs.get("state") == "answered":
+            if not ok:
+                failed.set()
+                await retry.wait()
+            else:
+                committed.set()
+                await asyncio.Event().wait()
+        return ok
+
+    # All store instances share this engine; fail the deletion inside the
+    # same transaction that saves the new answer.
+    event.listen(store._conv_engine, "before_cursor_execute", _fail_old_delete)
+    monkeypatch.setattr(hooks_routes, "_write_card_record", _gate_answer)
+    monkeypatch.setattr(hooks_routes, "_CARD_RETRY_INTERVAL_S", 0.01)
+    try:
+        async with _serve(db_uri, tmp_path) as client:
+            session_id = await _new_session(client, "test-supersession-crash")
+            old, new = await _two_approval_cards(client, session_id)
+            old_id, new_id = old["elicitation_id"], new["elicitation_id"]
+            await _answer(client, session_id, old_id, "accept")
+            await _wait_for(lambda: bool(deliveries.calls))
+            await _answer(client, session_id, new_id, action)
+            await asyncio.wait_for(failed.wait(), 5)
+            rows = {row.elicitation_id: row for row in store.list_detached_cards()}
+            assert rows[old_id].verdict["action"] == "accept"
+            assert rows[new_id].state == "pending"
+            assert await _request_bash(client, session_id, "pnpm build") == "deny"
+            retry.set()
+            await asyncio.wait_for(committed.wait(), 5)
+            rows = {row.elicitation_id: row for row in store.list_detached_cards()}
+            assert old_id not in rows
+            assert rows[new_id].verdict["action"] == action
+            assert await _request_bash(client, session_id, "pnpm build") == "deny"
+    finally:
+        event.remove(store._conv_engine, "before_cursor_execute", _fail_old_delete)
+
+    async with _serve(db_uri, tmp_path) as client:
+        assert await _request_bash(client, session_id, "pnpm build") == (
+            "allow" if action == "accept" else "deny"
+        )
+        assert await _request_bash(client, session_id, "pnpm build") == "deny"
+
+
+async def test_answer_stamp_precedes_answer_history_append(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    deliveries: _Deliveries,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An acceptance stalled saving its answer cannot supersede a later denial."""
+    blocked, resume, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    old_id = ""
+    to_thread = asyncio.to_thread
+    callback = hooks_routes._detached_card_callback
+
+    async def _stall_append(write: Any, *args: Any, **kwargs: Any) -> Any:
+        if write.__name__ == "append" and old_id and old_id in str(args):
+            blocked.set()
+            await resume.wait()
+        return await to_thread(write, *args, **kwargs)
+
+    def _track_callback(card: Any, **kwargs: Any) -> Any:
+        on_result = callback(card, **kwargs)
+
+        async def _tracked(result: ElicitationResult | None) -> None:
+            try:
+                await on_result(result)
+            finally:
+                if card.elicitation_id == old_id:
+                    finished.set()
+
+        return _tracked
+
+    monkeypatch.setattr(asyncio, "to_thread", _stall_append)
+    monkeypatch.setattr(hooks_routes, "_detached_card_callback", _track_callback)
+    async with _serve(db_uri, tmp_path) as client:
+        session_id = await _new_session(client, "test-answer-before-history")
+        old, new = await _two_approval_cards(client, session_id)
+        old_id = old["elicitation_id"]
+        old_answer = asyncio.create_task(
+            _answer(client, session_id, old_id, "accept", {"remember": True})
+        )
+        try:
+            await asyncio.wait_for(blocked.wait(), 5)
+            await _answer(client, session_id, new["elicitation_id"], "decline")
+            await _wait_for(lambda: bool(deliveries.calls))
+        finally:
+            resume.set()
+        await asyncio.wait_for(old_answer, 5)
+        await asyncio.wait_for(finished.wait(), 5)
+        assert await _request_bash(client, session_id, "pnpm build") == "deny"
+
+
+@pytest.mark.parametrize("deletion", ["committed", "superseded", "failed"])
+async def test_grant_consumption_uses_committed_delete_cutoff(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    deliveries: _Deliveries,
+    monkeypatch: pytest.MonkeyPatch,
+    deletion: str,
+) -> None:
+    """A committed consumption wins; failed or superseded sources cannot allow."""
+    deleting, resume, denied = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    new_id = ""
+    to_thread = asyncio.to_thread
+    callback = hooks_routes._detached_card_callback
+
+    def _track_callback(card: Any, **kwargs: Any) -> Any:
+        on_result = callback(card, **kwargs)
+
+        async def _tracked(result: ElicitationResult | None) -> None:
+            try:
+                await on_result(result)
+            finally:
+                if card.elicitation_id == new_id:
+                    denied.set()
+
+        return _tracked
+
+    async def _gate_delete(write: Any, *args: Any, **kwargs: Any) -> Any:
+        if write.__name__ != "delete_detached_card" or "expected_verdict" not in kwargs:
+            return await to_thread(write, *args, **kwargs)
+        if deletion == "committed":
+            result = await to_thread(write, *args, **kwargs)
+            assert result is True
+            deleting.set()
+            await resume.wait()
+            return result
+        deleting.set()
+        await resume.wait()
+        if deletion == "failed":
+            raise RuntimeError("temporary consumption delete failure")
+        return await to_thread(write, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", _gate_delete)
+    monkeypatch.setattr(hooks_routes, "_detached_card_callback", _track_callback)
+    async with _serve(db_uri, tmp_path) as client:
+        session_id = await _new_session(client, "test-consumption-cutoff")
+        old, new = await _two_approval_cards(client, session_id)
+        new_id = new["elicitation_id"]
+        await _answer(client, session_id, old["elicitation_id"], "accept")
+        await _wait_for(lambda: bool(deliveries.calls))
+        consuming = asyncio.create_task(_request_bash(client, session_id, "pnpm build"))
+        try:
+            await asyncio.wait_for(deleting.wait(), 5)
+            if deletion != "failed":
+                await _answer(client, session_id, new_id, "decline")
+                await asyncio.wait_for(denied.wait(), 5)
+        finally:
+            resume.set()
+        assert await asyncio.wait_for(consuming, 5) == (
+            "allow" if deletion == "committed" else "deny"
+        )
+        assert await _request_bash(client, session_id, "pnpm build") == "deny"
+
+
+@pytest.mark.parametrize("legacy", ["single", "same_second", "different_second"])
+async def test_legacy_unstamped_grant_recovery(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    deliveries: _Deliveries,
+    legacy: str,
+) -> None:
+    """Unknown legacy answer order asks again; one identifiable grant works once."""
+    store = SqlAlchemyConversationStore(db_uri)
+    async with _serve(db_uri, tmp_path) as client:
+        session_id = await _new_session(client, "test-legacy-answer-order")
+        card, unanswered = await _two_approval_cards(client, session_id)
+        await _answer(client, session_id, card["elicitation_id"], "accept")
+        await _wait_for(lambda: bool(deliveries.calls))
+
+    original = next(
+        row for row in store.list_detached_cards() if row.elicitation_id == card["elicitation_id"]
+    )
+    assert original.verdict is not None
+    verdict = {key: value for key, value in original.verdict.items() if key != "answer_stamp"}
+    expiry = int(time.time()) + 300
+    store.update_detached_card(original.elicitation_id, verdict=verdict, expires_at=expiry)
+    if legacy != "single":
+        store.add_detached_card(
+            replace(
+                original,
+                elicitation_id="elicit_legacy_duplicate",
+                verdict=verdict,
+                expires_at=expiry if legacy == "same_second" else expiry + 1,
+            )
+        )
+
+    async with _serve(db_uri, tmp_path) as client:
+        assert unanswered["elicitation_id"] in {
+            card["elicitation_id"] for card in await _pending(client, session_id)
+        }
+        assert await _request_bash(client, session_id, "pnpm build") == (
+            "deny" if legacy == "same_second" else "allow"
+        )
+        assert await _request_bash(client, session_id, "pnpm build") == "deny"
+        if legacy == "same_second":
+            assert await _pending(client, session_id)
+            assert not _pending_record(store, original.elicitation_id)
+            assert not _pending_record(store, "elicit_legacy_duplicate")
