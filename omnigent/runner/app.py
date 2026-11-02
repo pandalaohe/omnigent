@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     # graph (they are imported lazily inside the codex-native helpers).
     from omnigent.harnesses.claude_native.bridge import ClaudeNativeToolRelay
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
+    from omnigent.harnesses.codex_native.app_server import CodexNativeAppServer
     from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
     from omnigent.runner.mcp_manager import RunnerMcpManager
     from omnigent.terminals.registry import TerminalRegistry
@@ -2284,6 +2285,7 @@ def create_runner_app(
     _session_tool_schemas: dict[str, list[_JsonObject]] = {}  # session_id → cached tool schemas
     _session_mcp_spec_hash: dict[str, str] = {}  # session_id → last MCP spec hash
     _session_comment_relays: dict[str, _CommentRelayBinding] = {}
+    _pending_codex_releases: dict[str, CodexNativeAppServer] = {}
 
     # Process-lifetime monotonic fill-generation counter per session id.
     # Incremented (never popped) at delete_session so a fill parked across a
@@ -5042,6 +5044,7 @@ def create_runner_app(
 
     @app.delete("/v1/sessions/{session_id}")
     async def delete_session(session_id: str) -> JSONResponse:
+        _pending_codex_releases.pop(session_id, None)
         startup_admission.forget(session_id)
         resource_registry.note_terminal_control_request(session_id, "delete_session")
         _cancel_claude_prompt_waiter(session_id)
@@ -12482,6 +12485,15 @@ def create_runner_app(
 
     async def _finish_cli_release(session_id: str) -> None:
         """Release non-terminal runtime pieces owned by one CLI session."""
+        if pending := _pending_codex_releases.get(session_id):
+            await pending.close()
+            if not pending.exit_confirmed:
+                raise RuntimeError("Codex exit is not confirmed before credential scrub")
+            _pending_codex_releases.pop(session_id)
+        # Capture before forwarder cancellation can remove the registered backend.
+        codex_backend = _native_runtime._AUTO_CODEX_APP_SERVERS.get(session_id)
+        if codex_backend is not None:
+            _pending_codex_releases[session_id] = codex_backend
         if not await _cancel_auto_forwarder_task(session_id):
             raise RuntimeError("native forwarder did not stop before runtime cleanup")
         relay_binding = _session_comment_relays.pop(session_id, None)
@@ -12491,13 +12503,9 @@ def create_runner_app(
             if await process_manager.release(session_id) is False:
                 raise RuntimeError("harness subprocess did not exit during CLI release")
         await _native_runtime.teardown_codex_native_app_server(session_id)
-        await _native_runtime.teardown_opencode_native_server(session_id)
-        # A forwarder or pane teardown can already have retired an unconfirmed backend.
-        if any(
-            session_id in owner.session_ids and not owner.exit_confirmed
-            for owner in _native_runtime.native_backend_resident_inventory().owners
-        ):
-            raise RuntimeError("native backend exit is not confirmed before credential scrub")
+        if codex_backend is not None and not codex_backend.exit_confirmed:
+            raise RuntimeError("Codex exit is not confirmed before credential scrub")
+        _pending_codex_releases.pop(session_id, None)
         # Resume still needs native history, undelivered items and cached attachments.
         await _delete_native_bridge_dirs(
             server_client=server_client,

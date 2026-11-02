@@ -7,8 +7,9 @@ import importlib
 import json
 import os
 import shutil
+import subprocess
+import sys
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import httpx
@@ -70,17 +71,20 @@ async def test_idle_release_scrubs_recreatable_credentials(
     assert all(not (home / name).exists() for name in credentials)
 
 
-@pytest.mark.parametrize("family", ["codex", "opencode"])
-@pytest.mark.parametrize("closed_before_release", [False, True])
-@pytest.mark.parametrize("outcome", ["confirmed", "unconfirmed", "raises"])
-async def test_idle_release_requires_confirmed_native_backend_exit(
+@pytest.mark.parametrize(
+    "family,outcome",
+    [("codex", "retry"), ("codex", "delete"), ("codex", "confirmed"), ("opencode", "confirmed")],
+)
+async def test_idle_release_checks_own_codex_close(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     family: str,
-    closed_before_release: bool,
     outcome: str,
 ) -> None:
+    from omnigent.harnesses.codex_native import app_server as codex_module
+    from omnigent.harnesses.opencode_native.app_server import OpenCodeNativeServer
     from omnigent.runner.native import orchestration
+    from tests.harnesses.codex_native.app_server._support import _test_app_server
 
     bridge = importlib.import_module(f"omnigent.harnesses.{family}_native.bridge")
     monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / family)
@@ -89,45 +93,59 @@ async def test_idle_release_requires_confirmed_native_backend_exit(
     auth = home / ("codex-home/auth.json" if family == "codex" else "xdg-data/opencode/auth.json")
     auth.parent.mkdir(parents=True)
     auth.write_text("{}")
-    backend = SimpleNamespace(
-        resident_incarnation_id="exit-gate-backend",
-        exit_confirmed=False,
-        process_exit_confirmed=False,
-    )
-
-    async def close() -> None:
-        backend.process_exit_confirmed = True
-        backend.exit_confirmed = outcome == "confirmed"
-        if outcome == "raises":
-            raise RuntimeError("fixture close failed")
-
-    backend.close = close
+    census_available = outcome == "confirmed"
+    if family == "codex":
+        backend = _test_app_server(tmp_path, auth.parent, home, tmp_path)
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", "pass", start_new_session=True
+        )
+        await process.wait()
+        backend.proc = process
+        backend.process_group_id = process.pid
+        backend.process_registry_tag = "release-close-test"
+        monkeypatch.setattr(
+            codex_module,
+            "_tagged_process_group_members",
+            lambda *_: [] if census_available else None,
+        )
+        monkeypatch.setattr(codex_module, "unregister_codex_native_process", lambda *_: None)
+    else:
+        backend = OpenCodeNativeServer(
+            bridge_dir=home, workspace=tmp_path, opencode_path=sys.executable
+        )
+        process = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+        process.wait()
+        backend.process = process
     registry = "_AUTO_CODEX_APP_SERVERS" if family == "codex" else "_AUTO_OPENCODE_SERVERS"
     monkeypatch.setattr(orchestration, registry, {session_id: backend})
-    if closed_before_release:
-        teardown = (
-            orchestration.teardown_codex_native_app_server
-            if family == "codex"
-            else orchestration.teardown_opencode_native_server
-        )
-        await teardown(session_id)
+    if family == "opencode":
+        await orchestration.teardown_opencode_native_server(session_id)
+        assert backend.process_exit_confirmed and not backend.exit_confirmed
     app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
     async with _runner_client(app) as client:
-        for _ in range(2):
-            if outcome == "confirmed":
-                response = await client.post(
-                    f"/v1/sessions/{session_id}/cli-retention/release", json={"reason": "archive"}
-                )
-                assert response.status_code == 200
-                assert not auth.exists()
-            else:
-                with pytest.raises(RuntimeError, match="native backend exit is not confirmed"):
+        if outcome != "confirmed":
+            for _ in range(2):
+                with pytest.raises(RuntimeError, match="exit is not confirmed"):
                     await client.post(
                         f"/v1/sessions/{session_id}/cli-retention/release",
                         json={"reason": "archive"},
                     )
                 assert auth.exists()
                 assert app.state.cli_runtime_lifecycle.phase(session_id) == "live"
+                assert not backend.exit_confirmed
+            if outcome == "delete":
+                assert (await client.delete(f"/v1/sessions/{session_id}")).status_code == 200
+                auth.parent.mkdir(parents=True)
+                auth.write_text("{}")
+            else:
+                census_available = True
+        response = await client.post(
+            f"/v1/sessions/{session_id}/cli-retention/release", json={"reason": "archive"}
+        )
+        assert response.status_code == 200
+        assert not auth.exists()
+        if family == "codex":
+            assert backend.exit_confirmed is (outcome != "delete")
 
 
 async def test_idle_release_scrubs_pi_token_temporaries(
