@@ -1118,8 +1118,20 @@ def _serialize_terminal_resolution(
 
     async def after_verdict() -> None:
         async with lock:
-            if _harness_parked_elicitations.get(elicitation_id) is parked:
+            current = _harness_parked_elicitations.get(elicitation_id)
+            if current is parked:
                 apply()
+            elif (
+                parked is not None
+                and current is not None
+                and current.session_id == parked.session_id == session_id
+                and parked.request_fingerprint is not None
+                and current.request_fingerprint == parked.request_fingerprint
+            ):
+                # A retry replaced the waiter before this queued native receipt.
+                # Transfer only when both waiters describe the same question.
+                apply()
+                current.resolved_elsewhere.set()
 
     key = secrets.token_hex(16)
     coroutine = after_verdict()

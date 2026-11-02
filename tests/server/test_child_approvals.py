@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -176,6 +177,74 @@ def _pending(tree):
         (">tmp/log /bin/rm -rf /etc", True),
         ("r\\\nm -rf /etc", True),
         ("git commit -m 'a > b'", False),
+        ("ls -la", False),
+        ("git status", False),
+        ("python3 script.py", False),
+        ("nohup rm -rf /etc", True),
+        ("timeout 5 rm -rf /etc", True),
+        ("nice rm -rf /etc", True),
+        ("ionice rm -rf /etc", True),
+        ("stdbuf -oL rm -rf /etc", True),
+        ("setsid rm -rf /etc", True),
+        ("xargs rm -rf /etc", True),
+        ("parallel rm -rf /etc", True),
+        ("watch rm -rf /etc", True),
+        ("chroot / rm -rf /etc", True),
+        ("flock /tmp/lock rm -rf /etc", True),
+        ("unshare rm -rf /etc", True),
+        ("busybox rm -rf /etc", True),
+        ("doas rm -rf /etc", True),
+        ("ssh host rm -rf /etc", True),
+        ("sudo -s 'rm -rf /etc'", True),
+        ("/usr/bin/sudo -s 'rm -rf /etc'", True),
+        ("su -c 'rm -rf /etc'", True),
+        ("runuser -u root -- rm -rf /etc", True),
+        ("sg root -c 'rm -rf /etc'", True),
+        ("chrt 1 rm -rf /etc", True),
+        ("taskset 1 rm -rf /etc", True),
+        ("numactl --localalloc rm -rf /etc", True),
+        ("nsenter -t 1 -- rm -rf /etc", True),
+        ("systemd-run rm -rf /etc", True),
+        ("screen rm -rf /etc", True),
+        ("tmux new-session 'rm -rf /etc'", True),
+        ("script -c 'rm -rf /etc'", True),
+        ("nohup ls -la", True),
+        ("/usr/bin/nohup rm -rf /etc", True),
+        ("bash -c 'nohup rm -rf /etc'", True),
+        ("find / -delete", True),
+        ("find /etc -exec rm -rf {} \\;", True),
+        ("find /etc -execdir rm -rf {} +", True),
+        ("find /etc -ok rm -rf {} \\;", True),
+        ("find /etc -okdir rm -rf {} \\;", True),
+        ("find . -name '*.py' -print", False),
+        ("git -c alias.wipe='!git push --force origin main' wipe", True),
+        ("git -calias.wipe='!git push --force origin main' wipe", True),
+        ("git --config-env=alias.wipe=WIPE wipe", True),
+        ("git --config-env alias.wipe=WIPE wipe", True),
+        ("git --exec-path=/tmp/tools wipe", True),
+        ("git --exec-path /tmp/tools wipe", True),
+        ("python3", True),
+        ("python3 -", True),
+        ("python3 -B -", True),
+        ("cat program | python3", True),
+        ("cat program | python3 -", True),
+        ("cat program | node", True),
+        ("perl", True),
+        ("ruby -", True),
+        ("lua -", True),
+        ("php", True),
+        ("node --print '1'", True),
+        ("python3 < program", True),
+        ("python3 <<'PY'\nprint(1)\nPY", True),
+        ("cd / && rm -rf etc", True),
+        ("cd /; rm -rf etc", True),
+        ("mv /etc /tmp/saved", True),
+        ("dd if=/dev/zero of=/dev/sda", True),
+        ("truncate -s 0 /etc/passwd", True),
+        ("> file", True),
+        ("rm -rf /tmp/../etc", True),
+        ("rm -rf tmp/../probe", True),
+        ("rm ../probe", True),
     ],
 )
 def test_floor_preserves_quoting_and_fails_closed(command, user_only):
@@ -390,6 +459,62 @@ async def test_receipt_failure_keeps_wait_and_does_not_forward(tree, monkeypatch
     assert await _answer(tree) == {"status": "refused", "code": "receipt_failed"}
     assert _pending(tree)["triage"]["state"] == "offered"
     runner_lookup.assert_not_awaited()
+
+
+async def test_stalled_receipt_releases_lock_for_deadline_and_user(tree, monkeypatch):
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    append = tree.store.append
+
+    def stalled_append(session_id, items):
+        if session_id == tree.root_id:
+            entered.set()
+            try:
+                assert release.wait(5), "test must release the blocked database write"
+                return append(session_id, items)
+            finally:
+                finished.set()
+        return append(session_id, items)
+
+    monkeypatch.setattr(tree.store, "append", stalled_append)
+    monkeypatch.setattr(approvals, "RECEIPT_TIMEOUT_S", 0.05)
+    # The database stays stalled across the receipt limit and the display deadline.
+    monkeypatch.setattr(approvals, "OFFER_TIMEOUT_S", 0.2)
+    await _publish(tree, _claude_params())
+    future = asyncio.get_running_loop().create_future()
+    orchestration._harness_elicitation_registry["elicit_pi_dialog"] = future
+    orchestration._harness_elicitation_owners["elicit_pi_dialog"] = tree.child_id
+    runner_lookup = AsyncMock(return_value=None)
+    monkeypatch.setattr(helpers, "_get_runner_client", runner_lookup)
+    answer = asyncio.create_task(_answer(tree))
+    try:
+        await poll_until_async(entered.is_set, timeout_s=2)
+        assert await asyncio.wait_for(asyncio.shield(answer), 0.5) == {
+            "status": "refused",
+            "code": "receipt_failed",
+        }
+        await poll_until_async(
+            lambda: _pending(tree)["triage"]["state"] == "unanswered", timeout_s=1
+        )
+        assert not release.is_set()
+        assert pending_elicitations.display_count(tree.child_id, 1) == 1
+        runner_lookup.assert_not_awaited()
+        assert (
+            await asyncio.wait_for(
+                orchestration._resolve_elicitation(
+                    tree.child_id,
+                    {"elicitation_id": "elicit_pi_dialog", "action": "decline"},
+                    runner_router=None,
+                    conversation_store=tree.store,
+                ),
+                1,
+            )
+            is None
+        )
+        assert future.result().action == "decline"
+    finally:
+        release.set()
+        await asyncio.gather(answer, return_exceptions=True)
+        await poll_until_async(finished.is_set, timeout_s=2)
 
 
 @pytest.mark.parametrize("raises", [False, True])
@@ -641,6 +766,77 @@ async def test_native_first_writes_no_parent_receipt(tree):
     assert await _answer(tree) == {"status": "already_resolved"}
     assert await asyncio.wait_for(waiter, 5) is None
     assert tree.store.list_items(tree.root_id, type="error").data == []
+
+
+@pytest.mark.parametrize("source", ["tool_result", "by_id"])
+@pytest.mark.parametrize("same_question", [True, False])
+async def test_queued_native_signal_follows_same_question_repark(
+    tree, monkeypatch, source, same_question
+):
+    from omnigent.server._elicitation_registry import _harness_parked_elicitations
+
+    async def park(command, published):
+        return await orchestration._publish_and_wait_for_harness_elicitation(
+            None,
+            session_id=tree.child_id,
+            params=_claude_params(command),
+            timeout_s=5,
+            conversation_store=tree.store,
+            elicitation_id="elicit_pi_dialog",
+            published=published,
+            tool_name="Bash",
+            tool_input={"command": command},
+        )
+
+    published = asyncio.Event()
+    first = asyncio.create_task(park("echo ready", published))
+    await asyncio.wait_for(published.wait(), 5)
+    first.cancel()
+    await asyncio.gather(first, return_exceptions=True)
+    old = _harness_parked_elicitations["elicit_pi_dialog"]
+    entered, release = asyncio.Event(), asyncio.Event()
+    receipt = approvals._receipt
+
+    async def paused_receipt(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        return await receipt(*args, **kwargs)
+
+    monkeypatch.setattr(approvals, "_receipt", paused_receipt)
+    answer = asyncio.create_task(
+        _answer(tree, "pass_to_user", note="请决定这次调用。", recommend="approve")
+    )
+    await asyncio.wait_for(entered.wait(), 5)
+    retry_published = asyncio.Event()
+    retry = asyncio.create_task(
+        park("echo ready" if same_question else "echo different", retry_published)
+    )
+    try:
+        lock = approvals.card_lock(tree.child_id, "elicit_pi_dialog")
+        # Queue registration before the native signal while the parent owns the lock.
+        await poll_until_async(lambda: bool(lock._waiters), timeout_s=2)
+        if source == "tool_result":
+            helpers._signal_terminal_resolved_harness_elicitation_impl(
+                tree.child_id, "Bash", {"command": "echo ready"}
+            )
+        else:
+            helpers._signal_harness_elicitation_resolved_by_id(tree.child_id, "elicit_pi_dialog")
+        assert not old.resolved_elsewhere.is_set()
+        release.set()
+        assert await asyncio.wait_for(answer, 5) == {"status": "passed"}
+        await asyncio.wait_for(retry_published.wait(), 5)
+        await poll_until_async(lambda: not helpers._terminal_resolution_tasks, timeout_s=2)
+        if same_question:
+            assert await asyncio.wait_for(asyncio.shield(retry), 0.5) is None
+            assert _pending(tree) is None
+        else:
+            assert not retry.done()
+            assert not _harness_parked_elicitations["elicit_pi_dialog"].resolved_elsewhere.is_set()
+            assert _pending(tree)["command"] == "echo different"
+    finally:
+        release.set()
+        retry.cancel()
+        await asyncio.gather(answer, retry, return_exceptions=True)
 
 
 async def test_deferred_clear_cannot_resurrect_a_card_during_handoff(tree, monkeypatch):

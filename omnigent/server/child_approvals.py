@@ -23,9 +23,9 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.pi_extension_ui import parse_approval_declaration
 from omnigent.policies.builtins.orchestration import (
     _DENY_PATTERNS,
-    _command_index_after_shell_prefixes,
     _push_severity,
     _rm_severity,
+    _skip_shell_assignments,
 )
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import pending_elicitations, session_stream
@@ -40,6 +40,7 @@ from omnigent.stores.file_store import FileStore
 logger = logging.getLogger(__name__)
 APPROVAL_KIND = "answer-child-approvals"
 OFFER_TIMEOUT_S = 60.0
+RECEIPT_TIMEOUT_S = 5.0
 USER_ONLY_TOOLS = frozenset(
     {
         "AskUserQuestion",
@@ -135,19 +136,11 @@ def _command_is_user_only(command: str, depth: int = 0) -> bool:
     if not statements:
         return True
     for argv, piped in statements:
-        # Prefix helpers understand sudo/env/assignments; normalize executables,
-        # never arguments such as rm targets or git refspecs.
-        index = _command_index_after_shell_prefixes(argv)
+        # Normalize only the executable, never rm targets or git refspecs.
+        index = _skip_shell_assignments(argv, 0)
         if index >= len(argv):
             return True
-        while True:
-            argv[index] = PurePosixPath(argv[index]).name
-            next_index = _command_index_after_shell_prefixes(argv)
-            if next_index == index:
-                break
-            index = next_index
-            if index >= len(argv):
-                return True
+        argv[index] = PurePosixPath(argv[index]).name
         name = argv[index]
         args = argv[index + 1 :]
         if name in {
@@ -159,6 +152,38 @@ def _command_is_user_only(command: str, depth: int = 0) -> bool:
             "exec",
             "builtin",
             "sudo",
+            "nohup",
+            "timeout",
+            "nice",
+            "ionice",
+            "stdbuf",
+            "setsid",
+            "xargs",
+            "parallel",
+            "watch",
+            "chroot",
+            "flock",
+            "unshare",
+            "busybox",
+            "doas",
+            "ssh",
+            "su",
+            "runuser",
+            "sg",
+            "chrt",
+            "taskset",
+            "numactl",
+            "nsenter",
+            "systemd-run",
+            "screen",
+            "tmux",
+            "script",
+            "cd",
+            "pushd",
+            "popd",
+            "mv",
+            "dd",
+            "truncate",
             "{",
             "if",
             "then",
@@ -187,10 +212,22 @@ def _command_is_user_only(command: str, depth: int = 0) -> bool:
                 return True
             if _command_is_user_only(args[1], depth + 1):
                 return True
-        if name.startswith(("python", "pypy", "perl", "ruby", "node", "lua", "php")) and any(
-            arg in {"-c", "-e", "--eval"} or arg.startswith(("-c", "-e", "--eval="))
-            for arg in args
+        # Interpreter flags and stdin can supply a program we have not inspected.
+        # A plain script path remains for the parent's authority judgement.
+        if name.startswith(("python", "pypy", "perl", "ruby", "node", "lua", "php")) and (
+            piped or not args or args[0].startswith("-")
         ):
+            return True
+        if name == "find" and any(
+            arg.startswith(("-exec", "-ok", "-delete", "-fprint")) for arg in args
+        ):
+            return True
+        if name == "git" and any(
+            arg.startswith(("-c", "--config-env", "--exec-path")) for arg in args
+        ):
+            return True
+        # Relative traversal and cwd changes cannot be resolved without filesystem state.
+        if name == "rm" and any(".." in arg for arg in args):
             return True
         if (
             _rm_severity(argv) == "DENY"
@@ -519,7 +556,9 @@ async def _receipt(
         data=ErrorData(source="harness", code=code, level="info", message=json.dumps(payload)),
     )
     try:
-        persisted = await asyncio.to_thread(store.append, caller.id, [item])
+        persisted = await asyncio.wait_for(
+            asyncio.to_thread(store.append, caller.id, [item]), timeout=RECEIPT_TIMEOUT_S
+        )
     except Exception:
         logger.exception("Child approval receipt failed for %s", caller.id)
         return False
