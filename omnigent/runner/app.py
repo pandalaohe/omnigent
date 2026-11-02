@@ -12491,6 +12491,13 @@ def create_runner_app(
             if await process_manager.release(session_id) is False:
                 raise RuntimeError("harness subprocess did not exit during CLI release")
         await _native_runtime.teardown_codex_native_app_server(session_id)
+        await _native_runtime.teardown_opencode_native_server(session_id)
+        # A forwarder or pane teardown can already have retired an unconfirmed backend.
+        if any(
+            session_id in owner.session_ids and not owner.exit_confirmed
+            for owner in _native_runtime.native_backend_resident_inventory().owners
+        ):
+            raise RuntimeError("native backend exit is not confirmed before credential scrub")
         # Resume still needs native history, undelivered items and cached attachments.
         await _delete_native_bridge_dirs(
             server_client=server_client,

@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import httpx
@@ -67,6 +68,81 @@ async def test_idle_release_scrubs_recreatable_credentials(
     await app.state.finish_cli_release("conv_scrub")
     assert history.read_text() == "history"
     assert all(not (home / name).exists() for name in credentials)
+
+
+@pytest.mark.parametrize("family", ["codex", "opencode"])
+@pytest.mark.parametrize("closed_before_release", [False, True])
+@pytest.mark.parametrize("outcome", ["confirmed", "unconfirmed", "raises"])
+async def test_idle_release_requires_confirmed_native_backend_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    family: str,
+    closed_before_release: bool,
+    outcome: str,
+) -> None:
+    from omnigent.runner.native import orchestration
+
+    bridge = importlib.import_module(f"omnigent.harnesses.{family}_native.bridge")
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / family)
+    session_id = "conv_exit_gate"
+    home = bridge.prepare_bridge_dir(session_id)
+    auth = home / ("codex-home/auth.json" if family == "codex" else "xdg-data/opencode/auth.json")
+    auth.parent.mkdir(parents=True)
+    auth.write_text("{}")
+    backend = SimpleNamespace(
+        resident_incarnation_id="exit-gate-backend",
+        exit_confirmed=False,
+        process_exit_confirmed=False,
+    )
+
+    async def close() -> None:
+        backend.process_exit_confirmed = True
+        backend.exit_confirmed = outcome == "confirmed"
+        if outcome == "raises":
+            raise RuntimeError("fixture close failed")
+
+    backend.close = close
+    registry = "_AUTO_CODEX_APP_SERVERS" if family == "codex" else "_AUTO_OPENCODE_SERVERS"
+    monkeypatch.setattr(orchestration, registry, {session_id: backend})
+    if closed_before_release:
+        teardown = (
+            orchestration.teardown_codex_native_app_server
+            if family == "codex"
+            else orchestration.teardown_opencode_native_server
+        )
+        await teardown(session_id)
+    app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
+    async with _runner_client(app) as client:
+        for _ in range(2):
+            if outcome == "confirmed":
+                response = await client.post(
+                    f"/v1/sessions/{session_id}/cli-retention/release", json={"reason": "archive"}
+                )
+                assert response.status_code == 200
+                assert not auth.exists()
+            else:
+                with pytest.raises(RuntimeError, match="native backend exit is not confirmed"):
+                    await client.post(
+                        f"/v1/sessions/{session_id}/cli-retention/release",
+                        json={"reason": "archive"},
+                    )
+                assert auth.exists()
+                assert app.state.cli_runtime_lifecycle.phase(session_id) == "live"
+
+
+async def test_idle_release_scrubs_pi_token_temporaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.harnesses.pi_native import bridge
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "pi")
+    home = bridge.prepare_bridge_dir("conv_pi_temp")
+    token_temp = home / "pi-agent/omnigent-auth/token-test.json.123.tmp"
+    token_temp.parent.mkdir(parents=True)
+    token_temp.write_text("{}")
+    app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
+    await app.state.finish_cli_release("conv_pi_temp")
+    assert not token_temp.exists()
 
 
 @pytest.mark.parametrize("parent_link", [False, True])

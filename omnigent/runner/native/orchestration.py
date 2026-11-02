@@ -10885,9 +10885,9 @@ def _scrub_native_bridge_credentials(bridge_dir: Path, paths: tuple[str, ...]) -
                 bridge_dir.resolve()
             ):
                 raise ValueError("credential parent leaves bridge")
-            if target.name == "*.json":
+            if "*" in target.name:
                 try:
-                    targets = [path for path in target.parent.iterdir() if path.suffix == ".json"]
+                    targets = [path for path in target.parent.iterdir() if path.match(target.name)]
                 except FileNotFoundError:
                     continue
             else:
@@ -11030,6 +11030,7 @@ async def _delete_native_bridge_dirs(
                 "pi-agent/mcp-auth.json",
                 "pi-agent/mcp.json",
                 "pi-agent/omnigent-auth/*.json",
+                "pi-agent/omnigent-auth/*.json.*.tmp",
             ),
         }
         for target in history_targets:
