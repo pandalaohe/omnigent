@@ -55,6 +55,48 @@ def _isolate_anthropic_default_model_env(monkeypatch: pytest.MonkeyPatch) -> Non
         monkeypatch.delenv(var, raising=False)
 
 
+@pytest.mark.parametrize("confirmed", [True, False])
+async def test_codex_helper_mode_change_waits_for_harness(monkeypatch, confirmed):
+    app, pm = await _build_app_for_spec(_harness_spec("codex"))
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_post = pm._client.post
+    forwarded = []
+
+    async def post(url, *, json, timeout=None):
+        if json.get("type") != "codex_approval_mode_change":
+            return await original_post(url, json=json, timeout=timeout)
+        forwarded.append((url, json))
+        entered.set()
+        await release.wait()
+        return httpx.Response(
+            200, json={"approval_mode": "read-only", "helpers_stopped": confirmed}
+        )
+
+    monkeypatch.setattr(pm._client, "post", post)
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions",
+            json={"session_id": "sdk-session", "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert response.status_code == 201, response.text
+        body = {"type": "codex_approval_mode_change", "approval_mode": "read-only"}
+        change = asyncio.create_task(client.post("/v1/sessions/sdk-session/events", json=body))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            assert not change.done()
+            release.set()
+            response = await asyncio.wait_for(change, timeout=1)
+        finally:
+            release.set()
+            change.cancel()
+            await asyncio.gather(change, return_exceptions=True)
+    assert forwarded == [("/v1/sessions/sdk-session/events", body)]
+    assert response.status_code == (200 if confirmed else 409), response.text
+    if not confirmed:
+        assert response.json()["error"] == "codex_helper_stop_pending"
+        assert "next turn" in response.json()["detail"]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "effort_value",
@@ -459,6 +501,15 @@ async def test_sdk_mode_snapshot_and_event_reach_next_turn(
         _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
     ]
     harness_client = _ScriptedHarnessClient(frames)
+    original_post = harness_client.post
+
+    async def acknowledge_control(url, *, json, timeout=None):
+        result = await original_post(url, json=json, timeout=timeout)
+        if json.get("type") == "codex_approval_mode_change":
+            return httpx.Response(200, json={"helpers_stopped": True})
+        return result
+
+    monkeypatch.setattr(harness_client, "post", acknowledge_control)
     app = create_runner_app(
         process_manager=_FakeProcessManager(harness_client),  # type: ignore[arg-type]
         spec_resolver=_resolver,

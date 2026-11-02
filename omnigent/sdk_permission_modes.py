@@ -14,3 +14,19 @@ CODEX_SDK_TURN_POLICIES: dict[str, tuple[str, str, str]] = {
 CODEX_SDK_APPROVAL_MODES: frozenset[str] = frozenset(CODEX_SDK_TURN_POLICIES)
 CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY = "omnigent.claude_sdk.permission_mode"
 CODEX_SDK_APPROVAL_MODE_LABEL_KEY = "omnigent.codex_sdk.approval_mode"
+
+
+def codex_approval_mode_tightens(previous: str | None, requested: str | None) -> bool:
+    """Treat unknown authority as requiring helper revocation too."""
+    ranks = {
+        "read-only": 0,
+        "default": 1,
+        "ask-for-approval": 1,
+        "approve-for-me": 2,
+        "full-access": 3,
+    }
+    previous_rank = ranks.get(previous) if previous is not None else None
+    requested_rank = ranks.get(requested) if requested is not None else None
+    if previous_rank is None or requested_rank is None:
+        return True
+    return requested_rank < previous_rank

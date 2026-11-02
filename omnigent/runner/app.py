@@ -11295,6 +11295,39 @@ def create_runner_app(
                         content={"error": "invalid_input", "detail": "Invalid approval_mode"},
                     )
                 _session_approval_mode[conversation_id] = mode
+                helpers_stopped = True
+                if process_manager is not None:
+                    try:
+                        harness_client = await process_manager.get_client(conversation_id, "any")
+                        result = await harness_client.post(
+                            f"/v1/sessions/{conversation_id}/events",
+                            json={"type": "codex_approval_mode_change", "approval_mode": mode},
+                            timeout=3.0,
+                        )
+                        helpers_stopped = (
+                            result.status_code == 200
+                            and result.json().get("helpers_stopped") is True
+                        )
+                    except NoLiveHarnessError:
+                        pass
+                    except Exception:  # An unconfirmed stop stays pending.
+                        helpers_stopped = False
+                        _logger.warning(
+                            "Codex helper revocation unconfirmed for %s",
+                            conversation_id,
+                            exc_info=True,
+                        )
+                if not helpers_stopped:
+                    return JSONResponse(
+                        status_code=409,
+                        content={
+                            "error": "codex_helper_stop_pending",
+                            "detail": (
+                                "Mode saved for the next turn; helper stop is not confirmed. "
+                                "Retry the mode change before relying on the tighter permissions."
+                            ),
+                        },
+                    )
                 return JSONResponse(content={"approval_mode": mode})
             if harness == "codex-native":
                 mode = body.get("approval_mode") if isinstance(body, dict) else None

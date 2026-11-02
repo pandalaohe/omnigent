@@ -458,6 +458,38 @@ async def test_create_session_without_title_returns_none(
     assert session["title"] is None
 
 
+async def test_codex_helper_pending_stop_saves_restriction_without_effective_event(
+    client, monkeypatch
+):
+    agent = await create_test_agent(
+        client, executor={"type": "omnigent", "config": {"harness": "codex"}}
+    )
+    session = await _create_session(client, agent["id"])
+    published = []
+    _capture_published(monkeypatch, published)
+
+    def pending(request):
+        if request.method != "POST":
+            return httpx.Response(204)
+        return httpx.Response(
+            409,
+            json={
+                "error": "codex_helper_stop_pending",
+                "detail": "Mode saved for the next turn; helper stop is not confirmed.",
+            },
+        )
+
+    async with _runtime_runner(pending):
+        response = await client.patch(
+            f"/v1/sessions/{session['id']}", json={"approval_mode": "read-only"}
+        )
+    assert response.status_code == 503, response.text
+    assert "next turn" in response.text
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["labels"]["omnigent.codex_sdk.approval_mode"] == "read-only"
+    assert all(event["type"] != "session.codex_approval_mode" for _, event in published)
+
+
 @pytest.mark.parametrize(
     ("harness", "field", "value", "label_key"),
     [

@@ -64,6 +64,7 @@ from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.sdk_peer_delivery import SDKPeerInput, SDKPeerOutcome
 from omnigent.server.schemas import ElicitationResult
+from tests._helpers.polling import poll_until_async
 
 
 def _run(coro):
@@ -202,6 +203,450 @@ class _FakeProcess:
 
     async def wait(self) -> int:
         return self.returncode or 0
+
+
+@pytest.fixture
+async def codex_helper_stream():
+    session = _CodexAppServerSession(
+        codex_path="/opt/work/bin/codex",
+        cwd="/opt/work/project",
+        env={},
+        tool_executor=AsyncMock(return_value={"echo": "helper-result"}),
+        raw_elicitation_handler=AsyncMock(return_value=ElicitationResult(action="accept")),
+    )
+    session.start = AsyncMock()
+    session.thread_id = "parent-thread"
+    session._request = AsyncMock(return_value={"result": {"turn": {"id": "parent-turn"}}})
+    proc = _FakeProcess()
+    proc.stdout = _QueuedStdoutPipe()
+    session._proc = proc
+    reader = asyncio.create_task(session._reader_loop())
+    session._reader_task = reader
+    events = []
+
+    async def consume():
+        async for event in session.run_turn(
+            messages=[{"role": "user", "content": "delegate"}],
+            tools=[],
+            system_prompt="",
+            model="gpt-5.4-mini",
+            cwd="/opt/work/project",
+            sandbox="workspace-write",
+        ):
+            events.append(event)
+
+    turn = asyncio.create_task(consume())
+    try:
+        await poll_until_async(lambda: session.active_turn_id, timeout_s=1, interval_s=0)
+        frames = json.loads(
+            (Path(__file__).parent / "fixtures" / "codex_helper_stream.json").read_text()
+        )
+        yield session, proc, frames, events, turn
+    finally:
+        turn.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await turn
+        reader.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await reader
+        controls = list(session._helper_control_tasks)
+        for task in controls:
+            task.cancel()
+        if controls:
+            await asyncio.gather(*controls, return_exceptions=True)
+
+
+async def test_codex_helper_dynamic_tool_is_answered_without_parent_events(codex_helper_stream):
+    session, proc, frames, events, turn = codex_helper_stream
+    for frame in frames:
+        proc.stdout.feed(frame)
+    proc.stdout.feed(
+        {
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "helper-thread",
+                "tokenUsage": {"total": {"inputTokens": 500}, "last": {"inputTokens": 500}},
+            },
+        }
+    )
+    await poll_until_async(lambda: proc.stdin.writes, timeout_s=1, interval_s=0)
+    reply = json.loads(proc.stdin.writes[-1])
+    assert reply["id"] == 0
+    assert reply["result"]["success"] is True
+    assert "helper-result" in json.dumps(reply["result"])
+    session._tool_executor.assert_awaited_once_with("sys_capture_echo", {})
+    assert session.active_turn_id == "parent-turn"
+    assert session._events.empty()
+    proc.stdout.feed(
+        {
+            "method": "turn/completed",
+            "params": {"threadId": "parent-thread", "turn": {"id": "parent-turn"}},
+        }
+    )
+    await asyncio.wait_for(turn, timeout=3)
+    assert isinstance(events[-1], TurnComplete)
+    assert events[-1].usage is None
+    assert not any(isinstance(event, (ToolCallRequest, ToolCallComplete)) for event in events)
+
+
+@pytest.mark.parametrize("active", [True, False], ids=["owning-turn", "ended-turn"])
+@pytest.mark.parametrize("kind", ["tool", "approval", "unknown", "no-thread"])
+async def test_codex_helper_request_always_gets_reply(codex_helper_stream, active, kind):
+    session, proc, frames, _events, turn = codex_helper_stream
+    for frame in frames[:-1]:
+        proc.stdout.feed(frame)
+    if not active:
+        proc.stdout.feed(
+            {
+                "method": "turn/completed",
+                "params": {"threadId": "parent-thread", "turn": {"id": "parent-turn"}},
+            }
+        )
+        await asyncio.wait_for(turn, timeout=3)
+    request = frames[-1]
+    if kind == "approval":
+        request["method"] = "item/commandExecution/requestApproval"
+        request["params"]["command"] = "pwd"
+    elif kind in {"unknown", "no-thread"}:
+        request["method"] = "unknown/request"
+        if kind == "no-thread":
+            del request["params"]["threadId"]
+    proc.stdout.feed(request)
+    await poll_until_async(lambda: proc.stdin.writes, timeout_s=1, interval_s=0)
+    reply = json.loads(proc.stdin.writes[-1])
+    assert reply["id"] == 0
+    if kind == "approval":
+        assert reply["result"] == {"decision": "accept" if active else "decline"}
+        assert session._raw_elicitation_handler.await_count == int(active)
+    elif kind == "tool" and active:
+        assert reply["result"]["success"] is True
+    else:
+        assert "error" in reply
+    assert session._tool_executor.await_count == int(kind == "tool" and active)
+
+
+@pytest.mark.parametrize("pending_kind", ["tool", "approval"])
+async def test_codex_helper_stop_drains_pending_requests(codex_helper_stream, pending_kind):
+    session, proc, frames, _events, _turn = codex_helper_stream
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+
+    async def pending(*_args):
+        entered.set()
+        try:
+            await asyncio.Future()
+        finally:
+            cancelled.set()
+
+    async def interrupt(method, params):
+        if method == "turn/interrupt" and params["threadId"] == "helper-thread":
+            proc.stdout.feed(
+                {
+                    "method": "turn/completed",
+                    "params": {"threadId": "helper-thread", "turn": {"id": "helper-turn"}},
+                }
+            )
+        return {"result": {}}
+
+    session._request.side_effect = interrupt
+    if pending_kind == "approval":
+        session._raw_elicitation_handler.side_effect = pending
+        frames[-1]["method"] = "item/commandExecution/requestApproval"
+        frames[-1]["params"]["command"] = "pwd"
+    else:
+        session._tool_executor.side_effect = pending
+    for frame in frames:
+        proc.stdout.feed(frame)
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    assert await session.interrupt_turn()
+    assert cancelled.is_set()
+    replies = [json.loads(raw) for raw in proc.stdin.writes]
+    assert len(replies) == 1
+    if pending_kind == "approval":
+        assert replies[0]["result"] == {"decision": "decline"}
+    else:
+        assert "error" in replies[0]
+    assert not session._helper_requests
+    assert all(task.done() for task in session._helper_tasks)
+    assert any(
+        call.args == ("turn/interrupt", {"threadId": "helper-thread", "turnId": "helper-turn"})
+        for call in session._request.await_args_list
+    )
+    late = json.loads(json.dumps(frames[-1]))
+    late["id"] = 1
+    proc.stdout.feed(late)
+    await poll_until_async(lambda: len(proc.stdin.writes) == 2, timeout_s=1, interval_s=0)
+    assert session._raw_elicitation_handler.await_count == int(pending_kind == "approval")
+    assert session._tool_executor.await_count == int(pending_kind == "tool")
+
+
+@pytest.mark.parametrize("reply_in_flight", [False, True])
+async def test_codex_helper_stop_replies_once_across_task_start_and_write(
+    codex_helper_stream, reply_in_flight
+):
+    session, proc, frames, _events, _turn = codex_helper_stream
+    draining = asyncio.Event()
+
+    async def drain():
+        draining.set()
+        await asyncio.Future()
+
+    async def interrupt(method, params):
+        if method == "turn/interrupt" and params["threadId"] == "helper-thread":
+            proc.stdout.feed(
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "helper-thread",
+                        "turn": {"id": "helper-turn"},
+                    },
+                }
+            )
+        return {"result": {}}
+
+    session._request.side_effect = interrupt
+    if reply_in_flight:
+        proc.stdin.drain = drain
+    for frame in frames:
+        proc.stdout.feed(frame)
+    if reply_in_flight:
+        await asyncio.wait_for(draining.wait(), timeout=1)
+    stopped = asyncio.create_task(session.interrupt_turn())
+    assert await asyncio.wait_for(stopped, timeout=3)
+    assert len(proc.stdin.writes) == 1
+    assert session._tool_executor.await_count == int(reply_in_flight)
+    assert not session._helper_requests
+
+
+async def test_codex_helper_from_previous_generation_cannot_use_next_turn(codex_helper_stream):
+    session, proc, frames, _events, turn = codex_helper_stream
+    for frame in frames[:-1]:
+        proc.stdout.feed(frame)
+    proc.stdout.feed(
+        {
+            "method": "turn/completed",
+            "params": {"threadId": "parent-thread", "turn": {"id": "parent-turn"}},
+        }
+    )
+    await asyncio.wait_for(turn, timeout=3)
+    session._request.return_value = {"result": {"turn": {"id": "next-turn"}}}
+
+    async def next_turn():
+        return [
+            event
+            async for event in session.run_turn(
+                messages=[{"role": "user", "content": "next"}],
+                tools=[],
+                system_prompt="",
+                model="gpt-5.4-mini",
+                cwd="/opt/work/project",
+                sandbox="workspace-write",
+            )
+        ]
+
+    next_task = asyncio.create_task(next_turn())
+    try:
+        await poll_until_async(
+            lambda: session.active_turn_id == "next-turn", timeout_s=1, interval_s=0
+        )
+        proc.stdout.feed(frames[-1])
+        await poll_until_async(lambda: proc.stdin.writes, timeout_s=1, interval_s=0)
+        assert "error" in json.loads(proc.stdin.writes[-1])
+        session._tool_executor.assert_not_awaited()
+        assert session.active_turn_id == "next-turn"
+    finally:
+        next_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await next_task
+
+
+@pytest.mark.parametrize("failed_thread", ["parent-thread", "helper-thread"])
+async def test_codex_helper_retrying_failure_keeps_dispatch_open(
+    codex_helper_stream, failed_thread
+):
+    session, proc, frames, _events, _turn = codex_helper_stream
+    for frame in frames[:-1]:
+        proc.stdout.feed(frame)
+    proc.stdout.feed(
+        {
+            "method": "turn/failed",
+            "params": {
+                "threadId": failed_thread,
+                "turn": {
+                    "id": "parent-turn" if failed_thread == "parent-thread" else "helper-turn"
+                },
+                "willRetry": True,
+            },
+        }
+    )
+    proc.stdout.feed(frames[-1])
+    await poll_until_async(lambda: proc.stdin.writes, timeout_s=1, interval_s=0)
+    assert json.loads(proc.stdin.writes[-1])["result"]["success"] is True
+    session._tool_executor.assert_awaited_once_with("sys_capture_echo", {})
+    assert session.active_turn_id == "parent-turn"
+
+
+async def test_codex_helper_retrying_failure_still_requires_interrupt_on_tighten(
+    codex_helper_stream,
+):
+    session, proc, frames, _events, _turn = codex_helper_stream
+    for frame in frames[:-1]:
+        proc.stdout.feed(frame)
+    proc.stdout.feed(
+        {
+            "method": "turn/failed",
+            "params": {
+                "threadId": "helper-thread",
+                "turn": {"id": "helper-turn"},
+                "willRetry": True,
+            },
+        }
+    )
+    await poll_until_async(lambda: proc.stdout._frames.empty(), timeout_s=1, interval_s=0)
+
+    async def interrupt(method, params):
+        assert method == "turn/interrupt"
+        proc.stdout.feed(
+            {
+                "method": "turn/completed",
+                "params": {"threadId": params["threadId"], "turn": {"id": params["turnId"]}},
+            }
+        )
+        return {"result": {}}
+
+    session._request.reset_mock()
+    session._request.side_effect = interrupt
+    assert await session.change_approval_mode("read-only")
+    session._request.assert_awaited_once_with(
+        "turn/interrupt", {"threadId": "helper-thread", "turnId": "helper-turn"}
+    )
+
+
+@pytest.mark.parametrize("confirmed", [True, False])
+async def test_codex_helper_tighten_requires_terminal_confirmation(codex_helper_stream, confirmed):
+    session, proc, frames, _events, _turn = codex_helper_stream
+    for frame in frames[:-1]:
+        proc.stdout.feed(frame)
+    await poll_until_async(
+        lambda: "helper-thread" in session._helper_turns, timeout_s=1, interval_s=0
+    )
+
+    async def interrupt(method, params):
+        assert method == "turn/interrupt"
+        if confirmed:
+            proc.stdout.feed(
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": params["threadId"],
+                        "turn": {"id": params["turnId"]},
+                    },
+                }
+            )
+        return {"result": {}}
+
+    session._request.side_effect = interrupt
+    assert await session.change_approval_mode("read-only") is confirmed
+    proc.stdout.feed(frames[-1])
+    await poll_until_async(lambda: proc.stdin.writes, timeout_s=1, interval_s=0)
+    assert "error" in json.loads(proc.stdin.writes[-1])
+    session._tool_executor.assert_not_awaited()
+    if confirmed:
+        previous_interrupt_count = session._request.await_count
+        for frame in frames[:-1]:
+            later = json.loads(json.dumps(frame))
+            later["params"]["threadId"] = "later-helper"
+            proc.stdout.feed(later)
+        await poll_until_async(
+            lambda: session._request.await_count > previous_interrupt_count,
+            timeout_s=1,
+            interval_s=0,
+        )
+        assert session._request.await_args.args[1]["threadId"] == "later-helper"
+
+
+async def test_codex_helper_pending_tighten_retries_before_next_parent_turn(codex_helper_stream):
+    session, proc, frames, _events, turn = codex_helper_stream
+    for frame in frames[:-1]:
+        proc.stdout.feed(frame)
+    await poll_until_async(
+        lambda: "helper-thread" in session._helper_turns, timeout_s=1, interval_s=0
+    )
+    assert await session.change_approval_mode("read-only") is False
+    proc.stdout.feed(
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "parent-thread",
+                "turn": {"id": "parent-turn"},
+            },
+        }
+    )
+    await asyncio.wait_for(turn, timeout=3)
+    calls = []
+
+    async def respond(method, params):
+        calls.append((method, params))
+        if method == "turn/interrupt":
+            proc.stdout.feed(
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "helper-thread",
+                        "turn": {"id": "helper-turn"},
+                    },
+                }
+            )
+            return {"result": {}}
+        assert method == "turn/start"
+        proc.stdout.feed(
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "parent-thread",
+                    "turn": {"id": "next-turn"},
+                },
+            }
+        )
+        return {"result": {"turn": {"id": "next-turn"}}}
+
+    session._request.side_effect = respond
+    events = [
+        event
+        async for event in session.run_turn(
+            messages=[{"role": "user", "content": "next"}],
+            tools=[],
+            system_prompt="",
+            model="gpt-5.4-mini",
+            cwd="/opt/work/project",
+            sandbox="workspace-write",
+            approval_mode="read-only",
+        )
+    ]
+    assert [method for method, _ in calls] == ["turn/interrupt", "turn/start"]
+    assert calls[-1][1]["sandboxPolicy"] == {"type": "readOnly"}
+    assert isinstance(events[-1], TurnComplete)
+
+
+async def test_codex_helper_close_cancels_owned_tool_task(codex_helper_stream):
+    session, proc, frames, _events, _turn = codex_helper_stream
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+
+    async def pending(*_args):
+        entered.set()
+        try:
+            await asyncio.Future()
+        finally:
+            cancelled.set()
+
+    session._tool_executor.side_effect = pending
+    for frame in frames:
+        proc.stdout.feed(frame)
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    await asyncio.wait_for(session.close(), timeout=3)
+    assert cancelled.is_set()
+    assert all(task.done() for task in session._helper_tasks)
+    assert not session._helper_requests
+    assert "error" in json.loads(proc.stdin.writes[-1])
 
 
 @pytest.fixture
@@ -726,6 +1171,7 @@ async def test_sdk_loaded_thread_inventory_observes_new_threads(sdk_inventory_st
     session.start = AsyncMock(side_effect=AssertionError("read must not start"))
     session.close = AsyncMock(side_effect=AssertionError("read must not close"))
     requests = []
+    replies = []
     resample = False
     maintenance = asyncio.Queue()
     if case == "maintenance-started":
@@ -733,11 +1179,16 @@ async def test_sdk_loaded_thread_inventory_observes_new_threads(sdk_inventory_st
 
     async def notify(event, stdout=None):
         (stdout if stdout is not None else proc.stdout).feed(event)
+        if case == "server-request":
+            return
         queue = maintenance if case == "maintenance-started" else session._events
         assert await asyncio.wait_for(queue.get(), 1) == event
 
     async def respond():
         message = json.loads(proc.stdin.writes[-1])
+        if "method" not in message:
+            replies.append(message)
+            return
         assert message["method"] == "thread/list/loaded"
         requests.append(message)
         index = len(requests)
@@ -777,6 +1228,9 @@ async def test_sdk_loaded_thread_inventory_observes_new_threads(sdk_inventory_st
         else:
             assert result == (("main", "new") if case == "earlier-started" else ("main",))
         assert session.resident_thread_observation_revision == (1 if changed else 0)
+        if case == "server-request":
+            await poll_until_async(lambda: replies, timeout_s=1, interval_s=0)
+            assert replies[0]["id"] == 99 and replies[0]["error"]["code"] == -32601
         assert not reader.done() and session._pending_requests == {}
         assert session._events.empty() and session._transport_error is None
         session.start.assert_not_called()
@@ -1224,9 +1678,16 @@ async def test_sdk_executor_thread_inventory_reconciles_after_later_awaits(
     elif change == "collision":
         second._resident_incarnation_id = first.resident_incarnation_id
     elif change == "observation":
+        revision = first.resident_thread_observation_revision
+        assert revision is not None
         event = {"method": "thread/started", "params": {"thread": {"id": "new"}}}
         first._proc.stdout.feed(event)
-        assert await asyncio.wait_for(first._events.get(), 1) == event
+        await poll_until_async(
+            lambda: first.resident_thread_observation_revision == revision + 1,
+            timeout_s=1,
+            interval_s=0,
+        )
+        assert first._events.empty()
     elif change.startswith("observation-"):
         first._resident_thread_started_revision = {
             "observation-none": None,
@@ -1323,9 +1784,16 @@ async def test_sdk_thread_inventory_through_existing_adapter(sdk_inventory_owner
         if change == "transport":
             app._proc.stdin = _FakePipe()
         else:
+            revision = app.resident_thread_observation_revision
+            assert revision is not None
             event = {"method": "thread/started", "params": {"thread": {"id": "new"}}}
             app._proc.stdout.feed(event)
-            assert await asyncio.wait_for(app._events.get(), 1) == event
+            await poll_until_async(
+                lambda: app.resident_thread_observation_revision == revision + 1,
+                timeout_s=1,
+                interval_s=0,
+            )
+            assert app._events.empty()
         await asyncio.sleep(0)
         assert reconcile().thread_ids == (None,)
     else:
@@ -1352,9 +1820,16 @@ async def test_sdk_thread_inventory_http_uses_existing_stdio(sdk_inventory_owner
 
         async def after_read(*, timeout_s):
             reconcile = await prepare(timeout_s=timeout_s)
+            revision = owner.resident_thread_observation_revision
+            assert revision is not None
             event = {"method": "thread/started", "params": {"thread": {"id": "new"}}}
             owner._proc.stdout.feed(event)
-            assert await asyncio.wait_for(owner._events.get(), 1) == event
+            await poll_until_async(
+                lambda: owner.resident_thread_observation_revision == revision + 1,
+                timeout_s=1,
+                interval_s=0,
+            )
+            assert owner._events.empty()
             return reconcile
 
         adapter.prepare_resident_thread_inventory = after_read

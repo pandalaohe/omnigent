@@ -1,0 +1,45 @@
+[
+  {
+    "method": "thread/status/changed",
+    "params": {
+      "threadId": "helper-thread",
+      "status": {"type": "idle"}
+    }
+  },
+  {
+    "method": "thread/status/changed",
+    "params": {
+      "threadId": "helper-thread",
+      "status": {"type": "active", "activeFlags": []}
+    }
+  },
+  {
+    "method": "turn/started",
+    "params": {
+      "threadId": "helper-thread",
+      "turn": {
+        "id": "helper-turn",
+        "rootTurnId": "parent-turn",
+        "items": [],
+        "itemsView": "notLoaded",
+        "status": "inProgress",
+        "error": null,
+        "startedAt": 1,
+        "completedAt": null,
+        "durationMs": null
+      }
+    }
+  },
+  {
+    "method": "item/tool/call",
+    "id": 0,
+    "params": {
+      "threadId": "helper-thread",
+      "turnId": "helper-turn",
+      "callId": "helper-echo",
+      "namespace": null,
+      "tool": "sys_capture_echo",
+      "arguments": {}
+    }
+  }
+]

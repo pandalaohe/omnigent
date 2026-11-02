@@ -12,6 +12,7 @@ import enum
 import json
 import threading
 from collections.abc import AsyncIterator, Callable, Iterator
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Protocol, TypeAlias, runtime_checkable
 
@@ -42,6 +43,23 @@ ToolCallMetadata: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 ExecutorExtra: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 ExecutorUsage: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 CompactedMessages: TypeAlias = list[Message]
+
+
+@dataclass(frozen=True)
+class ExecutorCallbackScope:
+    """Bind a detached callback to the turn that delegated it."""
+
+    turn_context: object | None
+    current: Callable[[], bool]
+    call_id: str | None = None
+
+
+executor_turn_context: ContextVar[object | None] = ContextVar(
+    "executor_turn_context", default=None
+)
+executor_callback_scope: ContextVar[ExecutorCallbackScope | None] = ContextVar(
+    "executor_callback_scope", default=None
+)
 
 # ``enqueue_session_message`` content — arbitrary user-supplied payload
 # (string text or a structured JSON value).
