@@ -986,6 +986,8 @@ def _publish_and_persist_resource_event(
     resource_type: str,
     conversation_store: ConversationStore,
     resource: dict[str, Any] | None = None,
+    *,
+    instance_id: str | None = None,
 ) -> None:
     """Publish an SSE event and persist it as a conversation item.
 
@@ -1011,6 +1013,8 @@ def _publish_and_persist_resource_event(
         sse_payload["resource_id"] = resource_id
         sse_payload["resource_type"] = resource_type
         sse_payload["session_id"] = session_id
+        if instance_id is not None:
+            sse_payload["instance_id"] = instance_id
 
     session_stream.publish(session_id, sse_payload)
 
@@ -3847,6 +3851,9 @@ def _publish_elicitation_resolved(
         verdict is present — a verdict and a no-verdict reason are
         mutually exclusive on the wire.
     """
+    from omnigent.server.terminal_agent_access import release_terminal_access_request
+
+    release_terminal_access_request(session_id, elicitation_id)
     payload: dict[str, Any] = {
         "type": "response.elicitation_resolved",
         "elicitation_id": elicitation_id,
@@ -6848,7 +6855,7 @@ async def _validate_session_workspace(
         ``"alice@example.com"``, or ``None`` when auth is disabled.
     :param host_id: Stable host id, e.g. ``"host_a1b2c3d4..."``.
     :param workspace: Absolute path supplied by the caller, e.g.
-        ``"/Users/corey/universe/src/foo"``. ``None`` is rejected
+        ``"/opt/work/universe/src/foo"``. ``None`` is rejected
         with the "workspace required when host_id is set" message.
     :param agent: The agent the session binds to. Used to load the
         bundle and read ``os_env.cwd`` for boundary computation.
@@ -6859,7 +6866,7 @@ async def _validate_session_workspace(
         carries the host registry and host store.
     :returns: The canonicalized workspace path that should be
         stored on the session row, e.g.
-        ``"/Users/corey/universe/src/foo"`` (realpath; symlinks
+        ``"/opt/work/universe/src/foo"`` (realpath; symlinks
         already resolved by the host).
     :raises OmnigentError: With ``ErrorCode.INVALID_INPUT`` on
         any validation failure (offline host, missing path,
@@ -11053,7 +11060,7 @@ async def _create_session_worktree(
     :param host_id: Target host id, e.g. ``"host_a1b2c3d4..."``.
         Required (worktree creation needs a host).
     :param source_repo: Canonical path of the picked source repo (the
-        boundary-validated workspace), e.g. ``"/Users/alice/myrepo"``.
+        boundary-validated workspace), e.g. ``"/opt/work/myrepo"``.
         ``None`` is a programming error and fails loud.
     :param git: Validated git options (``branch_name``, optional
         ``base_branch``).
@@ -11139,7 +11146,7 @@ async def _canonical_worktree_path(
     :param host_id: Host that created the worktree, e.g.
         ``"host_a1b2c3d4..."``.
     :param worktree_path: Raw path the host returned, e.g.
-        ``"/Users/alice/myrepo-worktrees/feature-login"``.
+        ``"/opt/work/myrepo-worktrees/feature-login"``.
     :param request: FastAPI request carrying the host registry.
     :returns: The canonical path the host reports.
     :raises OmnigentError: ``INVALID_INPUT`` when the host rejects the
@@ -11428,7 +11435,7 @@ async def _remove_session_worktree_best_effort(
     :param host_id: Host that owns the worktree, e.g.
         ``"host_a1b2c3d4..."``.
     :param worktree_path: Absolute worktree directory to remove on the
-        host, e.g. ``"/Users/alice/myrepo-worktrees/feature-login"``.
+        host, e.g. ``"/opt/work/myrepo-worktrees/feature-login"``.
     :param branch: Branch checked out in the worktree, e.g.
         ``"feature/login"``.
     :param delete_branch: When ``True``, also run ``git branch -D``
@@ -13335,7 +13342,7 @@ class Placement(NamedTuple):
     :param host_id: Host that owns the session's working directory, e.g.
         ``"host_a1b2c3d4"``. ``None`` when neither the session nor any
         ancestor carries one.
-    :param cwd: Absolute working directory, e.g. ``"/Users/u/project"``.
+    :param cwd: Absolute working directory, e.g. ``"/opt/work/project"``.
         ``None`` when neither the session nor any ancestor carries one.
     :param git_branch: Branch checked out in :attr:`cwd`'s row. ``None``
         when that row recorded no branch.

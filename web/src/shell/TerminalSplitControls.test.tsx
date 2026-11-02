@@ -1,5 +1,9 @@
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 
+vi.mock("@/hooks/useSessionTerminalAccess", () => ({
+  useSessionTerminalAccess: () => ({ canCreateElevated: false }),
+}));
+
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";

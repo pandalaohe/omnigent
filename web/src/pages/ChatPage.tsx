@@ -3407,7 +3407,7 @@ function ComposerImpl(
   } = useComposerAttachments({
     limits: serverInfo !== "loading" ? serverInfo.attachment_limits : undefined,
     onAccepted: (accepted) => {
-      // MOD-s10: the hook calls this before it commits the append, so
+      // Fork mod: the hook calls this before it commits the append, so
       // filesRef still holds the prior list — label the batch against it and
       // drop one `[image N]` / `[file N]` token per file into the active field.
       assignLabels(accepted, filesRef.current);
@@ -4260,7 +4260,7 @@ function ComposerImpl(
   }, []);
   const isDragActive = useFileDropTarget(dropTarget, addFiles);
 
-  // MOD-s10: a removed attachment takes its composer tokens with it; the
+  // Fork mod: a removed attachment takes its composer tokens with it; the
   // hook then drops the file, clears the notice and marks the draft dirty.
   const removeFile = (index: number) => {
     for (const edit of removeFileTokens(draft, index, files)) editText(edit.fieldId, edit.text);

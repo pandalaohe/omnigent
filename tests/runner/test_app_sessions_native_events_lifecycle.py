@@ -4475,6 +4475,7 @@ async def test_required_terminal_exit_publishes_deleted_and_failed(
         "type": "session.resource.deleted",
         "resource_id": "terminal_worker_main",
         "resource_type": "terminal",
+        "instance_id": instance.diagnostic_id,
         "session_id": conv_id,
     } in queued_events
     failed_events = [
@@ -4699,6 +4700,7 @@ async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path:
             "type": "session.resource.deleted",
             "resource_id": "terminal_worker_main",
             "resource_type": "terminal",
+            "instance_id": instance.diagnostic_id,
             "session_id": conv_id,
         }
         queued_events = _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
@@ -4772,6 +4774,7 @@ async def test_auxiliary_codex_tui_exit_preserves_app_server(
         "type": "session.resource.deleted",
         "resource_id": "terminal_codex_main",
         "resource_type": "terminal",
+        "instance_id": None,
         "session_id": conv_id,
     } in events
     assert not [event for event in events if event.get("type") == "session.status"]
@@ -4844,6 +4847,7 @@ async def test_required_terminal_clean_quit_publishes_idle_not_failed(
         "type": "session.resource.deleted",
         "resource_id": f"terminal_{terminal_name}_main",
         "resource_type": "terminal",
+        "instance_id": None,
         "session_id": conv_id,
     } in queued_events
     assert {"type": "session.status", "status": "idle"} in queued_events
@@ -4981,6 +4985,7 @@ async def test_required_terminal_voluntary_exit_publishes_idle_not_failed() -> N
         "type": "session.resource.deleted",
         "resource_id": "terminal_claude_main",
         "resource_type": "terminal",
+        "instance_id": None,
         "session_id": conv_id,
     } in queued_events
     assert {"type": "session.status", "status": "idle"} in queued_events
@@ -5056,6 +5061,7 @@ async def test_required_terminal_exit_during_shutdown_does_not_fail_session(
         "type": "session.resource.deleted",
         "resource_id": "terminal_claude_main",
         "resource_type": "terminal",
+        "instance_id": None,
         "session_id": conv_id,
     } in queued_events
     # No spurious failure card while the runner is shutting down.
@@ -5217,6 +5223,7 @@ async def test_external_idle_status_makes_required_terminal_exit_clean(tmp_path:
             "type": "session.resource.deleted",
             "resource_id": "terminal_kiro_main",
             "resource_type": "terminal",
+            "instance_id": instance.diagnostic_id,
             "session_id": conv_id,
         }
         queued_events = _drain_session_event_queue(_session_event_queues_ref.get(conv_id))

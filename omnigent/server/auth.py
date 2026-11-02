@@ -445,6 +445,11 @@ class AuthProvider(ABC):
         """Return the authenticated user ID, or ``None``."""
         ...
 
+    @property
+    def host_terminal_signing_secret(self) -> bytes | None:
+        """Key for persistent host-terminal bindings; external identity modes have none."""
+        return None
+
     def mint_runner_token(self, user_id: str, ttl_seconds: int) -> str | None:  # noqa: ARG002
         """
         Mint a short-lived bearer a managed-sandbox runner presents as *user_id*.
@@ -708,7 +713,46 @@ class UnifiedAuthProvider(AuthProvider):
             ttl_seconds,
             self._source,
             account_generation=account_generation(user_id),
+            purpose="runner",
         )
+
+    @property
+    def browser_session_origin(self) -> str | None:
+        """Configured public origin for cookie-authenticated browser actions."""
+        from urllib.parse import urlsplit
+
+        config = self._oidc_config if self._source == "oidc" else self._accounts_config
+        if config is None:
+            return None
+        parts = urlsplit(config.base_url)
+        return f"{parts.scheme}://{parts.netloc}"
+
+    def browser_session_user_id(self, request: HTTPConnection) -> str | None:
+        """Validate an explicitly browser-issued cookie, including live account checks."""
+        import jwt
+
+        if self._source not in ("oidc", "accounts"):
+            return None
+        config = self._oidc_config if self._source == "oidc" else self._accounts_config
+        if config is None or not (token := request.cookies.get(config.session_cookie_name)):
+            return None
+        try:
+            claims = jwt.decode(token, config.cookie_secret, algorithms=["HS256"])
+        except jwt.InvalidTokenError:
+            return None
+        if (
+            claims.get("browser_session") is not True
+            or "scope" in claims
+            or "grant_id" in claims
+            or claims.get("purpose") == "runner"
+        ):
+            return None
+        return self.get_user_id(request)
+
+    @property
+    def host_terminal_signing_secret(self) -> bytes | None:
+        config = self._oidc_config if self._source == "oidc" else self._accounts_config
+        return config.cookie_secret if self._source in {"oidc", "accounts"} and config else None
 
     def _check_cookie(self, request: HTTPConnection) -> str | None:
         """Validate the session cookie or Bearer token and return the

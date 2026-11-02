@@ -31,7 +31,7 @@ def test_pi_inherits_native_defaults() -> None:
     result = _resolve(
         explicit={"agent_id": "pi-agent"},
         explicit_fields={"agent_id"},
-        master={"HDS": {"pi-native": {"model": "omnigent/kimi-k2", "effort": "high"}}},
+        master={"workstation": {"pi-native": {"model": "omnigent/kimi-k2", "effort": "high"}}},
     )
     assert (result.model, result.effort) == ("omnigent/kimi-k2", "high")
     assert result.sources["model"] == "master_native"
@@ -44,7 +44,7 @@ def _resolve(
     explicit_fields: set[str] | None = None,
     project_config: dict | None = None,
     master: dict | None = None,
-    host_id: str = "HDS",
+    host_id: str = "workstation",
 ):
     return resolve_calling(
         explicit=explicit if explicit is not None else {},
@@ -69,7 +69,7 @@ def test_explicit_values_win_per_field() -> None:
     """Scenario 3: an explicit model keeps the project's effort."""
     project = {
         "calling_defaults": {
-            "HDS": {"harnesses": {"codex": {"model": "gpt-6-sol", "effort": "high"}}}
+            "workstation": {"harnesses": {"codex": {"model": "gpt-6-sol", "effort": "high"}}}
         }
     }
     result = _resolve(
@@ -94,7 +94,7 @@ def test_explicit_none_is_kept() -> None:
     """Scenario 4: an explicit null effort stays unset despite a project default."""
     project = {
         "calling_defaults": {
-            "HDS": {"harnesses": {"codex": {"model": "gpt-6-sol", "effort": "high"}}}
+            "workstation": {"harnesses": {"codex": {"model": "gpt-6-sol", "effort": "high"}}}
         }
     }
     result = _resolve(
@@ -112,7 +112,9 @@ def test_explicit_speed_wins_over_project_default(speed: str | None) -> None:
     result = _resolve(
         explicit={"agent_id": "codex-sdk", "speed": speed},
         explicit_fields={"agent_id", "speed"},
-        project_config={"calling_defaults": {"HDS": {"harnesses": {"codex": {"speed": "fast"}}}}},
+        project_config={
+            "calling_defaults": {"workstation": {"harnesses": {"codex": {"speed": "fast"}}}}
+        },
     )
     assert result.speed == speed
     assert result.sources["speed"] == "explicit"
@@ -124,9 +126,9 @@ def test_full_project_permission_resolves_before_master(harness: str) -> None:
         explicit={"harness_override": harness},
         explicit_fields={"harness_override"},
         project_config={
-            "calling_defaults": {"HDS": {"harnesses": {harness: {"permission": "full"}}}}
+            "calling_defaults": {"workstation": {"harnesses": {harness: {"permission": "full"}}}}
         },
-        master={"HDS": {harness: {"permission": "ask"}}},
+        master={"workstation": {harness: {"permission": "ask"}}},
     )
     assert result.permission == "full"
     assert result.sources["permission"] == "project_host"
@@ -134,7 +136,7 @@ def test_full_project_permission_resolves_before_master(harness: str) -> None:
 
 def test_sdk_harness_inherits_master_native() -> None:
     """Scenario 5: an unset SDK harness falls back to its native sibling."""
-    master = {"HDS": {"codex-native": {"model": "gpt-6-astra", "effort": "medium"}}}
+    master = {"workstation": {"codex-native": {"model": "gpt-6-astra", "effort": "medium"}}}
     result = _resolve(
         explicit={"agent_id": "codex-sdk"},
         explicit_fields={"agent_id"},
@@ -150,9 +152,11 @@ def test_sdk_harness_inherits_master_native() -> None:
 def test_master_sdk_entry_beats_project_native_fallback() -> None:
     """Scenario 6: the pinned order checks the master SDK row before the native."""
     project = {
-        "calling_defaults": {"HDS": {"harnesses": {"codex-native": {"model": "gpt-6-sol"}}}}
+        "calling_defaults": {
+            "workstation": {"harnesses": {"codex-native": {"model": "gpt-6-sol"}}}
+        }
     }
-    master = {"HDS": {"codex": {"model": "gpt-5.5"}}}
+    master = {"workstation": {"codex": {"model": "gpt-5.5"}}}
     result = _resolve(
         explicit={"agent_id": "codex-sdk"},
         explicit_fields={"agent_id"},
@@ -166,9 +170,11 @@ def test_master_sdk_entry_beats_project_native_fallback() -> None:
 def test_project_native_entry_beats_master_native() -> None:
     """The project native fallback sits above the master native fallback."""
     project = {
-        "calling_defaults": {"HDS": {"harnesses": {"codex-native": {"model": "project-native"}}}}
+        "calling_defaults": {
+            "workstation": {"harnesses": {"codex-native": {"model": "project-native"}}}
+        }
     }
-    master = {"HDS": {"codex-native": {"model": "master-native"}}}
+    master = {"workstation": {"codex-native": {"model": "master-native"}}}
     result = _resolve(
         explicit={"agent_id": "codex-sdk"},
         explicit_fields={"agent_id"},
@@ -200,7 +206,7 @@ def test_no_defaults_anywhere() -> None:
 
 def test_projectless_uses_master_layers_only() -> None:
     """D29: no project keeps the master entry and its native fallback."""
-    master = {"HDS": {"codex-native": {"model": "gpt-6-astra"}}}
+    master = {"workstation": {"codex-native": {"model": "gpt-6-astra"}}}
     result = _resolve(
         explicit={"agent_id": "codex-sdk"},
         explicit_fields={"agent_id"},
@@ -213,8 +219,8 @@ def test_projectless_uses_master_layers_only() -> None:
 
 def test_fields_resolve_independently() -> None:
     """A project effort and a master model resolve in one pass."""
-    project = {"calling_defaults": {"HDS": {"harnesses": {"codex": {"effort": "high"}}}}}
-    master = {"HDS": {"codex": {"model": "gpt-5.5"}}}
+    project = {"calling_defaults": {"workstation": {"harnesses": {"codex": {"effort": "high"}}}}}
+    master = {"workstation": {"codex": {"model": "gpt-5.5"}}}
     result = _resolve(
         explicit={"agent_id": "codex-sdk"},
         explicit_fields={"agent_id"},
@@ -229,14 +235,14 @@ def test_fields_resolve_independently() -> None:
 
 def test_other_host_entries_do_not_apply() -> None:
     """Project and master entries are keyed by host id."""
-    project = {"calling_defaults": {"TMB": {"harnesses": {"codex": {"model": "gpt-6-sol"}}}}}
-    master = {"TMB": {"codex": {"model": "gpt-5.5"}}}
+    project = {"calling_defaults": {"laptop": {"harnesses": {"codex": {"model": "gpt-6-sol"}}}}}
+    master = {"laptop": {"codex": {"model": "gpt-5.5"}}}
     result = _resolve(
         explicit={"agent_id": "codex-sdk"},
         explicit_fields={"agent_id"},
         project_config=project,
         master=master,
-        host_id="HDS",
+        host_id="workstation",
     )
     assert result.model is None
     assert result.sources["model"] == "none"
@@ -246,7 +252,7 @@ def test_agent_resolution_prefers_project_host_then_legacy() -> None:
     """The agent chain is per-host default, legacy config, then none."""
     project = {
         "agent_id": "legacy-agent",
-        "calling_defaults": {"HDS": {"agent_id": "codex-sdk"}},
+        "calling_defaults": {"workstation": {"agent_id": "codex-sdk"}},
     }
     per_host = _resolve(project_config=project)
     assert per_host.agent_id == "codex-sdk"
@@ -286,8 +292,8 @@ def test_legacy_model_applies_only_to_the_legacy_agent() -> None:
 
 def test_blank_stored_values_fall_through() -> None:
     """Blank project / master values count as absent."""
-    project = {"calling_defaults": {"HDS": {"harnesses": {"codex": {"model": "   "}}}}}
-    master = {"HDS": {"codex": {"model": "gpt-5.5"}}}
+    project = {"calling_defaults": {"workstation": {"harnesses": {"codex": {"model": "   "}}}}}
+    master = {"workstation": {"codex": {"model": "gpt-5.5"}}}
     result = _resolve(
         explicit={"agent_id": "codex-sdk"},
         explicit_fields={"agent_id"},
@@ -297,7 +303,7 @@ def test_blank_stored_values_fall_through() -> None:
     assert result.model == "gpt-5.5"
     assert result.sources["model"] == "master"
 
-    project = {"agent_id": "legacy-agent", "calling_defaults": {"HDS": {"agent_id": ""}}}
+    project = {"agent_id": "legacy-agent", "calling_defaults": {"workstation": {"agent_id": ""}}}
     result = _resolve(project_config=project)
     assert result.agent_id == "legacy-agent"
     assert result.sources["agent"] == "project_legacy"
@@ -311,7 +317,7 @@ def test_check_offered_flags_a_default_model_missing_from_the_catalog() -> None:
         effort=None,
         catalog=_catalog([{"id": "gpt-5.5"}]),
         sources={"model": "project_host", "effort": "none"},
-        host_id="HDS",
+        host_id="workstation",
         project_name="P",
     )
     assert problems == [
@@ -320,7 +326,7 @@ def test_check_offered_flags_a_default_model_missing_from_the_catalog() -> None:
             "setting": "project_host",
             "message": (
                 "Default model 'gpt-6-sol' from project 'P' host settings is not offered "
-                "by host 'HDS' (codex, last sync 2023-11-14 22:13 UTC). "
+                "by host 'workstation' (codex, last sync 2023-11-14 22:13 UTC). "
                 "Change the setting, pass model, or run Sync models (Settings › "
                 "Calling defaults) if the host offers it now."
             ),
@@ -336,10 +342,10 @@ def test_check_offered_names_the_master_table() -> None:
         effort=None,
         catalog=_catalog([{"id": "gpt-5.5"}]),
         sources={"model": "master", "effort": "none"},
-        host_id="HDS",
+        host_id="workstation",
     )
     assert problem["setting"] == "master"
-    assert "from the master table is not offered by host 'HDS'" in problem["message"]
+    assert "from the master table is not offered by host 'workstation'" in problem["message"]
 
     (legacy,) = check_offered(
         harness="codex",
@@ -347,11 +353,13 @@ def test_check_offered_names_the_master_table() -> None:
         effort=None,
         catalog=_catalog([{"id": "gpt-5.5"}]),
         sources={"model": "project_legacy", "effort": "none"},
-        host_id="HDS",
+        host_id="workstation",
         project_name="P",
     )
     assert legacy["setting"] == "project_legacy"
-    assert "from project 'P' All hosts row is not offered by host 'HDS'" in legacy["message"]
+    assert (
+        "from project 'P' All hosts row is not offered by host 'workstation'" in legacy["message"]
+    )
 
 
 def test_check_offered_speed_uses_selected_or_default_model_tiers() -> None:
@@ -368,7 +376,7 @@ def test_check_offered_speed_uses_selected_or_default_model_tiers() -> None:
         "effort": None,
         "catalog": _catalog(rows),
         "sources": {"model": "none", "effort": "none", "speed": "master"},
-        "host_id": "HDS",
+        "host_id": "workstation",
     }
     assert check_offered(model=None, speed="fast", **base) == []
     assert [p["field"] for p in check_offered(model=None, speed="ultrafast", **base)] == ["speed"]
@@ -383,7 +391,7 @@ def test_check_offered_flags_an_unoffered_default_effort() -> None:
         effort="high",
         catalog=_catalog([{"id": "gpt-6-sol", "supportedReasoningEfforts": ["low", "medium"]}]),
         sources={"model": "project_host", "effort": "project_host"},
-        host_id="HDS",
+        host_id="workstation",
         project_name="P",
     )
     assert len(problems) == 1
@@ -403,7 +411,7 @@ def test_check_offered_skips_a_stale_or_empty_catalog() -> None:
             effort="high",
             catalog=stale,
             sources=sources,
-            host_id="HDS",
+            host_id="workstation",
         )
         == []
     )
@@ -414,7 +422,7 @@ def test_check_offered_skips_a_stale_or_empty_catalog() -> None:
             effort="high",
             catalog=_catalog([]),
             sources=sources,
-            host_id="HDS",
+            host_id="workstation",
         )
         == []
     )
@@ -425,7 +433,7 @@ def test_check_offered_skips_a_stale_or_empty_catalog() -> None:
             effort="high",
             catalog=None,
             sources=sources,
-            host_id="HDS",
+            host_id="workstation",
         )
         == []
     )
@@ -441,7 +449,7 @@ def test_check_offered_accepts_effort_option_objects_and_uses_the_ladder() -> No
             effort="high",
             catalog=_catalog(objects),
             sources={"model": "master", "effort": "master"},
-            host_id="HDS",
+            host_id="workstation",
         )
         == []
     )
@@ -454,7 +462,7 @@ def test_check_offered_accepts_effort_option_objects_and_uses_the_ladder() -> No
             effort="ultra",
             catalog=_catalog(bare),
             sources={"model": "master_native", "effort": "master_native"},
-            host_id="HDS",
+            host_id="workstation",
         )
         == []
     )
@@ -464,7 +472,7 @@ def test_check_offered_accepts_effort_option_objects_and_uses_the_ladder() -> No
         effort="ultra",
         catalog=_catalog([{"id": "claude-opus-4-8"}]),
         sources={"model": "master", "effort": "master"},
-        host_id="HDS",
+        host_id="workstation",
     )
     assert [problem["field"] for problem in problems] == ["effort"]
 
@@ -478,7 +486,7 @@ def test_check_offered_ignores_explicit_sources() -> None:
             effort="high",
             catalog=_catalog([{"id": "gpt-5.5"}]),
             sources={"model": "explicit", "effort": "explicit"},
-            host_id="HDS",
+            host_id="workstation",
         )
         == []
     )
@@ -487,11 +495,11 @@ def test_check_offered_ignores_explicit_sources() -> None:
 def test_validate_project_calling_defaults_accepts_and_copies_the_shape() -> None:
     """A full valid shape round-trips unchanged."""
     value = {
-        "HDS": {
+        "workstation": {
             "agent_id": "codex-sdk",
             "harnesses": {"codex": {"model": "gpt-6-sol", "effort": "high"}},
         },
-        "TMB": {},
+        "laptop": {},
     }
     assert validate_project_calling_defaults(value) == value
 
@@ -500,15 +508,15 @@ def test_validate_project_calling_defaults_accepts_and_copies_the_shape() -> Non
     "value",
     [
         [],
-        {"HDS": []},
-        {"HDS": {"agent_id": 5}},
-        {"HDS": {"unknown": True}},
-        {"HDS": {"harnesses": []}},
-        {"HDS": {"harnesses": {"codex": {"model": 5}}}},
-        {"HDS": {"harnesses": {"codex": {"model": "gpt 6"}}}},
-        {"HDS": {"harnesses": {"codex": {"model": ""}}}},
-        {"HDS": {"harnesses": {"codex": {"effort": "bogus"}}}},
-        {"HDS": {"harnesses": {"codex": {"unknown": "x"}}}},
+        {"workstation": []},
+        {"workstation": {"agent_id": 5}},
+        {"workstation": {"unknown": True}},
+        {"workstation": {"harnesses": []}},
+        {"workstation": {"harnesses": {"codex": {"model": 5}}}},
+        {"workstation": {"harnesses": {"codex": {"model": "gpt 6"}}}},
+        {"workstation": {"harnesses": {"codex": {"model": ""}}}},
+        {"workstation": {"harnesses": {"codex": {"effort": "bogus"}}}},
+        {"workstation": {"harnesses": {"codex": {"unknown": "x"}}}},
     ],
 )
 def test_validate_project_calling_defaults_rejects_bad_shapes(value: object) -> None:
@@ -529,7 +537,7 @@ class _RaisingStore:
 async def test_load_master_reads_the_namespace_and_defaults_on_gaps(db_uri: str) -> None:
     """load_master returns the namespace dict and {} on every gap."""
     store = SqlAlchemyUserPreferencesStore(db_uri)
-    master = {"HDS": {"codex": {"model": "gpt-6-sol", "effort": "high"}}}
+    master = {"workstation": {"codex": {"model": "gpt-6-sol", "effort": "high"}}}
     store.patch_namespace("alice@example.com", "calling_defaults", master)
     assert await load_master("alice@example.com", store) == master
 
@@ -560,8 +568,8 @@ def test_session_modes_follow_harness_chain(field: str, value: str, layer: str) 
     result = _resolve(
         explicit={"agent_id": "codex-sdk"},
         explicit_fields={"agent_id"},
-        project_config={"calling_defaults": {"HDS": {"harnesses": project_harnesses}}},
-        master={"HDS": master_harnesses},
+        project_config={"calling_defaults": {"workstation": {"harnesses": project_harnesses}}},
+        master={"workstation": master_harnesses},
     )
     assert getattr(result, field) == value
     assert result.sources[field] == layer
@@ -572,16 +580,16 @@ def test_session_modes_resolve_independently_and_filter_harness_vocabulary() -> 
         explicit={"agent_id": "codex-sdk"},
         explicit_fields={"agent_id"},
         project_config={
-            "calling_defaults": {"HDS": {"harnesses": {"codex": {"speed": "standard"}}}}
+            "calling_defaults": {"workstation": {"harnesses": {"codex": {"speed": "standard"}}}}
         },
-        master={"HDS": {"codex": {"speed": "fast", "permission": "read-only"}}},
+        master={"workstation": {"codex": {"speed": "fast", "permission": "read-only"}}},
     )
     assert (result.speed, result.permission) == ("standard", "read-only")
     result = _resolve(
         explicit={"agent_id": "claude-agent"},
         explicit_fields={"agent_id"},
         master={
-            "HDS": {
+            "workstation": {
                 "claude-sdk": {"speed": "fast", "permission": "read-only"},
                 "claude-native": {"permission": "plan"},
             }
@@ -598,7 +606,7 @@ def test_session_modes_use_the_canonical_override_harness() -> None:
     result = _resolve(
         explicit={"agent_id": "codex-sdk", "harness_override": "claude"},
         explicit_fields={"agent_id", "harness_override"},
-        master={"HDS": {"claude-sdk": {"permission": "plan", "model": "sonnet"}}},
+        master={"workstation": {"claude-sdk": {"permission": "plan", "model": "sonnet"}}},
     )
     assert result.harness == "claude"
     assert result.permission == "plan"
@@ -615,7 +623,9 @@ def test_session_modes_fall_back_to_the_agent_harness_for_a_null_override(
     result = _resolve(
         explicit={"agent_id": "codex-sdk", "harness_override": override},
         explicit_fields={"agent_id", "harness_override"},
-        master={"HDS": {"codex": {"speed": "fast", "permission": "read-only", "model": "gpt"}}},
+        master={
+            "workstation": {"codex": {"speed": "fast", "permission": "read-only", "model": "gpt"}}
+        },
     )
     assert (result.speed, result.permission) == ("fast", "read-only")
     assert (result.sources["speed"], result.sources["permission"]) == ("master", "master")
@@ -626,7 +636,7 @@ def test_session_modes_fall_back_to_the_agent_harness_for_a_null_override(
     result = _resolve(
         explicit={"harness_override": override},
         explicit_fields={"harness_override"},
-        master={"HDS": {"codex": {"speed": "fast"}}},
+        master={"workstation": {"codex": {"speed": "fast"}}},
     )
     assert result.speed is None
 
@@ -656,7 +666,7 @@ def test_session_modes_fall_back_to_the_agent_harness_for_a_null_override(
     ],
 )
 def test_validate_session_default_modes(harness: str, field: str, value: str) -> None:
-    defaults = {"HDS": {"harnesses": {harness: {field: value}}}}
+    defaults = {"workstation": {"harnesses": {harness: {field: value}}}}
     assert validate_project_calling_defaults(defaults) == defaults
 
 
@@ -676,4 +686,6 @@ def test_validate_session_default_modes_rejects_wrong_vocabulary(
     harness: str, field: str, value: object
 ) -> None:
     with pytest.raises(OmnigentError, match=field):
-        validate_project_calling_defaults({"HDS": {"harnesses": {harness: {field: value}}}})
+        validate_project_calling_defaults(
+            {"workstation": {"harnesses": {harness: {field: value}}}}
+        )

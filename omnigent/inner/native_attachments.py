@@ -36,6 +36,7 @@ from typing import IO, Any, Literal
 import httpx
 
 from omnigent.debug_logging import debug_event
+from omnigent.native import native_bridge_common
 from omnigent.process_logging import data_dir
 
 _logger = logging.getLogger(__name__)
@@ -292,6 +293,11 @@ def _data_uri_mime(data_uri: object) -> str | None:
         return None
 
 
+def attachments_root() -> Path:
+    """Return the host directory holding every attachment cache and session dir."""
+    return data_dir().resolve() / "attachments"
+
+
 def attachment_cache_dir(bridge_dir: Path) -> Path:
     """Return the local attachment cache for a native session's bridge.
 
@@ -299,7 +305,7 @@ def attachment_cache_dir(bridge_dir: Path) -> Path:
     All harnesses share ``~/.omnigent/attachments/`` (or ``OMNIGENT_DATA_DIR``).
     """
     key = hashlib.sha256(os.fsencode(bridge_dir.resolve())).hexdigest()[:32]
-    return data_dir().resolve() / "attachments" / key
+    return attachments_root() / key
 
 
 def session_attachment_dir(session_id: str) -> Path:
@@ -309,7 +315,7 @@ def session_attachment_dir(session_id: str) -> Path:
     every host that runs the session; files live under ``<file_id>/<name>``.
     """
     digest = hashlib.sha256(session_id.encode()).hexdigest()[:32]
-    return data_dir().resolve() / "attachments" / f"s-{digest}"
+    return attachments_root() / f"s-{digest}"
 
 
 # One "[Attached: <path>]" line whose path ends in the per-session layout
@@ -412,6 +418,17 @@ def materialize_attachment(block: Mapping[str, object], bridge_dir: Path) -> Pat
         return None
 
     attachments_dir = attachment_cache_dir(bridge_dir)
+    try:
+        # Held while placing, so the expired-cache sweep cannot remove the dir mid-write.
+        with native_bridge_common.attachment_dir_lock(attachments_dir):
+            return _materialize_into_cache(attachments_dir, filename, raw_bytes)
+    except OSError:
+        _logger.warning("Refusing to materialize into %s", attachments_dir, exc_info=True)
+        return None
+
+
+def _materialize_into_cache(attachments_dir: Path, filename: str, raw_bytes: bytes) -> Path | None:
+    """Place decoded bytes in *attachments_dir*, reusing an identical file there."""
     if not _dir_fd_supported():
         return _materialize_attachment_by_path(attachments_dir, filename, raw_bytes)
     try:
@@ -497,6 +514,9 @@ def _materialize_attachment_by_path(
                         # A reused file must not stay executable; if the bits
                         # can't be cleared, fall through to the collision name.
                         continue
+                    # Reuse is activity for the expired-cache sweep.
+                    with contextlib.suppress(OSError):
+                        os.utime(target)
                     return target
             continue
         temp_path = attachments_dir / f"{name}.{uuid.uuid4().hex}.tmp"
@@ -680,6 +700,9 @@ async def _materialize_file_reference_no_follow(
                 _logger.warning("Refusing to write through %s", target_dir / local_name)
                 return None
             if info.st_size == expected_bytes:
+                # Reuse is activity for the expired-cache sweep.
+                with contextlib.suppress(OSError):
+                    os.utime(local_name, dir_fd=target_fd, follow_symlinks=False)
                 return target_dir / local_name
 
         temp_name = f"{local_name}.{uuid.uuid4().hex}.tmp"
@@ -785,6 +808,9 @@ async def _materialize_file_reference_by_path(
             _logger.warning("Refusing to write through %s", target)
             return None
         if info.st_size == expected_bytes:
+            # Reuse is activity for the expired-cache sweep.
+            with contextlib.suppress(OSError):
+                os.utime(target)
             return target
 
     temp_path = target_dir / f"{local_name}.{uuid.uuid4().hex}.tmp"
@@ -836,8 +862,8 @@ async def restore_session_attachments(
     """
     Re-materialize every by-path file a session owns on this host.
 
-    The deterministic host copies can be removed by cleanup on another host
-    (or on this one after a CLI release); a transcript that still references
+    The deterministic host copies may be absent (written on another host, or
+    retired after the orphan retention); a transcript that still references
     them needs the files back before the harness resumes. The session file
     listing supplies the by-path rows; a file whose size still matches is
     reused without fetching. Rows the archive cleanup purged (``done``) are
@@ -994,6 +1020,9 @@ def _place_no_follow(
             # A reused file must not stay executable; if the bits can't be
             # cleared, fall through to the collision name instead.
             return "taken"
+        # Reuse is activity for the expired-cache sweep.
+        with contextlib.suppress(OSError):
+            os.utime(fd)
         return "placed"
     finally:
         os.close(fd)

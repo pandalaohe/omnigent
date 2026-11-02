@@ -219,6 +219,7 @@ def _fail_pending_folder_facts(conn: HostConnection) -> None:
 def _fail_pending_worktrees(conn: HostConnection) -> None:
     """Fail worktree requests as soon as their host disappears."""
     for pending in (
+        conn.pending_restarts,
         conn.pending_create_worktrees,
         conn.pending_remove_worktrees,
         conn.pending_list_worktrees,
@@ -401,6 +402,7 @@ class HostLaunchResult(TypedDict, total=False):
     error: str | None
     error_code: str | None
     workspace_recreated: bool
+    exists: str | None
 
 
 @dataclass
@@ -619,6 +621,7 @@ class HostConnection:
     pending_harness_startup: dict[str, asyncio.Future[HarnessStartup | None]] = field(
         default_factory=dict
     )
+    pending_restarts: dict[str, asyncio.Future[Any]] = field(default_factory=dict)
     pending_plugins: dict[str, asyncio.Future[HostPluginsResultFrame]] = field(
         default_factory=dict
     )
@@ -665,6 +668,9 @@ class HostRegistry:
 
     def __init__(self) -> None:
         """Initialize an empty host registry."""
+        from omnigent.server.host_restart import HostRestarts
+
+        self.restarts = HostRestarts(self)
         self._lock = threading.RLock()
         # Keyed by (workspace_id, host_id) to mirror the hosts-table PK:
         # one stable host_id can be live in more than one workspace.
@@ -680,6 +686,7 @@ class HostRegistry:
         # server re-learns it from the reconnect handshake.
         self._gateway_inference: dict[str, dict[str, bool]] = {}
         self._interactive_shells: dict[str, list[str]] = {}
+        self._terminal_runners: dict[tuple[int, str], str] = {}
         self.launch_authorizer: (
             Callable[[str, str, str | None, str | None, bool, str | None], None] | None
         ) = None
@@ -789,6 +796,7 @@ class HostRegistry:
                 )
             else:
                 self._interactive_shells.pop(host_id, None)
+        self.restarts.connected(conn)
         return conn
 
     def deregister(
@@ -823,6 +831,7 @@ class HostRegistry:
         # Without this the route handler's loops keep running and its ping loop
         # keeps the host row online, even though the host is now unreachable.
         removed.retirement_reason = "deregistered"
+        self.restarts.disconnected(removed)
         removed.outbound_queue.put_nowait(None)
         _fail_pending_imports(removed)
         _fail_pending_harness_startup(removed)
@@ -851,6 +860,27 @@ class HostRegistry:
             conn.last_frame_at = time.time()
             conn.last_frame_monotonic = time.monotonic()
             return True
+
+    def terminal_runner(self, host_id: str) -> str | None:
+        """Return the runner admitted by a verified terminal-purpose binding, never hello."""
+        with self._lock:
+            return self._terminal_runners.get(
+                (current_workspace_id(), _canonical_host_id(host_id))
+            )
+
+    def record_terminal_runner(self, host_id: str, runner_id: str) -> None:
+        key = (current_workspace_id(), _canonical_host_id(host_id))
+        with self._lock:
+            previous = self._terminal_runners.get(key)
+            if previous is not None and previous != runner_id:
+                raise ValueError("host already has a terminal runner")
+            self._terminal_runners[key] = runner_id
+
+    def forget_terminal_runner(self, host_id: str, runner_id: str) -> None:
+        key = (current_workspace_id(), _canonical_host_id(host_id))
+        with self._lock:
+            if self._terminal_runners.get(key) == runner_id:
+                self._terminal_runners.pop(key)
 
     def get(self, host_id: str, workspace_id: int | None = None) -> HostConnection | None:
         """Look up a live host connection.

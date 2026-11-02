@@ -36,7 +36,7 @@ async def test_interrupt_fences_startup_before_cancelling_canonical_input(
         client,
         {
             "host_id": _HOST_ID,
-            "workspace": "/Users/sample/project",
+            "workspace": "/opt/work/project",
         },
     )
     assert response.status_code == 201, response.text

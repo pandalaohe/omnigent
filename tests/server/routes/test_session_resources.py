@@ -390,6 +390,7 @@ class _FakeRunnerClient:
         # the caller sent no params — lets tests assert that a proxy
         # forwarded (or deliberately dropped) the incoming query string.
         self.get_params: list[dict[str, str] | None] = []
+        self.delete_params: list[dict[str, str] | None] = []
 
     def _make_response(
         self,
@@ -491,9 +492,12 @@ class _FakeRunnerClient:
         del json, timeout
         return self._make_response("PATCH", url)
 
-    async def delete(self, url: str, *, timeout: float | None = None) -> httpx.Response:
+    async def delete(
+        self, url: str, *, timeout: float | None = None, params: dict[str, str] | None = None
+    ) -> httpx.Response:
         """Record and return a DELETE response."""
         del timeout
+        self.delete_params.append(params)
         return self._make_response("DELETE", url)
 
 
@@ -1864,6 +1868,7 @@ async def test_delete_terminal_proxies_to_runner(
         "id": "terminal_bash_s1",
         "object": "session.resource.deleted",
         "deleted": True,
+        "metadata": {"instance_id": "instance-one", "elevated": False},
     }
     fake_runner = _FakeRunnerClient(payload=deletion)
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
@@ -1874,7 +1879,13 @@ async def test_delete_terminal_proxies_to_runner(
 
     assert resp.status_code == 200
     assert resp.json()["deleted"] is True
+    assert fake_runner.get_params == [{"include_stopped": "true"}]
+    assert fake_runner.delete_params == [{"instance_id": "instance-one"}]
     assert fake_runner.calls == [
+        (
+            "GET",
+            "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals/terminal_bash_s1",
+        ),
         (
             "DELETE",
             "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals/terminal_bash_s1",
@@ -2000,8 +2011,8 @@ async def test_transfer_terminal_authorizes_sessions_and_proxies_to_runner(
     source = conversation_store.get_conversation("79b22ebd2309e48fdeb450c65611d51b")
     assert source is not None
     source.host_id = "host_arca"
-    source.workspace = "/home/alice/workspace"
-    source.worktree = "/home/alice/workspace/entry/wt"
+    source.workspace = "/opt/work/workspace"
+    source.worktree = "/opt/work/workspace/entry/wt"
     source.git_branch = "feature/clear"
     terminal_resource = {
         "id": "terminal_bash_s1",
@@ -2043,8 +2054,8 @@ async def test_transfer_terminal_authorizes_sessions_and_proxies_to_runner(
     target = conversation_store.get_conversation("5d29bee4350489d66feafecfebd94a97")
     assert target is not None
     assert target.host_id == "host_arca"
-    assert target.workspace == "/home/alice/workspace"
-    assert target.worktree == "/home/alice/workspace/entry/wt"
+    assert target.workspace == "/opt/work/workspace"
+    assert target.worktree == "/opt/work/workspace/entry/wt"
     assert target.git_branch == "feature/clear"
 
 
@@ -4187,14 +4198,14 @@ async def test_filesystem_base_host_forwards_an_absolute_path(
 
     resp = await client.get(
         "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
-        "/filesystem/Users/me/reports?limit=1000&order=asc&base=host",
+        "/filesystem/opt/work/reports?limit=1000&order=asc&base=host",
     )
 
     assert resp.status_code == 200
     forwarded_url = fake_runner.calls[0][1]
     # The runner receives an absolute path: the leading slash re-added and
     # sent as %2F, interior slashes literal.
-    assert "/filesystem/%2FUsers/me/reports?" in forwarded_url
+    assert "/filesystem/%2Fopt/work/reports?" in forwarded_url
 
 
 @pytest.mark.asyncio
@@ -4213,12 +4224,12 @@ async def test_filesystem_bare_path_without_base_is_workspace_relative(
 
     resp = await client.get(
         "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
-        "/filesystem/Users/me/reports?limit=1000&order=asc",
+        "/filesystem/opt/work/reports?limit=1000&order=asc",
     )
 
     assert resp.status_code == 200
     forwarded_url = fake_runner.calls[0][1]
-    assert "/filesystem/Users/me/reports?" in forwarded_url
+    assert "/filesystem/opt/work/reports?" in forwarded_url
     assert "%2F" not in forwarded_url
 
 
@@ -6401,7 +6412,7 @@ async def test_claude_native_mirror_matches_text_behind_attachment_markers() -> 
         lost_user, _lost_error, matched_user = store.appended_items
         assert lost_user.data.content == [{"type": "input_text", "text": "lost"}]
         assert lost_user.data.user_authored is True
-        # MOD-s10 restores the pending entry's ordered content as the durable
+        # Fork mod: restores the pending entry's ordered content as the durable
         # item, so the marker-prefixed mirror text is not what was persisted.
         assert matched_user.data.content == [
             image,
@@ -9879,7 +9890,7 @@ async def test_relay_never_delivers_terminal_on_pty_status(
 # ── Offline (agent asleep) environment synthesis ──────────────────────────────
 
 _OFFLINE_SESSION = "b17c0a4f9d2e4c6a8f1b3d5e7a9c0b2d"
-_OFFLINE_WORKSPACE = "/Users/dev/project"
+_OFFLINE_WORKSPACE = "/opt/work/project"
 
 
 class _OfflineRunnerClient:
@@ -10135,9 +10146,9 @@ async def test_github_set_preference_falls_back_to_host_when_runner_offline(
     assert captured["params"] == {"account": "octocat", "remote": None}
 
 
-# ── GITROOT host-fallback: worktree ?? workspace (XHO04 batch C) ─────
+# ── GITROOT host-fallback: worktree ?? workspace ─────────────────────
 
-_OFFLINE_WORKTREE = "/Users/dev/project/.worktrees/app/feature-x"
+_OFFLINE_WORKTREE = "/opt/work/project/.worktrees/app/feature-x"
 
 
 @pytest.fixture

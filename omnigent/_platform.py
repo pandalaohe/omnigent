@@ -27,6 +27,8 @@ from pathlib import Path
 
 _logger = logging.getLogger(__name__)
 
+CLI_FALLBACK_DIRS_ENV_VAR = "OMNIGENT_CLI_FALLBACK_DIRS"
+
 
 # Common global install dirs for npm/homebrew CLIs, probed when a binary isn't
 # on ``PATH``. The host daemon snapshots ``PATH`` at spawn and never refreshes
@@ -38,7 +40,11 @@ def _cli_fallback_dirs() -> tuple[Path, ...]:
     Includes nvm's version-specific bin dirs (``~/.nvm/versions/node/*/bin``),
     where npm global installs land under nvm — the common driver of a CLI that
     a foreground shell sees but the daemon's frozen ``PATH`` doesn't.
+    ``OMNIGENT_CLI_FALLBACK_DIRS`` replaces this list with path-separated
+    directories; an empty value disables fallback discovery.
     """
+    if (override := os.environ.get(CLI_FALLBACK_DIRS_ENV_VAR)) is not None:
+        return tuple(Path(directory) for directory in override.split(os.pathsep) if directory)
     home = Path.home()
     dirs = [
         home / ".local" / "bin",

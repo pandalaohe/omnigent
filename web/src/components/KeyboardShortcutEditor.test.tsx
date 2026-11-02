@@ -168,6 +168,15 @@ describe("KeyboardShortcutEditor", () => {
     expect(within(row).getByText(/Focusing the workspace tabs/)).toBeTruthy();
   });
 
+  it("renders the secondary description on the Poll sessions row", () => {
+    render(<KeyboardShortcutEditor />);
+
+    const row = actionRow("Poll sessions");
+    expect(
+      within(row).getByText("Jumps to the next session waiting for your answer."),
+    ).toBeTruthy();
+  });
+
   it("refuses a Shift chord for the recent-sessions switcher", () => {
     render(<KeyboardShortcutEditor />);
 

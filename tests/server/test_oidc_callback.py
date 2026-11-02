@@ -291,6 +291,7 @@ def test_callback_verified_email_mints_session(
     # sub is the normalized (lowercased) verified email — proves the
     # decoded claim flowed all the way into the minted session.
     assert decoded["sub"] == "alice@example.com"
+    assert decoded["browser_session"] is True
 
 
 @pytest.mark.parametrize(

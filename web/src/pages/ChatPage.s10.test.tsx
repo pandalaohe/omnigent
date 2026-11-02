@@ -1,4 +1,4 @@
-// MOD-s10 fork tests: attachments live as visible `[image N]` / `[file N]`
+// Fork tests: attachments live as visible `[image N]` / `[file N]`
 // tokens in upstream's textarea, bind to files at send, and survive the
 // restore paths. Mounted the way the upstream composer tests mount it
 // (ChatPage.composer.test.tsx) so the assertions speak the same DOM.
@@ -190,7 +190,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe("MOD-s10 attachment tokens", () => {
+describe("attachment tokens", () => {
   it("inserts a token at the caret for a pasted file", () => {
     const file = img();
     renderComposer(<Composer {...composerProps()} />);

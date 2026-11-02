@@ -130,7 +130,7 @@ _MIGRATION_HARNESSES: dict[str, Literal["claude", "codex"]] = {
     "codex-native": "codex",
 }
 #: Reasons a cold / paused label may carry. ``pol`` and ``mom`` are legacy
-#: (SCC19) codes — never written any more, still parsed from old labels.
+#: (legacy) codes — never written any more, still parsed from old labels.
 _WHY_CODES = frozenset({"cap", "exp", "fail", "pol", "miss", "rev", "mom"})
 _BLOCKER_STATUS: dict[str, str] = {
     "i": "not_inspectable",
@@ -222,7 +222,7 @@ class _WarmState:
 
     :param s: Episode state.
     :param why: Reason for a cold / paused state — one of ``cap``, ``exp``,
-        ``fail``, ``miss``, ``rev`` (``pol`` / ``mom`` parse from SCC19
+        ``fail``, ``miss``, ``rev`` (``pol`` / ``mom`` parse from legacy
         labels but are never written).
     :param y: Model family (``claude`` / ``codex``), written on every label
         write so readers can derive the warm rule without a harness lookup.

@@ -122,6 +122,7 @@ from omnigent.tools.builtins.sys_terminal import (
     SysTerminalLaunchTool,
     SysTerminalListTool,
     SysTerminalReadTool,
+    SysTerminalRequestAccessTool,
     SysTerminalSendTool,
 )
 from omnigent.tools.builtins.timer import (
@@ -298,6 +299,7 @@ _TERMINAL_TOOLS = frozenset(
         SysTerminalReadTool.name(),
         SysTerminalListTool.name(),
         SysTerminalCloseTool.name(),
+        SysTerminalRequestAccessTool.name(),
     }
 )
 
@@ -325,6 +327,7 @@ _SESSION_CREATE_TOOLS = frozenset({"sys_session_create"})
 _CHILD_CAP_TOOLS = frozenset({"sys_child_cap"})
 _CHILD_CHECKIN_TOOLS = frozenset({"sys_child_checkin"})
 _HOST_LOAD_TOOLS = frozenset({"sys_host_load"})
+_HOST_RESTART_TOOLS = frozenset({"sys_host_restart"})
 
 # Both sys_session_create create shapes (JSON and config_path multipart)
 # carry the agent-origin marker: the server charges the owner's open-rate
@@ -615,6 +618,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _CHILD_CAP_TOOLS
     | _CHILD_CHECKIN_TOOLS
     | _HOST_LOAD_TOOLS
+    | _HOST_RESTART_TOOLS
     | _SESSION_OPEN_TOOLS
     | _TASK_LIFECYCLE_TOOLS
     | _AGENT_TOOLS
@@ -684,6 +688,7 @@ def build_native_relay_tool_schemas(
     peer_messaging_enabled: bool = False,
     session_open_enabled: bool = False,
     skill_registry: list[SkillSpec] | None = None,
+    terminal_access_requests_enabled: bool = False,
 ) -> list[_JsonObject]:
     """Build the flat Omnigent tool surface for native harness bridges.
 
@@ -753,6 +758,7 @@ def build_native_relay_tool_schemas(
             session_open_enabled=session_open_enabled,
             os_env_schema_only=True,
             skill_registry=skill_registry,
+            terminal_access_requests_enabled=terminal_access_requests_enabled,
         ).get_tool_schemas():
             function = _string_object_dict(schema.get("function"))
             if function is not None and function.get("name") in _NATIVE_RELAY_BUILTIN_TOOLS:
@@ -1101,6 +1107,7 @@ _ALL_LOCAL_TOOLS = (
     | _CHILD_CAP_TOOLS
     | _CHILD_CHECKIN_TOOLS
     | _HOST_LOAD_TOOLS
+    | _HOST_RESTART_TOOLS
     | _SESSION_OPEN_TOOLS
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
@@ -1187,7 +1194,7 @@ class _GrantedToolSurface:
 # release flag is part of the key: the same spec advertises a different
 # surface under each flag.
 _granted_tool_surface_cache: dict[
-    tuple[int, str | None, bool, bool], tuple[weakref.ref[AgentSpec], _GrantedToolSurface]
+    tuple[int, str | None, bool, bool, bool], tuple[weakref.ref[AgentSpec], _GrantedToolSurface]
 ] = {}
 _GRANTED_TOOL_NAMES_CACHE_MAX = 256
 
@@ -1218,6 +1225,7 @@ def _granted_tool_names(
     *,
     peer_messaging_enabled: bool = False,
     session_open_enabled: bool = False,
+    terminal_access_requests_enabled: bool = False,
 ) -> frozenset[str]:
     """Return the names in the session's cached, advertised tool surface."""
     return _granted_tool_surface(
@@ -1225,6 +1233,7 @@ def _granted_tool_names(
         harness,
         peer_messaging_enabled=peer_messaging_enabled,
         session_open_enabled=session_open_enabled,
+        terminal_access_requests_enabled=terminal_access_requests_enabled,
     ).names
 
 
@@ -1234,6 +1243,7 @@ def _granted_tool_surface(
     *,
     peer_messaging_enabled: bool = False,
     session_open_enabled: bool = False,
+    terminal_access_requests_enabled: bool = False,
 ) -> _GrantedToolSurface:
     """Return the non-MCP tool metadata advertised for *agent_spec* on *harness*.
 
@@ -1256,7 +1266,13 @@ def _granted_tool_surface(
     :raises Exception: Propagates ``ToolManager`` construction failures so
         callers can fail closed instead of guessing at the surface.
     """
-    cache_key = (id(agent_spec), harness, peer_messaging_enabled, session_open_enabled)
+    cache_key = (
+        id(agent_spec),
+        harness,
+        peer_messaging_enabled,
+        session_open_enabled,
+        terminal_access_requests_enabled,
+    )
     cached = _granted_tool_surface_cache.get(cache_key)
     if cached is not None and cached[0]() is agent_spec:
         return cached[1]
@@ -1264,6 +1280,7 @@ def _granted_tool_surface(
         agent_spec,
         peer_messaging_enabled=peer_messaging_enabled,
         session_open_enabled=session_open_enabled,
+        terminal_access_requests_enabled=terminal_access_requests_enabled,
         os_env_schema_only=True,
         # Keep skill discovery out of the per-call metadata check.
         skill_registry=[],
@@ -1321,6 +1338,7 @@ def _ungranted_tool_reason(
     *,
     peer_messaging_enabled: bool = False,
     session_open_enabled: bool = False,
+    terminal_access_requests_enabled: bool = False,
     arguments: _JsonObject | None = None,
 ) -> str | None:
     """Return why *tool_name* is refused for *agent_spec*, or ``None`` if allowed.
@@ -1357,6 +1375,7 @@ def _ungranted_tool_reason(
             _effective_harness_name(agent_spec, effective_harness),
             peer_messaging_enabled=peer_messaging_enabled,
             session_open_enabled=session_open_enabled,
+            terminal_access_requests_enabled=terminal_access_requests_enabled,
         )
     except Exception as exc:
         _logger.exception("granted tool surface unavailable for %s", tool_name)
@@ -1849,6 +1868,7 @@ async def _patch_subagent_label(
     :param child_session_id: Child session id, e.g. ``"conv_abc123"``.
     :param key: Label key, e.g. ``"omnigent.subagent.dispatch_id"``.
     :param value: Label value, e.g. ``"subagent_a1b2c3d4e5f6"``.
+    :param extra_labels: Optional companion labels to write in the same patch.
     :returns: A short failure description, or ``None`` on success.
     """
     try:
@@ -1906,7 +1926,11 @@ async def _prepare_child_dispatch(
     except subagent_work._SubagentRecoveryReadError as exc:
         return None, f"failed to read preceding child result: {exc}"
     error = await _patch_subagent_label(
-        server_client, child_session_id, subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY, work_id
+        server_client,
+        child_session_id,
+        subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY,
+        work_id,
+        extra_labels=subagent_work.SUBAGENT_DISPATCH_RESET_LABELS,
     )
     return prior_result[0] if prior_result is not None else None, error
 
@@ -2097,6 +2121,7 @@ async def _send_to_in_flight_child(
                 child_session_id,
                 _subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY,
                 work_id,
+                extra_labels=_subagent_work.SUBAGENT_DISPATCH_RESET_LABELS,
             )
             if stamp_error is not None:
                 _logger.warning(
@@ -2342,7 +2367,7 @@ def _short_cwd(cwd: str) -> str:
     The path under the home directory reads ``~/…``; anything else keeps its
     last two components.
 
-    :param cwd: Absolute directory path, e.g. ``"/home/alice/projects/app"``.
+    :param cwd: Absolute directory path, e.g. ``"/opt/work/projects/app"``.
     :returns: The shortened form, e.g. ``"~/projects/app"`` or ``"b/c"``.
     """
     normalized = cwd.rstrip("/")
@@ -8242,21 +8267,115 @@ async def _runner_online_or_none(
     return online if isinstance(online, bool) else None
 
 
-async def _host_harnesses_or_none(
+async def _host_detail_or_none(
     host_id: str | None,
     server_client: httpx.AsyncClient,
 ) -> _JsonObject | None:
-    """Return the bound host's reported harness readiness, best-effort."""
+    """Return the bound host's ``GET /v1/hosts/{id}`` detail, best-effort."""
     if not host_id:
         return None
     try:
         resp = await server_client.get(f"/v1/hosts/{host_id}", timeout=30.0)
         if resp.status_code != 200:
             return None
-        readiness = resp.json().get("configured_harnesses")
+        detail = resp.json()
     except Exception:  # noqa: BLE001
         return None
+    return detail if isinstance(detail, dict) else None
+
+
+def _configured_harnesses(host: _JsonObject | None) -> _JsonObject | None:
+    """Return a host detail's reported harness readiness map, if any."""
+    readiness = host.get("configured_harnesses") if host is not None else None
     return readiness if isinstance(readiness, dict) else None
+
+
+async def _host_harnesses_or_none(
+    host_id: str | None,
+    server_client: httpx.AsyncClient,
+) -> _JsonObject | None:
+    """Return the bound host's reported harness readiness, best-effort."""
+    return _configured_harnesses(await _host_detail_or_none(host_id, server_client))
+
+
+def _session_info_runner_state(
+    runner_online: bool | None,
+    host_id: str | None,
+    host: _JsonObject | None,
+    *,
+    harness: str | None = None,
+    host_resumable: bool = False,
+    host_inherited: bool = False,
+    closed: bool = False,
+) -> tuple[str | None, str | None]:
+    """
+    Say whether a session can take its next turn, and why when it cannot.
+
+    A host restart stops every runner on it; a child borrowing its parent's
+    runner keeps the stopped binding until a message reaches it, and that
+    message starts or reattaches a runner on the still-online host. A closed
+    session accepts no message at all, and a host that cannot launch the
+    session's harness starts no runner, so neither reads ``relaunchable``.
+
+    :param runner_online: Bound runner connectivity; ``False`` for a stopped
+        runner or a host session with no runner bound, ``None`` when unknown.
+    :param host_id: The session's effective host — its own, else its nearest
+        host-bound ancestor's — or ``None``.
+    :param host: That host's detail, or ``None`` when not read.
+    :param harness: The session's effective harness, when reported.
+    :param host_resumable: Whether the bound host is a dormant managed host
+        the server wakes in place on the next message.
+    :param host_inherited: Whether only an ancestor is bound to the host;
+        a message to this session cannot wake that ancestor's host.
+    :param closed: Whether the session is closed to new input.
+    :returns: ``(state, reason)`` — ``online``, ``relaunchable`` or
+        ``offline`` with a reason for the last two; ``(None, None)`` when
+        the runner or host state is unknown or there is no host.
+    """
+    if runner_online is True:
+        return "online", None
+    if runner_online is None or host_id is None or host is None:
+        return None, None
+    name = _optional_string(host.get("name")) or host_id
+    status = host.get("status")
+    if status == "online":
+        from omnigent.harness_availability import harness_launch_availability
+
+        available, unavailable_reason = harness_launch_availability(
+            harness, _configured_harnesses(host)
+        )
+        if available is False:
+            return "offline", (
+                f"Host {name} is online but cannot launch harness {harness} "
+                f"({unavailable_reason}); install or configure it on that host."
+            )
+    elif status == "offline":
+        if host_inherited:
+            return "offline", (
+                f"Host {name} is offline; this session inherits its host and cannot wake it. "
+                "Reconnect the host or wake it through a host-bound ancestor, then retry "
+                "this session."
+            )
+        if not host_resumable:
+            return "offline", (
+                f"Host {name} is offline; the session cannot take a turn until "
+                "that host reconnects."
+            )
+    else:
+        return None, None
+    if closed:
+        return "offline", (
+            "Session is closed; a new message is rejected, so no runner is started."
+        )
+    if status == "online":
+        return "relaunchable", (
+            f"Runner stopped (host restart or stop); host {name} is online, so the "
+            "next message starts or reattaches it. No archive needed."
+        )
+    return "relaunchable", (
+        f"Host {name} is asleep and resumable; the next message wakes it and "
+        "starts its runner. No archive needed."
+    )
 
 
 # Cap on ``sys_session_get_info``'s ``session_ids`` fan-out; 20 parallel
@@ -8303,8 +8422,14 @@ async def _session_get_info_via_rest(
     ``args["include_host_readiness"]`` allows it (default ``True`` for the
     single-session form, ``False`` for the ``session_ids`` form, so a
     supervisor reading many children does not fan out one host-readiness
-    GET per item). The full transcript is intentionally omitted — that is
-    what ``sys_session_get_history`` returns.
+    GET per item). An item whose runner stopped also reads its host's status
+    (the session's effective host: a hostless child borrows its nearest
+    host-bound ancestor's) to report ``runner_state``: ``relaunchable`` when
+    the host is online and can launch the session's harness, or when it is a
+    dormant resumable managed host; ``offline`` when the host is offline and
+    not resumable, cannot launch the harness, or the session is closed. The
+    full transcript is intentionally omitted — that is what
+    ``sys_session_get_history`` returns.
 
     Maps a 404 to ``session_not_found`` and 401/403 to ``access_denied``
     (the server denied the read, so from the caller's vantage the target is
@@ -8491,15 +8616,44 @@ async def _session_info_item(
     pending = pending_value if isinstance(pending_value, list) else []
     snap_agent_name = _optional_string(snap.get("agent_name"))
     snap_runner_id = _optional_string(snap.get("runner_id"))
-    configured_harnesses: _JsonObject | None = None
+    snap_host_id = _optional_string(snap.get("host_id"))
+    # A sub-agent row usually carries no host of its own: it runs on the host
+    # its nearest host-bound ancestor is pinned to, which the snapshot reports
+    # as ``effective_host_id``. The raw null must not hide the host that
+    # decides whether the session can take its next turn.
+    resolved_host_id = snap_host_id or _optional_string(snap.get("effective_host_id"))
+    host: _JsonObject | None = None
     if include_host_readiness:
-        snap_host_id = _optional_string(snap.get("host_id"))
-        runner_online, configured_harnesses = await asyncio.gather(
+        runner_online, host = await asyncio.gather(
             _runner_online_or_none(snap_runner_id, server_client),
-            _host_harnesses_or_none(snap_host_id, server_client),
+            _host_detail_or_none(resolved_host_id, server_client),
         )
     else:
         runner_online = await _runner_online_or_none(snap_runner_id, server_client)
+    # A host session with no runner bound starts one on its next message too.
+    runner_running = runner_online if snap_runner_id else False
+    if runner_running is False and not include_host_readiness:
+        # Only a stopped runner needs the host's status, so a batch read of
+        # live children still makes no per-item host lookup.
+        host = await _host_detail_or_none(resolved_host_id, server_client)
+    runner_state, runner_state_reason = _session_info_runner_state(
+        runner_running,
+        resolved_host_id,
+        host,
+        harness=_optional_string(snap.get("harness")),
+        host_resumable=snap.get("host_resumable") is True,
+        host_inherited=snap_host_id is None and resolved_host_id is not None,
+        closed=is_session_closed(labels, _optional_string(snap.get("title"))),
+    )
+    keep_warm = snap.get("keep_warm")
+    if (
+        runner_state == "relaunchable"
+        and isinstance(keep_warm, dict)
+        and keep_warm.get("blocked_by") == "runner_offline"
+    ):
+        # Keep-warm skipped pings while the runner was down; the session
+        # itself is not lost, so its blocker must not read as offline.
+        keep_warm = {**keep_warm, "blocked_by": "runner_relaunchable"}
     context_tokens = snap.get("last_total_tokens")
     context_window = snap.get("context_window")
     auto_compact_token_limit = snap.get("auto_compact_token_limit")
@@ -8522,6 +8676,10 @@ async def _session_info_item(
         "agent_name": public_agent_name(snap_agent_name),
         "runner_id": snap.get("runner_id"),
         "runner_online": runner_online,
+        # Whether the next message can run: ``relaunchable`` means the runner
+        # stopped on a live host and comes back on that message.
+        "runner_state": runner_state,
+        "runner_state_reason": runner_state_reason,
         "host_id": snap.get("host_id"),
         "parent_session_id": snap.get("parent_session_id"),
         "created_by_session_id": (_string_mapping(snap.get("labels")) or {}).get(
@@ -8558,7 +8716,7 @@ async def _session_info_item(
         # Keep-warm state plus why an auto-archived row was retired.
         "warm_state": snap.get("warm_state"),
         "warm_state_reason": snap.get("warm_state_reason"),
-        "keep_warm": snap.get("keep_warm"),
+        "keep_warm": keep_warm,
         "archive_reason": snap.get("archive_reason"),
         "total_cost_usd": snap.get("total_cost_usd"),
         "context_tokens": context_tokens,
@@ -8571,7 +8729,7 @@ async def _session_info_item(
         "last_error": snap.get("last_task_error"),
     }
     if include_host_readiness:
-        item["configured_harnesses"] = configured_harnesses
+        item["configured_harnesses"] = _configured_harnesses(host)
     return item
 
 
@@ -10648,8 +10806,11 @@ async def execute_tool(
             tool_name,
             agent_spec,
             effective_harness,
-            peer_messaging_enabled=_peer_messaging_enabled_for(conversation_id),
-            session_open_enabled=_session_open_enabled_for(conversation_id),
+            peer_messaging_enabled=agent_spec is not None
+            and _peer_messaging_enabled_for(conversation_id),
+            session_open_enabled=agent_spec is not None
+            and _session_open_enabled_for(conversation_id),
+            terminal_access_requests_enabled=server_client is not None,
             arguments=args,
         )
         if refusal is not None:
@@ -10763,6 +10924,10 @@ async def execute_tool(
             output = await _execute_child_checkin(args, server_client, conversation_id)
         elif tool_name in _HOST_LOAD_TOOLS:
             output = await _execute_host_load(args, server_client)
+        elif tool_name in _HOST_RESTART_TOOLS:
+            from omnigent.runner.host_restart import execute_host_restart
+
+            output = await execute_host_restart(args, server_client, conversation_id)
         elif tool_name == SysSessionMessageTool.name():
             from omnigent.runner.session_message import execute_message_tool
 
@@ -11760,6 +11925,8 @@ async def _execute_terminal_tool(
         tool_instance = SysTerminalListTool(registry=terminal_registry)
     elif tool_name == SysTerminalCloseTool.name():
         tool_instance = SysTerminalCloseTool(registry=terminal_registry)
+    elif tool_name == SysTerminalRequestAccessTool.name():
+        tool_instance = SysTerminalRequestAccessTool(registry=terminal_registry)
     else:
         return f"Error: unknown terminal tool {tool_name}"
 
@@ -11858,6 +12025,9 @@ async def _emit_terminal_resource_event(
             terminal_name=terminal_name,
             session_key=session_key,
             publish_event=publish_event,
+            instance_id=_optional_string(envelope.get("instance_id"))
+            if envelope.get("elevated")
+            else None,
         )
 
 
@@ -11956,6 +12126,7 @@ def _publish_terminal_deleted_event(
     terminal_name: str,
     session_key: str,
     publish_event: Callable[[str, _JsonObject], None],
+    instance_id: str | None = None,
 ) -> None:
     """Build and publish ``session.resource.deleted`` for a closed terminal.
 
@@ -11978,6 +12149,7 @@ def _publish_terminal_deleted_event(
             "resource_id": terminal_resource_id(terminal_name, session_key),
             "resource_type": "terminal",
             "session_id": conversation_id,
+            **({"instance_id": instance_id} if instance_id is not None else {}),
         },
     )
 
@@ -12684,6 +12856,8 @@ def _spawn_async_tool(
         return 'Error: sys_call_async requires string "args" argument'
     if target_tool == SysCallAsyncTool.name():
         return "Error: sys_call_async cannot dispatch itself"
+    if target_tool == SysTerminalRequestAccessTool.name():
+        return "Error: terminal access requires an interactive application approval card"
     if session_inbox is None or session_async_tasks is None:
         return "Error: async inbox not initialized for this session"
     if mcp_manager is None:

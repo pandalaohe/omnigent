@@ -73,7 +73,14 @@ import contextlib
 import logging
 from typing import Final
 
-from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, WebSocketException
+from fastapi import (
+    APIRouter,
+    HTTPException,
+    Query,
+    WebSocket,
+    WebSocketDisconnect,
+    WebSocketException,
+)
 from starlette import status
 
 from omnigent.debug_logging import debug_event, set_current_user_id
@@ -85,6 +92,10 @@ from omnigent.runtime import (
 from omnigent.server._runner_ws_tunnel import WrongReplicaWSError
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, AuthProvider
 from omnigent.server.routes._auth_helpers import require_access
+from omnigent.server.routes._terminal_access import (
+    require_terminal_browser_session,
+    require_terminal_host_owner,
+)
 from omnigent.stores import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
@@ -127,6 +138,28 @@ def create_terminal_attach_router(
     :returns: An :class:`APIRouter` carrying the attach route.
     """
     router = APIRouter()
+
+    async def authorize_elevated_attach(
+        websocket: WebSocket, session_id: str, read_only: bool
+    ) -> None:
+        if read_only:
+            raise WebSocketException(
+                code=1008, reason="admin terminals do not allow read-only watchers"
+            )
+        try:
+            require_terminal_browser_session(websocket, auth_provider)
+            if conversation_store is None:
+                if auth_provider is not None:
+                    raise WebSocketException(code=1008, reason="host ownership cannot be verified")
+                return
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is None:
+                raise WebSocketException(code=1008, reason="session not found")
+            await require_terminal_host_owner(websocket, conv, auth_provider, conversation_store)
+        except HTTPException as exc:
+            raise WebSocketException(
+                code=1008, reason="not authorized for admin terminal attach"
+            ) from exc
 
     @router.websocket("/sessions/{session_id}/resources/terminals/{terminal_id}/attach")
     async def attach_terminal_by_resource_id(
@@ -181,7 +214,41 @@ def create_terminal_attach_router(
         if ws_factory is not None:
             from urllib.parse import urlencode
 
-            qs = urlencode({"read_only": "true" if read_only else "false"})
+            from omnigent.server.routes._sessions.helpers import (
+                _get_runner_client_for_resource_access,
+            )
+
+            params = {"read_only": "true" if read_only else "false"}
+            try:
+                client = await _get_runner_client_for_resource_access(session_id)
+                if client is not None:
+                    resource = await client.get(
+                        f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}", timeout=10
+                    )
+                    if resource.is_success:
+                        metadata = resource.json().get("metadata", {})
+                        if metadata.get("elevated"):
+                            await authorize_elevated_attach(websocket, session_id, read_only)
+                            params["elevated_instance_id"] = metadata["instance_id"]
+            except OmnigentError as exc:
+                await websocket.close(
+                    code=_WS_CLOSE_WRONG_REPLICA
+                    if exc.code == "wrong_replica"
+                    else _WS_CLOSE_INTERNAL_ERROR,
+                    reason="host on another replica; retry without slice key"
+                    if exc.code == "wrong_replica"
+                    else "terminal access lookup failed",
+                )
+                return
+            except WebSocketException as exc:
+                await websocket.close(code=exc.code, reason=exc.reason or "not authorized")
+                return
+            except Exception:  # noqa: BLE001 - fail closed before opening the relay.
+                await websocket.close(
+                    code=_WS_CLOSE_INTERNAL_ERROR, reason="terminal access lookup failed"
+                )
+                return
+            qs = urlencode(params)
             runner_path = (
                 f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}/attach?{qs}"
             )
@@ -257,6 +324,12 @@ def create_terminal_attach_router(
                 reason="terminal resource not found or not running",
             )
             return
+        if entry.instance.elevated:
+            try:
+                await authorize_elevated_attach(websocket, session_id, read_only)
+            except WebSocketException as exc:
+                await websocket.close(code=exc.code, reason=exc.reason or "not authorized")
+                return
 
         from omnigent.runtime import telemetry
 
@@ -274,6 +347,7 @@ def create_terminal_attach_router(
                 socket_path=str(entry.instance.socket_path),
                 tmux_target=entry.instance.tmux_target,
                 read_only=read_only,
+                on_input=entry.instance.note_input,
             )
 
     return router

@@ -8134,6 +8134,29 @@ async def test_channel_server_relays_active_omnigent_tools(
 
 
 @pytest.mark.asyncio
+async def test_create_without_spec_validates_arguments_without_loading_runner_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runner import tool_dispatch
+
+    def unexpected_flag_lookup(_conversation_id: str | None) -> bool:
+        raise AssertionError("A missing agent spec does not need the runner's tool surface")
+
+    monkeypatch.setattr(tool_dispatch, "_peer_messaging_enabled_for", unexpected_flag_lookup)
+    monkeypatch.setattr(tool_dispatch, "_session_open_enabled_for", unexpected_flag_lookup)
+    for arguments, expected in (
+        ({"unknown": True}, "unknown argument(s): unknown"),
+        ({"agent_id": "ag_x"}, "sys_session_create requires server access"),
+    ):
+        result = await tool_dispatch.execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(arguments),
+            conversation_id="parent",
+        )
+        assert expected in json.loads(result)["error"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("slow_phase", ["create", "message"])
 @pytest.mark.parametrize("message_status", [202, 503])
 async def test_session_create_relay_waits_for_created_handle(
@@ -16079,6 +16102,14 @@ async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
         )
         output = json.loads(body)
         assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
+        marker = claude_native_bridge.policy_fallback_marker(
+            bridge_dir, "conv_hook_eval", _PRE_TOOL_USE_PAYLOAD
+        )
+        assert marker.exists()
+        assert (
+            marker.read_text(encoding="utf-8")
+            == output["hookSpecificOutput"]["permissionDecisionReason"]
+        )
 
         post_body = await asyncio.to_thread(
             _relay_request_raw,
@@ -16087,6 +16118,7 @@ async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
             {**_PRE_TOOL_USE_PAYLOAD, "hook_event_name": "PostToolUse", "tool_output": "x"},
         )
         assert post_body == "", "PostToolUse must fail open (tool already ran)"
+        assert not marker.exists(), "a subsequent hook event clears the previous marker"
     finally:
         relay.close()
 
@@ -16134,6 +16166,14 @@ async def test_hook_evaluate_pre_tool_use_rides_out_an_outage(
         assert output["decision"] == "block", f"UserPromptSubmit must fail closed, got {output!r}"
         assert client.calls == 3, f"UserPromptSubmit keeps the short schedule, saw {client.calls}"
         assert [call.args[0] for call in _policy_retry_clock.sleep.call_args_list] == [0.4, 0.4]
+        hooks = [
+            json.loads(line)["payload"]
+            for line in (bridge_dir / "hooks.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        assert len(hooks) == 1
+        assert hooks[0]["hook_event_name"] == "StopFailure"
+        assert hooks[0]["error"] == "policy_evaluation_failed"
+        assert hooks[0]["error_details"] == output["reason"]
     finally:
         relay.close()
 
@@ -16627,12 +16667,111 @@ def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
     unmarked_dir = root / "unmarked"
     unmarked_dir.mkdir()
 
+    # A dead owner inside the 7-day window is kept; past it the dir goes.
+    assert prune_orphaned_bridge_dirs() == 0
+    assert dead_dir.exists()
+    eight_days_ago = time.time() - 8 * 24 * 60 * 60
+    os.utime(dead_dir / "owner.pid", (eight_days_ago, eight_days_ago))
+
     pruned = prune_orphaned_bridge_dirs()
 
     assert pruned == 1
     assert not dead_dir.exists()
     assert live_dir.exists()
     assert unmarked_dir.exists()
+
+
+def test_prune_orphaned_bridge_dirs_keeps_forwarder_cursor_and_drops_runtime_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dead-owner keep unlinks runtime files while preserving transcript_forwarder.json."""
+    from omnigent.harnesses.claude_native import forwarder
+    from omnigent.harnesses.claude_native.bridge import prune_orphaned_bridge_dirs
+
+    root = tmp_path / "claude-native"
+    root.mkdir(parents=True)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+
+    bridge_dir = prepare_bridge_dir("conv_restart", workspace=tmp_path)
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        '{"type":"user","message":{"role":"user","content":"hello"}}\n',
+        encoding="utf-8",
+    )
+    offset = transcript.stat().st_size
+    fingerprint = forwarder._jsonl_cursor_fingerprint(transcript, offset)
+    assert fingerprint is not None
+    forwarder._write_forward_state(
+        bridge_dir,
+        forwarder.TranscriptForwardState(
+            transcript_path=transcript,
+            line_cursor=1,
+            byte_offset=offset,
+            cursor_fingerprint=fingerprint,
+        ),
+    )
+    runtime_files = (
+        "server.json",
+        "state.json",
+        "hooks.jsonl",
+        "observer_hook.stderr",
+        "tool_relay.json",
+        "tool_relay.env",
+        "tmux.json",
+    )
+    for name in runtime_files:
+        (bridge_dir / name).write_text("{}", encoding="utf-8")
+    (bridge_dir / "permission_hook.json").write_text("{}", encoding="utf-8")
+
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    (bridge_dir / "owner.pid").write_text(str(dead.pid), encoding="utf-8")
+
+    assert prune_orphaned_bridge_dirs() == 0
+    assert bridge_dir.exists()
+    for name in runtime_files:
+        assert not (bridge_dir / name).exists(), name
+    assert (bridge_dir / "transcript_forwarder.json").exists()
+    assert (bridge_dir / "permission_hook.json").exists()
+
+    assert prepare_bridge_dir("conv_restart", workspace=tmp_path) == bridge_dir
+    assert forwarder.prepare_transcript_forward_state_for_resume(
+        bridge_dir,
+        transcript,
+        session_id="conv_restart",
+    )
+
+
+def test_prune_orphaned_bridge_dirs_respects_forwarder_cursor_activity_and_7_day_cutoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recent transcript_forwarder.json holds a dead-owner dir until both age past 7 days."""
+    from omnigent.harnesses.claude_native.bridge import prune_orphaned_bridge_dirs
+
+    root = tmp_path / "claude-native"
+    root.mkdir(parents=True)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+
+    bridge_dir = prepare_bridge_dir("conv_cursor_age", workspace=tmp_path)
+    cursor_file = bridge_dir / "transcript_forwarder.json"
+    cursor_file.write_text("{}", encoding="utf-8")
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    owner_file = bridge_dir / "owner.pid"
+    owner_file.write_text(str(dead.pid), encoding="utf-8")
+
+    eight_days_ago = time.time() - 8 * 24 * 60 * 60
+    os.utime(owner_file, (eight_days_ago, eight_days_ago))
+    assert prune_orphaned_bridge_dirs() == 0
+    assert bridge_dir.exists()
+
+    os.utime(cursor_file, (eight_days_ago, eight_days_ago))
+    assert prune_orphaned_bridge_dirs() == 1
+    assert not bridge_dir.exists()
 
 
 def test_read_transcript_items_surfaces_structured_active_goal_and_clear(tmp_path: Path) -> None:

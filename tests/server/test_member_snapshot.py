@@ -1,4 +1,4 @@
-"""Member snapshot labels at session create (SCC06 F1a, custom line).
+"""Member snapshot labels at session create (custom line).
 
 A bundle whose spec projects 2+ members freezes each member as one
 ``omnigent.member.<role>`` label: the effective host / harness / model /

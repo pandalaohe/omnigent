@@ -10,3 +10,6 @@ HOST_FATAL_EXIT_CODE = 78
 # Exit code a shell reports for a SIGTERM-killed process (128 + 15). A
 # supervisor treats it as a deliberate stop, not a crash.
 HOST_SIGTERM_EXIT_CODE = 143
+
+# Orderly teardown completed; the supervisor should launch a fresh host.
+HOST_RESTART_EXIT_CODE = 75

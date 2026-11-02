@@ -694,7 +694,7 @@ class CreateDirectoryRequest(BaseModel):
     """Request body for ``POST /v1/hosts/{host_id}/directories``.
 
     :param path: Absolute path of the directory to create on the host
-        machine, e.g. ``"/Users/corey/projects/new-app"``, or a
+        machine, e.g. ``"/opt/work/projects/new-app"``, or a
         tilde-prefixed path (``"~/scratch"``) the host expands against
         its own process owner. Missing parents are created.
     """
@@ -852,7 +852,7 @@ class LaunchRunnerRequest(BaseModel):
         ``"conv_abc123"``.
     :param workspace: Absolute path on the host machine to use
         as the runner's working directory, e.g.
-        ``"/Users/corey/projects/frontend"``. When ``git`` is set,
+        ``"/opt/work/projects/frontend"``. When ``git`` is set,
         this is interpreted as the source repository directory and
         the runner starts in the created worktree instead.
     :param git: Optional git worktree options. In create mode the
@@ -1002,6 +1002,12 @@ def create_hosts_router(
     )
     router = APIRouter()
 
+    from omnigent.server.routes._host_restart import register_host_restart_routes
+
+    register_host_restart_routes(
+        router, host_registry, host_store, conversation_store, auth_provider, permission_store
+    )
+
     def require_harness_install() -> None:
         if not harness_install_enabled(harness_install_gate):
             raise HTTPException(status_code=404, detail="not found")
@@ -1084,6 +1090,9 @@ def create_hosts_router(
                 "platform": host.platform,
                 "default_workspace": host.default_workspace,
                 "filesystem_roots": bool(conn and conn.hello.filesystem_roots),
+                "supervised": conn.hello.supervised if conn else None,
+                "started_at": conn.hello.started_at if conn else None,
+                "capabilities": list(conn.hello.capabilities) if conn else [],
                 # Held in memory from the host's connect handshake, not the
                 # hosts row. ``None`` means this replica has no report yet —
                 # emitted as-is so a client can tell "unknown" from "not
@@ -1155,7 +1164,10 @@ def create_hosts_router(
             # memory, so ``None`` is "no report on this replica yet".
             "gateway_inference": host_registry.gateway_inference(host.host_id),
             "interactive_shells": host_registry.interactive_shells(host.host_id),
+            "capabilities": list(conn.hello.capabilities) if conn else [],
             "runners": [],
+            "supervised": conn.hello.supervised if conn else None,
+            "started_at": conn.hello.started_at if conn else None,
         }
         if (
             harness_setup_enabled
@@ -2200,7 +2212,7 @@ def create_hosts_router(
             ``"host_a1b2c3d4..."``.
         :param limit: Max entries per page.
         :param after: Optional forward pagination cursor (entry
-            path), e.g. ``"/Users/corey/projects/m"``.
+            path), e.g. ``"/opt/work/projects/m"``.
         :param before: Optional backward pagination cursor.
         :returns: ``{"object": "list", "data": [...], "has_more": bool}``
             mirroring the existing session-scoped filesystem
@@ -2242,7 +2254,7 @@ def create_hosts_router(
         :param request: FastAPI request (for auth).
         :param host_id: Host identifier.
         :param path: Absolute path on the host (e.g.
-            ``"/Users/corey/universe"``) OR a tilde-prefixed
+            ``"/opt/work/universe"``) OR a tilde-prefixed
             path (``"~/foo"``). The host expands ``~`` itself.
             FastAPI's ``:path`` converter strips the leading
             ``/`` from the URL, so we re-add it for absolute paths.
@@ -2257,7 +2269,7 @@ def create_hosts_router(
         # FastAPI's :path converter strips the leading slash from
         # the URL match. Re-add it for POSIX paths; leave tilde,
         # Windows drive-letter, and UNC paths alone (prefixing /
-        # would turn C:/Users/me into /C:/Users/me).
+        # would turn C:/opt/work into /C:/opt/work).
         path = restore_host_filesystem_url_path(path)
         return await _list_host_filesystem(
             request=request,
@@ -3066,7 +3078,7 @@ def create_hosts_router(
         :param request: FastAPI request (for auth).
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
         :param path: Absolute path inside the repo on the host to list
-            worktrees for, e.g. ``"/Users/alice/myrepo"``.
+            worktrees for, e.g. ``"/opt/work/myrepo"``.
         :returns: ``{"object": "list", "data": [{path, branch,
             is_main, detached, updated_at?}, ...]}`` (main first).
         :raises HTTPException: 404 if host not found, 403 if not owned
@@ -3132,7 +3144,7 @@ def create_hosts_router(
         :param request: FastAPI request (for auth).
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
         :param path: Absolute folder path on the host to read facts for,
-            e.g. ``"/Users/alice/myrepo"``.
+            e.g. ``"/opt/work/myrepo"``.
         :returns: ``{"object": "folder_facts", exists, is_dir, is_repo,
             toplevel, branch, head, detached, dirty, remotes,
             setup_command_configured, error}``.

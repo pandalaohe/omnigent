@@ -396,7 +396,7 @@ async def test_ensure_local_codex_resume_rollout_rewrites_compacted_other_host_p
     codex_home = tmp_path / "codex-home"
     workspace = (tmp_path / "workspace").resolve()
     other_key = "a" * 32
-    other_line = f"[Attached: /home/other/.omnigent/attachments/s-{other_key}/file_mp4/a.mp4]"
+    other_line = f"[Attached: /opt/work/.omnigent/attachments/s-{other_key}/file_mp4/a.mp4]"
     items: list[dict[str, Any]] = [
         {
             "id": "cmp_1",

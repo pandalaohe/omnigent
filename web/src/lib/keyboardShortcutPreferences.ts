@@ -269,6 +269,7 @@ export const DEFAULT_SHORTCUT_DEFINITIONS: Record<ShortcutActionId, ShortcutDefi
     group: "navigation",
     scope: "global",
     defaultBindings: [chord("Backquote", ["alt"])],
+    note: "Jumps to the next session waiting for your answer.",
   },
   archiveSession: {
     id: "archiveSession",

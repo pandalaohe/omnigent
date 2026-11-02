@@ -46,6 +46,10 @@ def main() -> int:
     mode.add_argument("--local", action="store_true", help="Run a local Omnigent server.")
     args = parser.parse_args()
 
+    from omnigent.host.restart import mark_service_entry
+
+    mark_service_entry()
+
     from omnigent.cli import cli
 
     server = "" if args.local else args.server

@@ -7,8 +7,10 @@ import base64
 import hashlib
 import logging
 import ntpath
+import os
 import posixpath
 import re
+import time
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -808,6 +810,59 @@ async def test_materialize_file_reference_reuses_a_complete_file(
     assert content_gets == 0
 
 
+@pytest.mark.parametrize("dir_fd_supported", [True, False])
+def test_materialize_attachment_reuse_refreshes_mtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dir_fd_supported: bool
+) -> None:
+    """Re-sending identical bytes refreshes the copy, so the expired-cache sweep keeps it."""
+    monkeypatch.setattr(
+        "omnigent.inner.native_attachments._dir_fd_supported", lambda: dir_fd_supported
+    )
+    block = {
+        "type": "input_file",
+        "filename": "bundle.zip",
+        "file_data": "data:application/zip;base64,UEsDBA==",
+    }
+    path = materialize_attachment(block, tmp_path)
+    assert path is not None
+    old = time.time() - 30 * 24 * 60 * 60
+    os.utime(path, (old, old))
+
+    assert materialize_attachment(block, tmp_path) == path
+    assert path.stat().st_mtime > old + 60
+
+
+@pytest.mark.parametrize("dir_fd_supported", [True, False])
+@pytest.mark.asyncio
+async def test_materialize_file_reference_reuse_refreshes_mtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dir_fd_supported: bool
+) -> None:
+    """A reused by-path copy is refreshed, so the expired-cache sweep keeps it."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr(
+        "omnigent.inner.native_attachments._dir_fd_supported", lambda: dir_fd_supported
+    )
+    target_dir = _session_dir(tmp_path, "file_1")
+    target_dir.mkdir(parents=True)
+    target = target_dir / "clip.mp4"
+    target.write_bytes(b"hello")
+    old = time.time() - 30 * 24 * 60 * 60
+    os.utime(target, (old, old))
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"hello")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://test"
+    ) as client:
+        path = await materialize_file_reference(
+            "file_1", _file_meta("clip.mp4"), session_id="conv_1", client=client
+        )
+
+    assert path == target
+    assert target.stat().st_mtime > old + 60
+
+
 @pytest.mark.asyncio
 async def test_materialize_file_reference_discards_a_size_mismatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1213,7 +1268,7 @@ async def test_resolve_session_item_file_references_rewrites_string_message_cont
                     "type": "message",
                     "role": "user",
                     "content": (
-                        "[Attached: /home/other/.omnigent/attachments/"
+                        "[Attached: /opt/work/.omnigent/attachments/"
                         f"s-{'a' * 32}/file_mp4/a.mp4] inspect"
                     ),
                 }
@@ -1398,7 +1453,7 @@ def test_rewrite_attached_paths_redirects_both_separator_styles(
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
     key = "a" * 32
     posix = f"[Attached: /opt/work/omnigent/fork/wt/data/attachments/s-{key}/file_1/a.mp4]"
-    windows = "[Attached: C:\\Users\\other\\.omnigent\\attachments\\s-" + key + "\\file_2\\b.mp4]"
+    windows = "[Attached: C:\\work\\other\\.omnigent\\attachments\\s-" + key + "\\file_2\\b.mp4]"
     local = session_attachment_dir("session-a")
 
     assert (
@@ -1438,8 +1493,8 @@ def test_mark_purged_attachments_marks_only_the_purged_line(
     """A purged row's line becomes the marker; a live row's line is untouched."""
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
     key = "b" * 32
-    purged_line = f"[Attached: /home/other/.omnigent/attachments/s-{key}/file_gone/trip.mp4]"
-    live_line = f"[Attached: /home/other/.omnigent/attachments/s-{key}/file_live/clip.mp4]"
+    purged_line = f"[Attached: /opt/work/.omnigent/attachments/s-{key}/file_gone/trip.mp4]"
+    live_line = f"[Attached: /opt/work/.omnigent/attachments/s-{key}/file_live/clip.mp4]"
 
     marked = mark_purged_attachments(
         f"{purged_line} then {live_line}", "session-a", {"file_gone": "trip.mp4"}

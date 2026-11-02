@@ -181,7 +181,7 @@ def _publish_tmux_target_for_bridge(
     terminal_registry = resource_registry.terminal_registry
     if terminal_registry is None:
         return
-    instance = terminal_registry.get(session_id, terminal_name, session_key)
+    instance = terminal_registry.get_native(session_id, terminal_name, session_key)
     if instance is None or not instance.running:
         return
     # Imported here to avoid pulling Claude-native specifics into the
@@ -1044,7 +1044,7 @@ def _schedule_terminal_interactive_observer(
     terminal_registry = getattr(resource_registry, "terminal_registry", None)
     if terminal_registry is None:
         return
-    instance = terminal_registry.get(session_id, terminal_name, session_key)
+    instance = terminal_registry.get_native(session_id, terminal_name, session_key)
     if instance is None:
         _logger.warning(
             "Cannot observe native terminal interactivity: terminal is not registered; "
@@ -1105,6 +1105,8 @@ def _terminal_lookup_miss_reason(
     for entry in entries:
         if terminal_resource_id(entry.terminal_name, entry.session_key) != terminal_id:
             continue
+        if entry.instance.elevated:
+            return "admin_terminal_liveness_unavailable"
         if not entry.instance.running:
             return (
                 "terminal_registered_but_not_running "
@@ -4011,7 +4013,7 @@ async def _auto_create_cursor_terminal(
     # chat box to the running TUI.
     terminal_registry = resource_registry.terminal_registry
     if terminal_registry is not None:
-        instance = terminal_registry.get(session_id, "cursor", "main")
+        instance = terminal_registry.get_native(session_id, "cursor", "main")
         if instance is not None and instance.running:
             from omnigent.harnesses.cursor_native.bridge import write_tmux_target
 
@@ -4238,7 +4240,7 @@ async def _auto_create_goose_terminal(
     # inject web-UI messages into this same pane (tmux paste).
     terminal_registry = resource_registry.terminal_registry
     if terminal_registry is not None:
-        instance = terminal_registry.get(session_id, "goose", "main")
+        instance = terminal_registry.get_native(session_id, "goose", "main")
         if instance is not None and instance.running:
             write_tmux_target(
                 bridge_dir,
@@ -4512,7 +4514,7 @@ async def _auto_create_hermes_terminal(
     # inject web-UI messages into this same pane (tmux paste).
     terminal_registry = resource_registry.terminal_registry
     if terminal_registry is not None:
-        instance = terminal_registry.get(session_id, "hermes", "main")
+        instance = terminal_registry.get_native(session_id, "hermes", "main")
         if instance is not None and instance.running:
             write_tmux_target(
                 bridge_dir,
@@ -4692,7 +4694,7 @@ async def _auto_create_kiro_terminal(
     )
     terminal_registry = resource_registry.terminal_registry
     if terminal_registry is not None:
-        instance = terminal_registry.get(session_id, "kiro", "main")
+        instance = terminal_registry.get_native(session_id, "kiro", "main")
         if instance is not None and instance.running:
             from omnigent.harnesses.kiro_native.bridge import write_tmux_target
 
@@ -4940,7 +4942,7 @@ async def _auto_create_devin_terminal(
     )
     terminal_registry = resource_registry.terminal_registry
     if terminal_registry is not None:
-        instance = terminal_registry.get(session_id, "devin", "main")
+        instance = terminal_registry.get_native(session_id, "devin", "main")
         if instance is not None and instance.running:
             write_tmux_target(
                 bridge_dir,
@@ -5314,7 +5316,7 @@ async def _auto_create_qwen_terminal(
     # reach this pane — message injection itself is file-based, not tmux.
     terminal_registry = resource_registry.terminal_registry
     if terminal_registry is not None:
-        instance = terminal_registry.get(session_id, "qwen", "main")
+        instance = terminal_registry.get_native(session_id, "qwen", "main")
         if instance is not None and instance.running:
             write_tmux_target(
                 bridge_dir,
@@ -5555,7 +5557,7 @@ async def _auto_create_kimi_terminal(
     # chat box to the running TUI.
     terminal_registry = resource_registry.terminal_registry
     if terminal_registry is not None:
-        instance = terminal_registry.get(session_id, "kimi", "main")
+        instance = terminal_registry.get_native(session_id, "kimi", "main")
         if instance is not None and instance.running:
             write_tmux_target(
                 bridge_dir,
@@ -5581,7 +5583,7 @@ async def _auto_create_kimi_terminal(
         registry = resource_registry.terminal_registry
         if registry is None:
             return True
-        pane = registry.get(session_id, "kimi", "main")
+        pane = registry.get_native(session_id, "kimi", "main")
         return pane is not None and pane.running
 
     _forwarder_task = asyncio.create_task(
@@ -5789,7 +5791,7 @@ async def _launch_codex_native_tui(
     )
     terminal_registry = getattr(resource_registry, "terminal_registry", None)
     registry_instance = (
-        terminal_registry.get(session_id, "codex", "main")
+        terminal_registry.get_native(session_id, "codex", "main")
         if terminal_registry is not None
         else None
     )
@@ -6811,6 +6813,8 @@ class _CodexSignInPromptSeen(RuntimeError):
 
 async def _codex_pane_screen(instance: TerminalInstance) -> str:
     """Return the pane's screen with wrapped rows joined, or ``""`` when it cannot be read."""
+    if instance.elevated:
+        return ""
     try:
         # A sign-in address is far wider than the 80-column pane the runner
         # creates, so read wrapped rows joined back into their original lines.
@@ -8230,7 +8234,7 @@ def _terminal_tmux_pane(
     terminal_registry = resource_registry.terminal_registry
     if terminal_registry is None:
         return None, None
-    instance = terminal_registry.get(session_id, terminal_name, session_key)
+    instance = terminal_registry.get_native(session_id, terminal_name, session_key)
     if instance is None or not instance.running:
         return None, None
     # ``socket_path`` is a Path and ``tmux_target`` a str on the live terminal
@@ -9507,6 +9511,7 @@ class _ClaudeSessionLaunchMetadata:
     external_session_id: str | None = None
     fork_source_external_id: str | None = None
     fork_carry_history: bool = False
+    labels: Mapping[str, str] | None = None
     #: Both routing fields come from ``routing_class_from_snapshot``, so an
     #: auto-harness session always reads as routing-enabled too. Deriving them
     #: separately was the bug: a sub-agent child of a routed parent carries the
@@ -9555,6 +9560,7 @@ def _claude_launch_metadata_from_envelope(
             fork_source if isinstance(fork_source, str) and fork_source else None
         ),
         fork_carry_history=snapshot.labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1",
+        labels=dict(snapshot.labels),
     )
 
 
@@ -9623,6 +9629,7 @@ async def _load_legacy_claude_launch_metadata(
             fork_source if isinstance(fork_source, str) and fork_source else None
         ),
         fork_carry_history=labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1",
+        labels={str(key): str(value) for key, value in labels.items()},
     )
     permission_mode = _claude_launch_permission_mode(metadata.terminal_launch_args)
     _logger.info(
@@ -9957,6 +9964,7 @@ async def _auto_create_claude_terminal(
             _claude_resume_session_id,
             _ensure_local_claude_resume_transcript,
             _prepare_cold_resume_forward_state,
+            record_cold_resume_transcript_outcome,
         )
 
         resume_session_id = _claude_resume_session_id(session_external_id, session_id=session_id)
@@ -9974,6 +9982,12 @@ async def _auto_create_claude_terminal(
                 bridge_dir=bridge_dir,
                 resolution=resolution,
                 session_id=session_id,
+            )
+            await record_cold_resume_transcript_outcome(
+                server_client,
+                session_id=session_id,
+                resolution=resolution,
+                labels=launch_metadata.labels,
             )
             if degraded_sync:
                 await _post_claude_degraded_sync_notice(
@@ -10866,6 +10880,7 @@ async def _delete_native_bridge_dirs(
     *,
     server_client: httpx.AsyncClient | None,
     session_id: str,
+    keep_attachment_caches: bool = False,
 ) -> None:
     """
     Remove native-harness bridge directories and attachment caches for a session.
@@ -10886,6 +10901,10 @@ async def _delete_native_bridge_dirs(
     :param server_client: Omnigent server client used to resolve rotated bridge
         id labels. ``None`` skips label resolution (session_id keys only).
     :param session_id: Omnigent session/conversation id, e.g. ``"conv_abc123"``.
+    :param keep_attachment_caches: Leave the bridge-keyed caches and the
+        session's by-path dir in place for a session that can resume (a native
+        transcript reads them and nothing restores them); ``False`` (session
+        delete) removes them.
     """
     from omnigent.harnesses.antigravity_native.bridge import (
         ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
@@ -10958,11 +10977,12 @@ async def _delete_native_bridge_dirs(
         pi_bridge_dir(session_id),
         qwen_bridge_dir(session_id),
     }
-    # A cache can survive a missing bridge directory, including after a reboot.
-    targets.update(attachment_cache_dir(target) for target in tuple(targets))
-    # By-path attachments live under a session-keyed dir shared by all
-    # harnesses, independent of any bridge directory.
-    targets.add(session_attachment_dir(session_id))
+    if not keep_attachment_caches:
+        # A cache can survive a missing bridge directory, including after a reboot.
+        targets.update(attachment_cache_dir(target) for target in tuple(targets))
+        # By-path attachments live under a session-keyed dir shared by all
+        # harnesses, independent of any bridge directory.
+        targets.add(session_attachment_dir(session_id))
     for target in targets:
         try:
             shutil.rmtree(target, ignore_errors=False)
@@ -11467,7 +11487,7 @@ async def _launch_native_terminal(
         registry = ctx.resource_registry.terminal_registry
         has_terminal = (
             registry is not None
-            and registry.get(ctx.session_id, agent.terminal_name, "main") is not None
+            and registry.get_native(ctx.session_id, agent.terminal_name, "main") is not None
         )
         pending = False
         checking_pre_launch = False
@@ -11621,6 +11641,11 @@ async def _ensure_native_terminal(
         admitted = False
         existing = await ctx.resource_registry.get_terminal_resource(ctx.session_id, terminal_id)
         if existing is not None:
+            if existing.metadata.get("elevated"):
+                return JSONResponse(
+                    status_code=409,
+                    content={"error": {"message": "admin terminal cannot be a harness pane"}},
+                )
             if is_owned is None or is_owned(ctx.resource_registry, existing):
                 _logger.info(
                     "%s terminal ensure returning existing resource: session=%s terminal_id=%s",
@@ -11819,7 +11844,7 @@ async def _claude_native_terminal_arrives_via_transfer(
     # Fresh bridge, or the new session is already active — nothing transfers in.
     if active_session_id is None or active_session_id == session_id:
         return False
-    return terminal_registry.get(active_session_id, "claude", "main") is not None
+    return terminal_registry.get_native(active_session_id, "claude", "main") is not None
 
 
 async def _antigravity_native_terminal_arrives_via_transfer(
@@ -11873,7 +11898,7 @@ async def _antigravity_native_terminal_arrives_via_transfer(
     # Fresh bridge, or the new session is already active — nothing transfers in.
     if state is None or state.session_id == session_id:
         return False
-    return terminal_registry.get(state.session_id, "antigravity", "main") is not None
+    return terminal_registry.get_native(state.session_id, "antigravity", "main") is not None
 
 
 async def _codex_native_terminal_arrives_via_transfer(
@@ -11937,7 +11962,7 @@ async def _codex_native_terminal_arrives_via_transfer(
     # Fresh bridge, or the new session is already active — nothing transfers in.
     if state is None or state.session_id == session_id:
         return False
-    return terminal_registry.get(state.session_id, "codex", "main") is not None
+    return terminal_registry.get_native(state.session_id, "codex", "main") is not None
 
 
 _SESSION_LABEL_LOOKUP_TIMEOUT_SECONDS = 1.0

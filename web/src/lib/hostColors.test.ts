@@ -27,7 +27,7 @@ describe("hostColors", () => {
   });
 
   it("uses the user's valid pick for a host", () => {
-    expect(hostColor("host-1", "TMB", { "host-1": "purple" })).toEqual({
+    expect(hostColor("host-1", "laptop", { "host-1": "purple" })).toEqual({
       key: "purple",
       hex: "#8250df",
       darkHex: "#a371f7",
@@ -40,7 +40,7 @@ describe("hostColors", () => {
       expect(automatic.key).not.toBe("gray");
     }
     // The name that hashes to gray's former slot must now resolve elsewhere.
-    expect(hostColor("host-1", "TMB", { "host-1": "gray" })).toEqual({
+    expect(hostColor("host-1", "laptop", { "host-1": "gray" })).toEqual({
       key: "gray",
       hex: "#57606a",
       darkHex: "#8b949e",
@@ -57,16 +57,16 @@ describe("hostColors", () => {
   });
 
   it("ignores an unknown pick and falls back to the automatic colour", () => {
-    const automatic = hostColor("host-1", "TMB", {});
-    expect(hostColor("host-1", "TMB", { "host-1": "chartreuse" as never })).toEqual(automatic);
+    const automatic = hostColor("host-1", "laptop", {});
+    expect(hostColor("host-1", "laptop", { "host-1": "chartreuse" as never })).toEqual(automatic);
     expect(HOST_COLORS).toContainEqual(automatic);
   });
 
   it("derives a stable automatic colour from the host name", () => {
-    const first = hostColor("host-1", "TMB", {});
-    expect(hostColor("host-1", "TMB", {})).toEqual(first);
+    const first = hostColor("host-1", "laptop", {});
+    expect(hostColor("host-1", "laptop", {})).toEqual(first);
     // The name, not the id, owns the hash when both are known.
-    expect(hostColor("a-different-id", "TMB", {})).toEqual(first);
+    expect(hostColor("a-different-id", "laptop", {})).toEqual(first);
   });
 
   it("falls back to the host id and then the local sentinel", () => {
@@ -78,8 +78,8 @@ describe("hostColors", () => {
 
 describe("hostDisplayName", () => {
   it("mirrors resolveHostBadge's naming", () => {
-    const host = { host_id: "host-1", name: "TMB" } as Host;
-    expect(hostDisplayName("host-1", host)).toBe("TMB");
+    const host = { host_id: "host-1", name: "laptop" } as Host;
+    expect(hostDisplayName("host-1", host)).toBe("laptop");
     expect(
       hostDisplayName("host-2", {
         host_id: "host-2",

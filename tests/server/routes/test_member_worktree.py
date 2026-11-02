@@ -1,6 +1,6 @@
 """Cross-host member placement: the lead's branch worktree on the member host.
 
-Covers ``resolve_member_worktree_on_host`` (SCC06 F2b Step A) and its
+Covers ``resolve_member_worktree_on_host``, step A, and its
 owner-checked route ``GET /v1/sessions/{id}/member-worktree``: every missing
 fact (no project, no directory on the host, no recorded branch, no matching
 worktree, unreachable host) is a named 4xx so the member dispatch fails loud

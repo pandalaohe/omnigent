@@ -12,7 +12,7 @@ from omnigent.harnesses.codex_native import forwarder as fwd
 
 # Real Codex hook run ids are "<event>:<index>:<hooks file path>".
 _PATH_RUN_ID = (
-    "session-start:3:/home/user/.omnigent/codex-native/"
+    "session-start:3:/opt/work/.omnigent/codex-native/"
     "0123456789abcdef0123456789abcdef/codex-home/hooks.json"
 )
 _RESPONSE_ID_MAX_CHARS = SqlConversationItem.__table__.c.response_id.type.length

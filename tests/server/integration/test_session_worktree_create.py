@@ -57,8 +57,8 @@ from tests.server.helpers import build_agent_bundle, create_test_agent
 pytestmark = pytest.mark.asyncio
 
 _HOST_ID = "2b8753b34a61b09af35a01136d40fadf"
-_SOURCE_REPO = "/Users/alice/myrepo"
-_ENTRY = "/Users/alice/project"
+_SOURCE_REPO = "/opt/work/myrepo"
+_ENTRY = "/opt/work/project"
 _PROJECT_ID = "aa11bb22cc33dd44ee55ff6600112233"
 
 
@@ -437,8 +437,8 @@ async def test_create_with_template_and_no_entry_uses_the_repo_as_entry(
     assert cap.create[0].path_template == _ENTRY_TEMPLATE
 
     body = resp.json()
-    assert body["workspace"] == "/Users/alice/myrepo/.worktrees/myrepo/feature-x"
-    assert body["worktree"] == "/Users/alice/myrepo/.worktrees/myrepo/feature-x"
+    assert body["workspace"] == "/opt/work/myrepo/.worktrees/myrepo/feature-x"
+    assert body["worktree"] == "/opt/work/myrepo/.worktrees/myrepo/feature-x"
 
 
 async def test_create_without_base_branch_sends_none(
@@ -1077,8 +1077,8 @@ async def test_child_inherits_parent_project_entry_for_worktree_placement(
 
     # The child launches in its own worktree, not at the entry.
     body = resp.json()
-    assert body["workspace"] == "/Users/alice/project/.worktrees/project/feature-x"
-    assert body["worktree"] == "/Users/alice/project/.worktrees/project/feature-x"
+    assert body["workspace"] == "/opt/work/project/.worktrees/project/feature-x"
+    assert body["worktree"] == "/opt/work/project/.worktrees/project/feature-x"
 
 
 async def test_child_inherits_parent_project_entry_without_template_uses_sibling(
@@ -1121,7 +1121,7 @@ async def test_child_inherits_parent_project_entry_without_template_uses_sibling
     # (the entry here, since the project has no primary binding), not
     # under the entry.
     body = resp.json()
-    sibling = "/Users/alice/project-worktrees/feature-x"
+    sibling = "/opt/work/project-worktrees/feature-x"
     assert body["workspace"] == sibling
     assert body["worktree"] == sibling
 
@@ -1161,8 +1161,8 @@ async def test_child_naming_its_project_launches_in_its_worktree(
     assert len(cap.create) == 1, cap.create
     assert cap.create[0].entry == _ENTRY
     body = resp.json()
-    assert body["workspace"] == "/Users/alice/project/.worktrees/project/feature-x"
-    assert body["worktree"] == "/Users/alice/project/.worktrees/project/feature-x"
+    assert body["workspace"] == "/opt/work/project/.worktrees/project/feature-x"
+    assert body["worktree"] == "/opt/work/project/.worktrees/project/feature-x"
 
 
 async def test_child_with_explicit_null_project_inherits_no_entry(
@@ -1236,8 +1236,8 @@ async def test_explicit_project_create_launches_in_its_worktree(
     assert cap.create[0].path_template == _ENTRY_TEMPLATE
 
     body = resp.json()
-    assert body["workspace"] == "/Users/alice/project/.worktrees/project/feature-x"
-    assert body["worktree"] == "/Users/alice/project/.worktrees/project/feature-x"
+    assert body["workspace"] == "/opt/work/project/.worktrees/project/feature-x"
+    assert body["worktree"] == "/opt/work/project/.worktrees/project/feature-x"
 
 
 async def test_explicit_project_bind_launches_in_the_existing_worktree(
@@ -1323,7 +1323,7 @@ async def test_child_inherited_checkout_outside_boundary_fails_400(
     first. A failure raises 400 invalid_input before any
     ``host.create_worktree`` frame — no worktree, no session row.
     """
-    binding_repo = "/Users/alice/other-repo"
+    binding_repo = "/opt/work/other-repo"
     cap = register_worktree_host(stat_fails_for=lambda path: path == binding_repo)
     SqlAlchemyProjectStore(db_uri).create(_PROJECT_ID, "Entry project", None)
     app.state.project_host_binding_store = _ProjectDirs(
@@ -1361,7 +1361,7 @@ async def test_explicit_project_checkout_outside_boundary_fails_400(
     project's primary binding. A checkout that fails validation refuses the
     create with 400 before any ``host.create_worktree`` frame.
     """
-    binding_repo = "/Users/alice/other-repo"
+    binding_repo = "/opt/work/other-repo"
     cap = register_worktree_host(stat_fails_for=lambda path: path == binding_repo)
     SqlAlchemyProjectStore(db_uri).create(_PROJECT_ID, "Entry project", None)
     app.state.project_host_binding_store = _ProjectDirs(

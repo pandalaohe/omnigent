@@ -197,6 +197,12 @@ class _ResumeSnapshotServerClient(NullServerClient):
         self._session_url = session_url
         self._snapshot = snapshot
         self._items = items
+        self.patches: list[tuple[str, dict[str, Any]]] = []
+
+    async def patch(self, url: str, **kwargs: Any) -> NullServerClient._Response:
+        """Record session label patches and return a stub 200 response."""
+        self.patches.append((url, kwargs))
+        return await super().patch(url, **kwargs)
 
     async def get(self, url: str, **kwargs: Any) -> NullServerClient._Response:
         """Return empty labels (so the bridge id is the session id), items or the snapshot."""
@@ -3569,6 +3575,174 @@ async def test_auto_create_claude_terminal_resumes_in_place_when_the_registry_ch
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reused_local", "synthesized", "prior_labels", "expected_mode", "expected_count"),
+    [
+        (True, False, {"omnigent.claude_native.resume_count": "2"}, "kept", "3"),
+        (False, True, {}, "rebuilt", "1"),
+    ],
+)
+async def test_auto_create_claude_terminal_records_cold_resume_transcript_outcome(
+    reused_local: bool,
+    synthesized: bool,
+    prior_labels: dict[str, str],
+    expected_mode: str,
+    expected_count: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Cold relaunch logs whether the local transcript was kept or rebuilt and stamps labels."""
+    from omnigent.harnesses.claude_native.main import (
+        CLAUDE_RESUME_COUNT_LABEL_KEY,
+        CLAUDE_RESUME_TRANSCRIPT_LABEL_KEY,
+        ClaudeResumeTranscriptResolution,
+    )
+
+    absent = ClaudeResumeTranscriptResolution(None, reused_local=False, synthesized=False)
+    assert absent.mode is None
+    assert (
+        ClaudeResumeTranscriptResolution(
+            tmp_path / "kept.jsonl",
+            reused_local=True,
+            synthesized=False,
+        ).mode
+        == "kept"
+    )
+    assert (
+        ClaudeResumeTranscriptResolution(
+            tmp_path / "rebuilt.jsonl",
+            reused_local=False,
+            synthesized=True,
+        ).mode
+        == "rebuilt"
+    )
+
+    session_id = "5cdbea97a2fb0c659bc09605401e2bb2"
+    session_external_id = "02857840-6362-408f-b41f-309e396ed7c6"
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+    (tmp_path / "workspace").mkdir()
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+
+    async def _fake_synth(
+        client: Any,
+        *,
+        session_id: str,
+        external_session_id: str,
+        workspace: Path,
+        bridge_dir: Path,
+        resume_copy: bool,
+    ) -> ClaudeResumeTranscriptResolution:
+        del client, session_id, workspace, bridge_dir, resume_copy
+        transcript = tmp_path / f"{external_session_id}.jsonl"
+        transcript.write_text('{"type":"user"}\n', encoding="utf-8")
+        return ClaudeResumeTranscriptResolution(
+            transcript,
+            reused_local=reused_local,
+            synthesized=synthesized,
+        )
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main._ensure_local_claude_resume_transcript",
+        _fake_synth,
+    )
+    captured: dict[str, Any] = {}
+    client = _ResumeSnapshotServerClient(
+        f"/v1/sessions/{session_id}",
+        {"external_session_id": session_external_id, "labels": prior_labels},
+    )
+
+    with caplog.at_level(logging.INFO, logger="omnigent.harnesses.claude_native.main"):
+        await _auto_create_claude_terminal(
+            session_id,
+            _RecordingClaudeRegistry(captured),
+            lambda _sid, _evt: None,
+            server_client=client,  # type: ignore[arg-type]
+        )
+
+    assert (
+        f"claude-native: cold resume of {session_id} used the {expected_mode} transcript; "
+        f"resume={expected_count}"
+    ) in caplog.text
+    expected_patch = (
+        f"/v1/sessions/{session_id}",
+        {
+            "json": {
+                "labels": {
+                    CLAUDE_RESUME_TRANSCRIPT_LABEL_KEY: expected_mode,
+                    CLAUDE_RESUME_COUNT_LABEL_KEY: expected_count,
+                }
+            },
+            "params": {"include_usage": "false"},
+            "timeout": 10.0,
+        },
+    )
+    assert expected_patch in client.patches
+
+    from omnigent.harnesses.claude_native import main as claude_native_main
+
+    cli_client = _ResumeSnapshotServerClient(f"/v1/sessions/{session_id}", {})
+
+    @contextlib.asynccontextmanager
+    async def _fake_open_client(*_args: Any, **_kwargs: Any):
+        yield cli_client
+
+    async def _fake_find_running(_c: object, _sid: str) -> str | None:
+        return None
+
+    async def _fake_resolve_args(
+        _c: object, _sid: str
+    ) -> tuple[tuple[str, ...], ClaudeResumeTranscriptResolution]:
+        return (
+            ("--resume", session_external_id),
+            ClaudeResumeTranscriptResolution(
+                tmp_path / f"{session_external_id}.jsonl",
+                reused_local=reused_local,
+                synthesized=synthesized,
+            ),
+        )
+
+    async def _fake_fetch_labels(_c: object, _sid: str) -> dict[str, str]:
+        return dict(prior_labels)
+
+    async def _fake_launch_terminal(*_args: object, **_kwargs: object) -> str:
+        return "terminal_claude_main"
+
+    async def _fake_read_tmux(_c: object, _sid: str) -> SimpleNamespace:
+        return SimpleNamespace(socket=None, target=None)
+
+    monkeypatch.setattr("omnigent.cli_auth.open_server_client", _fake_open_client)
+    monkeypatch.setattr(claude_native_main, "_find_running_claude_terminal", _fake_find_running)
+    monkeypatch.setattr(claude_native_main, "_resolve_cold_resume_args", _fake_resolve_args)
+    monkeypatch.setattr(claude_native_main, "_fetch_claude_session_labels", _fake_fetch_labels)
+    monkeypatch.setattr(claude_native_main, "_launch_claude_terminal", _fake_launch_terminal)
+    monkeypatch.setattr(claude_native_main, "_read_claude_terminal_tmux", _fake_read_tmux)
+    monkeypatch.setattr(
+        claude_native_main,
+        "_prepare_cold_resume_forward_state",
+        lambda **_kw: False,
+    )
+
+    await claude_native_main._prepare_claude_terminal(
+        base_url="http://127.0.0.1:8000",
+        headers={},
+        session_id=session_id,
+        runner_id=None,
+        session_bundle=None,
+        claude_args=(),
+        command="claude",
+    )
+    assert cli_client.patches == [expected_patch]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("source_transcript", ["missing", "unreadable", "available"])
 async def test_auto_create_claude_fork_preserves_history_in_another_workspace(
     source_transcript: str,
@@ -4147,7 +4321,7 @@ async def test_auto_create_claude_terminal_keeps_successor_bridge_id(
     )
 
     class _FakeTerminalRegistry:
-        def get(self, conversation_id: str, terminal_name: str, session_key: str) -> Any:
+        def get_native(self, conversation_id: str, terminal_name: str, session_key: str) -> Any:
             del conversation_id, terminal_name, session_key
             return type(
                 "Terminal",
@@ -4304,7 +4478,7 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
     class _FakeTerminalRegistry:
         """Returns the live instance for any (session, terminal, key) lookup."""
 
-        def get(self, conversation_id: str, terminal_name: str, session_key: str) -> Any:
+        def get_native(self, conversation_id: str, terminal_name: str, session_key: str) -> Any:
             """Return the fake live instance."""
             del conversation_id, terminal_name, session_key
             return _FakeInstance()
@@ -4404,7 +4578,7 @@ class _LiveClaudeInstance:
 class _LiveClaudeTerminalRegistry:
     """Returns the live instance for any (session, terminal, key) lookup."""
 
-    def get(self, conversation_id: str, terminal_name: str, session_key: str) -> Any:
+    def get_native(self, conversation_id: str, terminal_name: str, session_key: str) -> Any:
         """Return the fake live instance."""
         del conversation_id, terminal_name, session_key
         return _LiveClaudeInstance()
@@ -4539,6 +4713,8 @@ async def test_claude_skill_bundle_survives_retries_and_transfer_until_bridge_cl
     materialized_bundle: bool,
 ) -> None:
     """Generated skills share the bridge lifetime; supplied bundles remain caller-owned."""
+    import time
+
     isolate_provider_resolution(monkeypatch, tmp_path / "config-home")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
@@ -4647,6 +4823,13 @@ async def test_claude_skill_bundle_survives_retries_and_transfer_until_bridge_cl
 
     instance.running = False
     monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    assert claude_native_bridge.prune_orphaned_bridge_dirs() == 0
+    assert bridge_dir.exists()
+    eight_days_ago = time.time() - 8 * 24 * 60 * 60
+    os.utime(bridge_dir / "owner.pid", (eight_days_ago, eight_days_ago))
+    forwarder_state = bridge_dir / "transcript_forwarder.json"
+    if forwarder_state.exists():
+        os.utime(forwarder_state, (eight_days_ago, eight_days_ago))
     assert claude_native_bridge.prune_orphaned_bridge_dirs() == 1
     assert not bridge_dir.exists()
     await resource_registry.cleanup_session("skill-lifetime-target")

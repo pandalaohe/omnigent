@@ -1031,6 +1031,22 @@ def test_runner_token_uses_saved_account_authority(
     assert issued.status_code == 200, issued.text
     runner.headers["Authorization"] = f"Bearer {issued.json()['token']}"
     assert runner.get("/auth/me").status_code == 200
+    if host_owner == "admin":
+        generation = stores["account_store"].get_user("admin").account_generation
+        for method, path, body in (
+            ("POST", "/auth/users/admin/reset", None),
+            ("POST", "/auth/users/alice/reset", None),
+            ("POST", "/auth/invite", {"is_admin": True}),
+            ("DELETE", "/auth/users/alice", None),
+        ):
+            refused = runner.request(
+                method, path, json=body, headers={"Origin": "http://localhost:8000"}
+            )
+            assert refused.status_code == 403, refused.text
+            assert "new_password" not in refused.json() and "token" not in refused.json()
+            assert "set-cookie" not in refused.headers
+        assert stores["account_store"].get_user("admin").account_generation == generation
+        assert stores["account_store"].get_user("alice") is not None
     # A separate administrator can delete either the host or session owner.
     stores["account_store"].set_admin("alice", True)
     deleter = alice if revoked_owner == "admin" else admin

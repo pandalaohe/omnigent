@@ -4152,14 +4152,14 @@ it("carries the recorded worktree when backfilling a session row", async () => {
     mockResponse({
       id: "conv_entry",
       created_at: 1,
-      workspace: "/Users/me/project",
-      worktree: "/Users/me/project/.worktrees/repo/feature-x",
+      workspace: "/opt/work/project",
+      worktree: "/opt/work/project/.worktrees/repo/feature-x",
       git_branch: "feature/x",
     }),
   );
   expect(await fetchConversationById("conv_entry")).toMatchObject({
-    workspace: "/Users/me/project",
-    worktree: "/Users/me/project/.worktrees/repo/feature-x",
+    workspace: "/opt/work/project",
+    worktree: "/opt/work/project/.worktrees/repo/feature-x",
     git_branch: "feature/x",
   });
 });

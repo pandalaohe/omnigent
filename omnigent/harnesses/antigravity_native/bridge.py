@@ -362,6 +362,7 @@ _AGY_ENABLED_TOOLS = [
     "sys_flow_list",
     "sys_flow_start",
     "sys_host_load",
+    "sys_host_restart",
     "sys_instruction_layer_update",
     "sys_instruction_layers_read",
     "sys_list_models",
@@ -396,6 +397,7 @@ _AGY_ENABLED_TOOLS = [
     "sys_terminal_launch",
     "sys_terminal_list",
     "sys_terminal_read",
+    "sys_terminal_request_access",
     "sys_terminal_send",
     "sys_timer_cancel",
     "sys_timer_set",
@@ -1340,16 +1342,14 @@ _AGY_IDLE_MARKER = "? for shortcuts"
 # this marker (footer text can change across agy builds or be truncated).
 _AGY_ACTIVE_MARKER = "esc to cancel"
 _AGY_MODE_HINT_RE = re.compile(r"^[A-Z][a-z]*(?:-[a-z]+)* mode: .+ \(shift\+tab to cycle\)$")
-# agy collapses a paste carrying many line breaks into a single placeholder row
-# (``[Pasted text #1 +17 lines]``) instead of echoing the text into the composer.
-# The threshold is line-count based — ~13+ line breaks; total length does not
-# matter, so a long single-line message still renders verbatim (measured against
-# agy 1.1.8). The pasted text is therefore NEVER visible for a multi-line prompt,
-# which is exactly the shape a sub-agent task prompt has. Treated as draft content
-# so both the render gate and the submit verification key off the placeholder
-# appearing and then leaving the composer.
+# agy can replace pasted text with a placeholder such as
+# ``[Pasted text #1 +17 lines]`` or ``[Pasted text #3 1034 chars]``. Its appearance
+# and departure count as draft render and submit signals.
 _AGY_PASTE_PLACEHOLDER_RE = re.compile(r"\[Pasted text #\d+[^\]]*\]")
 _AGY_COLLAPSED_LINES_RE = re.compile(r"↑ \d+ more lines?")
+# A background command row in agy's ruled task panel below the composer
+# (``● [12:45:28] sleep 600… running``; footer ``… · 1 task(s) · /tasks``).
+_AGY_TASK_ROW_RE = re.compile(r"[^\s>] \[\d{1,2}:\d{2}:\d{2}\] .+")
 # agy's notice when a turn is submitted before its startup account-eligibility
 # check settles. The composer footer mounts ~3s after launch but eligibility is
 # not settled for ~7-9s, and a turn landing in that window is CONSUMED (the draft
@@ -1586,12 +1586,14 @@ def _submit_needle(content: str, *, from_tail: bool = False) -> str:
     A stable single-line substring used to confirm the paste rendered in the pane.
 
     :param content: Message content.
-    :param from_tail: Use the last qualifying line for agy's collapsed composer.
-    :returns: Up to 24 chars of the first (or last) line with at least 4 non-space
-        chars, or ``""`` when no such line exists.
+    :param from_tail: Use a whitespace-free suffix for agy's collapsed composer.
+    :returns: Up to 24 chars from the first substantial line, or from the end of
+        the whitespace-free content; ``""`` when the selected text is too short.
     """
-    lines = content.splitlines()
-    for line in reversed(lines) if from_tail else lines:
+    if from_tail:
+        suffix = "".join(content.split())
+        return suffix[-24:] if len(suffix) >= 4 else ""
+    for line in content.splitlines():
         stripped = line.strip()
         if len(stripped) >= 4:
             return stripped[:24]
@@ -1634,10 +1636,15 @@ def _agy_input_region(pane: str) -> str:
     a successful submit, the submitted prompt remains in transcript history
     above a fresh empty composer, so checking the full pane would falsely think
     the draft is still present. The last separator pair scopes matching to the
-    currently editable input box, mirroring Kiro's input-region guard.
+    currently editable input box, mirroring Kiro's input-region guard. A
+    background-task panel ruled below the composer is skipped.
     """
     lines = pane.splitlines()
     separator_indexes = [index for index, line in enumerate(lines) if _agy_separator_line(line)]
+    while len(separator_indexes) >= 3 and _agy_task_panel(
+        lines[separator_indexes[-2] + 1 : separator_indexes[-1]]
+    ):
+        separator_indexes.pop()
     if len(separator_indexes) >= 2:
         start = separator_indexes[-2] + 1
         end = separator_indexes[-1]
@@ -1657,6 +1664,12 @@ def _agy_separator_line(line: str) -> bool:
     if stripped.count(_AGY_SEPARATOR_CHAR) < 8:
         return False
     return all(char in _AGY_BOX_GLYPHS for char in stripped if not char.isspace())
+
+
+def _agy_task_panel(lines: list[str]) -> bool:
+    """Return whether *lines* hold only agy background-task rows (never a composer)."""
+    rows = [line.strip() for line in lines if line.strip()]
+    return bool(rows) and all(_AGY_TASK_ROW_RE.fullmatch(row) for row in rows)
 
 
 def _agy_turn_running(pane: str) -> bool:
@@ -1693,11 +1706,12 @@ def _draft_in_input_region(
     normalized_needle = needle.strip() if needle else ""
     if not normalized_needle:
         return bool(candidates)
-    # A split paste in agy 1.3.4 hides the first lines but leaves the tail visible.
+    # A collapsed draft can hide the head of even one logical line. Ignore
+    # whitespace so the suffix also matches across visual wraps within a word.
     if (
         tail_needle.strip()
         and any(_AGY_COLLAPSED_LINES_RE.fullmatch(line) for line in candidates)
-        and any(tail_needle.strip() in line for line in candidates)
+        and "".join(tail_needle.split()) in "".join("".join(candidates).split())
     ):
         return True
     return any(

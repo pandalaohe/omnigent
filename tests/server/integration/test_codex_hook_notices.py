@@ -13,7 +13,7 @@ from tests.server.helpers import create_test_agent
 
 # Real Codex hook run ids embed the hooks file path.
 _PATH_RUN_ID = (
-    "session-start:3:/home/user/.omnigent/codex-native/"
+    "session-start:3:/opt/work/.omnigent/codex-native/"
     "0123456789abcdef0123456789abcdef/codex-home/hooks.json"
 )
 

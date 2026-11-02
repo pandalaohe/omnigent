@@ -113,6 +113,8 @@ name: no-guardrails
     assert [p.spec.name for p in engine.policies] == [
         "__ask_on_add_policy",
         "__ask_on_scheduled_task_change",
+        "__ask_on_terminal_agent_access",
+        "__ask_on_host_restart",
         "__ask_on_standing_pass_grant",
         "__ask_on_instruction_layer_update",
         "__ask_on_project_settings_update",
@@ -148,6 +150,8 @@ guardrails: {}
     assert [p.spec.name for p in engine.policies] == [
         "__ask_on_add_policy",
         "__ask_on_scheduled_task_change",
+        "__ask_on_terminal_agent_access",
+        "__ask_on_host_restart",
         "__ask_on_standing_pass_grant",
         "__ask_on_instruction_layer_update",
         "__ask_on_project_settings_update",
@@ -206,6 +210,8 @@ guardrails:
         "charlie",
         "__ask_on_add_policy",
         "__ask_on_scheduled_task_change",
+        "__ask_on_terminal_agent_access",
+        "__ask_on_host_restart",
         "__ask_on_standing_pass_grant",
         "__ask_on_instruction_layer_update",
         "__ask_on_project_settings_update",
@@ -617,9 +623,11 @@ def test_build_from_programmatic_spec(
     )
     assert engine.ask_timeout == 45
     assert engine.policies[0].spec.name == "taint_web"
-    assert [p.spec.name for p in engine.policies[-5:]] == [
+    assert [p.spec.name for p in engine.policies[-7:]] == [
         "__ask_on_add_policy",
         "__ask_on_scheduled_task_change",
+        "__ask_on_terminal_agent_access",
+        "__ask_on_host_restart",
         "__ask_on_standing_pass_grant",
         "__ask_on_instruction_layer_update",
         "__ask_on_project_settings_update",
@@ -665,6 +673,8 @@ def test_default_policies_appended_after_agent_policies(
         "admin_policy",
         "__ask_on_add_policy",
         "__ask_on_scheduled_task_change",
+        "__ask_on_terminal_agent_access",
+        "__ask_on_host_restart",
         "__ask_on_standing_pass_grant",
         "__ask_on_instruction_layer_update",
         "__ask_on_project_settings_update",
@@ -693,9 +703,11 @@ def test_default_policies_alone_builds_live_engine(
         default_policies=[admin_policy],
     )
     assert engine.policies[0].spec.name == "admin_audit"
-    assert [p.spec.name for p in engine.policies[-5:]] == [
+    assert [p.spec.name for p in engine.policies[-7:]] == [
         "__ask_on_add_policy",
         "__ask_on_scheduled_task_change",
+        "__ask_on_terminal_agent_access",
+        "__ask_on_host_restart",
         "__ask_on_standing_pass_grant",
         "__ask_on_instruction_layer_update",
         "__ask_on_project_settings_update",
@@ -727,6 +739,8 @@ def test_empty_default_policies_preserves_existing_behaviour(
     guards = [
         "__ask_on_add_policy",
         "__ask_on_scheduled_task_change",
+        "__ask_on_terminal_agent_access",
+        "__ask_on_host_restart",
         "__ask_on_standing_pass_grant",
         "__ask_on_instruction_layer_update",
         "__ask_on_project_settings_update",

@@ -82,8 +82,8 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 const navigateMock = vi.fn();
 
 const RECENT_KEY = "omnigent:recent-workspaces";
-const RECENT_WORKSPACE = "/Users/corey/universe/src/foo";
-const REPO = "/Users/corey/projects/alpha";
+const RECENT_WORKSPACE = "/opt/work/universe/src/foo";
+const REPO = "/opt/work/projects/alpha";
 
 // Mutable so a test can simulate clicking another project's pencil (the
 // screen stays mounted; only the param changes).
@@ -485,7 +485,7 @@ afterEach(() => {
 
 describe("NewChatLandingScreen project prefill", () => {
   it("discards project A's parked draft slots so project B's remount seeds B's defaults", async () => {
-    const BETA_REPO = "/Users/corey/projects/beta";
+    const BETA_REPO = "/opt/work/projects/beta";
     // Distinct stored defaults per project: Alpha pins ag_other + its repo,
     // Beta pins ag_hello + a different repo.
     vi.mocked(useProjectConfig).mockImplementation((id) => {
@@ -732,7 +732,7 @@ describe("NewChatLandingScreen project prefill", () => {
   });
 
   it("reseeds from the new project when another pencil is clicked while mounted", async () => {
-    const BETA_REPO = "/Users/corey/projects/beta";
+    const BETA_REPO = "/opt/work/projects/beta";
     vi.mocked(useProjectConfig).mockImplementation((id) => {
       const data =
         id === "proj_beta"
@@ -794,7 +794,7 @@ describe("NewChatLandingScreen project prefill", () => {
   });
 
   it("reseeds the SAME project after its stored defaults change (edited then re-opened)", async () => {
-    const EDITED_REPO = "/Users/corey/projects/alpha-edited";
+    const EDITED_REPO = "/opt/work/projects/alpha-edited";
     // First open reads the original config.
     setProjectConfig({ host_id: "host_1", workspace: REPO });
     const { rerender } = renderLanding();
@@ -851,8 +851,8 @@ describe("NewChatLandingScreen project prefill", () => {
   // A repo with a main work tree plus one linked worktree. `git worktree list`
   // returns both for any path inside the repo, so the probe (keyed on the
   // recent-workspace path) and the post-redirect main query both resolve here.
-  const MAIN_REPO = "/Users/corey/projects/gamma";
-  const LINKED_WORKTREE = "/Users/corey/projects/gamma-worktrees/feature-x";
+  const MAIN_REPO = "/opt/work/projects/gamma";
+  const LINKED_WORKTREE = "/opt/work/projects/gamma-worktrees/feature-x";
   const WORKTREE_LIST: HostWorktree[] = [
     {
       path: MAIN_REPO,
@@ -1491,23 +1491,23 @@ describe("NewChatLandingScreen base-branch seed order", () => {
 // while the new host still offers them (D28/D30); untouched fields follow the
 // new host. Carry-over ON prefers the last-used project × host entry.
 describe("NewChatLandingScreen calling-defaults seeding", () => {
-  const HDS = "host_1";
-  const TMB = "host_2";
+  const HOST_WORKSTATION = "host_1";
+  const HOST_LAPTOP = "host_2";
   const AG_CODEX = "ag_codex";
   const AG_CLAUDE = "ag_claude";
-  const TMB_REPO = "/Users/corey/projects/alpha-tmb";
+  const LAPTOP_REPO = "/opt/work/projects/alpha-laptop";
 
   function setTwoHosts(): void {
     vi.mocked(useHosts).mockReturnValue({
       data: [
         host({
-          host_id: HDS,
-          name: "HDS",
+          host_id: HOST_WORKSTATION,
+          name: "workstation",
           configured_harnesses: { "codex-native": true, "claude-native": true },
         }),
         host({
-          host_id: TMB,
-          name: "TMB",
+          host_id: HOST_LAPTOP,
+          name: "laptop",
           configured_harnesses: { "claude-native": true },
         }),
       ],
@@ -1537,10 +1537,10 @@ describe("NewChatLandingScreen calling-defaults seeding", () => {
     vi.mocked(useProjectHostRoots).mockReturnValue({
       data: {
         roots: [
-          { host_id: HDS, workspace: REPO, source: "config" },
-          { host_id: TMB, workspace: TMB_REPO, source: "binding" },
+          { host_id: HOST_WORKSTATION, workspace: REPO, source: "config" },
+          { host_id: HOST_LAPTOP, workspace: LAPTOP_REPO, source: "binding" },
         ],
-        default_host_id: HDS,
+        default_host_id: HOST_WORKSTATION,
         default_host_reason: "config",
       },
       isLoading: false,
@@ -1581,16 +1581,16 @@ describe("NewChatLandingScreen calling-defaults seeding", () => {
 
   function seedCatalogs(): void {
     vi.mocked(listCallingDefaultCatalogs).mockResolvedValue([
-      catalogRow(HDS, "codex-native", ["gpt-6-sol", "gpt-6-luna"]),
-      catalogRow(HDS, "claude-native", ["opus-5-5", "sonnet"]),
-      catalogRow(TMB, "claude-native", ["opus-5-5", "sonnet"]),
+      catalogRow(HOST_WORKSTATION, "codex-native", ["gpt-6-sol", "gpt-6-luna"]),
+      catalogRow(HOST_WORKSTATION, "claude-native", ["opus-5-5", "sonnet"]),
+      catalogRow(HOST_LAPTOP, "claude-native", ["opus-5-5", "sonnet"]),
     ]);
   }
 
-  /** HDS resolves Codex + gpt-6-sol/high; TMB resolves Claude Code + opus-5-5/xhigh. */
+  /** HOST_WORKSTATION resolves Codex + gpt-6-sol/high; HOST_LAPTOP resolves Claude Code + opus-5-5/xhigh. */
   function seedResolutions(): void {
     vi.mocked(resolveCallingDefaults).mockImplementation(async (options = {}) => {
-      if (options.hostId === TMB || options.agentId === AG_CLAUDE) {
+      if (options.hostId === HOST_LAPTOP || options.agentId === AG_CLAUDE) {
         return resolution({
           agent_id: AG_CLAUDE,
           harness: "claude-native",
@@ -1639,7 +1639,7 @@ describe("NewChatLandingScreen calling-defaults seeding", () => {
     setModelOptions();
     seedCatalogs();
     seedResolutions();
-    setProjectConfig({ host_id: HDS, workspace: REPO });
+    setProjectConfig({ host_id: HOST_WORKSTATION, workspace: REPO });
   });
 
   it("seeds the agent, model, and effort from resolve for the configured host", async () => {
@@ -1662,7 +1662,7 @@ describe("NewChatLandingScreen calling-defaults seeding", () => {
     );
 
     await submitAndReadBody();
-    expect(readCallingLast().projects["p:proj_alpha"]?.[HDS]).toMatchObject({
+    expect(readCallingLast().projects["p:proj_alpha"]?.[HOST_WORKSTATION]).toMatchObject({
       last_agent_id: AG_CODEX,
       agents: { [AG_CODEX]: { harness: "codex-native", model: "gpt-6-sol", effort: "high" } },
     });
@@ -1674,7 +1674,7 @@ describe("NewChatLandingScreen calling-defaults seeding", () => {
       expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(/Codex/),
     );
 
-    switchHost(TMB);
+    switchHost(HOST_LAPTOP);
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
         /Claude Code/,
@@ -1697,7 +1697,7 @@ describe("NewChatLandingScreen calling-defaults seeding", () => {
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${AG_CODEX}`));
 
-    switchHost(TMB);
+    switchHost(HOST_LAPTOP);
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
         /Claude Code/,
@@ -1705,7 +1705,7 @@ describe("NewChatLandingScreen calling-defaults seeding", () => {
     );
 
     expect(screen.getByTestId("new-chat-landing-calling-notice")).toHaveTextContent(
-      "Codex is not available on TMB; using Claude Code.",
+      "Codex is not available on laptop; using Claude Code.",
     );
     const body = await submitAndReadBody();
     expect(body.agent_id).toBe(AG_CLAUDE);
@@ -1719,7 +1719,7 @@ describe("NewChatLandingScreen calling-defaults seeding", () => {
     );
     pickModelFromGear(AG_CODEX, "gpt-6-luna");
 
-    switchHost(TMB);
+    switchHost(HOST_LAPTOP);
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
         /Claude Code/,
@@ -1727,7 +1727,7 @@ describe("NewChatLandingScreen calling-defaults seeding", () => {
     );
 
     expect(screen.getByTestId("new-chat-landing-calling-notice")).toHaveTextContent(
-      'Model "gpt-6-luna" is not available on TMB; using "opus-5-5".',
+      'Model "gpt-6-luna" is not available on laptop; using "opus-5-5".',
     );
     const body = await submitAndReadBody();
     expect(body.agent_id).toBe(AG_CLAUDE);
@@ -1745,23 +1745,23 @@ describe("NewChatLandingScreen calling-defaults seeding", () => {
     vi.mocked(useHosts).mockReturnValue({
       data: [
         host({
-          host_id: HDS,
-          name: "HDS",
+          host_id: HOST_WORKSTATION,
+          name: "workstation",
           configured_harnesses: { "codex-native": true, "claude-native": true },
         }),
         host({
-          host_id: TMB,
-          name: "TMB",
+          host_id: HOST_LAPTOP,
+          name: "laptop",
           configured_harnesses: { "codex-native": true, "claude-native": true },
         }),
       ],
     } as ReturnType<typeof useHosts>);
     vi.mocked(listCallingDefaultCatalogs).mockResolvedValue([
-      catalogRow(HDS, "codex-native", ["gpt-6-sol", "gpt-6-luna"]),
-      catalogRow(TMB, "codex-native", ["gpt-6-sol", "gpt-6-luna"]),
+      catalogRow(HOST_WORKSTATION, "codex-native", ["gpt-6-sol", "gpt-6-luna"]),
+      catalogRow(HOST_LAPTOP, "codex-native", ["gpt-6-sol", "gpt-6-luna"]),
     ]);
 
-    switchHost(TMB);
+    switchHost(HOST_LAPTOP);
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(/Codex/),
     );
@@ -1778,7 +1778,7 @@ describe("NewChatLandingScreen calling-defaults seeding", () => {
       JSON.stringify({
         enabled: true,
         "p:proj_alpha": {
-          [HDS]: {
+          [HOST_WORKSTATION]: {
             last_agent_id: AG_CLAUDE,
             agents: {
               [AG_CLAUDE]: {
@@ -1811,7 +1811,7 @@ describe("NewChatLandingScreen calling-defaults seeding", () => {
       JSON.stringify({
         enabled: true,
         "p:proj_alpha": {
-          [HDS]: {
+          [HOST_WORKSTATION]: {
             last_agent_id: AG_CLAUDE,
             agents: {
               [AG_CLAUDE]: {
@@ -1848,7 +1848,7 @@ describe("NewChatLandingScreen calling-defaults seeding", () => {
       JSON.stringify({
         enabled: false,
         "p:proj_alpha": {
-          [HDS]: {
+          [HOST_WORKSTATION]: {
             last_agent_id: AG_CODEX,
             agents: {
               [AG_CODEX]: {
@@ -1966,7 +1966,7 @@ describe("NewChatLandingScreen calling-defaults seeding", () => {
     expect(body.reasoning_effort).toBe("low");
     expect(vi.mocked(resolveCallingDefaults)).toHaveBeenCalledWith({
       projectId: "",
-      hostId: HDS,
+      hostId: HOST_WORKSTATION,
     });
   });
 });

@@ -511,6 +511,7 @@ export function InboxPage() {
             allowAllEdits={item.elicitation.allowAllEdits}
             allowAutoMode={item.elicitation.allowAutoMode}
             permissionDirectories={item.elicitation.permissionDirectories}
+            terminalAccess={item.elicitation.terminalAccess}
             rememberScope={item.elicitation.rememberScope}
             codexPersistModes={item.elicitation.codexPersistModes}
             targetSessionId={item.elicitation.targetSessionId}

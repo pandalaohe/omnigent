@@ -19,6 +19,7 @@ export interface MobileAssistantActionDefinition {
   id: MobileAssistantAction;
   label: string;
   shortLabel: string;
+  description?: string;
   key?: string;
   code?: string;
 }
@@ -37,7 +38,12 @@ export const MOBILE_ASSISTANT_ACTIONS: MobileAssistantActionDefinition[] = [
     code: "ArrowRight",
   },
   { id: "enter", label: "Enter", shortLabel: "↵", key: "Enter", code: "Enter" },
-  { id: "pollSessions", label: "Poll sessions", shortLabel: "Poll" },
+  {
+    id: "pollSessions",
+    label: "Poll sessions",
+    shortLabel: "Poll",
+    description: DEFAULT_SHORTCUT_DEFINITIONS.pollSessions.note,
+  },
   { id: "archiveSession", label: "Archive session", shortLabel: "Archive" },
 ];
 
@@ -102,6 +108,8 @@ export const TERMINAL_SOFT_KEY_EVENT = "omnigent:terminal-soft-key";
 
 export interface TerminalSoftKeyEventDetail {
   action: MobileAssistantSoftKey;
+  /** Raw terminal payload for modified key chords or phrase buttons. */
+  data?: string;
   handled: boolean;
   preferredTarget?: HTMLElement | null;
   candidates?: { focused: boolean; ownsPreferredTarget: boolean; send: () => void }[];
@@ -487,59 +495,250 @@ function softKeyForChord(chord: ShortcutChord): MobileAssistantSoftKey | null {
   )?.[0] ?? null) as MobileAssistantSoftKey | null;
 }
 
+export function isDomTargetVisible(
+  element: HTMLElement | null | undefined,
+): element is HTMLElement {
+  if (!element?.isConnected) return false;
+  if (element.closest('[inert], [aria-hidden="true"], [hidden], .invisible')) {
+    return false;
+  }
+  for (let current: HTMLElement | null = element; current; current = current.parentElement) {
+    const style = getComputedStyle(current);
+    if (
+      style.display === "none" ||
+      style.visibility === "hidden" ||
+      style.visibility === "collapse"
+    ) {
+      return false;
+    }
+  }
+  if (typeof element.checkVisibility === "function") {
+    return element.checkVisibility({
+      checkVisibilityCSS: true,
+      visibilityProperty: true,
+      contentVisibilityAuto: true,
+    } as CheckVisibilityOptions);
+  }
+  return true;
+}
+
+function isXtermElement(element: HTMLElement): boolean {
+  return element.classList.contains("xterm-helper-textarea") || Boolean(element.closest(".xterm"));
+}
+
+function isEditableDomInput(element: HTMLElement): boolean {
+  if (isXtermElement(element)) return false;
+  return (
+    element instanceof HTMLInputElement ||
+    element instanceof HTMLTextAreaElement ||
+    element.isContentEditable
+  );
+}
+
 function preferredTarget(preferredDomTarget?: HTMLElement | null): HTMLElement {
   const activeTarget =
-    document.activeElement instanceof HTMLElement ? document.activeElement : document.body;
-  if (!preferredDomTarget?.isConnected) return activeTarget;
-  const visible =
-    preferredDomTarget.checkVisibility?.({ checkVisibilityCSS: true }) ??
-    getComputedStyle(preferredDomTarget).visibility === "visible";
-  return visible ? preferredDomTarget : activeTarget;
+    document.activeElement instanceof HTMLElement && isDomTargetVisible(document.activeElement)
+      ? document.activeElement
+      : document.body;
+  if (!isDomTargetVisible(preferredDomTarget)) return activeTarget;
+  return preferredDomTarget;
+}
+
+export function terminalDataForChord(chord: ShortcutChord): string | null {
+  const platform = currentShortcutPlatform();
+  const modifiers = new Set(chord.modifiers);
+  const hasPrimary = modifiers.has("primary");
+  const hasControl = modifiers.has("control") || (hasPrimary && platform !== "macos");
+  const hasMeta = modifiers.has("meta") || (hasPrimary && platform === "macos");
+  const hasCtrlOrPrimary = modifiers.has("control") || hasPrimary;
+  const hasAlt = modifiers.has("alt");
+  const hasShift = modifiers.has("shift");
+
+  if (chord.code === "Tab" && hasShift && !hasCtrlOrPrimary && !hasMeta && !hasAlt) {
+    return "\x1b[Z";
+  }
+  if (chord.code === "Enter") {
+    if (hasShift && !hasCtrlOrPrimary && !hasMeta && !hasAlt) return "\x1b[13;2u";
+    if (hasAlt && !hasCtrlOrPrimary && !hasMeta && !hasShift) return "\x1b\r";
+    if ((hasCtrlOrPrimary || hasMeta) && !hasAlt && !hasShift) return "\r";
+  }
+  if (chord.code === "Backspace") {
+    if (!hasCtrlOrPrimary && !hasMeta && !hasAlt && !hasShift) return "\x7f";
+    if (hasAlt && !hasCtrlOrPrimary && !hasMeta && !hasShift) return "\x1b\x7f";
+    if (hasMeta && !hasControl && !hasAlt && !hasShift) return "\x15";
+    if (hasCtrlOrPrimary && !hasAlt && !hasShift) return "\x17";
+  }
+  if (chord.code === "Delete" && modifiers.size === 0) {
+    return "\x1b[3~";
+  }
+  if (chord.code === "ArrowLeft" || chord.code === "ArrowRight") {
+    const dir = chord.code === "ArrowLeft" ? "D" : "C";
+    if (hasMeta && !hasControl && !hasAlt && !hasShift) {
+      return chord.code === "ArrowLeft" ? "\x01" : "\x05";
+    }
+    if (hasControl && !hasMeta && !hasAlt && !hasShift) {
+      return `\x1b[1;5${dir}`;
+    }
+    if (hasAlt && !hasControl && !hasMeta && !hasShift) {
+      return `\x1b[1;3${dir}`;
+    }
+    if (hasShift && !hasControl && !hasMeta && !hasAlt) {
+      return `\x1b[1;2${dir}`;
+    }
+  }
+  if (modifiers.size === 0) {
+    const navigationPayloads: Record<string, string> = {
+      Home: "\x1b[H",
+      End: "\x1b[F",
+      PageUp: "\x1b[5~",
+      PageDown: "\x1b[6~",
+      Space: " ",
+      F1: "\x1bOP",
+      F2: "\x1bOQ",
+      F3: "\x1bOR",
+      F4: "\x1bOS",
+      F5: "\x1b[15~",
+      F6: "\x1b[17~",
+      F7: "\x1b[18~",
+      F8: "\x1b[19~",
+      F9: "\x1b[20~",
+      F10: "\x1b[21~",
+      F11: "\x1b[23~",
+      F12: "\x1b[24~",
+    };
+    if (chord.code in navigationPayloads) return navigationPayloads[chord.code];
+  }
+  if (hasCtrlOrPrimary && !modifiers.has("meta") && !hasShift) {
+    if (/^Key[A-Z]$/.test(chord.code)) {
+      const ctrlChar = String.fromCharCode(chord.code.charCodeAt(3) - 64);
+      return hasAlt ? `\x1b${ctrlChar}` : ctrlChar;
+    }
+    const controlPunctuation: Record<string, string> = {
+      Space: "\x00",
+      BracketLeft: "\x1b",
+      Backslash: "\x1c",
+      BracketRight: "\x1d",
+      Minus: "\x1f",
+      Slash: "\x1f",
+    };
+    if (chord.code in controlPunctuation) {
+      const ctrlChar = controlPunctuation[chord.code];
+      return hasAlt ? `\x1b${ctrlChar}` : ctrlChar;
+    }
+  }
+  if (!hasCtrlOrPrimary && !hasMeta) {
+    let char: string | null = null;
+    if (/^Key[A-Z]$/.test(chord.code)) {
+      const letter = chord.code.slice(3);
+      char = hasShift ? letter : letter.toLowerCase();
+    } else if (/^Digit[0-9]$/.test(chord.code)) {
+      const digit = chord.code.slice(5);
+      const shiftedDigits: Record<string, string> = {
+        "0": ")",
+        "1": "!",
+        "2": "@",
+        "3": "#",
+        "4": "$",
+        "5": "%",
+        "6": "^",
+        "7": "&",
+        "8": "*",
+        "9": "(",
+      };
+      char = hasShift ? (shiftedDigits[digit] ?? null) : digit;
+    } else {
+      const punctuation: Record<string, [string, string]> = {
+        Slash: ["/", "?"],
+        Period: [".", ">"],
+        Comma: [",", "<"],
+        Minus: ["-", "_"],
+        Equal: ["=", "+"],
+        Backquote: ["`", "~"],
+        BracketLeft: ["[", "{"],
+        BracketRight: ["]", "}"],
+        Backslash: ["\\", "|"],
+        Semicolon: [";", ":"],
+        Quote: ["'", '"'],
+      };
+      const pair = punctuation[chord.code];
+      if (pair) char = hasShift ? pair[1] : pair[0];
+    }
+    if (char !== null) return hasAlt ? `\x1b${char}` : char;
+  }
+  return null;
+}
+
+function dispatchToTerminal(
+  payload: { action: MobileAssistantSoftKey; data?: string },
+  target: HTMLElement,
+): boolean {
+  const detail: TerminalSoftKeyEventDetail = {
+    action: payload.action,
+    ...(payload.data !== undefined ? { data: payload.data } : {}),
+    handled: false,
+    preferredTarget: target,
+    candidates: [],
+  };
+  window.dispatchEvent(
+    new CustomEvent<TerminalSoftKeyEventDetail>(TERMINAL_SOFT_KEY_EVENT, { detail }),
+  );
+  const ownedTerminal = detail.candidates?.find((candidate) => candidate.ownsPreferredTarget);
+  const focusedTerminal = detail.candidates?.find((candidate) => candidate.focused);
+  // A mobile palette click can move DOM focus to app chrome after the TUI
+  // was active. When exactly one writable terminal is mounted, it remains
+  // the unambiguous target even if neither focus heuristic survived.
+  const targetIsEditable = isEditableDomInput(target);
+  const onlyTerminal =
+    !targetIsEditable && detail.candidates?.length === 1 ? detail.candidates[0] : undefined;
+  const terminal = ownedTerminal ?? focusedTerminal ?? onlyTerminal;
+  if (!detail.handled && terminal) {
+    terminal.send();
+    detail.handled = true;
+  }
+  if (detail.handled) return true;
+  if (!targetIsEditable && (target === document.body || isXtermElement(target))) {
+    const fallbackTerminal = detail.candidates?.[0];
+    if (fallbackTerminal) {
+      fallbackTerminal.send();
+      return true;
+    }
+  }
+  return false;
+}
+
+function dispatchGlobalShortcutChord(
+  chord: ShortcutChord,
+  preferredDomTarget?: HTMLElement | null,
+): void {
+  const activeElement =
+    document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  if (activeElement && isXtermElement(activeElement)) {
+    activeElement.blur();
+  }
+  const target = preferredTarget(preferredDomTarget);
+  const eventTarget = isXtermElement(target) ? document.body : target;
+  eventTarget.dispatchEvent(new KeyboardEvent("keydown", keyboardEventInit(chord)));
 }
 
 function dispatchChord(chord: ShortcutChord, preferredDomTarget?: HTMLElement | null): void {
   const target = preferredTarget(preferredDomTarget);
   const softKey = softKeyForChord(chord);
   if (softKey) {
-    const detail: TerminalSoftKeyEventDetail = {
-      action: softKey,
-      handled: false,
-      preferredTarget: target,
-      candidates: [],
-    };
-    window.dispatchEvent(
-      new CustomEvent<TerminalSoftKeyEventDetail>(TERMINAL_SOFT_KEY_EVENT, { detail }),
-    );
-    const ownedTerminal = detail.candidates?.find((candidate) => candidate.ownsPreferredTarget);
-    const focusedTerminal = detail.candidates?.find((candidate) => candidate.focused);
-    // A mobile palette click can move DOM focus to app chrome after the TUI
-    // was active. When exactly one writable terminal is mounted, it remains
-    // the unambiguous target even if neither focus heuristic survived.
-    const targetIsEditable =
-      target instanceof HTMLInputElement ||
-      target instanceof HTMLTextAreaElement ||
-      target.isContentEditable;
-    const onlyTerminal =
-      !targetIsEditable && detail.candidates?.length === 1 ? detail.candidates[0] : undefined;
-    const terminal = ownedTerminal ?? focusedTerminal ?? onlyTerminal;
-    if (!detail.handled && terminal) {
-      terminal.send();
-      detail.handled = true;
-    }
-    if (detail.handled) return;
-    if (target === document.body) {
-      const fallbackTerminal = detail.candidates?.[0];
-      if (fallbackTerminal) {
-        fallbackTerminal.send();
-        return;
-      }
-    }
+    if (dispatchToTerminal({ action: softKey }, target)) return;
+  } else {
+    const data = terminalDataForChord(chord);
+    if (data !== null && dispatchToTerminal({ action: "enter", data }, target)) return;
   }
   target.dispatchEvent(new KeyboardEvent("keydown", keyboardEventInit(chord)));
 }
 
 function insertText(text: string, target: HTMLElement): boolean {
-  if (!(target instanceof HTMLTextAreaElement || target instanceof HTMLInputElement)) return false;
+  if (
+    !isEditableDomInput(target) ||
+    !(target instanceof HTMLTextAreaElement || target instanceof HTMLInputElement)
+  ) {
+    return false;
+  }
   const start = target.selectionStart ?? target.value.length;
   const end = target.selectionEnd ?? start;
   target.setRangeText(text, start, end, "end");
@@ -590,7 +789,17 @@ export function dispatchMobileAssistantButton(
       return;
     }
     const chord = resolveShortcutBindings(binding.actionId)[0];
-    if (chord) dispatchChord(chord, preferredDomTarget);
+    if (!chord) return;
+    if (DEFAULT_SHORTCUT_DEFINITIONS[binding.actionId].scope === "global") {
+      dispatchGlobalShortcutChord(chord, preferredDomTarget);
+      return;
+    }
+    const target = preferredTarget(preferredDomTarget);
+    if (binding.actionId === "sendMessage" && !isEditableDomInput(target)) {
+      dispatchChord({ code: "Enter", modifiers: [] }, preferredDomTarget);
+      return;
+    }
+    dispatchChord(chord, preferredDomTarget);
     return;
   }
   if (binding.kind === "key") {
@@ -598,9 +807,15 @@ export function dispatchMobileAssistantButton(
     return;
   }
   const target = preferredTarget(preferredDomTarget);
-  if (!insertText(binding.text, target)) return;
-  if (binding.submit)
-    window.setTimeout(() => dispatchChord({ code: "Enter", modifiers: [] }, target), 0);
+  if (insertText(binding.text, target)) {
+    if (binding.submit)
+      window.setTimeout(() => dispatchChord({ code: "Enter", modifiers: [] }, target), 0);
+    return;
+  }
+  if (!dispatchToTerminal({ action: "enter", data: binding.text }, target)) return;
+  if (binding.submit) {
+    dispatchToTerminal({ action: "enter" }, target);
+  }
 }
 
 /** Backward-compatible helper used by older callers and tests. */

@@ -19,6 +19,7 @@ import {
   useState,
 } from "react";
 import { useLocation, useNavigate, useSearchParams } from "@/lib/routing";
+import { HostTerminalLink } from "@/components/HostTerminalLink";
 import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
 import { CANVAS_QUERY_PARAM, canvasLocation } from "@/canvas/canvasNavigation";
 import {
@@ -689,8 +690,8 @@ export function isValidWorkspace(workspace: string): boolean {
  * or symlink resolution — which suffices because the server stores canonical
  * absolute workspaces, so a freshly typed absolute path matches directly.
  *
- * @param path A host path, e.g. ``"/Users/me/repo/"``.
- * @returns The normalized path, e.g. ``"/Users/me/repo"``; ``null`` for blank.
+ * @param path A host path, e.g. ``"/opt/work/repo/"``.
+ * @returns The normalized path, e.g. ``"/opt/work/repo"``; ``null`` for blank.
  */
 export function normalizeWorkspacePath(path: string): string | null {
   const trimmed = path.trimStart();
@@ -709,7 +710,7 @@ export function normalizeWorkspacePath(path: string): string | null {
  * ``"…/myrepo-worktrees/feature-x"``) instead of a shared prefix that
  * truncates to the same string for every entry.
  *
- * @param path Absolute path, e.g. ``"/Users/me/myrepo-worktrees/feature-x"``.
+ * @param path Absolute path, e.g. ``"/opt/work/myrepo-worktrees/feature-x"``.
  * @returns The tail, prefixed with ``"…/"`` when segments were dropped;
  *   the original path when it already has two or fewer segments.
  */
@@ -833,7 +834,7 @@ export function composerWorktreeHeaderState({
  *
  * @param sessions The caller's sessions from ``useDirectorySessions``.
  * @param hostId The selected host id, or ``null`` when none is picked.
- * @param workspace The picked absolute directory, e.g. ``"/Users/me/repo"``.
+ * @param workspace The picked absolute directory, e.g. ``"/opt/work/repo"``.
  * @param isRunnerOnline Predicate: is this session's runner online right now?
  *   Backed by the shared runner-health poll in the component.
  * @returns Matching connected sessions; callers use ``.length`` for the count.
@@ -2115,7 +2116,7 @@ export function AgentHarnessPicker({
         <WandSparklesIcon className="size-4" aria-hidden="true" />
       ) : (
         // The id lets the SDK mark yield to a user badge set on this row's
-        // Agent (MOD-s25).
+        // Agent.
         <ComposerAgentIcon
           agent={{ ...visibleCachedPreview.agent, id: effectiveAgentId ?? undefined }}
         />
@@ -2746,7 +2747,7 @@ export function NewChatLandingScreen() {
   } = useComposerAttachments({
     initialFiles: restoredDraft?.files ?? [],
     limits: info !== "loading" ? info.attachment_limits : undefined,
-    // MOD-s10: accepted files take their `[image N]` / `[file N]` label and a
+    // Fork mod: accepted files take their `[image N]` / `[file N]` label and a
     // visible token at the caret. Runs before the append commits, so `files`
     // is still the prior list the labels count from.
     onAccepted: (accepted) => {
@@ -2764,7 +2765,7 @@ export function NewChatLandingScreen() {
     },
   });
   const fileInputRef = useRef<HTMLInputElement>(null);
-  // MOD-s10: removing a tile also removes its token from the text.
+  // Fork mod: removing a tile also removes its token from the text.
   const removeFile = (index: number) => {
     const edit = removeFileTokens({ quotes: [], text: message }, index, files)[0];
     if (edit) setMessage(edit.text);
@@ -3676,7 +3677,7 @@ export function NewChatLandingScreen() {
   const sdkHarness =
     !sandboxSelected &&
     effectiveAgentId !== PENDING_AGENT_ID &&
-    (activeSdk === "claude-sdk" || activeSdk === "codex")
+    (activeSdk === "claude-sdk" || activeSdk === "codex" || activeSdk === "pi")
       ? activeSdk
       : null;
   const selectionHarness =
@@ -4142,20 +4143,29 @@ export function NewChatLandingScreen() {
     if (supportsAgyPermissionTier) {
       const skipValue =
         AGY_NATIVE_PERMISSION_TIERS.find((m) => m.value === agySkipMode)?.label ?? agySkipMode;
+      const modelOptions =
+        sdkHarness === "pi"
+          ? sdkModelOptions
+          : selectionHarness === "antigravity-native"
+            ? agyModelOptions
+            : piModelOptions;
       return [
         {
           label: "Model",
           value: pickedModel
             ? nativeModelLabel(
-                (selectionHarness === "antigravity-native" ? agyModelOptions : piModelOptions).find(
-                  (row) => row.id === pickedModel,
-                ) ?? { id: pickedModel },
+                modelOptions.find((row) => row.id === pickedModel) ?? { id: pickedModel },
               )
-            : defaultModelLabel(
-                selectionHarness === "antigravity-native" ? agyModelOptions : piModelOptions,
-              ),
+            : defaultModelLabel(modelOptions),
         },
-        ...(pickedEffort ? [{ label: "Effort", value: normalizeEffortLabel(pickedEffort) }] : []),
+        ...(pickedEffort
+          ? [
+              {
+                label: sdkHarness === "pi" ? "Thinking level" : "Effort",
+                value: normalizeEffortLabel(pickedEffort),
+              },
+            ]
+          : []),
         { label: "Permission mode", value: skipValue },
         ...routingRow,
       ];
@@ -4187,7 +4197,12 @@ export function NewChatLandingScreen() {
                   : "Harness default",
               },
               ...(pickedEffort
-                ? [{ label: "Effort", value: normalizeEffortLabel(pickedEffort) }]
+                ? [
+                    {
+                      label: sdkHarness === "pi" ? "Thinking level" : "Effort",
+                      value: normalizeEffortLabel(pickedEffort),
+                    },
+                  ]
                 : []),
               ...(sdkModes
                 ? [
@@ -4746,7 +4761,10 @@ export function NewChatLandingScreen() {
     pickerEffortOptions.length > 0
       ? {
           testId: "new-chat-landing-agent-efforts",
-          header: selectedNativeHarness === "pi-native" ? "Thinking level" : "Effort",
+          header:
+            selectionHarness === "pi-native" || selectionHarness === "pi"
+              ? "Thinking level"
+              : "Effort",
           choices: [
             {
               key: "__default__",
@@ -4917,7 +4935,7 @@ export function NewChatLandingScreen() {
       ? selectedNativeHarness === "codex-native"
         ? [...declaredPermissionOptions, CODEX_NATIVE_BYPASS_APPROVAL_OPTION]
         : declaredPermissionOptions
-      : sdkHarness !== null
+      : sdkHarness === "claude-sdk" || sdkHarness === "codex"
         ? (sdkPermissionOptions(sdkHarness) ?? [])
         : supportsPermissionMode
           ? CLAUDE_NATIVE_PERMISSION_MODES
@@ -4934,7 +4952,7 @@ export function NewChatLandingScreen() {
                   : [];
   const selectDirectMode = (mode: string) => {
     setPermissionTouched(true);
-    if (sdkHarness !== null) {
+    if (sdkHarness === "claude-sdk" || sdkHarness === "codex") {
       if (sdkHarness === "claude-sdk") setPermissionMode(mode);
       else setApprovalMode(mode);
       rememberPickerOptions(sdkHarness, { mode });
@@ -5036,10 +5054,13 @@ export function NewChatLandingScreen() {
     // model catalog resolves.
     const storedRoutingOn = stored.routing === "on";
     if (sdkHarness !== null) {
-      const sdkModes = sdkPermissionOptions(sdkHarness)!;
-      const sdkMode = seededPermission ?? resolve(sdkModes, sdkInitialPermissionMode(sdkHarness)!);
-      if (sdkHarness === "claude-sdk") setPermissionMode(sdkMode);
-      else setApprovalMode(sdkMode);
+      const sdkModes = sdkPermissionOptions(sdkHarness);
+      const initialMode = sdkInitialPermissionMode(sdkHarness);
+      if (sdkModes && initialMode) {
+        const sdkMode = seededPermission ?? resolve(sdkModes, initialMode);
+        if (sdkHarness === "claude-sdk") setPermissionMode(sdkMode);
+        else setApprovalMode(sdkMode);
+      }
       if (!projectVisit) {
         const model =
           stored.model != null &&
@@ -7367,39 +7388,41 @@ export function NewChatLandingScreen() {
   const renderHostMenuItem = (host: Host) => {
     const reconnect = isReconnectRow(host);
     return (
-      <DropdownMenuItem
-        key={host.host_id}
-        onSelect={() => {
-          if (reconnect) pendingConnectRef.current = true;
-          else selectHost(host.host_id);
-        }}
-        disabled={reconnect ? connectingThisMachine : host.status !== "online"}
-        data-testid={
-          reconnect
-            ? "new-chat-landing-run-on-this-machine"
-            : `new-chat-landing-host-${host.host_id}`
-        }
-        data-active={!sandboxSelected && host.host_id === selectedHostId ? "true" : undefined}
-        title={`${host.name} — ${host.status}`}
-        className={reconnect ? "group" : undefined}
-      >
-        <HostOption
-          host={host}
-          cloud={isCloudHostEntry(host)}
-          displayName={displayNameForHost(host, thisMachineHostId, navigator.userAgent)}
-          subtitle={host.host_id === arcaHostId ? "Arca instance" : undefined}
-          action={
-            reconnect ? (
-              <span
-                className="inline-flex h-6 shrink-0 items-center rounded-md px-2 text-xs font-medium text-muted-foreground group-hover:text-foreground"
-                data-testid="new-chat-landing-use-this-machine"
-              >
-                {connectingThisMachine ? <ConnectingText /> : "Use this machine"}
-              </span>
-            ) : undefined
+      <div key={host.host_id} className="flex min-w-0 items-center gap-1">
+        <DropdownMenuItem
+          onSelect={() => {
+            if (reconnect) pendingConnectRef.current = true;
+            else selectHost(host.host_id);
+          }}
+          disabled={reconnect ? connectingThisMachine : host.status !== "online"}
+          data-testid={
+            reconnect
+              ? "new-chat-landing-run-on-this-machine"
+              : `new-chat-landing-host-${host.host_id}`
           }
-        />
-      </DropdownMenuItem>
+          data-active={!sandboxSelected && host.host_id === selectedHostId ? "true" : undefined}
+          title={`${host.name} — ${host.status}`}
+          className={cn("min-w-0 flex-1", reconnect && "group")}
+        >
+          <HostOption
+            host={host}
+            cloud={isCloudHostEntry(host)}
+            displayName={displayNameForHost(host, thisMachineHostId, navigator.userAgent)}
+            subtitle={host.host_id === arcaHostId ? "Arca instance" : undefined}
+            action={
+              reconnect ? (
+                <span
+                  className="inline-flex h-6 shrink-0 items-center rounded-md px-2 text-xs font-medium text-muted-foreground group-hover:text-foreground"
+                  data-testid="new-chat-landing-use-this-machine"
+                >
+                  {connectingThisMachine ? <ConnectingText /> : "Use this machine"}
+                </span>
+              ) : undefined
+            }
+          />
+        </DropdownMenuItem>
+        {!reconnect && <HostTerminalLink host={host} inMenu />}
+      </div>
     );
   };
 

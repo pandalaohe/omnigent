@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse, urlunparse
 
-from omnigent._platform import IS_WINDOWS, WINDOWS_ENV_PASSTHROUGH
+from omnigent._platform import CLI_FALLBACK_DIRS_ENV_VAR, IS_WINDOWS, WINDOWS_ENV_PASSTHROUGH
 from omnigent.runner.identity import (
     OMNIGENT_SESSION_ENV_VAR,
     strip_runner_auth_secrets,
@@ -136,6 +136,7 @@ class _PopenKwargs(TypedDict, total=False):
 _DEFAULT_ENV_PASSTHROUGH: tuple[str, ...] = (
     # Shell + binary discovery.
     "PATH",
+    CLI_FALLBACK_DIRS_ENV_VAR,
     "HOME",
     "USER",
     "LOGNAME",

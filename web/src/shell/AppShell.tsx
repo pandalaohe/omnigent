@@ -165,6 +165,7 @@ import { MobileFloatingAssistant } from "@/components/MobileFloatingAssistant";
 import { ImportReviewGate } from "@/components/onboarding/HostImportReview";
 import { CommandPalette } from "./CommandPalette";
 import { RecentSessionsSwitcher } from "./RecentSessionsSwitcher";
+import { ReloadNotice } from "@/components/ReloadNotice";
 import { Toaster } from "@/components/ui/sonner";
 import { CloseShellDialog } from "./CloseShellDialog";
 import { ForkSessionDialog } from "./ForkSessionDialog";
@@ -915,7 +916,7 @@ function AppShellImpl() {
     serverConversationId != null && agentHasInfo(boundAgent, serverConversationId);
   // Whether the mobile three-dot menu has any entry to offer.
   const hasHeaderMenu = canShare || hasAgentInfo;
-  // Held-messages panel entry (SCC01-S1 peer messaging) — gated on the
+  // Held-messages panel entry — gated on the
   // server's feature flag; the panel itself reads the open session, so no
   // owner/permission check here beyond having a session to show it for.
   const showPeerMessages =
@@ -2801,6 +2802,7 @@ function AppShellImpl() {
                       onOpenChanges: openChangesPanel,
                       onOpenArchive: openArchivePanel,
                       onOpenShells: openShellsPanel,
+                      onCreatedTerminal: openTerminalsPanel,
                       onOpenSubagents: openSubagentsPanel,
                       onOpenGithub: openGithubPanel,
                       onOpenSideChats: openSideChatsPanel,
@@ -3099,6 +3101,7 @@ function AppShellImpl() {
           {!isEmbedded && <ImportReviewGate />}
           {/* Keep this after Outlet so a visible chat banner wins before the toast effect runs. */}
           {isFeatureEnabled(serverInfo, "arca_shutdown_warnings") && <ArcaShutdownToast />}
+          <ReloadNotice />
           {/* Dev-only `?import-preview` for the post-setup import modal. */}
           {ImportContextPreview && (
             <Suspense fallback={null}>

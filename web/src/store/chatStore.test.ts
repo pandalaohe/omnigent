@@ -5705,7 +5705,7 @@ describe("chatStore — sending during a model switch", () => {
         files: [],
       },
     });
-    // MOD-s19: no optimistic idle/cancel — the stream and lifecycle state stay
+    // Fork mod: no optimistic idle/cancel — the stream and lifecycle state stay
     // live until the runner confirms the interrupt, so Stop cannot look
     // successful while the vendor process keeps generating.
     expect(useChatStore.getState().sessionStatus).toBe("running");
@@ -11710,6 +11710,36 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
   }
 
   describe("session.resource.created (terminal)", () => {
+    it("updates the root agent switch from a card grant event without adding a tab", () => {
+      client.setQueryData<TerminalInfo[]>(terminalsQueryKey("conv_abc"), [
+        {
+          id: "terminal_bash_s1",
+          name: "bash",
+          session: "s1",
+          running: true,
+          instanceId: "instance-a",
+          elevated: true,
+          agentAccess: false,
+        },
+      ]);
+      handleSessionEvent({
+        type: "session_resource_created",
+        resource: {
+          ...makeTerminalResource("terminal_bash_s1"),
+          metadata: {
+            terminal_name: "bash",
+            session_key: "s1",
+            running: true,
+            elevated: true,
+            instance_id: "instance-a",
+            agent_access: true,
+          },
+        } as never,
+      });
+      const cached = client.getQueryData<TerminalInfo[]>(terminalsQueryKey("conv_abc"));
+      expect(cached).toHaveLength(1);
+      expect(cached?.[0].agentAccess).toBe(true);
+    });
     it("appends a new terminal to the cached list", () => {
       client.setQueryData<TerminalInfo[]>(terminalsQueryKey("conv_abc"), []);
       const event: SessionResourceCreatedEvent = {
@@ -11769,6 +11799,34 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
   });
 
   describe("session.resource.deleted (terminal)", () => {
+    it("ignores the deleted event of an older root instance", () => {
+      const terminal = {
+        id: "terminal_bash_s1",
+        name: "bash",
+        session: "s1",
+        running: true,
+        instanceId: "instance-b",
+        elevated: true,
+        agentAccess: false,
+      };
+      client.setQueryData<TerminalInfo[]>(terminalsQueryKey("conv_abc"), [terminal]);
+      handleSessionEvent({
+        type: "session_resource_deleted",
+        sessionId: "conv_abc",
+        resourceType: "terminal",
+        resourceId: terminal.id,
+        instanceId: "instance-a",
+      });
+      expect(client.getQueryData(terminalsQueryKey("conv_abc"))).toEqual([terminal]);
+      handleSessionEvent({
+        type: "session_resource_deleted",
+        sessionId: "conv_abc",
+        resourceType: "terminal",
+        resourceId: terminal.id,
+        instanceId: "instance-b",
+      });
+      expect(client.getQueryData(terminalsQueryKey("conv_abc"))).toEqual([]);
+    });
     it("removes the matching terminal from the cached list", () => {
       client.setQueryData<TerminalInfo[]>(terminalsQueryKey("conv_abc"), [
         { id: "terminal_bash_s1", name: "bash", session: "s1", running: true },
@@ -12105,7 +12163,7 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
           id: "conv_child1",
           host_id: "host-1",
           cwd: "/work/rail",
-          git_branch: "feature/scc18",
+          git_branch: "feature/rail",
           harness: "codex-native",
           agent_id: "ag_1",
           agent_name: "codex",
@@ -12119,7 +12177,7 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       ).toMatchObject({
         host_id: "host-1",
         cwd: "/work/rail",
-        git_branch: "feature/scc18",
+        git_branch: "feature/rail",
         harness: "codex-native",
         agent_id: "ag_1",
         agent_name: "codex",

@@ -47,7 +47,7 @@ from enum import Enum
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import FrameType
-from typing import TYPE_CHECKING, Any, Protocol, TextIO, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TextIO, TypeAlias, cast
 from urllib.parse import urlparse
 
 if TYPE_CHECKING:
@@ -345,6 +345,10 @@ class _ResumeWorkspaceActionOption:
     label: str
 
 
+CLAUDE_RESUME_TRANSCRIPT_LABEL_KEY = "omnigent.claude_native.resume"
+CLAUDE_RESUME_COUNT_LABEL_KEY = "omnigent.claude_native.resume_count"
+
+
 @dataclass(frozen=True)
 class ClaudeResumeTranscriptResolution:
     """One cold-resume transcript and its explicit provenance."""
@@ -359,6 +363,13 @@ class ClaudeResumeTranscriptResolution:
                 raise ValueError("an absent transcript cannot have provenance")
         elif self.reused_local == self.synthesized:
             raise ValueError("a transcript must be either reused or synthesized")
+
+    @property
+    def mode(self) -> Literal["kept", "rebuilt"] | None:
+        """Return ``"kept"`` or ``"rebuilt"`` when a resume transcript exists."""
+        if self.path is None:
+            return None
+        return "kept" if self.reused_local else "rebuilt"
 
 
 @dataclass
@@ -5387,6 +5398,7 @@ async def _prepare_claude_terminal(
             reused_local=False,
             synthesized=False,
         )
+        labels: dict[str, str] = {}
         bridge_id: str | None = None
         if session_id is not None:
             record_startup_event("session_resolved", session_id=session_id)
@@ -5501,6 +5513,12 @@ async def _prepare_claude_terminal(
             resolution=cold_resume_resolution,
             session_id=session_id,
         )
+        await record_cold_resume_transcript_outcome(
+            client,
+            session_id=session_id,
+            resolution=cold_resume_resolution,
+            labels=labels,
+        )
         _mark_startup_step(
             startup_profiler,
             "transcript forward state prepared",
@@ -5583,6 +5601,51 @@ def _prepare_cold_resume_forward_state(
     click.echo(f"warning: {message}", err=True)
     _logger.warning(message, extra={"session_id": session_id})
     return True
+
+
+async def record_cold_resume_transcript_outcome(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    resolution: ClaudeResumeTranscriptResolution,
+    labels: Mapping[str, str] | None = None,
+) -> None:
+    """Log whether cold resume kept or rebuilt the transcript and stamp session labels."""
+    mode = resolution.mode
+    if mode is None:
+        return
+    raw_count = (labels or {}).get(CLAUDE_RESUME_COUNT_LABEL_KEY, "0")
+    try:
+        count = max(0, int(raw_count)) + 1
+    except (TypeError, ValueError):
+        count = 1
+    _logger.info(
+        "claude-native: cold resume of %s used the %s transcript; resume=%d",
+        session_id,
+        mode,
+        count,
+        extra={"session_id": session_id},
+    )
+    try:
+        resp = await client.patch(
+            f"/v1/sessions/{url_component(session_id)}",
+            json={
+                "labels": {
+                    CLAUDE_RESUME_TRANSCRIPT_LABEL_KEY: mode,
+                    CLAUDE_RESUME_COUNT_LABEL_KEY: str(count),
+                }
+            },
+            params={"include_usage": "false"},
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+    except (httpx.HTTPError, OSError) as exc:
+        _logger.warning(
+            "claude-native: failed to record cold-resume transcript outcome for %s: %s",
+            session_id,
+            exc,
+            extra={"session_id": session_id},
+        )
 
 
 async def _fetch_claude_session_labels(

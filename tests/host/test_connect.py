@@ -2076,6 +2076,109 @@ async def test_live_host_full_refresh_detects_auth_completion(
     _cleanup_host(host)
 
 
+@pytest.mark.parametrize(
+    "harness,binary,path_override",
+    [
+        ("claude-native", "claude", None),
+        ("codex-native", "codex", None),
+        ("pi-native", "pi", None),
+        ("claude-native", "claude", "other-claude"),
+        ("codex-native", "codex", "other-codex"),
+        ("pi-native", "pi", "custom-pi"),
+    ],
+)
+async def test_native_cli_loss_logs_path_once_and_rearms_after_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    harness: str,
+    binary: str,
+    path_override: str | None,
+) -> None:
+    cli = tmp_path / binary
+    cli.write_text("#!/bin/sh\nexit 99\n")
+    cli.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_CLI_FALLBACK_DIRS", "")
+    if path_override:
+        other_cli = tmp_path / path_override
+        other_cli.write_text("#!/bin/sh\nexit 99\n")
+        other_cli.chmod(0o755)
+        monkeypatch.setenv(f"OMNIGENT_{binary.upper()}_PATH", str(other_cli))
+        if binary == "pi":
+            cli = other_cli
+    host = _make_host_process()
+    ready = {harness: True}
+    missing = {harness: "binary-missing"}
+    if harness == "claude-native":
+        ready["native-claude"] = True
+        missing["native-claude"] = "binary-missing"
+    try:
+        with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+            host._replace_capabilities(ready, None)
+            cli.unlink()
+            host._replace_capabilities(missing, None)
+            host._replace_capabilities(None, None)
+            host._replace_capabilities(missing, None)
+            messages = [r.message for r in caplog.records if "Native CLI disappeared" in r.message]
+            assert messages == [f"Native CLI disappeared: cli={binary} last_resolved_path={cli}"]
+            if path_override and binary != "pi":
+                assert (tmp_path / path_override).exists()
+            cli.write_text("#!/bin/sh\nexit 99\n")
+            cli.chmod(0o755)
+            host._replace_capabilities(ready, None)
+            cli.unlink()
+            host._replace_capabilities(missing, None)
+            assert sum("Native CLI disappeared" in r.message for r in caplog.records) == 2
+    finally:
+        _cleanup_host(host)
+
+
+async def test_initially_missing_native_cli_and_sdk_do_not_log_loss(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    host = _make_host_process()
+    try:
+        with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+            host._replace_capabilities(
+                {"claude-native": "binary-missing", "claude-sdk": True}, None
+            )
+            host._replace_capabilities({"claude-sdk": "binary-missing"}, None)
+        assert not any("Native CLI disappeared" in r.message for r in caplog.records)
+    finally:
+        _cleanup_host(host)
+
+
+async def test_periodic_readiness_refresh_reports_native_cli_loss(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    cli = tmp_path / "claude"
+    cli.write_text("#!/bin/sh\nexit 99\n")
+    cli.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_CLI_FALLBACK_DIRS", "")
+    monkeypatch.setattr(
+        "omnigent.host.connect.configured_harness_map", lambda: {"claude-native": "binary-missing"}
+    )
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", dict)
+    monkeypatch.setattr("omnigent.host.connect.HARNESS_READINESS_FULL_REFRESH_INTERVAL_S", 0.01)
+    host = _make_host_process()
+    host._replace_capabilities({"claude-native": True}, {})
+    cli.unlink()
+    ws = _RecordingWS()
+    task = asyncio.create_task(host._harness_readiness_loop(ws))
+    try:
+        with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+            await asyncio.wait_for(ws.first_send.wait(), timeout=2.0)
+        assert f"Native CLI disappeared: cli=claude last_resolved_path={cli}" in caplog.text
+        refresh = decode_host_frame(ws.sent[0])
+        assert isinstance(refresh, HostHarnessReadinessFrame)
+        assert refresh.configured_harnesses == {"claude-native": "binary-missing"}
+    finally:
+        await _cancel(task)
+        _cleanup_host(host)
+
+
 async def test_live_host_publishes_sanitized_codex_rate_limits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5408,7 +5511,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
     """
     base = {
         "PATH": "/usr/bin:/bin",
-        "HOME": "/home/alice",
+        "HOME": "/opt/work",
         "LANG": "en_US.UTF-8",
         "LC_CTYPE": "UTF-8",
         "DATABRICKS_CONFIG_PROFILE": "ambient",
@@ -5421,7 +5524,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
         "SOME_RANDOM_VAR": "x",
         "OMNIGENT_CLAUDE_SDK_NO_SANDBOX": "1",
         "OMNIGENT_CLAUDE_CODE_ENTRYPOINT": "gateway-client",
-        "KUBECONFIG": "/home/alice/.kube/config",
+        "KUBECONFIG": "/opt/work/.kube/config",
         "SSH_AUTH_SOCK": "/private/tmp/com.apple.launchd.7Qk/Listeners",
         "BROWSER": "www-browser",
         "CLAUDE_CODE_SKIP_BEDROCK_AUTH": "1",
@@ -5451,7 +5554,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
 
     # Process essentials + the locale family pass through.
     assert env["PATH"] == "/usr/bin:/bin"
-    assert env["HOME"] == "/home/alice"
+    assert env["HOME"] == "/opt/work"
     assert env["LANG"] == "en_US.UTF-8"
     assert env["LC_CTYPE"] == "UTF-8"
     # Databricks config selectors are allowlisted ambient passthrough —
@@ -5480,7 +5583,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
     assert env["OMNIGENT_CLAUDE_CODE_ENTRYPOINT"] == "gateway-client"
     # KUBECONFIG is a filesystem path (not a secret) — kubectl, helm, k9s
     # need it to resolve the user's cluster contexts and namespaces.
-    assert env["KUBECONFIG"] == "/home/alice/.kube/config"
+    assert env["KUBECONFIG"] == "/opt/work/.kube/config"
     # SSH_AUTH_SOCK is a socket path on the same footing. Dropping it leaves
     # every runner-spawned context without ssh-agent auth, so git-over-SSH and
     # SSH-cert tooling fail with "dial unix: missing address".
@@ -7514,6 +7617,130 @@ def _host(
     """
     identity = HostIdentity(host_id="host_test_connect", name="test-laptop")
     return HostProcess(identity, server_url)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dry_run,force", [(True, False), (False, False), (False, True)])
+async def test_host_restart_previews_then_drains_without_signals(monkeypatch, dry_run, force):
+    from omnigent.host.frames import HostRestartFrame, HostRestartResultFrame
+
+    host = _host()
+    monkeypatch.setattr("omnigent.host.restart.supervisor_kind", lambda: "launchd")
+    monkeypatch.setattr("omnigent.host.restart.REQUESTER_GRACE_S", 0)
+    inventory = AsyncMock(side_effect=[["requester", "busy"], ["requester"]])
+    monkeypatch.setattr(host, "_restart_running_sessions", inventory)
+    frames = []
+
+    async def send(_ws, raw):
+        frames.append(decode_host_frame(raw))
+
+    monkeypatch.setattr(host, "_send_text", send)
+    abort = Mock()
+    monkeypatch.setattr(host, "_abort_live_tunnel", abort)
+    await host._dispatch_host_frame(
+        object(), HostRestartFrame("restart", dry_run, "requester", 120, force)
+    )
+    assert frames[0] == HostRestartResultFrame(
+        "restart",
+        True,
+        supervisor="launchd",
+        running_sessions=["requester", "busy"],
+        runner_count=0,
+    )
+    assert host.restart_requested is (not dry_run)
+    assert abort.call_count == (0 if dry_run else 1)
+    if not dry_run:
+        assert frames[-1].phase == "stopping"
+    assert inventory.await_count == (2 if not dry_run and not force else 1)
+
+
+@pytest.mark.asyncio
+async def test_restart_ack_failure_releases_admission(monkeypatch):
+    from omnigent.host.frames import HostRestartFrame
+
+    host = _host()
+    monkeypatch.setattr("omnigent.host.restart.supervisor_kind", lambda: "launchd")
+    monkeypatch.setattr(host, "_restart_running_sessions", AsyncMock(return_value=[]))
+    send = AsyncMock(side_effect=ConnectionError("fake tunnel dropped"))
+    monkeypatch.setattr(host, "_send_text", send)
+    with pytest.raises(ConnectionError):
+        await host._dispatch_host_frame(object(), HostRestartFrame("failed", False, force=True))
+    send.side_effect = None
+    abort = Mock()
+    monkeypatch.setattr(host, "_abort_live_tunnel", abort)
+    await host._dispatch_host_frame(object(), HostRestartFrame("retry", False, force=True))
+    assert host.restart_requested
+    abort.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_restart_inventory_includes_hostless_shared_runner(monkeypatch):
+    import httpx
+
+    host = _host()
+    host._runners["local-runner"] = Mock()
+    pages = [
+        {
+            "data": [
+                {
+                    "id": "source",
+                    "host_id": host._identity.host_id,
+                    "runner_id": "local-runner",
+                    "status": "idle",
+                }
+            ],
+            "has_more": True,
+            "last_id": "source",
+        },
+        {
+            "data": [
+                {
+                    "id": "side-chat",
+                    "host_id": None,
+                    "runner_id": "local-runner",
+                    "status": "running",
+                },
+                {
+                    "id": "other",
+                    "host_id": "other-host",
+                    "runner_id": "other-runner",
+                    "status": "running",
+                },
+            ],
+            "has_more": False,
+        },
+    ]
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200, json=pages.pop(0))
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr("omnigent.host.connect.httpx.AsyncClient", lambda: client)
+    monkeypatch.setattr(host, "_build_connect_headers", dict)
+    assert await host._restart_running_sessions() == ["side-chat"]
+    assert "host_id" not in seen[0].url.params
+    assert seen[1].url.params["after"] == "source"
+    host._runners.clear()
+
+
+def test_host_restart_exits_75_after_run_teardown(monkeypatch, tmp_path):
+    from omnigent.host import HOST_RESTART_EXIT_CODE
+
+    calls = []
+
+    async def serve(host):
+        host.restart_requested = True
+
+    monkeypatch.setattr(HostProcess, "_connect_and_serve", serve)
+    monkeypatch.setattr(HostProcess, "_cleanup_runners", lambda _host: calls.append("cleaned"))
+    with pytest.raises(SystemExit) as error:
+        run_host_process(
+            server_url="https://app.example.databricks.com", config_path=tmp_path / "config.yaml"
+        )
+    assert calls == ["cleaned"]
+    assert error.value.code == HOST_RESTART_EXIT_CODE == 75
 
 
 def test_build_connect_headers_adds_org_header(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -11603,9 +11830,9 @@ async def test_dispatch_create_worktree_passes_entry_to_creator(
     def _fake_create_worktree(**kwargs: object) -> object:
         seen.update(kwargs)
         return SimpleNamespace(
-            worktree_path="/Users/alice/project/.worktrees/myrepo/x",
+            worktree_path="/opt/work/project/.worktrees/myrepo/x",
             branch="x",
-            workspace="/Users/alice/project/.worktrees/myrepo/x/sub",
+            workspace="/opt/work/project/.worktrees/myrepo/x/sub",
         )
 
     monkeypatch.setattr(connect_module, "create_worktree", _fake_create_worktree)
@@ -11615,19 +11842,19 @@ async def test_dispatch_create_worktree_passes_entry_to_creator(
         ws,
         HostCreateWorktreeFrame(
             request_id="req_wt_9",
-            repo_path="/Users/alice/myrepo",
+            repo_path="/opt/work/myrepo",
             branch_name="x",
-            entry="/Users/alice/project",
+            entry="/opt/work/project",
         ),
     )
 
-    assert seen["entry"] == "/Users/alice/project"
-    assert seen["repo_path"] == "/Users/alice/myrepo"
+    assert seen["entry"] == "/opt/work/project"
+    assert seen["repo_path"] == "/opt/work/myrepo"
     result = decode_host_frame(ws.sent[0])
     assert isinstance(result, HostCreateWorktreeResultFrame)
     assert result.request_id == "req_wt_9"
     assert result.status == "ok"
-    assert result.workspace == "/Users/alice/project/.worktrees/myrepo/x/sub"
+    assert result.workspace == "/opt/work/project/.worktrees/myrepo/x/sub"
     _cleanup_host(host)
 
 
@@ -11643,9 +11870,9 @@ async def test_dispatch_create_worktree_passes_path_template_to_creator(
     def _fake_create_worktree(**kwargs: object) -> object:
         seen.update(kwargs)
         return SimpleNamespace(
-            worktree_path="/Users/alice/project/.worktrees/myrepo/x",
+            worktree_path="/opt/work/project/.worktrees/myrepo/x",
             branch="x",
-            workspace="/Users/alice/project/.worktrees/myrepo/x",
+            workspace="/opt/work/project/.worktrees/myrepo/x",
         )
 
     monkeypatch.setattr(connect_module, "create_worktree", _fake_create_worktree)
@@ -11655,15 +11882,15 @@ async def test_dispatch_create_worktree_passes_path_template_to_creator(
         ws,
         HostCreateWorktreeFrame(
             request_id="req_wt_10",
-            repo_path="/Users/alice/myrepo",
+            repo_path="/opt/work/myrepo",
             branch_name="x",
-            entry="/Users/alice/project",
+            entry="/opt/work/project",
             path_template="{entry}/.worktrees/{repo}/{branch}",
         ),
     )
 
     assert seen["path_template"] == "{entry}/.worktrees/{repo}/{branch}"
-    assert seen["entry"] == "/Users/alice/project"
+    assert seen["entry"] == "/opt/work/project"
     result = decode_host_frame(ws.sent[0])
     assert isinstance(result, HostCreateWorktreeResultFrame)
     assert result.request_id == "req_wt_10"
@@ -11729,7 +11956,7 @@ def _post_bind_hook_frame() -> HostPostBindHookFrame:
         binding_id="bind_1",
         revision=2,
         repository_name="root",
-        workspace="/Users/alice/myrepo",
+        workspace="/opt/work/myrepo",
         is_primary=True,
         context_manifest_path=".agents/project/manifest.json",
     )

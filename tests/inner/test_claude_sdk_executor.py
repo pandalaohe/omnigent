@@ -2881,15 +2881,25 @@ class TestGatewayModelVocabulary(unittest.TestCase):
     def test_settings_payload_carries_helper_and_rewrites(self):
         from omnigent.inner.claude_sdk_executor import _claude_settings_payload
 
-        self.assertIsNone(_claude_settings_payload(None, {}))
+        self.assertEqual(
+            json.loads(_claude_settings_payload(None, {})),
+            {"env": {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"}},
+        )
         self.assertEqual(
             json.loads(_claude_settings_payload("printf tok", {"claude-opus-4-8": "gw-opus"})),
-            {"apiKeyHelper": "printf tok", "modelOverrides": {"claude-opus-4-8": "gw-opus"}},
+            {
+                "apiKeyHelper": "printf tok",
+                "modelOverrides": {"claude-opus-4-8": "gw-opus"},
+                "env": {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"},
+            },
         )
         # No credential helper, but a gateway that still needs the rewrites.
         self.assertEqual(
             json.loads(_claude_settings_payload(None, {"claude-opus-4-8": "gw-opus"})),
-            {"modelOverrides": {"claude-opus-4-8": "gw-opus"}},
+            {
+                "modelOverrides": {"claude-opus-4-8": "gw-opus"},
+                "env": {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"},
+            },
         )
 
 
@@ -3329,10 +3339,12 @@ async def test_hermetic_turn_carries_user_settings_env_under_omnigent_env(
         "ANTHROPIC_BEDROCK_BASE_URL": "https://gateway.example",
         "CLAUDE_CODE_ENTRYPOINT": "user-settings-entrypoint",
         "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "64000",
+        "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "0",
     }
     (config_dir / "settings.json").write_text(json.dumps({"env": user_env}))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
     monkeypatch.setenv("OMNIGENT_CLAUDE_CODE_ENTRYPOINT", "omnigent-entrypoint")
+    monkeypatch.setenv("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "0")
     executor = make_executor(skills_filter=skills_filter)
 
     options = await _turn_options(executor, ExecutorConfig(extra={"max_tokens": 32}))
@@ -3340,6 +3352,11 @@ async def test_hermetic_turn_carries_user_settings_env_under_omnigent_env(
     assert options.env.get("ANTHROPIC_BEDROCK_BASE_URL") == expected_base_url
     assert options.env["CLAUDE_CODE_ENTRYPOINT"] == "omnigent-entrypoint"
     assert options.env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "32"
+    assert options.env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] == "1"
+    assert (
+        json.loads(options.settings or "{}")["env"]["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] == "1"
+    )
+    assert "Agent" in options.tools
 
 
 async def test_hermetic_turn_reads_relative_config_dir_from_cli_cwd(
@@ -3470,6 +3487,141 @@ class TestBundlePluginGating(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Tests: StreamEvent-based streaming
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["full-messages", "streaming"])
+async def test_subagent_messages_do_not_contaminate_parent_turn(monkeypatch, streaming):
+    import claude_agent_sdk as sdk
+
+    from omnigent.inner.executor import ReasoningChunk
+
+    def stream(event, parent_tool_use_id=None):
+        return sdk.StreamEvent(
+            uuid="event",
+            session_id="parent",
+            event=event,
+            parent_tool_use_id=parent_tool_use_id,
+        )
+
+    parent_events = [
+        {
+            "type": "message_start",
+            "message": {"usage": {"input_tokens": 10, "cache_read_input_tokens": 5}},
+        },
+        {"type": "content_block_start", "content_block": {"type": "thinking"}},
+        {
+            "type": "content_block_delta",
+            "delta": {"type": "thinking_delta", "thinking": "parent thought"},
+        },
+        {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "parent answer"}},
+    ]
+    helper_events = [
+        {
+            "type": "message_start",
+            "message": {"usage": {"input_tokens": 900, "cache_read_input_tokens": 900}},
+        },
+        {"type": "content_block_start", "content_block": {"type": "thinking"}},
+        {
+            "type": "content_block_delta",
+            "delta": {"type": "thinking_delta", "thinking": "helper thought"},
+        },
+        {
+            "type": "content_block_start",
+            "content_block": {
+                "type": "tool_use",
+                "id": "helper-call",
+                "name": "mcp__omnigent__sys_os_read",
+            },
+        },
+        {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "helper text"}},
+    ]
+    messages = [stream(event) for event in parent_events] if streaming else []
+    # A helper stream must not turn a full-message parent into a streaming parent.
+    messages.extend(stream(event, "agent-call") for event in helper_events)
+    messages.extend(
+        [
+            sdk.AssistantMessage(
+                content=[
+                    sdk.TextBlock(text="parent answer"),
+                    sdk.ThinkingBlock(thinking="parent thought", signature="signature"),
+                    sdk.ToolUseBlock(id="agent-call", name="Agent", input={"prompt": "inspect"}),
+                ],
+                model="claude-sonnet-4-6",
+            ),
+            sdk.AssistantMessage(
+                content=[
+                    sdk.TextBlock(text="helper text"),
+                    sdk.ThinkingBlock(thinking="helper thought", signature="signature"),
+                    sdk.ToolUseBlock(
+                        id="helper-call",
+                        name="mcp__omnigent__sys_os_read",
+                        input={"path": "/opt/work/input.txt"},
+                    ),
+                ],
+                model="claude-haiku-4-5",
+                parent_tool_use_id="agent-call",
+            ),
+            sdk.UserMessage(
+                content=[sdk.ToolResultBlock(tool_use_id="helper-call", content="file contents")],
+                parent_tool_use_id="agent-call",
+            ),
+            sdk.UserMessage(
+                content=[sdk.ToolResultBlock(tool_use_id="agent-call", content="helper summary")]
+            ),
+            sdk.ResultMessage(
+                subtype="success",
+                session_id="parent",
+                result="parent answer",
+                is_error=False,
+                duration_ms=10,
+                duration_api_ms=10,
+                num_turns=1,
+                total_cost_usd=0,
+                usage={"input_tokens": 10, "output_tokens": 2, "cache_read_input_tokens": 5},
+            ),
+        ]
+    )
+
+    class Client(_SDKClient):
+        async def receive_response(self):
+            for message in messages:
+                yield message
+
+    monkeypatch.setattr(sdk, "ClaudeSDKClient", Client)
+    monkeypatch.setattr("omnigent.inner.claude_sdk_executor._ensure_sdk", lambda: sdk)
+    executor = _default_executor()
+    try:
+        events = [
+            event
+            async for event in executor.run_turn([{"role": "user", "content": "inspect"}], [], "")
+        ]
+    finally:
+        await executor.close()
+
+    assert not [event for event in events if isinstance(event, ExecutorError)]
+    assert [event.text for event in events if isinstance(event, TextChunk)] == ["parent answer"]
+    assert [
+        event.delta for event in events if isinstance(event, ReasoningChunk) and event.delta
+    ] == ["parent thought"]
+    requests = [event for event in events if isinstance(event, ToolCallRequest)]
+    assert [(event.name, event.args, event.metadata["call_id"]) for event in requests] == [
+        ("Agent", {"prompt": "inspect"}, "agent-call")
+    ]
+    results = [event for event in events if isinstance(event, ToolCallComplete)]
+    assert [(event.name, event.result, event.metadata["call_id"]) for event in results] == [
+        ("Agent", "helper summary", "agent-call")
+    ]
+    turn = events[-1]
+    assert isinstance(turn, TurnComplete)
+    assert turn.response == "parent answer"
+    assert turn.usage == {
+        "input_tokens": 10,
+        "output_tokens": 2,
+        "total_tokens": 12,
+        "cache_read_input_tokens": 5,
+        "context_tokens": 15,
+        "model": "claude-sonnet-4-6",
+    }
 
 
 class TestStreamEventStreaming(unittest.TestCase):
@@ -3768,7 +3920,7 @@ class TestStreamEventStreaming(unittest.TestCase):
             )
             # Skill remains available for configured skills; ToolSearch
             # keeps large MCP definitions deferred until they are needed.
-            self.assertEqual(query_calls[0]["tools"], ["Skill", "ToolSearch"])
+            self.assertEqual(query_calls[0]["tools"], ["Skill", "ToolSearch", "Agent"])
             self.assertEqual(query_calls[0]["env"]["ENABLE_TOOL_SEARCH"], "true")
             self.assertEqual(query_calls[0]["allowed_tools"], [])
             self.assertEqual(query_calls[1]["session_id"], "session-b")
@@ -3840,7 +3992,7 @@ class TestStreamEventStreaming(unittest.TestCase):
                 ]
             # OS operations route through sys_os_* MCP tools, not SDK
             # built-ins. Skill and ToolSearch do not widen OS access.
-            self.assertEqual(captured_options["tools"], ["Skill", "ToolSearch"])
+            self.assertEqual(captured_options["tools"], ["Skill", "ToolSearch", "Agent"])
             self.assertIn("mcp__omnigent__sleep", captured_options["allowed_tools"])
             self.assertNotIn("Bash", captured_options["allowed_tools"])
             self.assertIsInstance(events[-1], TurnComplete)
@@ -3906,9 +4058,8 @@ class TestStreamEventStreaming(unittest.TestCase):
             # through the Claude SDK plugin mechanism. ToolSearch defers
             # MCP definitions until needed. The OS tools
             # (Bash/Read/Edit/Write/Glob/Grep) stay absent — that's
-            # what this test pins. Neither base tool widens the FS attack
-            # surface.
-            self.assertEqual(captured_options["tools"], ["Skill", "ToolSearch"])
+            # what this test pins. Agent helpers inherit the same tools.
+            self.assertEqual(captured_options["tools"], ["Skill", "ToolSearch", "Agent"])
             self.assertEqual(captured_options["allowed_tools"], ["mcp__omnigent__sleep"])
             self.assertIsInstance(events[-1], TurnComplete)
 

@@ -105,9 +105,28 @@ _SUBAGENT_DELIVERY_SUPERSEDED_DISPATCH = "superseded_dispatch"
 SUBAGENT_DISPATCH_ID_LABEL_KEY = "omnigent.subagent.dispatch_id"
 SUBAGENT_DELIVERED_ID_LABEL_KEY = "omnigent.subagent.delivered_id"
 SUBAGENT_TERMINAL_STATUS_LABEL_KEY = "omnigent.subagent.terminal_status"
+SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY = "omnigent.subagent.activity_unverified"
 # Pins an undrained mother result across peer turns: "<work_id>:<status>:<item_id>".
 # Restart recovery uses its outcome and item instead of the newer peer result.
 SUBAGENT_RESULT_ITEM_LABEL_KEY = "omnigent.subagent.result_item"
+SUBAGENT_LAST_TASK_ERROR_LABEL_KEYS: tuple[str, ...] = (
+    "omnigent.last_task_error_code",
+    "omnigent.last_task_error_message",
+    "omnigent.last_task_error_agent_name",
+    "omnigent.last_task_error_title",
+    "omnigent.last_task_error_cause",
+    "omnigent.last_task_error_remediation",
+    "omnigent.last_task_error_item_id",
+    "omnigent.last_task_error_runner_id",
+)
+# Per-turn terminal and failure labels cleared when stamping a new child
+# dispatch so a prior completed, failed, or quarantined turn cannot persist
+# into the new turn before its running edge arrives.
+SUBAGENT_DISPATCH_RESET_LABELS: dict[str, str] = {
+    SUBAGENT_TERMINAL_STATUS_LABEL_KEY: "",
+    SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY: "",
+    **dict.fromkeys(SUBAGENT_LAST_TASK_ERROR_LABEL_KEYS, ""),
+}
 
 
 # Bounded retry budget for the sub-agent wake POST. The wake is the sole

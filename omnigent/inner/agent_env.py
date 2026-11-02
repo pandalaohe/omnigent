@@ -25,7 +25,7 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable, Mapping
 
-from omnigent._platform import WINDOWS_ENV_PASSTHROUGH
+from omnigent._platform import CLI_FALLBACK_DIRS_ENV_VAR, WINDOWS_ENV_PASSTHROUGH
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 
 # Desktop access requires an explicit grant outside the sandbox.
@@ -55,6 +55,7 @@ BASE_ALLOW_EXACT: frozenset[str] = frozenset(
     {
         "HOME",
         "PATH",
+        CLI_FALLBACK_DIRS_ENV_VAR,
         "TERM",
         "TMPDIR",
         "TMP",

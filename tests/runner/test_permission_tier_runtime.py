@@ -169,6 +169,66 @@ def test_user_extension_tools_follow_tier_not_builtin_name(tmp_path, tier, expec
     assert decision.action.value == expected, decision.reason
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tier", omnigent.permission_tiers.NON_FULL_TIERS)
+@pytest.mark.parametrize("background", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("scope", ["user", "project"], ids=["verified", "unverified"])
+async def test_pi_subagent_denial_cannot_open_card_or_acquire_launch_lease(
+    tmp_path, monkeypatch, tier, background, scope
+):
+    from omnigent.server import permission_gate as gate
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.schemas import ElicitationResult
+
+    runtime, _source, _registry = _extension_runtime(tmp_path, tier, scope, "subagent")
+    arguments = {"agent": "worker", "task": "Read a.py", "async": background}
+    binding, decision = runtime.inspect(
+        "session-a",
+        call_id="delegate",
+        name="subagent",
+        arguments=arguments,
+        expected_revision=3,
+    )
+    cards = []
+
+    async def approve(*args, **kwargs):
+        cards.append(kwargs)
+        return ElicitationResult(action="accept")
+
+    monkeypatch.setattr(orchestration, "_publish_and_wait_for_harness_elicitation", approve)
+    for _ in range(2):
+        authorized = await gate.authorize_permission_call(
+            gate.InspectedPermissionCall(binding, decision),
+            request=None,
+            harness="pi-native",
+            arguments=arguments,
+            conversation_store=None,
+            runner_router=None,
+        )
+        assert authorized.action.value == "DENY"
+    assert cards == []
+    assert decision.action.value == "DENY"
+    assert decision.reason == "Pi subagents are not yet governed by Omnigent permissions"
+    # Even a direct attempted approval cannot mint an execution lease.
+    assert not runtime.authorize(
+        "session-a",
+        call_id=binding.call_id,
+        name=binding.name,
+        arguments_digest=binding.arguments_digest,
+        expected_revision=3,
+    )
+    assert not runtime.verify_execute(
+        "session-a",
+        call_id=binding.call_id,
+        revision=3,
+        arguments_digest=binding.arguments_digest,
+        name=binding.name,
+        arguments=arguments,
+        operation_id="native-launch",
+        step="launch",
+    )
+
+
 @pytest.mark.parametrize("scope", ["project", "temporary", "unknown"])
 def test_extension_scope_cannot_claim_builtin_read_permissions(tmp_path, scope):
     runtime, _source, _registry = _extension_runtime(tmp_path, "auto", scope, "read")

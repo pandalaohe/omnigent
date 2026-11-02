@@ -129,6 +129,7 @@ class ToolManager:
         *,
         os_env_schema_only: bool = False,
         skill_registry: list[SkillSpec] | None = None,
+        terminal_access_requests_enabled: bool = False,
     ) -> None:
         """
         Initialize the tool manager and register built-in,
@@ -176,6 +177,7 @@ class ToolManager:
         self._session_open_enabled = session_open_enabled
         self._workdir = workdir
         self._skill_registry = skill_registry
+        self._terminal_access_requests_enabled = terminal_access_requests_enabled
         self._sandbox_enabled = sandbox_enabled
         self._pre_resolved_os_env = os_env
         self._started = False
@@ -267,6 +269,9 @@ class ToolManager:
         from omnigent.tools.builtins.standing_pass import SysStandingPassTool
 
         self._tools[SysStandingPassTool.name()] = SysStandingPassTool()
+        from omnigent.tools.builtins.host_restart import SysHostRestartTool
+
+        self._tools[SysHostRestartTool.name()] = SysHostRestartTool()
 
     def _register_scheduled_task_tools(self) -> None:
         """
@@ -805,6 +810,7 @@ class ToolManager:
             SysTerminalLaunchTool,
             SysTerminalListTool,
             SysTerminalReadTool,
+            SysTerminalRequestAccessTool,
             SysTerminalSendTool,
         )
 
@@ -823,6 +829,11 @@ class ToolManager:
                     f"earlier registration."
                 )
             self._tools[tool.name()] = tool
+
+        if self._terminal_access_requests_enabled:
+            self._tools[SysTerminalRequestAccessTool.name()] = SysTerminalRequestAccessTool(
+                registry
+            )
 
     def _register_local_tools(self, workdir: Path | None) -> None:
         """

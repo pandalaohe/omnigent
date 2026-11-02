@@ -1789,8 +1789,8 @@ describe("Sidebar session list", () => {
   });
 
   it("shows the worktree under the project directory in the session tooltip when they differ", async () => {
-    const workspace = "/Users/me/project";
-    const worktree = "/Users/me/project/.worktrees/repo/feature-x";
+    const workspace = "/opt/work/project";
+    const worktree = "/opt/work/project/.worktrees/repo/feature-x";
     mockConversations([
       conv("conv_entry_tooltip", "Codex", {
         title: "Entry session",
@@ -1811,7 +1811,7 @@ describe("Sidebar session list", () => {
   });
 
   it("omits the tooltip worktree line when it matches the directory", async () => {
-    const workspace = "/Users/me/project";
+    const workspace = "/opt/work/project";
     mockConversations([
       conv("conv_same_tooltip", "Codex", {
         title: "Plain session",
@@ -2772,7 +2772,7 @@ describe("Sidebar project sections", () => {
   it("selects Project and No Project independently from expand/collapse", () => {
     projectsMock.push("Customer X");
     mockConversations([
-      conv("conv_unfiled", "Claude Code", { workspace: "D:\\AIProgram\\Codex\\core" }),
+      conv("conv_unfiled", "Claude Code", { workspace: "D:\\work\\Codex\\core" }),
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
     ]);
     renderSidebar();
@@ -2809,7 +2809,7 @@ describe("Sidebar project sections", () => {
   });
 
   it("shows an unfiled session CWD as a bounded inspection control", () => {
-    const workspace = "D:\\AIProgram\\Projects\\A very long workspace folder\\repo";
+    const workspace = "D:\\work\\Projects\\A very long workspace folder\\repo";
     mockConversations([conv("conv_unfiled", "Claude Code", { workspace })]);
     renderSidebar();
 
@@ -2828,7 +2828,7 @@ describe("Sidebar project sections", () => {
     mockConversations([
       conv("conv_filed", "Claude Code", {
         labels: { omni_project: "Customer X" },
-        workspace: "D:\\AIProgram\\Projects\\CustomerX",
+        workspace: "D:\\work\\Projects\\CustomerX",
       }),
     ]);
     renderSidebar();
@@ -4635,7 +4635,7 @@ describe("Sidebar view options", () => {
     });
     mockConversations([
       conv("conv_gh", "claude-native-ui", {
-        workspace: "/Users/me/omnigent",
+        workspace: "/opt/work/omnigent",
         labels: { "omnigent.wrapper": "claude-code-native-ui" },
       }),
       conv("conv_no_workspace", "Codex"),
@@ -4678,7 +4678,7 @@ describe("Sidebar view options", () => {
         ],
       },
     });
-    mockConversations([conv("conv_assoc", "Codex", { workspace: "/Users/me/omnigent" })]);
+    mockConversations([conv("conv_assoc", "Codex", { workspace: "/opt/work/omnigent" })]);
     renderGroupingSidebar();
 
     fireEvent.pointerMove(screen.getByRole("link", { name: "conv_assoc" }), {
@@ -4694,7 +4694,7 @@ describe("Sidebar view options", () => {
     usePullRequestInfoMock.mockReturnValue({ data: undefined });
     mockConversations([
       conv("conv_offline", "Codex", {
-        workspace: "/Users/me/omnigent",
+        workspace: "/opt/work/omnigent",
         pull_request: {
           url: "https://github.com/omnigent-ai/omnigent/pull/7918",
           provider: "github",
@@ -4721,7 +4721,7 @@ describe("Sidebar view options", () => {
     usePullRequestInfoMock.mockReturnValue({ data: undefined });
     mockConversations([
       conv("conv_stale", "Codex", {
-        workspace: "/Users/me/omnigent",
+        workspace: "/opt/work/omnigent",
         pull_request: {
           url: "https://github.com/omnigent-ai/omnigent/pull/7918",
           provider: "github",

@@ -597,7 +597,7 @@ class _FakeTerminalRegistry:
         self._existing = existing
         self.cleaned: list[str] = []
 
-    def get(self, session_id: str, terminal_name: str, session_key: str) -> object | None:
+    def get_native(self, session_id: str, terminal_name: str, session_key: str) -> object | None:
         return object() if self._existing else None
 
     async def cleanup_conversation(self, session_id: str) -> None:

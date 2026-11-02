@@ -170,6 +170,8 @@ _READ_NO_PATH = frozenset(
         "sys_scheduled_task_list",
         "sys_flow_list",
         "sys_host_load",
+        "sys_host_restart",
+        "sys_terminal_request_access",
         "list_comments",
         "load_skill",
         "read_skill_file",
@@ -581,6 +583,11 @@ def _adapt_unbound_call(
                 raise ValueError("MCP Arguments must be an object")
             name, arguments = tool, embedded
         _validate_agy_argument_keys(name, arguments)
+        if name == "sys_host_restart":
+            dry_run = arguments.get("dry_run", True)
+            if not isinstance(dry_run, bool):
+                raise ValueError("dry_run must be a boolean")
+            return ToolIntent(ToolKind.READ if dry_run else ToolKind.OTHER, name, digest, context)
         if name == "open_in_panel":
             path = _required_text(arguments, "path")
             if any(
@@ -2021,6 +2028,10 @@ def decide_tier(tier: PermissionTier, intent: ToolIntent, rules: RelaxedRules) -
             )
         if tier == "full":
             return TierDecision(Verdict.ALLOW)
+        if intent.name == "subagent":
+            return TierDecision(
+                Verdict.DENY, "Pi subagents are not yet governed by Omnigent permissions"
+            )
         active, _, _, control_reason, protected_reason = _validated_rules(rules)
         context = intent.context
         if context.platform not in ("darwin", "linux", "windows"):

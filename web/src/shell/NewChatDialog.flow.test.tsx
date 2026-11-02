@@ -119,7 +119,7 @@ const RECENT_KEY = "omnigent:recent-workspaces";
 const PROMPT_HISTORY_KEY = "omnigent:prompt-history:conv_new";
 // The seeded working directory (from the host's persisted recent) that the
 // create body must carry through.
-const SEEDED_WORKSPACE = "/Users/corey/universe/src/foo";
+const SEEDED_WORKSPACE = "/opt/work/universe/src/foo";
 
 // The landing screen navigates via the embed-aware routing abstraction
 // (`@/lib/routing`), not react-router directly — mock that so the create
@@ -202,7 +202,7 @@ vi.mock("@/hooks/useHostWorktrees", async (importOriginal) => ({
   ...(await importOriginal<typeof HostWorktreesModule>()),
   useHostWorktrees: (_hostId: string | null, path: string | null) => ({
     data:
-      path === "/Users/corey/universe/src/foo"
+      path === "/opt/work/universe/src/foo"
         ? [
             {
               path,
@@ -219,7 +219,7 @@ vi.mock("@/hooks/useHostWorktrees", async (importOriginal) => ({
   hostWorktreesQueryOptions: (hostId: string, repoPath: string) => ({
     queryKey: ["host-worktrees", hostId, repoPath],
     queryFn: async () =>
-      repoPath === "/Users/corey/universe/src/foo"
+      repoPath === "/opt/work/universe/src/foo"
         ? [
             {
               path: repoPath,
@@ -859,7 +859,7 @@ describe("NewChatLandingScreen create flow", () => {
         expect.any(Object),
         project,
         expect.objectContaining({ boundAgentId: "ag_hello", reasoningEffort: null }),
-        // Fork mod (MOD-s10), last slot: the inline-attachment order, sent only
+        // Fork mod, last slot: the inline-attachment order, sent only
         // when there are attachments to order. This draft is text-only.
         undefined,
       ),
@@ -887,9 +887,9 @@ describe("NewChatLandingScreen create flow", () => {
   it("prefers the last successful create directory over general recent activity", async () => {
     localStorage.setItem(
       RECENT_KEY,
-      JSON.stringify({ host_1: ["/Users/corey/switched-host-location"] }),
+      JSON.stringify({ host_1: ["/opt/work/switched-host-location"] }),
     );
-    writeLastCreatedWorkspace("host_1", "/Users/corey/created-session-location");
+    writeLastCreatedWorkspace("host_1", "/opt/work/created-session-location");
 
     renderLanding();
 
@@ -901,7 +901,7 @@ describe("NewChatLandingScreen create flow", () => {
   });
 
   it("preserves a legal trailing-space directory in the create and its host default", async () => {
-    const exactWorkspace = "/Users/corey/projects/legal-trailing-space ";
+    const exactWorkspace = "/opt/work/projects/legal-trailing-space ";
     localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [exactWorkspace] }));
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
       ok: true,
@@ -1365,7 +1365,7 @@ describe("NewChatLandingScreen create flow", () => {
     localStorage.setItem(
       RECENT_KEY,
       JSON.stringify({
-        host_1: ["/Users/corey/projects/other", SEEDED_WORKSPACE],
+        host_1: ["/opt/work/projects/other", SEEDED_WORKSPACE],
         host_2: ["/srv/elsewhere"],
       }),
     );
@@ -1386,7 +1386,7 @@ describe("NewChatLandingScreen create flow", () => {
     const stored = JSON.parse(localStorage.getItem(RECENT_KEY) ?? "{}") as Record<string, string[]>;
     // Launched path stays a single front entry — re-launching the same
     // workspace must not insert a duplicate or reorder the rest.
-    expect(stored.host_1).toEqual(["/Users/corey/projects/other", SEEDED_WORKSPACE]);
+    expect(stored.host_1).toEqual(["/opt/work/projects/other", SEEDED_WORKSPACE]);
     // Another host's recents are untouched by the write-back.
     expect(stored.host_2).toEqual(["/srv/elsewhere"]);
   });
@@ -1653,7 +1653,7 @@ describe("NewChatLandingScreen create flow", () => {
     fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
       target: { files: [file] },
     });
-    // MOD-s10: attachments now render as tiles under the field (the removed
+    // Fork mod: attachments now render as tiles under the field (the removed
     // editor's chip carried the "Image attachment …" aria-label).
     await screen.findByRole("img", { name: "diagram.png" });
     typeMessage("what is in this image?");
@@ -1700,7 +1700,7 @@ describe("NewChatLandingScreen create flow", () => {
         text: "",
         skill: null,
         files: [file],
-        // Fork mod (MOD-s10): the draft's visual order rides along, so the
+        // Fork mod: the draft's visual order rides along, so the
         // first message renders the image where the user placed it.
         composerParts: [{ type: "attachment", file }],
       }),
@@ -1757,7 +1757,7 @@ describe("NewChatLandingScreen create flow", () => {
       expect(setPendingInitialPromptMock).toHaveBeenCalledWith(
         "conv_new",
         expect.objectContaining({
-          // MOD-s10: the token's own insertion space stays in the authored
+          // Fork mod: the token's own insertion space stays in the authored
           // text, so the prompt reads with it (the token itself is gone).
           text: "/review-pr 123 ",
           skill: null,

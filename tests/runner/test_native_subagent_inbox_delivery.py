@@ -938,6 +938,252 @@ async def test_runner_restart_recovers_failed_child_error(
     assert not any(url.endswith("/items") for url, _ in server_client.requests)
 
 
+@pytest.mark.asyncio
+async def test_continued_child_turn_cut_by_502_permission_refusal_reports_failed_with_reason(
+    _clean_subagent_registry: None,
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A continued child turn cut at tool_use by HTTP 502 reaches the parent as failed.
+
+    Reproduces the three-stage chain where a child continued after a completed
+    turn hits HTTP 502 on PreToolUse policy evaluation and PermissionRequest:
+    1. Continuing the child clears stale ``omnigent.subagent.terminal_status``.
+    2. Relay PreToolUse 502 writes the policy-fallback marker with the 502
+       detail, and PermissionRequest 502 records ``StopFailure`` in
+       ``hooks.jsonl`` with ``error="policy_evaluation_failed"`` and the 502
+       reason, which the forwarder translates into
+       ``external_session_status(status="failed", failure_detail=...)``.
+    3. Both live delivery and restart recovery report ``status="failed"`` with
+       the 502 reason to the parent inbox, never ``status="completed"`` with
+       ``"[System: sub-agent completed with no output]"``.
+    """
+    import io
+    import sys
+
+    from omnigent.entities import Conversation
+    from omnigent.harnesses.claude_native import (
+        bridge as claude_native_bridge,
+    )
+    from omnigent.harnesses.claude_native import (
+        forwarder as claude_native_forwarder,
+    )
+    from omnigent.harnesses.claude_native import (
+        hook as claude_native_hook,
+    )
+    from omnigent.runner.tool_dispatch import _prepare_child_dispatch
+    from omnigent.server.routes._sessions.helpers import (
+        _child_session_summary_from_conversation,
+    )
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_PRE_TOOL_USE_POLICY_EVAL_RETRY_DELAYS_S",
+        (0.0,) * len(claude_native_bridge._PRE_TOOL_USE_POLICY_EVAL_RETRY_DELAYS_S),
+    )
+
+    # Stage 1: Child completed or failed a previous turn, then is continued for a new turn.
+    child_labels: dict[str, str] = {
+        subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY: "subagent_prev",
+        subagent_work.SUBAGENT_DELIVERED_ID_LABEL_KEY: "subagent_prev",
+        subagent_work.SUBAGENT_TERMINAL_STATUS_LABEL_KEY: "completed",
+        subagent_work.SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY: "true",
+        "omnigent.last_task_error_code": "native_turn_error",
+        "omnigent.last_task_error_message": "stale prior error",
+    }
+    child_status_events: list[dict[str, Any]] = []
+    items_path = f"/v1/sessions/{CHILD_SESSION_ID}/items"
+    prior_item = {**_CHILD_RESULT_ITEM, "id": "msg_child_final"}
+
+    async def _dispatch_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == items_path:
+            return httpx.Response(200, json={"data": [prior_item], "has_more": False})
+        if request.method == "PATCH" and request.url.path == f"/v1/sessions/{CHILD_SESSION_ID}":
+            body = json.loads(request.content)
+            # ``ConversationStore.set_labels`` upserts empty strings rather than deleting.
+            child_labels.update(body.get("labels", {}))
+            return httpx.Response(200, json={"labels": dict(child_labels)})
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_dispatch_handler), base_url="http://server"
+    ) as client:
+        prior_id, stamp_err = await _prepare_child_dispatch(client, CHILD_SESSION_ID, DISPATCH_ID)
+    assert prior_id == "msg_child_final"
+    assert stamp_err is None
+    assert child_labels.get(subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY) == DISPATCH_ID
+    for key, value in subagent_work.SUBAGENT_DISPATCH_RESET_LABELS.items():
+        assert child_labels.get(key) == value
+
+    # Verify the server summary projection after dispatch reset does not leak
+    # prior completed/failed/quarantined state into the new turn.
+    post_dispatch_summary = _child_session_summary_from_conversation(
+        Conversation(
+            id=CHILD_SESSION_ID,
+            created_at=100,
+            updated_at=200,
+            root_conversation_id=PARENT_SESSION_ID,
+            title="claude-code:reviewer",
+            agent_id="ag_test",
+            labels=dict(child_labels),
+            live_status="running",
+        ),
+        PARENT_SESSION_ID,
+        None,
+        cached_status="running",
+    )
+    assert post_dispatch_summary.current_task_status == "in_progress"
+    assert post_dispatch_summary.last_task_error is None
+
+    # Stage 2: Relay PreToolUse hits HTTP 502 -> fail-closed ask + fallback marker;
+    # PermissionRequest also hits 502 -> records StopFailure in hooks.jsonl.
+    workspace = tmp_path / "opt" / "work" / "omnigent" / "fork" / "wt"
+    workspace.mkdir(parents=True)
+    bridge_dir = claude_native_bridge.prepare_bridge_dir(
+        CHILD_SESSION_ID, bridge_id="bridge_child_502", workspace=workspace
+    )
+    claude_native_bridge.write_active_session_id(bridge_dir, CHILD_SESSION_ID)
+    claude_native_bridge.build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
+
+    class _Policy502Client:
+        async def post(self, url: str, json: dict[str, object] | None = None) -> Any:
+            del url, json
+            return SimpleNamespace(status_code=502, content=b"Bad Gateway", headers={})
+
+    async def _noop_executor(name: str, arguments: dict[str, object]) -> dict[str, object]:
+        del name, arguments
+        return {}
+
+    relay = claude_native_bridge.start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=[],
+        tool_executor=_noop_executor,
+        loop=asyncio.get_running_loop(),
+        policy_client=_Policy502Client(),  # type: ignore[arg-type]
+        session_id=CHILD_SESSION_ID,
+    )
+    try:
+        info = json.loads((bridge_dir / claude_native_bridge._TOOL_RELAY_FILE).read_text("utf-8"))
+        async with httpx.AsyncClient(trust_env=False) as relay_http:
+            eval_resp = await relay_http.post(
+                f"{info['url'].rstrip('/')}/hook/claude/evaluate-policy",
+                headers={"Authorization": f"Bearer {info['token']}"},
+                json={
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "git status"},
+                },
+            )
+        assert eval_resp.status_code == 200
+        eval_out = eval_resp.json()
+        assert eval_out["hookSpecificOutput"]["permissionDecision"] == "ask"
+        assert (
+            "server returned HTTP 502"
+            in (eval_out["hookSpecificOutput"]["permissionDecisionReason"])
+        )
+    finally:
+        relay.close()
+
+    monkeypatch.setattr(claude_native_hook, "_post_hook_with_reattach", lambda *a, **k: None)
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "hook_event_name": "PermissionRequest",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "git status"},
+                }
+            )
+        ),
+    )
+    assert claude_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)]) == 0
+
+    def _status_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        child_status_events.append(body)
+        if body.get("type") == "external_session_status":
+            data = body.get("data", {})
+            if data.get("status") == "failed":
+                child_labels[subagent_work.SUBAGENT_TERMINAL_STATUS_LABEL_KEY] = "failed"
+                child_labels["omnigent.last_task_error_code"] = "native_turn_error"
+                child_labels["omnigent.last_task_error_message"] = str(
+                    data.get("failure_detail") or data.get("output") or ""
+                )
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_status_handler), base_url="http://ap"
+    ) as forward_client:
+        hook_state = await claude_native_forwarder._ensure_hook_state(
+            bridge_dir, start_at_end=False, session_id=CHILD_SESSION_ID
+        )
+        await claude_native_forwarder._forward_available_status_events(
+            client=forward_client,
+            session_id=CHILD_SESSION_ID,
+            bridge_dir=bridge_dir,
+            state=hook_state,
+            retry_tracker=claude_native_forwarder._PostRetryTracker(),
+            dedupe=claude_native_forwarder._ForwardDedupeState(),
+            task_subjects={},
+            task_statuses={},
+            task_order=[],
+            response_id="resp_turn_2",
+        )
+
+    assert len(child_status_events) == 1
+    assert child_status_events[0]["type"] == "external_session_status"
+    assert child_status_events[0]["data"]["status"] == "failed"
+    assert "server returned HTTP 502" in child_status_events[0]["data"]["failure_detail"]
+
+    # Stage 3: Project the server summary from the updated labels and verify
+    # recovery after runner restart delivers status="failed" with the 502 reason
+    # to the parent inbox, never "completed" with no output.
+    failed_summary = _child_session_summary_from_conversation(
+        Conversation(
+            id=CHILD_SESSION_ID,
+            created_at=100,
+            updated_at=200,
+            root_conversation_id=PARENT_SESSION_ID,
+            title="claude-code:reviewer",
+            agent_id="ag_test",
+            labels=dict(child_labels),
+            live_status="idle",
+        ),
+        PARENT_SESSION_ID,
+        None,
+        cached_status="idle",
+    )
+    assert failed_summary.current_task_status == "failed"
+    assert failed_summary.last_task_error is not None
+    assert "server returned HTTP 502" in failed_summary.last_task_error["message"]
+
+    subagent_work._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    recovery_client = _RecoveryServerClient(
+        [
+            _child_summary(
+                current_task_status=failed_summary.current_task_status,
+                last_task_error=dict(failed_summary.last_task_error),
+                labels=dict(child_labels),
+            )
+        ],
+        child_items=[
+            {"type": "function_call", "name": "Bash", "call_id": "toolu_502"},
+            _CHILD_RESULT_ITEM,
+        ],
+    )
+    app = create_runner_app(server_client=recovery_client)  # type: ignore[arg-type]
+    await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
+
+    payload = subagent_work._session_inboxes_ref[PARENT_SESSION_ID].get_nowait()
+    assert payload["status"] == "failed"
+    assert "server returned HTTP 502" in payload["output"]
+    assert payload["output"] != "[System: sub-agent completed with no output]"
+
+
 @pytest.mark.parametrize("terminal_status", ["stopped", "killed"])
 async def test_runner_restart_preserves_structured_terminal_child_status(
     _clean_subagent_registry: None,

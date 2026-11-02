@@ -157,6 +157,34 @@ def _seed_registry(
         slot[(instance.name, instance.session_key)] = instance
 
 
+@pytest.mark.parametrize("read_only", [False, True])
+def test_admin_local_attach_is_interactive_only(
+    app, server_registry, tmp_path, monkeypatch, read_only
+):
+    instance = _make_running_instance("bash", "admin", tmp_path)
+    instance.elevated = True
+    _seed_registry(server_registry, "admin_session", [instance])
+    calls = []
+
+    async def bridge(websocket, **kwargs):
+        calls.append(kwargs)
+        await websocket.send_bytes(b"owner attach")
+        await websocket.close()
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.terminal_attach.bridge_tmux_control_to_websocket", bridge
+    )
+    path = "/v1/sessions/admin_session/resources/terminals/terminal_bash_admin/attach"
+    with TestClient(app).websocket_connect(path + f"?read_only={str(read_only).lower()}") as ws:
+        if read_only:
+            with pytest.raises(WebSocketDisconnect) as rejected:
+                ws.receive_bytes()
+            assert rejected.value.code == 1008
+        else:
+            assert ws.receive_bytes() == b"owner attach"
+    assert len(calls) == (0 if read_only else 1)
+
+
 @pytest.fixture
 def server_registry(tmp_path: Path) -> Iterator[TerminalRegistry]:
     """
@@ -720,8 +748,9 @@ async def test_attach_terminal_local_fallback_uses_control_mode(
         socket_path: str,
         tmux_target: str,
         read_only: bool,
+        on_input: object = None,
     ) -> None:
-        del websocket
+        del websocket, on_input
         calls.append((socket_path, tmux_target, read_only))
 
     monkeypatch.setattr(

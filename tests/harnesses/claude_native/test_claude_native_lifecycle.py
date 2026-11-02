@@ -480,6 +480,9 @@ def test_prepare_bridge_dir_preserves_launch_evidence_until_bridge_cleanup(
     assert bridge.prune_orphaned_bridge_dirs() == 0
 
     monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    assert bridge.prune_orphaned_bridge_dirs() == 0
+    eight_days_ago = time.time() - 8 * 24 * 60 * 60
+    os.utime(directory / "owner.pid", (eight_days_ago, eight_days_ago))
     assert bridge.prune_orphaned_bridge_dirs() == 1
     assert not directory.exists()
     assert _read(launch)["read_status"] == "not_found"

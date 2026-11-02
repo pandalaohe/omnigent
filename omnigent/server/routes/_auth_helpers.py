@@ -22,6 +22,7 @@ import asyncio
 import dataclasses
 
 from fastapi import Request
+from starlette.requests import HTTPConnection
 
 from omnigent.db.utils import shared_read_scope
 from omnigent.entities import Conversation
@@ -82,7 +83,7 @@ def attribution_user(user_id: str | None) -> str | None:
 
 
 def require_user(
-    request: Request,
+    request: HTTPConnection,
     auth_provider: AuthProvider | None,
 ) -> str | None:
     """Extract user identity, raising 401 if missing in multi-user mode.
