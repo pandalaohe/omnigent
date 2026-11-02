@@ -16,6 +16,62 @@ from omnigent.inner.native_attachments import attachment_cache_dir, materialize_
 from omnigent.native import native_bridge_common
 
 
+@pytest.mark.posix_only
+def test_retained_bridge_ownership_stays_in_root_and_cannot_be_reassigned(tmp_path: Path) -> None:
+    root = tmp_path / "bridges"
+    owned = root / ("a" * 32)
+    owned.mkdir(parents=True)
+    native_bridge_common.record_bridge_session(owned, "conv_owned")
+    native_bridge_common.record_bridge_session(owned, "conv_owned")
+    other = root / ("b" * 32)
+    other.mkdir()
+    native_bridge_common.record_bridge_session(other, "conv_other")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    native_bridge_common.record_bridge_session(outside, "conv_owned")
+    (root / ("c" * 32)).symlink_to(outside, target_is_directory=True)
+    linked_marker = root / ("d" * 32)
+    linked_marker.mkdir()
+    (linked_marker / native_bridge_common.SESSION_ID_FILENAME).symlink_to(
+        outside / native_bridge_common.SESSION_ID_FILENAME
+    )
+
+    assert native_bridge_common.bridge_dirs_for_session(root, "conv_owned") == {owned}
+    with pytest.raises(ValueError, match="another session"):
+        native_bridge_common.record_bridge_session(owned, "conv_other")
+    with pytest.raises(ValueError, match="symlink"):
+        native_bridge_common.record_bridge_session(linked_marker, "conv_owned")
+    assert native_bridge_common.bridge_dirs_for_session(root, "conv_owned") == {owned}
+    assert native_bridge_common.bridge_dirs_for_session(tmp_path / "absent", "conv_owned") == set()
+
+
+@pytest.mark.parametrize("fault", ["invalid_utf8", "directory", "unreadable"])
+def test_bad_ownership_marker_does_not_block_other_sessions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    owned, unrelated = tmp_path / ("a" * 32), tmp_path / ("b" * 32)
+    owned.mkdir()
+    unrelated.mkdir()
+    native_bridge_common.record_bridge_session(owned, "conv_owned")
+    marker = unrelated / native_bridge_common.SESSION_ID_FILENAME
+    if fault == "directory":
+        marker.mkdir()
+    else:
+        marker.write_bytes(b"\xff" if fault == "invalid_utf8" else b"conv_other")
+    if fault == "unreadable":
+        read = Path.read_text
+
+        def fail_bad_marker(path: Path, *args, **kwargs):
+            if path == marker:
+                raise PermissionError("marker unreadable")
+            return read(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", fail_bad_marker)
+
+    assert native_bridge_common.bridge_dirs_for_session(tmp_path, "conv_owned") == {owned}
+    assert unrelated.exists()
+
+
 def test_write_owner_pid_marker_records_current_pid(tmp_path: Path) -> None:
     """The marker names the process that prepared the dir (owner-pid invariant)."""
     native_bridge_common.write_owner_pid_marker(tmp_path)

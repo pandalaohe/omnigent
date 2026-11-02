@@ -33,6 +33,7 @@ import logging
 import os
 import re
 import shutil
+import tempfile
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -44,6 +45,7 @@ from filelock import Timeout as FileLockTimeout
 _logger = logging.getLogger(__name__)
 
 OWNER_PID_FILENAME = "owner.pid"
+SESSION_ID_FILENAME = "session.id"
 _LOCK_DIR_NAME = ".locks"
 #: A dead-owner bridge dir may hold a resumable session, so it is kept this long.
 ORPHAN_RETENTION_SECONDS = 70 * 24 * 60 * 60
@@ -99,6 +101,54 @@ def write_owner_pid_marker(bridge_dir: Path) -> None:
     """
     with contextlib.suppress(OSError):
         (bridge_dir / OWNER_PID_FILENAME).write_text(str(os.getpid()), encoding="utf-8")
+
+
+def record_bridge_session(bridge_dir: Path, session_id: str) -> None:
+    """Keep a retained bridge attributable after its session label rotates."""
+    if bridge_dir.is_symlink() or not bridge_dir.is_dir():
+        return
+    with bridge_dir_preparation_lock(bridge_dir):
+        if bridge_dir.is_symlink() or not bridge_dir.is_dir():
+            return
+        marker = bridge_dir / SESSION_ID_FILENAME
+        if marker.is_symlink():
+            raise ValueError("native bridge session marker must not be a symlink")
+        if marker.exists():
+            if marker.read_text(encoding="utf-8") != session_id:
+                raise ValueError("native bridge already belongs to another session")
+            return
+        fd, temporary = tempfile.mkstemp(prefix="session.id.", dir=bridge_dir)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(session_id)
+            os.replace(temporary, marker)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+
+
+def bridge_dirs_for_session(bridge_root: Path, session_id: str) -> set[Path]:
+    """Find retained bridges using owner markers, never stored filesystem paths."""
+    try:
+        entries = list(bridge_root.iterdir())
+    except FileNotFoundError:
+        return set()
+    result: set[Path] = set()
+    for entry in entries:
+        if (
+            not re.fullmatch(r"[0-9a-f]{32}", entry.name)
+            or entry.is_symlink()
+            or not entry.is_dir()
+        ):
+            continue
+        marker = entry / SESSION_ID_FILENAME
+        if marker.is_symlink():
+            continue
+        try:
+            if marker.read_text(encoding="utf-8") == session_id:
+                result.add(entry)
+        except (OSError, UnicodeError):
+            continue
+    return result
 
 
 def orphan_retention_expired(bridge_dir: Path) -> bool:

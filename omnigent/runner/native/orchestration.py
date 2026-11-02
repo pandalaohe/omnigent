@@ -10909,7 +10909,7 @@ async def _delete_native_bridge_dirs(
     :param keep_session_history: Keep bridges containing native history or
         Codex's undelivered-item queue during idle release. Their harness
         orphan sweeps expire them after owner death; session deletion still
-        removes them immediately.
+        removes them immediately, including previously retained bridge ids.
     """
     from omnigent.harnesses.antigravity_native.bridge import (
         ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
@@ -10957,6 +10957,7 @@ async def _delete_native_bridge_dirs(
         bridge_dir_for_session_id as qwen_bridge_dir,
     )
     from omnigent.inner.native_attachments import attachment_cache_dir, session_attachment_dir
+    from omnigent.native.native_bridge_common import bridge_dirs_for_session, record_bridge_session
 
     labels: dict[str, str] = {}
     if server_client is not None:
@@ -10965,38 +10966,32 @@ async def _delete_native_bridge_dirs(
             session_id=session_id,
         )
 
-    targets = {
+    history_targets = {
         antigravity_bridge_dir(labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
         antigravity_bridge_dir(session_id),
-        claude_bridge_dir(labels.get(BRIDGE_ID_LABEL_KEY) or session_id),
-        claude_bridge_dir(session_id),
         codex_bridge_dir(labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
         codex_bridge_dir(session_id),
-        cursor_bridge_dir(session_id),
-        goose_bridge_dir(session_id),
         hermes_bridge_dir(session_id),
-        kimi_bridge_dir(session_id),
-        kiro_bridge_dir(session_id),
         opencode_bridge_dir(labels.get(OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
         opencode_bridge_dir(session_id),
         pi_bridge_dir(session_id),
+    }
+    if not keep_session_history:
+        for root in {target.parent for target in history_targets}:
+            history_targets.update(bridge_dirs_for_session(root, session_id))
+    targets = history_targets | {
+        claude_bridge_dir(labels.get(BRIDGE_ID_LABEL_KEY) or session_id),
+        claude_bridge_dir(session_id),
+        cursor_bridge_dir(session_id),
+        goose_bridge_dir(session_id),
+        kimi_bridge_dir(session_id),
+        kiro_bridge_dir(session_id),
         qwen_bridge_dir(session_id),
     }
     if keep_session_history:
-        targets.difference_update(
-            {
-                antigravity_bridge_dir(
-                    labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id
-                ),
-                antigravity_bridge_dir(session_id),
-                codex_bridge_dir(labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
-                codex_bridge_dir(session_id),
-                opencode_bridge_dir(labels.get(OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
-                opencode_bridge_dir(session_id),
-                pi_bridge_dir(session_id),
-                hermes_bridge_dir(session_id),
-            }
-        )
+        for target in history_targets:
+            record_bridge_session(target, session_id)
+        targets.difference_update(history_targets)
     if not keep_attachment_caches:
         # A cache can survive a missing bridge directory, including after a reboot.
         targets.update(attachment_cache_dir(target) for target in tuple(targets))

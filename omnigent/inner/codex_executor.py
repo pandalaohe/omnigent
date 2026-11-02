@@ -1410,8 +1410,8 @@ def _populate_codex_home_config(
     :param target_dir: The per-conversation temp ``CODEX_HOME``
         directory. Must already exist.
     :param source_dir: The primary ``CODEX_HOME`` directory
-        (typically ``$CODEX_HOME`` or ``~/.codex``). Missing files are
-        skipped.
+        (typically ``$CODEX_HOME`` or ``~/.codex``). Missing credential stores
+        remove their private snapshots; other missing files are skipped.
     :param minimal_config: Copy only auth and provider-routing config when
         ``True``. ``None`` preserves the environment-controlled behavior.
     :param inject_hooks: Skip the ``hooks.json`` symlink because the caller
@@ -1464,6 +1464,10 @@ def _populate_codex_home_config(
         minimal_config=minimal_config,
         include_credentials=include_credentials,
     )
+    for filename in ("auth.json", ".credentials.json"):
+        if not (source_dir / filename).is_file():
+            # Hard links and fallback copies otherwise outlive a host logout.
+            (target_dir / filename).unlink(missing_ok=True)
     if not source_dir.is_dir():
         return
     symlink_files: tuple[str, ...] = _CODEX_HOME_SYMLINK_FILES

@@ -313,6 +313,8 @@ def _codex_newest_activity_time(bridge_dir: Path) -> float | None:
             if not (
                 (bridge_dir / _MCP_CONFIG_FILE).exists()
                 or codex_home_for_bridge_dir(bridge_dir).exists()
+                or (bridge_dir / "launch.json").is_file()
+                or (bridge_dir / native_bridge_common.SESSION_ID_FILENAME).is_file()
             ):
                 return None
             newest = max(

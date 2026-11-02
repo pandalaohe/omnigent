@@ -10863,3 +10863,33 @@ async def test_codex_update_keeps_thread_when_replacement_cannot_start(
         assert home is not None and (home / "thread.jsonl").read_text() == "remember this thread"
     finally:
         await executor.close()
+
+
+@pytest.mark.parametrize("filename", ["auth.json", ".credentials.json"])
+@pytest.mark.parametrize("remove_source_home", [False, True])
+def test_populate_codex_home_config_removes_logged_out_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, filename: str, remove_source_home: bool
+) -> None:
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source, target = tmp_path / "source", tmp_path / "target"
+    source.mkdir()
+    target.mkdir()
+    auth = source / filename
+    auth.write_text("{}")
+    if filename == "auth.json":
+
+        def no_symlink(*_args: object, **_kwargs: object) -> None:
+            raise OSError("symlinks unavailable")
+
+        monkeypatch.setattr(Path, "symlink_to", no_symlink)
+    _populate_codex_home_config(target, source)
+    assert (target / filename).is_file()
+    if remove_source_home:
+        source.rename(tmp_path / "logged-out-home")
+    else:
+        auth.rename(source / "logged-out.json")
+
+    _populate_codex_home_config(target, source)
+
+    assert not (target / filename).exists()

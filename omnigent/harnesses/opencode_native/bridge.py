@@ -560,14 +560,18 @@ def seed_opencode_auth(bridge_dir: Path) -> Path | None:
     :param bridge_dir: Native OpenCode bridge directory.
     :returns: The destination path written, or ``None`` when there is no
         source ``auth.json`` or the copy fails.
+    :raises OSError: A logged-out credential snapshot cannot be removed;
+        refusing reuse is safer than launching with the old credential.
     """
     src = user_opencode_auth_path()
-    if not src.is_file():
-        return None
     dest_dir = xdg_data_home_for_bridge_dir(bridge_dir) / "opencode"
+    dest = dest_dir / "auth.json"
+    if not src.is_file():
+        # A logout must remove the old snapshot before this home is reused.
+        dest.unlink(missing_ok=True)
+        return None
     try:
         dest_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        dest = dest_dir / "auth.json"
         shutil.copyfile(src, dest)
         os.chmod(dest, 0o600)
     except OSError:

@@ -1703,11 +1703,13 @@ def test_prune_orphaned_bridge_dirs_keeps_unmarked_non_bridge_siblings(
     assert process_owners.exists()
 
 
-def test_prune_keeps_expired_standalone_launch_state(
+@pytest.mark.parametrize("expired", [False, True])
+def test_prune_ages_standalone_launch_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    expired: bool,
 ) -> None:
-    """Old launch state under a session digest survives while its bridge lives elsewhere."""
+    """Launch-only state expires independently of the random-id runtime bridge."""
     from omnigent.harnesses.codex_native.state import read_launch_state, write_launch_state
 
     root = tmp_path / "codex-native"
@@ -1716,20 +1718,23 @@ def test_prune_keeps_expired_standalone_launch_state(
     monkeypatch.setenv("OMNIGENT_CODEX_NATIVE_STATE_DIR", str(root))
     now = 2_000_000_000.0
     monkeypatch.setattr(codex_native_bridge.time, "time", lambda: now)
-    expired_at = now - codex_native_bridge._ORPHAN_RETENTION_SECONDS - 1
+    activity_at = now - (71 if expired else 69) * 86400
 
     session_id = "0123456789abcdef0123456789abcdef"
     write_launch_state(session_id, str(tmp_path))
     (state_dir,) = root.iterdir()
     for path in (state_dir / "launch.json", state_dir):
-        os.utime(path, (expired_at, expired_at))
+        os.utime(path, (activity_at, activity_at))
     live_bridge = codex_native_bridge.prepare_bridge_dir("random-bridge-id")
 
-    assert codex_native_bridge.prune_orphaned_bridge_dirs() == 0
+    assert codex_native_bridge.prune_orphaned_bridge_dirs() == int(expired)
     assert live_bridge.exists()
     launch_state = read_launch_state(session_id)
-    assert launch_state is not None
-    assert launch_state.working_directory == str(tmp_path)
+    if expired:
+        assert launch_state is None
+    else:
+        assert launch_state is not None
+        assert launch_state.working_directory == str(tmp_path)
 
 
 def test_prune_removes_expired_unmarked_bridge_that_also_holds_launch_state(

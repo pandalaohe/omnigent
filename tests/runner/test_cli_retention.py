@@ -25,6 +25,62 @@ from tests.runner.conftest import _FakeProcessManager, _runner_client, _Scripted
 from tests.runner.helpers import NullServerClient
 
 
+@pytest.mark.parametrize("family", ["codex", "antigravity", "opencode"])
+async def test_session_delete_finds_bridges_retained_before_label_rotation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, family: str
+) -> None:
+    from omnigent.runner.native import orchestration
+
+    bridge = importlib.import_module(f"omnigent.harnesses.{family}_native.bridge")
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / family)
+    key = f"omnigent.{family}_native.bridge_id"
+    labels = {key: "bridge-a"}
+    monkeypatch.setattr(
+        orchestration,
+        "_session_labels_for_runner_spawn",
+        AsyncMock(side_effect=lambda **_: labels),
+    )
+    old = bridge.prepare_bridge_dir("bridge-a")
+    (old / "history.jsonl").write_text("native history")
+    app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
+    await app.state.finish_cli_release("conv_rotated")
+    assert old.exists()
+
+    labels[key] = "bridge-b"
+    new = bridge.prepare_bridge_dir("bridge-b")
+    unrelated = bridge.prepare_bridge_dir("unrelated")
+    async with _runner_client(app) as client:
+        response = await client.delete("/v1/sessions/conv_rotated")
+    assert response.status_code == 200
+    assert not old.exists(), (
+        "a live owner must not hide the prior retained bridge from session delete"
+    )
+    assert not new.exists()
+    assert unrelated.exists()
+
+
+@pytest.mark.parametrize("family", ["pi", "antigravity", "opencode", "hermes"])
+def test_unmarked_housekeeping_dirs_follow_retention(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, family: str
+) -> None:
+    from omnigent.native import native_bridge_common
+
+    bridge = importlib.import_module(f"omnigent.harnesses.{family}_native.bridge")
+    root = tmp_path / family
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", root)
+    housekeeping = root / ("a" * 32)
+    housekeeping.mkdir(parents=True)
+    launch = housekeeping / "launch.json"
+    launch.write_text("{}")
+    now = 2_000_000_000.0
+    os.utime(launch, (now - 69 * 86400, now - 69 * 86400))
+    monkeypatch.setattr(native_bridge_common.time, "time", lambda: now)
+    assert bridge.prune_orphaned_bridge_dirs() == 0
+    monkeypatch.setattr(native_bridge_common.time, "time", lambda: now + 2 * 86400)
+    assert bridge.prune_orphaned_bridge_dirs() == 1
+    assert not housekeeping.exists()
+
+
 @pytest.mark.parametrize(
     "family,history_path,label_key",
     [
