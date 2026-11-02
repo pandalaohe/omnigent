@@ -54,6 +54,7 @@ class StartupSnapshot:
     occupied: bool
     resident: bool
     cancel_requested: bool
+    cold_claims: dict[str, str]
     host_generation: str | None
     input_accepted: bool
     proof_source: str | None
@@ -1530,19 +1531,36 @@ class SessionStartupStore:
         row.updated_at = now_epoch()
 
     def confirm_stopped(
-        self, startup_id: str, attempt_id: str, *, expected_runner_id: str | None = None
+        self,
+        startup_id: str,
+        attempt_id: str,
+        *,
+        expected_runner_id: str | None = None,
+        expected_cold_claims: dict[str, str] | None = None,
+        expected_host_generation: str | None = None,
     ) -> bool:
-        """The authenticated runtime owner supplies exact-attempt stop evidence."""
+        """Polled death evidence must still match the launch authority it observed."""
 
         def write(db: Session) -> bool:
             row = db.get(SqlSessionStartup, (current_workspace_id(), startup_id))
             if row is None:
                 return False
-            self._budgets(db, row.host_id)
+            _, host = self._budgets(db, row.host_id)
             db.refresh(row, with_for_update=True)
-            if row.attempt_id != attempt_id or (
-                expected_runner_id is not None
-                and not self._bound_runner_matches(db, row, expected_runner_id)
+            if (
+                row.attempt_id != attempt_id
+                or (
+                    expected_cold_claims is not None
+                    and (not row.occupied or row.cold_claims != expected_cold_claims)
+                )
+                or (
+                    expected_host_generation is not None
+                    and host.current_generation != expected_host_generation
+                )
+                or (
+                    expected_runner_id is not None
+                    and not self._bound_runner_matches(db, row, expected_runner_id)
+                )
             ):
                 return False
             self._settle_runtime_stopped(db, row)

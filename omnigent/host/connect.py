@@ -2932,11 +2932,12 @@ class HostProcess:
         # loop to avoid freezing the daemon on the enabled path.
         while await asyncio.to_thread(handle.proc.poll) is None:
             await asyncio.sleep(_RUNNER_WATCH_INTERVAL_S)
-        if self._runners.get(runner_id) is not handle or handle.stop_requested:
-            # Intentional stops stay tracked until their exit is confirmed.
+        if self._runners.get(runner_id) is not handle:
             return
         self._runners.pop(runner_id)
         self._trigger_maintenance("runner_exited")
+        if handle.stop_requested:
+            return
         had_connected = None
         if handle.connect_marker is not None:
             try:

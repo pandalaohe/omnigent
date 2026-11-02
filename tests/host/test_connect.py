@@ -4916,16 +4916,22 @@ async def test_stop_trigger_waits_for_termination_after_cancellation(
     assert maintenance_reasons == ["runner_stopped"]
 
 
-async def test_watcher_keeps_an_exited_intentional_stop_quiet_before_ack(tmp_path: Path) -> None:
+async def test_watcher_reaps_a_later_exit_after_failed_intentional_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     host = _make_host_process()
-    proc = Mock(spec=subprocess.Popen, pid=1234, returncode=0)
-    proc.poll.return_value = 0
-    handle = _RunnerHandle(proc=proc, log_path=tmp_path / "runner.log", stop_requested=True)
+    proc = Mock(spec=subprocess.Popen, pid=1234, returncode=None)
+    proc.poll.return_value = None
+    handle = _RunnerHandle(proc=proc, log_path=tmp_path / "runner.log")
     host._runners["runner_stopping"] = handle
     host._report_runner_exit = AsyncMock()
+    monkeypatch.setattr(host, "_stop_runner_proc", lambda _proc: None)
+    result = await host._handle_stop(HostStopRunnerFrame("stop", "runner_stopping"))
+    assert result.status == "failed" and host._runners["runner_stopping"] is handle
+    proc.poll.return_value = proc.returncode = 0
     await host._watch_runner("runner_stopping")
     host._report_runner_exit.assert_not_awaited()
-    assert host._runners["runner_stopping"] is handle
+    assert "runner_stopping" not in host._runners
 
 
 async def test_handle_runner_status_alive_for_running_process(tmp_path: Path) -> None:

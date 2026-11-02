@@ -644,35 +644,43 @@ class StartupAdmission:
         from omnigent.server.routes._sessions.helpers import _query_host_runner_status
 
         conn = self.hosts.get(host_id)
-        for startup in await asyncio.to_thread(self.startups.list_occupied, host_id):
-            if startup.attempt_id is None:
-                continue
-            conv = await asyncio.to_thread(self.conversations.get_conversation, startup.session_id)
-            if conv is None:
-                continue
-            if conv.runner_id is None:
-                if conv.archived:
-                    await self.cancel_session(conv.id)
-                continue
-            if conv.host_id != host_id:
-                continue
-            if conn is None or not (
-                conv.archived
-                or startup.cancel_requested
-                or startup.host_generation != conn.startup_generation
-                or not await self._runner_available(conv.id)
-            ):
-                continue
-            status = await _query_host_runner_status(conn, self.hosts, conv.runner_id)
-            # A tunnel nonce changes on reconnect; only the process owner can
-            # distinguish a surviving runner from one lost in a host restart.
-            if self.hosts.get(host_id) is conn and status in ("dead", "unknown"):
-                await asyncio.to_thread(
-                    self.startups.confirm_stopped,
-                    startup.id,
-                    startup.attempt_id,
-                    expected_runner_id=conv.runner_id,
+        for candidate in await asyncio.to_thread(self.startups.list_occupied, host_id):
+            async with self.hosts.startup_launch(candidate.session_id):
+                startup = await asyncio.to_thread(self.startups.get, candidate.id)
+                if startup is None or not startup.occupied:
+                    continue
+                if startup.attempt_id is None:
+                    continue
+                conv = await asyncio.to_thread(
+                    self.conversations.get_conversation, startup.session_id
                 )
+                if conv is None:
+                    continue
+                if conv.runner_id is None:
+                    if conv.archived:
+                        await self.cancel_session(conv.id)
+                    continue
+                if conv.host_id != host_id:
+                    continue
+                if conn is None or not (
+                    conv.archived
+                    or startup.cancel_requested
+                    or startup.host_generation != conn.startup_generation
+                    or not await self._runner_available(conv.id)
+                ):
+                    continue
+                status = await _query_host_runner_status(conn, self.hosts, conv.runner_id)
+                # A tunnel nonce changes on reconnect; only the process owner can
+                # distinguish a surviving runner from one lost in a host restart.
+                if self.hosts.get(host_id) is conn and status in ("dead", "unknown"):
+                    await asyncio.to_thread(
+                        self.startups.confirm_stopped,
+                        startup.id,
+                        startup.attempt_id,
+                        expected_runner_id=conv.runner_id,
+                        expected_cold_claims=startup.cold_claims,
+                        expected_host_generation=conn.startup_generation,
+                    )
 
     async def advance(self, host_id: str) -> None:
         """Observe fixed deadlines before admitting another cold attempt."""

@@ -1587,6 +1587,12 @@ def create_hosts_router(
     async def _execute_host_launch(
         request: Request, host_id: str, body: LaunchRunnerRequest, user_id: str | None
     ) -> dict[str, Any]:
+        async with host_registry.startup_launch(body.session_id):
+            return await _execute_host_launch_serialized(request, host_id, body, user_id)
+
+    async def _execute_host_launch_serialized(
+        request: Request, host_id: str, body: LaunchRunnerRequest, user_id: str | None
+    ) -> dict[str, Any]:
         # Authorize against BOTH the host and the session before
         # spawning anything (see _host_launch for the threat model).
         target = await asyncio.to_thread(
