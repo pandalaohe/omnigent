@@ -236,6 +236,10 @@ APPROVAL_WAIT_MARKER_REFRESH_S = 60.0
 # Several refresh intervals of slack, so a hook that is slow to wake never
 # reads stale; a hook killed mid-wait leaves a marker that expires on its own.
 APPROVAL_WAIT_MARKER_TTL_S = 420.0
+# Adapted from omnigent-ae-public (Copyright 2026 Analytic Endeavors LLC, Apache-2.0):
+# Once a marker is older than one refresh interval plus slack, verify the hook
+# subprocess PID encoded in the marker name is still alive before trusting it.
+APPROVAL_WAIT_ORPHAN_GRACE_S = APPROVAL_WAIT_MARKER_REFRESH_S + 30.0
 _CONFIG_FILE = "bridge.json"
 _SERVER_FILE = "server.json"
 # Control socket of one ``serve-mcp`` process under the harness socket root,
@@ -259,6 +263,20 @@ _TMUX_FILE = "tmux.json"
 _EXPECTED_CLOSE_FILE = "expected_close"
 _PERMISSION_HOOK_FILE = "permission_hook.json"
 _CONTEXT_FILE = "context.json"
+# Adapted from omnigent-ae-public (Copyright 2026 Analytic Endeavors LLC, Apache-2.0):
+# Retain dead-owner claude-native bridge dirs for 7 days after last activity so
+# a relaunch after a host restart still finds transcript_forwarder.json.
+_ORPHAN_RETENTION_SECONDS = 7 * 24 * 60 * 60
+_TRANSCRIPT_FORWARDER_STATE_FILE = "transcript_forwarder.json"
+_ORPHAN_RUNTIME_FILES = (
+    _SERVER_FILE,
+    _STATE_FILE,
+    _HOOKS_FILE,
+    OBSERVER_HOOK_STDERR_FILE,
+    _TOOL_RELAY_FILE,
+    _TOOL_RELAY_ENV_FILE,
+    _TMUX_FILE,
+)
 _USER_CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 _MCP_SERVER_NAME = "omnigent"
 _MCP_PROTOCOL_VERSION = "2024-11-05"
@@ -1847,6 +1865,17 @@ def clear_approval_wait_marker(marker: Path) -> None:
         marker.unlink(missing_ok=True)
 
 
+def _approval_wait_owner_alive(marker: Path) -> bool:
+    """Return whether the hook process encoded in *marker*'s filename is alive."""
+    try:
+        pid = int(marker.name.split(".")[-2])
+    except (IndexError, ValueError):
+        return True
+    from omnigent.inner._proc import process_alive
+
+    return process_alive(pid)
+
+
 def approval_wait_is_fresh(session_id: str, *, bridge_dir: Path | None = None) -> bool:
     """
     Whether a permission hook is parked on this session's verdict right now.
@@ -1858,7 +1887,8 @@ def approval_wait_is_fresh(session_id: str, *, bridge_dir: Path | None = None) -
         ``"conv_abc123"``.
     :param bridge_dir: Derive the marker root from this bridge, matching the hook writer.
     :returns: ``True`` when any marker was touched within
-        :data:`APPROVAL_WAIT_MARKER_TTL_S`; ``False`` when none exists, all
+        :data:`APPROVAL_WAIT_MARKER_TTL_S` by a live owner (or within
+        :data:`APPROVAL_WAIT_ORPHAN_GRACE_S`); ``False`` when none exists, all
         are stale, or the root is unreadable.
     """
     root = bridge_dir.parent / _APPROVAL_WAIT_DIR_NAME if bridge_dir else _APPROVAL_WAIT_ROOT
@@ -1873,7 +1903,10 @@ def approval_wait_is_fresh(session_id: str, *, bridge_dir: Path | None = None) -
             touched_at = marker.stat().st_mtime
         except OSError:
             continue
-        if now - touched_at < APPROVAL_WAIT_MARKER_TTL_S:
+        age = now - touched_at
+        if age < APPROVAL_WAIT_ORPHAN_GRACE_S or (
+            age < APPROVAL_WAIT_MARKER_TTL_S and _approval_wait_owner_alive(marker)
+        ):
             fresh = True
         else:
             clear_approval_wait_marker(marker)
@@ -2051,9 +2084,38 @@ def prepare_bridge_dir(
     return bridge_dir
 
 
+def _claude_orphan_retention_expired(bridge_dir: Path) -> bool:
+    """Return whether a dead-owner claude-native bridge dir has been idle for 7 days."""
+    cutoff = time.time() - _ORPHAN_RETENTION_SECONDS
+    for name in (
+        native_bridge_common.OWNER_PID_FILENAME,
+        _TRANSCRIPT_FORWARDER_STATE_FILE,
+    ):
+        try:
+            if (bridge_dir / name).stat().st_mtime > cutoff:
+                return False
+        except FileNotFoundError:
+            if name == native_bridge_common.OWNER_PID_FILENAME:
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def _drop_claude_orphan_runtime_files(bridge_dir: Path) -> None:
+    """Unlink per-launch runtime files from a dead-owner bridge dir kept across sweep."""
+    for filename in _ORPHAN_RUNTIME_FILES:
+        with contextlib.suppress(OSError):
+            (bridge_dir / filename).unlink()
+
+
 def prune_orphaned_bridge_dirs() -> int:
     """
-    Remove claude-native bridge dirs whose owner process is provably dead.
+    Remove claude-native bridge dirs whose owner is dead and that sat idle for 7 days.
+
+    A dir inside the retention window keeps ``transcript_forwarder.json`` so a
+    relaunch after a host restart preserves the forwarding cursor, while
+    per-launch runtime files are unlinked immediately.
 
     Delegates to the shared sweep against this harness's bridge root; the
     global maintenance calls it (via ``native_bridge_common.reap_orphaned_native_bridge_dirs``)
@@ -2062,7 +2124,11 @@ def prune_orphaned_bridge_dirs() -> int:
 
     :returns: The number of orphaned bridge dirs removed.
     """
-    return native_bridge_common.prune_orphaned_dirs(_BRIDGE_ROOT)
+    return native_bridge_common.prune_orphaned_dirs(
+        _BRIDGE_ROOT,
+        should_prune=_claude_orphan_retention_expired,
+        on_keep=_drop_claude_orphan_runtime_files,
+    )
 
 
 def claude_global_config_path(

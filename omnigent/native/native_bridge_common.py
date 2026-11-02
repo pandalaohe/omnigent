@@ -145,6 +145,7 @@ def prune_orphaned_dirs(
     bridge_root: Path,
     *,
     should_prune: Callable[[Path], bool] | None = None,
+    on_keep: Callable[[Path], None] | None = None,
 ) -> int:
     """
     Remove per-session bridge dirs under *bridge_root* whose owner is dead.
@@ -177,6 +178,9 @@ def prune_orphaned_dirs(
         runs under the directory's cleanup lock, so it may trim in place before
         answering. ``None`` removes every dead-owner directory and keeps
         every unmarked one.
+    :param on_keep: Optional hook called, under the cleanup lock, for a
+        dead-owner directory *should_prune* decided to keep (adapted from
+        omnigent-ae-public, Copyright 2026 Analytic Endeavors LLC, Apache-2.0).
     :returns: The number of orphaned bridge dirs removed.
     """
     if not bridge_root.exists():
@@ -209,6 +213,11 @@ def prune_orphaned_dirs(
                     _logger.exception("Error checking orphaned bridge dir %s", entry)
                     continue
                 if not eligible:
+                    if on_keep is not None and pid is not None:
+                        try:
+                            on_keep(entry)
+                        except Exception:
+                            _logger.exception("Error keeping orphaned bridge dir %s", entry)
                     continue
             confirmed_pid: int | None
             try:
