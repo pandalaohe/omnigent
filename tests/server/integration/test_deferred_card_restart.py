@@ -505,7 +505,10 @@ async def test_old_lapse_preserves_newer_same_command_grant(
 ) -> None:
     """An older card lapsing cannot revoke or consume a newer grant for that command."""
 
+    old_armed = asyncio.Event()
+
     async def _offline(*_args: Any, **_kwargs: Any) -> bool:
+        old_armed.set()
         return False
 
     monkeypatch.setattr(hooks_routes, "_deliver_with_retry", _offline)
@@ -527,6 +530,8 @@ async def test_old_lapse_preserves_newer_same_command_grant(
             for row in store.list_detached_cards()
             if row.elicitation_id == card["elicitation_id"]
         )
+        # The answered record is written before its callback arms the grant.
+        await asyncio.wait_for(old_armed.wait(), timeout=5)
         newer = replace(
             old, elicitation_id="elicit_newer_grant", expires_at=int(time.time()) + 300
         )
@@ -549,3 +554,85 @@ async def test_old_lapse_preserves_newer_same_command_grant(
         assert await _request_bash(client, session_id, "pnpm build") == "allow"
         assert _pending_record(store, old.elicitation_id)
         assert not _pending_record(store, newer.elicitation_id)
+
+
+async def test_delayed_old_answer_cannot_overwrite_newer_approval(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent answers preserve the newer approval when the older one lapses."""
+    old_read = asyncio.Event()
+    release_old = asyncio.Event()
+    newer_started = asyncio.Event()
+    newer_armed = asyncio.Event()
+    answering: dict[asyncio.Task[Any], str] = {}
+    old_id = new_id = new_aid = ""
+    to_thread = asyncio.to_thread
+    callback = hooks_routes._detached_card_callback
+
+    def _track_callback(card: Any, **kwargs: Any) -> Any:
+        on_result = callback(card, **kwargs)
+
+        async def _answer_started(result: ElicitationResult | None) -> None:
+            task = asyncio.current_task()
+            assert task is not None
+            answering[task] = card.elicitation_id
+            if card.elicitation_id == new_id:
+                newer_started.set()
+            try:
+                await on_result(result)
+            finally:
+                answering.pop(task, None)
+
+        return _answer_started
+
+    async def _controlled_store_call(write: Any, *args: Any, **kwargs: Any) -> Any:
+        task = asyncio.current_task()
+        source = answering.get(task) if task is not None else None
+        if source is None:
+            return await to_thread(write, *args, **kwargs)
+        # Inline callback store calls make each answer run to its next gate;
+        # thread scheduling cannot choose which answer arms first.
+        result = write(*args, **kwargs)
+        if source == old_id and write.__name__ == "list_detached_cards" and not old_read.is_set():
+            old_read.set()
+            await release_old.wait()
+        return result
+
+    async def _offline(_session_id: str, text: str, **_kwargs: Any) -> bool:
+        if f"#{new_aid} granted" in text:
+            newer_armed.set()
+        return False
+
+    monkeypatch.setattr(hooks_routes, "_detached_card_callback", _track_callback)
+    monkeypatch.setattr(asyncio, "to_thread", _controlled_store_call)
+    monkeypatch.setattr(hooks_routes, "_deliver_with_retry", _offline)
+    monkeypatch.setattr(hooks_routes, "_CARD_RETRY_INTERVAL_S", 0.01)
+    store = SqlAlchemyConversationStore(db_uri)
+    async with _serve(db_uri, tmp_path) as client:
+        session_id = await _new_session(client, "test-concurrent-same-command-answers")
+        assert await _request_bash(client, session_id, "pnpm build") == "deny"
+        (old,) = await _pending(client, session_id)
+        old_id = old["elicitation_id"]
+        assert await _request_bash(client, session_id, "pnpm build") == "deny"
+        new = next(card for card in await _pending(client, session_id) if card != old)
+        new_id, new_aid = new["elicitation_id"], new["params"]["approval_ref"]
+        await _answer(client, session_id, old_id, "accept")
+        await asyncio.wait_for(old_read.wait(), timeout=5)
+        await _answer(client, session_id, new_id, "accept")
+        await asyncio.wait_for(newer_started.wait(), timeout=5)
+        store.update_detached_card(old_id, expires_at=int(time.time()) - 1)
+        release_old.set()
+        await asyncio.wait_for(newer_armed.wait(), timeout=5)
+        await _wait_for(
+            lambda: any(
+                row.elicitation_id == old_id and row.grant_key is None
+                for row in store.list_detached_cards()
+            )
+        )
+        assert await _request_bash(client, session_id, "pnpm build") == "allow"
+        assert _pending_record(store, old_id)
+        assert not _pending_record(store, new_id)
+        assert await _request_bash(client, session_id, "pnpm build") == "deny"
