@@ -2890,7 +2890,7 @@ function GeneralSection() {
             <BrowserLoginControl />
           </SettingsGroup>
         )}
-        <SettingsGroup title="Sessions" testId="settings-group-sessions">
+        <SettingsGroup title="Sessions" testId="settings-group-sessions" className="max-w-none">
           <OpenSubagentsInPanelControl />
           <BackgroundSessionTitlesControl />
           <ExpandableSettings
@@ -2953,7 +2953,7 @@ function DefaultBaseBranchControl() {
     <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
       <SettingsLabel
         label="Default base branch"
-        className="flex-1"
+        className="min-w-min flex-1"
         description="Auto-filled as the base when you name a new worktree branch. Leave blank to not auto-fill."
         descriptionClassName="text-ui"
       />

@@ -517,6 +517,40 @@ describe("SettingsPage", () => {
     expect(await screen.findByTestId("background-session-titles-toggle")).toBeChecked();
   });
 
+  it("keeps the real Sessions host matrix outside the ordinary group width cap", async () => {
+    mocks.hosts = [
+      { host_id: "h1", name: "Hawk" },
+      { host_id: "h2", name: "Owl" },
+    ];
+    mocks.authenticatedFetch.mockImplementation(
+      async (input: string) =>
+        new Response(
+          JSON.stringify(
+            input.endsWith("/keep_warm/convert")
+              ? {
+                  cells: { "": {}, h1: {}, h2: {} },
+                  columns: ["harness:claude-native"],
+                  already: true,
+                }
+              : input.endsWith("/harnesses")
+                ? { data: [], capabilities_by_harness: {} }
+                : { preferences: { settings: {} } },
+          ),
+          { status: 200 },
+        ),
+    );
+    renderPage("/settings/general#keep-warm");
+    const table = await screen.findByRole("table", {
+      name: "Keep-warm settings by host and agent",
+    });
+    for (const hostLabel of ["Server", "Hawk", "Owl"])
+      expect(
+        within(table).getByRole("columnheader", { name: new RegExp(hostLabel) }),
+      ).toBeInTheDocument();
+    expect(table.closest('[data-testid="settings-group-sessions"]')).toHaveClass("max-w-none");
+    expect(screen.getByTestId("settings-group-composer")).toHaveClass("max-w-2xl");
+  });
+
   it("persists session auto-rename changes", async () => {
     renderPage("/settings/general");
     const toggle = await screen.findByTestId("background-session-titles-toggle");
@@ -1595,6 +1629,9 @@ describe("SettingsPage", () => {
     renderPage("/settings/git");
     expect(screen.getByRole("heading", { name: "Git" })).toBeInTheDocument();
     const input = screen.getByTestId("settings-default-base-branch-input") as HTMLInputElement;
+    expect(screen.getByText("Default base branch").parentElement?.parentElement).toHaveClass(
+      "min-w-min",
+    );
     // Nothing stored → blank field, so the composer won't auto-fill.
     expect(input.value).toBe("");
 
