@@ -5332,6 +5332,17 @@ def create_app(
         # with no bound session still gets a session-less row.
         for session_id in [conv.id for conv in affected] or [None]:
             log_runner_exited(host_id, runner_id, error, session_id=session_id)
+        startups = app.state.startup_store
+        if startups is not None:
+            for conv in affected:
+                current = await asyncio.to_thread(startups.for_session, conv.id)
+                if current is not None and current.host_id == host_id and current.attempt_id:
+                    await asyncio.to_thread(
+                        startups.confirm_stopped,
+                        current.id,
+                        current.attempt_id,
+                        expected_runner_id=runner_id,
+                    )
         await _mark_runner_sessions_offline(
             affected,
             ErrorDetail(code="runner_failed_to_start", message=error),

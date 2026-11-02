@@ -53,6 +53,7 @@ class StartupSnapshot:
     owner_user_id: str
     occupied: bool
     resident: bool
+    cancel_requested: bool
     host_generation: str | None
     input_accepted: bool
     proof_source: str | None
@@ -130,11 +131,9 @@ class SessionStartupStore:
         *,
         host_resident_limit: int | None = None,
         deployment_resident_limit: int | None = None,
-        startup_limit: int = 2,
+        startup_limit: int | None = 2,
         mode: Literal["guarded", "startup_only"] = "guarded",
     ) -> None:
-        if type(startup_limit) is not int or startup_limit not in (1, 2):
-            raise ValueError("Resident limits must be positive and startup limit must be 1 or 2")
         if mode == "guarded":
             if (
                 type(host_resident_limit) is not int
@@ -143,16 +142,22 @@ class SessionStartupStore:
                 or deployment_resident_limit < 1
             ):
                 raise ValueError("Resident limits must be positive")
+            if type(startup_limit) is not int or startup_limit not in (1, 2):
+                raise ValueError("Guarded startup limit must be 1 or 2")
         elif (
             mode != "startup_only"
-            or startup_limit != 2
+            or (
+                startup_limit is not None and (type(startup_limit) is not int or startup_limit < 1)
+            )
             or (host_resident_limit is not None or deployment_resident_limit is not None)
         ):
-            raise ValueError("startup_only requires two starts and no resident limits")
+            raise ValueError("startup_only requires positive starts and no resident limits")
+        # Zero represents unlimited capacity in the existing non-null budget column.
+        stored_startup_limit = startup_limit if startup_limit is not None else 0
 
         def write(db: Session) -> None:
             deployment, host = self._budgets(db, host_id)
-            changed = host.admission_mode != mode or host.startup_limit != startup_limit
+            changed = host.admission_mode != mode or host.startup_limit != stored_startup_limit
             if mode == "guarded":
                 assert host_resident_limit is not None and deployment_resident_limit is not None
                 changed |= (
@@ -163,7 +168,7 @@ class SessionStartupStore:
                 host.resident_limit = host_resident_limit
             host.policy_revision = (host.policy_revision or 0) + int(changed)
             host.admission_mode = mode
-            host.startup_limit = startup_limit
+            host.startup_limit = stored_startup_limit
 
         run_write_transaction(self._session, "configure_capacity", write)
 
@@ -732,6 +737,18 @@ class SessionStartupStore:
             )
             return [_snapshot(row) for row in rows]
 
+    def list_occupied(self, host_id: str) -> list[StartupSnapshot]:
+        """Reconcile held permits without walking the host's conversation history."""
+        with self._session("read_occupied_startups") as db:
+            rows = db.scalars(
+                select(SqlSessionStartup).where(
+                    SqlSessionStartup.workspace_id == current_workspace_id(),
+                    SqlSessionStartup.host_id == host_id,
+                    SqlSessionStartup.occupied.is_(True),
+                )
+            )
+            return [_snapshot(row) for row in rows]
+
     def attach_queued_input(self, startup_id: str, input_id: str) -> StartupSnapshot | None:
         """Attach the canonical first input only before any permit is issued."""
 
@@ -1151,7 +1168,10 @@ class SessionStartupStore:
                         or host.resident_limit == 0
                     )
                 )
-                or count(*scope, SqlSessionStartup.occupied.is_(True)) >= host.startup_limit
+                or (
+                    host.startup_limit > 0
+                    and count(*scope, SqlSessionStartup.occupied.is_(True)) >= host.startup_limit
+                )
             ):
                 return None
             full = host.admission_mode != "startup_only" and (
@@ -1496,7 +1516,9 @@ class SessionStartupStore:
             row.state = "cancelled" if row.cancel_requested else "stopped"
         row.updated_at = now_epoch()
 
-    def confirm_stopped(self, startup_id: str, attempt_id: str) -> bool:
+    def confirm_stopped(
+        self, startup_id: str, attempt_id: str, *, expected_runner_id: str | None = None
+    ) -> bool:
         """The authenticated runtime owner supplies exact-attempt stop evidence."""
 
         def write(db: Session) -> bool:
@@ -1505,7 +1527,10 @@ class SessionStartupStore:
                 return False
             self._budgets(db, row.host_id)
             db.refresh(row, with_for_update=True)
-            if row.attempt_id != attempt_id:
+            if row.attempt_id != attempt_id or (
+                expected_runner_id is not None
+                and not self._bound_runner_matches(db, row, expected_runner_id)
+            ):
                 return False
             self._settle_runtime_stopped(db, row)
             return True

@@ -1,5 +1,6 @@
 """Host admission composes the saved-input owner with durable permits."""
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
@@ -142,8 +143,13 @@ async def test_empty_prepared_sdk_defers_context_until_its_first_saved_input(db_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("late", [False, True])
-async def test_prepared_input_waits_for_runner_then_resumes_the_same_attempt(db_uri, late):
+@pytest.mark.parametrize(
+    "mode, late, connects",
+    [("guarded", False, False), ("startup_only", False, True), ("startup_only", True, False)],
+)
+async def test_prepared_input_waits_for_runner_then_resumes_the_same_attempt(
+    db_uri, monkeypatch, mode, late, connects
+):
     conversations, startups = SqlAlchemyConversationStore(db_uri), SessionStartupStore(db_uri)
     registry, host = HostRegistry(), uuid4().hex
     conn = registry.register(
@@ -153,20 +159,29 @@ async def test_prepared_input_waits_for_runner_then_resumes_the_same_attempt(db_
             version="test",
             frame_protocol_version=1,
             name="sample-host",
-            capabilities=["startup_admission_v1", "startup_receipts:test"],
+            capabilities=["startup_admission_v1", "startup_receipts:test", "startup_queue_v1"],
         ),
         owner=None,
     )
     inputs = ManagedStartupInputs(conversations, registry)
     admission = StartupAdmission(
-        startups, conversations, registry, StartupAdmissionPolicy(8, 8, 2)
+        startups,
+        conversations,
+        registry,
+        StartupAdmissionPolicy(None, None, 2, mode)
+        if mode == "startup_only"
+        else StartupAdmissionPolicy(8, 8, 2),
     )
     router = Mock()
     router.client_for_existing_conversation.return_value = None
     admission.bind(
         SimpleNamespace(state=SimpleNamespace(startup_inputs=inputs, runner_router=router))
     )
-    admission.resolve_harness = AsyncMock(return_value="test")
+    admission.resolve_harness = AsyncMock(
+        return_value="codex-native" if mode == "startup_only" else "test"
+    )
+    wait = AsyncMock(return_value=Mock() if connects else None)
+    monkeypatch.setattr("omnigent.server.routes.sessions._wait_for_runner_client", wait)
     conv = conversations.create_conversation()
     conversations.set_host_id(conv.id, host, "/opt/work/project")
     item = await inputs.enqueue(
@@ -212,19 +227,118 @@ async def test_prepared_input_waits_for_runner_then_resumes_the_same_attempt(db_
     await admission.coordinator.advance(host)
     await admission.coordinator.drain()
     current = startups.get(queued.id)
-    assert prepared == [queued.id] and delivered == []
+    assert prepared == [queued.id]
+    if connects:
+        assert delivered == [current.attempt_id]
+        wait.assert_awaited_once()
+        assert wait.call_args.kwargs["runner_id"] == "runner"
+        assert 0 < wait.call_args.kwargs["timeout_s"] < 180
+        await admission.shutdown()
+        await inputs.shutdown()
+        return
+    assert delivered == []
     assert conversations.get_item(conv.id, item.id).status == "in_progress"
     assert not await admission.recover_session(conv.id, conn)
     if late:
         startups.expire_observations(host, now=current.admitted_at + 210)
         assert startups.get(queued.id).state == "uncertain"
     router.client_for_existing_conversation.return_value = Mock()
-    await admission.recover_session(conv.id, conn)
-    await admission.recover_session(conv.id, conn)
+    await asyncio.gather(*(admission.recover_session(conv.id, conn) for _ in range(2)))
+    assert not startups.claim_boundary(
+        current.id,
+        current.attempt_id,
+        runtime_id=current.runtime_id,
+        host_generation=conn.startup_generation,
+        boundary="input_dispatch",
+        claim_id="duplicate",
+    )
     assert prepared == [queued.id] and delivered == [current.attempt_id]
     assert conversations.get_item(conv.id, item.id).status == "incomplete"
     await admission.shutdown()
     await inputs.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trigger", ["archive", "generation", "stop", "stop_expired", "rebind"])
+@pytest.mark.parametrize("status", ["dead", "unknown", "alive", None])
+async def test_two_stuck_startups_release_only_proven_dead_runners(
+    app, db_uri, monkeypatch, trigger, status
+):
+    from tests.server.test_startup_observations import _startup
+
+    conversations, startups, hosts, conn, first, _, ref, _ = _startup(
+        app, db_uri, mode="startup_only"
+    )
+    second = conversations.create_conversation()
+    conversations.set_host_id(second.id, conn.host_id, "/opt/work/project")
+    conversations.set_runner_id(second.id, "runner-two")
+    startups.enqueue(
+        owner_user_id="owner",
+        host_id=conn.host_id,
+        session_id=second.id,
+        operation_key="second",
+        input_id=None,
+    )
+    attempt = startups.reserve(conn.host_id)
+    assert startups.claim_boundary(
+        attempt.id,
+        attempt.attempt_id,
+        runtime_id="runtime-two",
+        host_generation=conn.startup_generation,
+        boundary="runner_prepare",
+        claim_id="second",
+    )
+    startups.expire_observations(conn.host_id, now=attempt.admitted_at + 210)
+    assert all(startups.for_session(conv.id).occupied for conv in (first, second))
+    admission = StartupAdmission(
+        startups, conversations, hosts, StartupAdmissionPolicy(None, None, 2, "startup_only")
+    )
+    admission.bind(app)
+    admission.resolve_harness = AsyncMock(return_value="codex-native")
+    admission.coordinator._launch = AsyncMock()
+    third = conversations.create_conversation()
+    conversations.set_host_id(third.id, conn.host_id, "/opt/work/project")
+    queued = await admission.queue_session(conn, third.id)
+    assert startups.reserve(conn.host_id) is None
+    if trigger in ("archive", "rebind"):
+        for conv in (first, second):
+            conversations.update_conversation(conv.id, archived=True)
+    elif trigger == "generation":
+        conn = hosts.register(conn.host_id, FakeWebSocket(), conn.hello, owner=None)
+        startups.register_host_generation(conn.host_id, conn.startup_generation)
+        assert conn.startup_generation != ref.host_generation
+    else:
+        for conv in (first, second):
+            assert startups.cancel_session_current(conv.id).state == "cancelling"
+        if trigger == "stop_expired":
+            startups.expire_observations(conn.host_id, now=attempt.admitted_at + 210)
+            assert startups.for_session(first.id).state == "uncertain"
+
+    async def query(_conn, _hosts, runner_id):
+        if trigger == "rebind":
+            for conv in (first, second):
+                if conversations.get_conversation(conv.id).runner_id == runner_id:
+                    conversations.replace_runner_id(
+                        conv.id, f"replacement-{runner_id}", expected_runner_id=runner_id
+                    )
+        return status
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.helpers._query_host_runner_status",
+        query,
+    )
+    await admission.advance(conn.host_id)
+    await admission.coordinator.drain()
+    dead = status in ("dead", "unknown") and trigger != "rebind"
+    assert (startups.get(queued.id).state == "starting") is dead
+    for conv in (first, second):
+        current = startups.for_session(conv.id)
+        assert current.occupied is not dead
+        if dead:
+            assert current.state == ("cancelled" if trigger.startswith("stop") else "stopped")
+            assert not current.resident
+    assert admission.coordinator._launch.await_count == int(dead)
+    await admission.shutdown()
 
 
 def test_preflight_discard_preserves_a_committed_cancellation(db_uri):
@@ -248,7 +362,8 @@ def test_preflight_discard_preserves_a_committed_cancellation(db_uri):
 
 
 @pytest.mark.asyncio
-async def test_saved_inputs_wait_for_compatible_host_then_only_two_dispatch(db_uri):
+@pytest.mark.parametrize("limit", [2, 4, None])
+async def test_saved_inputs_wait_for_compatible_host_then_use_configured_capacity(db_uri, limit):
     conversations, startups = SqlAlchemyConversationStore(db_uri), SessionStartupStore(db_uri)
     registry, host = HostRegistry(), uuid4().hex
     conn = registry.register(
@@ -258,9 +373,8 @@ async def test_saved_inputs_wait_for_compatible_host_then_only_two_dispatch(db_u
         owner="owner",
     )
     inputs = ManagedStartupInputs(conversations, registry)
-    admissions = StartupAdmission(
-        startups, conversations, registry, StartupAdmissionPolicy(8, 8, 2)
-    )
+    policy = StartupAdmissionPolicy(None, None, limit, "startup_only")
+    admissions = StartupAdmission(startups, conversations, registry, policy)
     delivered = []
 
     async def dispatch(context, session_id, event):
@@ -291,23 +405,22 @@ async def test_saved_inputs_wait_for_compatible_host_then_only_two_dispatch(db_u
     assert delivered == []
     assert len(startups.list_queued(host)) == 4
     conn.hello.connection_id = "generation"
-    conn.hello.capabilities = ["startup_admission_v1", "startup_receipts:test"]
-    admissions.resolve_harness = AsyncMock(return_value="test")
+    conn.hello.capabilities = ["startup_queue_v1"]
+    admissions.resolve_harness = AsyncMock(return_value="codex-native")
     await admissions.coordinator.advance(host)
     await admissions.coordinator.drain()
-    assert len(delivered) == 2
+    expected = 2 if limit == 2 else 4
+    assert len(delivered) == expected
     for session_id, ref, input_id in delivered:
         assert ref.input_id == input_id == dict(sessions)[session_id]
         assert ref.host_generation == conn.startup_generation
         assert len(conversations.list_pending_inputs(session_id)) == 1
-    replacement = StartupAdmission(
-        startups, conversations, registry, StartupAdmissionPolicy(8, 8, 2)
-    )
+    replacement = StartupAdmission(startups, conversations, registry, policy)
     replacement.bind(app)
-    replacement.resolve_harness = AsyncMock(return_value="test")
+    replacement.resolve_harness = AsyncMock(return_value="codex-native")
     await replacement.coordinator.advance(host)
     await replacement.coordinator.drain()
-    assert len(delivered) == 2
+    assert len(delivered) == expected
     await admissions.shutdown()
     await replacement.shutdown()
     await inputs.shutdown()

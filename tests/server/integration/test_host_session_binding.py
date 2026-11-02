@@ -2221,6 +2221,39 @@ def _runner_exited_events(caplog: pytest.LogCaptureFixture) -> list[logging.LogR
     return [r for r in caplog.records if getattr(r, "event_name", None) == "runner_exited"]
 
 
+async def test_runner_exited_releases_its_startup_permit(db_uri: str, tmp_path: Path) -> None:
+    app, conversations = _runner_exited_app(db_uri, tmp_path)
+    startups = app.state.startup_store
+    startups.configure(_HOST_ID, mode="startup_only")
+    conv = conversations.create_conversation()
+    conversations.set_host_id(conv.id, _HOST_ID, "/opt/work/project")
+    conversations.set_runner_id(conv.id, "runner_crashed")
+    queued = startups.enqueue(
+        owner_user_id="owner",
+        host_id=_HOST_ID,
+        session_id=conv.id,
+        operation_key="create",
+        input_id=None,
+    )
+    attempt = startups.reserve(_HOST_ID)
+    assert startups.claim_boundary(
+        queued.id,
+        attempt.attempt_id,
+        runtime_id="runtime",
+        host_generation="previous",
+        boundary="runner_prepare",
+        claim_id="prepare",
+    )
+    comm = await _report_runner_exited(app, "runner_crashed")
+    try:
+        await poll_until_async(lambda: not startups.get(queued.id).occupied)
+        assert startups.get(queued.id).state == "stopped"
+        assert not startups.get(queued.id).resident
+    finally:
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await comm.wait(timeout=5)
+
+
 async def test_runner_exited_logs_one_event_per_bound_session(
     db_uri: str,
     tmp_path: Path,

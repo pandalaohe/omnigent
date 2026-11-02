@@ -39,12 +39,16 @@ def test_invalid_enabled_capacity_fails_closed(invalid):
         startup_admission_policy({"startup_admission": {"enabled": True, **invalid}})
 
 
-def test_startup_only_policy_needs_no_resident_capacity():
+@pytest.mark.parametrize(
+    "settings, expected",
+    [({}, None), ({"startup_limit": 1}, 1), ({"startup_limit": 2}, 2), ({"startup_limit": 4}, 4)],
+)
+def test_startup_only_policy_needs_no_resident_capacity(settings, expected):
     policy = startup_admission_policy(
-        {"startup_admission": {"enabled": True, "mode": "startup_only"}}
+        {"startup_admission": {"enabled": True, "mode": "startup_only", **settings}}
     )
     assert policy is not None
-    assert policy.mode == "startup_only" and policy.startup_limit == 2
+    assert policy.mode == "startup_only" and policy.startup_limit == expected
     assert policy.host_resident_limit is policy.deployment_resident_limit is None
     assert policy.observation_timeout_seconds == 180 and policy.stuck_release == "manual"
 
@@ -53,7 +57,9 @@ def test_startup_only_policy_needs_no_resident_capacity():
     "settings",
     [
         {"mode": "unknown"},
-        {"startup_limit": 1},
+        {"startup_limit": 0},
+        {"startup_limit": -1},
+        {"startup_limit": "4"},
         {"startup_limit": True},
         {"stuck_release": "timeout"},
         {"observation_timeout_seconds": 0},

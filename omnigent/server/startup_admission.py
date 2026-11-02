@@ -472,7 +472,24 @@ class StartupAdmission:
                 if startup.preparation is not None and not await self._runner_available(
                     startup.session_id
                 ):
-                    return
+                    from omnigent.server.routes._sessions.helpers import _wait_for_runner_client
+
+                    conv = await asyncio.to_thread(
+                        self.conversations.get_conversation, startup.session_id
+                    )
+                    if (
+                        conv is None
+                        or conv.runner_id is None
+                        or await _wait_for_runner_client(
+                            startup.session_id,
+                            getattr(self._app.state, "runner_router", None),
+                            getattr(self._app.state, "tunnel_registry", None),
+                            runner_id=conv.runner_id,
+                            timeout_s=120.0,
+                        )
+                        is None
+                    ):
+                        return
                 item = await asyncio.to_thread(
                     self.conversations.get_item, startup.session_id, startup.input_id
                 )
@@ -562,7 +579,7 @@ class StartupAdmission:
             current is not None
             and current.preparation is not None
             and current.input_id is not None
-            and current.reason != "opening_unconfirmed"
+            and (current.reason != "opening_unconfirmed" or current.first_dispatch_at is None)
         ):
             return await self._resume_prepared_input(current, conn)
         # Receipt waiting has no pending command. The host worker wakes on
@@ -623,11 +640,43 @@ class StartupAdmission:
             else 0,
         )
 
+    async def _settle_gone_runtimes(self, host_id: str) -> None:
+        from omnigent.server.routes._sessions.helpers import _query_host_runner_status
+
+        conn = self.hosts.get(host_id)
+        for startup in await asyncio.to_thread(self.startups.list_occupied, host_id):
+            if startup.attempt_id is None:
+                continue
+            conv = await asyncio.to_thread(self.conversations.get_conversation, startup.session_id)
+            if conv is None or conv.host_id != host_id:
+                continue
+            if conv.runner_id is None:
+                if conv.archived:
+                    await self.cancel_session(conv.id)
+                continue
+            if conn is None or not (
+                conv.archived
+                or startup.cancel_requested
+                or startup.host_generation != conn.startup_generation
+            ):
+                continue
+            status = await _query_host_runner_status(conn, self.hosts, conv.runner_id)
+            # A tunnel nonce changes on reconnect; only the process owner can
+            # distinguish a surviving runner from one lost in a host restart.
+            if self.hosts.get(host_id) is conn and status in ("dead", "unknown"):
+                await asyncio.to_thread(
+                    self.startups.confirm_stopped,
+                    startup.id,
+                    startup.attempt_id,
+                    expected_runner_id=conv.runner_id,
+                )
+
     async def advance(self, host_id: str) -> None:
         """Observe fixed deadlines before admitting another cold attempt."""
         from omnigent.runtime import session_stream
         from omnigent.server.schemas import SessionStartupEvent
 
+        await self._settle_gone_runtimes(host_id)
         changed = await asyncio.to_thread(self.startups.expire_observations, host_id)
         for startup in changed:
             status = await asyncio.to_thread(self.startups.presentation, startup.session_id)

@@ -58,7 +58,7 @@ SESSION_TITLE_INSTRUCTIONS_MAX_CHARS = 4_000
 class StartupAdmissionPolicy:
     host_resident_limit: int | None
     deployment_resident_limit: int | None
-    startup_limit: int
+    startup_limit: int | None
     mode: Literal["guarded", "startup_only"] = "guarded"
     observation_timeout_seconds: int = 180
     stuck_release: Literal["manual"] = "manual"
@@ -85,13 +85,17 @@ def startup_admission_policy(config: Mapping[str, Any]) -> StartupAdmissionPolic
         raise ValueError("startup_admission requires a 180 second marker and manual release")
     host = raw.get("host_resident_limit")
     deployment = raw.get("deployment_resident_limit")
-    starts = raw.get("startup_limit", 2)
+    starts = raw.get("startup_limit", None if mode == "startup_only" else 2)
     if mode == "startup_only":
-        if type(starts) is not int or starts != 2 or host is not None or deployment is not None:
+        if (
+            (starts is not None and (type(starts) is not int or starts < 1))
+            or host is not None
+            or deployment is not None
+        ):
             raise ValueError(
-                "startup_admission startup_only requires two starts and no resident limits"
+                "startup_admission startup_only requires positive starts and no resident limits"
             )
-        return StartupAdmissionPolicy(None, None, 2, mode="startup_only")
+        return StartupAdmissionPolicy(None, None, starts, mode="startup_only")
     if (
         type(host) is not int
         or host < 1
