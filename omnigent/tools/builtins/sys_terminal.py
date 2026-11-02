@@ -946,7 +946,11 @@ class SysTerminalReadTool(Tool):
             return resolved
 
         scrollback_raw = resolved.parsed.get("scrollback", 0)
-        if not isinstance(scrollback_raw, int) or scrollback_raw < 0:
+        if (
+            isinstance(scrollback_raw, bool)
+            or not isinstance(scrollback_raw, int)
+            or scrollback_raw < 0
+        ):
             return json.dumps({"error": "'scrollback' must be a non-negative integer"})
 
         # Hold the per-instance lock so a concurrent ``send`` can't
@@ -967,7 +971,14 @@ class SysTerminalReadTool(Tool):
             except (RuntimeError, OSError, ValueError) as exc:
                 # tmux capture-pane subprocess failures land here.
                 _logger.exception("sys_terminal_read failed")
-                return json.dumps({"error": f"read failed: {exc}"})
+                result = {"error": f"read failed: {exc}"}
+        error = result.get("error")
+        if resolved.instance.origin == "user" and isinstance(error, str):
+            socket = str(resolved.instance.socket_path)
+            # Command diagnostics JSON-encode paths; start failures use raw paths.
+            for spelling in (json.dumps(socket)[1:-1], socket):
+                error = error.replace(spelling, "<redacted terminal socket>")
+            result = {**result, "error": error}
         return json.dumps(result)
 
 

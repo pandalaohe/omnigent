@@ -14,6 +14,7 @@ spawn → send → read → close round-trip.
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import shutil
 from collections.abc import AsyncIterator
@@ -453,6 +454,55 @@ async def test_multiple_sessions_per_terminal_are_independent(
 
 
 # ── sys_terminal_send / read ──────────────────────────────────
+
+
+@pytest.mark.parametrize("origin", ["user", "agent"])
+@pytest.mark.parametrize("failure", ["bool_true", "bool_false", "command", "start", "raised"])
+async def test_read_errors_do_not_disclose_user_shell_socket(
+    registry: TerminalRegistry,
+    ctx: ToolContext,
+    cleanup_registry: None,
+    monkeypatch: pytest.MonkeyPatch,
+    origin: str,
+    failure: str,
+) -> None:
+    from omnigent.inner.terminal import _tmux_process_start_error, _TmuxCommandFailedError
+
+    spec = _make_spec(terminals={"bash": TerminalEnvSpec(command="bash")})
+    target = {"terminal": "bash", "session": "read-error"}
+    assert (await _invoke(SysTerminalLaunchTool(spec, registry), target, ctx))[
+        "status"
+    ] == "launched"
+    instance = registry.get(ctx.conversation_id, "bash", "read-error")
+    assert instance is not None
+    instance.origin = origin
+    socket = str(instance.socket_path)
+    if failure in {"command", "start"}:
+        command = ["tmux", "-S", socket, "capture-pane", "-t", "main", "-p"]
+
+        async def fail_output(*_args):
+            if failure == "command":
+                raise _TmuxCommandFailedError(command, returncode=1, stderr=b"probe failed")
+            raise _tmux_process_start_error(command, OSError(errno.EAGAIN, "probe failed"))
+
+        monkeypatch.setattr(instance, "_tmux_output", fail_output)
+    elif failure == "raised":
+
+        async def fail_read(**_kwargs):
+            raise OSError(f"probe failed for {socket}")
+
+        monkeypatch.setattr(instance, "read", fail_read)
+    scrollback = True if failure == "bool_true" else False if failure == "bool_false" else 1
+    result = await _invoke(
+        SysTerminalReadTool(registry), {**target, "scrollback": scrollback}, ctx
+    )
+    if origin == "user":
+        assert socket not in json.dumps(result), result
+    if failure.startswith("bool_"):
+        assert result == {"error": "'scrollback' must be a non-negative integer"}
+    else:
+        assert "probe failed" in result["error"]
+        assert (socket in result["error"]) is (origin == "agent")
 
 
 def test_send_unknown_session_returns_error(registry: TerminalRegistry, ctx: ToolContext) -> None:
