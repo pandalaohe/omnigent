@@ -2609,7 +2609,7 @@ class SessionResponse(BaseModel):
         :mod:`omnigent.runtime.pending_inputs` index; startup inputs also
         survive server restart in the conversation store.
     :param workspace: Absolute path on disk where the runner cd's,
-        e.g. ``"/Users/corey/universe/src/foo"``. Set when the
+        e.g. ``"/opt/work/app/src/foo"``. Set when the
         session was bound to a host workspace at create-time, or
         when the CLI captured ``os.getcwd()`` at session-create.
         Always ``None`` when not yet validated against a host. When a
@@ -3570,7 +3570,7 @@ class SessionListItem(BaseModel):
         children); changes when a new prompt appears, stable otherwise.
         ``None`` when the in-memory index holds none.
     :param workspace: Absolute path on disk where the runner cd's,
-        e.g. ``"/Users/corey/universe/src/foo"``. ``None`` for
+        e.g. ``"/opt/work/app/src/foo"``. ``None`` for
         sessions that haven't been bound to a host workspace.
     :param worktree: The session's working tree when it differs from
         its launch directory (``workspace``), e.g. a worktree placed

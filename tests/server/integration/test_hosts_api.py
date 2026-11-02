@@ -1246,15 +1246,15 @@ async def test_restart_owner_offline_supervisor_and_requester_guards(multi_user_
             content={"error": {"code": error.code, "message": error.message}},
         )
 
-    hosts.upsert_on_connect(_HOST_ID, "test", "owner@test.com")
+    hosts.upsert_on_connect(_HOST_ID, "test", "owner@example.com")
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         path = f"/v1/hosts/{_HOST_ID}/restart"
-        response = await client.post(path, json={}, headers={"x-test-user": "other@test.com"})
+        response = await client.post(path, json={}, headers={"x-test-user": "other@example.com"})
         assert response.status_code == 403
-        headers = {"x-test-user": "owner@test.com"}
+        headers = {"x-test-user": "owner@example.com"}
         assert (await client.post(path, json={}, headers=headers)).status_code == 409
         conn = registry.register(
-            _HOST_ID, AsyncMock(), HostHelloFrame("test", 1, "test"), "owner@test.com"
+            _HOST_ID, AsyncMock(), HostHelloFrame("test", 1, "test"), "owner@example.com"
         )
         assert (await client.post(path, json={}, headers=headers)).status_code == 409
         conn.hello.capabilities = [CAP_HOST_RESTART]
