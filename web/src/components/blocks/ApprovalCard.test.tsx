@@ -1378,6 +1378,42 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
 
   it.each([
     {
+      name: "SDK",
+      message: "Codex has questions",
+      policyName: "omnigent_async_question",
+    },
+    {
+      name: "native",
+      message: "Codex has questions",
+      policyName: "codex_async_question",
+    },
+    {
+      name: "unknown-agent",
+      message: "Agent has questions",
+      policyName: "omnigent_async_question",
+    },
+  ])("uses the server agent name for $name async question cards", ({ message, policyName }) => {
+    render(
+      <ApprovalCard
+        elicitationId={`elic_async_title_${policyName}`}
+        message={message}
+        phase="async_question"
+        policyName={policyName}
+        contentPreview=""
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+        asyncKind="question"
+        askUserQuestion={{ questions: [{ question: "Continue?", options: [] }] }}
+      />,
+    );
+
+    expect(screen.getByText(message)).toBeDefined();
+    expect(screen.queryByText("Claude has questions")).toBeNull();
+  });
+
+  it.each([
+    {
       name: "select",
       harness: "Pi",
       options: [{ label: "Allow" }, { label: "Block" }],

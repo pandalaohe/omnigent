@@ -533,15 +533,17 @@ export function ApprovalCard({
   // information the card doesn't already show, so hide it for them.
   const showPhase = phase !== "" && !isNativePolicy;
   const askUserQuestionTitle =
-    policyName.startsWith("agy_") || phase.startsWith("agy_")
-      ? "Antigravity needs your input"
-      : policyName.startsWith("codex_") || phase.startsWith("codex_")
-        ? "Codex needs input"
-        : policyName.startsWith("cursor_") || phase.startsWith("cursor_")
-          ? "Cursor has questions"
-          : policyName.startsWith("pi_") || phase.startsWith("pi_")
-            ? "Pi needs your input"
-            : "Claude has questions";
+    phase === "async_question"
+      ? message.trim() || "Agent has questions"
+      : policyName.startsWith("agy_") || phase.startsWith("agy_")
+        ? "Antigravity needs your input"
+        : policyName.startsWith("codex_") || phase.startsWith("codex_")
+          ? "Codex needs input"
+          : policyName.startsWith("cursor_") || phase.startsWith("cursor_")
+            ? "Cursor has questions"
+            : policyName.startsWith("pi_") || phase.startsWith("pi_")
+              ? "Pi needs your input"
+              : `${nativeCodingAgentForPolicyName(policyName)?.displayName ?? "Agent"} has questions`;
 
   // Hide the raw JSON preview for AskUserQuestion (the form already
   // renders the questions + options structurally) and for option-

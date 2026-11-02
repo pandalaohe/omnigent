@@ -21,6 +21,7 @@ from fastapi.responses import Response
 from omnigent.debug_logging import add_audit_attrs
 from omnigent.entities import Agent, Conversation
 from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
+from omnigent.harness_plugins import harness_labels
 from omnigent.harnesses.codex_native.elicitation import codex_elicitation_id
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
@@ -1411,7 +1412,11 @@ def register_hooks_routes(
         native_agent = native_coding_agent_for_harness(harness) or (
             native_coding_agent_for_wrapper_label(conv.labels.get("omnigent.wrapper"))
         )
-        asking_name = native_agent.display_name if native_agent is not None else "Agent"
+        asking_name = (
+            native_agent.display_name
+            if native_agent is not None
+            else harness_labels().get(harness or "", "Agent")
+        )
         vendor = (
             _NATIVE_POLICY_VENDORS.get(native_agent.key, native_agent.key)
             if native_agent is not None
