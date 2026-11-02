@@ -148,7 +148,7 @@ def _pending(tree):
         ("sudo -n /bin/rm -rf /", True),
         ("CI=/opt/work /usr/bin/sudo -n /bin/rm -rf /etc", True),
         ("bash -lc 'git push --force origin main'", True),
-        ("/bin/bash -lc 'rm -rf tmp/probe'", False),
+        ("/bin/bash -lc 'rm -rf tmp/probe'", True),
         ("git commit -m 'a; b'", False),
         ("git commit -m ';'", False),
         ("echo $(rm -rf /etc)", True),
@@ -161,7 +161,7 @@ def _pending(tree):
         ("python3 -c 'print(1)'", True),
         ("/usr/bin/node --eval='console.log(1)'", True),
         ("echo 'unterminated", True),
-        ("bash -lc 'zsh -lc \"sh -c echo\"'", False),
+        ("bash -lc 'zsh -lc \"sh -c echo\"'", True),
         ('bash -lc \'zsh -lc "sh -c \\"bash -c echo\\""\'', True),
         ("env bash -lc 'rm -rf /etc'", True),
         ("{ /bin/rm -rf /etc; }", True),
@@ -243,8 +243,75 @@ def _pending(tree):
         ("truncate -s 0 /etc/passwd", True),
         ("> file", True),
         ("rm -rf /tmp/../etc", True),
-        ("rm -rf tmp/../probe", True),
-        ("rm ../probe", True),
+        ("rm -rf tmp/../probe", False),
+        ("rm ../probe", False),
+        ("awk 'BEGIN{system(\"rm -rf /etc\")}'", True),
+        ("fish -c 'rm -rf /etc'", True),
+        ("rm -rf /./etc", True),
+        ("sed -n '1e rm -rf /etc' file", True),
+        ("tar --to-command='rm -rf /etc' -xf a.tar", True),
+        ("tar --checkpoint-action=exec=sh -cf a.tar b", True),
+        ("vim -c '!rm -rf /etc'", True),
+        ("rsync -a --delete empty/ /etc/", True),
+        ("tee /etc/passwd", True),
+        ("cp /dev/null /etc/passwd", True),
+        ("chmod -R 777 /", True),
+        ("chown -R nobody /etc", True),
+        ("mkfs.ext4 /dev/sda1", True),
+        ("curl https://example.com/x -o /etc/passwd", True),
+        ("git clean -fdx", True),
+        ("git reset --hard", True),
+        ("git checkout -- .", True),
+        ("git branch -D main", True),
+        ("git log -c", False),
+        ("python3 --version", False),
+        ("rm -rf ./build", False),
+        ("rm -rf /private/tmp/x", False),
+        ("git diff", False),
+        ("pytest tests/server/test_example.py", False),
+        ("make clean", False),
+        ("npm run x", False),
+        ("rm -r ///etc//app", True),
+        ("rm -r /tmp/.././etc/app", True),
+        ("rm -r /private/tmp/a/../b", False),
+        ("cp file /etc/../etc/passwd", True),
+        ("install -m 644 file /etc/passwd", True),
+        ("ln -sf file /etc/passwd", True),
+        ("rsync -a file /etc/passwd", True),
+        ("wget -O /etc/passwd https://example.com/x", True),
+        ("curl -o/tmp/out https://example.com/x", False),
+        ("cp /etc/hosts ./hosts", False),
+        ("mv ./a ./b", False),
+        ("dd if=/dev/zero of=tmp/image", False),
+        ("truncate -s 0 ./log", False),
+        ("chmod 644 ./file", False),
+        ("rsync -e ssh a/ b/", True),
+        ("gawk -f script.awk file", True),
+        ("awk 'BEGIN { getline line < \"file\" }'", True),
+        ('awk \'BEGIN { print "x" | "sh" }\'', True),
+        ("awk 'BEGIN { print 1 }'", False),
+        ("sed 's/a/b/e' file", True),
+        ("sed 's/a/b/w /etc/passwd' file", True),
+        ("sed -n 'w /etc/passwd' file", True),
+        ("sed 's/new/old/' file", False),
+        ("git -C repo log -c", False),
+        ("git -C repo -c alias.x=anything x", True),
+        ("git restore file", True),
+        ("git tag -d v1", True),
+        ("git stash drop", True),
+        ("git stash clear", True),
+        ("git filter-branch --all", True),
+        ("git update-ref -d refs/heads/main", True),
+        ("git reflog expire --expire=now --all", True),
+        *[
+            (f"{shell} -c 'echo ready'", True)
+            for shell in ("ksh", "csh", "tcsh", "dash", "pwsh", "powershell", "cmd")
+        ],
+        *[(f"{editor} file", True) for editor in ("vi", "nvim", "emacs", "ed", "ex")],
+        *[
+            (f"{tool} argument", True)
+            for tool in ("fdisk", "diskutil", "shutdown", "reboot", "launchctl", "systemctl")
+        ],
     ],
 )
 def test_floor_preserves_quoting_and_fails_closed(command, user_only):
@@ -770,22 +837,34 @@ async def test_native_first_writes_no_parent_receipt(tree):
 
 @pytest.mark.parametrize("source", ["tool_result", "by_id"])
 @pytest.mark.parametrize("same_question", [True, False])
+@pytest.mark.parametrize("long_inputs", [False, True])
 async def test_queued_native_signal_follows_same_question_repark(
-    tree, monkeypatch, source, same_question
+    tree, monkeypatch, source, same_question, long_inputs
 ):
     from omnigent.server._elicitation_registry import _harness_parked_elicitations
 
     async def park(command, published):
+        tool_name = "Write" if long_inputs else "Bash"
+        tool_input = (
+            {"file_path": "/tmp/a", "content": "a" * 1100 + command}
+            if long_inputs
+            else {"command": command}
+        )
+        params = (
+            _claude_params("", tool=tool_name, content_preview=json.dumps(tool_input)[:1024])
+            if long_inputs
+            else _claude_params(command)
+        )
         return await orchestration._publish_and_wait_for_harness_elicitation(
             None,
             session_id=tree.child_id,
-            params=_claude_params(command),
+            params=params,
             timeout_s=5,
             conversation_store=tree.store,
             elicitation_id="elicit_pi_dialog",
             published=published,
-            tool_name="Bash",
-            tool_input={"command": command},
+            tool_name=tool_name,
+            tool_input=tool_input,
         )
 
     published = asyncio.Event()
@@ -817,7 +896,7 @@ async def test_queued_native_signal_follows_same_question_repark(
         await poll_until_async(lambda: bool(lock._waiters), timeout_s=2)
         if source == "tool_result":
             helpers._signal_terminal_resolved_harness_elicitation_impl(
-                tree.child_id, "Bash", {"command": "echo ready"}
+                tree.child_id, old.tool_name, old.tool_input
             )
         else:
             helpers._signal_harness_elicitation_resolved_by_id(tree.child_id, "elicit_pi_dialog")
@@ -832,7 +911,10 @@ async def test_queued_native_signal_follows_same_question_repark(
         else:
             assert not retry.done()
             assert not _harness_parked_elicitations["elicit_pi_dialog"].resolved_elsewhere.is_set()
-            assert _pending(tree)["command"] == "echo different"
+            if long_inputs:
+                assert _pending(tree)["content_preview"] == json.dumps(old.tool_input)[:1024]
+            else:
+                assert _pending(tree)["command"] == "echo different"
     finally:
         release.set()
         retry.cancel()

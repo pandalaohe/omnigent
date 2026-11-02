@@ -1127,9 +1127,13 @@ def _serialize_terminal_resolution(
                 and current.session_id == parked.session_id == session_id
                 and parked.request_fingerprint is not None
                 and current.request_fingerprint == parked.request_fingerprint
+                and parked.tool_name is not None
+                and current.tool_name == parked.tool_name
+                and isinstance(parked.tool_input, dict)
+                and current.tool_input == parked.tool_input
             ):
                 # A retry replaced the waiter before this queued native receipt.
-                # Transfer only when both waiters describe the same question.
+                # Previews can collide; also require the full tool identity/input.
                 apply()
                 current.resolved_elsewhere.set()
 
