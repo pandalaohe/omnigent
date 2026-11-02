@@ -2088,6 +2088,9 @@ def test_functional_rpcs_use_rpc_call_timeout(monkeypatch: pytest.MonkeyPatch) -
     rpc.get_all_cascade_trajectories(52548)
 
     assert timeouts == [rpc._RPC_CALL_TIMEOUT_S] * 7
+    rpc.get_trajectory_steps(52548, "c", timeout_s=2.0)
+    rpc.get_all_cascade_trajectories(52548, timeout_s=2.0)
+    assert timeouts[-2:] == [2.0, 2.0]
 
 
 def test_discovery_probes_keep_probe_timeout(monkeypatch: pytest.MonkeyPatch) -> None:

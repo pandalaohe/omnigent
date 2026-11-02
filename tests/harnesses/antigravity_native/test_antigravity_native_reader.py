@@ -51,6 +51,7 @@ import contextlib
 import copy
 import json
 import logging
+import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, cast
@@ -479,7 +480,7 @@ class _StepScript:
         self._snapshots = snapshots
         self.calls = 0
 
-    def __call__(self, port: int, cascade_id: str) -> list[dict[str, object]]:
+    def __call__(self, port: int, cascade_id: str, **_kwargs: Any) -> list[dict[str, object]]:
         self.calls += 1
         idx = min(self.calls - 1, len(self._snapshots) - 1)
         # Return a deep-ish copy so the reader cannot mutate the script.
@@ -494,7 +495,7 @@ class _RaisingThenOk:
         self._snapshot = snapshot
         self.calls = 0
 
-    def __call__(self, port: int, cascade_id: str) -> list[dict[str, object]]:
+    def __call__(self, port: int, cascade_id: str, **_kwargs: Any) -> list[dict[str, object]]:
         self.calls += 1
         if self.calls == 1:
             raise self._exc
@@ -694,7 +695,7 @@ def no_rotation(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         reader,
         "get_all_cascade_trajectories",
-        lambda port: {
+        lambda port, **_kwargs: {
             "trajectorySummaries": {
                 _CASCADE_ID: {"status": "CASCADE_RUN_STATUS_RUNNING"},
                 "child-aaa": {"status": "CASCADE_RUN_STATUS_IDLE"},
@@ -1029,7 +1030,7 @@ async def test_interaction_done_callback_clears_slot(monkeypatch: pytest.MonkeyP
     interaction can fire."""
     # The clear now ALSO re-scans the freshest steps (#1472); keep that a no-op here
     # so this test stays focused on slot-clearing + the manual re-fire.
-    monkeypatch.setattr(reader, "get_trajectory_steps", lambda _port, _cascade_id: [])
+    monkeypatch.setattr(reader, "get_trajectory_steps", lambda _port, _cascade_id, **_kwargs: [])
     state = reader._ReaderState(
         seen=set(),
         interacted=set(),
@@ -1111,7 +1112,9 @@ async def test_clear_slot_resurfaces_deferred_gate(monkeypatch: pytest.MonkeyPat
     # the dedup-race case: its verdict landed but the DONE transition has not yet
     # propagated to the snapshot, so ``state.interacted`` (not status) is what stops
     # it re-firing. gate2 is the newly-arrived, deferred gate.
-    monkeypatch.setattr(reader, "get_trajectory_steps", lambda _port, _cascade_id: [gate1, gate2])
+    monkeypatch.setattr(
+        reader, "get_trajectory_steps", lambda _port, _cascade_id, **_kwargs: [gate1, gate2]
+    )
 
     fired: list[int] = []
 
@@ -1159,7 +1162,9 @@ async def test_clear_slot_rescan_empty_then_stream_frame_surfaces(
     gate2["runCommand"]["commandLine"] = "ls"
     # Re-scan snapshot: gate-1 resolved (DONE), gate-2 not present yet → the re-scan
     # surfaces nothing and must leave the slot open.
-    monkeypatch.setattr(reader, "get_trajectory_steps", lambda _port, _cascade_id: [gate1_done])
+    monkeypatch.setattr(
+        reader, "get_trajectory_steps", lambda _port, _cascade_id, **_kwargs: [gate1_done]
+    )
 
     fired: list[int] = []
 
@@ -1227,7 +1232,9 @@ async def test_rescan_skips_auto_allowed_step_and_surfaces_next_gate(
     gate2["runCommand"]["commandLine"] = "rm b"
     # Re-scan snapshot: gate-1 resolved, the allowed command DONE (no gate), gate-2 WAITING.
     monkeypatch.setattr(
-        reader, "get_trajectory_steps", lambda _port, _cascade_id: [gate1_done, allowed, gate2]
+        reader,
+        "get_trajectory_steps",
+        lambda _port, _cascade_id, **_kwargs: [gate1_done, allowed, gate2],
     )
 
     fired: list[int] = []
@@ -1260,7 +1267,7 @@ async def test_resurface_pending_interaction_swallows_poll_error(
     (#1472 review: the re-scan is the sole backstop on the healthy-stream path)."""
     calls = 0
 
-    def _boom(_port: int, _cascade_id: str) -> list[dict[str, Any]]:
+    def _boom(_port: int, _cascade_id: str, **_kwargs: Any) -> list[dict[str, Any]]:
         nonlocal calls
         calls += 1
         raise httpx.ConnectError("refused")
@@ -1302,7 +1309,7 @@ async def test_resurface_pending_interaction_retries_transient_poll_error(
     gate = _load("run_command_waiting")  # stepIndex 6 — the deferred gate
     failed_once = False
 
-    def _flaky(_port: int, _cascade_id: str) -> list[dict[str, Any]]:
+    def _flaky(_port: int, _cascade_id: str, **_kwargs: Any) -> list[dict[str, Any]]:
         nonlocal failed_once
         if not failed_once:
             failed_once = True
@@ -4084,7 +4091,7 @@ async def test_supervise_reader_returns_new_cascade_on_rotation(
     """
     new_cascade = "11111111-2222-3333-4444-555555555555"
     monkeypatch.setattr(
-        reader, "get_all_cascade_trajectories", lambda port: _rotation_body(new_cascade)
+        reader, "get_all_cascade_trajectories", lambda port, **_kwargs: _rotation_body(new_cascade)
     )
     monkeypatch.setattr(reader, "stream_agent_state_updates", _FrameScript([]))
     monkeypatch.setattr(reader, "get_trajectory_steps", _StepScript([[]]))
@@ -4126,7 +4133,7 @@ async def test_supervise_reader_skips_failed_rotation_cascade(
     """
     skipped = "deadbeef-0000-0000-0000-000000000000"
     monkeypatch.setattr(
-        reader, "get_all_cascade_trajectories", lambda port: _rotation_body(skipped)
+        reader, "get_all_cascade_trajectories", lambda port, **_kwargs: _rotation_body(skipped)
     )
     monkeypatch.setattr(reader, "stream_agent_state_updates", _FrameScript([]))
     monkeypatch.setattr(reader, "get_trajectory_steps", _StepScript([[]]))
@@ -4168,7 +4175,7 @@ class _RotationFetchScript:
         self._exceptions = exceptions
         self.calls = 0
 
-    def __call__(self, port: int) -> dict[str, object]:
+    def __call__(self, port: int, **_kwargs: Any) -> dict[str, object]:
         idx = min(self.calls, len(self._exceptions) - 1)
         self.calls += 1
         raise self._exceptions[idx]
@@ -4409,7 +4416,7 @@ async def test_explicit_clear_confirms_only_one_new_root(
         after["another-root"] = _summary()
     injected: list[str] = []
 
-    def summaries(port: int) -> dict[str, Any]:
+    def summaries(port: int, **_kwargs: Any) -> dict[str, Any]:
         assert port == 54321
         if outcome == "unreadable":
             return {}
@@ -4467,7 +4474,7 @@ async def test_explicit_clear_retry_resumes_without_clearing_twice(
     monkeypatch.setattr(
         reader,
         "get_all_cascade_trajectories",
-        lambda _port: {
+        lambda _port, **_kwargs: {
             "trajectorySummaries": {
                 _CASCADE_ID: _summary(),
                 **({"new-root": _summary()} if injected else {}),
@@ -4560,7 +4567,7 @@ async def test_explicit_clear_retries_only_before_submission(
     monkeypatch.setattr(
         reader,
         "get_all_cascade_trajectories",
-        lambda _port: {
+        lambda _port, **_kwargs: {
             "trajectorySummaries": {
                 _CASCADE_ID: _summary(),
                 **({"new-root": _summary()} if accepted else {}),
@@ -4622,7 +4629,7 @@ async def test_successor_clear_refreshes_binding_after_predecessor_recovery(
     monkeypatch.setattr(
         reader,
         "get_all_cascade_trajectories",
-        lambda _port: {
+        lambda _port, **_kwargs: {
             "trajectorySummaries": {
                 _CASCADE_ID: _summary(),
                 "root-b": _summary(),
@@ -4999,7 +5006,7 @@ async def test_supervise_reader_actuates_rotation_when_stream_is_wedged(
     blocking = _BlockingStream()
     poll = _StepScript([[]])
     monkeypatch.setattr(
-        reader, "get_all_cascade_trajectories", lambda port: _rotation_body(new_cascade)
+        reader, "get_all_cascade_trajectories", lambda port, **_kwargs: _rotation_body(new_cascade)
     )
     monkeypatch.setattr(reader, "stream_agent_state_updates", blocking)
     monkeypatch.setattr(reader, "get_trajectory_steps", poll)
@@ -5125,7 +5132,7 @@ async def test_reconciliation_closes_only_after_consecutive_idle(
     script = [idle, busy, idle, idle, idle]
     seen = {"n": 0}
 
-    def _fetch(port: int) -> dict[str, object]:
+    def _fetch(port: int, **_kwargs: Any) -> dict[str, object]:
         i = seen["n"]
         seen["n"] += 1
         if i >= len(script):
@@ -5133,7 +5140,7 @@ async def test_reconciliation_closes_only_after_consecutive_idle(
         return script[i]
 
     monkeypatch.setattr(reader, "get_all_cascade_trajectories", _fetch)
-    monkeypatch.setattr(reader, "get_trajectory_steps", lambda *args: [])
+    monkeypatch.setattr(reader, "get_trajectory_steps", lambda *args, **_kwargs: [])
     state = reader._ReaderState(seen=set(), interacted=set(), turn_active=True)
 
     async def post(client: Any, session: str, event: Any) -> None:
@@ -5184,7 +5191,7 @@ async def test_idle_reconciliation_commits_final_before_one_close(
     monkeypatch.setattr(
         reader,
         "get_all_cascade_trajectories",
-        lambda port: {
+        lambda port, **_kwargs: {
             "trajectorySummaries": {
                 _CASCADE_ID: {
                     "status": "CASCADE_RUN_STATUS_IDLE" if idle else "CASCADE_RUN_STATUS_RUNNING"
@@ -5193,7 +5200,7 @@ async def test_idle_reconciliation_commits_final_before_one_close(
         },
     )
 
-    def snapshot(*args: Any) -> list[dict[str, Any]]:
+    def snapshot(*args: Any, **_kwargs: Any) -> list[dict[str, Any]]:
         nonlocal fail_snapshot
         if fail_snapshot:
             fail_snapshot = False
@@ -5516,7 +5523,9 @@ async def test_mirror_posts_the_child_cascade_into_the_child_session(
     closing its turn before the poll returns — so the turn-open check has to run
     per step, not per poll, or the mirror never notices it ended.
     """
-    monkeypatch.setattr(reader, "get_trajectory_steps", lambda _p, _c: _child_transcript())
+    monkeypatch.setattr(
+        reader, "get_trajectory_steps", lambda _p, _c, **_kwargs: _child_transcript()
+    )
     sink = _PostSink()
     monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
 
@@ -5539,7 +5548,7 @@ async def test_mirror_posts_the_child_cascade_into_the_child_session(
         f"the child's work must post to the CHILD session; got {set(sink.urls)}"
     )
     # The closing step fires the child's own IDLE edge, clearing the rail badge.
-    assert sink.statuses() == ["running", "idle"], (
+    assert sink.statuses() == ["idle"], (
         f"Expected the child's turn to open then close; got {sink.statuses()}"
     )
 
@@ -5560,7 +5569,7 @@ async def test_mirror_keeps_polling_while_the_child_is_still_working(
     finished = _child_transcript()
     polls = 0
 
-    def _steps(_port: int, _cascade: str) -> list[dict[str, Any]]:
+    def _steps(_port: int, _cascade: str, **_kwargs: Any) -> list[dict[str, Any]]:
         nonlocal polls
         polls += 1
         return working if polls < 3 else finished
@@ -5599,12 +5608,14 @@ async def test_a_child_that_goes_quiet_without_closing_is_closed_from_agy_status
     of the session and the row spinning forever. agy's run status is the
     authority for that stall.
     """
-    monkeypatch.setattr(reader, "get_trajectory_steps", lambda _p, _c: [_load("user_input")])
+    monkeypatch.setattr(
+        reader, "get_trajectory_steps", lambda _p, _c, **_kwargs: [_load("user_input")]
+    )
     monkeypatch.setattr(reader, "_sleep", _no_sleep)
     monkeypatch.setattr(
         reader,
         "get_all_cascade_trajectories",
-        lambda _port: {
+        lambda _port, **_kwargs: {
             "trajectorySummaries": {"child-aaa": {"status": "CASCADE_RUN_STATUS_IDLE"}}
         },
     )
@@ -5623,7 +5634,7 @@ async def test_a_child_that_goes_quiet_without_closing_is_closed_from_agy_status
             timeout=_MIRROR_HANG_GUARD_S,
         )
 
-    assert sink.statuses() == ["running", "idle"], (
+    assert sink.statuses() == ["idle"], (
         f"a stalled child must still be closed out; got {sink.statuses()}"
     )
 
@@ -5643,12 +5654,12 @@ async def test_a_quiet_child_agy_still_reports_running_is_not_closed(
     polls = 0
     idle_checks = 0
 
-    def _steps(_port: int, _cascade: str) -> list[dict[str, Any]]:
+    def _steps(_port: int, _cascade: str, **_kwargs: Any) -> list[dict[str, Any]]:
         nonlocal polls
         polls += 1
         return working if polls <= _QUIET_POLLS_BEFORE_FINISHING else finished
 
-    def _still_running(_port: int) -> dict[str, Any]:
+    def _still_running(_port: int, **_kwargs: Any) -> dict[str, Any]:
         nonlocal idle_checks
         idle_checks += 1
         return {
@@ -5685,7 +5696,7 @@ async def test_a_quiet_child_agy_still_reports_running_is_not_closed(
     # mirror was still alive to see the child finish.
     assert idle_checks >= 1, f"the quiescence timer should have fired; got {idle_checks}"
     assert polls > _QUIET_POLLS_BEFORE_FINISHING, "the mirror gave up before the child finished"
-    assert sink.statuses() == ["running", "idle"], (
+    assert sink.statuses() == ["idle"], (
         f"the child closed on its own step, not the timer; got {sink.statuses()}"
     )
 
@@ -5699,14 +5710,14 @@ async def test_running_child_reads_status_once_per_tick_without_closing(
     reached_target = asyncio.Event()
     loop = asyncio.get_running_loop()
 
-    def _steps(_port: int, _cascade: str) -> list[dict[str, Any]]:
+    def _steps(_port: int, _cascade: str, **_kwargs: Any) -> list[dict[str, Any]]:
         nonlocal polls
         polls += 1
         if polls == 30:
             loop.call_soon_threadsafe(reached_target.set)
         return [_load("user_input")]  # turn open, never another step
 
-    def _still_running(_port: int) -> dict[str, Any]:
+    def _still_running(_port: int, **_kwargs: Any) -> dict[str, Any]:
         nonlocal idle_checks
         idle_checks += 1
         return {"trajectorySummaries": {"child-aaa": {"status": "CASCADE_RUN_STATUS_RUNNING"}}}
@@ -5736,7 +5747,7 @@ async def test_running_child_reads_status_once_per_tick_without_closing(
 
     assert polls >= 30, f"the mirror should have kept polling a vetoed child; got {polls}"
     assert idle_checks == polls
-    assert sink.statuses() == ["running"], (
+    assert sink.statuses() == [], (
         f"a child agy still calls running must not be closed; got {sink.statuses()}"
     )
 
@@ -5755,7 +5766,7 @@ async def test_a_finished_child_takes_its_own_grandchild_mirrors_down(
     """
     grandchild_polls = 0
 
-    def _steps(_port: int, cascade: str) -> list[dict[str, Any]]:
+    def _steps(_port: int, cascade: str, **_kwargs: Any) -> list[dict[str, Any]]:
         if cascade == "grand-ccc":
             nonlocal grandchild_polls
             grandchild_polls += 1
@@ -5773,7 +5784,7 @@ async def test_a_finished_child_takes_its_own_grandchild_mirrors_down(
     monkeypatch.setattr(
         reader,
         "get_all_cascade_trajectories",
-        lambda _port: {
+        lambda _port, **_kwargs: {
             "trajectorySummaries": {
                 "grand-ccc": {"status": "CASCADE_RUN_STATUS_RUNNING"},
                 "child-aaa": {"status": "CASCADE_RUN_STATUS_IDLE"},
@@ -5806,28 +5817,94 @@ async def test_a_finished_child_takes_its_own_grandchild_mirrors_down(
     )
 
 
-async def test_subagent_idle_check_failure_is_bounded(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Persistent summary failure ends the mirror with one failed status."""
+async def test_stream_frame_refreshes_silence_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Even a frame with no committed steps proves work; read failures do not."""
+    clock = [0.0]
+    monkeypatch.setattr(reader, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(reader, "stream_agent_state_updates", _FrameScript([{}]))
 
-    def _raise(_port: int) -> dict[str, Any]:
-        raise httpx.ConnectError("agy went away")
+    def unavailable(*args: Any, **kwargs: Any) -> Any:
+        raise httpx.ReadTimeout("unavailable")
 
-    monkeypatch.setattr(reader, "get_all_cascade_trajectories", _raise)
-    monkeypatch.setattr(reader, "get_trajectory_steps", lambda *args: _child_transcript())
-    monkeypatch.setattr(reader, "_sleep", _no_sleep)
+    monkeypatch.setattr(reader, "get_all_cascade_trajectories", unavailable)
+    monkeypatch.setattr(reader, "get_trajectory_steps", unavailable)
     sink = _PostSink()
     monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
-    client, _ = _subagent_client()
-    async with client:
-        await asyncio.wait_for(
-            reader._mirror_subagent_cascade(
+    state = reader._ReaderState(seen=set(), interacted=set(), turn_active=True)
+    params: dict[str, Any] = {
+        "port": _PORT,
+        "cascade_id": _CASCADE_ID,
+        "client": cast(Any, object()),
+        "session_id": _SESSION_ID,
+        "state": state,
+        "on_pending_interaction": cast(Any, object()),
+    }
+    clock[0] = 119
+    await reader._stream_loop(**params, stop=_stop_after(1))
+    for clock[0] in (120, 121, 122, 238):
+        await reader._reconcile_idle_turn(**params)
+        assert sink.statuses() == []
+    for clock[0] in (239, 240):
+        await reader._reconcile_idle_turn(**params)
+    assert sink.statuses() == ["failed"]
+
+
+async def test_slow_completion_reads_are_sequential_with_transport_timeouts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each slow read finishes before its replacement enters the transport."""
+    from omnigent.harnesses.antigravity_native import rpc
+
+    loop = asyncio.get_running_loop()
+    started = [asyncio.Event() for _ in range(4)]
+    release = [threading.Event() for _ in range(4)]
+    calls, active, peak = [], 0, 0
+    clock = [0.0]
+    monkeypatch.setattr(reader, "monotonic", lambda: clock[0], raising=False)
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        nonlocal active, peak
+        index = len(calls)
+        calls.append(request.extensions["timeout"]["read"])
+        active += 1
+        peak = max(peak, active)
+        loop.call_soon_threadsafe(started[index].set)
+        try:
+            assert release[index].wait(5)
+            raise httpx.ReadTimeout("transport deadline", request=request)
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(rpc, "_HTTP_TRANSPORT", httpx.MockTransport(transport))
+    monkeypatch.setattr(rpc, "_rpc_headers", lambda port: {})
+    monkeypatch.setattr(reader, "get_all_cascade_trajectories", rpc.get_all_cascade_trajectories)
+    monkeypatch.setattr(reader, "get_trajectory_steps", rpc.get_trajectory_steps)
+    state = reader._ReaderState(seen=set(), interacted=set(), turn_active=True)
+
+    async def ticks() -> None:
+        for _ in range(2):
+            await reader._reconcile_idle_turn(
                 port=_PORT,
-                child_cascade_id="child-aaa",
-                client=client,
-                child_session_id="conv_child_a",
-            ),
-            timeout=2,
-        )
-    assert sink.statuses() == ["running", "failed"]
+                cascade_id=_CASCADE_ID,
+                client=cast(Any, object()),
+                session_id=_SESSION_ID,
+                state=state,
+                on_pending_interaction=cast(Any, object()),
+            )
+
+    task = asyncio.create_task(ticks())
+    try:
+        for index in range(4):
+            await asyncio.wait_for(started[index].wait(), 1)
+            assert len(calls) == index + 1
+            assert not task.done()
+            clock[0] += 2.0
+            release[index].set()
+        await task
+    finally:
+        for gate in release:
+            gate.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert calls == [2.0] * 4
+    assert peak == 1

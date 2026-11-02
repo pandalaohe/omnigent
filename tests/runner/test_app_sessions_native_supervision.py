@@ -1018,7 +1018,19 @@ async def test_native_subagent_completion_wakes_idle_parent() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("quiet_progress", [False, True])
-@pytest.mark.parametrize("fault", ["none", "summary", "trajectory", "continuation", "slow_error"])
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "none",
+        "summary",
+        "trajectory",
+        "continuation",
+        "slow_error",
+        "working",
+        "unfinished",
+        "helper",
+    ],
+)
 async def test_antigravity_progress_does_not_spend_the_parent_wake(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, quiet_progress: bool, fault: str
 ) -> None:
@@ -1042,15 +1054,20 @@ async def test_antigravity_progress_does_not_spend_the_parent_wake(
     )
     latest_text = ""
     messages: list[str] = []
+    closed_at: list[float] = []
     snapshot: list[dict[str, Any]] = []
     ready, reading = asyncio.Event(), asyncio.Event()
     release = threading.Event()
     loop = asyncio.get_running_loop()
     blocked = False
+    clock, reads, working = [0.0], 0, True
+    deadline_ticks = iter([1.0, 2.0, 3.0, 119.0, 120.0])
+    progressed = asyncio.Event()
+    monkeypatch.setattr(reader, "monotonic", lambda: clock[0], raising=False)
 
-    def summaries(_port: int) -> dict[str, Any]:
+    def summaries(_port: int, **kwargs: Any) -> dict[str, Any]:
         nonlocal blocked
-        if fault == "summary":
+        if fault == "summary" or (fault in {"working", "unfinished"} and working):
             raise httpx.ReadTimeout("summary unavailable")
         if fault == "slow_error" and not blocked:
             blocked = True
@@ -1068,10 +1085,16 @@ async def test_antigravity_progress_does_not_spend_the_parent_wake(
             }
         }
 
-    def steps(*args: Any) -> list[dict[str, Any]]:
-        nonlocal blocked
-        if fault == "trajectory":
+    def steps(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        nonlocal blocked, reads
+        if fault in {"trajectory", "helper"}:
             raise httpx.ReadTimeout("trajectory unavailable")
+        if fault in {"working", "unfinished"} and working:
+            reads += 1
+            if fault == "working":
+                snapshot.append(planner(10 + reads, "Still working.\n[quiet]"))
+            if reads == 5:
+                loop.call_soon_threadsafe(progressed.set)
         captured = list(snapshot)
         if fault == "continuation" and not blocked:
             blocked = True
@@ -1081,7 +1104,14 @@ async def test_antigravity_progress_does_not_spend_the_parent_wake(
 
     async def tick(_seconds: float) -> None:
         await ready.wait()
-        await asyncio.sleep(0.001)
+        clock[0] = (
+            next(deadline_ticks, 121.0)
+            if fault in {"summary", "trajectory", "helper"}
+            else clock[0] + 40.0
+        )
+        if fault == "helper" and clock[0] > 120:
+            raise AssertionError("registered helper never posted its bounded failure")
+        await asyncio.sleep(0)
 
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
@@ -1121,6 +1151,8 @@ async def test_antigravity_progress_does_not_spend_the_parent_wake(
                         latest_text = "".join(block.get("text", "") for block in item["content"])
                         messages.append(latest_text)
                 if payload["type"] == "external_session_status":
+                    if data["status"] in {"idle", "failed"}:
+                        closed_at.append(clock[0])
                     response = await client.post(
                         f"/v1/sessions/{child_id}/events",
                         json={"type": payload["type"], "data": {"output": latest_text, **data}},
@@ -1139,9 +1171,11 @@ async def test_antigravity_progress_does_not_spend_the_parent_wake(
                 progress = planner(
                     1, "Running the check." + ("\n[quiet]" if quiet_progress else "")
                 )
-                final = planner(2, "READY")
+                final = planner(99, "READY")
 
                 async def stream(**kwargs: Any) -> None:
+                    nonlocal working
+
                     async def step(value: dict[str, Any]) -> None:
                         await reader._process_committed_step(
                             value,
@@ -1168,9 +1202,36 @@ async def test_antigravity_progress_does_not_spend_the_parent_wake(
                     await step(progress)
                     assert inbox.empty(), "progress spent the completion"
                     snapshot[:] = [user, progress, final]
+                    if fault in {"working", "unfinished"}:
+                        snapshot[:] = [user, progress]
+                        if fault == "unfinished":
+                            snapshot.append(
+                                {
+                                    "type": "CORTEX_STEP_TYPE_RUN_COMMAND",
+                                    "status": "CORTEX_STEP_STATUS_RUNNING",
+                                    "metadata": {"executionId": "long-command"},
+                                }
+                            )
                     if fault in {"summary", "trajectory"}:
                         await step(final)
                     ready.set()
+                    if fault in {"working", "unfinished"}:
+                        progress_wait = asyncio.create_task(progressed.wait())
+                        wake_wait = asyncio.create_task(server.wake_seen.wait())
+                        try:
+                            await asyncio.wait(
+                                [progress_wait, wake_wait], return_when=asyncio.FIRST_COMPLETED
+                            )
+                            assert inbox.empty(), (
+                                "observable work was retired after three failed reads"
+                            )
+                            assert clock[0] >= 200
+                        finally:
+                            for task in (progress_wait, wake_wait):
+                                task.cancel()
+                            await asyncio.gather(progress_wait, wake_wait, return_exceptions=True)
+                        working = False
+                        snapshot.append(final)
                     if fault == "continuation":
                         await asyncio.wait_for(reading.wait(), 1)
                         user_b = {**user, "metadata": {"executionId": "turn-two"}}
@@ -1186,20 +1247,30 @@ async def test_antigravity_progress_does_not_spend_the_parent_wake(
                     await step(snapshot[-1])
 
                 monkeypatch.setattr(reader, "_stream_loop", stream)
-                await asyncio.wait_for(
-                    reader.supervise_reader(
+                if fault == "helper":
+                    ready.set()
+                    run = reader._mirror_subagent_cascade(
+                        port=4242,
+                        child_cascade_id=cascade_id,
+                        client=reader_client,
+                        child_session_id=child_id,
+                    )
+                else:
+                    run = reader.supervise_reader(
                         bridge_dir,
                         child_id,
                         client=reader_client,
                         on_pending_interaction=no_interaction,
-                    ),
-                    4,
-                )
+                    )
+                await asyncio.wait_for(run, 4)
+                await asyncio.wait_for(server.wake_seen.wait(), 1)
         assert inbox.qsize() == 1
         delivered = inbox.get_nowait()
-        if fault in {"summary", "trajectory"}:
+        if fault in {"summary", "trajectory", "helper"}:
             assert delivered["status"] == "failed"
-            assert "READY" in delivered["output"]
+            assert closed_at == [120], "unconfirmed close must wait for 120 seconds without work"
+            if fault != "helper":
+                assert "READY" in delivered["output"]
             assert "confirm" in delivered["output"].lower()
         elif fault != "slow_error":
             expected = "READY B" if fault == "continuation" else "READY"
