@@ -3062,25 +3062,31 @@ async def _reconcile_helpers_once(
 
     children: dict[str, dict[str, str | None]] = {}
     unknown = False
+
+    async def read_snapshot(tid: str) -> tuple[_JsonObject, list[object]]:
+        response = await client.request("thread/read", {"threadId": tid, "includeTurns": True})
+        return _thread_turns_from_response(response)
+
     try:
         async with asyncio.timeout(1.0):
             children = read_active_child_turns(bridge_dir, strict=True)
-            parent_response = await client.request(
-                "thread/read", {"threadId": thread_id, "includeTurns": True}
-            )
-            parent_result = parent_response.get("result")
-            parent_thread = (
-                parent_result.get("thread") if isinstance(parent_result, dict) else None
-            )
-            turns = parent_thread.get("turns") if isinstance(parent_thread, dict) else None
-            if not isinstance(turns, list):
+            parent_thread, turns = await read_snapshot(thread_id)
+            if not parent_thread:
                 raise ValueError("Parent helper ownership unavailable")
             # Earlier turns may own helpers missing from the persisted inventory.
             unknown = len(turns) > 1
             turn = turns[-1] if turns else {}
-            for item in turn.get("items", []) if isinstance(turn, dict) else []:
-                if isinstance(item, dict) and item.get("type") == _CODEX_COLLAB_AGENT_ITEM_TYPE:
-                    for tid in _collab_receiver_thread_ids(item):
+            if not isinstance(turn, dict):
+                raise ValueError("Parent helper ownership unavailable")
+            last_calls: dict[str, _JsonObject] = {}
+            for item in turn.get("items", []):
+                if not isinstance(item, dict):
+                    continue
+                for tid in _collab_receiver_thread_ids(item):
+                    last_calls[tid] = item
+                    if len(last_calls) > 512:
+                        raise ValueError("Helper observations exceed their bound")
+                    if item.get("type") == _CODEX_COLLAB_AGENT_ITEM_TYPE:
                         children.setdefault(tid, {"session_id": None, "turn_id": None})
             if len(children) > 512:
                 raise ValueError("Helper snapshot exceeds its bound")
@@ -3095,49 +3101,33 @@ async def _reconcile_helpers_once(
                         item={},
                     )
                 if not sid:
-                    unknown = True
                     continue
                 info["session_id"] = sid
                 state.note_child_thread(tid, sid)
-                response = await client.request(
-                    "thread/read", {"threadId": tid, "includeTurns": True}
-                )
-                result = response.get("result")
-                thread = result.get("thread") if isinstance(result, dict) else None
-                child_turns = thread.get("turns") if isinstance(thread, dict) else None
-                latest = child_turns[-1] if isinstance(child_turns, list) and child_turns else None
+                thread, child_turns = await read_snapshot(tid)
+                latest = child_turns[-1] if child_turns else None
                 if not isinstance(latest, dict) or latest.get("status") not in {
                     "completed",
                     "failed",
                     "interrupted",
                 }:
-                    unknown = True
                     continue
-                assert isinstance(thread, dict)
+                last_call = last_calls.get(tid, {})
+                statuses = last_call.get("agentsStates")
+                status = statuses.get(tid) if isinstance(statuses, dict) else None
                 if (
-                    isinstance(turn, dict)
-                    and turn.get("status") == "inProgress"
+                    turn.get("status") == "inProgress"
                     and state.active_parent_turn_id in {None, _turn_id_from_payload(turn)}
                     and _turn_id_from_payload(turn) not in state.completed_parent_turn_ids
                     and info.get("turn_id") is not None
                     and info.get("turn_id") == _turn_id_from_payload(latest)
+                    and last_call.get("tool") == "wait"
+                    and last_call.get("status") == "completed"
+                    and isinstance(status, dict)
+                    and _omnigent_status_from_collab_state(status) in {"idle", "failed"}
                 ):
                     # Only the current parent's last observation of this execution counts.
-                    for item in reversed(turn.get("items", [])):
-                        if not isinstance(item, dict) or tid not in _collab_receiver_thread_ids(
-                            item
-                        ):
-                            continue
-                        statuses = item.get("agentsStates")
-                        status = statuses.get(tid) if isinstance(statuses, dict) else None
-                        if (
-                            item.get("tool") == "wait"
-                            and item.get("status") == "completed"
-                            and isinstance(status, dict)
-                            and _omnigent_status_from_collab_state(status) in {"idle", "failed"}
-                        ):
-                            state.consumed_child_threads.add(tid)
-                        break
+                    state.consumed_child_threads.add(tid)
                 await _apply_child_resume(
                     ap_client,
                     parent_session_id=session_id,
@@ -3149,7 +3139,7 @@ async def _reconcile_helpers_once(
                 children.pop(tid)
     except (TimeoutError, RuntimeError, OSError, ValueError, httpx.HTTPError):
         unknown = True
-    if unknown:
+    if unknown or children:
         # One control request; no poller, retained candidates or input-admission gate.
         await _post_session_event(
             ap_client,
@@ -3814,14 +3804,8 @@ async def _replay_resume_response(
         interrupted forwarder. Earlier acknowledged turns are skipped.
     :returns: None.
     """
-    result = response.get("result")
-    if not isinstance(result, dict):
-        return
-    thread = result.get("thread")
-    if not isinstance(thread, dict):
-        return
-    turns = thread.get("turns")
-    if not isinstance(turns, list):
+    thread, turns = _thread_turns_from_response(response)
+    if not thread:
         return
     thread_id = thread.get("id")
     thread_id = thread_id if isinstance(thread_id, str) and thread_id else None
@@ -3862,6 +3846,16 @@ async def _replay_resume_response(
             thread_id=thread_id,
             turns=turns,
         )
+
+
+def _thread_turns_from_response(response: CodexMessage) -> tuple[_JsonObject, list[object]]:
+    """Validate the shared thread/read and thread/resume snapshot shape."""
+    result = response.get("result")
+    thread = result.get("thread") if isinstance(result, dict) else None
+    turns = thread.get("turns") if isinstance(thread, dict) else None
+    if isinstance(thread, dict) and isinstance(turns, list):
+        return thread, turns
+    return {}, []
 
 
 def _resume_turns_from(turns: list[object], replay_from_turn_id: str | None) -> list[object]:
@@ -8002,12 +7996,18 @@ async def _apply_child_resume(
     :param forwarder_state: Mutable state for sub-agent mappings.
     :returns: None.
     """
-    await _upsert_child_name_from_resume(
-        client,
-        parent_session_id=parent_session_id,
-        child_thread_id=child_thread_id,
-        response=response,
-    )
+    result = response.get("result")
+    thread = result.get("thread") if isinstance(result, dict) else None
+    if isinstance(thread, dict):
+        data = _codex_child_name_data(child_thread_id, thread)
+        if len(data) > 1:
+            response_obj = await _post_session_event(
+                client,
+                parent_session_id,
+                event_type=_EXTERNAL_CODEX_SUBAGENT_START_TYPE,
+                data=data,
+            )
+            _log_failed_session_event_post(_EXTERNAL_CODEX_SUBAGENT_START_TYPE, response_obj)
     # Seed the session model (sub-agents inherit it) so replayed child token
     # usage is priced into the child's total_cost_usd — see _SessionUsageCoalescer.
     usage_coalescer = _SessionUsageCoalescer(client, child_session_id, model=forwarder_state.model)
@@ -8026,10 +8026,8 @@ async def _apply_child_resume(
         )
     finally:
         await child_elicitation_tracker.close()
-    result = response.get("result")
-    thread = result.get("thread") if isinstance(result, dict) else None
-    turns = thread.get("turns") if isinstance(thread, dict) else None
-    latest = turns[-1] if isinstance(turns, list) and turns else None
+    _, turns = _thread_turns_from_response(response)
+    latest = turns[-1] if turns else None
     child_stream = forwarder_state.child_stream(client, child_thread_id, child_session_id)
     if isinstance(latest, dict) and child_stream.active_turn_id in {
         None,
@@ -8040,38 +8038,35 @@ async def _apply_child_resume(
         bridge_dir = forwarder_state.child_usage_baseline_dir
         if bridge_dir is not None and turn_id is not None:
             if (
-                status == "inProgress"
-                and turn_id not in child_stream.terminal_turn_ids
-                and turn_id not in child_stream.state.surfaced_terminal_error_turns
+                turn_id not in child_stream.terminal_turn_ids
+                and status in {"inProgress", "completed", "failed", "interrupted"}
+                and (
+                    status != "inProgress"
+                    or turn_id not in child_stream.state.surfaced_terminal_error_turns
+                )
             ):
                 update_active_child_turn(
                     bridge_dir,
                     child_thread_id,
                     session_id=child_session_id,
                     turn_id=turn_id,
-                    status="running",
+                    status="running" if status == "inProgress" else None,
                 )
-            elif (
-                status in {"completed", "failed", "interrupted"}
-                and turn_id not in child_stream.terminal_turn_ids
-            ):
-                update_active_child_turn(
-                    bridge_dir, child_thread_id, session_id=child_session_id, turn_id=turn_id
-                )
-                bridge = read_bridge_state(bridge_dir)
-                await _handle_event(
-                    client,
-                    session_id=parent_session_id,
-                    bridge_dir=bridge_dir,
-                    event={
-                        "method": "turn/failed" if status == "failed" else "turn/completed",
-                        "params": {"threadId": child_thread_id, "turn": latest},
-                    },
-                    usage_coalescer=usage_coalescer,
-                    elicitation_tracker=child_elicitation_tracker,
-                    expected_thread_id=bridge.thread_id if bridge else None,
-                    forwarder_state=forwarder_state,
-                )
+                if status != "inProgress":
+                    bridge = read_bridge_state(bridge_dir)
+                    await _handle_event(
+                        client,
+                        session_id=parent_session_id,
+                        bridge_dir=bridge_dir,
+                        event={
+                            "method": "turn/failed" if status == "failed" else "turn/completed",
+                            "params": {"threadId": child_thread_id, "turn": latest},
+                        },
+                        usage_coalescer=usage_coalescer,
+                        elicitation_tracker=child_elicitation_tracker,
+                        expected_thread_id=bridge.thread_id if bridge else None,
+                        forwarder_state=forwarder_state,
+                    )
     forwarder_state.note_child_thread_subscribed(child_thread_id)
 
 
@@ -8103,40 +8098,6 @@ def _codex_child_name_data(
         if isinstance(prompt, str) and prompt:
             data["prompt"] = prompt
     return data
-
-
-async def _upsert_child_name_from_resume(
-    client: httpx.AsyncClient,
-    *,
-    parent_session_id: str,
-    child_thread_id: str,
-    response: CodexMessage,
-) -> None:
-    """
-    Upsert ``agent_nickname`` / ``agent_role`` from a child resume response.
-
-    Idempotent — the server merges labels. No-ops when the resume carries
-    no name fields beyond the thread id.
-
-    :param client: HTTP client for Omnigent event posts.
-    :param parent_session_id: Parent Omnigent session id, e.g. ``"conv_parent"``.
-    :param child_thread_id: Codex child thread id, e.g. ``"thread_child"``.
-    :param response: Codex ``thread/resume`` response envelope.
-    :returns: None.
-    """
-    result = response.get("result")
-    if not isinstance(result, dict):
-        return
-    thread = result.get("thread")
-    if not isinstance(thread, dict):
-        return
-    data = _codex_child_name_data(child_thread_id, thread)
-    if len(data) <= 1:
-        return
-    response_obj = await _post_session_event(
-        client, parent_session_id, event_type=_EXTERNAL_CODEX_SUBAGENT_START_TYPE, data=data
-    )
-    _log_failed_session_event_post(_EXTERNAL_CODEX_SUBAGENT_START_TYPE, response_obj)
 
 
 def _thread_spawn_source(thread: _JsonObject) -> _JsonObject | None:
@@ -8521,15 +8482,7 @@ def _find_turn_user_message(response: CodexMessage, turn_id: str) -> _JsonObject
     :returns: The ``userMessage`` item dict, or ``None`` when the turn or
         its user message is absent.
     """
-    result = response.get("result")
-    if not isinstance(result, dict):
-        return None
-    thread = result.get("thread")
-    if not isinstance(thread, dict):
-        return None
-    turns = thread.get("turns")
-    if not isinstance(turns, list):
-        return None
+    _, turns = _thread_turns_from_response(response)
     for turn in turns:
         if not isinstance(turn, dict) or _turn_id_from_payload(turn) != turn_id:
             continue

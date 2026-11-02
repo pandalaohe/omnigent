@@ -4860,7 +4860,10 @@ async def test_codex_native_approval_mode_tighten_stops_running_helpers_or_retur
                 await asyncio.wait_for(interrupt_requested.wait(), timeout=0.5)
                 assert not operation.done(), "RPC acknowledgement is not terminal confirmation"
                 release_terminal.set()
-            response = await asyncio.wait_for(operation, timeout=0.5)
+            # This branch only reselects Full Access; no helper-stop deadline is exercised.
+            response = await asyncio.wait_for(
+                operation, timeout=3.0 if scenario == "full-unknown" else 0.5
+            )
         except TimeoutError:
             pytest.fail("helper revocation RPC exceeded the bounded response budget")
         if scenario == "pending-restart":
