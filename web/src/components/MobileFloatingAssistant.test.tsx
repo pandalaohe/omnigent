@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -7,6 +7,7 @@ import {
   MOBILE_ASSISTANT_DEVICE_STORAGE_KEY,
   TERMINAL_SOFT_KEY_EVENT,
   readMobileAssistantPreferences,
+  registerTypableTerminal,
   writeMobileAssistantPreferences,
   type TerminalSoftKeyEventDetail,
 } from "@/lib/mobileAssistantPreferences";
@@ -16,12 +17,8 @@ import {
   layoutMobileAssistantCircle,
 } from "./MobileFloatingAssistant";
 
-vi.mock("@/hooks/useIsMobileViewport", () => ({
-  useIsMobileViewport: () => true,
-}));
-vi.mock("@/lib/nativeBridge", () => ({
-  isAndroidShell: () => false,
-  isIOSShell: () => false,
+vi.mock("@/hooks/useIsPhone", () => ({
+  useIsPhone: () => true,
 }));
 
 describe("MobileFloatingAssistant", () => {
@@ -535,5 +532,31 @@ describe("MobileFloatingAssistant", () => {
     warmSurface.remove();
     activeSurface.remove();
     switcher.remove();
+  });
+
+  it("hides when a typable terminal is showing its key rows and returns when the bar hides", () => {
+    render(<MobileFloatingAssistant />);
+    expect(screen.getByTestId("mobile-floating-assistant")).toBeTruthy();
+
+    let releaseBar = () => {};
+    act(() => {
+      releaseBar = registerTypableTerminal(true);
+    });
+    expect(screen.queryByTestId("mobile-floating-assistant")).toBeNull();
+
+    act(() => {
+      releaseBar();
+    });
+    expect(screen.getByTestId("mobile-floating-assistant")).toBeTruthy();
+
+    let releaseNoBar = () => {};
+    act(() => {
+      releaseNoBar = registerTypableTerminal(false);
+    });
+    expect(screen.getByTestId("mobile-floating-assistant")).toBeTruthy();
+
+    act(() => {
+      releaseNoBar();
+    });
   });
 });

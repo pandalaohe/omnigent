@@ -20,7 +20,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useHostTerminals, type HostTerminal } from "@/hooks/useHostTerminals";
 import { useHosts } from "@/hooks/useHosts";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
-import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useIsPhone } from "@/hooks/useIsPhone";
 import { Link, useParams } from "@/lib/routing";
 import { ApiError } from "@/lib/sessionsApi";
 import { cn } from "@/lib/utils";
@@ -36,7 +36,7 @@ function HostTerminals({ hostId }: { hostId: string }) {
   const available =
     host?.status === "online" && host.capabilities?.includes("host_terminals_v1") === true;
   const isAdmin = useIsAdmin();
-  const isMobile = useIsMobileViewport();
+  const isMobile = useIsPhone();
   const { terminals, create, close } = useHostTerminals(hostId, available);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [closing, setClosing] = useState<HostTerminal | null>(null);
@@ -185,6 +185,7 @@ function HostTerminals({ hostId }: { hostId: string }) {
                     hostId={hostId}
                     terminalId={terminal.terminal_id}
                     active={activeId === terminal.terminal_id}
+                    reservesBottomSafeArea={false}
                   />
                 </TabsContent>
               ))}

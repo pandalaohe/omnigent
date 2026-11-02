@@ -632,3 +632,94 @@ def test_sidebar_surfaces_with_their_own_headers(
     output = Path(request.config.getoption("output"))
     output.mkdir(parents=True, exist_ok=True)
     page.screenshot(path=str(output / f"{surface}-mobile.png"))
+
+
+@pytest.mark.parametrize(
+    ("width", "height"),
+    [
+        pytest.param(
+            768,
+            390,
+            marks=pytest.mark.browser_context_args(
+                has_touch=True,
+                is_mobile=True,
+                viewport={"width": 768, "height": 390},
+                screen={"width": 768, "height": 390},
+            ),
+        ),
+        pytest.param(
+            844,
+            390,
+            marks=pytest.mark.browser_context_args(
+                has_touch=True,
+                is_mobile=True,
+                viewport={"width": 844, "height": 390},
+                screen={"width": 844, "height": 390},
+            ),
+        ),
+    ],
+)
+@pytest.mark.parametrize("surface", ["chat", "host-terminals"])
+def test_touch_landscape_chat_and_host_terminals_clear_header_and_controls(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    width: int,
+    height: int,
+    surface: str,
+    request: pytest.FixtureRequest,
+) -> None:
+    chat = chat_session_contract
+    contract = chat.contract
+    assert page.evaluate("window.matchMedia('(pointer: coarse)').matches") is True
+    if surface == "host-terminals":
+        contract.json(
+            "/v1/hosts",
+            {
+                "hosts": [
+                    {
+                        "host_id": chat.host_id,
+                        "name": "Example host",
+                        "owner": "local",
+                        "status": "online",
+                        "capabilities": ["host_terminals_v1"],
+                    }
+                ]
+            },
+        )
+        contract.json(
+            f"/v1/hosts/{chat.host_id}/terminals",
+            {"terminals": [{"terminal_id": "term_host_1", "elevated": False}]},
+        )
+        contract.websocket(
+            f"**/v1/hosts/{chat.host_id}/terminals/term_host_1/attach",
+            lambda ws: None,
+        )
+        page.goto(f"{contract.base_url}/hosts/{chat.host_id}/terminals")
+        first_row = page.get_by_role("heading", name="Example host · Terminals")
+        menu = page.get_by_role("link", name="Back to sessions")
+        expect(first_row).to_be_visible()
+        expect(menu).to_be_visible()
+        key_row = page.get_by_test_id("terminal-key-row")
+        expect(key_row).to_be_visible()
+        expect(page.get_by_test_id("mobile-floating-assistant")).to_have_count(0)
+        key_box = key_row.bounding_box()
+        assert key_box is not None
+        assert 52 <= key_box["height"] <= 58, key_box
+    else:
+        page.goto(chat.url)
+        if page.locator(".app-shell").get_attribute("data-sidebar-open") == "true":
+            page.get_by_role("button", name="Close sidebar", exact=True).click()
+        first_row = page.get_by_role("navigation", name="Conversation", exact=True)
+        menu = page.get_by_role("button", name="Open sidebar", exact=True)
+        expect(first_row).to_be_visible()
+        expect(menu).to_be_visible()
+        expect(page.get_by_test_id("mobile-floating-assistant")).to_be_visible()
+    row_box, menu_box = first_row.bounding_box(), menu.bounding_box()
+    assert row_box is not None and menu_box is not None
+    assert (
+        row_box["x"] >= menu_box["x"] + menu_box["width"]
+        or row_box["y"] >= menu_box["y"] + menu_box["height"]
+    ), (row_box, menu_box)
+    output = Path(request.config.getoption("output"))
+    output.mkdir(parents=True, exist_ok=True)
+    page.screenshot(path=str(output / f"{surface}-touch-landscape-{width}x{height}.png"))

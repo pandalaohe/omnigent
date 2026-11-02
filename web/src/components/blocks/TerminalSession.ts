@@ -40,6 +40,8 @@ export function terminalSoftKeyPayload(
     arrowDown: `${prefix}B`,
     arrowRight: `${prefix}C`,
     arrowLeft: `${prefix}D`,
+    home: `${prefix}H`,
+    end: `${prefix}F`,
   };
   return payloads[action];
 }
@@ -998,7 +1000,11 @@ export class TerminalSession {
   }
 
   /** Feed a mobile assistant key or text payload through xterm's normal onData path. */
-  sendSoftKey(action: TerminalSoftKeyEventDetail["action"], data?: string): void {
+  sendSoftKey(
+    action: TerminalSoftKeyEventDetail["action"],
+    data?: string,
+    options?: { focus?: boolean },
+  ): void {
     if (!this.imeInput.beforeSoftKey()) return;
     if (data !== undefined) {
       this.imeInput.sendSoftInput(data);
@@ -1008,7 +1014,9 @@ export class TerminalSession {
         true,
       );
     }
-    this.term.focus();
+    if (options?.focus !== false) {
+      this.term.focus();
+    }
   }
 
   /** Enable clipboard bridging only for the visible, interactive surface. */
@@ -1024,6 +1032,17 @@ export class TerminalSession {
    */
   focus(): void {
     this.term.focus();
+  }
+
+  /** Remove keyboard focus from the terminal so the system keyboard closes. */
+  blur(): void {
+    this.term.blur();
+  }
+
+  /** Whether the terminal's helper textarea currently owns DOM focus. */
+  isFocused(): boolean {
+    const active = document.activeElement;
+    return Boolean(active && this.term.element?.contains(active));
   }
 
   /**

@@ -368,9 +368,13 @@ describe("terminalKeyEventPayload", () => {
 });
 
 describe("terminalSoftKeyPayload", () => {
-  it("uses normal and application cursor sequences for arrow buttons", () => {
+  it("uses normal and application cursor sequences for arrow, Home, and End buttons", () => {
     expect(terminalSoftKeyPayload("arrowUp", false)).toBe("\u001b[A");
     expect(terminalSoftKeyPayload("arrowUp", true)).toBe("\u001bOA");
+    expect(terminalSoftKeyPayload("home", false)).toBe("\u001b[H");
+    expect(terminalSoftKeyPayload("home", true)).toBe("\u001bOH");
+    expect(terminalSoftKeyPayload("end", false)).toBe("\u001b[F");
+    expect(terminalSoftKeyPayload("end", true)).toBe("\u001bOF");
   });
 
   it("maps the non-arrow mobile keys to terminal control bytes", () => {
@@ -796,6 +800,26 @@ describe("TerminalSession", () => {
     expect(onInput).toHaveBeenCalledOnce();
     expect(socket.sent).toHaveLength(1);
     expect(new TextDecoder().decode(socket.sent[0] as Uint8Array)).toBe("\u001b[A");
+    session.dispose();
+  });
+
+  it("can send soft keys without focusing and tracks focus/blur state", () => {
+    const { socket, session } = makeSession(undefined, undefined, true, undefined, false);
+    const term = (session as unknown as { term: Terminal }).term;
+    const focusSpy = vi.spyOn(term, "focus");
+    socket.open();
+    socket.sent = [];
+
+    expect(session.isFocused()).toBe(false);
+    session.sendSoftKey("home", undefined, { focus: false });
+    expect(focusSpy).not.toHaveBeenCalled();
+    expect(session.isFocused()).toBe(false);
+    expect(new TextDecoder().decode(socket.sent[0] as Uint8Array)).toBe("\u001b[H");
+
+    session.focus();
+    expect(session.isFocused()).toBe(true);
+    session.blur();
+    expect(session.isFocused()).toBe(false);
     session.dispose();
   });
 

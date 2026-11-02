@@ -1,3 +1,4 @@
+import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { POLL_SESSIONS_ACTION_EVENT } from "@/hooks/useSessionPollingHotkeys";
@@ -9,7 +10,10 @@ import {
   dispatchMobileAssistantAction,
   dispatchMobileAssistantButton,
   readMobileAssistantPreferences,
+  registerTypableTerminal,
+  softKeyForChord,
   terminalDataForChord,
+  useTypableTerminals,
   writeMobileAssistantDeviceState,
   writeMobileAssistantPreferences,
   type TerminalSoftKeyEventDetail,
@@ -442,5 +446,38 @@ describe("mobileAssistantPreferences", () => {
     expect(terminalDataForChord({ code: chord.code, modifiers: [...chord.modifiers] })).toBe(
       expected,
     );
+  });
+
+  it("maps unmodified Home and End chords to softKeyForChord actions", () => {
+    expect(softKeyForChord({ code: "Home", modifiers: [] })).toBe("home");
+    expect(softKeyForChord({ code: "End", modifiers: [] })).toBe("end");
+    expect(softKeyForChord({ code: "Home", modifiers: ["shift"] })).toBeNull();
+  });
+
+  it("tracks active typable terminals and those showing a key row via registerTypableTerminal", () => {
+    const { result } = renderHook(() => useTypableTerminals());
+    expect(result.current).toEqual({ count: 0, withBar: 0 });
+
+    let releaseBar = () => {};
+    let releaseNoBar = () => {};
+    act(() => {
+      releaseBar = registerTypableTerminal(true);
+    });
+    expect(result.current).toEqual({ count: 1, withBar: 1 });
+
+    act(() => {
+      releaseNoBar = registerTypableTerminal(false);
+    });
+    expect(result.current).toEqual({ count: 2, withBar: 1 });
+
+    act(() => {
+      releaseBar();
+    });
+    expect(result.current).toEqual({ count: 1, withBar: 0 });
+
+    act(() => {
+      releaseNoBar();
+    });
+    expect(result.current).toEqual({ count: 0, withBar: 0 });
   });
 });

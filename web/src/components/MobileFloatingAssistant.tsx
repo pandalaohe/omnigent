@@ -15,19 +15,19 @@ import {
   type LucideIcon,
 } from "lucide-react";
 
-import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useIsPhone } from "@/hooks/useIsPhone";
 import {
   MOBILE_ASSISTANT_CHANGED_EVENT,
   dispatchMobileAssistantButton,
   mobileAssistantBindingSupportsRepeat,
   readMobileAssistantPreferences,
+  useTypableTerminals,
   writeMobileAssistantDeviceState,
   type MobileAssistantButton,
   type MobileAssistantDock,
   type MobileAssistantDockEdge,
   type MobileAssistantIcon,
 } from "@/lib/mobileAssistantPreferences";
-import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 
 const MAIN_SIZE = 52;
@@ -260,8 +260,8 @@ export function MobileAssistantButtonContent({
 }
 
 export function MobileFloatingAssistant() {
-  const mobileViewport = useIsMobileViewport();
-  const nativeMobile = isAndroidShell() || isIOSShell();
+  const isPhone = useIsPhone();
+  const { withBar } = useTypableTerminals();
   const [preferences, setPreferences] = useState(readMobileAssistantPreferences);
   const [open, setOpen] = useState(false);
   const [viewport, setViewport] = useState<ViewportSize>(() => viewportSize());
@@ -442,7 +442,9 @@ export function MobileFloatingAssistant() {
     writeMobileAssistantDeviceState(next);
   };
 
-  if ((!mobileViewport && !nativeMobile) || !preferences.enabled) return null;
+  if (!isPhone || !preferences.enabled || preferences.buttons.length === 0 || withBar > 0) {
+    return null;
+  }
 
   const commonPointerProps = {
     onPointerDown,

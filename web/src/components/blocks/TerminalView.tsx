@@ -33,9 +33,12 @@ import { useFileViewer, useWorkspacePaths } from "@/shell/FileViewerContext";
 import { resolveInitialAttachUrl, watchDirectUpgrade, withAttachParams } from "@/lib/terminals";
 import { getSessionHost, markHostKeyless, isHostKeyless } from "@/lib/sessionHost";
 import { hostTerminalsPath } from "@/hooks/useHostTerminals";
+import { useIsPhone } from "@/hooks/useIsPhone";
+import { useTerminalKeyboardRoom } from "@/hooks/useTerminalKeyboardRoom";
 import {
   TERMINAL_SOFT_KEY_EVENT,
   isDomTargetVisible,
+  registerTypableTerminal,
   type TerminalSoftKeyEventDetail,
 } from "@/lib/mobileAssistantPreferences";
 import {
@@ -43,6 +46,7 @@ import {
   type TerminalClipboardDecision,
   type TerminalClipboardPromptReason,
 } from "./TerminalClipboardPrompt";
+import { TerminalKeyRow } from "./TerminalKeyRow";
 import {
   type ConnectionState,
   type TerminalActivityListener,
@@ -154,6 +158,17 @@ type TerminalViewProps = (
    * way. It still grabs focus on the reveal edge and on an explicit open.
    */
   focusOnConnect?: boolean;
+  /**
+   * Whether this surface owns bottom safe-area reservation when the software
+   * keyboard is down. False on HostTerminalsPage where the page root already
+   * reserves `--omnigent-safe-bottom`. Default true.
+   */
+  reservesBottomSafeArea?: boolean;
+  /**
+   * Whether phone key rows may render inside this TerminalView. False on
+   * unfocused split panes and the desktop workspace rail. Default true.
+   */
+  showKeyRows?: boolean;
 };
 
 export function TerminalView({
@@ -169,6 +184,8 @@ export function TerminalView({
   resumePending = false,
   active = true,
   focusOnConnect = active,
+  reservesBottomSafeArea = true,
+  showKeyRows = true,
   directAttachUrl,
 }: TerminalViewProps) {
   const openFile = useFileViewer();
@@ -284,6 +301,25 @@ export function TerminalView({
   isDarkRef.current = isDark;
   const sessionRef = useRef<TerminalSession | null>(null);
   const terminalNodeRef = useRef<HTMLDivElement | null>(null);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const isPhone = useIsPhone();
+  const isPhoneRef = useRef(isPhone);
+  isPhoneRef.current = isPhone;
+  const terminalEnded = (state.kind === "closed" && !reconnectPending) || state.kind === "error";
+  const canShowKeyRows = isPhone && !readOnly && showKeyRows && active && !terminalEnded;
+  const { overlap, keyboardUp, roomPx, rootWidth } = useTerminalKeyboardRoom(
+    rootRef,
+    canShowKeyRows,
+    reservesBottomSafeArea,
+  );
+  const barHeight = rootWidth >= 560 ? 55 : 99;
+  const hasBar = canShowKeyRows && roomPx >= barHeight + 108;
+
+  useEffect(() => {
+    if (!active || readOnly || terminalEnded) return;
+    return registerTypableTerminal(hasBar);
+  }, [active, readOnly, terminalEnded, hasBar]);
+
   // Stable refs so callback prop changes never recreate the WS session.
   const onStateChangeRef = useRef(onStateChange);
   onStateChangeRef.current = onStateChange;
@@ -622,7 +658,7 @@ export function TerminalView({
           notifyInput,
           !readOnly && activeRef.current,
           notifyClipboardRequest,
-          focusOnConnectRef.current,
+          focusOnConnectRef.current && !isPhoneRef.current,
           terminalId === "terminal_codex_main",
           notifyFileLink,
         );
@@ -686,7 +722,7 @@ export function TerminalView({
   const wasActiveRef = useRef(active);
   useEffect(() => {
     if (active && !wasActiveRef.current) {
-      sessionRef.current?.focus();
+      if (!isPhoneRef.current) sessionRef.current?.focus();
       const current = stateRef.current;
       if (current.kind === "closed" && isReconnectableTerminalClose(current.code)) {
         reconnectAttemptsRef.current = 0;
@@ -786,15 +822,29 @@ export function TerminalView({
     };
   }, [state, disposeActiveSession, sessionId, hostId]);
 
+  const safeBottom = reservesBottomSafeArea
+    ? "var(--term-safe-b, var(--omnigent-safe-bottom, env(safe-area-inset-bottom, 0px)))"
+    : "0px";
+
   // `isolate` scopes the status overlay's z-index to this surface so it
   // can't paint over body-portaled UI such as the header's session menu.
   return (
     <div
+      ref={rootRef}
       data-testid="terminal-view"
       data-state={state.kind}
       data-terminal-id={terminalId}
       data-terminal-theme={isDark ? "dark" : "light"}
-      className="relative isolate flex min-h-0 flex-1 flex-col"
+      data-keyboard-overlap={canShowKeyRows ? String(overlap) : undefined}
+      data-keyboard-up={canShowKeyRows ? String(keyboardUp) : undefined}
+      className="relative isolate flex min-h-0 flex-1 flex-col @container [:is([data-ios-native],[data-android-native])_[data-testid=terminals-panel]_&]:[--term-safe-b:0px]"
+      style={
+        canShowKeyRows
+          ? {
+              paddingBottom: `max(${overlap}px, ${keyboardUp ? "0px" : safeBottom})`,
+            }
+          : undefined
+      }
     >
       {visibleClipboardPrompt !== null && (
         <TerminalClipboardPrompt
@@ -822,6 +872,13 @@ export function TerminalView({
           />
         )}
       </div>
+      {hasBar && (
+        <TerminalKeyRow
+          sessionRef={sessionRef}
+          keyboardUp={keyboardUp}
+          disabled={state.kind !== "connected"}
+        />
+      )}
     </div>
   );
 }
