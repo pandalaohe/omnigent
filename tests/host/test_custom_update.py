@@ -1779,6 +1779,9 @@ def test_windows_custom_helper_survives_launcher_exit_and_completes(
     lock = tmp_path / "update.lock"
     rollback = tmp_path / "rollback.json"
     installed = tmp_path / "installed.txt"
+    tool_venv = tmp_path / "tool"
+    tool_venv.mkdir()
+    (tool_venv / "working.txt").write_text("old")
     wrapper = tmp_path / "omni-host-service.cmd"
     installer = tmp_path / "installer.py"
     status = tmp_path / "status.py"
@@ -1790,6 +1793,7 @@ def test_windows_custom_helper_survives_launcher_exit_and_completes(
         "import os, pathlib, sys\n"
         "assert os.environ['OMNIGENT_SKIP_WEB_UI'] == 'true'\n"
         "pathlib.Path(sys.argv[1]).write_text('installed')\n"
+        f"pathlib.Path({str(tool_venv)!r}).mkdir()\n"
     )
     status.write_text(
         "import json\n"
@@ -1810,7 +1814,10 @@ def test_windows_custom_helper_survives_launcher_exit_and_completes(
                 "target_commit": new,
                 "host_id": host_id,
                 "previous_records": [{"target": target, "pid": 111}],
+                "tool_venv_path": str(tool_venv),
+                "cli_bin_path": str(tmp_path / ".local" / "bin" / "omni.exe"),
                 "probe_argv": [sys.executable, "-c", f"print('{new}')"],
+                "version_argv": [sys.executable, "--version"],
                 "status_argv": [sys.executable, str(status)],
                 "wrapper_path": str(wrapper),
                 "rollback_path": str(rollback),
@@ -1891,3 +1898,29 @@ def test_windows_custom_helper_survives_launcher_exit_and_completes(
     assert "Waiting for CLI process" in log_text
     assert "Running custom Host installer." in log_text
     assert "Custom Host update completed and reconnected." in log_text
+
+
+@windows_pwsh_only
+def test_windows_custom_update_native_transaction_and_file_locks(tmp_path: Path) -> None:
+    """Exercise native locks and failure recovery without touching an installed Host."""
+    uv = shutil.which("uv")
+    root = Path(__file__).parents[2]
+    native_uv = ["-PythonPath", sys.executable, "-UvPath", uv] if uv is not None else []
+    completed = subprocess.run(
+        [
+            str(_WINDOWS_PWSH),
+            "-NoProfile",
+            "-File",
+            str(Path(__file__).with_name("windows_custom_update_probe.ps1")),
+            "-HelperPath",
+            str(root / "omnigent" / "host" / "windows_custom_update.ps1"),
+            "-FixtureRoot",
+            str(tmp_path / "fixtures"),
+            *native_uv,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr

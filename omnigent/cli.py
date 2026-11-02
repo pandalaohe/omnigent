@@ -10276,6 +10276,7 @@ class _WindowsProcessInfo:
     name: str
     exe: str = ""
     cmdline: str = ""
+    loaded_paths: tuple[str, ...] = ()
 
 
 _CUSTOM_HOST_PARENT_EXIT_TIMEOUT_S = 120.0
@@ -10346,6 +10347,12 @@ def _windows_path_holds_tool_venv(
         return True
     if cli_norm and cli_norm in cmd_norm:
         return True
+    if any(
+        _normalize_windows_fs_path(path).startswith(venv_norm + "\\")
+        for path in proc.loaded_paths
+        if venv_norm
+    ):
+        return True
     return (
         not exe_norm
         and not cmd_norm
@@ -10377,6 +10384,15 @@ def _list_windows_processes() -> list[_WindowsProcessInfo]:
                 cmdline = cmdline_raw
             else:
                 cmdline = ""
+            loaded_paths: set[str] = set()
+            # uv's base interpreter can load the tool's DLLs without naming
+            # its venv in either exe or argv. Keep partial observations if a
+            # process exits or denies inspection; the detached helper also
+            # checks exclusive access to every installation file.
+            with contextlib.suppress(psutil.Error, OSError):
+                loaded_paths.update(item.path for item in proc.memory_maps())
+            with contextlib.suppress(psutil.Error, OSError):
+                loaded_paths.update(item.path for item in proc.open_files())
             rows.append(
                 _WindowsProcessInfo(
                     pid=pid,
@@ -10384,6 +10400,7 @@ def _list_windows_processes() -> list[_WindowsProcessInfo]:
                     name=str(info.get("name") or ""),
                     exe=str(info.get("exe") or ""),
                     cmdline=cmdline,
+                    loaded_paths=tuple(loaded_paths),
                 )
             )
         except (psutil.Error, OSError, ValueError):
@@ -10431,6 +10448,7 @@ def _windows_stopped_host_tree_pids(
         name_lower = current.name.casefold()
         is_host_identity = (
             " host" in cmd_lower
+            or "omnigent.host._daemon_entry" in cmd_lower
             or name_lower in {"omni.exe", "omnigent.exe", "omni", "omnigent"}
             or (
                 not cmd_lower
@@ -10468,8 +10486,13 @@ def _windows_stopped_host_tree_pids(
             continue
         cmd_lower = proc.cmdline.replace("/", "\\").casefold()
         is_supervisor_script = (
-            "start-omnigenthostdefault.ps1" in cmd_lower or "launch-omnigenthost.pyw" in cmd_lower
-        ) and (not owner_home_prefix or owner_home_prefix in cmd_lower)
+            (
+                "start-omnigenthostdefault.ps1" in cmd_lower
+                or "launch-omnigenthost.pyw" in cmd_lower
+            )
+            and bool(owner_home_prefix)
+            and owner_home_prefix in cmd_lower
+        )
         if is_supervisor_script or (
             proc.ppid in dead_stopped_seeds
             and _windows_path_holds_tool_venv(
@@ -10806,6 +10829,7 @@ def _launch_windows_custom_host_update(
         _copy_windows_custom_host_helper(paths["helper"])
         paths["log"].write_text("", encoding="utf-8")
         probe_code = (
+            "import omnigent.cli, omnigent.runner._entry; "
             "from omnigent.update_check import _read_installed_wheel_info as r; "
             "i=r(); print((i.commit_sha or '') if i is not None else '')"
         )
@@ -10832,7 +10856,8 @@ def _launch_windows_custom_host_update(
             "previous_records": [
                 {"target": record.target, "pid": record.pid} for record in previous_records
             ],
-            "probe_argv": [sys.executable, "-c", probe_code],
+            "probe_argv": [str(tool_venv_path / "Scripts" / "python.exe"), "-I", "-c", probe_code],
+            "version_argv": [cli_executable, "--version"],
             "status_argv": [cli_executable, "host", "status", "--json"],
             "wrapper_path": str(wrapper),
             "rollback_path": str(_custom_host_rollback_path()),

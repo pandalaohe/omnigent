@@ -147,6 +147,12 @@ function Test-PathHoldsToolVenv {
     if ($cliNorm -and $cmdNorm.Contains($cliNorm)) {
         return $true
     }
+    foreach ($loadedPath in $ProcessRow.LoadedPaths) {
+        $loadedNorm = ConvertTo-NormalizedWindowsPath ([string]$loadedPath)
+        if ($venvNorm -and $loadedNorm.StartsWith("$venvNorm\")) {
+            return $true
+        }
+    }
     $nameNorm = if ($ProcessRow.Name) { ([string]$ProcessRow.Name).ToLowerInvariant() } else { '' }
     if (-not $exeNorm -and -not $cmdNorm -and $nameNorm -in @('omni.exe', 'omnigent.exe', 'omni', 'omnigent')) {
         return $true
@@ -156,6 +162,15 @@ function Test-PathHoldsToolVenv {
 
 function Get-ProcessTable {
     $rows = @()
+    $loadedByPid = @{}
+    foreach ($process in Get-Process -ErrorAction SilentlyContinue) {
+        try {
+            $loadedByPid[[int]$process.Id] = @($process.Modules | ForEach-Object { $_.FileName })
+        } catch {
+            # Protected/exited processes may be uninspectable. Exclusive file
+            # access below is the final gate, including non-module file handles.
+        }
+    }
     try {
         $rows = @(Get-CimInstance Win32_Process -ErrorAction Stop | ForEach-Object {
             [pscustomobject]@{
@@ -164,6 +179,7 @@ function Get-ProcessTable {
                 Name = [string]$_.Name
                 ExecutablePath = [string]$_.ExecutablePath
                 CommandLine = [string]$_.CommandLine
+                LoadedPaths = @($loadedByPid[[int]$_.ProcessId])
             }
         })
     }
@@ -177,6 +193,7 @@ function Get-ProcessTable {
                 Name = [string]$_.ProcessName
                 ExecutablePath = $exePath
                 CommandLine = ''
+                LoadedPaths = @($loadedByPid[[int]$_.Id])
             }
         })
     }
@@ -223,6 +240,7 @@ function Get-StoppedHostTreePids {
         $cmdLower = ([string]$current.CommandLine).ToLowerInvariant()
         $nameLower = ([string]$current.Name).ToLowerInvariant()
         $isHostIdentity = $cmdLower.Contains(' host') -or
+            $cmdLower.Contains('omnigent.host._daemon_entry') -or
             $nameLower -in @('omni.exe', 'omnigent.exe', 'omni', 'omnigent') -or
             (-not $cmdLower -and (Test-PathHoldsToolVenv -ProcessRow $current -ToolVenvPath $ToolVenvPath -CliBinPath $CliBinPath))
         if ($isHostIdentity) {
@@ -254,7 +272,7 @@ function Get-StoppedHostTreePids {
         if ($excluded.Contains($pidVal)) { continue }
         $cmdLower = ([string]$proc.CommandLine).Replace('/', '\').ToLowerInvariant()
         $isSupervisorScript = ($cmdLower.Contains('start-omnigenthostdefault.ps1') -or $cmdLower.Contains('launch-omnigenthost.pyw')) -and
-            (-not $ownerHomePrefix -or $cmdLower.Contains($ownerHomePrefix))
+            $ownerHomePrefix -and $cmdLower.Contains($ownerHomePrefix)
         if ($isSupervisorScript) {
             [void]$roots.Add($pidVal)
         }
@@ -346,6 +364,13 @@ function Wait-CustomHostVenvReleased {
         }
         $locking = Get-VenvLockingProcesses -Processes $processes -ToolVenvPath $toolVenvPath -CliBinPath $cliBinPath -ExcludedPids @($HelperPid)
         if ($locking.Count -eq 0) {
+            Assert-ToolFilesReleased $toolVenvPath
+            foreach ($launcher in Get-ToolLaunchers $cliBinPath) {
+                if (Test-Path -LiteralPath $launcher) {
+                    $handle = [IO.File]::Open($launcher, 'Open', 'ReadWrite', 'None')
+                    $handle.Dispose()
+                }
+            }
             return
         }
         if ([DateTimeOffset]::UtcNow -ge $deadline) {
@@ -354,6 +379,104 @@ function Wait-CustomHostVenvReleased {
             throw "Cannot update custom Host while tool files are still in use by: $summary. Aborted before modifying the installation. Recovery: $recoverySteps"
         }
         Start-Sleep -Milliseconds 100
+    }
+}
+
+function Assert-ToolFilesReleased {
+    param([string]$ToolVenvPath)
+    if (-not $ToolVenvPath -or -not (Test-Path -LiteralPath $ToolVenvPath -PathType Container)) {
+        throw 'Cannot verify the existing tool environment; installation was not modified.'
+    }
+    # ReadWrite + FileShare.None also refuses mapped images whose loader has
+    # already closed its original file handle. Do not write through the handle.
+    foreach ($file in Get-ChildItem -LiteralPath $ToolVenvPath -File -Recurse -Force -ErrorAction Stop) {
+        try {
+            $handle = [IO.File]::Open($file.FullName, 'Open', 'ReadWrite', 'None')
+            $handle.Dispose()
+        } catch {
+            throw "Cannot release tool file '$($file.FullName)': $($_.Exception.Message). Installation was not modified."
+        }
+    }
+}
+
+function Get-ToolLaunchers {
+    param([string]$CliBinPath)
+    $directory = Split-Path -Parent $CliBinPath
+    return @((Join-Path $directory 'omni.exe'), (Join-Path $directory 'omnigent.exe'))
+}
+
+function Restore-ToolInstallation {
+    param([object]$Instruction, [System.Collections.IDictionary]$Result)
+    $backup = [string]$Result.backup_path
+    if (-not $backup) { return }
+    $venv = [string]$Instruction.tool_venv_path
+    $transaction = Split-Path -Parent $backup
+    if (-not $Result.venv_restored) {
+        if (-not (Test-Path -LiteralPath $backup)) { return }
+        if (Test-Path -LiteralPath $venv) {
+            # Keep failed output for diagnosis. Never recursively remove a venv.
+            Move-Item -LiteralPath $venv -Destination (Join-Path $transaction 'failed') -ErrorAction Stop
+        }
+        Move-Item -LiteralPath $backup -Destination $venv -ErrorAction Stop
+        $Result.venv_restored = $true
+    }
+    foreach ($launcher in Get-ToolLaunchers ([string]$Instruction.cli_bin_path)) {
+        $saved = Join-Path $transaction (Split-Path -Leaf $launcher)
+        if (Test-Path -LiteralPath $saved) {
+            Copy-Item -LiteralPath $saved -Destination $launcher -Force -ErrorAction Stop
+        }
+    }
+    $Result.restored = $true
+}
+
+function Invoke-TransactionalInstall {
+    param(
+        [object]$Instruction,
+        [string]$TargetCommit,
+        [string]$LogPath,
+        [System.Collections.IDictionary]$Result
+    )
+    $venv = [IO.Path]::GetFullPath([string]$Instruction.tool_venv_path)
+    Assert-ToolFilesReleased $venv
+    $transaction = "$venv.update-$([guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Path $transaction -ErrorAction Stop | Out-Null
+    $Result.backup_path = Join-Path $transaction 'previous'
+    $Result.restored = $false
+    if ($Instruction.result_path) { Write-JsonAtomic ([string]$Instruction.result_path) $Result }
+    foreach ($launcher in Get-ToolLaunchers ([string]$Instruction.cli_bin_path)) {
+        if (Test-Path -LiteralPath $launcher) {
+            Copy-Item -LiteralPath $launcher -Destination $transaction -ErrorAction Stop
+        }
+    }
+    # If the rename is refused, uv never runs. The working venv stays untouched.
+    Move-Item -LiteralPath $venv -Destination $Result.backup_path -ErrorAction Stop
+    Add-UpdateLog $LogPath "Previous installation retained at $($Result.backup_path)."
+    try {
+        $installArguments = @($Instruction.install_argv | ForEach-Object { [string]$_ })
+        Add-UpdateLog $LogPath 'Running custom Host installer.'
+        $install = Invoke-CapturedProcess $installArguments @{ OMNIGENT_SKIP_WEB_UI = 'true' }
+        if ($install.Stdout) { Add-UpdateLog $LogPath $install.Stdout.Trim() }
+        if ($install.Stderr) { Add-UpdateLog $LogPath $install.Stderr.Trim() }
+        if ($install.ExitCode -ne 0) {
+            throw "Installer exited with status $($install.ExitCode)."
+        }
+        $probeArguments = @($Instruction.probe_argv | ForEach-Object { [string]$_ })
+        $probe = Invoke-CapturedProcess $probeArguments
+        $installedCommit = $probe.Stdout.Trim().ToLowerInvariant()
+        if ($probe.ExitCode -ne 0 -or $installedCommit -ne $TargetCommit) {
+            throw "Installation import/commit check failed (exit $($probe.ExitCode), commit '$installedCommit'): $($probe.Stderr)"
+        }
+        $versionArguments = @($Instruction.version_argv | ForEach-Object { [string]$_ })
+        if ($versionArguments.Count -eq 0) { throw 'Missing CLI version check.' }
+        $version = Invoke-CapturedProcess $versionArguments
+        if ($version.ExitCode -ne 0) {
+            throw "CLI version check failed (exit $($version.ExitCode)): $($version.Stderr)"
+        }
+    } catch {
+        $failure = $_.Exception.Message
+        try { Restore-ToolInstallation -Instruction $Instruction -Result $Result }
+        catch { throw "$failure Restore incomplete; recovery files: '$transaction': $($_.Exception.Message)" }
+        throw "$failure Previous installation restored."
     }
 }
 
@@ -391,6 +514,16 @@ function Test-HostReconnected {
     return $false
 }
 
+function Wait-HostReconnected {
+    param([object]$Instruction)
+    $deadline = [DateTimeOffset]::UtcNow.AddSeconds(60)
+    do {
+        if (Test-HostReconnected $Instruction) { return $true }
+        if ([DateTimeOffset]::UtcNow -ge $deadline) { return $false }
+        Start-Sleep -Seconds 1
+    } while ($true)
+}
+
 $result = [ordered]@{
     schema_version = 1
     status = 'starting'
@@ -402,6 +535,7 @@ $result = [ordered]@{
 }
 $exitCode = 0
 $instruction = $null
+$restartAttempted = $false
 
 try {
     $instruction = Get-Content -LiteralPath $InstructionPath -Raw | ConvertFrom-Json
@@ -438,36 +572,11 @@ try {
         commit_sha = $OldCommit
     })
 
-    $installArguments = @($instruction.install_argv | ForEach-Object { [string]$_ })
-    Add-UpdateLog $LogPath "Running custom Host installer."
-    $install = Invoke-CapturedProcess $installArguments @{
-        OMNIGENT_SKIP_WEB_UI = 'true'
-    }
-    if ($install.Stdout) { Add-UpdateLog $LogPath $install.Stdout.Trim() }
-    if ($install.Stderr) { Add-UpdateLog $LogPath $install.Stderr.Trim() }
-    if ($install.ExitCode -ne 0) {
-        $recoverySteps = Format-RecoverySteps -Instruction $instruction -WrapperPath $WrapperPath
-        throw "Installer exited with status $($install.ExitCode). Recovery: $recoverySteps"
-    }
+    Invoke-TransactionalInstall -Instruction $instruction -TargetCommit $TargetCommit -LogPath $LogPath -Result $result
 
-    $probeArguments = @($instruction.probe_argv | ForEach-Object { [string]$_ })
-    $probe = Invoke-CapturedProcess $probeArguments
-    $installedCommit = $probe.Stdout.Trim().ToLowerInvariant()
-    if ($probe.ExitCode -ne 0 -or $installedCommit -ne $TargetCommit) {
-        throw "Installed commit '$installedCommit' did not match '$TargetCommit'."
-    }
-
+    $restartAttempted = $true
     Restart-HostSupervisor $WrapperPath
-    $reconnected = $false
-    $deadline = [DateTimeOffset]::UtcNow.AddSeconds(60)
-    while ([DateTimeOffset]::UtcNow -lt $deadline) {
-        if (Test-HostReconnected $instruction) {
-            $reconnected = $true
-            break
-        }
-        Start-Sleep -Seconds 1
-    }
-    if (-not $reconnected) {
+    if (-not (Wait-HostReconnected $instruction)) {
         throw "The updated Host did not reconnect on its managed target within 60 seconds."
     }
 
@@ -484,8 +593,28 @@ catch {
     catch {
         [Console]::Error.WriteLine("Failed to write custom Host update log: $($_.Exception.Message)")
     }
+    if ($instruction -and $result.backup_path -and -not $result.restored) {
+        try {
+            if ($restartAttempted) {
+                $output = & $WrapperPath stop 2>&1
+                if ($LASTEXITCODE -ne 0) { throw "Supervisor pause failed: $output" }
+                $stop = Invoke-CapturedProcess @([string]$instruction.cli_bin_path, 'host', 'stop', '--all', '--daemon-only', '--force')
+                if ($stop.ExitCode -ne 0) { throw "Updated Host stop failed (exit $($stop.ExitCode))." }
+                Wait-CustomHostVenvReleased -Instruction $instruction -LogPath $LogPath -HelperPid $PID
+            }
+            Restore-ToolInstallation -Instruction $instruction -Result $result
+        } catch {
+            $result.error = "$($result.error) Restore failed: $($_.Exception.Message). Backup: $($result.backup_path)"
+        }
+    }
     try {
         Restart-HostSupervisor $WrapperPath
+        if ($result.restored) {
+            if (-not (Wait-HostReconnected $instruction)) {
+                throw 'The restored Host did not reconnect within 60 seconds.'
+            }
+            $result.recovery_status = 'online'
+        }
     }
     catch {
         $result.error = "$($result.error) Additionally failed to restart Host: $($_.Exception.Message)"
@@ -506,9 +635,7 @@ finally {
         [Console]::Error.WriteLine("Failed to write custom Host update result: $($_.Exception.Message)")
     }
     Remove-Item -LiteralPath $LockPath -Force -ErrorAction SilentlyContinue
-    if ($ConstraintsDirectory) {
-        Remove-Item -LiteralPath $ConstraintsDirectory -Recurse -Force -ErrorAction SilentlyContinue
-    }
+    # Keep constraints and transaction directories with the failure evidence.
 }
 
 exit $exitCode
