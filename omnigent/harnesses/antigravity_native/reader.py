@@ -1777,7 +1777,7 @@ async def _reconcile_idle_turn(
         state.idle_ticks = (
             state.idle_ticks + 1 if status == _CASCADE_RUN_STATUS_IDLE and steps is not None else 0
         )
-        if state.idle_ticks >= _QUIESCENT_TICKS_TO_CLOSE:
+        if state.turn_generation > 0 and state.idle_ticks >= _QUIESCENT_TICKS_TO_CLOSE:
             event = _status_event(_STATUS_IDLE)
         elif monotonic() - state.last_work_at >= _UNCONFIRMED_TURN_TIMEOUT_S:
             event = _status_event(_STATUS_FAILED)

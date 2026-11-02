@@ -5141,7 +5141,7 @@ async def test_reconciliation_closes_only_after_consecutive_idle(
 
     monkeypatch.setattr(reader, "get_all_cascade_trajectories", _fetch)
     monkeypatch.setattr(reader, "get_trajectory_steps", lambda *args, **_kwargs: [])
-    state = reader._ReaderState(seen=set(), interacted=set(), turn_active=True)
+    state = reader._ReaderState(seen=set(), interacted=set(), turn_active=True, turn_generation=1)
 
     async def post(client: Any, session: str, event: Any) -> None:
         if event.data.get("status") == "idle":

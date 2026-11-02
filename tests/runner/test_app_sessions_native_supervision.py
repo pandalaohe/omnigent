@@ -1029,6 +1029,7 @@ async def test_native_subagent_completion_wakes_idle_parent() -> None:
         "working",
         "unfinished",
         "helper",
+        "late_helper",
     ],
 )
 async def test_antigravity_progress_does_not_spend_the_parent_wake(
@@ -1089,6 +1090,12 @@ async def test_antigravity_progress_does_not_spend_the_parent_wake(
         nonlocal blocked, reads
         if fault in {"trajectory", "helper"}:
             raise httpx.ReadTimeout("trajectory unavailable")
+        if fault == "late_helper":
+            reads += 1
+            if reads <= 2:
+                return []
+            assert inbox.empty(), "empty snapshots spent the helper completion"
+            return [user, final]
         if fault in {"working", "unfinished"} and working:
             reads += 1
             if fault == "working":
@@ -1247,7 +1254,7 @@ async def test_antigravity_progress_does_not_spend_the_parent_wake(
                     await step(snapshot[-1])
 
                 monkeypatch.setattr(reader, "_stream_loop", stream)
-                if fault == "helper":
+                if fault in {"helper", "late_helper"}:
                     ready.set()
                     run = reader._mirror_subagent_cascade(
                         port=4242,
@@ -1265,6 +1272,8 @@ async def test_antigravity_progress_does_not_spend_the_parent_wake(
                 await asyncio.wait_for(run, 4)
                 await asyncio.wait_for(server.wake_seen.wait(), 1)
         assert inbox.qsize() == 1
+        if fault == "late_helper":
+            assert reads >= 3, "helper retired before its turn appeared"
         delivered = inbox.get_nowait()
         if fault in {"summary", "trajectory", "helper"}:
             assert delivered["status"] == "failed"
