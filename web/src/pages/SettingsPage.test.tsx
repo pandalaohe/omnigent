@@ -12,6 +12,7 @@ import { toast } from "sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as UseCommentsModule from "@/hooks/useComments";
+import type * as ContextUsageModule from "@/components/ContextUsageSettings";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
 import { CONTEXT_INDICATOR_STORAGE_KEY } from "@/lib/contextIndicatorPreferences";
 import { OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY } from "@/lib/subagentPanelPreferences";
@@ -23,6 +24,12 @@ import {
 } from "@/lib/terminalClipboardPreferences";
 import { readWidenWorkspaceForContent } from "@/lib/workspacePanelPreferences";
 import type { ElectronUpdateBridge, UpdateConfig, UpdateStatus } from "@/lib/nativeBridge";
+import { useChatStore } from "@/store/chatStore";
+import {
+  DEFAULT_USAGE_CONTEXT_PREFERENCES,
+  usageContextLevelKey,
+  writeUsageContextPreferences,
+} from "@/lib/usageContextPreferences";
 
 const mocks = vi.hoisted(() => ({
   setTheme: vi.fn(),
@@ -38,6 +45,7 @@ const mocks = vi.hoisted(() => ({
   worktreeStatusEnabled: false,
   importSessionsPanel: vi.fn(() => null),
   enabledConnections: [] as string[],
+  realContextUsage: false,
   // login_url: non-null for any sign-in mode (accounts OR OIDC), null in
   // header mode. Gates the Account section.
   loginUrl: "/login" as string | null,
@@ -186,6 +194,7 @@ vi.mock("@/hooks/useConversations", async () => {
 });
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: () => ({ data: mocks.hosts }),
+  useCodexRateLimits: () => ({ data: null, isLoading: false }),
 }));
 // The archived delete dialogs read the session's comments; these fixtures
 // hold none, so the count line stays out of the dialogs under test.
@@ -245,14 +254,20 @@ vi.mock("@/components/ui/select", async () => {
     ),
   };
 });
-vi.mock("@/components/ContextUsageSettings", () => ({
-  ContextUsageSettings: () => (
-    <div data-testid="context-usage-settings">
-      Context source and overrides
-      <span>Show provider usage limits</span>
-    </div>
-  ),
-}));
+vi.mock("@/components/ContextUsageSettings", async (importOriginal) => {
+  const actual = await importOriginal<typeof ContextUsageModule>();
+  return {
+    ContextUsageSettings: () =>
+      mocks.realContextUsage ? (
+        <actual.ContextUsageSettings />
+      ) : (
+        <div data-testid="context-usage-settings">
+          Context source and overrides
+          <span>Show provider usage limits</span>
+        </div>
+      ),
+  };
+});
 vi.mock("@/components/CliRetentionSettings", () => ({
   CliRetentionSettings: () => (
     <div data-testid="cli-retention-settings">Host-scoped idle CLI retention</div>
@@ -344,6 +359,7 @@ beforeEach(() => {
   mocks.worktreeStatusEnabled = false;
   mocks.importSessionsPanel.mockClear();
   mocks.enabledConnections = [];
+  mocks.realContextUsage = false;
   mocks.loginUrl = "/login";
   mocks.me = { id: "alice", is_admin: false };
   mocks.conversations = [];
@@ -549,6 +565,48 @@ describe("SettingsPage", () => {
       ).toBeInTheDocument();
     expect(table.closest('[data-testid="settings-group-sessions"]')).toHaveClass("max-w-none");
     expect(screen.getByTestId("settings-group-composer")).toHaveClass("max-w-2xl");
+  });
+
+  it("keeps the nested saved-context matrix outside the ordinary group width cap", async () => {
+    mocks.realContextUsage = true;
+    const previous = useChatStore.getState();
+    useChatStore.setState({
+      boundAgentName: "A",
+      sessionHarness: "pi",
+      llmModel: "m",
+      conversationId: null,
+    });
+    writeUsageContextPreferences({
+      ...DEFAULT_USAGE_CONTEXT_PREFERENCES,
+      overrides: Object.fromEntries(
+        ["A", "B", "C", "D"].map((agentName) => [
+          usageContextLevelKey({ hostId: "", agentName, harness: "pi", model: "" }, "column"),
+          { contextWindowTokens: 1000, autoCompactBufferTokens: 100 },
+        ]),
+      ),
+    });
+    try {
+      renderPage("/settings/general#context-usage");
+      const table = await screen.findByRole("table", {
+        name: "Saved context sources by computer and agent",
+      });
+      expect(within(table).getAllByRole("columnheader")).toHaveLength(5);
+      for (const agentName of ["A", "B", "C", "D"])
+        expect(
+          within(table).getByRole("button", { name: `Edit ${agentName} · Pi · all hosts` }),
+        ).toBeInTheDocument();
+      expect(table.closest('[data-testid="settings-group-display-usage"]')).toHaveClass(
+        "max-w-none",
+      );
+    } finally {
+      cleanup();
+      useChatStore.setState({
+        boundAgentName: previous.boundAgentName,
+        sessionHarness: previous.sessionHarness,
+        llmModel: previous.llmModel,
+        conversationId: previous.conversationId,
+      });
+    }
   });
 
   it("persists session auto-rename changes", async () => {

@@ -2917,7 +2917,11 @@ function GeneralSection() {
             </ExpandableSettings>
           )}
         </SettingsGroup>
-        <SettingsGroup title="Display & usage" testId="settings-group-display-usage">
+        <SettingsGroup
+          title="Display & usage"
+          testId="settings-group-display-usage"
+          className="max-w-none"
+        >
           <ExpandableSettings id="context-usage" title="Context & usage">
             <div className="flex flex-col gap-6">
               <CompactProgressIndicatorControl />
