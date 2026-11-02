@@ -316,6 +316,7 @@ class NativeControls:
     handle_claude_native_slash_command: Callable[..., Coroutine[Any, Any, Response]]
     handle_claude_sdk_compact: Callable[[str], Coroutine[Any, Any, Response]]
     handle_codex_native_approval_mode_change: Callable[[str, str], Coroutine[Any, Any, Response]]
+    retry_codex_native_helper_stop: Callable[[str], Coroutine[Any, Any, bool]]
     handle_codex_native_clear: Callable[[str], Coroutine[Any, Any, Response]]
     handle_codex_native_compact: Callable[[str], Coroutine[Any, Any, Response]]
     handle_codex_native_cost_popup: _HandleCodexNativeCostPopupFn
@@ -870,7 +871,6 @@ def build_native_controls(
             },
         )
 
-    _codex_native_approval_modes: dict[str, str] = {}
     _codex_native_helper_stop_pending: set[str] = set()
 
     def _running_codex_native_work(session_id: str) -> bool:
@@ -886,6 +886,13 @@ def build_native_controls(
         )
 
     async def _stop_codex_native_helpers_on_tighten(conv_id: str) -> bool:
+        try:
+            async with asyncio.timeout(_CODEX_HELPER_STOP_TIMEOUT_S):
+                return await _drain_codex_native_helpers(conv_id)
+        except TimeoutError:
+            return False
+
+    async def _drain_codex_native_helpers(conv_id: str) -> bool:
         from omnigent.harnesses.codex_native.app_server import (
             CodexAppServerResponseError,
             client_for_transport,
@@ -957,7 +964,7 @@ def build_native_controls(
                 interrupt_failed = True
             finally:
                 with contextlib.suppress(Exception):
-                    await client.close()
+                    await asyncio.wait_for(client.close(), timeout=_CODEX_HELPER_STOP_POLL_S)
 
         await _interrupt_unseen_children()
         deadline = time.monotonic() + _CODEX_HELPER_STOP_TIMEOUT_S
@@ -968,6 +975,56 @@ def build_native_controls(
                 return False
             await asyncio.sleep(_CODEX_HELPER_STOP_POLL_S)
             await _interrupt_unseen_children()
+
+    async def _retry_codex_native_helper_stop(conv_id: str) -> bool:
+        from omnigent.harnesses.codex_native.bridge import set_helper_stop_pending
+
+        bridge, bridge_dir = await _codex_native_bridge_state_and_dir_for_session(
+            conv_id, action="pending helper revocation"
+        )
+        if conv_id not in _codex_native_helper_stop_pending and not getattr(
+            bridge, "helper_stop_pending", False
+        ):
+            return True
+        set_helper_stop_pending(bridge_dir, True)
+        stopped = await _stop_codex_native_helpers_on_tighten(conv_id)
+        if stopped:
+            set_helper_stop_pending(bridge_dir, False)
+            _codex_native_helper_stop_pending.discard(conv_id)
+        return stopped
+
+    async def _current_codex_native_approval_mode(conv_id: str) -> str | None:
+        from omnigent.codex_approval_modes import codex_permission_preset_from_thread_settings
+        from omnigent.harnesses.codex_native.app_server import client_for_transport
+        from omnigent.harnesses.codex_native.bridge import read_active_child_turns
+
+        client = None
+        try:
+            async with asyncio.timeout(_CODEX_HELPER_STOP_TIMEOUT_S):
+                bridge, bridge_dir = await _codex_native_bridge_state_and_dir_for_session(
+                    conv_id, action="current helper authority"
+                )
+                if bridge is None or (
+                    not read_active_child_turns(bridge_dir)
+                    and not _running_codex_native_work(conv_id)
+                ):
+                    return None
+                client = client_for_transport(
+                    bridge.socket_path, client_name="omnigent-codex-native-runner"
+                )
+                await client.connect()
+                response = await client.request("thread/resume", {"threadId": bridge.thread_id})
+                result = response.get("result")
+                return codex_permission_preset_from_thread_settings(result)
+        except Exception:
+            _logger.warning(
+                "Current Codex authority could not be confirmed for %s", conv_id, exc_info=True
+            )
+            return None
+        finally:
+            if client is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(client.close(), timeout=_CODEX_HELPER_STOP_POLL_S)
 
     async def _handle_codex_native_approval_mode_change(
         conv_id: str,
@@ -1000,6 +1057,7 @@ def build_native_controls(
                     "detail": "Codex terminal is not running; reconnect first.",
                 },
             )
+        previous_mode = await _current_codex_native_approval_mode(conv_id)
         try:
             offered = await asyncio.to_thread(
                 _inject_codex_permission_mode,
@@ -1086,30 +1144,42 @@ def build_native_controls(
                 except Exception:
                     _logger.warning("Failed to select Codex permission profile row", exc_info=True)
                 try:
-                    await apply_codex_thread_permissions(
-                        bridge.socket_path, bridge.thread_id, bridge.permission_profile
+                    await asyncio.wait_for(
+                        apply_codex_thread_permissions(
+                            bridge.socket_path, bridge.thread_id, bridge.permission_profile
+                        ),
+                        timeout=_CODEX_HELPER_STOP_TIMEOUT_S,
                     )
                 except Exception:
                     _logger.warning("Failed to apply Codex permission profile", exc_info=True)
         from omnigent.sdk_permission_modes import codex_approval_mode_tightens
 
-        previous_mode = _codex_native_approval_modes.get(conv_id)
         tightening = codex_approval_mode_tightens(previous_mode, preset.value)
-        _codex_native_approval_modes[conv_id] = preset.value
-        if tightening or conv_id in _codex_native_helper_stop_pending:
+        from omnigent.harnesses.codex_native.bridge import set_helper_stop_pending
+
+        bridge, bridge_dir = await _codex_native_bridge_state_and_dir_for_session(
+            conv_id, action="helper revocation"
+        )
+        if (
+            tightening
+            or conv_id in _codex_native_helper_stop_pending
+            or getattr(bridge, "helper_stop_pending", False)
+        ):
+            _codex_native_helper_stop_pending.add(conv_id)
+            set_helper_stop_pending(bridge_dir, True)
             helpers_stopped = await _stop_codex_native_helpers_on_tighten(conv_id)
             if not helpers_stopped:
-                _codex_native_helper_stop_pending.add(conv_id)
                 return JSONResponse(
                     status_code=409,
                     content={
                         "error": "codex_helper_stop_pending",
                         "detail": (
                             "Mode saved for the next turn; helper stop is not confirmed. "
-                            "Retry the mode change before relying on the tighter permissions."
+                            "Further work retries revocation before it can start."
                         ),
                     },
                 )
+            set_helper_stop_pending(bridge_dir, False)
             _codex_native_helper_stop_pending.discard(conv_id)
         return JSONResponse(status_code=200, content={"approval_mode": preset.value})
 
@@ -2852,6 +2922,7 @@ def build_native_controls(
         handle_claude_native_slash_command=_handle_claude_native_slash_command,
         handle_claude_sdk_compact=_handle_claude_sdk_compact,
         handle_codex_native_approval_mode_change=_handle_codex_native_approval_mode_change,
+        retry_codex_native_helper_stop=_retry_codex_native_helper_stop,
         handle_codex_native_clear=_handle_codex_native_clear,
         handle_codex_native_compact=_handle_codex_native_compact,
         handle_codex_native_cost_popup=_handle_codex_native_cost_popup,

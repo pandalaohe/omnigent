@@ -9832,6 +9832,18 @@ def create_runner_app(
             extra={"session_id": conversation_id},
         )
         _side_thread_id = body.get("codex_side_thread_id") if isinstance(body, dict) else None
+        if (
+            body_type in ("message", None)
+            and _session_harness_name(conversation_id) == "codex-native"
+            and not await _native_controls.retry_codex_native_helper_stop(conversation_id)
+        ):
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "codex_helper_stop_pending",
+                    "detail": "Helper revocation is not confirmed; no new work was admitted.",
+                },
+            )
         if _side_thread_id:
             # Side-chat controls use the parent's bridge but target the child's
             # thread, leaving the parent's turn and message buffer untouched.
@@ -9888,12 +9900,59 @@ def create_runner_app(
                         "detail": "Codex /side follow-up requires a loaded parent Codex bridge.",
                     },
                 )
+            if (
+                body.get("codex_elicitation_interrupt") is True
+                and _side_thread_id == _side_state.thread_id
+            ):
+                result = await _native_interrupt_runner.interrupt("codex-native", conversation_id)
+                return result if result is not None else Response(status_code=204)
             _side_client = client_for_transport(
                 _side_state.socket_path, client_name="omnigent-codex-native-runner"
             )
             try:
                 await _side_client.connect()
                 if body_type == "interrupt":
+                    from omnigent.harnesses.codex_native.bridge import read_active_child_turns
+
+                    _, owner_bridge_dir = await _codex_native_bridge_state_and_dir_for_session(
+                        conversation_id, action="elicitation thread ownership"
+                    )
+                    if (
+                        body.get("codex_elicitation_interrupt") is True
+                        and _side_thread_id != _side_state.thread_id
+                        and str(_side_thread_id) not in read_active_child_turns(owner_bridge_dir)
+                    ):
+                        owner_response = await _side_client.request(
+                            "thread/read", {"threadId": _side_thread_id, "includeTurns": False}
+                        )
+                        owner_result = owner_response.get("result")
+                        owner_thread = (
+                            owner_result.get("thread") if isinstance(owner_result, dict) else None
+                        )
+                        owner_source = (
+                            owner_thread.get("source") if isinstance(owner_thread, dict) else None
+                        )
+                        owner_subagent = (
+                            owner_source.get("subAgent")
+                            if isinstance(owner_source, dict)
+                            else None
+                        )
+                        owner_spawn = (
+                            owner_subagent.get("thread_spawn")
+                            if isinstance(owner_subagent, dict)
+                            else None
+                        )
+                        if (
+                            not isinstance(owner_spawn, dict)
+                            or owner_spawn.get("parent_thread_id") != _side_state.thread_id
+                        ):
+                            return JSONResponse(
+                                status_code=409,
+                                content={
+                                    "error": "codex_child_ownership_unconfirmed",
+                                    "detail": "Interrupt thread does not belong to this session.",
+                                },
+                            )
                     await side_chat.interrupt_side_turn(
                         _side_client, str(_side_thread_id), _side_turn_id
                     )

@@ -1172,9 +1172,11 @@ async def test_claude_stop_on_paneless_subagent_mirror_returns_honest_not_stoppe
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("superseded", [False, True])
 async def test_codex_interrupt_also_interrupts_active_child_turns(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,
+    superseded: bool,
 ) -> None:
     """T31: parent codex-native interrupt also sends turn/interrupt to active child turns."""
     from omnigent.harnesses.codex_native import app_server, bridge
@@ -1194,6 +1196,7 @@ async def test_codex_interrupt_also_interrupts_active_child_turns(
         turn_id="turn_child_stale",
         status="running",
     )
+    bridge.update_active_child_turn(tmp_path, "thread_child_unknown", session_id="conv_unknown")
 
     requests: list[tuple[str, dict[str, Any]]] = []
 
@@ -1206,9 +1209,20 @@ async def test_codex_interrupt_also_interrupts_active_child_turns(
 
         async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
             requests.append((method, params))
+            if method == "thread/read" and params.get("threadId") == "thread_child_unknown":
+                return {
+                    "result": {
+                        "thread": {"turns": [{"id": "turn_recovered", "status": "inProgress"}]}
+                    }
+                }
             if params.get("threadId") == "thread_child_stale":
                 raise app_server.CodexAppServerResponseError(
-                    {"code": -32600, "message": "no active turn to interrupt"}
+                    {
+                        "code": -32600,
+                        "message": "expected active turn id stale but found current"
+                        if superseded
+                        else "no active turn to interrupt",
+                    }
                 )
             return {"result": {}}
 
@@ -1233,7 +1247,7 @@ async def test_codex_interrupt_also_interrupts_active_child_turns(
     )
 
     resp = await runner.interrupt("codex-native", "conv_cx")
-    assert isinstance(resp, Response) and resp.status_code == 204
+    assert isinstance(resp, Response) and resp.status_code == (503 if superseded else 204)
     assert ("turn/interrupt", {"threadId": "thread_parent", "turnId": "turn_parent"}) in requests
     assert (
         "turn/interrupt",
@@ -1244,5 +1258,10 @@ async def test_codex_interrupt_also_interrupts_active_child_turns(
         {"threadId": "thread_child_stale", "turnId": "turn_child_stale"},
     ) in requests
     remaining = bridge.read_active_child_turns(tmp_path)
-    assert "thread_child_stale" not in remaining
+    assert ("thread_child_stale" in remaining) == superseded
     assert "thread_child_1" in remaining
+    if not superseded:
+        assert (
+            "turn/interrupt",
+            {"threadId": "thread_child_unknown", "turnId": "turn_recovered"},
+        ) in requests

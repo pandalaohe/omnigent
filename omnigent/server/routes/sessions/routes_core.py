@@ -309,6 +309,7 @@ from omnigent.server.session_open_rate import (
 )
 from omnigent.server.session_orchestration import require_orchestration_source
 from omnigent.session_default_modes import (
+    CODEX_NATIVE_PERMISSION_DEFAULT_ARGS,
     SPEED_TIER_LABEL_KEY,
     SPEED_TIER_REQUESTED_LABEL_KEY,
     valid_speed_tier,
@@ -5250,7 +5251,7 @@ def register_core_routes(
         session_id: str,
         body: UpdateSessionRequest,
         include_usage: bool = Query(default=True),
-    ) -> SessionResponse:
+    ) -> SessionResponse | JSONResponse:
         """
         Update a session's mutable fields. When ``runner_id`` is
         provided, this is the mutable affinity primitive for the Alpha
@@ -5292,7 +5293,7 @@ def register_core_routes(
         body: UpdateSessionRequest,
         include_usage: bool,
         live_change: _LiveSettingsChange | None = None,
-    ) -> SessionResponse:
+    ) -> SessionResponse | JSONResponse:
         """Apply the PATCH that :func:`update_session` documents."""
         began = live_change.position() if live_change is not None else 0
         user_id = _get_user_id(request, auth_provider)
@@ -6760,6 +6761,20 @@ def register_core_routes(
                             {CODEX_SDK_APPROVAL_MODE_LABEL_KEY: requested_codex_approval_mode},
                         )
                     else:
+                        from omnigent.server.routes._sessions.helpers import (
+                            _merge_codex_permission_launch_args,
+                        )
+
+                        await asyncio.to_thread(
+                            conversation_store.update_conversation,
+                            session_id,
+                            terminal_launch_args=_merge_codex_permission_launch_args(
+                                updated.terminal_launch_args,
+                                CODEX_NATIVE_PERMISSION_DEFAULT_ARGS[
+                                    requested_codex_approval_mode
+                                ],
+                            ),
+                        )
                         receipt_labels, _receipt = _codex_permission_observation_labels(
                             codex_permission_application_receipt(requested_codex_approval_mode),
                             updated,
@@ -6769,6 +6784,7 @@ def register_core_routes(
                             session_id,
                             receipt_labels,
                         )
+                    return JSONResponse(status_code=409, content=approval_payload)
             _require_codex_approval_mode_forward(
                 session_id,
                 requested_codex_approval_mode,

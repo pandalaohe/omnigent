@@ -214,6 +214,7 @@ class CodexNativeBridgeState:
     usage_admission_id: str | None = None
     usage_turn_id: str | None = None
     permission_profile: str | None = None
+    helper_stop_pending: bool = False
 
 
 @dataclass(frozen=True)
@@ -1366,6 +1367,7 @@ def _write_bridge_state_unlocked(bridge_dir: Path, state: CodexNativeBridgeState
                     "codex_home": state.codex_home,
                     "active_turn_id": state.active_turn_id,
                     "cwd": state.cwd,
+                    **({"helper_stop_pending": True} if state.helper_stop_pending else {}),
                     **(
                         {
                             "usage_admission_id": state.usage_admission_id,
@@ -1399,6 +1401,9 @@ def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
     :returns: None.
     """
     with _bridge_state_lock(bridge_dir):
+        previous = read_bridge_state(bridge_dir)
+        if previous is not None and previous.helper_stop_pending:
+            state = replace(state, helper_stop_pending=True)
         _write_bridge_state_unlocked(bridge_dir, state)
     # A new or rotated session's policies were never checked.
     policy_allow_cache.invalidate(bridge_dir)
@@ -1978,6 +1983,7 @@ def read_bridge_state_result(bridge_dir: Path) -> CodexNativeBridgeStateRead:
             permission_profile=permission_profile
             if isinstance(permission_profile, str) and permission_profile
             else None,
+            helper_stop_pending=raw.get("helper_stop_pending") is True,
         ),
         "ready",
     )
@@ -2165,6 +2171,14 @@ def clear_active_turn_id_if_matches(
         )
         _run_on_cleared()
         return True
+
+
+def set_helper_stop_pending(bridge_dir: Path, pending: bool) -> None:
+    """Keep revocation outstanding across runner and forwarder reconnects."""
+    with _bridge_state_lock(bridge_dir):
+        state = read_bridge_state(bridge_dir)
+        if state is not None:
+            _write_bridge_state_unlocked(bridge_dir, replace(state, helper_stop_pending=pending))
 
 
 def read_active_child_turns(bridge_dir: Path) -> dict[str, dict[str, str | None]]:

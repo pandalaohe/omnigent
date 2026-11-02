@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,235 @@ from tests.harnesses.codex_native.session._support import (
 )
 
 # ── Codex subagent tracking and dedup ────────────────────────────────────────
+
+
+@asynccontextmanager
+async def _review_event_context():
+    posted = []
+
+    def handler(request):
+        posted.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(202, json={"queued": False})
+
+    async with httpx.AsyncClient(
+        base_url="http://test", transport=httpx.MockTransport(handler)
+    ) as client:
+        tracker = _elicitation_tracker()
+        usage = _usage_coalescer(client)
+        try:
+            yield client, posted, tracker, usage
+        finally:
+            await tracker.close()
+            await usage.flush()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["parent", "child"])
+async def test_retryable_error_preserves_helper_control_and_wait(
+    tmp_path: Path, target: str
+) -> None:
+    from omnigent.harnesses.codex_native.bridge import (
+        read_active_child_turns,
+        update_active_child_turn,
+    )
+
+    state = codex_native_forwarder._CodexForwarderState(parent_session_id="conv_parent")
+    state.note_child_thread("thread_child", "conv_child")
+    state.active_parent_turn_id = "turn_parent"
+    state.in_flight_collab_calls_by_thread["thread_child"] = {"wait"}
+    update_active_child_turn(
+        tmp_path, "thread_child", session_id="conv_child", turn_id="turn_child"
+    )
+    async with _review_event_context() as (client, _posted, tracker, usage):
+        await codex_native_forwarder._handle_event(
+            client,
+            session_id="conv_parent",
+            bridge_dir=tmp_path,
+            event={
+                "method": "error",
+                "params": {
+                    "threadId": f"thread_{target}",
+                    "turnId": f"turn_{target}",
+                    "willRetry": True,
+                    "error": {"message": "retry"},
+                },
+            },
+            usage_coalescer=usage,
+            elicitation_tracker=tracker,
+            expected_thread_id="thread_parent",
+            forwarder_state=state,
+        )
+    assert read_active_child_turns(tmp_path)["thread_child"]["turn_id"] == "turn_child"
+    assert state.active_parent_turn_id == "turn_parent"
+    assert state.in_flight_collab_calls_by_thread == {"thread_child": {"wait"}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["inProgress", "completed"])
+async def test_child_resume_recovers_control_and_terminal_delivery(
+    tmp_path: Path, status: str
+) -> None:
+    from omnigent.harnesses.codex_native.bridge import (
+        read_active_child_turns,
+        update_active_child_turn,
+    )
+
+    response = _child_resume_response()
+    response["result"]["thread"]["turns"][-1].update(id="turn_current", status=status)
+    state = codex_native_forwarder._CodexForwarderState(parent_session_id="conv_parent")
+    state.child_usage_baseline_dir = tmp_path
+    state.note_child_thread("thread_child", "conv_child")
+    update_active_child_turn(tmp_path, "thread_child", session_id="conv_child", turn_id="turn_old")
+    async with _review_event_context() as (client, posted, _tracker, _usage):
+        await codex_native_forwarder._apply_child_resume(
+            client,
+            parent_session_id="conv_parent",
+            child_session_id="conv_child",
+            child_thread_id="thread_child",
+            response=response,
+            forwarder_state=state,
+        )
+    if status == "inProgress":
+        assert read_active_child_turns(tmp_path)["thread_child"]["turn_id"] == "turn_current"
+    else:
+        assert not read_active_child_turns(tmp_path)
+        assert any(
+            body.get("type") == "external_session_status" and body["data"].get("status") == "idle"
+            for _path, body in posted
+        )
+
+
+@pytest.mark.asyncio
+async def test_child_terminal_error_waits_for_parent_consumption(tmp_path: Path) -> None:
+    state = codex_native_forwarder._CodexForwarderState(parent_session_id="conv_parent")
+    state.note_child_thread("thread_child", "conv_child")
+    state.active_parent_turn_id = "turn_parent"
+    state.in_flight_collab_calls_by_thread["thread_child"] = {"wait"}
+    async with _review_event_context() as (client, posted, tracker, usage):
+        await codex_native_forwarder._handle_event(
+            client,
+            session_id="conv_parent",
+            bridge_dir=tmp_path,
+            event={
+                "method": "error",
+                "params": {
+                    "threadId": "thread_child",
+                    "turnId": "turn_child",
+                    "willRetry": False,
+                    "error": {"message": "failed"},
+                },
+            },
+            usage_coalescer=usage,
+            elicitation_tracker=tracker,
+            expected_thread_id="thread_parent",
+            forwarder_state=state,
+        )
+        assert not any(
+            body.get("type") == "external_session_status"
+            and body["data"].get("status") == "failed"
+            for _path, body in posted
+        )
+        assert "thread_child" in state.deferred_child_terminal_edges
+        await state.close_child_streams()
+
+
+@pytest.mark.asyncio
+async def test_pending_revocation_retries_surviving_and_new_helpers(tmp_path: Path) -> None:
+    from omnigent.harnesses.codex_native import bridge
+
+    bridge.write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_parent",
+            socket_path="ws://127.0.0.1:1234",
+            thread_id="thread_parent",
+            codex_home=str(tmp_path / "home"),
+            helper_stop_pending=True,
+        ),
+    )
+    bridge.update_active_child_turn(tmp_path, "survivor", turn_id="stale_turn")
+    # A reconnect recreates bridge state; only explicit revocation completion may clear it.
+    bridge.write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_parent",
+            socket_path="ws://127.0.0.1:1234",
+            thread_id="thread_parent",
+            codex_home=str(tmp_path / "home"),
+        ),
+    )
+    calls = []
+    retried = asyncio.Event()
+
+    class Client:
+        async def request(self, method, params):
+            calls.append((method, params))
+            if method == "thread/read":
+                return {
+                    "result": {
+                        "thread": {"turns": [{"id": "current_turn", "status": "inProgress"}]}
+                    }
+                }
+            if params["threadId"] == "new_helper":
+                retried.set()
+            return {"result": {}}
+
+    task = asyncio.create_task(
+        codex_native_forwarder._retry_pending_helper_stops(Client(), tmp_path)
+    )
+    try:
+        async with asyncio.timeout(1):
+            while not any(method == "turn/interrupt" for method, _params in calls):
+                await asyncio.sleep(0)
+            bridge.update_active_child_turn(tmp_path, "new_helper")
+            await retried.wait()
+        assert ("turn/interrupt", {"threadId": "survivor", "turnId": "current_turn"}) in calls
+        assert bridge.read_bridge_state(tmp_path).helper_stop_pending
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    bridge.set_helper_stop_pending(tmp_path, False)
+    assert not bridge.read_bridge_state(tmp_path).helper_stop_pending
+
+
+@pytest.mark.asyncio
+async def test_announced_child_approval_carries_native_owner_without_mirror(
+    tmp_path: Path,
+) -> None:
+    from omnigent.harnesses.codex_native.bridge import read_active_child_turns
+    from tests._helpers.polling import poll_until_async
+
+    state = codex_native_forwarder._CodexForwarderState(parent_session_id="conv_parent")
+    state.note_pending_child_thread("thread_child", "thread_parent")
+    fake = _FakeCodexAppServerClient()
+    async with _review_event_context() as (client, posted, tracker, usage):
+        await codex_native_forwarder._handle_event(
+            client,
+            session_id="conv_parent",
+            bridge_dir=tmp_path,
+            event={
+                "id": 7,
+                "method": "item/fileChange/requestApproval",
+                "params": {"threadId": "thread_child", "turnId": "turn_child", "itemId": "patch"},
+            },
+            usage_coalescer=usage,
+            elicitation_tracker=tracker,
+            expected_thread_id="thread_parent",
+            forwarder_state=state,
+            codex_client=fake,
+        )
+        await poll_until_async(
+            lambda: any(
+                path.endswith("/hooks/codex-elicitation-request") for path, _body in posted
+            ),
+            timeout_s=1,
+        )
+        hook = next(
+            body for path, body in posted if path.endswith("/hooks/codex-elicitation-request")
+        )
+        assert hook["params"]["omnigentParentThreadId"] == "thread_parent"
+    assert read_active_child_turns(tmp_path)["thread_child"]["turn_id"] == "turn_child"
 
 
 def _collab_item_completed_event(

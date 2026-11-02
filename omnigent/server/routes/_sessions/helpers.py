@@ -8391,6 +8391,13 @@ async def _stop_session_via_runner_impl(
             f"(status {resp.status_code}): {resp.text}",
             code=ErrorCode.RUNNER_UNAVAILABLE,
         )
+    if resp.content:
+        with contextlib.suppress(ValueError):
+            outcome = resp.json()
+            if isinstance(outcome, dict) and (
+                outcome.get("stopped") is False or outcome.get("cancel_confirmed") is False
+            ):
+                raise HTTPException(status_code=409, detail=outcome)
     return True
 
 

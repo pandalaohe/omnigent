@@ -55,6 +55,7 @@ from omnigent.harnesses.codex_native.bridge import (
     codex_config_revision,
     codex_home_for_bridge_dir,
     pending_mcp_servers,
+    read_active_child_turns,
     read_bridge_state,
     read_certificate_failure,
     read_child_usage_baselines,
@@ -2894,6 +2895,10 @@ async def supervise_forwarder(
             _retry_usage_completions(ap_client, bridge_dir, usage_completion_wake),
             name="codex-usage-completions",
         )
+        helper_revocation_task = asyncio.create_task(
+            _retry_pending_helper_stops(client, bridge_dir),
+            name="codex-helper-revocation",
+        )
         stream_error: BaseException | None = None
         try:
             async for event in client.iter_events():
@@ -3000,7 +3005,12 @@ async def supervise_forwarder(
             raise
         finally:
             # Stop producers before draining their output while the HTTP client is open.
-            background_tasks = [subscribe_task, side_chat_task, usage_completion_task]
+            background_tasks = [
+                subscribe_task,
+                side_chat_task,
+                usage_completion_task,
+                helper_revocation_task,
+            ]
             if mcp_settle_timer is not None:
                 background_tasks.append(mcp_settle_timer)
             for task in background_tasks:
@@ -3032,6 +3042,52 @@ async def supervise_forwarder(
                 )
             if stream_error is None and cleanup_errors:
                 raise cleanup_errors[0]
+
+
+async def _retry_pending_helper_stops(client: CodexAppServerClient, bridge_dir: Path) -> None:
+    """Continue revocation even if its control request timed out or the runner restarted."""
+    from omnigent.harnesses.codex_native.app_server import is_no_active_turn_error
+
+    while True:
+        state = read_bridge_state(bridge_dir)
+        if state is not None and state.helper_stop_pending:
+            for thread_id, info in read_active_child_turns(bridge_dir).items():
+                try:
+                    async with asyncio.timeout(0.5):
+                        # Refresh the id: a missing start or a superseded-id rejection
+                        # must never be accepted as proof that a helper stopped.
+                        response = await client.request(
+                            "thread/read", {"threadId": thread_id, "includeTurns": True}
+                        )
+                        result = response.get("result")
+                        thread = result.get("thread") if isinstance(result, dict) else None
+                        turns = thread.get("turns") if isinstance(thread, dict) else None
+                        latest = turns[-1] if isinstance(turns, list) and turns else None
+                        turn_id = info.get("turn_id")
+                        if isinstance(latest, dict):
+                            current_id = _turn_id_from_payload(latest)
+                            if current_id is not None:
+                                turn_id = current_id
+                                if latest.get("status") in {"completed", "failed", "interrupted"}:
+                                    clear_active_child_turn(
+                                        bridge_dir, thread_id, info.get("turn_id") or turn_id
+                                    )
+                                    continue
+                                update_active_child_turn(bridge_dir, thread_id, turn_id=turn_id)
+                        if turn_id:
+                            try:
+                                await client.request(
+                                    "turn/interrupt", {"threadId": thread_id, "turnId": turn_id}
+                                )
+                            except CodexAppServerResponseError as exc:
+                                if not is_no_active_turn_error(exc):
+                                    raise
+                                clear_active_child_turn(bridge_dir, thread_id, turn_id)
+                except Exception:
+                    _logger.warning(
+                        "Codex helper revocation remains pending for %s", thread_id, exc_info=True
+                    )
+        await asyncio.sleep(0.05)
 
 
 def _side_chat_developer_instructions(bridge_dir: Path) -> str:
@@ -4020,6 +4076,11 @@ async def _handle_event(
     params = event.get("params")
     if not isinstance(method, str) or not isinstance(params, dict):
         return
+    if forwarder_state is not None and bridge_dir != Path():
+        forwarder_state.child_usage_baseline_dir = bridge_dir
+    terminal_event = method in {"turn/completed", "turn/failed"} or (
+        method == "error" and params.get("willRetry") is not True
+    )
     if forwarder_state is not None and _thread_started_is_subagent(event):
         child_thread_id = _thread_id_from_started_event(event)
         if child_thread_id is not None:
@@ -4027,6 +4088,10 @@ async def _handle_event(
                 child_thread_id,
                 _parent_thread_id_from_started_event(event),
             )
+            if not is_replay and forwarder_state.is_pending_child_thread(
+                child_thread_id, expected_thread_id
+            ):
+                update_active_child_turn(bridge_dir, child_thread_id, status="running")
         return
     if method == _CODEX_MCP_STARTUP_STATUS_METHOD:
         # MCP startup is bridge-level state, surfaced on the parent
@@ -4063,6 +4128,28 @@ async def _handle_event(
         )
     if method == "thread/tokenUsage/updated" and forwarder_state is not None:
         forwarder_state.note_usage_frame(params, expected_thread_id)
+    event_thread_id = _thread_id_from_params(params)
+    if (
+        not is_replay
+        and forwarder_state is not None
+        and event_thread_id is not None
+        and event_thread_id != expected_thread_id
+        and forwarder_state.session_for_child_thread(event_thread_id) is None
+        and forwarder_state.is_pending_child_thread(event_thread_id, expected_thread_id)
+    ):
+        child_turn_id = (
+            _terminal_turn_id_from_params(params)
+            if terminal_event
+            else (_turn_id_from_payload(params.get("turn")) or _turn_id_from_payload(params))
+        )
+        if terminal_event:
+            clear_active_child_turn(bridge_dir, event_thread_id, child_turn_id)
+        elif child_turn_id is not None:
+            update_active_child_turn(
+                bridge_dir, event_thread_id, turn_id=child_turn_id, status="running"
+            )
+        if method in _CODEX_ELICITATION_REQUEST_METHODS:
+            event = {**event, "params": {**params, "omnigentParentThreadId": expected_thread_id}}
     # Resolve routing: parent thread, known child thread, or stale/ignored.
     route_session_id, is_child = _resolve_event_session(
         params, method, expected_thread_id, forwarder_state, fallback_session_id=session_id
@@ -4123,7 +4210,7 @@ async def _handle_event(
                         turn_id=child_turn_id,
                         status="running",
                     )
-        elif method in {"turn/completed", "turn/failed", "error"}:
+        elif terminal_event:
             if method in {"turn/completed", "turn/failed"}:
                 observed_status = (
                     "failed"
@@ -4171,7 +4258,7 @@ async def _handle_event(
             if parent_turn_id is not None:
                 forwarder_state.active_parent_turn_id = parent_turn_id
                 forwarder_state.completed_parent_turn_ids.discard(parent_turn_id)
-        elif method in {"turn/completed", "turn/failed", "error"}:
+        elif terminal_event:
             parent_turn_id = (
                 _terminal_turn_id_from_params(params)
                 if method in {"turn/completed", "turn/failed"}
@@ -5014,21 +5101,23 @@ async def _maybe_handle_turn_event(
                     )
                 except Exception:
                     _logger.warning("Could not read the Codex rollout's last model", exc_info=True)
-            await _post_turn_status_edge(
-                client,
-                session_id,
-                _CodexTurnStatusEdge(
-                    status="failed",
-                    turn_id=turn_id,
-                    source="error",
-                    error=error,
-                    compaction_model=compaction_model,
-                    selected_model=selected_model if compaction_model else None,
-                    parent_turn_consumed=bool(
-                        forwarder_state is not None and forwarder_state.parent_turn_consumed
-                    ),
+            edge = _CodexTurnStatusEdge(
+                status="failed",
+                turn_id=turn_id,
+                source="error",
+                error=error,
+                compaction_model=compaction_model,
+                selected_model=selected_model if compaction_model else None,
+                parent_turn_consumed=bool(
+                    forwarder_state is not None and forwarder_state.parent_turn_consumed
                 ),
             )
+            defer_cb = forwarder_state.defer_terminal_edge_callback if forwarder_state else None
+            if defer_cb is not None and forwarder_state is not None:
+                forwarder_state.defer_terminal_edge_callback = None
+                defer_cb(session_id, edge)
+            else:
+                await _post_turn_status_edge(client, session_id, edge)
             await usage_coalescer.flush()
         return True
     if method == "turn/started":
@@ -7818,6 +7907,49 @@ async def _apply_child_resume(
         )
     finally:
         await child_elicitation_tracker.close()
+    result = response.get("result")
+    thread = result.get("thread") if isinstance(result, dict) else None
+    turns = thread.get("turns") if isinstance(thread, dict) else None
+    latest = turns[-1] if isinstance(turns, list) and turns else None
+    child_stream = forwarder_state.child_stream(client, child_thread_id, child_session_id)
+    if isinstance(latest, dict) and child_stream.active_turn_id in {
+        None,
+        _turn_id_from_payload(latest),
+    }:
+        turn_id = _turn_id_from_payload(latest)
+        status = latest.get("status")
+        bridge_dir = forwarder_state.child_usage_baseline_dir
+        if bridge_dir is not None and turn_id is not None:
+            if (
+                status == "inProgress"
+                and turn_id not in child_stream.terminal_turn_ids
+                and turn_id not in child_stream.state.surfaced_terminal_error_turns
+            ):
+                update_active_child_turn(
+                    bridge_dir,
+                    child_thread_id,
+                    session_id=child_session_id,
+                    turn_id=turn_id,
+                    status="running",
+                )
+            elif status in {"completed", "failed", "interrupted"}:
+                # The snapshot replaces a missed start as well as its terminal edge.
+                clear_active_child_turn(bridge_dir, child_thread_id)
+                child_stream.state.parent_turn_consumed = (
+                    child_thread_id in forwarder_state.consumed_child_threads
+                )
+                await _handle_terminal_turn_boundary(
+                    client,
+                    session_id=child_session_id,
+                    bridge_dir=None,
+                    method="turn/failed" if status == "failed" else "turn/completed",
+                    params={"threadId": child_thread_id, "turn": latest},
+                    usage_coalescer=usage_coalescer,
+                    delta_coalescer=child_stream.delta_coalescer,
+                    elicitation_tracker=child_elicitation_tracker,
+                    codex_client=None,
+                    forwarder_state=child_stream.state,
+                )
     forwarder_state.note_child_thread_subscribed(child_thread_id)
 
 

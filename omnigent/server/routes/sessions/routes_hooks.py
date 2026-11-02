@@ -280,6 +280,23 @@ async def _forward_codex_elicitation_interrupt(
     """Forward a Codex elicitation interrupt, targeting a child helper's thread on its parent runner when needed."""
     target_session_id = session_id
     payload: dict[str, Any] = {"type": "interrupt"}
+    param_thread = codex_params.get("threadId") if isinstance(codex_params, dict) else None
+    param_turn = codex_params.get("turnId") if isinstance(codex_params, dict) else None
+    owning_thread = (
+        codex_params.get("omnigentParentThreadId") if isinstance(codex_params, dict) else None
+    )
+    # The runner validates ownership against its bridge and native thread source.
+    # A child mirror is optional, so the request's thread also works on the parent hook.
+    if (
+        isinstance(owning_thread, str)
+        and owning_thread
+        and isinstance(param_thread, str)
+        and param_thread.strip() != owning_thread
+    ):
+        payload["codex_side_thread_id"] = param_thread.strip()
+        payload["codex_elicitation_interrupt"] = True
+        if isinstance(param_turn, str) and param_turn.strip():
+            payload["codex_side_turn_id"] = param_turn.strip()
     if conversation_store is not None:
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if (
@@ -288,7 +305,6 @@ async def _forward_codex_elicitation_interrupt(
             and _is_codex_native_subagent(conv)
             and conv.parent_conversation_id
         ):
-            param_thread = codex_params.get("threadId") if isinstance(codex_params, dict) else None
             child_thread_id = (
                 param_thread.strip()
                 if isinstance(param_thread, str) and param_thread.strip()
@@ -296,7 +312,6 @@ async def _forward_codex_elicitation_interrupt(
                 .get(_CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY, "")
                 .strip()
             )
-            param_turn = codex_params.get("turnId") if isinstance(codex_params, dict) else None
             response_id = _session_active_response_cache.get(session_id)
             cached_turn_id = (
                 response_id.removeprefix("codex_")
@@ -313,6 +328,7 @@ async def _forward_codex_elicitation_interrupt(
             if child_thread_id:
                 target_session_id = conv.parent_conversation_id
                 payload["codex_side_thread_id"] = child_thread_id
+                payload["codex_elicitation_interrupt"] = True
                 if child_turn_id:
                     payload["codex_side_turn_id"] = child_turn_id
     return await _forward_session_change_to_runner(

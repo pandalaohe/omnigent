@@ -6856,9 +6856,11 @@ async def test_pi_extension_ui_hook_malformed_body_400(
             assert sessions_route._harness_elicitation_owners[elicitation_id] == "another_session"
 
 
+@pytest.mark.parametrize("registered", [True, False])
 async def test_codex_helper_elicitation_decline_forwards_side_thread_interrupt_to_parent(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    registered: bool,
 ) -> None:
     """T32: declining a codex-native helper card interrupts the helper turn via parent."""
     forwarded: list[tuple[str, dict[str, Any]]] = []
@@ -6872,20 +6874,22 @@ async def test_codex_helper_elicitation_decline_forwards_side_thread_interrupt_t
     )
     agent = await create_test_agent(client, "test-codex-helper-decline")
     parent_id = await _create_session(client, agent["id"])
-    start_resp = await client.post(
-        f"/v1/sessions/{parent_id}/events",
-        json={
-            "type": "external_codex_subagent_start",
-            "data": {
-                "thread_id": "thread_helper_t32",
-                "tool_call_id": "call_t32",
-                "agent_nickname": "Archimedes",
-                "agent_role": "worker",
+    child_id = parent_id
+    if registered:
+        start_resp = await client.post(
+            f"/v1/sessions/{parent_id}/events",
+            json={
+                "type": "external_codex_subagent_start",
+                "data": {
+                    "thread_id": "thread_helper_t32",
+                    "tool_call_id": "call_t32",
+                    "agent_nickname": "Archimedes",
+                    "agent_role": "worker",
+                },
             },
-        },
-    )
-    assert start_resp.status_code == 202, start_resp.text
-    child_id = start_resp.json()["child_session_id"]
+        )
+        assert start_resp.status_code == 202, start_resp.text
+        child_id = start_resp.json()["child_session_id"]
 
     payload = {
         "id": 91,
@@ -6893,6 +6897,7 @@ async def test_codex_helper_elicitation_decline_forwards_side_thread_interrupt_t
         "params": {
             "threadId": "thread_helper_t32",
             "turnId": "turn_helper_t32",
+            **({"omnigentParentThreadId": "thread_parent"} if not registered else {}),
             "itemId": "patch_t32",
             "grantRoot": "/repo/app",
             "reason": "write file",
@@ -6917,6 +6922,7 @@ async def test_codex_helper_elicitation_decline_forwards_side_thread_interrupt_t
                 "type": "interrupt",
                 "codex_side_thread_id": "thread_helper_t32",
                 "codex_side_turn_id": "turn_helper_t32",
+                "codex_elicitation_interrupt": True,
             },
         )
     ]

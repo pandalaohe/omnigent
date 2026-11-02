@@ -920,9 +920,8 @@ class NativeInterruptRunner:
             return None
         pending_mcp = cancel_pending_mcp_startup(bridge_dir)
         active_child_turns = [
-            (child_tid, child_turn_id)
+            (child_tid, info.get("turn_id"))
             for child_tid, info in read_active_child_turns(bridge_dir).items()
-            if isinstance((child_turn_id := info.get("turn_id")), str) and child_turn_id
         ]
         if state.active_turn_id is None and not pending_mcp and not active_child_turns:
             self._logger.info(
@@ -1034,16 +1033,35 @@ class NativeInterruptRunner:
                     if not active_child_turns:
                         return Response(status_code=204)
             for child_tid, child_turn_id in active_child_turns:
+                if not child_turn_id:
+                    response = await codex_client.request(
+                        "thread/read", {"threadId": child_tid, "includeTurns": True}
+                    )
+                    result = response.get("result")
+                    thread = result.get("thread") if isinstance(result, dict) else None
+                    turns = thread.get("turns") if isinstance(thread, dict) else None
+                    latest = turns[-1] if isinstance(turns, list) and turns else None
+                    child_turn_id = latest.get("id") if isinstance(latest, dict) else None
+                    if (
+                        not isinstance(latest, dict)
+                        or not isinstance(child_turn_id, str)
+                        or not child_turn_id
+                    ):
+                        raise RuntimeError("Codex helper turn could not be confirmed")
+                    if latest.get("status") in {"completed", "failed", "interrupted"}:
+                        clear_active_child_turn(bridge_dir, child_tid, child_turn_id)
+                        continue
                 try:
                     await codex_client.request(
                         "turn/interrupt",
                         {"threadId": child_tid, "turnId": child_turn_id},
                     )
                 except CodexAppServerResponseError as exc:
-                    if not is_stale_active_turn_error(exc):
-                        raise
                     if is_no_active_turn_error(exc):
                         clear_active_child_turn(bridge_dir, child_tid, child_turn_id)
+                    else:
+                        # A superseded id proves a newer helper turn is still live.
+                        raise
         except Exception as exc:
             self._logger.warning(
                 "Codex-native turn/interrupt failed for session=%s thread=%s turn=%s",
