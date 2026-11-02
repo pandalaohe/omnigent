@@ -4829,9 +4829,30 @@ def test_augment_claude_args_appends_caller_system_prompt(
         append_system_prompt=framework_instruction,
     )
 
-    assert args.count("--append-system-prompt") == 1
-    index = args.index("--append-system-prompt")
-    assert args[index + 1] == framework_instruction
+    assert "--append-system-prompt" not in args
+    assert args.count("--append-system-prompt-file") == 1
+    prompt_path = Path(args[args.index("--append-system-prompt-file") + 1])
+    assert prompt_path.read_text(encoding="utf-8") == framework_instruction
+
+
+def test_augment_claude_args_passes_text_over_tmux_command_cap_by_file(tmp_path: Path) -> None:
+    """
+    Startup text over tmux's 16 KB command cap, yet under 64 KiB, is passed by file.
+
+    An inline ``--append-system-prompt`` of this size made tmux reject the whole
+    launch with ``command too long`` before Claude started.
+    """
+    text = "全🙂" * 3_000 + "\nlast instruction"
+    assert 16 * 1024 < len(text.encode("utf-8")) < 64 * 1024
+
+    args = augment_claude_args(
+        (), bridge_dir=tmp_path, python_executable="/venv/bin/python", append_system_prompt=text
+    )
+
+    assert "--append-system-prompt" not in args
+    prompt_path = Path(args[args.index("--append-system-prompt-file") + 1])
+    assert prompt_path.read_text(encoding="utf-8") == text
+    assert text not in args
 
 
 def test_augment_claude_args_delivers_large_prompt_through_private_file(tmp_path: Path) -> None:
@@ -4879,6 +4900,7 @@ def test_augment_claude_args_omits_unsupplied_system_prompt(tmp_path: Path) -> N
     )
 
     assert "--append-system-prompt" not in args
+    assert "--append-system-prompt-file" not in args
 
 
 def test_augment_claude_args_merges_user_disallowed_tools(tmp_path: Path) -> None:

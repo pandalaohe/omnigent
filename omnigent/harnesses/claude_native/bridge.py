@@ -3104,7 +3104,7 @@ def augment_claude_args(
         ``--setting-sources`` exactly as the SDK executor maps it onto
         ``setting_sources``. Defaults to ``"all"``.
     :param append_system_prompt: Composed startup instructions, appended
-        through Claude Code's native prompt flag or a private file.
+        through a private file (``--append-system-prompt-file``).
     :param allowed_tools: Optional narrowly scoped Claude tool names to merge
         into ``--allowedTools`` without replacing the user's allowlist.
     :param disallowed_tools: Optional Claude tool names to merge into
@@ -3151,14 +3151,12 @@ def augment_claude_args(
         ]
     )
     prompt_path = bridge_dir / "startup-instructions.txt"
-    # Large argv strings fail at exec on Linux; files preserve the full text.
-    if append_system_prompt and len(append_system_prompt.encode("utf-8")) >= 64 * 1024:
+    # tmux rejects a launch command over 16 KB and Linux caps argv, so pass startup text by file.
+    if append_system_prompt:
         _write_text_file(prompt_path, append_system_prompt)
         args.extend(["--append-system-prompt-file", str(prompt_path)])
     else:
         prompt_path.unlink(missing_ok=True)
-        if append_system_prompt:
-            args.extend(["--append-system-prompt", append_system_prompt])
     # Imported here: bundle-skills parsing rides the spec graph; launch-only.
     from omnigent.inner.bundle_skills import claude_agents_skill_args, claude_native_skill_args
 
