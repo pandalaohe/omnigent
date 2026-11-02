@@ -143,6 +143,8 @@ select optgroup {
  * 1.6 rhythm at every size the Appearance setting allows. */
 @theme {
   /* App-default interface/body text — every control, label, and menu item. */
+  /* Type roles: page title text-2xl font-medium; section text-ui font-semibold;
+     row/body text-ui (row titles font-normal md:font-medium); note text-sm text-muted-foreground. */
   --text-ui: 1rem;
   --text-ui--line-height: 1.6;
   /* Caption tier: captions, descriptions, sub/group titles. Always 0.9 of the
