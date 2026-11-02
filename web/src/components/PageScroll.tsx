@@ -51,21 +51,23 @@ export function PageScroll({
   className,
   "data-testid": testId,
 }: PageScrollProps) {
-  // Keep header clearance outside the scroll viewport so swiping cannot move
-  // page content underneath the floating navigation control. Bottom padding
-  // lets the last item scroll clear of the native bar and home indicator.
-  const style: CSSProperties = {
-    marginTop: `calc(0px${clearHeader ? " + var(--omnigent-header-height)" : ""}${
+  // Phones reserve header clearance outside the scroll viewport. Desktop
+  // keeps its full-height scroll viewport and scrollable top padding.
+  const style = {
+    "--page-scroll-top-clearance": `calc(0px${clearHeader ? " + var(--omnigent-header-height)" : ""}${
       insetTop ? " + var(--omnigent-inset-top)" : ""
     })`,
-    paddingTop: extraTop,
+    "--page-scroll-extra-top": extraTop,
     paddingBottom: `calc(${extraBottom}${insetBottom ? " + var(--omnigent-inset-bottom)" : ""})`,
-  };
+  } as CSSProperties;
 
   return (
     <div
       data-testid={testId}
-      className={cn("min-h-0 w-full flex-1 overflow-y-auto", className)}
+      className={cn(
+        "min-h-0 w-full flex-1 overflow-y-auto mt-[var(--page-scroll-top-clearance)] pt-[var(--page-scroll-extra-top)] md:mt-0 md:pt-[calc(var(--page-scroll-top-clearance)_+_var(--page-scroll-extra-top))]",
+        className,
+      )}
       style={style}
     >
       <div className={cn("mx-auto w-full", maxWidthClassName, contentClassName)}>{children}</div>

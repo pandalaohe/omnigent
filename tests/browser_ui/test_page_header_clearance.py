@@ -97,6 +97,7 @@ def test_usage_clears_mobile_sidebar_control(
     menu = page.get_by_role("button", name="Open sidebar", exact=True)
     expect(title).to_be_visible()
     expect(menu).to_be_visible()
+    expect(page.get_by_text("Total cost", exact=True)).to_be_visible()
     if native:
         page.locator(".app-shell").evaluate(
             """shell => {
@@ -106,7 +107,7 @@ def test_usage_clears_mobile_sidebar_control(
         )
     # Bring the first row to the top of its own scroll viewport, as a phone
     # swipe does. Header clearance must survive scrolling the initial padding.
-    title.evaluate(
+    scroll_top = title.evaluate(
         """title => {
             let scroll = title.parentElement;
             while (scroll && getComputedStyle(scroll).overflowY !== 'auto') {
@@ -115,14 +116,16 @@ def test_usage_clears_mobile_sidebar_control(
             if (!scroll) throw new Error('Page scroll viewport not found');
             const titleTop = title.getBoundingClientRect().top;
             scroll.scrollTop = titleTop - scroll.getBoundingClientRect().top;
+            return scroll.scrollTop;
         }"""
     )
+    assert scroll_top > 0, "Loaded Usage content must actually scroll before checking overlap"
     title_box = title.bounding_box()
     menu_box = menu.bounding_box()
     assert title_box is not None and menu_box is not None
     output = Path(request.config.getoption("output"))
     output.mkdir(parents=True, exist_ok=True)
-    geometry = {"title": title_box, "menu": menu_box}
+    geometry = {"title": title_box, "menu": menu_box, "scroll_top": scroll_top}
     suffix = "native" if native else "browser"
     (output / f"usage-geometry-{suffix}.json").write_text(json.dumps(geometry, indent=2))
     page.screenshot(path=str(output / f"usage-mobile-{suffix}.png"))
@@ -179,16 +182,12 @@ def test_sidebar_page_scroll_viewport_clears_mobile_navigation(
     assert geometry["scroll"]["top"] >= geometry["menu"]["bottom"], geometry
 
 
-@pytest.mark.parametrize("kind", ["external", "proxied"])
-@pytest.mark.parametrize("native", [False, True])
-def test_extension_page_clears_mobile_navigation(
-    page: Page,
+@pytest.fixture
+def extension_url(
     pages_url: str,
     browser_contract: BrowserContract,
     kind: str,
-    native: bool,
-    request: pytest.FixtureRequest,
-) -> None:
+) -> str:
     board_url = (
         "/v1/extensions/example.board/proxy/board/"
         if kind == "proxied"
@@ -243,8 +242,20 @@ def test_extension_page_clears_mobile_navigation(
         f"{pages_url}{board_url}" if kind == "proxied" else board_url,
         lambda route: route.fulfill(content_type="text/html", body="<h1>Example usage data</h1>"),
     )
+    return f"{pages_url}/extensions/example.board/board"
+
+
+@pytest.mark.parametrize("kind", ["external", "proxied"])
+@pytest.mark.parametrize("native", [False, True])
+def test_extension_page_clears_mobile_navigation(
+    page: Page,
+    extension_url: str,
+    kind: str,
+    native: bool,
+    request: pytest.FixtureRequest,
+) -> None:
     page.set_viewport_size({"width": 390, "height": 844})
-    page.goto(f"{pages_url}/extensions/example.board/board")
+    page.goto(extension_url)
     title = page.get_by_role("heading", name="Usage board", exact=True)
     menu = page.get_by_role("button", name="Open sidebar", exact=True)
     expect(title).to_be_visible()
@@ -269,7 +280,59 @@ def test_extension_page_clears_mobile_navigation(
     expect(page.locator("main[data-shell-header]")).to_have_attribute(
         "data-shell-header", "hidden"
     )
-    expect(page.locator(".extension-view-host")).to_have_css("padding-top", "0px")
+    expect(page.locator('iframe[title="Usage board"]').locator("..")).to_have_css(
+        "padding-top", "0px"
+    )
+
+
+def test_system_status_keeps_desktop_scroll_geometry(
+    page: Page, pages_url: str, request: pytest.FixtureRequest
+) -> None:
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.goto(f"{pages_url}/system")
+    expect(page.get_by_text("No hosts connected.", exact=True)).to_be_visible()
+    main = page.locator("main[data-shell-header]")
+    scroll = main.locator(":scope > div").first
+    main_box, scroll_box = main.bounding_box(), scroll.bounding_box()
+    assert main_box is not None and scroll_box is not None
+    geometry = {
+        "main": main_box,
+        "scroll": scroll_box,
+        "padding_top": scroll.evaluate("element => getComputedStyle(element).paddingTop"),
+    }
+    output = Path(request.config.getoption("output"))
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "system-desktop-geometry.json").write_text(json.dumps(geometry, indent=2))
+    page.screenshot(path=str(output / "system-desktop.png"))
+    assert scroll_box["y"] == main_box["y"], geometry
+    assert geometry["padding_top"] == "80px", geometry
+
+
+@pytest.mark.parametrize("kind", ["external", "proxied"])
+def test_extension_page_keeps_desktop_header_padding(
+    page: Page, extension_url: str, kind: str, request: pytest.FixtureRequest
+) -> None:
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.goto(extension_url)
+    title = page.get_by_role("heading", name="Usage board", exact=True)
+    expect(title).to_be_visible()
+    main = page.locator("main[data-shell-header]")
+    expect(main).to_have_attribute("data-shell-header", "hidden")
+    frame = page.locator('iframe[title="Usage board"]')
+    host = frame.locator("..")
+    geometry = {
+        "title": title.bounding_box(),
+        "frame": frame.bounding_box(),
+        "padding_top": host.evaluate("element => getComputedStyle(element).paddingTop"),
+    }
+    output = Path(request.config.getoption("output"))
+    output.mkdir(parents=True, exist_ok=True)
+    (output / f"{kind}-desktop-geometry.json").write_text(json.dumps(geometry, indent=2))
+    page.screenshot(path=str(output / f"{kind}-desktop.png"))
+    assert geometry["padding_top"] == "48px", geometry
+    page.get_by_role("button", name="Close sidebar", exact=True).click()
+    expect(main).to_have_attribute("data-shell-header", "visible")
+    expect(host).to_have_css("padding-top", "48px")
 
 
 @pytest.mark.parametrize("surface", ["chat", "canvas", "host-terminals", "archived"])

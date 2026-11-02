@@ -35,7 +35,7 @@ export function ExternalPageView({ page }: { page: ExtensionExternalPage }) {
 
   const blocked = window.location.protocol === "https:" && url?.protocol === "http:";
   return (
-    <div className="extension-view-host relative flex h-full min-h-0 w-full flex-col overflow-hidden pt-14 md:pt-12">
+    <div className="external-page-host relative flex h-full min-h-0 w-full flex-col overflow-hidden pt-14 md:pt-12">
       <div className="flex flex-wrap items-center gap-3 border-b px-4 py-2">
         <h1 className="mr-auto font-semibold">{page.title}</h1>
         <button
