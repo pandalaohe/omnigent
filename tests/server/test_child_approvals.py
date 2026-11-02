@@ -303,6 +303,25 @@ def _pending(tree):
         ("git filter-branch --all", True),
         ("git update-ref -d refs/heads/main", True),
         ("git reflog expire --expire=now --all", True),
+        ("sed '1s/x/y/w /etc/passwd' file", True),
+        ("sed '1,2s/x/y/e' file", True),
+        ("sed '/x/s/x/y/w /etc/passwd' file", True),
+        ("sed '1s/x/y/' file", False),
+        ("chmod -R -w /etc", True),
+        ("chmod -w ./file", False),
+        ("git checkout -f main", True),
+        ("git checkout --force main", True),
+        ("git checkout main", False),
+        ("tar -cI /tmp/filter -f a.tar file", True),
+        ("tar -cf a.tar file", False),
+        ("git diff HEAD~1", False),
+        ("git show HEAD~2:README.md", False),
+        ("ls ~", False),
+        ("cat ~/notes.txt", False),
+        ("rm -rf ~/work", True),
+        ("bash infra/fork-ci-check.sh . tests/x.py", False),
+        ("sh script.sh", False),
+        ("cmd /c 'echo ready'", True),
         *[
             (f"{shell} -c 'echo ready'", True)
             for shell in ("ksh", "csh", "tcsh", "dash", "pwsh", "powershell", "cmd")
@@ -838,8 +857,9 @@ async def test_native_first_writes_no_parent_receipt(tree):
 @pytest.mark.parametrize("source", ["tool_result", "by_id"])
 @pytest.mark.parametrize("same_question", [True, False])
 @pytest.mark.parametrize("long_inputs", [False, True])
+@pytest.mark.parametrize("signal_before_retry", [False, True])
 async def test_queued_native_signal_follows_same_question_repark(
-    tree, monkeypatch, source, same_question, long_inputs
+    tree, monkeypatch, source, same_question, long_inputs, signal_before_retry
 ):
     from omnigent.server._elicitation_registry import _harness_parked_elicitations
 
@@ -868,10 +888,12 @@ async def test_queued_native_signal_follows_same_question_repark(
         )
 
     published = asyncio.Event()
+    clears_before = set(orchestration._deferred_elicitation_clear_tasks)
     first = asyncio.create_task(park("echo ready", published))
     await asyncio.wait_for(published.wait(), 5)
     first.cancel()
     await asyncio.gather(first, return_exceptions=True)
+    clears = set(orchestration._deferred_elicitation_clear_tasks) - clears_before
     old = _harness_parked_elicitations["elicit_pi_dialog"]
     entered, release = asyncio.Event(), asyncio.Event()
     receipt = approvals._receipt
@@ -886,25 +908,36 @@ async def test_queued_native_signal_follows_same_question_repark(
         _answer(tree, "pass_to_user", note="请决定这次调用。", recommend="approve")
     )
     await asyncio.wait_for(entered.wait(), 5)
-    retry_published = asyncio.Event()
-    retry = asyncio.create_task(
-        park("echo ready" if same_question else "echo different", retry_published)
-    )
-    try:
-        lock = approvals.card_lock(tree.child_id, "elicit_pi_dialog")
-        # Queue registration before the native signal while the parent owns the lock.
-        await poll_until_async(lambda: bool(lock._waiters), timeout_s=2)
+
+    def signal():
         if source == "tool_result":
             helpers._signal_terminal_resolved_harness_elicitation_impl(
                 tree.child_id, old.tool_name, old.tool_input
             )
         else:
             helpers._signal_harness_elicitation_resolved_by_id(tree.child_id, "elicit_pi_dialog")
+
+    lock = approvals.card_lock(tree.child_id, "elicit_pi_dialog")
+    if signal_before_retry:
+        signal()
+        await poll_until_async(lambda: bool(lock._waiters), timeout_s=2)
+    retry_published = asyncio.Event()
+    retry = asyncio.create_task(
+        park("echo ready" if same_question else "echo different", retry_published)
+    )
+    try:
+        await poll_until_async(
+            lambda: len(lock._waiters or []) >= (2 if signal_before_retry else 1), timeout_s=2
+        )
+        if not signal_before_retry:
+            signal()
         assert not old.resolved_elsewhere.is_set()
         release.set()
         assert await asyncio.wait_for(answer, 5) == {"status": "passed"}
         await asyncio.wait_for(retry_published.wait(), 5)
         await poll_until_async(lambda: not helpers._terminal_resolution_tasks, timeout_s=2)
+        if signal_before_retry:
+            await asyncio.wait_for(asyncio.gather(*clears), 2)
         if same_question:
             assert await asyncio.wait_for(asyncio.shield(retry), 0.5) is None
             assert _pending(tree) is None
@@ -919,6 +952,41 @@ async def test_queued_native_signal_follows_same_question_repark(
         release.set()
         retry.cancel()
         await asyncio.gather(answer, retry, return_exceptions=True)
+
+
+async def test_pi_hook_repark_preserves_queued_by_id_evidence(tree):
+    from omnigent.server._elicitation_registry import _harness_parked_elicitations
+
+    eid = "elicit_pi_" + "e" * 32
+
+    async def park():
+        return await tree.client.post(
+            f"/v1/sessions/{tree.child_id}/hooks/pi-extension-ui",
+            json={"elicitation_id": eid, "request": _pi_request()},
+        )
+
+    first = asyncio.create_task(park())
+    await poll_until_async(
+        lambda: (
+            eid in _harness_parked_elicitations
+            and pending_elicitations.lookup(eid, conversation_id=tree.child_id) is not None
+        ),
+        timeout_s=2,
+    )
+    first.cancel()
+    await asyncio.gather(first, return_exceptions=True)
+    lock = approvals.card_lock(tree.child_id, eid)
+    async with lock:
+        retry = asyncio.create_task(park())
+        await poll_until_async(lambda: bool(lock._waiters), timeout_s=2)
+        helpers._signal_harness_elicitation_resolved_by_id(tree.child_id, eid)
+    try:
+        response = await asyncio.wait_for(asyncio.shield(retry), 0.5)
+        assert response.status_code == 200
+        assert pending_elicitations.lookup(eid, conversation_id=tree.child_id) is None
+    finally:
+        retry.cancel()
+        await asyncio.gather(retry, return_exceptions=True)
 
 
 async def test_deferred_clear_cannot_resurrect_a_card_during_handoff(tree, monkeypatch):

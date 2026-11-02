@@ -394,6 +394,7 @@ from omnigent.server.routes._sessions.helpers import (
     _routing_decision_item_from_sse,
     _runner_supports_side_chat_settings,
     _RunnerForwardResult,
+    _same_parked_question,
     _seed_missing_title_from_user_message,
     _session_background_activity_count,
     _session_status_from_cache,
@@ -1425,10 +1426,7 @@ def _schedule_deferred_elicitation_clear(
         async with card_lock(session_id, elicitation_id):
             current = _harness_parked_elicitations.get(elicitation_id)
             if parked is not None and current is not None and current is not parked:
-                if (
-                    resolved_in_terminal
-                    and current.request_fingerprint == parked.request_fingerprint
-                ):
+                if resolved_in_terminal and _same_parked_question(parked, current):
                     current.resolved_elsewhere.set()
                 return
             parked_is_current = _harness_parked_elicitations.get(elicitation_id) is parked
@@ -1441,7 +1439,7 @@ def _schedule_deferred_elicitation_clear(
                 # mirrored result that proved the answer will not be sent twice.
                 if resolved_in_terminal:
                     current = _harness_parked_elicitations.get(elicitation_id)
-                    if current is not None:
+                    if current is not None and _same_parked_question(parked, current):
                         current.resolved_elsewhere.set()
                 return
             if native_delivery_attempt is not None:

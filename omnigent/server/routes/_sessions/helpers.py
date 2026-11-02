@@ -1102,6 +1102,23 @@ def _signal_terminal_resolved_harness_elicitation(*args: Any, **kwargs: Any) -> 
 _terminal_resolution_tasks: WorkspaceScopedCache[str, asyncio.Task[None]] = WorkspaceScopedCache()
 
 
+def _same_parked_question(
+    first: _ParkedHarnessElicitation | None, second: _ParkedHarnessElicitation | None
+) -> bool:
+    """Prove identity without relying on a potentially truncated display preview."""
+    return (
+        first is not None
+        and second is not None
+        and first.session_id == second.session_id
+        and first.request_fingerprint is not None
+        and first.request_fingerprint == second.request_fingerprint
+        and first.tool_name is not None
+        and first.tool_name == second.tool_name
+        and isinstance(first.tool_input, dict)
+        and first.tool_input == second.tool_input
+    )
+
+
 def _serialize_terminal_resolution(
     session_id: str,
     elicitation_id: str,
@@ -1124,13 +1141,8 @@ def _serialize_terminal_resolution(
             elif (
                 parked is not None
                 and current is not None
-                and current.session_id == parked.session_id == session_id
-                and parked.request_fingerprint is not None
-                and current.request_fingerprint == parked.request_fingerprint
-                and parked.tool_name is not None
-                and current.tool_name == parked.tool_name
-                and isinstance(parked.tool_input, dict)
-                and current.tool_input == parked.tool_input
+                and parked.session_id == session_id
+                and _same_parked_question(parked, current)
             ):
                 # A retry replaced the waiter before this queued native receipt.
                 # Previews can collide; also require the full tool identity/input.

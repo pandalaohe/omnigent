@@ -108,7 +108,7 @@ def _shell_statements(command: str) -> list[tuple[list[str], bool]]:
                 quote = ""
         elif char in {"'", '"'}:
             quote = char
-        elif char in "<>(){}*?[~":
+        elif char in "<>(){}*?[":
             raise ValueError("unsupported shell grouping or expansion")
         elif char in ";&|\n":
             segments.append((command[start:index], piped))
@@ -129,7 +129,7 @@ def _shell_statements(command: str) -> list[tuple[list[str], bool]]:
 
 
 def _split_command_options(
-    args: list[str], value_options: set[str]
+    args: list[str], value_options: set[str], *, preserve_modes: bool = False
 ) -> tuple[list[str], dict[str, list[str]]]:
     """Separate operands and relevant option values, including short bundles."""
     operands: list[str] = []
@@ -141,7 +141,9 @@ def _split_command_options(
             operands.extend(args[index + 1 :])
             break
         option, equal, attached = arg.partition("=")
-        if option in value_options:
+        if preserve_modes and re.fullmatch(r"-[rwxXstugo]+(?:,[ugoa]*[+=-][rwxXstugo]*)*", arg):
+            operands.append(arg)
+        elif option in value_options:
             if not equal:
                 index += 1
                 if index >= len(args):
@@ -170,11 +172,13 @@ def _always_user_only(_name: str, _args: list[str], _piped: bool) -> bool:
     return True
 
 
-def _interpreter_user_only(_name: str, args: list[str], piped: bool) -> bool:
+def _interpreter_user_only(name: str, args: list[str], piped: bool) -> bool:
     if args and all(arg in {"--version", "--help", "-V", "-h", "-?"} for arg in args):
         return False
     # Script contents stay for parent judgement; options before a script may supply code.
-    return piped or not args or args[0].startswith("-")
+    return (
+        piped or not args or args[0].startswith("-") or (name == "cmd" and args[0].startswith("/"))
+    )
 
 
 def _awk_user_only(_name: str, args: list[str], _piped: bool) -> bool:
@@ -191,11 +195,13 @@ def _sed_user_only(_name: str, args: list[str], _piped: bool) -> bool:
     if values.get("-f") or values.get("--file"):
         return True
     scripts = values.get("-e", []) + values.get("--expression", []) or operands[:1]
+    address = r"(?:\d+|\$|/(?:\\.|[^/])*/)"
+    command_start = rf"(?:^|[;\n{{}}])\s*(?:{address}(?:\s*,\s*{address})?\s*)?!?\s*"
     for script in scripts:
-        if re.search(r"(?:^|[;\n{}])\s*(?:(?:\d+|\$|/[^/\n]*/)[,\s]*)*[ew](?:\s|/|$)", script):
+        if re.search(command_start + r"[ew](?:\s|/|$)", script):
             return True
         # Skip both substitution fields before examining their executable/write flags.
-        for match in re.finditer(r"\bs([^\w\s])", script):
+        for match in re.finditer(command_start + r"s([^\w\s])", script):
             delimiter = match[1]
             fields = 0
             index = match.end()
@@ -213,7 +219,8 @@ def _sed_user_only(_name: str, args: list[str], _piped: bool) -> bool:
 
 
 def _tar_user_only(_name: str, args: list[str], _piped: bool) -> bool:
-    return any(
+    _, values = _split_command_options(args, {"-I", "-f", "-C"})
+    return bool(values.get("-I")) or any(
         arg.startswith(
             (
                 "--to-command",
@@ -238,14 +245,19 @@ def _normal_path(path: str) -> str:
 
 def _critical_target(path: str) -> bool:
     normalized = _normal_path(path)
-    return normalized in _RM_CRITICAL_DIRS or any(
-        normalized.startswith(parent + "/") for parent in _RM_SYSTEM_PARENTS
+    return (
+        path.startswith("~")
+        or normalized in _RM_CRITICAL_DIRS
+        or any(normalized.startswith(parent + "/") for parent in _RM_SYSTEM_PARENTS)
     )
 
 
 def _write_user_only(name: str, args: list[str], _piped: bool) -> bool:
     if name == "rm":
-        return _rm_severity([name, *(_normal_path(arg) for arg in args)]) == "DENY"
+        severity = _rm_severity([name, *(_normal_path(arg) for arg in args)])
+        return severity == "DENY" or (
+            severity is not None and any(arg.startswith("~") for arg in args)
+        )
     if name == "dd":
         targets = [arg.removeprefix("of=") for arg in args if arg.startswith("of=")]
     elif name in {"curl", "wget"}:
@@ -268,7 +280,9 @@ def _write_user_only(name: str, args: list[str], _piped: bool) -> bool:
             _, execution = _split_command_options(args, {"-e", "--rsh", "--rsync-path"})
             if execution or any(arg.startswith("--delete") for arg in args):
                 return True
-        operands, values = _split_command_options(args, value_options)
+        operands, values = _split_command_options(
+            args, value_options, preserve_modes=name == "chmod"
+        )
         if name in {"tee", "truncate", "mv"} or (
             name == "install" and any(arg in {"-d", "--directory"} for arg in args)
         ):
@@ -298,7 +312,9 @@ def _git_user_only(_name: str, args: list[str], _piped: bool) -> bool:
         return True
     if subcommand == "reset" and any(arg.startswith("--hard") for arg in options):
         return True
-    if subcommand == "checkout" and "--" in options:
+    if subcommand == "checkout" and (
+        "--" in options or "f" in short_flags or "--force" in options
+    ):
         return True
     if (subcommand == "branch" and "D" in short_flags) or (
         subcommand in {"tag", "update-ref"} and "d" in short_flags
@@ -317,9 +333,9 @@ def _git_user_only(_name: str, args: list[str], _piped: bool) -> bool:
 _FLOOR_CLASSES: dict[
     str, tuple[frozenset[str], tuple[str, ...], Callable[[str, list[str], bool], bool]]
 ] = {
-    "shells, wrappers, editors and shell control": (
+    "shells with inline code or stdin (script files stay clear)": (
         frozenset(
-            [
+            {
                 "sh",
                 "bash",
                 "zsh",
@@ -331,6 +347,14 @@ _FLOOR_CLASSES: dict[
                 "pwsh",
                 "powershell",
                 "cmd",
+            }
+        ),
+        (),
+        _interpreter_user_only,
+    ),
+    "wrappers, editors and shell control": (
+        frozenset(
+            [
                 "eval",
                 "source",
                 ".",

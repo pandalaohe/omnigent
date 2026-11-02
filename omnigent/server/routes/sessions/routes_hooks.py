@@ -3316,6 +3316,7 @@ def register_hooks_routes(
             conversation_store=conversation_store,
             elicitation_id=elicitation_id,
             tool_name="Pi(extension_ui)",
+            tool_input=raw_request,
         )
         return Response(
             content=json.dumps(to_ui_response(raw_request, result)),
