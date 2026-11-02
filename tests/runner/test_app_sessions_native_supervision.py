@@ -1015,6 +1015,121 @@ async def test_native_subagent_completion_wakes_idle_parent() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("quiet_progress", [False, True])
+@pytest.mark.parametrize("replay", [False, True])
+async def test_antigravity_progress_does_not_spend_the_parent_wake(
+    monkeypatch: pytest.MonkeyPatch, quiet_progress: bool, replay: bool
+) -> None:
+    """A streamed planner can speak before continuing tools in the same turn."""
+    from omnigent.harnesses.antigravity_native import reader
+
+    parent_id, child_id, cascade_id = "parent", "agy_child", "cascade"
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    server = _WakeRecordingServerClient(parent_id)
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        server_client=server,  # type: ignore[arg-type]
+    )
+    subagent_work._session_inboxes_ref[parent_id] = inbox
+    subagent_work.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="antigravity",
+        title="worker",
+        registered_by="sys_session_create",
+    )
+    idle = replay
+    latest_text = ""
+    snapshot: list[dict[str, Any]] = []
+    monkeypatch.setattr(reader, "get_trajectory_steps", lambda *args: snapshot)
+    monkeypatch.setattr(
+        reader,
+        "get_all_cascade_trajectories",
+        lambda _port: {
+            "trajectorySummaries": {
+                cascade_id: {
+                    "status": "CASCADE_RUN_STATUS_IDLE" if idle else "CASCADE_RUN_STATUS_RUNNING"
+                }
+            }
+        },
+    )
+    state = reader._ReaderState(seen=set(), interacted=set(), port=4242)
+
+    async def no_interaction(*args: Any) -> None:
+        pass
+
+    def planner(index: int, text: str) -> dict[str, Any]:
+        return {
+            "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+            "status": "CORTEX_STEP_STATUS_DONE",
+            "metadata": {
+                "sourceTrajectoryStepInfo": {"trajectoryId": cascade_id, "stepIndex": index}
+            },
+            "plannerResponse": {"modifiedResponse": text},
+        }
+
+    try:
+        async with _runner_client(app) as client:
+
+            async def post_reader_event(**kwargs: Any) -> httpx.Response:
+                nonlocal latest_text
+                payload = kwargs["payload"]
+                data = payload["data"]
+                if payload["type"] == "external_conversation_item":
+                    item = data["item_data"]
+                    if item.get("role") == "assistant":
+                        latest_text = "".join(block.get("text", "") for block in item["content"])
+                if payload["type"] == "external_session_status":
+                    response = await client.post(
+                        f"/v1/sessions/{child_id}/events",
+                        json={"type": payload["type"], "data": {**data, "output": latest_text}},
+                    )
+                    assert response.status_code == 204, response.text
+                return httpx.Response(202)
+
+            monkeypatch.setattr(reader, "post_session_event_with_retry", post_reader_event)
+            async with httpx.AsyncClient(base_url="http://reader.test") as reader_client:
+
+                async def step(value: dict[str, Any]) -> None:
+                    await reader._process_committed_step(
+                        value,
+                        client=reader_client,
+                        session_id=child_id,
+                        cascade_id=cascade_id,
+                        state=state,
+                        on_pending_interaction=no_interaction,
+                    )
+
+                user = {
+                    "type": "CORTEX_STEP_TYPE_USER_INPUT",
+                    "status": "CORTEX_STEP_STATUS_DONE",
+                    "metadata": {"executionId": "turn-one"},
+                    "userInput": {"userResponse": "Work"},
+                }
+                progress = planner(
+                    1, "Running the check." + ("\n[quiet]" if quiet_progress else "")
+                )
+                final = planner(2, "READY")
+                snapshot[:] = [user, progress, final] if replay else [user, progress]
+                await step(user)
+                await step(progress)
+                assert state.turn_active, "progress text closed the turn before agy stopped"
+                assert inbox.empty()
+                assert server.wake_posts == []
+                idle = True
+                snapshot[:] = [user, progress, final]
+                await step(final)
+                await step(final)
+                await asyncio.wait_for(server.wake_seen.wait(), timeout=5)
+        assert inbox.qsize() == 1
+        assert inbox.get_nowait()["output"] == "READY"
+        assert len(server.wake_posts) == 1
+    finally:
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
+
+
+@pytest.mark.asyncio
 async def test_external_status_for_untracked_session_does_not_wake() -> None:
     """
     Completing a session that is not a tracked sub-agent wakes nobody.

@@ -694,6 +694,22 @@ def no_rotation(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(reader, "get_all_cascade_trajectories", lambda port: {})
 
 
+@pytest.fixture(autouse=True)
+def confirmed_text_finish(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Mapping scenarios assume their closing text is the confirmed final step.
+
+    The reader-to-runner wake scenarios exercise the real confirmation RPCs.
+    """
+
+    original = reader._text_step_finishes_idle_cascade
+
+    async def confirmed(*args: object) -> bool:
+        return True
+
+    monkeypatch.setattr(reader, "_text_step_finishes_idle_cascade", confirmed)
+    return original
+
+
 def _bridge_dir(tmp_path: Path) -> Path:
     """A bridge dir whose state.json names the real (non-placeholder) cascade id."""
     bridge_dir = tmp_path / "bridge"
@@ -5137,8 +5153,8 @@ async def test_watch_for_rotation_signals_quiescence_only_after_consecutive_idle
 
     idle = {"trajectorySummaries": {_BOUND_CASCADE: {"status": "CASCADE_RUN_STATUS_IDLE"}}}
     busy = {"trajectorySummaries": {_BOUND_CASCADE: {"status": "CASCADE_RUN_STATUS_RUNNING"}}}
-    # idle, busy (resets), idle, idle -> exactly one signal, on the 4th tick.
-    script = [idle, busy, idle, idle]
+    # Keep reconciling while idle so a failed snapshot read can retry next tick.
+    script = [idle, busy, idle, idle, idle]
     seen = {"n": 0}
 
     def _fetch(port: int) -> dict[str, object]:
@@ -5165,7 +5181,107 @@ async def test_watch_for_rotation_signals_quiescence_only_after_consecutive_idle
             on_quiescent=_on_quiescent,
         )
 
-    assert calls == [1], "expected exactly one quiescence signal, after two idle ticks"
+    assert calls == [1, 1], "expected reconciliation after each tick beyond the idle threshold"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("snapshot_failure", [False, True])
+async def test_idle_reconciliation_commits_final_before_one_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+    confirmed_text_finish: Any,
+    snapshot_failure: bool,
+) -> None:
+    """A delayed final frame races idle reconciliation without losing or repeating it."""
+    monkeypatch.setattr(reader, "_text_step_finishes_idle_cascade", confirmed_text_finish)
+    monkeypatch.setattr(reader, "get_available_models", lambda port: {})
+    user = _load("user_input")
+    progress = _load("stream_planner_text_done")
+    progress["plannerResponse"]["modifiedResponse"] = "Checking.\n[quiet]"
+    final = copy.deepcopy(progress)
+    final["metadata"]["sourceTrajectoryStepInfo"]["stepIndex"] = 99
+    final["plannerResponse"]["modifiedResponse"] = "READY"
+    idle, fail_snapshot = False, snapshot_failure
+    ready, finish, done = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    sink = _PostSink()
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+    monkeypatch.setattr(
+        reader,
+        "get_all_cascade_trajectories",
+        lambda port: {
+            "trajectorySummaries": {
+                _CASCADE_ID: {
+                    "status": "CASCADE_RUN_STATUS_IDLE" if idle else "CASCADE_RUN_STATUS_RUNNING"
+                }
+            }
+        },
+    )
+
+    def snapshot(*args: Any) -> list[dict[str, Any]]:
+        nonlocal fail_snapshot
+        if fail_snapshot:
+            fail_snapshot = False
+            raise httpx.ReadTimeout("snapshot unavailable")
+        return [user, progress, final]
+
+    monkeypatch.setattr(reader, "get_trajectory_steps", snapshot)
+
+    async def stream(**kwargs: Any) -> None:
+        async def commit(step: dict[str, Any]) -> None:
+            await reader._process_committed_step(
+                step,
+                **{
+                    key: kwargs[key]
+                    for key in (
+                        "client",
+                        "session_id",
+                        "cascade_id",
+                        "state",
+                        "on_pending_interaction",
+                    )
+                },
+            )
+
+        await commit(user)
+        await commit(progress)
+        assert sink.statuses() == ["running"]
+        ready.set()
+        await finish.wait()
+        await commit(final)
+        await done.wait()
+
+    async def watch(**kwargs: Any) -> None:
+        nonlocal idle
+        await ready.wait()
+        idle = True
+        finish.set()
+        await asyncio.gather(kwargs["on_quiescent"](), kwargs["on_quiescent"]())
+        done.set()
+
+    async def no_interaction(*args: Any) -> None:
+        pass
+
+    monkeypatch.setattr(reader, "_stream_loop", stream)
+    monkeypatch.setattr(reader, "_watch_for_rotation", watch)
+    async with httpx.AsyncClient(base_url="http://reader.test") as client:
+        await asyncio.wait_for(
+            reader.supervise_reader(
+                _bridge_dir(tmp_path),
+                _SESSION_ID,
+                client=client,
+                on_pending_interaction=no_interaction,
+            ),
+            timeout=5,
+        )
+    assert sink.statuses() == ["running", "idle"]
+    assert sink.message_roles() == ["user", "assistant", "assistant"]
+    delivery = [
+        kind
+        for kind, data in sink.posts
+        if kind in {"external_conversation_item", "external_session_status"}
+    ]
+    assert delivery[-1] == "external_session_status"
 
 
 # ---------------------------------------------------------------------------
