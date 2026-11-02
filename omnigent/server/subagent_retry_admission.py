@@ -49,6 +49,35 @@ class _RetryDispatch:
 _dispatch: ContextVar[_RetryDispatch | None] = ContextVar("subagent_retry_dispatch", default=None)
 
 
+@dataclass
+class _FinalDispatch:
+    admission: SubagentRetryAdmission
+    owner: InboxOwnerFence
+    receipt: RetryInput
+    forwarded: bool = False
+
+
+_final_dispatch: ContextVar[_FinalDispatch | None] = ContextVar(
+    "subagent_final_dispatch", default=None
+)
+
+
+@contextmanager
+def final_dispatch_scope(
+    admission: SubagentRetryAdmission, owner: InboxOwnerFence, receipt: RetryInput
+) -> Iterator[None]:
+    token = _final_dispatch.set(_FinalDispatch(admission, owner, receipt))
+    try:
+        yield
+    finally:
+        _final_dispatch.reset(token)
+
+
+def active_final_dispatch() -> RetryInput | None:
+    current = _final_dispatch.get()
+    return current.receipt if current else None
+
+
 class RetryDispatchRefused(RuntimeError):
     def __init__(self, reason: str) -> None:
         self.reason = reason
@@ -164,6 +193,29 @@ def native_retry_marker(
 
 async def claim_retry_forward(session_id: str, event: dict[str, Any], *, deadline: float) -> None:
     """Run after normal policy/routing, immediately before the sole forward."""
+    final = _final_dispatch.get()
+    if final is not None:
+        if final.receipt.chain_id is None:
+            raise RetryDispatchRefused("final_delivery_changed")
+        receipt = await asyncio.to_thread(
+            final.admission.journal.get_input, final.receipt.input_id
+        )
+        chain = await asyncio.to_thread(final.admission.journal.get_chain, final.receipt.chain_id)
+        if (
+            receipt is None
+            or chain is None
+            or receipt.target_id != session_id
+            or receipt.state != "dispatching"
+            or final.forwarded
+            or not await asyncio.to_thread(final.admission._owns, chain, final.owner)
+        ):
+            raise RetryDispatchRefused("final_delivery_changed")
+        final.forwarded = True
+        event["input_admission_required"] = True
+        event["input_id"] = receipt.input_id
+        event["input_admission_deadline"] = deadline
+        event["_final_wake"] = True
+        return
     current = _dispatch.get()
     if current is None:
         return
@@ -247,6 +299,18 @@ class RetryTerminalRequest(BaseModel):
 class RetryFinalizeRequest(RetryInputControl):
     outcome: RetryOutcome
     wake_payload: dict[str, Any]
+
+
+class RetryChainPage(RetryInputControl):
+    after: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+
+
+class RetryResultReceipt(RetryInputControl):
+    result_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+
+
+class RetryReplacement(RetryInputControl):
+    input_id: str = Field(min_length=1, max_length=256)
 
 
 class SubagentRetryAdmission:

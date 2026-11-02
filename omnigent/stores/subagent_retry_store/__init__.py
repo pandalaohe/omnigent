@@ -54,6 +54,10 @@ class SubagentRetryStore(Protocol):
 
     def get_chain(self, chain_id: str) -> RetryChain | None: ...
 
+    def list_chains(
+        self, *, owner: InboxOwnerFence, after: str | None = None, limit: int = 100
+    ) -> list[RetryChain]: ...
+
     def take_over(
         self,
         chain_id: str,
@@ -184,4 +188,8 @@ class SubagentRetryStore(Protocol):
         owner: InboxOwnerFence,
         successor: InboxOwnerFence,
         expected_version: int,
+    ) -> RetryChain | None: ...
+
+    def adopt_parent(
+        self, chain_id: str, *, successor: InboxOwnerFence, expected_version: int
     ) -> RetryChain | None: ...

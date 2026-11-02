@@ -17,13 +17,15 @@ def journal(db_uri, conversation_store):
     return _journal(db_uri, conversation_store)
 
 
-def _journal(db_uri, conversation_store):
+def _journal(db_uri, conversation_store, *, agent_id=None):
     from omnigent.stores.subagent_retry_store.sqlalchemy_store import (
         SqlAlchemySubagentRetryStore,
     )
 
-    parent = conversation_store.create_conversation()
-    child = conversation_store.create_conversation(parent_conversation_id=parent.id)
+    parent = conversation_store.create_conversation(agent_id=agent_id)
+    child = conversation_store.create_conversation(
+        parent_conversation_id=parent.id, agent_id=agent_id
+    )
     assert conversation_store.set_runner_id(parent.id, "runner-original")
     store = SqlAlchemySubagentRetryStore(db_uri)
     owner = store.claim_owner(parent.id, "runner-original", expected_epoch=0)

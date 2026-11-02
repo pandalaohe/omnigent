@@ -5572,10 +5572,7 @@ async def test_sys_session_send_completion_drains_from_parent_inbox(
             subagent_work._session_inboxes_ref.pop("conv_parent_inbox", None)
 
     assert "sub-agent task conv_child_inbox completed" in inbox_output
-    assert (
-        "worker:phase-a (terminal_identity_unavailable: turn_id, input_id) returned: CHILD_MARKER"
-        in inbox_output
-    )
+    assert "worker:phase-a returned: CHILD_MARKER" in inbox_output
     # The dispatch id rides along with child creation, and the drain writes
     # it back as the delivered-id receipt a runner restart checks.
     dispatch_id = create_bodies[0]["labels"][subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY]
@@ -5705,15 +5702,9 @@ async def test_subagent_inbox_cleanup_does_not_unregister_next_turn(
             subagent_work.unregister_subagent_work(child_id)
             subagent_work._session_inboxes_ref.pop(parent_id, None)
 
-    assert (
-        "worker:repeat (terminal_identity_unavailable: turn_id, input_id) returned: FIRST_RESULT"
-        in first_drain
-    )
+    assert "worker:repeat returned: FIRST_RESULT" in first_drain
     assert "SECOND_RESULT" not in first_drain
-    assert (
-        "worker:repeat (terminal_identity_unavailable: turn_id, input_id) returned: SECOND_RESULT"
-        in second_drain
-    )
+    assert "worker:repeat returned: SECOND_RESULT" in second_drain
 
 
 def _sse_text_turn(text: str) -> list[str]:
@@ -6242,10 +6233,7 @@ async def test_sys_read_inbox_requeues_subagent_output_on_transient_policy_failu
         subagent_work._session_inboxes_ref.pop(parent_id, None)
 
     assert policy_attempts == 2
-    assert (
-        "worker:retry-policy (terminal_identity_unavailable: turn_id, input_id) "
-        "returned: SECRET_RETRY_MARKER" in second_drain
-    )
+    assert "worker:retry-policy returned: SECRET_RETRY_MARKER" in second_drain
     assert work_after_second_drain is None
 
 
@@ -6371,8 +6359,7 @@ async def test_sys_cancel_task_stops_subagent_and_dedupes_late_completion(
         "status": "cancelled",
     }
     assert inbox_output == (
-        "[System: sub-agent task conv_child_cancel cancelled — runner:phase-c "
-        "(terminal_identity_unavailable: turn_id, input_id)]"
+        "[System: sub-agent task conv_child_cancel cancelled — runner:phase-c]"
     ), "Cancelled sub-agent work must produce exactly one cancelled inbox item."
 
 
@@ -10987,6 +10974,26 @@ def test_format_async_task_item_nonempty_subagent_completion_shows_output() -> N
     )
     assert "returned: review done: LGTM" in line
     assert "produced no output" not in line
+
+
+@pytest.mark.parametrize("status", ["completed", "failed", "cancelled", "stopped", "killed"])
+def test_format_async_task_item_keeps_identity_diagnostic_out_of_parent_text(status: str) -> None:
+    from omnigent.runner.tool_dispatch import _format_async_task_item
+
+    payload = {
+        "type": "sub_agent",
+        "handle_id": "native-child",
+        "agent": "worker",
+        "title": "native",
+        "status": status,
+        "output": "native result",
+        "identity_diagnostic": "terminal_identity_unavailable: turn_id, input_id",
+    }
+    line = _format_async_task_item(payload)
+
+    assert "worker:native" in line and "native result" in line
+    assert "terminal_identity_unavailable" not in line
+    assert payload["identity_diagnostic"] == "terminal_identity_unavailable: turn_id, input_id"
 
 
 def test_format_async_task_item_truncated_subagent_output_names_retrieval_path() -> None:

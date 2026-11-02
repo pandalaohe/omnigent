@@ -9,23 +9,29 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from omnigent.entities.subagent_retry import retry_identity
+from omnigent.entities.subagent_retry import InputExecutionClaim, retry_identity
 from omnigent.runner import subagent_work
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.subagent_retry import SubagentRetryRuntime, retry_attempt_limit
 from omnigent.server.subagent_retry_admission import SubagentRetryAdmission
+from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from tests.server.routes.test_session_event_batches import _make_client
 from tests.stores.test_subagent_retry_store import _journal
 
 
 @asynccontextmanager
-async def runtime_case(db_uri, *, limit=3, mode="accepted", early=False):
-    journal = _journal(db_uri, SqlAlchemyConversationStore(db_uri))
+async def runtime_case(
+    db_uri, *, limit=3, mode="accepted", early=False, spool=None, wake_mode="accepted"
+):
+    agents = SqlAlchemyAgentStore(db_uri)
+    agent_id = uuid4().hex
+    agents.create(agent_id, "retry-runtime-" + agent_id, "fixtures/retry-agent")
+    journal = _journal(db_uri, SqlAlchemyConversationStore(db_uri), agent_id=agent_id)
     token = "test-parent-retry-runtime"
     journal.conversations.clear_runner_id(journal.parent)
     assert journal.conversations.set_runner_id(journal.parent, token_bound_runner_id(token))
-    now, sent = [100.0], []
+    now, sent, wakes = [100.0], [], []
 
     def clock():
         return now[0]
@@ -33,7 +39,7 @@ async def runtime_case(db_uri, *, limit=3, mode="accepted", early=False):
     service = SubagentRetryAdmission(
         journal.store, journal.conversations, host_store=None, host_registry=None, clock=clock
     )
-    server = _make_client(journal.conversations)
+    server = _make_client(journal.conversations, agent_store=agents)
     server.app.state.subagent_retry_admission = service
     app = FastAPI()
     app.mount("/v1", server.app)
@@ -41,6 +47,31 @@ async def runtime_case(db_uri, *, limit=3, mode="accepted", early=False):
     pending = asyncio.Event()
 
     async def dispatch(request):
+        if request.url.path.endswith("/policies/evaluate"):
+            return httpx.Response(200, json={"result": "POLICY_ACTION_ALLOW"})
+        if request.url.path.endswith("/wake"):
+            chain_id = request.url.path.split("/")[-2]
+            chain = journal.store.get_chain(chain_id)
+            final = journal.store.get_final(chain_id)
+            receipt = journal.store.get_input(final.notice_id)
+            if receipt.state == "accepted" or final.drain_receipt:
+                return httpx.Response(200, json={"state": receipt.state})
+            if wake_mode == "denied":
+                return httpx.Response(
+                    200, json={"state": "pending", "reason": {"code": "admission_denied"}}
+                )
+            if receipt.state == "prepared":
+                assert journal.store.claim_input(receipt.input_id, owner=chain.owner).claimed
+            result = journal.store.admit_execution(
+                chain.parent_id,
+                InputExecutionClaim(input_id=receipt.input_id, kind="wake", turn_id="wake-turn"),
+                runner_id=chain.owner.runner_id,
+            )
+            assert result.accepted
+            wakes.append(receipt.input_id)
+            if wake_mode == "lost_ack":
+                raise httpx.ReadError("wake response lost", request=request)
+            return httpx.Response(200, json={"state": "accepted"})
         if request.url.path.endswith("/dispatch"):
             input_id = request.url.path.split("/")[-2]
             receipt = journal.store.get_input(input_id)
@@ -100,7 +131,7 @@ async def runtime_case(db_uri, *, limit=3, mode="accepted", early=False):
         base_url="http://server",
         headers={**dict(server.headers), RUNNER_TUNNEL_TOKEN_HEADER: token},
     ) as client:
-        runtime = SubagentRetryRuntime(client, clock=clock, limit=limit)
+        runtime = SubagentRetryRuntime(client, clock=clock, limit=limit, spool=spool)
         inbox = asyncio.Queue()
         subagent_work._session_inboxes_ref[journal.parent] = inbox
         entry = subagent_work.register_subagent_work(
@@ -121,6 +152,7 @@ async def runtime_case(db_uri, *, limit=3, mode="accepted", early=False):
                 client=client,
                 service=service,
                 pending=pending,
+                wakes=wakes,
             )
         finally:
             await runtime.close()
@@ -183,7 +215,7 @@ async def test_exact_attempts_duplicate_deadlines_and_final_tombstone(db_uri, li
             await rt.accept_terminal(replay, "late same error")
         assert state.timer is None and len(case.sent) == limit
         assert j.store.get_final(ack.chain_id) == final
-        assert case.inbox.empty() and not case.entry.delivered
+        assert case.inbox.qsize() == 1 and case.entry.delivered and len(case.wakes) == 1
 
 
 @pytest.mark.asyncio
@@ -211,7 +243,7 @@ async def test_refusal_finalizes_without_an_invented_attempt(db_uri, reason):
         final = case.journal.store.get_final(ack.chain_id)
         assert final.attempts == 0 and final.outcome.reason == reason
         assert "original failure" in final.outcome.output
-        assert not case.entry.delivered and case.inbox.empty()
+        assert case.entry.delivered and case.inbox.qsize() == 1 and len(case.wakes) == 1
 
 
 @pytest.mark.asyncio
@@ -486,4 +518,4 @@ async def test_old_chain_replay_preserves_a_newly_registered_dispatch(db_uri, fi
             replacement.delivered,
             replacement.work_id,
         ) == before
-        assert replacement.status == "launching" and case.inbox.empty()
+        assert replacement.status == "launching" and case.inbox.qsize() == int(finalized)

@@ -116,6 +116,7 @@ class InputExecutionClaim(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     input_id: str = Field(min_length=1, max_length=256)
+    kind: Literal["ordinary", "wake"] = "ordinary"
     turn_id: str | None = Field(default=None, min_length=1, max_length=256)
     retry: RetryExecutionGuard | None = None
     native_generation: int | None = Field(default=None, strict=True, ge=1)

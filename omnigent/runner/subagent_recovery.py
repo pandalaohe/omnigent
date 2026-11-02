@@ -212,6 +212,8 @@ def build_subagent_recovery(
         :returns: None.
         """
         for entry in list_subagent_work(parent_id):
+            if entry.retry_chain_id is not None:
+                continue
             if entry.status not in _SUBAGENT_TERMINAL_STATUSES or entry.delivered:
                 continue
             if _deliver_subagent_completion(entry).delivered_now:
@@ -236,6 +238,11 @@ def build_subagent_recovery(
         :returns: None.
         """
         _session_inboxes.setdefault(parent_id, asyncio.Queue())
+        retry_runtime = getattr(app.state, "subagent_retry_runtime", None)
+        if retry_runtime is not None:
+            retry_runtime.on_delivered = getattr(app.state, "retry_final_delivered", None)
+            if not await retry_runtime.recover_parent(parent_id):
+                return
         _deliver_retained_subagent_results(parent_id)
         if parent_id in _subagent_recovery_done:
             return
@@ -311,8 +318,15 @@ def build_subagent_recovery(
             for entry in list(_subagent_work_by_child.values())
             if entry.status == "waiting"
         }
+        retry_runtime = getattr(app.state, "subagent_retry_runtime", None)
+        retry_parents = (
+            await retry_runtime.pending_parents() if retry_runtime is not None else set()
+        )
+        parents.update(retry_parents)
         for parent_id in parents:
-            if not any(entry.status == "waiting" for entry in list_subagent_work(parent_id)):
+            if parent_id not in retry_parents and not any(
+                entry.status == "waiting" for entry in list_subagent_work(parent_id)
+            ):
                 continue
             _subagent_recovery_done.discard(parent_id)
             await _recover_undrained_subagent_results(parent_id)

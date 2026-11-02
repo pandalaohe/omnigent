@@ -135,6 +135,9 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
         self._conversation_session = make_named_managed_session_maker(
             conv_engine, query_name_prefix="omnigent.subagent_retry_store", immediate=True
         )
+        self._conversation_read = make_named_managed_session_maker(
+            conv_engine, query_name_prefix="omnigent.subagent_retry_store"
+        )
 
     def _execution_write(
         self,
@@ -316,6 +319,51 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
                 return InputExecutionReceipt(reason="invalid_native_admission")
             receipt = _current(db, SqlRetryInput, (current_workspace_id(), claim.input_id))
             if receipt is not None:
+                if receipt.kind == "wake" and receipt.chain_id is not None:
+                    if claim.kind != "wake":
+                        return InputExecutionReceipt(reason="input_identity_conflict")
+                    chain = _current(db, SqlRetryChain, (current_workspace_id(), receipt.chain_id))
+                    if chain is None or receipt.target_id != child_id or claim.turn_id is None:
+                        return InputExecutionReceipt(reason="input_identity_conflict")
+                    owner = InboxOwnerFence(
+                        parent_id=chain.parent_id,
+                        runner_id=chain.owner_runner_id,
+                        epoch=chain.inbox_epoch,
+                    )
+                    bindings = self._bindings(db, {chain.parent_id})
+                    if not self._owner(db, owner, bindings) or owner.runner_id != runner_id:
+                        return InputExecutionReceipt(reason="stale_owner")
+                    if receipt.state == "accepted":
+                        original_turn = (receipt.reason or {}).get(
+                            "execution_turn_id", receipt.turn_id
+                        )
+                        if original_turn != claim.turn_id:
+                            return InputExecutionReceipt(
+                                reason="input_already_consumed", receipt=_input(receipt)
+                            )
+                    else:
+                        refused_turns = (receipt.reason or {}).get("refused_turns", {})
+                        if claim.turn_id in refused_turns:
+                            return InputExecutionReceipt(
+                                reason="wake_attempt_abandoned", receipt=_input(receipt)
+                            )
+                        if receipt.state != "dispatching" or (
+                            claim.admission_deadline is not None
+                            and time.time() >= claim.admission_deadline
+                        ):
+                            return InputExecutionReceipt(
+                                reason="input_closed", receipt=_input(receipt)
+                            )
+                        receipt.expected_input_generation = self._child_control(
+                            db, child_id
+                        ).generation
+                        if not self._accept(db, receipt, chain, claim.turn_id):
+                            return InputExecutionReceipt(
+                                reason="input_closed", receipt=_input(receipt)
+                            )
+                    return InputExecutionReceipt(
+                        state="accepted", reason="accepted", receipt=_input(receipt)
+                    )
                 original_turn = (receipt.reason or {}).get("execution_turn_id", receipt.turn_id)
                 if (
                     receipt.target_id != child_id
@@ -329,6 +377,8 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
                     state="accepted", reason="accepted", receipt=_input(receipt)
                 )
             control = self._child_control(db, child_id)
+            if claim.kind == "wake":
+                return InputExecutionReceipt(reason="unknown_wake_input")
             if claim.admission_deadline is not None and time.time() >= claim.admission_deadline:
                 return InputExecutionReceipt(reason="input_expired")
             previous = (
@@ -410,6 +460,8 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
             if receipt is not None:
                 if receipt.target_id != child_id:
                     return InputExecutionReceipt(reason="input_identity_conflict")
+                if receipt.kind == "wake" and claim.kind != "wake":
+                    return InputExecutionReceipt(reason="input_identity_conflict")
                 if receipt.state in {"closed", "rejected"}:
                     return InputExecutionReceipt(
                         reason=(receipt.reason or {}).get("code", "input_closed"),
@@ -427,6 +479,23 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
                 if not close:
                     return InputExecutionReceipt(
                         state="pending", reason="acceptance_unknown", receipt=_input(receipt)
+                    )
+                if receipt.kind == "wake":
+                    now = time.time()
+                    refused_turns = {
+                        turn: deadline
+                        for turn, deadline in (receipt.reason or {})
+                        .get("refused_turns", {})
+                        .items()
+                        if deadline is None or deadline > now
+                    }
+                    if claim.turn_id is None:
+                        return InputExecutionReceipt(reason="input_identity_conflict")
+                    refused_turns[claim.turn_id] = claim.admission_deadline
+                    receipt.reason = {**(receipt.reason or {}), "refused_turns": refused_turns}
+                    receipt.version += 1
+                    return InputExecutionReceipt(
+                        reason="wake_attempt_abandoned", receipt=_input(receipt)
                     )
                 receipt.state, receipt.reason = "closed", {"code": "acceptance_unknown"}
                 receipt.version += 1
@@ -987,6 +1056,48 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
             row = db.get(SqlRetryChain, (current_workspace_id(), chain_id))
             return _chain(row) if row else None
 
+    def list_chains(
+        self, *, owner: InboxOwnerFence, after: str | None = None, limit: int = 100
+    ) -> list[RetryChain]:
+        if not 1 <= limit <= 1000:
+            raise ValueError("Chain page limit must be 1 to 1000")
+        from omnigent.stores.conversation_store import SUCCEEDED_BY_LABEL_KEY
+
+        parents = {owner.parent_id}
+        frontier = parents.copy()
+        with self._conversation_read("read_retry_predecessors") as ap:
+            while frontier:
+                prior = (
+                    set(
+                        ap.scalars(
+                            select(SqlConversationLabel.conversation_id).where(
+                                SqlConversationLabel.workspace_id == current_workspace_id(),
+                                SqlConversationLabel.key == SUCCEEDED_BY_LABEL_KEY,
+                                SqlConversationLabel.value.in_(frontier),
+                            )
+                        ).all()
+                    )
+                    - parents
+                )
+                parents.update(prior)
+                if len(parents) > 256:
+                    raise ValueError("Retry succession lineage exceeds 256 sessions")
+                frontier = prior
+        with self._read("read_parent_retry_chains") as db:
+            binding = db.get(SqlConversationMetadata, (current_workspace_id(), owner.parent_id))
+            if not self._owner(db, owner, {owner.parent_id: binding} if binding else {}):
+                return []
+            query = select(SqlRetryChain).where(
+                SqlRetryChain.workspace_id == current_workspace_id(),
+                SqlRetryChain.parent_id.in_(parents),
+            )
+            if after is not None:
+                query = query.where(SqlRetryChain.chain_id > after)
+            return [
+                _chain(row)
+                for row in db.scalars(query.order_by(SqlRetryChain.chain_id).limit(limit)).all()
+            ]
+
     def get_input(self, input_id: str) -> RetryInput | None:
         with self._read("read_input_receipt") as db:
             row = db.get(SqlRetryInput, (current_workspace_id(), input_id))
@@ -1227,7 +1338,12 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
             target = _current(
                 db, SqlConversationMetadata, (current_workspace_id(), receipt.target_id)
             )
-            if final is None or final.inbox_parent_id is None or target is None:
+            if (
+                final is None
+                or final.inbox_parent_id is None
+                or final.drain_receipt is not None
+                or target is None
+            ):
                 return False
             control = self._child_control(db, receipt.target_id)
             if receipt.expected_input_generation != control.generation:
@@ -1309,22 +1425,43 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
         _identifier(terminal.input_id)
 
         def write(db: Session) -> RetryMutation | None:
-            chain = self._locked_chain(db, chain_id, owner)
+            chain = self._locked_chain(db, chain_id, owner, take_over=terminal.recovered)
             if chain is None or terminal.child_id != chain.child_id:
                 return None
+
+            def recover_owner() -> None:
+                assert chain is not None
+                if not terminal.recovered:
+                    return
+                changed = (chain.owner_runner_id, chain.inbox_epoch) != (
+                    owner.runner_id,
+                    owner.epoch,
+                )
+                chain.owner_runner_id, chain.inbox_epoch = owner.runner_id, owner.epoch
+                if chain.phase not in {"finalized", "superseded"} and not chain.retry_closed:
+                    chain.retry_closed, chain.phase, chain.due_at = True, "resolving", None
+                    changed = True
+                if changed:
+                    chain.version += 1
+
             seen = _current(
                 db,
                 SqlRetryTerminal,
                 (current_workspace_id(), terminal.child_id, terminal.turn_id, terminal.status),
             )
+            receipt = _current(db, SqlRetryInput, (current_workspace_id(), terminal.input_id))
             if seen is not None:
                 if seen.chain_id != chain_id:
                     return None
+                if terminal.recovered:
+                    if not self._terminal_source(db, chain, receipt, terminal):
+                        return None
+                    recover_owner()
                 return RetryMutation(chain=_chain(chain), duplicate=True)
-            receipt = _current(db, SqlRetryInput, (current_workspace_id(), terminal.input_id))
             if chain.phase in {"finalized", "superseded"}:
                 if not self._terminal_source(db, chain, receipt, terminal):
                     return None
+                recover_owner()
                 db.add(
                     SqlRetryTerminal(
                         child_id=terminal.child_id,
@@ -1359,6 +1496,7 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
                 terminal.input_generation,
             ):
                 return None
+            recover_owner()
             db.add(
                 SqlRetryTerminal(
                     child_id=terminal.child_id,
@@ -1579,11 +1717,88 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
             if final is not None:
                 final.parent_id = successor.parent_id
                 wake = _current(db, SqlRetryInput, (current_workspace_id(), final.notice_id))
-                if wake is not None and wake.state == "prepared":
+                if wake is not None and wake.state in {"prepared", "dispatching", "reserved"}:
                     wake.target_id = successor.parent_id
+                    wake.state, wake.turn_id = "prepared", None
+                    wake.version += 1
                     wake.expected_input_generation = self._child_control(
                         db, successor.parent_id
                     ).generation
             return _chain(chain)
 
         return run_write_transaction(self._session, "transfer_final_delivery_destination", write)
+
+    def adopt_parent(
+        self, chain_id: str, *, successor: InboxOwnerFence, expected_version: int
+    ) -> RetryChain | None:
+        """A recorded succession can recover delivery after the old runner unbinds."""
+        from omnigent.stores.conversation_store import SUCCEEDED_BY_LABEL_KEY
+
+        original = self.get_chain(chain_id)
+        if original is None:
+            return None
+
+        def write(db: Session) -> RetryChain | None:
+            bindings = self._bindings(
+                db, {original.parent_id, successor.parent_id, original.child_id}
+            )
+            if not self._owner(db, successor, bindings):
+                return None
+            chain = _current(db, SqlRetryChain, (current_workspace_id(), chain_id))
+            if (
+                chain is None
+                or chain.version != expected_version
+                or chain.parent_id != original.parent_id
+            ):
+                return None
+            if chain.parent_id == successor.parent_id:
+                return _chain(chain)
+            chain.parent_id = successor.parent_id
+            chain.owner_runner_id, chain.inbox_epoch = successor.runner_id, successor.epoch
+            chain.retry_closed, chain.due_at = True, None
+            if chain.phase not in {"finalized", "superseded"}:
+                chain.phase = "resolving"
+            chain.version += 1
+            final = _current(db, SqlRetryFinal, (current_workspace_id(), chain_id))
+            if final is not None:
+                final.parent_id = successor.parent_id
+                wake = _current(db, SqlRetryInput, (current_workspace_id(), final.notice_id))
+                if wake is not None and wake.state in {"prepared", "dispatching", "reserved"}:
+                    wake.target_id = successor.parent_id
+                    wake.state, wake.turn_id = "prepared", None
+                    wake.version += 1
+                    wake.expected_input_generation = self._child_control(
+                        db, successor.parent_id
+                    ).generation
+            return _chain(chain)
+
+        def lock_succession(ap: Session) -> RetryChain | None:
+            for session_id in sorted({original.parent_id, successor.parent_id, original.child_id}):
+                if _current(ap, SqlConversation, (current_workspace_id(), session_id)) is None:
+                    return None
+            child = _current(ap, SqlConversation, (current_workspace_id(), original.child_id))
+            current = original.parent_id
+            seen: set[str] = set()
+            while current != successor.parent_id:
+                if current in seen or len(seen) >= 256:
+                    return None
+                seen.add(current)
+                label = _current(
+                    ap,
+                    SqlConversationLabel,
+                    (current_workspace_id(), current, SUCCEEDED_BY_LABEL_KEY),
+                )
+                if label is None:
+                    return None
+                current = label.value
+            if child is None or child.parent_conversation_id != successor.parent_id:
+                return None
+            if self._conversation_session.engine is self._session.engine:
+                return write(ap)
+            return run_write_transaction(
+                self._session, "adopt_retry_final_after_succession", write
+            )
+
+        return run_write_transaction(
+            self._conversation_session, "lock_retry_succession", lock_succession
+        )

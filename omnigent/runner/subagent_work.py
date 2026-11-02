@@ -23,6 +23,7 @@ from fastapi.responses import JSONResponse
 
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
 from omnigent.debug_logging import runner_primary_session_id
+from omnigent.entities.subagent_retry import InboxOwnerFence, RetryFinal
 from omnigent.entities.subagent_terminal import (
     RESULT_IDENTITY_LABEL_PREFIX,
     TERMINAL_IDENTITY_LABEL_PREFIX,
@@ -210,6 +211,9 @@ class _SubagentWorkEntry:
     launch_timed_out: bool = False
     recovered: bool = False
     terminal: TerminalEnvelope | None = None
+    retry_chain_id: str | None = None
+    retry_owner: InboxOwnerFence | None = None
+    retry_final: RetryFinal | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -971,7 +975,7 @@ async def _list_child_sessions(
 
 
 async def _fetch_latest_assistant_item(
-    server_client: httpx.AsyncClient, session_id: str
+    server_client: httpx.AsyncClient, session_id: str, *, response_id: str | None = None
 ) -> tuple[str | None, str] | None:
     """
     Return the latest turn's newest assistant message as ``(id, text)``.
@@ -992,6 +996,8 @@ async def _fetch_latest_assistant_item(
     while True:
         page = await _get_recovery_page(server_client, f"/v1/sessions/{session_id}/items", params)
         for item in page.get("data", []):
+            if response_id is not None and item.get("response_id") != response_id:
+                continue
             item_type = item.get("type")
             if item_type == "message" and item.get("is_meta") is True:
                 continue
@@ -1004,10 +1010,10 @@ async def _fetch_latest_assistant_item(
                         for block in item.get("content", [])
                         if block.get("type") in {"output_text", "text"} and block.get("text")
                     )
-                if item.get("role") == "user":
+                if item.get("role") == "user" and response_id is None:
                     return None
                 continue
-            if item_type in {"function_call", "function_call_output"}:
+            if item_type in {"function_call", "function_call_output"} and response_id is None:
                 return None
         if not page.get("has_more") or not page.get("last_id"):
             return None
@@ -1104,9 +1110,10 @@ async def _recover_subagent_results_from_server(
         if status not in _SUBAGENT_TERMINAL_STATUSES and not interrupted:
             continue
         existing = get_subagent_work(child_id)
-        if (existing is not None and existing.status != "waiting") or (
-            child_id in _drained_delivered_subagent_results
-        ):
+        if (
+            existing is not None
+            and (existing.status != "waiting" or existing.retry_chain_id is not None)
+        ) or (child_id in _drained_delivered_subagent_results):
             continue
         labels = child.get("labels")
         label_map = labels if isinstance(labels, dict) else {}
@@ -1414,7 +1421,7 @@ def _deliver_subagent_completion(
             delivered_now=False,
             reason=_SUBAGENT_DELIVERY_ALREADY_DELIVERED,
         )
-    if _is_quiet_output(entry.output):
+    if entry.retry_final is None and _is_quiet_output(entry.output):
         entry.delivered = True
         entry.delivered_result_key = result_key
         _remember_terminal_identity(entry)
@@ -1448,6 +1455,18 @@ def _deliver_subagent_completion(
         payload["terminal"] = entry.terminal.model_dump(mode="json")
         if entry.terminal.identity_diagnostic is not None:
             payload["identity_diagnostic"] = entry.terminal.identity_diagnostic
+    if entry.retry_final is not None and entry.retry_owner is not None:
+        payload["auto_retry"] = {
+            "chain_id": entry.retry_final.chain_id,
+            "attempts": entry.retry_final.attempts,
+            "of": entry.retry_final.limit,
+            "reason": entry.retry_final.outcome.reason,
+        }
+        payload["retry_final"] = {
+            "chain_id": entry.retry_final.chain_id,
+            "result_id": entry.retry_final.result_id,
+            "owner": entry.retry_owner.model_dump(mode="json"),
+        }
     held = _held_successions.get(entry.parent_session_id)
     if held is not None:
         # A successor still waiting for its opening message must not be woken

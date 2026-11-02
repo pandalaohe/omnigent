@@ -456,6 +456,7 @@ from omnigent.server.subagent_activity import (
     record_subagent_activity,
 )
 from omnigent.server.subagent_retry_admission import (
+    active_final_dispatch,
     active_retry_dispatch,
     claim_retry_forward,
     native_retry_marker,
@@ -8339,7 +8340,7 @@ async def _persist_native_terminal_failure(
     :param failure_context: Normalized cause metadata from the runner's ensure response.
     :returns: Store-assigned id of the consumed user message item.
     """
-    if active_retry_dispatch() is not None:
+    if active_retry_dispatch() is not None or active_final_dispatch() is not None:
         from omnigent.server.subagent_retry_admission import RetryDispatchRefused
 
         raise RetryDispatchRefused("launch_refused")
@@ -8809,7 +8810,7 @@ async def _persist_session_event(
     """
     import uuid
 
-    if active_retry_dispatch() is not None:
+    if active_retry_dispatch() is not None or active_final_dispatch() is not None:
         from omnigent.server.subagent_retry_admission import RetryDispatchRefused
 
         raise RetryDispatchRefused("not_forwarded")
@@ -9302,6 +9303,7 @@ async def _forward_event_to_runner(
     item = item.model_copy(update={"replaces_pending_id": startup_input_id})
     sdk_peer = body.data.get("peer_delivery") is not None
     retry_guard = active_retry_dispatch()
+    final_input = active_final_dispatch()
     annotation_lookup = getattr(conversation_store, "annotation_receipt_for_item", None)
     annotation_pending = bool(
         startup_input_id is not None
@@ -9337,14 +9339,18 @@ async def _forward_event_to_runner(
         ):
             raise HTTPException(409, "Startup input owner changed")
         persisted_items = [canonical]
-    elif sdk_peer or retry_guard is not None:
+    elif sdk_peer or retry_guard is not None or final_input is not None:
         # The peer store owns undelivered input. Only an SDK accepted receipt
         # may put it in conversation history, where recovery could replay it.
         persisted_items = [
             ConversationItem(
                 id=retry_guard.input_id
                 if retry_guard
-                else body.data["peer_delivery"]["attempt_id"],
+                else (
+                    final_input.input_id
+                    if final_input
+                    else body.data["peer_delivery"]["attempt_id"]
+                ),
                 type=item.type,
                 response_id=turn_id,
                 data=item.data,

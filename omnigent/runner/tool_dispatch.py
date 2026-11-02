@@ -12154,12 +12154,15 @@ def _format_async_task_item(payload: _JsonObject) -> str:
         agent = payload.get("agent") or payload.get("tool_name", "sub_agent")
         title = payload.get("title", "")
         target = f"{agent}:{title}" if title else str(agent)
-        diagnostic = payload.get("identity_diagnostic")
-        if isinstance(diagnostic, str) and diagnostic:
-            target = f"{target} ({diagnostic})"
         placement_label = payload.get("placement_label")
         if isinstance(placement_label, str) and placement_label:
             target = f"{target} [{placement_label}]"
+        retry = payload.get("auto_retry")
+        if isinstance(retry, dict):
+            target += (
+                f" (automatic retries {retry.get('attempts')}/{retry.get('of')}: "
+                f"{retry.get('reason')})"
+            )
         if status == "completed":
             if not has_output:
                 return (
@@ -12409,7 +12412,7 @@ async def _evaluate_subagent_inbox_output(
 
 async def _cleanup_drained_subagent_work(
     payload: _JsonObject, *, server_client: httpx.AsyncClient | None
-) -> None:
+) -> bool:
     """
     Remove terminal sub-agent work after its inbox item is drained.
 
@@ -12426,23 +12429,42 @@ async def _cleanup_drained_subagent_work(
     :param payload: Drained inbox payload.
     :param server_client: HTTP client pointed at the Omnigent server, or
         ``None`` when the drain runs without server access.
-    :returns: None.
+    :returns: Whether cleanup completed; pending final receipts keep the payload queued.
     """
     if payload.get("type") != "sub_agent":
-        return
+        return True
     if payload.get("status") not in _SUBAGENT_INBOX_TERMINAL_STATUSES:
-        return
+        return True
     child_id = _subagent_child_id(payload)
     if child_id is None:
-        return
+        return True
     work_id = payload.get("work_id")
     if not isinstance(work_id, str) or not work_id:
-        return
+        return True
+    reference = payload.get("retry_final")
+    if isinstance(reference, dict):
+        if server_client is None:
+            return False
+        from omnigent.entities.subagent_retry import InboxOwnerFence
+
+        try:
+            owner = InboxOwnerFence.model_validate(reference.get("owner"))
+            response = await server_client.post(
+                f"/v1/sessions/{owner.parent_id}/retry-chains/{reference['chain_id']}/drain",
+                json={"owner": owner.model_dump(mode="json"), "result_id": reference["result_id"]},
+                timeout=5,
+            )
+            response.raise_for_status()
+            if response.json() is not True:
+                return False
+        except (httpx.HTTPError, ValueError, KeyError):
+            _logger.warning("Final sub-agent drain receipt pending; child=%s", child_id)
+            return False
     from omnigent.runner import subagent_work as _subagent_work
 
     entry = _subagent_work.get_subagent_work(child_id)
     if entry is not None and entry.work_id == work_id and entry.launch_timed_out:
-        return
+        return True
     _subagent_work.unregister_subagent_work(
         child_id,
         work_id=work_id,
@@ -12450,6 +12472,7 @@ async def _cleanup_drained_subagent_work(
     )
     if server_client is not None:
         await _record_subagent_receipt(server_client, child_id, work_id)
+    return True
 
 
 async def _drain_inbox(
@@ -12498,7 +12521,10 @@ async def _drain_inbox(
         if evaluation.retry_original:
             retry_payloads.append(payload)
         else:
-            await _cleanup_drained_subagent_work(evaluation.payload, server_client=server_client)
+            if not await _cleanup_drained_subagent_work(
+                evaluation.payload, server_client=server_client
+            ):
+                retry_payloads.append(payload)
     if inbox is not None:
         for payload in retry_payloads:
             inbox.put_nowait(payload)

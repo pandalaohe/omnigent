@@ -360,16 +360,21 @@ from omnigent.server.subagent_activity import (
 from omnigent.server.subagent_retry_admission import (
     ControlDeliveryRefused,
     ControlDispatch,
+    RetryChainPage,
     RetryDispatchRefused,
     RetryFinalizeRequest,
     RetryInputControl,
+    RetryReplacement,
+    RetryResultReceipt,
     RetryTerminalRequest,
     SubagentRetryAdmission,
+    active_final_dispatch,
     active_retry_dispatch,
     control_dispatch_scope,
     control_not_sent,
     control_transport_event,
     control_was_not_sent,
+    final_dispatch_scope,
     retry_dispatch_scope,
 )
 from omnigent.server.user_preferences_store import read_keep_warm_settings
@@ -1930,16 +1935,26 @@ def register_events_routes(
                 "input_id",
                 "input_generation",
                 "_input_admission_required",
+                "_final_wake",
                 "input_admission_deadline",
             ):
                 body.data.pop(key, None)
             retry_guard = active_retry_dispatch()
             if retry_guard is not None:
                 body.data["auto_retry"] = retry_guard.metadata.model_dump(mode="json")
-            if (
-                conv.parent_conversation_id
-                and getattr(request.app.state, "subagent_retry_admission", None) is not None
-            ):
+            service = getattr(request.app.state, "subagent_retry_admission", None)
+            stable_input = body.data.get("stable_id")
+            if service is not None and isinstance(stable_input, str):
+                receipt = await asyncio.to_thread(service.journal.get_input, stable_input)
+                final_input = active_final_dispatch()
+                trusted_input = (
+                    retry_guard is not None and retry_guard.input_id == stable_input
+                ) or (final_input is not None and final_input.input_id == stable_input)
+                if receipt is not None and receipt.kind in {"retry", "wake"} and not trusted_input:
+                    raise HTTPException(409, "Input identity is reserved for system delivery")
+            if (conv.parent_conversation_id or active_final_dispatch() is not None) and getattr(
+                request.app.state, "subagent_retry_admission", None
+            ) is not None:
                 body.data["_input_admission_required"] = True
         if body.type == "session_message":
             if not isinstance(request, Request):
@@ -5242,7 +5257,7 @@ def register_events_routes(
                     "Invalid question reply comments.", code=ErrorCode.INVALID_INPUT
                 )
         # A legacy receiver cannot enforce the final execution fence.
-        if active_retry_dispatch() is not None and (
+        if (active_retry_dispatch() is not None or active_final_dispatch() is not None) and (
             runner_router is None
             or not conv.runner_id
             or not runner_router.runner_has_capability(
@@ -5464,7 +5479,15 @@ def register_events_routes(
         )
         chain = await asyncio.to_thread(service.journal.get_chain, chain_id)
         if chain is not None:
-            if not await asyncio.to_thread(service._owns, chain, body.owner):
+            current_owner = await asyncio.to_thread(service.journal.get_owner, parent_id)
+            recovery_owner = (
+                body.terminal.recovered
+                and chain.parent_id == parent_id
+                and current_owner == body.owner
+            )
+            if not recovery_owner and not await asyncio.to_thread(
+                service._owns, chain, body.owner
+            ):
                 raise HTTPException(409, "Inbox owner changed")
             return await asyncio.to_thread(
                 service.journal.record_terminal,
@@ -5495,6 +5518,161 @@ def register_events_routes(
         ):
             raise HTTPException(409, "Inbox owner changed")
         return service, chain
+
+    @event_router.post("/sessions/{parent_id}/retry-chains", include_in_schema=False)
+    async def retry_list_chains(request: Request, parent_id: str, body: RetryChainPage):
+        service, parent = await _retry_parent(request, parent_id)
+        if body.owner.parent_id != parent.id or body.owner.runner_id != parent.runner_id:
+            raise HTTPException(409, "Inbox owner changed")
+        return await asyncio.to_thread(
+            service.journal.list_chains, owner=body.owner, after=body.after
+        )
+
+    @event_router.post(
+        "/sessions/{parent_id}/retry-chains/{chain_id}/recover", include_in_schema=False
+    )
+    async def retry_recover_chain(
+        request: Request, parent_id: str, chain_id: str, body: RetryInputControl
+    ):
+        service, parent = await _retry_parent(request, parent_id)
+        if (
+            body.owner.parent_id != parent.id
+            or body.owner.runner_id != parent.runner_id
+            or body.expected_version is None
+        ):
+            raise HTTPException(409, "Current owner and chain version required")
+        chain = await asyncio.to_thread(
+            service.journal.take_over,
+            chain_id,
+            owner=body.owner,
+            expected_version=body.expected_version,
+        )
+        if chain is None:
+            raise HTTPException(409, "Retry chain changed")
+        return chain
+
+    @event_router.post(
+        "/sessions/{parent_id}/retry-chains/{chain_id}/adopt", include_in_schema=False
+    )
+    async def retry_adopt_chain(
+        request: Request, parent_id: str, chain_id: str, body: RetryInputControl
+    ):
+        service, parent = await _retry_parent(request, parent_id)
+        if (
+            body.owner.parent_id != parent.id
+            or body.owner.runner_id != parent.runner_id
+            or body.expected_version is None
+        ):
+            raise HTTPException(409, "Current successor and chain version required")
+        chain = await asyncio.to_thread(
+            service.journal.adopt_parent,
+            chain_id,
+            successor=body.owner,
+            expected_version=body.expected_version,
+        )
+        if chain is None:
+            raise HTTPException(409, "Recorded succession required")
+        return chain
+
+    @event_router.post(
+        "/sessions/{parent_id}/retry-chains/{chain_id}/control", include_in_schema=False
+    )
+    async def retry_chain_control(
+        request: Request, parent_id: str, chain_id: str, body: RetryInputControl
+    ):
+        service, chain = await _retry_chain_owner(request, parent_id, chain_id, body)
+        return await asyncio.to_thread(service.journal.get_control, chain.child_id)
+
+    @event_router.post(
+        "/sessions/{parent_id}/retry-chains/{chain_id}/supersede", include_in_schema=False
+    )
+    async def retry_supersede_chain(
+        request: Request, parent_id: str, chain_id: str, body: RetryReplacement
+    ):
+        service, chain = await _retry_chain_owner(request, parent_id, chain_id, body)
+        if body.expected_version != chain.version:
+            raise HTTPException(409, "Retry chain changed")
+        return await asyncio.to_thread(
+            service.journal.supersede,
+            chain_id,
+            owner=body.owner,
+            expected_version=chain.version,
+            replacement_input_id=body.input_id,
+        )
+
+    @event_router.post(
+        "/sessions/{parent_id}/retry-chains/{chain_id}/final", include_in_schema=False
+    )
+    async def retry_read_final(
+        request: Request, parent_id: str, chain_id: str, body: RetryInputControl
+    ):
+        service, _chain = await _retry_chain_owner(request, parent_id, chain_id, body)
+        return await asyncio.to_thread(service.journal.get_final, chain_id)
+
+    @event_router.post(
+        "/sessions/{parent_id}/retry-chains/{chain_id}/inbox", include_in_schema=False
+    )
+    async def retry_record_inbox(
+        request: Request, parent_id: str, chain_id: str, body: RetryResultReceipt
+    ):
+        service, _chain = await _retry_chain_owner(request, parent_id, chain_id, body)
+        return await asyncio.to_thread(
+            service.journal.record_inbox, chain_id, owner=body.owner, result_id=body.result_id
+        )
+
+    @event_router.post(
+        "/sessions/{parent_id}/retry-chains/{chain_id}/drain", include_in_schema=False
+    )
+    async def retry_record_drain(
+        request: Request, parent_id: str, chain_id: str, body: RetryResultReceipt
+    ):
+        service, _chain = await _retry_chain_owner(request, parent_id, chain_id, body)
+        return await asyncio.to_thread(
+            service.journal.record_drain, chain_id, owner=body.owner, result_id=body.result_id
+        )
+
+    @event_router.post(
+        "/sessions/{parent_id}/retry-chains/{chain_id}/wake", include_in_schema=False
+    )
+    async def retry_dispatch_final_wake(
+        request: Request, parent_id: str, chain_id: str, body: RetryInputControl
+    ):
+        service, _chain = await _retry_chain_owner(request, parent_id, chain_id, body)
+        final = await asyncio.to_thread(service.journal.get_final, chain_id)
+        if final is None:
+            raise HTTPException(409, "Retry final not committed")
+        receipt = await asyncio.to_thread(service.journal.get_input, final.notice_id)
+        if receipt is None:
+            raise HTTPException(409, "Final input missing")
+        if final.drain_receipt or receipt.state in {"accepted", "closed", "rejected"}:
+            return {"state": receipt.state, "receipt": receipt}
+        if final.inbox_parent_id != parent_id:
+            return {"state": "pending", "reason": "inbox_not_confirmed"}
+        if receipt.state == "prepared":
+            claimed = await asyncio.to_thread(
+                service.journal.claim_input, receipt.input_id, owner=body.owner
+            )
+            if claimed is None or not claimed.claimed:
+                return {"state": "pending", "reason": "input_claim_changed"}
+            receipt = claimed.receipt
+        reason = None
+        try:
+            with final_dispatch_scope(service, body.owner, receipt):
+                result = await _post_event_impl(
+                    request, parent_id, SessionEventInput.model_validate(receipt.payload)
+                )
+            if result.get("denied"):
+                reason = {"code": "admission_denied", "detail": result.get("reason")}
+            elif result.get("forwarded") is False or result.get("queued") is False:
+                reason = {"code": "not_forwarded", "detail": result}
+        except (RetryDispatchRefused, OmnigentError, HTTPException) as exc:
+            reason = {"code": getattr(exc, "reason", "routing_error"), "detail": str(exc)}
+        current = await asyncio.to_thread(service.journal.get_input, final.notice_id)
+        return {
+            "state": current.state if current else "pending",
+            "receipt": current,
+            "reason": reason,
+        }
 
     @event_router.post(
         "/sessions/{parent_id}/retry-chains/{chain_id}/read", include_in_schema=False
@@ -5666,7 +5844,11 @@ def register_events_routes(
         ):
             return InputExecutionReceipt(reason="native_reservation_required")
         result = await service.admit_execution(session_id, body, runner_id=conv.runner_id)
-        if result.accepted and result.receipt is not None and body.retry is not None:
+        if (
+            result.accepted
+            and result.receipt is not None
+            and (body.retry is not None or result.receipt.kind == "wake")
+        ):
             harness = await asyncio.to_thread(
                 _resolve_harness, conv, agent_store=agent_store, agent_cache=agent_cache
             )

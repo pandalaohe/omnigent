@@ -2464,7 +2464,7 @@ def create_runner_app(
     _desync_terminalized: dict[str, int] = {}
     app.state.desync_terminalized = _desync_terminalized
     _background_tasks: set[asyncio.Task[Any]] = set()
-    _input_execution_claims: dict[tuple[str, str], tuple[object, float]] = {}
+    _input_execution_claims: dict[tuple[str, str], tuple[object, float, str]] = {}
     _pending_input_executions: dict[tuple[str, str], InputExecutionClaim] = {}
     _abandoned_input_executions: dict[tuple[str, str], InputExecutionClaim] = {}
     _control_receipts: dict[tuple[str, str], bool] = {}
@@ -2493,6 +2493,9 @@ def create_runner_app(
                 result.raise_for_status()
                 if result.json().get("state") in {"accepted", "rejected", "closed"}:
                     _control_receipts.pop((target, input_id), None)
+                    retry_runtime = getattr(app.state, "subagent_retry_runtime", None)
+                    if retry_runtime is not None:
+                        await retry_runtime.observe_control(target)
             except (httpx.HTTPError, KeyError, ValueError, RuntimeError):
                 # Keep the same receipt for the next input/reconnect boundary.
                 continue
@@ -2536,7 +2539,7 @@ def create_runner_app(
             _abandoned_input_executions.pop(key, None)
             _pending_input_executions.pop(key, None)
             expected = _input_execution_claims.get(key)
-            if expected == (claim.retry, claim.admission_deadline):
+            if expected == (claim.retry, claim.admission_deadline, claim.kind):
                 _input_execution_claims.pop(key, None)
         return True
 
@@ -2575,12 +2578,13 @@ def create_runner_app(
             and frame.claim.admission_deadline == expected[1]
             and frame.claim.turn_id == _live_response_id.get(session_id)
         ):
-            _pending_input_executions[key] = frame.claim
+            claim = frame.claim.model_copy(update={"kind": expected[2]})
+            _pending_input_executions[key] = claim
             while True:
                 try:
                     response = await server_client.post(
                         f"/v1/sessions/{session_id}/input-admission",
-                        json=frame.claim.model_dump(mode="json"),
+                        json=claim.model_dump(mode="json"),
                         timeout=5,
                     )
                     response.raise_for_status()
@@ -2593,7 +2597,7 @@ def create_runner_app(
                     break
                 await asyncio.sleep(0.05)
             if result.state == "pending":
-                result = await _resolve_receiver_input(session_id, frame.claim)
+                result = await _resolve_receiver_input(session_id, claim)
             current_turn = (
                 _turn_bind_epoch.get(session_id) == expected_epoch
                 and _live_response_id.get(session_id) == expected_response
@@ -2625,7 +2629,7 @@ def create_runner_app(
         )
         reply.raise_for_status()
         if result.state == "pending":
-            _abandoned_input_executions[key] = frame.claim
+            _abandoned_input_executions[key] = _pending_input_executions.get(key, frame.claim)
         elif result.state != "reserved":
             _pending_input_executions.pop(key, None)
         if (
@@ -7602,8 +7606,10 @@ def create_runner_app(
             )
         retry_runtime = getattr(app.state, "subagent_retry_runtime", None)
         if retry_runtime is not None and not _retry_bypass:
+            retry_runtime.on_delivered = _settle_member_obligation_for_child
 
             async def accept() -> _SubagentDeliveryAck:
+                assert retry_runtime is not None
                 if only_if_work_id is not None and (
                     entry is None or entry.work_id != only_if_work_id
                 ):
@@ -7616,7 +7622,7 @@ def create_runner_app(
                         if entry
                         else None,
                     )
-                except (httpx.HTTPError, ValueError, RuntimeError):
+                except (httpx.HTTPError, ValueError, RuntimeError, OSError):
                     if entry is not None:
                         entry.recovery_result = (status, result_key, output)
                         entry.terminal = terminal
@@ -7915,6 +7921,7 @@ def create_runner_app(
                 child_session_id, work_id=entry.work_id, remember_drained_delivery=True
             )
 
+    app.state.retry_final_delivered = _settle_member_obligation_for_child
     _subagent_recovery = build_subagent_recovery(
         app,
         _background_tasks=_background_tasks,
@@ -10392,7 +10399,11 @@ def create_runner_app(
                     return JSONResponse(
                         status_code=422, content={"error": "missing_input_deadline"}
                     )
-                _input_execution_claims[(conversation_id, input_id)] = (retry_guard, deadline)
+                _input_execution_claims[(conversation_id, input_id)] = (
+                    retry_guard,
+                    deadline,
+                    "wake" if message_body.get("_final_wake") is True else "ordinary",
+                )
             _apply_archive_states(
                 conversation_id,
                 message_body.pop("_archive_states", None),
@@ -12010,6 +12021,9 @@ def create_runner_app(
             if not async_task.done():
                 async_task.cancel()
             dropped.append({"kind": "async", "id": handle_id, "label": async_task.get_name()})
+        retry_runtime = getattr(app.state, "subagent_retry_runtime", None)
+        if retry_runtime is not None:
+            await retry_runtime.succeed_parent(session_id, target_session_id)
         return JSONResponse(
             status_code=200,
             content={"status": "rekeyed", "dropped": dropped},
@@ -12030,12 +12044,17 @@ def create_runner_app(
         _deliver_retained_subagent_results(session_id)
         if held:
             entries = [
-                entry for entry in list_subagent_work(session_id) if entry.completed_at is not None
+                entry
+                for entry in list_subagent_work(session_id)
+                if entry.completed_at is not None and entry.retry_chain_id is None
             ]
             if entries:
                 _wake_for_delivered_result(
                     max(entries, key=lambda entry: entry.completed_at or 0.0)
                 )
+        retry_runtime = getattr(app.state, "subagent_retry_runtime", None)
+        if retry_runtime is not None:
+            await retry_runtime.recover_parent(session_id)
         return JSONResponse(
             status_code=200,
             content={"status": "released", "delivered": len(held)},

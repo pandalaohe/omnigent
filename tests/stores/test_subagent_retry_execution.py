@@ -12,6 +12,179 @@ from tests.stores.test_subagent_retry_store import _journal, _open
 from tests.stores.test_subagent_retry_store import journal as journal
 
 
+@pytest.mark.parametrize("drained", [False, True])
+def test_final_wake_receiver_admits_one_turn_and_cannot_be_claimed_as_human(journal, drained):
+    from tests.stores.test_subagent_retry_store import _finish
+
+    chain = _open(journal)
+    final = _finish(journal, chain)
+    assert journal.store.record_inbox(
+        chain.chain_id, owner=journal.owner, result_id=final.result_id
+    )
+    assert journal.store.claim_input(final.notice_id, owner=journal.owner).claimed
+    human = InputExecutionClaim(input_id=final.notice_id, turn_id="wake-turn")
+    assert (
+        journal.store.admit_execution(
+            journal.parent, human, runner_id=journal.owner.runner_id
+        ).reason
+        == "input_identity_conflict"
+    )
+    # An intervening human admission does not consume the final input.
+    assert journal.store.record_input(
+        journal.parent,
+        input_id="human-intervention",
+        turn_id="human-turn",
+        expected_generation=0,
+        payload={"text": "human work"},
+    )
+    if drained:
+        assert journal.store.record_drain(
+            chain.chain_id, owner=journal.owner, result_id=final.result_id
+        )
+    claim = human.model_copy(update={"kind": "wake"})
+    result = journal.store.admit_execution(
+        journal.parent, claim, runner_id=journal.owner.runner_id
+    )
+    if drained:
+        assert not result.accepted
+        assert journal.store.get_control(journal.parent).turn_id == "human-turn"
+    else:
+        assert result.accepted and result.receipt.input_generation == 2
+        assert (
+            journal.store.admit_execution(journal.parent, claim, runner_id=journal.owner.runner_id)
+            == result
+        )
+        duplicate_turn = claim.model_copy(update={"turn_id": "second-wake-turn"})
+        assert (
+            journal.store.admit_execution(
+                journal.parent, duplicate_turn, runner_id=journal.owner.runner_id
+            ).reason
+            == "input_already_consumed"
+        )
+        assert journal.store.get_control(journal.parent).generation == 2
+        assert journal.store.get_final(chain.chain_id).wake_receipt == final.notice_id
+
+
+def test_abandoned_wake_attempt_fences_its_turn_without_losing_the_logical_input(journal):
+    from tests.stores.test_subagent_retry_store import _finish
+
+    chain = _open(journal)
+    final = _finish(journal, chain)
+    assert journal.store.record_inbox(
+        chain.chain_id, owner=journal.owner, result_id=final.result_id
+    )
+    assert journal.store.claim_input(final.notice_id, owner=journal.owner).claimed
+    first = InputExecutionClaim(
+        input_id=final.notice_id, kind="wake", turn_id="abandoned-wake-turn"
+    )
+    resolved = journal.store.resolve_execution(
+        journal.parent, first, runner_id=journal.owner.runner_id, close=True
+    )
+    assert resolved.reason == "wake_attempt_abandoned" and resolved.receipt.state == "dispatching"
+    assert (
+        journal.store.admit_execution(
+            journal.parent, first, runner_id=journal.owner.runner_id
+        ).reason
+        == "wake_attempt_abandoned"
+    )
+    second = first.model_copy(update={"turn_id": "replacement-wake-turn"})
+    admitted = journal.store.admit_execution(
+        journal.parent, second, runner_id=journal.owner.runner_id
+    )
+    assert admitted.accepted and admitted.receipt.input_id == final.notice_id
+    assert (
+        journal.store.resolve_execution(
+            journal.parent, second, runner_id=journal.owner.runner_id, close=True
+        )
+        == admitted
+    )
+    assert journal.store.get_final(chain.chain_id).wake_receipt == final.notice_id
+
+
+@pytest.mark.parametrize("split", [False, True])
+@pytest.mark.parametrize("wake_phase", ["prepared", "dispatching", "accepted"])
+def test_recorded_succession_recovers_after_old_runner_unbinds(
+    journal, split_db_conversation_store, split, wake_phase
+):
+    from tests.stores.test_subagent_retry_store import _finish
+
+    if split:
+        conversations = split_db_conversation_store
+        journal = _journal(conversations.storage_location, conversations)
+        journal.store = type(journal.store)(
+            conversations.storage_location, conversations.conversation_storage_location
+        )
+    chain = _open(journal)
+    final = _finish(journal, chain)
+    original_payload = journal.store.get_input(final.notice_id).payload
+    if wake_phase != "prepared":
+        assert journal.store.record_inbox(
+            chain.chain_id, owner=journal.owner, result_id=final.result_id
+        )
+        assert journal.store.claim_input(final.notice_id, owner=journal.owner).claimed
+    if wake_phase == "accepted":
+        assert journal.store.admit_execution(
+            journal.parent,
+            InputExecutionClaim(input_id=final.notice_id, kind="wake", turn_id="old-parent-wake"),
+            runner_id=journal.owner.runner_id,
+        ).accepted
+    successor = journal.conversations.create_conversation(
+        title="successor", runner_id="successor-runner"
+    )
+    owner = journal.store.claim_owner(successor.id, "successor-runner", expected_epoch=0)
+    chain = journal.store.get_chain(chain.chain_id)
+    assert (
+        journal.store.adopt_parent(chain.chain_id, successor=owner, expected_version=chain.version)
+        is None
+    )
+    assert not journal.store.list_chains(owner=owner)
+    direct, _moved = journal.conversations.reassign_live_children(
+        journal.parent, successor.id, uuid4().hex
+    )
+    assert direct == [journal.child]
+    journal.conversations.clear_runner_id(journal.parent)
+    [listed] = journal.store.list_chains(owner=owner)
+    assert listed.chain_id == chain.chain_id
+    adopted = journal.store.adopt_parent(
+        chain.chain_id, successor=owner, expected_version=chain.version
+    )
+    assert adopted.parent_id == successor.id and adopted.owner == owner and adopted.retry_closed
+    actual = journal.store.get_final(chain.chain_id)
+    assert (actual.notice_id, actual.result_id, actual.outcome) == (
+        final.notice_id,
+        final.result_id,
+        final.outcome,
+    )
+    assert journal.store.get_input(final.notice_id).payload == original_payload
+    assert journal.store.get_input(final.notice_id).target_id == (
+        journal.parent if wake_phase == "accepted" else successor.id
+    )
+    assert not journal.store.record_inbox(
+        chain.chain_id, owner=journal.owner, result_id=final.result_id
+    )
+    assert journal.store.record_inbox(chain.chain_id, owner=owner, result_id=final.result_id)
+    if wake_phase == "accepted":
+        assert actual.wake_receipt == final.notice_id
+        assert not journal.store.claim_input(final.notice_id, owner=owner).claimed
+        return
+    assert journal.store.claim_input(final.notice_id, owner=owner).claimed
+    assert (
+        journal.store.admit_execution(
+            journal.parent,
+            InputExecutionClaim(
+                input_id=final.notice_id, kind="wake", turn_id="late-old-parent-wake"
+            ),
+            runner_id=journal.owner.runner_id,
+        ).reason
+        == "stale_runner"
+    )
+    assert journal.store.admit_execution(
+        successor.id,
+        InputExecutionClaim(input_id=final.notice_id, kind="wake", turn_id="successor-wake"),
+        runner_id=owner.runner_id,
+    ).accepted
+
+
 def _prepared(journal):
     chain = _open(journal)
     receipt = journal.store.prepare_attempt(
