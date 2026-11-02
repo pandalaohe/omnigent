@@ -292,7 +292,9 @@ async def test_create_rejects_malformed_calling_defaults(
         "/v1/projects",
         json={
             "name": "Bad",
-            "config": {"calling_defaults": {"HDS": {"harnesses": {"codex": {"model": 5}}}}},
+            "config": {
+                "calling_defaults": {"workstation": {"harnesses": {"codex": {"model": 5}}}}
+            },
         },
     )
     assert resp.status_code == 400
@@ -304,7 +306,7 @@ async def test_create_roundtrips_valid_calling_defaults(project_client: httpx.As
     """A valid calling_defaults config round-trips through create."""
     config = {
         "calling_defaults": {
-            "HDS": {
+            "workstation": {
                 "agent_id": "codex-sdk",
                 "harnesses": {"codex": {"model": "gpt-6-sol", "effort": "high"}},
             }
@@ -348,7 +350,7 @@ async def test_patch_rejects_malformed_calling_defaults(
     ).json()
     resp = await project_client.patch(
         f"/v1/projects/{created['id']}",
-        json={"config": {"host_id": "new", "calling_defaults": {"HDS": {"agent_id": 5}}}},
+        json={"config": {"host_id": "new", "calling_defaults": {"workstation": {"agent_id": 5}}}},
     )
     assert resp.status_code == 400
     assert resp.json()["error"]["code"] == "invalid_input"

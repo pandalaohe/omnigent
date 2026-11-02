@@ -30,6 +30,7 @@ describe("effortLevelsFor", () => {
     ["codex-native", ["low", "high"]],
     ["devin-native", ["low", "high"]],
     ["pi-native", ["none", "minimal", "low", "medium", "high", "xhigh", "max"]],
+    ["pi", ["none", "minimal", "low", "medium", "high", "xhigh", "max"]],
     ["claude-sdk", ["low", "medium", "high", "xhigh", "max"]],
     ["codex", ["low", "high"]],
     [null, null],

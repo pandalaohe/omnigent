@@ -69,7 +69,7 @@ vi.mock("./WorkspacePicker", async (importActual) => ({
     <button
       type="button"
       data-testid="mock-pick-workspace"
-      onClick={() => onSelect("/Users/a/git/omnigent")}
+      onClick={() => onSelect("/opt/work/git/omnigent")}
     >
       pick
     </button>
@@ -270,9 +270,9 @@ beforeEach(() => {
   // legacy `-worktrees` path stays recognisable so the pre-existing worktree
   // tests keep their prefill.
   setHostWorktrees({
-    "/Users/a/repo-worktrees/fix-1": [
-      worktreeRow("/Users/a/repo", { is_main: true }),
-      worktreeRow("/Users/a/repo-worktrees/fix-1", { branch: "fix-1" }),
+    "/opt/work/repo-worktrees/fix-1": [
+      worktreeRow("/opt/work/repo", { is_main: true }),
+      worktreeRow("/opt/work/repo-worktrees/fix-1", { branch: "fix-1" }),
     ],
   });
   useHostWorktreesMock.mockReset();
@@ -302,7 +302,7 @@ describe("ForkSessionDialog", () => {
         error: null,
       } as ReturnType<typeof useSession>);
       setHosts([host({ sandbox_provider: provider })]);
-      renderDialog({ sourceHostId: "host_1", sourceWorkspace: "/Users/a/repo", info });
+      renderDialog({ sourceHostId: "host_1", sourceWorkspace: "/opt/work/repo", info });
 
       const submit = screen.getByTestId("fork-session-submit");
       expect(submit).toBeDisabled();
@@ -331,7 +331,7 @@ describe("ForkSessionDialog", () => {
 
   it("does not expose an actionable form before the source snapshot resolves", () => {
     useSessionMock.mockReturnValue({ session: null, isLoading: true, error: null });
-    renderDialog({ sourceHostId: "host_1", sourceWorkspace: "/Users/a/repo" });
+    renderDialog({ sourceHostId: "host_1", sourceWorkspace: "/opt/work/repo" });
     expect(screen.getByRole("status")).toHaveTextContent("Checking session capabilities…");
     expect(screen.queryByTestId("fork-session-submit")).not.toBeInTheDocument();
     expect(screen.queryByTestId("fork-session-host-select")).not.toBeInTheDocument();
@@ -783,14 +783,14 @@ describe("ForkSessionDialog", () => {
   describe("missing workspace recovery", () => {
     const RECOVERY = {
       sourceTitle: "My session",
-      sourceWorkspace: "/Users/a/repo-worktrees/deleted-branch",
+      sourceWorkspace: "/opt/work/repo-worktrees/deleted-branch",
       sourceGitBranch: "deleted-branch",
       sourceHostId: "host_1",
       workspaceRecovery: true,
     };
 
     it.each([
-      ["plain directory", "/Users/a/repo", null],
+      ["plain directory", "/opt/work/repo", null],
       ["worktree", RECOVERY.sourceWorkspace, RECOVERY.sourceGitBranch],
       ["worktree without a recorded branch", RECOVERY.sourceWorkspace, null],
     ])("requires a directory instead of prefilling the missing %s", (_name, workspace, branch) => {
@@ -853,11 +853,11 @@ describe("ForkSessionDialog", () => {
       renderDialog(RECOVERY);
 
       fireEvent.change(screen.getByTestId("workspace-path-input"), {
-        target: { value: "/Users/a/repo" },
+        target: { value: "/opt/work/repo" },
       });
       fireEvent.click(screen.getByTestId("fork-session-submit"));
 
-      expect(checkHostDirectoryMock).toHaveBeenCalledWith("host_1", "/Users/a/repo");
+      expect(checkHostDirectoryMock).toHaveBeenCalledWith("host_1", "/opt/work/repo");
       expect(forkSessionMock).not.toHaveBeenCalled();
       expect(launchRunnerMock).not.toHaveBeenCalled();
       finishPreflight(null);
@@ -873,7 +873,7 @@ describe("ForkSessionDialog", () => {
       expect(launchRunnerMock).toHaveBeenCalledWith(
         "host_1",
         "conv_fork",
-        "/Users/a/repo",
+        "/opt/work/repo",
         undefined,
       );
       expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork");
@@ -888,14 +888,14 @@ describe("ForkSessionDialog", () => {
 
       fireEvent.click(screen.getByTestId("workspace-browse-toggle"));
       fireEvent.click(screen.getByTestId("mock-pick-workspace"));
-      expect(screen.getByTestId("workspace-path-input")).toHaveValue("/Users/a/git/omnigent");
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue("/opt/work/git/omnigent");
       fireEvent.click(screen.getByTestId("fork-session-submit"));
 
       await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
       expect(launchRunnerMock).toHaveBeenCalledWith(
         "host_1",
         "conv_fork",
-        "/Users/a/git/omnigent",
+        "/opt/work/git/omnigent",
         undefined,
       );
     });
@@ -908,7 +908,7 @@ describe("ForkSessionDialog", () => {
       renderDialog(RECOVERY);
 
       fireEvent.change(screen.getByTestId("workspace-path-input"), {
-        target: { value: "/Users/a/repo" },
+        target: { value: "/opt/work/repo" },
       });
       fireEvent.change(screen.getByTestId("fork-session-branch-input"), {
         target: { value: "recovered" },
@@ -916,10 +916,10 @@ describe("ForkSessionDialog", () => {
       fireEvent.click(screen.getByTestId("fork-session-submit"));
 
       await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
-      expect(checkHostDirectoryMock).toHaveBeenCalledExactlyOnceWith("host_1", "/Users/a/repo");
+      expect(checkHostDirectoryMock).toHaveBeenCalledExactlyOnceWith("host_1", "/opt/work/repo");
       // Even when the chosen repo is the one the missing worktree came from,
       // the new branch is not based on the missing worktree's branch.
-      expect(launchRunnerMock).toHaveBeenCalledWith("host_1", "conv_fork", "/Users/a/repo", {
+      expect(launchRunnerMock).toHaveBeenCalledWith("host_1", "conv_fork", "/opt/work/repo", {
         branchName: "recovered",
         baseBranch: undefined,
       });
@@ -928,13 +928,13 @@ describe("ForkSessionDialog", () => {
 
     it("points a directory conflict at the worktree field", () => {
       useDirectorySessionsMock.mockReturnValue({
-        data: [{ id: "conv_other", host_id: "host_1", workspace: "/Users/a/repo" }],
+        data: [{ id: "conv_other", host_id: "host_1", workspace: "/opt/work/repo" }],
       } as unknown as ReturnType<typeof useDirectorySessions>);
       useRunnerHealthMock.mockReturnValue(new Map([["conv_other", true]]));
       renderDialog(RECOVERY);
 
       fireEvent.change(screen.getByTestId("workspace-path-input"), {
-        target: { value: "/Users/a/repo" },
+        target: { value: "/opt/work/repo" },
       });
       expect(screen.getByTestId("fork-session-conflict-hint")).toHaveTextContent(
         "1 other agent is working in this directory, so writes may conflict. Name a git branch to work in an isolated copy.",
@@ -1137,7 +1137,7 @@ describe("ForkSessionDialog", () => {
     // the worktree dir and gitBranch the branch checked out there.
     const WORKTREE_CODING = {
       sourceTitle: "My session",
-      sourceWorkspace: "/Users/a/repo-worktrees/fix-1",
+      sourceWorkspace: "/opt/work/repo-worktrees/fix-1",
       sourceHostId: "host_1",
       sourceGitBranch: "fix-1",
     };
@@ -1160,7 +1160,7 @@ describe("ForkSessionDialog", () => {
       // The working directory shows the repo the worktree came from, and the
       // worktree field carries the source branch — not the worktree path as
       // the directory with a blank branch.
-      expect(screen.getByTestId("workspace-path-input")).toHaveValue("/Users/a/repo");
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue("/opt/work/repo");
       expect(screen.getByTestId("fork-session-branch-input")).toHaveValue("fix-1");
     });
 
@@ -1180,12 +1180,12 @@ describe("ForkSessionDialog", () => {
       expect(launchRunnerMock).toHaveBeenCalledWith(
         "host_1",
         "conv_fork",
-        "/Users/a/repo-worktrees/fix-1",
+        "/opt/work/repo-worktrees/fix-1",
         undefined,
       );
       expect(checkHostDirectoryMock).toHaveBeenCalledWith(
         "host_1",
-        "/Users/a/repo-worktrees/fix-1",
+        "/opt/work/repo-worktrees/fix-1",
       );
     });
 
@@ -1198,16 +1198,16 @@ describe("ForkSessionDialog", () => {
       // miss is a 404, so the fork recreates the worktree at the same
       // branch instead of erroring. The repo path itself is intact.
       checkHostDirectoryMock.mockImplementation(async (_hostId: string, path: string) =>
-        path === "/Users/a/repo"
+        path === "/opt/work/repo"
           ? null
-          : "The working directory /Users/a/repo-worktrees/fix-1 doesn't exist on this host (or isn't a directory).",
+          : "The working directory /opt/work/repo-worktrees/fix-1 doesn't exist on this host (or isn't a directory).",
       );
       hostDirectoryMissingMock.mockResolvedValue(true);
       // The deleted worktree is listed from its nearest surviving parent, so
       // the source-path lookup has no containing row; the `-worktrees` parse
       // must still recover the repo and branch for the recreate.
       setHostWorktrees({
-        "/Users/a/repo-worktrees/fix-1": [worktreeRow("/Users/a/repo", { is_main: true })],
+        "/opt/work/repo-worktrees/fix-1": [worktreeRow("/opt/work/repo", { is_main: true })],
       });
       renderDialog(WORKTREE_CODING);
 
@@ -1218,12 +1218,12 @@ describe("ForkSessionDialog", () => {
       // exists) — the host adds the worktree back at the conventional path.
       // existingBranch (not baseBranch): the branch survives its deleted
       // directory, so it is checked out rather than re-created.
-      expect(launchRunnerMock).toHaveBeenCalledWith("host_1", "conv_fork", "/Users/a/repo", {
+      expect(launchRunnerMock).toHaveBeenCalledWith("host_1", "conv_fork", "/opt/work/repo", {
         branchName: "fix-1",
         existingBranch: true,
       });
       // Both the worktree path and the repo fallback path were pre-flighted.
-      expect(checkHostDirectoryMock).toHaveBeenCalledWith("host_1", "/Users/a/repo");
+      expect(checkHostDirectoryMock).toHaveBeenCalledWith("host_1", "/opt/work/repo");
     });
 
     it("still errors when the repo path is also missing (nothing to recreate from)", async () => {
@@ -1279,7 +1279,7 @@ describe("ForkSessionDialog", () => {
       await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
       // A NEW branch name → worktree created off the original repo, based on
       // the source's branch so the clone starts from where it left off.
-      expect(launchRunnerMock).toHaveBeenCalledWith("host_1", "conv_fork", "/Users/a/repo", {
+      expect(launchRunnerMock).toHaveBeenCalledWith("host_1", "conv_fork", "/opt/work/repo", {
         branchName: "feature/x",
         baseBranch: "fix-1",
       });
@@ -1296,7 +1296,7 @@ describe("ForkSessionDialog", () => {
       renderDialog({ ...WORKTREE_CODING, sourceGitBranch: null });
 
       openAdvanced();
-      expect(screen.getByTestId("workspace-path-input")).toHaveValue("/Users/a/repo");
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue("/opt/work/repo");
       expect(screen.getByTestId("fork-session-branch-input")).toHaveValue("fix-1");
 
       fireEvent.click(screen.getByTestId("fork-session-submit"));
@@ -1307,7 +1307,7 @@ describe("ForkSessionDialog", () => {
       expect(launchRunnerMock).toHaveBeenCalledWith(
         "host_1",
         "conv_fork",
-        "/Users/a/repo-worktrees/fix-1",
+        "/opt/work/repo-worktrees/fix-1",
         undefined,
       );
     });
@@ -1316,10 +1316,10 @@ describe("ForkSessionDialog", () => {
       // A worktree placed by any template: the host's own list is
       // authoritative for both the original repo and the checked-out branch —
       // the branch is never derived from the worktree directory name.
-      const workspace = "/Users/a/proj/.worktrees/proj/fix-1";
+      const workspace = "/opt/work/proj/.worktrees/proj/fix-1";
       setHostWorktrees({
         [workspace]: [
-          worktreeRow("/Users/a/proj", { is_main: true }),
+          worktreeRow("/opt/work/proj", { is_main: true }),
           worktreeRow(workspace, { branch: "fix/one" }),
         ],
       });
@@ -1330,7 +1330,7 @@ describe("ForkSessionDialog", () => {
       });
 
       openAdvanced();
-      expect(screen.getByTestId("workspace-path-input")).toHaveValue("/Users/a/proj");
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue("/opt/work/proj");
       expect(screen.getByTestId("fork-session-branch-input")).toHaveValue("fix/one");
     });
 
@@ -1341,11 +1341,11 @@ describe("ForkSessionDialog", () => {
         id: "conv_fork",
       } as unknown as Awaited<ReturnType<typeof forkSession>>);
       launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
-      const worktreePath = "/Users/a/proj/.worktrees/proj/fix-1";
+      const worktreePath = "/opt/work/proj/.worktrees/proj/fix-1";
       const workspace = `${worktreePath}/pkg`;
       setHostWorktrees({
         [workspace]: [
-          worktreeRow("/Users/a/proj", { is_main: true }),
+          worktreeRow("/opt/work/proj", { is_main: true }),
           worktreeRow(worktreePath, { branch: "fix/one" }),
         ],
       });
@@ -1356,7 +1356,7 @@ describe("ForkSessionDialog", () => {
       });
 
       openAdvanced();
-      expect(screen.getByTestId("workspace-path-input")).toHaveValue("/Users/a/proj/pkg");
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue("/opt/work/proj/pkg");
       expect(screen.getByTestId("fork-session-branch-input")).toHaveValue("fix/one");
 
       fireEvent.click(screen.getByTestId("fork-session-submit"));
@@ -1374,10 +1374,10 @@ describe("ForkSessionDialog", () => {
         id: "conv_fork",
       } as unknown as Awaited<ReturnType<typeof forkSession>>);
       launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
-      const workspace = "C:\\Users\\a\\proj\\.worktrees\\proj\\fix-1";
+      const workspace = "C:\\work\\a\\proj\\.worktrees\\proj\\fix-1";
       setHostWorktrees({
         [workspace]: [
-          worktreeRow("C:\\Users\\a\\proj", { is_main: true }),
+          worktreeRow("C:\\work\\a\\proj", { is_main: true }),
           worktreeRow(workspace, { branch: "fix/one" }),
         ],
       });
@@ -1388,7 +1388,7 @@ describe("ForkSessionDialog", () => {
       });
 
       openAdvanced();
-      expect(screen.getByTestId("workspace-path-input")).toHaveValue("C:\\Users\\a\\proj");
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue("C:\\work\\a\\proj");
       expect(screen.getByTestId("fork-session-branch-input")).toHaveValue("fix/one");
 
       fireEvent.click(screen.getByTestId("fork-session-submit"));
@@ -1405,11 +1405,11 @@ describe("ForkSessionDialog", () => {
         id: "conv_fork",
       } as unknown as Awaited<ReturnType<typeof forkSession>>);
       launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
-      const workspace = "C:\\Users\\a\\proj\\.worktrees\\proj\\fix-1";
+      const workspace = "C:\\work\\a\\proj\\.worktrees\\proj\\fix-1";
       setHostWorktrees({
         [workspace]: [
-          worktreeRow("c:/Users/a/proj", { is_main: true }),
-          worktreeRow("c:/Users/a/proj/.worktrees/proj/fix-1", { branch: "fix/one" }),
+          worktreeRow("c:/work/a/proj", { is_main: true }),
+          worktreeRow("c:/work/a/proj/.worktrees/proj/fix-1", { branch: "fix/one" }),
         ],
       });
       renderDialog({
@@ -1419,7 +1419,7 @@ describe("ForkSessionDialog", () => {
       });
 
       openAdvanced();
-      expect(screen.getByTestId("workspace-path-input")).toHaveValue("C:\\Users\\a\\proj");
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue("C:\\work\\a\\proj");
       fireEvent.click(screen.getByTestId("fork-session-submit"));
 
       await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
@@ -1431,10 +1431,10 @@ describe("ForkSessionDialog", () => {
         id: "conv_fork",
       } as unknown as Awaited<ReturnType<typeof forkSession>>);
       launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
-      const workspace = "C:\\Users\\a\\proj\\.worktrees\\proj\\fix-1";
+      const workspace = "C:\\work\\a\\proj\\.worktrees\\proj\\fix-1";
       setHostWorktrees({
         [workspace]: [
-          worktreeRow("C:\\Users\\a\\proj", { is_main: true }),
+          worktreeRow("C:\\work\\a\\proj", { is_main: true }),
           worktreeRow(workspace, { branch: "fix/one" }),
         ],
       });
@@ -1451,7 +1451,7 @@ describe("ForkSessionDialog", () => {
       fireEvent.click(screen.getByTestId("fork-session-submit"));
 
       await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
-      expect(launchRunnerMock).toHaveBeenCalledWith("host_1", "conv_fork", "C:\\Users\\a\\proj", {
+      expect(launchRunnerMock).toHaveBeenCalledWith("host_1", "conv_fork", "C:\\work\\a\\proj", {
         branchName: "feature/x",
         baseBranch: "fix/one",
       });
@@ -1460,7 +1460,7 @@ describe("ForkSessionDialog", () => {
     it("waits for the host worktree list before prefilling the repo", async () => {
       // A cold cache must not lock the raw worktree path into the directory
       // field before the host answers.
-      const workspace = "/Users/a/proj/.worktrees/proj/fix-1";
+      const workspace = "/opt/work/proj/.worktrees/proj/fix-1";
       useHostWorktreesMock.mockReturnValue({
         data: undefined,
         isPending: true,
@@ -1483,7 +1483,7 @@ describe("ForkSessionDialog", () => {
 
       setHostWorktrees({
         [workspace]: [
-          worktreeRow("/Users/a/proj", { is_main: true }),
+          worktreeRow("/opt/work/proj", { is_main: true }),
           worktreeRow(workspace, { branch: "fix/one" }),
         ],
       });
@@ -1491,7 +1491,7 @@ describe("ForkSessionDialog", () => {
       rerenderDialog();
 
       await waitFor(() =>
-        expect(screen.getByTestId("workspace-path-input")).toHaveValue("/Users/a/proj"),
+        expect(screen.getByTestId("workspace-path-input")).toHaveValue("/opt/work/proj"),
       );
       // The resolved list fills the repo but does not clobber the typed branch.
       expect(screen.getByTestId("fork-session-branch-input")).toHaveValue("feature/typed");
@@ -1505,7 +1505,7 @@ describe("ForkSessionDialog", () => {
       await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
       // The typed branch becomes the new worktree, based on the source's row
       // branch (not the overwritten prefill value).
-      expect(launchRunnerMock).toHaveBeenCalledWith("host_1", "conv_fork", "/Users/a/proj", {
+      expect(launchRunnerMock).toHaveBeenCalledWith("host_1", "conv_fork", "/opt/work/proj", {
         branchName: "feature/typed",
         baseBranch: "fix/one",
       });
@@ -1514,10 +1514,10 @@ describe("ForkSessionDialog", () => {
     it("takes no branch from a detached host worktree row", () => {
       // A detached row has no branch to alias; the raw workspace is the only
       // safe prefill and the worktree field stays empty.
-      const workspace = "/Users/a/proj/.worktrees/proj/fix-1";
+      const workspace = "/opt/work/proj/.worktrees/proj/fix-1";
       setHostWorktrees({
         [workspace]: [
-          worktreeRow("/Users/a/proj", { is_main: true }),
+          worktreeRow("/opt/work/proj", { is_main: true }),
           worktreeRow(workspace, { branch: null, detached: true }),
         ],
       });
@@ -1536,7 +1536,7 @@ describe("ForkSessionDialog", () => {
       // The upstream layout stays recognisable when the host list yields no
       // containing row — a deleted worktree is listed from its nearest
       // surviving parent — and when the source host is offline (no lookup).
-      const workspace = "/Users/a/repo-worktrees/fix-1";
+      const workspace = "/opt/work/repo-worktrees/fix-1";
       setHostWorktrees({ [workspace]: [] });
       const { rerenderDialog } = renderDialog({
         sourceTitle: "My session",
@@ -1546,7 +1546,7 @@ describe("ForkSessionDialog", () => {
 
       openAdvanced();
       // Online, no containing row → the path parse recovers repo + branch.
-      expect(screen.getByTestId("workspace-path-input")).toHaveValue("/Users/a/repo");
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue("/opt/work/repo");
       expect(screen.getByTestId("fork-session-branch-input")).toHaveValue("fix-1");
 
       // The source host goes offline; an explicit clear remains the user's
@@ -1569,10 +1569,10 @@ describe("ForkSessionDialog", () => {
         id: "conv_fork",
       } as unknown as Awaited<ReturnType<typeof forkSession>>);
       launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
-      // Home listing: the first entry's parent (/Users/a) resolves the host's
-      // home, so "~/git/omnigent" expands to "/Users/a/git/omnigent".
+      // Home listing: the first entry's parent (/opt/work) resolves the host's
+      // home, so "~/git/omnigent" expands to "/opt/work/git/omnigent".
       useHostFilesystemMock.mockReturnValue({
-        data: { entries: [{ name: "git", path: "/Users/a/git", type: "directory" }] },
+        data: { entries: [{ name: "git", path: "/opt/work/git", type: "directory" }] },
         isPlaceholderData: false,
         isLoading: false,
         error: null,
@@ -1595,7 +1595,7 @@ describe("ForkSessionDialog", () => {
       expect(launchRunnerMock).toHaveBeenCalledWith(
         "host_1",
         "conv_fork",
-        "/Users/a/git/omnigent",
+        "/opt/work/git/omnigent",
         undefined,
       );
     });
@@ -1623,7 +1623,7 @@ describe("ForkSessionDialog", () => {
 
       // "Select" commits the browser's absolute path into the form.
       fireEvent.click(screen.getByTestId("mock-pick-workspace"));
-      expect(screen.getByTestId("workspace-path-input")).toHaveValue("/Users/a/git/omnigent");
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue("/opt/work/git/omnigent");
       expect(screen.getByTestId("fork-session-submit")).not.toHaveAttribute("aria-disabled");
 
       fireEvent.click(screen.getByTestId("fork-session-submit"));
@@ -1631,7 +1631,7 @@ describe("ForkSessionDialog", () => {
       expect(launchRunnerMock).toHaveBeenCalledWith(
         "host_1",
         "conv_fork",
-        "/Users/a/git/omnigent",
+        "/opt/work/git/omnigent",
         undefined,
       );
     });

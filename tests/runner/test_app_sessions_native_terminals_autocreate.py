@@ -4147,7 +4147,7 @@ async def test_auto_create_claude_terminal_keeps_successor_bridge_id(
     )
 
     class _FakeTerminalRegistry:
-        def get(self, conversation_id: str, terminal_name: str, session_key: str) -> Any:
+        def get_native(self, conversation_id: str, terminal_name: str, session_key: str) -> Any:
             del conversation_id, terminal_name, session_key
             return type(
                 "Terminal",
@@ -4304,7 +4304,7 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
     class _FakeTerminalRegistry:
         """Returns the live instance for any (session, terminal, key) lookup."""
 
-        def get(self, conversation_id: str, terminal_name: str, session_key: str) -> Any:
+        def get_native(self, conversation_id: str, terminal_name: str, session_key: str) -> Any:
             """Return the fake live instance."""
             del conversation_id, terminal_name, session_key
             return _FakeInstance()
@@ -4404,7 +4404,7 @@ class _LiveClaudeInstance:
 class _LiveClaudeTerminalRegistry:
     """Returns the live instance for any (session, terminal, key) lookup."""
 
-    def get(self, conversation_id: str, terminal_name: str, session_key: str) -> Any:
+    def get_native(self, conversation_id: str, terminal_name: str, session_key: str) -> Any:
         """Return the fake live instance."""
         del conversation_id, terminal_name, session_key
         return _LiveClaudeInstance()

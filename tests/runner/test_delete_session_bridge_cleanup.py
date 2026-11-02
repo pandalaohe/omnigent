@@ -24,6 +24,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import shutil
 import uuid
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
@@ -195,13 +196,12 @@ async def test_cleanup_resources_removes_native_bridge_dir(
     family: str,
     bridge_present: bool,
 ) -> None:
-    """The PRODUCTION delete path must remove every family's bridge dir.
+    """Resource cleanup removes every family's bridge dir but keeps attachments.
 
-    Server-side session delete drives ``DELETE /v1/sessions/{id}/resources``
-    (``cleanup_session_resources``), NOT the bare ``DELETE /v1/sessions/{id}``
-    route — so the token-bearing bridge dir must be removed there too, else the
-    #1350 leak persists in real deletes. All 11 native families create such a
-    dir, so all 11 must be cleaned up.
+    ``DELETE /v1/sessions/{id}/resources`` (``cleanup_session_resources``)
+    releases a session that keeps running, so the token-bearing bridge dir must
+    go (else the #1350 leak persists) while the attachment dirs its transcript
+    reads stay. All 11 native families create such a dir.
     """
     session_id = f"conv_{uuid.uuid4().hex}"
     bridge_dir = BRIDGE_DIR_RESOLVERS[family](session_id)
@@ -218,14 +218,22 @@ async def test_cleanup_resources_removes_native_bridge_dir(
         bridge_dir,
     )
     assert cached is not None
+    by_path = session_attachment_dir(session_id) / "file_1" / "clip.mp4"
+    by_path.parent.mkdir(parents=True)
+    by_path.write_bytes(b"clip")
 
-    resp = await client.delete(f"/v1/sessions/{session_id}/resources")
-    assert resp.status_code == 200
+    try:
+        resp = await client.delete(f"/v1/sessions/{session_id}/resources")
+        assert resp.status_code == 200
 
-    assert not bridge_dir.exists(), (
-        f"{family} bridge dir must be deleted on the real /resources path"
-    )
-    assert not attachment_cache_dir(bridge_dir).exists()
+        assert not bridge_dir.exists(), (
+            f"{family} bridge dir must be deleted on the real /resources path"
+        )
+        assert attachment_cache_dir(bridge_dir).exists()
+        assert by_path.exists()
+    finally:
+        shutil.rmtree(attachment_cache_dir(bridge_dir), ignore_errors=True)
+        shutil.rmtree(session_attachment_dir(session_id), ignore_errors=True)
 
 
 # ── #3728: spec-fill generation guard ───────────────────────────────────────

@@ -70,9 +70,9 @@ from tests.server.helpers import create_test_agent
 pytestmark = pytest.mark.asyncio
 
 _HOST_ID = "51dc949aba31e24ca8f047d6fba31a0d"
-_SOURCE_REPO = "/Users/alice/myrepo"
-_ENTRY = "/Users/alice/entry"
-_CHECKOUT = "/Users/alice/entry/fork/omnigent"
+_SOURCE_REPO = "/opt/work/myrepo"
+_ENTRY = "/opt/work/entry"
+_CHECKOUT = "/opt/work/entry/fork/omnigent"
 _PROJECT_ID = "f0e1d2c3b4a5968778695a4b3c2d1e0f"
 
 
@@ -431,7 +431,7 @@ async def _launch(
     :param client: The test HTTP client.
     :param session_id: Existing session to bind.
     :param workspace: Directory to bind (the worktree for a Fork reuse),
-        e.g. ``"/Users/alice/myrepo"``.
+        e.g. ``"/opt/work/myrepo"``.
     :param git: Optional ``git`` block. Create mode, e.g.
         ``{"branch_name": "feature/x"}``; bind mode, e.g.
         ``{"branch_name": "feature/x", "existing_worktree": True}``.
@@ -971,7 +971,7 @@ async def test_launch_runner_git_create_at_entry_sources_the_checkout(
     # dir name + sanitized branch).
     assert cap.create[0].entry == _ENTRY
     assert cap.create[0].path_template == _ENTRY_TEMPLATE
-    created = "/Users/alice/entry/.worktrees/omnigent/feature-x"
+    created = "/opt/work/entry/.worktrees/omnigent/feature-x"
     assert cap.launch[0].workspace == created
     conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
     assert conv is not None
@@ -1007,7 +1007,7 @@ async def test_launch_runner_git_create_at_entry_without_template_uses_sibling(
     assert cap.create[0].repo_path == _CHECKOUT
     assert cap.create[0].entry == _ENTRY
     assert cap.create[0].path_template is None
-    sibling = "/Users/alice/entry/fork/omnigent-worktrees/feature-x"
+    sibling = "/opt/work/entry/fork/omnigent-worktrees/feature-x"
     assert cap.launch[0].workspace == sibling
     conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
     assert conv is not None
@@ -1018,7 +1018,7 @@ async def test_launch_runner_git_create_at_entry_without_template_uses_sibling(
 
 @pytest.mark.parametrize(
     ("checkout", "allowed"),
-    [(_CHECKOUT, True), ("/Users/alice/other/omnigent", False)],
+    [(_CHECKOUT, True), ("/opt/work/other/omnigent", False)],
 )
 async def test_launch_runner_checkout_meets_the_agent_boundary_before_the_cut(
     app: FastAPI,

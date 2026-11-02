@@ -13,7 +13,7 @@ from omnigent.runner.session_history import build_session_history
 
 _OTHER_HOST_KEY = "a" * 32
 _OTHER_HOST_LINE = (
-    f"[Attached: /home/other/.omnigent/attachments/s-{_OTHER_HOST_KEY}/file_mp4/a.mp4]"
+    f"[Attached: /opt/work/.omnigent/attachments/s-{_OTHER_HOST_KEY}/file_mp4/a.mp4]"
 )
 
 

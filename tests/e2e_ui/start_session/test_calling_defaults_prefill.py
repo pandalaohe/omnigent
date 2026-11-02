@@ -29,8 +29,8 @@ from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
 
 _PROJECT_ID = "proj_e2e_calling_defaults"
 _PROJECT_NAME = "CallingDefaultsProject"
-_HOST_HDS = "host_e2e_calling_hds"
-_HOST_TMB = "host_e2e_calling_tmb"
+_HOST_WORKSTATION = "host_e2e_calling_workstation"
+_HOST_LAPTOP = "host_e2e_calling_laptop"
 _ROOT = "/work/calling-defaults-repo"
 _AGENT_CODEX = "ag_codex_sdk_e2e"
 _AGENT_CLAUDE = "ag_claude_native_e2e"
@@ -100,7 +100,7 @@ async def _drive_calling_defaults_prefill(base_url: str, session_id: str) -> Non
             async def handle_resolve(route: Route) -> None:
                 query = parse_qs(urlparse(route.request.url).query)
                 host_id = (query.get("host_id") or [""])[0]
-                if host_id == _HOST_TMB:
+                if host_id == _HOST_LAPTOP:
                     body = {
                         "agent_id": _AGENT_CLAUDE,
                         "harness": "claude-native",
@@ -126,14 +126,14 @@ async def _drive_calling_defaults_prefill(base_url: str, session_id: str) -> Non
                     json={
                         "hosts": [
                             {
-                                "host_id": _HOST_HDS,
-                                "name": "host-hds",
+                                "host_id": _HOST_WORKSTATION,
+                                "name": "host-workstation",
                                 "owner": "e2e",
                                 "status": "online",
                             },
                             {
-                                "host_id": _HOST_TMB,
-                                "name": "host-tmb",
+                                "host_id": _HOST_LAPTOP,
+                                "name": "host-laptop",
                                 "owner": "e2e",
                                 "status": "online",
                             },
@@ -141,13 +141,13 @@ async def _drive_calling_defaults_prefill(base_url: str, session_id: str) -> Non
                     }
                 ),
             )
-            await stub_empty_host_picker_data(page, _HOST_HDS)
-            await stub_empty_host_picker_data(page, _HOST_TMB)
+            await stub_empty_host_picker_data(page, _HOST_WORKSTATION)
+            await stub_empty_host_picker_data(page, _HOST_LAPTOP)
             # The SDK picker labels an unknown model by its id, but the native
-            # Claude picker only labels catalog rows — give the TMB stub the one
+            # Claude picker only labels catalog rows — give the laptop stub the one
             # row the resolve names so the picker can show it.
             await page.route(
-                f"**/v1/hosts/{_HOST_TMB}/harnesses/claude-native/model-options",
+                f"**/v1/hosts/{_HOST_LAPTOP}/harnesses/claude-native/model-options",
                 lambda route: route.fulfill(
                     json={"models": [{"id": _CLAUDE_MODEL, "displayName": _CLAUDE_MODEL}]}
                 ),
@@ -187,7 +187,7 @@ async def _drive_calling_defaults_prefill(base_url: str, session_id: str) -> Non
                     json={
                         "id": _PROJECT_ID,
                         "name": _PROJECT_NAME,
-                        "config": {"host_id": _HOST_HDS, "workspace": _ROOT},
+                        "config": {"host_id": _HOST_WORKSTATION, "workspace": _ROOT},
                     }
                 ),
             )
@@ -195,8 +195,10 @@ async def _drive_calling_defaults_prefill(base_url: str, session_id: str) -> Non
                 f"**/v1/projects/{_PROJECT_ID}/host-roots",
                 lambda route: route.fulfill(
                     json={
-                        "roots": [{"host_id": _HOST_HDS, "workspace": _ROOT, "source": "config"}],
-                        "default_host_id": _HOST_HDS,
+                        "roots": [
+                            {"host_id": _HOST_WORKSTATION, "workspace": _ROOT, "source": "config"}
+                        ],
+                        "default_host_id": _HOST_WORKSTATION,
                         "default_host_reason": "config",
                     }
                 ),
@@ -221,7 +223,7 @@ async def _drive_calling_defaults_prefill(base_url: str, session_id: str) -> Non
                 state="visible", timeout=30_000
             )
 
-            # Untouched: the HDS resolve (Codex SDK · gpt-6-sol · high) owns the
+            # Untouched: the workstation resolve (Codex SDK · gpt-6-sol · high) owns the
             # pickers with no interaction at all.
             trigger = page.get_by_test_id("new-chat-landing-agent-select")
             await expect(trigger).to_have_attribute(
@@ -230,26 +232,26 @@ async def _drive_calling_defaults_prefill(base_url: str, session_id: str) -> Non
             await expect(trigger).to_contain_text(_CODEX_MODEL)
             await expect(trigger).to_contain_text("High")
             host_chip = page.get_by_test_id("new-chat-landing-host-chip")
-            await expect(host_chip).to_have_attribute("aria-label", re.compile("host-hds"))
+            await expect(host_chip).to_have_attribute("aria-label", re.compile("host-workstation"))
 
             # A host switch the user did not touch: the untouched agent / model /
-            # effort follow the TMB resolve (Claude Code · opus-5-5 · xhigh).
+            # effort follow the laptop resolve (Claude Code · opus-5-5 · xhigh).
             await host_chip.click()
-            await page.get_by_test_id(f"new-chat-landing-host-{_HOST_TMB}").click()
+            await page.get_by_test_id(f"new-chat-landing-host-{_HOST_LAPTOP}").click()
             await _wait_for_host_menu_closed(page)
-            await expect(host_chip).to_have_attribute("aria-label", re.compile("host-tmb"))
+            await expect(host_chip).to_have_attribute("aria-label", re.compile("host-laptop"))
             await expect(trigger).to_have_attribute(
                 "aria-label", re.compile("Claude Code"), timeout=15_000
             )
             await expect(trigger).to_contain_text(_CLAUDE_MODEL)
             await expect(trigger).to_contain_text("xHigh")
 
-            # Back on HDS the seed re-resolves its set; the create carries the
+            # Back on workstation the seed re-resolves its set; the create carries the
             # values the picker shows.
             await host_chip.click()
-            await page.get_by_test_id(f"new-chat-landing-host-{_HOST_HDS}").click()
+            await page.get_by_test_id(f"new-chat-landing-host-{_HOST_WORKSTATION}").click()
             await _wait_for_host_menu_closed(page)
-            await expect(host_chip).to_have_attribute("aria-label", re.compile("host-hds"))
+            await expect(host_chip).to_have_attribute("aria-label", re.compile("host-workstation"))
             await expect(trigger).to_have_attribute(
                 "aria-label", re.compile("Codex SDK"), timeout=15_000
             )
@@ -261,7 +263,7 @@ async def _drive_calling_defaults_prefill(base_url: str, session_id: str) -> Non
             await _wait_for_create(create_bodies)
             body = create_bodies[0]
             assert body["project_id"] == _PROJECT_ID, body
-            assert body["host_id"] == _HOST_HDS, body
+            assert body["host_id"] == _HOST_WORKSTATION, body
             assert body["agent_id"] == _AGENT_CODEX, body
             assert body["model_override"] == _CODEX_MODEL, body
             assert body["reasoning_effort"] == _CODEX_EFFORT, body

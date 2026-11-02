@@ -178,7 +178,7 @@ async def test_existing_worktree_lookup_keeps_linked_root_and_branch(
     assert conn.pending_list_worktrees == {}
 
 
-@pytest.mark.parametrize("workspace", [None, "/Users/alice/myrepo-worktrees/feature-login/web"])
+@pytest.mark.parametrize("workspace", [None, "/opt/work/myrepo-worktrees/feature-login/web"])
 async def test_create_worktree_success_returns_path_and_branch(
     host_setup: HostRegistry,
     workspace: str | None,
@@ -188,7 +188,7 @@ async def test_create_worktree_success_returns_path_and_branch(
     registry._create_reply_for_test.update(  # type: ignore[attr-defined]
         {
             "status": "ok",
-            "worktree_path": "/Users/alice/myrepo-worktrees/feature-login",
+            "worktree_path": "/opt/work/myrepo-worktrees/feature-login",
             "branch": "feature/login",
             "error": None,
         }
@@ -200,19 +200,19 @@ async def test_create_worktree_success_returns_path_and_branch(
     result = await create_worktree_on_host(
         host_registry=registry,
         host_conn=conn,
-        repo_path="/Users/alice/myrepo",
+        repo_path="/opt/work/myrepo",
         branch_name="feature/login",
         base_branch="main",
     )
     # Both fields must thread through; a regression in the result
     # routing or unpacking would drop one and break session create.
-    assert result.worktree_path == "/Users/alice/myrepo-worktrees/feature-login"
+    assert result.worktree_path == "/opt/work/myrepo-worktrees/feature-login"
     assert result.branch == "feature/login"
     assert result.workspace == workspace
     # The frame the proxy actually sent carries the request params.
     sent = registry._sent_frames_for_test[-1]  # type: ignore[attr-defined]
     assert isinstance(sent, HostCreateWorktreeFrame)
-    assert sent.repo_path == "/Users/alice/myrepo"
+    assert sent.repo_path == "/opt/work/myrepo"
     assert sent.branch_name == "feature/login"
     assert sent.base_branch == "main"
     assert sent.timeout_s == WORKTREE_CREATE_BUDGET_S
@@ -228,7 +228,7 @@ async def test_create_worktree_forwards_path_template(host_setup: HostRegistry) 
     registry._create_reply_for_test.update(  # type: ignore[attr-defined]
         {
             "status": "ok",
-            "worktree_path": "/Users/alice/project/.worktrees/myrepo/feature-login",
+            "worktree_path": "/opt/work/project/.worktrees/myrepo/feature-login",
             "branch": "feature/login",
             "error": None,
         }
@@ -238,15 +238,15 @@ async def test_create_worktree_forwards_path_template(host_setup: HostRegistry) 
     await create_worktree_on_host(
         host_registry=registry,
         host_conn=conn,
-        repo_path="/Users/alice/myrepo",
+        repo_path="/opt/work/myrepo",
         branch_name="feature/login",
         base_branch=None,
-        entry="/Users/alice/project",
+        entry="/opt/work/project",
         path_template="{entry}/.worktrees/{repo}/{branch}",
     )
     sent = registry._sent_frames_for_test[-1]  # type: ignore[attr-defined]
     assert isinstance(sent, HostCreateWorktreeFrame)
-    assert sent.entry == "/Users/alice/project"
+    assert sent.entry == "/opt/work/project"
     assert sent.path_template == "{entry}/.worktrees/{repo}/{branch}"
 
 
@@ -256,7 +256,7 @@ async def test_create_worktree_forwards_entry(host_setup: HostRegistry) -> None:
     registry._create_reply_for_test.update(  # type: ignore[attr-defined]
         {
             "status": "ok",
-            "worktree_path": "/Users/alice/project/.worktrees/myrepo/feature-login",
+            "worktree_path": "/opt/work/project/.worktrees/myrepo/feature-login",
             "branch": "feature/login",
             "error": None,
         }
@@ -266,14 +266,14 @@ async def test_create_worktree_forwards_entry(host_setup: HostRegistry) -> None:
     await create_worktree_on_host(
         host_registry=registry,
         host_conn=conn,
-        repo_path="/Users/alice/myrepo",
+        repo_path="/opt/work/myrepo",
         branch_name="feature/login",
         base_branch=None,
-        entry="/Users/alice/project",
+        entry="/opt/work/project",
     )
     sent = registry._sent_frames_for_test[-1]  # type: ignore[attr-defined]
     assert isinstance(sent, HostCreateWorktreeFrame)
-    assert sent.entry == "/Users/alice/project"
+    assert sent.entry == "/opt/work/project"
 
 
 async def test_create_worktree_failure_surfaced(host_setup: HostRegistry) -> None:
@@ -330,7 +330,7 @@ async def test_remove_worktree_success(host_setup: HostRegistry) -> None:
     await remove_worktree_on_host(
         host_registry=registry,
         host_conn=conn,
-        worktree_path="/Users/alice/myrepo-worktrees/feature-login",
+        worktree_path="/opt/work/myrepo-worktrees/feature-login",
         branch="feature/login",
         delete_branch=True,
     )
@@ -339,7 +339,7 @@ async def test_remove_worktree_success(host_setup: HostRegistry) -> None:
     # delete_branch must thread through unchanged — it controls whether
     # the branch is destroyed.
     assert sent.delete_branch is True
-    assert sent.worktree_path == "/Users/alice/myrepo-worktrees/feature-login"
+    assert sent.worktree_path == "/opt/work/myrepo-worktrees/feature-login"
     assert sent.branch == "feature/login"
 
 

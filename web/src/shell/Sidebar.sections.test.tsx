@@ -266,6 +266,7 @@ beforeEach(() => {
 
 afterEach(async () => {
   cleanup();
+  vi.restoreAllMocks();
   // dnd-kit swallows document clicks for 50ms after a drag ends, so the next
   // test's first click would be lost if it starts immediately.
   await new Promise((resolve) => {
@@ -811,6 +812,151 @@ describe("Sidebar sections", () => {
     expect(canonicalRow).toHaveClass("opacity-40");
     fireEvent.mouseUp(document);
 
+    platform.mockRestore();
+  });
+
+  it("does not scroll the sidebar or auto-expand folders when clicking a top-area session row, while keeping reveal scroll for lower-tree and non-click navigation", async () => {
+    localStorage.setItem(
+      LAYOUT_STORAGE_KEY,
+      JSON.stringify({
+        version: 1,
+        sections: [
+          { id: "sec_recent", kind: "recent", name: "Recent", maxRows: null, count: 5 },
+          {
+            id: "sec_fav",
+            kind: "favorites",
+            name: "Pinned",
+            maxRows: null,
+            items: [
+              { type: "session", id: "pin_top" },
+              { type: "project", id: "p_beta" },
+            ],
+          },
+          {
+            id: "sec_work",
+            kind: "projects",
+            name: "Work",
+            maxRows: null,
+            projectIds: ["p_alpha", "p_gamma"],
+          },
+          { id: "default-other-sessions", kind: "other_sessions", name: "Sessions", maxRows: null },
+        ],
+      }),
+    );
+    localStorage.setItem(
+      "omnigent:expanded-project-sections",
+      JSON.stringify(["Alpha", "fav:sec_fav:Beta"]),
+    );
+    const sAlpha = conversation("s_alpha", {
+      project_id: "p_alpha",
+      labels: { omni_project: "Alpha" },
+      updated_at: 5,
+    });
+    const sBeta = conversation("s_beta", {
+      project_id: "p_beta",
+      labels: { omni_project: "Beta" },
+      updated_at: 4,
+    });
+    const sGamma = conversation("s_gamma", {
+      project_id: "p_gamma",
+      labels: { omni_project: "Gamma" },
+      updated_at: 3,
+    });
+    const pinTop = conversation("pin_top", {
+      labels: { "omnigent.pinned": "1000" },
+      updated_at: 2,
+    });
+    const sOther = conversation("s_other", {
+      project_id: "p_alpha",
+      labels: { omni_project: "Alpha" },
+      updated_at: 1,
+    });
+    pinnedRef.current = [pinTop];
+    folderRowsRef.current.set("Alpha", [sAlpha, sOther]);
+    folderRowsRef.current.set("Beta", [sBeta]);
+    folderRowsRef.current.set("Gamma", [sGamma]);
+    mockConversations([sAlpha, sBeta, sGamma, pinTop, sOther]);
+    recentRef.current.data = [sAlpha, sBeta, sGamma];
+
+    const scrolledElements: Element[] = [];
+    const scrollSpy = vi.spyOn(Element.prototype, "scrollIntoView").mockImplementation(function (
+      this: Element,
+    ) {
+      scrolledElements.push(this);
+    });
+    const platform = vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+
+    renderSidebarAt("/c/s_other");
+
+    await waitFor(() =>
+      expect(within(sectionOf("Recent")).getByText("s_alpha")).toBeInTheDocument(),
+    );
+    const workAlphaRow = sectionOf("Work").querySelector(
+      'li[data-sidebar-session-id="s_alpha"][data-sidebar-canonical="true"]',
+    );
+    expect(workAlphaRow).not.toBeNull();
+
+    // Initial route load reveals the active canonical row in Work.
+    const workOtherRow = sectionOf("Work").querySelector(
+      'li[data-sidebar-session-id="s_other"][data-sidebar-canonical="true"]',
+    );
+    expect(scrolledElements).toEqual([workOtherRow]);
+    scrolledElements.length = 0;
+    scrollSpy.mockClear();
+
+    // Clicking a session row in Recent whose folder is expanded in Work opens the
+    // session without scrolling the sidebar to the lower Work row.
+    fireEvent.click(within(sectionOf("Recent")).getByRole("link", { name: /s_alpha/ }));
+    await waitFor(() => expect(screen.getByTestId("location").textContent).toBe("/c/s_alpha"));
+    expect(scrolledElements).toEqual([]);
+
+    const favBetaRow = sectionOf("Pinned").querySelector(
+      'li[data-sidebar-session-id="s_beta"][data-sidebar-canonical="true"]',
+    );
+    expect(favBetaRow).not.toBeNull();
+
+    // Clicking a session row in Recent whose folder is a favorite project in Pinned
+    // opens the session without scrolling the sidebar.
+    fireEvent.click(within(sectionOf("Recent")).getByRole("link", { name: /s_beta/ }));
+    await waitFor(() => expect(screen.getByTestId("location").textContent).toBe("/c/s_beta"));
+    expect(scrolledElements).toEqual([]);
+
+    // Clicking a session row in Recent whose project folder (Gamma) is collapsed
+    // neither auto-expands Gamma nor scrolls the sidebar.
+    fireEvent.click(within(sectionOf("Recent")).getByRole("link", { name: /s_gamma/ }));
+    await waitFor(() => expect(screen.getByTestId("location").textContent).toBe("/c/s_gamma"));
+    expect(within(sectionOf("Work")).queryByText("s_gamma")).toBeNull();
+    expect(scrolledElements).toEqual([]);
+
+    // Clicking a pinned session row in Pinned opens the session without scrolling.
+    fireEvent.click(within(sectionOf("Pinned")).getByRole("link", { name: "pin_top" }));
+    await waitFor(() => expect(screen.getByTestId("location").textContent).toBe("/c/pin_top"));
+    expect(scrolledElements).toEqual([]);
+
+    // Clicking a row in the lower Work tree still reveals that canonical row.
+    fireEvent.click(within(sectionOf("Work")).getByRole("link", { name: "s_alpha" }));
+    await waitFor(() => expect(screen.getByTestId("location").textContent).toBe("/c/s_alpha"));
+    expect(scrolledElements).toEqual([workAlphaRow]);
+    expect(scrollSpy).toHaveBeenCalledWith({ behavior: "smooth", block: "center" });
+    scrolledElements.length = 0;
+
+    // Clicking a row inside an expanded favorite project folder in Pinned reveals it,
+    // and non-click navigation (Cmd+] hotkey) still reveals the destination canonical row.
+    fireEvent.click(within(sectionOf("Pinned")).getByRole("link", { name: "s_beta" }));
+    await waitFor(() => expect(screen.getByTestId("location").textContent).toBe("/c/s_beta"));
+    expect(scrolledElements).toEqual([favBetaRow]);
+    scrolledElements.length = 0;
+
+    fireEvent.keyDown(document.body, { code: "BracketLeft", metaKey: true, bubbles: true });
+    await waitFor(() => expect(screen.getByTestId("location").textContent).toBe("/c/s_alpha"));
+    expect(scrolledElements).toEqual([workAlphaRow]);
+    scrolledElements.length = 0;
+
+    fireEvent.keyDown(document.body, { code: "BracketRight", metaKey: true, bubbles: true });
+    await waitFor(() => expect(screen.getByTestId("location").textContent).toBe("/c/s_beta"));
+    expect(scrolledElements).toEqual([favBetaRow]);
+
+    scrollSpy.mockRestore();
     platform.mockRestore();
   });
 });

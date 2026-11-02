@@ -2239,14 +2239,14 @@ describe("SettingsPage", () => {
         title: "Archive details",
         host_id: "host-win",
         agent_name: "codex-native",
-        workspace: "D:/AIProgram/Projects/Omnigent",
+        workspace: "D:/work/Projects/Omnigent",
         labels: { omni_project: "Omnigent" },
       }),
     ];
 
     renderPage("/settings/archived");
 
-    expect(screen.queryByText("D:/AIProgram/Projects/Omnigent")).toBeNull();
+    expect(screen.queryByText("D:/work/Projects/Omnigent")).toBeNull();
     expect(screen.getByText("Omnigent")).toBeInTheDocument();
     const context = screen.getByTestId("archived-context");
     const row = screen.getByTestId("archived-row");

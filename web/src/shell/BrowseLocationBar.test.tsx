@@ -8,7 +8,7 @@ vi.mock("./WorkspacePickerDialog", () => ({
     open ? <div data-testid="stub-picker-dialog" /> : null,
 }));
 
-const WORKSPACE = "/home/user/proj";
+const WORKSPACE = "/opt/work/proj";
 
 function renderBar(overrides: Partial<ComponentProps<typeof BrowseLocationBar>> = {}) {
   return render(

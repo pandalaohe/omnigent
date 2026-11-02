@@ -599,7 +599,7 @@ describe("resolveThisMachineHostId", () => {
 // Keep the submit gate aligned with the server's workspace validation.
 describe("isValidWorkspace", () => {
   it("accepts a fully absolute path", () => {
-    expect(isValidWorkspace("/Users/corey/projects/myapp")).toBe(true);
+    expect(isValidWorkspace("/opt/work/projects/myapp")).toBe(true);
   });
 
   it("accepts root path", () => {
@@ -609,15 +609,15 @@ describe("isValidWorkspace", () => {
   });
 
   it("accepts Windows drive and UNC absolute paths", () => {
-    expect(isValidWorkspace("D:\\AIProgram\\Projects")).toBe(true);
+    expect(isValidWorkspace("D:\\work\\Projects")).toBe(true);
     expect(isValidWorkspace("E:/Projects/Omnigent")).toBe(true);
     expect(isValidWorkspace("\\\\server\\share\\repo")).toBe(true);
   });
 
   it("trims whitespace before checking", () => {
     // Browsers paste with stray whitespace; trim must run before
-    // the shape check or "  /Users/corey  " would be rejected.
-    expect(isValidWorkspace("  /Users/corey  ")).toBe(true);
+    // the shape check or "  /opt/work  " would be rejected.
+    expect(isValidWorkspace("  /opt/work  ")).toBe(true);
   });
 
   it("rejects empty string", () => {
@@ -646,10 +646,10 @@ describe("isValidWorkspace", () => {
   });
 
   it("accepts Windows drive-letter paths", () => {
-    expect(isValidWorkspace("C:\\Users\\alice\\work")).toBe(true);
-    expect(isValidWorkspace("C:/Users/alice/work")).toBe(true);
+    expect(isValidWorkspace("C:\\work\\alice\\work")).toBe(true);
+    expect(isValidWorkspace("C:/opt/work/work")).toBe(true);
     expect(isValidWorkspace("c:\\work")).toBe(true);
-    expect(isValidWorkspace("  C:\\Users\\alice  ")).toBe(true);
+    expect(isValidWorkspace("  C:\\work\\alice  ")).toBe(true);
   });
 
   it("rejects a bare drive letter and non-drive colon shapes", () => {
@@ -665,16 +665,16 @@ describe("isValidWorkspace", () => {
 // (false-equal) or false-warn.
 describe("normalizeWorkspacePath", () => {
   it.each<[string, string | null]>([
-    ["/Users/me/repo", "/Users/me/repo"],
+    ["/opt/work/repo", "/opt/work/repo"],
     // Trailing slash dropped so "/repo/" matches a stored "/repo".
-    ["/Users/me/repo/", "/Users/me/repo"],
-    ["/Users/me/repo///", "/Users/me/repo"],
+    ["/opt/work/repo/", "/opt/work/repo"],
+    ["/opt/work/repo///", "/opt/work/repo"],
     // Surrounding whitespace (pasted paths) trimmed before comparison.
     ["  /a/b  ", "/a/b  "],
     // Root is preserved, not collapsed away.
     ["/", "/"],
     ["///", "/"],
-    ["D:\\AIProgram\\Projects\\", "D:\\AIProgram\\Projects"],
+    ["D:\\work\\Projects\\", "D:\\work\\Projects"],
     ["E:/Projects/Omnigent/", "E:/Projects/Omnigent"],
     ["C:\\", "C:\\"],
     // Blank → null (no path) — must NOT become "/", or an empty input would
@@ -831,7 +831,7 @@ describe("sandbox repository helpers", () => {
     ["git@github.com:org/repo.git", true],
     // Bare shorthand and paths are not API surface.
     ["org/repo", false],
-    ["/Users/me/repo", false],
+    ["/opt/work/repo", false],
     // Host with no repo path.
     ["https://github.com", false],
     ["", false],
@@ -889,12 +889,12 @@ describe("sandbox repository helpers", () => {
 
   it.each<[string, string]>([
     // Deep path → leading ellipsis + last two segments (the disambiguating tail).
-    ["/Users/me/myrepo-worktrees/feature-x", "…/myrepo-worktrees/feature-x"],
+    ["/opt/work/myrepo-worktrees/feature-x", "…/myrepo-worktrees/feature-x"],
     // Two-or-fewer segments → returned unchanged (nothing useful to trim).
     ["/Users", "/Users"],
     ["/a/b", "/a/b"],
     // Trailing slash doesn't create an empty tail segment.
-    ["/Users/me/myrepo-worktrees/feature-x/", "…/myrepo-worktrees/feature-x"],
+    ["/opt/work/myrepo-worktrees/feature-x/", "…/myrepo-worktrees/feature-x"],
   ])("worktreePathTail(%j) === %j", (path, expected) => {
     expect(worktreePathTail(path)).toBe(expected);
   });
@@ -904,7 +904,7 @@ describe("sandbox repository helpers", () => {
       name: "existing linked worktree",
       workspace: "/Volumes/worktrees/auth-refresh",
       worktrees: [
-        { path: "/Users/corey/projects/alpha", branch: "main", is_main: true, detached: false },
+        { path: "/opt/work/projects/alpha", branch: "main", is_main: true, detached: false },
         {
           path: "/Volumes/worktrees/auth-refresh",
           branch: "auth-refresh",
@@ -925,7 +925,7 @@ describe("sandbox repository helpers", () => {
       name: "proposed branch from an existing worktree",
       workspace: "/Volumes/worktrees/auth-refresh",
       worktrees: [
-        { path: "/Users/corey/projects/alpha", branch: "main", is_main: true, detached: false },
+        { path: "/opt/work/projects/alpha", branch: "main", is_main: true, detached: false },
         {
           path: "/Volumes/worktrees/auth-refresh",
           branch: "auth-refresh",
@@ -944,9 +944,9 @@ describe("sandbox repository helpers", () => {
     },
     {
       name: "auto-seeded branch",
-      workspace: "/Users/corey/projects/alpha",
+      workspace: "/opt/work/projects/alpha",
       worktrees: [
-        { path: "/Users/corey/projects/alpha", branch: "main", is_main: true, detached: false },
+        { path: "/opt/work/projects/alpha", branch: "main", is_main: true, detached: false },
       ],
       worktreesResolved: true,
       branchName: "worktree-1234abcd",
@@ -959,9 +959,9 @@ describe("sandbox repository helpers", () => {
     },
     {
       name: "main repository",
-      workspace: "/Users/corey/projects/alpha",
+      workspace: "/opt/work/projects/alpha",
       worktrees: [
-        { path: "/Users/corey/projects/alpha", branch: "main", is_main: true, detached: false },
+        { path: "/opt/work/projects/alpha", branch: "main", is_main: true, detached: false },
       ],
       worktreesResolved: true,
       branchName: "",
@@ -976,7 +976,7 @@ describe("sandbox repository helpers", () => {
       name: "detached linked worktree",
       workspace: "/Volumes/worktrees/review",
       worktrees: [
-        { path: "/Users/corey/projects/alpha", branch: "main", is_main: true, detached: false },
+        { path: "/opt/work/projects/alpha", branch: "main", is_main: true, detached: false },
         {
           path: "/Volumes/worktrees/review",
           branch: null,
@@ -995,7 +995,7 @@ describe("sandbox repository helpers", () => {
     },
     {
       name: "plain directory with no worktree state",
-      workspace: "/Users/corey/Documents",
+      workspace: "/opt/work/Documents",
       worktrees: [],
       worktreesResolved: true,
       branchName: "",
@@ -1008,10 +1008,10 @@ describe("sandbox repository helpers", () => {
     },
     {
       name: "explicit branch request from the main repository",
-      workspace: "/Users/corey/current-repo",
+      workspace: "/opt/work/current-repo",
       worktrees: [
         {
-          path: "/Users/corey/current-repo",
+          path: "/opt/work/current-repo",
           branch: "main",
           is_main: true,
           detached: false,
@@ -1033,11 +1033,11 @@ describe("sandbox repository helpers", () => {
   it.each([
     {
       name: "stale placeholder data",
-      workspace: "/Users/corey/current-repo",
+      workspace: "/opt/work/current-repo",
       worktrees: [
-        { path: "/Users/corey/old-repo", branch: "main", is_main: true, detached: false },
+        { path: "/opt/work/old-repo", branch: "main", is_main: true, detached: false },
         {
-          path: "/Users/corey/current-repo",
+          path: "/opt/work/current-repo",
           branch: "old-branch",
           is_main: false,
           detached: false,
@@ -1054,7 +1054,7 @@ describe("sandbox repository helpers", () => {
     },
     {
       name: "explicit branch request while worktrees load",
-      workspace: "/Users/corey/current-repo",
+      workspace: "/opt/work/current-repo",
       worktrees: [],
       worktreesResolved: false,
       branchName: "feature/new-ui",
@@ -1067,7 +1067,7 @@ describe("sandbox repository helpers", () => {
     },
     {
       name: "auto-seeded branch request while worktrees load",
-      workspace: "/Users/corey/current-repo",
+      workspace: "/opt/work/current-repo",
       worktrees: [],
       worktreesResolved: false,
       branchName: "worktree-1234abcd",
@@ -1089,8 +1089,8 @@ describe("sandbox repository helpers", () => {
 // and the one case it can't resolve (empty home → null → blank field).
 describe("deriveHomeDir", () => {
   it("returns the parent directory of the first entry", () => {
-    expect(deriveHomeDir([fsEntry("/Users/corey/projects"), fsEntry("/Users/corey/Desktop")])).toBe(
-      "/Users/corey",
+    expect(deriveHomeDir([fsEntry("/opt/work/projects"), fsEntry("/opt/work/Desktop")])).toBe(
+      "/opt/work",
     );
   });
 
@@ -1101,7 +1101,7 @@ describe("deriveHomeDir", () => {
   });
 
   it("returns the Windows home directory from a native entry path", () => {
-    expect(deriveHomeDir([fsEntry("C:\\Users\\corey\\Desktop")])).toBe("C:\\Users\\corey");
+    expect(deriveHomeDir([fsEntry("C:\\work\\corey\\Desktop")])).toBe("C:\\work\\corey");
   });
 
   it("returns null for an empty listing", () => {
@@ -1464,7 +1464,7 @@ function setupLandingMocks() {
   localStorage.clear();
   // host_1's most-recent workspace seeds the field (so submit can enable
   // without manual picks). Tests that exercise the home fallback clear this.
-  localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: ["/Users/corey/repo"] }));
+  localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: ["/opt/work/repo"] }));
   useDirectorySessionsMock.mockReturnValue({
     data: [],
   } as unknown as ReturnType<typeof useDirectorySessions>);
@@ -2834,7 +2834,7 @@ describe("NewChatLandingScreen cached picker preview", () => {
         ...SUCCESS_QUERY_STATE,
         data: {
           host_id: "host_1",
-          workspace: "/Users/corey/repo",
+          workspace: "/opt/work/repo",
           agent_id: "a1",
           model: "sonnet",
         },
@@ -2847,7 +2847,7 @@ describe("NewChatLandingScreen cached picker preview", () => {
       useProjectHostRootsMock.mockReturnValue({
         ...SUCCESS_QUERY_STATE,
         data: {
-          roots: [{ host_id: "host_1", workspace: "/Users/corey/repo", source: "config" }],
+          roots: [{ host_id: "host_1", workspace: "/opt/work/repo", source: "config" }],
           default_host_id: "host_1",
           default_host_reason: "config",
         },
@@ -3059,7 +3059,7 @@ describe("NewChatLandingScreen cached picker preview", () => {
     );
     const snapshot = seedResolvedPicker();
     expect(readNewChatPermissionCache(snapshot.key)?.row?.value).toBe("Plan");
-    expect(readNewChatWorkspaceCache(snapshot.key)?.workspace).toBe("/Users/corey/repo");
+    expect(readNewChatWorkspaceCache(snapshot.key)?.workspace).toBe("/opt/work/repo");
     mockAgents(undefined);
     mockHosts(undefined);
     mockModelQueries(() => pendingModels);
@@ -3071,7 +3071,7 @@ describe("NewChatLandingScreen cached picker preview", () => {
 
     const workspace = screen.getByTestId("new-chat-landing-workspace-chip");
     const permission = screen.getByTestId("new-chat-landing-permission-chip");
-    expect(workspace).toHaveAttribute("title", "/Users/corey/repo");
+    expect(workspace).toHaveAttribute("title", "/opt/work/repo");
     expect(permission).toHaveTextContent("Plan");
     for (const control of [workspace, permission]) {
       expect(control).toHaveAttribute("aria-busy", "true");
@@ -3244,6 +3244,32 @@ describe("NewChatLandingScreen cached picker preview", () => {
 });
 
 describe("Run on this machine (desktop host enrollment)", () => {
+  it("reaches the row's Terminal action with menu keyboard navigation", async () => {
+    mockHosts([{ ...host("online"), capabilities: ["host_terminals_v1"] }]);
+    renderLanding();
+    const chip = await screen.findByTestId("new-chat-landing-host-chip");
+    fireEvent.keyDown(chip, { key: "ArrowDown" });
+    const hostItem = await screen.findByTestId("new-chat-landing-host-host_1");
+    act(() => hostItem.focus());
+    fireEvent.keyDown(hostItem, { key: "ArrowDown" });
+    await waitFor(() => expect(screen.getByRole("menuitem", { name: "Terminal" })).toHaveFocus());
+    fireEvent.keyDown(document.activeElement!, { key: "Enter" });
+    expect(screen.getByTestId("landing-location")).toHaveTextContent("/hosts/host_1/terminals");
+  });
+  it("opens the capable host's standalone terminal without selecting the host row", async () => {
+    mockHosts([
+      { ...host("online"), capabilities: ["host_terminals_v1"] },
+      host("online", 2),
+      { ...host("offline", 3), capabilities: ["host_terminals_v1"] },
+    ]);
+    renderLanding();
+    await openHostMenu();
+    const link = await screen.findByRole("menuitem", { name: "Terminal" });
+    expect(link).toHaveAttribute("href", "/hosts/host_1/terminals");
+    expect(screen.getAllByRole("menuitem", { name: "Terminal" })).toHaveLength(1);
+    fireEvent.click(link);
+    expect(screen.getByTestId("landing-location")).toHaveTextContent("/hosts/host_1/terminals");
+  });
   beforeEach(() => {
     setupLandingMocks();
     // No hosts connected yet → the picker offers the one-click connect.
@@ -4227,11 +4253,11 @@ describe("NewChatLandingScreen", () => {
       "Project: No Project",
     );
     expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAccessibleName(
-      "Working directory: /Users/corey/repo",
+      "Working directory: /opt/work/repo",
     );
     const { body } = await submitAndReadBody();
     expect(body).not.toHaveProperty("project_id");
-    expect(body.workspace).toBe("/Users/corey/repo");
+    expect(body.workspace).toBe("/opt/work/repo");
   });
 
   it("keeps a sandbox-config project on the sandbox despite a host root", async () => {
@@ -4302,7 +4328,7 @@ describe("NewChatLandingScreen", () => {
       localStorage.setItem("omnigent:last-host-choice", "host_2");
       localStorage.setItem(
         RECENT_KEY,
-        JSON.stringify({ host_1: ["/Users/corey/repo"], host_2: ["/work/repo"] }),
+        JSON.stringify({ host_1: ["/opt/work/repo"], host_2: ["/work/repo"] }),
       );
       mockHosts([host("online", 1), host("offline", 2), host("offline", 3)]);
       renderLanding({ managed_sandboxes_enabled: managedSandboxesEnabled });
@@ -4561,7 +4587,7 @@ describe("NewChatLandingScreen", () => {
     useHostWorktreesMock.mockReturnValue({
       data: [
         {
-          path: "/Users/corey/repo",
+          path: "/opt/work/repo",
           branch: "main",
           is_main: true,
           detached: false,
@@ -4809,7 +4835,7 @@ describe("NewChatLandingScreen", () => {
         ...SUCCESS_QUERY_STATE,
         data: [
           {
-            path: "/Users/corey/repo",
+            path: "/opt/work/repo",
             branch: "main",
             is_main: true,
             detached: false,
@@ -4843,7 +4869,7 @@ describe("NewChatLandingScreen", () => {
   );
 
   it("keeps the verified worktree control visible while a nested repo path loads", async () => {
-    const repo = "/Users/corey/repo";
+    const repo = "/opt/work/repo";
     const nested = `${repo}/src/components`;
     localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [repo, nested] }));
     useHostWorktreesMock.mockImplementation(
@@ -4874,8 +4900,8 @@ describe("NewChatLandingScreen", () => {
   });
 
   describe("worktree choices after workspace changes", () => {
-    const gitWorkspace = "/Users/corey/repo";
-    const nextWorkspace = "/Users/corey/next-workspace";
+    const gitWorkspace = "/opt/work/repo";
+    const nextWorkspace = "/opt/work/next-workspace";
     const branchName = "feature/workspace-switch";
     const mainWorktree = {
       path: gitWorkspace,
@@ -5823,7 +5849,7 @@ describe("NewChatLandingScreen", () => {
   it("shows recent workspaces first and opens WorkspacePicker only from Open folder", () => {
     localStorage.setItem(
       RECENT_KEY,
-      JSON.stringify({ host_1: ["/Users/corey/repo", "/Users/corey/other"] }),
+      JSON.stringify({ host_1: ["/opt/work/repo", "/opt/work/other"] }),
     );
     renderLanding();
 
@@ -5835,8 +5861,8 @@ describe("NewChatLandingScreen", () => {
     const firstRecent = screen.getByTestId("recent-workspace-select-0");
     const secondRecent = screen.getByTestId("recent-workspace-select-1");
     expect(firstRecent).toHaveClass("py-[3px]", "text-ui");
-    expect(firstRecent).toHaveTextContent("/Users/corey/repo");
-    expect(secondRecent).toHaveTextContent("/Users/corey/other");
+    expect(firstRecent).toHaveTextContent("/opt/work/repo");
+    expect(secondRecent).toHaveTextContent("/opt/work/other");
     expect(
       firstRecent.compareDocumentPosition(secondRecent) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
@@ -5862,7 +5888,7 @@ describe("NewChatLandingScreen", () => {
   it("browses a recent folder provisionally without selecting it", () => {
     localStorage.setItem(
       RECENT_KEY,
-      JSON.stringify({ host_1: ["/Users/corey/repo", "/Users/corey/other"] }),
+      JSON.stringify({ host_1: ["/opt/work/repo", "/opt/work/other"] }),
     );
     renderLanding();
 
@@ -5871,12 +5897,12 @@ describe("NewChatLandingScreen", () => {
     fireEvent.click(screen.getByTestId("recent-workspace-browse-1"));
 
     expect(screen.getByTestId("workspace-picker")).toBeVisible();
-    expect(screen.getByTestId("workspace-picker-path-input")).toHaveValue("/Users/corey/other");
-    expect(workspace).toHaveAttribute("title", "/Users/corey/repo");
+    expect(screen.getByTestId("workspace-picker-path-input")).toHaveValue("/opt/work/other");
+    expect(workspace).toHaveAttribute("title", "/opt/work/repo");
 
     fireEvent.click(screen.getByTestId("workspace-picker-cancel"));
     expect(screen.queryByTestId("workspace-picker")).toBeNull();
-    expect(workspace).toHaveAttribute("title", "/Users/corey/repo");
+    expect(workspace).toHaveAttribute("title", "/opt/work/repo");
   });
 
   it("separates the zero-session import action from an empty notice slot", () => {
@@ -5943,7 +5969,7 @@ describe("NewChatLandingScreen", () => {
     const hostTrigger = screen.getByTestId("new-chat-landing-host-chip");
     const workspaceTrigger = screen.getByTestId("new-chat-landing-workspace-chip");
     expect(hostTrigger).toHaveAccessibleName(`Host: ${label}, Online`);
-    expect(workspaceTrigger).toHaveAccessibleName("Working directory: /Users/corey/repo");
+    expect(workspaceTrigger).toHaveAccessibleName("Working directory: /opt/work/repo");
     expect(hostTrigger).not.toHaveAttribute("title");
     expect(within(hostTrigger).getByTestId("new-chat-landing-host-status")).toHaveClass(
       "bg-success",
@@ -5960,9 +5986,9 @@ describe("NewChatLandingScreen", () => {
   it("keeps placeholder worktrees from relabeling the selected directory", async () => {
     let worktreeResult = {
       data: [
-        { path: "/Users/corey/legacy", branch: "main", is_main: true, detached: false },
+        { path: "/opt/work/legacy", branch: "main", is_main: true, detached: false },
         {
-          path: "/Users/corey/repo",
+          path: "/opt/work/repo",
           branch: "legacy-branch",
           is_main: false,
           detached: false,
@@ -5980,7 +6006,7 @@ describe("NewChatLandingScreen", () => {
     worktreeResult = {
       data: [
         {
-          path: "/Users/corey/repo",
+          path: "/opt/work/repo",
           branch: "main",
           is_main: true,
           detached: false,
@@ -6001,7 +6027,7 @@ describe("NewChatLandingScreen", () => {
       ),
     );
     expect(workspaceTrigger).toHaveTextContent("repo");
-    expect(workspaceTrigger).toHaveAttribute("title", "/Users/corey/repo");
+    expect(workspaceTrigger).toHaveAttribute("title", "/opt/work/repo");
   });
 
   it("dismisses sibling popovers and restores each trigger's focus on Escape", async () => {
@@ -6525,7 +6551,7 @@ describe("NewChatLandingScreen", () => {
       git?: unknown;
     };
     expect(body.host_id).toBe("host_1");
-    expect(body.workspace).toBe("/Users/corey/repo");
+    expect(body.workspace).toBe("/opt/work/repo");
     expect(body).not.toHaveProperty("git");
   });
 
@@ -7021,7 +7047,7 @@ describe("NewChatLandingScreen", () => {
       "M20.998 10.949H24v3.102",
     );
 
-    // A user badge (MOD-s25) owns the slot: no mark, badge + vendor logo only.
+    // A user badge owns the slot: no mark, badge + vendor logo only.
     closeMenu();
     writeAgentBadgePreferences({
       version: 1,
@@ -7405,7 +7431,7 @@ describe("NewChatLandingScreen", () => {
 
   it("seeds the working directory from the host's most-recent path", async () => {
     renderLanding();
-    // host_1's recent ("/Users/corey/repo") seeds the field; the chip shows
+    // host_1's recent ("/opt/work/repo") seeds the field; the chip shows
     // the basename. A regression in the seed effect leaves it "Working
     // directory" and submit stuck disabled.
     await waitFor(() =>
@@ -7417,7 +7443,7 @@ describe("NewChatLandingScreen", () => {
     mockHosts([
       {
         ...host("online"),
-        default_workspace: "D:\\AIProgram\\Projects",
+        default_workspace: "D:\\work\\Projects",
       },
     ]);
     renderLanding();
@@ -7430,7 +7456,7 @@ describe("NewChatLandingScreen", () => {
     mockHosts([
       {
         ...host("online"),
-        default_workspace: "/Users/corey/Projects",
+        default_workspace: "/opt/work/Projects",
       },
     ]);
     renderLanding();
@@ -7994,10 +8020,10 @@ describe("NewChatLandingScreen", () => {
   });
 
   it("shows a conflict banner in the file browser for an occupied directory", async () => {
-    // A live session in the seeded workspace ("/Users/corey/repo") on the
+    // A live session in the seeded workspace ("/opt/work/repo") on the
     // auto-selected host occupies the directory the picker opens at.
     useDirectorySessionsMock.mockReturnValue({
-      data: [conv({ id: "s1", host_id: "host_1", workspace: "/Users/corey/repo" })],
+      data: [conv({ id: "s1", host_id: "host_1", workspace: "/opt/work/repo" })],
     } as unknown as ReturnType<typeof useDirectorySessions>);
     useRunnerHealthMock.mockReturnValue(new Map([["s1", true]]));
     renderLanding();
@@ -8534,7 +8560,7 @@ describe("NewChatLandingScreen", () => {
 
   it("suppresses the conflict banner once a git branch is named", async () => {
     useDirectorySessionsMock.mockReturnValue({
-      data: [conv({ id: "s1", host_id: "host_1", workspace: "/Users/corey/repo" })],
+      data: [conv({ id: "s1", host_id: "host_1", workspace: "/opt/work/repo" })],
     } as unknown as ReturnType<typeof useDirectorySessions>);
     useRunnerHealthMock.mockReturnValue(new Map([["s1", true]]));
     renderLanding();
@@ -8558,14 +8584,14 @@ describe("NewChatLandingScreen", () => {
       useHostWorktreesMock.mockReturnValue({
         data: [
           {
-            path: "/Users/corey/repo",
+            path: "/opt/work/repo",
             branch: "main",
             is_main: true,
             detached: false,
             ...(remoteProvider === undefined ? {} : { remote_provider: remoteProvider }),
           },
           {
-            path: "/Users/corey/repo-worktrees/feature-x",
+            path: "/opt/work/repo-worktrees/feature-x",
             branch: "feature/x",
             is_main: false,
             detached: false,
@@ -8683,7 +8709,7 @@ describe("NewChatLandingScreen", () => {
       // bind mode (`existing_worktree`): no worktree is created, but the
       // worktree's branch rides along as `branch_name` so the sidebar shows it
       // and the delete flow can offer to remove it. No base_branch on a bind.
-      expect(body.workspace).toBe("/Users/corey/repo-worktrees/feature-x");
+      expect(body.workspace).toBe("/opt/work/repo-worktrees/feature-x");
       expect(body.git?.existing_worktree).toBe(true);
       expect(body.git?.branch_name).toBe("feature/x");
       expect(body.git?.base_branch).toBeUndefined();
@@ -8694,13 +8720,13 @@ describe("NewChatLandingScreen", () => {
     useHostWorktreesMock.mockReturnValue({
       data: [
         {
-          path: "/Users/corey/repo",
+          path: "/opt/work/repo",
           branch: "main",
           is_main: true,
           detached: false,
         },
         ...Array.from({ length: 12 }, (_, index) => ({
-          path: `/Users/corey/repo-worktrees/feature-${index}`,
+          path: `/opt/work/repo-worktrees/feature-${index}`,
           branch: `feature/${index}`,
           is_main: false,
           detached: false,
@@ -8737,7 +8763,7 @@ describe("NewChatLandingScreen", () => {
     useHostWorktreesMock.mockReturnValue({
       data: [
         {
-          path: "/Users/corey/repo-worktrees/feature-x",
+          path: "/opt/work/repo-worktrees/feature-x",
           branch: "feature/x",
           is_main: false,
           detached: false,
@@ -8789,18 +8815,18 @@ describe("NewChatLandingScreen", () => {
   it("announces and creates a new worktree branch from a detached worktree", async () => {
     localStorage.setItem(
       RECENT_KEY,
-      JSON.stringify({ host_1: ["/Users/corey/repo-worktrees/review"] }),
+      JSON.stringify({ host_1: ["/opt/work/repo-worktrees/review"] }),
     );
     useHostWorktreesMock.mockReturnValue({
       data: [
         {
-          path: "/Users/corey/repo",
+          path: "/opt/work/repo",
           branch: "main",
           is_main: true,
           detached: false,
         },
         {
-          path: "/Users/corey/repo-worktrees/review",
+          path: "/opt/work/repo-worktrees/review",
           branch: null,
           is_main: false,
           detached: true,
@@ -8818,7 +8844,7 @@ describe("NewChatLandingScreen", () => {
     await waitFor(() =>
       expect(worktreeTrigger).toHaveAttribute(
         "title",
-        "Existing detached worktree: /Users/corey/repo-worktrees/review",
+        "Existing detached worktree: /opt/work/repo-worktrees/review",
       ),
     );
 
@@ -8846,13 +8872,13 @@ describe("NewChatLandingScreen", () => {
     useHostWorktreesMock.mockReturnValue({
       data: [
         {
-          path: "/Users/corey/repo-worktrees/feature-x",
+          path: "/opt/work/repo-worktrees/feature-x",
           branch: "feature/x",
           is_main: false,
           detached: false,
         },
         {
-          path: "/Users/corey/repo-worktrees/bugfix-login",
+          path: "/opt/work/repo-worktrees/bugfix-login",
           branch: "bugfix/login",
           is_main: false,
           detached: false,
@@ -8938,7 +8964,7 @@ describe("NewChatLandingScreen", () => {
   it("commits the browsed working directory with Select", async () => {
     // The picker lists a child folder under the seeded workspace.
     useHostFilesystemMock.mockReturnValue({
-      data: { entries: [fsEntry("/Users/corey/repo/src")], truncated: false },
+      data: { entries: [fsEntry("/opt/work/repo/src")], truncated: false },
       isLoading: false,
       error: null,
       isPlaceholderData: false,
@@ -9918,7 +9944,7 @@ describe("NewChatLandingScreen skills menu", () => {
     expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
     expect(authenticatedFetchMock).toHaveBeenCalledTimes(1);
     expect(authenticatedFetchMock.mock.calls[0]![0]).toContain(
-      "/v1/skills?host_id=host_1&harness=claude-native&path=%2FUsers%2Fcorey%2Frepo",
+      "/v1/skills?host_id=host_1&harness=claude-native&path=%2Fopt%2Fwork%2Frepo",
     );
     expect(authenticatedFetchMock.mock.calls[0]![0]).toContain("allow_pending=true");
     await act(async () =>
@@ -10066,7 +10092,7 @@ describe("NewChatLandingScreen skills menu", () => {
         target: {
           hostId: "host_1",
           harness: "claude-sdk",
-          path: "/Users/corey/repo",
+          path: "/opt/work/repo",
           agentId: "ag_skilled",
         },
         enabled: false,
@@ -10737,7 +10763,7 @@ describe("NewChatLandingScreen paste", () => {
 // exists yet) and its paths are converted from the host's absolute form to
 // workspace-relative for the chip and the "[Attached: …]" marker.
 describe("NewChatLandingScreen @-file-mention", () => {
-  const ROOT = "/Users/corey/repo";
+  const ROOT = "/opt/work/repo";
   function dir(path: string): HostFilesystemEntry {
     return {
       name: path.split("/").pop() ?? "",
@@ -10848,7 +10874,7 @@ describe("NewChatLandingScreen @-file-mention", () => {
 
     // The contract: the first message carries "[Attached: <relpath>]" so the
     // runner (rooted at the workspace) reads the on-disk file — relative, never
-    // the "/Users/corey/repo/…" absolute path the host filesystem returned.
+    // the "/opt/work/repo/…" absolute path the host filesystem returned.
     await waitFor(() => expect(setPendingInitialPromptMock).toHaveBeenCalled());
     const [, payload] = setPendingInitialPromptMock.mock.calls[0]!;
     expect((payload as { text: string }).text).toBe("[Attached: omnigent/cli.py]\n\nexplain this");
@@ -12351,6 +12377,96 @@ describe("NewChatLandingScreen smart routing", () => {
   });
 });
 
+describe("NewChatLandingScreen Pi RPC model catalog", () => {
+  beforeEach(() => {
+    setupLandingMocks();
+    Object.assign(emptyHarnessCapabilities, {
+      pi: { calling_defaults: { model_options: true, inherits_from: "pi-native" } },
+    });
+    mockAgents([
+      testAgent("a_pi_rpc", "pi-rpc", {
+        display_name: "Pi RPC",
+        harness: "pi",
+        builtin: true,
+        product_of: "pi",
+        integration_mode: "cli-subprocess",
+      }),
+    ]);
+    mockModelQueries((harness) => ({
+      ...SUCCESS_QUERY_STATE,
+      data: harness === "pi" ? [{ id: "litellm/model-a", displayName: "Host model A" }] : [],
+    }));
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_pi_rpc" }),
+    } as Response);
+  });
+  afterEach(() => {
+    cleanup();
+    Reflect.deleteProperty(emptyHarnessCapabilities, "pi");
+  });
+
+  it.each(["win32", "darwin"])(
+    "lists host models and sends the selected model and thinking level on %s",
+    async (platform) => {
+      mockHosts([{ ...host("online"), platform, configured_harnesses: { pi: true } }]);
+      renderLanding();
+      fireEvent.keyDown(window, { code: "KeyM", ctrlKey: true, shiftKey: true });
+      expect(screen.queryAllByText("Models unavailable")).toHaveLength(0);
+      pickPrimaryOption("model", "Host model A");
+      pickPrimaryOption("effort", "High");
+      expect(screen.getByTestId("new-chat-landing-agent-efforts")).toHaveTextContent(
+        "Thinking level",
+      );
+      closePrimaryPicker();
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent("Host model A");
+      const { body } = await submitAndReadBody();
+      expect(body).toMatchObject({
+        agent_id: "a_pi_rpc",
+        model_override: "litellm/model-a",
+        reasoning_effort: "high",
+      });
+      expect(body.permission_mode).toBeUndefined();
+      expect(body.approval_mode).toBeUndefined();
+    },
+  );
+
+  it("shows a failed Pi RPC catalog lookup", () => {
+    mockModelQueries(() => ({
+      data: undefined,
+      isLoading: false,
+      error: new Error("Host model lookup failed"),
+      isError: true,
+    }));
+    renderLanding();
+    fireEvent.keyDown(window, { code: "KeyM", ctrlKey: true, shiftKey: true });
+    expect(screen.getByText("Host model lookup failed")).toBeVisible();
+  });
+
+  it.each([false, true])("keeps Pi permissions when declared modes are %s", async (declared) => {
+    if (declared) {
+      Object.assign(emptyHarnessCapabilities, {
+        pi: {
+          calling_defaults: { model_options: true, inherits_from: "pi-native" },
+          session_modes: {
+            permission: {
+              handler: "agy-tier",
+              options: [
+                { value: "auto", label: "Auto", concept: "automatic", contexts: ["create"] },
+                { value: "plan", label: "Plan", concept: "read-only", contexts: ["create"] },
+              ],
+            },
+          },
+        },
+      });
+    }
+    renderLanding();
+    pickPermissionOption("plan");
+    const { body } = await submitAndReadBody();
+    expect(body.permission_tier).toBe("plan");
+  });
+});
+
 describe("NewChatLandingScreen Auto harness", () => {
   beforeEach(() => {
     setupLandingMocks();
@@ -13601,7 +13717,7 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
       );
       expect(composerContextMetadata).toEqual({
         version: 1,
-        working_directory: { path: "/Users/corey/repo" },
+        working_directory: { path: "/opt/work/repo" },
         worktree: { mode: "none" },
       });
       expect(body.terminal_launch_args).toBeUndefined();

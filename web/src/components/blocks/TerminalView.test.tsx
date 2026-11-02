@@ -15,7 +15,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Toaster } from "@/components/ui/sonner";
 import { FileViewerContext, type OpenFileOptions } from "@/shell/FileViewerContext";
 import { toast } from "sonner";
-import { dispatchMobileAssistantAction } from "@/lib/mobileAssistantPreferences";
+import {
+  dispatchMobileAssistantAction,
+  dispatchMobileAssistantButton,
+} from "@/lib/mobileAssistantPreferences";
 import * as host from "@/lib/host";
 import { isHostKeyless, setSessionHost } from "@/lib/sessionHost";
 import { resolveInitialAttachUrl, watchDirectUpgrade } from "@/lib/terminals";
@@ -204,6 +207,37 @@ describe("buildAttachPath", () => {
 });
 
 describe("control-mode terminal", () => {
+  it("attaches a host terminal through the shared relay client", async () => {
+    const routing = vi.spyOn(host, "isHostRoutingEnabled").mockReturnValue(true);
+    render(<TerminalView hostId="host-a" terminalId="aaaaaaaa" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const url = new URL(terminalSessionMock.instances[0].url);
+    expect(url.pathname).toBe("/v1/hosts/host-a/terminals/aaaaaaaa/attach");
+    expect(url.searchParams.get("omnigent_slice_key")).toBe("host-a");
+    expect(url.searchParams.has("read_only")).toBe(false);
+    routing.mockRestore();
+  });
+
+  it("redials a host terminal without its slice key after wrong-replica 4400", async () => {
+    const routing = vi.spyOn(host, "isHostRoutingEnabled").mockReturnValue(true);
+    const databricks = vi.spyOn(host, "isDatabricksWorkspace").mockReturnValue(true);
+    render(<TerminalView hostId="host-replica" terminalId="bbbbbbbb" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    act(() =>
+      terminalSessionMock.instances[0].onState({
+        kind: "closed",
+        code: 4400,
+        reason: "wrong_replica",
+      }),
+    );
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
+    expect(
+      new URL(terminalSessionMock.instances[1].url).searchParams.has("omnigent_slice_key"),
+    ).toBe(false);
+    expect(isHostKeyless("host-replica")).toBe(true);
+    routing.mockRestore();
+    databricks.mockRestore();
+  });
   it("routes a mobile assistant soft key to the active writable terminal", async () => {
     render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
     await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
@@ -226,6 +260,38 @@ describe("control-mode terminal", () => {
 
     expect(terminalSessionMock.instances[0]?.sendSoftKey).toHaveBeenCalledWith("tab");
     assistantButton.remove();
+  });
+
+  it("ignores a terminal inside a hidden container and forwards phrase and chord payloads to the visible terminal", async () => {
+    render(
+      <>
+        <div className="invisible opacity-0" aria-hidden="true">
+          <TerminalView sessionId="conv_warm" terminalId="terminal_claude_main" />
+        </div>
+        <TerminalView sessionId="conv_active" terminalId="terminal_claude_main" />
+      </>,
+    );
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
+
+    act(() => {
+      dispatchMobileAssistantButton({
+        id: "cp",
+        label: "Cp",
+        binding: { kind: "text", text: "/compact", submit: true },
+      });
+      dispatchMobileAssistantButton({
+        id: "stop",
+        label: "Stop",
+        binding: { kind: "key", chord: { code: "KeyC", modifiers: ["primary"] } },
+      });
+    });
+
+    expect(terminalSessionMock.instances[0]?.sendSoftKey).not.toHaveBeenCalled();
+    expect(terminalSessionMock.instances[1]?.sendSoftKey.mock.calls).toEqual([
+      ["enter", "/compact"],
+      ["enter"],
+      ["enter", "\x03"],
+    ]);
   });
 
   it.each([

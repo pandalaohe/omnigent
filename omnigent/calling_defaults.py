@@ -490,7 +490,7 @@ def check_offered(
     :param catalog: ``{"models": [...], "error": str | None, "fetched_at":
         int | None}`` for the (host, harness) pair, or ``None``.
     :param sources: The resolution's per-field source tokens.
-    :param host_id: Host the message names, e.g. ``"HDS"``.
+    :param host_id: Host the message names, e.g. ``"workstation"``.
     :param project_name: Project the message names for a project-sourced
         value, or ``None`` when no project applies.
     :returns: Zero or more ``{"field", "setting", "message"}`` problems.

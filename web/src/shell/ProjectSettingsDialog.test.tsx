@@ -76,7 +76,7 @@ const LAPTOP = {
   name: "Laptop",
   owner: "me",
   status: "online",
-  default_workspace: "/Users/me/Projects",
+  default_workspace: "/opt/work/Projects",
 };
 const DESKTOP = {
   host_id: "h2",

@@ -1083,7 +1083,7 @@ async def _cross_host_subagent_parent(
     """
     Return the parent when *conv* is a sub-agent running on another host.
 
-    A cross-host member child (SCC06 F2b) runs on its own host's runner, so
+    A cross-host member child runs on its own host's runner, so
     its terminal status cannot be delivered into the parent inbox the way a
     co-located child's is; the parent's runner owns that inbox. ``None`` for a
     top-level session, a hostless child, or a child on its parent's host.
@@ -3118,6 +3118,27 @@ def register_events_routes(
                 pass
             return {"queued": False}
         if body.type == _APPROVAL_TYPE:
+            from omnigent.server.host_restart_approval import authorize_restart_resolution
+
+            authorize_restart_resolution(
+                session_id,
+                str(body.data.get("elicitation_id", "")),
+                user_id,
+                body.data.get("action"),
+                request=request if isinstance(request, Request) else None,
+                auth_provider=auth_provider,
+            )
+            from omnigent.server.terminal_agent_access import authorize_terminal_access_resolution
+
+            await authorize_terminal_access_resolution(
+                session_id,
+                str(body.data.get("elicitation_id", "")),
+                user_id,
+                body.data.get("action"),
+                request=request if isinstance(request, Request) else None,
+                auth_provider=auth_provider,
+                store=conversation_store,
+            )
             # Deliver the verdict through the shared resolver: it
             # sets any server-side harness Future (owner-checked),
             # clears the sidebar badge, and forwards
@@ -3887,7 +3908,7 @@ def register_events_routes(
                     turn_completed=data.get("turn_completed"),
                 )
                 if outcome is None:
-                    # The fork's structured terminal edges (MOD-s21) feed the
+                    # The fork's structured terminal edges feed the
                     # same "returned" activity: completed → completed,
                     # stopped / killed → cancelled.
                     outcome = {
@@ -5199,6 +5220,7 @@ def register_events_routes(
     # The same intake owns persistence and steering for ordinary child messages.
     if app_state is not None:
         app_state.standing_pass_post_event = post_standing_pass_notice
+        app_state.host_restart_post_event = _post_event_impl
 
     # ── GET /sessions/{session_id}/stream ────────────────────────
 

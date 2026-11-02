@@ -66,9 +66,15 @@ def recovery_tree(
 @pytest.mark.asyncio
 async def test_restore_active_descendants_and_idle_ancestor(recovery_tree: Any) -> None:
     store, parent, child, relay, recovered, initializer = recovery_tree
+    store.set_host_id(parent.id, "b" * 32, workspace="/opt/work/omnigent/fork/main")
+    parent = store.get_conversation(parent.id)  # type: ignore[assignment]
     active = child()
     waiting = child("waiting")
-    disconnected = child("failed")
+    disconnected = child(
+        "failed",
+        host_id="b" * 32,
+        workspace="/opt/work/omnigent/fork/wt",
+    )
     store.set_labels(
         disconnected.id,
         {
@@ -77,8 +83,16 @@ async def test_restore_active_descendants_and_idle_ancestor(recovery_tree: Any) 
         },
     )
     idle_ancestor = child("idle")
-    nested = child(owner=idle_ancestor)
-    untouched = [child("idle"), child("failed")]
+    nested = child(
+        owner=idle_ancestor,
+        host_id="b" * 32,
+        workspace="/opt/work/omnigent/fork/nested",
+    )
+    untouched = [
+        child("idle"),
+        child("failed"),
+        child(host_id="c" * 32, workspace="/opt/work/omnigent/fork/other"),
+    ]
     calls = []
 
     def respond(request: httpx.Request) -> httpx.Response:
@@ -91,6 +105,13 @@ async def test_restore_active_descendants_and_idle_ancestor(recovery_tree: Any) 
         transport=httpx.MockTransport(respond), base_url="http://runner"
     ) as client:
         await restore_active_children(parent, client, store, initializer)
+        store.replace_runner_id(nested.id, "old")
+        await restore_active_children(
+            store.get_conversation(idle_ancestor.id),  # type: ignore[arg-type]
+            client,
+            store,
+            initializer,
+        )
 
     by_id = {call["session_id"]: call["session_init"] for call in calls}
     assert set(by_id) == {active.id, waiting.id, disconnected.id, idle_ancestor.id, nested.id}
@@ -105,8 +126,9 @@ async def test_restore_active_descendants_and_idle_ancestor(recovery_tree: Any) 
     }
     ids = list(by_id)
     assert ids.index(idle_ancestor.id) < ids.index(nested.id)
-    assert relay.call_count == 5
+    assert relay.call_count == 6
     recovered.assert_not_awaited()
+    assert store.get_conversation(nested.id).runner_id == "new"
     assert all(store.get_conversation(row.id).runner_id == "old" for row in untouched)
 
 

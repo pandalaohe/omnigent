@@ -985,6 +985,30 @@ async def _publish_and_wait_for_harness_elicitation(
     """
     if elicitation_id is None:
         elicitation_id = f"elicit_{secrets.token_hex(16)}"
+    from omnigent.server.host_restart_approval import restart_card_fields
+
+    try:
+        restart_fields = await restart_card_fields(
+            session_id, elicitation_id, tool_name, tool_input, conversation_store
+        )
+    except OmnigentError:
+        if published is not None:
+            published.set()
+        return ElicitationResult(action="decline")
+    if restart_fields:
+        params = params.model_copy(update=restart_fields)
+    from omnigent.server.terminal_agent_access import terminal_access_card_fields
+
+    try:
+        terminal_fields = await terminal_access_card_fields(
+            session_id, elicitation_id, tool_name, tool_input, conversation_store, timeout_s
+        )
+    except OmnigentError as exc:
+        if published is not None:
+            published.set()
+        return ElicitationResult(action="decline", content={"reason": exc.message})
+    if terminal_fields:
+        params = params.model_copy(update=terminal_fields)
     future: asyncio.Future[ElicitationResult] = asyncio.get_running_loop().create_future()
 
     def approved_verdict(verdict: ElicitationResult | None) -> ElicitationResult | None:
@@ -5335,7 +5359,7 @@ def _new_external_conversation_item(
         item = item.model_copy(
             update={"data": item.data.model_copy(update={"subagent_return_id": return_id})}
         )
-    # Fork dedupe key (MOD-s21): ``_parse_external_conversation_item`` validates
+    # Fork dedupe key: ``_parse_external_conversation_item`` validates
     # ``data.source_id`` and sets ``idempotency_key="external:<source_id>"``; the
     # store derives the row id from it and flags a re-post ``replayed``. Upstream's
     # uuid5 ``stable_id`` would re-id items persisted under the fork key, so the
@@ -5865,7 +5889,7 @@ async def _heal_subagent_runner_binding_via_parent(
     :returns: The live ``httpx.AsyncClient`` for the nearest live ancestor runner
         after healing, or ``None`` when no live ancestor could be found.
     """
-    # A cross-host member child (SCC06 F2b) runs on its OWN host's runner, so
+    # A cross-host member child runs on its OWN host's runner, so
     # the parent's runner is not a valid place to heal it to; leave the binding
     # alone and let the caller fail the forward instead of misrouting it.
     parent_id = child_conv.parent_conversation_id
@@ -11874,6 +11898,21 @@ async def _relay_runner_stream_once(
                     # clients.
                     resource_item = _resource_event_item_from_sse(session_id, event)
                     if (
+                        event.get("type") == "session.resource.deleted"
+                        and event.get("resource_type") == "terminal"
+                        and isinstance(event.get("resource_id"), str)
+                    ):
+                        from omnigent.server.terminal_agent_access import (
+                            end_terminal_access_requests,
+                        )
+
+                        await end_terminal_access_requests(
+                            session_id,
+                            event["resource_id"],
+                            event.get("instance_id"),
+                            conversation_store,
+                        )
+                    if (
                         resource_item is not None
                         and event.get("persist_resource_event") is not False
                     ):
@@ -12154,6 +12193,12 @@ async def _relay_runner_stream_once(
                         )
                         continue
                     if evt_type == "response.elicitation_resolved":
+                        from omnigent.server.terminal_agent_access import (
+                            release_terminal_access_request,
+                        )
+
+                        if isinstance(event.get("elicitation_id"), str):
+                            release_terminal_access_request(session_id, event["elicitation_id"])
                         session_stream.publish(session_id, event)
                         elicitation_id = event.get("elicitation_id")
                         if isinstance(elicitation_id, str) and elicitation_id:
@@ -12429,6 +12474,10 @@ async def _register_policy_elicitation(
     result: PolicyResult,
     arguments_preview: str,
     conversation_store: ConversationStore,
+    *,
+    tool_name: str | None = None,
+    tool_input: dict[str, Any] | None = None,
+    ask_timeout_s: float = 86400,
 ) -> str:
     """
     Publish an elicitation request event on the session stream.
@@ -12466,6 +12515,20 @@ async def _register_policy_elicitation(
     # runner which resolves it. No server-side state needed.
     _elicit_event = build_elicitation_request_event(
         elicitation_id, elicitation, session_id=session_id
+    )
+    from omnigent.server.host_restart_approval import restart_card_fields
+
+    _elicit_event["params"].update(
+        await restart_card_fields(
+            session_id, elicitation_id, tool_name, tool_input, conversation_store
+        )
+    )
+    from omnigent.server.terminal_agent_access import terminal_access_card_fields
+
+    _elicit_event["params"].update(
+        await terminal_access_card_fields(
+            session_id, elicitation_id, tool_name, tool_input, conversation_store, ask_timeout_s
+        )
     )
     session_stream.publish(session_id, _elicit_event)
     await asyncio.to_thread(
@@ -12667,7 +12730,11 @@ async def _evaluate_independent_tool_call_policy(
             tool_input=args_payload if isinstance(args_payload, dict) else None,
         )
         if approval is None or approval.action != "accept":
-            return {"verdict": "deny", "reason": result.reason or "Approval was not granted"}
+            reason = (approval.content or {}).get("reason") if approval is not None else None
+            return {
+                "verdict": "deny",
+                "reason": reason or result.reason or "Approval was not granted",
+            }
         if result.set_labels:
             await asyncio.to_thread(engine.apply_label_writes, result.set_labels)
         if result.state_updates:
@@ -12678,12 +12745,18 @@ async def _evaluate_independent_tool_call_policy(
 
     # ASK — publish elicitation event. Approval state lives
     # on the runner (_pending_approvals dict).
-    elicitation_id = await _register_policy_elicitation(
-        session_id=session_id,
-        result=result,
-        arguments_preview=arguments_str,
-        conversation_store=conversation_store,
-    )
+    try:
+        elicitation_id = await _register_policy_elicitation(
+            session_id=session_id,
+            result=result,
+            arguments_preview=arguments_str,
+            conversation_store=conversation_store,
+            tool_name=tool_name,
+            tool_input=args_payload if isinstance(args_payload, dict) else None,
+            ask_timeout_s=float(resolve_ask_timeout(engine, result)),
+        )
+    except OmnigentError as exc:
+        return {"verdict": "deny", "reason": exc.message}
     # The deciding policy's writes (e.g. a cost-budget checkpoint via
     # ``state_updates``) must land ONLY on approve. This relay path returns
     # ``pending`` and the verdict arrives later off-request, so stash them to
@@ -14440,7 +14513,7 @@ async def _create_session_from_existing_agent(
         if body.host_id is not None and body.host_id != effective_host_id(
             conversation_store, parent_conv
         ):
-            # Cross-host member child (SCC06 F2b): the parent's runner
+            # Cross-host member child: the parent's runner
             # cannot serve the member's host. Leave it unbound so the
             # create route's host launch starts a runner on that host. The
             # parent's effective host is its nearest host-bound ancestor:
@@ -15861,6 +15934,20 @@ async def _handle_mcp_tools_call(
             if approval.get("action") != "accept":
                 return _mcp_error_response(rpc_id, -32000, "Tool call denied by user")
             _pending = _pending_policy_ask_writes.get(elicitation_id_from_state)
+            if namespaced_name == "sys_host_restart":
+                from omnigent.server.host_restart_approval import require_restart_card_approval
+
+                try:
+                    require_restart_card_approval(session_id, elicitation_id_from_state)
+                except OmnigentError as exc:
+                    return _mcp_error_response(rpc_id, -32000, exc.message)
+            if namespaced_name == "sys_terminal_request_access":
+                from omnigent.server.terminal_agent_access import require_terminal_card_approval
+
+                try:
+                    require_terminal_card_approval(session_id, elicitation_id_from_state)
+                except OmnigentError as exc:
+                    return _mcp_error_response(rpc_id, -32000, exc.message)
             identity = (session_id, namespaced_name, (actor or {}).get("run_as"), credential_user)
             if _pending is not None and _pending.mcp_call_identity not in (None, identity):
                 return _mcp_error_response(rpc_id, -32000, "Approval does not match this call")
@@ -15927,12 +16014,18 @@ async def _handle_mcp_tools_call(
             # Emit elicitation SSE event (for REPL approval UI) and return
             # InputRequiredResult per the MCP MRTR spec so the runner can
             # park on the approval Future and retry when the user decides.
-            elicitation_id = await _register_policy_elicitation(
-                session_id,
-                call_result,
-                json.dumps(arguments)[:1024],
-                conversation_store,
-            )
+            try:
+                elicitation_id = await _register_policy_elicitation(
+                    session_id,
+                    call_result,
+                    json.dumps(arguments)[:1024],
+                    conversation_store,
+                    tool_name=namespaced_name,
+                    tool_input=arguments,
+                    ask_timeout_s=float(resolve_ask_timeout(engine, call_result)),
+                )
+            except OmnigentError as exc:
+                return _mcp_error_response(rpc_id, -32000, exc.message)
             # Keep the reviewed call and deferred writes together until approval.
             _pending_policy_ask_writes[elicitation_id] = _PendingPolicyAskWrites(
                 state_updates=call_result.state_updates,

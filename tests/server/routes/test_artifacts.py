@@ -754,7 +754,7 @@ async def test_mint_absolute_host_path_by_non_owner_is_forbidden(
 
     resp = await client.post(
         f"/v1/sessions/{_SESSION_ID}/artifacts",
-        json={"path": "Users/x/report.html", "base": "host", "view": "panel"},
+        json={"path": "opt/work/report.html", "base": "host", "view": "panel"},
     )
 
     assert resp.status_code == 403
@@ -1841,13 +1841,13 @@ async def test_open_absolute_path_carries_host_base(client: httpx.AsyncClient) -
         assert await anext(stream) == {"type": "test.ready"}
         await client.post(
             f"/v1/sessions/{_SESSION_ID}/artifacts/open",
-            json={"path": "Users/x/report.html", "base": "host"},
+            json={"path": "opt/work/report.html", "base": "host"},
         )
         event = await asyncio.wait_for(anext(stream), timeout=1)
     finally:
         await stream.aclose()
 
-    assert event["path"] == "/Users/x/report.html"
+    assert event["path"] == "/opt/work/report.html"
     assert event["base"] == "host"
 
 

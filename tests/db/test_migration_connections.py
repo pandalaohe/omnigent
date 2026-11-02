@@ -77,7 +77,7 @@ def test_legacy_custom_gc_collision_upgrades_without_data_loss(
                 "INSERT INTO hosts "
                 "(workspace_id, host_id, user_id, name, status, default_workspace) "
                 "VALUES (0, 'host_custom', 'user_custom', 'Custom host', 2, "
-                "'D:/AIProgram/Projects')"
+                "'D:/work/Projects')"
             )
         )
         conn.execute(
@@ -119,7 +119,7 @@ def test_legacy_custom_gc_collision_upgrades_without_data_loss(
             conn.scalar(
                 sa.text("SELECT default_workspace FROM hosts WHERE host_id = 'host_custom'")
             )
-            == "D:/AIProgram/Projects"
+            == "D:/work/Projects"
         )
         assert (
             conn.scalar(sa.text("SELECT name FROM custom_agents WHERE id = 'agent_custom'"))

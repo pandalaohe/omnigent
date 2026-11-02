@@ -1164,7 +1164,7 @@ async def _register_fake_host(
     return captured
 
 
-_WORKTREE_PATH = "/Users/alice/myrepo-worktrees/feature-login"
+_WORKTREE_PATH = "/opt/work/myrepo-worktrees/feature-login"
 
 
 def _make_worktree_conversation(
@@ -1245,7 +1245,7 @@ async def test_delete_with_flag_sends_remove_worktree(
         "0 means the delete-flow cleanup gate didn't fire; >1 means it fired twice."
     )
     frame = captured[0]
-    assert frame.worktree_path == "/Users/alice/myrepo-worktrees/feature-login"
+    assert frame.worktree_path == "/opt/work/myrepo-worktrees/feature-login"
     assert frame.branch == "feature/login"
     assert frame.delete_branch is True
 
@@ -1361,7 +1361,7 @@ def test_has_other_live_session_in_workspace(db_uri: str) -> None:
 
     # A different path, and a different host, never count.
     assert not conv_store.has_other_live_session_in_workspace(
-        host_id=_HOST_ID, workspace="/Users/alice/elsewhere", exclude_conversation_id=mine
+        host_id=_HOST_ID, workspace="/opt/work/elsewhere", exclude_conversation_id=mine
     )
     assert not conv_store.has_other_live_session_in_workspace(
         host_id="b" * 32, workspace=_WORKTREE_PATH, exclude_conversation_id=mine
@@ -1487,13 +1487,13 @@ def test_conversation_worktree_round_trip(db_uri: str) -> None:
     conv = conv_store.create_conversation(
         agent_id=None,
         host_id=_HOST_ID,
-        workspace="/Users/alice/entry",
+        workspace="/opt/work/entry",
         worktree=_WORKTREE_PATH,
         git_branch="feature/login",
     )
     loaded = conv_store.get_conversation(conv.id)
     assert loaded is not None
-    assert loaded.workspace == "/Users/alice/entry"
+    assert loaded.workspace == "/opt/work/entry"
     assert loaded.worktree == _WORKTREE_PATH
     assert loaded.git_branch == "feature/login"
     legacy = conv_store.create_conversation(agent_id=None, host_id=_HOST_ID, workspace="/w")
@@ -1505,11 +1505,11 @@ def test_set_host_id_worktree_and_clear_host_binding(db_uri: str) -> None:
     conv_store = SqlAlchemyConversationStore(db_uri)
     conv = conv_store.create_conversation(agent_id=None)
     bound = conv_store.set_host_id(
-        conv.id, _HOST_ID, workspace="/Users/alice/entry", worktree=_WORKTREE_PATH
+        conv.id, _HOST_ID, workspace="/opt/work/entry", worktree=_WORKTREE_PATH
     )
-    assert (bound.workspace, bound.worktree) == ("/Users/alice/entry", _WORKTREE_PATH)
+    assert (bound.workspace, bound.worktree) == ("/opt/work/entry", _WORKTREE_PATH)
     unchanged = conv_store.set_host_id(conv.id, _HOST_ID)
-    assert (unchanged.workspace, unchanged.worktree) == ("/Users/alice/entry", _WORKTREE_PATH)
+    assert (unchanged.workspace, unchanged.worktree) == ("/opt/work/entry", _WORKTREE_PATH)
     moved = conv_store.set_host_id(conv.id, _HOST_ID, worktree="/elsewhere")
     assert moved.worktree == "/elsewhere"
     cleared = conv_store.clear_host_binding(conv.id)
@@ -1538,7 +1538,7 @@ def test_has_other_live_session_matches_effective_worktree(db_uri: str) -> None:
     entry_session = conv_store.create_conversation(
         agent_id=None,
         host_id=_HOST_ID,
-        workspace="/Users/alice/entry",
+        workspace="/opt/work/entry",
         worktree=_WORKTREE_PATH,
     )
     legacy = conv_store.create_conversation(
@@ -1547,7 +1547,7 @@ def test_has_other_live_session_matches_effective_worktree(db_uri: str) -> None:
     # The entry session's launch directory is not the directory being cleaned.
     assert not conv_store.has_other_live_session_in_workspace(
         host_id=_HOST_ID,
-        workspace="/Users/alice/entry",
+        workspace="/opt/work/entry",
         exclude_conversation_id=legacy.id,
     )
     # Its worktree does count, whichever row is the one being excluded.
@@ -1798,11 +1798,11 @@ async def test_delete_removes_the_recorded_worktree_not_the_entry(
     db_uri: str,
 ) -> None:
     """Scenario 8: an entry-started session's delete removes its worktree only."""
-    worktree = "/Users/alice/entry/nested/wt"
+    worktree = "/opt/work/entry/nested/wt"
     captured = await _register_fake_host(app, db_uri, worktree_path=worktree)
     conv_id = _make_worktree_conversation(
         db_uri,
-        workspace="/Users/alice/entry",
+        workspace="/opt/work/entry",
         worktree_root=worktree,
         worktree=worktree,
         git_branch="feature/login",
@@ -1841,21 +1841,21 @@ async def test_delete_of_an_entry_session_is_not_blocked_by_a_sibling_at_the_ent
 ) -> None:
     """Scenario 18: sessions at the entry with distinct worktrees are not sharers."""
     captured = await _register_fake_host(
-        app, db_uri, worktree_path="/Users/alice/entry/wt-a", branch="feature/a"
+        app, db_uri, worktree_path="/opt/work/entry/wt-a", branch="feature/a"
     )
-    app.state.project_host_binding_store = _Entries({(_HOST_ID, "/Users/alice/entry")})
+    app.state.project_host_binding_store = _Entries({(_HOST_ID, "/opt/work/entry")})
     first = _make_worktree_conversation(
         db_uri,
-        workspace="/Users/alice/entry",
-        worktree_root="/Users/alice/entry/wt-a",
-        worktree="/Users/alice/entry/wt-a",
+        workspace="/opt/work/entry",
+        worktree_root="/opt/work/entry/wt-a",
+        worktree="/opt/work/entry/wt-a",
         git_branch="feature/a",
     )
     _make_worktree_conversation(
         db_uri,
-        workspace="/Users/alice/entry",
-        worktree_root="/Users/alice/entry/wt-b",
-        worktree="/Users/alice/entry/wt-b",
+        workspace="/opt/work/entry",
+        worktree_root="/opt/work/entry/wt-b",
+        worktree="/opt/work/entry/wt-b",
         git_branch="feature/b",
     )
 
@@ -1863,7 +1863,7 @@ async def test_delete_of_an_entry_session_is_not_blocked_by_a_sibling_at_the_ent
     assert resp.status_code == 200, resp.text
 
     assert len(captured) == 1, "a co-located entry session must not count as sharing this worktree"
-    assert captured[0].worktree_path == "/Users/alice/entry/wt-a"
+    assert captured[0].worktree_path == "/opt/work/entry/wt-a"
 
 
 async def test_delete_never_removes_a_project_entry(
@@ -1874,7 +1874,7 @@ async def test_delete_never_removes_a_project_entry(
 ) -> None:
     """Scenario 19: a session bound to some project's entry is never cleaned up."""
     captured = await _register_fake_host(app, db_uri)
-    entry = "/Users/alice/entry-repo"
+    entry = "/opt/work/entry-repo"
     # A No Project session bound (existing_worktree) to project A's entry: the
     # row's launch directory is the entry and carries a branch, exactly the
     # shape the cleanup gate used to remove.
@@ -1906,7 +1906,7 @@ async def test_delete_keeps_a_worktree_holding_a_nested_project_entry(
     anywhere under the directory, not only exactly at it.
     """
     captured = await _register_fake_host(app, db_uri)
-    worktree = "/Users/alice/repo-worktrees/topic"
+    worktree = "/opt/work/repo-worktrees/topic"
     app.state.project_host_binding_store = _Entries({(_HOST_ID, f"{worktree}/subproject")})
     conv_id = _make_worktree_conversation(
         db_uri, workspace=worktree, worktree_root=worktree, worktree=worktree

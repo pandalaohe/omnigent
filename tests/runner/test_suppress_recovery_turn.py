@@ -624,10 +624,9 @@ async def test_cleanup_restores_cached_history_attachments_on_the_next_message(
 ) -> None:
     """Resource cleanup must not leave cached history pointing at dead files.
 
-    Cleanup deletes the session attachment dir while the cached history
-    survives. The next message on the same runner app must re-materialize the
-    files before the harness receives the turn, and the harness must see the
-    path line (not a deleted path).
+    Cleanup preserves attachment copies for a resumable session. If a copy
+    later disappears, the next message must re-materialize it before the
+    harness receives the cached history path.
     """
     from omnigent.inner.native_attachments import session_attachment_dir
     from omnigent.runner.app import _session_histories_ref
@@ -684,7 +683,8 @@ async def test_cleanup_restores_cached_history_attachments_on_the_next_message(
             try:
                 cleanup_resp = await client.delete(f"/v1/sessions/{SESSION_ID}/resources")
                 assert cleanup_resp.status_code == 200, cleanup_resp.text
-                assert not host_copy.exists(), "cleanup must delete the host copy"
+                assert host_copy.exists(), "cleanup must preserve the resumable copy"
+                host_copy.unlink()  # Simulate a later missing local cache file.
 
                 forward_resp = await client.post(
                     f"/v1/sessions/{SESSION_ID}/events",
@@ -717,8 +717,8 @@ async def test_cleanup_marks_purged_cached_history_attachment_for_the_next_turn(
 ) -> None:
     """A purged cached-history line must read as lost before the next harness call.
 
-    Cleanup deletes the host copy and the archive cleanup later purges the
-    stored bytes. The cached ``[Attached: ...]`` line must be rewritten in
+    After cleanup, a missing host copy and purged stored bytes leave the
+    cached ``[Attached: ...]`` line needing to be rewritten in
     place to the could-not-load marker so the next turn's harness never sees
     a dead path, and no content GET may be attempted for the purged row.
     """
@@ -783,7 +783,8 @@ async def test_cleanup_marks_purged_cached_history_attachment_for_the_next_turn(
             try:
                 cleanup_resp = await client.delete(f"/v1/sessions/{SESSION_ID}/resources")
                 assert cleanup_resp.status_code == 200, cleanup_resp.text
-                assert not host_copy.exists(), "cleanup must delete the host copy"
+                assert host_copy.exists(), "cleanup must preserve the resumable copy"
+                host_copy.unlink()  # Simulate a later missing local cache file.
 
                 forward_resp = await client.post(
                     f"/v1/sessions/{SESSION_ID}/events",
@@ -815,10 +816,9 @@ async def test_failed_restore_keeps_the_flag_for_the_next_message(
 ) -> None:
     """A failed attachment restore must be retried on the next message.
 
-    Cleanup deletes the cached history's host copies. When the first
-    post-cleanup turn cannot list the session files, the pending flag must
-    survive so the following turn retries; that retry restores the file and
-    clears the flag.
+    Cleanup preserves the cached history's host copies. If a copy later
+    disappears and the next turn cannot list the session files, the pending
+    flag must survive so the following turn retries and restores the file.
     """
     from omnigent.inner.native_attachments import session_attachment_dir
     from omnigent.runner.app import _session_histories_ref
@@ -878,6 +878,8 @@ async def test_failed_restore_keeps_the_flag_for_the_next_message(
             try:
                 cleanup_resp = await client.delete(f"/v1/sessions/{SESSION_ID}/resources")
                 assert cleanup_resp.status_code == 200, cleanup_resp.text
+                assert host_copy.exists(), "cleanup must preserve the resumable copy"
+                host_copy.unlink()  # Simulate a later missing local cache file.
                 assert SESSION_ID in pending
 
                 first_resp = await client.post(

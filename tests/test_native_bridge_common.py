@@ -65,9 +65,104 @@ def test_prune_removes_dead_keeps_live_and_unmarked(tmp_path: Path) -> None:
     assert not dead_dir.exists()
     assert live_dir.exists()
     assert unmarked_dir.exists()
-    assert not attachment_cache_dir(dead_dir).exists()
+    # The cache outlives the runner: a resumed transcript still reads it.
+    assert attachment_cache_dir(dead_dir).exists()
     assert attachment_cache_dir(live_dir).exists()
     assert attachment_cache_dir(unmarked_dir).exists()
+
+
+def _write_file(directory: Path, *, expired: bool) -> Path:
+    """Write one file in *directory*, backdated past the orphan retention when *expired*."""
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "bundle.zip"
+    path.write_bytes(b"PK")
+    if expired:
+        old = time.time() - native_bridge_common.ORPHAN_RETENTION_SECONDS - 60
+        os.utime(path, (old, old))
+    return path
+
+
+def test_prune_expired_attachment_caches_removes_only_expired_attachment_dirs(
+    tmp_path: Path,
+) -> None:
+    """Expired bridge and session dirs go; fresh, other and symlinked ones stay."""
+    attachments = tmp_path / "attachments"
+    expired = attachments / ("a" * 32)
+    fresh = attachments / ("b" * 32)
+    session_dir = attachments / ("s-" + "c" * 32)
+    fresh_session_dir = attachments / ("s-" + "f" * 32)
+    other = attachments / "not-a-cache"
+    _write_file(expired, expired=True)
+    _write_file(fresh, expired=False)
+    _write_file(session_dir / "file_1", expired=True)
+    _write_file(fresh_session_dir / "file_1", expired=False)
+    _write_file(other, expired=True)
+    target_file = _write_file(tmp_path / "elsewhere", expired=True)
+    link = attachments / ("d" * 32)
+    link.symlink_to(target_file.parent, target_is_directory=True)
+
+    removed = native_bridge_common.prune_expired_attachment_caches(attachments)
+
+    assert removed == 2
+    assert not expired.exists()
+    assert not session_dir.exists()
+    assert fresh.exists()
+    assert fresh_session_dir.exists()
+    assert other.exists()
+    assert link.is_symlink()
+    assert target_file.exists()
+
+
+def test_prune_expired_attachment_caches_skips_a_dir_being_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An expired dir is kept while materialize_attachment holds its lock."""
+    from omnigent.inner import native_attachments
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    bridge_dir = tmp_path / "bridge"
+    busy = attachment_cache_dir(bridge_dir)
+    expired_file = _write_file(busy, expired=True)
+    real_into_cache = native_attachments._materialize_into_cache
+    swept_mid_write: list[int] = []
+
+    def _sweep_then_place(attachments_dir: Path, filename: str, raw_bytes: bytes) -> Path | None:
+        swept_mid_write.append(
+            native_bridge_common.prune_expired_attachment_caches(attachments_dir.parent)
+        )
+        return real_into_cache(attachments_dir, filename, raw_bytes)
+
+    monkeypatch.setattr(native_attachments, "_materialize_into_cache", _sweep_then_place)
+    placed = materialize_attachment(
+        {
+            "type": "input_file",
+            "filename": "fresh.zip",
+            "file_data": "data:application/zip;base64,UEsDBA==",
+        },
+        bridge_dir,
+    )
+
+    assert swept_mid_write == [0]
+    assert placed is not None and placed.exists()
+    assert expired_file.exists()
+
+
+def test_prune_expired_attachment_caches_missing_dir_returns_zero(tmp_path: Path) -> None:
+    """A never-created attachments dir is a no-op, not an error."""
+    assert native_bridge_common.prune_expired_attachment_caches(tmp_path / "never-created") == 0
+
+
+def test_reap_sweeps_expired_attachment_caches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The host-wide sweep also retires expired attachment caches under the data dir."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr("omnigent.harness_plugins.native_agents", list)
+    cache = tmp_path / "data" / "attachments" / ("e" * 32)
+    _write_file(cache, expired=True)
+
+    assert native_bridge_common.reap_orphaned_native_bridge_dirs() == 1
+    assert not cache.exists()
 
 
 def test_prune_ignores_non_dir_entries_and_bad_markers(tmp_path: Path) -> None:

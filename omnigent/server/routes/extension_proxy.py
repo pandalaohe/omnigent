@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response
@@ -9,6 +11,7 @@ from fastapi.responses import Response
 from omnigent.extensions import ExtensionPermission, ExtensionPluginState, ExternalPageContribution
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.ws_origin import origin_allowed, parse_allowed_origins
 
 _REQUEST_HEADERS = ("content-type", "accept")
 _RESPONSE_HEADERS = (
@@ -19,6 +22,29 @@ _RESPONSE_HEADERS = (
 )
 _MAX_REQUEST_BYTES = 1024 * 1024
 _MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+
+
+def _is_same_origin(request: Request, supplied_origin: str | None) -> bool:
+    if supplied_origin is None:
+        return False
+    try:
+        supplied = httpx.URL(supplied_origin)
+    except httpx.InvalidURL:
+        return False
+    if supplied.scheme not in {"http", "https"} or not supplied.netloc:
+        return False
+    if supplied != httpx.URL(f"{supplied.scheme}://{supplied.netloc.decode('ascii')}"):
+        return False
+    if supplied == httpx.URL(f"{request.url.scheme}://{request.url.netloc}"):
+        return True
+    configured = set(parse_allowed_origins())
+    if base_url := os.environ.get("OMNIGENT_ACCOUNTS_BASE_URL", "").strip().rstrip("/"):
+        configured.add(base_url)
+    return bool(configured) and origin_allowed(
+        supplied_origin,
+        local_mode=False,
+        extra_allowed=frozenset(configured),
+    )
 
 
 def create_extension_proxy_router(
@@ -59,20 +85,16 @@ def create_extension_proxy_router(
         ):
             raise HTTPException(404, "Extension proxy route not allowed")
 
-        origin = f"{request.url.scheme}://{request.url.netloc}"
+        forwarded_proto = request.url.scheme
         if request.method not in {"GET", "HEAD"}:
             supplied_origin = request.headers.get("origin")
-            try:
-                same_origin = supplied_origin is not None and httpx.URL(
-                    supplied_origin
-                ) == httpx.URL(origin)
-            except httpx.InvalidURL:
-                same_origin = False
             if (
-                not same_origin
+                not _is_same_origin(request, supplied_origin)
                 or request.headers.get("sec-fetch-site", "same-origin") != "same-origin"
             ):
                 raise HTTPException(403, "Same-origin request required")
+            assert supplied_origin is not None
+            forwarded_proto = httpx.URL(supplied_origin).scheme
 
         body = bytearray()
         async for chunk in request.stream():
@@ -93,7 +115,7 @@ def create_extension_proxy_router(
                 "host": upstream.netloc.decode("ascii"),
                 "x-forwarded-prefix": prefix,
                 "x-forwarded-host": request.url.netloc,
-                "x-forwarded-proto": request.url.scheme,
+                "x-forwarded-proto": forwarded_proto,
             }
         )
         if request.method not in {"GET", "HEAD"}:

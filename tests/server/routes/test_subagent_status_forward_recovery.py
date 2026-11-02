@@ -204,7 +204,7 @@ async def test_cross_host_child_is_not_healed_to_the_parent_runner(
     """
     A child on another host keeps its own runner; the parent's cannot serve it.
 
-    SCC06 F2b: a cross-host member child runs on its host's runner, so
+    A cross-host member child runs on its host's runner, so
     repointing it at the parent's runner would move it to the wrong host.
     Recovery must decline (the caller then fails the forward rather than
     misroute it).

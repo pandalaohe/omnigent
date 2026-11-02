@@ -93,6 +93,7 @@ CAP_HARNESS_LOGIN = "harness_login"
 CAP_MCP_REGISTRY = "mcp_registry"
 # The host bounds a whole worktree create by ``HostCreateWorktreeFrame.timeout_s``:
 CAP_WORKTREE_CREATE_BUDGET = "worktree_create_budget"
+CAP_HOST_TERMINALS = "host_terminals_v1"
 
 # The server gates ``raw``/``within`` reads on this: an old host ignores unknown params silently.
 CAP_FS_READ_RAW = "fs_read_raw"
@@ -101,6 +102,7 @@ CAP_FS_READ_RAW = "fs_read_raw"
 # ``host.resource_sampling`` leases; the server gates fast-mode on this.
 CAP_RESOURCE_SNAPSHOT = "resource_snapshot"
 CAP_LOAD_LEVEL_V1 = "load_level_v1"
+CAP_HOST_RESTART = "host_restart"
 
 # The runner answers keep-warm controls (``keep_warm_ping`` / ``keep_warm_touch``)
 # and posts ``external_keep_warm_receipt`` events; the server pings only runners
@@ -108,6 +110,7 @@ CAP_LOAD_LEVEL_V1 = "load_level_v1"
 CAP_KEEP_WARM = "keep_warm_v1"
 CAP_WORKTREE_SAFE_ARCHIVE = "worktree_safe_archive_v1"
 CAP_WORKTREE_ARCHIVE_CONTENT = "worktree_archive_content_v1"
+CAP_TERMINAL_ELEVATED = "terminal_elevated_v1"
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
     "startup_queue_v1",
@@ -142,9 +145,9 @@ def workspace_missing_message(workspace: str | PathLike[str] | None) -> str:
     that rebuilds the client-facing message from its own authorized
     workspace, so the two spellings cannot drift apart.
 
-    :param workspace: Session workspace path, e.g. ``"/home/me/proj"``.
+    :param workspace: Session workspace path, e.g. ``"/opt/work/proj"``.
     :returns: The refusal reason, e.g.
-        ``"workspace path does not exist: /home/me/proj"``.
+        ``"workspace path does not exist: /opt/work/proj"``.
     """
     return f"workspace path does not exist: {workspace}"
 
@@ -183,6 +186,8 @@ class HostFrameKind(str, Enum):
     """All host frame kinds; the value is the JSON wire string."""
 
     HELLO = "host.hello"
+    HOST_RESTART = "host_restart"
+    HOST_RESTART_RESULT = "host_restart_result"
     CONNECTION_ERROR = "host.connection_error"
     HARNESS_READINESS = "host.harness_readiness"
     CODEX_RATE_LIMITS = "host.codex_rate_limits"
@@ -329,6 +334,33 @@ class HostHelloFrame:
     project_code: bool = False
     capabilities: list[str] = field(default_factory=list)
     connection_id: str | None = None
+    terminal_runner_id: str | None = None
+    supervised: str | None = None
+    started_at: int | None = None
+
+
+@dataclass
+class HostRestartFrame:
+    """Server request to preview or perform an orderly host restart."""
+
+    request_id: str
+    dry_run: bool = True
+    requested_by_session_id: str | None = None
+    drain_timeout_s: int = 120
+    force: bool = False
+
+
+@dataclass
+class HostRestartResultFrame:
+    """Admission result, or the host's transition from draining to stopping."""
+
+    request_id: str
+    accepted: bool
+    reason: str | None = None
+    supervisor: str | None = None
+    running_sessions: list[str] = field(default_factory=list)
+    runner_count: int = 0
+    phase: str = "draining"
 
 
 @dataclass
@@ -382,7 +414,7 @@ class HostLaunchRunnerFrame:
         this via ``token_bound_runner_id()``.
     :param workspace: Absolute path on the host machine to use
         as the runner's working directory, e.g.
-        ``"/Users/corey/projects/frontend"``.
+        ``"/opt/work/projects/frontend"``.
     :param session_id: Conversation/session ID the runner is being
         launched for, e.g. ``"conv_abc123"``. ``None`` means an older
         server did not include it.
@@ -412,6 +444,7 @@ class HostLaunchRunnerFrame:
     startup_required: bool = False
     retain_runner_ids: list[str] | None = None
     superseded_runner_ids: tuple[str, ...] | None = None
+    purpose: Literal["host_terminals"] | None = None
 
 
 @dataclass
@@ -460,6 +493,7 @@ class HostLaunchRunnerResultFrame:
     error: str | None = None
     error_code: str | None = None
     workspace_recreated: bool = False
+    exists: str | None = None
 
 
 @dataclass
@@ -568,6 +602,7 @@ class HostRunnerStatusFrame:
 
     request_id: str
     runner_id: str
+    purpose: Literal["host_terminals"] | None = None
 
 
 @dataclass
@@ -742,7 +777,7 @@ class HostStatFrame:
     :param request_id: Unique ID for correlating the result,
         e.g. ``"req_stat_1"``.
     :param path: Absolute path on the host (e.g.
-        ``"/Users/corey/universe"``) OR a tilde-prefixed path
+        ``"/opt/work/universe"``) OR a tilde-prefixed path
         (``"~/foo"``). The host expands ``~`` against its own
         process owner's home directory before stating. Only the
         host knows its own ``HOME`` — the server never expands
@@ -774,7 +809,7 @@ class HostStatResultFrame:
         a symlink to a directory returns ``"directory"``, never
         ``"symlink"``. ``None`` when ``exists`` is ``False``.
     :param canonical_path: Absolute, normalized realpath, e.g.
-        ``"/Users/corey/universe"``. ``None`` when ``exists`` is
+        ``"/opt/work/universe"``. ``None`` when ``exists`` is
         ``False``. The server stores this on the session row
         instead of the user's input so symlinks cannot smuggle a
         workspace out of an agent's ``os_env.cwd`` boundary.
@@ -801,7 +836,7 @@ class HostListDirEntry:
 
     :param name: Basename of the entry, e.g. ``"src"``.
     :param path: Absolute path on the host, e.g.
-        ``"/Users/corey/universe/src"``. The host returns absolute
+        ``"/opt/work/universe/src"``. The host returns absolute
         paths so the Web UI can address each entry directly via
         the same REST endpoint without re-resolving relatives.
     :param type: ``"directory"``, ``"file"``, or ``"other"``.
@@ -835,7 +870,7 @@ class HostListDirFrame:
     :param request_id: Unique ID for correlating the result, e.g.
         ``"req_list_1"``.
     :param path: Absolute or tilde-prefixed directory path, e.g.
-        ``"/Users/corey/projects"`` or ``"~/projects"``. Same rules
+        ``"/opt/work/projects"`` or ``"~/projects"``. Same rules
         as ``host.stat`` — the host expands ``~`` against its own
         process owner's home.
     :param limit: Maximum entries to return per page,
@@ -891,7 +926,7 @@ class HostCreateWorktreeFrame:
 
     :param request_id: Correlates the result, e.g. ``"req_wt_1"``.
     :param repo_path: Absolute path inside the source repo (the
-        picked dir or a subdir), e.g. ``"/Users/alice/myrepo"``.
+        picked dir or a subdir), e.g. ``"/opt/work/myrepo"``.
     :param branch_name: New branch to create, e.g. ``"feature/login"``.
     :param base_branch: Optional base ref, e.g. ``"main"``. ``None``
         branches from ``HEAD``.
@@ -899,7 +934,7 @@ class HostCreateWorktreeFrame:
         ``branch_name`` into a fresh worktree (the deleted-worktree
         recreate path) instead of creating a new branch.
     :param entry: The project's entry directory on the host, e.g.
-        ``"/Users/alice/project"``. Only fills the ``{entry}`` token of
+        ``"/opt/work/project"``. Only fills the ``{entry}`` token of
         ``path_template``; it no longer decides the layout on its own.
     :param path_template: The user's worktree location template, e.g.
         ``"{entry}/.worktrees/{repo}/{branch}"``. ``None`` keeps the
@@ -928,7 +963,7 @@ class HostCreateWorktreeResultFrame:
         :class:`HostCreateWorktreeFrame`, e.g. ``"req_wt_1"``.
     :param status: ``"ok"`` or ``"failed"``.
     :param worktree_path: Created worktree root directory, e.g.
-        ``"/Users/alice/myrepo-worktrees/feature-login"``. ``None``
+        ``"/opt/work/myrepo-worktrees/feature-login"``. ``None``
         on failure.
     :param branch: Branch checked out, e.g. ``"feature/login"``.
         ``None`` on failure.
@@ -955,7 +990,7 @@ class HostRemoveWorktreeFrame:
     :param request_id: Correlates the result, e.g. ``"req_wt_rm_1"``.
     :param worktree_path: Worktree directory to remove (the stored
         session ``workspace``), e.g.
-        ``"/Users/alice/myrepo-worktrees/feature-login"``.
+        ``"/opt/work/myrepo-worktrees/feature-login"``.
     :param branch: Branch to delete when ``delete_branch`` is
         ``True``, e.g. ``"feature/login"``. ``None`` skips deletion.
     :param delete_branch: When ``True``, ``git branch -D`` after
@@ -1001,7 +1036,7 @@ class HostListWorktreesFrame:
 
     :param request_id: Correlates the result, e.g. ``"req_wt_ls_1"``.
     :param repo_path: Absolute path inside the repo (the picked dir or
-        a subdir), e.g. ``"/Users/alice/myrepo"``.
+        a subdir), e.g. ``"/opt/work/myrepo"``.
     :param for_cleanup: Avoid replacement symlinks in a stored canonical workspace.
     :param for_status: Include filename-only status and merge information
         for the exact requested linked worktree.
@@ -1045,7 +1080,7 @@ class HostFolderFactsFrame:
 
     :param request_id: Correlates the result, e.g. ``"req_ff_1"``.
     :param path: Absolute folder path on the host, e.g.
-        ``"/Users/alice/myrepo"``.
+        ``"/opt/work/myrepo"``.
     """
 
     request_id: str
@@ -1066,7 +1101,7 @@ class HostFolderFactsResultFrame:
     :param exists: Whether the path exists on the host.
     :param is_dir: Whether the path is a directory.
     :param is_repo: Whether the folder lies in a non-bare git work tree.
-    :param toplevel: Work-tree root, e.g. ``"/Users/alice/myrepo"``.
+    :param toplevel: Work-tree root, e.g. ``"/opt/work/myrepo"``.
     :param branch: Checked-out branch, ``None`` when detached or unborn.
     :param default_branch: Repository main branch, ``None`` if unknown.
     :param head: Full HEAD commit sha, or ``None`` when unresolvable.
@@ -1107,7 +1142,7 @@ class HostCreateDirFrame:
 
     :param request_id: Correlates the result, e.g. ``"req_mkdir_1"``.
     :param path: Absolute or tilde-prefixed directory path to create,
-        e.g. ``"/Users/corey/projects/new-app"`` or ``"~/scratch"``.
+        e.g. ``"/opt/work/projects/new-app"`` or ``"~/scratch"``.
         Missing parent directories are created (``os.makedirs``).
     """
 
@@ -1128,7 +1163,7 @@ class HostCreateDirResultFrame:
         ``error`` so the route layer can map it to a 409 rather than a
         500 — same posture as ``host.list_dir`` for a missing path.
     :param path: Absolute path of the created directory, e.g.
-        ``"/Users/corey/projects/new-app"``. ``None`` when the
+        ``"/opt/work/projects/new-app"``. ``None`` when the
         directory was not created.
     :param error: Filesystem error, e.g. ``"directory already
         exists"`` or ``"permission denied"``. ``None`` on success.
@@ -1431,7 +1466,7 @@ class HostFsRequestFrame:
     :param op: Operation name — one of ``"list_or_read"``, ``"changes"``,
         ``"diff"``, ``"search"``.
     :param workspace: Absolute path to the session's workspace on the
-        host, e.g. ``"/Users/alice/project"``.
+        host, e.g. ``"/opt/work/project"``.
     :param session_id: Session id, forwarded to the change registry.
     :param params: Operation-specific arguments (relative path, glob
         filters, pagination cursors), e.g.
@@ -1907,6 +1942,8 @@ class HostPostBindHookResultFrame:
 
 HostFrame = (
     HostHelloFrame
+    | HostRestartFrame
+    | HostRestartResultFrame
     | HostConnectionErrorFrame
     | HostHarnessReadinessFrame
     | HostCodexRateLimitsFrame
@@ -2042,6 +2079,22 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "project_code": frame.project_code,
                 "capabilities": list(frame.capabilities),
                 "connection_id": frame.connection_id,
+                **(
+                    {"terminal_runner_id": frame.terminal_runner_id}
+                    if frame.terminal_runner_id is not None
+                    else {}
+                ),
+                "supervised": frame.supervised,
+                "started_at": frame.started_at,
+            }
+        )
+    if isinstance(frame, (HostRestartFrame, HostRestartResultFrame)):
+        return _encode_payload(
+            {
+                "kind": "host_restart"
+                if isinstance(frame, HostRestartFrame)
+                else "host_restart_result",
+                **asdict(frame),
             }
         )
     if isinstance(frame, HostConnectionErrorFrame):
@@ -2080,6 +2133,7 @@ def encode_host_frame(frame: HostFrame) -> str:
             "inference_config": frame.inference_config,
             "startup": frame.startup.model_dump() if frame.startup else None,
             "startup_required": frame.startup_required,
+            **({"purpose": frame.purpose} if frame.purpose is not None else {}),
         }
         if frame.retain_runner_ids is not None:
             payload["retain_runner_ids"] = frame.retain_runner_ids
@@ -2115,6 +2169,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "error": frame.error,
                 "error_code": frame.error_code,
                 "workspace_recreated": frame.workspace_recreated,
+                **({"exists": frame.exists} if frame.exists is not None else {}),
             }
         )
     if isinstance(frame, HostStopRunnerFrame):
@@ -2159,6 +2214,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.RUNNER_STATUS.value,
                 "request_id": frame.request_id,
                 "runner_id": frame.runner_id,
+                **({"purpose": frame.purpose} if frame.purpose is not None else {}),
             }
         )
     if isinstance(frame, HostRunnerStatusResultFrame):
@@ -3224,6 +3280,27 @@ def _decode_known_host_frame(
     match kind:
         case HostFrameKind.HELLO:
             return _decode_host_hello(msg)
+        case HostFrameKind.HOST_RESTART:
+            timeout = _required_int(msg, "drain_timeout_s")
+            if not 0 <= timeout <= 600:
+                raise ValueError("drain_timeout_s must be between 0 and 600")
+            return HostRestartFrame(
+                request_id=_required_str(msg, "request_id"),
+                dry_run=_required_bool(msg, "dry_run"),
+                requested_by_session_id=_optional_nullable_str(msg, "requested_by_session_id"),
+                drain_timeout_s=timeout,
+                force=_required_bool(msg, "force"),
+            )
+        case HostFrameKind.HOST_RESTART_RESULT:
+            return HostRestartResultFrame(
+                request_id=_required_str(msg, "request_id"),
+                accepted=_required_bool(msg, "accepted"),
+                reason=_optional_nullable_str(msg, "reason"),
+                supervisor=_optional_nullable_str(msg, "supervisor"),
+                running_sessions=_optional_str_list(msg, "running_sessions"),
+                runner_count=_required_int(msg, "runner_count"),
+                phase=_required_str(msg, "phase"),
+            )
         case HostFrameKind.CONNECTION_ERROR:
             return HostConnectionErrorFrame(
                 stage=_required_str(msg, "stage"),
@@ -3535,6 +3612,9 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         project_code=_required_bool(msg, "project_code") if "project_code" in msg else False,
         capabilities=_optional_str_list(msg, "capabilities"),
         connection_id=_optional_nullable_str(msg, "connection_id"),
+        supervised=_optional_nullable_str(msg, "supervised"),
+        started_at=_required_int(msg, "started_at") if msg.get("started_at") is not None else None,
+        terminal_runner_id=_optional_nullable_str(msg, "terminal_runner_id"),
     )
 
 
@@ -3600,6 +3680,7 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
             if "superseded_runner_ids" in msg
             else None
         ),
+        purpose=_optional_runner_purpose(msg),
     )
 
 
@@ -3618,6 +3699,7 @@ def _decode_launch_runner_result(
         error=_optional_nullable_str(msg, "error"),
         error_code=_optional_nullable_str(msg, "error_code"),
         workspace_recreated=_optional_bool(msg, "workspace_recreated"),
+        exists=_optional_nullable_str(msg, "exists"),
     )
 
 
@@ -3689,7 +3771,15 @@ def _decode_runner_status(msg: _JsonObject) -> HostRunnerStatusFrame:
     return HostRunnerStatusFrame(
         request_id=_required_str(msg, "request_id"),
         runner_id=_required_str(msg, "runner_id"),
+        purpose=_optional_runner_purpose(msg),
     )
+
+
+def _optional_runner_purpose(msg: _JsonObject) -> Literal["host_terminals"] | None:
+    purpose = msg.get("purpose")
+    if purpose is None or purpose == "host_terminals":
+        return purpose
+    raise ValueError("unsupported runner purpose")
 
 
 def _decode_runner_status_result(

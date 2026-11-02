@@ -1,5 +1,6 @@
 import type { AssistantMessagePhase } from "./conversationItems";
 import type { NativePermissionDelivery } from "./nativePermissionDelivery";
+import type { TerminalAccessRequest } from "./terminalAccess";
 // Mirrors sdks/python-client/omnigent_client/_events.py.
 //
 // Hand-ported. When _events.py changes, update this file and the
@@ -186,6 +187,7 @@ export interface PolicyDenied {
 }
 
 export interface ElicitationRequest {
+  terminalAccess?: TerminalAccessRequest | null;
   nativeDelivery?: NativePermissionDelivery;
   type: "elicitation_request";
   elicitationId: string;
@@ -909,6 +911,7 @@ export interface SessionResourceCreatedEvent {
  * `session.resource.deleted` — a session-scoped resource was deleted.
  */
 export interface SessionResourceDeletedEvent {
+  instanceId?: string;
   type: "session_resource_deleted";
   resourceId: string;
   resourceType: string;

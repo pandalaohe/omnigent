@@ -69,13 +69,13 @@ function isWindowsPath(path: string): boolean {
  *
  * Handles the filesystem root (``"/"`` + ``"foo"`` → ``"/foo"`` rather
  * than ``"//foo"``) and trims a trailing slash off the parent so a
- * typed ``"/Users/me/"`` still produces ``"/Users/me/foo"``. The child
+ * typed ``"/opt/work/"`` still produces ``"/opt/work/foo"``. The child
  * name is trimmed; surrounding/duplicate slashes in it are left to the
  * host to resolve.
  *
- * @param dir Absolute parent directory, e.g. ``"/Users/me"`` or ``"/"``.
+ * @param dir Absolute parent directory, e.g. ``"/opt/work"`` or ``"/"``.
  * @param name New child name, e.g. ``"new-app"``.
- * @returns The joined absolute path, e.g. ``"/Users/me/new-app"``.
+ * @returns The joined absolute path, e.g. ``"/opt/work/new-app"``.
  */
 export function joinPath(dir: string, name: string): string {
   const trimmedName = name.trim();
@@ -146,7 +146,7 @@ export function parentOf(absolutePath: string): string | null {
  *   ``"  /Users//corey/"`` or ``"~/projects"``.
  * @param home Resolved absolute path of the host's home dir, or
  *   ``null`` if not yet known.
- * @returns Cleaned absolute path (e.g. ``"/Users/corey"``) or
+ * @returns Cleaned absolute path (e.g. ``"/opt/work"``) or
  *   ``null`` when the input isn't usable.
  */
 export function normalizeTypedPath(input: string, home: string | null = null): string | null {
@@ -194,7 +194,7 @@ export function normalizeTypedPath(input: string, home: string | null = null): s
  * Basename of an absolute path, for the "Select current" label.
  *
  * @param absolutePath Current directory, e.g.
- *   ``"/Users/corey/projects"``, ``"/"``, or ``""`` (home,
+ *   ``"/opt/work/projects"``, ``"/"``, or ``""`` (home,
  *   pre-resolution).
  * @returns The last path segment (``"projects"``), ``"/"`` for the
  *   root, or ``"~"`` when the path is still the empty placeholder.
@@ -318,7 +318,7 @@ export interface WorkspacePickerProps {
   onClose?: () => void;
   /**
    * Absolute path to open the picker at on mount, e.g.
-   * ``"/Users/corey/projects"``. ``undefined`` starts at the Host's home
+   * ``"/opt/work/projects"``. ``undefined`` starts at the Host's home
    * directory. Read only at
    * mount time; later changes are ignored (navigate via the picker UI instead).
    */
@@ -327,13 +327,13 @@ export interface WorkspacePickerProps {
    * How many other live agents are working in a given absolute directory,
    * used to show a conflict banner for the directory currently being browsed.
    * Called per render with the picker's current absolute path (e.g.
-   * ``"/Users/corey/repo"``); return ``0`` for no conflict. ``undefined``
+   * ``"/opt/work/repo"``); return ``0`` for no conflict. ``undefined``
    * disables the banner entirely.
    */
   occupancyForPath?: (absolutePath: string) => number;
   /**
    * Absolute path of the session's workspace, e.g.
-   * ``"/Users/corey/repo"``. When set, a "back to workspace" button appears
+   * ``"/opt/work/repo"``. When set, a "back to workspace" button appears
    * beside Home so a user who has wandered off can return in one click.
    * Omit where there is no workspace yet — the new-session / fork / project
    * dialogs are *choosing* one, so for them Home (``~``) is the only
@@ -521,7 +521,7 @@ export function WorkspacePicker({
       return;
     }
     const first = homeData.entries[0];
-    // first.path is "/Users/corey/x" → parent is "/Users/corey".
+    // first.path is "/opt/work/x" → parent is "/opt/work".
     setResolvedHome(parentOf(first.path));
   }, [resolvedHome, homeData, homeIsPlaceholder]);
 

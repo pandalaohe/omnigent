@@ -62,7 +62,7 @@ def windows_host(**changes: object) -> TrustedHostContext:
             platform="windows",
             cwd=r"C:\work\project",
             workspace=r"C:\work\project",
-            home=r"C:\Users\sample",
+            home=r"C:\work\sample",
             shell="pwsh",
             control_paths=(r"C:\work\control",),
             resolver=resolve,
@@ -95,6 +95,20 @@ def test_canonical_values_and_legacy_migration() -> None:
         normalize_permission_tier({}, harness="antigravity-native", legacy=True)
 
 
+def test_host_restart_preview_is_read_but_real_call_is_operational():
+    assert (
+        adapt_tool_call("sys_host_restart", {"host": "test"}, posix_host()).kind == ToolKind.READ
+    )
+    assert (
+        adapt_tool_call("sys_host_restart", {"host": "test", "dry_run": False}, posix_host()).kind
+        == ToolKind.OTHER
+    )
+    assert (
+        decision("plan", "sys_host_restart", {"host": "test", "dry_run": False}).action
+        == Verdict.DENY
+    )
+
+
 def test_read_plan_edit_and_single_call_ask() -> None:
     assert decision("ask", "read", {"path": "src/a.py"}).action == Verdict.ALLOW
     assert decision("plan", "write", {"path": "src/a.py", "content": "x"}).action == Verdict.DENY
@@ -104,6 +118,18 @@ def test_read_plan_edit_and_single_call_ask() -> None:
     first = decision("ask", "write", {"path": "src/a.py", "content": "x"})
     second = decision("ask", "write", {"path": "src/a.py", "content": "x"})
     assert first.action == second.action == Verdict.ASK
+
+
+@pytest.mark.parametrize("tier", NON_FULL_TIERS)
+@pytest.mark.parametrize("background", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("verified", [False, True], ids=["unverified", "verified"])
+def test_pi_subagent_is_never_approvable_below_full(tier, background, verified):
+    host = posix_host(extension_tools={"subagent": "" if verified else "Unverified Pi extension"})
+    arguments = {"agent": "worker", "task": "Read a.py", "async": background}
+    assert decision("full", "subagent", arguments, host).action == Verdict.ALLOW
+    result = decision(tier, "subagent", arguments, host)
+    assert result.action == Verdict.DENY
+    assert result.reason == "Pi subagents are not yet governed by Omnigent permissions"
 
 
 @pytest.mark.parametrize(
@@ -1265,7 +1291,7 @@ def test_windows_drive_unc_ads_device_and_system(option_command: str, expected: 
         == Verdict.ALLOW
     )
     for path in (
-        r"C:\Users\sample\AppData\Roaming\Microsoft\Credentials\a",
+        r"C:\work\sample\AppData\Roaming\Microsoft\Credentials\a",
         r"C:\Program Files\Application\a",
     ):
         assert (

@@ -411,7 +411,7 @@ async def test_failed_receipt_can_be_requeried_only_for_current_attempt(source):
                 created_at=1,
                 updated_at=1,
                 root_conversation_id=SESSION,
-                workspace="/Users/sample/project",
+                workspace="/opt/work/project",
             ),
             client,
             timeout=2,

@@ -409,7 +409,9 @@ async def test_retired_tail_skips_successor_pane(
         "conv_successor", terminal_resource_id("codex", "main"), "codex", old.socket_path, old
     )
     reaper._record_pending(pane, old)
-    successor = SimpleNamespace(socket_path=tmp_path / "new.sock", diagnostic_id="successor")
+    successor = SimpleNamespace(
+        socket_path=tmp_path / "new.sock", diagnostic_id="successor", elevated=False
+    )
     registry._by_conversation.setdefault("conv_successor", {})[("codex", "main")] = successor
     app.state.test_resource_registry._terminal_roles[("conv_successor", pane.terminal_id)] = (
         _TerminalRoleRegistration("codex-native", successor.diagnostic_id)

@@ -92,7 +92,7 @@ describe("HostWorkspacePicker shared preference wiring", () => {
     useHostFilesystemMock.mockReturnValue(
       result({
         data: {
-          entries: [dir("Projects", "D:\\AIProgram\\Projects")],
+          entries: [dir("Projects", "D:\\work\\Projects")],
           truncated: false,
         },
         isLoading: false,
@@ -106,7 +106,7 @@ describe("HostWorkspacePicker shared preference wiring", () => {
           name: "Windows desktop",
           owner: "me",
           status: "online",
-          default_workspace: "D:\\AIProgram\\Projects",
+          default_workspace: "D:\\work\\Projects",
         },
       ],
     } as ReturnType<typeof useHosts>);
@@ -114,14 +114,12 @@ describe("HostWorkspacePicker shared preference wiring", () => {
 
     render(
       <QueryClientProvider client={client}>
-        <HostWorkspacePicker hostId="win_host" initialPath={"D:\\AIProgram\\Projects"} />
+        <HostWorkspacePicker hostId="win_host" initialPath={"D:\\work\\Projects"} />
       </QueryClientProvider>,
     );
 
     const pin = screen.getByTestId("workspace-picker-default");
-    expect(screen.getByTestId("workspace-picker-path-input")).toHaveValue(
-      "D:\\AIProgram\\Projects",
-    );
+    expect(screen.getByTestId("workspace-picker-path-input")).toHaveValue("D:\\work\\Projects");
     expect(pin).toHaveAttribute(
       "aria-label",
       "Unpin this folder for Windows desktop. Pinning only provides quick access; new sessions remember the last working folder.",
@@ -155,9 +153,7 @@ function result(value: FakeListing): ReturnType<typeof useHostFilesystem> {
 
 describe("workspace path resolution", () => {
   it("resolves tilde and preserves absolute paths", () => {
-    expect(resolveWorkspacePath("~/git/omnigent", "/Users/alice")).toBe(
-      "/Users/alice/git/omnigent",
-    );
+    expect(resolveWorkspacePath("~/git/omnigent", "/opt/work")).toBe("/opt/work/git/omnigent");
     expect(resolveWorkspacePath("  /a//b/", null)).toBe("/a//b");
     expect(resolveWorkspacePath("  /a//b  ", null)).toBe("/a//b  ");
     expect(resolveWorkspacePath("~/git/omnigent", null)).toBeNull();
@@ -166,16 +162,16 @@ describe("workspace path resolution", () => {
   it("derives the host home only from a settled listing", () => {
     useHostFilesystemMock.mockReturnValue(
       result({
-        data: { entries: [dir("git", "/Users/alice/git")], truncated: false },
+        data: { entries: [dir("git", "/opt/work/git")], truncated: false },
         isLoading: false,
         isPlaceholderData: false,
       }),
     );
-    expect(renderHook(() => useResolvedHostHome("host_1")).result.current).toBe("/Users/alice");
+    expect(renderHook(() => useResolvedHostHome("host_1")).result.current).toBe("/opt/work");
 
     useHostFilesystemMock.mockReturnValue(
       result({
-        data: { entries: [dir("git", "/Users/alice/git")], truncated: false },
+        data: { entries: [dir("git", "/opt/work/git")], truncated: false },
         isLoading: false,
         isPlaceholderData: true,
       }),
@@ -213,15 +209,15 @@ describe("parentOf", () => {
   });
 
   it("strips one segment from a nested path", () => {
-    expect(parentOf("/Users/corey/projects")).toBe("/Users/corey");
-    expect(parentOf("/Users/corey")).toBe("/Users");
+    expect(parentOf("/opt/work/projects")).toBe("/opt/work");
+    expect(parentOf("/opt/work")).toBe("/opt");
   });
 
   it("ignores a trailing slash on the input", () => {
     // A user-typed path with a trailing slash should still
     // climb correctly; without the strip the parent would
     // wrongly include the trailing-empty segment.
-    expect(parentOf("/Users/corey/")).toBe("/Users");
+    expect(parentOf("/opt/work/")).toBe("/opt");
   });
 
   it("climbs Windows drive paths without losing the drive", () => {
@@ -233,25 +229,25 @@ describe("parentOf", () => {
 
 describe("normalizeTypedPath", () => {
   it("returns the path unchanged for a clean absolute path", () => {
-    expect(normalizeTypedPath("/Users/corey/projects")).toBe("/Users/corey/projects");
+    expect(normalizeTypedPath("/opt/work/projects")).toBe("/opt/work/projects");
   });
 
   it("ignores leading whitespace and preserves legal trailing whitespace", () => {
     // Leading whitespace cannot start an absolute path, while trailing
     // whitespace can be path data on POSIX hosts.
-    expect(normalizeTypedPath("  /Users/corey  ")).toBe("/Users/corey  ");
+    expect(normalizeTypedPath("  /opt/work  ")).toBe("/opt/work  ");
   });
 
   it("collapses runs of slashes", () => {
-    // A typo like "/Users//corey" should still navigate to the
+    // A typo like "/opt//work" should still navigate to the
     // intended directory rather than failing the listing.
-    expect(normalizeTypedPath("/Users//corey///foo")).toBe("/Users/corey/foo");
+    expect(normalizeTypedPath("/opt//work///foo")).toBe("/opt/work/foo");
   });
 
   it("strips a trailing slash", () => {
     // Trailing slash would break breadcrumb / parent calc, which
     // both assume no trailing separator.
-    expect(normalizeTypedPath("/Users/corey/")).toBe("/Users/corey");
+    expect(normalizeTypedPath("/opt/work/")).toBe("/opt/work");
   });
 
   it("preserves the root path exactly", () => {
@@ -289,26 +285,26 @@ describe("normalizeTypedPath", () => {
     // The user from the bug report typed "~/omnigent"
     // and nothing happened. Now the picker expands it
     // client-side using the resolved home dir.
-    expect(normalizeTypedPath("~/omnigent", "/Users/corey")).toBe("/Users/corey/omnigent");
+    expect(normalizeTypedPath("~/omnigent", "/opt/work")).toBe("/opt/work/omnigent");
   });
 
   it("expands a bare tilde to the resolved home", () => {
-    expect(normalizeTypedPath("~", "/Users/corey")).toBe("/Users/corey");
+    expect(normalizeTypedPath("~", "/opt/work")).toBe("/opt/work");
   });
 
   it("collapses extra slashes after tilde expansion", () => {
     // ~//foo → home + "/" + "/foo" → run-of-slashes collapse.
-    expect(normalizeTypedPath("~//projects", "/Users/corey")).toBe("/Users/corey/projects");
+    expect(normalizeTypedPath("~//projects", "/opt/work")).toBe("/opt/work/projects");
   });
 
   it("strips a trailing slash after tilde expansion", () => {
-    expect(normalizeTypedPath("~/projects/", "/Users/corey")).toBe("/Users/corey/projects");
+    expect(normalizeTypedPath("~/projects/", "/opt/work")).toBe("/opt/work/projects");
   });
 
   it("does not support ~user form", () => {
     // ~root, ~alice, etc. would require a server round-trip to
     // resolve. Out of scope for v1 — fall through to "invalid".
-    expect(normalizeTypedPath("~root/foo", "/Users/corey")).toBeNull();
+    expect(normalizeTypedPath("~root/foo", "/opt/work")).toBeNull();
   });
 
   it("preserves and normalizes absolute Windows paths", () => {
@@ -325,7 +321,7 @@ describe("isNavigablePath", () => {
   );
 
   it("accepts an absolute path with legal trailing whitespace", () => {
-    expect(isNavigablePath("  /Users/me/trailing-space ")).toBe(true);
+    expect(isNavigablePath("  /opt/work/trailing-space ")).toBe(true);
   });
 });
 
@@ -344,14 +340,14 @@ describe("basename", () => {
   });
 
   it("returns the last segment of a nested path", () => {
-    expect(basename("/Users/corey/projects")).toBe("projects");
+    expect(basename("/opt/work/projects")).toBe("projects");
     expect(basename("/Users")).toBe("Users");
   });
 
   it("ignores a trailing slash", () => {
     // Filtering out empty segments means a trailing slash doesn't
     // produce an empty basename.
-    expect(basename("/Users/corey/")).toBe("corey");
+    expect(basename("/opt/work/")).toBe("work");
   });
 
   it("returns the final Windows segment and drive root", () => {
@@ -443,7 +439,7 @@ describe("WorkspacePicker path bar", () => {
     useHostFilesystemMock.mockReturnValue(
       result({
         data: {
-          entries: [dir("app", "/Users/corey/projects/app")],
+          entries: [dir("app", "/opt/work/projects/app")],
           truncated: false,
         },
         isLoading: false,
@@ -453,7 +449,7 @@ describe("WorkspacePicker path bar", () => {
     const onSelect = vi.fn();
     render(<WorkspacePicker hostId="host_1" initialPath="~/projects" onSelect={onSelect} />);
     fireEvent.click(screen.getByTestId("workspace-picker-select"));
-    expect(onSelect).toHaveBeenCalledWith("/Users/corey/projects");
+    expect(onSelect).toHaveBeenCalledWith("/opt/work/projects");
   });
 });
 
@@ -518,15 +514,15 @@ describe("WorkspacePicker pinned folder", () => {
     );
 
     const { rerender } = render(
-      <WorkspacePicker hostId="mac_host" defaultPath="/Users/me/Projects" />,
+      <WorkspacePicker hostId="mac_host" defaultPath="/opt/work/Projects" />,
     );
     expect(useHostFilesystemMock).toHaveBeenCalledWith("mac_host", "");
 
-    rerender(<WorkspacePicker hostId="windows_host" defaultPath={"D:\\AIProgram\\Projects"} />);
+    rerender(<WorkspacePicker hostId="windows_host" defaultPath={"D:\\work\\Projects"} />);
     expect(useHostFilesystemMock).toHaveBeenCalledWith("windows_host", "");
     expect(screen.getByTestId("workspace-picker-open-pinned")).toHaveAttribute(
       "aria-label",
-      "Open pinned folder: D:\\AIProgram\\Projects",
+      "Open pinned folder: D:\\work\\Projects",
     );
   });
 
@@ -577,17 +573,17 @@ describe("WorkspacePicker conflict banner", () => {
   });
 
   it("shows the banner for the current directory, querying it by absolute path", () => {
-    const occupancyForPath = vi.fn((abs: string) => (abs === "/Users/corey/repo" ? 2 : 0));
+    const occupancyForPath = vi.fn((abs: string) => (abs === "/opt/work/repo" ? 2 : 0));
     render(
       <WorkspacePicker
         hostId="host_1"
-        initialPath="/Users/corey/repo"
+        initialPath="/opt/work/repo"
         occupancyForPath={occupancyForPath}
       />,
     );
     // It's the browsed directory (not, say, home) that's queried — so the
     // warning tracks the folder you'd actually commit to.
-    expect(occupancyForPath).toHaveBeenCalledWith("/Users/corey/repo");
+    expect(occupancyForPath).toHaveBeenCalledWith("/opt/work/repo");
     // The count (2) flows into the copy, proving it's the callback's return
     // value driving the banner, not a hardcoded string.
     expect(screen.getByTestId("workspace-picker-conflict").textContent).toContain(
@@ -598,11 +594,7 @@ describe("WorkspacePicker conflict banner", () => {
   it("hides the banner when the current directory is unoccupied", () => {
     // occupancyForPath returns 0 → no live agent here → no banner.
     render(
-      <WorkspacePicker
-        hostId="host_1"
-        initialPath="/Users/corey/repo"
-        occupancyForPath={() => 0}
-      />,
+      <WorkspacePicker hostId="host_1" initialPath="/opt/work/repo" occupancyForPath={() => 0} />,
     );
     expect(screen.queryByTestId("workspace-picker-conflict")).toBeNull();
   });
@@ -610,7 +602,7 @@ describe("WorkspacePicker conflict banner", () => {
   it("renders no banner when occupancyForPath is omitted", () => {
     // The prop is optional; without it the picker never warns (the
     // non-conflict-aware callers, e.g. ResumeWithDirectoryDialog).
-    render(<WorkspacePicker hostId="host_1" initialPath="/Users/corey/repo" />);
+    render(<WorkspacePicker hostId="host_1" initialPath="/opt/work/repo" />);
     expect(screen.queryByTestId("workspace-picker-conflict")).toBeNull();
   });
 });
@@ -829,10 +821,10 @@ describe("WorkspacePicker keyboard and sorting", () => {
     fireEvent.keyDown(search, { key: "Enter" });
     expect(onNavigate).toHaveBeenLastCalledWith("/x/docs");
 
-    fireEvent.change(search, { target: { value: "/Users/corey/work//" } });
+    fireEvent.change(search, { target: { value: "/opt/work/work//" } });
     fireEvent.keyDown(search, { key: "Enter" });
 
-    expect(onNavigate).toHaveBeenLastCalledWith("/Users/corey/work");
+    expect(onNavigate).toHaveBeenLastCalledWith("/opt/work/work");
     expect(search.value).toBe("");
   });
 
@@ -887,14 +879,14 @@ describe("WorkspacePicker keyboard and sorting", () => {
       "true",
     );
     // A path elsewhere leaves the listing unfiltered, so docs is still shown.
-    fireEvent.change(search, { target: { value: "/Users/corey/work" } });
+    fireEvent.change(search, { target: { value: "/opt/work/work" } });
     expect(screen.getByTestId("workspace-picker-entry-docs")).toHaveAttribute(
       "aria-selected",
       "false",
     );
     fireEvent.keyDown(search, { key: "Enter" });
 
-    expect(onNavigate).toHaveBeenLastCalledWith("/Users/corey/work");
+    expect(onNavigate).toHaveBeenLastCalledWith("/opt/work/work");
   });
 
   it("ignores Enter and arrows while an IME is composing", () => {
@@ -965,7 +957,7 @@ describe("WorkspacePicker on this machine", () => {
     useHostFilesystemMock.mockReset();
     useHostFilesystemMock.mockReturnValue(
       result({
-        data: { entries: [dir("src", "/Users/corey/repo/src")], truncated: false },
+        data: { entries: [dir("src", "/opt/work/repo/src")], truncated: false },
         isLoading: false,
         isPlaceholderData: false,
         error: null,
@@ -1000,33 +992,29 @@ describe("WorkspacePicker on this machine", () => {
 
   it("confirms the folder chosen in the OS chooser", async () => {
     const onSelect = vi.fn();
-    chooseDirectory.mockResolvedValueOnce(null).mockResolvedValueOnce("/Users/corey/other");
+    chooseDirectory.mockResolvedValueOnce(null).mockResolvedValueOnce("/opt/work/other");
     render(
-      <WorkspacePicker hostId="host_local" initialPath="/Users/corey/repo" onSelect={onSelect} />,
+      <WorkspacePicker hostId="host_local" initialPath="/opt/work/repo" onSelect={onSelect} />,
     );
     const choose = screen.getByTestId("workspace-picker-choose-native");
 
     // Cancelling the OS chooser leaves the picker open with nothing chosen.
     fireEvent.click(choose);
-    await waitFor(() => expect(chooseDirectory).toHaveBeenCalledWith("/Users/corey/repo"));
+    await waitFor(() => expect(chooseDirectory).toHaveBeenCalledWith("/opt/work/repo"));
     expect(onSelect).not.toHaveBeenCalled();
 
     fireEvent.click(choose);
-    await waitFor(() => expect(onSelect).toHaveBeenCalledWith("/Users/corey/other"));
+    await waitFor(() => expect(onSelect).toHaveBeenCalledWith("/opt/work/other"));
   });
 
   it("opens a dropped folder, or the folder of a dropped file", async () => {
     const onNavigate = vi.fn();
     render(
-      <WorkspacePicker
-        hostId="host_local"
-        initialPath="/Users/corey/repo"
-        onNavigate={onNavigate}
-      />,
+      <WorkspacePicker hostId="host_local" initialPath="/opt/work/repo" onNavigate={onNavigate} />,
     );
 
-    drop("/Users/corey/projects/app", true);
-    await waitFor(() => expect(onNavigate).toHaveBeenLastCalledWith("/Users/corey/projects/app"));
+    drop("/opt/work/projects/app", true);
+    await waitFor(() => expect(onNavigate).toHaveBeenLastCalledWith("/opt/work/projects/app"));
     drop("/tmp/notes/todo.txt", false);
     await waitFor(() => expect(onNavigate).toHaveBeenLastCalledWith("/tmp/notes"));
   });
@@ -1036,27 +1024,27 @@ describe("WorkspacePicker on this machine", () => {
     const { rerender } = render(
       <WorkspacePicker
         hostId="host_remote"
-        initialPath="/Users/corey/repo"
+        initialPath="/opt/work/repo"
         onSelect={vi.fn()}
         onNavigate={onNavigate}
       />,
     );
     expect(screen.queryByTestId("workspace-picker-choose-native")).toBeNull();
     // Not default-prevented: the picker didn't claim the drop.
-    expect(drop("/Users/corey/projects/app", true)).toBe(true);
+    expect(drop("/opt/work/projects/app", true)).toBe(true);
 
     vi.stubGlobal("omnigentDesktop", { kind: "electron" });
     rerender(
       <WorkspacePicker
         hostId="host_local"
-        initialPath="/Users/corey/repo"
+        initialPath="/opt/work/repo"
         onSelect={vi.fn()}
         onNavigate={onNavigate}
       />,
     );
     expect(screen.queryByTestId("workspace-picker-choose-native")).toBeNull();
-    expect(drop("/Users/corey/projects/app", true)).toBe(true);
-    expect(onNavigate).not.toHaveBeenCalledWith("/Users/corey/projects/app");
+    expect(drop("/opt/work/projects/app", true)).toBe(true);
+    expect(onNavigate).not.toHaveBeenCalledWith("/opt/work/projects/app");
   });
 });
 
@@ -1066,7 +1054,7 @@ describe("WorkspacePicker breadcrumbs", () => {
     useHostFilesystemMock.mockImplementation((_hostId, path) =>
       result({
         data: {
-          entries: path === "" ? [dir("projects", "/Users/corey/projects")] : [],
+          entries: path === "" ? [dir("projects", "/opt/work/projects")] : [],
           truncated: false,
         },
         isLoading: false,
@@ -1083,8 +1071,8 @@ describe("WorkspacePicker breadcrumbs", () => {
     ["/", "/"],
     ["/Users", "/Users"],
     ["/var/log", "/var/log"],
-    ["/Users/corey", "corey"],
-    ["/Users/corey/projects/app", "corey/projects/app"],
+    ["/opt/work", "work"],
+    ["/opt/work/projects/app", "work/projects/app"],
   ])("renders %s without duplicating the root separator", (path, expected) => {
     render(<WorkspacePicker hostId="host_1" initialPath={path} />);
 
@@ -1144,8 +1132,8 @@ describe("WorkspacePicker modal actions", () => {
       result({
         data: {
           entries: [
-            dir("src", "/Users/corey/repo/src"),
-            file("README.md", "/Users/corey/repo/README.md"),
+            dir("src", "/opt/work/repo/src"),
+            file("README.md", "/opt/work/repo/README.md"),
           ],
           truncated: false,
         },
@@ -1166,7 +1154,7 @@ describe("WorkspacePicker modal actions", () => {
     render(
       <WorkspacePicker
         hostId="host_1"
-        initialPath="/Users/corey/repo"
+        initialPath="/opt/work/repo"
         onClose={onClose}
         onSelect={onSelect}
       />,
@@ -1204,14 +1192,14 @@ describe("WorkspacePicker modal actions", () => {
       expect(screen.getByTestId(testId)).toHaveAttribute("data-size", "icon");
     }
     fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
-    expect(onSelect).toHaveBeenCalledWith("/Users/corey/repo");
+    expect(onSelect).toHaveBeenCalledWith("/opt/work/repo");
 
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(onClose).toHaveBeenCalledOnce();
   });
 
   it("keeps files disabled while directories remain navigable", () => {
-    render(<WorkspacePicker hostId="host_1" initialPath="/Users/corey/repo" />);
+    render(<WorkspacePicker hostId="host_1" initialPath="/opt/work/repo" />);
 
     expect(screen.getByTestId("workspace-picker-entry-README.md")).toBeDisabled();
     expect(screen.getByTestId("workspace-picker-entry-src")).not.toBeDisabled();
@@ -1223,7 +1211,7 @@ describe("WorkspacePicker modal actions", () => {
       useHostWorktreesMock.mockReturnValue({
         data: [
           {
-            path: "/Users/corey/repo",
+            path: "/opt/work/repo",
             branch: "main",
             is_main: true,
             detached: false,
@@ -1231,7 +1219,7 @@ describe("WorkspacePicker modal actions", () => {
             updated_at: 1_700_000_000,
           },
           {
-            path: "/Users/corey/worktrees/feature-layout",
+            path: "/opt/work/worktrees/feature-layout",
             branch: "feature/layout",
             is_main: false,
             detached: false,
@@ -1249,7 +1237,7 @@ describe("WorkspacePicker modal actions", () => {
       render(
         <WorkspacePicker
           hostId="host_1"
-          initialPath="/Users/corey/repo"
+          initialPath="/opt/work/repo"
           onSelect={onSelect}
           onNavigate={onNavigate}
         />,
@@ -1279,7 +1267,7 @@ describe("WorkspacePicker modal actions", () => {
       );
       const currentFolderRow = screen.getByTestId("workspace-picker-current-folder");
       const linkedWorktreeRow = screen.getByTestId(
-        "workspace-picker-worktree-/Users/corey/worktrees/feature-layout",
+        "workspace-picker-worktree-/opt/work/worktrees/feature-layout",
       );
       const spaciousRowClasses = WORKTREE_RADIO_SPACIOUS_ROW_CLASS.split(" ");
       const spaciousInputClasses = WORKTREE_RADIO_SPACIOUS_INPUT_CLASS.split(" ");
@@ -1306,21 +1294,21 @@ describe("WorkspacePicker modal actions", () => {
 
       fireEvent.click(screen.getByRole("radio", { name: "Use worktree feature-layout" }));
       expect(
-        screen.getByTestId("workspace-picker-worktree-/Users/corey/worktrees/feature-layout"),
+        screen.getByTestId("workspace-picker-worktree-/opt/work/worktrees/feature-layout"),
       ).toHaveClass("bg-muted");
-      expect(onNavigate).not.toHaveBeenCalledWith("/Users/corey/worktrees/feature-layout");
+      expect(onNavigate).not.toHaveBeenCalledWith("/opt/work/worktrees/feature-layout");
       fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
-      expect(onNavigate).not.toHaveBeenCalledWith("/Users/corey/worktrees/feature-layout");
-      expect(onSelect).toHaveBeenCalledWith("/Users/corey/worktrees/feature-layout");
+      expect(onNavigate).not.toHaveBeenCalledWith("/opt/work/worktrees/feature-layout");
+      expect(onSelect).toHaveBeenCalledWith("/opt/work/worktrees/feature-layout");
     },
   );
 
   it("keeps cached verified worktrees and selection while a nested path query is disabled", () => {
     useHostFilesystemMock.mockImplementation((_host, path) =>
-      path === "/Users/corey/repo/src"
+      path === "/opt/work/repo/src"
         ? result({
             data: {
-              entries: [dir("src", "/Users/corey/repo/src")],
+              entries: [dir("src", "/opt/work/repo/src")],
               truncated: false,
             },
             isLoading: false,
@@ -1330,7 +1318,7 @@ describe("WorkspacePicker modal actions", () => {
           })
         : result({
             data: {
-              entries: [dir("src", "/Users/corey/repo/src")],
+              entries: [dir("src", "/opt/work/repo/src")],
               truncated: false,
             },
             isLoading: false,
@@ -1350,13 +1338,13 @@ describe("WorkspacePicker modal actions", () => {
           : {
               data: [
                 {
-                  path: "/Users/corey/repo",
+                  path: "/opt/work/repo",
                   branch: "main",
                   is_main: true,
                   detached: false,
                 },
                 {
-                  path: "/Users/corey/worktrees/feature-layout",
+                  path: "/opt/work/worktrees/feature-layout",
                   branch: "feature/layout",
                   is_main: false,
                   detached: false,
@@ -1367,7 +1355,7 @@ describe("WorkspacePicker modal actions", () => {
               error: null,
             }) as ReturnType<typeof useHostWorktrees>,
     );
-    render(<WorkspacePicker hostId="host_1" initialPath="/Users/corey/repo" onSelect={vi.fn()} />);
+    render(<WorkspacePicker hostId="host_1" initialPath="/opt/work/repo" onSelect={vi.fn()} />);
 
     expect(screen.getByTestId("workspace-picker-worktrees")).toBeVisible();
     const worktreeRadio = screen.getByRole("radio", { name: "Use worktree feature-layout" });
@@ -1387,13 +1375,13 @@ describe("WorkspacePicker modal actions", () => {
       error: null,
     } as unknown as ReturnType<typeof useHostWorktrees>);
 
-    render(<WorkspacePicker hostId="host_1" initialPath="/Users/corey/repo" onSelect={vi.fn()} />);
+    render(<WorkspacePicker hostId="host_1" initialPath="/opt/work/repo" onSelect={vi.fn()} />);
 
     expect(screen.queryByTestId("workspace-picker-worktrees")).toBeNull();
   });
 
   it("queries linked worktrees for a Windows path in the full modal", () => {
-    const windowsPath = "C:\\Users\\alice\\repo";
+    const windowsPath = "C:\\work\\alice\\repo";
     useHostFilesystemMock.mockReturnValue(
       result({
         data: {
@@ -1412,7 +1400,7 @@ describe("WorkspacePicker modal actions", () => {
 
   it("uses the same fixed frame and compact rows regardless of callback shape", () => {
     const { rerender } = render(
-      <WorkspacePicker hostId="host_1" initialPath="/Users/corey/repo" onNavigate={vi.fn()} />,
+      <WorkspacePicker hostId="host_1" initialPath="/opt/work/repo" onNavigate={vi.fn()} />,
     );
 
     expect(screen.queryByTestId("workspace-picker-worktrees")).toBeNull();
@@ -1420,9 +1408,7 @@ describe("WorkspacePicker modal actions", () => {
     expect(liveClass).toContain("h-[min(600px,calc(100dvh-4rem))]");
     expect(liveClass).toContain("w-[min(800px,calc(100vw-2rem))]");
 
-    rerender(
-      <WorkspacePicker hostId="host_1" initialPath="/Users/corey/repo" onSelect={vi.fn()} />,
-    );
+    rerender(<WorkspacePicker hostId="host_1" initialPath="/opt/work/repo" onSelect={vi.fn()} />);
     const modalClass = screen.getByTestId("workspace-picker").className;
     expect(modalClass).toBe(liveClass);
   });
@@ -1448,7 +1434,7 @@ describe("WorkspacePicker modal actions", () => {
     const { rerender } = render(
       <WorkspacePicker
         hostId="host_1"
-        initialPath="/Users/corey/repo"
+        initialPath="/opt/work/repo"
         onSelect={vi.fn()}
         onClose={vi.fn()}
       />,
@@ -1466,7 +1452,7 @@ describe("WorkspacePicker modal actions", () => {
     rerender(
       <WorkspacePicker
         hostId="host_1"
-        initialPath="/Users/corey/repo"
+        initialPath="/opt/work/repo"
         onSelect={vi.fn()}
         onClose={vi.fn()}
       />,
@@ -1475,9 +1461,9 @@ describe("WorkspacePicker modal actions", () => {
 
     useHostWorktreesMock.mockReturnValue({
       data: [
-        { path: "/Users/corey/repo", branch: "main", is_main: true, detached: false },
+        { path: "/opt/work/repo", branch: "main", is_main: true, detached: false },
         {
-          path: "/Users/corey/worktrees/feature-layout",
+          path: "/opt/work/worktrees/feature-layout",
           branch: "feature/layout",
           is_main: false,
           detached: false,
@@ -1490,7 +1476,7 @@ describe("WorkspacePicker modal actions", () => {
     rerender(
       <WorkspacePicker
         hostId="host_1"
-        initialPath="/Users/corey/repo"
+        initialPath="/opt/work/repo"
         onSelect={vi.fn()}
         onClose={vi.fn()}
       />,
@@ -1510,7 +1496,7 @@ describe("WorkspacePicker refresh", () => {
   function mockListing(overrides: Partial<FakeListing> = {}) {
     useHostFilesystemMock.mockReturnValue({
       ...result({
-        data: { entries: [dir("src", "/Users/corey/repo/src")], truncated: false },
+        data: { entries: [dir("src", "/opt/work/repo/src")], truncated: false },
         isLoading: false,
         isFetching: false,
         isPlaceholderData: false,
@@ -1543,7 +1529,7 @@ describe("WorkspacePicker refresh", () => {
     render(
       <WorkspacePicker
         hostId="host_1"
-        initialPath="/Users/corey/repo"
+        initialPath="/opt/work/repo"
         onClose={vi.fn()}
         onSelect={vi.fn()}
       />,
@@ -1562,7 +1548,7 @@ describe("WorkspacePicker refresh", () => {
   });
 
   it("skips the worktree read when the picker has no worktree panel", () => {
-    render(<WorkspacePicker hostId="host_1" initialPath="/Users/corey/repo" />);
+    render(<WorkspacePicker hostId="host_1" initialPath="/opt/work/repo" />);
 
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
 
@@ -1572,7 +1558,7 @@ describe("WorkspacePicker refresh", () => {
 
   it("is disabled while the listing is already loading", () => {
     mockListing({ isFetching: true });
-    render(<WorkspacePicker hostId="host_1" initialPath="/Users/corey/repo" onClose={vi.fn()} />);
+    render(<WorkspacePicker hostId="host_1" initialPath="/opt/work/repo" onClose={vi.fn()} />);
 
     expect(screen.getByRole("button", { name: "Refresh" })).toBeDisabled();
   });
@@ -1664,7 +1650,7 @@ describe("WorkspacePicker navigation status", () => {
 
 describe("joinPath", () => {
   it("joins a nested directory and a child name", () => {
-    expect(joinPath("/Users/me", "new-app")).toBe("/Users/me/new-app");
+    expect(joinPath("/opt/work", "new-app")).toBe("/opt/work/new-app");
   });
 
   it("does not double the slash at the filesystem root", () => {
@@ -1674,11 +1660,11 @@ describe("joinPath", () => {
   });
 
   it("ignores a trailing slash on the parent", () => {
-    expect(joinPath("/Users/me/", "foo")).toBe("/Users/me/foo");
+    expect(joinPath("/opt/work/", "foo")).toBe("/opt/work/foo");
   });
 
   it("trims surrounding whitespace from the child name", () => {
-    expect(joinPath("/Users/me", "  foo  ")).toBe("/Users/me/foo");
+    expect(joinPath("/opt/work", "  foo  ")).toBe("/opt/work/foo");
   });
 });
 
@@ -1706,8 +1692,8 @@ describe("WorkspacePicker new folder", () => {
   }
 
   it("creates a folder under the current directory and navigates into it", async () => {
-    listingWith([dir("app", "/Users/corey/projects/app")]);
-    const mutateAsync = vi.fn().mockResolvedValue("/Users/corey/projects/fresh");
+    listingWith([dir("app", "/opt/work/projects/app")]);
+    const mutateAsync = vi.fn().mockResolvedValue("/opt/work/projects/fresh");
     useCreateHostDirectoryMock.mockReturnValue({
       mutateAsync,
       isPending: false,
@@ -1715,11 +1701,7 @@ describe("WorkspacePicker new folder", () => {
 
     const onNavigate = vi.fn();
     render(
-      <WorkspacePicker
-        hostId="host_1"
-        initialPath="/Users/corey/projects"
-        onNavigate={onNavigate}
-      />,
+      <WorkspacePicker hostId="host_1" initialPath="/opt/work/projects" onNavigate={onNavigate} />,
     );
 
     fireEvent.click(screen.getByTestId("workspace-picker-new-folder"));
@@ -1729,23 +1711,23 @@ describe("WorkspacePicker new folder", () => {
     fireEvent.click(screen.getByTestId("workspace-picker-new-folder-create"));
 
     await waitFor(() => {
-      expect(onNavigate).toHaveBeenLastCalledWith("/Users/corey/projects/fresh");
+      expect(onNavigate).toHaveBeenLastCalledWith("/opt/work/projects/fresh");
     });
     expect(mutateAsync).toHaveBeenCalledWith({
       hostId: "host_1",
-      path: "/Users/corey/projects/fresh",
+      path: "/opt/work/projects/fresh",
     });
   });
 
   it("shows the server error inline when creation fails", async () => {
-    listingWith([dir("app", "/Users/corey/projects/app")]);
+    listingWith([dir("app", "/opt/work/projects/app")]);
     const mutateAsync = vi.fn().mockRejectedValue(new Error("directory already exists"));
     useCreateHostDirectoryMock.mockReturnValue({
       mutateAsync,
       isPending: false,
     } as unknown as ReturnType<typeof useCreateHostDirectory>);
 
-    render(<WorkspacePicker hostId="host_1" initialPath="/Users/corey/projects" />);
+    render(<WorkspacePicker hostId="host_1" initialPath="/opt/work/projects" />);
 
     fireEvent.click(screen.getByTestId("workspace-picker-new-folder"));
     fireEvent.change(screen.getByTestId("workspace-picker-new-folder-input"), {
@@ -1806,7 +1788,7 @@ describe("WorkspacePicker back-to-workspace", () => {
     // why the button is its own control rather than a repurposed Home.
     useHostFilesystemMock.mockReturnValue(
       result({
-        data: { entries: [dir("app", "/Users/corey/projects/app")], truncated: false },
+        data: { entries: [dir("app", "/opt/work/projects/app")], truncated: false },
         isLoading: false,
         isPlaceholderData: false,
       }),
@@ -1821,7 +1803,7 @@ describe("WorkspacePicker back-to-workspace", () => {
   it("returns to the workspace in one click after wandering off", () => {
     useHostFilesystemMock.mockReturnValue(
       result({
-        data: { entries: [dir("Music", "/Users/corey/Music")], truncated: false },
+        data: { entries: [dir("Music", "/opt/work/Music")], truncated: false },
         isLoading: false,
         isPlaceholderData: false,
       }),
@@ -1831,14 +1813,14 @@ describe("WorkspacePicker back-to-workspace", () => {
     render(
       <WorkspacePicker
         hostId="host_1"
-        initialPath="/Users/corey"
-        workspacePath="/Users/corey/repo"
+        initialPath="/opt/work"
+        workspacePath="/opt/work/repo"
         onNavigate={onNavigate}
       />,
     );
     fireEvent.click(screen.getByTestId("workspace-picker-workspace"));
 
-    expect(onNavigate).toHaveBeenCalledWith("/Users/corey/repo");
+    expect(onNavigate).toHaveBeenCalledWith("/opt/work/repo");
   });
 
   it("is disabled once the workspace is already showing", () => {
@@ -1846,7 +1828,7 @@ describe("WorkspacePicker back-to-workspace", () => {
     // so the header does not reflow as the user navigates.
     useHostFilesystemMock.mockReturnValue(
       result({
-        data: { entries: [dir("src", "/Users/corey/repo/src")], truncated: false },
+        data: { entries: [dir("src", "/opt/work/repo/src")], truncated: false },
         isLoading: false,
         isPlaceholderData: false,
       }),
@@ -1855,8 +1837,8 @@ describe("WorkspacePicker back-to-workspace", () => {
     render(
       <WorkspacePicker
         hostId="host_1"
-        initialPath="/Users/corey/repo"
-        workspacePath="/Users/corey/repo"
+        initialPath="/opt/work/repo"
+        workspacePath="/opt/work/repo"
       />,
     );
 
@@ -1872,7 +1854,7 @@ describe("WorkspacePicker initial focus", () => {
     useHostFilesystemMock.mockReset();
     useHostFilesystemMock.mockReturnValue(
       result({
-        data: { entries: [dir("src", "/Users/corey/repo/src")], truncated: false },
+        data: { entries: [dir("src", "/opt/work/repo/src")], truncated: false },
         isLoading: false,
         isPlaceholderData: false,
       }),
@@ -1888,7 +1870,7 @@ describe("WorkspacePicker initial focus", () => {
       <Popover>
         <PopoverTrigger data-testid="open-picker">Working folder</PopoverTrigger>
         <PopoverContent>
-          <WorkspacePicker hostId="host_1" initialPath="/Users/corey/repo" />
+          <WorkspacePicker hostId="host_1" initialPath="/opt/work/repo" />
         </PopoverContent>
       </Popover>,
     );

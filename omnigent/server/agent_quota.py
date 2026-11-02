@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any
 
 from omnigent.codex_rate_limits import fresh_codex_rate_limits
@@ -167,12 +167,27 @@ class AgentQuotaService:
                 or settings.quota_period_default
                 or newest.get("pinned_period")
             )
-            result[product] = agent_quota(windows, tiers, now=now, deciding_period=period)
+            quota = agent_quota(windows, tiers, now=now, deciding_period=period)
+            if not fresh:
+                quota = replace(quota, reason="stale_report")
+            elif newest.get("windows") == []:
+                quota = replace(quota, reason="empty_report")
+            result[product] = quota
         return tiers, result
 
     def payload(self, conversation: Conversation) -> dict[str, Any]:
+        from omnigent.harness_plugins import native_agents
+
         tiers, quotas = self.quotas(self.context(conversation))
-        return {"tiers": asdict(tiers), "agents": {k: asdict(v) for k, v in quotas.items()}}
+        # Missing reports are explicit at the API boundary; instruction lines
+        # still enumerate only products with an actual source in this scope.
+        missing = AgentQuota("unknown", None, None, (), reason="no_report")
+        return {
+            "tiers": asdict(tiers),
+            "agents": {
+                agent.key: asdict(quotas.get(agent.key, missing)) for agent in native_agents()
+            },
+        }
 
     def context_line(self, context: QuotaContext) -> str:
         now = time.time()

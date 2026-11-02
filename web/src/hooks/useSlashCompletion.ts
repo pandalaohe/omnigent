@@ -199,7 +199,7 @@ export function useSlashCompletion({
     e: SlashCompletionKeyEvent,
     { shouldPreferSendOverCompletion }: SlashCompletionKeyIntent,
   ): boolean {
-    // MOD-s11: navigate / apply / dismiss follow the user's suggestion
+    // Fork mod: navigate / apply / dismiss follow the user's suggestion
     // bindings (defaults ArrowDown, ArrowUp, Tab + Enter, Escape). Absent
     // modifier fields read as unset.
     const chord = {

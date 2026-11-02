@@ -39,8 +39,8 @@ const VIEWER = {
   openGithubTab: () => {},
   isChangedPath: () => false,
   conversationId: "conv_1" as string | undefined,
-  workspaceRoot: "/home/u/ws" as string | null,
-  workspaceHome: "/home/u" as string | null,
+  workspaceRoot: "/opt/work/ws" as string | null,
+  workspaceHome: "/opt/work" as string | null,
 };
 
 function Harness() {

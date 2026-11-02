@@ -4790,6 +4790,7 @@ async def test_codex_discover_thread_and_forward_waits_while_terminal_alive(
 
     class _Terminal:
         diagnostic_id = "terminal-1"
+        elevated = False
         reads = 0
         joined_reads = 0
 
@@ -4931,6 +4932,7 @@ async def test_codex_discover_thread_and_forward_records_a_sign_in_prompt_before
 
     class _Terminal:
         diagnostic_id = "terminal-1"
+        elevated = False
         reads = 0
 
         async def is_alive(self) -> bool:

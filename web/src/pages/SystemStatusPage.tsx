@@ -9,10 +9,14 @@ import { Fragment, memo, useEffect, useMemo, useState } from "react";
 import { ChevronDownIcon, ChevronRightIcon } from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
 import { Sparkline } from "@/components/Sparkline";
+import { HostRestartControl } from "@/components/HostRestartControl";
+import { HostTerminalLink } from "@/components/HostTerminalLink";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
+import { useHosts, type Host } from "@/hooks/useHosts";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { type HealthCheckNotice, useStartHealthCheck } from "@/hooks/useStartHealthCheck";
 import {
@@ -809,6 +813,7 @@ export function HostCard({
   nowMs,
   isAdmin = false,
   defaultLines = null,
+  controlHost,
 }: {
   host: SystemStatusHost;
   threshold: number | null;
@@ -818,8 +823,11 @@ export function HostCard({
   isAdmin?: boolean;
   /** The workspace default lines, known to admins only. */
   defaultLines?: SystemLoadLinePair | null;
+  /** Owned host from /v1/hosts, with current control capabilities. */
+  controlHost?: Host;
 }) {
   const history = useSystemHistory(host.host_id);
+  const isMobileViewport = useIsMobileViewport();
   const [processesOpen, setProcessesOpen] = useState(false);
   const snapshot = host.last_snapshot;
   const machine = snapshot?.machine ?? null;
@@ -842,6 +850,17 @@ export function HostCard({
         <StatePill state={host.state} />
         {showFreshness && (
           <Freshness sampledAtMs={sampledAtMs} staleAfterS={staleAfterS} nowMs={nowMs} />
+        )}
+        {controlHost && (
+          <div
+            className={cn(
+              "flex items-center gap-2 [&>button]:ml-0 max-md:[&>button]:min-h-10",
+              isMobileViewport ? "w-full" : "ml-auto",
+            )}
+          >
+            <HostTerminalLink host={controlHost} />
+            <HostRestartControl host={controlHost} sessionTitles={sessionTitles} />
+          </div>
         )}
       </div>
       {host.state === "offline" && (
@@ -949,6 +968,7 @@ function MonitorOverheadFooter({
 
 export function SystemStatusPage() {
   const isAdmin = useIsAdmin();
+  const { data: ownedHosts } = useHosts();
   const nowMs = useSecondTick();
   const status = useSystemStatus({ live: true });
   // The thresholds are admin-only; members never see the bytes line.
@@ -971,7 +991,7 @@ export function SystemStatusPage() {
       </PageScroll>
     );
   }
-  if (status.isError || status.data === undefined) {
+  if (status.data === undefined) {
     return (
       <PageScroll contentClassName="px-8">
         <p
@@ -1014,6 +1034,12 @@ export function SystemStatusPage() {
         <HealthCheckNoticeBox notice={healthCheck.notice} />
       )}
 
+      {status.isError && (
+        <p role="alert" className="mb-4 text-ui text-destructive">
+          Unable to refresh system status. Showing the last received data.
+        </p>
+      )}
+
       <FindingsBanner
         findings={data.findings}
         hostNames={hostNames}
@@ -1042,6 +1068,7 @@ export function SystemStatusPage() {
               nowMs={nowMs}
               isAdmin={isAdmin}
               defaultLines={defaultLines}
+              controlHost={ownedHosts?.find((owned) => owned.host_id === host.host_id)}
             />
           ))}
         </div>

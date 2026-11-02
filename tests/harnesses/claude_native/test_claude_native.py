@@ -6024,7 +6024,7 @@ async def test_cold_resume_transcript_rewrites_compacted_other_host_attached_pat
     monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", tmp_path / "projects")
     monkeypatch.chdir(workspace)
     other_key = "a" * 32
-    other_line = f"[Attached: /home/other/.omnigent/attachments/s-{other_key}/file_mp4/a.mp4]"
+    other_line = f"[Attached: /opt/work/.omnigent/attachments/s-{other_key}/file_mp4/a.mp4]"
     items: list[dict[str, Any]] = [
         {
             "id": "cmp_1",
@@ -7926,7 +7926,7 @@ def test_align_working_directory_matching_cwd_silent_skip(
     symlink-equivalent path matches the recorded canonical form.
     If this regresses to a string compare, every session opened
     via a symlinked directory (e.g. ``/repo`` vs
-    ``/home/me/repo``) would prompt to chdir on every resume,
+    ``/opt/work/repo``) would prompt to chdir on every resume,
     which is noise the user has to dismiss every time.
     """
     from omnigent.harnesses.claude_native.state import write_launch_state
@@ -9590,7 +9590,7 @@ def test_record_launch_for_fresh_session_writes_resolved_cwd(
     Resolved (not raw) so a session created via a symlinked path
     records the canonical form. The resume-time check also
     resolves both sides before comparing, so a session created
-    in ``/home/me/repo`` (a symlink) and resumed from
+    in ``/opt/work/repo`` (a symlink) and resumed from
     ``/repo`` (the canonical) won't falsely flag as mismatched.
     """
     from omnigent.harnesses.claude_native.state import read_launch_state

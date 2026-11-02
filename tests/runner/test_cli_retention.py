@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from omnigent.harnesses.claude_native.bridge import bridge_dir_for_bridge_id
+from omnigent.inner.native_attachments import (
+    attachment_cache_dir,
+    materialize_attachment,
+    session_attachment_dir,
+)
 from omnigent.runner import create_runner_app
 from omnigent.terminals.pane_reaper import NativePaneReaper, PaneRef
 from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient
@@ -512,6 +519,73 @@ async def test_runner_idle_release_cleans_up_when_harness_died_first() -> None:
     assert released.json()["status"] == "released"
     assert pm.released == [session_id]
     assert app.state.cli_runtime_lifecycle.phase(session_id) == "absent"
+
+
+@pytest.mark.asyncio
+async def test_runner_idle_release_keeps_native_attachment_cache() -> None:
+    """An idle release keeps both attachment dirs of a resumable session.
+
+    The session lives on after the runtime is released, and its native
+    transcript still references the cached files by path; a native turn
+    reads them as they are, with no restore step.
+    """
+    pm = _AbsentHarnessProcessManager(_ScriptedHarnessClient([]))
+    pm.retention_snapshot_result = {
+        "present": True,
+        "supported": True,
+        "family": "codex",
+        "busy": False,
+        "eligible": True,
+        "idle_seconds": 120.0,
+        "activity_token": "0:123.0",
+    }
+    app = create_runner_app(process_manager=pm, server_client=NullServerClient())  # type: ignore[arg-type]
+    app.state.native_pane_reaper = None
+    session_id = "b02c3d4e5f6a71234567890abcdef013"
+    bridge_dir = bridge_dir_for_bridge_id(session_id)
+    cached = materialize_attachment(
+        {
+            "type": "input_file",
+            "filename": "bundle.zip",
+            "file_data": "data:application/zip;base64,UEsDBA==",
+        },
+        bridge_dir,
+    )
+    assert cached is not None
+    by_path = session_attachment_dir(session_id) / "file_1" / "clip.mp4"
+    by_path.parent.mkdir(parents=True)
+    by_path.write_bytes(b"clip")
+
+    try:
+        async with _runner_client(app) as client:
+            snapshot = await client.get(
+                f"/v1/sessions/{session_id}/cli-retention",
+                params={
+                    "idle_threshold_seconds": 60,
+                    "host_id": "host-a",
+                    "policy_revision": 11,
+                },
+            )
+            released = await client.post(
+                f"/v1/sessions/{session_id}/cli-retention/release",
+                json={
+                    "reason": "idle_pool_overflow",
+                    "idle_threshold_seconds": 60,
+                    "expected_activity_token": "harness:0:123.0",
+                    "runtime_generation": snapshot.json()["runtime_generation"],
+                    "host_id": "host-a",
+                    "policy_revision": 11,
+                },
+            )
+
+        assert released.status_code == 200
+        assert released.json()["status"] == "released"
+        assert pm.released == [session_id]
+        assert cached.exists()
+        assert by_path.exists()
+    finally:
+        shutil.rmtree(attachment_cache_dir(bridge_dir), ignore_errors=True)
+        shutil.rmtree(session_attachment_dir(session_id), ignore_errors=True)
 
 
 async def _never_busy(pane: PaneRef) -> bool:

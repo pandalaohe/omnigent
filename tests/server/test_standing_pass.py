@@ -66,7 +66,7 @@ def test_project_removal_exceptions_and_no_later_default_changes(passes, db_uri)
             "orchestration": {
                 "standing_pass": {
                     "remove": ["install"],
-                    "exceptions": ["fn server release", 'custom\nline "push"'],
+                    "exceptions": ["production release", 'custom\nline "push"'],
                 }
             }
         },
@@ -74,7 +74,7 @@ def test_project_removal_exceptions_and_no_later_default_changes(passes, db_uri)
     root = passes.store.create_conversation(project_id=project.id)
     assert passes.resolve(root)["kinds"] == ["merge"]
     line = passes.line(root)
-    assert '"fn server release"' in line
+    assert '"production release"' in line
     assert '"custom line \\"push\\""' in line
     assert "\n" not in line
     passes.prefs_store.patch_namespace(

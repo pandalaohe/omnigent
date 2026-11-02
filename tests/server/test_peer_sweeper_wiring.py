@@ -87,7 +87,7 @@ def test_flag_on_no_store_no_sweeper(runtime_init: None, db_uri: str, tmp_path: 
 def test_flag_off_still_starts_the_keep_warm_sweeper(
     runtime_init: None, db_uri: str, tmp_path: Path
 ) -> None:
-    """SCC28 A1: keep-warm runs whether or not peer messaging is on."""
+    """Keep-warm runs whether or not peer messaging is on."""
     app = _build_app(db_uri, tmp_path, flag_on=False, with_store=True)
     keep_warm = app.state.child_keep_warm
     idle_reminders = app.state.child_idle

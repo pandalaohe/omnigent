@@ -787,12 +787,12 @@ describe("parseEvent — artifact.open_request", () => {
     });
     expect(
       parseEvent("artifact.open_request", {
-        path: "/Users/x/report.html",
+        path: "/opt/work/report.html",
         base: "host",
       }),
     ).toEqual({
       type: "artifact_open_request",
-      path: "/Users/x/report.html",
+      path: "/opt/work/report.html",
       base: "host",
     });
   });

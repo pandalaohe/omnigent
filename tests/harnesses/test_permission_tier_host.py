@@ -97,7 +97,7 @@ def test_host_checks_paths_rules_and_blocked_state(
 
 def test_windows_nondefault_installation_paths(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(host.sys, "platform", "win32")
-    monkeypatch.setattr(host.Path, "home", lambda: Path("C:/Users/sample"))
+    monkeypatch.setattr(host.Path, "home", lambda: Path("C:/opt/work"))
     monkeypatch.setenv("SystemRoot", r"C:\Windows")
     monkeypatch.setenv("ProgramFiles", r"D:\Apps")
     monkeypatch.setenv("ProgramFiles(x86)", r"E:\LegacyApps")

@@ -1453,23 +1453,23 @@ def _gateway_model_vocabulary(base_url: str, auth_command: str | None) -> _Gatew
 
 def _claude_settings_payload(
     api_key_helper: str | None, model_overrides: dict[str, str], *, fast_mode: bool | None = None
-) -> str | None:
+) -> str:
     """Serialize the invocation-local settings Claude Code launches with.
 
     :param api_key_helper: The gateway ``apiKeyHelper`` command, or ``None``.
     :param model_overrides: Canonical-to-served model id rewrites.
     :param fast_mode: Session speed override; ``None`` preserves Claude's default.
-    :returns: Compact JSON for ``ClaudeAgentOptions.settings``, or ``None``
-        when there is nothing to configure.
+    :returns: Compact JSON for ``ClaudeAgentOptions.settings``.
     """
-    settings: dict[str, Any] = {}
+    # CLI settings env can override the subprocess launch environment.
+    settings: dict[str, Any] = {"env": {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"}}
     if api_key_helper:
         settings["apiKeyHelper"] = api_key_helper
     if model_overrides:
         settings["modelOverrides"] = model_overrides
     if fast_mode is not None:
         settings["fastMode"] = fast_mode
-    return json.dumps(settings, separators=(",", ":")) if settings else None
+    return json.dumps(settings, separators=(",", ":"))
 
 
 def _claude_user_settings_env(cwd: str | None = None) -> dict[str, str]:
@@ -3471,15 +3471,15 @@ class ClaudeSDKExecutor(Executor):
     def _base_tools(self, sdk: _ClaudeSDK) -> list[str]:
         """Native Claude Code tools exposed to the model.
 
-        ``Skill`` and ``ToolSearch`` are always present so MCP tool
-        definitions can be discovered on demand. ``AskUserQuestion`` is added
+        ``Agent`` enables foreground helpers; ``Skill`` and ``ToolSearch``
+        let them discover MCP tools. ``AskUserQuestion`` is added
         only when :meth:`_ask_user_question_enabled` — the tool would hang
         headless without the PreToolUse intercept, so it's never exposed
         without the bridge that answers it. OS-environment operations route
         through Omnigent ``sys_os_*`` MCP tools, not the SDK's native
         Bash/Read/Edit/Write.
         """
-        tools = ["Skill", "ToolSearch"]
+        tools = ["Skill", "ToolSearch", "Agent"]
         if self._ask_user_question_enabled(sdk):
             tools.append("AskUserQuestion")
         return tools
@@ -4023,6 +4023,8 @@ class ClaudeSDKExecutor(Executor):
         if max_output_tokens is not None:
             max_output_tokens = int(max_output_tokens)
             env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(max_output_tokens)
+        # A headless turn must wait for its helpers before ResultMessage ends it.
+        env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
         options_kwargs: dict[str, Any] = {  # type: ignore[explicit-any]  # ClaudeAgentOptions accepts mixed-typed kwargs (str / list / dict / callable / etc.)
             "tools": base_tools,
             "system_prompt": system_prompt or None,
@@ -4429,6 +4431,8 @@ class ClaudeSDKExecutor(Executor):
                         message = next_task.result()
                     except StopAsyncIteration:
                         break
+                    if getattr(message, "parent_tool_use_id", None) is not None:
+                        continue
                     self._observe_resident_context(
                         session_key, client, resident_owner, message, sdk
                     )

@@ -774,7 +774,7 @@ async def _phase_publish_done(
         child = await asyncio.to_thread(conversation_store.get_conversation, child_id)
         if child is None:
             continue
-        # Only the session.created SSE per moved child (the scc24 contract);
+        # Only the session.created SSE per moved child;
         # the child was relocated, not created, so no delegated transcript
         # item or creation debug row.
         session_stream.publish(

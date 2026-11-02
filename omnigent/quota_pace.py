@@ -60,6 +60,7 @@ class AgentQuota:
     pace_pct: float | None
     deciding_window: str | None
     windows: tuple[WindowPace, ...]
+    reason: str | None = None
 
 
 def accept_snapshot(captured_at: object, now: object) -> bool:

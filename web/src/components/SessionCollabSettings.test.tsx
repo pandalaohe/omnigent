@@ -9,8 +9,8 @@ import { HostColorsSettings, SessionCollabSettings } from "./SessionCollabSettin
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: () => ({
     data: [
-      { host_id: "host-1", name: "TMB", owner: "u", status: "online" },
-      { host_id: "host-2", name: "fn", owner: "u", status: "online" },
+      { host_id: "host-1", name: "laptop", owner: "u", status: "online" },
+      { host_id: "host-2", name: "server", owner: "u", status: "online" },
     ],
   }),
 }));
@@ -124,7 +124,7 @@ describe("SessionCollabSettings", () => {
 
     const rows = screen.getAllByTestId("host-color-row");
     expect(rows).toHaveLength(2);
-    expect(rows[0]).toHaveTextContent("TMB");
+    expect(rows[0]).toHaveTextContent("laptop");
     expect(rows[0]).toHaveTextContent("Automatic");
     // Eight palette swatches per host.
     expect(within(rows[0]).getAllByRole("button")).toHaveLength(8);
@@ -138,7 +138,7 @@ describe("SessionCollabSettings", () => {
       </MemoryRouter>,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "TMB colour: purple" }));
+    fireEvent.click(screen.getByRole("button", { name: "laptop colour: purple" }));
 
     expect(readHostColorPreferences()).toEqual({ "host-1": "purple" });
     expect(screen.getByRole("button", { name: "Reset to automatic" })).toBeInTheDocument();

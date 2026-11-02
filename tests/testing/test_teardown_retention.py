@@ -1,6 +1,6 @@
 """Teardown retention when the OS denies the process-table read.
 
-The observed failure (26BUG-164) is an EPERM from ``sysctl(KERN_PROC)`` during
+The observed failure is an EPERM from ``sysctl(KERN_PROC)`` during
 ``pytest_unconfigure``. These regressions pin the two properties the fix must
 keep: nothing is signalled once visibility is denied, and the teardown retains
 the paths it can no longer prove are unused instead of deleting them.

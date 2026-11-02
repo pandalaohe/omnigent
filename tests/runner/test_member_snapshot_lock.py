@@ -1,4 +1,4 @@
-"""Runner-side member snapshot lock for joint-agent dispatches (SCC06 F1a).
+"""Runner-side member snapshot lock for joint-agent dispatches.
 
 A session launched from a saved library joint agent (the ``ca_`` template
 label) freezes a member snapshot (``omnigent.member.<role>`` labels) and locks
@@ -584,7 +584,7 @@ async def test_builtin_member_takes_the_calling_defaults_chain(
             "model_override": _PARENT_MODEL,
             "llm_model": None,
             "project_id": "proj_polly",
-            "host_id": "host_hds",
+            "host_id": "host_workstation",
         },
         resolve_payload={"model": "gpt-6-astra", "effort": "medium"},
         resolve_queries=queries,
@@ -597,7 +597,7 @@ async def test_builtin_member_takes_the_calling_defaults_chain(
     assert queries == [
         {
             "project_id": "proj_polly",
-            "host_id": "host_hds",
+            "host_id": "host_workstation",
             "agent_id": "worker",
             "harness": "codex-native",
         }

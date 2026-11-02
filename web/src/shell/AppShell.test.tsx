@@ -5548,7 +5548,7 @@ describe("AppShell clone/fork action", () => {
 describe("AppShell share action", () => {
   it("passes the conversation workspace to the Share dialog before the snapshot loads", () => {
     withWindowOrigin("https://app.example.com", () => {
-      mockConversations([{ id: "conv_home", permission_level: 4, workspace: "/home/alice" }]);
+      mockConversations([{ id: "conv_home", permission_level: 4, workspace: "/root" }]);
       renderShell("/c/conv_home", serverInfo({ sharing_mode: "restricted_read_only" }));
       fireEvent.click(screen.getByRole("button", { name: /share session/i }));
       expect(
@@ -6136,13 +6136,13 @@ describe("artifact.open_request consumer", () => {
 
     act(() => {
       emitArtifactOpenRequest(
-        { type: "artifact_open_request", path: "/Users/x/report.html", base: "host" },
+        { type: "artifact_open_request", path: "/opt/work/report.html", base: "host" },
         "conv_abc",
       );
     });
     expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute(
       "data-path",
-      "/Users/x/report.html",
+      "/opt/work/report.html",
     );
   });
 });

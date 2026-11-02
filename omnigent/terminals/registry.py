@@ -38,7 +38,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
@@ -52,6 +54,12 @@ from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.os_env import OSEnvironment
 from omnigent.inner.terminal import TerminalInstance, create_terminal_instance
 from omnigent.runner.owner_file import write_owner_entry
+from omnigent.terminals.elevation import (
+    AGENT_ACCESS_REQUIRED,
+    ELEVATED_INPUT_IDLE_S,
+    ELEVATED_TERMINALS_ENV,
+    elevated_terminal_spec,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -279,6 +287,8 @@ class TerminalRegistry:
         cwd_override: str | None = None,
         sandbox_override: str | None = None,
         program_status_app: str | None = None,
+        elevated: bool = False,
+        agent_invocation: bool = False,
     ) -> TerminalInstance:
         """Launch a terminal session, or return the existing one.
 
@@ -320,6 +330,10 @@ class TerminalRegistry:
         with self._lock:
             existing = self._by_conversation.get(conversation_id, {}).get(key)
         if existing is not None and existing.running:
+            if agent_invocation and existing.elevated and not existing.agent_access:
+                raise ValueError(AGENT_ACCESS_REQUIRED)
+            if existing.elevated != elevated and not agent_invocation:
+                raise ValueError("terminal key already belongs to a different elevation mode")
             if await existing.is_alive():
                 return existing
             await self.close(conversation_id, terminal_name, session_key)
@@ -331,6 +345,10 @@ class TerminalRegistry:
         # registry lock across them would serialize all conversations'
         # terminal spawns globally. Instead we re-check after the
         # spawn completes.
+        if elevated:
+            spec = elevated_terminal_spec(spec, method=os.environ.get(ELEVATED_TERMINALS_ENV))
+            parent_os_env = None
+            sandbox_override = None
         parent_environment = None
         environment_spec = spec.os_env if isinstance(spec.os_env, OSEnvSpec) else parent_os_env
         if (
@@ -362,6 +380,7 @@ class TerminalRegistry:
             )
         stage = "terminal_spawn"
         try:
+            created.instance.elevated = elevated
             created.instance.program_status_app = program_status_app
             created.instance.lifecycle_trace.transfer_session(conversation_id)
             await created.instance.launch(cwd=created.cwd)
@@ -461,7 +480,99 @@ class TerminalRegistry:
                     session_key,
                     conversation_id,
                 )
+        if agent_invocation and winning_instance.elevated and not winning_instance.agent_access:
+            raise ValueError(AGENT_ACCESS_REQUIRED)
+        if not agent_invocation and winning_instance.elevated != elevated:
+            raise ValueError("terminal key already belongs to a different elevation mode")
+        if winning_instance is created.instance and elevated:
+            self._watch_elevated(conversation_id, terminal_name, session_key, winning_instance)
         return winning_instance
+
+    def get_native(
+        self, conversation_id: str, terminal_name: str, session_key: str
+    ) -> TerminalInstance | None:
+        """Resolve a harness pane, excluding user-created admin terminals."""
+        instance = self.get(conversation_id, terminal_name, session_key)
+        return instance if instance is not None and not instance.elevated else None
+
+    def require_agent_access(
+        self,
+        conversation_id: str,
+        terminal_name: str,
+        session_key: str,
+        expected: TerminalInstance,
+    ) -> None:
+        """Recheck under the operation lock, after any pending grant/revoke."""
+        with self._lock:
+            current = self._by_conversation.get(conversation_id, {}).get(
+                (terminal_name, session_key)
+            )
+            if current is not expected:
+                raise ValueError("terminal instance no longer current")
+            if current.elevated and not current.agent_access:
+                raise ValueError(AGENT_ACCESS_REQUIRED)
+
+    def set_agent_access(
+        self,
+        conversation_id: str,
+        terminal_name: str,
+        session_key: str,
+        instance_id: str,
+        enabled: bool,
+    ) -> TerminalInstance:
+        """Atomically change consent for the named live instance only."""
+        lock = self.get_instance_lock(conversation_id, terminal_name, session_key)
+        if lock is None:
+            raise ValueError("terminal instance not found")
+        with lock, self._lock:
+            instance = self._by_conversation.get(conversation_id, {}).get(
+                (terminal_name, session_key)
+            )
+            if instance is None or instance.instance_id != instance_id or not instance.running:
+                raise ValueError("terminal instance no longer running")
+            if not instance.elevated:
+                raise ValueError("not an admin terminal")
+            instance.agent_access = enabled
+            return instance
+
+    def _watch_elevated(
+        self,
+        conversation_id: str,
+        terminal_name: str,
+        session_key: str,
+        instance: TerminalInstance,
+    ) -> None:
+        """Close expired/dead launchers even for callers with short-lived event loops."""
+
+        def watch() -> None:
+            while not instance._elevated_watch_stop.wait(1):
+                try:
+                    alive = asyncio.run(instance.is_alive())
+                    if alive and time.monotonic() - instance.last_input_at < ELEVATED_INPUT_IDLE_S:
+                        continue
+                    lock = self.get_instance_lock(conversation_id, terminal_name, session_key)
+                    if lock is None:
+                        return
+                    with lock:
+                        # Input could have arrived while the watchdog waited for the lock.
+                        if (
+                            alive
+                            and time.monotonic() - instance.last_input_at < ELEVATED_INPUT_IDLE_S
+                        ):
+                            continue
+                        if instance.on_elevated_exit is not None:
+                            instance.on_elevated_exit()
+                            return
+                        asyncio.run(
+                            self.close(
+                                conversation_id, terminal_name, session_key, expected=instance
+                            )
+                        )
+                    return
+                except Exception:
+                    logger.exception("Admin terminal watchdog failed")
+
+        threading.Thread(target=watch, name="elevated-terminal-idle", daemon=True).start()
 
     def get_instance_lock(
         self,
@@ -604,7 +715,11 @@ class TerminalRegistry:
         with self._lock:
             for conv_id, slot in self._by_conversation.items():
                 for (name, key), instance in slot.items():
-                    if key == "main" and name in NATIVE_PANE_TERMINAL_NAMES:
+                    if (
+                        key == "main"
+                        and name in NATIVE_PANE_TERMINAL_NAMES
+                        and not instance.elevated
+                    ):
                         out.append((conv_id, name, instance.socket_path))
         return out
 
@@ -642,6 +757,8 @@ class TerminalRegistry:
             instance = source_slot.get(key)
             if instance is None:
                 return False
+            if instance.elevated:
+                raise RuntimeError("admin terminals cannot be transferred")
             target_slot = self._by_conversation.setdefault(target_conversation_id, {})
             if key in target_slot:
                 raise RuntimeError(

@@ -1,4 +1,5 @@
 import { parseNativePermissionDelivery } from "./nativePermissionDelivery";
+import { parseTerminalAccess } from "./terminalAccess";
 // Mirrors sdks/python-client/omnigent_client/_sse.py.
 //
 // Parses raw `text/event-stream` bytes into typed `StreamEvent`
@@ -993,6 +994,9 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     if (typeof sessionId !== "string" || !sessionId) return null;
     return {
       type: "session_resource_deleted",
+      ...(typeof data.instance_id === "string" && data.instance_id
+        ? { instanceId: data.instance_id }
+        : {}),
       resourceId,
       resourceType,
       sessionId,
@@ -1211,6 +1215,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     ];
     return {
       type: "elicitation_request",
+      ...(parseTerminalAccess(p) ? { terminalAccess: parseTerminalAccess(p) } : {}),
       ...(p.native_delivery
         ? { nativeDelivery: parseNativePermissionDelivery(p.native_delivery) }
         : {}),

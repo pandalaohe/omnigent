@@ -1,4 +1,4 @@
-"""Cross-host sub-agent completion forwarding (SCC06 F2b, Step B).
+"""Cross-host sub-agent completion forwarding, step B.
 
 A member child running on another host has no parent inbox on its own runner,
 so its terminal ``external_session_status`` edge must be delivered through the

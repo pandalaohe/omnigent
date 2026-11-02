@@ -96,7 +96,7 @@ async def test_create_returns_durable_queue_on_incompatible_local_host(
     capture = register_host()
     response = await _multipart_create(
         client,
-        {"host_id": _HOST_ID, "workspace": "/Users/sample/project"}
+        {"host_id": _HOST_ID, "workspace": "/opt/work/project"}
         if create_form == "multipart"
         else {},
     )
@@ -108,7 +108,7 @@ async def test_create_returns_durable_queue_on_incompatible_local_host(
             json={
                 "agent_id": response.json()["agent_id"],
                 "host_id": _HOST_ID,
-                "workspace": "/Users/sample/project",
+                "workspace": "/opt/work/project",
             },
         )
         assert response.status_code == 201, response.text
@@ -151,7 +151,7 @@ async def test_host_runner_request_is_queued_before_any_workspace_probe(
         f"/v1/hosts/{_HOST_ID}/runners",
         json={
             "session_id": session_id,
-            "workspace": "/Users/sample/project",
+            "workspace": "/opt/work/project",
         },
     )
     assert response.status_code == 200, response.text
@@ -159,7 +159,7 @@ async def test_host_runner_request_is_queued_before_any_workspace_probe(
     assert capture.stats == [] and capture.launch == []
     startup = app.state.startup_store.for_session(session_id)
     assert startup is not None and startup.host_id == _HOST_ID
-    assert startup.preparation["workspace"] == "/Users/sample/project"
+    assert startup.preparation["workspace"] == "/opt/work/project"
     conn = app.state.host_registry.get(_HOST_ID)
     conn.hello.capabilities = ["startup_admission_v1", "startup_receipts:test"]
     app.state.startup_admission.resolve_harness = AsyncMock(return_value="test")
@@ -174,7 +174,7 @@ async def test_host_runner_request_is_queued_before_any_workspace_probe(
         f"/v1/hosts/{_HOST_ID}/runners",
         json={
             "session_id": session_id,
-            "workspace": "/Users/sample/project",
+            "workspace": "/opt/work/project",
         },
     )
     assert retried.status_code == 200, retried.text
@@ -198,7 +198,7 @@ async def test_definite_preparation_refusal_does_not_hold_runtime_capacity(
         f"/v1/hosts/{_HOST_ID}/runners",
         json={
             "session_id": session_id,
-            "workspace": "/Users/sample/project",
+            "workspace": "/opt/work/project",
         },
     )
     assert response.status_code == 200, response.text
@@ -219,7 +219,7 @@ async def test_definite_preparation_refusal_does_not_hold_runtime_capacity(
         f"/v1/hosts/{_HOST_ID}/runners",
         json={
             "session_id": session_id,
-            "workspace": "/Users/sample/corrected",
+            "workspace": "/opt/work/corrected",
         },
     )
     assert retried.status_code == 200, retried.text

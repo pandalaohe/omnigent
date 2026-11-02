@@ -2561,12 +2561,12 @@ def create_runner_app(
     _session_background_task_counts: dict[str, int] = {}
 
     async def _restore_pending_session_attachments(session_id: str) -> None:
-        """Re-materialize by-path files a cleanup removed while history survived.
+        """Re-materialize by-path files after a CLI release or resource cleanup.
 
-        CLI release and resource cleanup delete the session attachment dir but
-        keep ``_session_histories``; the cached ``[Attached: ...]`` lines then
-        point at deleted files, so the next turn restores them before the
-        harness reads the history. A purged row has no bytes to restore, so
+        CLI release and resource cleanup keep ``_session_histories``; the next
+        turn ensures any missing by-path files referenced by cached
+        ``[Attached: ...]`` lines are present before the harness reads the
+        history. A purged row has no bytes to restore, so
         its cached lines are replaced in place with the could-not-load marker.
         Calls are idempotent and non-fatal.
         """
@@ -2958,6 +2958,8 @@ def create_runner_app(
         if registry is None:
             return None
         for entry in registry.list_for_conversation(conv_id):
+            if entry.instance.elevated:
+                continue
             try:
                 pane = trim_terminal_output(entry.instance.last_pane_text())
             except Exception:
@@ -3024,6 +3026,7 @@ def create_runner_app(
                 "type": "session.resource.deleted",
                 "resource_id": event.terminal_id,
                 "resource_type": "terminal",
+                "instance_id": event.terminal_instance_id,
                 "session_id": event.session_id,
             },
         )
@@ -7778,6 +7781,7 @@ def create_runner_app(
             peer_messaging_enabled=peer_for_relay,
             session_open_enabled=open_for_relay,
             skill_registry=skill_registry,
+            terminal_access_requests_enabled=server_client is not None,
         )
         if relay_spec is not None and relay_spec.mcp_servers:
             # Native terminals consume the persistent relay, not per-turn schemas.
@@ -8444,6 +8448,7 @@ def create_runner_app(
                         session_open_enabled=_session_open_enabled.get(conv, False),
                         os_env_schema_only=True,
                         skill_registry=_tmgr_registry,
+                        terminal_access_requests_enabled=server_client is not None,
                     )
                     all_tools.extend(_tmgr.get_tool_schemas())
                 except (
@@ -10371,7 +10376,7 @@ def create_runner_app(
                     _cond.notify_all()
 
         if body_type == "interrupt":
-            # Fork mod (MOD-s19): read before the cancel pops it; the Claude idle guard
+            # Fork mod: read before the cancel pops it; the Claude idle guard
             # must not treat a pane parked on a question as an idle composer.
             _prompt_pending = conversation_id in _claude_prompt_waiters
             _cancel_claude_prompt_waiter(conversation_id)
@@ -12082,9 +12087,12 @@ def create_runner_app(
         if process_manager is not None:
             await process_manager.release(session_id)
         await resource_registry.cleanup_session(session_id)
+        # The session keeps running here (session delete is DELETE /v1/sessions/{id}),
+        # and its native transcript still reads the cached attachments.
         await _delete_native_bridge_dirs(
             server_client=server_client,
             session_id=session_id,
+            keep_attachment_caches=True,
         )
         if session_id in _session_histories:
             _attachment_restore_pending.add(session_id)
@@ -12483,9 +12491,11 @@ def create_runner_app(
             if await process_manager.release(session_id) is False:
                 raise RuntimeError("harness subprocess did not exit during CLI release")
         await _native_runtime.teardown_codex_native_app_server(session_id)
+        # The session resumes later and its native transcript still reads the cached attachments.
         await _delete_native_bridge_dirs(
             server_client=server_client,
             session_id=session_id,
+            keep_attachment_caches=True,
         )
         if session_id in _session_histories:
             _attachment_restore_pending.add(session_id)

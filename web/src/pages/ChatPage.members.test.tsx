@@ -132,7 +132,7 @@ function multiMemberLabels(): Record<string, string> {
     }),
     [`${MEMBER_KEY}executor`]: memberLabel(),
     [`${MEMBER_KEY}reviewer`]: memberLabel({
-      host: "Desktop-HRF",
+      host: "Studio-Mac",
       model: "gpt-6-astra",
       effort: "medium",
     }),

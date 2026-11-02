@@ -2515,6 +2515,7 @@ def create_app(
             if host_load_notices is not None:
                 await host_load_notices.shutdown()
             await app_inst.state.host_load_queue.shutdown()
+            await host_registry.restarts.shutdown()
             if system_status_hub is not None:
                 await system_status_hub.save_history()
                 system_status_hub.close()
@@ -5358,7 +5359,10 @@ def create_app(
             _session_sandbox_status_cache,
             _session_status_cache,
         )
-        from omnigent.server.routes._sessions.helpers import _last_task_error_from_labels
+        from omnigent.server.routes._sessions.helpers import (
+            _last_task_error_from_labels,
+            effective_host_id,
+        )
         from omnigent.server.routes.sessions import (
             _ensure_runner_relay,
             _publish_runner_recovered_status,
@@ -5382,11 +5386,45 @@ def create_app(
             conversation_store.list_conversations_by_runner_id, runner_id
         )
         bound_ids = {conv.id for conv in convs}
+        by_id = {conv.id: conv for conv in convs}
+        ancestor_host_ids: dict[str, str | None] = {}
+        # A hostless tree can inherit its host from an ancestor on another runner.
+        for conv in convs:
+            parent_id = conv.parent_conversation_id
+            if (
+                conv.host_id is None
+                and parent_id is not None
+                and parent_id not in by_id
+                and parent_id not in ancestor_host_ids
+            ):
+                try:
+                    ancestor_host_ids[parent_id] = await asyncio.to_thread(
+                        effective_host_id, conversation_store, conv
+                    )
+                except Exception:
+                    _logger.exception(
+                        "Failed to resolve inherited host for session %s on reconnect", conv.id
+                    )
+
+        def _tree_host_id(conv_id: str | None) -> str | None:
+            seen: set[str] = set()
+            while conv_id is not None and conv_id not in seen:
+                seen.add(conv_id)
+                ancestor = by_id.get(conv_id)
+                if ancestor is None:
+                    return ancestor_host_ids.get(conv_id)
+                if ancestor.host_id is not None:
+                    return ancestor.host_id
+                conv_id = ancestor.parent_conversation_id
+            return None
 
         def is_independent(conv: Conversation) -> bool:
             return not (
                 is_parent_owned_subagent(conv)
-                or (conv.parent_conversation_id in bound_ids and conv.host_id is None)
+                or (
+                    conv.parent_conversation_id in bound_ids
+                    and conv.host_id in (None, _tree_host_id(conv.parent_conversation_id))
+                )
             )
 
         def needs_eager_recovery(conv: Conversation) -> bool:
@@ -5408,8 +5446,6 @@ def create_app(
                 or pending > 0
                 or _last_task_error_from_labels(conv.labels) is not None
             )
-
-        by_id = {conv.id: conv for conv in convs}
 
         def independent_root_id(conv: Conversation) -> str | None:
             seen: set[str] = set()
@@ -5512,6 +5548,7 @@ def create_app(
             for conv, _ in roots
             if conv.agent_id is not None and _restorable(conv) and conv.id not in eager_root_ids
         }
+        root_host_ids = {conv.id: _tree_host_id(conv.id) for conv, _ in roots}
         idle_root_ids = set(frontier.values())
         try:
             while frontier:
@@ -5541,7 +5578,10 @@ def create_app(
                             row = rows.get(child_id)
                             if (
                                 row is None
-                                or row.host_id is not None
+                                or (
+                                    row.host_id is not None
+                                    and row.host_id != root_host_ids.get(root_id)
+                                )
                                 or row.runner_id is None
                                 or not _restorable(row)
                                 or is_side_chat_child(row.labels)
@@ -5776,6 +5816,20 @@ def create_app(
         return None
 
     # WS tunnel endpoint for runners (RUNNER.md §2-3).
+    from omnigent.server.host_terminals import HostTerminalService
+
+    host_terminals = (
+        HostTerminalService(
+            host_registry,
+            host_store,
+            tunnel_registry,
+            auth_provider=auth_provider,
+            account_store=runner_account_store,
+        )
+        if host_store is not None
+        else None
+    )
+    app.state.host_terminals = host_terminals
     app.include_router(
         create_runner_tunnel_router(
             tunnel_registry,
@@ -5785,6 +5839,7 @@ def create_app(
             auth_provider=auth_provider,
             runner_exit_reports=runner_exit_reports,
             resolve_managed_runner_owner=_resolve_managed_runner_owner,
+            host_terminals=host_terminals,
             mint_managed_runner_token=(
                 _mint_managed_runner_token if runner_account_store is not None else None
             ),
@@ -5802,6 +5857,7 @@ def create_app(
     if host_store is not None:
         from omnigent.server.admin_list import resolve_data_dir
         from omnigent.server.routes.harness_startup import create_harness_startup_router
+        from omnigent.server.routes.host_terminals import create_host_terminals_router
         from omnigent.server.routes.host_tunnel import create_host_tunnel_router
         from omnigent.server.routes.hosts import create_hosts_router
         from omnigent.server.routes.mcp_servers import create_mcp_servers_router
@@ -5818,6 +5874,17 @@ def create_app(
         system_status = SystemStatusHub(resolve_data_dir(), server_metrics)
         system_status.load()
         app.state.system_status = system_status
+        assert host_terminals is not None
+        app.include_router(
+            create_host_terminals_router(
+                host_terminals,
+                auth_provider=auth_provider,
+                runner_router=runner_router,
+                permission_store=permission_store,
+            ),
+            prefix="/v1",
+            tags=["hosts"],
+        )
 
         async def _on_hosts_changed(host_id: str, owner: str | None) -> None:
             announce_hosts_changed(owner)

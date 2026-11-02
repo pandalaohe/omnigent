@@ -807,6 +807,18 @@ class SysSessionGetInfoTool(Tool):
             'in one call as {"sessions": [...]} with per-item errors; omit '
             "both to describe your own. The batch form omits "
             "configured_harnesses unless include_host_readiness is true. "
+            "runner_state reports runner connectivity and recovery: online; "
+            "relaunchable — the runner stopped (e.g. a host restart) on a host "
+            "that can start it, or the session's own bound host is an asleep resumable managed "
+            "host, so the next message starts, reattaches or wakes it and no "
+            "archive is needed (keep_warm.blocked_by then reads "
+            "runner_relaunchable); offline — a host that is offline and not "
+            "resumable, a host that cannot launch the session's harness, or a "
+            "closed session whose runner would otherwise be relaunchable, with "
+            "runner_state_reason saying why. A closed session preserves online or "
+            "unknown connectivity. A hostless sub-agent reads its nearest host-bound "
+            "ancestor's host; when that host is offline, the child cannot wake it. "
+            "Reconnect the host or wake it through a host-bound ancestor first. "
             "Each item carries last_message_tail — the end of the newest "
             "assistant reply. Metadata only — "
             "use sys_session_get_history for the conversation transcript, "
@@ -1257,7 +1269,7 @@ class SysSessionCreateTool(Tool):
                             "type": "string",
                             "description": (
                                 "Placement (agent_id mode): a registered "
-                                "host id or its exact name, e.g. 'fn' or "
+                                "host id or its exact name, e.g. 'server' or "
                                 "'host_a1b2c3'. Unknown names are refused "
                                 "with the registered names. Naming another "
                                 "host requires 'workspace' or 'worktree'. "

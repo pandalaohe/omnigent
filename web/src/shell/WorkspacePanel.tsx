@@ -100,6 +100,8 @@ import { PullRequestPanel } from "./PullRequestPanel";
 import type { ChangedSort } from "./FlatFileList";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { useTerminalStatuses } from "./useTerminalStatuses";
+import { useSessionTerminalAccess } from "@/hooks/useSessionTerminalAccess";
+import { TerminalAgentAccess } from "./TerminalAgentAccess";
 import { type RightRailTab, TAB_BADGE_BASE } from "./railTabs";
 import { Button } from "../components/ui/button";
 
@@ -252,6 +254,7 @@ function NewTabMenu({
 }) {
   const { data: agent } = useSessionAgent(conversationId);
   const create = useCreateTerminal(conversationId);
+  const { canCreateElevated } = useSessionTerminalAccess(conversationId);
   const newShellShortcut = useShortcutHint("newShell");
   const newBrowserShortcut = useShortcutHint("newBrowserTab");
   const connectState = shellConnectState(liveness);
@@ -270,14 +273,14 @@ function NewTabMenu({
   // access is available; the menu can also contain just built-in pages.
   const defaultShell = resolveDefaultShell(declaredTerminals, preferred) as string;
 
-  const launchShell = (name: string) => {
+  const launchShell = (name: string, elevated = false) => {
     setMenuOpen(false);
     // Signal the create is starting so the shell gets focused the moment its
     // tab lands in the list — not only when this POST resolves. On a waking
     // (runner-asleep) session the POST can lag the tab's arrival by seconds;
     // ``onOpenTerminal`` on success is a backstop for when it's already open.
     onCreateStart?.();
-    create.mutate(name, {
+    create.mutate(elevated ? { terminal: name, elevated: true } : name, {
       onSuccess: (info) => onOpenTerminal(terminalTabKey(info)),
       onError: () => onCreateError?.(),
     });
@@ -428,6 +431,14 @@ function NewTabMenu({
               {shellItemContent}
             </DropdownMenuItem>
           ))}
+        {canOpenShell && canCreateElevated && (
+          <DropdownMenuItem
+            disabled={shellDisabled}
+            onSelect={() => launchShell(defaultShell, true)}
+          >
+            Admin (root)
+          </DropdownMenuItem>
+        )}
       </DropdownMenuContent>
     </DropdownMenu>
   );
@@ -674,7 +685,13 @@ function RailTerminalView({
     );
   }
   return (
-    <div key={terminal.id} className="flex h-full min-h-0 flex-col">
+    <div
+      key={`${terminal.id}:${terminal.instanceId ?? ""}`}
+      className="flex h-full min-h-0 flex-col"
+    >
+      {terminal.elevated && (
+        <TerminalAgentAccess conversationId={conversationId} terminal={terminal} />
+      )}
       <Suspense fallback={null}>
         <TerminalView
           sessionId={conversationId}

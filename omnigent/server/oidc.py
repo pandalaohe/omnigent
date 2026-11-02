@@ -59,6 +59,8 @@ def mint_session_token(
     *,
     account_generation: str | None = None,
     cli_login_ticket: str | None = None,
+    browser_session: bool = False,
+    purpose: str | None = None,
 ) -> str:
     """
     Mint a signed session JWT with a second-granularity lifetime.
@@ -77,6 +79,8 @@ def mint_session_token(
         ``"accounts"``. Stored as an informational claim.
     :param cli_login_ticket: Ticket authenticated by the browser callback,
         never included in runner, refresh, or CLI-issued credentials.
+    :param browser_session: Mark a fresh browser login for human-only approval cards.
+        Runner and CLI issuers leave this false.
     :returns: An HS256-signed JWT string.
     """
     now = int(time.time())
@@ -90,6 +94,10 @@ def mint_session_token(
         payload["account_generation"] = account_generation
     if cli_login_ticket is not None:
         payload["cli_login_ticket"] = cli_login_ticket
+    if browser_session:
+        payload["browser_session"] = True
+    if purpose is not None:
+        payload["purpose"] = purpose
     return jwt.encode(payload, cookie_secret, algorithm="HS256")
 
 
@@ -101,6 +109,7 @@ def mint_session_cookie(
     *,
     account_generation: str | None = None,
     cli_login_ticket: str | None = None,
+    browser_session: bool = False,
 ) -> str:
     """Mint a signed session cookie JWT.
 
@@ -111,6 +120,7 @@ def mint_session_cookie(
     :param provider: Identity provider name, e.g. ``"google"``
         or ``"github"``. Stored as an informational claim.
     :param cli_login_ticket: Ticket authenticated by the browser callback.
+    :param browser_session: Mark a fresh browser login for human-only approval cards.
     :returns: An HS256-signed JWT string.
     """
     return mint_session_token(
@@ -120,6 +130,7 @@ def mint_session_cookie(
         provider,
         account_generation=account_generation,
         cli_login_ticket=cli_login_ticket,
+        browser_session=browser_session,
     )
 
 

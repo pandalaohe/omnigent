@@ -2784,7 +2784,7 @@ def register_hooks_routes(
                     media_type="application/json",
                 )
         # Async questions are answered outside the turn that asked them
-        # (BUG12 contract), so they keep the day-long budget and never stop.
+        # (out-of-turn contract), so they keep the day-long budget and never stop.
         is_async_question = bool(codex_request.codex_params.get("omnigentAsyncQuestion"))
         if is_async_question:
             timeout_policy: HarnessTimeoutPolicy | None = None

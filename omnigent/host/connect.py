@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -40,6 +41,7 @@ import websockets.asyncio.client
 from websockets.exceptions import ConnectionClosed, InvalidStatus, InvalidURI
 
 from omnigent._platform import (
+    CLI_FALLBACK_DIRS_ENV_VAR,
     IS_POSIX,
     WINDOWS_ENV_PASSTHROUGH,
     installed_interactive_shells,
@@ -77,9 +79,11 @@ from omnigent.harness_availability import (
     HARNESS_BINARY_MISSING,
     HarnessAvailability,
 )
+from omnigent.harness_plugins import native_harnesses
 from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
 from omnigent.host.frames import (
+    CAP_HOST_TERMINALS,
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HOST_CAPABILITIES,
     LAUNCH_HANDLER_FAILED_ERROR_CODE,
@@ -179,7 +183,12 @@ from omnigent.host.git_worktree import (
     read_worktree_status,
     remove_worktree,
 )
-from omnigent.host.identity import CONFIG_PATH, HostIdentity, load_or_create_host_identity
+from omnigent.host.identity import (
+    CONFIG_PATH,
+    HostIdentity,
+    load_elevated_terminals_method,
+    load_or_create_host_identity,
+)
 from omnigent.host.load_level import FACTORY_LINES, LevelState, LoadLines, utc_iso
 from omnigent.host.maintenance import (
     HostMaintenanceJanitor,
@@ -205,6 +214,8 @@ from omnigent.onboarding.harness_install import (
     harness_cli_version,
     harness_setup_hint,
     invalidate_harness_probe_caches,
+    required_cli_binary_for_harness,
+    required_cli_for_harness,
     try_install_harness_cli,
     ui_install_key,
 )
@@ -635,6 +646,7 @@ _HOST_CAPABILITY_INIT_TIMEOUT_S = 15.0
 _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
     {
         "PATH",
+        CLI_FALLBACK_DIRS_ENV_VAR,
         "PYTHONPATH",
         "HOME",
         "USER",
@@ -1014,6 +1026,8 @@ def _build_runner_env(
     host_owns_global_cleanup: bool = False,
     harness_tmp_parent: Path | None = None,
     inference_config: dict[str, object] | None = None,
+    elevated_terminals: str | None = None,
+    purpose: Literal["host_terminals"] | None = None,
 ) -> dict[str, str]:
     """
     Build the environment for a spawned runner subprocess.
@@ -1067,7 +1081,11 @@ def _build_runner_env(
     )
 
     try:
-        config_env_vars = provider_credential_env_vars(load_config())
+        config_env_vars = (
+            frozenset()
+            if purpose == "host_terminals"
+            else provider_credential_env_vars(load_config())
+        )
     except (OSError, _OmnigentError):
         config_env_vars = frozenset()
     if inference_config is not None:
@@ -1082,11 +1100,36 @@ def _build_runner_env(
         or key.startswith(_RUNNER_ENV_ALLOWLIST_PREFIXES)
         or key in forwarded
     }
+    if purpose == "host_terminals":
+        from omnigent.runner.identity import RUNNER_PURPOSE_ENV_VAR
+
+        safe_names = {
+            "PATH",
+            "HOME",
+            "USER",
+            "LOGNAME",
+            "SHELL",
+            "LANG",
+            "TERM",
+            "COLORTERM",
+            "TZ",
+            "TMPDIR",
+            "TMP",
+            "TEMP",
+            "PYTHONPATH",
+            "VIRTUAL_ENV",
+        }
+        env = {
+            key: value
+            for key, value in base_env.items()
+            if key in safe_names or key.startswith("LC_")
+        }
+        env[RUNNER_PURPOSE_ENV_VAR] = purpose
     env["RUNNER_SERVER_URL"] = server_url
     env[RUNNER_ID_ENV_VAR] = runner_id
     env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] = binding_token
     env[RUNNER_DELEGATED_AUTH_ENV_VAR] = "1"
-    if initial_auth_token:
+    if initial_auth_token and purpose is None:
         env[RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR] = initial_auth_token
     env[RUNNER_WORKSPACE_ENV_VAR] = workspace
     env[RUNNER_PARENT_PID_ENV_VAR] = str(parent_pid)
@@ -1109,6 +1152,11 @@ def _build_runner_env(
         env[RUNNER_LAUNCH_HARNESS_ENV_VAR] = harness
     if interactive_shells is not None:
         env[RUNNER_INTERACTIVE_SHELLS_ENV_VAR] = json.dumps(interactive_shells)
+    from omnigent.terminals.elevation import ELEVATED_TERMINALS_ENV
+
+    env.pop(ELEVATED_TERMINALS_ENV, None)
+    if elevated_terminals == "sudo":
+        env[ELEVATED_TERMINALS_ENV] = elevated_terminals
     return env
 
 
@@ -1265,6 +1313,7 @@ class _RunnerHandle:
     connect_marker: Path | None = None
     stop_requested: bool = False
     incarnation_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    purpose: Literal["host_terminals"] | None = None
 
 
 @dataclass(frozen=True)
@@ -1359,6 +1408,7 @@ class HostProcess:
         # started with; a host launched with an explicit --config must not
         # fall back to the default file.
         self._config_path = config_path or CONFIG_PATH
+        self._elevated_terminals_method = load_elevated_terminals_method(self._config_path)
         self._post_bind_hook_runner = PostBindHookRunner(self._config_path)
         # One reader per workspace, so its registry keeps state between
         # requests (the changed-files snapshot search reuses for untracked
@@ -1410,6 +1460,7 @@ class HostProcess:
         # connection handshake. Reconnects reuse this snapshot while the live
         # refresh task keeps it current.
         self._configured_harnesses: dict[str, HarnessAvailability] | None = None
+        self._ready_native_cli_paths: dict[str, str | None] = {}
         self._harness_accounts: HarnessAccounts | None = None
         self._gateway_inference: dict[str, bool] | None = None
         # Last sanitized Codex subscription snapshot. It is kept across tunnel
@@ -1562,6 +1613,9 @@ class HostProcess:
         self._lifecycle_lock = lifecycle_lock
         self._lifecycle_task: asyncio.Task[None] | None = None
         self._lifecycle_lost = asyncio.Event()
+        self.restart_requested = False
+        self._restart_pending = False
+        self._started_at = int(time.time())
 
     def _live_runner_log_paths(self) -> set[Path]:
         """Return the log path of every runner this host process owns.
@@ -1722,6 +1776,19 @@ class HostProcess:
         if dead:
             self._trigger_maintenance("runner_exited_during_reconnect")
         return list(self._runners.keys())
+
+    def _terminal_runner_id(self) -> str | None:
+        return next(
+            (
+                runner_id
+                for runner_id, handle in self._runners.items()
+                if handle.purpose == "host_terminals"
+            ),
+            None,
+        )
+
+    def _host_terminals_supported(self) -> bool:
+        return IS_POSIX and shutil.which("tmux") is not None and bool(self._interactive_shells)
 
     def _owner_inventory_snapshot(self) -> HostOwnerInventorySnapshot:
         """Copy the event-loop-owned registrations without probing or reaping."""
@@ -2183,6 +2250,23 @@ class HostProcess:
             ``"failed"`` result. Deterministic preflight refusals
             include a machine-readable ``error_code``.
         """
+        terminal_runner = frame.purpose == "host_terminals"
+        if terminal_runner:
+            if frame.session_id or frame.harness or frame.inference_config or frame.startup:
+                return self._launch_failed(frame, "terminal runners cannot host sessions")
+            if not self._host_terminals_supported():
+                return self._launch_failed(frame, "host terminals are not supported")
+            for existing_id, handle in list(self._runners.items()):
+                if (
+                    handle.purpose == "host_terminals"
+                    and await asyncio.to_thread(handle.proc.poll) is None
+                ):
+                    return HostLaunchRunnerResultFrame(
+                        request_id=frame.request_id,
+                        status="exists",
+                        runner_id=existing_id,
+                        exists=existing_id,
+                    )
         if not await self._claim_startup(frame):
             return self._launch_failed(
                 frame, "Startup permission is no longer current", error_code="startup_not_admitted"
@@ -2243,7 +2327,7 @@ class HostProcess:
                 error_code=HARNESS_NOT_CONFIGURED_ERROR_CODE,
             )
 
-        workspace = Path(frame.workspace).expanduser()
+        workspace = Path.home() if terminal_runner else Path(frame.workspace).expanduser()
         workspace_recreated = False
         if not workspace.is_dir():
             # Recreate a vanished leaf (pruned worktree, an agent's rm -rf) so the
@@ -2284,17 +2368,22 @@ class HostProcess:
 
         # The host's own pre-launch command prepares the workspace; it never
         # blocks the launch.
-        try:
-            await self._run_host_subprocess_in_thread(
-                functools.partial(run_pre_launch_command, self._config_path, workspace)
-            )
-        except Exception:
-            _logger.exception("Pre-launch command crashed for %s", workspace)
+        if not terminal_runner:
+            try:
+                await self._run_host_subprocess_in_thread(
+                    functools.partial(run_pre_launch_command, self._config_path, workspace)
+                )
+            except Exception:
+                _logger.exception("Pre-launch command crashed for %s", workspace)
 
         runner_id = token_bound_runner_id(frame.binding_token)
-        initial_auth_token = await asyncio.to_thread(
-            self._current_auth_token,
-            initialize=False,
+        initial_auth_token = (
+            None
+            if terminal_runner
+            else await asyncio.to_thread(
+                self._current_auth_token,
+                initialize=False,
+            )
         )
         env = _build_runner_env(
             os.environ,
@@ -2310,6 +2399,8 @@ class HostProcess:
             host_owns_global_cleanup=self._maintenance_janitor is not None,
             harness_tmp_parent=self._harness_tmp_parent,
             inference_config=frame.inference_config,
+            elevated_terminals=self._elevated_terminals_method,
+            purpose=frame.purpose,
         )
         if frame.inference_config is not None:
             try:
@@ -2426,6 +2517,7 @@ class HostProcess:
             log_path=log_path,
             session_id=frame.session_id or None,
             connect_marker=_connect_marker_path(log_path),
+            purpose=frame.purpose,
         )
         watcher = asyncio.create_task(self._watch_runner(runner_id))
         self._watcher_tasks.add(watcher)
@@ -2781,7 +2873,8 @@ class HostProcess:
             await asyncio.shield(asyncio.gather(*pending, return_exceptions=True))
         handle = self._runners.get(frame.runner_id)
         if handle is None:
-            status = "unknown"
+            # Pending launches were joined above; no owned process remains for this purpose.
+            status = "dead" if frame.purpose == "host_terminals" else "unknown"
         else:
             # poll() is a lock-free waitpid for a direct-Popen runner, but a
             # blocking control-socket round-trip (bounded only by the 30s
@@ -5078,6 +5171,7 @@ class HostProcess:
         """Replace the advisory snapshot and invalidate older probe results."""
         readiness_changed = configured is not None or gateway is not None
         if configured is not None:
+            self._log_missing_native_clis(configured)
             self._configured_harnesses = dict(configured)
         if gateway is not None:
             self._gateway_inference = dict(gateway)
@@ -5086,6 +5180,39 @@ class HostProcess:
             self._account_generation += 1
         if readiness_changed:
             self._capability_generation += 1
+
+    def _log_missing_native_clis(self, configured: Mapping[str, HarnessAvailability]) -> None:
+        """Remember ready CLI paths and report each disappearance once."""
+        ready: dict[str, str] = {}
+        missing: set[str] = set()
+        native = native_harnesses()
+        for harness, availability in configured.items():
+            canonical = canonicalize_harness(harness) or harness
+            if canonical not in native:
+                continue
+            spec = required_cli_for_harness(canonical)
+            if spec is None:
+                continue
+            if availability is True:
+                ready[spec.binary] = canonical
+            elif availability == HARNESS_BINARY_MISSING:
+                missing.add(spec.binary)
+        for binary, harness in ready.items():
+            try:
+                resolved = required_cli_binary_for_harness(harness)
+            except OSError:
+                resolved = None
+            self._ready_native_cli_paths[binary] = resolved or self._ready_native_cli_paths.get(
+                binary
+            )
+        for binary in sorted(missing.difference(ready)):
+            if binary in self._ready_native_cli_paths:
+                last_path = self._ready_native_cli_paths.pop(binary)
+                _logger.warning(
+                    "Native CLI disappeared: cli=%s last_resolved_path=%s",
+                    binary,
+                    last_path or "<unknown>",
+                )
 
     def _start_capability_discovery(self) -> None:
         """Share discovery across reconnects, retrying unexpected initialization errors."""
@@ -5290,7 +5417,7 @@ class HostProcess:
             self._ensure_model_options_prewarm()
             self._start_capability_discovery()
             while True:
-                if self._lifecycle_lost.is_set():
+                if self._lifecycle_lost.is_set() or self.restart_requested:
                     break
                 try:
                     await self._connect_and_serve()
@@ -5303,7 +5430,7 @@ class HostProcess:
                     # ``run_host_process`` can fail loud.
                     raise
                 except Exception as exc:
-                    if self._lifecycle_lost.is_set():
+                    if self._lifecycle_lost.is_set() or self.restart_requested:
                         # The lifecycle monitor aborted the tunnel to retire this
                         # stale daemon; the resulting disconnect is expected, so
                         # exit cleanly rather than logging a spurious reconnect.
@@ -5890,6 +6017,15 @@ class HostProcess:
         else:
             await diagnostics.send(ws.send, data)
 
+    def _terminal_capabilities(self) -> list[str]:
+        """Advertise elevation only when the host explicitly enabled it."""
+        from omnigent.host.frames import CAP_TERMINAL_ELEVATED
+
+        capabilities = list(HOST_CAPABILITIES)
+        if self._elevated_terminals_method is not None:
+            capabilities.append(CAP_TERMINAL_ELEVATED)
+        return capabilities
+
     async def _serve_frames(
         self, ws: websockets.asyncio.client.ClientConnection, *, connection_id: str | None = None
     ) -> None:
@@ -5913,6 +6049,9 @@ class HostProcess:
                 _tel_install_id = _get_install_id()
         except Exception:  # noqa: BLE001
             pass
+        from omnigent.host.restart import supervisor_kind
+
+        supervisor = await asyncio.to_thread(supervisor_kind)
         hello = HostHelloFrame(
             version=VERSION,
             frame_protocol_version=1,
@@ -5929,8 +6068,15 @@ class HostProcess:
             filesystem_roots=True,
             post_bind_hook=True,
             project_code=True,
-            capabilities=list(HOST_CAPABILITIES),
+            capabilities=[
+                *self._terminal_capabilities(),
+                *(["host_restart"] if supervisor else []),
+                *([CAP_HOST_TERMINALS] if self._host_terminals_supported() else []),
+            ],
+            supervised=supervisor,
+            started_at=self._started_at,
             connection_id=connection_id,
+            terminal_runner_id=self._terminal_runner_id(),
         )
         try:
             encoded_hello = encode_host_frame(hello)
@@ -6429,6 +6575,103 @@ class HostProcess:
         with telemetry.consume_frame_span(kind, carrier):
             await self._dispatch_host_frame(ws, frame)
 
+    async def _restart_running_sessions(self) -> list[str]:
+        """Read all host sessions, including children, without changing them."""
+        rows: list[dict[str, Any]] = []
+        async with httpx.AsyncClient() as client:
+            after: str | None = None
+            while True:
+                params: dict[str, str] = {
+                    "kind": "any",
+                    "limit": "200",
+                    "visibility": "all",
+                    "include_archived": "true",
+                    "include_side_chats": "true",
+                }
+                if after is not None:
+                    params["after"] = after
+                response = await client.get(
+                    f"{self._server_url}/v1/sessions",
+                    params=params,
+                    headers=self._build_connect_headers(),
+                    timeout=5,
+                )
+                response.raise_for_status()
+                page = response.json()
+                rows.extend(page["data"])
+                if not page.get("has_more"):
+                    return [
+                        row["id"]
+                        for row in rows
+                        if row.get("status") == "running"
+                        and (
+                            row.get("host_id") == self._identity.host_id
+                            or row.get("runner_id") in self._runners
+                        )
+                    ]
+                cursor = page.get("last_id")
+                if not isinstance(cursor, str) or cursor == after:
+                    raise ValueError("invalid session pagination")
+                after = cursor
+
+    async def _handle_host_restart(self, ws: Any, frame: Any) -> None:
+        """Acknowledge, drain and retire through run()'s normal teardown."""
+        from omnigent.host.frames import HostRestartResultFrame
+        from omnigent.host.restart import REQUESTER_GRACE_S, supervisor_kind
+
+        supervisor = supervisor_kind()
+        reason = "host is not supervised" if supervisor is None else None
+        if self._restart_pending and not frame.dry_run:
+            reason = "restart pending"
+        try:
+            running = await self._restart_running_sessions()
+        except Exception:  # noqa: BLE001 -- refuse admission when the session inventory fails
+            if reason is None:
+                reason = "could not read running sessions"
+            running = []
+        result = HostRestartResultFrame(
+            request_id=frame.request_id,
+            accepted=reason is None,
+            reason=reason,
+            supervisor=supervisor,
+            running_sessions=running,
+            runner_count=len(self._runners),
+        )
+        if frame.dry_run or reason is not None:
+            await self._send_text(ws, encode_host_frame(result))
+            return
+        # Admission is atomic after the preview read, which can yield to another request.
+        if self._restart_pending:
+            result.accepted, result.reason = False, "restart pending"
+            await self._send_text(ws, encode_host_frame(result))
+            return
+        self._restart_pending = True
+        try:
+            await self._send_text(ws, encode_host_frame(result))
+        except BaseException:
+            self._restart_pending = False
+            raise
+        deadline = time.monotonic() + frame.drain_timeout_s
+        while not frame.force and time.monotonic() < deadline:
+            if not set(running) - {frame.requested_by_session_id}:
+                break
+            await asyncio.sleep(min(1, max(0, deadline - time.monotonic())))
+            try:
+                running = await asyncio.wait_for(
+                    self._restart_running_sessions(),
+                    timeout=max(0.01, deadline - time.monotonic()),
+                )
+            except Exception:  # noqa: BLE001 -- an unreadable inventory must keep draining
+                running = ["unknown"]
+        if frame.requested_by_session_id:
+            await asyncio.sleep(REQUESTER_GRACE_S)
+        result.phase = "stopping"
+        result.running_sessions = running
+        with contextlib.suppress(Exception):
+            await self._send_text(ws, encode_host_frame(result))
+        self.restart_requested = True
+        self._abort_live_tunnel()
+
     async def _dispatch_host_frame(
         self,
         ws: websockets.asyncio.client.ClientConnection,
@@ -6442,6 +6685,11 @@ class HostProcess:
             ignored.
         :returns: None.
         """
+        from omnigent.host.frames import HostRestartFrame
+
+        if isinstance(frame, HostRestartFrame):
+            await self._handle_host_restart(ws, frame)
+            return
         if isinstance(frame, HostConnectionErrorFrame):
             # Defensive for direct callers; production handles this inline in
             # _serve_frames so detached request tasks cannot swallow it.
@@ -6975,4 +7223,8 @@ def _serve_host_until_exit(
             stderr=True,
         )
         raise SystemExit(HOST_FATAL_EXIT_CODE) from exc
+    if host.restart_requested:
+        from omnigent.host import HOST_RESTART_EXIT_CODE
+
+        raise SystemExit(HOST_RESTART_EXIT_CODE)
     return host.lifecycle_lost

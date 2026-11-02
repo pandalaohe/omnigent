@@ -16,6 +16,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useTerminalSplitHotkey } from "@/hooks/useTerminalSplitHotkey";
+import { useSessionTerminalAccess } from "@/hooks/useSessionTerminalAccess";
 import {
   findAgentTerminal,
   isAgentTerminalKey,
@@ -53,6 +54,7 @@ export function TerminalSplitControls({
   const { data: agent } = useSessionAgent(conversationId);
   const { terminals } = useTerminals(conversationId);
   const create = useCreateTerminal(conversationId);
+  const { canCreateElevated } = useSessionTerminalAccess(conversationId);
   const deleteTerminal = useDeleteTerminal(conversationId);
   const split = useTerminalSplitPanes(conversationId);
   // The shell a pending close targets, fixed when the dialog opens.
@@ -95,9 +97,9 @@ export function TerminalSplitControls({
     });
   };
 
-  const splitWith = (shell: string, axis: TerminalSplitAxis) => {
-    writePreferredShell(shell);
-    create.mutate(shell, {
+  const splitWith = (shell: string, axis: TerminalSplitAxis, elevated = false) => {
+    if (!elevated) writePreferredShell(shell);
+    create.mutate(elevated ? { terminal: shell, elevated: true } : shell, {
       onSuccess: (info) => {
         const newKey = terminalTabKey(info);
         updateTerminalSplit(conversationId, (current) => {
@@ -119,7 +121,8 @@ export function TerminalSplitControls({
         icon={<Columns2Icon className="size-3.5" />}
         disabled={create.isPending}
         shells={shellOptions}
-        onPick={(shell) => splitWith(shell, "columns")}
+        canElevate={canCreateElevated}
+        onPick={(shell, elevated) => splitWith(shell, "columns", elevated)}
       />
       <SplitMenu
         label="Split down"
@@ -127,7 +130,8 @@ export function TerminalSplitControls({
         icon={<Rows2Icon className="size-3.5" />}
         disabled={create.isPending}
         shells={shellOptions}
-        onPick={(shell) => splitWith(shell, "rows")}
+        canElevate={canCreateElevated}
+        onPick={(shell, elevated) => splitWith(shell, "rows", elevated)}
       />
       {(focusedShell || focusedMissingPane) && (
         <HeaderTooltip label="Close pane">
@@ -166,13 +170,15 @@ function SplitMenu({
   disabled,
   shells,
   onPick,
+  canElevate,
 }: {
   label: string;
   axis: TerminalSplitAxis;
   icon: ReactNode;
   disabled: boolean;
   shells: string[];
-  onPick: (shell: string) => void;
+  onPick: (shell: string, elevated?: boolean) => void;
+  canElevate: boolean;
 }) {
   // The chord skips the picker and opens the default shell. It stays bound while a
   // create is pending so a second press is still claimed instead of reaching the PTY.
@@ -208,6 +214,9 @@ function SplitMenu({
             {index === 0 ? `${shell} (default)` : shell}
           </DropdownMenuItem>
         ))}
+        {canElevate && (
+          <DropdownMenuItem onSelect={() => onPick(shells[0], true)}>Admin (root)</DropdownMenuItem>
+        )}
       </DropdownMenuContent>
     </DropdownMenu>
   );

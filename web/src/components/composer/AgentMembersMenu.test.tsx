@@ -33,7 +33,7 @@ const MEMBERS: SessionMember[] = [
     lead: true,
   }),
   member({ role: "executor" }),
-  member({ role: "reviewer", host: "Desktop-HRF", harness: "codex", model: "gpt-6-astra" }),
+  member({ role: "reviewer", host: "Studio-Mac", harness: "codex", model: "gpt-6-astra" }),
 ];
 
 function child(overrides: Partial<ChildSessionInfo> = {}): ChildSessionInfo {

@@ -671,6 +671,12 @@ def required_cli_for_harness(harness: str) -> HarnessInstallSpec | None:
     return _all_harness_install().get(key) if key is not None else None
 
 
+def required_cli_binary_for_harness(harness: str) -> str | None:
+    """Resolve the same CLI used by readiness for an executor harness identifier."""
+    key = _all_harness_name_to_key().get(harness)
+    return harness_cli_binary(key) if key is not None else None
+
+
 def missing_harness_cli(harness: str) -> HarnessInstallSpec | None:
     """Return a harness's required CLI spec when that CLI can't be used.
 
