@@ -66,11 +66,16 @@ export function InstructionsPage() {
         ? "child"
         : "route";
   const requestedRole = useRef<string>(role);
+  const loggedLegacyRole = useRef(false);
   useLayoutEffect(() => {
     requestedRole.current = role;
   }, [role]);
   useEffect(() => {
     if (roleParam === "mother") {
+      if (!loggedLegacyRole.current) {
+        console.info("legacy name used: mother");
+        loggedLegacyRole.current = true;
+      }
       setParams(
         (previous) => {
           const next = new URLSearchParams(previous);
@@ -79,6 +84,8 @@ export function InstructionsPage() {
         },
         { replace: true },
       );
+    } else {
+      loggedLegacyRole.current = false;
     }
   }, [roleParam, setParams]);
   const view = session || params.get("view") === "route" ? "route" : "overview";

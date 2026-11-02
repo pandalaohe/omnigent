@@ -610,29 +610,32 @@ describe("ChatHeader — conversation breadcrumb", () => {
     expect(screen.queryByText("general-purpose")).toBeNull();
   });
 
-  it("shows the child's own name and placement chip, and no unconfigured badge", () => {
-    renderHeader({
-      sidebarOpen: true,
-      conversationId: "child-9",
-      isChildSession: true,
-      conversationTitle: "Peer relay",
-      titleLinkTo: "/c/parent-123",
-      childSession: {
-        id: "child-9",
-        title: "researcher:auth",
-        agent_name: "researcher",
-        host_id: "h1",
-        labels: {},
-      },
-      childCwd: "/Users/u/projects/x/y/z",
-    });
+  it.each(["/Users/<u>/projects/x", "/home/<u>/projects/x"])(
+    "shows the child's name and shortened home placement without an unconfigured badge (%s)",
+    (childCwd) => {
+      renderHeader({
+        sidebarOpen: true,
+        conversationId: "child-9",
+        isChildSession: true,
+        conversationTitle: "Peer relay",
+        titleLinkTo: "/c/parent-123",
+        childSession: {
+          id: "child-9",
+          title: "researcher:auth",
+          agent_name: "researcher",
+          host_id: "h1",
+          labels: {},
+        },
+        childCwd,
+      });
 
-    expect(screen.getByTestId("breadcrumb-child-label")).toHaveTextContent("auth");
-    const chip = screen.getByTestId("breadcrumb-child-placement");
-    expect(chip).toHaveTextContent("researcher @ laptop · ~/projects/x/y/z");
-    expect(chip).toHaveAttribute("title", "/Users/u/projects/x/y/z");
-    expect(screen.queryByTestId("rail-agent-badge")).toBeNull();
-  });
+      expect(screen.getByTestId("breadcrumb-child-label")).toHaveTextContent("auth");
+      const chip = screen.getByTestId("breadcrumb-child-placement");
+      expect(chip).toHaveTextContent("researcher @ laptop · ~/projects/x");
+      expect(chip).toHaveAttribute("title", childCwd);
+      expect(screen.queryByTestId("rail-agent-badge")).toBeNull();
+    },
+  );
 
   it("shows the child's configured agent badge", () => {
     localStorage.setItem(
@@ -704,13 +707,13 @@ describe("ChatHeader — conversation breadcrumb", () => {
         host_id: "h1",
         labels: {},
       },
-      childCwd: "/Users/u/projects/x/y/z",
+      childCwd: "/opt/work/project/x/y/z",
     });
 
     vi.mocked(copyText).mockClear();
     fireEvent.click(screen.getByTestId("breadcrumb-child-placement"));
 
-    expect(copyText).toHaveBeenCalledWith("/Users/u/projects/x/y/z");
+    expect(copyText).toHaveBeenCalledWith("/opt/work/project/x/y/z");
   });
 
   it("falls back to a 'Sub-agent' segment before the agent snapshot loads", () => {

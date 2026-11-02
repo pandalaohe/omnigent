@@ -1,5 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { StrictMode } from "react";
 import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { InstructionsPage } from "./InstructionsPage";
@@ -167,7 +168,10 @@ beforeEach(() => {
   mocks.copy.mockReset().mockResolvedValue(undefined);
   mocks.previewQuery.mockClear();
 });
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 describe("InstructionsPage", () => {
   it("saves the Parent grid's Codex row with its role key", async () => {
@@ -235,37 +239,47 @@ describe("InstructionsPage", () => {
     expect(screen.getByLabelText("Instruction text")).toHaveValue("Shared text");
   });
 
-  it("redirects ?role=mother to ?role=parent with replace", async () => {
-    mocks.layers!.data.push(layer("parent", "Parent text"));
-    render(
-      <MemoryRouter
-        initialEntries={[
-          "/settings/instructions?view=overview",
-          "/settings/instructions?role=mother&custom=retained",
-        ]}
-        initialIndex={1}
-      >
-        <TooltipProvider>
-          <InstructionsPage />
-        </TooltipProvider>
-        <Location />
-      </MemoryRouter>,
-    );
-    expect(screen.getByRole("tab", { name: "Parent" })).toHaveAttribute("aria-selected", "true");
-    await waitFor(() =>
-      expect(
-        Object.fromEntries(new URLSearchParams(screen.getByTestId("location").textContent!)),
-      ).toEqual({
-        role: "parent",
-        custom: "retained",
-      }),
-    );
-    fireEvent.click(screen.getByRole("button", { name: "Edit Shared" }));
-    expect(screen.getByLabelText("Instruction text")).toHaveValue("Parent text");
-    fireEvent.click(screen.getByRole("button", { name: "Close" }));
-    fireEvent.click(screen.getByRole("button", { name: "History back" }));
-    await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent("?view=overview"));
-  });
+  it.each(["mother", "parent"])(
+    "accepts ?role=%s and logs only legacy redirects once",
+    async (role) => {
+      const info = vi.spyOn(console, "info").mockImplementation(() => {});
+      mocks.layers!.data.push(layer("parent", "Parent text"));
+      render(
+        <StrictMode>
+          <MemoryRouter
+            initialEntries={[
+              "/settings/instructions?view=overview",
+              `/settings/instructions?role=${role}&custom=retained`,
+            ]}
+            initialIndex={1}
+          >
+            <TooltipProvider>
+              <InstructionsPage />
+            </TooltipProvider>
+            <Location />
+          </MemoryRouter>
+        </StrictMode>,
+      );
+      expect(screen.getByRole("tab", { name: "Parent" })).toHaveAttribute("aria-selected", "true");
+      await waitFor(() =>
+        expect(
+          Object.fromEntries(new URLSearchParams(screen.getByTestId("location").textContent!)),
+        ).toEqual({
+          role: "parent",
+          custom: "retained",
+        }),
+      );
+      expect(info).toHaveBeenCalledTimes(role === "mother" ? 1 : 0);
+      if (role === "mother") expect(info).toHaveBeenCalledWith("legacy name used: mother");
+      fireEvent.click(screen.getByRole("button", { name: "Edit Shared" }));
+      expect(screen.getByLabelText("Instruction text")).toHaveValue("Parent text");
+      fireEvent.click(screen.getByRole("button", { name: "Close" }));
+      fireEvent.click(screen.getByRole("button", { name: "History back" }));
+      await waitFor(() =>
+        expect(screen.getByTestId("location")).toHaveTextContent("?view=overview"),
+      );
+    },
+  );
 
   it("switches one grid with keyboard tabs, retaining shared axes and URL context without saves", async () => {
     const layout = { hosts: ["host-a", "host-cloud"], agents: ["codex"] };
