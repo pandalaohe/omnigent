@@ -2391,6 +2391,7 @@ def test_windows_locked_install_constraints_lifetime(
         return result
 
     monkeypatch.setattr(cli_module, "_prepare_uv_git_install", prepare_then_stub)
+    (tmp_path / "service.cmd").write_text("@echo off\nexit /b 0\n")
     kwargs = {
         "install_command": f"uv tool install --force --reinstall git+{repo.as_uri()}@{sha}",
         "recovery_command": "fixture recovery",

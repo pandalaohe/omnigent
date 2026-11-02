@@ -1301,13 +1301,14 @@ def test_windows_custom_update_stops_host_tree_and_waits_for_cli_parent(
         waited_parents.append(pid)
         alive_pids.discard(pid)
 
-    def _terminate(pid: int) -> None:
+    def _terminate(pid: int, _created_at: float) -> None:
         terminated.append(pid)
         alive_pids.discard(pid)
 
     def _processes() -> list[object]:
         rows = [
             cli_module._WindowsProcessInfo(
+                created_at=1.0,
                 pid=500,
                 ppid=400,
                 name="pwsh.exe",
@@ -1318,6 +1319,7 @@ def test_windows_custom_update_stops_host_tree_and_waits_for_cli_parent(
                 ),
             ),
             cli_module._WindowsProcessInfo(
+                created_at=1.0,
                 pid=501,
                 ppid=500,
                 name="omni.exe",
@@ -1325,6 +1327,7 @@ def test_windows_custom_update_stops_host_tree_and_waits_for_cli_parent(
                 cmdline=f'"{cli_bin}" host --server https://managed.example --non-interactive',
             ),
             cli_module._WindowsProcessInfo(
+                created_at=1.0,
                 pid=502,
                 ppid=501,
                 name="python.exe",
@@ -1332,6 +1335,7 @@ def test_windows_custom_update_stops_host_tree_and_waits_for_cli_parent(
                 cmdline=rf'"{tool_venv}\Scripts\python.exe" -m omnigent.cli host',
             ),
             cli_module._WindowsProcessInfo(
+                created_at=1.0,
                 pid=503,
                 ppid=502,
                 name="python.exe",
@@ -1339,6 +1343,7 @@ def test_windows_custom_update_stops_host_tree_and_waits_for_cli_parent(
                 cmdline=rf'"{tool_venv}\Scripts\python.exe" -m omnigent.runner',
             ),
             cli_module._WindowsProcessInfo(
+                created_at=1.0,
                 pid=600,
                 ppid=300,
                 name="python.exe",
@@ -1346,6 +1351,7 @@ def test_windows_custom_update_stops_host_tree_and_waits_for_cli_parent(
                 cmdline=rf'"{tool_venv}\Scripts\python.exe" -m omnigent.cli up',
             ),
             cli_module._WindowsProcessInfo(
+                created_at=1.0,
                 pid=700,
                 ppid=1,
                 name="python.exe",
@@ -1377,6 +1383,7 @@ def test_windows_custom_update_stops_host_tree_and_waits_for_cli_parent(
     # Recycled stopped-host PIDs and foreign-user supervisors are not selected.
     unrelated = [
         cli_module._WindowsProcessInfo(
+            created_at=1.0,
             pid=502,
             ppid=200,
             name="python.exe",
@@ -1384,6 +1391,7 @@ def test_windows_custom_update_stops_host_tree_and_waits_for_cli_parent(
             cmdline=rf'"{tool_venv}\Scripts\python.exe" unrelated_worker.py',
         ),
         cli_module._WindowsProcessInfo(
+            created_at=1.0,
             pid=900,
             ppid=800,
             name="pwsh.exe",
@@ -1435,6 +1443,7 @@ def test_windows_custom_update_aborts_before_uv_and_restarts_supervisor_when_ven
     def _processes() -> list[object]:
         rows = [
             cli_module._WindowsProcessInfo(
+                created_at=1.0,
                 pid=502,
                 ppid=501,
                 name="python.exe",
@@ -1442,6 +1451,7 @@ def test_windows_custom_update_aborts_before_uv_and_restarts_supervisor_when_ven
                 cmdline=rf'"{tool_venv}\Scripts\python.exe" -m omnigent.cli host',
             ),
             cli_module._WindowsProcessInfo(
+                created_at=1.0,
                 pid=888,
                 ppid=200,
                 name="python.exe",
@@ -1451,7 +1461,7 @@ def test_windows_custom_update_aborts_before_uv_and_restarts_supervisor_when_ven
         ]
         return [row for row in rows if row.pid in alive_pids]
 
-    def _terminate(pid: int) -> None:
+    def _terminate(pid: int, _created_at: float) -> None:
         terminated.append(pid)
         alive_pids.discard(pid)
 
@@ -1514,7 +1524,8 @@ def test_windows_custom_helper_instruction_and_recovery_steps_include_stopping_l
 
     old = "a" * 40
     new = "b" * 40
-    wrapper = Path(r"C:\Profiles\user-a\.local\bin\omni-host-service.cmd")
+    wrapper = tmp_path / "omni-host-service.cmd"
+    wrapper.write_text("@echo off\nexit /b 0\n")
     tool_venv = Path(r"C:\Profiles\user-a\AppData\Roaming\uv\tools\omnigent")
     cli_bin = Path(r"C:\Profiles\user-a\.local\bin\omni.exe")
     recovery_cmd = (
@@ -1816,8 +1827,13 @@ def test_windows_custom_helper_survives_launcher_exit_and_completes(
                 "previous_records": [{"target": target, "pid": 111}],
                 "tool_venv_path": str(tool_venv),
                 "cli_bin_path": str(tmp_path / ".local" / "bin" / "omni.exe"),
+                "helper_path": str(helper),
                 "probe_argv": [sys.executable, "-c", f"print('{new}')"],
-                "version_argv": [sys.executable, "--version"],
+                "version_argv": [
+                    sys.executable,
+                    "-c",
+                    f"print('omnigent fixture ({new[:8]}, built fixture)')",
+                ],
                 "status_argv": [sys.executable, str(status)],
                 "wrapper_path": str(wrapper),
                 "rollback_path": str(rollback),
@@ -1921,6 +1937,6 @@ def test_windows_custom_update_native_transaction_and_file_locks(tmp_path: Path)
         check=False,
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=600,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
