@@ -1450,6 +1450,27 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     expect(screen.queryByText("Agent has questions")).toBeNull();
   });
 
+  it.each(["__proto___sdk_permission", "constructor_sdk_permission"])(
+    "uses the generic title for inherited SDK label key %s",
+    (policyName) => {
+      render(
+        <ApprovalCard
+          elicitationId={`elic_unknown_sdk_${policyName}`}
+          message="Unknown wants to use **AskUserQuestion**"
+          phase="pre_tool_use"
+          policyName={policyName}
+          contentPreview=""
+          requestedSchema={{}}
+          status="pending"
+          response={null}
+          askUserQuestion={{ questions: [{ question: "Continue?", options: [] }] }}
+        />,
+      );
+
+      expect(screen.getByText("Agent has questions")).toBeDefined();
+    },
+  );
+
   it.each([
     {
       name: "select",

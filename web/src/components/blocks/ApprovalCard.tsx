@@ -317,7 +317,9 @@ const SDK_PERMISSION_SUFFIX = "_sdk_permission";
 function sdkAgentNameForPolicyName(policyName: string): string | undefined {
   if (!policyName.endsWith(SDK_PERMISSION_SUFFIX)) return undefined;
   const vendor = policyName.slice(0, -SDK_PERMISSION_SUFFIX.length);
-  return BRAIN_HARNESS_LABELS[vendor === "claude" ? "claude-sdk" : vendor];
+  const harness = vendor === "claude" ? "claude-sdk" : vendor;
+  if (!Object.hasOwn(BRAIN_HARNESS_LABELS, harness)) return undefined;
+  return BRAIN_HARNESS_LABELS[harness];
 }
 
 function TerminalAccessActions({
