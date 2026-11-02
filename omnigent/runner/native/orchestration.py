@@ -10468,6 +10468,13 @@ async def _auto_create_claude_terminal(
         # Its dead-owner cleanup also reclaims these generated skill links.
         bundle_dir = bridge_dir / "skill-bundle"
         _ensure_orchestrator_skills_in_bundle(bundle_dir, agent_spec)
+    from omnigent.config import load_effective_config
+    from omnigent.harness_startup_config import (
+        resolve_harness_args,
+        resolve_harness_command,
+    )
+
+    _harness_cfg = load_effective_config(workspace=workspace)
     claude_args = augment_claude_args(
         base_claude_args,
         bridge_dir=bridge_dir,
@@ -10497,6 +10504,8 @@ async def _auto_create_claude_terminal(
         or None,
         allowed_tools=routed_spawn_tools,
         disallowed_tools=("AskUserQuestion",) if is_child_session else (),
+        # Config args are prepended after augmentation; augment only checks them for a prompt flag.
+        configured_args=tuple(resolve_harness_args("claude-native", (), cfg=_harness_cfg)),
         # The route-turn hook is registered only when this session can
         # actually route; otherwise every submit would pay its round trip.
         turn_routing=_claude_turn_router is not None,
@@ -10510,13 +10519,6 @@ async def _auto_create_claude_terminal(
     # appended above, so the ``--`` stays first). Identity by default. This is
     # the same resolver the local-CLI native launch uses (see cli_native.py), so
     # both terminal-creation paths honour one config surface.
-    from omnigent.config import load_effective_config
-    from omnigent.harness_startup_config import (
-        resolve_harness_args,
-        resolve_harness_command,
-    )
-
-    _harness_cfg = load_effective_config(workspace=workspace)
     launch_command = resolve_harness_command("claude-native", default="claude", cfg=_harness_cfg)
     launch_args = resolve_harness_args("claude-native", tuple(claude_args), cfg=_harness_cfg)
     # Validate the binary this terminal will actually spawn: ``launch_command``

@@ -4855,6 +4855,65 @@ def test_augment_claude_args_passes_text_over_tmux_command_cap_by_file(tmp_path:
     assert text not in args
 
 
+def _prompt_flags(args: list[str]) -> list[str]:
+    return [arg for arg in args if arg.startswith("--append-system-prompt")]
+
+
+@pytest.mark.parametrize("where", ["pass-through", "configured"])
+@pytest.mark.parametrize(
+    "caller_prompt",
+    [
+        ("--append-system-prompt", "caller"),
+        ("--append-system-prompt=caller",),
+        ("--append-system-prompt-file", "/opt/work/omnigent/role.txt"),
+        ("--append-system-prompt-file=/opt/work/omnigent/role.txt",),
+    ],
+    ids=["inline-spaced", "inline-joined", "file-spaced", "file-joined"],
+)
+def test_augment_claude_args_keeps_text_inline_beside_caller_prompt_flag(
+    tmp_path: Path, where: str, caller_prompt: tuple[str, ...]
+) -> None:
+    """A caller prompt flag, passed or configured, is left alone and our text goes inline."""
+    claude_args = ("--model", "claude-new", *(caller_prompt if where == "pass-through" else ()))
+
+    args = augment_claude_args(
+        claude_args,
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        append_system_prompt="ours",
+        configured_args=caller_prompt if where == "configured" else (),
+    )
+
+    assert args[: len(claude_args)] == list(claude_args)
+    assert args[args.index("ours") - 1] == "--append-system-prompt"
+    caller_flags = [caller_prompt[0]] if where == "pass-through" else []
+    assert _prompt_flags(args) == [*caller_flags, "--append-system-prompt"]
+    assert not (tmp_path / "startup-instructions.txt").exists()
+
+
+@pytest.mark.parametrize("where", ["pass-through", "configured"])
+def test_augment_claude_args_ignores_prompt_flag_text_after_separator(
+    tmp_path: Path, where: str
+) -> None:
+    """Text after ``--`` is positional: it is not a caller prompt flag and stays as given."""
+    suffix = ("--", "--append-system-prompt-file=missing.txt")
+
+    args = augment_claude_args(
+        suffix if where == "pass-through" else (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        append_system_prompt="ours",
+        configured_args=suffix if where == "configured" else (),
+    )
+
+    assert _prompt_flags(args)[-1] == "--append-system-prompt-file"
+    prompt_path = Path(args[args.index("--append-system-prompt-file") + 1])
+    assert prompt_path.read_text(encoding="utf-8") == "ours"
+    assert "ours" not in args
+    if where == "pass-through":
+        assert args[:2] == list(suffix)
+
+
 def test_augment_claude_args_delivers_large_prompt_through_private_file(tmp_path: Path) -> None:
     text = "全🙂" * 32_768 + "\nlast instruction"
     args = augment_claude_args(
