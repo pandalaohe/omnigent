@@ -682,6 +682,7 @@ class StartupAdmission:
                         expected_runner_id=conv.runner_id,
                         expected_cold_claims=startup.cold_claims,
                         expected_host_generation=conn.startup_generation,
+                        clear_runner_binding=True,
                     )
 
     async def advance(self, host_id: str) -> None:

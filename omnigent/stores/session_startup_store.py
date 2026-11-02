@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
 
-from sqlalchemy import case, func, or_, select
+from sqlalchemy import case, func, or_, select, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -1538,8 +1538,11 @@ class SessionStartupStore:
         expected_runner_id: str | None = None,
         expected_cold_claims: dict[str, str] | None = None,
         expected_host_generation: str | None = None,
+        clear_runner_binding: bool = False,
     ) -> bool:
         """Polled death evidence must still match the launch authority it observed."""
+        if clear_runner_binding and expected_runner_id is None:
+            raise ValueError("Clearing a startup runner requires its expected identity")
 
         def write(db: Session) -> bool:
             row = db.get(SqlSessionStartup, (current_workspace_id(), startup_id))
@@ -1564,6 +1567,17 @@ class SessionStartupStore:
             ):
                 return False
             self._settle_runtime_stopped(db, row)
+            if clear_runner_binding:
+                db.execute(
+                    update(SqlConversationMetadata)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id == row.session_id,
+                        SqlConversationMetadata.host_id == row.host_id,
+                        SqlConversationMetadata.runner_id == expected_runner_id,
+                    )
+                    .values(runner_id=None)
+                )
             return True
 
         return run_write_transaction(self._session, "settle_stopped_startup", write)

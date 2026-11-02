@@ -113,11 +113,12 @@ async def test_death_reconciliation_waits_for_binding_to_launch_issuance(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", ["unknown", "alive", None])
+@pytest.mark.parametrize("status", ["unknown", "dead", "alive", None])
 async def test_prepared_launch_timeout_remains_reconcilable(
     app, client, conv_store, register_host, monkeypatch, status
 ):
-    register_host()
+    monkeypatch.setattr(app.state.startup_inputs, "host_changed", lambda *_args: None)
+    capture = register_host()
     registry = app.state.host_registry
     conn = registry.get(_HOST_ID)
     conn.hello.capabilities = ["startup_admission_v1", "startup_receipts:test"]
@@ -174,7 +175,38 @@ async def test_prepared_launch_timeout_remains_reconcilable(
     )
     await admission.advance(_HOST_ID)
     query.assert_awaited_with(conn, registry, runner_id)
-    assert store.for_session(session_id).occupied is (status != "unknown")
+    stopped = status in ("unknown", "dead")
+    assert store.for_session(session_id).occupied is not stopped
+    if stopped:
+        placement = (conv.host_id, conv.workspace, conv.worktree, conv.git_branch)
+        settled = conv_store.get_conversation(session_id)
+        assert (
+            settled.host_id,
+            settled.workspace,
+            settled.worktree,
+            settled.git_branch,
+        ) == placement
+        monkeypatch.setattr(registry, "send_text", original_send)
+        retry = await client.post(
+            f"/v1/hosts/{_HOST_ID}/runners",
+            json={"session_id": session_id, "workspace": conv.workspace},
+        )
+        assert retry.status_code == 200, retry.text
+        assert retry.json()["status"] == "queued"
+        await admission.coordinator.advance(_HOST_ID)
+        await admission.coordinator.drain()
+        assert len(capture.launch) == 1, (
+            "settled runner binding prevented the same-session relaunch"
+        )
+        relaunched = conv_store.get_conversation(session_id)
+        assert relaunched.runner_id not in (None, runner_id)
+        assert store.for_session(session_id).occupied
+        assert (
+            relaunched.host_id,
+            relaunched.workspace,
+            relaunched.worktree,
+            relaunched.git_branch,
+        ) == placement
 
 
 @pytest.mark.asyncio
