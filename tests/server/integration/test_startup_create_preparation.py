@@ -181,6 +181,8 @@ async def test_prepared_launch_timeout_remains_reconcilable(
 async def test_busy_launch_does_not_block_other_startups_or_queue(
     app, client, conv_store, register_host, monkeypatch
 ):
+    # Recovery passes and their candidate ordering are driven explicitly below.
+    monkeypatch.setattr(app.state.startup_inputs, "host_changed", lambda *_args: None)
     register_host()
     registry = app.state.host_registry
     conn = registry.get(_HOST_ID)
