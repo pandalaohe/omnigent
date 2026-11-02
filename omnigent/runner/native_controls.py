@@ -906,12 +906,12 @@ def build_native_controls(
             bridge, bridge_dir = await _codex_native_bridge_state_and_dir_for_session(
                 conv_id, action="helper revocation"
             )
-            inventory_unknown = False
+            inventory_unknown = reason == "recovery"
             children = dict(discovered)
             try:
                 children.update(read_active_child_turns(bridge_dir, strict=True))
             except FileNotFoundError:
-                inventory_unknown = bool(getattr(bridge, "helper_stop_pending", False))
+                inventory_unknown |= bool(getattr(bridge, "helper_stop_pending", False))
             except (OSError, ValueError):
                 inventory_unknown = True
             if not owns_backend():
@@ -957,7 +957,8 @@ def build_native_controls(
                                 )
             except (TimeoutError, OSError, ValueError, RuntimeError):
                 pass
-            if not confirmed:
+            retired = not confirmed
+            if retired:
                 # Capture before closing: shell commands may own separate process groups.
                 identities: dict[int, float] = {}
                 try:
@@ -1011,11 +1012,11 @@ def build_native_controls(
             try:
                 async with asyncio.timeout(1.5):
                     confirmed = await _finish_codex_native_helpers(
-                        conv_id, bridge_dir, reason, confirmed, children, owns_backend
+                        conv_id, bridge_dir, reason, confirmed, children, owns_backend, retired
                     )
             except TimeoutError:
                 confirmed = False
-            if owns_backend():
+            if retired and owns_backend():
                 clear_active_child_turns(bridge_dir)
             return confirmed
 

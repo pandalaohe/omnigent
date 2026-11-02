@@ -107,6 +107,9 @@ async def test_native_permission_frames_revoke_only_on_tightening(tmp_path, tigh
         "hung",
         "discovered",
         "historical",
+        "earlier-running",
+        "overflow",
+        "consumed-newer",
     ],
 )
 async def test_reconnect_reconciles_once_without_preloaded_mapping(tmp_path, scenario):
@@ -127,7 +130,7 @@ async def test_reconnect_reconciles_once_without_preloaded_mapping(tmp_path, sce
     if scenario == "corrupt":
         (tmp_path / "active_child_turns.json").write_text("{")
     parent_turn = {"id": "turn_parent", "status": "completed", "items": []}
-    if scenario in {"consumed", "deferred"}:
+    if scenario in {"consumed", "deferred", "consumed-newer"}:
         parent_turn.update(
             status="inProgress",
             items=[
@@ -135,11 +138,11 @@ async def test_reconnect_reconciles_once_without_preloaded_mapping(tmp_path, sce
                     "id": "wait",
                     "type": "collabAgentToolCall",
                     "tool": "wait",
-                    "status": "completed" if scenario == "consumed" else "inProgress",
+                    "status": "inProgress" if scenario == "deferred" else "completed",
                     "receiverThreadIds": ["thread_child"],
                     "agentsStates": {
                         "thread_child": {
-                            "status": "completed" if scenario == "consumed" else "running"
+                            "status": "running" if scenario == "deferred" else "completed"
                         }
                     },
                 }
@@ -167,6 +170,28 @@ async def test_reconnect_reconciles_once_without_preloaded_mapping(tmp_path, sce
         parent_turn["items"] = [
             {"type": "collabAgentToolCall", "receiverThreadIds": ["thread_unknown"]}
         ]
+    if scenario == "earlier-running":
+        parent_turns.insert(
+            0,
+            {
+                "id": "old_parent",
+                "status": "completed",
+                "items": [
+                    {
+                        "type": "collabAgentToolCall",
+                        "receiverThreadIds": ["thread_unknown"],
+                        "agentsStates": {"thread_unknown": {"status": "running"}},
+                    }
+                ],
+            },
+        )
+    if scenario == "overflow":
+        parent_turn["items"] = [
+            {
+                "type": "collabAgentToolCall",
+                "receiverThreadIds": [f"thread_{i}" for i in range(513)],
+            }
+        ]
 
     class Client(_FakeCodexAppServerClient):
         async def request(self, method, params):
@@ -185,7 +210,7 @@ async def test_reconnect_reconciles_once_without_preloaded_mapping(tmp_path, sce
                         "id": "thread_child",
                         "turns": [
                             {
-                                "id": "turn_child",
+                                "id": "turn_new" if scenario == "consumed-newer" else "turn_child",
                                 "status": "inProgress" if scenario == "running" else "completed",
                                 "items": [],
                             }
@@ -222,9 +247,18 @@ async def test_reconnect_reconciles_once_without_preloaded_mapping(tmp_path, sce
                 and body["data"].get("status") == "idle"
             ]
 
-        if scenario in {"running", "unreadable", "corrupt", "hung", "discovered"}:
+        if scenario in {
+            "running",
+            "unreadable",
+            "corrupt",
+            "hung",
+            "discovered",
+            "earlier-running",
+            "overflow",
+        }:
             assert len(controls) == 1
             assert controls[0]["data"]["helper_action"] == "recovery"
+            assert len(controls[0]["data"].get("children", {})) <= 512
             if scenario == "discovered":
                 assert "thread_unknown" in controls[0]["data"].get("children", {})
         elif scenario == "deferred":
@@ -249,7 +283,9 @@ async def test_reconnect_reconciles_once_without_preloaded_mapping(tmp_path, sce
             assert len(terminal()) == 1
         else:
             assert len(terminal()) == 1
-            assert not terminal()[0]["data"].get("parent_turn_consumed", False)
+            assert terminal()[0]["data"].get("parent_turn_consumed", False) == (
+                scenario == "consumed"
+            )
         count = len(calls)
         await asyncio.sleep(0.06)  # custom-lint: disable=sleep-then-assert -- observe no retries
         assert len(calls) == count, "recovery must not leave a retry task"
@@ -321,6 +357,68 @@ async def test_native_tightening_keeps_terminal_consumer_responsive(tmp_path):
             assert not bridge.read_active_child_turns(tmp_path)
         finally:
             completed.set()
+            await tracker.close()
+            await state.close_child_streams()
+
+
+@pytest.mark.asyncio
+async def test_native_tightening_keeps_one_ordered_followup_while_reporting(tmp_path):
+    state = codex_native_forwarder._CodexForwarderState(parent_session_id="conv_parent")
+    first_entered, first_release = asyncio.Event(), asyncio.Event()
+    calls, active, peak = 0, 0, 0
+
+    async def handler(request):
+        nonlocal calls, active, peak
+        if json.loads(request.content).get("data", {}).get("helper_action"):
+            calls += 1
+            active += 1
+            peak = max(peak, active)
+            if calls == 1:
+                first_entered.set()
+                await first_release.wait()
+            active -= 1
+        return httpx.Response(202, json={"queued": False})
+
+    async with httpx.AsyncClient(
+        base_url="http://test", transport=httpx.MockTransport(handler)
+    ) as client:
+        tracker, usage = _elicitation_tracker(), _usage_coalescer(client)
+
+        async def permission(policy, sandbox):
+            await codex_native_forwarder._handle_event(
+                client,
+                session_id="conv_parent",
+                bridge_dir=tmp_path,
+                event={
+                    "method": "thread/settings/updated",
+                    "params": {
+                        "threadId": "thread_parent",
+                        "threadSettings": {
+                            "approvalPolicy": policy,
+                            "approvalsReviewer": "user",
+                            "sandboxPolicy": {"type": sandbox},
+                        },
+                    },
+                },
+                expected_thread_id="thread_parent",
+                forwarder_state=state,
+                usage_coalescer=usage,
+                elicitation_tracker=tracker,
+            )
+
+        try:
+            await permission("never", "dangerFullAccess")
+            await permission("on-request", "workspaceWrite")
+            await asyncio.wait_for(first_entered.wait(), 1)
+            for _ in range(2):
+                await permission("never", "dangerFullAccess")
+                await permission("on-request", "workspaceWrite")
+            first_release.set()
+            await asyncio.wait_for(state.helper_control_task, 1)
+            assert calls == 2, "distinct tightenings during reporting need one coalesced followup"
+            assert peak == 1, "controls must stay ordered"
+        finally:
+            first_release.set()
             await tracker.close()
             await state.close_child_streams()
 

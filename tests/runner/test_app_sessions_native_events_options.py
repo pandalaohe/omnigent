@@ -4976,7 +4976,17 @@ async def test_unregistered_elicitation_interrupt_validates_native_thread_owner(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "case", ["recycled", "exited", "hint", "late", "slow-report", "replacement-report"]
+    "case",
+    [
+        "recycled",
+        "exited",
+        "hint",
+        "empty-recovery",
+        "late",
+        "slow-report",
+        "replacement-report",
+        "spawn-during-report",
+    ],
 )
 async def test_codex_helper_stop_ownership_and_finalization(tmp_path, monkeypatch, case):
     from types import SimpleNamespace
@@ -4996,7 +5006,7 @@ async def test_codex_helper_stop_ownership_and_finalization(tmp_path, monkeypatc
             codex_home=str(tmp_path / "home"),
         ),
     )
-    if case != "hint":
+    if case not in {"hint", "empty-recovery"}:
         bridge.update_active_child_turn(
             tmp_path, "child_thread", session_id="child", turn_id="child_turn"
         )
@@ -5004,7 +5014,7 @@ async def test_codex_helper_stop_ownership_and_finalization(tmp_path, monkeypatc
     monkeypatch.setattr(
         native_controls,
         "_CODEX_HELPER_STOP_TIMEOUT_S",
-        1.0 if case in {"slow-report", "replacement-report"} else 0.02,
+        1.0 if case in {"slow-report", "replacement-report", "spawn-during-report"} else 0.02,
     )
     monkeypatch.setattr(native_controls, "_CODEX_HELPER_PROCESS_GRACE_S", 0.001)
     closed, signals, reports, child_posts = [], [], [], []
@@ -5054,6 +5064,7 @@ async def test_codex_helper_stop_ownership_and_finalization(tmp_path, monkeypatc
                 orchestration._AUTO_CODEX_APP_SERVERS[parent] = SimpleNamespace(
                     resident_incarnation_id="new"
                 )
+            if case in {"replacement-report", "spawn-during-report"}:
                 bridge.update_active_child_turn(
                     tmp_path, "new_thread", session_id="new_child", turn_id="new_turn"
                 )
@@ -5081,7 +5092,7 @@ async def test_codex_helper_stop_ownership_and_finalization(tmp_path, monkeypatc
                     title="late",
                     wrapper_label="codex-native-ui-subagent",
                 )
-            if case in {"slow-report", "replacement-report"}:
+            if case in {"slow-report", "replacement-report", "spawn-during-report"}:
                 async with httpx.AsyncClient(
                     base_url="http://test",
                     transport=httpx.MockTransport(lambda _: httpx.Response(202, json={})),
@@ -5124,7 +5135,7 @@ async def test_codex_helper_stop_ownership_and_finalization(tmp_path, monkeypatc
                 f"/v1/sessions/{parent}/events",
                 json={
                     "type": "codex_helpers_stop",
-                    "reason": "recovery",
+                    "reason": "recovery" if case in {"hint", "empty-recovery"} else "tightening",
                     "children": {"hint_thread": {"session_id": "hint_child", "turn_id": None}}
                     if case == "hint"
                     else {},
@@ -5139,11 +5150,13 @@ async def test_codex_helper_stop_ownership_and_finalization(tmp_path, monkeypatc
         elif case == "hint":
             assert closed, "a discovered unknown helper cannot count as an empty successful drain"
             assert any("hint_child" in path for path in child_posts)
+        elif case == "empty-recovery":
+            assert closed, "incomplete ownership requires stop/report even without child IDs"
         elif case == "late":
             assert subagent_work.get_subagent_work("late_child").status == "failed"
             assert any("late_child" in path for path in child_posts)
         else:
             assert closed == [], "reporting must not destroy a responsive backend"
-            if case == "replacement-report":
+            if case in {"replacement-report", "spawn-during-report"}:
                 assert "new_thread" in bridge.read_active_child_turns(tmp_path)
         assert len(reports) == 1

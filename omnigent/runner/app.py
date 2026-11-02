@@ -11926,10 +11926,11 @@ def create_runner_app(
         confirmed: bool,
         children: dict[str, dict[str, str | None]],
         owns_backend: Callable[[], bool],
+        retired: bool,
     ) -> bool:
         from omnigent.harnesses.codex_native.bridge import read_active_child_turns
 
-        if owns_backend():
+        if retired and owns_backend():
             children.update(read_active_child_turns(bridge_dir))
             for entry in _subagent_work.list_active_codex_native_work(parent):
                 children.setdefault(entry.child_session_id, {"session_id": entry.child_session_id})
