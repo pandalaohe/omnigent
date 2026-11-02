@@ -505,6 +505,60 @@ async def test_read_errors_do_not_disclose_user_shell_socket(
         assert (socket in result["error"]) is (origin == "agent")
 
 
+@pytest.mark.parametrize("origin", ["user", "harness"])
+@pytest.mark.parametrize("operation", ["send", "close", "launch"])
+@pytest.mark.parametrize("failure", ["command", "start", "raised"])
+async def test_consented_admin_tool_errors_do_not_disclose_user_socket(
+    registry: TerminalRegistry,
+    ctx: ToolContext,
+    cleanup_registry: None,
+    monkeypatch: pytest.MonkeyPatch,
+    origin: str,
+    operation: str,
+    failure: str,
+) -> None:
+    from omnigent.inner.terminal import _tmux_process_start_error, _TmuxCommandFailedError
+
+    spec = _make_spec(terminals={"bash": TerminalEnvSpec(command="bash")})
+    launch = SysTerminalLaunchTool(spec, registry)
+    target = {"terminal": "bash", "session": "admin-error"}
+    assert (await _invoke(launch, target, ctx))["status"] == "launched"
+    instance = registry.get(ctx.conversation_id, "bash", "admin-error")
+    assert instance is not None
+    instance.origin = origin
+    # A normal shell stands in for sudo: only the instance consent gate matters.
+    instance.elevated = True
+    registry.set_agent_access(
+        ctx.conversation_id, "bash", "admin-error", instance.instance_id, True
+    )
+    socket = str(instance.socket_path)
+    command = ["tmux", "-S", socket, "send-keys", "-t", "main", "Enter"]
+
+    async def fail(*_args, **_kwargs):
+        if failure == "command":
+            raise _TmuxCommandFailedError(command, returncode=1, stderr=b"probe failed")
+        if failure == "start":
+            raise _tmux_process_start_error(command, OSError(errno.EAGAIN, "probe failed"))
+        raise OSError(f"probe failed for {socket}")
+
+    method = {
+        "send": "send" if failure == "raised" else "_tmux",
+        "close": "close",
+        "launch": "is_alive",
+    }[operation]
+    tools = {
+        "send": SysTerminalSendTool(registry),
+        "close": SysTerminalCloseTool(registry),
+        "launch": launch,
+    }
+    # Undo faults before the owning fixture shuts the real terminal down.
+    with monkeypatch.context() as patch:
+        patch.setattr(instance, method, fail)
+        result = await _invoke(tools[operation], {**target, "keys": "Enter"}, ctx)
+    assert "probe failed" in result["error"]
+    assert (socket in result["error"]) is (origin == "harness"), result
+
+
 def test_send_unknown_session_returns_error(registry: TerminalRegistry, ctx: ToolContext) -> None:
     """
     Sending to a (terminal, session) the registry doesn't know

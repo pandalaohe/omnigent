@@ -115,6 +115,18 @@ class _ResolvedInstance:
     lock: threading.Lock
 
 
+def _terminal_tool_result(result: dict[str, Any], instance: TerminalInstance | None) -> str:
+    """Keep user-owned sockets out of tool errors while retaining pane contents."""
+    error = result.get("error")
+    if instance is not None and instance.origin == "user" and isinstance(error, str):
+        socket = str(instance.socket_path)
+        # Command diagnostics JSON-encode paths; start failures use raw paths.
+        for spelling in (json.dumps(socket)[1:-1], socket):
+            error = error.replace(spelling, "<redacted terminal socket>")
+        result = {**result, "error": error}
+    return json.dumps(result)
+
+
 def _format_launch_envelope(
     validated: _ValidatedLaunchArgs,
     instance: TerminalInstance,
@@ -696,6 +708,10 @@ class SysTerminalLaunchTool(Tool):
             a JSON-encoded error envelope (``str``) on a known
             recoverable failure.
         """
+        # A failed relaunch may remove the existing user instance from the registry.
+        existing = self._registry.get(
+            conversation_id, validated.terminal_name, validated.session_key
+        )
         try:
             return asyncio.run(
                 self._registry.launch(
@@ -718,7 +734,7 @@ class SysTerminalLaunchTool(Tool):
             # surface as these. Wrap in the LLM-facing JSON envelope
             # so the LLM can recover (e.g. by adjusting cwd / sandbox).
             _logger.exception("sys_terminal_launch failed")
-            return json.dumps({"error": f"launch failed: {exc}"})
+            return _terminal_tool_result({"error": f"launch failed: {exc}"}, existing)
 
     def _validate_launch_args(self, arguments: str) -> str | _ValidatedLaunchArgs:
         """
@@ -889,8 +905,8 @@ class SysTerminalSendTool(Tool):
                 # errors land here. Wrap so the LLM sees a structured
                 # error and can decide whether to relaunch the terminal.
                 _logger.exception("sys_terminal_send failed")
-                return json.dumps({"error": f"send failed: {exc}"})
-        return json.dumps(result)
+                result = {"error": f"send failed: {exc}"}
+        return _terminal_tool_result(result, resolved.instance)
 
 
 class SysTerminalReadTool(Tool):
@@ -972,14 +988,7 @@ class SysTerminalReadTool(Tool):
                 # tmux capture-pane subprocess failures land here.
                 _logger.exception("sys_terminal_read failed")
                 result = {"error": f"read failed: {exc}"}
-        error = result.get("error")
-        if resolved.instance.origin == "user" and isinstance(error, str):
-            socket = str(resolved.instance.socket_path)
-            # Command diagnostics JSON-encode paths; start failures use raw paths.
-            for spelling in (json.dumps(socket)[1:-1], socket):
-                error = error.replace(spelling, "<redacted terminal socket>")
-            result = {**result, "error": error}
-        return json.dumps(result)
+        return _terminal_tool_result(result, resolved.instance)
 
 
 class SysTerminalListTool(Tool):
@@ -1142,7 +1151,7 @@ class SysTerminalCloseTool(Tool):
             else:
                 closed = _do_close()
         except _CloseFailed as exc:
-            return json.dumps({"error": f"close failed: {exc}"})
+            return _terminal_tool_result({"error": f"close failed: {exc}"}, instance)
 
         return json.dumps(
             {
