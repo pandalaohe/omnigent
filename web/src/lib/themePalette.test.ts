@@ -1,11 +1,24 @@
+import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { render } from "@testing-library/react";
+import { createElement } from "react";
 import { afterEach, describe, expect, it } from "vitest";
+import {
+  DARK_MODE_PREVIEW,
+  LIGHT_MODE_PREVIEW,
+  PaletteChip,
+  PaletteSwatchPreview,
+} from "@/components/theme/AppearancePreviews";
 import { setEmbedRoot, setEmbedScopeRoot } from "./host";
 import {
   applyThemePalette,
   DEFAULT_PALETTE,
   isThemeSelection,
   isThemePalette,
+  PALETTE_TOKEN_CSS_NAMES,
   PALETTES,
+  paletteTokens,
   readThemePalette,
   themeSelections,
   themePalettes,
@@ -64,6 +77,28 @@ function deltaE(first: Rgb, second: Rgb): number {
   const [l1, a1, b1] = lab(first);
   const [l2, a2, b2] = lab(second);
   return Math.hypot(l1 - l2, a1 - a2, b1 - b2);
+}
+
+function hueDegrees([r, g, b]: Rgb): number {
+  const rn = r / 255;
+  const gn = g / 255;
+  const bn = b / 255;
+  const max = Math.max(rn, gn, bn);
+  const min = Math.min(rn, gn, bn);
+  const d = max - min;
+  if (d === 0) return 0;
+  const h =
+    max === rn
+      ? (gn - bn) / d + (gn < bn ? 6 : 0)
+      : max === gn
+        ? (bn - rn) / d + 2
+        : (rn - gn) / d + 4;
+  return (h / 6) * 360;
+}
+
+function hueDistance(first: Rgb, second: Rgb): number {
+  const diff = Math.abs(hueDegrees(first) - hueDegrees(second)) % 360;
+  return diff > 180 ? 360 - diff : diff;
 }
 
 afterEach(() => {
@@ -258,6 +293,155 @@ describe("themePalette", () => {
         label,
       ).toBeGreaterThanOrEqual(4.5);
       expect(deltaE(highlight, page), label).toBeGreaterThanOrEqual(8);
+    }
+  });
+
+  it.each(PALETTES)(
+    "keeps $label companion (>= 3:1) and status colours (>= 4.5:1) readable on surfaces and own tints",
+    (palette) => {
+      for (const mode of ["light", "dark"] as const) {
+        const tokens = palette.tokens[mode];
+        const page = parseColor(tokens.background).rgb;
+        const surfaces: [string, Rgb][] = [
+          ["background", page],
+          ["cardSolid", composite(parseColor(tokens.cardSolid), page)],
+          ["popover", composite(parseColor(tokens.popover), page)],
+          ["sidebar", composite(parseColor(tokens.sidebar), page)],
+        ];
+        const companionRgb = parseColor(tokens.companion).rgb;
+        for (const [surfaceName, surfaceRgb] of surfaces) {
+          expect(
+            contrast(companionRgb, surfaceRgb),
+            `${palette.label} ${mode} companion on ${surfaceName}`,
+          ).toBeGreaterThanOrEqual(3);
+        }
+
+        const statusSpecs: [string, string, number][] = [
+          ["success", tokens.success, 0.15],
+          ["warning", tokens.warning, 0.15],
+          ["destructive", tokens.destructive, 0.1],
+          ["keepCold", tokens.keepCold, 0.1],
+        ];
+        for (const [role, value, tintAlpha] of statusSpecs) {
+          const colorRgb = parseColor(value).rgb;
+          for (const [surfaceName, surfaceRgb] of surfaces) {
+            expect(
+              contrast(colorRgb, surfaceRgb),
+              `${palette.label} ${mode} ${role} on ${surfaceName}`,
+            ).toBeGreaterThanOrEqual(4.5);
+            const tintedSurface = composite({ rgb: colorRgb, alpha: tintAlpha }, surfaceRgb);
+            expect(
+              contrast(colorRgb, tintedSurface),
+              `${palette.label} ${mode} ${role} on ${tintAlpha} tint over ${surfaceName}`,
+            ).toBeGreaterThanOrEqual(4.5);
+          }
+        }
+      }
+      // Guard that a low-contrast candidate would fail the floor check.
+      const lightPage = parseColor(palette.tokens.light.background).rgb;
+      expect(contrast(lightPage, lightPage)).toBeLessThan(3);
+    },
+  );
+
+  it.each(PALETTES)(
+    "keeps $label companion hue at least 35 degrees apart from primary in both modes",
+    (palette) => {
+      for (const mode of ["light", "dark"] as const) {
+        const { primary, companion } = palette.tokens[mode];
+        expect(
+          hueDistance(parseColor(primary).rgb, parseColor(companion).rgb),
+          `${palette.label} ${mode} (${primary} vs ${companion})`,
+        ).toBeGreaterThanOrEqual(35);
+      }
+    },
+  );
+
+  it("keeps themePalettes.generated.css in sync with PALETTES and PALETTE_TOKEN_CSS_NAMES", () => {
+    const scriptPath = resolve(process.cwd(), "scripts/generate-theme-palettes.mjs");
+    execFileSync(process.execPath, [scriptPath, "--check"], { stdio: "pipe" });
+
+    const generatedCss = readFileSync(
+      resolve(process.cwd(), "src/themePalettes.generated.css"),
+      "utf8",
+    );
+    for (const cssName of Object.values(PALETTE_TOKEN_CSS_NAMES)) {
+      expect(generatedCss).toContain(`--${cssName}:`);
+      expect(generatedCss).toContain(`var(--custom-light-${cssName})`);
+      expect(generatedCss).toContain(`var(--custom-dark-${cssName})`);
+    }
+  });
+
+  it("requires companion and status tokens in paletteTokens at compile time and defaults primaryCta pair", () => {
+    const validBase = {
+      background: "#f7f6f9",
+      foreground: "#11171c",
+      card: "#ffffff",
+      cardSolid: "#ffffff",
+      primary: "#df3c85",
+      primaryForeground: "#ffffff",
+      selectionBackground: "rgba(223, 60, 133, 0.1)",
+      secondary: "#efedf3",
+      muted: "#efedf3",
+      mutedForeground: "#52525b",
+      codeBackground: "#efedf3",
+      accent: "#efedf3",
+      accentForeground: "#11171c",
+      border: "#e4e2e8",
+      borderStrong: "#d0cdd7",
+      ring: "#df3c85",
+      companion: "#0d9488",
+      success: "#247345",
+      warning: "#826022",
+      destructive: "#c3314a",
+      sidebar: "#efedf3",
+      shellBackground: "#f7f6f9",
+    };
+    const valid = paletteTokens(validBase);
+    expect(valid.primaryCta).toBe("#11171c");
+    expect(valid.primaryCtaForeground).toBe("#ffffff");
+
+    const darkValid = paletteTokens({
+      ...validBase,
+      background: "#0e0b19",
+      foreground: "#e8ecf0",
+      companion: "#2dd4bf",
+      success: "#39ab65",
+      warning: "#d4972a",
+      destructive: "#e7627d",
+    });
+    expect(darkValid.primaryCta).toBe("#e8ecf0");
+    expect(darkValid.primaryCtaForeground).toBe("#11171c");
+
+    const { companion: _omitted, ...missingCompanion } = validBase;
+    void _omitted;
+    // @ts-expect-error companion is required on PaletteTokenInput
+    paletteTokens(missingCompanion);
+  });
+
+  it("renders both accent and companion swatches in PaletteChip and PaletteSwatchPreview", () => {
+    for (const swatch of [
+      PALETTES[0].light,
+      PALETTES[0].dark,
+      LIGHT_MODE_PREVIEW,
+      DARK_MODE_PREVIEW,
+    ]) {
+      const chip = render(createElement(PaletteChip, { swatch }));
+      const chipAccent = chip.container.querySelector('[data-swatch-role="accent"]') as HTMLElement;
+      const chipCompanion = chip.container.querySelector(
+        '[data-swatch-role="companion"]',
+      ) as HTMLElement;
+      expect(chipAccent).not.toBeNull();
+      expect(chipCompanion).not.toBeNull();
+      expect(chipAccent.style.backgroundColor).not.toBe("");
+      expect(chipCompanion.style.backgroundColor).not.toBe("");
+      chip.unmount();
+
+      const preview = render(createElement(PaletteSwatchPreview, { swatch }));
+      expect(preview.container.querySelector('[data-swatch-role="accent"]')).not.toBeNull();
+      expect(preview.container.querySelector('[data-swatch-role="companion"]')).not.toBeNull();
+      expect(preview.container.querySelector('[data-swatch-role="accent-pill"]')).not.toBeNull();
+      expect(preview.container.querySelector('[data-swatch-role="companion-pill"]')).not.toBeNull();
+      preview.unmount();
     }
   });
 });

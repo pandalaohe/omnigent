@@ -69,6 +69,7 @@ select optgroup {
   --color-button-border: var(--button-border);
   --color-destructive: var(--destructive);
   --color-destructive-foreground: var(--destructive-foreground);
+  --color-companion: var(--companion);
   --color-success: var(--success);
   --color-warning: var(--warning);
   --color-info: var(--info);
@@ -78,12 +79,12 @@ select optgroup {
   --color-session-active: var(--session-active);
   /* Brand pink — reserved for brand moments, not status. */
   --color-brand-accent: var(--brand-accent);
-  /* Cold keep-warm cache — clear status blue, distinct from brand pink. */
+  /* Cold keep-warm cache and info tone — per-palette status blue untinted by accent. */
   --color-keep-cold: var(--keep-cold);
   /* Pink tag surface (translucent) — generates `bg-tag-pink`. */
   --color-tag-pink: var(--tag-pink);
-  /* Named status hues — success/warning/info are repointed to the
-     * green/yellow/blue of this set below, so the two stay in lockstep. */
+  /* Named status hues — aliased to the palette-scoped status tokens below
+     * so existing status utilities follow the active palette and custom tint. */
   --color-status-blue: var(--status-blue);
   --color-status-green: var(--status-green);
   --color-status-yellow: var(--status-yellow);
@@ -179,7 +180,7 @@ select optgroup {
   --composer-shadow-focus: 0 0 20px -6px rgb(0 0 0 / 12%);
   --composer-header-bg: color-mix(in srgb, var(--background) 94%, black);
   --primary-cta: #11171c;
-  --primary-cta-foreground: #fff;
+  --primary-cta-foreground: #ffffff;
 
   /* User-controlled UI font family (see Appearance settings /
    * lib/uiFontPreferences.ts). Deliberately left unset here so the `html` rule's
@@ -248,13 +249,16 @@ select optgroup {
 
   /* Tertiary gray for lighter/disabled/placeholder text. */
   --foreground-tertiary: #a1a1aa;
-  --destructive: #c8324c;
+  --companion: #0d9488;
+  --destructive: #c3314a;
   --destructive-foreground: #fff;
-  /* success/warning/info repointed onto the named status hues below so
-     * the ~45 existing badges/indicators adopt the brand status palette. */
-  --success: #2ea65c;
-  --warning: #d4972a;
-  --info: #3b8ff5;
+  /* Palette-scoped element and status colours; themePalettes.generated.css
+     * overrides --companion/--success/--warning/--destructive/--keep-cold per
+     * palette and customTheme.ts derives them on custom tints. */
+  --success: #247345;
+  --warning: #826022;
+  --keep-cold: #2a6cb3;
+  --info: var(--keep-cold);
   /* Session active / idle-alive blue — a deeper, saturated azure
      * that harmonizes with the brand blues (#2272b4 / #3b8ff5) and reads
      * with strong contrast on the white card surface. */
@@ -264,11 +268,11 @@ select optgroup {
   --button-icon-hover-color: #27272a;
   /* Pink tag surface — a translucent wash, so it tints whatever it sits on. */
   --tag-pink: rgba(240, 1, 150, 0.06);
-  /* Named status hues. success/warning/info above mirror green/yellow/blue. */
-  --status-blue: #3b8ff5;
-  --status-green: #2ea65c;
-  --status-yellow: #d4972a;
-  --status-red: #f04858;
+  /* Named status aliases pointing to the active palette's status tokens. */
+  --status-blue: var(--info);
+  --status-green: var(--success);
+  --status-yellow: var(--warning);
+  --status-red: var(--destructive);
   --status-gray: #8e99a4;
   --chart-1: #3b8ff5;
   --chart-2: #2272b4;
@@ -312,13 +316,15 @@ select optgroup {
   --onboarding-modal-shadow: 0 24px 80px 8px #00000038;
   --composer-shadow: 0 0 12px -6px rgb(0 0 0 / 80%);
   --composer-shadow-focus: 0 0 14px -8px rgb(0 0 0 / 90%);
-  --destructive: #e65b77;
+  --companion: #2dd4bf;
+  --destructive: #e7627d;
   --destructive-foreground: #fff;
-  /* success/warning/info repointed onto the status hues below, mirroring
-     * light mode so dark mode doesn't carry a second green/yellow/blue. */
-  --success: #2ea65c;
+  /* Dark-mode defaults for Omni; themePalettes.generated.css and customTheme.ts
+     * override these per palette and custom tint. */
+  --success: #39ab65;
   --warning: #d4972a;
-  --info: #3b8ff5;
+  --keep-cold: #3e91f5;
+  --info: var(--keep-cold);
   /* Session active / idle-alive blue, lightened for the dark glass card so
      * the small dot keeps adequate contrast against the dark canvas (the
      * light-mode #2f7fd4 reads too dim here). */
@@ -326,10 +332,10 @@ select optgroup {
   /* Pink tag surface — a heavier wash than light, since 6% all but vanishes
      * against the dark canvas. */
   --tag-pink: rgba(240, 1, 150, 0.15);
-  --status-blue: #3b8ff5;
-  --status-green: #2ea65c;
-  --status-yellow: #d4972a;
-  --status-red: #f04858;
+  --status-blue: var(--info);
+  --status-green: var(--success);
+  --status-yellow: var(--warning);
+  --status-red: var(--destructive);
   --status-gray: #8e99a4;
   --chart-1: oklch(0.64 0.22 254);
   --chart-2: oklch(0.65 0.14 200);

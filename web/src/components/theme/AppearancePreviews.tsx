@@ -5,6 +5,7 @@ export const LIGHT_MODE_PREVIEW: PaletteSwatch = {
   bg: "#e9ebee",
   card: "#ffffff",
   accent: "#aab2bd",
+  companion: "#8c96a3",
   border: "#d7dbe0",
   text: "#11171c",
 };
@@ -13,6 +14,7 @@ export const DARK_MODE_PREVIEW: PaletteSwatch = {
   bg: "#0e1013",
   card: "#232a33",
   accent: "#5b6672",
+  companion: "#46505b",
   border: "#2b333d",
   text: "#e6edf3",
 };
@@ -38,10 +40,19 @@ export function PaletteChip({ swatch }: { swatch: PaletteSwatch }) {
   return (
     <span
       aria-hidden
-      className="flex size-5 shrink-0 items-center justify-center rounded-md border"
+      className="flex size-5 shrink-0 items-center justify-center gap-0.5 rounded-md border"
       style={{ backgroundColor: swatch.bg, borderColor: swatch.border }}
     >
-      <span className="size-2 rounded-full" style={{ backgroundColor: swatch.accent }} />
+      <span
+        data-swatch-role="accent"
+        className="size-1.5 shrink-0 rounded-full"
+        style={{ backgroundColor: swatch.accent }}
+      />
+      <span
+        data-swatch-role="companion"
+        className="size-1.5 shrink-0 rounded-full"
+        style={{ backgroundColor: swatch.companion }}
+      />
     </span>
   );
 }
@@ -57,7 +68,18 @@ export function PaletteSwatchPreview({ swatch }: { swatch: PaletteSwatch }) {
         className="flex w-1/3 flex-col gap-1 rounded-md p-1"
         style={{ backgroundColor: swatch.card, border: `1px solid ${swatch.border}` }}
       >
-        <div className="size-1.5 rounded-full" style={{ backgroundColor: swatch.accent }} />
+        <div className="flex items-center gap-1">
+          <div
+            data-swatch-role="accent"
+            className="size-1.5 shrink-0 rounded-full"
+            style={{ backgroundColor: swatch.accent }}
+          />
+          <div
+            data-swatch-role="companion"
+            className="size-1.5 shrink-0 rounded-full"
+            style={{ backgroundColor: swatch.companion }}
+          />
+        </div>
         <div
           className="h-1 w-4/5 rounded-full"
           style={{ backgroundColor: swatch.text, opacity: 0.35 }}
@@ -79,7 +101,18 @@ export function PaletteSwatchPreview({ swatch }: { swatch: PaletteSwatch }) {
           className="h-1 w-1/2 rounded-full"
           style={{ backgroundColor: swatch.text, opacity: 0.3 }}
         />
-        <div className="mt-auto h-2.5 w-2/5 rounded" style={{ backgroundColor: swatch.accent }} />
+        <div className="mt-auto flex items-center gap-1">
+          <div
+            data-swatch-role="accent-pill"
+            className="h-2.5 w-2/5 rounded"
+            style={{ backgroundColor: swatch.accent }}
+          />
+          <div
+            data-swatch-role="companion-pill"
+            className="h-2.5 w-1/4 rounded"
+            style={{ backgroundColor: swatch.companion }}
+          />
+        </div>
       </div>
     </div>
   );
