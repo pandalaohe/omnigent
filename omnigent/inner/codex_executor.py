@@ -4813,13 +4813,11 @@ class _CodexAppServerSession:
                         duration_ms=duration_ms,
                     )
                     logger.info(
-                        "Codex dynamic tool result: turn_id=%s call_id=%s "
-                        "tool=%s status=%s result=%s",
+                        "Codex dynamic tool result: turn_id=%s call_id=%s tool=%s status=%s",
                         active_turn_id,
                         call_id,
                         tool_name,
                         classification.status.value,
-                        _result_text(result),
                     )
                     await self._send_response(
                         int(message["id"]),

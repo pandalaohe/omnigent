@@ -1042,7 +1042,7 @@ async def test_session_snapshot_exit_report_still_fails_non_idle_session_of_conn
 
     assert snapshot.status == "failed"
     assert snapshot.last_task_error == {
-        "code": "runner_failed_to_start",
+        "code": "runner_process_crash",
         "message": _RUNNER_EXIT_ERROR,
     }
 
@@ -3376,6 +3376,41 @@ async def test_persist_error_labels_keeps_host_runner_exit_cause(
     assert len(stored) <= _LABEL_VALUE_MAX_LEN
     assert stored.startswith("runner process exited with code 1")
     assert stored.endswith(f"\n…\n{_REJECTED_TUNNEL_ERROR}")
+
+
+@pytest.mark.asyncio
+async def test_persist_error_labels_omits_chopped_cross_session_log_tail(
+    tmp_path: Path,
+) -> None:
+    """A mid-line slice from a runner log exceeding the tail window is not stored as the cause."""
+    from omnigent.host.connect import _runner_exit_error
+    from omnigent.server.schemas import ErrorDetail
+
+    cross_session_excerpt = (
+        "sibling-brief: /opt/work/omnigent/fork/wt/simple-snapshot-backup_pretask.md " + "x" * 4200
+    )
+    log_path = tmp_path / "runner.log"
+    log_path.write_text(
+        "INFO  11-02 20:46:55.000 inner.codex_executor run_turn | "
+        f"Codex dynamic tool result: {cross_session_excerpt}\n"
+        + "\n".join(_RUNNER_SHUTDOWN_LOG_LINES)
+        + "\n"
+    )
+    captured: dict[str, dict[str, str]] = {}
+
+    class _MockStore:
+        def set_labels(self, session_id: str, updates: dict[str, str]) -> None:
+            captured[session_id] = updates
+
+    error = ErrorDetail(code="runner_process_crash", message=_runner_exit_error(1, log_path))
+
+    await _persist_session_status_error_labels(
+        "d397345925f08ea06e7303c01686efff", error, _MockStore()
+    )  # type: ignore[arg-type]
+
+    stored = captured["d397345925f08ea06e7303c01686efff"]["omnigent.last_task_error_message"]
+    assert "simple-snapshot-backup_pretask.md" not in stored
+    assert stored.endswith(f"\n…\n{_RUNNER_SHUTDOWN_LOG_LINES[-1]}")
 
 
 @pytest.mark.asyncio

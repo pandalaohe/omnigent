@@ -499,8 +499,13 @@ def _read_log_tail(path: Path, max_bytes: int = _LOG_TAIL_MAX_BYTES) -> str:
         with path.open("rb") as fh:
             fh.seek(0, os.SEEK_END)
             size = fh.tell()
-            fh.seek(max(0, size - max_bytes))
-            return fh.read().decode("utf-8", errors="replace")
+            offset = max(0, size - max_bytes)
+            fh.seek(offset)
+            raw = fh.read().decode("utf-8", errors="replace")
+            if offset > 0:
+                # Discard partial first line when seeking into middle of file.
+                return "\n".join(raw.splitlines()[1:])
+            return raw
     except OSError:
         return ""
 

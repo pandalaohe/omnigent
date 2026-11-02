@@ -3080,6 +3080,35 @@ def test_runner_exit_error_redacts_credential_values(tmp_path: Path) -> None:
     assert "code 3" in error
 
 
+def test_runner_exit_error_drops_chopped_first_line_and_oversized_single_line(
+    tmp_path: Path,
+) -> None:
+    """Mid-line tail slices must not leak chopped lines or cross-session tool dumps."""
+    log = tmp_path / "runner-chopped.log"
+    chopped_payload = "sibling-session-text /opt/work/omnigent/fork/wt/other_pretask.md " * 80
+    log.write_text(
+        f"INFO  11-02 20:46:55.000 runner.app | {chopped_payload}\n"
+        "INFO  11-02 20:46:56.000 runner.app | clean trailing line\n",
+        encoding="utf-8",
+    )
+
+    error = _runner_exit_error(1, log)
+
+    assert "other_pretask.md" not in error
+    assert "clean trailing line" in error
+
+    oversized_single_line = tmp_path / "runner-oversized.log"
+    oversized_single_line.write_text(
+        f"INFO  11-02 20:46:55.000 runner.app | {chopped_payload}\n",
+        encoding="utf-8",
+    )
+
+    single_line_error = _runner_exit_error(1, oversized_single_line)
+
+    assert "other_pretask.md" not in single_line_error
+    assert "--- runner log tail ---" not in single_line_error
+
+
 @pytest.mark.parametrize("console_closed", [False, True])
 async def test_watch_runner_silent_on_intentional_stop(
     tmp_path: Path,

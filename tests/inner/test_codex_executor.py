@@ -2416,6 +2416,75 @@ class TestCodexExecutor(unittest.TestCase):
 
         _run(_t())
 
+    def test_app_server_dynamic_tool_log_omits_result_payload(self):
+        async def _t():
+            other_session_text = (
+                "sibling-brief /opt/work/omnigent/fork/wt/simple-snapshot-backup_pretask.md"
+            )
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/opt/work/omnigent/fork/wt",
+                env={},
+                tool_executor=lambda name, args: {
+                    "conversation_id": "1c8125ba0d244bfe88fe1672b5d66bfd",
+                    "items": [{"text": other_session_text}],
+                },
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session.thread_id = "thread-1"
+            session._request = AsyncMock(return_value={"result": {"turn": {"id": "turn-1"}}})
+
+            async def _inject_events() -> None:
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {
+                        "id": 7,
+                        "method": "item/tool/call",
+                        "params": {
+                            "turnId": "turn-1",
+                            "callId": "call_hist1",
+                            "tool": "omnigent__sys_session_get_history",
+                            "arguments": {"conversation_id": "1c8125ba0d244bfe88fe1672b5d66bfd"},
+                        },
+                    }
+                )
+                session._events.put_nowait(
+                    {
+                        "method": "turn/completed",
+                        "params": {"turn": {"id": "turn-1"}},
+                    }
+                )
+
+            inject_task = asyncio.create_task(_inject_events())
+            with self.assertLogs("omnigent.inner.codex_executor", level="INFO") as captured:
+                _ = [
+                    event
+                    async for event in session.run_turn(
+                        messages=[{"role": "user", "content": "check history"}],
+                        tools=[
+                            {
+                                "name": "omnigent__sys_session_get_history",
+                                "description": "History",
+                            }
+                        ],
+                        system_prompt="",
+                        model="gpt-5.4-mini",
+                        cwd=".",
+                        sandbox="workspace-write",
+                    )
+                ]
+            await inject_task
+            joined = "\n".join(captured.output)
+            self.assertIn(
+                "Codex dynamic tool result: turn_id=turn-1 call_id=call_hist1 "
+                "tool=omnigent__sys_session_get_history status=success",
+                joined,
+            )
+            self.assertNotIn(other_session_text, joined)
+
+        _run(_t())
+
     def test_app_server_run_turn_can_disable_native_tools_when_requested(self):
         async def _t():
             session = _CodexAppServerSession(
