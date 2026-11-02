@@ -24,7 +24,6 @@ from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCategory
 from omnigent.llms.errors import detect_request_size_overflow
 
 __all__ = [
-    "RUNNER_PROCESS_CRASH",
     "FailureDiagnosis",
     "classify_native_turn_error",
     "classify_terminal_failure",
@@ -41,7 +40,7 @@ __all__ = [
 CODEX_COMPACTION_MODEL_FAILED = "codex_compaction_model_failed"
 # A Codex turn failed because the model provider's token command gave Codex no token.
 CODEX_PROVIDER_AUTH_FAILED = "codex_provider_auth_failed"
-# A bound runner process exited after it had already connected or shown liveness.
+# A runner that connected and then exited, as opposed to one that never came up.
 RUNNER_PROCESS_CRASH = "runner_process_crash"
 
 

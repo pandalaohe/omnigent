@@ -32,11 +32,11 @@ export interface AgentStatus {
 
 // Error codes that mean "the runner went away", not "the task failed".
 // ``runner_disconnected`` is published when the SSE relay's tunnel drops
-// mid-stream; ``runner_failed_to_start`` / ``runner_process_crash`` when a
-// bound runner reports an unexpected exit. They are surfaced via
-// ``last_task_error.code`` (child rows) / the session snapshot's
-// ``lastTaskError.code`` (main row). A genuine task failure carries any
-// other code (or none), so it still renders the red "Failed" pill.
+// mid-stream; ``runner_failed_to_start`` / ``runner_process_crash`` when a bound
+// runner reports an unexpected exit. Both are surfaced via ``last_task_error.code`` (child
+// rows) / the session snapshot's ``lastTaskError.code`` (main row). A
+// genuine task failure carries any other code (or none), so it still
+// renders the red "Failed" pill.
 const RUNNER_DISCONNECT_CODES = new Set([
   "runner_disconnected",
   "runner_failed_to_start",
