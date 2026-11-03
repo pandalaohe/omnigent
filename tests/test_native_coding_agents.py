@@ -190,3 +190,36 @@ def test_native_shell_terminal_specs_preserves_login_shell_path(
     spec = native_shell_terminal_specs(["fish"])
 
     assert spec["fish"].command == str(fish)
+
+
+@pytest.mark.posix_only
+def test_native_shell_terminal_specs_posix_session_args_stay_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A POSIX session shell takes no argv, preserving historical behavior."""
+    monkeypatch.setattr("omnigent._platform.IS_WINDOWS", False)
+    monkeypatch.setattr(
+        "omnigent._platform._resolve_interactive_shell", lambda shell: f"/resolved/{shell}"
+    )
+    spec = native_shell_terminal_specs(["bash", "zsh"])
+    assert [spec[name].args for name in ("bash", "zsh")] == [[], []]
+
+
+def test_native_shell_terminal_specs_windows_powershell_suppresses_banner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows runtime specs add -NoLogo to PowerShell but never to cmd."""
+    monkeypatch.setattr("omnigent._platform.IS_WINDOWS", True)
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: {
+            "pwsh": r"C:\Program Files\PowerShell\7\pwsh.exe",
+            "powershell": r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            "cmd": r"C:\Windows\System32\cmd.exe",
+        }.get(name),
+    )
+    spec = native_shell_terminal_specs(["pwsh", "powershell", "cmd"])
+    assert spec["pwsh"].args == ["-NoLogo"]
+    assert spec["powershell"].args == ["-NoLogo"]
+    assert spec["cmd"].args == []
+    assert spec["pwsh"].command == r"C:\Program Files\PowerShell\7\pwsh.exe"

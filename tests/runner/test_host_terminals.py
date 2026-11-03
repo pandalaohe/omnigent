@@ -6,6 +6,7 @@ import asyncio
 import uuid
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -15,6 +16,60 @@ from omnigent.runner import _entry
 from omnigent.runner.host_terminals import create_host_terminal_app
 from omnigent.runner.identity import RUNNER_PURPOSE_ENV_VAR
 from tests._helpers.polling import poll_until
+
+
+class _RecordingTerminalRegistry:
+    """Records the spec the app hands to the registry launch seam."""
+
+    def __init__(self) -> None:
+        self.specs = []
+
+    def list_for_conversation(self, _key: str):
+        return []
+
+    def get(self, *_args):
+        return None
+
+    async def launch(self, _key, _name, _session_key, spec, *, elevated=False):
+        self.specs.append(spec)
+        return SimpleNamespace(elevated=elevated)
+
+    async def shutdown(self) -> None:
+        pass
+
+
+def test_standalone_posix_host_shell_spec_stays_a_login_shell(tmp_path: Path) -> None:
+    """The actual standalone host spec launches POSIX shells with ``-l``."""
+    registry = _RecordingTerminalRegistry()
+    app = create_host_terminal_app(home=tmp_path, shells=["sh"], terminal_registry=registry)
+    with TestClient(app) as client:
+        response = client.post("/v1/host-terminals", json={"session_key": uuid.uuid4().hex})
+        assert response.status_code == 201, response.text
+    assert len(registry.specs) == 1
+    assert registry.specs[0].args == ["-l"]
+
+
+def test_standalone_windows_powershell_spec_suppresses_banner(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The actual standalone host spec adds ``-NoLogo`` for Windows PowerShell."""
+    monkeypatch.setattr("omnigent._platform.IS_WINDOWS", True)
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: {
+            "powershell": r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+        }.get(name),
+    )
+    registry = _RecordingTerminalRegistry()
+    app = create_host_terminal_app(
+        home=tmp_path, shells=["powershell"], terminal_registry=registry
+    )
+    with TestClient(app) as client:
+        response = client.post("/v1/host-terminals", json={"session_key": uuid.uuid4().hex})
+        assert response.status_code == 201, response.text
+    assert len(registry.specs) == 1
+    assert registry.specs[0].args == ["-NoLogo"]
+    assert registry.specs[0].command.endswith("powershell.exe")
 
 
 def test_terminal_app_real_tmux_roundtrip_and_no_session_surface(tmp_path: Path) -> None:

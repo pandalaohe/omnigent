@@ -12,7 +12,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Response, WebSocket
 
-from omnigent._platform import installed_interactive_shells
+from omnigent._platform import installed_interactive_shells, interactive_shell_args
 from omnigent.entities.host_terminal import (
     HostTerminalList,
     HostTerminalResource,
@@ -41,7 +41,11 @@ def create_host_terminal_app(
     base_spec = native_shell_terminal_specs([shell])[shell]
     if base_spec.os_env is None or isinstance(base_spec.os_env, str):
         raise RuntimeError("host shell requires a caller-process environment")
-    spec = replace(base_spec, args=["-l"], os_env=replace(base_spec.os_env, cwd=str(home)))
+    spec = replace(
+        base_spec,
+        args=interactive_shell_args(shell, standalone=True),
+        os_env=replace(base_spec.os_env, cwd=str(home)),
+    )
 
     def entries():
         return registry.list_for_conversation(_REGISTRY_KEY)

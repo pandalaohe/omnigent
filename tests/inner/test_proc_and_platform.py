@@ -220,6 +220,164 @@ def test_installed_interactive_shells_always_nonempty(
     assert _platform.installed_interactive_shells() == ["bash"]
 
 
+# --------------------------------------------------------------------------
+# _platform: Windows shell inventory and interactive argv (TS36)
+# --------------------------------------------------------------------------
+
+_WINDOWS_SHELLS = ("pwsh", "powershell", "cmd")
+
+
+def _which_mapping(**paths: str):
+    """A ``shutil.which`` stand-in resolving only the explicitly mapped names."""
+    return lambda name: paths.get(name)
+
+
+def test_normalize_interactive_shells_accepts_windows_shell_names() -> None:
+    """Host/server normalization accepts a Windows host's native inventory."""
+    assert _platform.normalize_interactive_shells(
+        ["pwsh", "powershell", "cmd", "pwsh", "not-a-shell"]
+    ) == ["pwsh", "powershell", "cmd"]
+
+
+@pytest.mark.parametrize(
+    ("standalone", "expected"),
+    [(True, ["-l"]), (False, [])],
+)
+def test_interactive_shell_args_preserves_posix_argv(
+    standalone: bool, expected: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TS36: a POSIX standalone host shell logs in; session shells take no args."""
+    monkeypatch.setattr(_platform, "IS_WINDOWS", False)
+    assert _platform.interactive_shell_args("bash", standalone=standalone) == expected
+
+
+@pytest.mark.parametrize("name", ["pwsh", "powershell"])
+@pytest.mark.parametrize("standalone", [True, False])
+def test_interactive_shell_args_suppresses_windows_powershell_banner(
+    name: str, standalone: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows PowerShell skips its logo in both standalone and session modes."""
+    monkeypatch.setattr(_platform, "IS_WINDOWS", True)
+    assert _platform.interactive_shell_args(name, standalone=standalone) == ["-NoLogo"]
+
+
+@pytest.mark.parametrize("name", ["cmd", "bash"])
+@pytest.mark.parametrize("standalone", [True, False])
+def test_interactive_shell_args_adds_nothing_for_other_windows_shells(
+    name: str, standalone: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cmd (and any non-PowerShell name) takes no extra argv on Windows."""
+    monkeypatch.setattr(_platform, "IS_WINDOWS", True)
+    assert _platform.interactive_shell_args(name, standalone=standalone) == []
+
+
+def test_installed_interactive_shells_windows_orders_native_shells(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """pwsh, then powershell, then cmd — never bash/WSL; ``$SHELL`` ignored."""
+    monkeypatch.setattr(_platform, "IS_WINDOWS", True)
+    monkeypatch.setattr(
+        "shutil.which",
+        _which_mapping(
+            pwsh=r"C:\Program Files\PowerShell\7\pwsh.exe",
+            powershell=r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            cmd=r"C:\Windows\System32\cmd.exe",
+            bash=r"C:\Program Files\Git\bin\bash.exe",
+            wsl=r"C:\Windows\System32\wsl.exe",
+        ),
+    )
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+    assert _platform.installed_interactive_shells() == list(_WINDOWS_SHELLS)
+    assert _platform.default_interactive_shell() == "pwsh"
+
+
+def test_installed_interactive_shells_windows_skips_unresolved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only resolvable native shells appear, in canonical order."""
+    monkeypatch.setattr(_platform, "IS_WINDOWS", True)
+    monkeypatch.setattr(
+        "shutil.which",
+        _which_mapping(
+            powershell=r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            cmd=r"C:\Windows\System32\cmd.exe",
+        ),
+    )
+    assert _platform.installed_interactive_shells() == ["powershell", "cmd"]
+    assert _platform.default_interactive_shell() == "powershell"
+
+
+@pytest.mark.parametrize("resolved", [r"C:\tools\pwsh.exe", r"C:\tools\pwsh.COM"])
+def test_windows_shell_inventory_accepts_native_executables(
+    resolved: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(_platform, "IS_WINDOWS", True)
+    monkeypatch.setattr("shutil.which", _which_mapping(pwsh=resolved))
+    assert _platform.installed_interactive_shells() == ["pwsh"]
+    assert _platform._resolve_interactive_shell("pwsh") == resolved
+
+
+@pytest.mark.parametrize("resolved", [r"C:\tools\pwsh.cmd", r"C:\tools\pwsh.bat"])
+def test_windows_shell_inventory_rejects_non_native_shims(
+    resolved: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """npm-style ``.cmd``/``.bat`` shims are not spawnable shells."""
+    monkeypatch.setattr(_platform, "IS_WINDOWS", True)
+    monkeypatch.setattr("shutil.which", _which_mapping(pwsh=resolved))
+    assert _platform.installed_interactive_shells() == []
+    assert _platform._resolve_interactive_shell("pwsh") is None
+
+
+def test_windows_shell_inventory_ignores_bash_and_wsl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_platform, "IS_WINDOWS", True)
+    monkeypatch.setattr(
+        "shutil.which",
+        _which_mapping(
+            bash=r"C:\Program Files\Git\bin\bash.exe",
+            wsl=r"C:\Windows\System32\wsl.exe",
+            cmd=r"C:\Windows\System32\cmd.exe",
+        ),
+    )
+    assert _platform.installed_interactive_shells() == ["cmd"]
+    assert _platform._resolve_interactive_shell("bash") is None
+
+
+def test_windows_shell_inventory_is_empty_without_native_shell(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No native shell resolves: empty inventory, no phantom bash; dirs/$SHELL ignored."""
+    stale = tmp_path / "pwsh.exe"
+    stale.write_text("")
+    monkeypatch.setattr(_platform, "IS_WINDOWS", True)
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    monkeypatch.setattr(_platform, "_INTERACTIVE_SHELL_DIRS", (str(tmp_path),))
+    monkeypatch.setenv("SHELL", str(stale))
+    assert _platform.installed_interactive_shells() == []
+
+
+@pytest.mark.posix_only
+@pytest.mark.parametrize("name", ["pwsh", "powershell", "cmd"])
+def test_windows_shell_names_do_not_resolve_as_posix_login_shells(
+    name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Adding Windows names to the allowlist must not make them POSIX shells."""
+    monkeypatch.setattr("shutil.which", lambda value: f"/usr/local/bin/{value}")
+    assert _platform._resolve_interactive_shell(name) is None
+    monkeypatch.setenv("SHELL", f"/usr/local/bin/{name}")
+    assert _platform.default_interactive_shell() == "bash"
+
+
+@pytest.mark.posix_only
+def test_posix_inventory_never_offers_windows_shells(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("shutil.which", lambda value: f"/usr/bin/{value}")
+    monkeypatch.setenv("SHELL", "/bin/bash")
+    inventory = _platform.installed_interactive_shells()
+    assert inventory[0] == "bash"
+    assert not set(inventory) & set(_WINDOWS_SHELLS)
+
+
 def test_stable_user_id_is_stable_and_path_safe() -> None:
     uid = _platform.stable_user_id()
     assert uid == _platform.stable_user_id()

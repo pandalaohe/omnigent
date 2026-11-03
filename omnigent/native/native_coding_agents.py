@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from omnigent._platform import installed_interactive_shells
+from omnigent._platform import installed_interactive_shells, interactive_shell_args
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_plugins import (
     ANTIGRAVITY_NATIVE_CODING_AGENT,
@@ -134,6 +134,7 @@ def native_shell_terminal_specs(
 
     Resolution runs in the host-launched runner and honors a matching absolute
     ``$SHELL`` path, including login shells outside the standard directories.
+    Session shells take no argv on POSIX; Windows PowerShell adds ``-NoLogo``.
     """
     from omnigent._platform import _resolve_interactive_shell
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
@@ -141,6 +142,7 @@ def native_shell_terminal_specs(
     return {
         shell: TerminalEnvSpec(
             command=_resolve_interactive_shell(shell) or shell,
+            args=interactive_shell_args(shell, standalone=False),
             allow_cwd_override=True,
             os_env=OSEnvSpec(
                 type="caller_process",

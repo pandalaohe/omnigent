@@ -239,14 +239,47 @@ def default_shell_argv(command: str) -> list[str]:
 
 #: Interactive shells we honor from ``$SHELL`` for a user terminal. Anything
 #: outside this set (or a ``$SHELL`` that doesn't resolve on PATH) falls back to
-#: bash for a predictable pane.
-_KNOWN_INTERACTIVE_SHELLS = frozenset({"bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh"})
+#: bash for a predictable pane. Windows shells are deliberately not here: a
+#: name in the normalization allowlist must not become a POSIX login shell.
+_POSIX_INTERACTIVE_SHELLS = frozenset({"bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh"})
+
+#: Native Windows shells in offer order. Only these are discovered on Windows;
+#: bash/WSL and POSIX login-shell rules do not apply there.
+_WINDOWS_INTERACTIVE_SHELLS = ("pwsh", "powershell", "cmd")
+#: Windows PowerShell builds suppress their startup banner with ``-NoLogo``.
+_WINDOWS_POWERSHELL_SHELLS = frozenset({"pwsh", "powershell"})
+#: A real Windows shell is a native image; ``shutil.which`` also returns
+#: npm-style ``.cmd``/``.bat`` shims, which ConPTY cannot spawn as a shell.
+_WINDOWS_NATIVE_EXECUTABLE_SUFFIXES = (".exe", ".com")
+
+#: Every shell basename host/server normalization accepts, on any OS: a POSIX
+#: server must accept a Windows host's inventory (and vice versa). Resolution
+#: stays OS-scoped (see :func:`_resolve_interactive_shell`).
+_KNOWN_INTERACTIVE_SHELLS = _POSIX_INTERACTIVE_SHELLS | frozenset(_WINDOWS_INTERACTIVE_SHELLS)
 
 #: Mainstream interactive shells we proactively offer as launch choices (the
 #: "New shell" picker), in display order. The user's ``$SHELL`` is always
 #: offered first regardless (see :func:`installed_interactive_shells`); this is
 #: the set of well-known alternatives we surface beyond it.
 _OFFERED_INTERACTIVE_SHELLS = ("bash", "zsh", "fish")
+
+
+def interactive_shell_args(name: str, *, standalone: bool) -> list[str]:
+    """Return the extra argv for an interactive shell terminal.
+
+    POSIX keeps the historical argv: a standalone host shell is a login shell
+    (``-l``), while a shell launched on a session's behalf takes no arguments
+    (TS36). Windows PowerShell suppresses its startup banner in both modes so
+    the pane never replays the logo per attach; ``cmd`` takes no arguments.
+
+    :param name: Shell basename from a normalized inventory.
+    :param standalone: ``True`` for a user-facing host shell pane, ``False`` for
+        a shell spawned on a session's behalf.
+    :returns: Extra argv entries, e.g. ``["-l"]`` or ``["-NoLogo"]``.
+    """
+    if IS_WINDOWS:
+        return ["-NoLogo"] if name in _WINDOWS_POWERSHELL_SHELLS else []
+    return ["-l"] if standalone else []
 
 
 def normalize_interactive_shells(shells: object) -> list[str]:
@@ -272,6 +305,27 @@ def normalize_interactive_shells(shells: object) -> list[str]:
 _INTERACTIVE_SHELL_DIRS = ("/bin", "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin")
 
 
+def _resolve_windows_interactive_shell(name: str) -> str | None:
+    """Resolve a native Windows shell, ignoring ``.cmd``/``.bat`` shims.
+
+    ``shutil.which`` honors ``PATHEXT``, so it also returns npm-style
+    ``.cmd``/``.bat`` shims, which are not spawnable shell processes. Only a
+    native ``.exe``/``.com`` counts as installed. ``$SHELL`` and the POSIX
+    fallback dirs are never consulted on Windows.
+
+    :param name: A shell basename such as ``"pwsh"`` or ``"cmd"``.
+    :returns: An executable path, or ``None`` when no native shell resolves.
+    """
+    if name not in _WINDOWS_INTERACTIVE_SHELLS:
+        return None
+    resolved = shutil.which(name)
+    if resolved is None:
+        return None
+    if Path(resolved).suffix.lower() not in _WINDOWS_NATIVE_EXECUTABLE_SUFFIXES:
+        return None
+    return resolved
+
+
 def _resolve_interactive_shell(name: str) -> str | None:
     """Resolve an interactive-shell basename to an executable, off ``PATH`` too.
 
@@ -284,10 +338,19 @@ def _resolve_interactive_shell(name: str) -> str | None:
 
     :param name: A shell basename such as ``"zsh"`` or ``"bash"``.
     :returns: An executable path, or ``None`` when the shell isn't installed.
+        On Windows, only a native ``.exe``/``.com`` resolved from ``PATH``
+        counts; ``$SHELL`` and the POSIX dirs are not consulted.
     """
     import shutil
 
-    if name not in _KNOWN_INTERACTIVE_SHELLS or os.path.basename(name) != name:
+    if os.path.basename(name) != name or name not in _KNOWN_INTERACTIVE_SHELLS:
+        return None
+    if IS_WINDOWS:
+        # Native Windows discovery only; no $SHELL, no POSIX fallback dirs.
+        return _resolve_windows_interactive_shell(name)
+    if name not in _POSIX_INTERACTIVE_SHELLS:
+        # Windows names are in the normalization allowlist so a server accepts a
+        # Windows host's inventory, but they are not POSIX login shells.
         return None
 
     login_shell = os.environ.get("SHELL", "").strip()
@@ -313,21 +376,25 @@ def default_interactive_shell() -> str:
     """
     Basename of the user's login shell for an interactive terminal.
 
-    Reads ``$SHELL`` and keeps its basename when it names a known shell that
-    resolves — trusting ``$SHELL``'s own absolute path, then ``PATH``, then the
-    standard shell dirs (:func:`_resolve_interactive_shell`); otherwise falls
-    back to ``"bash"``. Returns a basename for the host inventory; the runner
-    on that host resolves the launch path and honors the same ``$SHELL``.
+    Reads ``$SHELL`` and keeps its basename when it names a known POSIX shell
+    that resolves — trusting ``$SHELL``'s own absolute path, then ``PATH``, then
+    the standard shell dirs (:func:`_resolve_interactive_shell`); otherwise
+    falls back to ``"bash"``. Returns a basename for the host inventory; the
+    runner on that host resolves the launch path and honors the same
+    ``$SHELL``. On Windows it is the first native shell that resolves (``cmd``
+    nominally when none do; the inventory itself stays empty then).
 
     :returns: A shell basename such as ``"zsh"``, ``"fish"``, or ``"bash"``.
     """
     if IS_WINDOWS:
-        # Native tmux/PTY terminals are unsupported on Windows anyway.
-        return "bash"
+        # Native tmux/PTY terminals are unsupported on Windows; the inventory
+        # is whatever native PowerShell/cmd actually resolves (possibly empty).
+        inventory = installed_interactive_shells()
+        return inventory[0] if inventory else "cmd"
 
     shell = os.environ.get("SHELL", "").strip()
     name = os.path.basename(shell)
-    if name in _KNOWN_INTERACTIVE_SHELLS:
+    if name in _POSIX_INTERACTIVE_SHELLS:
         # ``$SHELL`` is already an absolute executable path — trust it directly
         # rather than re-resolving its basename against a ``PATH`` that may be
         # stripped, so the login shell is honored even on a frozen-PATH daemon.
@@ -346,17 +413,21 @@ def installed_interactive_shells() -> list[str]:
     the "New shell" affordance can treat entry ``[0]`` as the click default —
     followed by any mainstream alternatives (bash/zsh/fish) that resolve
     (:func:`_resolve_interactive_shell`, which also probes standard shell dirs
-    off ``PATH``). Always non-empty (the default is always present, and bash is
-    the ultimate fallback).
+    off ``PATH``). On POSIX the result is always non-empty (the default is
+    always present, and bash is the ultimate fallback). On Windows it lists the
+    native shells that actually resolve (possibly empty — never a phantom
+    bash).
 
     :returns: Basenames such as ``["zsh", "bash", "fish"]`` — the default first.
     """
-    ordered = [default_interactive_shell()]
     if IS_WINDOWS:
-        # Native tmux/PTY terminals are unsupported on Windows anyway; the lone
-        # bash default from above is all we can meaningfully offer.
-        return ordered
+        return [
+            name
+            for name in _WINDOWS_INTERACTIVE_SHELLS
+            if _resolve_windows_interactive_shell(name) is not None
+        ]
 
+    ordered = [default_interactive_shell()]
     for name in _OFFERED_INTERACTIVE_SHELLS:
         if name not in ordered and _resolve_interactive_shell(name):
             ordered.append(name)

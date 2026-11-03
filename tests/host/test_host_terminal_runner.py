@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +11,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+import omnigent.host.connect as host_connect
 from omnigent.host.connect import HostProcess, _build_runner_env
 from omnigent.host.frames import (
     HostHelloFrame,
@@ -141,3 +143,138 @@ async def test_terminal_launch_refuses_session_payload(
     )
     assert result.status == "failed"
     spawn.assert_not_called()
+
+
+def test_terminal_runner_keeps_windows_constants_but_drops_secrets() -> None:
+    """Host-purpose env keeps Windows process constants/TEMP and still drops secrets.
+
+    ``SYSTEMROOT`` is mandatory for Winsock and ``PROGRAMDATA`` for Win32-OpenSSH;
+    dropping them silently broke shells on Windows (#10926/#10934). Provider and
+    exporter credentials remain filtered regardless of OS.
+    """
+    base_env = {
+        "PATH": r"C:\Windows\System32",
+        "TEMP": r"C:\Users\sample\AppData\Local\Temp",
+        "TMP": r"C:\Users\sample\AppData\Local\Temp",
+        "SYSTEMROOT": r"C:\Windows",
+        "PROGRAMDATA": r"C:\ProgramData",
+        "USERPROFILE": r"C:\Users\sample",
+        "ANTHROPIC_API_KEY": "synthetic-provider",
+        "CUSTOM_PROVIDER_KEY": "synthetic-custom",
+        "OMNIGENT_RUNNER_ENV_PASSTHROUGH": "CUSTOM_PROVIDER_KEY",
+        "OTEL_EXPORTER_OTLP_HEADERS": "synthetic-exporter-auth",
+        "SSH_AUTH_SOCK": "synthetic-agent-socket",
+    }
+    env = _build_runner_env(
+        base_env,
+        server_url="http://testserver",
+        runner_id="runner-a",
+        binding_token="synthetic-binding",
+        workspace=r"C:\Users\sample",
+        parent_pid=123,
+        purpose="host_terminals",
+    )
+    assert env[RUNNER_PURPOSE_ENV_VAR] == "host_terminals"
+    for name in ("PATH", "TEMP", "TMP", "SYSTEMROOT", "PROGRAMDATA", "USERPROFILE"):
+        assert env[name] == base_env[name]
+    for name in (
+        "ANTHROPIC_API_KEY",
+        "CUSTOM_PROVIDER_KEY",
+        "OTEL_EXPORTER_OTLP_HEADERS",
+        "SSH_AUTH_SOCK",
+    ):
+        assert name not in env
+
+
+def _terminal_capability_host(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, shells: list[str]
+) -> HostProcess:
+    monkeypatch.setattr(host_connect, "IS_WINDOWS", True)
+    monkeypatch.setattr(host_connect, "IS_POSIX", False)
+    return HostProcess(
+        HostIdentity("11aa11aa11aa11aa11aa11aa11aa11aa", "test-host"),
+        "http://testserver",
+        interactive_shells=shells,
+        config_path=tmp_path / "config.yaml",
+    )
+
+
+def test_windows_terminal_support_needs_conpty_and_inventory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Windows needs the ConPTY export plus an inventory, never tmux."""
+    monkeypatch.setattr(host_connect, "_windows_conpty_available", lambda: True)
+    monkeypatch.setattr(
+        host_connect.shutil, "which", Mock(side_effect=AssertionError("tmux probe on Windows"))
+    )
+    host = _terminal_capability_host(monkeypatch, tmp_path, ["pwsh"])
+    assert host._host_terminals_supported() is True
+    monkeypatch.setattr(host_connect, "_windows_conpty_available", lambda: False)
+    assert host._host_terminals_supported() is False
+
+
+def test_windows_terminal_support_keeps_an_empty_inventory_empty(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An empty Windows inventory must not fall back to bash."""
+    monkeypatch.setattr(host_connect, "_windows_conpty_available", lambda: True)
+    host = _terminal_capability_host(monkeypatch, tmp_path, [])
+    assert host._interactive_shells == []
+    assert host._host_terminals_supported() is False
+
+
+def test_posix_terminal_support_still_requires_tmux_and_inventory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    host = HostProcess(
+        HostIdentity("11aa11aa11aa11aa11aa11aa11aa11aa", "test-host"),
+        "http://testserver",
+        interactive_shells=["sh"],
+        config_path=tmp_path / "config.yaml",
+    )
+    monkeypatch.setattr(
+        host_connect.shutil, "which", lambda name: "/usr/bin/tmux" if name == "tmux" else None
+    )
+    assert host._host_terminals_supported() is True
+    monkeypatch.setattr(host_connect.shutil, "which", lambda name: None)
+    assert host._host_terminals_supported() is False
+    host._interactive_shells = []
+    monkeypatch.setattr(
+        host_connect.shutil, "which", lambda name: "/usr/bin/tmux" if name == "tmux" else None
+    )
+    assert host._host_terminals_supported() is False
+
+
+class _FakeKernel32:
+    def __init__(self, exports: set[str]) -> None:
+        self._exports = exports
+
+    def __getattr__(self, name: str):
+        if name in self._exports:
+            return lambda *_args: None
+        raise AttributeError(name)
+
+
+def test_windows_conpty_probe_requires_the_kernel32_export(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(host_connect, "IS_WINDOWS", True)
+    monkeypatch.setattr(
+        ctypes,
+        "WinDLL",
+        lambda *_args, **_kwargs: _FakeKernel32({"CreatePseudoConsole"}),
+        raising=False,
+    )
+    assert host_connect._windows_conpty_available() is True
+    monkeypatch.setattr(
+        ctypes, "WinDLL", lambda *_args, **_kwargs: _FakeKernel32(set()), raising=False
+    )
+    assert host_connect._windows_conpty_available() is False
+
+    def broken_loader(*_args, **_kwargs):
+        raise OSError("no kernel32")
+
+    monkeypatch.setattr(ctypes, "WinDLL", broken_loader, raising=False)
+    assert host_connect._windows_conpty_available() is False
+    monkeypatch.setattr(host_connect, "IS_WINDOWS", False)
+    assert host_connect._windows_conpty_available() is False
