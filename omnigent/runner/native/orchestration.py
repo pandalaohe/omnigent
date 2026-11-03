@@ -9943,11 +9943,20 @@ async def _auto_create_claude_terminal(
     session_model_override = launch_metadata.model_override
     session_launch_args = launch_metadata.terminal_launch_args
     session_external_id = launch_metadata.external_session_id
+    # True while the selected id is this session's own native binding: the server
+    # snapshot, its owner label, or a bridge this session still owns. A
+    # successor's bridge hint (upstream #11836) names another conversation's
+    # transcript: it may be resumed once, never written down as this session's.
+    session_external_id_is_owned = session_external_id is not None
     confirmed_claude_sid = _read_confirmed_csid(launch_metadata.labels, session_id)
     if _pre_wipe_bridge_is_current and _pre_wipe_claude_sid is not None:
         session_external_id = _pre_wipe_claude_sid
+        session_external_id_is_owned = True
     elif confirmed_claude_sid is not None:
+        # The server refuses to replace an existing external_session_id, so an
+        # owner-confirmed id is never older than the snapshot's value.
         session_external_id = confirmed_claude_sid
+        session_external_id_is_owned = True
     fork_source_external_id = launch_metadata.fork_source_external_id
     fork_carry_history = launch_metadata.fork_carry_history
 
@@ -9957,6 +9966,7 @@ async def _auto_create_claude_terminal(
     # captured from the bridge state file before prepare_bridge_dir wiped it.
     if session_external_id is None and _pre_wipe_claude_sid is not None:
         session_external_id = _pre_wipe_claude_sid
+        session_external_id_is_owned = False
         _logger.info(
             "cold-resume fallback: server snapshot missing external_session_id, "
             "using local bridge hint: session=%s local_claude_sid=%s",
@@ -9965,7 +9975,7 @@ async def _auto_create_claude_terminal(
             extra={"session_id": session_id},
         )
 
-    if session_external_id is not None:
+    if session_external_id is not None and session_external_id_is_owned:
         if _read_csid_pre_wipe(bridge_dir) != session_external_id:
             _write_csid(bridge_dir, session_external_id)
         if server_client is not None and confirmed_claude_sid != session_external_id:

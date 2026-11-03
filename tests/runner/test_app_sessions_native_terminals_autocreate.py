@@ -186,34 +186,51 @@ class _RecordingClaudeRegistry:
 
 
 class _ResumeSnapshotServerClient(NullServerClient):
-    """Server client serving one session snapshot, empty labels and optional items."""
+    """Server client serving one session snapshot, empty labels and optional items.
+
+    With ``track_labels`` the client keeps the labels it is patched with, so a
+    second launch of the same session reads back what the first one persisted.
+    """
 
     def __init__(
         self,
         session_url: str,
         snapshot: dict[str, Any],
         items: list[dict[str, Any]] | None = None,
+        *,
+        track_labels: bool = False,
     ) -> None:
         self._session_url = session_url
         self._snapshot = snapshot
         self._items = items
+        self._track_labels = track_labels
+        self._labels: dict[str, str] = {}
         self.patches: list[tuple[str, dict[str, Any]]] = []
 
     async def patch(self, url: str, **kwargs: Any) -> NullServerClient._Response:
         """Record session label patches and return a stub 200 response."""
         self.patches.append((url, kwargs))
+        body = kwargs.get("json")
+        labels = body.get("labels") if isinstance(body, dict) else None
+        if self._track_labels and isinstance(labels, dict):
+            self._labels.update({str(key): str(value) for key, value in labels.items()})
         return await super().patch(url, **kwargs)
 
     async def get(self, url: str, **kwargs: Any) -> NullServerClient._Response:
-        """Return empty labels (so the bridge id is the session id), items or the snapshot."""
+        """Return labels, items, or the snapshot with the labels patched so far."""
         del kwargs
         if url.endswith("/labels"):
-            payload: dict[str, Any] = {"labels": {}}
+            payload: dict[str, Any] = {"labels": dict(self._labels)}
         elif self._items is not None and url == f"{self._session_url}/items":
             payload = {"data": self._items}
         else:
             assert url == self._session_url
-            payload = self._snapshot
+            initial_labels = self._snapshot.get("labels")
+            payload = dict(self._snapshot)
+            payload["labels"] = {
+                **(initial_labels if isinstance(initial_labels, dict) else {}),
+                **self._labels,
+            }
 
         class _Response(NullServerClient._Response):
             """Canned JSON response."""
@@ -4092,6 +4109,132 @@ async def test_auto_create_claude_terminal_cold_resume_retains_confirmed_sid(
             "claude_session_id": expected_resume_sid,
         }
     assert forwarder_kwargs.get("start_at_end") is True
+
+
+@pytest.mark.asyncio
+async def test_auto_create_claude_terminal_does_not_promote_foreign_bridge_sid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successor's bridge hint must never become this session's durable binding.
+
+    Upstream #11836: after repeated ``/clear`` runs, session A's bridge label can
+    point at replacement C's live bridge. When the server snapshot is missing
+    ``external_session_id``, the cold-resume fallback still resumes C once; that
+    id belongs to another conversation and must not outlive the launch. Otherwise
+    a later start — after bridge cleanup and with the server naming this
+    session's own transcript — would resume C again.
+    """
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+    (tmp_path / "workspace").mkdir()
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+
+    session_id = "5cdbea97a2fb0c659bc09605401e2bb2"
+    successor_owner = "16b56b3db496417b4413c44e9a7a6478"
+    foreign_claude_sid = "c6e0f48a-1a4e-4f57-9a03-8f0cd8b1e0c4"
+    own_claude_sid = "02857840-6362-408f-b41f-309e396ed7c6"
+    bridge_dir = bridge_dir_for_bridge_id(session_id)
+    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (bridge_dir / "state.json").write_text(
+        json.dumps({"claude_session_id": foreign_claude_sid}), encoding="utf-8"
+    )
+    (bridge_dir / "bridge.json").write_text(
+        json.dumps({"active_session_id": successor_owner}), encoding="utf-8"
+    )
+
+    synth_calls: list[str] = []
+
+    async def _fake_synth(
+        client: Any,
+        *,
+        session_id: str,
+        external_session_id: str,
+        workspace: Path,
+        bridge_dir: Path,
+        resume_copy: bool,
+    ) -> Any:
+        assert not resume_copy
+        del client, session_id, workspace, bridge_dir
+        synth_calls.append(external_session_id)
+        from omnigent.harnesses.claude_native.main import ClaudeResumeTranscriptResolution
+
+        transcript = tmp_path / f"{external_session_id}.jsonl"
+        transcript.write_text('{"type":"user","message":{"content":"fixture"}}\n')
+        return ClaudeResumeTranscriptResolution(transcript, reused_local=False, synthesized=True)
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main._ensure_local_claude_resume_transcript",
+        _fake_synth,
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+
+    # Attempt 1 reaches a server snapshot that never recorded a binding; attempt
+    # 2 runs after cleanup, when the server names this session's own transcript.
+    snapshot: dict[str, Any] = {}
+    client = _ResumeSnapshotServerClient(
+        f"/v1/sessions/{session_id}",
+        snapshot,
+        track_labels=True,
+    )
+
+    binding_label_key = "omnigent.claude_native.confirmed_session"
+    confirmed_bindings: list[dict[str, Any]] = []
+
+    def _record_confirmed_bindings() -> None:
+        for _, kwargs in client.patches:
+            body = kwargs.get("json")
+            labels = body.get("labels") if isinstance(body, dict) else None
+            raw = labels.get(binding_label_key) if isinstance(labels, dict) else None
+            if isinstance(raw, str):
+                confirmed_bindings.append(json.loads(raw))
+
+    captured: dict[str, Any] = {}
+    await _auto_create_claude_terminal(
+        session_id,
+        _RecordingClaudeRegistry(captured),
+        lambda _sid, _evt: None,
+        server_client=client,  # type: ignore[arg-type]
+    )
+    first_args = list(captured["spec"].args)
+    state_after_launch = (
+        (bridge_dir / "state.json").read_text(encoding="utf-8")
+        if (bridge_dir / "state.json").exists()
+        else ""
+    )
+    _record_confirmed_bindings()
+
+    import shutil
+
+    shutil.rmtree(bridge_dir)
+    snapshot["external_session_id"] = own_claude_sid
+    captured.clear()
+    await _auto_create_claude_terminal(
+        session_id,
+        _RecordingClaudeRegistry(captured),
+        lambda _sid, _evt: None,
+        server_client=client,  # type: ignore[arg-type]
+    )
+    second_args = list(captured["spec"].args)
+    _record_confirmed_bindings()
+
+    # The pre-existing fallback still resumes the successor's transcript once.
+    assert synth_calls[:1] == [foreign_claude_sid]
+    assert first_args[first_args.index("--resume") + 1] == foreign_claude_sid
+    # After cleanup the server's own binding decides again; the foreign hint is
+    # not carried over.
+    assert synth_calls == [foreign_claude_sid, own_claude_sid], (
+        "After cleanup the launch must resume this session's own transcript; "
+        f"resumed ids: {synth_calls!r}"
+    )
+    assert second_args[second_args.index("--resume") + 1] == own_claude_sid
+    assert [binding["claude_session_id"] for binding in confirmed_bindings] == [own_claude_sid]
+    assert foreign_claude_sid not in state_after_launch
 
 
 @dataclass
