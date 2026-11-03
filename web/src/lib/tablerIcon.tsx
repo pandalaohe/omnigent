@@ -72,7 +72,7 @@ export function TablerSvg({ node, className }: { node: TablerIconNode; className
 /** A Tabler row holds its footprint while loading, then draws or falls back. */
 export function TablerRowIcon({ name, className }: { name: string; className?: string }) {
   const set = useTablerIcons();
-  const node = set && set !== "error" ? set[name] : undefined;
+  const node = knownNode(set, name);
   if (set === "error" || (set && !node)) {
     return (
       <FolderIcon
@@ -112,9 +112,14 @@ export function ProjectIconGlyph({
   return <TablerGlyph name={parsed.name} className={className} />;
 }
 
+/** Own names only: `constructor` or `__proto__` must not reach `Object.prototype`. */
+function knownNode(set: TablerIconSet | "error" | null, name: string): TablerIconNode | undefined {
+  return set && set !== "error" && Object.hasOwn(set, name) ? set[name] : undefined;
+}
+
 function TablerGlyph({ name, className }: { name: string; className?: string }) {
   const set = useTablerIcons();
-  const node = set && set !== "error" ? set[name] : undefined;
+  const node = knownNode(set, name);
   if (set === "error" || (set && !node)) {
     return <FolderIcon aria-hidden="true" className={className ?? "size-[1em]"} />;
   }

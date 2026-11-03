@@ -69,6 +69,24 @@ describe("ProjectRowIcon with Tabler values", () => {
     expect(container.querySelector(".lucide-folder")?.getAttribute("class")).toContain("size-4");
   });
 
+  it("falls back to the folder for inherited property names in both renderers", async () => {
+    // `set[name]` would otherwise reach Object.prototype and throw on `.map`.
+    for (const name of ["constructor", "toString", "__proto__"]) {
+      const row = render(<ProjectRowIcon icon={`tabler:${name}`} />);
+      // Each case renders, asserts and unmounts before the next one starts.
+      // eslint-disable-next-line no-await-in-loop
+      await waitFor(() => expect(row.container.querySelector("svg.lucide-folder")).not.toBeNull());
+      row.unmount();
+
+      const glyph = render(<ProjectIconGlyph icon={`tabler:${name}`} />);
+      // eslint-disable-next-line no-await-in-loop
+      await waitFor(() =>
+        expect(glyph.container.querySelector("svg.lucide-folder")).not.toBeNull(),
+      );
+      glyph.unmount();
+    }
+  });
+
   it("falls back to the folder when the chunk fails", async () => {
     data.loadIcons.mockRejectedValueOnce(new Error("offline"));
     const { container } = render(<ProjectRowIcon icon="tabler:rocket" />);

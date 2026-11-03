@@ -1,6 +1,7 @@
 import { QueryClient } from "@tanstack/react-query";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  PROJECT_ICON_MAX_LENGTH,
   cachedProjectSummaries,
   createProjectSummary,
   listProjectSummaries,
@@ -14,18 +15,32 @@ vi.mock("@/lib/identity", () => ({ authenticatedFetch: authenticatedFetchMock })
 beforeEach(() => authenticatedFetchMock.mockReset());
 
 describe("projectSummary", () => {
-  it("keeps only id, name, and icon and bounds the strings", () => {
+  it("keeps only id, name, and the whole stored icon", () => {
     const summary = projectSummary({
       id: "proj_1",
       name: "n".repeat(300),
       user_id: "private@example.com",
       created_at: 1,
-      config: { icon: "🔥".repeat(20) },
+      config: { icon: "tabler:device-ipad-horizontal-exclamation" },
     });
     expect(Object.keys(summary).sort()).toEqual(["icon", "id", "name"]);
     expect(summary.name).toHaveLength(100);
-    expect(summary.icon).toHaveLength(16);
+    // 41 characters; the longest installed Tabler id, so no bound cuts one.
+    expect(summary.icon).toBe("tabler:device-ipad-horizontal-exclamation");
     expect(projectSummary({ id: "proj_2", name: "Plain" }).icon).toBeNull();
+  });
+
+  it("drops an over-long icon instead of shortening it", () => {
+    expect(
+      projectSummary({ id: "p", name: "P", config: { icon: "tabler:brand-github" } }).icon,
+    ).toBe("tabler:brand-github");
+    // A multi-codepoint Emoji sequence used to be sliced at 16 UTF-16 units.
+    const sequence = "\u{1F468}\u200D\u{1F469}\u200D\u{1F467}\u200D\u{1F466}".repeat(2);
+    expect(sequence.length).toBeGreaterThan(16);
+    expect(projectSummary({ id: "p", name: "P", config: { icon: sequence } }).icon).toBe(sequence);
+
+    const tooLong = "i".repeat(PROJECT_ICON_MAX_LENGTH + 1);
+    expect(projectSummary({ id: "p", name: "P", config: { icon: tooLong } }).icon).toBeNull();
   });
 });
 
@@ -42,6 +57,18 @@ describe("cachedProjectSummaries", () => {
 
     expect(cachedProjectSummaries(queryClient)).toEqual([
       { id: "proj_1", name: "Alpha", icon: "🅰️" },
+    ]);
+  });
+
+  it("keeps a cached Tabler icon whole", () => {
+    const queryClient = new QueryClient();
+    queryClient.setQueryData(
+      ["projects"],
+      [{ id: "proj_1", name: "Alpha", icon: "tabler:brand-google-play" }],
+    );
+
+    expect(cachedProjectSummaries(queryClient)).toEqual([
+      { id: "proj_1", name: "Alpha", icon: "tabler:brand-google-play" },
     ]);
   });
 });
