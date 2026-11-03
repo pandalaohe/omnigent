@@ -2016,6 +2016,13 @@ def register_events_routes(
                     )
                 await _authorized_conversation(request, target_id, acting_user_id=acting_user_id)
                 redirected = await _redirected_message(body, session_id, target_id)
+                # Carry an orchestration message's provenance to the successor:
+                # the conversion above replaced the ``session_message`` that
+                # marked it, so the forwarding call would skip the source
+                # rechecks this pass already ran against the old id. Only a body
+                # that passed ``require_orchestration_source`` sets it, and that
+                # body carries no peer-delivery metadata, so nothing else is
+                # trusted here.
                 ack = await _post_event_impl(
                     request,
                     target_id,
@@ -2023,7 +2030,7 @@ def register_events_routes(
                     in_flight=in_flight,
                     acting_user_id=acting_user_id,
                     require_init_success=require_init_success,
-                    trusted_peer=trusted_peer,
+                    trusted_peer=trusted_peer or peer_message,
                 )
                 return {**ack, "redirected_to": ack.get("redirected_to") or target_id}
         if body.type == "message" and _is_native_terminal_session(conv):
