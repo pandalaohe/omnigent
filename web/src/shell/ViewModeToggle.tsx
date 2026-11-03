@@ -42,6 +42,7 @@ export function ViewModeToggle({ hotkeyEnabled = true, alwaysVisible = false } =
     ctx?.isTerminalFirst && !ctx.isShellView && (!isMobile || alwaysVisible),
   );
   useEffect(() => {
+    if (!toggleVisible) setOpenView(null);
     const radios = segmentedRef.current?.querySelectorAll<HTMLElement>('[role="radio"]');
     radios?.forEach((radio) => {
       if (shortcutAria) radio.setAttribute("aria-keyshortcuts", shortcutAria);

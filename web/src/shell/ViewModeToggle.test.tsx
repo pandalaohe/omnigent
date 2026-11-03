@@ -222,6 +222,27 @@ describe("ViewModeToggle", () => {
     expect(keys.map((key) => key.textContent)).toEqual([MOD_KEY, ALT_KEY, "\\"]);
   });
 
+  it("does not reopen a tooltip after the toggle is hidden and shown", async () => {
+    const element = () => (
+      <TooltipProvider>
+        <TerminalFirstContextProvider value={makeCtx()}>
+          <ViewModeToggle />
+        </TerminalFirstContextProvider>
+      </TooltipProvider>
+    );
+    const { rerender } = render(element());
+    fireEvent.focus(chatSegment());
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("Chat view");
+
+    isMobileMock.mockReturnValue(true);
+    rerender(element());
+    expect(screen.queryByTestId("view-mode-chat")).toBeNull();
+
+    isMobileMock.mockReturnValue(false);
+    rerender(element());
+    expect(screen.queryByRole("tooltip")).toBeNull();
+  });
+
   it("syncs shortcut ARIA when a mobile-mounted toggle becomes visible on desktop", () => {
     isMobileMock.mockReturnValue(true);
     const element = () => (
