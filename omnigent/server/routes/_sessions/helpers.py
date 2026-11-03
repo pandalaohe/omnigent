@@ -7263,7 +7263,7 @@ async def _launch_runner_on_host_impl(
 
     require_start_allowed(conv)
     lock = _relaunch_locks.setdefault(conv.id, asyncio.Lock())
-    async with lock:
+    async with lock, host_registry.startup_launch(conv.id):
         # Re-read under the lock: a binding that moved past the caller's
         # snapshot means another flight just relaunched (concurrently, or
         # a moment ago) — ride its runner rather than rotating it away

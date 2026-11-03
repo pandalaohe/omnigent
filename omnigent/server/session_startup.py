@@ -115,7 +115,7 @@ class StartupCoordinator:
                 eligible_ids.add(startup.id)
         if not eligible_ids:
             return
-        for _ in range(2):
+        for _ in range(len(eligible_ids)):
             if self._closing:
                 break
             attempt = await asyncio.to_thread(

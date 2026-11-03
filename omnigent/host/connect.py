@@ -2500,8 +2500,8 @@ class HostProcess:
         # it would idle forever: tunnel still authenticating, transcript
         # forwarder still posting — one leaked generation per relaunch.
         # The pops run under the _runner_lifecycle_lock the frame
-        # dispatcher holds (mirroring _handle_stop, so the watcher reads
-        # the exit as intentional); the SIGTERM/SIGKILL round itself is
+        # dispatcher holds; stop_requested keeps the watcher quiet.
+        # The SIGTERM/SIGKILL round itself is
         # detached so a stop that waits out its 5s grace cannot
         # head-of-line block other sessions' launches on this host.
         # A server that names the superseded runners is authoritative: after
@@ -2741,7 +2741,7 @@ class HostProcess:
         :param frame: The stop request frame.
         :returns: Result frame with status.
         """
-        handle = self._runners.pop(frame.runner_id, None)
+        handle = self._runners.get(frame.runner_id)
         if handle is None:
             return HostStopRunnerResultFrame(
                 request_id=frame.request_id,
@@ -2754,6 +2754,14 @@ class HostProcess:
         # zygote-forked one — run them off the loop so a wedged zygote can't
         # freeze the daemon's control handler.
         await self._stop_runner_and_trigger(handle.proc, "runner_stopped")
+        if await asyncio.to_thread(handle.proc.poll) is None:
+            return HostStopRunnerResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error="runner termination is not confirmed",
+            )
+        if self._runners.get(frame.runner_id) is handle:
+            self._runners.pop(frame.runner_id)
         _logger.info("Stopped runner %s", frame.runner_id)
         _print_host_status(
             f"  ↓ Runner stopped: {frame.runner_id}",
@@ -2912,8 +2920,7 @@ class HostProcess:
         """Watch a spawned runner and report an unexpected exit.
 
         Polls the runner subprocess until it exits. An exit while the
-        runner is still tracked in ``self._runners`` is unexpected (a
-        ``host.stop_runner`` pops the entry *before* terminating), so
+        runner is still tracked without an intentional stop request is unexpected, so
         the watcher composes the exit error — code plus log tail — and
         reports it to the server via ``host.runner_exited``. Without
         this, a runner that crashes before connecting its tunnel
@@ -2936,11 +2943,11 @@ class HostProcess:
         while await asyncio.to_thread(handle.proc.poll) is None:
             await asyncio.sleep(_RUNNER_WATCH_INTERVAL_S)
         if self._runners.get(runner_id) is not handle:
-            # _handle_stop (or _cleanup_runners) removed it first —
-            # an intentional termination, not a crash to report.
             return
         self._runners.pop(runner_id)
         self._trigger_maintenance("runner_exited")
+        if handle.stop_requested:
+            return
         had_connected = None
         if handle.connect_marker is not None:
             try:

@@ -3,6 +3,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid4
 
+import pytest
 from sqlalchemy import select
 
 from omnigent.db.session_startup import SqlStartupBudget
@@ -25,10 +26,13 @@ def test_one_start_policy_survives_store_replacement(db_uri):
     assert replacement.reserve(host) is None
 
 
-def test_startup_only_ignores_resident_budget_but_reserves_exactly_two(db_uri):
+@pytest.mark.parametrize("limit, expected", [(2, 2), (4, 4), (None, 5)])
+def test_startup_only_ignores_resident_budget_and_reserves_configured_limit(
+    db_uri, limit, expected
+):
     stores = [SessionStartupStore(db_uri), SessionStartupStore(db_uri)]
     host = uuid4().hex
-    stores[0].configure(host, mode="startup_only")
+    stores[0].configure(host, mode="startup_only", startup_limit=limit)
     with stores[0]._session("retain_unknown_resident_budget") as db:
         for budget in db.scalars(select(SqlStartupBudget)):
             budget.resident_inventory_unknown = True
@@ -44,7 +48,7 @@ def test_startup_only_ignores_resident_budget_but_reserves_exactly_two(db_uri):
     with ThreadPoolExecutor(max_workers=2) as pool:
         reserved = list(pool.map(lambda i: stores[i % 2].reserve(host), range(5)))
     active = [row for row in reserved if row is not None]
-    assert len(active) == 2
+    assert len(active) == expected
     assert all(row.admission_mode == "startup_only" and row.policy_revision == 1 for row in active)
     first = active[0]
     assert stores[1].claim(first.id, first.attempt_id, runtime_id="owned-runtime")

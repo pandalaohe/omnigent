@@ -89,7 +89,7 @@ def register_startup_routes(
             conversation = await asyncio.to_thread(
                 conversation_store.get_conversation, target.session_id
             )
-            if conversation is None or conversation.archived:
+            if conversation is None:
                 continue
             items.append(
                 StartupReleasePreviewItem(
@@ -114,8 +114,6 @@ def register_startup_routes(
             )
             if conversation is None:
                 raise HTTPException(404, "Session not found")
-            if conversation.archived:
-                raise HTTPException(409, "Session is archived; refresh before release")
         admission = getattr(request.app.state, "startup_admission", None)
         store = getattr(request.app.state, "startup_store", None)
         if admission is None or store is None or admission.policy.mode != "startup_only":

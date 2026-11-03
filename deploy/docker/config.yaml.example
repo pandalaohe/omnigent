@@ -61,3 +61,11 @@ allowed_domains:
 #     loading: loading.webp      # working indicator (falls back to main)
 #     favicon: favicon.png       # browser-tab icon
 #   powered_by: true             # "Powered by Omnigent" credit (only when branded); false to hide
+
+# Limit simultaneous cold startups per host; omit startup_limit for no limit.
+startup_admission:
+  enabled: false
+  mode: startup_only
+  startup_limit: 2
+  observation_timeout_seconds: 180
+  stuck_release: manual

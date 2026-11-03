@@ -140,7 +140,7 @@ async def test_release_endpoint_requires_host_and_session_owner(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("hint", ["working", "unknown"])
-async def test_preview_hints_do_not_veto_targets_or_expose_archived_sessions(
+async def test_preview_hints_and_archive_do_not_veto_release_targets(
     app, client, db_uri, monkeypatch, hint
 ):
     conversations, startups, hosts, conn, conv, _item, ref, _runner = _startup(
@@ -183,8 +183,7 @@ async def test_preview_hints_do_not_veto_targets_or_expose_archived_sessions(
     assert len(preview["targets"]) == 1
     assert preview["targets"][0]["work_hint"] == hint
     conversations.update_conversation(conv.id, archived=True)
-    assert (await client.get(route)).json()["targets"] == []
-    conversations.update_conversation(conv.id, archived=False)
+    assert len((await client.get(route)).json()["targets"]) == 1
     response = await client.post(
         route,
         json={

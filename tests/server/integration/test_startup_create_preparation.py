@@ -2,11 +2,14 @@
 
 import asyncio
 import json
+import threading
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 
 import pytest
 
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.host.frames import HostLaunchRunnerFrame, decode_host_frame
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.server.session_open_rate import CREATE_ORIGIN_AGENT, CREATE_ORIGIN_HEADER
 from omnigent.server.startup_registration import (
@@ -26,6 +29,320 @@ from tests.server.integration.test_multipart_create_host_launch import (
     register_host as register_host,
 )
 from tests.server.test_member_snapshot import joint_bundle
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["prepared", "relaunch"])
+async def test_death_reconciliation_waits_for_binding_to_launch_issuance(
+    app, client, conv_store, register_host, monkeypatch, entry
+):
+    capture = register_host()
+    conn = app.state.host_registry.get(_HOST_ID)
+    conn.hello.capabilities = ["startup_admission_v1", "startup_receipts:test"]
+    admission = app.state.startup_admission
+    admission.resolve_harness = AsyncMock(return_value="test")
+    created = await _multipart_create(
+        client,
+        {"host_id": _HOST_ID, "workspace": "/opt/work/project"} if entry == "prepared" else {},
+    )
+    assert created.status_code == 201, created.text
+    session_id = created.json()["session_id"]
+    if entry == "relaunch":
+        conv_store.set_host_id(session_id, _HOST_ID, "/opt/work/project")
+        await admission.queue_session(conn, session_id)
+    store = app.state.startup_store
+    store.register_host_generation(_HOST_ID, conn.startup_generation)
+    bound, proceed = threading.Event(), threading.Event()
+    queried, waiting = asyncio.Event(), asyncio.Event()
+    binding_method = "set_host_id" if entry == "prepared" else "replace_runner_id"
+    original_bind = getattr(conv_store, binding_method)
+
+    def pause_binding(*args, **kwargs):
+        result = original_bind(*args, **kwargs)
+        if args[0] == session_id and conv_store.get_conversation(session_id).runner_id:
+            bound.set()
+            assert proceed.wait(5), "test did not release binding persistence"
+        return result
+
+    registry = app.state.host_registry
+    original_guard = getattr(registry, "startup_launch", None)
+
+    @asynccontextmanager
+    async def trace_guard(target, **kwargs):
+        if target == session_id and bound.is_set():
+            waiting.set()
+        if original_guard is None:
+            yield
+        else:
+            async with original_guard(target, **kwargs) as acquired:
+                yield acquired
+
+    async def status(*_args):
+        queried.set()
+        return "alive" if capture.launch else "unknown"
+
+    monkeypatch.setattr(conv_store, binding_method, pause_binding)
+    monkeypatch.setattr(registry, "startup_launch", trace_guard, raising=False)
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.helpers._query_host_runner_status", status
+    )
+    reconcile = None
+    barriers = []
+    try:
+        await admission.coordinator.advance(_HOST_ID)
+        assert await asyncio.to_thread(bound.wait, 5)
+        assert not capture.launch
+        reconcile = asyncio.create_task(admission._settle_gone_runtimes(_HOST_ID))
+        barriers = [asyncio.create_task(event.wait()) for event in (queried, waiting)]
+        done, _ = await asyncio.wait(barriers, timeout=5, return_when=asyncio.FIRST_COMPLETED)
+        assert done, "neither reconciliation query nor issuance guard was reached"
+        if queried.is_set():
+            await asyncio.wait_for(reconcile, 5)
+        assert not queried.is_set(), "death was queried before the launch frame reached the host"
+        assert store.for_session(session_id).occupied
+    finally:
+        proceed.set()
+        await admission.coordinator.drain()
+        if reconcile is not None:
+            await asyncio.wait_for(reconcile, 5)
+        for barrier in barriers:
+            barrier.cancel()
+        await asyncio.gather(*barriers, return_exceptions=True)
+    assert len(capture.launch) == 1
+    assert store.for_session(session_id).occupied
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["unknown", "dead", "alive", None])
+async def test_prepared_launch_timeout_remains_reconcilable(
+    app, client, conv_store, register_host, monkeypatch, status
+):
+    monkeypatch.setattr(app.state.startup_inputs, "host_changed", lambda *_args: None)
+    capture = register_host()
+    registry = app.state.host_registry
+    conn = registry.get(_HOST_ID)
+    conn.hello.capabilities = ["startup_admission_v1", "startup_receipts:test"]
+    admission = app.state.startup_admission
+    admission.resolve_harness = AsyncMock(return_value="test")
+    created = await _multipart_create(
+        client, {"host_id": _HOST_ID, "workspace": "/opt/work/project"}
+    )
+    assert created.status_code == 201, created.text
+    session_id = created.json()["session_id"]
+    store = app.state.startup_store
+    store.register_host_generation(_HOST_ID, conn.startup_generation)
+    sent, reconciling = asyncio.Event(), asyncio.Event()
+    frames = []
+    original_send, original_guard = registry.send_text, registry.startup_launch
+
+    def no_ack(connection, text):
+        frame = decode_host_frame(text)
+        if isinstance(frame, HostLaunchRunnerFrame):
+            frames.append(frame)
+            sent.set()
+        else:
+            original_send(connection, text)
+
+    @asynccontextmanager
+    async def trace_guard(target, **kwargs):
+        if target == session_id and sent.is_set():
+            reconciling.set()
+        async with original_guard(target, **kwargs) as acquired:
+            yield acquired
+
+    query = AsyncMock(return_value=status)
+    monkeypatch.setattr(registry, "send_text", no_ack)
+    monkeypatch.setattr(registry, "startup_launch", trace_guard)
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.helpers._query_host_runner_status", query
+    )
+    await admission.coordinator.advance(_HOST_ID)
+    await asyncio.wait_for(sent.wait(), 5)
+    reconcile = asyncio.create_task(admission._settle_gone_runtimes(_HOST_ID))
+    try:
+        await asyncio.wait_for(reconciling.wait(), 5)
+        assert store.for_session(session_id).occupied
+        query.assert_not_awaited()
+    finally:
+        # Expire the unanswered host future deterministically at the timeout boundary.
+        conn.pending_launches[frames[0].request_id].set_exception(TimeoutError())
+        await admission.coordinator.drain()
+        await asyncio.wait_for(reconcile, 5)
+    runner_id = token_bound_runner_id(frames[0].binding_token)
+    conv = conv_store.get_conversation(session_id)
+    assert (conv.host_id, conv.runner_id) == (_HOST_ID, runner_id), (
+        "an unacknowledged launch lost its reconciliation identity"
+    )
+    await admission.advance(_HOST_ID)
+    query.assert_awaited_with(conn, registry, runner_id)
+    stopped = status in ("unknown", "dead")
+    assert store.for_session(session_id).occupied is not stopped
+    if stopped:
+        placement = (conv.host_id, conv.workspace, conv.worktree, conv.git_branch)
+        settled = conv_store.get_conversation(session_id)
+        assert (
+            settled.host_id,
+            settled.workspace,
+            settled.worktree,
+            settled.git_branch,
+        ) == placement
+        monkeypatch.setattr(registry, "send_text", original_send)
+        retry = await client.post(
+            f"/v1/hosts/{_HOST_ID}/runners",
+            json={"session_id": session_id, "workspace": conv.workspace},
+        )
+        assert retry.status_code == 200, retry.text
+        assert retry.json()["status"] == "queued"
+        await admission.coordinator.advance(_HOST_ID)
+        await admission.coordinator.drain()
+        assert len(capture.launch) == 1, (
+            "settled runner binding prevented the same-session relaunch"
+        )
+        relaunched = conv_store.get_conversation(session_id)
+        assert relaunched.runner_id not in (None, runner_id)
+        assert store.for_session(session_id).occupied
+        assert (
+            relaunched.host_id,
+            relaunched.workspace,
+            relaunched.worktree,
+            relaunched.git_branch,
+        ) == placement
+
+
+@pytest.mark.asyncio
+async def test_busy_launch_does_not_block_other_startups_or_queue(
+    app, client, conv_store, register_host, monkeypatch
+):
+    # Recovery passes and their candidate ordering are driven explicitly below.
+    monkeypatch.setattr(app.state.startup_inputs, "host_changed", lambda *_args: None)
+    register_host()
+    registry = app.state.host_registry
+    conn = registry.get(_HOST_ID)
+    conn.hello.capabilities = ["startup_admission_v1", "startup_receipts:test"]
+    admission = app.state.startup_admission
+    admission.resolve_harness = AsyncMock(return_value="test")
+    store = app.state.startup_store
+    store.register_host_generation(_HOST_ID, conn.startup_generation)
+    sessions = []
+    for index in range(3):
+        created = await _multipart_create(
+            client, {"host_id": _HOST_ID, "workspace": "/opt/work/project"}
+        )
+        assert created.status_code == 201, created.text
+        sessions.append(created.json()["session_id"])
+        if index == 0:
+            await admission.coordinator.advance(_HOST_ID)
+            await admission.coordinator.drain()
+    exited, busy, queued = sessions
+    sent = asyncio.Event()
+    frames = []
+    original_send, original_list = registry.send_text, store.list_occupied
+
+    def no_ack(connection, text):
+        frame = decode_host_frame(text)
+        if isinstance(frame, HostLaunchRunnerFrame) and frame.session_id == busy:
+            frames.append(frame)
+            sent.set()
+        else:
+            original_send(connection, text)
+
+    monkeypatch.setattr(registry, "send_text", no_ack)
+    monkeypatch.setattr(
+        store,
+        "list_occupied",
+        lambda host: sorted(original_list(host), key=lambda s: s.session_id != busy),
+    )
+    query = AsyncMock(return_value="unknown")
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.helpers._query_host_runner_status", query
+    )
+    await admission.coordinator.advance(_HOST_ID)
+    await asyncio.wait_for(sent.wait(), 5)
+    assert store.for_session(queued).state == "queued"
+    try:
+        # A has no acknowledgement or deadline event; B must still release C's slot.
+        await asyncio.wait_for(admission.advance(_HOST_ID), 5)
+        assert store.for_session(busy).occupied
+        assert not store.for_session(exited).occupied
+        assert store.for_session(queued).occupied
+        busy_runner = token_bound_runner_id(frames[0].binding_token)
+        assert busy_runner not in [call.args[2] for call in query.await_args_list]
+    finally:
+        conn.pending_launches[frames[0].request_id].set_result({"status": "launched"})
+        await admission.coordinator.drain()
+    await admission.advance(_HOST_ID)
+    assert not store.for_session(busy).occupied
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("advance", ["grants", "host_generation"])
+async def test_death_settlement_rejects_authority_advanced_after_unknown(
+    app, client, conv_store, register_host, monkeypatch, advance
+):
+    register_host()
+    registry = app.state.host_registry
+    conn = registry.get(_HOST_ID)
+    conn.hello.capabilities = ["startup_admission_v1", "startup_receipts:test"]
+    admission = app.state.startup_admission
+    admission.resolve_harness = AsyncMock(return_value="test")
+    created = await _multipart_create(
+        client, {"host_id": _HOST_ID, "workspace": "/opt/work/project"}
+    )
+    assert created.status_code == 201, created.text
+    session_id = created.json()["session_id"]
+    store = app.state.startup_store
+    store.register_host_generation(_HOST_ID, conn.startup_generation)
+    await admission.coordinator.advance(_HOST_ID)
+    await admission.coordinator.drain()
+    startup = store.for_session(session_id)
+    runner_id = conv_store.get_conversation(session_id).runner_id
+    reached, proceed = threading.Event(), threading.Event()
+    original_settle = store.confirm_stopped
+
+    def pause_settlement(*args, **kwargs):
+        reached.set()
+        assert proceed.wait(5), "test did not release stop settlement"
+        return original_settle(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.helpers._query_host_runner_status",
+        AsyncMock(return_value="unknown"),
+    )
+    monkeypatch.setattr(store, "confirm_stopped", pause_settlement)
+    reconcile = asyncio.create_task(admission._settle_gone_runtimes(_HOST_ID))
+    try:
+        assert await asyncio.to_thread(reached.wait, 5)
+        if advance == "grants":
+            for boundary in ("runner_prepare", "runner_spawn"):
+                assert await asyncio.to_thread(
+                    store.claim_boundary,
+                    startup.id,
+                    startup.attempt_id,
+                    runtime_id=startup.runtime_id,
+                    host_generation=conn.startup_generation,
+                    boundary=boundary,
+                    claim_id=boundary,
+                    expected_runner_id=runner_id,
+                )
+        else:
+            await asyncio.to_thread(
+                store.register_host_generation, _HOST_ID, "replacement-generation"
+            )
+    finally:
+        proceed.set()
+        await asyncio.wait_for(reconcile, 5)
+    assert store.get(startup.id).occupied, "stale death evidence cleared advanced launch authority"
+    monkeypatch.setattr(store, "confirm_stopped", original_settle)
+    if advance == "host_generation":
+        registry.register(
+            _HOST_ID,
+            conn.ws,
+            conn.hello,
+            owner=conn.owner,
+            startup_generation="replacement-generation",
+        )
+    await admission._settle_gone_runtimes(_HOST_ID)
+    assert not store.get(startup.id).occupied
 
 
 @pytest.fixture(autouse=True)

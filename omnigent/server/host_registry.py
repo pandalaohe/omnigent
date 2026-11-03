@@ -678,6 +678,9 @@ class HostRegistry:
         self._startup_registrations: WeakValueDictionary[tuple[int, str], LockType] = (
             WeakValueDictionary()
         )
+        self._startup_launches: WeakValueDictionary[tuple[int, str], LockType] = (
+            WeakValueDictionary()
+        )
         # Last gateway-inference map each host reported, keyed by canonical
         # host_id alone: the map describes the machine's local config, so the
         # same machine connected to two workspaces reports the same answer.
@@ -708,6 +711,25 @@ class HostRegistry:
             await asyncio.sleep(0.01)
         try:
             yield
+        finally:
+            lock.release()
+
+    @asynccontextmanager
+    async def startup_launch(self, session_id: str, *, wait: bool = True) -> AsyncIterator[bool]:
+        """Keep binding-to-host issuance and process-death queries in causal order."""
+        key = (current_workspace_id(), session_id)
+        with self._lock:
+            lock = self._startup_launches.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._startup_launches[key] = lock
+        while not lock.acquire(blocking=False):
+            if not wait:
+                yield False
+                return
+            await asyncio.sleep(0.01)
+        try:
+            yield True
         finally:
             lock.release()
 
