@@ -326,6 +326,7 @@ from omnigent.server.routes._sessions.helpers import (
     _forward_approval_to_runner,
     _forward_session_change_to_runner,
     _get_runner_client,
+    _had_recorded_usage,
     _handle_advise_models_mcp,
     _HostRunnerStopAttempt,
     _inherited_placement,
@@ -357,6 +358,7 @@ from omnigent.server.routes._sessions.helpers import (
     _owner_from_grants,
     _parse_background_tasks,
     _parse_external_conversation_item,
+    _parse_token_buckets,
     _parse_tokens_by_model,
     _pending_elicitation_snapshot_for_session,
     _permission_level_from_grants,
@@ -385,6 +387,7 @@ from omnigent.server.routes._sessions.helpers import (
     _record_daily_cost,
     _record_native_hours,
     _record_usage_hours,
+    _recorded_token_total,
     _reject_reserved_cost_control_label_seed,
     _reject_server_reserved_label_seed,
     _relay_persist,
@@ -3510,6 +3513,15 @@ def _persist_native_cumulative_usage(
     # Old cumulative token totals, captured before the overwrites below so
     # per-model attribution can add only this report's growth (new - old).
     old_tokens = {key: int(current.get(key, 0) or 0) for key in _MODEL_TOKEN_KEYS}
+    # The BILLING baseline: a per-bucket high-water mark, kept apart from the
+    # displayed (SET) counters above. Growth is measured from the mark, so a
+    # replayed or rebased report below it bills nothing, and the count coming
+    # back up is not charged a second time.
+    billed_tokens = _parse_token_buckets(current.get("native_billed_tokens"))
+    # Whether this session already carries usage from before this build: the
+    # first report of such a session adopts its totals instead of backfilling
+    # history into the current hour.
+    had_recorded_usage = _had_recorded_usage(current, old_cost)
     # Baseline for the per-model token growth a Claude host reports with its
     # cost: cumulative per model, so a retried or repeated post adds nothing.
     old_tokens_by_model = _parse_tokens_by_model(current.get("native_tokens_by_model"))
@@ -3605,15 +3617,24 @@ def _persist_native_cumulative_usage(
                 # switch or a model that gains a price never reprices earlier
                 # usage. At a fixed price and model this equals pricing the
                 # running total, because compute_llm_cost is linear in each
-                # count. Growth is clamped >= 0 per bucket, so a fabricated
-                # low report can only leave the figure unchanged, never lower
-                # it — the same guarantee the previous ``max`` gave.
+                # count. Growth is measured from the monotonic billing mark, so
+                # a lower report bills nothing and the count coming back up
+                # bills nothing either — a replayed total cannot double charge.
                 growth = {
-                    key: max(0, int(current.get(key, 0) or 0) - old_tokens[key])
+                    key: max(0, int(current.get(key, 0) or 0) - billed_tokens.get(key, 0))
                     for key in _MODEL_TOKEN_KEYS
                 }
                 current["total_cost_usd"] = old_cost + compute_llm_cost(growth, pricing)
                 growth_priced = True
+
+    if has_tokens:
+        # Advance the billing mark unconditionally: an unpriced growth is
+        # recorded once, in its own hourly row, and must not be charged later
+        # when a price appears (design §2.10 — only the fill reaches it).
+        current["native_billed_tokens"] = {
+            key: max(int(current.get(key, 0) or 0), billed_tokens.get(key, 0))
+            for key in _MODEL_TOKEN_KEYS
+        }
 
     # ADD this report's growth (new - old) to the active model, not the whole
     # cumulative total, so per-model buckets sum to the flat total across model
@@ -3645,26 +3666,50 @@ def _persist_native_cumulative_usage(
     # shrunken report (a ``/clear``) contributes no negative growth.
     token_growth_by_model: dict[str, TokenGrowth] = {}
     if tokens_by_model:
-        merged_baseline = dict(old_tokens_by_model)
-        for token_model, counts in tokens_by_model.items():
-            prior = old_tokens_by_model.get(token_model, {})
-            token_growth_by_model[token_model] = TokenGrowth(
-                input_tokens=max(0, counts.get("input_tokens", 0) - prior.get("input_tokens", 0)),
-                cached_tokens=max(
-                    0, counts.get("cached_tokens", 0) - prior.get("cached_tokens", 0)
-                ),
-                cache_write_tokens=max(
-                    0, counts.get("cache_write_tokens", 0) - prior.get("cache_write_tokens", 0)
-                ),
-                output_tokens=max(
-                    0, counts.get("output_tokens", 0) - prior.get("output_tokens", 0)
-                ),
-                total_tokens=max(0, counts.get("total_tokens", 0) - prior.get("total_tokens", 0)),
-            )
-            merged_baseline[token_model] = {
-                key: max(counts.get(key, 0), prior.get(key, 0)) for key in _USAGE_HOUR_TOKEN_KEYS
+        if not old_tokens_by_model and had_recorded_usage:
+            # An existing session upgraded to this build: its usage predates the
+            # hourly table, and there is no history to take (design §2.7 closes
+            # the hours at install). Adopt the reported totals as the baseline
+            # and record no token growth for this report, so history is not
+            # backfilled into the current hour.
+            current["native_tokens_by_model"] = {
+                token_model: {key: counts.get(key, 0) for key in _USAGE_HOUR_TOKEN_KEYS}
+                for token_model, counts in tokens_by_model.items()
             }
-        current["native_tokens_by_model"] = merged_baseline
+        else:
+            merged_baseline = dict(old_tokens_by_model)
+            for token_model, counts in tokens_by_model.items():
+                prior = old_tokens_by_model.get(token_model, {})
+                if prior and _recorded_token_total(counts) < _recorded_token_total(prior):
+                    # The transcript ledger restarted below the persisted
+                    # baseline — a cross-host reconstruction replays history
+                    # without usage. Rebase this model to zero so the new
+                    # transcript's tokens are recorded rather than masked; the
+                    # billing mark above keeps the money from being recharged.
+                    prior = {}
+                token_growth_by_model[token_model] = TokenGrowth(
+                    input_tokens=max(
+                        0, counts.get("input_tokens", 0) - prior.get("input_tokens", 0)
+                    ),
+                    cached_tokens=max(
+                        0, counts.get("cached_tokens", 0) - prior.get("cached_tokens", 0)
+                    ),
+                    cache_write_tokens=max(
+                        0,
+                        counts.get("cache_write_tokens", 0) - prior.get("cache_write_tokens", 0),
+                    ),
+                    output_tokens=max(
+                        0, counts.get("output_tokens", 0) - prior.get("output_tokens", 0)
+                    ),
+                    total_tokens=max(
+                        0, counts.get("total_tokens", 0) - prior.get("total_tokens", 0)
+                    ),
+                )
+                merged_baseline[token_model] = {
+                    key: max(counts.get(key, 0), prior.get(key, 0))
+                    for key in _USAGE_HOUR_TOKEN_KEYS
+                }
+            current["native_tokens_by_model"] = merged_baseline
 
     conversation_store.set_session_usage(session_id, current)
     # Per-user daily rollup. Native reports cumulative totals, so the turn's
@@ -3676,16 +3721,23 @@ def _persist_native_cumulative_usage(
     # daily rollup from ever being clawed back even if that invariant changes.
     cost_growth = max(0.0, new_cost - old_cost)
     _record_daily_cost(conv, cost_growth, conversation_store)
-    _record_native_hours(
-        conv,
-        conversation_store,
-        model=model_name if isinstance(model_name, str) else None,
-        old_tokens=old_tokens,
-        current=current,
-        cost_growth=cost_growth,
-        priced=growth_priced,
-        token_growth_by_model=token_growth_by_model,
-    )
+    # The whole hourly-recording operation is guarded here as well as inside
+    # itself: a bookkeeping write must never fail a turn whose usage and cost
+    # are already persisted.
+    try:
+        _record_native_hours(
+            conv,
+            conversation_store,
+            model=model_name if isinstance(model_name, str) else None,
+            billed_tokens=billed_tokens,
+            current=current,
+            cost_growth=cost_growth,
+            priced=growth_priced,
+            tokens_by_model_reported=bool(tokens_by_model),
+            token_growth_by_model=token_growth_by_model,
+        )
+    except Exception:  # noqa: BLE001 — the turn continues without hourly rows
+        _logger.warning("usage_hours recording failed; continuing the turn", exc_info=True)
     return _priced_cost_for_display(current)
 
 

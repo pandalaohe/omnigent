@@ -414,3 +414,195 @@ def test_owner_isolation_between_accounts(
     [bob_row] = hours.read(_OTHER_OWNER, _this_hour(), _this_hour() + 3600)
     assert alice_row.input_tokens == 1_000_000
     assert bob_row.input_tokens == 2_000_000
+
+
+def _claude_tokens(count: int) -> dict:
+    """One model's cumulative token totals, as a Claude host posts them."""
+    return {"claude-x": {"input_tokens": count, "total_tokens": count}}
+
+
+def test_replayed_lower_report_does_not_recharge(
+    db_uri: str, hours: UsageHoursStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A shrunken then restored cumulative report bills 1M tokens once.
+
+    A replayed or rebased report below the high-water mark must not reset the
+    billing baseline: 1M -> 500K -> 1M at $1/M is $1.00 of usage, and the extra
+    $0.50 would exhaust a real budget.
+    """
+    _patch_price(monkeypatch, _price(1.0))
+    conv_id = _session(db_uri)
+    store = SqlAlchemyConversationStore(db_uri)
+    for tokens in (1_000_000, 500_000, 1_000_000):
+        _persist_native_cumulative_usage(
+            conv_id, {"cumulative_input_tokens": tokens, "model": "m"}, store
+        )
+
+    assert _usage(store, conv_id)["total_cost_usd"] == pytest.approx(1.0)
+    assert store.get_daily_cost(_OWNER, _today()) == pytest.approx(1.0)
+    [row] = hours.read(_OWNER, _this_hour(), _this_hour() + 3600)
+    assert row.cost_usd == pytest.approx(1.0)
+    assert row.input_tokens == 1_000_000
+
+
+def test_disabled_recorder_does_not_look_up_the_owner(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Recording off means no attribution work at all, so nothing can fail."""
+    lookups: list[str] = []
+    configure_usage_hours(UsageHoursRecorder(UsageHoursStore(db_uri), enabled=False))
+    try:
+        _patch_price(monkeypatch, None)
+        conv_id = _session(db_uri)
+        store = SqlAlchemyConversationStore(db_uri)
+        real = store.get_session_owner_authority
+
+        def _spy(conversation_id, **kwargs):
+            lookups.append(conversation_id)
+            return real(conversation_id, **kwargs)
+
+        monkeypatch.setattr(store, "get_session_owner_authority", _spy)
+        _persist_native_cumulative_usage(
+            conv_id, {"cumulative_input_tokens": 10, "model": "unpriced"}, store
+        )
+        assert lookups == []
+        assert _usage(store, conv_id)["input_tokens"] == 10
+    finally:
+        configure_usage_hours(None)
+
+
+def test_owner_lookup_failure_does_not_fail_the_turn(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unpriced completion survives a failing attribution lookup.
+
+    Before the hourly rows existed, an unpriced turn needed no owner lookup at
+    all; adding one must not turn a bookkeeping read into a failed turn after
+    the usage was already persisted.
+    """
+    configure_usage_hours(UsageHoursRecorder(UsageHoursStore(db_uri)))
+    try:
+        _patch_price(monkeypatch, None)
+        conv_id = _session(db_uri)
+        store = SqlAlchemyConversationStore(db_uri)
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("owner lookup down")
+
+        monkeypatch.setattr(store, "get_session_owner_authority", _boom)
+        _persist_native_cumulative_usage(
+            conv_id, {"cumulative_input_tokens": 10, "model": "unpriced"}, store
+        )
+        assert _usage(store, conv_id)["input_tokens"] == 10
+    finally:
+        configure_usage_hours(None)
+
+
+def test_policy_only_tokens_are_not_filled_again(db_uri: str, hours: UsageHoursStore) -> None:
+    """Tokens carried by a policy-only post are already covered by Claude's cost.
+
+    Mid-sub-agent the forwarder posts tokens with only ``policy_cost_usd``, and
+    the display cost arrives later on its own. The tokens are priced (design
+    §2.7), so a later fill must not charge them a second time.
+    """
+    conv_id = _session(db_uri)
+    store = SqlAlchemyConversationStore(db_uri)
+    _persist_native_cumulative_usage(
+        conv_id,
+        {
+            "policy_cost_usd": 0.0,
+            "model": "claude-x",
+            "cumulative_tokens_by_model": _claude_tokens(1_000_000),
+        },
+        store,
+    )
+    _persist_native_cumulative_usage(
+        conv_id,
+        {
+            "cumulative_cost_usd": 1.0,
+            "model": "claude-x",
+            "cumulative_tokens_by_model": _claude_tokens(1_000_000),
+        },
+        store,
+    )
+
+    assert hours.fill_unpriced(lambda model: _price(1.0), _this_hour() + 3600) == 0
+    rows = hours.read(_OWNER, _this_hour(), _this_hour() + 3600)
+    daily = store.get_daily_cost(_OWNER, _today())
+    assert sum(row.cost_usd for row in rows) == pytest.approx(daily)
+    assert daily == pytest.approx(1.0)
+
+
+def test_reconstructed_transcript_rebases_the_token_baseline(
+    db_uri: str, hours: UsageHoursStore
+) -> None:
+    """A rebuilt transcript restarts the ledger, so the next tokens still count."""
+    conv_id = _session(db_uri)
+    store = SqlAlchemyConversationStore(db_uri)
+    _persist_native_cumulative_usage(
+        conv_id,
+        {
+            "cumulative_cost_usd": 1.0,
+            "model": "claude-x",
+            "cumulative_tokens_by_model": _claude_tokens(1_000_000),
+        },
+        store,
+    )
+    # Cross-host reconstruction replays history without usage, so the ledger
+    # restarts at zero and this report covers only the new work.
+    _persist_native_cumulative_usage(
+        conv_id,
+        {
+            "cumulative_cost_usd": 1.1,
+            "model": "claude-x",
+            "cumulative_tokens_by_model": _claude_tokens(100_000),
+        },
+        store,
+    )
+
+    rows = [row for row in hours.read(_OWNER, _this_hour(), _this_hour() + 3600) if row.model]
+    assert sum(row.input_tokens for row in rows) == 1_100_000
+
+
+def test_upgraded_session_does_not_backfill_historical_tokens(
+    db_uri: str, hours: UsageHoursStore
+) -> None:
+    """A session the previous build already recorded adopts its baseline.
+
+    There is no hours history to take (design §2.7: no backfill), so the first
+    report after the upgrade records only its own cost growth and no tokens.
+    """
+    conv_id = _session(db_uri)
+    store = SqlAlchemyConversationStore(db_uri)
+    store.increment_session_usage(
+        conv_id,
+        {"input_tokens": 1_000_000, "total_tokens": 1_000_000, "total_cost_usd": 1.0},
+    )
+    _persist_native_cumulative_usage(
+        conv_id,
+        {
+            "cumulative_cost_usd": 1.1,
+            "model": "claude-x",
+            "cumulative_tokens_by_model": _claude_tokens(1_100_000),
+        },
+        store,
+    )
+
+    rows = hours.read(_OWNER, _this_hour(), _this_hour() + 3600)
+    assert [row.total_tokens for row in rows] == [0]
+    assert sum(row.cost_usd for row in rows) == pytest.approx(0.1)
+
+    # The growth after the adoption is recorded normally.
+    _persist_native_cumulative_usage(
+        conv_id,
+        {
+            "cumulative_cost_usd": 1.2,
+            "model": "claude-x",
+            "cumulative_tokens_by_model": _claude_tokens(1_200_000),
+        },
+        store,
+    )
+    token_rows = [
+        row for row in hours.read(_OWNER, _this_hour(), _this_hour() + 3600) if row.total_tokens
+    ]
+    assert [row.input_tokens for row in token_rows] == [100_000]
