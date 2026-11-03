@@ -25,9 +25,9 @@ How it differs from the transcript forwarder it supersedes:
   no-delta mapping layer. It deliberately does NOT emit
   status edges — that was always the stateful parser's job. This driver is now
   that stateful layer: it replicates the transcript parser's RUNNING/IDLE
-  transition emission (a turn opens on a USER_INPUT step and closes on an
-  assistant-text PLANNER_RESPONSE that issues no tool calls), deduped so an edge
-  fires only on a real transition.
+  transition emission (a turn opens on USER_INPUT, errors close immediately,
+  and the idle detector closes successful turns),
+  deduped so an edge fires only on a real transition.
 
 Discovery mirrors the forwarder's discipline — *poll until ready, never guess*:
 
@@ -61,6 +61,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from time import monotonic
 from typing import Literal
 
 import httpx
@@ -118,19 +119,6 @@ _DEFAULT_POLL_INTERVAL_S = 0.25
 # them streams — they are committed-only, so a sub-second tick buys nothing.
 _SUBAGENT_POLL_INTERVAL_S = 1.0
 
-# Consecutive no-new-step polls before a sub-agent whose turn never closed is
-# checked against agy's own run status. Generous: a child running a long build
-# produces no steps meanwhile, and cutting it short would truncate its
-# transcript. The cost of waiting is only how long a stuck badge lingers.
-_SUBAGENT_QUIESCENT_POLLS = 60
-
-# Ceiling for that window. agy answering "still running" does not end the mirror
-# — a wrong "idle" truncates a transcript, so the status check can only ever
-# veto — which makes the window a repeating re-check rather than one grace
-# period. It doubles after each veto so a child that never reports idle settles
-# to one cheap check every few minutes instead of one a minute all session.
-_SUBAGENT_QUIESCENT_POLLS_MAX = 480
-
 # Default seconds between Task T-G ``/clear``-rotation checks
 # (``GetAllCascadeTrajectories``). Coarse on purpose: a ``/clear`` is a rare,
 # human-initiated event, so a few seconds of detection latency is fine and keeps
@@ -181,6 +169,9 @@ _CASCADE_RUN_STATUS_IDLE = "CASCADE_RUN_STATUS_IDLE"
 # Consecutive idle observations required before the backstop closes a turn. One
 # reading can catch the gap between delivering a turn and agy starting it.
 _QUIESCENT_TICKS_TO_CLOSE = 2
+# Bound unavailable completion observations without blocking the stream's error path.
+_IDLE_READ_TIMEOUT_S = 2.0
+_UNCONFIRMED_TURN_TIMEOUT_S = 120.0
 # Terminal-failure session status (a valid ``external_session_status``; see the
 # ``Literal["idle", "running", "failed"]`` schema). Emitted when an agy turn
 # closes on a model/turn ERROR so the web UI shows the turn FAILED instead of a
@@ -632,19 +623,11 @@ def _is_user_turn_step(step: dict[str, object]) -> bool:
 
 def _is_assistant_text_close_step(step: dict[str, object]) -> bool:
     """
-    Return whether a step closes a turn (assistant text, no further tool calls).
+    Return whether a step is a successful turn-close candidate.
 
-    The RPC equivalent of the transcript forwarder's
-    :func:`_is_assistant_text_step`: a PLANNER_RESPONSE that carries assistant
-    text (``modifiedResponse`` or ``response``) is the closing edge of a turn —
-    agy answered and stopped. A planner step that only invokes a tool does not
-    close the turn (the tool result, and possibly more planner steps, follow).
-
-    The TEXT is what separates the two: a dispatching planner carries none, in
-    either RPC shape. The ``toolCalls`` test below is a poll-shape-only
-    belt-and-braces guard for a planner that somehow carried both — it cannot
-    fire on the stream, where the field is stripped (see
-    :func:`_is_turn_close_step`).
+    This is only a candidate: streamed progress text can accompany a tool
+    dispatch whose ``toolCalls`` field was stripped. The caller must confirm
+    that agy is idle and this is the last step before closing the turn.
 
     :param step: One RPC step dict.
     :returns: ``True`` when the step is a DONE PLANNER_RESPONSE with non-empty
@@ -674,22 +657,16 @@ def _is_turn_close_step(step: dict[str, object]) -> bool:
     """
     Return whether a step ends the current turn (fire the IDLE edge).
 
-    A turn opens on USER_INPUT and stays open until agy stops working. Exactly
-    two steps close it:
+    A turn opens on USER_INPUT and stays open until agy stops working. Two
+    kinds of step can close it:
 
     * a DONE PLANNER_RESPONSE carrying assistant text
-      (:func:`_is_assistant_text_close_step`) — agy answered and stopped; and
+      (:func:`_is_assistant_text_close_step`), subject to idle confirmation; and
     * a terminal-ERROR PLANNER_RESPONSE — agy's model step failed, so no tool
       result or recovery planner follows.
 
-    **Assistant text is the close signal, not the absence of ``toolCalls``.**
-    Text is the one discriminator that holds in BOTH RPC shapes: a planner that
-    dispatches a tool carries no text on the poll shape *or* the stream shape,
-    while an answering planner carries text on both. ``toolCalls`` exists only
-    on the poll shape (the stream strips it, as does ``metadata.toolCall``), so
-    a "closes unless it dispatched" rule read a STREAMED dispatch — DONE, no
-    toolCalls, no text — as a degenerate close and fired IDLE the moment agy
-    called a tool, clearing the spinner for the rest of the turn.
+    Successful candidates additionally require the cascade's idle status and
+    latest step identity. Text alone can be progress before further tool work.
 
     A DONE planner with neither text nor a dispatch is therefore NOT treated as
     a close: that shape is indistinguishable from a streamed dispatch, and
@@ -851,7 +828,7 @@ async def _watch_for_rotation(
     interval_s: float,
     skip_cascade_ids: frozenset[str],
     on_rotation: Callable[[str], None],
-    on_quiescent: Callable[[], Awaitable[None]] | None = None,
+    read_summaries: Callable[[], Awaitable[dict[str, object]]] | None = None,
     bridge_dir: Path | None = None,
 ) -> None:
     """
@@ -889,15 +866,10 @@ async def _watch_for_rotation(
     :param skip_cascade_ids: Cascade ids a prior rotation attempt failed to bind;
         never re-signalled.
     :param on_rotation: Called once with the detected new cascade id.
-    :param on_quiescent: Optional turn-close BACKSTOP, awaited once the bound
-        cascade has reported idle on :data:`_QUIESCENT_TICKS_TO_CLOSE`
-        consecutive ticks. Unlike ``on_rotation`` this does NOT end the detector:
-        a session can go idle and busy again many times over its life. It exists
-        so a turn the step-based close missed cannot strand the session forever —
-        the cost of a miss becomes one interval, not a permanent hang.
+    :param read_summaries: Optional per-tick summary read and turn reconciliation.
+        Shares the summary RPC with rotation detection, including on failed reads.
     :returns: None.
     """
-    idle_ticks = 0
     while True:
         await _sleep(interval_s)
         if bridge_dir is not None:
@@ -906,7 +878,13 @@ async def _watch_for_rotation(
                 on_rotation(binding.conversation_id)
                 return
         try:
-            body = await asyncio.to_thread(get_all_cascade_trajectories, port)
+            body = (
+                await read_summaries()
+                if read_summaries is not None
+                else await asyncio.to_thread(
+                    get_all_cascade_trajectories, port, timeout_s=_IDLE_READ_TIMEOUT_S
+                )
+            )
         except httpx.ConnectError as exc:
             # Connection refused is benign here: the agy port is gone because the
             # terminal is being torn down / rotated / shut down before this
@@ -933,13 +911,6 @@ async def _watch_for_rotation(
         summaries = body.get("trajectorySummaries")
         if not isinstance(summaries, dict):
             continue
-        if on_quiescent is not None:
-            if _cascade_is_idle(summaries, bound_cascade_id):
-                idle_ticks += 1
-                if idle_ticks == _QUIESCENT_TICKS_TO_CLOSE:
-                    await on_quiescent()
-            else:
-                idle_ticks = 0
         new_cascade_id = _detect_rotated_cascade(summaries, bound_cascade_id)
         if new_cascade_id is None or new_cascade_id in skip_cascade_ids:
             continue
@@ -974,8 +945,8 @@ async def supervise_reader(
 
     * maps the step to conversation-item events (:func:`map_step_to_events`) and
       POSTs each one, including user turns, with a stable source identity;
-    * emits an ``external_session_status`` RUNNING edge when a user turn opens and
-      an IDLE edge when an assistant-text step closes it, each only on a real
+    * emits RUNNING when a user turn opens, FAILED on an error step, and IDLE
+      after consecutive idle observations, each only on a real
       transition (deduped via an in-memory turn-active flag);
     * when the step is ``WAITING`` for user interaction, invokes
       ``on_pending_interaction`` exactly once for that interaction (the Task 8
@@ -1078,22 +1049,15 @@ async def supervise_reader(
             if body_holder:
                 body_holder[0].cancel()
 
-    async def _close_turn_if_stranded() -> None:
-        # Turn-close BACKSTOP. The step-based close (``_is_turn_close_step``) is the
-        # fast path; this fires only when agy itself has reported the cascade idle
-        # and Omnigent still believes a turn is open — i.e. the close was missed.
-        # Reconciliation rather than edge detection, so a missed/unknown/reordered
-        # step costs one detector interval instead of stranding the session.
-        if not state.turn_active:
-            return
-        state.turn_active = False
-        _logger.info(
-            "agy reader closing a turn agy reports finished but Omnigent still had "
-            "open (step-based close was missed): session=%s cascade=%s",
-            session_id,
-            cascade_id,
+    async def _read_summaries_and_close() -> dict[str, object]:
+        return await _reconcile_idle_turn(
+            port=port,
+            cascade_id=cascade_id,
+            client=client,
+            session_id=session_id,
+            state=state,
+            on_pending_interaction=on_pending_interaction,
         )
-        await _post_event(client, session_id, _status_event(_STATUS_IDLE))
 
     def _body_should_stop() -> bool:
         # The reader body stops either on the caller's stop OR once a rotation was
@@ -1153,7 +1117,7 @@ async def supervise_reader(
             interval_s=detect_rotation_interval_s,
             skip_cascade_ids=skip_cascade_ids,
             on_rotation=_on_rotation,
-            on_quiescent=_close_turn_if_stranded,
+            read_summaries=_read_summaries_and_close,
             bridge_dir=bridge_dir,
         ),
         name="antigravity-rotation-detector",
@@ -1299,10 +1263,15 @@ class _ReaderState:
 
     seen: set[_StepKey]
     interacted: set[_StepKey]
+    commit_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     prefixes: dict[int, str] = field(default_factory=dict)
     delta_chunks: dict[int, int] = field(default_factory=dict)
     reasoning_prefixes: dict[int, str] = field(default_factory=dict)
     turn_active: bool = False
+    turn_generation: int = 0
+    idle_ticks: int = 0
+    last_work_at: float = field(default_factory=lambda: monotonic())
+    last_text: str = ""
     posted_model_enum: str | None = None
     model_catalog: dict[str, object] | None = None
     port: int = 0
@@ -1447,6 +1416,7 @@ async def _stream_loop(
     """
     while not stop():
         async for frame in stream_agent_state_updates(port, cascade_id):
+            state.last_work_at = monotonic()
             context = frame.get("contextWindowUsage")
             if isinstance(context, dict):
                 payload: dict[str, object] = {}
@@ -1525,6 +1495,27 @@ async def _process_committed_step(
     state: _ReaderState,
     on_pending_interaction: OnPendingInteraction,
 ) -> None:
+    """Serialize live frames and idle reconciliation through the same commit path."""
+    async with state.commit_lock:
+        await _commit_step(
+            step,
+            client=client,
+            session_id=session_id,
+            cascade_id=cascade_id,
+            state=state,
+            on_pending_interaction=on_pending_interaction,
+        )
+
+
+async def _commit_step(
+    step: dict[str, object],
+    *,
+    client: httpx.AsyncClient,
+    session_id: str,
+    cascade_id: str,
+    state: _ReaderState,
+    on_pending_interaction: OnPendingInteraction,
+) -> None:
     """
     Emit one step's committed items + status edges + interaction (poll path).
 
@@ -1567,8 +1558,16 @@ async def _process_committed_step(
             state.metered_steps.add(key)
             state.pending_metering.discard(key)
     if key not in state.seen:
+        if _is_user_turn_step(step):
+            state.turn_generation += 1
+            state.idle_ticks = 0
+            state.last_text = ""
+        text = _committed_planner_text(step)
+        if text:
+            state.last_text = text
         if _is_settled(step):
             state.seen.add(key)
+            state.last_work_at = monotonic()
         # Close any live block for this step BEFORE its committed item. Done
         # here rather than in the stream handler because the poll loop commits
         # through this same function: closing in only one path leaves every
@@ -1723,32 +1722,74 @@ async def _register_subagent_child(
     return child_session_id
 
 
-async def _subagent_cascade_is_idle(port: int, child_cascade_id: str) -> bool:
-    """
-    Ask agy whether a sub-agent cascade has stopped running.
-
-    The authoritative completion signal, used only to break a stall: a child that
-    has gone quiet without a recognizable closing step. Fail-safe on any RPC
-    trouble — reporting "not idle" keeps mirroring, where a wrong "idle" would
-    truncate a sub-agent mid-run.
-
-    :param port: agy connect-RPC port.
-    :param child_cascade_id: The sub-agent's agy conversation id.
-    :returns: ``True`` only on an explicit idle status for that cascade.
-    """
+async def _reconcile_idle_turn(
+    *,
+    port: int,
+    cascade_id: str,
+    client: httpx.AsyncClient,
+    session_id: str,
+    state: _ReaderState,
+    on_pending_interaction: OnPendingInteraction,
+    poll_steps: bool = False,
+) -> dict[str, object]:
+    """Read once per tick, then atomically reconcile only the turn we observed."""
+    generation = state.turn_generation
+    body: dict[str, object] = {}
+    steps: list[dict[str, object]] | None = None
     try:
-        body = await asyncio.to_thread(get_all_cascade_trajectories, port)
-    except (httpx.HTTPError, ValueError) as exc:
-        _logger.warning(
-            "agy sub-agent idle check failed; still mirroring: child=%s error=%r",
-            child_cascade_id,
-            exc,
+        body = await asyncio.to_thread(
+            get_all_cascade_trajectories, port, timeout_s=_IDLE_READ_TIMEOUT_S
         )
-        return False
+    except (httpx.HTTPError, ValueError) as exc:
+        _logger.warning("agy completion summary failed: session=%s error=%r", session_id, exc)
     summaries = body.get("trajectorySummaries")
-    if not isinstance(summaries, dict):
-        return False
-    return _cascade_is_idle(summaries, child_cascade_id)
+    summary = summaries.get(cascade_id) if isinstance(summaries, dict) else None
+    status = summary.get("status") if isinstance(summary, dict) else None
+    if generation == state.turn_generation and status == "CASCADE_RUN_STATUS_RUNNING":
+        state.last_work_at = monotonic()
+        state.idle_ticks = 0
+    if not poll_steps and (not state.turn_active or status == "CASCADE_RUN_STATUS_RUNNING"):
+        return body
+    try:
+        steps = await asyncio.to_thread(
+            get_trajectory_steps, port, cascade_id, timeout_s=_IDLE_READ_TIMEOUT_S
+        )
+    except (httpx.HTTPError, ValueError) as exc:
+        _logger.warning("agy completion snapshot failed: session=%s error=%r", session_id, exc)
+    async with state.commit_lock:
+        # A continuation observed during either RPC owns a different completion.
+        if generation != state.turn_generation:
+            return body
+        for step in steps or ():
+            if isinstance(step, dict):
+                await _commit_step(
+                    step,
+                    client=client,
+                    session_id=session_id,
+                    cascade_id=cascade_id,
+                    state=state,
+                    on_pending_interaction=on_pending_interaction,
+                )
+        if not state.turn_active or generation != state.turn_generation:
+            return body
+        if steps and isinstance(steps[-1], dict) and not _is_settled(steps[-1]):
+            state.last_work_at = monotonic()
+        state.idle_ticks = (
+            state.idle_ticks + 1 if status == _CASCADE_RUN_STATUS_IDLE and steps is not None else 0
+        )
+        if state.turn_generation > 0 and state.idle_ticks >= _QUIESCENT_TICKS_TO_CLOSE:
+            event = _status_event(_STATUS_IDLE)
+        elif monotonic() - state.last_work_at >= _UNCONFIRMED_TURN_TIMEOUT_S:
+            event = _status_event(_STATUS_FAILED)
+            event.data["output"] = (
+                state.last_text + "\n\nAntigravity completion could not be confirmed after "
+                "120 seconds without evidence of work; the last received text is shown above."
+            ).strip()
+        else:
+            return body
+        state.turn_active = False
+        await _post_event(client, session_id, event)
+    return body
 
 
 async def _mirror_subagent_cascade(
@@ -1758,43 +1799,10 @@ async def _mirror_subagent_cascade(
     client: httpx.AsyncClient,
     child_session_id: str,
 ) -> None:
-    """
-    Mirror one sub-agent cascade into its Omnigent child session until it ends.
+    """Mirror a registered helper through the root reader's idle/silence checks.
 
-    A sub-agent cascade is an ordinary cascade on the SAME agy RPC port, so this
-    is the committed-only poll path pointed at the child — the same mapper, the
-    same status edges. Its ``_ReaderState`` is private to the child so its
-    de-dup and turn flag cannot collide with the parent's.
-
-    **The parent's step is not the finish signal.** ``invoke_subagent`` is
-    fire-and-forget: its step reaches DONE the moment the child is spawned, while
-    the child runs on for minutes afterwards (live-verified — a child kept
-    working 23s past its spawning step's ``completedAt``, and accumulated 35
-    steps). Stopping on it mirrored only the child's opening prompt and left the
-    rail spinning forever, so the child's OWN turn decides:
-
-    * the turn opened and then closed — the ordinary path, and the close is what
-      posts the child's IDLE edge;
-    * the turn is open but the child has gone quiet for
-      :data:`_SUBAGENT_QUIESCENT_POLLS` polls AND agy reports the cascade idle —
-      its closing step was not recognizable, so IDLE is posted here instead.
-      Without this a child whose turn never closes polls for the whole session
-      and shows as running forever. A "still running" answer only vetoes the
-      close, so the window then widens toward
-      :data:`_SUBAGENT_QUIESCENT_POLLS_MAX` rather than re-asking at the same
-      cadence forever.
-
-    Sub-agents are headless (they never raise an interaction), so the pending
-    handler is a no-op rather than the parent's bridge.
-
-    Runs until one of those two ends; the caller cancels it on reader teardown.
-    Whichever way it ends, it takes its own nested mirrors down with it.
-
-    :param port: agy connect-RPC port (shared with the parent).
-    :param child_cascade_id: The sub-agent's agy conversation id.
-    :param client: HTTP client for Omnigent event posts.
-    :param child_session_id: The Omnigent child conversation to mirror into.
-    :returns: None.
+    Registration opens its turn before the first trajectory read. Its spawning
+    step does not signal completion; nested mirrors end with their owning helper.
     """
 
     async def _no_interaction(_cascade: str, _port: int, _pending: PendingInteraction) -> None:
@@ -1802,67 +1810,24 @@ async def _mirror_subagent_cascade(
         return
 
     child_state = _ReaderState(
-        seen=set(), interacted=set(), port=port, usage_thread_kind="subagent"
+        seen=set(), interacted=set(), port=port, usage_thread_kind="subagent", turn_active=True
     )
-    turn_opened = False
-    quiet_polls = 0
-    quiescent_window = _SUBAGENT_QUIESCENT_POLLS
     try:
         while True:
-            try:
-                steps = await asyncio.to_thread(get_trajectory_steps, port, child_cascade_id)
-            except (httpx.HTTPError, ValueError) as exc:
-                _logger.warning(
-                    "agy sub-agent poll failed; retrying: child=%s error=%r",
-                    child_cascade_id,
-                    exc,
-                )
-                await _sleep(_SUBAGENT_POLL_INTERVAL_S)
-                continue
-            mirrored_before = len(child_state.seen)
-            for step in steps:
-                if not isinstance(step, dict):
-                    continue
-                await _process_committed_step(
-                    step,
-                    client=client,
-                    session_id=child_session_id,
-                    cascade_id=child_cascade_id,
-                    state=child_state,
-                    on_pending_interaction=_no_interaction,
-                )
-                # Checked per step, not per poll: a child that finishes between two
-                # polls delivers its whole transcript in ONE pass, opening and
-                # closing the turn before the poll returns.
-                if child_state.turn_active:
-                    turn_opened = True
-            if turn_opened and not child_state.turn_active:
+            await _reconcile_idle_turn(
+                port=port,
+                cascade_id=child_cascade_id,
+                client=client,
+                session_id=child_session_id,
+                state=child_state,
+                on_pending_interaction=_no_interaction,
+                poll_steps=True,
+            )
+            if not child_state.turn_active:
                 if not child_state.pending_metering:
                     return
                 await _sleep(_SUBAGENT_POLL_INTERVAL_S)
                 continue
-            if len(child_state.seen) != mirrored_before:
-                quiet_polls = 0
-                quiescent_window = _SUBAGENT_QUIESCENT_POLLS
-                continue
-            quiet_polls += 1
-            if turn_opened and quiet_polls >= quiescent_window:
-                if await _subagent_cascade_is_idle(port, child_cascade_id):
-                    _logger.info(
-                        "agy sub-agent went quiet with its turn open and agy reports it "
-                        "idle; closing it: child=%s session=%s",
-                        child_cascade_id,
-                        child_session_id,
-                    )
-                    await _post_event(client, child_session_id, _status_event(_STATUS_IDLE))
-                    if not child_state.pending_metering:
-                        return
-                    child_state.turn_active = False
-                # agy says it is still working, so keep mirroring — but a child
-                # that never reports idle would otherwise re-ask every window for
-                # the life of the session, so widen it geometrically.
-                quiet_polls = 0
-                quiescent_window = min(quiescent_window * 2, _SUBAGENT_QUIESCENT_POLLS_MAX)
             await _sleep(_SUBAGENT_POLL_INTERVAL_S)
     finally:
         # A child's steps run this same path, so a NESTED ``INVOKE_SUBAGENT``
@@ -2010,6 +1975,9 @@ async def _process_stream_step(
     :returns: None.
     """
     if _is_generating_planner(step):
+        text = _partial_planner_text(step)
+        if text:
+            state.last_text = text
         # Reasoning precedes the response (§10.2), so emit its delta first.
         await _emit_partial_reasoning_delta(
             step,
@@ -2339,8 +2307,9 @@ async def _emit_step(
     Emit one new step's status edges + mapped conversation items.
 
     Replicates the transcript parser's ordering: a RUNNING status edge (when this
-    step opens a turn) is posted BEFORE the step's items, and an IDLE edge (when
-    this step closes the turn) AFTER them. Status edges fire only on a real
+    step opens a turn) is posted BEFORE the step's items, and a FAILED edge for
+    an error AFTER them. Successful closes belong to the idle detector.
+    Status edges fire only on a real
     transition, deduped via the ``turn_active`` flag threaded through the loop.
 
     :param step: One new (not-yet-seen) RPC step dict.
@@ -2373,14 +2342,13 @@ async def _emit_step(
         event.data["source_id"] = "agy:" + hashlib.sha256(identity.encode()).hexdigest()
         await _post_event(client, session_id, event)
 
-    if _is_turn_close_step(step) and turn_active:
+    if _step_is_error_planner(step) and turn_active:
         turn_active = False
         # An ERROR planner closes the turn as FAILED, not a clean idle: a model /
         # safety-policy / rate-limit / provider-overload error must surface as a
         # failed turn (alongside the error item the mapper now emits), not a
         # silent empty success that looks identical to a normal reply (#6).
-        close_status = _STATUS_FAILED if _step_is_error_planner(step) else _STATUS_IDLE
-        await _post_event(client, session_id, _status_event(close_status))
+        await _post_event(client, session_id, _status_event(_STATUS_FAILED))
 
     return turn_active
 

@@ -6,7 +6,9 @@ import asyncio
 import contextlib
 import json
 import logging
+import threading
 import uuid
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -1012,6 +1014,282 @@ async def test_native_subagent_completion_wakes_idle_parent() -> None:
     # Notice names the finished worker and steers the parent to drain the inbox.
     assert "sub-agent claude_code/auth finished (completed)" in wake_text
     assert "sys_read_inbox" in wake_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("quiet_progress", [False, True])
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "none",
+        "summary",
+        "trajectory",
+        "continuation",
+        "slow_error",
+        "working",
+        "unfinished",
+        "helper",
+        "late_helper",
+    ],
+)
+async def test_antigravity_progress_does_not_spend_the_parent_wake(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, quiet_progress: bool, fault: str
+) -> None:
+    """Real idle reconciliation delivers once through the runner, even with RPC faults."""
+    from omnigent.harnesses.antigravity_native import reader
+
+    parent_id, child_id, cascade_id = "parent", "agy_child", "cascade"
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    server = _WakeRecordingServerClient(parent_id)
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        server_client=server,  # type: ignore[arg-type]
+    )
+    subagent_work._session_inboxes_ref[parent_id] = inbox
+    subagent_work.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="antigravity",
+        title="worker",
+        registered_by="sys_session_create",
+    )
+    latest_text = ""
+    messages: list[str] = []
+    closed_at: list[float] = []
+    snapshot: list[dict[str, Any]] = []
+    ready, reading = asyncio.Event(), asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    blocked = False
+    clock, reads, working = [0.0], 0, True
+    deadline_ticks = iter([1.0, 2.0, 3.0, 119.0, 120.0])
+    progressed = asyncio.Event()
+    monkeypatch.setattr(reader, "monotonic", lambda: clock[0], raising=False)
+
+    def summaries(_port: int, **kwargs: Any) -> dict[str, Any]:
+        nonlocal blocked
+        if fault == "summary" or (fault in {"working", "unfinished"} and working):
+            raise httpx.ReadTimeout("summary unavailable")
+        if fault == "slow_error" and not blocked:
+            blocked = True
+            loop.call_soon_threadsafe(reading.set)
+            assert release.wait(5)
+        return {
+            "trajectorySummaries": {
+                cascade_id: {
+                    "status": (
+                        "CASCADE_RUN_STATUS_IDLE"
+                        if ready.is_set()
+                        else "CASCADE_RUN_STATUS_RUNNING"
+                    )
+                }
+            }
+        }
+
+    def steps(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        nonlocal blocked, reads
+        if fault in {"trajectory", "helper"}:
+            raise httpx.ReadTimeout("trajectory unavailable")
+        if fault == "late_helper":
+            reads += 1
+            if reads <= 2:
+                return []
+            assert inbox.empty(), "empty snapshots spent the helper completion"
+            return [user, final]
+        if fault in {"working", "unfinished"} and working:
+            reads += 1
+            if fault == "working":
+                snapshot.append(planner(10 + reads, "Still working.\n[quiet]"))
+            if reads == 5:
+                loop.call_soon_threadsafe(progressed.set)
+        captured = list(snapshot)
+        if fault == "continuation" and not blocked:
+            blocked = True
+            loop.call_soon_threadsafe(reading.set)
+            assert release.wait(5)
+        return captured
+
+    async def tick(_seconds: float) -> None:
+        await ready.wait()
+        clock[0] = (
+            next(deadline_ticks, 121.0)
+            if fault in {"summary", "trajectory", "helper"}
+            else clock[0] + 40.0
+        )
+        if fault == "helper" and clock[0] > 120:
+            raise AssertionError("registered helper never posted its bounded failure")
+        await asyncio.sleep(0)
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "state.json").write_text(
+        json.dumps({"session_id": child_id, "conversation_id": cascade_id})
+    )
+    monkeypatch.setattr(reader, "_candidate_agy_rpc_ports", lambda: [4242])
+    monkeypatch.setattr(reader, "_conversation_matches", lambda *args: True)
+    monkeypatch.setattr(reader, "get_available_models", lambda *args: {})
+    monkeypatch.setattr(reader, "get_trajectory_steps", steps)
+    monkeypatch.setattr(reader, "get_all_cascade_trajectories", summaries)
+    monkeypatch.setattr(reader, "_sleep", tick)
+
+    async def no_interaction(*args: Any) -> None:
+        pass
+
+    def planner(index: int, text: str) -> dict[str, Any]:
+        return {
+            "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+            "status": "CORTEX_STEP_STATUS_DONE",
+            "metadata": {
+                "sourceTrajectoryStepInfo": {"trajectoryId": cascade_id, "stepIndex": index}
+            },
+            "plannerResponse": {"modifiedResponse": text},
+        }
+
+    try:
+        async with _runner_client(app) as client:
+
+            async def post_reader_event(**kwargs: Any) -> httpx.Response:
+                nonlocal latest_text
+                payload = kwargs["payload"]
+                data = payload["data"]
+                if payload["type"] == "external_conversation_item":
+                    item = data["item_data"]
+                    if item.get("role") == "assistant":
+                        latest_text = "".join(block.get("text", "") for block in item["content"])
+                        messages.append(latest_text)
+                if payload["type"] == "external_session_status":
+                    if data["status"] in {"idle", "failed"}:
+                        closed_at.append(clock[0])
+                    response = await client.post(
+                        f"/v1/sessions/{child_id}/events",
+                        json={"type": payload["type"], "data": {"output": latest_text, **data}},
+                    )
+                    assert response.status_code == 204, response.text
+                return httpx.Response(202)
+
+            monkeypatch.setattr(reader, "post_session_event_with_retry", post_reader_event)
+            async with httpx.AsyncClient(base_url="http://reader.test") as reader_client:
+                user = {
+                    "type": "CORTEX_STEP_TYPE_USER_INPUT",
+                    "status": "CORTEX_STEP_STATUS_DONE",
+                    "metadata": {"executionId": "turn-one"},
+                    "userInput": {"userResponse": "Work"},
+                }
+                progress = planner(
+                    1, "Running the check." + ("\n[quiet]" if quiet_progress else "")
+                )
+                final = planner(99, "READY")
+
+                async def stream(**kwargs: Any) -> None:
+                    nonlocal working
+
+                    async def step(value: dict[str, Any]) -> None:
+                        await reader._process_committed_step(
+                            value,
+                            client=reader_client,
+                            session_id=child_id,
+                            cascade_id=cascade_id,
+                            state=kwargs["state"],
+                            on_pending_interaction=no_interaction,
+                        )
+
+                    await step(user)
+                    if fault == "slow_error":
+                        ready.set()
+                        pending = asyncio.create_task(step(progress))
+                        try:
+                            await asyncio.wait_for(reading.wait(), 1)
+                            error = {**planner(3, ""), "status": "CORTEX_STEP_STATUS_ERROR"}
+                            await asyncio.wait_for(step(error), 0.2)
+                            await asyncio.wait_for(server.wake_seen.wait(), 1)
+                        finally:
+                            release.set()
+                            await pending
+                        return
+                    await step(progress)
+                    assert inbox.empty(), "progress spent the completion"
+                    snapshot[:] = [user, progress, final]
+                    if fault in {"working", "unfinished"}:
+                        snapshot[:] = [user, progress]
+                        if fault == "unfinished":
+                            snapshot.append(
+                                {
+                                    "type": "CORTEX_STEP_TYPE_RUN_COMMAND",
+                                    "status": "CORTEX_STEP_STATUS_RUNNING",
+                                    "metadata": {"executionId": "long-command"},
+                                }
+                            )
+                    if fault in {"summary", "trajectory"}:
+                        await step(final)
+                    ready.set()
+                    if fault in {"working", "unfinished"}:
+                        progress_wait = asyncio.create_task(progressed.wait())
+                        wake_wait = asyncio.create_task(server.wake_seen.wait())
+                        try:
+                            await asyncio.wait(
+                                [progress_wait, wake_wait], return_when=asyncio.FIRST_COMPLETED
+                            )
+                            assert inbox.empty(), (
+                                "observable work was retired after three failed reads"
+                            )
+                            assert clock[0] >= 200
+                        finally:
+                            for task in (progress_wait, wake_wait):
+                                task.cancel()
+                            await asyncio.gather(progress_wait, wake_wait, return_exceptions=True)
+                        working = False
+                        snapshot.append(final)
+                    if fault == "continuation":
+                        await asyncio.wait_for(reading.wait(), 1)
+                        user_b = {**user, "metadata": {"executionId": "turn-two"}}
+                        progress_b = planner(4, "Checking B.\n[quiet]")
+                        final_b = planner(5, "READY B")
+                        await step(user_b)
+                        await step(progress_b)
+                        snapshot[:] = [user, progress, final, user_b, progress_b, final_b]
+                        release.set()
+                    await asyncio.wait_for(server.wake_seen.wait(), 2)
+                    # The final stream frame arrives AFTER reconciliation closed.
+                    await step(snapshot[-1])
+                    await step(snapshot[-1])
+
+                monkeypatch.setattr(reader, "_stream_loop", stream)
+                if fault in {"helper", "late_helper"}:
+                    ready.set()
+                    run = reader._mirror_subagent_cascade(
+                        port=4242,
+                        child_cascade_id=cascade_id,
+                        client=reader_client,
+                        child_session_id=child_id,
+                    )
+                else:
+                    run = reader.supervise_reader(
+                        bridge_dir,
+                        child_id,
+                        client=reader_client,
+                        on_pending_interaction=no_interaction,
+                    )
+                await asyncio.wait_for(run, 4)
+                await asyncio.wait_for(server.wake_seen.wait(), 1)
+        assert inbox.qsize() == 1
+        if fault == "late_helper":
+            assert reads >= 3, "helper retired before its turn appeared"
+        delivered = inbox.get_nowait()
+        if fault in {"summary", "trajectory", "helper"}:
+            assert delivered["status"] == "failed"
+            assert closed_at == [120], "unconfirmed close must wait for 120 seconds without work"
+            if fault != "helper":
+                assert "READY" in delivered["output"]
+            assert "confirm" in delivered["output"].lower()
+        elif fault != "slow_error":
+            expected = "READY B" if fault == "continuation" else "READY"
+            assert delivered["output"] == expected
+            assert messages.count(expected) == 1
+        assert len(server.wake_posts) == 1
+    finally:
+        release.set()
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
 
 @pytest.mark.asyncio

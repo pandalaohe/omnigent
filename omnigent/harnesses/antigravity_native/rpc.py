@@ -626,7 +626,9 @@ def _conversation_matches(port: int, conversation_id: str) -> bool:
     return metadata.get("rootConversationId") == conversation_id
 
 
-def get_trajectory_steps(port: int, cascade_id: str) -> list[dict[str, object]]:
+def get_trajectory_steps(
+    port: int, cascade_id: str, *, timeout_s: float = _RPC_CALL_TIMEOUT_S
+) -> list[dict[str, object]]:
     """
     Return the trajectory steps for ``cascade_id`` from the agy on ``port``.
 
@@ -636,6 +638,7 @@ def get_trajectory_steps(port: int, cascade_id: str) -> list[dict[str, object]]:
 
     :param port: Validated connect-RPC port, e.g. ``52548``.
     :param cascade_id: agy cascade id (equal to the conversation id) to query.
+    :param timeout_s: Transport timeout; ordinary callers retain the 30-second default.
     :returns: List of step dicts, each containing at least ``stepIndex`` and
         ``status`` (may be empty when no steps have been recorded yet).
     :raises httpx.HTTPError: On transport errors or non-2xx responses; the
@@ -647,7 +650,7 @@ def get_trajectory_steps(port: int, cascade_id: str) -> list[dict[str, object]]:
     """
     url = _rpc_url(port, _METHOD_GET_CASCADE_TRAJECTORY_STEPS)
     _assert_loopback_url(url)
-    with _sync_client(_RPC_CALL_TIMEOUT_S) as client:
+    with _sync_client(timeout_s) as client:
         response = client.post(
             url,
             headers=_rpc_headers(port),
@@ -943,7 +946,9 @@ def get_available_models(port: int) -> dict[str, object]:
     return inner if isinstance(inner, dict) else body
 
 
-def get_all_cascade_trajectories(port: int) -> dict[str, object]:
+def get_all_cascade_trajectories(
+    port: int, *, timeout_s: float = _RPC_CALL_TIMEOUT_S
+) -> dict[str, object]:
     """
     Return agy's cascade-trajectory summaries from ``GetAllCascadeTrajectories``.
 
@@ -985,6 +990,7 @@ def get_all_cascade_trajectories(port: int) -> dict[str, object]:
     these summaries; this function only fetches them.
 
     :param port: Validated connect-RPC port, e.g. ``52548``.
+    :param timeout_s: Transport timeout; defaults to 30 seconds for ordinary callers.
     :returns: The parsed response body (at minimum ``{"trajectorySummaries":
         {...}}``), or ``{}`` when the 200 body is not a dict (guards against a
         future agy returning a non-object 200).
@@ -997,7 +1003,7 @@ def get_all_cascade_trajectories(port: int) -> dict[str, object]:
     """
     url = _rpc_url(port, _METHOD_GET_ALL_CASCADE_TRAJECTORIES)
     _assert_loopback_url(url)
-    with _sync_client(_RPC_CALL_TIMEOUT_S) as client:
+    with _sync_client(timeout_s) as client:
         response = client.post(
             url,
             headers=_rpc_headers(port),
