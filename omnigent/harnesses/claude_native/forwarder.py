@@ -27,6 +27,7 @@ from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.errors import ErrorCode
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
+    CONFIRMED_CLAUDE_SESSION_LABEL_KEY,
     KEEP_WARM_BTW_MARKER,
     OBSERVER_HOOK_STDERR_FILE,
     BtwOverlay,
@@ -40,6 +41,7 @@ from omnigent.harnesses.claude_native.bridge import (
     _transcript_items_from_entry,
     _transcript_timestamp,
     accumulate_transcript_cost,
+    encode_confirmed_claude_session,
     price_transcript_cost_ledger,
     read_active_session_id,
     read_bridge_id,
@@ -1537,6 +1539,7 @@ async def forward_claude_transcript_to_session(
     # lifetime of the forwarder task; the server's idempotence handles
     # the rare case where two forwarder processes race the same conv.
     external_session_id_mirrored = False
+    confirmed_binding: tuple[str, str] | None = None
     # Native task system state: maps and ordered list accumulated from
     # TaskCreated / TaskCompleted / PostToolUse/TaskUpdate hook events.
     # Reset on /clear and /fork rotations alongside other session state.
@@ -1745,6 +1748,12 @@ async def forward_claude_transcript_to_session(
                             session_id=current_session_id,
                             bridge_dir=bridge_dir,
                         )
+                    confirmed_binding = await _maybe_mirror_confirmed_claude_session(
+                        client=client,
+                        session_id=current_session_id,
+                        bridge_dir=bridge_dir,
+                        confirmed_binding=confirmed_binding,
+                    )
                     # Normalize the statusLine shim's raw capture into
                     # context.json (one stat when nothing changed).
                     status_raw_sig = sync_raw_status_context(bridge_dir, status_raw_sig)
@@ -5732,6 +5741,59 @@ async def _fetch_session_snapshot(
     resp = await client.get(f"/v1/sessions/{url_component(session_id)}")
     resp.raise_for_status()
     return _parse_json_response(resp, context=f"session {session_id!r} snapshot")
+
+
+async def patch_confirmed_claude_session(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    claude_session_id: str,
+) -> None:
+    """Persist an owner-associated Claude binding for cleanup and cold resume."""
+    resp = await client.patch(
+        f"/v1/sessions/{url_component(session_id)}",
+        json={
+            "labels": {
+                CONFIRMED_CLAUDE_SESSION_LABEL_KEY: encode_confirmed_claude_session(
+                    session_id, claude_session_id
+                )
+            }
+        },
+        params={"include_usage": "false"},
+        timeout=10.0,
+    )
+    resp.raise_for_status()
+
+
+async def _maybe_mirror_confirmed_claude_session(
+    *,
+    client: httpx.AsyncClient,
+    session_id: str,
+    bridge_dir: Path,
+    confirmed_binding: tuple[str, str] | None,
+) -> tuple[str, str] | None:
+    """Update the durable binding when Claude confirms a new id, retrying failures."""
+    claude_session_id = read_claude_session_id(bridge_dir)
+    if claude_session_id is None:
+        return confirmed_binding
+    binding = (session_id, claude_session_id)
+    if binding == confirmed_binding:
+        return confirmed_binding
+    try:
+        await patch_confirmed_claude_session(
+            client,
+            session_id=session_id,
+            claude_session_id=claude_session_id,
+        )
+    except (httpx.HTTPError, OSError) as exc:
+        _logger.warning(
+            "Failed to retain confirmed Claude binding for %s: %s",
+            session_id,
+            exc,
+            extra={"session_id": session_id},
+        )
+        return confirmed_binding
+    return binding
 
 
 async def _maybe_mirror_external_session_id(

@@ -3875,32 +3875,36 @@ async def test_auto_create_claude_fork_preserves_history_in_another_workspace(
 
 
 @pytest.mark.parametrize(
-    ("server_claude_sid", "current_bridge", "expect_server_sid"),
+    ("server_claude_sid", "current_bridge", "expect_server_sid", "second_attempt"),
     [
-        (None, True, False),
-        ("02857840-6362-408f-b41f-309e396ed7c6", True, False),
-        ("02857840-6362-408f-b41f-309e396ed7c6", False, True),
+        (None, True, False, None),
+        ("02857840-6362-408f-b41f-309e396ed7c6", True, False, None),
+        ("02857840-6362-408f-b41f-309e396ed7c6", False, True, None),
+        ("02857840-6362-408f-b41f-309e396ed7c6", True, False, "failed-launch"),
+        ("02857840-6362-408f-b41f-309e396ed7c6", True, False, "idle-release"),
     ],
     ids=[
         "missing-server-binding",
         "current-bridge-newer-than-server",
         "foreign-bridge-does-not-override",
+        "retry-after-failed-launch",
+        "resume-after-idle-release",
     ],
 )
 @pytest.mark.asyncio
-async def test_auto_create_claude_terminal_cold_resume_selects_current_bridge_sid(
+async def test_auto_create_claude_terminal_cold_resume_retains_confirmed_sid(
     server_claude_sid: str | None,
     current_bridge: bool,
     expect_server_sid: bool,
+    second_attempt: str | None,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Only the current session's pre-wipe bridge sid overrides its server id.
+    """Cold resume retains the owner-confirmed id across retries and cleanup.
 
-    The server snapshot may omit external_session_id or retain the id from
-    before ``/clear``. When the bridge config still belongs to this session,
-    its state.json identifies the transcript live at shutdown. A successor's
-    bridge must not rebind the superseded session to its own new transcript.
+    A current-owned pre-wipe bridge supplies the newest id without letting a
+    successor rebind the old session. Failed launches retain it in bridge
+    state, while bridge-deleting resumable cleanup retains it in labels.
     """
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
@@ -3966,26 +3970,28 @@ async def test_auto_create_claude_terminal_cold_resume_selects_current_bridge_si
     )
 
     class _NullBindingServerClient(NullServerClient):
-        """Server client with a missing or stale external_session_id."""
+        """Server client with a stale external id and optionally durable labels."""
 
-        def __init__(self, external_session_id: str | None) -> None:
+        def __init__(self, external_session_id: str | None, *, track_labels: bool) -> None:
             self._external_session_id = external_session_id
+            self._track_labels = track_labels
+            self._labels: dict[str, str] = {}
+            self.patch_bodies: list[dict[str, Any]] = []
 
         async def get(self, url: str, **kwargs: Any) -> NullServerClient._Response:
             del kwargs
             if url.endswith("/labels"):
+                labels = dict(self._labels)
 
                 class _LabelsResponse(NullServerClient._Response):
                     def json(self) -> dict[str, Any]:
-                        return {"labels": {}}
+                        return {"labels": labels}
 
                 return _LabelsResponse()
 
-            snapshot = (
-                {}
-                if self._external_session_id is None
-                else {"external_session_id": self._external_session_id}
-            )
+            snapshot: dict[str, Any] = {"labels": dict(self._labels)}
+            if self._external_session_id is not None:
+                snapshot["external_session_id"] = self._external_session_id
 
             class _SnapResponse(NullServerClient._Response):
                 def json(self) -> dict[str, Any]:
@@ -3993,8 +3999,22 @@ async def test_auto_create_claude_terminal_cold_resume_selects_current_bridge_si
 
             return _SnapResponse()
 
+        async def patch(self, url: str, **kwargs: Any) -> NullServerClient._Response:
+            del url
+            body = kwargs.get("json")
+            if isinstance(body, dict):
+                self.patch_bodies.append(body)
+                labels = body.get("labels")
+                if self._track_labels and isinstance(labels, dict):
+                    self._labels.update({str(key): str(value) for key, value in labels.items()})
+            return self._Response()
+
     class _FakeResourceRegistry:
         terminal_registry = None
+
+        def __init__(self, *, fail_first: bool) -> None:
+            self._fail_first = fail_first
+            self.launch_args: list[list[str]] = []
 
         async def launch_required_terminal(
             self,
@@ -4006,7 +4026,11 @@ async def test_auto_create_claude_terminal_cold_resume_selects_current_bridge_si
             resource_role: str | None = None,
             parent_os_env: Any = None,
         ) -> SessionResourceView:
-            del terminal_name, session_key, spec
+            del terminal_name, session_key, resource_role, parent_os_env
+            self.launch_args.append(list(spec.args))
+            if self._fail_first:
+                self._fail_first = False
+                raise RuntimeError("simulated launch failure before Claude hook")
             return SessionResourceView(
                 id="terminal_claude_main",
                 type="terminal",
@@ -4015,23 +4039,58 @@ async def test_auto_create_claude_terminal_cold_resume_selects_current_bridge_si
                 metadata={"terminal_name": "claude", "session_key": "main", "running": True},
             )
 
-    await _auto_create_claude_terminal(
-        session_id,
-        _FakeResourceRegistry(),
-        lambda _sid, _evt: None,
-        server_client=_NullBindingServerClient(server_claude_sid),  # type: ignore[arg-type]
+    client = _NullBindingServerClient(
+        server_claude_sid,
+        track_labels=second_attempt != "failed-launch",
     )
+    registry = _FakeResourceRegistry(fail_first=second_attempt == "failed-launch")
+    attempt_count = 2 if second_attempt is not None else 1
+    state_after_failure: dict[str, Any] | None = None
+    for attempt in range(attempt_count):
+        try:
+            await _auto_create_claude_terminal(
+                session_id,
+                registry,
+                lambda _sid, _evt: None,
+                server_client=client,  # type: ignore[arg-type]
+            )
+        except RuntimeError as exc:
+            assert second_attempt == "failed-launch" and attempt == 0
+            assert str(exc) == "simulated launch failure before Claude hook"
+        else:
+            assert second_attempt != "failed-launch" or attempt == 1
+        await asyncio.sleep(0)
+        if second_attempt == "failed-launch" and attempt == 0:
+            state_path = pre_bridge_dir / "state.json"
+            state_after_failure = (
+                json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else None
+            )
+        if second_attempt == "idle-release" and attempt == 0:
+            import shutil
 
-    await asyncio.sleep(0)
+            shutil.rmtree(pre_bridge_dir)
 
     expected_resume_sid = server_claude_sid if expect_server_sid else prior_claude_sid
-    assert synth_calls == [expected_resume_sid], (
-        f"Expected synthesis with resume sid {expected_resume_sid!r}; "
-        f"got {synth_calls!r}. A current bridge must supply the transcript "
-        "live at shutdown without letting a foreign bridge rebind this session."
-    )
-    # The forwarder must start past the replayed transcript (same as a
-    # normal cold resume where the server returned the binding directly).
+    assert synth_calls == [expected_resume_sid] * attempt_count
+    assert len(registry.launch_args) == attempt_count
+    for launch_args in registry.launch_args:
+        assert launch_args[launch_args.index("--resume") + 1] == expected_resume_sid
+    if second_attempt == "failed-launch":
+        assert state_after_failure is not None
+        assert state_after_failure["claude_session_id"] == expected_resume_sid
+
+    binding_label_key = "omnigent.claude_native.confirmed_session"
+    binding_payloads = [
+        body["labels"][binding_label_key]
+        for body in client.patch_bodies
+        if isinstance(body.get("labels"), dict) and binding_label_key in body["labels"]
+    ]
+    assert binding_payloads
+    for raw_binding in binding_payloads:
+        assert json.loads(raw_binding) == {
+            "omnigent_session_id": session_id,
+            "claude_session_id": expected_resume_sid,
+        }
     assert forwarder_kwargs.get("start_at_end") is True
 
 

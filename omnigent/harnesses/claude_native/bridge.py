@@ -136,6 +136,7 @@ _InjectionFunction = TypeVar("_InjectionFunction", bound=Callable[..., Any])
 BRIDGE_DIR_ENV_VAR = "HARNESS_CLAUDE_NATIVE_BRIDGE_DIR"
 REQUEST_SESSION_ID_ENV_VAR = "HARNESS_CLAUDE_NATIVE_REQUEST_SESSION_ID"
 BRIDGE_ID_LABEL_KEY = "omnigent.claude_native.bridge_id"
+CONFIRMED_CLAUDE_SESSION_LABEL_KEY = "omnigent.claude_native.confirmed_session"
 RESUME_COPY_MARKER_SUFFIX = ".omnigent-resume-copy"
 
 
@@ -3419,6 +3420,53 @@ def read_transcript_path(bridge_dir: Path) -> Path | None:
     if not isinstance(raw, str) or not raw:
         return None
     return Path(raw)
+
+
+def encode_confirmed_claude_session(session_id: str, claude_session_id: str) -> str:
+    """Encode a Claude transcript binding with its owning Omnigent session."""
+    if not session_id or not claude_session_id:
+        raise ValueError("confirmed Claude bindings require both session ids")
+    return json.dumps(
+        {
+            "omnigent_session_id": session_id,
+            "claude_session_id": claude_session_id,
+        },
+        separators=(",", ":"),
+    )
+
+
+def read_confirmed_claude_session_id(
+    labels: Mapping[str, str] | None, session_id: str
+) -> str | None:
+    """Return the confirmed Claude id owned by this session, ignoring copied labels."""
+    if labels is None:
+        return None
+    raw = labels.get(CONFIRMED_CLAUDE_SESSION_LABEL_KEY)
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict) or payload.get("omnigent_session_id") != session_id:
+        return None
+    claude_session_id = payload.get("claude_session_id")
+    return claude_session_id if isinstance(claude_session_id, str) and claude_session_id else None
+
+
+def write_claude_session_id(bridge_dir: Path, claude_session_id: str) -> None:
+    """Retain a confirmed Claude id across bridge preparation and launch retries."""
+    if not claude_session_id:
+        raise ValueError("claude_session_id must not be empty")
+    state = _read_json_file(bridge_dir / _STATE_FILE)
+    if not isinstance(state, dict):
+        state = {}
+    seen = read_seen_claude_session_ids(bridge_dir)
+    seen.add(claude_session_id)
+    state["claude_session_id"] = claude_session_id
+    state["seen_claude_session_ids"] = sorted(seen)
+    state["updated_at"] = time.time()
+    _write_json_file(bridge_dir / _STATE_FILE, state)
 
 
 def read_claude_session_id(bridge_dir: Path) -> str | None:

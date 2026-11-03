@@ -1359,6 +1359,12 @@ async def test_forwarder_mirrors_external_session_id_at_most_once(
         # consume it so it doesn't pollute the residual-queue check.
         first_patch = await _get_recorded_request(server, method="PATCH")
         assert first_patch["body"]["external_session_id"] == "claude-sid-once"
+        binding_patch = await _get_recorded_request(server, method="PATCH")
+        raw_binding = binding_patch["body"]["labels"]["omnigent.claude_native.confirmed_session"]
+        assert json.loads(raw_binding) == {
+            "omnigent_session_id": "conv_once",
+            "claude_session_id": "claude-sid-once",
+        }
         # Pump several POST requests through the loop — proves the
         # loop ran multiple iterations after the first PATCH. The
         # bridge state still carries claude_session_id; the only
@@ -1385,6 +1391,72 @@ async def test_forwarder_mirrors_external_session_id_at_most_once(
     # across the ~3 iterations we forced. Asserting on the literal
     # list (not just length) gives a useful diff in failure output.
     assert leftover_patches == []
+
+
+@pytest.mark.asyncio
+async def test_forwarder_updates_confirmed_binding_after_external_mirror_latches(
+    tmp_path: Path,
+) -> None:
+    """A new confirmed Claude id updates its owner label after the one-shot external mirror."""
+    bridge_dir = tmp_path / "bridge"
+    first_transcript = tmp_path / "first.jsonl"
+    first_transcript.write_text("", encoding="utf-8")
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-sid-a",
+            "transcript_path": str(first_transcript),
+        },
+    )
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forwarder.forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_binding",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        external_patch = await _get_recorded_request(server, method="PATCH")
+        assert external_patch["body"]["external_session_id"] == "claude-sid-a"
+        first_binding = await _get_recorded_request(server, method="PATCH")
+        assert json.loads(
+            first_binding["body"]["labels"]["omnigent.claude_native.confirmed_session"]
+        ) == {
+            "omnigent_session_id": "conv_binding",
+            "claude_session_id": "claude-sid-a",
+        }
+
+        second_transcript = tmp_path / "second.jsonl"
+        second_transcript.write_text("", encoding="utf-8")
+        record_hook_event(
+            bridge_dir,
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "claude-sid-b",
+                "transcript_path": str(second_transcript),
+            },
+        )
+        second_binding = await _get_recorded_request(server, method="PATCH")
+        assert second_binding["body"].get("external_session_id") is None
+        assert json.loads(
+            second_binding["body"]["labels"]["omnigent.claude_native.confirmed_session"]
+        ) == {
+            "omnigent_session_id": "conv_binding",
+            "claude_session_id": "claude-sid-b",
+        }
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
 
 
 @pytest.mark.asyncio

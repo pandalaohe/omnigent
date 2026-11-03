@@ -9871,6 +9871,12 @@ async def _auto_create_claude_terminal(
     from omnigent.harnesses.claude_native.bridge import (
         read_claude_session_id as _read_csid_pre_wipe,
     )
+    from omnigent.harnesses.claude_native.bridge import (
+        read_confirmed_claude_session_id as _read_confirmed_csid,
+    )
+    from omnigent.harnesses.claude_native.bridge import (
+        write_claude_session_id as _write_csid,
+    )
 
     _pre_wipe_bridge_dir = _bridge_dir_for_bridge_id(bridge_id)
     _pre_wipe_claude_sid = _read_csid_pre_wipe(_pre_wipe_bridge_dir)
@@ -9886,6 +9892,8 @@ async def _auto_create_claude_terminal(
         workspace=Path(workspace),
         sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
     )
+    if _pre_wipe_bridge_is_current and _pre_wipe_claude_sid is not None:
+        _write_csid(bridge_dir, _pre_wipe_claude_sid)
     # Cancel any surviving forwarder BEFORE wiping its cursor/seen state, else it
     # re-posts with fresh dedup state alongside the forwarder spawned below.
     await _cancel_auto_forwarder_task(session_id)
@@ -9935,8 +9943,11 @@ async def _auto_create_claude_terminal(
     session_model_override = launch_metadata.model_override
     session_launch_args = launch_metadata.terminal_launch_args
     session_external_id = launch_metadata.external_session_id
+    confirmed_claude_sid = _read_confirmed_csid(launch_metadata.labels, session_id)
     if _pre_wipe_bridge_is_current and _pre_wipe_claude_sid is not None:
         session_external_id = _pre_wipe_claude_sid
+    elif confirmed_claude_sid is not None:
+        session_external_id = confirmed_claude_sid
     fork_source_external_id = launch_metadata.fork_source_external_id
     fork_carry_history = launch_metadata.fork_carry_history
 
@@ -9953,6 +9964,20 @@ async def _auto_create_claude_terminal(
             _pre_wipe_claude_sid,
             extra={"session_id": session_id},
         )
+
+    if session_external_id is not None:
+        if _read_csid_pre_wipe(bridge_dir) != session_external_id:
+            _write_csid(bridge_dir, session_external_id)
+        if server_client is not None and confirmed_claude_sid != session_external_id:
+            from omnigent.harnesses.claude_native.forwarder import (
+                patch_confirmed_claude_session,
+            )
+
+            await patch_confirmed_claude_session(
+                server_client,
+                session_id=session_id,
+                claude_session_id=session_external_id,
+            )
 
     # Preserve native local history and its cursor on same-host resume.
     # Reconstruct from Server only when no valid local transcript exists.
