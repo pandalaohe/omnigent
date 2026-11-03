@@ -1893,7 +1893,8 @@ def register_events_routes(
                 _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
             ),
         )
-        if body.type == "session_message":
+        peer_message = body.type == "session_message"
+        if peer_message:
             if not isinstance(request, Request):
                 raise OmnigentError(
                     "Session messages require a runner HTTP request", code=ErrorCode.FORBIDDEN
@@ -1944,7 +1945,9 @@ def register_events_routes(
             body = ordinary_message
         # Inline peer delivery re-enters here with an ordinary message. Keep
         # upstream's source checks around runner startup and before persistence.
-        peer_message = trusted_peer and ORCHESTRATION_SOURCE_HEADER in request.headers
+        peer_message = peer_message or (
+            trusted_peer and ORCHESTRATION_SOURCE_HEADER in request.headers
+        )
         if peer_message:
             await asyncio.to_thread(
                 require_orchestration_source,

@@ -60,6 +60,8 @@ def orchestration_environment(monkeypatch, request):
     features = getattr(request, "param", None)
     if features is None:
         monkeypatch.setenv("OMNIGENT_FEATURES", "session_peer_messaging")
+    elif features == "-session_peer_messaging":
+        monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
     else:
         monkeypatch.setenv("OMNIGENT_FEATURES", f"{features},session_peer_messaging")
     return features
@@ -346,6 +348,9 @@ async def test_refusal_before_delivery(condition, auth_client, auth_app, peers, 
     assert not captured.get("posts")
 
 
+@pytest.mark.parametrize(
+    "orchestration_environment", [None, "-session_peer_messaging"], indirect=True
+)
 async def test_sharing_during_receiver_startup_blocks_delivery(
     auth_client, peers, db_uri, monkeypatch
 ):
