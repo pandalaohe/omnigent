@@ -212,8 +212,14 @@ function latestLayers() {
 function convertCalls() {
   return state.fetch.mock.calls.filter(([url]) => String(url).endsWith("/keep_warm/convert"));
 }
+function editName(name: string) {
+  return new RegExp(`^${name}(:|$)`);
+}
+function editButton(name: string): HTMLElement {
+  return screen.getByRole("button", { name: editName(name) });
+}
 function openEditor(name: string): HTMLElement {
-  fireEvent.click(screen.getByRole("button", { name }));
+  fireEvent.click(editButton(name));
   return document.querySelector('[data-slot="popover-content"][data-state="open"]') as HTMLElement;
 }
 function choose(editor: HTMLElement, group: string, option: string) {
@@ -290,24 +296,26 @@ describe("KeepWarmSettings table", () => {
     });
     await mount();
     expect(screen.getAllByRole("columnheader").map((header) => header.textContent)).toEqual([
-      "All agents, all hostsOff",
-      "No hostOff",
-      "HawkOff",
-      "OwlOff",
-      "removed (unavailable)Off",
+      "AllMC–4h",
+      "No hostMC–4h",
+      "HawkMC–4h",
+      "OwlMC–4h",
+      "removed (unavailable)MC–4h",
     ]);
     expect(within(screen.getByTestId("layered-col-h1")).getByTitle("Online")).toBeInTheDocument();
     expect(within(screen.getByTestId("layered-col-h2")).getByTitle("Offline")).toBeInTheDocument();
     expect(
       screen.getByText("Converted from your previous settings · saved when you first edit"),
     ).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Edit Claude Code on Hawk" })).toHaveTextContent(
-      "Main only",
+    expect(editButton("Edit Claude Code on Hawk")).toHaveAccessibleName(
+      /main on( \(set here\))?, children off/,
     );
     const claudeRow = screen.getByTestId("layered-row-harness:claude-native").closest("tr");
     expect(claudeRow).toHaveTextContent("Not installed here");
-    expect(screen.queryByRole("button", { name: "Edit Claude Code on Owl" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Edit Claude Code on removed" })).toBeNull();
+    expect(screen.queryByRole("button", { name: editName("Edit Claude Code on Owl") })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: editName("Edit Claude Code on removed") }),
+    ).toBeNull();
     expect(patches()).toEqual([]);
     expect(readKeepWarmPreferences().layers).toBeUndefined();
   });
@@ -340,8 +348,8 @@ describe("KeepWarmSettings table", () => {
     await waitFor(() =>
       expect(document.querySelector('[data-slot="popover-content"][data-state="open"]')).toBeNull(),
     );
-    expect(screen.getByRole("button", { name: "Edit Claude Code on Hawk" })).toHaveTextContent(
-      "Main only",
+    expect(editButton("Edit Claude Code on Hawk")).toHaveAccessibleName(
+      /main on( \(set here\))?, children off/,
     );
   });
 
@@ -384,13 +392,13 @@ describe("KeepWarmSettings table", () => {
     choose(editor, "Main sessions", "On");
     clickSave(editor);
     await within(editor).findByRole("alert");
-    expect(screen.getByRole("button", { name: "Edit Claude Code on Hawk" })).toHaveTextContent(
-      "Main only",
+    expect(editButton("Edit Claude Code on Hawk")).toHaveAccessibleName(
+      /main on( \(set here\))?, children off/,
     );
     fireEvent.click(screen.getByRole("button", { name: "Discard unsaved changes" }));
     await waitFor(() =>
-      expect(screen.getByRole("button", { name: "Edit Claude Code on Hawk" })).toHaveTextContent(
-        "Off",
+      expect(editButton("Edit Claude Code on Hawk")).toHaveAccessibleName(
+        /main off( \(set here\))?, children off/,
       ),
     );
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
@@ -442,8 +450,8 @@ describe("KeepWarmSettings table", () => {
     expect(latestLayers().cells).toEqual({
       h2: { ca_codex: { child: true, coldAfterSeconds: 0 } },
     });
-    expect(screen.getByRole("button", { name: "Edit Claude Code on Hawk" })).toHaveTextContent(
-      "Main only",
+    expect(editButton("Edit Claude Code on Hawk")).toHaveAccessibleName(
+      /main on( \(set here\))?, children off/,
     );
     const codex = openEditor("Edit My Codex");
     expect(
@@ -482,11 +490,11 @@ describe("KeepWarmSettings table", () => {
     choose(editor, "Children", "Off");
     await saveAndClose(editor);
     expect(latestLayers().cells).toEqual({ h1: { direct: { main: false, child: false } } });
-    expect(screen.getByRole("button", { name: "Edit Direct Claude on Hawk" })).toHaveTextContent(
-      "Off",
+    expect(editButton("Edit Direct Claude on Hawk")).toHaveAccessibleName(
+      /main off( \(set here\))?, children off/,
     );
-    expect(screen.getByRole("button", { name: "Edit Claude Code on Hawk" })).toHaveTextContent(
-      "On",
+    expect(editButton("Edit Claude Code on Hawk")).toHaveAccessibleName(
+      /main on( \(set here\))?, children on/,
     );
   });
 
@@ -499,8 +507,8 @@ describe("KeepWarmSettings table", () => {
     client.clear();
     state.preview = { layers: server.layers as KeepWarmLayers, already: true };
     await mount(server);
-    expect(screen.getByRole("button", { name: "Edit Claude Code on Hawk" })).toHaveTextContent(
-      "Main only",
+    expect(editButton("Edit Claude Code on Hawk")).toHaveAccessibleName(
+      /main on( \(set here\))?, children off/,
     );
     expect(
       screen.queryByText("Converted from your previous settings · saved when you first edit"),
@@ -526,10 +534,8 @@ describe("KeepWarmSettings table", () => {
     expect(within(editor).queryByRole("spinbutton", { name: /Ping every/ })).toBeNull();
     expect(within(editor).getByText("30 min (Pi limit)")).toBeInTheDocument();
     fireEvent.click(within(editor).getByRole("button", { name: "Cancel" }));
-    expect(screen.queryByRole("button", { name: "Edit Other" })).toBeNull();
-    expect(screen.getByText("Keep-warm is not available for:").closest("p")).toHaveTextContent(
-      "Other",
-    );
+    expect(screen.queryByRole("button", { name: editName("Edit Other") })).toBeNull();
+    expect(screen.getByText("No keep-warm:").closest("p")).toHaveTextContent("Other");
   });
 
   it("refuses an edit made after the signed-in owner changed", async () => {

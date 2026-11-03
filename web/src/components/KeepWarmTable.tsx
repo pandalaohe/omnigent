@@ -7,13 +7,16 @@ import {
   type ReactElement,
 } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { SnowflakeIcon } from "lucide-react";
 
 import { AgentNameTag } from "@/components/AgentNameTag";
 import { HelpTip } from "@/components/HelpTip";
 import { LayeredEditor } from "@/components/LayeredEditor";
 import {
+  LayeredChip,
+  LayeredLight,
   LayeredMark,
-  LayeredOwn,
+  LayeredSwitch,
   LayeredTable,
   type LayeredCell,
   type LayeredCellLevel,
@@ -159,13 +162,6 @@ function fieldText(field: KeepWarmLayerField, value: unknown): string {
   return "platform rule";
 }
 
-function stateWord(main: boolean, child: boolean): string {
-  if (main && child) return "On";
-  if (main) return "Main only";
-  if (child) return "Children only";
-  return "Off";
-}
-
 function fieldsShown(at: LayeredLevel, family: KeepWarmFamily | null): KeepWarmLayerField[] {
   if (at.level === "corner" || at.level === "col") {
     return ["main", "child", "maxSeconds", "coldAfterSeconds"];
@@ -238,7 +234,7 @@ function levelValue(
   }
   const store = keepWarmLayeredStore(
     layers,
-    at.level === "row" ? { row: at.row, ...identity } : undefined,
+    at.level === "row" || at.level === "cell" ? { row: at.row, ...identity } : undefined,
   );
   return inheritedAt(store, at, field, options).value;
 }
@@ -249,24 +245,68 @@ function ownPartText(field: KeepWarmLayerField, value: unknown): string {
     : fieldText(field, value);
 }
 
-/** The state word, then every other value set at this level; dots mark what differs. */
-function LevelStateParts({
-  word,
-  wordDiffers,
-  parts,
-}: {
-  word: string;
-  wordDiffers: boolean;
-  parts: readonly string[];
-}) {
+function coldChipText(value: unknown): string {
+  if (value === 0) return "∞";
+  return typeof value === "number" ? `${minutesText(value)}m` : "auto";
+}
+
+interface LevelGlyph {
+  main: boolean;
+  child: boolean;
+  intervalSeconds: number | null;
+  maxSeconds: number;
+  cold?: unknown;
+  own: readonly KeepWarmLayerField[];
+}
+
+/** One fixed format: M and C lights, then the interval, the cap and any cold-after set here. */
+function LevelGlyphMarks({ glyph, stacked }: { glyph: LevelGlyph; stacked?: boolean }) {
+  const own = (field: KeepWarmLayerField) => glyph.own.includes(field);
   return (
-    <>
-      {wordDiffers ? <LayeredOwn>{word}</LayeredOwn> : <span>{word}</span>}
-      {parts.map((part) => (
-        <LayeredOwn key={part}>{part}</LayeredOwn>
-      ))}
-    </>
+    <span
+      className={cn(
+        "flex min-w-0",
+        stacked ? "flex-col items-start gap-1" : "flex-wrap items-center gap-x-2.5 gap-y-1",
+      )}
+    >
+      <span className="inline-flex items-center gap-2">
+        <LayeredSwitch letter="M" on={glyph.main} own={own("main")} />
+        <LayeredSwitch letter="C" on={glyph.child} own={own("child")} />
+      </span>
+      <span className="inline-flex flex-wrap items-center gap-1">
+        <LayeredChip tone="first" own={own("intervalSeconds")}>
+          {glyph.intervalSeconds === null ? "–" : `${minutesText(glyph.intervalSeconds)}m`}
+        </LayeredChip>
+        <LayeredChip tone="second" own={own("maxSeconds")}>
+          {hoursText(glyph.maxSeconds)}h
+        </LayeredChip>
+        {glyph.cold !== undefined && (
+          <LayeredChip own={own("coldAfterSeconds")}>
+            <SnowflakeIcon aria-hidden="true" className="size-3 shrink-0" />
+            {coldChipText(glyph.cold)}
+          </LayeredChip>
+        )}
+      </span>
+    </span>
   );
+}
+
+function levelGlyphSummary(glyph: LevelGlyph): string {
+  const set = (field: KeepWarmLayerField) => (glyph.own.includes(field) ? " (set here)" : "");
+  const parts = [
+    `main ${glyph.main ? "on" : "off"}${set("main")}`,
+    `children ${glyph.child ? "on" : "off"}${set("child")}`,
+  ];
+  if (glyph.intervalSeconds !== null) {
+    parts.push(
+      `${fieldText("intervalSeconds", glyph.intervalSeconds).replace("every", "ping every")}${set("intervalSeconds")}`,
+    );
+  }
+  parts.push(`${fieldText("maxSeconds", glyph.maxSeconds)}${set("maxSeconds")}`);
+  if (glyph.cold !== undefined) {
+    parts.push(`${ownPartText("coldAfterSeconds", glyph.cold)}${set("coldAfterSeconds")}`);
+  }
+  return parts.join(", ");
 }
 
 function FieldNote({
@@ -1092,50 +1132,63 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
     })();
   }
 
-  /** The state line of a level; the corner has nothing to differ from, so it carries no dots. */
-  function levelStateFor(
+  /** What a level runs; the corner has nothing to differ from, so it carries no dots. */
+  function levelGlyph(
     at: LayeredLevel,
     family: KeepWarmFamily | null,
     identity?: KeepWarmRuntimeIdentity,
-    word?: string,
-  ) {
+  ): LevelGlyph | null {
     if (!layers) return null;
     const crossAgent = at.level === "corner" || at.level === "col";
     const value = (field: KeepWarmLayerField) => levelValue(layers, at, field, family, identity);
-    const shownWord = word ?? stateWord(value("main") === true, value("child") === true);
-    if (at.level === "corner") {
-      const { maxSeconds, coldAfterSeconds } = layers.corner;
-      return (
-        <>
-          <span>{shownWord}</span>
-          {maxSeconds !== undefined && <span>{fieldText("maxSeconds", value("maxSeconds"))}</span>}
-          {coldAfterSeconds !== undefined && (
-            <span>{ownPartText("coldAfterSeconds", value("coldAfterSeconds"))}</span>
-          )}
-        </>
-      );
+    const own =
+      at.level === "corner"
+        ? []
+        : fieldsShown(at, family).filter((field) =>
+            differsAt(layers, at, field, family, crossAgent, identity),
+          );
+    const showsCold =
+      at.level === "corner"
+        ? layers.corner.coldAfterSeconds !== undefined
+        : own.includes("coldAfterSeconds");
+    const cold = showsCold ? value("coldAfterSeconds") : undefined;
+    const hasInterval = family !== null && family !== "pi";
+    if (at.level === "cell") {
+      const resolved = resolveKeepWarmRow(layers, at.row, at.col, family, identity);
+      return {
+        main: resolved.main,
+        child: resolved.child,
+        intervalSeconds: hasInterval ? resolved.intervalSeconds : null,
+        maxSeconds: resolved.maxSeconds,
+        cold,
+        own,
+      };
     }
-    const differing = fieldsShown(at, family).filter((field) =>
-      differsAt(layers, at, field, family, crossAgent, identity),
-    );
-    const options = keepWarmLayeredOptions(family, { crossAgent });
-    const own = levelRecord(layers, at);
-    const parts = differing
-      .filter((field) => field !== "main" && field !== "child")
-      .map((field) =>
-        ownPartText(
-          field,
-          options.normalize ? options.normalize(levelRow(at), field, own[field]) : own[field],
-        ),
-      );
-    return (
-      <LevelStateParts
-        word={shownWord}
-        wordDiffers={differing.includes("main") || differing.includes("child")}
-        parts={parts}
-      />
-    );
+    const interval = value("intervalSeconds");
+    const max = value("maxSeconds");
+    return {
+      main: value("main") === true,
+      child: value("child") === true,
+      intervalSeconds: !hasInterval
+        ? null
+        : typeof interval === "number"
+          ? interval
+          : defaultKeepWarmIntervalSeconds(family),
+      maxSeconds: typeof max === "number" ? max : KEEP_WARM_DEFAULT_MAX_SECONDS,
+      cold,
+      own,
+    };
   }
+
+  function levelMarks(glyph: LevelGlyph | null, stacked?: boolean) {
+    return glyph ? <LevelGlyphMarks glyph={glyph} stacked={stacked} /> : null;
+  }
+
+  const glyphSummaryOf = (glyph: LevelGlyph | null) =>
+    glyph ? levelGlyphSummary(glyph) : undefined;
+  const cornerGlyph = levelGlyph({ level: "corner" }, null);
+  const rowGlyph = (item: RegistryItem) =>
+    levelGlyph({ level: "row", row: item.key }, familyForItem(item), identityForRow(item.key));
 
   function renderCell(rowKey: string, host: string): LayeredCell {
     if (!layers) return { content: null };
@@ -1150,7 +1203,6 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
     }
     const family = familyForRow(rowKey);
     const identity = identityForRow(rowKey);
-    const resolved = resolveKeepWarmRow(layers, rowKey, host, family, identity);
     const at: LayeredCellLevel = { level: "cell", row: rowKey, col: host };
     const options = keepWarmLayeredOptions(family);
     const store = keepWarmLayeredStore(layers, { row: rowKey, ...identity });
@@ -1170,8 +1222,10 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
         ].join("\n");
       })
       .join("\n\n");
+    const glyph = levelGlyph(at, family, identity);
     return {
-      content: levelStateFor(at, family, identity, stateWord(resolved.main, resolved.child)),
+      content: levelMarks(glyph, true),
+      summary: glyphSummaryOf(glyph),
       clash: clash || undefined,
     };
   }
@@ -1251,10 +1305,12 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
           <LayeredTable
             label="Keep-warm by agent and host"
             cornerLabel="All agents, all hosts"
-            cornerDetail={levelStateFor({ level: "corner" }, null)}
+            cornerContent="All"
+            cornerDetail={levelMarks(cornerGlyph, true)}
+            cornerSummary={glyphSummaryOf(cornerGlyph)}
             note={
               <>
-                Click the corner, a header or a cell to change it.
+                Click to edit.
                 <HelpTip label="Keep sessions warm" className="size-11 md:size-4">
                   A cell beats its row and column; those beat the corner. An unset level inherits
                   the one above. Every ping costs one cache read.
@@ -1268,15 +1324,48 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
                   variant="outline"
                   size="sm"
                   className="min-h-11 md:min-h-7"
+                  aria-label={
+                    showAll
+                      ? "Hide agents with no sessions"
+                      : `Show agents with no sessions (${hiddenCount})`
+                  }
                   onClick={() => setShowAll((current) => !current)}
                 >
-                  {showAll
-                    ? "Hide agents with no sessions"
-                    : `Show agents with no sessions (${hiddenCount})`}
+                  {showAll ? "Hide no sessions" : `No sessions (${hiddenCount})`}
                 </Button>
               )
             }
-            legend={<span>No host: sessions not tied to a host</span>}
+            legend={
+              <>
+                <span>M main</span>
+                <span>C children</span>
+                <span className="inline-flex items-center gap-1">
+                  <LayeredLight on />
+                  on
+                </span>
+                <span className="inline-flex items-center gap-1">
+                  <LayeredLight on={false} />
+                  off
+                </span>
+                <span className="inline-flex items-center gap-1">
+                  <LayeredChip tone="first">30m</LayeredChip>
+                  ping every
+                </span>
+                <span className="inline-flex items-center gap-1">
+                  <LayeredChip tone="second">4h</LayeredChip>
+                  up to
+                </span>
+                <span className="inline-flex items-center gap-1">
+                  <SnowflakeIcon aria-hidden="true" className="size-3" />
+                  cold after
+                </span>
+                <span className="inline-flex items-center gap-1">
+                  <LayeredChip>H</LayeredChip>
+                  host wins
+                </span>
+                <span>No host: sessions with no host</span>
+              </>
+            }
             rows={visibleRows.map((item) => ({
               id: item.key,
               label: rowNameFor(item),
@@ -1289,19 +1378,20 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
                   />
                 </span>
               ),
-              detail: levelStateFor(
-                { level: "row", row: item.key },
-                familyForItem(item),
-                identityForRow(item.key),
-              ),
+              detail: levelMarks(rowGlyph(item)),
+              summary: glyphSummaryOf(rowGlyph(item)),
             }))}
-            columns={hosts.map((host) => ({
-              id: host,
-              label: hostName(host),
-              content: hostHeader(host),
-              detail: levelStateFor({ level: "col", col: host }, null),
-              hostWins: !!layers.hostWins[host],
-            }))}
+            columns={hosts.map((host) => {
+              const glyph = levelGlyph({ level: "col", col: host }, null);
+              return {
+                id: host,
+                label: hostName(host),
+                content: hostHeader(host),
+                detail: levelMarks(glyph, true),
+                summary: glyphSummaryOf(glyph),
+                hostWins: !!layers.hostWins[host],
+              };
+            })}
             renderCell={renderCell}
             renderEditor={renderEditor}
             // oxlint-disable-next-line react/no-unstable-nested-components -- render prop, not a component
@@ -1340,7 +1430,7 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
           )}
           {noChannel.length > 0 && (
             <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-muted-foreground">
-              <span>Keep-warm is not available for:</span>
+              <span>No keep-warm:</span>
               {noChannel.map((item) => (
                 <span key={item.key} title={fullIdFor(item)}>
                   <AgentNameTag
@@ -1378,7 +1468,7 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
         <SettingRow
           label="Archive children of an offline host"
           hint="Children whose host stays offline this long are archived automatically."
-          note="0 turns this off."
+          note="0 = off"
         >
           <NumericField
             ariaLabel="Archive children of an offline host after in hours"
@@ -1393,7 +1483,7 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
               }));
             }}
           />
-          <span className="text-sm text-muted-foreground">hours</span>
+          <span className="text-sm text-muted-foreground">h</span>
         </SettingRow>
       </div>
     </div>

@@ -224,7 +224,7 @@ describe("KeepWarmTable review regressions", () => {
     };
     renderTable();
     const cell = await screen.findByTestId(`layered-cell-custom-agent-${HOST_ID}`);
-    expect(cell).toHaveTextContent("On");
+    expect(cell).toHaveAccessibleName(/main on, children on/);
   });
 
   it("shows a retained product-id value on its visible harness row", async () => {
@@ -240,7 +240,7 @@ describe("KeepWarmTable review regressions", () => {
     };
     renderTable();
     const cell = await screen.findByTestId(`layered-cell-harness:codex-${HOST_ID}`);
-    expect(cell).toHaveTextContent("Main only");
+    expect(cell).toHaveAccessibleName(/main on, children off/);
   });
 
   it("shows a bound-agent override on its visible template row", async () => {
@@ -257,7 +257,7 @@ describe("KeepWarmTable review regressions", () => {
     };
     renderTable();
     const cell = await screen.findByTestId(`layered-cell-ca_library-${HOST_ID}`);
-    expect(cell).toHaveTextContent("Main only");
+    expect(cell).toHaveAccessibleName(/main on, children off/);
   });
 
   it("converts and saves a first edit in one namespace write", async () => {
@@ -354,16 +354,24 @@ describe("KeepWarmTable review regressions", () => {
     };
     renderTable();
     const corner = await screen.findByTestId("layered-corner");
-    expect(corner).toHaveTextContent("All agents, all hostsOnup to 4 h");
+    expect(corner).toHaveTextContent("AllMC–4h");
+    expect(corner).toHaveAccessibleName(
+      "Edit All agents, all hosts: main on, children on, up to 4 h",
+    );
     expect(corner.querySelector(".bg-pink-500")).toBeNull();
     const column = screen.getByTestId(`layered-col-${HOST_ID}`);
-    expect(column).toHaveTextContent("Host wins");
-    expect(column).toHaveTextContent("up to 2 h");
+    expect(within(column).getByTitle("Host wins")).toBeVisible();
+    expect(column).toHaveTextContent("2h");
+    expect(column).toHaveAccessibleName(expect.stringContaining("up to 2 h (set here)"));
     expect(column.querySelectorAll(".bg-pink-500")).toHaveLength(2);
     const row = screen.getByTestId("layered-row-harness:codex");
-    expect(row).toHaveTextContent("Main only");
+    expect(row).toHaveAccessibleName(expect.stringContaining("main on, children off (set here)"));
     expect(row.querySelectorAll(".bg-pink-500")).toHaveLength(1);
-    expect(screen.getByText("Differs from the level above")).toBeVisible();
-    expect(screen.getByText("No host: sessions not tied to a host")).toBeVisible();
+    // One filled light and one hollow one, so on and off differ by more than colour.
+    expect(row.querySelectorAll(".bg-success")).toHaveLength(1);
+    expect(row.querySelectorAll(".border-muted-foreground")).toHaveLength(1);
+    expect(row).not.toHaveTextContent(/every|up to|Main only/);
+    expect(screen.getByText("Differs from above")).toBeVisible();
+    expect(screen.getByText("No host: sessions with no host")).toBeVisible();
   });
 });

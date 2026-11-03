@@ -12,6 +12,8 @@ export interface LayeredTableRow {
   content?: ReactNode;
   detail?: ReactNode;
   mark?: boolean;
+  /** Spoken and hover text for a level whose values show only as marks. */
+  summary?: string;
 }
 
 export interface LayeredTableColumn {
@@ -20,12 +22,14 @@ export interface LayeredTableColumn {
   content?: ReactNode;
   detail?: ReactNode;
   mark?: boolean;
+  summary?: string;
   hostWins?: boolean;
 }
 
 export interface LayeredCell {
   content: ReactNode;
   mark?: boolean;
+  summary?: string;
   clash?: string;
   unavailable?: string;
 }
@@ -37,6 +41,9 @@ export interface LayeredTableProps {
   cornerLabel: string;
   cornerDetail?: ReactNode;
   cornerMark?: boolean;
+  /** Shown instead of `cornerLabel`, which still names the corner for assistive tech. */
+  cornerContent?: ReactNode;
+  cornerSummary?: string;
   /** The line beside the tools, left of the table. */
   note?: ReactNode;
   /** Page actions, placed before `Select cells`. */
@@ -61,6 +68,78 @@ export function LayeredMark() {
   return <span aria-hidden="true" className="size-1.5 shrink-0 rounded-full bg-pink-500" />;
 }
 
+function OwnDot() {
+  return (
+    <span
+      aria-hidden="true"
+      className="absolute -top-0.5 -right-1 size-1.5 rounded-full bg-pink-500 ring-1 ring-background"
+    />
+  );
+}
+
+/** A green light when on; hollow when off, so it does not rely on colour. */
+export function LayeredLight({ on }: { on: boolean }) {
+  return (
+    <span
+      aria-hidden="true"
+      className={cn(
+        "size-2 shrink-0 rounded-full",
+        on ? "bg-success" : "border-[1.5px] border-muted-foreground",
+      )}
+    />
+  );
+}
+
+/** One fixed switch: a letter and its light, dotted when this level sets it. */
+export function LayeredSwitch({ letter, on, own }: { letter: string; on: boolean; own?: boolean }) {
+  return (
+    <span
+      className={cn(
+        "relative inline-flex items-center gap-1 pr-1 text-sm leading-5",
+        on || own ? "text-foreground" : "text-muted-foreground",
+        own && "font-semibold",
+      )}
+    >
+      {letter}
+      <LayeredLight on={on} />
+      {own && <OwnDot />}
+    </span>
+  );
+}
+
+const CHIP_TONES = {
+  plain: "border-border",
+  first: "border-violet-400 bg-violet-500/10",
+  second: "border-companion/70 bg-companion/10",
+};
+
+/** One short value in a fixed slot; the frame tells which field it is. */
+export function LayeredChip({
+  tone = "plain",
+  own,
+  title,
+  children,
+}: {
+  tone?: keyof typeof CHIP_TONES;
+  own?: boolean;
+  title?: string;
+  children: ReactNode;
+}) {
+  return (
+    <span
+      title={title}
+      className={cn(
+        "relative inline-flex h-5 min-w-11 shrink-0 items-center justify-center gap-0.5 rounded border px-1 text-sm leading-none tabular-nums",
+        CHIP_TONES[tone],
+        own ? "font-semibold text-foreground" : "text-muted-foreground",
+      )}
+    >
+      {children}
+      {own && <OwnDot />}
+    </span>
+  );
+}
+
 /** A value that differs from what its level would inherit. */
 export function LayeredOwn({ children }: { children: ReactNode }) {
   return (
@@ -82,7 +161,7 @@ function LevelState({ children, mark }: { children: ReactNode; mark?: boolean })
 const LEVEL_CELL = "h-px border-b border-border bg-background p-0 text-left align-top font-normal";
 const FIRST_COLUMN = "sticky left-0 min-w-34 max-w-34 border-r md:min-w-50 md:max-w-none";
 const BODY_COLUMN = "min-w-37.5";
-const LEVEL_NAME = "block min-w-0 text-ui font-medium text-foreground";
+const LEVEL_NAME = "flex min-w-0 items-center gap-1.5 text-ui font-medium text-foreground";
 
 /** Field-neutral layered grid; pages own values, editors and bulk mutations. */
 export function LayeredTable({
@@ -90,6 +169,8 @@ export function LayeredTable({
   cornerLabel,
   cornerDetail,
   cornerMark,
+  cornerContent,
+  cornerSummary,
   note,
   tools,
   legend,
@@ -149,13 +230,15 @@ export function LayeredTable({
     clash?: string,
     levels?: readonly LayeredCellLevel[],
     cellTestId?: string,
+    summary?: string,
   ) {
     const isSelected =
       !!levels?.length && levels.every(({ row, col }) => selected.has(selectionKey(row, col)));
     const button = (
       <button
         type="button"
-        aria-label={ariaLabel}
+        aria-label={summary ? `${ariaLabel}: ${summary}` : ariaLabel}
+        title={summary}
         aria-pressed={selecting ? isSelected : undefined}
         disabled={selecting && levels?.length === 0}
         data-testid={cellTestId}
@@ -190,20 +273,19 @@ export function LayeredTable({
             variant="outline"
             size="sm"
             className="min-h-11 md:min-h-7"
+            aria-label={selecting ? "Done selecting" : "Select cells"}
             onClick={() => (selecting ? stopSelecting() : setSelecting(true))}
           >
-            {selecting ? "Done selecting" : "Select cells"}
+            {selecting ? "Done" : "Select"}
           </Button>
         </div>
       </div>
       {selecting && (
         <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1.5 rounded-lg border border-border bg-muted px-2.5 py-1.5 text-sm">
           <span className="font-semibold text-foreground" aria-live="polite">
-            {selectedLevels.length} {selectedLevels.length === 1 ? "cell" : "cells"} selected
+            {selectedLevels.length} selected
           </span>
-          <span className="text-muted-foreground">
-            Click cells, a header for its line, or the corner for all.
-          </span>
+          <span className="text-muted-foreground">Click cells, a header or the corner.</span>
           <span className="ml-auto flex flex-wrap items-center gap-1.5">
             {selectionActions?.(selectedLevels, () => setSelected(new Set()))}
           </span>
@@ -220,13 +302,14 @@ export function LayeredTable({
                 {editorButton(
                   { level: "corner" },
                   <>
-                    <span className={LEVEL_NAME}>{cornerLabel}</span>
+                    <span className={LEVEL_NAME}>{cornerContent ?? cornerLabel}</span>
                     {cornerDetail && <LevelState mark={cornerMark}>{cornerDetail}</LevelState>}
                   </>,
                   selecting ? "Select every available cell" : `Edit ${cornerLabel}`,
                   undefined,
                   availableLevels,
                   "layered-corner",
+                  cornerSummary,
                 )}
               </th>
               {columns.map((col) => (
@@ -234,13 +317,15 @@ export function LayeredTable({
                   {editorButton(
                     { level: "col", col: col.id },
                     <>
-                      <span className={LEVEL_NAME}>{col.content ?? col.label}</span>
-                      {(col.hostWins || col.detail) && (
-                        <span className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5">
-                          {col.hostWins && <LayeredOwn>Host wins</LayeredOwn>}
-                          {col.detail && <LevelState mark={col.mark}>{col.detail}</LevelState>}
-                        </span>
-                      )}
+                      <span className={LEVEL_NAME}>
+                        {col.content ?? col.label}
+                        {col.hostWins && (
+                          <LayeredChip own title="Host wins">
+                            H
+                          </LayeredChip>
+                        )}
+                      </span>
+                      {col.detail && <LevelState mark={col.mark}>{col.detail}</LevelState>}
                     </>,
                     selecting ? `Select ${col.label} cells` : `Edit ${col.label}`,
                     undefined,
@@ -250,6 +335,7 @@ export function LayeredTable({
                         : [{ level: "cell" as const, row: row.id, col: col.id }],
                     ),
                     `layered-col-${col.id}`,
+                    col.summary,
                   )}
                 </th>
               ))}
@@ -273,6 +359,7 @@ export function LayeredTable({
                         : [{ level: "cell" as const, row: row.id, col: col.id }],
                     ),
                     `layered-row-${row.id}`,
+                    row.summary,
                   )}
                 </th>
                 {columns.map((col) => {
@@ -295,6 +382,7 @@ export function LayeredTable({
                             cell.clash,
                             [at],
                             `layered-cell-${row.id}-${col.id}`,
+                            cell.summary,
                           )}
                           {cell.clash && (
                             <HelpTip
@@ -321,8 +409,10 @@ export function LayeredTable({
         </table>
       </div>
       <p className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-muted-foreground">
-        <LayeredOwn>Differs from the level above</LayeredOwn>
-        <span>No dot: inherited</span>
+        <span className="inline-flex items-center gap-1.5">
+          <LayeredMark />
+          Differs from above
+        </span>
         {legend}
       </p>
     </div>
