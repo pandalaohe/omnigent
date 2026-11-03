@@ -687,6 +687,8 @@ class PermissionTierRuntime:
                     )
                 if name not in registry.tool_names:
                     return TierDecision(Verdict.DENY, "Tool is not registered in this Pi scope")
+                if name in registry.unsupported_tools:
+                    return TierDecision(Verdict.DENY, "Pi inline tool source is not attested")
             if name in registry.invalid_tools:
                 return TierDecision(Verdict.DENY, registry.extensions[name])
             if registry.reason:

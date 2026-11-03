@@ -376,6 +376,37 @@ def _scope_call(runtime, admission, *, call_id="same-call", name="read", argumen
     return receipt, binding, decision
 
 
+@pytest.mark.parametrize("tier", ["plan", "ask", "accept-edits", "auto", "full"])
+def test_scoped_inline_tool_is_denied_without_disabling_registered_read(tmp_path, tier):
+    runtime, _parent, _child, _source, _registry = _scoped_runtime(tmp_path, tier)
+    child = runtime.open_pi_child_scope("session-a")
+    _publish_scope(
+        runtime,
+        child,
+        [
+            {"name": "read", "sourceInfo": {"source": "builtin", "path": "builtin:read"}},
+            {
+                "name": "contact_supervisor",
+                "sourceInfo": {
+                    "path": "<inline:pi-subagents:prompt-runtime>",
+                    "source": "inline",
+                    "scope": "temporary",
+                    "origin": "top-level",
+                },
+            },
+        ],
+    )
+    _receipt, _binding, read = _scope_call(runtime, child, call_id="read")
+    assert read.action.value == "ALLOW", read.reason
+    _receipt, _binding, inline = _scope_call(
+        runtime, child, call_id="inline", name="contact_supervisor", arguments={}
+    )
+    assert inline.action.value == ("ALLOW" if tier == "full" else "DENY"), inline.reason
+    if tier != "full":
+        assert inline.reason == "Pi inline tool source is not attested"
+    assert runtime.pi_scopes.record(child.principal).status == "ready"
+
+
 def test_pi_native_attestation_keeps_identical_calls_and_refreshes_distinct(tmp_path):
     runtime, _parent, _child, _source, _registry = _scoped_runtime(tmp_path)
     child = runtime.open_pi_child_scope("session-a")

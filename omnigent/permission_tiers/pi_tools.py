@@ -24,6 +24,7 @@ class PiToolRegistry:
     registration_digest: str | None = None
     native_tools: dict[str, str] = field(default_factory=dict)
     bridge_tools: frozenset[str] = frozenset()
+    unsupported_tools: frozenset[str] = frozenset()
 
 
 def _file_identity(info: os.stat_result) -> tuple[int, ...]:
@@ -162,6 +163,7 @@ def read_pi_tool_registry(
         invalid: set[str] = set()
         native_tools: dict[str, str] = {}
         bridge_tools: set[str] = set()
+        unsupported: set[str] = set()
         native_packages: dict[str, str] = {}
         for tool in tools:
             if not isinstance(tool, dict) or not isinstance(tool.get("name"), str):
@@ -186,6 +188,18 @@ def read_pi_tool_registry(
                     continue
                 if path in (str(guard), "<inline:omnigent-permission>"):
                     bridge_tools.add(name)
+                    continue
+                if (
+                    scoped
+                    and source.get("source") == "inline"
+                    and source.get("scope") == "temporary"
+                    and source.get("origin") == "top-level"
+                    and isinstance(path, str)
+                    and path.startswith("<inline:")
+                    and path.endswith(">")
+                ):
+                    # Record actual inline tools without granting them file-backed provenance.
+                    unsupported.add(name)
                     continue
             if scoped and (
                 not isinstance(source, dict)
@@ -319,6 +333,7 @@ def read_pi_tool_registry(
             ),
             native_tools=native_tools,
             bridge_tools=frozenset(bridge_tools),
+            unsupported_tools=frozenset(unsupported),
         )
     except (OSError, ValueError, KeyError, TypeError, RuntimeError):
         return PiToolRegistry(
