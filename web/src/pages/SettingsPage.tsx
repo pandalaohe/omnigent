@@ -377,6 +377,10 @@ const InstructionsPage = lazy(() =>
 const SharingPage = lazy(() =>
   import("@/pages/SharingPage").then((m) => ({ default: m.SharingPage })),
 );
+// The Usage board's settings group is part of the board's own chunk.
+const UsageBoardSettingsLazy = lazy(() =>
+  import("@/pages/usageBoard").then((m) => ({ default: m.UsageBoardSettings })),
+);
 
 /**
  * Settings content panel. The section nav lives in the sidebar card
@@ -2923,6 +2927,15 @@ function GeneralSection() {
               <CompactProgressIndicatorControl />
               <ContextUsageSettings />
             </div>
+          </ExpandableSettings>
+        </SettingsGroup>
+        {/* The Usage board module's whole settings surface. It stays reachable
+            with the module switched off, because the switch lives here. */}
+        <SettingsGroup title="Usage board" testId="settings-group-usage-board">
+          <ExpandableSettings id="usage-board" title="Usage board">
+            <Suspense fallback={<div className="h-10" />}>
+              <UsageBoardSettingsLazy />
+            </Suspense>
           </ExpandableSettings>
         </SettingsGroup>
         <SettingsGroup title="Background processes" testId="settings-group-background-processes">

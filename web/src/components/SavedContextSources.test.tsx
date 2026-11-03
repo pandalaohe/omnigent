@@ -9,6 +9,7 @@ import {
   usageContextSourceFromKey,
   usageContextLevelKey,
   writeUsageContextPreferences,
+  DEFAULT_USAGE_CONTEXT_PREFERENCES,
   type UsageContextOverride,
   type UsageContextPreferences,
 } from "@/lib/usageContextPreferences";
@@ -32,7 +33,13 @@ function override(
 }
 
 function preferencesWith(overrides: Record<string, UsageContextOverride>): UsageContextPreferences {
-  return { version: 5, showProviderUsageLimits: true, overrides, lastProviderUsageLimits: {} };
+  return {
+    version: 5,
+    showProviderUsageLimits: true,
+    overrides,
+    lastProviderUsageLimits: {},
+    board: DEFAULT_USAGE_CONTEXT_PREFERENCES.board,
+  };
 }
 
 function renderSources(options: {

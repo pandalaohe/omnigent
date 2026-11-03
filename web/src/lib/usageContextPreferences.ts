@@ -32,6 +32,8 @@ export interface UsageContextPreferences {
   overrides: Record<string, UsageContextOverride>;
   /** Last valid provider reading for the exact Host/agent/harness/model source. */
   lastProviderUsageLimits: Record<string, ProviderUsageLimitsSnapshot>;
+  /** The Usage board's display preferences. */
+  board: UsageBoardPreferences;
 }
 
 export interface UsageContextSource {
@@ -41,11 +43,48 @@ export interface UsageContextSource {
   model: string;
 }
 
+/**
+ * Usage board display preferences. All per user, in the existing
+ * ``usage_context`` namespace (a new namespace would refuse a full-envelope
+ * write on an older image), and never written back to a usage source.
+ */
+export interface UsageBoardBand {
+  id: string;
+  name: string;
+  /** Account ids in hand order; an id absent here is shown after them. */
+  accounts: string[];
+  open: boolean;
+}
+
+export interface UsageBoardPreferences {
+  /** The user's switch. The deployment gate sits on top of it. */
+  enabled: boolean;
+  density: "std" | "mini";
+  /** Grouping and order; empty means one group in the server's order. */
+  bands: UsageBoardBand[];
+  /** Account id → window id, or ``auto`` (most urgent). */
+  windows: Record<string, string>;
+  /** Account id → renewal date, epoch ms, where the source gives none. */
+  renewals: Record<string, number>;
+  /** Accounts the user switched off in ``On board``: not on the board. */
+  hidden: string[];
+}
+
+export const DEFAULT_USAGE_BOARD_PREFERENCES: UsageBoardPreferences = {
+  enabled: false,
+  density: "std",
+  bands: [],
+  windows: {},
+  renewals: {},
+  hidden: [],
+};
+
 export const DEFAULT_USAGE_CONTEXT_PREFERENCES: UsageContextPreferences = {
   version: 6,
   showProviderUsageLimits: true,
   overrides: {},
   lastProviderUsageLimits: {},
+  board: DEFAULT_USAGE_BOARD_PREFERENCES,
 };
 
 function positiveInteger(value: unknown): number | null {
@@ -78,6 +117,7 @@ export function normalizeUsageContextPreferences(value: unknown): UsageContextPr
     showCodexRateLimits?: unknown;
     overrides?: unknown;
     lastProviderUsageLimits?: unknown;
+    board?: unknown;
   };
   const overrides: Record<string, UsageContextOverride> = {};
   if (raw.overrides && typeof raw.overrides === "object") {
@@ -160,7 +200,87 @@ export function normalizeUsageContextPreferences(value: unknown): UsageContextPr
         : raw.showCodexRateLimits !== false,
     overrides,
     lastProviderUsageLimits,
+    board: normalizeUsageBoardPreferences(raw.board),
   };
+}
+
+function idMap(value: unknown): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!value || typeof value !== "object") return out;
+  for (const [key, candidate] of Object.entries(value).slice(0, 64)) {
+    if (key.length === 0 || key.length > 64) continue;
+    if (typeof candidate !== "string" || candidate.length === 0 || candidate.length > 32) continue;
+    out[key] = candidate;
+  }
+  return out;
+}
+
+function dateMap(value: unknown): Record<string, number> {
+  const out: Record<string, number> = {};
+  if (!value || typeof value !== "object") return out;
+  for (const [key, candidate] of Object.entries(value).slice(0, 64)) {
+    if (key.length === 0 || key.length > 64) continue;
+    if (typeof candidate !== "number" || !Number.isFinite(candidate) || candidate <= 0) continue;
+    out[key] = Math.round(candidate);
+  }
+  return out;
+}
+
+export function normalizeUsageBoardPreferences(value: unknown): UsageBoardPreferences {
+  if (!value || typeof value !== "object") return { ...DEFAULT_USAGE_BOARD_PREFERENCES };
+  const raw = value as {
+    enabled?: unknown;
+    density?: unknown;
+    bands?: unknown;
+    windows?: unknown;
+    renewals?: unknown;
+    hidden?: unknown;
+  };
+  const bands: UsageBoardBand[] = [];
+  const seenBands = new Set<string>();
+  if (Array.isArray(raw.bands)) {
+    for (const candidate of raw.bands.slice(0, 24)) {
+      if (!candidate || typeof candidate !== "object") continue;
+      const band = candidate as {
+        id?: unknown;
+        name?: unknown;
+        accounts?: unknown;
+        open?: unknown;
+      };
+      const id = typeof band.id === "string" ? band.id.slice(0, 32) : "";
+      if (id.length === 0 || seenBands.has(id)) continue;
+      seenBands.add(id);
+      bands.push({
+        id,
+        name: typeof band.name === "string" ? band.name.slice(0, 40) : id,
+        accounts: Array.isArray(band.accounts)
+          ? band.accounts.filter((item): item is string => typeof item === "string").slice(0, 64)
+          : [],
+        open: band.open !== false,
+      });
+    }
+  }
+  return {
+    enabled: raw.enabled === true,
+    density: raw.density === "mini" ? "mini" : "std",
+    bands,
+    windows: idMap(raw.windows),
+    renewals: dateMap(raw.renewals),
+    hidden: Array.isArray(raw.hidden)
+      ? raw.hidden.filter((item): item is string => typeof item === "string").slice(0, 64)
+      : [],
+  };
+}
+
+export function isDefaultUsageBoardPreferences(board: UsageBoardPreferences): boolean {
+  return (
+    !board.enabled &&
+    board.density === "std" &&
+    board.bands.length === 0 &&
+    Object.keys(board.windows).length === 0 &&
+    Object.keys(board.renewals).length === 0 &&
+    board.hidden.length === 0
+  );
 }
 
 export function usageContextSourceKey(source: {
@@ -380,7 +500,8 @@ function isDefault(preferences: UsageContextPreferences): boolean {
   return (
     preferences.showProviderUsageLimits &&
     Object.keys(preferences.overrides).length === 0 &&
-    Object.keys(preferences.lastProviderUsageLimits).length === 0
+    Object.keys(preferences.lastProviderUsageLimits).length === 0 &&
+    isDefaultUsageBoardPreferences(preferences.board)
   );
 }
 
@@ -569,4 +690,15 @@ export function writeLastProviderUsageLimits(
   } else {
     writeUsageContextPreferences(next);
   }
+}
+
+/** Merge one change into the stored Usage board preferences. */
+export function patchUsageBoardPreferences(patch: Partial<UsageBoardPreferences>): void {
+  const current = readUsageContextPreferences();
+  const next: UsageContextPreferences = {
+    ...current,
+    version: 6,
+    board: normalizeUsageBoardPreferences({ ...current.board, ...patch }),
+  };
+  writeUsageContextPreferences(next);
 }

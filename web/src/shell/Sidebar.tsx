@@ -54,6 +54,7 @@ import {
   FolderInputIcon,
   FolderMinusIcon,
   FolderOpenIcon,
+  GaugeIcon,
   GitBranchIcon,
   GitForkIcon,
   GitMergeIcon,
@@ -194,7 +195,12 @@ import { useComments } from "@/hooks/useComments";
 import { bulkCommentsDeleteLine, unhandledCommentsDeleteLine } from "@/lib/comments";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled, isSingleUserMode, sandboxOptionLabel } from "@/lib/capabilities";
+import {
+  isFeatureEnabled,
+  isSingleUserMode,
+  sandboxOptionLabel,
+  usageBoardAvailable,
+} from "@/lib/capabilities";
 import { useBranding } from "@/lib/branding";
 import { relativeTime } from "@/lib/relativeTime";
 import { showToast } from "@/components/ui/toast";
@@ -214,6 +220,7 @@ import {
   GoalActivityBadge,
   SessionStateBadge,
 } from "@/components/SessionStateBadge";
+import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useActiveRootSessionId } from "@/hooks/useSession";
 import { useSessionNavigationPreferences } from "@/hooks/useSessionNavigationPreferences";
@@ -584,6 +591,7 @@ function useActiveNavItem(): {
   isCanvasPage: boolean;
   isTasksPage: boolean;
   isUsagePage: boolean;
+  isUsageBoardPage: boolean;
   isSystemStatusPage: boolean;
   activeExtensionPageId: string | null;
   newSessionProjectName: string | null;
@@ -601,6 +609,9 @@ function useActiveNavItem(): {
   // match the "tasks" segment by position from the end, not an absolute path.
   const isTasksPage = !isExtensionRoute && (leaf === "tasks" || segments.at(-2) === "tasks");
   const isUsagePage = !isExtensionRoute && leaf === "usage";
+  // The board's routes are `/usage/board`, `/usage/board/<id>` and its
+  // settings; the "usage" segment one before the leaf tells them apart.
+  const isUsageBoardPage = !isExtensionRoute && segments.at(-2) === "usage";
   const isSystemStatusPage = !isExtensionRoute && leaf === "system";
   const activeExtensionPageId =
     resolveExtensionPageFromPath(extensions, location.pathname)?.page.id ?? null;
@@ -620,6 +631,7 @@ function useActiveNavItem(): {
     isCanvasPage,
     isTasksPage,
     isUsagePage,
+    isUsageBoardPage,
     isSystemStatusPage,
     activeExtensionPageId,
     newSessionProjectName,
@@ -841,6 +853,10 @@ function SidebarImpl({
     selectProject: selectProjectNewSessionTarget,
   } = useNewSessionTarget(newSessionProjects);
   const usagePageEnabled = isFeatureEnabled(serverInfo, "usage_page");
+  const usageBoardEnabledPref = useUsageContextPreferences().board.enabled;
+  // The board replaces the Usage row only when both are on: the deployment
+  // allows the module and this user turned it on.
+  const usageBoardOn = usageBoardAvailable(serverInfo) && usageBoardEnabledPref;
   const canvasEnabled = isFeatureEnabled(serverInfo, "canvas");
   const [searchParams] = useSearchParams();
   const canvasDestination = canvasLocation(searchParams.get(CANVAS_QUERY_PARAM) ?? MAIN_CANVAS_ID);
@@ -984,6 +1000,7 @@ function SidebarImpl({
     isCanvasPage,
     isTasksPage,
     isUsagePage,
+    isUsageBoardPage,
     isSystemStatusPage,
     activeExtensionPageId,
     newSessionProjectName,
@@ -1549,7 +1566,35 @@ function SidebarImpl({
                 activePageId={activeExtensionPageId}
                 onNavigate={onNavClick}
               />
-              {usagePageEnabled && (
+              {usageBoardOn && (
+                <Button
+                  asChild
+                  variant="ghost"
+                  className={cn(
+                    SIDEBAR_ROW,
+                    "w-full justify-start border-0 font-normal",
+                    SIDEBAR_HOVER_HIGHLIGHT,
+                    isUsageBoardPage && SIDEBAR_ACTIVE_HIGHLIGHT,
+                  )}
+                  data-testid="usage-board-nav"
+                >
+                  <Link to="/usage/board" onClick={onNavClick} componentId="sidebar.usage_board">
+                    <GaugeIcon
+                      className={cn(
+                        "ui-icon",
+                        isUsageBoardPage
+                          ? "text-[var(--sidebar-active-foreground)]"
+                          : "text-muted-foreground",
+                      )}
+                    />
+                    Usage board
+                  </Link>
+                </Button>
+              )}
+              {/* One entry, not two: with the board on, its row is the usage
+                  destination and the per-session Usage page stays reachable
+                  from the board's cost page and by its own path. */}
+              {usagePageEnabled && !usageBoardOn && (
                 <Button
                   asChild
                   variant="ghost"

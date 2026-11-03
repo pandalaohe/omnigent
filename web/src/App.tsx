@@ -63,6 +63,19 @@ const UsagePage = withPageView(
   "usage",
   lazy(() => import("@/pages/UsagePage").then((m) => ({ default: m.UsagePage }))),
 );
+// The Usage board is its own module, gated by its own switch rather than a
+// release feature: /v1/info's usage_board_enabled plus the user's preference.
+// One lazy chunk serves its three routes; each route keeps its own page-view id.
+const UsageBoardRoute = lazy(() =>
+  import("@/pages/usageBoard").then((m) => ({ default: m.UsageBoardRoute })),
+);
+const UsageBoardPage = withPageView("usage_board", () => <UsageBoardRoute view="board" />);
+const UsageBoardAccountPage = withPageView("usage_board.account", () => (
+  <UsageBoardRoute view="account" />
+));
+const UsageBoardAccountSettingsPage = withPageView("usage_board.account_settings", () => (
+  <UsageBoardRoute view="account_settings" />
+));
 const SystemStatusPage = withPageView(
   "system_status",
   lazy(() => import("@/pages/SystemStatusPage").then((m) => ({ default: m.SystemStatusPage }))),
@@ -227,6 +240,12 @@ function AppRoutes({ basename }: AppProps) {
                 <UsagePage />
               </FeatureGatedPage>
             }
+          />
+          <Route path={`${prefix}/usage/board`} element={<UsageBoardPage />} />
+          <Route path={`${prefix}/usage/board/:accountId`} element={<UsageBoardAccountPage />} />
+          <Route
+            path={`${prefix}/usage/board/:accountId/settings`}
+            element={<UsageBoardAccountSettingsPage />}
           />
           <Route path={`${prefix}/system`} element={<SystemStatusPage />} />
           <Route path={`${prefix}/hosts/:hostId/terminals`} element={<HostTerminalsPage />} />

@@ -273,6 +273,11 @@ export interface ServerInfo {
   filesystem_attachments?: FilesystemAttachmentsInfo | null;
   /** Scheduled tasks accept a project; absent on older servers (off). */
   scheduled_task_projects?: boolean;
+  /**
+   * The Usage board module may run here (server config ``usage.enabled``).
+   * Absent on older servers, which reads as off.
+   */
+  usage_board_enabled?: boolean;
   /** Operator branding, or null when the built-in identity should be used. */
   branding?: Branding | null;
   /**
@@ -517,6 +522,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           archive_worktree_cleanup: data.archive_worktree_cleanup === true,
           worktree_status: data.worktree_status === true,
           session_search_scope: data.session_search_scope === true,
+          usage_board_enabled: data.usage_board_enabled === true,
           scheduled_task_session_modes: data.scheduled_task_session_modes === true,
           request_managed_sandbox_host_id: data.request_managed_sandbox_host_id === true,
           agent_install: data.agent_install === true,
@@ -566,6 +572,15 @@ export function getCachedServerInfo(): ServerInfo | null {
  */
 export function isSingleUserMode(info: ServerInfo | "loading"): boolean {
   return info !== "loading" && info.single_user;
+}
+
+/**
+ * Whether the Usage board module may run on this server at all. The module's
+ * own per-user switch sits on top of this: effective = this AND the user chose
+ * it on. An older server omits the field, which reads as off.
+ */
+export function usageBoardAvailable(info: ServerInfo | "loading"): boolean {
+  return info !== "loading" && info.usage_board_enabled === true;
 }
 
 /**

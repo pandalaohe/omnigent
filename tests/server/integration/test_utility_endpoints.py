@@ -130,6 +130,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert data["scheduled_task_projects"] is False
     # This app wires no scheduled-task store, so it has no automations to offer.
     assert data["automations_enabled"] is False
+    # The Usage board module runs unless the server config turns it off.
+    assert data["usage_board_enabled"] is True
     # single_user reflects OMNIGENT_LOCAL_SINGLE_USER, which the suite's
     # conftest sets to "1" (the default local-dev posture), so it's true here.
     # The multi-user (marker-off) case is covered below.
@@ -144,6 +146,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert ServerInfoResponse.model_validate(data).session_event_types == []
     del data["automations_enabled"]
     assert ServerInfoResponse.model_validate(data).automations_enabled is False
+    del data["usage_board_enabled"]
+    assert ServerInfoResponse.model_validate(data).usage_board_enabled is False
 
 
 async def test_info_disables_config_edit_for_unsupported_store(

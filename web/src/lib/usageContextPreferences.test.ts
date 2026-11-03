@@ -19,6 +19,9 @@ import {
   writeUsageContextOverride,
   writeUsageContextPreferences,
   writeLastProviderUsageLimits,
+  normalizeUsageContextPreferences,
+  isDefaultUsageBoardPreferences,
+  patchUsageBoardPreferences,
   type UsageContextPreferences,
 } from "./usageContextPreferences";
 
@@ -126,6 +129,7 @@ describe("usage/context preferences", () => {
     writeUsageContextOverride(
       {
         version: 5,
+        board: DEFAULT_USAGE_CONTEXT_PREFERENCES.board,
         showProviderUsageLimits: false,
         overrides: {},
         lastProviderUsageLimits: {},
@@ -192,6 +196,7 @@ describe("usage/context preferences", () => {
       "omnigent:usage-context-preferences",
       JSON.stringify({
         version: 5,
+        board: DEFAULT_USAGE_CONTEXT_PREFERENCES.board,
         showProviderUsageLimits: true,
         overrides: { [source]: { contextWindowTokens: 100_000, autoCompactBufferTokens: 20_000 } },
         lastProviderUsageLimits: {},
@@ -213,6 +218,7 @@ describe("usage/context preferences", () => {
       "omnigent:usage-context-preferences",
       JSON.stringify({
         version: 5,
+        board: DEFAULT_USAGE_CONTEXT_PREFERENCES.board,
         overrides: {
           [source]: {
             contextWindowTokens: 100_000,
@@ -233,6 +239,7 @@ describe("usage/context preferences", () => {
   it("does not leak a manual override into a different Host or model", () => {
     writeUsageContextPreferences({
       version: 5,
+      board: DEFAULT_USAGE_CONTEXT_PREFERENCES.board,
       showProviderUsageLimits: false,
       overrides: {
         [source]: { contextWindowTokens: 330_000, autoCompactBufferTokens: 33_000 },
@@ -297,6 +304,7 @@ describe("usage/context preferences", () => {
   it("recomputes from the reported buffer when the saved buffer meets the context total", () => {
     writeUsageContextPreferences({
       version: 5,
+      board: DEFAULT_USAGE_CONTEXT_PREFERENCES.board,
       showProviderUsageLimits: true,
       overrides: {
         [source]: { contextWindowTokens: 30_000, autoCompactBufferTokens: 33_000 },
@@ -395,6 +403,7 @@ describe("usage/context preferences", () => {
     });
     const preferences: UsageContextPreferences = {
       version: 5,
+      board: DEFAULT_USAGE_CONTEXT_PREFERENCES.board,
       showProviderUsageLimits: true,
       overrides: {
         [source]: { contextWindowTokens: 100_000, autoCompactBufferTokens: 10_000 },
@@ -419,6 +428,7 @@ describe("usage/context preferences", () => {
   it("clears a patched field to Auto and drops a row left all-Auto", () => {
     const preferences: UsageContextPreferences = {
       version: 5,
+      board: DEFAULT_USAGE_CONTEXT_PREFERENCES.board,
       showProviderUsageLimits: true,
       overrides: {
         [source]: { contextWindowTokens: 100_000, autoCompactBufferTokens: 10_000 },
@@ -461,6 +471,7 @@ describe("usage/context preferences", () => {
     });
     const preferences: UsageContextPreferences = {
       version: 5,
+      board: DEFAULT_USAGE_CONTEXT_PREFERENCES.board,
       showProviderUsageLimits: true,
       overrides: {
         [source]: { contextWindowTokens: 100_000, autoCompactBufferTokens: 10_000 },
@@ -684,5 +695,67 @@ describe("usage/context preferences", () => {
     preferences.overrides[second] = value;
     preferences.overrides[usageContextLevelKey(identity, "cell")] = value;
     expect(proposeUsageContextCollapse(preferences).removed).toEqual([]);
+  });
+
+  it("keeps the Usage board switch and display fields, dropping a malformed value", () => {
+    writeUsageContextPreferences({
+      ...DEFAULT_USAGE_CONTEXT_PREFERENCES,
+      board: {
+        enabled: true,
+        density: "mini",
+        bands: [
+          { id: "paid", name: "Paid", accounts: ["codex", "litellm"], open: false },
+          { id: "paid", name: "Duplicate id", accounts: [], open: true },
+        ],
+        windows: { codex: "5h", broken: 7 as unknown as string },
+        renewals: { codex: 1_800_000_000_000, nope: -1 },
+        hidden: ["grok"],
+      },
+    });
+    const board = readUsageContextPreferences().board;
+    expect(board.enabled).toBe(true);
+    expect(board.density).toBe("mini");
+    expect(board.bands).toEqual([
+      { id: "paid", name: "Paid", accounts: ["codex", "litellm"], open: false },
+    ]);
+    expect(board.windows).toEqual({ codex: "5h" });
+    expect(board.renewals).toEqual({ codex: 1_800_000_000_000 });
+    expect(board.hidden).toEqual(["grok"]);
+  });
+
+  it("reads a stored envelope written before the board existed", () => {
+    const legacy = {
+      version: 6,
+      showProviderUsageLimits: true,
+      overrides: {},
+      lastProviderUsageLimits: {},
+    };
+    expect(normalizeUsageContextPreferences(legacy).board).toEqual(
+      DEFAULT_USAGE_CONTEXT_PREFERENCES.board,
+    );
+    // The board own defaults count as no preference, so the key is dropped
+    // rather than written back.
+    expect(isDefaultUsageBoardPreferences(DEFAULT_USAGE_CONTEXT_PREFERENCES.board)).toBe(true);
+    expect(
+      isDefaultUsageBoardPreferences({ ...DEFAULT_USAGE_CONTEXT_PREFERENCES.board, enabled: true }),
+    ).toBe(false);
+  });
+
+  it("patches one board field without disturbing the others", () => {
+    writeUsageContextPreferences({
+      ...DEFAULT_USAGE_CONTEXT_PREFERENCES,
+      overrides: { [source]: { contextWindowTokens: 100_000, autoCompactBufferTokens: null } },
+    });
+    patchUsageBoardPreferences({ enabled: true });
+    patchUsageBoardPreferences({ hidden: ["grok"] });
+    const saved = readUsageContextPreferences();
+    expect(saved.board.enabled).toBe(true);
+    expect(saved.board.hidden).toEqual(["grok"]);
+    // The context override is untouched, and the write carries the whole
+    // envelope because the server stores this namespace as one value.
+    expect(saved.overrides[source]).toEqual({
+      contextWindowTokens: 100_000,
+      autoCompactBufferTokens: null,
+    });
   });
 });
