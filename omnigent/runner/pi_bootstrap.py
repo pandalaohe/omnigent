@@ -64,6 +64,14 @@ class PiAttestorProcess:
     handoff: Path | None = field(default=None, repr=False)
 
 
+@dataclass
+class PiRootProcessLaunch:
+    launch_id: str
+    handoff: Path
+    actor: PiAttestorProcess | None = None
+    status: Literal["reserved", "published", "revoked"] = "reserved"
+
+
 class PiBootstrapBroker:
     """One runner-loop ledger backed by the existing scope and permission registries."""
 
@@ -73,6 +81,8 @@ class PiBootstrapBroker:
         self.endpoint: str | None = None
         self._actors: dict[str, PiAttestorProcess] = {}
         self._proofs: dict[tuple[str, str], NativeSupport] = {}
+        self._launcher_capability: str | None = None
+        self._root_process_launch: PiRootProcessLaunch | None = None
         self._unsubscribe = runtime.pi_scopes.observe_launch_invalidation(self._launch_invalidated)
 
     def _launch_invalidated(self, root_session_id: str) -> None:
@@ -81,8 +91,125 @@ class PiBootstrapBroker:
 
     def close(self) -> None:
         self.endpoint = None
+        self._launcher_capability = None
+        self._root_process_launch = None
         self.invalidate()
         self._unsubscribe()
+
+    def launcher_descriptor(self) -> dict[str, object]:
+        """Delivered only to the authenticated Python harness, never to a Pi scope."""
+        state = self.runtime.state(self.session_id)
+        if (
+            self.endpoint is None
+            or self.runtime.observation_harness(self.session_id) != "pi"
+            or state is None
+            or state.status not in ("ready", "blocked")
+            or state.tier == "full"
+        ):
+            raise ValueError("Pi root launcher unavailable")
+        self.invalidate()
+        self._launcher_capability = "pi_attestor_" + secrets.token_urlsafe(32)
+        self._root_process_launch = None
+        return {
+            "protocol": 1,
+            "session_id": self.session_id,
+            "endpoint": self.endpoint,
+            "process_capability": self._launcher_capability,
+        }
+
+    def authenticate_launcher(self, authorization: str | None) -> None:
+        state = self.runtime.state(self.session_id)
+        if (
+            self.endpoint is None
+            or self._launcher_capability is None
+            or not isinstance(authorization, str)
+            or len(authorization) > 256
+            or not hmac.compare_digest(
+                authorization.encode(), ("Bearer " + self._launcher_capability).encode()
+            )
+            or self.runtime.observation_harness(self.session_id) != "pi"
+            or state is None
+            or state.status not in ("ready", "blocked")
+            or state.tier == "full"
+        ):
+            raise ValueError("Pi root launcher authentication unavailable")
+
+    def handle_launcher(self, payload: dict[str, object]) -> dict[str, object]:
+        """Reserve/publish/confirm the exact subprocess observed by the trusted harness."""
+        common = {"protocol", "op", "launch_id"}
+        op, launch_id = payload.get("op"), payload.get("launch_id")
+        fields = {
+            "reserve": common,
+            "publish": common | {"pid", "started_at"},
+            "confirm": common,
+            "revoke": common,
+        }
+        if (
+            type(payload.get("protocol")) is not int
+            or payload["protocol"] != 1
+            or not isinstance(op, str)
+            or op not in fields
+            or set(payload) != fields[op]
+            or not isinstance(launch_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", launch_id) is None
+        ):
+            raise ValueError("Pi root launcher request unavailable")
+        launch = self._root_process_launch
+        if op == "reserve":
+            if launch is None or launch.launch_id != launch_id:
+                if launch is not None and launch.actor is not None and self.live(launch.actor):
+                    raise ValueError("Pi root process is still owned by another launch")
+                launch = PiRootProcessLaunch(launch_id, self.reserve_handoff())
+                self._root_process_launch = launch
+            if launch.status != "reserved":
+                raise ValueError("Pi root handoff reservation is no longer pending")
+            reply: dict[str, object] = {"handoff": str(launch.handoff)}
+        else:
+            if launch is None or launch.launch_id != launch_id:
+                raise ValueError("Pi root launcher generation changed")
+            if op == "revoke":
+                if launch.actor is not None:
+                    self.revoke_process(launch.actor)
+                launch.status = "revoked"
+                reply = {"revoked": True}
+            elif op == "publish":
+                pid, started_at = payload.get("pid"), payload.get("started_at")
+                if type(pid) is not int or type(started_at) not in (int, float):
+                    raise ValueError("Pi root process identity unavailable")
+                identity = (cast(int, pid), cast(float, started_at))
+                if launch.status == "reserved":
+                    actor = self.register_process(
+                        identity[0], expected_identity=identity, root=True
+                    )
+                    launch.actor = actor
+                    try:
+                        self.publish_handoff(actor, launch.handoff)
+                    except BaseException:
+                        self.revoke_process(actor)
+                        launch.status = "revoked"
+                        raise
+                    launch.status = "published"
+                if (
+                    launch.status != "published"
+                    or launch.actor is None
+                    or launch.actor.identity != identity
+                    or not self.live(launch.actor)
+                ):
+                    raise ValueError("Pi root process publication is stale")
+                reply = {"published": True}
+            else:
+                if (
+                    launch.status != "published"
+                    or launch.actor is None
+                    or not self.live(launch.actor)
+                ):
+                    raise ValueError("Pi root process is not published")
+                parent = self.runtime.pi_scopes.parent_scope(self.session_id)
+                ready = parent.status == "ready" and self.runtime.acknowledge_pi_scope(
+                    self.session_id, parent.admission.credential
+                )
+                reply = {"ready": ready}
+        return {**reply, "launch_id": launch_id}
 
     def frame(self, actor: PiAttestorProcess) -> dict[str, object]:
         if not self.live(actor):

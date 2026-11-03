@@ -180,6 +180,17 @@ class PermissionTierRuntime:
         )
         path = self.state_path(envelope.session_id, harness, snapshot.labels)
         self._verify_installation(path, harness, confirmed.tier)
+        confirm_scope = (
+            harness in ("pi", "pi-native")
+            and confirmed.tier != "full"
+            and self.pi_scope_protocol_active(envelope.session_id)
+        )
+        if confirm_scope:
+            parent = self.pi_scopes.parent_scope(envelope.session_id)
+            if parent.native_classifier is None or not self.acknowledge_pi_scope(
+                envelope.session_id, parent.admission.credential
+            ):
+                raise ValueError("Pi scope startup registration is incomplete")
         write_host_permission_state(path, state)
         if read_host_permission_state(path) != state:
             raise ValueError("Permission state readback failed")
@@ -203,6 +214,8 @@ class PermissionTierRuntime:
         self._states[envelope.session_id] = state
         self._paths[envelope.session_id] = path
         self._harnesses[envelope.session_id] = harness
+        if confirm_scope:
+            self.pi_scopes.confirm_launch(envelope.session_id)
         return state
 
     @staticmethod
@@ -279,13 +292,13 @@ class PermissionTierRuntime:
         state = self.state(session_id)
         if (
             state is None
-            or state.status != "ready"
+            or state.status not in ("ready", "blocked")
             or self._harnesses.get(session_id) not in ("pi", "pi-native")
         ):
             raise ValueError("Pi scope launch unavailable")
         if self._leases.get(session_id):
             raise ValueError("Pi scope rebind requires idle execution")
-        self.pi_scopes.begin_launch(session_id)
+        self.pi_scopes.begin_launch(session_id, preparing=state.status == "blocked")
         self._inspected.pop(session_id, None)
         self._finished.pop(session_id, None)
         return self._open_pi_scope(session_id, origin="parent", native_guard=native_guard)
@@ -337,7 +350,10 @@ class PermissionTierRuntime:
 
         record = self.pi_scopes.pending(session_id, credential)
         state = self.state(session_id)
-        if state is None or state.status != "ready":
+        if state is None or not (
+            state.status == "ready"
+            or (state.status == "blocked" and self.pi_scopes.preparing(session_id))
+        ):
             return False
         registry = read_pi_tool_registry(
             record.admission.registry_dir, state, expected_binding=record.expected

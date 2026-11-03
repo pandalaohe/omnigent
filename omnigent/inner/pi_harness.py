@@ -427,6 +427,15 @@ def create_app() -> FastAPI:
         adapter._session_key = session_id
         try:
             executor = adapter._ensure_executor()
+            if payload.get("phase") == "configure":
+                descriptor = payload.get("launcher")
+                if (
+                    adapter._in_flight
+                    or not isinstance(executor, PiExecutor)
+                    or not isinstance(descriptor, dict)
+                ):
+                    return JSONResponse({"installed": False}, status_code=400)
+                await executor.configure_scoped_bootstrap(session_id, descriptor)
             if payload.get("phase") == "prepare":
                 locator = payload.get("handoff")
                 if not isinstance(executor, PiExecutor) or not isinstance(locator, str):
@@ -434,7 +443,7 @@ def create_app() -> FastAPI:
                 return JSONResponse(
                     await executor.prepare_scoped_bootstrap(session_id, Path(locator))
                 )
-            if payload.get("phase") not in (None, "confirm"):
+            if payload.get("phase") not in (None, "confirm", "configure"):
                 return JSONResponse({"installed": False}, status_code=400)
             installed = isinstance(
                 executor, PiExecutor

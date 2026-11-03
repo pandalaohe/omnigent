@@ -18,6 +18,11 @@ from omnigent.permission_tiers import NativeCallBinding
 from omnigent.permission_tiers import _native_digest as native_digest
 from omnigent.runner.pi_bootstrap import process_identity
 from omnigent.runner.pi_scope_relay import PiScopeRelay
+from omnigent.runner.session_init_protocol import (
+    RunnerSessionInitEnvelope,
+    RunnerSessionInitSnapshot,
+)
+from omnigent.server.permission_tiers import ConfirmedPermissionState
 from tests.runner.test_permission_tier_runtime import (
     _extension_runtime,
     _scope_call,
@@ -75,6 +80,326 @@ async def bind_ready(runtime, broker, relay, pid=None):
         assert published.status_code == 200
         assert published.json()["ready"] is True
     return actor, admission
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "publication", ["pending", "ready", "changed-registry", "revoked", "state-write-retry"]
+)
+async def test_scoped_startup_keeps_root_blocked_until_complete_registration(
+    attestor_relay, monkeypatch, publication
+):
+    runtime, broker, _relay, _source, _registry = attestor_relay
+    path = runtime.path("session-a")
+    monkeypatch.setattr(runtime, "state_path", lambda *_: path)
+    envelope = RunnerSessionInitEnvelope(
+        protocol_version=2,
+        server_version="test",
+        session_id="session-a",
+        agent_id="agent",
+        snapshot=RunnerSessionInitSnapshot(
+            created_at=1,
+            updated_at=1,
+            host_id="host-a",
+            workspace=runtime.state("session-a").workspace,
+            labels=ConfirmedPermissionState("auto", 3, "blocked").labels("pi-native"),
+        ),
+    )
+    runtime.fence_start(envelope, "pi-native")
+    expected = json.loads((path.parent / "permission_expected.json").read_text())
+    (path.parent / "permission_installation.json").write_text(
+        json.dumps(
+            {
+                **expected,
+                "tier": "auto",
+                "revision": 3,
+                "tools_verified": True,
+                "active_tools": ["read"],
+            }
+        )
+    )
+    identity = process_identity(os.getpid())
+    actor = broker.register_process(os.getpid(), expected_identity=identity, root=True)
+    bind = {"protocol": 1, "op": "bind", "loader": "root-loader", "handle": "root"}
+    assert broker.handle(actor, {**bind, "sequence": 1})["ready"] is False
+    admission = actor.installations["root"]
+    if publication != "pending":
+        _write_scope_registry(
+            admission,
+            [{"name": "read", "sourceInfo": {"source": "builtin", "path": "builtin:read"}}],
+        )
+        registry_path = admission.registry_dir / "permission_tools.json"
+        registry = json.loads(registry_path.read_text())
+        assert broker.handle(actor, {**bind, "sequence": 2, "registry": registry})["ready"] is True
+        if publication == "changed-registry":
+            registry_path.write_text(json.dumps({**registry, "tools": []}))
+        elif publication == "revoked":
+            runtime.revoke_pi_scope(admission.principal)
+        elif publication == "state-write-retry":
+            from omnigent.runner import permission_tiers as permission_module
+
+            write = permission_module.write_host_permission_state
+
+            def fail_write(*_args):
+                raise OSError("fixture state write failed")
+
+            monkeypatch.setattr(permission_module, "write_host_permission_state", fail_write)
+            with pytest.raises(OSError, match="fixture state write failed"):
+                runtime.install(envelope, "pi-native")
+            assert runtime.pi_scopes.preparing("session-a")
+            monkeypatch.setattr(permission_module, "write_host_permission_state", write)
+            registry_path.write_text(json.dumps({**registry, "tools": []}))
+    assert runtime.state("session-a").status == "blocked"
+    with pytest.raises(ValueError):
+        runtime.pi_origin_receipt(
+            "session-a",
+            admission.credential,
+            call_id="early",
+            name="read",
+            arguments={"path": "notes.txt"},
+            local_execution=True,
+        )
+    with pytest.raises(ValueError):
+        runtime.inspect(
+            "session-a",
+            call_id="early",
+            name="read",
+            arguments={"path": "notes.txt"},
+            expected_revision=3,
+        )
+    if publication == "ready":
+        assert runtime.install(envelope, "pi-native").status == "ready"
+        assert runtime.pi_scopes.authenticate("session-a", admission.credential).status == "ready"
+        with pytest.raises(ValueError):
+            runtime.inspect(
+                "session-a",
+                call_id="legacy",
+                name="read",
+                arguments={"path": "notes.txt"},
+                expected_revision=3,
+            )
+    else:
+        with pytest.raises(ValueError, match="Pi scope"):
+            runtime.install(envelope, "pi-native")
+        assert runtime.state("session-a").status == "blocked"
+
+
+@pytest.mark.asyncio
+async def test_root_launcher_control_rejects_scope_authority_and_stale_generations(attestor_relay):
+    from omnigent.harnesses.pi_native.bridge import prepare_permission_installation
+
+    runtime, broker, relay, _source, _registry = attestor_relay
+    runtime._harnesses["session-a"] = "pi"
+    bridge = runtime.path("session-a").parent
+    prepare_permission_installation(
+        bridge,
+        session_id="session-a",
+        harness="pi",
+        extension=bridge / "omnigent_pi_native_extension.js",
+    )
+    descriptor = broker.launcher_descriptor()
+    actor, admission = await bind_ready(runtime, broker, relay)
+    decoder = relay._httpd.RequestHandlerClass._read_json_body
+    decoded = []
+
+    def decode(handler):
+        decoded.append(True)
+        return decoder(handler)
+
+    relay._httpd.RequestHandlerClass._read_json_body = decode
+    path = "/pi/bootstrap/launcher"
+    headers = {"Authorization": "Bearer " + descriptor["process_capability"]}
+    body = {
+        "protocol": 1,
+        "op": "reserve",
+        "launch_id": "a" * 32,
+    }
+    async with httpx.AsyncClient(base_url=relay._advertised_url, trust_env=False) as client:
+        for token in ["invalid", admission.credential, actor.token, relay._relay_info["token"]]:
+            response = await client.post(
+                path, content=b"not JSON", headers={"Authorization": "Bearer " + token}
+            )
+            assert response.status_code == 403
+        assert decoded == []
+        first = await client.post(path, headers=headers, json=body)
+        repeated = await client.post(path, headers=headers, json=body)
+        assert first.status_code == repeated.status_code == 200
+        assert first.json() == repeated.json()
+        assert set(first.json()) == {"handoff", "launch_id"}
+        identity = process_identity(os.getpid())
+        publish = {**body, "op": "publish", "pid": identity[0], "started_at": identity[1]}
+        for _ in range(2):
+            response = await client.post(path, headers=headers, json=publish)
+            assert response.status_code == 200
+            assert response.json()["published"] is True
+        response = await client.post(path, headers=headers, json={**body, "op": "confirm"})
+        assert response.status_code == 200
+        assert response.json()["ready"] is False
+        other = {**body, "launch_id": "b" * 32}
+        assert (await client.post(path, headers=headers, json=other)).status_code == 403
+        assert (
+            await client.post(path, headers=headers, json={**body, "op": "revoke"})
+        ).status_code == 200
+        reserved = await client.post(path, headers=headers, json=other)
+        assert reserved.status_code == 200
+        assert (
+            await client.post(path, headers=headers, json={**body, "op": "revoke"})
+        ).status_code == 403
+        assert (await client.post(path, headers=headers, json=other)).json() == reserved.json()
+        broker.launcher_descriptor()
+        before = len(decoded)
+        assert (await client.post(path, headers=headers, content=b"not JSON")).status_code == 403
+        assert len(decoded) == before
+
+
+@pytest.mark.asyncio
+async def test_real_rpc_launcher_rebinds_fresh_process_without_unlocking_startup(
+    attestor_relay, monkeypatch
+):
+    from omnigent.inner.pi_executor import PiExecutor
+
+    node, pi = shutil.which("node"), shutil.which("pi")
+    if not node or not pi:
+        pytest.skip("installed Pi SDK and Node required")
+    sdk = next(
+        (
+            parent
+            for parent in Path(pi_cli_argv(pi)[-1]).resolve().parents
+            if (parent / "package.json").is_file() and (parent / "dist/index.js").is_file()
+        ),
+        None,
+    )
+    if sdk is None or json.loads((sdk / "package.json").read_text()).get("version") != "1.3.0":
+        pytest.skip("the pinned Pi SDK 1.3.0 is required")
+    runtime, broker, _relay, _source, _registry = attestor_relay
+    permission = runtime.state("session-a")
+    path = runtime.path("session-a")
+    bridge = path.parent
+    monkeypatch.setattr(runtime, "state_path", lambda *_: path)
+    envelope = RunnerSessionInitEnvelope(
+        protocol_version=2,
+        server_version="test",
+        session_id="session-a",
+        agent_id="agent",
+        snapshot=RunnerSessionInitSnapshot(
+            created_at=1,
+            updated_at=1,
+            host_id="host-a",
+            workspace=permission.workspace,
+            labels=ConfirmedPermissionState("auto", 3, "blocked").labels("pi"),
+        ),
+    )
+    runtime.fence_start(envelope, "pi")
+    monkeypatch.setattr("omnigent.inner.pi_executor.bridge_dir_for_session_id", lambda _: bridge)
+    monkeypatch.setattr("omnigent.inner.pi_executor.prepare_bridge_dir", lambda _: bridge)
+    executor = PiExecutor(
+        cwd=permission.workspace, pi_path=pi, context_files=False, permission_controlled=True
+    )
+    try:
+        await executor.configure_scoped_bootstrap("session-a", broker.launcher_descriptor())
+        assert await executor.bootstrap_permission_tier("session-a")
+        first = executor._session_states["session-a"].rpc
+        first_scope = runtime.pi_scopes.parent_scope("session-a").admission
+        assert runtime.state("session-a").status == "blocked"
+        assert runtime.pi_scopes.record(first_scope.principal).status == "ready"
+        with pytest.raises(ValueError):
+            runtime.pi_origin_receipt(
+                "session-a",
+                first_scope.credential,
+                call_id="early",
+                name="read",
+                arguments={"path": "notes.txt"},
+                local_execution=True,
+            )
+        assert first.process is not None
+        old_identity = process_identity(first.process.pid)
+        assert runtime.install(envelope, "pi").status == "ready"
+        replacement = await executor._ensure_rpc("session-a", "Fresh root instructions", None, [])
+        assert replacement is not first
+        assert first.process is None
+        assert replacement.process is not None
+        assert process_identity(replacement.process.pid) != old_identity
+        current = runtime.pi_scopes.parent_scope("session-a").admission
+        assert current.principal.launch_epoch != first_scope.principal.launch_epoch
+        assert current.credential != first_scope.credential
+        response = await replacement.request(
+            {"type": "get_state", "id": "ready"}, expected="get_state"
+        )
+        assert response is not None
+        with pytest.raises(ValueError):
+            runtime.pi_scopes.authenticate("session-a", first_scope.credential)
+    finally:
+        await executor.close()
+
+
+@pytest.mark.parametrize(
+    "fault", ["session", "remote", "port", "empty", "long", "nonstring", "extra"]
+)
+def test_python_launcher_rejects_unbound_or_nonloopback_descriptor(tmp_path, fault):
+    from omnigent.inner.pi_executor import PiPermissionBootstrapError, _PiScopedLauncher
+
+    descriptor = {
+        "protocol": 1,
+        "session_id": "session-a",
+        "endpoint": "http://127.0.0.1:1",
+        "process_capability": "pi_attestor_" + "a" * 43,
+    }
+    key, value = {
+        "session": ("session_id", "other-session"),
+        "remote": ("endpoint", "http://example.invalid:80"),
+        "port": ("endpoint", "http://127.0.0.1:invalid"),
+        "empty": ("process_capability", ""),
+        "long": ("process_capability", "a" * 250),
+        "nonstring": ("process_capability", None),
+        "extra": ("origin", "parent"),
+    }[fault]
+    descriptor[key] = value
+    with pytest.raises(PiPermissionBootstrapError, match="descriptor unavailable"):
+        _PiScopedLauncher("session-a", tmp_path, descriptor)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ready", [False, True])
+async def test_scoped_confirmation_uses_the_callers_remaining_deadline(
+    tmp_path, monkeypatch, ready
+):
+    from types import SimpleNamespace
+
+    from omnigent.inner.pi_executor import PiPermissionBootstrapError, _PiScopedLauncher
+
+    launcher = _PiScopedLauncher(
+        "session-a",
+        tmp_path,
+        {
+            "protocol": 1,
+            "session_id": "session-a",
+            "endpoint": "http://127.0.0.1:1",
+            "process_capability": "opaque-launcher-bearer",
+        },
+    )
+    entered, release, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def delayed_confirm(*_args, **_kwargs):
+        entered.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return {"ready": True}
+
+    monkeypatch.setattr(launcher, "request", delayed_confirm)
+    rpc = SimpleNamespace(process=SimpleNamespace(returncode=None))
+    deadline = asyncio.get_running_loop().time() + 0.05
+    if ready:
+        release.set()
+        await launcher.confirm("a" * 32, rpc, deadline=deadline)
+        assert entered.is_set()
+        assert not cancelled.is_set()
+    else:
+        with pytest.raises(PiPermissionBootstrapError, match="registration unavailable"):
+            await launcher.confirm("a" * 32, rpc, deadline=deadline)
+        assert entered.is_set() and cancelled.is_set()
 
 
 @pytest.mark.asyncio

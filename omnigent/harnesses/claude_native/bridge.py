@@ -8506,11 +8506,14 @@ def _tool_relay_handler_factory(
     cancelled_ids: deque[str] = deque(maxlen=_MAX_CONCURRENT_MCP_REQUESTS * 2)
 
     async def _bootstrap_request(
-        authorization: str | None, payload: _JsonObject | None = None
+        authorization: str | None, payload: _JsonObject | None = None, *, launcher: bool = False
     ) -> _JsonObject:
         if pi_scope_relay is None:
             raise ValueError("Pi bootstrap unavailable")
         broker = pi_scope_relay.bootstrap
+        if launcher:
+            broker.authenticate_launcher(authorization)
+            return {} if payload is None else broker.handle_launcher(payload)
         actor = broker.authenticate(authorization)
         return broker.frame(actor) if payload is None else broker.handle(actor, payload)
 
@@ -8558,9 +8561,11 @@ def _tool_relay_handler_factory(
                     future.cancel()
                     return
 
-        def _handle_bootstrap(self) -> None:
+        def _handle_bootstrap(self, *, launcher: bool = False) -> None:
             authorization = self.headers.get("Authorization")
-            future = asyncio.run_coroutine_threadsafe(_bootstrap_request(authorization), loop)
+            future = asyncio.run_coroutine_threadsafe(
+                _bootstrap_request(authorization, launcher=launcher), loop
+            )
             try:
                 future.result(timeout=5.0)
             except Exception:  # noqa: BLE001 - authenticate before body decoding
@@ -8572,7 +8577,7 @@ def _tool_relay_handler_factory(
                 self.send_error(HTTPStatus.BAD_REQUEST)
                 return
             future = asyncio.run_coroutine_threadsafe(
-                _bootstrap_request(authorization, payload), loop
+                _bootstrap_request(authorization, payload, launcher=launcher), loop
             )
             try:
                 response = future.result(timeout=5.0)
@@ -8626,8 +8631,11 @@ def _tool_relay_handler_factory(
 
             :returns: None.
             """
-            if self.path == "/pi/bootstrap" and pi_scope_relay is not None:
-                self._handle_bootstrap()
+            if (
+                self.path in ("/pi/bootstrap", "/pi/bootstrap/launcher")
+                and pi_scope_relay is not None
+            ):
+                self._handle_bootstrap(launcher=self.path == "/pi/bootstrap/launcher")
                 return
             if self.path == "/pi/rpc":
                 self._handle_pi_rpc()

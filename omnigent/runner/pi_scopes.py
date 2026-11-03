@@ -68,12 +68,18 @@ class PiOriginReceipt:
     token: str = field(repr=False)
 
 
+@dataclass
+class PiScopeLaunch:
+    epoch: str
+    status: Literal["preparing", "ready", "revoked"]
+
+
 class PiScopeRegistry:
     """One process incarnation; bootstrap methods are never model-facing controls."""
 
     def __init__(self, runner_epoch: str) -> None:
         self.runner_epoch = runner_epoch
-        self._launches: dict[str, str | None] = {}
+        self._launches: dict[str, PiScopeLaunch] = {}
         self._scopes: dict[str, PiScopeRecord] = {}
         self._credentials: dict[str, str] = {}
         self._receipts: dict[str, PiOriginReceipt] = {}
@@ -94,7 +100,37 @@ class PiScopeRegistry:
     def enabled(self, root_session_id: str) -> bool:
         return root_session_id in self._launches
 
-    def begin_launch(self, root_session_id: str) -> None:
+    def preparing(self, root_session_id: str) -> bool:
+        launch = self._launches.get(root_session_id)
+        return launch is not None and launch.status == "preparing"
+
+    def parent_scope(self, root_session_id: str) -> PiScopeRecord:
+        launch = self._launches.get(root_session_id)
+        parents = [
+            record
+            for record in self._scopes.values()
+            if launch is not None
+            and launch.status != "revoked"
+            and record.admission.principal.root_session_id == root_session_id
+            and record.admission.principal.launch_epoch == launch.epoch
+            and record.admission.principal.origin == "parent"
+            and record.status != "revoked"
+        ]
+        if len(parents) != 1:
+            raise ValueError("Pi scope root installation unavailable")
+        return parents[0]
+
+    def confirm_launch(self, root_session_id: str) -> None:
+        parent = self.parent_scope(root_session_id)
+        if (
+            parent.status != "ready"
+            or not parent.registration_digest
+            or parent.native_classifier is None
+        ):
+            raise ValueError("Pi scope root registration is incomplete")
+        self._launches[root_session_id].status = "ready"
+
+    def begin_launch(self, root_session_id: str, *, preparing: bool = False) -> None:
         self.invalidate(root_session_id)
         old_scopes = {
             scope_id
@@ -110,7 +146,9 @@ class PiScopeRegistry:
             for key, value in self._receipts.items()
             if value.principal.root_session_id != root_session_id
         }
-        self._launches[root_session_id] = uuid4().hex
+        self._launches[root_session_id] = PiScopeLaunch(
+            uuid4().hex, "preparing" if preparing else "ready"
+        )
         self._scope_counts[root_session_id] = 0
         self._receipt_counts[root_session_id] = 0
 
@@ -119,8 +157,8 @@ class PiScopeRegistry:
             if record.admission.principal.root_session_id == root_session_id:
                 record.status = "revoked"
         # Keep the v2 requirement latched during a blocked/rebinding launch.
-        if root_session_id in self._launches:
-            self._launches[root_session_id] = None
+        if launch := self._launches.get(root_session_id):
+            launch.status = "revoked"
         for callback in tuple(self._launch_observers):
             callback(root_session_id)
 
@@ -134,8 +172,12 @@ class PiScopeRegistry:
         installation_id: str,
         registry_generation: str,
     ) -> PiScopeAdmission:
-        launch_epoch = self._launches.get(state.session_id)
-        if launch_epoch is None or state.status != "ready":
+        launch = self._launches.get(state.session_id)
+        if (
+            launch is None
+            or launch.status == "revoked"
+            or state.status != ("blocked" if launch.status == "preparing" else "ready")
+        ):
             raise ValueError("Pi scope launch is not ready")
         if not installation_id or not registry_generation:
             raise ValueError("Pi scope installation identity is incomplete")
@@ -144,7 +186,7 @@ class PiScopeRegistry:
         principal = PiScopePrincipal(
             state.session_id,
             self.runner_epoch,
-            launch_epoch,
+            launch.epoch,
             uuid4().hex,
             origin,
             installation_id,
@@ -169,11 +211,14 @@ class PiScopeRegistry:
 
     def record(self, principal: PiScopePrincipal) -> PiScopeRecord:
         record = self._scopes.get(principal.scope_id)
+        launch = self._launches.get(principal.root_session_id)
         if (
             record is None
             or record.admission.principal != principal
             or principal.runner_epoch != self.runner_epoch
-            or self._launches.get(principal.root_session_id) != principal.launch_epoch
+            or launch is None
+            or launch.status == "revoked"
+            or launch.epoch != principal.launch_epoch
         ):
             raise ValueError("Pi scope installation is stale")
         return record
@@ -220,7 +265,7 @@ class PiScopeRegistry:
     ) -> PiOriginReceipt:
         principal = record.admission.principal
         self.record(principal)
-        if record.status != "ready" or state.status != "ready":
+        if record.status != "ready" or state.status != "ready" or self.preparing(state.session_id):
             raise ValueError("Pi scope is not ready")
         if not isinstance(call_id, str) or not call_id:
             raise ValueError("Pi tool call identity is missing")

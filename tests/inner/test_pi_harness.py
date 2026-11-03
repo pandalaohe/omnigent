@@ -197,8 +197,9 @@ def test_permission_bootstrap_requires_harness_auth() -> None:
     assert response.status_code == 401
 
 
+@pytest.mark.parametrize("phase", ["prepare", "configure"])
 def test_scoped_prepare_uses_authenticated_harness_route_without_returning_capability(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, phase
 ):
     from omnigent.inner.pi_executor import PiExecutor
 
@@ -209,27 +210,45 @@ def test_scoped_prepare_uses_authenticated_harness_route_without_returning_capab
         calls.append((session_id, locator))
         return {"pid": 123, "started_at": 10.0, "handoff": str(locator)}
 
+    async def configure(session_id, descriptor):
+        calls.append((session_id, descriptor))
+
+    async def bootstrap(_session_id):
+        return True
+
     monkeypatch.setattr(executor, "prepare_scoped_bootstrap", prepare)
+    monkeypatch.setattr(executor, "configure_scoped_bootstrap", configure)
+    monkeypatch.setattr(executor, "bootstrap_permission_tier", bootstrap)
     monkeypatch.setattr(pi_harness, "_build_pi_executor", lambda: executor)
     app = pi_harness.create_app()
     app.state.conversation_id = "test-session"
     app.state.harness_auth_token = "test-token"
     locator = tmp_path / ("a" * 32 + ".json")
+    value = str(locator) if phase == "prepare" else {"process_capability": "nonsecret-fixture"}
+    payload = {
+        "session_id": "test-session",
+        "phase": phase,
+        "handoff" if phase == "prepare" else "launcher": value,
+    }
     with TestClient(app) as client:
         denied = client.post(
             "/v1/permission-tier/bootstrap",
-            json={"session_id": "test-session", "phase": "prepare", "handoff": str(locator)},
+            json=payload,
         )
         assert denied.status_code == 401
         assert calls == []
         response = client.post(
             "/v1/permission-tier/bootstrap",
             headers={"Authorization": "Bearer test-token"},
-            json={"session_id": "test-session", "phase": "prepare", "handoff": str(locator)},
+            json=payload,
         )
     assert response.status_code == 200
-    assert response.json() == {"pid": 123, "started_at": 10.0, "handoff": str(locator)}
-    assert calls == [("test-session", locator)]
+    if phase == "prepare":
+        assert response.json() == {"pid": 123, "started_at": 10.0, "handoff": str(locator)}
+        assert calls == [("test-session", locator)]
+    else:
+        assert response.json() == {"installed": True}
+        assert calls == [("test-session", value)]
 
 
 @pytest.mark.parametrize("sdk_missing", [True, False])
