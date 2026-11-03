@@ -179,6 +179,10 @@ describe("KeepWarmTable keyboard path", () => {
       );
     });
 
+    expect(screen.queryByText("Keep non-archived main sessions warm.")).toBeNull();
+
+    await user.tab();
+    expect(document.activeElement).toHaveAccessibleName(/Main sessions/);
     await user.tab();
     const focused = document.activeElement as HTMLElement;
     expect(dialog.contains(focused)).toBe(true);
@@ -333,10 +337,33 @@ describe("KeepWarmTable review regressions", () => {
     };
     renderTable();
     const cell = await screen.findByTestId(`layered-cell-harness:codex-${HOST_ID}`);
-    const warning = within(cell).getByLabelText(/^Warning:/);
-    const title = warning.getAttribute("title") ?? "";
+    const warning = within(cell.closest("td")!).getByLabelText(/^Warning:/);
+    const title = warning.getAttribute("aria-label") ?? "";
     expect(title).toContain("Main sessions\nCodex: On\nDesktop Alpha: Off\nWinner: Codex");
     expect(title).toContain("Up to\nCodex: up to 3 h\nDesktop Alpha: up to 2 h\nWinner: Codex");
     expect(title).not.toContain("maxSeconds");
+  });
+
+  it("states each level's value and dots only what that level sets", async () => {
+    mocks.layers = {
+      corner: { main: true, child: true, maxSeconds: 14400 },
+      hosts: { [HOST_ID]: { maxSeconds: 7200 } },
+      agents: { "harness:codex": { child: false } },
+      cells: {},
+      hostWins: { [HOST_ID]: true },
+    };
+    renderTable();
+    const corner = await screen.findByTestId("layered-corner");
+    expect(corner).toHaveTextContent("All agents, all hostsOnup to 4 h");
+    expect(corner.querySelector(".bg-pink-500")).toBeNull();
+    const column = screen.getByTestId(`layered-col-${HOST_ID}`);
+    expect(column).toHaveTextContent("Host wins");
+    expect(column).toHaveTextContent("up to 2 h");
+    expect(column.querySelectorAll(".bg-pink-500")).toHaveLength(2);
+    const row = screen.getByTestId("layered-row-harness:codex");
+    expect(row).toHaveTextContent("Main only");
+    expect(row.querySelectorAll(".bg-pink-500")).toHaveLength(1);
+    expect(screen.getByText("Differs from the level above")).toBeVisible();
+    expect(screen.getByText("No host: sessions not tied to a host")).toBeVisible();
   });
 });

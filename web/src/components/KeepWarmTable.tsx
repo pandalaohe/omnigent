@@ -11,7 +11,13 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { AgentNameTag } from "@/components/AgentNameTag";
 import { HelpTip } from "@/components/HelpTip";
 import { LayeredEditor } from "@/components/LayeredEditor";
-import { LayeredTable, type LayeredCell, type LayeredCellLevel } from "@/components/LayeredTable";
+import {
+  LayeredMark,
+  LayeredOwn,
+  LayeredTable,
+  type LayeredCell,
+  type LayeredCellLevel,
+} from "@/components/LayeredTable";
 import { NumericField, SettingRow } from "@/components/SettingsFields";
 import { Button } from "@/components/ui/button";
 import { Segmented } from "@/components/ui/segmented";
@@ -30,7 +36,6 @@ import { useHarnessCatalog, type HarnessCapability } from "@/lib/agentLabels";
 import { getOmnigentServerIdentity } from "@/lib/host";
 import { authenticatedFetch, getCurrentUserId, subscribeIdentity } from "@/lib/identity";
 import {
-  KEEP_WARM_COLUMN_FIELDS,
   KEEP_WARM_DEFAULT_MAX_SECONDS,
   clearKeepWarmBelow,
   clearKeepWarmLevel,
@@ -66,6 +71,7 @@ import {
   type LayeredLevel,
 } from "@/lib/layeredValues";
 import { ApiError, apiErrorFromResponse } from "@/lib/sessionsApi";
+import { cn } from "@/lib/utils";
 
 const EMPTY_CAPABILITIES: Record<string, HarnessCapability> = {};
 
@@ -215,8 +221,52 @@ function rowRank(item: RegistryItem, capabilities: Record<string, HarnessCapabil
   return 3;
 }
 
-function Mark() {
-  return <span aria-hidden="true" className="size-1.5 shrink-0 rounded-full bg-pink-500" />;
+/** What runs at this level: a value saved here, else what it inherits. */
+function levelValue(
+  layers: KeepWarmLayers,
+  at: LayeredLevel,
+  field: KeepWarmLayerField,
+  family: KeepWarmFamily | null,
+  identity?: KeepWarmRuntimeIdentity,
+): unknown {
+  const options = keepWarmLayeredOptions(family, {
+    crossAgent: at.level === "corner" || at.level === "col",
+  });
+  const own = levelRecord(layers, at)[field];
+  if (own !== undefined && (!options.canHold || options.canHold(levelRow(at), field, own))) {
+    return options.normalize ? options.normalize(levelRow(at), field, own) : own;
+  }
+  const store = keepWarmLayeredStore(
+    layers,
+    at.level === "row" ? { row: at.row, ...identity } : undefined,
+  );
+  return inheritedAt(store, at, field, options).value;
+}
+
+function ownPartText(field: KeepWarmLayerField, value: unknown): string {
+  return field === "coldAfterSeconds" && value === null
+    ? "cold by platform rule"
+    : fieldText(field, value);
+}
+
+/** The state word, then every other value set at this level; dots mark what differs. */
+function LevelStateParts({
+  word,
+  wordDiffers,
+  parts,
+}: {
+  word: string;
+  wordDiffers: boolean;
+  parts: readonly string[];
+}) {
+  return (
+    <>
+      {wordDiffers ? <LayeredOwn>{word}</LayeredOwn> : <span>{word}</span>}
+      {parts.map((part) => (
+        <LayeredOwn key={part}>{part}</LayeredOwn>
+      ))}
+    </>
+  );
 }
 
 function FieldNote({
@@ -256,7 +306,7 @@ function FieldNote({
   }
   return (
     <p className="flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground">
-      <Mark />
+      <LayeredMark />
       <span>Saved here</span>
       {inheritedSource && (
         <>
@@ -869,11 +919,23 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
     ]),
   ];
   const hostName = (id: string) => (id === "" ? "No host" : (knownHosts.get(id)?.name ?? id));
-  const hostDetail = (id: string) => {
-    if (id === "") return undefined;
+  const hostHeader = (id: string) => {
     const host = knownHosts.get(id);
-    if (!host) return "Unavailable host";
-    return host.status === "online" ? "Online" : "Offline";
+    if (id === "") return hostName(id);
+    if (!host) return `${hostName(id)} (unavailable)`;
+    const online = host.status === "online";
+    return (
+      <span className="inline-flex min-w-0 items-center gap-1.5">
+        <span
+          title={online ? "Online" : "Offline"}
+          className={cn(
+            "size-2 shrink-0 rounded-full",
+            online ? "bg-success" : "border-[1.5px] border-muted-foreground",
+          )}
+        />
+        <span className="min-w-0 wrap-anywhere">{host.name}</span>
+      </span>
+    );
   };
   const rowLabel = (rowKey: string) => {
     const item = rowItemFor(rowKey);
@@ -1030,6 +1092,51 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
     })();
   }
 
+  /** The state line of a level; the corner has nothing to differ from, so it carries no dots. */
+  function levelStateFor(
+    at: LayeredLevel,
+    family: KeepWarmFamily | null,
+    identity?: KeepWarmRuntimeIdentity,
+    word?: string,
+  ) {
+    if (!layers) return null;
+    const crossAgent = at.level === "corner" || at.level === "col";
+    const value = (field: KeepWarmLayerField) => levelValue(layers, at, field, family, identity);
+    const shownWord = word ?? stateWord(value("main") === true, value("child") === true);
+    if (at.level === "corner") {
+      const { maxSeconds, coldAfterSeconds } = layers.corner;
+      return (
+        <>
+          <span>{shownWord}</span>
+          {maxSeconds !== undefined && <span>{fieldText("maxSeconds", value("maxSeconds"))}</span>}
+          {coldAfterSeconds !== undefined && (
+            <span>{ownPartText("coldAfterSeconds", value("coldAfterSeconds"))}</span>
+          )}
+        </>
+      );
+    }
+    const differing = fieldsShown(at, family).filter((field) =>
+      differsAt(layers, at, field, family, crossAgent, identity),
+    );
+    const options = keepWarmLayeredOptions(family, { crossAgent });
+    const own = levelRecord(layers, at);
+    const parts = differing
+      .filter((field) => field !== "main" && field !== "child")
+      .map((field) =>
+        ownPartText(
+          field,
+          options.normalize ? options.normalize(levelRow(at), field, own[field]) : own[field],
+        ),
+      );
+    return (
+      <LevelStateParts
+        word={shownWord}
+        wordDiffers={differing.includes("main") || differing.includes("child")}
+        parts={parts}
+      />
+    );
+  }
+
   function renderCell(rowKey: string, host: string): LayeredCell {
     if (!layers) return { content: null };
     const item = rowItemFor(rowKey);
@@ -1048,17 +1155,6 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
     const options = keepWarmLayeredOptions(family);
     const store = keepWarmLayeredStore(layers, { row: rowKey, ...identity });
     const fields = fieldsShown(at, family);
-    const differing = fields.filter((field) =>
-      differsAt(layers, at, field, family, false, identity),
-    );
-    const ownRecord = levelRecord(layers, at);
-    const parts = differing
-      .filter((field) => field !== "main" && field !== "child")
-      .map((field) => {
-        const own = ownRecord[field];
-        const shown = options.normalize ? options.normalize(rowKey, field, own) : own;
-        return fieldText(field, shown);
-      });
     const clashes = crossingClashes(store, rowKey, host, fields, options);
     const clash = clashes
       .map(({ field, winner }) => {
@@ -1075,17 +1171,7 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
       })
       .join("\n\n");
     return {
-      content: (
-        <span className="flex flex-col gap-0.5">
-          <span>{stateWord(resolved.main, resolved.child)}</span>
-          {parts.map((part) => (
-            <span key={part} className="text-xs text-muted-foreground">
-              {part}
-            </span>
-          ))}
-        </span>
-      ),
-      mark: differing.length > 0,
+      content: levelStateFor(at, family, identity, stateWord(resolved.main, resolved.child)),
       clash: clash || undefined,
     };
   }
@@ -1122,27 +1208,6 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
 
   return (
     <div className="space-y-4" data-testid="keep-warm-table">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div className="space-y-1">
-          <p className="flex items-center gap-1.5 text-sm font-medium">
-            Keep sessions warm
-            <HelpTip label="Keep sessions warm">
-              A cell beats its row and column; those beat the corner. An unset level inherits the
-              one above. Every ping costs one cache read.
-            </HelpTip>
-          </p>
-          <p className="text-xs text-muted-foreground">
-            Click the corner, a header or a cell to change it.
-          </p>
-        </div>
-        {!unknown && hiddenCount > 0 && (
-          <Button variant="outline" size="sm" onClick={() => setShowAll((current) => !current)}>
-            {showAll
-              ? "Hide agents with no sessions"
-              : `Show agents with no sessions (${hiddenCount})`}
-          </Button>
-        )}
-      </div>
       {conversion.isPending && (
         <p role="status" className="text-sm text-muted-foreground">
           Loading keep-warm settings…
@@ -1182,11 +1247,36 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
         </div>
       )}
       {layers && conversion.data ? (
-        <>
+        <div className="space-y-1.5">
           <LayeredTable
             label="Keep-warm by agent and host"
             cornerLabel="All agents, all hosts"
-            cornerMark={false}
+            cornerDetail={levelStateFor({ level: "corner" }, null)}
+            note={
+              <>
+                Click the corner, a header or a cell to change it.
+                <HelpTip label="Keep sessions warm" className="size-11 md:size-4">
+                  A cell beats its row and column; those beat the corner. An unset level inherits
+                  the one above. Every ping costs one cache read.
+                </HelpTip>
+              </>
+            }
+            tools={
+              !unknown &&
+              hiddenCount > 0 && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="min-h-11 md:min-h-7"
+                  onClick={() => setShowAll((current) => !current)}
+                >
+                  {showAll
+                    ? "Hide agents with no sessions"
+                    : `Show agents with no sessions (${hiddenCount})`}
+                </Button>
+              )
+            }
+            legend={<span>No host: sessions not tied to a host</span>}
             rows={visibleRows.map((item) => ({
               id: item.key,
               label: rowNameFor(item),
@@ -1199,29 +1289,18 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
                   />
                 </span>
               ),
-              mark: fieldsShown({ level: "row", row: item.key }, familyForItem(item)).some(
-                (field) =>
-                  differsAt(
-                    layers,
-                    { level: "row", row: item.key },
-                    field,
-                    familyForItem(item),
-                    false,
-                    identityForRow(item.key),
-                  ),
+              detail: levelStateFor(
+                { level: "row", row: item.key },
+                familyForItem(item),
+                identityForRow(item.key),
               ),
             }))}
             columns={hosts.map((host) => ({
               id: host,
               label: hostName(host),
-              content: hostName(host),
-              detail: hostDetail(host),
+              content: hostHeader(host),
+              detail: levelStateFor({ level: "col", col: host }, null),
               hostWins: !!layers.hostWins[host],
-              mark:
-                !!layers.hostWins[host] ||
-                KEEP_WARM_COLUMN_FIELDS.some((field) =>
-                  differsAt(layers, { level: "col", col: host }, field, null, true),
-                ),
             }))}
             renderCell={renderCell}
             renderEditor={renderEditor}
@@ -1260,7 +1339,7 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
             </div>
           )}
           {noChannel.length > 0 && (
-            <p className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
+            <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-muted-foreground">
               <span>Keep-warm is not available for:</span>
               {noChannel.map((item) => (
                 <span key={item.key} title={fullIdFor(item)}>
@@ -1271,20 +1350,22 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
                   />
                 </span>
               ))}
-              <HelpTip label="About agents with no keep-warm channel">
+              <HelpTip label="About agents with no keep-warm channel" className="size-11 md:size-4">
                 These agents have no cache channel to ping, and they show no warm or cold state.
               </HelpTip>
             </p>
           )}
-        </>
+        </div>
       ) : (
         !conversion.isPending &&
         !error && <p className="text-sm text-muted-foreground">Loading keep-warm settings…</p>
       )}
-      <div className="border-t pt-4">
+      <div className="space-y-3 border-t pt-4">
+        <p className="text-ui font-semibold">Offline hosts</p>
         <SettingRow
-          label="Archive children of an offline host after"
-          hint="Children whose host stays offline this long are archived automatically. 0 turns auto-archive off."
+          label="Archive children of an offline host"
+          hint="Children whose host stays offline this long are archived automatically."
+          note="0 turns this off."
         >
           <NumericField
             ariaLabel="Archive children of an offline host after in hours"
@@ -1299,7 +1380,7 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
               }));
             }}
           />
-          <span className="text-sm text-muted-foreground">hours (0 = off)</span>
+          <span className="text-sm text-muted-foreground">hours</span>
         </SettingRow>
       </div>
     </div>

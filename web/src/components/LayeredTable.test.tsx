@@ -287,9 +287,12 @@ describe("LayeredTable and LayeredEditor", () => {
     const row = screen.getByTestId("layered-row-codex");
     expect(row.querySelector(".bg-pink-500")).toBeNull();
     expect(screen.getByTestId("layered-cell-codex-desktop")).toHaveTextContent("On");
-    expect(
-      screen.getByLabelText("Warning: state: Codex and Desktop differ; Codex wins"),
-    ).toHaveTextContent("?");
+    const warning = screen.getByLabelText("Warning: state: Codex and Desktop differ; Codex wins");
+    await user.hover(warning);
+    expect(await screen.findByText("Click this cell to set it here.")).toBeVisible();
+    expect(screen.queryByText("Saved here")).toBeNull();
+    await user.unhover(warning);
+    await user.keyboard("{Escape}");
     await user.click(row);
     expect(screen.getByText("Saved here")).toBeVisible();
   });
@@ -320,16 +323,16 @@ describe("LayeredTable and LayeredEditor", () => {
     render(<StatefulTable />);
     await user.click(screen.getByRole("button", { name: "Select cells" }));
     await user.click(screen.getByTestId("layered-row-codex"));
-    expect(screen.getByText("1 selected")).toBeVisible();
+    expect(screen.getByText("1 cell selected")).toBeVisible();
     await user.click(screen.getByRole("button", { name: "Set values to Off" }));
     expect(screen.getByTestId("layered-cell-codex-desktop")).toHaveTextContent("Off");
 
     await user.click(screen.getByTestId("layered-col-desktop"));
-    expect(screen.getByText("1 selected")).toBeVisible();
+    expect(screen.getByText("1 cell selected")).toBeVisible();
     await user.click(screen.getByTestId("layered-corner"));
-    expect(screen.getByText("0 selected")).toBeVisible();
+    expect(screen.getByText("0 cells selected")).toBeVisible();
     await user.click(screen.getByTestId("layered-corner"));
-    expect(screen.getByText("1 selected")).toBeVisible();
+    expect(screen.getByText("1 cell selected")).toBeVisible();
     await user.click(screen.getByRole("button", { name: "Use inherited" }));
     expect(screen.getByTestId("layered-cell-codex-desktop")).toHaveTextContent("Off");
   });
@@ -339,10 +342,10 @@ describe("LayeredTable and LayeredEditor", () => {
     const { rerender } = render(<StatefulTable />);
     await user.click(screen.getByRole("button", { name: "Select cells" }));
     await user.click(screen.getByTestId("layered-cell-codex-desktop"));
-    expect(screen.getByText("1 selected")).toBeVisible();
+    expect(screen.getByText("1 cell selected")).toBeVisible();
 
     rerender(<StatefulTable unavailable={{ "codex/desktop": "Not installed here" }} />);
-    expect(screen.getByText("0 selected")).toBeVisible();
+    expect(screen.getByText("0 cells selected")).toBeVisible();
     await user.click(screen.getByRole("button", { name: "Use inherited" }));
 
     rerender(<StatefulTable />);
@@ -393,7 +396,7 @@ describe("LayeredTable and LayeredEditor", () => {
     expect(screen.queryByRole("button", { name: "Edit Codex on Desktop" })).toBeNull();
     await user.click(screen.getByRole("button", { name: "Select cells" }));
     await user.click(screen.getByTestId("layered-corner"));
-    expect(screen.getByText("0 selected")).toBeVisible();
+    expect(screen.getByText("0 cells selected")).toBeVisible();
   });
 
   it("displays the normalized runtime value rather than the stored seconds", () => {

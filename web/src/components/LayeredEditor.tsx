@@ -52,6 +52,10 @@ export function LayeredEditor({
         align="start"
         collisionPadding={8}
         data-pop=""
+        onOpenAutoFocus={(event) => {
+          event.preventDefault();
+          (event.currentTarget as HTMLElement | null)?.focus();
+        }}
         className={cn("max-h-[min(32rem,calc(100vh-1rem))] w-80 overflow-y-auto", contentClassName)}
       >
         <PopoverHeader>

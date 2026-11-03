@@ -36,18 +36,18 @@ export function AgentNameTag({
 
   return (
     <span className={cn("inline-flex min-w-0 items-center gap-1.5", className)}>
+      {!markOnly && <span className="min-w-0 wrap-anywhere">{name}</span>}
       {badge ? (
         <AgentBadgeMark badge={badge} data-testid="agent-name-badge" />
       ) : (
         <span
           aria-hidden="true"
           data-testid="agent-name-mark"
-          className="inline-flex shrink-0 items-center rounded border border-border px-1 py-0.5 text-[10px] font-medium tracking-wide text-muted-foreground"
+          className="inline-flex shrink-0 items-center rounded border border-border px-1 text-[11px] leading-4 font-normal text-muted-foreground"
         >
           {plainMark(harness)}
         </span>
       )}
-      {!markOnly && <span className="min-w-0 wrap-anywhere">{name}</span>}
     </span>
   );
 }
