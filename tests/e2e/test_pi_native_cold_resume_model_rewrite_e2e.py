@@ -184,7 +184,8 @@ def test_cold_resume_preserves_model_and_prompt_settings(
     workspace.mkdir(parents=True)
     agent = home / ("custom-pi-agent" if provider_managed else ".pi/agent")
     selection = _MANAGED_SELECTION if provider_managed else _SELECTION
-    seed_pi_own_login_catalog(agent, "openai-codex", ["gpt-5.6-sol", "gpt-5.5"])
+    # Curate a sibling that the pinned catalog still ships: Pi 1.4 removed gpt-5.5.
+    seed_pi_own_login_catalog(agent, "openai-codex", ["gpt-5.6-sol", "gpt-5.6-terra"])
     (agent / "auth.json").write_text(
         json.dumps(
             {
@@ -355,7 +356,7 @@ os_env:
             (project_config / "APPEND_SYSTEM.md").unlink()
             # Hiding a saved model must preserve its launch identity.
             user_settings["enabledModels"] = [
-                "omnigent/not-enabled" if provider_managed else "openai-codex/gpt-5.5"
+                "omnigent/not-enabled" if provider_managed else "openai-codex/gpt-5.6-terra"
             ]
             user_settings["extensions"] = ["./resource-settings/resumed.js"]
             (agent / "settings.json").write_text(json.dumps(user_settings))
@@ -393,7 +394,7 @@ os_env:
             options = _wait_for_catalog(http_client, session_id, selection)["model_options"]
             ids = {option["id"] for option in options}
             assert ids == (
-                {selection} if provider_managed else {_SELECTION, "openai-codex/gpt-5.5"}
+                {selection} if provider_managed else {_SELECTION, "openai-codex/gpt-5.6-terra"}
             )
             poll_until(
                 lambda: len(prompts.read_text().splitlines()) >= 3, timeout_s=30, interval_s=0.2
