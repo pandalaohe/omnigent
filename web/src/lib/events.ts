@@ -16,6 +16,8 @@ import type { CodexPermissionObservation } from "./codexApprovalMode";
 import type { ProviderUsageLimitsSnapshot } from "./providerUsageLimits";
 import type {
   AgyPermission,
+  ApprovalTriage,
+  ApprovalAnswerer,
   BackgroundTaskInfo,
   CodexPersistMode,
   ElicitationSource,
@@ -187,6 +189,7 @@ export interface PolicyDenied {
 }
 
 export interface ElicitationRequest {
+  triage?: ApprovalTriage;
   terminalAccess?: TerminalAccessRequest | null;
   nativeDelivery?: NativePermissionDelivery;
   type: "elicitation_request";
@@ -328,6 +331,7 @@ export interface ElicitationRequest {
  * carry an elicitation id.
  */
 export interface ElicitationResolved {
+  answeredBy?: ApprovalAnswerer;
   type: "elicitation_resolved";
   elicitationId: string;
   /**

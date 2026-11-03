@@ -18,6 +18,74 @@ afterEach(() => {
 });
 
 describe("ApprovalCard — binary approve/reject", () => {
+  it("keeps an offered card expandable, then shows the parent's handoff and answer", () => {
+    const client = new QueryClient();
+    client.setQueryData(["session", "parent"], { title: "Parent review" });
+    const submit = vi.fn();
+    const props = {
+      elicitationId: "child-offer",
+      message: "Run the check?",
+      phase: "pre_tool_use",
+      policyName: "claude_native_permission",
+      contentPreview: "echo ready",
+      requestedSchema: {},
+      status: "pending" as const,
+      response: null,
+      onSubmit: submit,
+      triage: {
+        offerId: "offer",
+        rootSessionId: "parent",
+        mode: "answer" as const,
+        state: "offered" as const,
+      },
+    };
+    const wrap = (card: React.ReactNode) => (
+      <QueryClientProvider client={client}>{card}</QueryClientProvider>
+    );
+    const view = render(wrap(<ApprovalCard {...props} />));
+    expect(screen.getByText("Parent review")).toBeVisible();
+    expect(screen.getByTestId("approval-offer")).not.toHaveAttribute("open");
+    fireEvent.click(screen.getByText("Review and answer"));
+    fireEvent.click(screen.getByRole("button", { name: "Approve", hidden: true }));
+    expect(submit).toHaveBeenCalledWith("child-offer", "accept");
+    view.rerender(
+      wrap(
+        <ApprovalCard
+          {...props}
+          triage={{
+            ...props.triage,
+            state: "passed",
+            note: "请确认是否允许这次操作。",
+            recommend: "decline",
+          }}
+        />,
+      ),
+    );
+    expect(screen.queryByTestId("approval-offer")).toBeNull();
+    expect(screen.getByText("请确认是否允许这次操作。")).toBeVisible();
+    expect(screen.getByText("Parent recommends: reject")).toBeVisible();
+    view.rerender(
+      wrap(
+        <ApprovalCard
+          {...props}
+          status="responded"
+          response={{
+            action: "decline",
+            answeredBy: {
+              sessionId: "parent",
+              title: "Parent review",
+              reason: "Outside the assigned workspace",
+            },
+          }}
+        />,
+      ),
+    );
+    expect(screen.getByText("Rejected by Parent review")).toBeVisible();
+    expect(screen.getByText("Outside the assigned workspace")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
+    client.clear();
+  });
+
   it("transports the frozen terminal-access fields through SSE, block stream and renderer", () => {
     const events = [
       ...parseEventLines([

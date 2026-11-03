@@ -11,6 +11,7 @@ const KINDS = [
   { key: "install", label: "Install" },
   { key: "merge", label: "Merge" },
   { key: "release", label: "Release" },
+  { key: "answer-child-approvals", label: "Answer child approvals" },
 ];
 
 export function StandingApprovalDefaults() {

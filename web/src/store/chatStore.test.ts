@@ -1517,6 +1517,57 @@ describe("chatStore — switchTo", () => {
     expect(reconciled[0]!.response).toEqual({ action: "auto_resolved" });
   });
 
+  it("does not replace a live parent handoff with an older visibility snapshot", async () => {
+    const id = "conv_parent_race";
+    const triage = {
+      offer_id: "offer",
+      root_session_id: "parent",
+      mode: "answer",
+      state: "offered",
+    };
+    seedSession(id, []);
+    seedPendingElicitations(id, [
+      { elicitation_id: "offer", params: { message: "Run check?", triage } },
+    ]);
+    await useChatStore.getState().switchTo(id);
+    const entry = conversationRegistry.peek(id)!;
+    const original = entry.getState().blocks[0] as ElicitationBlock;
+    expect(original.triage?.state).toBe("offered");
+    const stale = await defaultFetchHandler(`/v1/sessions/${id}`, {});
+    let finish!: (response: Response) => void;
+    const held = new Promise<Response>((resolve) => {
+      finish = resolve;
+    });
+    let started = false;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (
+        input.toString().split("?")[0] === `/v1/sessions/${id}` &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        started = true;
+        return held;
+      }
+      return defaultFetchHandler(input, init);
+    });
+    document.dispatchEvent(new Event("visibilitychange"));
+    await tick();
+    expect(started).toBe(true);
+    entry.setState({
+      blocks: [
+        {
+          ...original,
+          triage: { ...original.triage!, state: "passed", note: "请确认", recommend: "approve" },
+        },
+      ],
+    });
+    finish(stale);
+    await tick();
+    await tick();
+    expect(entry.getState().blocks[0]).toMatchObject({
+      triage: { state: "passed", note: "请确认" },
+    });
+  });
+
   it("does not resurrect the rebuilt Codex question card from a stale snapshot on tab focus", async () => {
     // A reconnect reconcile drops the live pending copy once history has
     // rebuilt the answered card, but the snapshot fetched beside it can still
@@ -12935,6 +12986,24 @@ describe("chatStore — elicitation_resolved", () => {
     bindConversationForTest("conv_elic");
   });
 
+  it("shows the parent's winning answer over an optimistic local verdict", () => {
+    const answerer = { sessionId: "parent", title: "Parent review", reason: "Outside the brief" };
+    useChatStore.setState({
+      blocks: [
+        { ...elicitationBlock("race"), status: "responded", response: { action: "accept" } },
+      ],
+    });
+    handleSessionEvent({
+      type: "elicitation_resolved",
+      elicitationId: "race",
+      action: "decline",
+      answeredBy: answerer,
+    });
+    expect(useChatStore.getState().blocks[0]).toMatchObject({
+      response: { action: "decline", answeredBy: answerer },
+    });
+  });
+
   function elicitationResolvedEvent(
     id: string,
     action?: "accept" | "decline" | "cancel",
@@ -15079,55 +15148,138 @@ describe("chatStore — pumpStreamEvents frame batching", () => {
     controller.abort();
   });
 
-  it("settles an approval resolved before its buffered card reaches the store", async () => {
-    useChatStore.setState({ conversationId: "conv_fast_elicitation", blocks: [] });
+  it.each([false, true])(
+    "settles a buffered approval including parent attribution (%s)",
+    async (parent) => {
+      useChatStore.setState({ conversationId: "conv_fast_elicitation", blocks: [] });
+      const sink = pushableStream();
+      const controller = new AbortController();
+      const manual = manualScheduler();
+      void pumpStreamEvents(
+        "conv_fast_elicitation",
+        sink.stream,
+        controller,
+        setState,
+        getState,
+        manual.scheduler,
+      );
+
+      sink.push(sse("response.created", { id: "resp_fast", status: "in_progress", output: [] }));
+      sink.push(delta("A"));
+      await tick();
+
+      sink.push(
+        sse("response.elicitation_request", {
+          elicitation_id: "elic_fast",
+          params: {
+            mode: "form",
+            message: "Approve fast operation?",
+            phase: "codex_mcp_elicitation",
+            policy_name: "codex_native_mcp_elicitation",
+            content_preview: "",
+          },
+        }),
+      );
+      sink.push(
+        sse("response.elicitation_resolved", {
+          elicitation_id: "elic_fast",
+          ...(parent
+            ? {
+                action: "accept",
+                reason: "Inside the brief",
+                answered_by: { session_id: "parent", title: "Parent review" },
+              }
+            : {}),
+        }),
+      );
+      await tick();
+
+      expect(manual.pending()).toBe(true);
+      manual.fire();
+
+      const card = useChatStore
+        .getState()
+        .blocks.find(
+          (block): block is ElicitationBlock =>
+            block.type === "elicitation" && block.elicitationId === "elic_fast",
+        );
+      expect(card?.status).toBe("responded");
+      expect(card?.response).toEqual(
+        parent
+          ? {
+              action: "accept",
+              answeredBy: {
+                sessionId: "parent",
+                title: "Parent review",
+                reason: "Inside the brief",
+              },
+            }
+          : { action: "auto_resolved" },
+      );
+
+      controller.abort();
+    },
+  );
+
+  it("updates a repeated offered card in place when the parent passes it to the user", async () => {
+    useChatStore.setState({ conversationId: "conv_offer", blocks: [] });
     const sink = pushableStream();
     const controller = new AbortController();
     const manual = manualScheduler();
     void pumpStreamEvents(
-      "conv_fast_elicitation",
+      "conv_offer",
       sink.stream,
       controller,
       setState,
       getState,
       manual.scheduler,
     );
-
-    sink.push(sse("response.created", { id: "resp_fast", status: "in_progress", output: [] }));
-    sink.push(delta("A"));
-    await tick();
-
-    sink.push(
+    const triage = {
+      offer_id: "offer",
+      root_session_id: "parent",
+      mode: "answer",
+      state: "offered",
+    };
+    const request = (state: string) =>
       sse("response.elicitation_request", {
-        elicitation_id: "elic_fast",
+        elicitation_id: "offer",
         params: {
-          mode: "form",
-          message: "Approve fast operation?",
-          phase: "codex_mcp_elicitation",
-          policy_name: "codex_native_mcp_elicitation",
-          content_preview: "",
+          message: "Run check?",
+          phase: "pre_tool_use",
+          policy_name: "claude_native_permission",
+          triage: {
+            ...triage,
+            state,
+            ...(state === "passed" ? { note: "请确认", recommend: "approve" } : {}),
+          },
         },
-      }),
-    );
+      });
+    sink.push(request("offered"));
+    await tick();
+    manual.fire();
+    expect(useChatStore.getState().blocks[0]).toMatchObject({ triage: { state: "offered" } });
+    sink.push(request("passed"));
+    await tick();
+    manual.fire();
+    expect(useChatStore.getState().blocks).toHaveLength(1);
+    expect(useChatStore.getState().blocks[0]).toMatchObject({
+      triage: { state: "passed", note: "请确认", recommend: "approve" },
+    });
     sink.push(
       sse("response.elicitation_resolved", {
-        elicitation_id: "elic_fast",
+        elicitation_id: "offer",
+        action: "decline",
+        reason: "Outside the brief",
+        answered_by: { session_id: "parent", title: "Parent review" },
       }),
     );
     await tick();
-
-    expect(manual.pending()).toBe(true);
-    manual.fire();
-
-    const card = useChatStore
-      .getState()
-      .blocks.find(
-        (block): block is ElicitationBlock =>
-          block.type === "elicitation" && block.elicitationId === "elic_fast",
-      );
-    expect(card?.status).toBe("responded");
-    expect(card?.response).toEqual({ action: "auto_resolved" });
-
+    expect(useChatStore.getState().blocks[0]).toMatchObject({
+      response: {
+        action: "decline",
+        answeredBy: { title: "Parent review", reason: "Outside the brief" },
+      },
+    });
     controller.abort();
   });
 

@@ -53,6 +53,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useDescendantSession } from "@/hooks/useChildSessions";
+import { useSession } from "@/hooks/useSession";
 import {
   type AskUserQuestionPayload,
   castAskUserQuestionPayload,
@@ -66,6 +67,8 @@ import { Link, useLocation } from "@/lib/routing";
 import { sessionNavigationSearch } from "@/lib/sessionNavigation";
 import type {
   AgyPermission,
+  ApprovalTriage,
+  ApprovalAnswerer,
   CodexPersistMode,
   ElicitationSource,
   RememberScope,
@@ -190,6 +193,7 @@ function SubagentRequesterLine({ sessionId, ancestorSessionId }: SubagentRequest
 }
 
 interface ApprovalCardProps {
+  triage?: ApprovalTriage;
   terminalAccess?: TerminalAccessRequest | null;
   nativeDelivery?: NativePermissionDelivery;
   elicitationId: string;
@@ -206,6 +210,7 @@ interface ApprovalCardProps {
   url?: string | null;
   status: "pending" | "responded";
   response: {
+    answeredBy?: ApprovalAnswerer;
     action: "accept" | "decline" | "cancel" | "auto_resolved";
     /** Why an `auto_resolved` card has no verdict; see `ElicitationBlock`. */
     reason?: "unanswered" | "timed_out";
@@ -311,6 +316,11 @@ interface ApprovalCardProps {
 
 const EMPTY_CODEX_PERSIST_MODES: CodexPersistMode[] = [];
 
+function ParentApprovalName({ sessionId }: { sessionId: string }) {
+  const { session } = useSession(sessionId);
+  return <span className="break-words">{session?.title || "parent session"}</span>;
+}
+
 function TerminalAccessActions({
   request,
   onApprove,
@@ -355,6 +365,7 @@ function TerminalAccessActions({
 }
 
 export function ApprovalCard({
+  triage,
   terminalAccess,
   nativeDelivery,
   elicitationId,
@@ -911,6 +922,10 @@ export function ApprovalCard({
       icon = <CheckIcon className="size-4 text-success" />;
       label = isExitPlanMode ? "Plan approved" : "Approved";
     }
+    const answerer = response?.answeredBy;
+    if (answerer) {
+      label = `${accepted ? "Approved" : response?.action === "decline" ? "Rejected" : "Resolved"} by ${answerer.title || "parent session"}`;
+    }
 
     // The gating message ("Claude wants to call **AskUserQuestion**") is
     // written in pending tense. On a question or plan card the ask has
@@ -944,6 +959,9 @@ export function ApprovalCard({
           {label}
           {policyLabel && <span className="text-muted-foreground text-sm">· {policyLabel}</span>}
         </AlertTitle>
+        {answerer?.reason && (
+          <p className="break-words whitespace-pre-wrap text-sm">{answerer.reason}</p>
+        )}
         {hasBody && (
           <AlertDescription className="flex flex-col gap-1 text-sm">
             {showSource && source && <ElicitationSourceLine source={source} />}
@@ -1012,12 +1030,22 @@ export function ApprovalCard({
   }
 
   // Pending state.
-  return (
+  const card = (
     <Alert
       data-testid="approval-card"
       data-state="pending"
       className={cn("flex flex-col gap-2 py-3 px-4", className)}
     >
+      {triage?.state === "passed" && (
+        <div className="space-y-1 text-sm" role="note">
+          <p className="break-words whitespace-pre-wrap">{triage.note}</p>
+          {triage.recommend && (
+            <span className="inline-flex rounded bg-muted px-2 py-1 text-xs font-medium">
+              Parent recommends: {triage.recommend === "approve" ? "approve" : "reject"}
+            </span>
+          )}
+        </div>
+      )}
       <AlertTitle className="flex items-center gap-2 text-ui">
         {isCodexCommandApproval ? (
           <TerminalIcon className="size-4 text-yellow-600 dark:text-yellow-400" />
@@ -1180,6 +1208,19 @@ export function ApprovalCard({
       </AlertDescription>
     </Alert>
   );
+  if (triage?.state === "offered") {
+    return (
+      <details data-testid="approval-offer" className="min-w-0">
+        <summary className="cursor-pointer rounded-md border border-border p-3 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+          <ClockIcon className="mr-2 inline size-4 text-muted-foreground" />
+          Waiting for <ParentApprovalName sessionId={triage.rootSessionId} />
+          <span className="ml-2 text-muted-foreground">Review and answer</span>
+        </summary>
+        <div className="mt-2">{card}</div>
+      </details>
+    );
+  }
+  return card;
 }
 
 /**
@@ -1206,6 +1247,7 @@ export function ElicitationCard({
   return (
     <ApprovalCard
       elicitationId={item.elicitationId}
+      triage={item.triage}
       targetSessionId={item.targetSessionId}
       nativeDelivery={item.nativeDelivery}
       message={item.message}

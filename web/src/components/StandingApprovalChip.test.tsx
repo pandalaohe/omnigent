@@ -33,6 +33,31 @@ afterEach(() => {
 });
 
 describe("standing approval chip", () => {
+  it("labels child approval delegation and keeps the wire kind when revoking", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        ...initial,
+        record: { ...initial.record, kinds: ["answer-child-approvals"] },
+      }),
+    });
+    mount();
+    fireEvent.click(await screen.findByRole("button", { name: "Standing approval: 1 active" }));
+    expect(screen.getByText("Answer child approvals", { exact: true })).toBeVisible();
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ ...initial, record: { ...initial.record, kinds: [] } }),
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Revoke Answer child approvals" }));
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenLastCalledWith(
+        expect.any(String),
+        expect.objectContaining({
+          body: JSON.stringify({ op: "revoke", kinds: ["answer-child-approvals"] }),
+        }),
+      ),
+    );
+  });
   it.each(["before", "during"])(
     "does not let a GET started %s revoke overwrite the successful change",
     async (when) => {
