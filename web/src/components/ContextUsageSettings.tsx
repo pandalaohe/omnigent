@@ -1055,7 +1055,7 @@ export function ContextUsageSettings() {
           return {
             content: <LevelState resolved={resolveAt(at)} mark={markAt(at)} models={models} />,
             summary: stateSummary(resolveAt(at), markAt(at), models),
-            clash: cellClash(source, column, preferences, agentLabelOf),
+            clash: cellClash(source, column, preferences, reportedFor(source), agentLabelOf),
           };
         }}
         renderEditor={(at, trigger) => {
@@ -1097,13 +1097,14 @@ function cellClash(
   source: UsageContextSource,
   column: HostColumn,
   preferences: UsageContextPreferences,
+  reported: { contextWindow: number | null; autoCompactTokenLimit: number | null },
   agentLabelOf: (source: UsageContextSource) => string,
 ): string | undefined {
   const cell = preferences.overrides[usageContextLevelKey(source, "cell")];
   const fromRow = preferences.overrides[usageContextLevelKey(source, "column")];
   const fromHost = preferences.overrides[usageContextLevelKey(source, "host")];
   const agentLabel = agentLabelOf(source);
-  const resolved = resolveUsageContextLevel(preferences, source, "cell");
+  const resolved = resolveUsageContextLevel(preferences, source, "cell", reported);
   const lines: string[] = [];
   const fields = [
     { key: "contextWindowTokens" as const, label: "Context total" },

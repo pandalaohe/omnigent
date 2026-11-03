@@ -508,6 +508,25 @@ describe("ContextUsageSettings", () => {
     ).toBeInTheDocument();
   });
 
+  it("uses reported capacity when naming the buffer clash winner", () => {
+    mocks.contextWindow = 100_000;
+    store({
+      [usageContextLevelKey(source, "column")]: value(null, 150_000),
+      [usageContextLevelKey({ ...source, agentName: "", harness: "" }, "host")]: value(
+        null,
+        20_000,
+      ),
+    });
+    renderSettings();
+
+    expect(cell("claude-claude-native", "host-a")).toHaveTextContent("100k20k");
+    expect(
+      within(cell("claude-claude-native", "host-a").closest("td")!).getByLabelText(
+        "Warning: Compact buffer: Claude Code and Alpha differ; Alpha wins.",
+      ),
+    ).toBeInTheDocument();
+  });
+
   it("counts and clears model records below the corner", async () => {
     const cellKey = usageContextLevelKey(source, "cell");
     const modelKey = usageContextLevelKey({ ...source, model: "claude-opus-5-5" }, "agent-model");
