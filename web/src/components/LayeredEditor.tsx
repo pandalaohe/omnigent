@@ -49,13 +49,13 @@ export function LayeredEditor({
     <Popover open={open} onOpenChange={onOpenChange}>
       <PopoverTrigger asChild>{trigger}</PopoverTrigger>
       <PopoverContent
-        align="start"
-        collisionPadding={8}
-        data-pop=""
         onOpenAutoFocus={(event) => {
           event.preventDefault();
           (event.currentTarget as HTMLElement | null)?.focus();
         }}
+        align="start"
+        collisionPadding={8}
+        data-pop=""
         className={cn("max-h-[min(32rem,calc(100vh-1rem))] w-80 overflow-y-auto", contentClassName)}
       >
         <PopoverHeader>
