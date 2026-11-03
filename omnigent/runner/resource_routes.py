@@ -75,7 +75,7 @@ from omnigent.runner.session_runtime_lifecycle import (
 )
 from omnigent.runner.startup_admission import StartupAdmission
 from omnigent.spec.types import AgentSpec
-from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
+from omnigent.terminals.conpty_bridge import bridge_terminal_to_websocket
 from omnigent.terminals.ws_common import WS_CLOSE_TERMINAL_NOT_FOUND
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -1296,7 +1296,7 @@ def register_resource_routes(
                 code=1008, reason="admin terminals require the host owner's interactive relay"
             )
             return
-        if not entry.instance.elevated:
+        if not entry.instance.elevated and entry.instance.backend == "tmux":
             _repop_task = asyncio.create_task(
                 _repop_pending_cost_popup_on_attach(
                     session_id,
@@ -1306,10 +1306,9 @@ def register_resource_routes(
             )
             _COST_POPUP_REPOP_TASKS.add(_repop_task)
             _repop_task.add_done_callback(_COST_POPUP_REPOP_TASKS.discard)
-        await bridge_tmux_control_to_websocket(
+        await bridge_terminal_to_websocket(
             websocket,
-            socket_path=str(entry.instance.socket_path),
-            tmux_target=entry.instance.tmux_target,
+            entry.instance,
             read_only=read_only,
             on_client_interaction=entry.instance.note_client_interaction,
             on_input=entry.instance.note_input,

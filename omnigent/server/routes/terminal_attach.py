@@ -98,7 +98,7 @@ from omnigent.server.routes._terminal_access import (
 )
 from omnigent.stores import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
-from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
+from omnigent.terminals.conpty_bridge import bridge_terminal_to_websocket
 from omnigent.terminals.ws_common import (
     WS_CLOSE_INTERNAL_ERROR,
     WS_CLOSE_TERMINAL_NOT_FOUND,
@@ -342,10 +342,9 @@ def create_terminal_attach_router(
                 "terminal.mode": "in-process",
             },
         ):
-            await bridge_tmux_control_to_websocket(
+            await bridge_terminal_to_websocket(
                 websocket,
-                socket_path=str(entry.instance.socket_path),
-                tmux_target=entry.instance.tmux_target,
+                entry.instance,
                 read_only=read_only,
                 on_input=entry.instance.note_input,
             )

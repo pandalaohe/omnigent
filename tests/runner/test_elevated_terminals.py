@@ -187,7 +187,7 @@ def test_direct_attach_rejects_admin_even_with_valid_token_and_instance(
     registry, instance = admin
     runner = create_runner_app(terminal_registry=registry, server_client=NullServerClient())
     bridge = AsyncMock(side_effect=AssertionError("must not reach admin socket"))
-    monkeypatch.setattr("omnigent.runner.resource_routes.bridge_tmux_control_to_websocket", bridge)
+    monkeypatch.setattr("omnigent.runner.resource_routes.bridge_terminal_to_websocket", bridge)
     direct = create_direct_attach_app(
         runner.state.terminal_attach_handler,
         token="test-token",
