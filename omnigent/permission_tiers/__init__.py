@@ -98,6 +98,8 @@ class ToolIntent:
     protected_prefix_paths: tuple[str, ...] = ()
     command_paths: tuple[str, ...] = ()
     command_write_paths: tuple[str, ...] = ()
+    command_delete_paths: tuple[str, ...] = ()
+    command_read_only: bool = False
     unbound_write: bool = False
 
 
@@ -134,6 +136,69 @@ _PROTECTED_PREFIX = (
     "~/.gnupg",
     "~/Library/Keychains",
 )
+# Skill and settings trees a read may enter; the guard's own files stay closed.
+_READABLE_CONTROL_DIRECTORIES = (".pi", ".agents")
+_CREDENTIAL_FILES = ("auth.json", "models.json")
+_RECURSIVE_READS = ("grep_search", "find_by_name")
+# A delete stays refused while its target cannot be bound; other writes proceed.
+_DELETE_COMMANDS = ("rm", "rmdir", "unlink", "del", "erase", "rd", "remove-item", "srm")
+_FIND_ACTIONS = (
+    "-delete",
+    "-exec",
+    "-execdir",
+    "-ok",
+    "-okdir",
+    "-fls",
+    "-fprint",
+    "-fprint0",
+    "-fprintf",
+)
+# Commands whose operands are only read, so a control-path mention may proceed.
+_READ_ONLY_COMMANDS = frozenset(
+    (
+        "ag",
+        "basename",
+        "bat",
+        "cat",
+        "cut",
+        "date",
+        "diff",
+        "dirname",
+        "du",
+        "echo",
+        "egrep",
+        "fgrep",
+        "file",
+        "grep",
+        "head",
+        "jq",
+        "less",
+        "ls",
+        "md5sum",
+        "more",
+        "nl",
+        "od",
+        "printf",
+        "pwd",
+        "readlink",
+        "realpath",
+        "rg",
+        "sed",
+        "sha256sum",
+        "shasum",
+        "stat",
+        "tail",
+        "tr",
+        "tree",
+        "type",
+        "uniq",
+        "wc",
+        "which",
+        "xxd",
+    )
+)
+_CRITICAL_SYSTEM_ROOTS = ("/etc", "/usr", "/bin", "/sbin", "/boot", "/root")
+_USER_HOME_ROOTS = ("/home", "/Users")
 _READ_PATH = {
     "read": "path",
     "read_file": "Path",
@@ -363,6 +428,16 @@ _ENCODED = re.compile(
 )
 _ENCODED_OPTION = re.compile(
     r"(?i)\b(?:powershell|pwsh)(?:\.exe)?\b[^\r\n]*?\s-(?:encodedcommand|enc|e)\b"
+)
+_TRUSTED_EXPANSION = re.compile(r"\$(?:\{(HOME|TMPDIR)\}|(HOME|TMPDIR))(?![A-Za-z0-9_])")
+_CREDENTIAL_MENTION = re.compile(r"(?<![\w.-])(?:auth|models)\.json(?![\w-])")
+_DARWIN_TEMP_ROOT = re.compile(r"^(/var/folders/[^/]+/[^/]+/T)(?:/|$)")
+# Redirections bind a write target; the rest only feed the command.
+_REDIRECTIONS = (">", ">>", ">|", "&>", "&>>", ">&", "<", "<<", "<<<", "<&", "<>")
+_WRITE_REDIRECTIONS = (">", ">>", ">|", "&>", "&>>", "<>")
+_UNBOUND_DELETE = (
+    "A delete needs a bindable target: an unresolved variable or substitution could "
+    "delete an unintended tree"
 )
 
 
@@ -751,20 +826,30 @@ def adapt_tool_call(
             protected_exact_paths=tuple(_resolve(path, context).path for path in exact),
             protected_prefix_paths=tuple(_resolve(path, context).path for path in prefixes),
             command_paths=_command_paths(intent.command, intent.context) if intent.command else (),
+            command_read_only=(
+                _read_only_command(intent.command, intent.context) if intent.command else False
+            ),
         )
+        if not intent.command:
+            return bound
         try:
+            writes = _shell_writes(intent.command, intent.context, 0)
+        except _UnboundShellWrite as exc:
             return replace(
                 bound,
-                command_write_paths=(
-                    _command_paths(intent.command, intent.context, writes_only=True)
-                    if intent.command
-                    else ()
-                ),
+                status="unknown",
+                detail=str(exc),
+                unbound_write=True,
+                command_read_only=False,
             )
-        except _UnboundSedWrite as exc:
-            return replace(bound, status="unknown", detail=str(exc), unbound_write=True)
-        except _UnboundShellWrite as exc:
-            return replace(bound, status="unknown", detail=str(exc))
+        return replace(
+            bound,
+            command_write_paths=writes.paths,
+            command_delete_paths=writes.deletes,
+            status="unknown" if writes.unbound_delete else bound.status,
+            detail=writes.unbound_delete or bound.detail,
+            unbound_write=bool(writes.unbound_delete),
+        )
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         return replace(intent, status="invalid", detail=str(exc))
 
@@ -1559,219 +1644,431 @@ def _windows_command_paths(
     return tuple(paths)
 
 
+def _read_tokens(command: str, *, powershell: bool) -> list[str]:
+    """Tokens of a command the read scan walks; quoting is already resolved."""
+    if powershell:
+        return [
+            next(value for value in match if value)
+            for match in re.findall(r""""([^"]+)"|'([^']+)'|([^\s|;&<>()]+)""", command)
+        ]
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>()")
+    lexer.whitespace_split = True
+    return list(lexer)
+
+
+def _write_tokens(command: str, *, windows: bool) -> tuple[list[str], list[str]]:
+    """Tokens plus their original text, for binding shell write targets."""
+    if windows:
+        raw_tokens = re.findall(r"""[;&|<>()]+|(?:"[^"]*"|'[^']*'|[^\s"'|;&<>()])+""", command)
+        tokens = [
+            re.sub(
+                r""""([^"]*)"|'([^']*)'""",
+                lambda match: next(value for value in match.groups() if value is not None),
+                token,
+            )
+            for token in raw_tokens
+        ]
+        return tokens, raw_tokens
+    stream = io.StringIO(command)
+    lexer = shlex.shlex(stream, posix=True, punctuation_chars=";&|<>()\n")
+    lexer.whitespace_split = True
+    lexer.whitespace = " \t\r"
+    lookahead = getattr(lexer, "_pushback_chars", None)
+    if lookahead is None:
+        raise ValueError("Shell token positions unavailable")
+    tokens: list[str] = []
+    raw_tokens: list[str] = []
+    while True:
+        # Exclude shlex's lookahead to retain each operator's original quoting.
+        start = stream.tell() - len(lookahead)
+        token = lexer.get_token()
+        if token is None:
+            break
+        end = stream.tell() - len(lookahead)
+        tokens.append(token)
+        raw_tokens.append(command[start:end].strip(" \t\r"))
+    return tokens, raw_tokens
+
+
+def _command_name(token: str) -> str:
+    return token.replace("\\", "/").rsplit("/", 1)[-1].lower().removesuffix(".exe")
+
+
+def _command_offset(tokens: list[str]) -> int:
+    """Offset of the command word after assignments and command-lead keywords."""
+    offset = 0
+    while offset < len(tokens) and (
+        tokens[offset] in ("if", "then", "else", "elif", "do", "!", "command", "builtin")
+        or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[offset], re.DOTALL)
+    ):
+        execution = tokens[offset] == "command"
+        offset += 1
+        if execution:
+            while offset < len(tokens) and tokens[offset] == "-p":
+                offset += 1
+            if offset < len(tokens) and tokens[offset] == "--":
+                offset += 1
+    return offset
+
+
+def _wrapped_command(
+    tokens: list[str], raw_tokens: list[str], index: int, *, writes_only: bool
+) -> tuple[str, str] | None:
+    """The shell dialect and inner command when a token opens `-c` execution."""
+    shell = _command_name(tokens[index])
+    if shell not in ("sh", "bash", "zsh", "cmd", "powershell", "pwsh"):
+        return None
+    for option_index in range(index + 1, len(tokens) - 1):
+        option = tokens[option_index].lower()
+        supported = (
+            option in ("-command", "-c")
+            if shell in ("powershell", "pwsh")
+            else option == "/c"
+            if shell == "cmd"
+            else re.fullmatch(r"-[a-z]*c[a-z]*", option) is not None
+        )
+        if supported:
+            inner = (
+                " ".join(
+                    raw_tokens[option_index + 1 :]
+                    if writes_only and len(tokens) > option_index + 2
+                    else tokens[option_index + 1 :]
+                )
+                if shell in ("cmd", "powershell", "pwsh")
+                else tokens[option_index + 1]
+            )
+            return shell, inner
+        if not option.startswith(("-", "/")):
+            return None
+    return None
+
+
 def _command_paths(
-    command: str,
-    context: TrustedHostContext,
-    *,
-    powershell: bool = False,
-    depth: int = 0,
-    writes_only: bool = False,
+    command: str, context: TrustedHostContext, *, powershell: bool = False, depth: int = 0
 ) -> tuple[str, ...]:
     """Bind direct path operands; this does not interpret scripts or terminal state."""
     if depth > 3:
         raise ValueError("Shell wrapper nesting cannot be checked")
-    if context.platform == "windows" and not writes_only:
+    if context.platform == "windows":
         return _windows_command_paths(command, context, depth)
-    raw_tokens = []
-    if writes_only:
-        if context.platform == "windows" or powershell:
-            raw_tokens = re.findall(r"""[;&|<>()]+|(?:"[^"]*"|'[^']*'|[^\s"'|;&<>()])+""", command)
-            tokens = [
-                re.sub(
-                    r""""([^"]*)"|'([^']*)'""",
-                    lambda match: next(value for value in match.groups() if value is not None),
-                    token,
-                )
-                for token in raw_tokens
-            ]
-        else:
-            stream = io.StringIO(command)
-            lexer = shlex.shlex(stream, posix=True, punctuation_chars=";&|<>()\n")
-            lexer.whitespace_split = True
-            lexer.whitespace = " \t\r"
-            tokens = []
-            lookahead = getattr(lexer, "_pushback_chars", None)
-            if lookahead is None:
-                raise ValueError("Shell token positions unavailable")
-            while True:
-                # Exclude shlex's lookahead to retain each operator's original quoting.
-                start = stream.tell() - len(lookahead)
-                token = lexer.get_token()
-                if token is None:
-                    break
-                end = stream.tell() - len(lookahead)
-                tokens.append(token)
-                raw_tokens.append(command[start:end].strip(" \t\r"))
-    elif context.platform == "windows" or powershell:
-        tokens = [
-            next(value for value in match if value)
-            for match in re.findall(r""""([^"]+)"|'([^']+)'|([^\s|;&<>()]+)""", command)
-        ]
-    else:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>()")
-        lexer.whitespace_split = True
-        tokens = list(lexer)
-    if (
-        writes_only
-        and context.platform != "windows"
-        and not powershell
-        and len(tokens) > 3
-        and raw_tokens[0] == "cd"
-        and tokens[1].startswith("/")
-        and not any(char in raw_tokens[1] for char in "$`\\~*?[{}\r\n")
-        and raw_tokens[2] == "&&"
-    ):
-        paths = _command_paths(
-            " ".join(raw_tokens[3:]),
-            replace(context, cwd=_resolve(os.path.normpath(tokens[1]), context).path),
-            depth=depth,
-            writes_only=True,
-        )
-        if paths and any(
-            "\n" in raw
-            or (raw and all(char in ";|&()" for char in raw) and raw not in ("&&", "|"))
-            for raw in raw_tokens[3:]
-        ):
-            raise _UnboundShellWrite("Shell cwd changes outside an && chain cannot be bound")
-        return paths
+    tokens = _read_tokens(command, powershell=powershell)
     paths = []
-    if writes_only and context.platform != "windows" and not powershell:
-        for body in _shell_scan(command)[2]:
-            try:
-                paths.extend(_command_paths(body, context, depth=depth + 1, writes_only=True))
-            except _UnboundShellWrite:
-                raise
-            except ValueError:
-                continue
-    for index, token in enumerate(tokens):
-        shell = token.replace("\\", "/").rsplit("/", 1)[-1].lower().removesuffix(".exe")
-        if shell not in ("sh", "bash", "zsh", "cmd", "powershell", "pwsh"):
+    for index, _token in enumerate(tokens):
+        wrapped = _wrapped_command(tokens, tokens, index, writes_only=False)
+        if wrapped is None:
             continue
-        for option_index in range(index + 1, len(tokens) - 1):
-            option = tokens[option_index].lower()
-            supported = (
-                option in ("-command", "-c")
-                if shell in ("powershell", "pwsh")
-                else option == "/c"
-                if shell == "cmd"
-                else re.fullmatch(r"-[a-z]*c[a-z]*", option) is not None
+        shell, inner = wrapped
+        paths.extend(
+            _command_paths(
+                inner,
+                replace(context, shell=shell),
+                powershell=shell in ("powershell", "pwsh"),
+                depth=depth + 1,
             )
-            if supported:
-                inner = (
-                    " ".join(
-                        raw_tokens[option_index + 1 :]
-                        if writes_only and len(tokens) > option_index + 2
-                        else tokens[option_index + 1 :]
-                    )
-                    if shell in ("cmd", "powershell", "pwsh")
-                    else tokens[option_index + 1]
-                )
-                paths.extend(
-                    _command_paths(
-                        inner,
-                        context,
-                        powershell=shell in ("powershell", "pwsh"),
-                        depth=depth + 1,
-                        writes_only=writes_only,
-                    )
-                )
-                break
-            if not option.startswith(("-", "/")):
-                break
-    if writes_only:
-        candidates = []
-        segments = []
-        segment = []
-        raw_segments = []
-        raw_segment = []
-        index = 0
-        while index < len(tokens):
-            raw = raw_tokens[index]
-            if raw.startswith("#") and "\n" in raw:
-                segments.append(segment)
-                segment = []
-                raw_segments.append(raw_segment)
-                raw_segment = []
-                raw = raw.rsplit("\n", 1)[-1]
-            if (
-                raw.startswith(tokens[index])
-                and tokens[index]
-                and all(char in ";|&<>()\n" for char in tokens[index])
-            ):
-                raw = tokens[index]
-            if raw and all(char in ";|&()\n" for char in raw):
-                segments.append(segment)
-                segment = []
-                raw_segments.append(raw_segment)
-                raw_segment = []
-            elif raw in (">", ">>", ">|", "&>", "&>>", ">&", "<", "<<", "<<<", "<&", "<>"):
-                if index + 1 >= len(tokens):
-                    raise ValueError("Missing shell redirection target")
-                index += 1
-                destination = tokens[index]
-                if raw in (">", ">>", ">|", "&>", "&>>", "<>") or (
-                    raw == ">&" and not destination.isdigit() and destination != "-"
-                ):
-                    if destination != "/dev/null" or context.platform == "windows":
-                        candidates.append(destination)
-            else:
-                segment.append(tokens[index])
-                raw_segment.append(raw)
-            index += 1
-        segments.append(segment)
-        raw_segments.append(raw_segment)
-        cwd_changed = False
-        for segment, raw_segment in zip(segments, raw_segments, strict=True):
-            candidates.extend(
-                _write_operands(
-                    segment,
-                    raw_segment,
-                    posix_shell=context.platform != "windows" and not powershell,
-                    bsd_sed=context.platform == "darwin",
-                )
-            )
-            prefix = 0
-            while prefix < len(segment) and (
-                segment[prefix] in ("if", "then", "else", "elif", "do", "!", "command", "builtin")
-                or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", segment[prefix], re.DOTALL)
-            ):
-                execution_command = segment[prefix] == "command"
-                prefix += 1
-                if execution_command:
-                    while prefix < len(segment) and segment[prefix] == "-p":
-                        prefix += 1
-                    if prefix < len(segment) and segment[prefix] == "--":
-                        prefix += 1
-            if prefix < len(segment) and segment[prefix].lower() in (
-                "cd",
-                "pushd",
-                "popd",
-                "set-location",
-            ):
-                cwd_changed = True
-        if (candidates or paths) and cwd_changed:
-            raise _UnboundShellWrite("Shell cwd changes mixed with writes cannot be bound")
-        tokens = candidates
+        )
     for token in tokens:
-        if writes_only and any(char in token for char in "\r\n"):
-            raise _UnboundShellWrite("Shell write target with a newline cannot be bound")
         if (
             not token
             or token.startswith("-")
             or token in (";", "&&", "||", "|", ">", ">>", "<", "(", ")")
         ):
             continue
-        if context.platform != "windows":
-            if token == "$HOME" or token.startswith("$HOME/"):
-                token = context.home + token[5:]
-            elif token == "${HOME}" or token.startswith("${HOME}/"):
-                token = context.home + token[7:]
-        if writes_only and any(char in token for char in "$`"):
-            raise _UnboundShellWrite("Shell write target expansion cannot be bound")
-        if "$" in token or (not writes_only and any(char in token for char in "*?=")):
+        if token == "$HOME" or token.startswith("$HOME/"):
+            token = context.home + token[5:]
+        elif token == "${HOME}" or token.startswith("${HOME}/"):
+            token = context.home + token[7:]
+        if "$" in token or "=" in token:
             continue
+        # Globs stay literal so a read of a globbed directory is still visible.
         paths.append(_resolve(token, context).path)
     return tuple(paths)
+
+
+@dataclass(frozen=True)
+class _ShellWrites:
+    """Write targets bound from one shell command, and the deletes among them."""
+
+    paths: tuple[str, ...] = ()
+    deletes: tuple[str, ...] = ()
+    unbound_delete: str = ""
+
+    def merged(self, other: _ShellWrites) -> _ShellWrites:
+        return _ShellWrites(
+            self.paths + other.paths,
+            self.deletes + other.deletes,
+            self.unbound_delete or other.unbound_delete,
+        )
+
+
+def _shell_segments(
+    tokens: list[str], raw_tokens: list[str], *, windows: bool
+) -> list[tuple[list[str], list[str], list[str], str]]:
+    """Split a token stream into commands with redirect targets and leading operator."""
+    segments: list[tuple[list[str], list[str], list[str], str]] = []
+    segment: list[str] = []
+    raws: list[str] = []
+    redirects: list[str] = []
+    operator = ""
+    index = 0
+    while index < len(tokens):
+        raw = raw_tokens[index]
+        if raw.startswith("#") and "\n" in raw:
+            segments.append((segment, raws, redirects, operator))
+            segment, raws, redirects, operator = [], [], [], "\n"
+            raw = raw.rsplit("\n", 1)[-1]
+        if (
+            raw.startswith(tokens[index])
+            and tokens[index]
+            and all(char in ";|&<>()\n" for char in tokens[index])
+        ):
+            raw = tokens[index]
+        if raw and all(char in ";|&()\n" for char in raw):
+            segments.append((segment, raws, redirects, operator))
+            segment, raws, redirects = [], [], []
+            operator = raw
+        elif raw in _REDIRECTIONS:
+            if index + 1 >= len(tokens):
+                raise ValueError("Missing shell redirection target")
+            index += 1
+            destination = tokens[index]
+            if raw in _WRITE_REDIRECTIONS or (
+                raw == ">&" and not destination.isdigit() and destination != "-"
+            ):
+                if destination != "/dev/null" or windows:
+                    redirects.append(destination)
+        else:
+            segment.append(tokens[index])
+            raws.append(raw)
+        index += 1
+    segments.append((segment, raws, redirects, operator))
+    return segments
+
+
+def _find_deletes(tokens: list[str], offset: int) -> bool:
+    """Whether this find runs a delete: -delete, or -exec of a delete command."""
+    arguments = tokens[offset + 1 :]
+    if any(value.split("=", 1)[0] == "-delete" for value in arguments):
+        return True
+    for index, value in enumerate(arguments):
+        if value in ("-exec", "-execdir", "-ok", "-okdir") and index + 1 < len(arguments):
+            if _command_name(arguments[index + 1]) in _DELETE_COMMANDS:
+                return True
+    return False
+
+
+def _delete_segment(tokens: list[str]) -> bool:
+    """A command deletes when it names a delete command or tells find to act."""
+    for offset, token in enumerate(tokens):
+        command = _command_name(token)
+        if command in _DELETE_COMMANDS:
+            return True
+        if command == "find" and _find_deletes(tokens, offset):
+            return True
+    return False
+
+
+def _assigned_variables(command: str) -> frozenset[str]:
+    """Variables the command assigns itself, whose value is not the trusted one."""
+    return frozenset(
+        re.findall(
+            r"(?:^|[\s;&|(])(?:export\s+|local\s+|declare\s+)?([A-Za-z_][A-Za-z0-9_]*)=",
+            command,
+        )
+    )
+
+
+def _expand_trusted(
+    token: str, context: TrustedHostContext, assigned: frozenset[str]
+) -> str | None:
+    """Expand the trusted variables a target may name; None when it stays unresolved."""
+    values = {
+        "HOME": context.home,
+        "TMPDIR": (context.environment.get("TMPDIR") or "").rstrip("/"),
+    }
+
+    def expand(match: re.Match[str]) -> str:
+        name = match[1] or match[2]
+        if name in assigned or not values[name]:
+            raise ValueError(name)
+        return values[name]
+
+    try:
+        expanded = _TRUSTED_EXPANSION.sub(expand, token)
+    except ValueError:
+        return None
+    return None if not expanded or "$" in expanded or "`" in expanded else expanded
+
+
+def _anchored(path: str, windows: bool) -> bool:
+    """Whether a target names its own root, so no cwd applies."""
+    if windows:
+        drive, tail = ntpath.splitdrive(path)
+        return path.startswith("\\\\") or (bool(drive) and tail.startswith("\\"))
+    return path == "~" or path.startswith(("/", "~/"))
+
+
+def _bound_targets(
+    token: str, cwds: frozenset[str], context: TrustedHostContext, assigned: frozenset[str]
+) -> tuple[str, ...] | None:
+    """Resolve a write target under every cwd it can name; None when it is unresolved."""
+    expanded = _expand_trusted(token, context, assigned)
+    if expanded is None:
+        return None
+    if _anchored(expanded, context.platform == "windows"):
+        return (_resolve(expanded, context).path,)
+    if not cwds:
+        return None
+    return tuple(
+        dict.fromkeys(_resolve(expanded, replace(context, cwd=cwd)).path for cwd in sorted(cwds))
+    )
+
+
+def _literal_targets(
+    token: str, cwds: frozenset[str], context: TrustedHostContext
+) -> tuple[str, ...]:
+    """The literal part of an unresolved target, so path protections still see it."""
+    expansion = re.search(r"[$`]", token)
+    if expansion is None or not expansion.start() or not token[: expansion.start()].strip("/\\"):
+        return ()
+    return _bound_targets(token[: expansion.start()], cwds, context, frozenset()) or ()
+
+
+def _next_cwds(
+    segment: list[str],
+    cwds: frozenset[str],
+    context: TrustedHostContext,
+    assigned: frozenset[str],
+    *,
+    chained: bool,
+) -> frozenset[str]:
+    """The cwds the following command can run in; empty when that cannot be bound."""
+    offset = _command_offset(segment)
+    if offset >= len(segment):
+        return cwds
+    command = _command_name(segment[offset])
+    if command not in ("cd", "pushd", "popd", "set-location"):
+        return cwds
+    arguments = segment[offset + 1 :]
+    while arguments and arguments[0].lower() in ("-l", "-p", "-@", "-e", "--"):
+        arguments = arguments[1:]
+    if command == "popd" or (arguments and arguments[0] == "-"):
+        return frozenset()
+    bound = _bound_targets(arguments[0] if arguments else "~", cwds, context, assigned)
+    if not bound:
+        return frozenset()
+    return frozenset(bound) if chained else cwds | frozenset(bound)
+
+
+def _wrapped_writes(
+    segment: list[str],
+    raws: list[str],
+    cwds: frozenset[str],
+    context: TrustedHostContext,
+    depth: int,
+) -> _ShellWrites:
+    """Writes an inner shell command performs, bound under every cwd it can run in."""
+    for index in range(len(segment)):
+        wrapped = _wrapped_command(segment, raws, index, writes_only=True)
+        if wrapped is None:
+            continue
+        shell, inner = wrapped
+        writes = _ShellWrites()
+        for cwd in sorted(cwds) or (context.cwd,):
+            writes = writes.merged(
+                _shell_writes(
+                    inner,
+                    replace(context, cwd=cwd, shell=shell),
+                    depth + 1,
+                    powershell=shell in ("powershell", "pwsh"),
+                )
+            )
+        return writes
+    return _ShellWrites()
+
+
+def _shell_writes(
+    command: str, context: TrustedHostContext, depth: int, *, powershell: bool = False
+) -> _ShellWrites:
+    """Bind write targets, resolving each under every cwd its command can run in."""
+    if depth > 3:
+        raise ValueError("Shell wrapper nesting cannot be checked")
+    windows = context.platform == "windows"
+    tokens, raw_tokens = _write_tokens(command, windows=windows or powershell)
+    nested = _ShellWrites()
+    for body in _shell_scan(command)[2]:
+        try:
+            nested = nested.merged(_shell_writes(body, context, depth + 1, powershell=powershell))
+        except _UnboundShellWrite:
+            raise
+        except (OSError, RuntimeError, TypeError, ValueError):
+            continue
+    assigned = _assigned_variables(command)
+    cwds: frozenset[str] = frozenset((context.cwd,))
+    segments = _shell_segments(tokens, raw_tokens, windows=windows)
+    paths: list[str] = []
+    deletes: list[str] = []
+    unbound = ""
+    for position, (segment, raws, redirects, _operator) in enumerate(segments):
+        if not segment and not redirects:
+            continue
+        deleting = _delete_segment(segment)
+        operands = (
+            _write_operands(
+                segment,
+                raws,
+                posix_shell=not windows and not powershell,
+                bsd_sed=context.platform == "darwin",
+            )
+            if segment
+            else ()
+        )
+        for target in (*redirects, *operands):
+            bound = _bound_targets(target, cwds, context, assigned)
+            if bound is None:
+                paths.extend(_literal_targets(target, cwds, context))
+                if deleting and not unbound:
+                    unbound = _UNBOUND_DELETE
+                continue
+            paths.extend(bound)
+            if deleting:
+                deletes.extend(bound)
+        nested = nested.merged(_wrapped_writes(segment, raws, cwds, context, depth))
+        cwds = _next_cwds(
+            segment,
+            cwds,
+            context,
+            assigned,
+            chained=position + 1 < len(segments) and segments[position + 1][3] == "&&",
+        )
+    return _ShellWrites(tuple(paths), tuple(deletes), unbound).merged(nested)
+
+
+def _read_only_command(command: str, context: TrustedHostContext) -> bool:
+    """Whether every command in the line only reads its operands."""
+    windows = context.platform == "windows"
+    try:
+        tokens, raw_tokens = _write_tokens(command, windows=windows)
+        segments = _shell_segments(tokens, raw_tokens, windows=windows)
+    except (ValueError, RuntimeError):
+        return False
+    if not segments:
+        return False
+    for segment, _raws, redirects, _operator in segments:
+        if redirects:
+            return False
+        if not segment:
+            continue
+        offset = _command_offset(segment)
+        if offset >= len(segment):
+            return False
+        name = _command_name(segment[offset])
+        if name == "find":
+            if any(value.split("=", 1)[0] in _FIND_ACTIONS for value in segment[offset + 1 :]):
+                return False
+            continue
+        if name not in _READ_ONLY_COMMANDS:
+            return False
+    return True
 
 
 def _write_operands(
@@ -1849,6 +2146,11 @@ def _write_operands(
             ):
                 return conservative
             continue
+        if command == "find" and any(
+            value.split("=", 1)[0] in _FIND_ACTIONS for value in arguments
+        ):
+            # find -delete and -exec act on every match under its search roots.
+            return conservative
         if command == "tee":
             if offset or not posix_shell:
                 return conservative
@@ -1914,9 +2216,154 @@ def _mentions_path(command: str, path: str, context: TrustedHostContext) -> bool
     return False
 
 
+def _depth(value: str, parent: str, windows: bool) -> int | None:
+    """Levels below parent, or None when value is outside it."""
+    if windows:
+        target = ntpath.normcase(ntpath.normpath(value))
+        root = ntpath.normcase(ntpath.normpath(parent))
+        separator = "\\"
+    else:
+        target, root = os.path.normpath(value), os.path.normpath(parent)
+        separator = "/"
+    if target == root:
+        return 0
+    prefix = root.rstrip(separator) + separator
+    if not target.startswith(prefix):
+        return None
+    return len([part for part in target[len(prefix) :].split(separator) if part])
+
+
+def _critical_delete(path: str, context: TrustedHostContext) -> str:
+    """Say why deleting this bound path stays refused, or '' when it may proceed.
+
+    System and credential trees are refused at any depth; a home directory only
+    down to one level below it, so a project inside one still works.
+    """
+    if context.platform == "windows":
+        drive, tail = ntpath.splitdrive(path)
+        if not tail.strip("\\"):
+            return f"Deleting {path} is refused: it is a volume root"
+        environment = {key.upper(): value for key, value in context.environment.items()}
+        for name in ("SYSTEMROOT", "WINDIR", "PROGRAMFILES", "PROGRAMFILES(X86)"):
+            root = environment.get(name)
+            if root and _depth(path, root, True) is not None:
+                return f"Deleting {path} is refused: it is inside {root}"
+        depth = _depth(path, ntpath.join(drive + "\\", "Users"), True)
+        if depth is not None and depth <= 2:
+            return f"Deleting {path} is refused: it is a profile or one level below it"
+        return ""
+    if path == "/":
+        return "Deleting / is refused: it is the filesystem root"
+    for root in _CRITICAL_SYSTEM_ROOTS:
+        if _depth(path, root, False) is not None:
+            return f"Deleting {path} is refused: it is inside {root}"
+    depth = _depth(path, context.home, False)
+    if depth is not None and depth <= 1:
+        return f"Deleting {path} is refused: it is the home directory or one level below it"
+    for root in _USER_HOME_ROOTS:
+        depth = _depth(path, root, False)
+        if depth is not None and depth <= 2:
+            return f"Deleting {path} is refused: it is a user directory or one level below it"
+    depth = _depth(path, "/var/tmp", False)
+    if depth is not None:
+        return "" if depth else f"Deleting {path} is refused: it is a temporary root"
+    temporary = _DARWIN_TEMP_ROOT.match(path)
+    if temporary:
+        if path == temporary[1]:
+            return f"Deleting {path} is refused: it is a temporary root"
+        return ""
+    if _under(path, "/var", False):
+        return f"Deleting {path} is refused: /var is refused outside its temporary roots"
+    return ""
+
+
+def _readable_control(control: str, context: TrustedHostContext, windows: bool) -> bool:
+    """Whether this control path holds skill or settings files a read may enter."""
+    joined = ntpath.join if windows else os.path.join
+    return any(
+        _under(control, joined(root, name), windows)
+        for root in (context.home, context.workspace)
+        for name in _READABLE_CONTROL_DIRECTORIES
+    )
+
+
+def _credential_paths(context: TrustedHostContext, windows: bool) -> tuple[str, ...]:
+    """The credential files that stay refused even inside a readable tree."""
+    joined = ntpath.join if windows else os.path.join
+    return tuple(
+        joined(root, ".pi", "agent", name)
+        for root in (context.home, context.workspace)
+        for name in _CREDENTIAL_FILES
+    )
+
+
+def _glob_lists_credential(candidate: str, credentials: tuple[str, ...], windows: bool) -> bool:
+    """Whether a globbed read operand can list the directory that holds a credential."""
+    if not any(char in candidate for char in "*?["):
+        return False
+    separator = "\\" if windows else "/"
+    folder = candidate.rsplit(separator, 1)[0]
+    return any(credential.rsplit(separator, 1)[0] == folder for credential in credentials)
+
+
+def _control_refusal(
+    intent: ToolIntent,
+    control: str,
+    original: str,
+    context: TrustedHostContext,
+    windows: bool,
+    reasons: tuple[str, str],
+) -> str:
+    """Refuse writes and guard-file reads; allow skill and settings reads."""
+    control_reason, credential_reason = reasons
+    readable = _readable_control(control, context, windows)
+    target = intent.target
+    if intent.kind == ToolKind.READ and target is not None:
+        recursive = intent.name in _RECURSIVE_READS
+        covered = _under(target.path, control, windows) or (
+            recursive and _under(control, target.path, windows)
+        )
+        if not covered:
+            return ""
+        if not readable:
+            return control_reason
+        credentials = _credential_paths(context, windows)
+        if any(
+            target.path == credential or (recursive and _under(credential, target.path, windows))
+            for credential in credentials
+        ):
+            return credential_reason
+        return ""
+    if not intent.command:
+        if target is not None and _under(target.path, control, windows):
+            return control_reason
+        return ""
+    mentioned = any(
+        _mentions_path(intent.command, form, context)
+        for form in (control, _absolute(original, context))
+    )
+    if mentioned and _CREDENTIAL_MENTION.search(intent.command):
+        return credential_reason
+    for candidate in intent.command_write_paths:
+        if _under(candidate, control, windows):
+            return control_reason
+    allowed = readable and intent.command_read_only
+    credentials = _credential_paths(context, windows)
+    for candidate in intent.command_paths:
+        if not _under(candidate, control, windows):
+            continue
+        if not allowed:
+            return control_reason
+        if _glob_lists_credential(candidate, credentials, windows):
+            return credential_reason
+    if mentioned and not allowed:
+        return control_reason
+    return ""
+
+
 def _validated_rules(
     rules: RelaxedRules,
-) -> tuple[list[tuple[str, str, str, re.Pattern[str]]], list[str], list[str], str, str]:
+) -> tuple[list[tuple[str, str, str, re.Pattern[str]]], list[str], list[str], str, str, str]:
     document = rules.rules
     if not isinstance(document, Mapping) or document.get("schema") != 1:
         raise ValueError("Invalid ARES rule document")
@@ -1967,7 +2414,9 @@ def _validated_rules(
         or tuple(protected["prefix"]) != _PROTECTED_PREFIX
     ):
         raise ValueError("Changed protected paths")
-    if not all(isinstance(reasons.get(key), str) for key in ("control", "protected")):
+    if not all(
+        isinstance(reasons.get(key), str) for key in ("control", "protected", "credential")
+    ):
         raise ValueError("Malformed path reasons")
     return (
         [compiled[rule_id] for rule_id in active],
@@ -1975,6 +2424,7 @@ def _validated_rules(
         protected["prefix"],
         reasons["control"],
         reasons["protected"],
+        reasons["credential"],
     )
 
 
@@ -2032,7 +2482,7 @@ def decide_tier(tier: PermissionTier, intent: ToolIntent, rules: RelaxedRules) -
             return TierDecision(
                 Verdict.DENY, "Pi subagents are not yet governed by Omnigent permissions"
             )
-        active, _, _, control_reason, protected_reason = _validated_rules(rules)
+        active, _, _, control_reason, protected_reason, credential_reason = _validated_rules(rules)
         context = intent.context
         if context.platform not in ("darwin", "linux", "windows"):
             raise ValueError("Unknown host platform")
@@ -2067,24 +2517,11 @@ def decide_tier(tier: PermissionTier, intent: ToolIntent, rules: RelaxedRules) -
         for original, path in zip(
             context.control_paths, intent.resolved_control_paths, strict=True
         ):
-            if target and (
-                _under(target.path, path, windows)
-                or (
-                    intent.name in ("grep_search", "find_by_name")
-                    and _under(path, target.path, windows)
-                )
-            ):
-                return TierDecision(Verdict.DENY, control_reason, "control-path")
-            if intent.command and any(
-                _mentions_path(intent.command, form, context)
-                for form in (path, _absolute(original, context))
-            ):
-                return TierDecision(Verdict.DENY, control_reason, "control-path")
-            if any(
-                _under(candidate, path, windows)
-                for candidate in (*intent.command_paths, *intent.command_write_paths)
-            ):
-                return TierDecision(Verdict.DENY, control_reason, "control-path")
+            refusal = _control_refusal(
+                intent, path, original, context, windows, (control_reason, credential_reason)
+            )
+            if refusal:
+                return TierDecision(Verdict.DENY, refusal, "control-path")
         if intent.unbound_write:
             return TierDecision(Verdict.DENY, intent.detail, "unbound-write")
         if intent.kind == ToolKind.EDIT and target is not None:
@@ -2104,6 +2541,10 @@ def decide_tier(tier: PermissionTier, intent: ToolIntent, rules: RelaxedRules) -
                     return TierDecision(
                         Verdict.DENY, f"{protected_reason}: {candidate}", "protected-path"
                     )
+            for candidate in intent.command_delete_paths:
+                refusal = _critical_delete(candidate, context)
+                if refusal:
+                    return TierDecision(Verdict.DENY, refusal, "critical-delete")
             for rule_id, name, reason, pattern in active:
                 if pattern.search(intent.command):
                     explanation = _explanation(intent.command, context.platform, rules.signatures)
