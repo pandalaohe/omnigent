@@ -2013,6 +2013,10 @@ def test_recursive_reads_covering_an_agent_root_are_refused(root: str) -> None:
         ("sed -n 1p /opt/home/.pi/agent/skills/*/SKILL.md", "allowed"),
         ("rg token /opt/home/.pi/agent/skills", "allowed"),
         ("ls /opt/home/.pi/agent", "allowed"),
+        ("tail -n 5 /opt/home/.pi/agent/skills/x/SKILL.md", "allowed"),
+        ("stat /opt/home/.pi/agent/skills/x/SKILL.md", "allowed"),
+        ("jq . /opt/home/.pi/agent/skills/x/data.json", "allowed"),
+        ("printf '%s' /opt/home/.pi/agent/skills/x/SKILL.md", "allowed"),
     ],
 )
 def test_read_only_shell_keeps_key_files_out(command: str, expected: str) -> None:
@@ -2133,6 +2137,13 @@ def test_windows_critical_delete_depth_boundary(command: str, expected: Verdict)
         ("ls /opt/home", None),
         ("sed -n 1,5p /opt/home/.pi/agent/skills/plan/SKILL.md", None),
         ("tee /opt/home/.pi/note", "control-path"),
+        # Recursion is read off the segment that runs the command, not the first word.
+        ("echo scanning && rg . /opt/home/.pi/agent", "control-path"),
+        ("grep -R . /opt/home/.pi/agent", "control-path"),
+        ("echo scanning && sed -n 1p /opt/home/.pi/agent/skills/x/SKILL.md", None),
+        # An ancestor of an agent root, and dotfiles above it, stay readable.
+        ("grep -R . /opt/home", None),
+        ("cat /opt/home/.*/*.json", None),
     ],
 )
 def test_recursive_shell_reads_and_glob_prefixes(command: str, expected: str | None) -> None:
@@ -2172,6 +2183,8 @@ def test_a_same_command_assignment_disables_the_trusted_variable(command: str) -
         "{ cd /var; find log -delete; }",
         "cd /var || cd /opt/work/project && rm -rf log",
         "; ".join(["cd a"] * 8) + "; rm -rf x",
+        # A wrapper keeps the unknown cwd, so its relative delete stays unbound.
+        "cd /var; cd a; cd b; cd c; sh -c 'rm -rf log'",
     ],
 )
 def test_cwd_walk_reaches_every_cwd_a_command_can_run_in(command: str) -> None:
@@ -2229,6 +2242,12 @@ def test_canonical_temporary_roots_keep_the_var_boundary(
         ('unlink "$OUTPUT"', "unbound-write"),
         # The program name and its options are not delete operands.
         ("cd /var && rm -rf /opt/work/project/build", None),
+        # find without a path operand searches the current directory.
+        ("cd /var && find -delete", "critical-delete"),
+        ("cd /var && find . -delete", "critical-delete"),
+        # After -- every value is an operand.
+        ("cd /var && rm -- -log", "critical-delete"),
+        ("cd /var && rm -rf -- log", "critical-delete"),
     ],
 )
 def test_delete_operands_keep_only_real_targets(command: str, expected: str | None) -> None:
@@ -2264,3 +2283,27 @@ def test_key_refusals_name_the_target() -> None:
     assert result.rule_id == "control-path"
     assert path in result.reason
     assert "agent root" in result.reason
+    shell = decision("auto", "bash", {"command": "cat " + SKILLS + "/../models.json"}, pi_host())
+    assert shell.rule_id == "control-path"
+    assert SKILLS + "/../models.json" in shell.reason
+
+
+@pytest.mark.parametrize(
+    ("typed", "final", "expected"),
+    [
+        # A typed key name counts even when a link resolves outside the agent tree.
+        (SKILLS + "/x/models.json", "/opt/work/notes/x", "control-path"),
+        # A typed root-level json counts even when it resolves below skills.
+        ("/opt/home/.pi/agent/settings.json", SKILLS + "/x/s", "control-path"),
+        (SKILLS + "/x/notes.md", SKILLS + "/x/notes.md", None),
+    ],
+)
+def test_typed_and_resolved_reads_are_checked_separately(
+    typed: str, final: str, expected: str | None
+) -> None:
+    def linked(path: str) -> ResolvedPath:
+        kind = "directory" if path == "/opt/work/project" else "new-file"
+        return ResolvedPath(final if path == typed else path, kind)
+
+    host = posix_host(control_paths=PI_CONTROLS, resolver=linked)
+    assert decision("auto", "read", {"path": typed}, host).rule_id == expected

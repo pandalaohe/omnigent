@@ -99,7 +99,8 @@ class ToolIntent:
     command_paths: tuple[str, ...] = ()
     command_write_paths: tuple[str, ...] = ()
     command_delete_paths: tuple[str, ...] = ()
-    target_name: str = ""
+    target_text: str = ""
+    recursive_read_paths: tuple[str, ...] = ()
     command_read_only: bool = False
     unbound_write: bool = False
 
@@ -171,10 +172,14 @@ _READ_ONLY_COMMANDS = frozenset(
         "echo",
         "grep",
         "head",
+        "jq",
         "ls",
+        "printf",
         "pwd",
         "rg",
         "sed",
+        "stat",
+        "tail",
         "wc",
     )
 )
@@ -665,7 +670,7 @@ def _adapt_unbound_call(
                 digest,
                 context,
                 target=_resolve(path, context),
-                target_name=_basename(path),
+                target_text=path,
             )
         if name in _EDIT_PATH:
             if name in ("write", "sys_os_write") and not isinstance(arguments.get("content"), str):
@@ -799,13 +804,17 @@ def adapt_tool_call(
             raise ValueError("Workspace cannot be confirmed")
         controls = tuple(_resolve(path, context).path for path in context.control_paths)
         exact, prefixes = _protected_paths(context)
+        paths, recursive_paths = (
+            _command_paths(intent.command, intent.context) if intent.command else ((), ())
+        )
         bound = replace(
             intent,
             workspace_path=workspace,
             resolved_control_paths=controls,
             protected_exact_paths=tuple(_resolve(path, context).path for path in exact),
             protected_prefix_paths=tuple(_resolve(path, context).path for path in prefixes),
-            command_paths=_command_paths(intent.command, intent.context) if intent.command else (),
+            command_paths=paths,
+            recursive_read_paths=recursive_paths,
         )
         if not intent.command:
             return bound
@@ -830,10 +839,6 @@ def adapt_tool_call(
         )
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         return replace(intent, status="invalid", detail=str(exc))
-
-
-def _basename(path: str) -> str:
-    return path.replace("\\", "/").rsplit("/", 1)[-1]
 
 
 def _protected_paths(context: TrustedHostContext) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -1612,7 +1617,7 @@ def _windows_command_paths(
                 if shell in ("cmd", "powershell", "pwsh") and len(segment) > option_index + 2
                 else segment[option_index + 1]
             )
-            paths.extend(_command_paths(inner, replace(context, shell=shell), depth=depth + 1))
+            paths.extend(_command_paths(inner, replace(context, shell=shell), depth=depth + 1)[0])
             candidates.extend(
                 value for value in segment[:option_index] if not value.startswith("-")
             )
@@ -1704,35 +1709,37 @@ def _wrapped_command(
 
 def _command_paths(
     command: str, context: TrustedHostContext, *, powershell: bool = False, depth: int = 0
-) -> tuple[str, ...]:
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Bind direct path operands; this does not interpret scripts or terminal state."""
     if depth > 3:
         raise ValueError("Shell wrapper nesting cannot be checked")
     if context.platform == "windows":
-        return _windows_command_paths(command, context, depth)
+        return _windows_command_paths(command, context, depth), ()
     command = command.replace("\\\n", "")
     tokens, _raw = _write_tokens(command, windows=powershell)
     paths = []
+    recursive_paths = []
     for index, _token in enumerate(tokens):
         wrapped = _wrapped_command(tokens, tokens, index, writes_only=False)
         if wrapped is None:
             continue
         shell, inner = wrapped
-        paths.extend(
-            _command_paths(
-                inner,
-                replace(context, shell=shell),
-                powershell=shell in ("powershell", "pwsh"),
-                depth=depth + 1,
-            )
+        inner_paths, inner_recursive = _command_paths(
+            inner,
+            replace(context, shell=shell),
+            powershell=shell in ("powershell", "pwsh"),
+            depth=depth + 1,
         )
+        paths.extend(inner_paths)
+        recursive_paths.extend(inner_recursive)
+    reading = ""
     for token in tokens:
-        if (
-            not token
-            or token.startswith("-")
-            or token in (";", "&&", "||", "|", ">", ">>", "<", "(", ")", "\n")
-        ):
+        if not token or token in (";", "&&", "||", "|", ">", ">>", "<", "(", ")", "\n"):
+            reading = ""
             continue
+        if token.startswith("-"):
+            continue
+        reading = reading or _command_name(token)
         if token == "$HOME" or token.startswith("$HOME/"):
             token = context.home + token[5:]
         elif token == "${HOME}" or token.startswith("${HOME}/"):
@@ -1741,7 +1748,9 @@ def _command_paths(
             continue
         # Globs stay literal so a read of a globbed directory is still visible.
         paths.append(_resolve(token, context).path)
-    return tuple(paths)
+        if reading in _RECURSIVE_SHELL_READS:
+            recursive_paths.append(paths[-1])
+    return tuple(paths), tuple(recursive_paths)
 
 
 @dataclass(frozen=True)
@@ -1880,6 +1889,7 @@ def _shell_writes(
     *,
     powershell: bool = False,
     untrusted: frozenset[str] = frozenset(),
+    known: bool = True,
 ) -> _ShellWrites:
     """Bind write targets, resolving each under every cwd its command can run in."""
     if depth > 3:
@@ -1898,7 +1908,7 @@ def _shell_writes(
             raise
         except (OSError, RuntimeError, TypeError, ValueError):
             continue
-    cwds: frozenset[str] = frozenset((context.cwd,))
+    cwds: frozenset[str] = frozenset((context.cwd,)) if known else frozenset()
     segments = _shell_segments(tokens, raw_tokens, windows=windows)
     paths: list[str] = []
     deletes: list[str] = []
@@ -1948,6 +1958,7 @@ def _shell_writes(
                         depth + 1,
                         powershell=inner_shell in ("powershell", "pwsh"),
                         untrusted=assigned,
+                        known=bool(cwds),
                     )
                 )
             break
@@ -2055,8 +2066,9 @@ def _write_operands(
         if command == "find" and any(
             value.split("=", 1)[0] in _FIND_ACTIONS for value in arguments
         ):
-            # find -delete and -exec act on every match under its search roots.
-            return [value for value in conservative[offset + 1 :] if not value.startswith("-")]
+            # find -delete and -exec act on every match under its search roots, `.` by default.
+            operands = [value for value in conservative[offset + 1 :] if not value.startswith("-")]
+            return operands or ["."]
         if command == "tee":
             if offset or not posix_shell:
                 return conservative
@@ -2077,8 +2089,14 @@ def _write_operands(
             "remove-item",
             "move-item",
         ):
-            # The program name and options are not operands.
-            return [value for value in conservative[offset + 1 :] if not value.startswith("-")]
+            # The program name and options are not operands; after -- everything is.
+            operands = conservative[offset + 1 :]
+            if "--" in operands:
+                stop = operands.index("--")
+                return [
+                    value for value in operands[:stop] if not value.startswith("-")
+                ] + operands[stop + 1 :]
+            return [value for value in operands if not value.startswith("-")]
     return []
 
 
@@ -2220,12 +2238,12 @@ def _credential_refusal(reason: str, path: str) -> str:
     return f"{reason} Target: {path}"
 
 
-def _names_key_file(command: str) -> bool:
-    """Whether the command text names a file that can carry a key."""
-    return any(
-        "." in word and _key_name(word.replace("\\", "/").rsplit("/", 1)[-1])
-        for word in _COMMAND_WORDS.findall(command)
-    )
+def _names_key_file(command: str) -> str:
+    """The first file name in the command text that can carry a key, or ''."""
+    for word in _COMMAND_WORDS.findall(command):
+        if "." in word and _key_name(word.replace("\\", "/").rsplit("/", 1)[-1]):
+            return word
+    return ""
 
 
 def _control_refusal(
@@ -2252,19 +2270,16 @@ def _control_refusal(
     target = intent.target
     if intent.kind == ToolKind.READ and target is not None:
         recursive = intent.name in _RECURSIVE_READS
-        covered = _under(target.path, control, windows) or (
-            recursive and _under(control, target.path, windows)
-        )
-        if not covered:
-            return ""
-        if not readable:
-            return control_reason
-        keyed = _key_name(intent.target_name) or (
-            _key_read(target.path, roots, windows, covers=True)
-            if recursive
-            else _key_read(target.path, roots, windows)
-        )
-        return _credential_refusal(credential_reason, target.path) if keyed else ""
+        for path in dict.fromkeys((intent.target_text or target.path, target.path)):
+            if not (
+                _under(path, control, windows) or (recursive and _under(control, path, windows))
+            ):
+                continue
+            if not readable:
+                return control_reason
+            if _key_read(path, roots, windows, covers=recursive):
+                return _credential_refusal(credential_reason, path)
+        return ""
     if not intent.command:
         return (
             control_reason if target is not None and _under(target.path, control, windows) else ""
@@ -2273,21 +2288,21 @@ def _control_refusal(
         _mentions_path(intent.command, form, context)
         for form in (control, _absolute(original, context))
     )
-    if mentioned and _names_key_file(intent.command):
-        return credential_reason
+    named = _names_key_file(intent.command)
+    if mentioned and named:
+        return _credential_refusal(credential_reason, named)
     for candidate in intent.command_write_paths:
         if _under(candidate, control, windows):
             return control_reason
     allowed = readable and intent.command_read_only
-    first = _COMMAND_WORDS.findall(intent.command)
-    recursive_shell = bool(first) and _command_name(first[0]) in _RECURSIVE_SHELL_READS
+    recursive_paths = frozenset(intent.recursive_read_paths)
     for candidate in intent.command_paths:
         if not _under(candidate, control, windows):
             continue
         if not allowed:
             return control_reason
         if _key_read(candidate, roots, windows) or (
-            recursive_shell and _key_read(candidate, roots, windows, covers=True)
+            candidate in recursive_paths and _key_read(candidate, roots, windows, covers=True)
         ):
             return _credential_refusal(credential_reason, candidate)
     if mentioned and not allowed:
