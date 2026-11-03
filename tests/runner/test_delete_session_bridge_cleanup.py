@@ -25,6 +25,7 @@ import contextlib
 import json
 import logging
 import shutil
+import sys
 import uuid
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
@@ -354,6 +355,117 @@ async def test_delete_reclaims_owned_or_missing_metadata_bridge(
     finally:
         shutil.rmtree(bridge_dir, ignore_errors=True)
         shutil.rmtree(cache, ignore_errors=True)
+
+
+@pytest.mark.parametrize("suffix", ["", "/resources"])
+async def test_cleanup_preserves_bridge_and_cache_while_metadata_writer_holds_lock(
+    client: httpx.AsyncClient, tmp_path: Path, suffix: str
+) -> None:
+    """A busy metadata writer defers deletion; later cleanup can remove the owner."""
+    from omnigent.native.native_bridge_common import bridge_dir_preparation_lock
+
+    session_id = f"conv_{uuid.uuid4().hex}"
+    bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
+    attachment = materialize_attachment(
+        {"type": "input_file", "filename": "input.txt", "file_data": "data:;base64,aGk="},
+        bridge_dir,
+    )
+    assert attachment is not None
+    config = (bridge_dir / "bridge.json").read_bytes()
+
+    with bridge_dir_preparation_lock(bridge_dir):
+        response = await client.delete(f"/v1/sessions/{session_id}{suffix}")
+        assert response.status_code == 200
+        assert (bridge_dir / "bridge.json").read_bytes() == config
+        assert attachment.read_bytes() == b"hi"
+
+    response = await client.delete(f"/v1/sessions/{session_id}{suffix}")
+    assert response.status_code == 200
+    assert not bridge_dir.exists()
+    assert attachment.exists() == (suffix == "/resources")
+    # Resource release retains transcript attachments; full deletion reclaims them.
+    response = await client.delete(f"/v1/sessions/{session_id}")
+    assert response.status_code == 200
+    assert not attachment_cache_dir(bridge_dir).exists()
+
+
+async def test_cleanup_preserves_bridge_while_separate_process_updates_owner(
+    client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    """A real metadata writer excludes cleanup across processes, then releases the lock."""
+    from omnigent.harnesses.claude_native.bridge import read_active_session_id
+
+    session_id = f"conv_{uuid.uuid4().hex}"
+    bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
+    attachment = materialize_attachment(
+        {"type": "input_file", "filename": "input.txt", "file_data": "data:;base64,aGk="},
+        bridge_dir,
+    )
+    assert attachment is not None
+    config = (bridge_dir / "bridge.json").read_bytes()
+    ready, release = tmp_path / "writer-ready", tmp_path / "writer-release"
+    script = """
+import sys
+import time
+from pathlib import Path
+from omnigent.harnesses.claude_native import bridge
+
+bridge_dir, ready, release = map(Path, sys.argv[1:4])
+bridge._BRIDGE_ROOT = bridge_dir.parent
+bridge._TRUSTED_PARENT = bridge_dir.parent
+original_read = bridge._read_json_file
+
+def paused_read(path):
+    value = original_read(path)
+    ready.touch()
+    deadline = time.monotonic() + 30
+    while not release.exists():
+        if time.monotonic() > deadline:
+            raise RuntimeError("writer release timed out")
+        time.sleep(0.01)
+    return value
+
+bridge._read_json_file = paused_read
+bridge.write_active_session_id(bridge_dir, sys.argv[4])
+"""
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        script,
+        str(bridge_dir),
+        str(ready),
+        str(release),
+        session_id,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        async with asyncio.timeout(10):
+            while not ready.exists():
+                if process.returncode is not None:
+                    _, stderr = await process.communicate()
+                    pytest.fail(f"metadata writer exited before locking: {stderr.decode()}")
+                await asyncio.sleep(0.01)
+        response = await client.delete(f"/v1/sessions/{session_id}/resources")
+        assert response.status_code == 200
+        assert (bridge_dir / "bridge.json").read_bytes() == config
+        assert attachment.read_bytes() == b"hi"
+        release.touch()
+        _, stderr = await asyncio.wait_for(process.communicate(), timeout=10)
+        assert process.returncode == 0, stderr.decode()
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.communicate()
+
+    assert read_active_session_id(bridge_dir) == session_id
+    response = await client.delete(f"/v1/sessions/{session_id}/resources")
+    assert response.status_code == 200
+    assert not bridge_dir.exists()
+    assert attachment.read_bytes() == b"hi"
+    response = await client.delete(f"/v1/sessions/{session_id}")
+    assert response.status_code == 200
+    assert not attachment_cache_dir(bridge_dir).exists()
 
 
 async def test_cleanup_resources_without_cached_history_leaves_no_restore_flag(

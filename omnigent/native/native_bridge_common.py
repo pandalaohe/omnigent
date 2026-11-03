@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import json
 import logging
 import os
 import re
@@ -58,7 +59,7 @@ def _bridge_dir_lock(bridge_dir: Path) -> FileLock:
 
 @contextmanager
 def bridge_dir_preparation_lock(bridge_dir: Path) -> Iterator[None]:
-    """Prevent orphan cleanup while a runner prepares a bridge directory."""
+    """Exclude cleanup while preparing a bridge or updating its ownership."""
     with _bridge_dir_lock(bridge_dir):
         yield
 
@@ -71,7 +72,7 @@ def attachment_dir_lock(attachments_dir: Path) -> Iterator[None]:
 
 
 @contextmanager
-def _try_bridge_dir_cleanup_lock(bridge_dir: Path) -> Iterator[bool]:
+def try_bridge_dir_cleanup_lock(bridge_dir: Path) -> Iterator[bool]:
     """Try to exclude bridge preparation without ever blocking cleanup."""
     lock = _bridge_dir_lock(bridge_dir)
     try:
@@ -83,6 +84,18 @@ def _try_bridge_dir_cleanup_lock(bridge_dir: Path) -> Iterator[bool]:
         yield True
     finally:
         lock.release()
+
+
+def read_bridge_session_id(bridge_dir: Path) -> str | None:
+    """Read the owner independently of runtime fields; invalid existing state raises."""
+    try:
+        raw = json.loads((bridge_dir / "state.json").read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    session_id = raw.get("session_id") if isinstance(raw, dict) else None
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError("ownership metadata has no session id")
+    return session_id
 
 
 def write_owner_pid_marker(bridge_dir: Path) -> None:
@@ -191,7 +204,7 @@ def prune_orphaned_dirs(
     for entry in bridge_root.iterdir():
         if not entry.is_dir() or entry.name == _LOCK_DIR_NAME:
             continue
-        with _try_bridge_dir_cleanup_lock(entry) as acquired:
+        with try_bridge_dir_cleanup_lock(entry) as acquired:
             if not acquired:
                 continue
             marker = entry / OWNER_PID_FILENAME
@@ -263,7 +276,7 @@ def prune_expired_attachment_caches(attachments_dir: Path | None = None) -> int:
                 continue
             if entry.is_symlink() or not entry.is_dir():
                 continue
-            with _try_bridge_dir_cleanup_lock(entry) as acquired:
+            with try_bridge_dir_cleanup_lock(entry) as acquired:
                 if not acquired or not orphan_retention_expired(entry):
                     continue
                 shutil.rmtree(entry, ignore_errors=True)

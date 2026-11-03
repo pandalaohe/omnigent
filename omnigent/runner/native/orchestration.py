@@ -10982,6 +10982,10 @@ async def _delete_native_bridge_dirs(
         bridge_dir_for_session_id as qwen_bridge_dir,
     )
     from omnigent.inner.native_attachments import attachment_cache_dir, session_attachment_dir
+    from omnigent.native.native_bridge_common import (
+        read_bridge_session_id,
+        try_bridge_dir_cleanup_lock,
+    )
 
     labels: dict[str, str] = {}
     if server_client is not None:
@@ -10990,64 +10994,35 @@ async def _delete_native_bridge_dirs(
             session_id=session_id,
         )
 
-    history_targets = {
+    claude_targets = {
+        claude_bridge_dir(labels.get(BRIDGE_ID_LABEL_KEY) or session_id),
+        claude_bridge_dir(session_id),
+    }
+    transferred_targets = {
         antigravity_bridge_dir(labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
         antigravity_bridge_dir(session_id),
         codex_bridge_dir(labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
         codex_bridge_dir(session_id),
+    }
+    owned_targets = claude_targets | transferred_targets
+    history_targets = transferred_targets | {
         hermes_bridge_dir(session_id),
         opencode_bridge_dir(labels.get(OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
         opencode_bridge_dir(session_id),
         pi_bridge_dir(session_id),
     }
-    targets = history_targets | {
-        claude_bridge_dir(labels.get(BRIDGE_ID_LABEL_KEY) or session_id),
-        claude_bridge_dir(session_id),
-        cursor_bridge_dir(session_id),
-        goose_bridge_dir(session_id),
-        kimi_bridge_dir(session_id),
-        kiro_bridge_dir(session_id),
-        qwen_bridge_dir(session_id),
-    }
-    # A clear transfers the same bridge to its successor. Old labels and even
-    # the old session-id fallback can still point at that successor's data.
-    protected_targets: set[Path] = set()
-    for resolver, filename, owner_keys in (
-        (antigravity_bridge_dir, "state.json", ("session_id",)),
-        (codex_bridge_dir, "state.json", ("session_id",)),
-        (claude_bridge_dir, "bridge.json", ("active_session_id", "conversation_id")),
-    ):
-        for target in targets:
-            if target.parent != resolver(session_id).parent:
-                continue
-            try:
-                payload = json.loads((target / filename).read_text(encoding="utf-8"))
-                if not isinstance(payload, dict):
-                    raise ValueError("ownership metadata is not an object")
-                owner = next(
-                    (
-                        payload[key]
-                        for key in owner_keys
-                        if isinstance(payload.get(key), str) and payload[key]
-                    ),
-                    None,
-                )
-                if owner is None:
-                    raise ValueError("ownership metadata has no session id")
-            except FileNotFoundError:
-                continue
-            except (OSError, UnicodeError, ValueError) as exc:
-                _logger.warning(
-                    "Cannot read native bridge owner for %s (%s); preserving directory",
-                    target,
-                    type(exc).__name__,
-                )
-                protected_targets.add(target)
-                continue
-            if owner != session_id:
-                protected_targets.add(target)
-    targets.difference_update(protected_targets)
-    history_targets.difference_update(protected_targets)
+    targets = (
+        history_targets
+        | claude_targets
+        | {
+            cursor_bridge_dir(session_id),
+            goose_bridge_dir(session_id),
+            kimi_bridge_dir(session_id),
+            kiro_bridge_dir(session_id),
+            qwen_bridge_dir(session_id),
+        }
+    )
+    credentials: dict[Path, tuple[str, ...]] = {}
     if keep_session_history:
         credentials = {
             codex_bridge_dir(session_id).parent: (
@@ -11072,16 +11047,82 @@ async def _delete_native_bridge_dirs(
                 "pi-agent/omnigent-auth/*.json.*.tmp",
             ),
         }
-        for target in history_targets:
-            _scrub_native_bridge_credentials(target, credentials.get(target.parent, ()))
-        targets.difference_update(history_targets)
+    for bridge_target in targets:
+        try:
+            lock = (
+                try_bridge_dir_cleanup_lock(bridge_target)
+                if bridge_target in owned_targets
+                else contextlib.nullcontext(True)
+            )
+            with lock as acquired:
+                if not acquired:
+                    continue
+                try:
+                    if bridge_target in claude_targets:
+                        try:
+                            payload = json.loads(
+                                (bridge_target / "bridge.json").read_text(encoding="utf-8")
+                            )
+                        except FileNotFoundError:
+                            owner = None
+                        else:
+                            if not isinstance(payload, dict):
+                                raise ValueError("ownership metadata is not an object")
+                            owner = next(
+                                (
+                                    payload[key]
+                                    for key in ("active_session_id", "conversation_id")
+                                    if isinstance(payload.get(key), str) and payload[key]
+                                ),
+                                None,
+                            )
+                            if owner is None:
+                                raise ValueError("ownership metadata has no session id")
+                    elif bridge_target in transferred_targets:
+                        owner = read_bridge_session_id(bridge_target)
+                    else:
+                        owner = None
+                except (OSError, UnicodeError, ValueError, RecursionError) as exc:
+                    _logger.warning(
+                        "Cannot read native bridge owner for %s (%s); preserving directory",
+                        bridge_target,
+                        type(exc).__name__,
+                    )
+                    continue
+                if owner is not None and owner != session_id:
+                    continue
+                if keep_session_history and bridge_target in history_targets:
+                    _scrub_native_bridge_credentials(
+                        bridge_target, credentials.get(bridge_target.parent, ())
+                    )
+                    continue
+                # Ownership and both deletions share the stable lock. A cache
+                # can also survive a missing bridge directory after a reboot.
+                cleanup_targets = [bridge_target]
+                if not keep_attachment_caches:
+                    cleanup_targets.append(attachment_cache_dir(bridge_target))
+                for target in cleanup_targets:
+                    try:
+                        shutil.rmtree(target, ignore_errors=False)
+                    except FileNotFoundError:
+                        pass
+                    except OSError as exc:
+                        _logger.debug(
+                            "Failed to remove native session directory %s for session %s: %s",
+                            target,
+                            session_id,
+                            exc,
+                        )
+        except OSError as exc:
+            _logger.debug(
+                "Failed to clean native bridge directory %s for session %s: %s",
+                bridge_target,
+                session_id,
+                exc,
+            )
     if not keep_attachment_caches:
-        # A cache can survive a missing bridge directory, including after a reboot.
-        targets.update(attachment_cache_dir(target) for target in tuple(targets))
-        # By-path attachments live under a session-keyed dir shared by all
-        # harnesses, independent of any bridge directory.
-        targets.add(session_attachment_dir(session_id))
-    for target in targets:
+        # By-path attachments are session-keyed, independent of any bridge.
+        target = session_attachment_dir(session_id)
         try:
             shutil.rmtree(target, ignore_errors=False)
         except FileNotFoundError:
