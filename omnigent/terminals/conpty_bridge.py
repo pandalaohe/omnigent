@@ -7,18 +7,21 @@ import contextlib
 import json
 import time
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from fastapi import WebSocket, WebSocketDisconnect
 
 from omnigent.inner.async_utils import run_sync_on_thread
-from omnigent.inner.terminal import TerminalInstance
-from omnigent.terminals.conpty import ConPtyTerminalInstance
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
 from omnigent.terminals.ws_common import (
     WS_CLOSE_TERMINAL_NOT_FOUND,
     _coalesce_limit_after_input,
     _forward_terminal_to_ws,
 )
+
+if TYPE_CHECKING:
+    from omnigent.inner.terminal import TerminalInstance
+    from omnigent.terminals.conpty import ConPtyTerminalInstance
 
 
 async def bridge_terminal_to_websocket(
@@ -29,19 +32,23 @@ async def bridge_terminal_to_websocket(
     on_client_interaction: Callable[[], None] | None = None,
     on_input: Callable[[], None] | None = None,
 ) -> None:
-    if isinstance(instance, ConPtyTerminalInstance):
-        await bridge_conpty_to_websocket(
-            websocket,
-            instance,
-            read_only=read_only,
-            on_client_interaction=on_client_interaction,
-            on_input=on_input,
-        )
-    elif instance.backend == "tmux":
+    if instance.backend == "tmux":
         await bridge_tmux_control_to_websocket(
             websocket,
             socket_path=str(instance.socket_path),
             tmux_target=instance.tmux_target,
+            read_only=read_only,
+            on_client_interaction=on_client_interaction,
+            on_input=on_input,
+        )
+    elif instance.backend == "conpty":
+        from omnigent.terminals.conpty import ConPtyTerminalInstance
+
+        if not isinstance(instance, ConPtyTerminalInstance):
+            raise ValueError("invalid ConPTY terminal instance")
+        await bridge_conpty_to_websocket(
+            websocket,
+            instance,
             read_only=read_only,
             on_client_interaction=on_client_interaction,
             on_input=on_input,

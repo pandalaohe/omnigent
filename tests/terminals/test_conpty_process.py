@@ -41,6 +41,11 @@ def win32(monkeypatch):
             env[:],
             cwd,
             startup._obj.StartupInfo.dwFlags,
+            (
+                startup._obj.StartupInfo.hStdInput,
+                startup._obj.StartupInfo.hStdOutput,
+                startup._obj.StartupInfo.hStdError,
+            ),
         )
         info._obj.hProcess, info._obj.hThread, info._obj.dwProcessId = 31, 32, 41
         return True
@@ -85,11 +90,12 @@ def test_spawn_quotes_argv_normalizes_verbatim_cwd_and_assigns_before_resume(win
         argv, "\\\\?\\C:\\work space", {"PATH": "test"}, 90, 30
     )
     try:
-        command, inherit, flags, env, cwd, std_flags = win32.spawn_args
+        command, inherit, flags, env, cwd, std_flags, std_handles = win32.spawn_args
         assert command == subprocess.list2cmdline(argv)
         assert "PATH=test\0" in env
         assert not inherit and flags & process._CREATE_SUSPENDED
-        assert std_flags == 0 and cwd == "C:\\work space"
+        assert std_flags & 0x100 and cwd == "C:\\work space"
+        assert std_handles == (None, None, None)
         assert events == ["job", "resume"]
         assert child.pid == 41
     finally:

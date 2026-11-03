@@ -125,10 +125,24 @@ class _OutputState:
         overflow = self.size > self.limit
         while self.size > self.limit and self.chunks:
             self.size -= len(self.chunks.popleft())
-        if overflow and self.chunks:
-            retained = b"".join(self.chunks).partition(b"\r\n")[2]
-            self.chunks = deque([retained]) if retained else deque()
-            self.size = len(retained)
+        if overflow:
+            trailing_cr = False
+            while self.chunks:
+                head = self.chunks.popleft()
+                self.size -= len(head)
+                boundary = head.find(b"\r\n")
+                if trailing_cr and head.startswith(b"\n"):
+                    cut = 1
+                elif boundary >= 0:
+                    cut = boundary + 2
+                else:
+                    trailing_cr = head.endswith(b"\r")
+                    continue
+                retained = head[cut:]
+                if retained:
+                    self.chunks.appendleft(retained)
+                    self.size += len(retained)
+                break
 
     def snapshot(self) -> bytes:
         return b"".join(self.chunks)

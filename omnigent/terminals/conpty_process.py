@@ -266,6 +266,9 @@ class PseudoConsoleProcess:
             )
             startup = _StartupInfoEx()
             startup.StartupInfo.cb = ctypes.sizeof(startup)
+            # Null standard handles force the pseudoconsole even when the runner's
+            # own streams are redirected (microsoft/terminal discussion 15814).
+            startup.StartupInfo.dwFlags = 0x00000100  # STARTF_USESTDHANDLES
             startup.lpAttributeList = ctypes.cast(attributes, ctypes.c_void_p)
             process = _ProcessInfo()
             command = ctypes.create_unicode_buffer(subprocess.list2cmdline(argv))

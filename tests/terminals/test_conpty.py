@@ -3,6 +3,8 @@
 import asyncio
 import json
 import queue
+import subprocess
+import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -93,6 +95,36 @@ def test_replay_trims_to_line_and_tracks_split_mode_sequences():
     assert state.modes[1049] and state.modes[2004]
     state.append(b"\x1b[?;25l")
     assert not state.modes[25]
+
+
+def test_repeated_overflow_retains_recent_history_at_chunk_boundaries():
+    state = _OutputState()
+    chunk = (b"x" * 62 + b"\r\n") * 1024
+    for index in range(130):
+        state.append(chunk)
+        if index >= 64:
+            assert 4 * 1024 * 1024 - len(chunk) <= state.size <= 4 * 1024 * 1024
+            assert state.snapshot().endswith(chunk)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX import boundary")
+def test_posix_attach_imports_do_not_load_windows_backend():
+    script = """
+import importlib, sys
+windows = {
+    'omnigent.terminals.conpty',
+    'omnigent.terminals.conpty_process',
+    'omnigent.inner.windows_jobobject_sandbox',
+}
+for path in (
+    'omnigent.runner.host_terminals',
+    'omnigent.runner.resource_routes',
+    'omnigent.server.routes.terminal_attach',
+):
+    importlib.import_module(path)
+    assert not windows.intersection(sys.modules), path
+"""
+    subprocess.run([sys.executable, "-c", script], check=True, capture_output=True)
 
 
 class _Process:
