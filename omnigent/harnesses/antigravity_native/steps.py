@@ -96,6 +96,7 @@ class OutboundEvent:
 # RPC step type constants (CORTEX_STEP_TYPE_* enum values).
 _TYPE_USER_INPUT = "CORTEX_STEP_TYPE_USER_INPUT"
 _TYPE_PLANNER_RESPONSE = "CORTEX_STEP_TYPE_PLANNER_RESPONSE"
+_TYPE_ERROR_MESSAGE = "CORTEX_STEP_TYPE_ERROR_MESSAGE"
 _TYPE_RUN_COMMAND = "CORTEX_STEP_TYPE_RUN_COMMAND"
 _TYPE_LIST_DIRECTORY = "CORTEX_STEP_TYPE_LIST_DIRECTORY"
 
@@ -780,6 +781,32 @@ def _user_message_event(*, text: str, conversation_id: str, turn_id: str | None)
     )
 
 
+def error_message_text(step: dict[str, object]) -> str | None:
+    """Return a visible turn failure for agy's settled ERROR_MESSAGE steps."""
+    if step.get("type") != _TYPE_ERROR_MESSAGE or step.get("status") not in (
+        _STATUS_DONE,
+        _STATUS_ERROR,
+    ):
+        return None
+    message = step.get("errorMessage")
+    error = message.get("error") if isinstance(message, dict) else None
+    if isinstance(error, dict) and error.get("isBenign") is True:
+        return None
+    detail = "the model did not complete this turn"
+    if (
+        isinstance(message, dict)
+        and message.get("shouldShowUser") is True
+        and isinstance(error, dict)
+    ):
+        # fullError contains internal diagnostics; use the vendor's display fields.
+        for key in ("userErrorMessage", "shortError"):
+            value = error.get(key)
+            if isinstance(value, str) and value.strip():
+                detail = value.strip()
+                break
+    return f"[antigravity: {detail}]"
+
+
 def _planner_error_event(
     *, conversation_id: str, step_idx: int, step: dict[str, object]
 ) -> OutboundEvent:
@@ -1042,6 +1069,16 @@ def map_step_to_events(
         ]
 
     status = step.get("status")
+
+    error_text = error_message_text(step)
+    if error_text is not None:
+        return [
+            _message_event(
+                conversation_id=conversation_id,
+                step_idx=_step_index(step) or 0,
+                text=error_text,
+            )
+        ]
 
     # PLANNER_RESPONSE: emit the COMMITTED assistant message and/or function_call(s),
     # but ONLY at terminal (DONE) status. A pre-DONE planner (GENERATING) carries a

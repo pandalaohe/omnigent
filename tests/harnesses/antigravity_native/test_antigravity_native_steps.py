@@ -26,6 +26,8 @@ import json
 from pathlib import Path
 from typing import Any, cast
 
+import pytest
+
 from omnigent.harnesses.antigravity_native.steps import (
     OutboundEvent,
     _execution_discriminator,
@@ -253,6 +255,25 @@ class TestPlannerResponseText:
         step = _load("planner_response_text")
         events = map_step_to_events(step, conversation_id=_CID)
         assert events[0].data["response_id"] == f"agy_{_CID}_2"
+
+
+@pytest.mark.parametrize("visible", [True, False, None])
+def test_quota_error_message_visibility(visible: bool | None) -> None:
+    step = _load("quota_error_message")
+    if visible is None:
+        step["errorMessage"].pop("shouldShowUser")
+    else:
+        step["errorMessage"]["shouldShowUser"] = visible
+    step["errorMessage"]["error"]["fullError"] = "internal diagnostic sentinel"
+    events = map_step_to_events(step, conversation_id=_CID)
+    assert len(events) == 1
+    text = _item(events[0])["content"][0]["text"]
+    assert "internal diagnostic sentinel" not in text
+    if visible is True:
+        assert "Individual quota reached." in text
+        assert "Resets in 1h26m5s." in text
+    else:
+        assert text == "[antigravity: the model did not complete this turn]"
 
 
 class TestPlannerResponseError:
