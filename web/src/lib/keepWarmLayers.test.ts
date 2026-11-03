@@ -57,6 +57,43 @@ describe("shared keep-warm layer cases", () => {
   });
 });
 
+describe("keep-warm identity fallback", () => {
+  it("uses the harness row for a custom agent in display, clashes and equal-value removal", () => {
+    const layers: KeepWarmLayers = {
+      corner: { main: false, child: false },
+      hosts: { desktop: { main: false, child: false, maxSeconds: 7200 } },
+      agents: { "harness:codex": { main: true, child: true, maxSeconds: 10800 } },
+      cells: {},
+      hostWins: {},
+    };
+    const resolved = resolveKeepWarmRow(layers, "custom-agent", "desktop", "codex", "codex");
+    expect(resolved).toMatchObject({ main: true, child: true, maxSeconds: 10800 });
+
+    const store = keepWarmLayeredStore(layers, { row: "custom-agent", harness: "codex" });
+    const options = keepWarmLayeredOptions("codex");
+    expect(crossingClashes(store, "custom-agent", "desktop", CELL_FIELDS, options)).toEqual([
+      { field: "main", winner: "row" },
+      { field: "child", winner: "row" },
+      { field: "maxSeconds", winner: "row" },
+    ]);
+    expect(
+      dropKeepWarmCellEquals(
+        { main: true, child: true, maxSeconds: 10800 },
+        layers,
+        "custom-agent",
+        "desktop",
+        "codex",
+        "codex",
+      ),
+    ).toEqual({});
+
+    const hostWins = { ...layers, hostWins: { desktop: true as const } };
+    expect(resolveKeepWarmRow(hostWins, "custom-agent", "desktop", "codex", "codex")).toMatchObject(
+      { main: false, child: false, maxSeconds: 7200 },
+    );
+  });
+});
+
 describe("keep-warm layer editing", () => {
   it("drops a cell field equal to what it inherits", () => {
     const layers: KeepWarmLayers = {

@@ -606,12 +606,33 @@ function normalizeKeepWarmLayerValue(
 }
 
 /** The layered store shape the shared resolver reads. */
-export function keepWarmLayeredStore(layers: KeepWarmLayers): LayeredStore<KeepWarmLayerField> {
+export function keepWarmLayeredStore(
+  layers: KeepWarmLayers,
+  identity?: { row: string; harness?: string | null },
+): LayeredStore<KeepWarmLayerField> {
+  if (!identity) {
+    return {
+      corner: layers.corner,
+      rows: layers.agents,
+      cols: layers.hosts,
+      cells: layers.cells,
+      hostWins: layers.hostWins,
+    };
+  }
+  const harnessKey = identity.harness ? `harness:${identity.harness}` : null;
+  // The visible key is the template or bound agent; the runtime then tries its harness.
+  const row = layers.agents[identity.row] ?? (harnessKey ? layers.agents[harnessKey] : undefined);
+  const cells = Object.fromEntries(
+    Object.entries(layers.cells).map(([host, rows]) => {
+      const cell = rows[identity.row] ?? (harnessKey ? rows[harnessKey] : undefined);
+      return [host, cell ? { ...rows, [identity.row]: cell } : rows];
+    }),
+  );
   return {
     corner: layers.corner,
-    rows: layers.agents,
+    rows: row ? { ...layers.agents, [identity.row]: row } : layers.agents,
     cols: layers.hosts,
-    cells: layers.cells,
+    cells,
     hostWins: layers.hostWins,
   };
 }
@@ -638,8 +659,9 @@ export function resolveKeepWarmRow(
   row: string,
   host: string,
   family: KeepWarmFamily | null,
+  harness?: string | null,
 ): ResolvedKeepWarmLayerRow {
-  const store = keepWarmLayeredStore(layers);
+  const store = keepWarmLayeredStore(layers, { row, harness });
   const options = keepWarmLayeredOptions(family);
   const main = resolveField(store, row, host, "main", options);
   const child = resolveField(store, row, host, "child", options);
@@ -706,10 +728,11 @@ export function dropKeepWarmCellEquals(
   row: string,
   host: string,
   family: KeepWarmFamily | null,
+  harness?: string | null,
 ): KeepWarmLayerRecord {
   const at: LayeredLevel = { level: "cell", row, col: host };
   const options = keepWarmLayeredOptions(family);
-  const store = keepWarmLayeredStore(layers);
+  const store = keepWarmLayeredStore(layers, { row, harness });
   const fields: KeepWarmLayerField[] = ["main", "child"];
   if (family && family !== "pi") fields.push("intervalSeconds");
   fields.push("maxSeconds");

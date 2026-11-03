@@ -9,6 +9,7 @@ import {
   buildRegistry,
   registryHarnessOptions,
   registrySourceLabels,
+  rowsForAgentIds,
 } from "./useAgentRegistry";
 
 function agent(id: string, name: string, harness: string, product_of?: string): AvailableAgent {
@@ -181,6 +182,15 @@ describe("settings agent registry", () => {
     });
     expect(savedProducts["sdk-agent"]).toMatchObject({ harness: "codex", section: "sdk" });
     expect(savedProducts["polly-agent"]).toBeUndefined();
+  });
+
+  it("maps a builtin product session to its visible harness row", () => {
+    const catalog = [agent("product-codex", "Codex SDK", "codex", "codex")];
+    const items = buildRegistry(catalog, [], [], harnesses, hosts);
+    const products = buildLegacyProductRegistry(catalog, [], items);
+    expect(rowsForAgentIds(items, products, new Set(["product-codex"]))).toEqual(
+      new Set(["harness:codex"]),
+    );
   });
 
   it("uses offline reports, SDK auth state, unknown maps and distinct library ids", () => {

@@ -1388,18 +1388,6 @@ def _convert_keep_warm_layers(
     }
     corner = _materialize_keep_warm_layer(settings.default, allow_interval=False)
     rows = {key: _materialize_keep_warm_layer(row) for key, row in settings.agents.items()}
-    folded = dict(rows)
-    fold_map: dict[str, str] = {}
-    for harness, product in products.items():
-        if harness not in families or product not in rows:
-            continue
-        harness_key = f"harness:{harness}"
-        if harness_key in rows:
-            continue
-        folded.pop(product)
-        folded[harness_key] = rows[product]
-        fold_map[harness] = product
-
     identities = sorted(
         set(identities),
         key=lambda item: (
@@ -1440,32 +1428,57 @@ def _convert_keep_warm_layers(
                     break
         return changed
 
-    for identity in changed_routes(folded):
-        key = (
-            identity.template_id
-            if identity.template_id in settings.agents
-            else (identity.agent_id or identity.template_id)
-        )
-        if key is None and identity.harness in fold_map:
-            product = fold_map.pop(identity.harness)
-            folded.pop(f"harness:{identity.harness}", None)
-            folded[product] = rows[product]
+    declined: set[str] = set()
+    while True:
+        folded = dict(rows)
+        fold_map: dict[str, str] = {}
+        for harness, product in products.items():
+            if harness in declined or harness not in families or product not in rows:
+                continue
+            harness_key = f"harness:{harness}"
+            if harness_key in rows:
+                continue
+            folded.pop(product)
+            folded[harness_key] = rows[product]
+            fold_map[harness] = product
 
-    for identity in changed_routes(folded):
-        key = (
-            identity.template_id
-            if identity.template_id in settings.agents
-            else (identity.agent_id or identity.template_id)
-        )
-        if key is None:
-            continue
-        before = keep_warm_row(
-            settings,
-            template_id=identity.template_id,
-            agent_id=identity.agent_id,
-            harness=identity.harness,
-        )
-        folded[key] = _materialize_keep_warm_layer(before)
+        for identity in changed_routes(folded):
+            key = (
+                identity.template_id
+                if identity.template_id in settings.agents
+                else (identity.agent_id or identity.template_id)
+            )
+            if key is None and identity.harness in fold_map:
+                product = fold_map.pop(identity.harness)
+                folded.pop(f"harness:{identity.harness}", None)
+                folded[product] = rows[product]
+
+        for identity in changed_routes(folded):
+            key = (
+                identity.template_id
+                if identity.template_id in settings.agents
+                else (identity.agent_id or identity.template_id)
+            )
+            if key is None:
+                continue
+            before = keep_warm_row(
+                settings,
+                template_id=identity.template_id,
+                agent_id=identity.agent_id,
+                harness=identity.harness,
+            )
+            folded[key] = _materialize_keep_warm_layer(before)
+
+        masked = {
+            identity.harness
+            for identity in changed_routes(folded)
+            if identity.harness is not None and identity.harness in fold_map
+        }
+        if not masked:
+            break
+        # A correction at a template key can mask a bound agent below it.
+        # Keep the product row instead when that happens.
+        declined.update(masked)
 
     return {
         "corner": corner,

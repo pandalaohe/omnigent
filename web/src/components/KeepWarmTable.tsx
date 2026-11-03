@@ -128,6 +128,17 @@ function minutesText(seconds: number): string {
   return String(Math.round(seconds / 60));
 }
 
+function fieldName(field: KeepWarmLayerField): string {
+  const names: Record<KeepWarmLayerField, string> = {
+    main: "Main sessions",
+    child: "Children",
+    intervalSeconds: "Ping every",
+    maxSeconds: "Up to",
+    coldAfterSeconds: "Cold after",
+  };
+  return names[field];
+}
+
 function fieldText(field: KeepWarmLayerField, value: unknown): string {
   if (field === "main" || field === "child") return value === true ? "On" : "Off";
   if (field === "intervalSeconds") {
@@ -165,12 +176,16 @@ function differsAt(
   field: KeepWarmLayerField,
   family: KeepWarmFamily | null,
   crossAgent: boolean,
+  harness?: string | null,
 ): boolean {
   const record = levelRecord(layers, at);
   if (record[field] === undefined) return false;
   const options = keepWarmLayeredOptions(family, { crossAgent });
   if (options.canHold && !options.canHold(levelRow(at), field, record[field])) return false;
-  const store = keepWarmLayeredStore(layers);
+  const store = keepWarmLayeredStore(
+    layers,
+    at.level === "row" || at.level === "cell" ? { row: at.row, harness } : undefined,
+  );
   const own = options.normalize
     ? options.normalize(levelRow(at), field, record[field])
     : record[field];
@@ -261,6 +276,7 @@ function KeepWarmLevelEditor({
   onOpenChange,
   layers,
   family,
+  harness,
   rowLabel,
   colLabel,
   hostWins,
@@ -277,6 +293,7 @@ function KeepWarmLevelEditor({
   onOpenChange: (open: boolean) => void;
   layers: KeepWarmLayers;
   family: KeepWarmFamily | null;
+  harness?: string | null;
   rowLabel: string;
   colLabel: string;
   hostWins: boolean;
@@ -294,11 +311,14 @@ function KeepWarmLevelEditor({
     if (!open) setDraft(JSON.parse(ownKey) as KeepWarmLayerRecord);
   }, [open, ownKey]);
 
-  const store = keepWarmLayeredStore(layers);
+  const store = keepWarmLayeredStore(
+    layers,
+    at.level === "row" || at.level === "cell" ? { row: at.row, harness } : undefined,
+  );
   const crossAgent = at.level === "corner" || at.level === "col";
   const options = keepWarmLayeredOptions(family, { crossAgent });
   const fields = fieldsShown(at, family);
-  const belowCount = levelsBelow(store, at).length;
+  const belowCount = levelsBelow(keepWarmLayeredStore(layers), at).length;
 
   const levelName = (source: LayeredLevel | null): string | null => {
     if (!source) return null;
@@ -339,7 +359,7 @@ function KeepWarmLevelEditor({
   const commit = async () => {
     const record =
       at.level === "cell"
-        ? dropKeepWarmCellEquals(draft, layers, at.row, at.col, family)
+        ? dropKeepWarmCellEquals(draft, layers, at.row, at.col, family, harness)
         : { ...draft };
     if (await onSave(record)) onOpenChange(false);
   };
@@ -532,7 +552,7 @@ function KeepWarmLevelEditor({
                   : minutesText(inheritedAt(store, at, "coldAfterSeconds", options).value as number)
               }
               onCommit={(minutes) => setField("coldAfterSeconds", minutes * 60)}
-              onClear={() => setField("coldAfterSeconds", undefined)}
+              onClear={() => setField("coldAfterSeconds", null)}
             />
             <span className="text-sm text-muted-foreground">min</span>
           </SettingRow>
@@ -763,11 +783,12 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
       ),
     [registry.items, registry.legacyProducts],
   );
-  const familyForRow = (rowKey: string): KeepWarmFamily | null => {
+  const harnessForRow = (rowKey: string): string | null => {
     const item = byKey.get(rowKey);
-    const harness = item?.harness ?? (rowKey.startsWith("harness:") ? rowKey.slice(8) : null);
-    return keepWarmFamilyForHarness(harness, capabilities);
+    return item?.harness ?? (rowKey.startsWith("harness:") ? rowKey.slice(8) : null);
   };
+  const familyForRow = (rowKey: string): KeepWarmFamily | null =>
+    keepWarmFamilyForHarness(harnessForRow(rowKey), capabilities);
   const familyForItem = (item: RegistryItem) =>
     keepWarmFamilyForHarness(item.harness, capabilities);
 
@@ -855,12 +876,7 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
     setSaveError(null);
     setPending(change(preferencesWithLayers));
     try {
-      let authoritative = conversion.data;
-      if (!authoritative.already) {
-        authoritative = await convert(false, signal);
-        if (signal.aborted || scope !== scopeKey()) return false;
-        client.setQueryData(queryKey, { ...authoritative, already: true });
-      }
+      const authoritative = conversion.data;
       const current = readKeepWarmPreferences();
       const base = normalizeKeepWarmPreferences({
         ...current,
@@ -910,6 +926,7 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
         ...base,
         layers: clearKeepWarmLevel(base.layers!, at),
       }));
+      if (ok) setEditing(null);
       if (ok && before) setUndo({ layers: before, label: "Cleared this level." });
     })();
   }
@@ -969,7 +986,7 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
           next = setKeepWarmLayer(
             next,
             { level: "cell", row, col },
-            dropKeepWarmCellEquals(merged, next, row, col, family),
+            dropKeepWarmCellEquals(merged, next, row, col, family, harnessForRow(row)),
           );
         }
         return { ...base, layers: next };
@@ -1004,12 +1021,14 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
       return { content: null, unavailable: missingCellText(harness, machine?.platform) };
     }
     const family = familyForRow(rowKey);
-    const resolved = resolveKeepWarmRow(layers, rowKey, host, family);
+    const resolved = resolveKeepWarmRow(layers, rowKey, host, family, harness);
     const at: LayeredCellLevel = { level: "cell", row: rowKey, col: host };
     const options = keepWarmLayeredOptions(family);
-    const store = keepWarmLayeredStore(layers);
+    const store = keepWarmLayeredStore(layers, { row: rowKey, harness });
     const fields = fieldsShown(at, family);
-    const differing = fields.filter((field) => differsAt(layers, at, field, family, false));
+    const differing = fields.filter((field) =>
+      differsAt(layers, at, field, family, false, harness),
+    );
     const ownRecord = levelRecord(layers, at);
     const parts = differing
       .filter((field) => field !== "main" && field !== "child")
@@ -1020,13 +1039,19 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
       });
     const clashes = crossingClashes(store, rowKey, host, fields, options);
     const clash = clashes
-      .map(
-        ({ field, winner }) =>
-          `${rowLabel(rowKey)} and ${hostName(host)} both set ${field}; ${
-            winner === "row" ? rowLabel(rowKey) : hostName(host)
-          } wins. Click this cell to set it here.`,
-      )
-      .join(" ");
+      .map(({ field, winner }) => {
+        const rowValue = store.rows[rowKey]?.[field];
+        const colValue = store.cols[host]?.[field];
+        const shown = (value: unknown) =>
+          fieldText(field, options.normalize ? options.normalize(rowKey, field, value) : value);
+        return [
+          fieldName(field),
+          `${rowLabel(rowKey)}: ${shown(rowValue)}`,
+          `${hostName(host)}: ${shown(colValue)}`,
+          `Winner: ${winner === "row" ? rowLabel(rowKey) : hostName(host)}`,
+        ].join("\n");
+      })
+      .join("\n\n");
     return {
       content: (
         <span className="flex flex-col gap-0.5">
@@ -1057,6 +1082,7 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
         onOpenChange={(open) => setEditing(open ? levelKey(at) : null)}
         layers={layers}
         family={family}
+        harness={at.level === "row" || at.level === "cell" ? harnessForRow(at.row) : null}
         rowLabel={row}
         colLabel={col}
         hostWins={at.level === "col" || at.level === "cell" ? !!layers.hostWins[at.col] : false}
@@ -1159,6 +1185,7 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
                     field,
                     familyForItem(item),
                     false,
+                    item.harness,
                   ),
               ),
             }))}

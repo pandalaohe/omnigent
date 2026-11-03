@@ -380,7 +380,11 @@ export function rowsForAgentIds(
   const byKey = new Map(items.map((item) => [item.key, item]));
   const keys = new Set<RegistryKey>();
   for (const agentId of agentIds) {
-    const item = byKey.get(agentId) ?? legacyProducts[agentId];
+    const legacy = legacyProducts[agentId];
+    const item =
+      byKey.get(agentId) ??
+      (legacy?.harness ? byKey.get(`harness:${legacy.harness}`) : undefined) ??
+      legacy;
     if (item) keys.add(item.key);
   }
   return keys;

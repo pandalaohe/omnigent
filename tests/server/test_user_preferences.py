@@ -35,7 +35,6 @@ from omnigent.server.routes.sessions.routes_hooks import _approval_timeout_owner
 from omnigent.server.schemas import UserPreferenceNamespace
 from omnigent.server.user_preferences_store import (
     KEEP_WARM_DEFAULT_MAX_S,
-    KEEP_WARM_MAX_BOUNDS_S,
     USER_PREFERENCE_NAMESPACES,
     AgentKeepWarm,
     ApprovalTimeout,
@@ -2835,16 +2834,65 @@ def test_keep_warm_layers_shared_cases(case: dict[str, Any]) -> None:
             "maxSeconds": resolved.max_s,
             "coldAfterSeconds": row.cold_after_s,
         }
-    else:
-        max_low, max_high = KEEP_WARM_MAX_BOUNDS_S
-        actual = {
-            "main": row.main,
-            "child": row.child,
-            "intervalSeconds": 1800,
-            "maxSeconds": min(min(max(row.max_s, max_low), max_high), 1800),
-            "coldAfterSeconds": None,
+        assert actual == case["expected"]
+        return
+
+    from omnigent.entities import Conversation
+    from omnigent.server.child_keep_warm import pi_cache_warming_allowed
+
+    started_at = 1_900_000_000
+    labels = {"omnigent.running_since": str(started_at)}
+    if case.get("templateId"):
+        labels["omnigent:agent-template-id"] = case["templateId"]
+    conv = Conversation(
+        id="pi-shared-case",
+        root_conversation_id="pi-shared-case",
+        created_at=started_at,
+        updated_at=started_at,
+        agent_id=case.get("agentId") or case["row"],
+        host_id=case["host"] or None,
+        harness_override=case["harness"],
+        labels=labels,
+    )
+    assert pi_cache_warming_allowed(conv, settings, started_at) is case["expected"]["main"]
+    actual = {
+        "main": row.main,
+        "child": row.child,
+        "intervalSeconds": 1800,
+        "coldAfterSeconds": None,
+    }
+    expected = {key: value for key, value in case["expected"].items() if key != "maxSeconds"}
+    assert actual == expected
+
+
+def test_keep_warm_layers_pi_cap_uses_the_real_decision() -> None:
+    from omnigent.entities import Conversation
+    from omnigent.server.child_keep_warm import pi_cache_warming_allowed
+
+    layers = _parse_keep_warm_layers(
+        {
+            "corner": {"main": True},
+            "hosts": {},
+            "agents": {"harness:pi": {"maxSeconds": 7200}},
+            "cells": {},
+            "hostWins": {},
         }
-    assert actual == case["expected"]
+    )
+    assert layers is not None
+    settings = KeepWarmSettings({}, 0, None, True, layers=layers)
+    started_at = 1_900_000_000
+    conv = Conversation(
+        id="pi-cap",
+        root_conversation_id="pi-cap",
+        created_at=started_at,
+        updated_at=started_at,
+        agent_id="pi-agent",
+        host_id="desktop",
+        harness_override="pi",
+        labels={"omnigent.running_since": str(started_at)},
+    )
+    assert pi_cache_warming_allowed(conv, settings, started_at + 1799) is True
+    assert pi_cache_warming_allowed(conv, settings, started_at + 1800) is False
 
 
 def _identity_route(settings: KeepWarmSettings, identity: KeepWarmIdentity, host: str):
@@ -2944,6 +2992,52 @@ def test_keep_warm_layers_conversion_preserves_legacy_routes(db_uri: str) -> Non
     assert (
         store.convert_keep_warm("alice", [], [], dry_run=False, target="layers")["already"] is True
     )
+
+
+@pytest.mark.parametrize("default_on", [True, False])
+def test_keep_warm_layers_conversion_declines_a_masking_fold(
+    db_uri: str, default_on: bool
+) -> None:
+    from omnigent.db.utils import builtin_agent_id
+    from omnigent.harness_plugins import product_agent_harnesses
+
+    product = next(
+        builtin_agent_id(name)
+        for name, harness in product_agent_harnesses().items()
+        if harness == "codex"
+    )
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    store.patch_namespace(
+        "alice",
+        "keep_warm",
+        {
+            "default": {"main": default_on, "child": default_on},
+            "agents": {
+                product: {"main": not default_on, "child": not default_on},
+                "direct_exception": {
+                    "main": not default_on,
+                    "child": not default_on,
+                },
+            },
+        },
+    )
+    identities = [
+        KeepWarmIdentity("ca_library", "codex"),
+        KeepWarmIdentity("direct_exception", "codex", "ca_library"),
+        KeepWarmIdentity("default_copy", "codex", "ca_library"),
+    ]
+    old = read_keep_warm_settings(store, "alice")
+    saved = store.convert_keep_warm("alice", identities, ["h1"], dry_run=False, target="layers")
+    assert "harness:codex" not in saved["layers"]["agents"]
+    converted = read_keep_warm_settings(store, "alice")
+    for host in ("", "h1"):
+        for identity in identities:
+            assert _identity_route(old, identity, host) == _identity_route(
+                converted, identity, host
+            )
+    repeated = store.convert_keep_warm("alice", identities, ["h1"], dry_run=False, target="layers")
+    assert repeated["already"] is True
+    assert repeated["layers"] == saved["layers"]
 
 
 def test_keep_warm_layers_conversion_preserves_cells_and_off_rows(db_uri: str) -> None:
