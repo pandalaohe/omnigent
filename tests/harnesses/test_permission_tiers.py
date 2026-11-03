@@ -1861,6 +1861,7 @@ PI_CONTROLS = (
     "/opt/home/.pi",
     "/opt/home/.agents",
     "/opt/work/project/.pi",
+    "/opt/work/project/.agents",
 )
 
 
@@ -1927,9 +1928,18 @@ def test_narrowed_shell_refusals_now_run(command: str, platform: str) -> None:
 @pytest.mark.parametrize(
     ("name", "args"),
     [
+        ("read", {"path": "/opt/home/.pi/AGENTS.md"}),
         ("read", {"path": "/opt/home/.pi/agent/skills/plan/SKILL.md"}),
-        ("read", {"path": "/opt/home/.pi/agent/settings.json"}),
-        ("read", {"path": "/opt/work/project/.pi/agent/config.json"}),
+        ("read", {"path": "/opt/home/.pi/agent/extensions/collab-guard/index.ts"}),
+        ("read", {"path": "/opt/home/.pi/agent/missions/m1.md"}),
+        (
+            "read",
+            {"path": "/opt/home/.pi/agent/sessions/2026-11-03T07-56-01-754Z_01a1.jsonl"},
+        ),
+        ("read", {"path": "/opt/home/.pi/agent/skills/plan/references/patterns.md"}),
+        ("read", {"path": "/opt/home/.agents/skills/plan/SKILL.md"}),
+        ("read", {"path": "/opt/work/project/.agents/skills/x/SKILL.md"}),
+        ("read", {"path": "/opt/work/project/.pi/extensions/injected.js"}),
         ("grep_search", {"SearchPath": "/opt/home/.pi/agent/skills"}),
         ("find_by_name", {"SearchDirectory": "/opt/work/project/.agents/skills"}),
         ("load_skill", {"name": "plan"}),
@@ -1941,16 +1951,82 @@ def test_control_path_reads_are_allowed(name: str, args: dict) -> None:
 
 
 @pytest.mark.parametrize(
+    "path",
+    [
+        # Key-bearing names, at the agent roots and at any depth.
+        "/opt/home/.pi/agent/auth.json",
+        "/opt/home/.pi/agent/models.json",
+        "/opt/home/.pi/agent/models-store.json",
+        "/opt/home/.pi/agent/antigravity-accounts.json",
+        "/opt/home/.pi/agent/models.json.bak-20261102",
+        "/opt/home/.pi/mcp-auth.json",
+        "/opt/home/.pi/agent/skills/x/token-usage.md",
+        "/opt/home/.pi/agent/skills/x/credentials-policy.md",
+        "/opt/home/.pi/agent/skills/x/AuthNotes.md",
+        "/opt/home/.pi/agent/skills/x/secret-plans.md",
+        "/opt/home/.pi/agent/missions/apikeys.md",
+        "/opt/home/.pi/agent/.env",
+        "/opt/home/.pi/agent/skills/x/.env.local",
+        "/opt/work/project/.pi/agent/apikeys.json",
+        "/opt/work/project/.agents/skills/y/secret.md",
+        # Any .json sitting directly in an agent root, key word or not.
+        "/opt/home/.pi/agent/settings.json",
+        "/opt/home/.pi/mcp.json",
+        "/opt/work/project/.pi/agent/config.json",
+    ],
+)
+def test_key_bearing_reads_are_refused(path: str) -> None:
+    for tier in NON_FULL_TIERS:
+        result = decision(tier, "read", {"path": path}, pi_host())
+        assert result.action == Verdict.DENY
+        assert result.rule_id == "control-path"
+    assert decision("full", "read", {"path": path}, pi_host()).action == Verdict.ALLOW
+
+
+@pytest.mark.parametrize(
+    "root",
+    ["/opt/home/.pi", "/opt/home/.pi/agent", "/opt/home", "/opt/home/.agents"],
+)
+def test_recursive_reads_covering_an_agent_root_are_refused(root: str) -> None:
+    for name in ("grep_search", "find_by_name"):
+        for tier in NON_FULL_TIERS:
+            result = decision(tier, name, {"SearchPath": root, "SearchDirectory": root}, pi_host())
+            assert result.action == Verdict.DENY
+            assert result.rule_id == "control-path"
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("cat /opt/home/.pi/agent/*", "refused"),
+        ("cat /opt/home/.pi/agent/models-store.json", "refused"),
+        ("cat /opt/home/.pi/agent/models.json.bak-1", "refused"),
+        ("cat /opt/home/.pi/agent/skills/x/token.md", "refused"),
+        ("cat /opt/home/.pi/agent/skills/*token*", "refused"),
+        ("rg models.json /opt/home/.pi/agent", "refused"),
+        ("cd /opt/home/.pi/agent && cat models.json", "refused"),
+        ("sed -n 1,60p /opt/home/.pi/agent/skills/wiki-ops/SKILL.md", "allowed"),
+        ("rg --files /opt/home/.pi/agent/skills", "allowed"),
+        ("find /opt/home/.pi/agent/skills -name '*.md'", "allowed"),
+        ("cat /opt/home/.pi/AGENTS.md", "allowed"),
+        ("sed -n 1p /opt/home/.pi/agent/skills/*/SKILL.md", "allowed"),
+        ("rg token /opt/home/.pi/agent/skills", "allowed"),
+        ("ls /opt/home/.pi/agent", "allowed"),
+    ],
+)
+def test_read_only_shell_keeps_key_files_out(command: str, expected: str) -> None:
+    result = decision("auto", "bash", {"command": command}, pi_host())
+    if expected == "refused":
+        assert (result.action, result.rule_id) == (Verdict.DENY, "control-path")
+    else:
+        assert result.action == Verdict.ALLOW, result.reason
+
+
+@pytest.mark.parametrize(
     ("name", "args"),
     [
-        # Credentials stay refused for every read and write.
-        ("read", {"path": "/opt/home/.pi/agent/auth.json"}),
-        ("read", {"path": "/opt/home/.pi/agent/models.json"}),
-        ("bash", {"command": "cat /opt/home/.pi/agent/auth.json"}),
-        ("bash", {"command": "rg models.json /opt/home/.pi/agent"}),
-        ("grep_search", {"SearchPath": "/opt/home/.pi/agent"}),
-        # Writes and the guard's own files stay refused.
         ("write", {"path": "/opt/home/.pi/agent/settings.json", "content": "{}"}),
+        ("write", {"path": "/opt/home/.pi/agent/skills/x/SKILL.md", "content": "x"}),
         ("bash", {"command": "mkdir -p /opt/home/.pi/agent/x"}),
         ("bash", {"command": "touch /opt/home/.pi/x"}),
         ("bash", {"command": "sed -i s/a/b/ /opt/home/.pi/agent/settings.json"}),

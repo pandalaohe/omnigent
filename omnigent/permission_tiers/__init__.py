@@ -136,10 +136,14 @@ _PROTECTED_PREFIX = (
     "~/.gnupg",
     "~/Library/Keychains",
 )
-# Skill and settings trees a read may enter; the guard's own files stay closed.
+# Skill and note trees a read may enter; the guard's own files stay closed.
 _READABLE_CONTROL_DIRECTORIES = (".pi", ".agents")
-_CREDENTIAL_FILES = ("auth.json", "models.json")
+# Directories whose own .json children can carry keys, under home and workspace.
+_AGENT_ROOT_PARTS = ((".pi",), (".pi", "agent"), (".agents",))
+# A file name carrying one of these can hold a key wherever it sits.
+_KEY_NAME_WORDS = ("auth", "credential", "secret", "token", "apikey", "accounts", "models")
 _RECURSIVE_READS = ("grep_search", "find_by_name")
+_COMMAND_WORDS = re.compile(r"[^\s'\"|;&()<>]+")
 # A delete stays refused while its target cannot be bound; other writes proceed.
 _DELETE_COMMANDS = ("rm", "rmdir", "unlink", "del", "erase", "rd", "remove-item", "srm")
 _FIND_ACTIONS = (
@@ -156,45 +160,20 @@ _FIND_ACTIONS = (
 # Commands whose operands are only read, so a control-path mention may proceed.
 _READ_ONLY_COMMANDS = frozenset(
     (
-        "ag",
-        "basename",
         "bat",
         "cat",
-        "cut",
-        "date",
-        "diff",
-        "dirname",
-        "du",
         "echo",
-        "egrep",
-        "fgrep",
-        "file",
         "grep",
         "head",
         "jq",
-        "less",
         "ls",
-        "md5sum",
-        "more",
-        "nl",
-        "od",
         "printf",
         "pwd",
-        "readlink",
-        "realpath",
         "rg",
         "sed",
-        "sha256sum",
-        "shasum",
         "stat",
         "tail",
-        "tr",
-        "tree",
-        "type",
-        "uniq",
         "wc",
-        "which",
-        "xxd",
     )
 )
 _CRITICAL_SYSTEM_ROOTS = ("/etc", "/usr", "/bin", "/sbin", "/boot", "/root")
@@ -430,7 +409,12 @@ _ENCODED_OPTION = re.compile(
     r"(?i)\b(?:powershell|pwsh)(?:\.exe)?\b[^\r\n]*?\s-(?:encodedcommand|enc|e)\b"
 )
 _TRUSTED_EXPANSION = re.compile(r"\$(?:\{(HOME|TMPDIR)\}|(HOME|TMPDIR))(?![A-Za-z0-9_])")
-_CREDENTIAL_MENTION = re.compile(r"(?<![\w.-])(?:auth|models)\.json(?![\w-])")
+_WRAPPER_OPTIONS = {
+    "cmd": re.compile(r"/c"),
+    "powershell": re.compile(r"-command|-c"),
+    "pwsh": re.compile(r"-command|-c"),
+}
+_SHELL_COMMAND_OPTION = re.compile(r"-[a-z]*c[a-z]*")
 _DARWIN_TEMP_ROOT = re.compile(r"^(/var/folders/[^/]+/[^/]+/T)(?:/|$)")
 # Redirections bind a write target; the rest only feed the command.
 _REDIRECTIONS = (">", ">>", ">|", "&>", "&>>", ">&", "<", "<<", "<<<", "<&", "<>")
@@ -826,9 +810,6 @@ def adapt_tool_call(
             protected_exact_paths=tuple(_resolve(path, context).path for path in exact),
             protected_prefix_paths=tuple(_resolve(path, context).path for path in prefixes),
             command_paths=_command_paths(intent.command, intent.context) if intent.command else (),
-            command_read_only=(
-                _read_only_command(intent.command, intent.context) if intent.command else False
-            ),
         )
         if not intent.command:
             return bound
@@ -846,6 +827,7 @@ def adapt_tool_call(
             bound,
             command_write_paths=writes.paths,
             command_delete_paths=writes.deletes,
+            command_read_only=writes.read_only,
             status="unknown" if writes.unbound_delete else bound.status,
             detail=writes.unbound_delete or bound.detail,
             unbound_write=bool(writes.unbound_delete),
@@ -1718,28 +1700,18 @@ def _wrapped_command(
     shell = _command_name(tokens[index])
     if shell not in ("sh", "bash", "zsh", "cmd", "powershell", "pwsh"):
         return None
+    option_pattern = _WRAPPER_OPTIONS.get(shell, _SHELL_COMMAND_OPTION)
     for option_index in range(index + 1, len(tokens) - 1):
         option = tokens[option_index].lower()
-        supported = (
-            option in ("-command", "-c")
-            if shell in ("powershell", "pwsh")
-            else option == "/c"
-            if shell == "cmd"
-            else re.fullmatch(r"-[a-z]*c[a-z]*", option) is not None
-        )
-        if supported:
-            inner = (
-                " ".join(
-                    raw_tokens[option_index + 1 :]
-                    if writes_only and len(tokens) > option_index + 2
-                    else tokens[option_index + 1 :]
-                )
-                if shell in ("cmd", "powershell", "pwsh")
-                else tokens[option_index + 1]
-            )
-            return shell, inner
-        if not option.startswith(("-", "/")):
-            return None
+        if not option_pattern.fullmatch(option):
+            if not option.startswith(("-", "/")):
+                return None
+            continue
+        rest = tokens[option_index + 1 :]
+        if shell in ("cmd", "powershell", "pwsh"):
+            keep = raw_tokens[option_index + 1 :] if writes_only and len(rest) > 1 else rest
+            return shell, " ".join(keep)
+        return shell, rest[0]
     return None
 
 
@@ -1786,17 +1758,19 @@ def _command_paths(
 
 @dataclass(frozen=True)
 class _ShellWrites:
-    """Write targets bound from one shell command, and the deletes among them."""
+    """Write targets bound from one shell command, the deletes, and whether it only reads."""
 
     paths: tuple[str, ...] = ()
     deletes: tuple[str, ...] = ()
     unbound_delete: str = ""
+    read_only: bool = True
 
     def merged(self, other: _ShellWrites) -> _ShellWrites:
         return _ShellWrites(
             self.paths + other.paths,
             self.deletes + other.deletes,
             self.unbound_delete or other.unbound_delete,
+            self.read_only and other.read_only,
         )
 
 
@@ -1844,37 +1818,28 @@ def _shell_segments(
     return segments
 
 
-def _find_deletes(tokens: list[str], offset: int) -> bool:
-    """Whether this find runs a delete: -delete, or -exec of a delete command."""
-    arguments = tokens[offset + 1 :]
-    if any(value.split("=", 1)[0] == "-delete" for value in arguments):
-        return True
-    for index, value in enumerate(arguments):
-        if value in ("-exec", "-execdir", "-ok", "-okdir") and index + 1 < len(arguments):
-            if _command_name(arguments[index + 1]) in _DELETE_COMMANDS:
-                return True
-    return False
+def _reads_only(segment: list[str]) -> bool:
+    """Whether one command only reads: a read-only word, or find without an action."""
+    offset = _command_offset(segment)
+    if offset >= len(segment):
+        return False
+    name = _command_name(segment[offset])
+    if name == "find":
+        return not any(value.split("=", 1)[0] in _FIND_ACTIONS for value in segment[offset + 1 :])
+    return name in _READ_ONLY_COMMANDS
 
 
 def _delete_segment(tokens: list[str]) -> bool:
-    """A command deletes when it names a delete command or tells find to act."""
+    """A command deletes when it names a delete command or passes find -delete."""
     for offset, token in enumerate(tokens):
         command = _command_name(token)
         if command in _DELETE_COMMANDS:
             return True
-        if command == "find" and _find_deletes(tokens, offset):
+        if command == "find" and any(
+            value.split("=", 1)[0] == "-delete" for value in tokens[offset + 1 :]
+        ):
             return True
     return False
-
-
-def _assigned_variables(command: str) -> frozenset[str]:
-    """Variables the command assigns itself, whose value is not the trusted one."""
-    return frozenset(
-        re.findall(
-            r"(?:^|[\s;&|(])(?:export\s+|local\s+|declare\s+)?([A-Za-z_][A-Za-z0-9_]*)=",
-            command,
-        )
-    )
 
 
 def _expand_trusted(
@@ -1899,14 +1864,6 @@ def _expand_trusted(
     return None if not expanded or "$" in expanded or "`" in expanded else expanded
 
 
-def _anchored(path: str, windows: bool) -> bool:
-    """Whether a target names its own root, so no cwd applies."""
-    if windows:
-        drive, tail = ntpath.splitdrive(path)
-        return path.startswith("\\\\") or (bool(drive) and tail.startswith("\\"))
-    return path == "~" or path.startswith(("/", "~/"))
-
-
 def _bound_targets(
     token: str, cwds: frozenset[str], context: TrustedHostContext, assigned: frozenset[str]
 ) -> tuple[str, ...] | None:
@@ -1914,23 +1871,18 @@ def _bound_targets(
     expanded = _expand_trusted(token, context, assigned)
     if expanded is None:
         return None
-    if _anchored(expanded, context.platform == "windows"):
+    if context.platform == "windows":
+        drive, tail = ntpath.splitdrive(expanded)
+        anchored = expanded.startswith("\\\\") or (bool(drive) and tail.startswith("\\"))
+    else:
+        anchored = expanded == "~" or expanded.startswith(("/", "~/"))
+    if anchored:
         return (_resolve(expanded, context).path,)
     if not cwds:
         return None
     return tuple(
         dict.fromkeys(_resolve(expanded, replace(context, cwd=cwd)).path for cwd in sorted(cwds))
     )
-
-
-def _literal_targets(
-    token: str, cwds: frozenset[str], context: TrustedHostContext
-) -> tuple[str, ...]:
-    """The literal part of an unresolved target, so path protections still see it."""
-    expansion = re.search(r"[$`]", token)
-    if expansion is None or not expansion.start() or not token[: expansion.start()].strip("/\\"):
-        return ()
-    return _bound_targets(token[: expansion.start()], cwds, context, frozenset()) or ()
 
 
 def _next_cwds(
@@ -1959,33 +1911,6 @@ def _next_cwds(
     return frozenset(bound) if chained else cwds | frozenset(bound)
 
 
-def _wrapped_writes(
-    segment: list[str],
-    raws: list[str],
-    cwds: frozenset[str],
-    context: TrustedHostContext,
-    depth: int,
-) -> _ShellWrites:
-    """Writes an inner shell command performs, bound under every cwd it can run in."""
-    for index in range(len(segment)):
-        wrapped = _wrapped_command(segment, raws, index, writes_only=True)
-        if wrapped is None:
-            continue
-        shell, inner = wrapped
-        writes = _ShellWrites()
-        for cwd in sorted(cwds) or (context.cwd,):
-            writes = writes.merged(
-                _shell_writes(
-                    inner,
-                    replace(context, cwd=cwd, shell=shell),
-                    depth + 1,
-                    powershell=shell in ("powershell", "pwsh"),
-                )
-            )
-        return writes
-    return _ShellWrites()
-
-
 def _shell_writes(
     command: str, context: TrustedHostContext, depth: int, *, powershell: bool = False
 ) -> _ShellWrites:
@@ -2002,15 +1927,22 @@ def _shell_writes(
             raise
         except (OSError, RuntimeError, TypeError, ValueError):
             continue
-    assigned = _assigned_variables(command)
+    assigned = frozenset(
+        re.findall(
+            r"(?:^|[\s;&|(])(?:export\s+|local\s+|declare\s+)?([A-Za-z_][A-Za-z0-9_]*)=",
+            command,
+        )
+    )
     cwds: frozenset[str] = frozenset((context.cwd,))
     segments = _shell_segments(tokens, raw_tokens, windows=windows)
     paths: list[str] = []
     deletes: list[str] = []
     unbound = ""
+    read_only = True
     for position, (segment, raws, redirects, _operator) in enumerate(segments):
         if not segment and not redirects:
             continue
+        read_only = read_only and not redirects and _reads_only(segment)
         deleting = _delete_segment(segment)
         operands = (
             _write_operands(
@@ -2025,14 +1957,31 @@ def _shell_writes(
         for target in (*redirects, *operands):
             bound = _bound_targets(target, cwds, context, assigned)
             if bound is None:
-                paths.extend(_literal_targets(target, cwds, context))
+                expansion = re.search(r"[$`]", target)
+                literal = target[: expansion.start()] if expansion else ""
+                if literal.strip("/\\"):
+                    paths.extend(_bound_targets(literal, cwds, context, frozenset()) or ())
                 if deleting and not unbound:
                     unbound = _UNBOUND_DELETE
                 continue
             paths.extend(bound)
             if deleting:
                 deletes.extend(bound)
-        nested = nested.merged(_wrapped_writes(segment, raws, cwds, context, depth))
+        for index in range(len(segment)):
+            wrapped = _wrapped_command(segment, raws, index, writes_only=True)
+            if wrapped is None:
+                continue
+            inner_shell, inner = wrapped
+            for cwd in sorted(cwds) or (context.cwd,):
+                nested = nested.merged(
+                    _shell_writes(
+                        inner,
+                        replace(context, cwd=cwd, shell=inner_shell),
+                        depth + 1,
+                        powershell=inner_shell in ("powershell", "pwsh"),
+                    )
+                )
+            break
         cwds = _next_cwds(
             segment,
             cwds,
@@ -2040,35 +1989,7 @@ def _shell_writes(
             assigned,
             chained=position + 1 < len(segments) and segments[position + 1][3] == "&&",
         )
-    return _ShellWrites(tuple(paths), tuple(deletes), unbound).merged(nested)
-
-
-def _read_only_command(command: str, context: TrustedHostContext) -> bool:
-    """Whether every command in the line only reads its operands."""
-    windows = context.platform == "windows"
-    try:
-        tokens, raw_tokens = _write_tokens(command, windows=windows)
-        segments = _shell_segments(tokens, raw_tokens, windows=windows)
-    except (ValueError, RuntimeError):
-        return False
-    if not segments:
-        return False
-    for segment, _raws, redirects, _operator in segments:
-        if redirects:
-            return False
-        if not segment:
-            continue
-        offset = _command_offset(segment)
-        if offset >= len(segment):
-            return False
-        name = _command_name(segment[offset])
-        if name == "find":
-            if any(value.split("=", 1)[0] in _FIND_ACTIONS for value in segment[offset + 1 :]):
-                return False
-            continue
-        if name not in _READ_ONLY_COMMANDS:
-            return False
-    return True
+    return _ShellWrites(tuple(paths), tuple(deletes), unbound, read_only).merged(nested)
 
 
 def _write_operands(
@@ -2216,6 +2137,10 @@ def _mentions_path(command: str, path: str, context: TrustedHostContext) -> bool
     return False
 
 
+def _delete_refusal(path: str, why: str) -> str:
+    return f"Deleting {path} is refused: {why}"
+
+
 def _depth(value: str, parent: str, windows: bool) -> int | None:
     """Levels below parent, or None when value is outside it."""
     if windows:
@@ -2242,68 +2167,64 @@ def _critical_delete(path: str, context: TrustedHostContext) -> str:
     if context.platform == "windows":
         drive, tail = ntpath.splitdrive(path)
         if not tail.strip("\\"):
-            return f"Deleting {path} is refused: it is a volume root"
+            return _delete_refusal(path, "it is a volume root")
         environment = {key.upper(): value for key, value in context.environment.items()}
         for name in ("SYSTEMROOT", "WINDIR", "PROGRAMFILES", "PROGRAMFILES(X86)"):
             root = environment.get(name)
             if root and _depth(path, root, True) is not None:
-                return f"Deleting {path} is refused: it is inside {root}"
+                return _delete_refusal(path, f"it is inside {root}")
         depth = _depth(path, ntpath.join(drive + "\\", "Users"), True)
         if depth is not None and depth <= 2:
-            return f"Deleting {path} is refused: it is a profile or one level below it"
+            return _delete_refusal(path, "it is a profile or one level below it")
         return ""
     if path == "/":
-        return "Deleting / is refused: it is the filesystem root"
+        return _delete_refusal(path, "it is the filesystem root")
     for root in _CRITICAL_SYSTEM_ROOTS:
         if _depth(path, root, False) is not None:
-            return f"Deleting {path} is refused: it is inside {root}"
-    depth = _depth(path, context.home, False)
-    if depth is not None and depth <= 1:
-        return f"Deleting {path} is refused: it is the home directory or one level below it"
-    for root in _USER_HOME_ROOTS:
+            return _delete_refusal(path, f"it is inside {root}")
+    for root, levels in ((context.home, 1), *((value, 2) for value in _USER_HOME_ROOTS)):
         depth = _depth(path, root, False)
-        if depth is not None and depth <= 2:
-            return f"Deleting {path} is refused: it is a user directory or one level below it"
+        if depth is not None and depth <= levels:
+            return _delete_refusal(path, "it is a home directory or one level below it")
     depth = _depth(path, "/var/tmp", False)
     if depth is not None:
-        return "" if depth else f"Deleting {path} is refused: it is a temporary root"
+        return "" if depth else _delete_refusal(path, "it is a temporary root")
     temporary = _DARWIN_TEMP_ROOT.match(path)
     if temporary:
         if path == temporary[1]:
-            return f"Deleting {path} is refused: it is a temporary root"
+            return _delete_refusal(path, "it is a temporary root")
         return ""
     if _under(path, "/var", False):
-        return f"Deleting {path} is refused: /var is refused outside its temporary roots"
+        return _delete_refusal(path, "/var is refused outside its temporary roots")
     return ""
 
 
-def _readable_control(control: str, context: TrustedHostContext, windows: bool) -> bool:
-    """Whether this control path holds skill or settings files a read may enter."""
-    joined = ntpath.join if windows else os.path.join
-    return any(
-        _under(control, joined(root, name), windows)
-        for root in (context.home, context.workspace)
-        for name in _READABLE_CONTROL_DIRECTORIES
+def _key_name(name: str) -> bool:
+    """A file name that can carry a key, refused wherever it sits."""
+    folded = name.casefold()
+    return (
+        any(word in folded for word in _KEY_NAME_WORDS)
+        or folded == ".env"
+        or folded.startswith(".env.")
+        or folded.endswith(".env")
     )
 
 
-def _credential_paths(context: TrustedHostContext, windows: bool) -> tuple[str, ...]:
-    """The credential files that stay refused even inside a readable tree."""
-    joined = ntpath.join if windows else os.path.join
-    return tuple(
-        joined(root, ".pi", "agent", name)
-        for root in (context.home, context.workspace)
-        for name in _CREDENTIAL_FILES
-    )
-
-
-def _glob_lists_credential(candidate: str, credentials: tuple[str, ...], windows: bool) -> bool:
-    """Whether a globbed read operand can list the directory that holds a credential."""
-    if not any(char in candidate for char in "*?["):
-        return False
+def _key_read(path: str, roots: tuple[str, ...], windows: bool) -> bool:
+    """A key-bearing name, a .json directly in an agent root, or a glob over one."""
     separator = "\\" if windows else "/"
-    folder = candidate.rsplit(separator, 1)[0]
-    return any(credential.rsplit(separator, 1)[0] == folder for credential in credentials)
+    folder, _, name = path.rpartition(separator)
+    if _key_name(name) or (".json" in name.casefold() and folder in roots):
+        return True
+    return any(char in name for char in "*?[") and folder in roots
+
+
+def _names_key_file(command: str) -> bool:
+    """Whether the command text names a file that can carry a key."""
+    return any(
+        "." in word and _key_name(word.replace("\\", "/").rsplit("/", 1)[-1])
+        for word in _COMMAND_WORDS.findall(command)
+    )
 
 
 def _control_refusal(
@@ -2314,9 +2235,19 @@ def _control_refusal(
     windows: bool,
     reasons: tuple[str, str],
 ) -> str:
-    """Refuse writes and guard-file reads; allow skill and settings reads."""
+    """Refuse writes and key-bearing reads; allow skills, notes and extensions."""
     control_reason, credential_reason = reasons
-    readable = _readable_control(control, context, windows)
+    joined = ntpath.join if windows else os.path.join
+    readable = any(
+        _under(control, joined(root, name), windows)
+        for root in (context.home, context.workspace)
+        for name in _READABLE_CONTROL_DIRECTORIES
+    )
+    roots = tuple(
+        joined(root, *parts).rstrip("\\" if windows else "/")
+        for root in (context.home, context.workspace)
+        for parts in _AGENT_ROOT_PARTS
+    )
     target = intent.target
     if intent.kind == ToolKind.READ and target is not None:
         recursive = intent.name in _RECURSIVE_READS
@@ -2327,34 +2258,30 @@ def _control_refusal(
             return ""
         if not readable:
             return control_reason
-        credentials = _credential_paths(context, windows)
-        if any(
-            target.path == credential or (recursive and _under(credential, target.path, windows))
-            for credential in credentials
-        ):
-            return credential_reason
-        return ""
+        if recursive:
+            covered_roots = any(_under(root, target.path, windows) for root in roots)
+            return credential_reason if covered_roots else ""
+        return credential_reason if _key_read(target.path, roots, windows) else ""
     if not intent.command:
-        if target is not None and _under(target.path, control, windows):
-            return control_reason
-        return ""
+        return (
+            control_reason if target is not None and _under(target.path, control, windows) else ""
+        )
     mentioned = any(
         _mentions_path(intent.command, form, context)
         for form in (control, _absolute(original, context))
     )
-    if mentioned and _CREDENTIAL_MENTION.search(intent.command):
+    if mentioned and _names_key_file(intent.command):
         return credential_reason
     for candidate in intent.command_write_paths:
         if _under(candidate, control, windows):
             return control_reason
     allowed = readable and intent.command_read_only
-    credentials = _credential_paths(context, windows)
     for candidate in intent.command_paths:
         if not _under(candidate, control, windows):
             continue
         if not allowed:
             return control_reason
-        if _glob_lists_credential(candidate, credentials, windows):
+        if _key_read(candidate, roots, windows):
             return credential_reason
     if mentioned and not allowed:
         return control_reason
