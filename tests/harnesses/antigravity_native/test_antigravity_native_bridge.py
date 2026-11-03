@@ -857,6 +857,91 @@ def test_inject_user_message_via_tui_dismisses_startup_notice_banner(
     )
 
 
+def test_inject_user_message_via_tui_ignores_reply_text_mentioning_dismiss(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+) -> None:
+    """Ordinary reply text mentioning the dismiss phrase is not a notice footer."""
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    content = "Reply with exactly WORKING"
+    captured: list[list[str]] = []
+    tui = {"pane": "Assistant: Press esc to dismiss the dialog.\n> \n? for shortcuts"}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "has-session" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = f"> {content}\n? for shortcuts"
+        if cmd[-1] == "Enter":
+            tui["pane"] = "> \nesc to cancel"
+        captured.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message_via_tui(bridge_dir, content=content, timeout_s=0.5)
+
+    assert not any(cmd[-1] == "Escape" for cmd in captured), "reply text must not send Escape"
+    assert any(cmd[-1] == "Enter" for cmd in captured), "the turn must still be submitted"
+
+
+def test_inject_user_message_via_tui_ignores_history_notice_footer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+) -> None:
+    """A notice footer kept in transcript history above the composer is not dismissed."""
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    content = "Reply with exactly WORKING"
+    captured: list[list[str]] = []
+    rule = "─" * 40
+    tui = {
+        "pane": (
+            "┃ Verbosity is now medium by default.\n"
+            "┃ esc to dismiss\n"
+            f"{rule}\n> \n{rule}\n? for shortcuts"
+        )
+    }
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "has-session" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = f"> {content}\n? for shortcuts"
+        if cmd[-1] == "Enter":
+            tui["pane"] = "> \nesc to cancel"
+        captured.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message_via_tui(bridge_dir, content=content, timeout_s=0.5)
+
+    assert not any(cmd[-1] == "Escape" for cmd in captured), "history must not send Escape"
+    assert any(cmd[-1] == "Enter" for cmd in captured), "the turn must still be submitted"
+
+
+def test_wait_for_agy_prompt_ready_ignores_reply_text_with_active_footer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A running turn is never cancelled because reply text mentions the dismiss phrase."""
+    commands: list[tuple[str, ...]] = []
+    pane = "Assistant: press esc to dismiss the banner when you are done.\n> \nesc to cancel"
+    monkeypatch.setattr(_mod, "_capture_pane", lambda *_args: pane)
+    monkeypatch.setattr(_mod, "_run_tmux", lambda *args: commands.append(args))
+
+    _mod._wait_for_agy_prompt_ready("/tmp/ex/tmux.sock", "main", timeout_s=0.5)
+
+    assert commands == [], "an active footer must not receive an Escape key"
+
+
 def test_inject_user_message_via_tui_resends_enter_when_coalesced(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
