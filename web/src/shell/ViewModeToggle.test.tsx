@@ -213,6 +213,52 @@ describe("ViewModeToggle", () => {
     expect(chat).toHaveAttribute("tabindex", "-1");
   });
 
+  it("names the focused radio with its label and shortcut keys", async () => {
+    renderToggle(makeCtx({ view: "chat" }));
+    fireEvent.focus(chatSegment());
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip).toHaveTextContent("Chat view");
+    const keys = Array.from(tooltip.querySelectorAll<HTMLElement>('[data-slot="kbd"]'));
+    expect(keys.map((key) => key.textContent)).toEqual([MOD_KEY, ALT_KEY, "\\"]);
+  });
+
+  it("syncs shortcut ARIA when a mobile-mounted toggle becomes visible on desktop", () => {
+    isMobileMock.mockReturnValue(true);
+    const element = () => (
+      <TooltipProvider>
+        <TerminalFirstContextProvider value={makeCtx()}>
+          <ViewModeToggle />
+        </TerminalFirstContextProvider>
+      </TooltipProvider>
+    );
+    const { rerender } = render(element());
+    expect(screen.queryByTestId("view-mode-chat")).toBeNull();
+
+    isMobileMock.mockReturnValue(false);
+    rerender(element());
+    expect(chatSegment()).toHaveAttribute("aria-keyshortcuts", `${ARIA_MOD_KEY}+Alt+\\`);
+  });
+
+  it("syncs shortcut ARIA when the session becomes terminal-first", () => {
+    const { rerender } = render(
+      <TooltipProvider>
+        <TerminalFirstContextProvider value={makeCtx({ isTerminalFirst: false })}>
+          <ViewModeToggle />
+        </TerminalFirstContextProvider>
+      </TooltipProvider>,
+    );
+    expect(screen.queryByTestId("view-mode-chat")).toBeNull();
+
+    rerender(
+      <TooltipProvider>
+        <TerminalFirstContextProvider value={makeCtx({ isTerminalFirst: true })}>
+          <ViewModeToggle />
+        </TerminalFirstContextProvider>
+      </TooltipProvider>,
+    );
+    expect(chatSegment()).toHaveAttribute("aria-keyshortcuts", `${ARIA_MOD_KEY}+Alt+\\`);
+  });
+
   it("names each segment on hover so the icon-only control is legible", async () => {
     renderToggle(makeCtx({ view: "chat" }));
     expect(chatSegment()).toHaveAttribute("aria-keyshortcuts", `${ARIA_MOD_KEY}+Alt+\\`);

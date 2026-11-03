@@ -1,4 +1,4 @@
-import { useEffect, useRef, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { CheckIcon, Loader2Icon, MessagesSquareIcon, TerminalIcon } from "lucide-react";
 import { useShortcutHint } from "@/components/KeyboardShortcut";
 import { Segmented } from "@/components/ui/segmented";
@@ -7,7 +7,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useViewModeToggleHotkey } from "@/hooks/useViewModeToggleHotkey";
 import { useOmnigentAnalytics } from "@/lib/analytics";
-import { useTerminalFirst } from "./TerminalFirstContext";
+import { useTerminalFirst, type TerminalFirstView } from "./TerminalFirstContext";
 
 const ignoreViewChange = () => {};
 
@@ -37,13 +37,17 @@ export function ViewModeToggle({ hotkeyEnabled = true, alwaysVisible = false } =
   const { trackClick } = useOmnigentAnalytics();
   const shortcutHint = useShortcutHint("toggleViewMode");
   const shortcutAria = shortcutHint.aria;
+  const [openView, setOpenView] = useState<TerminalFirstView | null>(null);
+  const toggleVisible = Boolean(
+    ctx?.isTerminalFirst && !ctx.isShellView && (!isMobile || alwaysVisible),
+  );
   useEffect(() => {
     const radios = segmentedRef.current?.querySelectorAll<HTMLElement>('[role="radio"]');
     radios?.forEach((radio) => {
       if (shortcutAria) radio.setAttribute("aria-keyshortcuts", shortcutAria);
       else radio.removeAttribute("aria-keyshortcuts");
     });
-  }, [shortcutAria]);
+  }, [shortcutAria, toggleVisible]);
   useViewModeToggleHotkey({
     enabled: Boolean(hotkeyEnabled && ctx?.isTerminalFirst && !ctx.isShellView),
     view: ctx?.view ?? "chat",
@@ -57,14 +61,31 @@ export function ViewModeToggle({ hotkeyEnabled = true, alwaysVisible = false } =
   const terminalLabel = terminalStartingUp ? "Terminal is starting up…" : "Terminal view";
 
   return (
-    <div ref={segmentedRef} data-testid="view-mode-toggle" className="shrink-0">
+    <div
+      ref={segmentedRef}
+      data-testid="view-mode-toggle"
+      className="shrink-0"
+      onFocusCapture={(event) => {
+        const testId = (event.target as HTMLElement).dataset.testid;
+        if (testId === "view-mode-chat") setOpenView("chat");
+        if (testId === "view-mode-terminal") setOpenView("terminal");
+      }}
+      onBlurCapture={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setOpenView(null);
+      }}
+    >
       <Segmented
         label="Switch between chat and terminal"
         options={[
           {
             value: "chat",
             label: (
-              <ViewModeOptionLabel label="Chat view" shortcutHint={shortcutHint}>
+              <ViewModeOptionLabel
+                label="Chat view"
+                shortcutHint={shortcutHint}
+                open={openView === "chat"}
+                onOpenChange={(open) => setOpenView(open ? "chat" : null)}
+              >
                 <MessagesSquareIcon className="size-4" aria-hidden />
               </ViewModeOptionLabel>
             ),
@@ -74,7 +95,12 @@ export function ViewModeToggle({ hotkeyEnabled = true, alwaysVisible = false } =
           {
             value: "terminal",
             label: (
-              <ViewModeOptionLabel label={terminalLabel} shortcutHint={shortcutHint}>
+              <ViewModeOptionLabel
+                label={terminalLabel}
+                shortcutHint={shortcutHint}
+                open={openView === "terminal"}
+                onOpenChange={(open) => setOpenView(open ? "terminal" : null)}
+              >
                 {terminalStartingUp ? (
                   <Loader2Icon className="size-4 animate-spin" aria-hidden />
                 ) : (
@@ -103,14 +129,18 @@ export function ViewModeToggle({ hotkeyEnabled = true, alwaysVisible = false } =
 function ViewModeOptionLabel({
   label,
   shortcutHint,
+  open,
+  onOpenChange,
   children,
 }: {
   label: string;
   shortcutHint: { keys: string[]; aria: string | undefined };
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
   children: ReactNode;
 }) {
   return (
-    <Tooltip>
+    <Tooltip open={open} onOpenChange={onOpenChange}>
       <TooltipTrigger asChild>
         <span className="inline-flex items-center justify-center">
           {children}
