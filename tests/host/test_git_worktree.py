@@ -1443,19 +1443,18 @@ def _index_signature(tree: Path) -> tuple[int, int]:
     return (stat.st_ino, stat.st_mtime_ns)
 
 
-def _stale_content(path: Path, content: str) -> None:
-    """Write ``content`` and age the file past the index, so git must refresh it.
+def _age_tracked_file(path: Path) -> None:
+    """Give a tracked file a new, older mtime and leave its bytes alone.
 
-    A file whose mtime is not older than the index's is "racily clean" to git,
-    which then skips the stat refresh. Aging it makes the refresh happen.
+    Content must stay unchanged: git keeps a dirty entry's cached stat, so a
+    scan never refreshes it and the index stays untouched even without the fix.
+    An unchanged file whose stat is stale is what forces the refresh.
 
-    :param path: Tracked file to modify.
-    :param content: New file content.
+    :param path: Tracked file whose cached stat is to go stale.
     """
     import os
     import time
 
-    path.write_text(content)
     past = time.time() - 10
     os.utime(path, (past, past))
 
@@ -1464,19 +1463,19 @@ def test_worktree_status_read_takes_no_optional_index_lock(git_repo: Path) -> No
     """A background status read must not refresh the index it shares with writers."""
     created = create_worktree(repo_path=str(git_repo), branch_name="feature/status-read")
     tree = Path(created.worktree_path)
-    _stale_content(tree / "README.md", "changed")
+    _age_tracked_file(tree / "README.md")
     before = _index_signature(tree)
     status = read_worktree_status(str(tree))
-    assert status["files"] == [{"path": "README.md", "status": " M", "kind": "source"}]
+    assert status["files"] == []
     assert _index_signature(tree) == before
 
 
 def test_read_folder_facts_takes_no_optional_index_lock(git_repo: Path) -> None:
     """The folder-facts status read is background work too, so it stays index-read-only."""
-    _stale_content(git_repo / "README.md", "changed")
+    _age_tracked_file(git_repo / "README.md")
     before = _index_signature(git_repo)
     facts = read_folder_facts(str(git_repo))
-    assert facts.dirty is True
+    assert facts.dirty is False
     assert _index_signature(git_repo) == before
 
 
