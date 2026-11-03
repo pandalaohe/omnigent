@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import TypeAlias
 
 from omnigent._platform import stable_user_id
+from omnigent.native import native_bridge_common
 from omnigent.native.input_ready import PaneSettledProbe
 
 _logger = logging.getLogger(__name__)
@@ -246,6 +247,20 @@ def _ensure_dir(path: Path) -> None:
         os.chmod(path, 0o700)
 
 
+def _prepare_bridge_dir(bridge_dir: Path) -> None:
+    """Protect a prepared Hermes home from the dead-owner sweep."""
+    with native_bridge_common.bridge_dir_preparation_lock(bridge_dir):
+        _ensure_dir(bridge_dir)
+        native_bridge_common.write_owner_pid_marker(bridge_dir)
+
+
+def prune_orphaned_bridge_dirs() -> int:
+    """Expire dead-owner Hermes bridges using the shared native history retention."""
+    return native_bridge_common.prune_orphaned_dirs(
+        bridge_root(), should_prune=native_bridge_common.orphan_retention_expired
+    )
+
+
 def build_hermes_native_spawn_env(session_id: str) -> dict[str, str]:
     """Build the ``HARNESS_HERMES_NATIVE_*`` env the harness executor reads.
 
@@ -259,7 +274,7 @@ def build_hermes_native_spawn_env(session_id: str) -> dict[str, str]:
     :returns: Env-var overrides for the harness executor spawn.
     """
     bridge_dir = bridge_dir_for_session_id(session_id)
-    _ensure_dir(bridge_dir)
+    _prepare_bridge_dir(bridge_dir)
     env: dict[str, str] = {BRIDGE_DIR_ENV_VAR: str(bridge_dir)}
     hermes_home = read_hermes_home(bridge_dir)
     if hermes_home is not None:
@@ -341,7 +356,7 @@ def write_policy_hook_config(
     """
     if hermes_home is None:
         hermes_home = bridge_dir / _HERMES_HOME_SUBDIR
-    _ensure_dir(bridge_dir)
+    _prepare_bridge_dir(bridge_dir)
     # Owner-only: the home holds the copied .env / auth.json credentials and the
     # token-bearing hook wrapper.
     _ensure_dir(hermes_home)
@@ -534,7 +549,7 @@ def write_tmux_target(
     pid: int | None = None,
 ) -> None:
     """Advertise the tmux socket + target for the running Hermes terminal."""
-    _ensure_dir(bridge_dir)
+    _prepare_bridge_dir(bridge_dir)
     payload: _ConfigObject = {
         "socket_path": str(socket_path),
         "tmux_target": tmux_target,

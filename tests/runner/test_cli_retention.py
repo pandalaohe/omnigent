@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
+import json
+import os
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
+import httpx
 import pytest
 
 from omnigent.harnesses.claude_native.bridge import bridge_dir_for_bridge_id
@@ -19,6 +25,454 @@ from omnigent.runner import create_runner_app
 from omnigent.terminals.pane_reaper import NativePaneReaper, PaneRef
 from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient
 from tests.runner.helpers import NullServerClient
+
+
+@pytest.mark.parametrize(
+    "family,credentials",
+    [
+        (
+            "codex",
+            ("codex-home/auth.json", "codex-home/.credentials.json", "codex-home/config.toml"),
+        ),
+        ("hermes", ("hermes_home/.env", "hermes_home/auth.json", "hermes_home/config.yaml")),
+        ("opencode", ("xdg-data/opencode/auth.json", "xdg-config/opencode/opencode.json")),
+        (
+            "pi",
+            (
+                "pi-agent/models.json",
+                "pi-agent/mcp-auth.json",
+                "pi-agent/mcp.json",
+                "pi-agent/omnigent-auth/auth-test.json",
+                "pi-agent/omnigent-auth/auth-test.result.json",
+                "pi-agent/omnigent-auth/token-test.json",
+            ),
+        ),
+    ],
+)
+async def test_idle_release_scrubs_recreatable_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, family: str, credentials: tuple[str, ...]
+) -> None:
+    bridge = importlib.import_module(f"omnigent.harnesses.{family}_native.bridge")
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / family)
+    home = (
+        bridge.bridge_dir_for_session_id
+        if family in {"pi", "hermes"}
+        else bridge.bridge_dir_for_bridge_id
+    )("conv_scrub")
+    for name in credentials:
+        path = home / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}")
+    history = home / "history.jsonl"
+    history.write_text("history")
+    app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
+    await app.state.finish_cli_release("conv_scrub")
+    assert history.read_text() == "history"
+    assert all(not (home / name).exists() for name in credentials)
+
+
+@pytest.mark.parametrize(
+    "family,outcome",
+    [("codex", "retry"), ("codex", "delete"), ("codex", "confirmed"), ("opencode", "confirmed")],
+)
+async def test_idle_release_checks_own_codex_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    family: str,
+    outcome: str,
+) -> None:
+    from omnigent.harnesses.codex_native import app_server as codex_module
+    from omnigent.harnesses.opencode_native.app_server import OpenCodeNativeServer
+    from omnigent.runner.native import orchestration
+    from tests.harnesses.codex_native.app_server._support import _test_app_server
+
+    bridge = importlib.import_module(f"omnigent.harnesses.{family}_native.bridge")
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / family)
+    session_id = "conv_exit_gate"
+    home = bridge.prepare_bridge_dir(session_id)
+    auth = home / ("codex-home/auth.json" if family == "codex" else "xdg-data/opencode/auth.json")
+    auth.parent.mkdir(parents=True)
+    auth.write_text("{}")
+    census_available = outcome == "confirmed"
+    if family == "codex":
+        backend = _test_app_server(tmp_path, auth.parent, home, tmp_path)
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", "pass", start_new_session=True
+        )
+        await process.wait()
+        backend.proc = process
+        backend.process_group_id = process.pid
+        backend.process_registry_tag = "release-close-test"
+        monkeypatch.setattr(
+            codex_module,
+            "_tagged_process_group_members",
+            lambda *_: [] if census_available else None,
+        )
+        monkeypatch.setattr(codex_module, "unregister_codex_native_process", lambda *_: None)
+    else:
+        backend = OpenCodeNativeServer(
+            bridge_dir=home, workspace=tmp_path, opencode_path=sys.executable
+        )
+        process = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+        process.wait()
+        backend.process = process
+    registry = "_AUTO_CODEX_APP_SERVERS" if family == "codex" else "_AUTO_OPENCODE_SERVERS"
+    monkeypatch.setattr(orchestration, registry, {session_id: backend})
+    if family == "opencode":
+        await orchestration.teardown_opencode_native_server(session_id)
+        assert backend.process_exit_confirmed and not backend.exit_confirmed
+    app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
+    async with _runner_client(app) as client:
+        if outcome != "confirmed":
+            for _ in range(2):
+                with pytest.raises(RuntimeError, match="exit is not confirmed"):
+                    await client.post(
+                        f"/v1/sessions/{session_id}/cli-retention/release",
+                        json={"reason": "archive"},
+                    )
+                assert auth.exists()
+                assert app.state.cli_runtime_lifecycle.phase(session_id) == "live"
+                assert not backend.exit_confirmed
+            if outcome == "delete":
+                assert (await client.delete(f"/v1/sessions/{session_id}")).status_code == 200
+                auth.parent.mkdir(parents=True)
+                auth.write_text("{}")
+            else:
+                census_available = True
+        response = await client.post(
+            f"/v1/sessions/{session_id}/cli-retention/release", json={"reason": "archive"}
+        )
+        assert response.status_code == 200
+        assert not auth.exists()
+        if family == "codex":
+            assert backend.exit_confirmed is (outcome != "delete")
+
+
+async def test_idle_release_scrubs_pi_token_temporaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.harnesses.pi_native import bridge
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "pi")
+    home = bridge.prepare_bridge_dir("conv_pi_temp")
+    token_temp = home / "pi-agent/omnigent-auth/token-test.json.123.tmp"
+    token_temp.parent.mkdir(parents=True)
+    token_temp.write_text("{}")
+    app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
+    await app.state.finish_cli_release("conv_pi_temp")
+    assert not token_temp.exists()
+
+
+@pytest.mark.parametrize("parent_link", [False, True])
+async def test_idle_credential_scrub_never_follows_links_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, parent_link: bool
+) -> None:
+    from omnigent.harnesses.codex_native import bridge
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "codex")
+    home = bridge.prepare_bridge_dir("conv_scrub")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "auth.json").write_text("source")
+    if parent_link:
+        (home / "codex-home").symlink_to(outside, target_is_directory=True)
+    else:
+        (home / "codex-home").mkdir()
+        (home / "codex-home" / "auth.json").symlink_to(outside / "auth.json")
+    app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
+    if parent_link:
+        with pytest.raises(RuntimeError, match="credential scrub"):
+            await app.state.finish_cli_release("conv_scrub")
+    else:
+        await app.state.finish_cli_release("conv_scrub")
+        assert not (home / "codex-home" / "auth.json").is_symlink()
+    assert (outside / "auth.json").read_text() == "source"
+
+
+async def test_idle_credential_scrub_failure_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from omnigent.harnesses.codex_native import bridge
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "codex")
+    home = bridge.prepare_bridge_dir("conv_scrub") / "codex-home"
+    home.mkdir()
+    auth = home / "auth.json"
+    auth.write_text("{}")
+    unlink = Path.unlink
+
+    def fail(path, *args, **kwargs):
+        if path == auth:
+            raise PermissionError("fixture")
+        return unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail)
+    app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="credential scrub"):
+        await app.state.finish_cli_release("conv_scrub")
+    assert "credential scrub" in caplog.text
+
+
+@pytest.mark.parametrize("source_available", [False, True])
+async def test_codex_resume_recopies_scrubbed_stores_and_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source_available: bool
+) -> None:
+    from omnigent.harnesses.codex_native import bridge
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "codex")
+    home = bridge.prepare_bridge_dir("conv_scrub") / "codex-home"
+    source = tmp_path / "source"
+    home.mkdir()
+    source.mkdir()
+    names = ("auth.json", ".credentials.json", "config.toml")
+    for name in names:
+        (source / name).write_text('model = "old"' if name.endswith("toml") else "{}")
+
+    def no_link(*args, **kwargs):
+        raise OSError("fixture: copy fallback")
+
+    monkeypatch.setattr(Path, "symlink_to", no_link)
+    _populate_codex_home_config(home, source)
+    for name in names:
+        replacement = source / "replacement"
+        replacement.write_text('model = "fresh"' if name.endswith("toml") else '{"fresh":true}')
+        replacement.replace(source / name)
+    app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
+    await app.state.finish_cli_release("conv_scrub")
+    assert all(not (home / name).exists() for name in names)
+    if not source_available:
+        source.rename(tmp_path / "unmounted-source")
+    _populate_codex_home_config(home, source)
+    if source_available:
+        assert all((home / name).read_text() == (source / name).read_text() for name in names)
+    else:
+        assert all(not (home / name).exists() for name in names)
+
+
+async def test_session_delete_does_not_trust_old_ownership_markers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.harnesses.codex_native import bridge
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "codex")
+    unrelated = bridge.prepare_bridge_dir("unrelated")
+    (unrelated / "session.id").write_text("conv_old")
+    app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
+    async with _runner_client(app) as client:
+        assert (await client.delete("/v1/sessions/conv_old")).status_code == 200
+    assert unrelated.exists()
+    await app.state.finish_cli_release("unrelated")
+    assert unrelated.exists()
+
+
+async def test_scrubbed_opencode_read_failure_has_no_old_credential(tmp_path, monkeypatch) -> None:
+    from omnigent.harnesses.opencode_native import bridge
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "opencode")
+    source = tmp_path / "source-auth.json"
+    source.write_text("{}")
+    monkeypatch.setattr(bridge, "user_opencode_auth_path", lambda: source)
+    home = bridge.prepare_bridge_dir("conv_scrub")
+    target = bridge.seed_opencode_auth(home)
+    assert target is not None
+    app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
+    await app.state.finish_cli_release("conv_scrub")
+    assert not target.exists()
+    monkeypatch.setattr(bridge.shutil, "copyfile", Mock(side_effect=PermissionError("fixture")))
+    assert bridge.seed_opencode_auth(home) is None
+    assert not target.exists()
+
+
+async def test_idle_release_keeps_agy_native_oauth(tmp_path, monkeypatch) -> None:
+    from omnigent.harnesses.antigravity_native import bridge
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "agy")
+    home = bridge.prepare_bridge_dir("conv_oauth")
+    native_oauth = bridge.agy_gemini_dir(home) / "oauth_creds.json"
+    native_oauth.parent.mkdir(parents=True)
+    native_oauth.write_text("{}")
+    app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
+    await app.state.finish_cli_release("conv_oauth")
+    assert native_oauth.exists()
+
+
+@pytest.mark.parametrize(
+    "family,history_path,label_key",
+    [
+        (
+            "codex",
+            "codex-home/sessions/2026/11/02/rollout-test-thread.jsonl",
+            "omnigent.codex_native.bridge_id",
+        ),
+        ("pi", "sessions/session.jsonl", None),
+        (
+            "antigravity",
+            "agy-home/.gemini/antigravity/conversations/session.pb",
+            "omnigent.antigravity_native.bridge_id",
+        ),
+        (
+            "opencode",
+            "xdg-data/opencode/opencode.db",
+            "omnigent.opencode_native.bridge_id",
+        ),
+        ("hermes", "hermes_home/state.db", None),
+    ],
+)
+async def test_idle_release_history_still_expires_or_deletes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    family: str,
+    history_path: str,
+    label_key: str | None,
+) -> None:
+    """Kept native histories retain their dead-owner TTL and explicit delete path."""
+    from omnigent.native import native_bridge_common
+    from omnigent.runner.native import orchestration
+
+    bridge = importlib.import_module(f"omnigent.harnesses.{family}_native.bridge")
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / family)
+    session_id = "conv_retained_history"
+    labels = {label_key: "rotated-bridge"} if label_key else {}
+    monkeypatch.setattr(
+        orchestration, "_session_labels_for_runner_spawn", AsyncMock(return_value=labels)
+    )
+    bridge_id = "rotated-bridge" if label_key else session_id
+    if family == "hermes":
+        bridge.build_hermes_native_spawn_env(session_id)
+        bridge_dir = bridge.bridge_dir_for_session_id(session_id)
+    else:
+        bridge_dir = bridge.prepare_bridge_dir(bridge_id)
+    history = bridge_dir / history_path
+    history.parent.mkdir(parents=True, exist_ok=True)
+    history.write_text("native history")
+    app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
+    await app.state.finish_cli_release(session_id)
+    assert history.read_text() == "native history"
+
+    now = 2_000_000_000.0
+    monkeypatch.setattr(native_bridge_common.time, "time", lambda: now)
+    for path in bridge_dir.rglob("*"):
+        if path.is_file():
+            os.utime(path, (now - 69 * 86400, now - 69 * 86400))
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: True)
+    assert bridge.prune_orphaned_bridge_dirs() == 0
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    assert bridge.prune_orphaned_bridge_dirs() == 0
+    assert history.read_text() == "native history"
+    monkeypatch.setattr(native_bridge_common.time, "time", lambda: now + 2 * 86400)
+    assert bridge.prune_orphaned_bridge_dirs() == 1
+    assert not bridge_dir.exists()
+
+    history.parent.mkdir(parents=True)
+    history.write_text("new history")
+    async with _runner_client(app) as client:
+        deleted = await client.delete(f"/v1/sessions/{session_id}")
+    assert deleted.status_code == 200
+    assert not bridge_dir.exists()
+
+
+@pytest.mark.parametrize("release_idle", [False, True])
+@pytest.mark.parametrize("history_available", [False, True])
+async def test_idle_release_preserves_codex_resume_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    release_idle: bool,
+    history_available: bool,
+) -> None:
+    """Resume can replay an undelivered reply or fall back to its local rollout."""
+    from omnigent.harnesses.codex_native import bridge, forwarder, main
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "codex-native")
+    session_id = "conv_idle_resume"
+    thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    bridge_dir = bridge.prepare_bridge_dir(session_id)
+    codex_home = bridge.codex_home_for_bridge_dir(bridge_dir)
+    rollout = main._codex_resume_rollout_path(codex_home, thread_id)
+    rollout.parent.mkdir(parents=True)
+    records = main._codex_rollout_records_from_session_items(
+        [
+            {
+                "id": "reply",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "reply saved during outage"}],
+            }
+        ],
+        session_id=session_id,
+        external_session_id=thread_id,
+        cwd=Path("/opt/work/project"),
+        model_provider="test",
+        cli_version="0.0.0",
+    )
+    rollout.write_text("".join(json.dumps(record) + "\n" for record in records))
+    replay_data = {
+        "item_type": "message",
+        "item_data": {
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "reply saved during outage"}],
+        },
+        "response_id": "turn_recovered",
+        "source_id": "codex:item:recovered",
+    }
+    forwarder.append_dead_letter(
+        bridge_dir,
+        session_id=session_id,
+        event_type="external_conversation_item",
+        payload=replay_data,
+        reason="http 503",
+        http_status=503,
+    )
+    server_items: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/resources/files"):
+            return httpx.Response(200, json={"data": [], "has_more": False})
+        if not history_available:
+            return httpx.Response(503)
+        if request.method == "POST":
+            body = json.loads(request.content)
+            server_items.append(
+                {"id": "recovered", "type": "message", **body["data"]["item_data"]}
+            )
+            return httpx.Response(200)
+        return httpx.Response(200, json={"data": server_items, "has_more": False})
+
+    app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
+    app.state.native_pane_reaper = _FakePaneReaper()
+    if release_idle:
+        async with _runner_client(app) as client:
+            snapshot = await client.get(
+                f"/v1/sessions/{session_id}/cli-retention",
+                params={"idle_threshold_seconds": 60, "host_id": "host-a", "policy_revision": 1},
+            )
+            released = await client.post(
+                f"/v1/sessions/{session_id}/cli-retention/release",
+                json={
+                    "reason": "idle_pool_overflow",
+                    "idle_threshold_seconds": 60,
+                    "expected_activity_token": "pane:activity-1",
+                    "runtime_generation": snapshot.json()["runtime_generation"],
+                    "host_id": "host-a",
+                    "policy_revision": 1,
+                },
+            )
+        assert released.json()["status"] == "released"
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        resumed = await main._ensure_local_codex_resume_rollout(
+            client,
+            session_id=session_id,
+            external_session_id=thread_id,
+            codex_home=codex_home,
+            workspace=Path("/opt/work/project"),
+            model_provider="test",
+            codex_path=None,
+        )
+    assert "reply saved during outage" in resumed.read_text()
+    if history_available:
+        assert server_items, "the undelivered reply must reach server history before resume"
 
 
 class _FakePaneReaper:
