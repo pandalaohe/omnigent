@@ -516,6 +516,103 @@ async def test_pi_rate_limits_reach_session_and_own_quota_row(db_uri: str) -> No
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("include_percent", [True, False])
+async def test_claude_spend_values_traverse_server_usage_seam(
+    db_uri: str, include_percent: bool
+) -> None:
+    from omnigent.harnesses.claude_native.status import normalize_status_payload
+    from omnigent.server.agent_quota import AgentQuotaService
+    from omnigent.server.auth import RESERVED_USER_LOCAL
+    from omnigent.server.routes._sessions.orchestration import _persist_external_session_usage
+    from omnigent.server.schemas import SessionEventInput
+
+    spend = {
+        "used_usd": 41,
+        "limit_usd": 100,
+        "period": "monthly",
+        "resets_at": int(time.time()) + 10_000,
+    }
+    if include_percent:
+        spend["used_percentage"] = 41
+    snapshot = normalize_status_payload(
+        {
+            "context_window": {"context_window_size": 200_000},
+            "rate_limits": {"spend_limit": spend},
+        }
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(agent_id=_AGENT_ID, harness_override="claude-native")
+    quotas = AgentQuotaService(store, None, None, None, None)
+    await _persist_external_session_usage(
+        conv.id,
+        SessionEventInput(
+            type="external_session_usage",
+            data={"provider_usage_limits": snapshot["provider_usage_limits"]},
+        ),
+        store,
+        conv,
+        quota_service=quotas,
+    )
+
+    stored = store.get_conversation(conv.id)
+    assert stored is not None and stored.provider_usage_limits is not None
+    window = stored.provider_usage_limits["windows"][0]
+    assert window["used_value"] == 41
+    assert window["limit_value"] == 100
+    assert window["unit"] == "USD"
+    tile = next(
+        item for item in quotas.overview(RESERVED_USER_LOCAL).accounts if item.id == "claude"
+    )
+    assert tile.windows[0].used_value == 41
+    assert tile.windows[0].limit_value == 100
+
+
+@pytest.mark.asyncio
+async def test_claude_routing_ignores_spend_window_when_usage_is_off(db_uri: str) -> None:
+    from omnigent.harnesses.claude_native.status import normalize_status_payload
+    from omnigent.server.agent_quota import AgentQuotaService
+    from omnigent.server.routes._sessions.orchestration import _persist_external_session_usage
+    from omnigent.server.schemas import SessionEventInput
+
+    snapshot = normalize_status_payload(
+        {
+            "context_window": {"context_window_size": 200_000},
+            "rate_limits": {
+                "five_hour": {
+                    "used_percentage": 10,
+                    "resets_at": int(time.time()) + 10_000,
+                },
+                "spend_limit": {
+                    "used_percentage": 100,
+                    "used_usd": 500,
+                    "limit_usd": 500,
+                    "period": "monthly",
+                    "resets_at": int(time.time()) + 20_000,
+                },
+            },
+        }
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(agent_id=_AGENT_ID, harness_override="claude-native")
+    quotas = AgentQuotaService(store, None, None, None, None, usage_enabled=False)
+    await _persist_external_session_usage(
+        conv.id,
+        SessionEventInput(
+            type="external_session_usage",
+            data={"provider_usage_limits": snapshot["provider_usage_limits"]},
+        ),
+        store,
+        conv,
+        quota_service=quotas,
+    )
+
+    quota = quotas.quotas(quotas.context(conv))[1]["claude"]
+    assert quota.deciding_window == "5h"
+    assert quota.state == "ok"
+    assert [window.label for window in quota.windows] == ["5h"]
+
+
+@pytest.mark.asyncio
 async def test_pi_cache_observation_persists_and_unsupported_model_clears(db_uri: str) -> None:
     from omnigent.errors import OmnigentError
     from omnigent.server.routes._sessions.orchestration import _persist_external_session_usage

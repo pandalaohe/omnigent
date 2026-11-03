@@ -2002,9 +2002,7 @@ def create_app(
         user_preferences_store,
         host_registry,
         host_store,
-        UsageSnapshotStore(
-            conversation_store.conversation_storage_location or conversation_store.storage_location
-        ),
+        UsageSnapshotStore(conversation_store.storage_location),
         usage_enabled=usage_module_enabled(resolved_server_config),
     )
     from omnigent.server.standing_approval import StandingApprovalService

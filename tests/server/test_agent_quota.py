@@ -7,8 +7,9 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from omnigent.db.db_models import workspace_scope
+from omnigent.db.db_models import current_workspace_id, workspace_scope
 from omnigent.server.agent_quota import AgentQuotaService, QuotaContext, UsageAccountLimitError
+from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.routes.agent_quota import create_agent_quota_router
 from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -443,6 +444,98 @@ def test_host_linked_account_enters_session_less_overview(service):
     assert account(overview, "gw").hosts[0].host_id == HOST
 
 
+def test_window_ids_drive_pins_and_duplicate_labels_keep_their_own_pace(service):
+    windows = [
+        {
+            "id": "fast",
+            "label": "days",
+            "percent_used": 40,
+            "window_minutes": 10_080,
+            "resets_at": NOW + 4 * 86400,
+        },
+        {
+            "id": "slow",
+            "label": "days",
+            "percent_used": 90,
+            "window_minutes": 300,
+            "resets_at": NOW + 1000,
+        },
+    ]
+    service.report_account(
+        OWNER, "gw", usage_report(windows=windows, pinned_window="slow"), now=NOW
+    )
+    tile = account(service.overview(OWNER, now=NOW), "gw")
+    assert tile.deciding_window == "slow"
+    views = {window.id: window for window in tile.windows}
+    assert views["fast"].pace_pct != views["slow"].pace_pct
+    assert views["fast"].label == views["slow"].label == "days"
+
+
+def test_deleting_one_account_keeps_other_sources_projection(service):
+    service.report_account(OWNER, "a", usage_report(account_product="codex"), now=NOW)
+    service.report_account(
+        OWNER, "b", usage_report(account_product="codex", observed_at=NOW + 1), now=NOW + 1
+    )
+    service.delete_account(OWNER, "a")
+    assert service.quotas(QuotaContext(OWNER, None), now=NOW + 1)[1]["codex"].state == "ok"
+
+    service.report_account(OWNER, "a", usage_report(account_product="codex"), now=NOW + 2)
+    service.delete_account(OWNER, "b")
+    quota = service.quotas(QuotaContext(OWNER, None), now=NOW + 2)[1]["codex"]
+    assert quota.state == "ok"
+
+
+def test_unavailable_without_identity_withdraws_its_previous_projection(service):
+    service.report_account(
+        OWNER, "gw", usage_report(account_product="codex", host_id=HOST), now=NOW
+    )
+    service.report_account(
+        OWNER,
+        "gw",
+        usage_report(observed_at=NOW + 1, status="unavailable", windows=[]),
+        now=NOW + 1,
+    )
+    quota = service.quotas(QuotaContext(OWNER, HOST), now=NOW + 1)[1]["codex"]
+    assert quota.state == "unknown"
+    assert quota.reason == "empty_report"
+
+
+def test_linked_account_includes_native_host_readings(service):
+    service.report(OWNER, HOST, "claude", snapshot(), now=NOW)
+    service.report_account(OWNER, "gw", usage_report(account_product="claude"), now=NOW)
+    tile = account(service.overview(OWNER, now=NOW), "gw")
+    assert [host.host_id for host in tile.hosts] == [HOST]
+    assert tile.hosts[0].windows[0].percent_used == 85
+
+
+def test_overview_includes_live_native_codex_evidence(service):
+    native = {
+        "captured_at": NOW,
+        "limits": [
+            {
+                "limit_id": "codex",
+                "windows": [
+                    {
+                        "kind": "primary",
+                        "used_percent": 25,
+                        "window_duration_mins": 300,
+                        "resets_at": NOW + 1000,
+                    }
+                ],
+            }
+        ],
+    }
+    conn = SimpleNamespace(owner=OWNER, hello=SimpleNamespace(codex_rate_limits=native))
+    service.host_registry = SimpleNamespace(
+        online_host_ids=lambda workspace_id: [HOST],
+        get=lambda host_id, workspace_id=None: conn,
+    )
+    service.note_reading(OWNER, HOST, "codex", native, now=NOW)
+    overview = service.overview(OWNER, now=NOW)
+    assert overview.agents["codex"]["state"] == "ok"
+    assert account(overview, "codex").windows[0].percent_used == 25
+
+
 def test_old_empty_report_also_keeps_display_but_not_routing(service):
     service.report(OWNER, None, "claude", snapshot(), now=NOW)
     service.report(OWNER, None, "claude", {"captured_at": NOW + 1, "windows": []}, now=NOW + 1)
@@ -477,6 +570,10 @@ def test_fresh_until_and_past_reset_are_distinct(service):
     overview = service.overview(OWNER, now=NOW + 6)
     assert account(overview, "codex").freshness == "old"
     assert overview.agents["codex"]["reason"] == "stale_report"
+    assert overview.agents["codex"]["state"] == "unknown"
+    assert overview.agents["codex"]["pace_pct"] is None
+    assert overview.agents["codex"]["deciding_window"] is None
+    assert not overview.agents["codex"]["windows"]
 
     service.report_account(
         OWNER,
@@ -533,18 +630,59 @@ def test_restart_hydrates_accounts_and_native_readings(db_uri):
     assert "codex" not in second.quotas(QuotaContext(OWNER, HOST), now=NOW)[1]
 
 
+def test_linked_account_restart_restores_routing_projection(db_uri):
+    store = UsageSnapshotStore(db_uri)
+    first = service_with_store(db_uri, store)
+    first.report_account(OWNER, "gw", usage_report(account_product="codex"), now=NOW)
+    first.flush(now=NOW, force=True)
+
+    second = service_with_store(db_uri, store)
+    quota = second.quotas(QuotaContext(OWNER, None), now=NOW)[1]["codex"]
+    assert quota.state == "ok"
+    assert account(second.overview(OWNER, now=NOW), "gw").read_at == NOW
+
+
+def test_legacy_failure_restart_keeps_latest_attempt_and_last_good_rings(db_uri):
+    store = UsageSnapshotStore(db_uri)
+    first = service_with_store(db_uri, store)
+    first.report(OWNER, None, "claude", snapshot(), now=NOW)
+    first.report(OWNER, None, "claude", {"captured_at": NOW + 1, "windows": []}, now=NOW + 1)
+    first.flush(now=NOW + 1, force=True)
+
+    second = service_with_store(db_uri, store)
+    quota = second.quotas(QuotaContext(OWNER, None), now=NOW + 1)[1]["claude"]
+    assert quota.reason == "empty_report"
+    assert quota.state == "unknown"
+    tile = account(second.overview(OWNER, now=NOW + 1), "claude")
+    assert tile.windows[0].percent_used == 85
+
+
+def test_empty_before_first_hydrate_still_loads_good_rings(db_uri):
+    store = UsageSnapshotStore(db_uri)
+    first = service_with_store(db_uri, store)
+    first.report(OWNER, None, "claude", snapshot(), now=NOW)
+    first.flush(now=NOW, force=True)
+
+    second = service_with_store(db_uri, store)
+    second.report(OWNER, None, "claude", {"captured_at": NOW + 1, "windows": []}, now=NOW + 1)
+    quota = second.quotas(QuotaContext(OWNER, None), now=NOW + 1)[1]["claude"]
+    assert quota.reason == "empty_report"
+    tile = account(second.overview(OWNER, now=NOW + 1), "claude")
+    assert tile.windows[0].percent_used == 85
+
+
 class MemorySnapshotStore:
     def __init__(self):
         self.records = {}
 
     def read(self, owner):
-        return dict(self.records.get(owner, {}))
+        return dict(self.records.get((current_workspace_id(), owner), {}))
 
     def write(self, owner, key, record):
-        self.records.setdefault(owner, {})[key] = record
+        self.records.setdefault((current_workspace_id(), owner), {})[key] = record
 
     def delete(self, owner, key):
-        self.records.get(owner, {}).pop(key, None)
+        self.records.get((current_workspace_id(), owner), {}).pop(key, None)
 
 
 def test_write_behind_waits_for_window_change_or_five_minutes(db_uri):
@@ -574,6 +712,16 @@ def test_write_behind_waits_for_window_change_or_five_minutes(db_uri):
     assert service.delete_account(OWNER, "gw") is True
     assert service.flush(now=NOW + 303) == 1
     assert store.read(OWNER) == {}
+
+
+def test_flush_binds_each_dirty_records_workspace(db_uri):
+    store = MemorySnapshotStore()
+    service = service_with_store(db_uri, store)
+    with workspace_scope(7):
+        service.report_account(OWNER, "gw", usage_report(), now=NOW)
+    with workspace_scope(0):
+        assert service.flush(now=NOW, force=True) == 1
+    assert set(store.records) == {(7, OWNER)}
 
 
 class FailingSnapshotStore:
@@ -607,9 +755,11 @@ def test_status_path_never_touches_store_and_hydrate_failure_is_fail_open(db_uri
     assert store.calls > 0
 
     calls = store.calls
-    assert service.quotas(QuotaContext(OWNER, HOST)) == service.quotas(QuotaContext(OWNER, HOST))
+    quota = service.quotas(QuotaContext(RESERVED_USER_LOCAL, HOST))[1]["claude"]
+    assert quota.state == "tight"
     assert store.calls == calls + 1
-    assert account(service.overview(OWNER), "claude").freshness == "none"
+    tile = account(service.overview(RESERVED_USER_LOCAL), "claude")
+    assert tile.read_at == report["captured_at"]
 
 
 def test_account_limit_is_bounded(service):
@@ -617,6 +767,13 @@ def test_account_limit_is_bounded(service):
         service.report_account(OWNER, f"gw-{index}", usage_report(), now=NOW)
     with pytest.raises(UsageAccountLimitError):
         service.report_account(OWNER, "gw-33", usage_report(), now=NOW)
+
+
+def test_rejected_reports_also_respect_account_bound(service):
+    for index in range(32):
+        service.note_rejected(OWNER, f"bad-{index}", now=NOW)
+    with pytest.raises(UsageAccountLimitError):
+        service.note_rejected(OWNER, "bad-33", now=NOW)
 
 
 @pytest.mark.asyncio
@@ -678,3 +835,25 @@ async def test_deployment_off_hides_only_new_usage_routes(db_uri):
         assert (await client.put("/v1/me/usage/accounts/gw", json={})).status_code == 404
         old = {"captured_at": time.time(), "windows": []}
         assert (await client.put("/v1/me/agent-quota/codex", json=old)).status_code == 204
+
+
+def test_usage_request_openapi_references_resolve(request):
+    app = request.getfixturevalue("auth_app")
+    document = app.openapi()
+    schema = document["paths"]["/v1/me/usage/accounts/{account_id}"]["put"]["requestBody"]
+
+    def check(node):
+        if isinstance(node, dict):
+            reference = node.get("$ref")
+            if reference is not None:
+                target = document
+                for part in reference.removeprefix("#/").split("/"):
+                    target = target[part.replace("~1", "/").replace("~0", "~")]
+                assert target is not None
+            for value in node.values():
+                check(value)
+        elif isinstance(node, list):
+            for value in node:
+                check(value)
+
+    check(schema)

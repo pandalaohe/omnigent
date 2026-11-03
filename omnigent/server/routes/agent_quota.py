@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from copy import deepcopy
 from typing import Annotated, Any
 
 from fastapi import APIRouter, HTTPException, Request, Response
@@ -24,6 +25,24 @@ _Period = Annotated[
     str, Field(min_length=1, max_length=32, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
 ]
 _ACCOUNT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
+
+
+def _inline_openapi_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    definitions = deepcopy(schema.get("$defs", {}))
+
+    def resolve(node: Any) -> Any:
+        if isinstance(node, dict):
+            reference = node.get("$ref")
+            if reference is not None:
+                name = reference.rsplit("/", 1)[-1]
+                siblings = {key: value for key, value in node.items() if key != "$ref"}
+                return resolve({**deepcopy(definitions[name]), **siblings})
+            return {key: resolve(value) for key, value in node.items() if key != "$defs"}
+        if isinstance(node, list):
+            return [resolve(value) for value in node]
+        return node
+
+    return resolve(schema)
 
 
 class QuotaReportWindow(BaseModel):
@@ -86,7 +105,10 @@ def create_agent_quota_router(
             raise HTTPException(404, "Not found")
 
     async def reject_report(owner: str, account_id: str) -> None:
-        await asyncio.to_thread(service.note_rejected, owner, account_id)
+        try:
+            await asyncio.to_thread(service.note_rejected, owner, account_id)
+        except UsageAccountLimitError as exc:
+            raise HTTPException(409, str(exc)) from None
 
     @router.put(
         "/me/usage/accounts/{account_id}",
@@ -94,7 +116,11 @@ def create_agent_quota_router(
         openapi_extra={
             "requestBody": {
                 "required": True,
-                "content": {"application/json": {"schema": UsageReport.model_json_schema()}},
+                "content": {
+                    "application/json": {
+                        "schema": _inline_openapi_schema(UsageReport.model_json_schema())
+                    }
+                },
             }
         },
     )

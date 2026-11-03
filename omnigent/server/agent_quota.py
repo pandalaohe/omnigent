@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass, replace
 from typing import Any, Literal, cast
 
 from omnigent.codex_rate_limits import fresh_codex_rate_limits
-from omnigent.db.db_models import current_workspace_id
+from omnigent.db.db_models import current_workspace_id, workspace_scope
 from omnigent.entities import Conversation
 from omnigent.quota_pace import (
     AgentQuota,
@@ -239,6 +239,15 @@ class AgentQuotaService:
         if snapshot is None or str(snapshot.get("provider", "")).lower() != "claude":
             return
         context = self.context(conversation)
+        if not self.usage_enabled:
+            legacy = [
+                window
+                for window in snapshot.get("windows", [])
+                if isinstance(window, dict) and window.get("label") in {"5h", "w"}
+            ]
+            if not legacy:
+                return
+            snapshot = {**snapshot, "windows": legacy}
         self.report(context.owner_id, context.host_id, "claude", snapshot)
 
     def report_pi(self, conversation: Conversation, snapshot: dict[str, Any] | None) -> None:
@@ -323,6 +332,12 @@ class AgentQuotaService:
                 record["last_attempt_at"] = captured
                 record["last_attempt_status"] = "unavailable"
             self._display[key] = record
+            if project:
+                record["routing_snapshot"] = deepcopy(snapshot)
+                record["project_snapshot"] = True
+            else:
+                record["routing_snapshot"] = deepcopy((previous or {}).get("routing_snapshot"))
+                record["project_snapshot"] = record["routing_snapshot"] is not None
             self._dirty[(key[0], owner, self._agent_key(product, host_id))] = record
 
     @staticmethod
@@ -347,9 +362,6 @@ class AgentQuotaService:
         self._hydrate(owner)
         from omnigent.harness_plugins import native_agents
 
-        product = report.product or (
-            account_id if account_id in {agent.key for agent in native_agents()} else None
-        )
         key = (current_workspace_id(), owner, account_id)
         observed = float(report.observed_at)
         snapshot: dict[str, Any] | None = None
@@ -366,16 +378,24 @@ class AgentQuotaService:
                 "schema_version": 1,
                 "account_id": account_id,
                 "report": None,
-                "product": product,
-                "host_id": report.host_id,
+                "product": None,
+                "host_id": None,
                 "read_at": None,
                 "fresh_until": None,
                 "pinned_window": None,
                 "reset_marks": {},
                 "report_log": [],
             }
+            product = (
+                report.product
+                or (previous or {}).get("product")
+                or (account_id if account_id in {agent.key for agent in native_agents()} else None)
+            )
+            host_id = (
+                report.host_id if report.host_id is not None else (previous or {}).get("host_id")
+            )
             record["product"] = product
-            record["host_id"] = report.host_id
+            record["host_id"] = host_id
             record["last_attempt_at"] = observed
             record["last_attempt_status"] = report.status
             if report.status == "available":
@@ -417,8 +437,9 @@ class AgentQuotaService:
                         for window in windows
                     ],
                 }
+                record["routing_snapshot"] = deepcopy(snapshot)
         if product is not None and snapshot is not None:
-            self._store_snapshot(owner, report.host_id, product, snapshot, now=now)
+            self._store_snapshot(owner, host_id, product, snapshot, now=now)
 
     @staticmethod
     def _append_log(record: dict[str, Any], kind: str, at: float) -> None:
@@ -433,7 +454,13 @@ class AgentQuotaService:
         self._hydrate(owner)
         key = (current_workspace_id(), owner, account_id)
         with self._lock:
-            record = deepcopy(self._accounts.get(key)) or {
+            previous = self._accounts.get(key)
+            if (
+                previous is None
+                and sum(1 for ws, user, _ in self._accounts if (ws, user) == key[:2]) >= 32
+            ):
+                raise UsageAccountLimitError("at most 32 usage accounts per owner")
+            record = deepcopy(previous) or {
                 "schema_version": 1,
                 "account_id": account_id,
                 "report": None,
@@ -461,8 +488,37 @@ class AgentQuotaService:
             self._dirty[(key[0], owner, self._account_key(account_id))] = _DELETE
             product = record.get("product")
             if isinstance(product, str):
-                self._snapshots.pop((key[0], owner, record.get("host_id"), product), None)
+                self._rebuild_projection(key[0], owner, record.get("host_id"), product)
             return True
+
+    def _rebuild_projection(
+        self, workspace: int, owner: str, host_id: str | None, product: str
+    ) -> None:
+        candidates: list[dict[str, Any]] = []
+        for key, record in self._accounts.items():
+            if (
+                key[:2] == (workspace, owner)
+                and record.get("product") == product
+                and record.get("host_id") == host_id
+                and isinstance(record.get("routing_snapshot"), dict)
+            ):
+                candidates.append(record["routing_snapshot"])
+        for key, record in self._display.items():
+            if (
+                key[:2] == (workspace, owner)
+                and key[2] == host_id
+                and key[3] == product
+                and record.get("project_snapshot")
+                and isinstance(record.get("routing_snapshot"), dict)
+            ):
+                candidates.append(record["routing_snapshot"])
+        key = (workspace, owner, host_id, product)
+        if candidates:
+            self._snapshots[key] = deepcopy(
+                max(candidates, key=lambda snapshot: snapshot["captured_at"])
+            )
+        else:
+            self._snapshots.pop(key, None)
 
     def quotas(
         self, context: QuotaContext, *, now: float | None = None
@@ -501,7 +557,16 @@ class AgentQuotaService:
                         )
                         if snapshot is not None:
                             candidates.setdefault(agent.key, []).append(snapshot)
-        if context.host_id and self.host_registry is not None:
+        if self.host_registry is not None and all_hosts:
+            for live_host in self.host_registry.online_host_ids(workspace_id=workspace):
+                conn = self.host_registry.get(live_host, workspace_id=workspace)
+                if conn is not None and (
+                    self.permissions is None or conn.owner == context.owner_id
+                ):
+                    native = conn.hello.codex_rate_limits
+                    if native is not None:
+                        candidates.setdefault("codex", []).append(native)
+        elif context.host_id and self.host_registry is not None:
             conn = self.host_registry.get(context.host_id)
             # The live tunnel already records its authenticated owner.
             if conn is not None and (self.permissions is None or conn.owner == context.owner_id):
@@ -531,7 +596,7 @@ class AgentQuotaService:
             )
             quota = agent_quota(windows, tiers, now=now, deciding_period=period)
             if not fresh:
-                quota = replace(quota, reason="stale_report")
+                quota = AgentQuota("unknown", None, None, (), reason="stale_report")
             elif newest.get("windows") == []:
                 quota = replace(quota, reason="empty_report")
             result[product] = quota
@@ -578,7 +643,16 @@ class AgentQuotaService:
             records = [item for item in display_records if item[1] == product]
             accounts.append(self._native_account(product, records, tiers, settings, now))
         for account_id, record in sorted(account_records):
-            accounts.append(self._reported_account(account_id, record, tiers, settings, now))
+            accounts.append(
+                self._reported_account(
+                    account_id,
+                    record,
+                    [item for item in display_records if item[1] == record.get("product")],
+                    tiers,
+                    settings,
+                    now,
+                )
+            )
         from omnigent.harness_plugins import native_agents
 
         missing = AgentQuota("unknown", None, None, (), reason="no_report")
@@ -644,17 +718,30 @@ class AgentQuotaService:
         self,
         account_id: str,
         record: dict[str, Any],
+        native_records: list[tuple[str | None, str, dict[str, Any]]],
         tiers: QuotaTiers,
         settings: Any,
         now: float,
     ) -> UsageAccountView:
         raw = record.get("report")
         report = UsageReport.model_validate(raw) if raw is not None else None
-        windows = report.windows if report is not None else []
+        latest_native = max(
+            native_records, key=lambda item: item[2].get("read_at") or 0, default=None
+        )
+        base_record = record
+        if report is not None:
+            windows = report.windows
+        elif latest_native is not None:
+            base_record = latest_native[2]
+            windows = _native_windows(
+                latest_native[2].get("snapshot") or {}, str(record["product"])
+            )
+        else:
+            windows = []
         view = self._account_view(
             account_id=account_id,
             kind="account",
-            record=record,
+            record=base_record,
             windows=windows,
             tiers=tiers,
             settings=settings,
@@ -677,6 +764,23 @@ class AgentQuotaService:
                     windows=view.windows,
                 )
             ]
+        view.hosts.extend(
+            UsageHostView(
+                host_id=native_host or "",
+                name=self._host_name(native_host),
+                read_at=native_record.get("read_at"),
+                windows=self._window_views(
+                    _native_windows(native_record.get("snapshot") or {}, str(record["product"])),
+                    self._freshness(native_record, now) == "fresh",
+                    now,
+                    tiers,
+                    None,
+                )[0],
+            )
+            for native_host, _, native_record in sorted(
+                native_records, key=lambda entry: entry[0] or ""
+            )
+        )
         return view
 
     def _account_view(
@@ -770,7 +874,7 @@ class AgentQuotaService:
         captured = now
         quota_windows = [
             Window(
-                window.label or window.id,
+                window.id,
                 window.percent_used,
                 float(window.window_minutes or 0) * 60,
                 window.resets_at,
@@ -779,13 +883,12 @@ class AgentQuotaService:
             for window in windows
         ]
         quota = agent_quota(quota_windows, tiers, now, deciding_period=deciding)
-        by_label = {window.label: window for window in quota.windows}
+        by_id = {window.label: window for window in quota.windows}
         views: list[UsageWindowView] = []
         for window in windows:
-            label = window.label or window.id
             reset = float(window.resets_at) if window.resets_at is not None else None
             past_reset = reset is not None and reset <= now
-            pace = by_label.get(label) if fresh and not past_reset else None
+            pace = by_id.get(window.id) if fresh and not past_reset else None
             percent = None if past_reset else window.percent_used
             remaining = 100 - percent if percent is not None else None
             time_left = max(0.0, reset - now) if reset is not None and not past_reset else None
@@ -835,6 +938,35 @@ class AgentQuotaService:
                 _logger.warning("Could not read usage host %s", host_id, exc_info=True)
         return host_id
 
+    @staticmethod
+    def _merge_hydrated_record(
+        current: dict[str, Any] | None,
+        stored: dict[str, Any],
+        good_fields: tuple[str, ...],
+    ) -> dict[str, Any]:
+        if current is None:
+            return stored
+        merged = deepcopy(current)
+        if float(stored.get("last_attempt_at") or 0) >= float(current.get("last_attempt_at") or 0):
+            for field in (
+                "last_attempt_at",
+                "last_attempt_status",
+                "routing_snapshot",
+                "project_snapshot",
+                "product",
+                "host_id",
+                "report_log",
+            ):
+                if field in stored:
+                    merged[field] = deepcopy(stored[field])
+        if stored.get(good_fields[0]) is not None and (
+            current.get(good_fields[0]) is None
+            or float(stored.get("read_at") or 0) >= float(current.get("read_at") or 0)
+        ):
+            for field in good_fields:
+                merged[field] = deepcopy(stored.get(field))
+        return merged
+
     def _hydrate(self, owner: str) -> None:
         if not self.usage_enabled or self.snapshot_store is None:
             return
@@ -859,11 +991,11 @@ class AgentQuotaService:
                         "usage.account."
                     )
                     key = (scope[0], owner, account_id)
-                    current = self._accounts.get(key)
-                    if current is None or float(record.get("last_attempt_at") or 0) >= float(
-                        current.get("last_attempt_at") or 0
-                    ):
-                        self._accounts[key] = record
+                    self._accounts[key] = self._merge_hydrated_record(
+                        self._accounts.get(key),
+                        record,
+                        ("report", "read_at", "fresh_until", "pinned_window", "reset_marks"),
+                    )
                     continue
                 if not storage_key.startswith("usage.agent."):
                     continue
@@ -872,18 +1004,23 @@ class AgentQuotaService:
                     continue
                 host_id = record.get("host_id")
                 key = (scope[0], owner, host_id, product)
-                current = self._display.get(key)
-                if current is None or float(record.get("last_attempt_at") or 0) >= float(
-                    current.get("last_attempt_at") or 0
-                ):
-                    self._display[key] = record
-                snapshot = record.get("snapshot")
-                if record.get("project_snapshot") and isinstance(snapshot, dict):
-                    existing = self._snapshots.get(key)
-                    if existing is None or float(snapshot.get("captured_at") or 0) >= float(
-                        existing.get("captured_at") or 0
-                    ):
-                        self._snapshots[key] = snapshot
+                self._display[key] = self._merge_hydrated_record(
+                    self._display.get(key),
+                    record,
+                    ("snapshot", "read_at", "fresh_until", "pinned_window", "reset_marks"),
+                )
+            slots = {
+                (key[2], key[3])
+                for key, record in self._display.items()
+                if key[:2] == scope and isinstance(record.get("routing_snapshot"), dict)
+            }
+            slots.update(
+                (record.get("host_id"), record["product"])
+                for key, record in self._accounts.items()
+                if key[:2] == scope and isinstance(record.get("product"), str)
+            )
+            for host_id, product in slots:
+                self._rebuild_projection(scope[0], owner, host_id, product)
 
     @staticmethod
     def _window_signature(record: dict[str, Any]) -> str:
@@ -918,10 +1055,13 @@ class AgentQuotaService:
             ):
                 continue
             try:
-                if record is _DELETE:
-                    self.snapshot_store.delete(owner, storage_key)
-                else:
-                    self.snapshot_store.write(owner, storage_key, cast("dict[str, Any]", record))
+                with workspace_scope(workspace):
+                    if record is _DELETE:
+                        self.snapshot_store.delete(owner, storage_key)
+                    else:
+                        self.snapshot_store.write(
+                            owner, storage_key, cast("dict[str, Any]", record)
+                        )
             except Exception:
                 _logger.warning("Could not persist usage reading %s", storage_key, exc_info=True)
                 continue
