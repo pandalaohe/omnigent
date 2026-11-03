@@ -13,6 +13,7 @@ import { KeepWarmTable } from "./KeepWarmTable";
 
 const mocks = vi.hoisted(() => ({
   items: [] as RegistryItem[],
+  legacyProducts: {} as Record<string, RegistryItem>,
   sessions: new Set<string>(),
   fetch: vi.fn(),
   patch: vi.fn(),
@@ -45,7 +46,7 @@ vi.mock("@/hooks/useAgentRegistry", async (importOriginal) => {
     ...actual,
     useAgentRegistry: () => ({
       items: mocks.items,
-      legacyProducts: {},
+      legacyProducts: mocks.legacyProducts,
       legacyLabels: {},
       isLoading: false,
       isError: false,
@@ -140,6 +141,7 @@ async function openDialog(): Promise<HTMLElement> {
 beforeEach(() => {
   localStorage.clear();
   mocks.items = [ITEM];
+  mocks.legacyProducts = {};
   mocks.sessions = new Set(["harness:codex"]);
   mocks.layers = structuredClone(LAYERS);
   mocks.already = true;
@@ -219,6 +221,39 @@ describe("KeepWarmTable review regressions", () => {
     renderTable();
     const cell = await screen.findByTestId(`layered-cell-custom-agent-${HOST_ID}`);
     expect(cell).toHaveTextContent("On");
+  });
+
+  it("shows a retained product-id value on its visible harness row", async () => {
+    const product = "product-codex";
+    mocks.legacyProducts = { [product]: { ...ITEM, key: product } };
+    mocks.sessions = new Set([product]);
+    mocks.layers = {
+      corner: { main: false },
+      hosts: {},
+      agents: { [product]: { main: true }, "harness:codex": { main: false } },
+      cells: {},
+      hostWins: {},
+    };
+    renderTable();
+    const cell = await screen.findByTestId(`layered-cell-harness:codex-${HOST_ID}`);
+    expect(cell).toHaveTextContent("Main only");
+  });
+
+  it("shows a bound-agent override on its visible template row", async () => {
+    mocks.items = [{ ...ITEM, key: "ca_library", label: "Library Codex", source: "library" }];
+    mocks.sessions = Object.assign(new Set(["ca_library", "bound-agent"]), {
+      templateByAgentId: { "bound-agent": "ca_library" },
+    });
+    mocks.layers = {
+      corner: { main: false },
+      hosts: {},
+      agents: { "bound-agent": { main: true }, "harness:codex": { main: false } },
+      cells: {},
+      hostWins: {},
+    };
+    renderTable();
+    const cell = await screen.findByTestId(`layered-cell-ca_library-${HOST_ID}`);
+    expect(cell).toHaveTextContent("Main only");
   });
 
   it("converts and saves a first edit in one namespace write", async () => {

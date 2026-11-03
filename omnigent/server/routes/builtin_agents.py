@@ -534,7 +534,7 @@ def create_builtin_agents_router(
         )
 
     @router.get("/agents/with-sessions")
-    async def list_agents_with_sessions(request: Request) -> dict[str, list[str]]:
+    async def list_agents_with_sessions(request: Request) -> dict[str, list[str] | dict[str, str]]:
         """List agent ids that at least one session uses, for settings tables.
 
         Reads distinct ``agent_id`` values from the conversation index and the
@@ -543,7 +543,8 @@ def create_builtin_agents_router(
         column and no per-agent query.
 
         :param request: The incoming request (for auth).
-        :returns: ``{"agent_ids": [...]}``, sorted and de-duplicated.
+        :returns: Sorted, de-duplicated ``agent_ids`` and the bound-agent to
+            template mapping already computed for the visible rows.
         """
         _require_user(request, auth_provider)
         if conversation_store is None:
@@ -554,10 +555,14 @@ def create_builtin_agents_router(
             conversation_store.agent_ids_with_sessions, AGENT_TEMPLATE_ID_LABEL
         )
         mappable = [agent_id for agent_id in agent_ids if _AGENT_ID_PATTERN.fullmatch(agent_id)]
+        templates: dict[str, str] = {}
         if mappable:
             templates = await asyncio.to_thread(agent_store.get_template_ids, sorted(mappable))
             agent_ids = {templates.get(agent_id, agent_id) for agent_id in agent_ids}
-        return {"agent_ids": sorted(agent_ids)}
+        return {
+            "agent_ids": sorted(agent_ids),
+            "template_by_agent_id": dict(sorted(templates.items())),
+        }
 
     @router.get("/agents/{agent_id}")
     async def get_agent(request: Request, agent_id: str) -> AgentDetailObject:

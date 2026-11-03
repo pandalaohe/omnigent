@@ -66,7 +66,9 @@ describe("keep-warm identity fallback", () => {
       cells: {},
       hostWins: {},
     };
-    const resolved = resolveKeepWarmRow(layers, "custom-agent", "desktop", "codex", "codex");
+    const resolved = resolveKeepWarmRow(layers, "custom-agent", "desktop", "codex", {
+      harness: "codex",
+    });
     expect(resolved).toMatchObject({ main: true, child: true, maxSeconds: 10800 });
 
     const store = keepWarmLayeredStore(layers, { row: "custom-agent", harness: "codex" });
@@ -83,14 +85,80 @@ describe("keep-warm identity fallback", () => {
         "custom-agent",
         "desktop",
         "codex",
-        "codex",
+        { harness: "codex" },
       ),
     ).toEqual({});
 
     const hostWins = { ...layers, hostWins: { desktop: true as const } };
-    expect(resolveKeepWarmRow(hostWins, "custom-agent", "desktop", "codex", "codex")).toMatchObject(
-      { main: false, child: false, maxSeconds: 7200 },
+    expect(
+      resolveKeepWarmRow(hostWins, "custom-agent", "desktop", "codex", { harness: "codex" }),
+    ).toMatchObject({ main: false, child: false, maxSeconds: 7200 });
+  });
+});
+
+describe("runtime identity lookup", () => {
+  it.each([true, false])(
+    "puts product and bound-agent rows before the harness row: %s",
+    (value) => {
+      const product = "product-codex";
+      const layers: KeepWarmLayers = {
+        corner: { main: false },
+        hosts: {},
+        agents: {
+          [product]: { main: value },
+          "bound-agent": { main: value },
+          "harness:codex": { main: !value },
+        },
+        cells: {
+          desktop: {
+            [product]: { main: value },
+            "bound-agent": { main: value },
+            "harness:codex": { main: !value },
+          },
+        },
+        hostWins: {},
+      };
+      expect(
+        resolveKeepWarmRow(layers, "harness:codex", "desktop", "codex", {
+          agentId: product,
+          harness: "codex",
+        }).main,
+      ).toBe(value);
+      expect(
+        resolveKeepWarmRow(layers, "ca_library", "desktop", "codex", {
+          templateId: "ca_library",
+          agentId: "bound-agent",
+          harness: "codex",
+        }).main,
+      ).toBe(value);
+    },
+  );
+
+  it.each([true, false])("keeps a chosen cell value that masks a fallback cell: %s", (value) => {
+    const layers: KeepWarmLayers = {
+      corner: { main: value },
+      hosts: {},
+      agents: {},
+      cells: { desktop: { "harness:codex": { main: !value } } },
+      hostWins: {},
+    };
+    const record = dropKeepWarmCellEquals(
+      { main: value },
+      layers,
+      "custom-agent",
+      "desktop",
+      "codex",
+      { harness: "codex" },
     );
+    expect(record).toEqual({ main: value });
+    const next = setKeepWarmLayer(
+      layers,
+      { level: "cell", row: "custom-agent", col: "desktop" },
+      record,
+    );
+    expect(
+      resolveKeepWarmRow(next, "custom-agent", "desktop", "codex", { harness: "codex" }).main,
+    ).toBe(value);
   });
 });
 

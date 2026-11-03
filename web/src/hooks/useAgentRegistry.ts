@@ -357,14 +357,19 @@ export function useAgentsWithSessions() {
     queryFn: async ({ signal }) => {
       const response = await authenticatedFetch("/v1/agents/with-sessions", { signal });
       if (!response.ok) throw await apiErrorFromResponse(response);
-      const body = (await response.json()) as { agent_ids?: unknown };
+      const body = (await response.json()) as {
+        agent_ids?: unknown;
+        template_by_agent_id?: Record<string, string>;
+      };
       if (
         !Array.isArray(body.agent_ids) ||
         body.agent_ids.some((value) => typeof value !== "string")
       ) {
         throw new Error("The server returned an invalid session list.");
       }
-      return new Set(body.agent_ids as string[]);
+      return Object.assign(new Set(body.agent_ids as string[]), {
+        templateByAgentId: body.template_by_agent_id ?? {},
+      });
     },
     staleTime: 30_000,
     retry: false,

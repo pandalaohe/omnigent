@@ -2995,8 +2995,9 @@ def test_keep_warm_layers_conversion_preserves_legacy_routes(db_uri: str) -> Non
 
 
 @pytest.mark.parametrize("default_on", [True, False])
+@pytest.mark.parametrize("bound_harness", ["codex", "claude-sdk"])
 def test_keep_warm_layers_conversion_declines_a_masking_fold(
-    db_uri: str, default_on: bool
+    db_uri: str, default_on: bool, bound_harness: str
 ) -> None:
     from omnigent.db.utils import builtin_agent_id
     from omnigent.harness_plugins import product_agent_harnesses
@@ -3023,18 +3024,18 @@ def test_keep_warm_layers_conversion_declines_a_masking_fold(
     )
     identities = [
         KeepWarmIdentity("ca_library", "codex"),
-        KeepWarmIdentity("direct_exception", "codex", "ca_library"),
+        KeepWarmIdentity("direct_exception", bound_harness, "ca_library"),
         KeepWarmIdentity("default_copy", "codex", "ca_library"),
     ]
     old = read_keep_warm_settings(store, "alice")
     saved = store.convert_keep_warm("alice", identities, ["h1"], dry_run=False, target="layers")
-    assert "harness:codex" not in saved["layers"]["agents"]
     converted = read_keep_warm_settings(store, "alice")
     for host in ("", "h1"):
         for identity in identities:
             assert _identity_route(old, identity, host) == _identity_route(
                 converted, identity, host
             )
+    assert "harness:codex" not in saved["layers"]["agents"]
     repeated = store.convert_keep_warm("alice", identities, ["h1"], dry_run=False, target="layers")
     assert repeated["already"] is True
     assert repeated["layers"] == saved["layers"]
@@ -3172,6 +3173,37 @@ async def test_agents_with_sessions_route_lists_conversation_agents(
         response = await client.get("/v1/agents/with-sessions", headers={"x-test-user": owner})
     assert response.status_code == 200, response.text
     assert set(response.json()["agent_ids"]) == {"a" * 32, "b" * 32, "ca_library"}
+
+
+@pytest.mark.asyncio
+async def test_agents_with_sessions_route_returns_template_identity_map(
+    db_uri: str, tmp_path: Path
+) -> None:
+    owner = "alice@example.com"
+    agents = SqlAlchemyAgentStore(db_uri)
+    agents.create("a" * 32, "server-a", "unused")
+    agents.create("c" * 32, "server-c", "unused")
+    agents.create_user_agent("b" * 32, "owned", f"{'c' * 32}/bundle", owner)
+    sessions = SqlAlchemyConversationStore(db_uri)
+    for agent_id in ("a" * 32, "b" * 32):
+        sessions.create_conversation(
+            agent_id=agent_id,
+            harness_override="codex",
+            labels={"omnigent:agent-template-id": "c" * 32},
+            host_id="1" * 32,
+            workspace="/opt/work/project",
+        )
+    app = _preferences_app(db_uri, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get("/v1/agents/with-sessions", headers={"x-test-user": owner})
+    assert response.status_code == 200, response.text
+    assert response.json()["template_by_agent_id"] == {
+        "a" * 32: "a" * 32,
+        "b" * 32: "c" * 32,
+        "c" * 32: "c" * 32,
+    }
 
 
 @pytest.mark.asyncio

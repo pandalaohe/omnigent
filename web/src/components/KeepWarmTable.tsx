@@ -56,6 +56,7 @@ import {
   type KeepWarmLayerRecord,
   type KeepWarmLayers,
   type KeepWarmPreferences,
+  type KeepWarmRuntimeIdentity,
 } from "@/lib/keepWarmPreferences";
 import {
   crossingClashes,
@@ -176,7 +177,7 @@ function differsAt(
   field: KeepWarmLayerField,
   family: KeepWarmFamily | null,
   crossAgent: boolean,
-  harness?: string | null,
+  identity?: KeepWarmRuntimeIdentity,
 ): boolean {
   const record = levelRecord(layers, at);
   if (record[field] === undefined) return false;
@@ -184,7 +185,7 @@ function differsAt(
   if (options.canHold && !options.canHold(levelRow(at), field, record[field])) return false;
   const store = keepWarmLayeredStore(
     layers,
-    at.level === "row" || at.level === "cell" ? { row: at.row, harness } : undefined,
+    at.level === "row" || at.level === "cell" ? { row: at.row, ...identity } : undefined,
   );
   const own = options.normalize
     ? options.normalize(levelRow(at), field, record[field])
@@ -276,7 +277,7 @@ function KeepWarmLevelEditor({
   onOpenChange,
   layers,
   family,
-  harness,
+  identity,
   rowLabel,
   colLabel,
   hostWins,
@@ -293,7 +294,7 @@ function KeepWarmLevelEditor({
   onOpenChange: (open: boolean) => void;
   layers: KeepWarmLayers;
   family: KeepWarmFamily | null;
-  harness?: string | null;
+  identity?: KeepWarmRuntimeIdentity;
   rowLabel: string;
   colLabel: string;
   hostWins: boolean;
@@ -313,7 +314,7 @@ function KeepWarmLevelEditor({
 
   const store = keepWarmLayeredStore(
     layers,
-    at.level === "row" || at.level === "cell" ? { row: at.row, harness } : undefined,
+    at.level === "row" || at.level === "cell" ? { row: at.row, ...identity } : undefined,
   );
   const crossAgent = at.level === "corner" || at.level === "col";
   const options = keepWarmLayeredOptions(family, { crossAgent });
@@ -359,7 +360,7 @@ function KeepWarmLevelEditor({
   const commit = async () => {
     const record =
       at.level === "cell"
-        ? dropKeepWarmCellEquals(draft, layers, at.row, at.col, family, harness)
+        ? dropKeepWarmCellEquals(draft, layers, at.row, at.col, family, identity)
         : { ...draft };
     if (await onSave(record)) onOpenChange(false);
   };
@@ -787,6 +788,26 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
     const item = byKey.get(rowKey);
     return item?.harness ?? (rowKey.startsWith("harness:") ? rowKey.slice(8) : null);
   };
+  const identityForRow = (rowKey: string): KeepWarmRuntimeIdentity => {
+    const item = byKey.get(rowKey);
+    const harness = harnessForRow(rowKey);
+    if (!item) return { harness };
+    const templateByAgentId = sessions.data?.templateByAgentId ?? {};
+    if (item.key.startsWith("harness:")) {
+      return { agentId: productIdFor(item, registry), harness };
+    }
+    if (item.source === "library") {
+      const agentId = Object.entries(templateByAgentId).find(
+        ([, templateId]) => templateId === item.key,
+      )?.[0];
+      return { templateId: item.key, agentId: agentId ?? null, harness };
+    }
+    return {
+      templateId: templateByAgentId[item.key] ?? null,
+      agentId: item.key,
+      harness,
+    };
+  };
   const familyForRow = (rowKey: string): KeepWarmFamily | null =>
     keepWarmFamilyForHarness(harnessForRow(rowKey), capabilities);
   const familyForItem = (item: RegistryItem) =>
@@ -986,7 +1007,7 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
           next = setKeepWarmLayer(
             next,
             { level: "cell", row, col },
-            dropKeepWarmCellEquals(merged, next, row, col, family, harnessForRow(row)),
+            dropKeepWarmCellEquals(merged, next, row, col, family, identityForRow(row)),
           );
         }
         return { ...base, layers: next };
@@ -1021,13 +1042,14 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
       return { content: null, unavailable: missingCellText(harness, machine?.platform) };
     }
     const family = familyForRow(rowKey);
-    const resolved = resolveKeepWarmRow(layers, rowKey, host, family, harness);
+    const identity = identityForRow(rowKey);
+    const resolved = resolveKeepWarmRow(layers, rowKey, host, family, identity);
     const at: LayeredCellLevel = { level: "cell", row: rowKey, col: host };
     const options = keepWarmLayeredOptions(family);
-    const store = keepWarmLayeredStore(layers, { row: rowKey, harness });
+    const store = keepWarmLayeredStore(layers, { row: rowKey, ...identity });
     const fields = fieldsShown(at, family);
     const differing = fields.filter((field) =>
-      differsAt(layers, at, field, family, false, harness),
+      differsAt(layers, at, field, family, false, identity),
     );
     const ownRecord = levelRecord(layers, at);
     const parts = differing
@@ -1082,7 +1104,7 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
         onOpenChange={(open) => setEditing(open ? levelKey(at) : null)}
         layers={layers}
         family={family}
-        harness={at.level === "row" || at.level === "cell" ? harnessForRow(at.row) : null}
+        identity={at.level === "row" || at.level === "cell" ? identityForRow(at.row) : undefined}
         rowLabel={row}
         colLabel={col}
         hostWins={at.level === "col" || at.level === "cell" ? !!layers.hostWins[at.col] : false}
@@ -1185,7 +1207,7 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
                     field,
                     familyForItem(item),
                     false,
-                    item.harness,
+                    identityForRow(item.key),
                   ),
               ),
             }))}

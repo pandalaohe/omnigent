@@ -9,7 +9,6 @@ import {
   readSessionCollabPreferences,
 } from "./sessionCollabPreferences";
 import {
-  inheritedAt,
   resolveField,
   type LayeredLevel,
   type LayeredOptions,
@@ -149,6 +148,12 @@ export interface KeepWarmLayers {
   agents: Record<string, KeepWarmLayerRecord>;
   cells: Record<string, Record<string, KeepWarmLayerRecord>>;
   hostWins: Record<string, true>;
+}
+
+export interface KeepWarmRuntimeIdentity {
+  templateId?: string | null;
+  agentId?: string | null;
+  harness?: string | null;
 }
 
 export interface ResolvedKeepWarmLayerRow {
@@ -608,7 +613,7 @@ function normalizeKeepWarmLayerValue(
 /** The layered store shape the shared resolver reads. */
 export function keepWarmLayeredStore(
   layers: KeepWarmLayers,
-  identity?: { row: string; harness?: string | null },
+  identity?: KeepWarmRuntimeIdentity & { row: string },
 ): LayeredStore<KeepWarmLayerField> {
   if (!identity) {
     return {
@@ -620,11 +625,15 @@ export function keepWarmLayeredStore(
     };
   }
   const harnessKey = identity.harness ? `harness:${identity.harness}` : null;
-  // The visible key is the template or bound agent; the runtime then tries its harness.
-  const row = layers.agents[identity.row] ?? (harnessKey ? layers.agents[harnessKey] : undefined);
+  const keys = [
+    identity.templateId ?? (identity.row.startsWith("harness:") ? null : identity.row),
+    identity.agentId,
+    harnessKey,
+  ].filter((key): key is string => !!key);
+  const row = keys.map((key) => layers.agents[key]).find((record) => record !== undefined);
   const cells = Object.fromEntries(
     Object.entries(layers.cells).map(([host, rows]) => {
-      const cell = rows[identity.row] ?? (harnessKey ? rows[harnessKey] : undefined);
+      const cell = keys.map((key) => rows[key]).find((record) => record !== undefined);
       return [host, cell ? { ...rows, [identity.row]: cell } : rows];
     }),
   );
@@ -659,9 +668,9 @@ export function resolveKeepWarmRow(
   row: string,
   host: string,
   family: KeepWarmFamily | null,
-  harness?: string | null,
+  identity?: KeepWarmRuntimeIdentity,
 ): ResolvedKeepWarmLayerRow {
-  const store = keepWarmLayeredStore(layers, { row, harness });
+  const store = keepWarmLayeredStore(layers, { row, ...identity });
   const options = keepWarmLayeredOptions(family);
   const main = resolveField(store, row, host, "main", options);
   const child = resolveField(store, row, host, "child", options);
@@ -721,29 +730,30 @@ export function setKeepWarmLayer(
   return next;
 }
 
-/** A body cell drops a field equal to what it would inherit at save time. */
+/** Drop a cell field only when the resulting identity lookup keeps the chosen value. */
 export function dropKeepWarmCellEquals(
   record: KeepWarmLayerRecord,
   layers: KeepWarmLayers,
   row: string,
   host: string,
   family: KeepWarmFamily | null,
-  harness?: string | null,
+  identity?: KeepWarmRuntimeIdentity,
 ): KeepWarmLayerRecord {
   const at: LayeredLevel = { level: "cell", row, col: host };
   const options = keepWarmLayeredOptions(family);
-  const store = keepWarmLayeredStore(layers, { row, harness });
   const fields: KeepWarmLayerField[] = ["main", "child"];
   if (family && family !== "pi") fields.push("intervalSeconds");
   fields.push("maxSeconds");
   if (family && family !== "pi") fields.push("coldAfterSeconds");
-  const next = { ...record };
+  let next = { ...record };
   for (const field of fields) {
     if (next[field] === undefined) continue;
     const own = options.normalize ? options.normalize(row, field, next[field]) : next[field];
-    if (Object.is(own, inheritedAt(store, at, field, options).value)) {
-      Reflect.deleteProperty(next, field);
-    }
+    const candidate = { ...next };
+    Reflect.deleteProperty(candidate, field);
+    const without = setKeepWarmLayer(layers, at, candidate);
+    const store = keepWarmLayeredStore(without, { row, ...identity });
+    if (Object.is(own, resolveField(store, row, host, field, options).value)) next = candidate;
   }
   return next;
 }
