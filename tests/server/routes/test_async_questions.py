@@ -216,6 +216,70 @@ async def test_async_question_happy_path(
         await collector.stop()
 
 
+@pytest.mark.parametrize(
+    ("harness", "resolved_harness", "expected_message", "expected_policy"),
+    [
+        ("codex", None, "Codex has questions", "omnigent_async_question"),
+        ("claude-sdk", None, "Claude SDK has questions", "omnigent_async_question"),
+        ("codex-native", None, "Codex has questions", "codex_async_question"),
+        ("goose", None, "Goose has questions", "omnigent_async_question"),
+        ("kimi", None, "Kimi has questions", "omnigent_async_question"),
+        ("qwen", None, "Qwen Code has questions", "omnigent_async_question"),
+        (
+            "openai-agents",
+            None,
+            "OpenAI Agents has questions",
+            "omnigent_async_question",
+        ),
+        ("claude-sdk", "acp", "ACP has questions", "omnigent_async_question"),
+        (
+            "claude-sdk",
+            "open-responses",
+            "OpenResponses has questions",
+            "omnigent_async_question",
+        ),
+        (
+            "claude-sdk",
+            "unregistered-harness",
+            "Agent has questions",
+            "omnigent_async_question",
+        ),
+    ],
+)
+async def test_async_question_message_uses_harness_display_name(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+    resolved_harness: str | None,
+    expected_message: str,
+    expected_policy: str,
+) -> None:
+    agent = await create_test_agent(
+        client,
+        f"test-async-question-title-{harness}",
+        executor={"type": "omnigent", "config": {"harness": harness}},
+    )
+    session_id = await _create_session(client, agent["id"])
+    if resolved_harness is not None:
+        monkeypatch.setattr(
+            hooks_routes,
+            "_resolve_harness",
+            lambda *_args, **_kwargs: resolved_harness,
+        )
+    collector = await start_session_stream_collector(session_id)
+    try:
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/async-questions",
+            json={"questions": [{"question": "Continue?"}]},
+        )
+        assert resp.status_code == 200, resp.text
+        params = (await _next_elicitation(collector))["params"]
+        assert params["message"] == expected_message
+        assert params["policy_name"] == expected_policy
+    finally:
+        await collector.stop()
+
+
 async def test_async_question_image_only_answer_keeps_references_and_rejects_foreign_files(
     client: httpx.AsyncClient,
     db_uri: str,

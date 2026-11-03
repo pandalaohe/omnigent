@@ -53,6 +53,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useDescendantSession } from "@/hooks/useChildSessions";
+import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
 import {
   type AskUserQuestionPayload,
   castAskUserQuestionPayload,
@@ -311,6 +312,16 @@ interface ApprovalCardProps {
 
 const EMPTY_CODEX_PERSIST_MODES: CodexPersistMode[] = [];
 
+const SDK_PERMISSION_SUFFIX = "_sdk_permission";
+
+function sdkAgentNameForPolicyName(policyName: string): string | undefined {
+  if (!policyName.endsWith(SDK_PERMISSION_SUFFIX)) return undefined;
+  const vendor = policyName.slice(0, -SDK_PERMISSION_SUFFIX.length);
+  const harness = vendor === "claude" ? "claude-sdk" : vendor;
+  if (!Object.hasOwn(BRAIN_HARNESS_LABELS, harness)) return undefined;
+  return BRAIN_HARNESS_LABELS[harness];
+}
+
 function TerminalAccessActions({
   request,
   onApprove,
@@ -532,16 +543,22 @@ export function ApprovalCard({
   // ("pre_tool_use", "codex_command_approval", ...). It carries no
   // information the card doesn't already show, so hide it for them.
   const showPhase = phase !== "" && !isNativePolicy;
+  const structuredQuestionAgentName =
+    nativeCodingAgentForPolicyName(policyName)?.displayName ??
+    sdkAgentNameForPolicyName(policyName) ??
+    "Agent";
   const askUserQuestionTitle =
-    policyName.startsWith("agy_") || phase.startsWith("agy_")
-      ? "Antigravity needs your input"
-      : policyName.startsWith("codex_") || phase.startsWith("codex_")
-        ? "Codex needs input"
-        : policyName.startsWith("cursor_") || phase.startsWith("cursor_")
-          ? "Cursor has questions"
-          : policyName.startsWith("pi_") || phase.startsWith("pi_")
-            ? "Pi needs your input"
-            : "Claude has questions";
+    phase === "async_question"
+      ? message.trim() || "Agent has questions"
+      : policyName.startsWith("agy_") || phase.startsWith("agy_")
+        ? "Antigravity needs your input"
+        : policyName.startsWith("codex_") || phase.startsWith("codex_")
+          ? "Codex needs input"
+          : policyName.startsWith("cursor_") || phase.startsWith("cursor_")
+            ? "Cursor has questions"
+            : policyName.startsWith("pi_") || phase.startsWith("pi_")
+              ? "Pi needs your input"
+              : `${structuredQuestionAgentName} has questions`;
 
   // Hide the raw JSON preview for AskUserQuestion (the form already
   // renders the questions + options structurally) and for option-

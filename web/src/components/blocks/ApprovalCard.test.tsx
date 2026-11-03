@@ -1378,6 +1378,101 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
 
   it.each([
     {
+      name: "SDK",
+      message: "Codex has questions",
+      policyName: "omnigent_async_question",
+    },
+    {
+      name: "native",
+      message: "Codex has questions",
+      policyName: "codex_async_question",
+    },
+    {
+      name: "unknown-agent",
+      message: "Agent has questions",
+      policyName: "omnigent_async_question",
+    },
+  ])("uses the server agent name for $name async question cards", ({ message, policyName }) => {
+    render(
+      <ApprovalCard
+        elicitationId={`elic_async_title_${policyName}`}
+        message={message}
+        phase="async_question"
+        policyName={policyName}
+        contentPreview=""
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+        asyncKind="question"
+        askUserQuestion={{ questions: [{ question: "Continue?", options: [] }] }}
+      />,
+    );
+
+    expect(screen.getByText(message)).toBeDefined();
+    expect(screen.queryByText("Claude has questions")).toBeNull();
+  });
+
+  it.each([
+    {
+      name: "Claude SDK pre-tool",
+      policyName: "claude_sdk_permission",
+      phase: "pre_tool_use",
+      expectedTitle: "Claude SDK has questions",
+    },
+    {
+      name: "Claude SDK tool-call",
+      policyName: "claude_sdk_permission",
+      phase: "tool_call",
+      expectedTitle: "Claude SDK has questions",
+    },
+    {
+      name: "Claude native",
+      policyName: "claude_native_permission",
+      phase: "pre_tool_use",
+      expectedTitle: "Claude Code has questions",
+    },
+  ])("names $name structured questions", ({ policyName, phase, expectedTitle }) => {
+    render(
+      <ApprovalCard
+        elicitationId={`elic_question_title_${policyName}_${phase}`}
+        message="Claude wants to use **AskUserQuestion**"
+        phase={phase}
+        policyName={policyName}
+        contentPreview=""
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+        askUserQuestion={{ questions: [{ question: "Continue?", options: [] }] }}
+      />,
+    );
+
+    expect(screen.getByText(expectedTitle)).toBeDefined();
+    expect(screen.queryByText("Agent has questions")).toBeNull();
+  });
+
+  it.each(["__proto___sdk_permission", "constructor_sdk_permission"])(
+    "uses the generic title for inherited SDK label key %s",
+    (policyName) => {
+      render(
+        <ApprovalCard
+          elicitationId={`elic_unknown_sdk_${policyName}`}
+          message="Unknown wants to use **AskUserQuestion**"
+          phase="pre_tool_use"
+          policyName={policyName}
+          contentPreview=""
+          requestedSchema={{}}
+          status="pending"
+          response={null}
+          askUserQuestion={{ questions: [{ question: "Continue?", options: [] }] }}
+        />,
+      );
+
+      expect(screen.getByText("Agent has questions")).toBeDefined();
+    },
+  );
+
+  it.each([
+    {
       name: "select",
       harness: "Pi",
       options: [{ label: "Allow" }, { label: "Block" }],

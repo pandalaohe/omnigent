@@ -1367,6 +1367,29 @@ def harness_labels() -> dict[str, str]:
     return _merge_dict(lambda contribution: contribution.harness_labels)
 
 
+_NON_PICKER_HARNESS_LABELS = {
+    "acp": "ACP",
+    "open-responses": "OpenResponses",
+    "openai-agents": "OpenAI Agents",
+}
+
+
+def harness_display_name(harness: str | None) -> str | None:
+    """Return a known harness's display name, independent of picker visibility."""
+    if harness is None:
+        return None
+    picker_label = harness_labels().get(harness)
+    if picker_label is not None:
+        return picker_label
+    native = next(
+        (agent for agent in native_agents() if harness in (agent.key, agent.harness)),
+        None,
+    )
+    if native is not None:
+        return native.display_name
+    return _NON_PICKER_HARNESS_LABELS.get(harness)
+
+
 def harness_capabilities() -> dict[str, HarnessCapabilities]:
     """Return the declared capability record per harness id.
 
