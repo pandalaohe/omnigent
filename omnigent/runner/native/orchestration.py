@@ -11009,6 +11009,45 @@ async def _delete_native_bridge_dirs(
         kiro_bridge_dir(session_id),
         qwen_bridge_dir(session_id),
     }
+    # A clear transfers the same bridge to its successor. Old labels and even
+    # the old session-id fallback can still point at that successor's data.
+    protected_targets: set[Path] = set()
+    for resolver, filename, owner_keys in (
+        (antigravity_bridge_dir, "state.json", ("session_id",)),
+        (codex_bridge_dir, "state.json", ("session_id",)),
+        (claude_bridge_dir, "bridge.json", ("active_session_id", "conversation_id")),
+    ):
+        for target in targets:
+            if target.parent != resolver(session_id).parent:
+                continue
+            try:
+                payload = json.loads((target / filename).read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError("ownership metadata is not an object")
+                owner = next(
+                    (
+                        payload[key]
+                        for key in owner_keys
+                        if isinstance(payload.get(key), str) and payload[key]
+                    ),
+                    None,
+                )
+                if owner is None:
+                    raise ValueError("ownership metadata has no session id")
+            except FileNotFoundError:
+                continue
+            except (OSError, UnicodeError, ValueError) as exc:
+                _logger.warning(
+                    "Cannot read native bridge owner for %s (%s); preserving directory",
+                    target,
+                    type(exc).__name__,
+                )
+                protected_targets.add(target)
+                continue
+            if owner != session_id:
+                protected_targets.add(target)
+    targets.difference_update(protected_targets)
+    history_targets.difference_update(protected_targets)
     if keep_session_history:
         credentials = {
             codex_bridge_dir(session_id).parent: (
