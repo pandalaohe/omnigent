@@ -131,18 +131,13 @@ describe("ViewModeToggle", () => {
     expect(terminalSegment()).toHaveAttribute("aria-pressed", "false");
   });
 
-  it("uses the dark segmented-control surface tokens", () => {
+  it("uses the neutral primary pair for the selected segment", () => {
     renderToggle(makeCtx({ view: "chat" }));
-    expect(screen.getByTestId("view-mode-toggle")).toHaveClass(
-      "bg-muted",
-      "dark:bg-[var(--segmented-trough-bg)]",
-    );
-    expect(chatSegment()).toHaveClass(
-      "bg-background",
-      "dark:border-transparent",
-      "dark:bg-[var(--segmented-active-bg)]",
-    );
-    expect(terminalSegment()).toHaveClass("dark:bg-[var(--segmented-inactive-bg)]");
+    expect(screen.getByTestId("view-mode-toggle")).toHaveClass("bg-muted");
+    expect(chatSegment()).toHaveAttribute("data-variant", "default");
+    expect(chatSegment()).toHaveClass("bg-primary-cta", "text-primary-cta-foreground");
+    expect(terminalSegment()).toHaveAttribute("data-variant", "ghost");
+    expect(terminalSegment()).not.toHaveClass("bg-primary-cta");
   });
 
   it("presses only the active segment in the terminal view", () => {

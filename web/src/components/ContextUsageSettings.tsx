@@ -6,7 +6,7 @@ import { useSession } from "@/hooks/useSession";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import { useStableProviderUsageLimits } from "@/hooks/useStableProviderUsageLimits";
 import { Input } from "@/components/ui/input";
-import { Button } from "@/components/ui/button";
+import { Segmented } from "@/components/ui/segmented";
 import { SavedContextSources } from "@/components/SavedContextSources";
 import { Switch } from "@/components/ui/switch";
 import {
@@ -269,38 +269,31 @@ export function ContextUsageSettings() {
           </label>
           <div className="grid gap-1.5 text-sm">
             <span>Compact buffer</span>
-            <div className="flex gap-1" role="group" aria-label="Buffer unit">
-              <Button
-                type="button"
-                size="xs"
-                variant={bufferMode === "tokens" ? "secondary" : "outline"}
-                aria-pressed={bufferMode === "tokens"}
-                onClick={() => {
-                  if (
-                    !fixedBufferFitsCapacity(
-                      activeOverride.autoCompactBufferTokens,
-                      editedLevelContext,
-                    )
-                  ) {
-                    setInputError("Token buffer must be less than the context total.");
-                    return;
-                  }
-                  setInputError("");
-                  writeOverride({ compactBufferMode: "tokens" });
-                }}
-              >
-                Tokens
-              </Button>
-              <Button
-                type="button"
-                size="xs"
-                variant={bufferMode === "percent" ? "secondary" : "outline"}
-                aria-pressed={bufferMode === "percent"}
-                onClick={() => writeOverride({ compactBufferMode: "percent" })}
-              >
-                Percent
-              </Button>
-            </div>
+            <Segmented
+              label="Buffer unit"
+              options={[
+                { value: "tokens", label: "Tokens", testId: "buffer-unit-tokens" },
+                { value: "percent", label: "Percent", testId: "buffer-unit-percent" },
+              ]}
+              value={bufferMode}
+              onChange={(mode) => {
+                if (mode === "percent") {
+                  writeOverride({ compactBufferMode: "percent" });
+                  return;
+                }
+                if (
+                  !fixedBufferFitsCapacity(
+                    activeOverride.autoCompactBufferTokens,
+                    editedLevelContext,
+                  )
+                ) {
+                  setInputError("Token buffer must be less than the context total.");
+                  return;
+                }
+                setInputError("");
+                writeOverride({ compactBufferMode: "tokens" });
+              }}
+            />
             <Input
               type="number"
               min={0}

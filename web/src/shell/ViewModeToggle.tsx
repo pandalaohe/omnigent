@@ -50,9 +50,8 @@ export function ViewModeToggle({ hotkeyEnabled = true, alwaysVisible = false } =
       role="group"
       aria-label="Switch between chat and terminal"
       data-testid="view-mode-toggle"
-      // Two 36×24 segments separated by 2px make a flush 74×24 track.
       // Desktop-only — mobile folds the switch into the header kebab.
-      className="flex h-6 w-[74px] shrink-0 items-center gap-0.5 rounded-[6px] bg-muted p-0 dark:bg-[var(--segmented-trough-bg)]"
+      className="flex h-6 w-[74px] shrink-0 items-center gap-0.5 rounded-[6px] bg-muted p-0"
     >
       <ViewModeSegment
         label="Chat view"
@@ -111,7 +110,7 @@ function ViewModeSegment({
         <span className="inline-flex">
           <Button
             type="button"
-            variant={active ? "secondary" : "ghost"}
+            variant={active ? "default" : "ghost"}
             size="icon-xs"
             aria-label={label}
             aria-pressed={active}
@@ -122,8 +121,8 @@ function ViewModeSegment({
             className={cn(
               "h-6 w-9 rounded-[6px] border px-2.5 py-0",
               active
-                ? "border-border bg-background text-foreground shadow-sm hover:bg-background dark:border-transparent dark:bg-[var(--segmented-active-bg)] dark:hover:bg-[var(--segmented-active-bg)]"
-                : "border-transparent text-muted-foreground hover:bg-transparent hover:text-foreground dark:bg-[var(--segmented-inactive-bg)] dark:hover:bg-[var(--segmented-inactive-bg)]",
+                ? "border-transparent shadow-sm"
+                : "border-transparent text-muted-foreground hover:bg-foreground/10 hover:text-foreground",
             )}
           >
             {children}

@@ -64,6 +64,23 @@ describe("GoalControl", () => {
     fireEvent.click(screen.getByTestId("goal-toggle"));
     expect(screen.getByTestId("mock-goal-dialog")).toHaveAttribute("data-open", "true");
     expect(screen.getByTestId("goal-toggle")).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId("goal-toggle")).toHaveAttribute("data-variant", "default");
+    expect(screen.getByTestId("goal-toggle")).toHaveClass(
+      "bg-primary-cta",
+      "text-primary-cta-foreground",
+    );
+  });
+
+  it("uses the outline state without a goal and keeps aria-pressed false", () => {
+    render(
+      <TooltipProvider>
+        <GoalControl conversationId="conv" readOnly={false} goal={null} onGoalChange={vi.fn()} />
+      </TooltipProvider>,
+    );
+
+    expect(screen.getByTestId("goal-toggle")).toHaveAttribute("data-variant", "outline");
+    expect(screen.getByTestId("goal-toggle")).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByTestId("goal-toggle")).not.toHaveClass("bg-primary-cta");
   });
 
   it("disables the button without a conversation", () => {

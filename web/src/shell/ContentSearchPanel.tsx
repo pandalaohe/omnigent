@@ -6,7 +6,6 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import type { OpenFileOptions } from "./FileViewerContext";
-import { cn } from "@/lib/utils";
 
 interface ContentMatch {
   path: string;
@@ -112,14 +111,14 @@ export function ContentSearchPanel({
             />
             <Button
               type="button"
-              variant={include.trim() || exclude.trim() ? "secondary" : "outline"}
+              variant={include.trim() || exclude.trim() ? "default" : "outline"}
               size="icon"
               aria-label="Filter files"
               aria-expanded={showFilters}
               aria-controls={filtersId}
               title="Include / exclude files"
               onClick={() => setShowFilters((visible) => !visible)}
-              className={cn("rounded-l-none border-l-0", showFilters && "bg-muted!")}
+              className="rounded-l-none border-l-0"
             >
               <FilterIcon className="size-4" />
             </Button>

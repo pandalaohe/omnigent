@@ -70,12 +70,20 @@ describe("SelectionList", () => {
     expect(screen.getByRole("checkbox", { name: /Archived/ })).toBeDisabled();
   });
 
-  it("keeps a separate draft when switching between Only and All except", () => {
+  it("keeps a separate draft and a clear selected segment when switching modes", () => {
     render(<Picker initial={{ mode: "except", ids: ["alpha"] }} />);
-    fireEvent.click(screen.getByRole("button", { name: "Only these" }));
+    const except = screen.getByRole("radio", { name: "All, except these" });
+    const only = screen.getByRole("radio", { name: "Only these" });
+    expect(except).toHaveAttribute("aria-checked", "true");
+    expect(except).toHaveClass("bg-primary-cta", "text-primary-cta-foreground");
+    expect(only).not.toHaveClass("bg-primary-cta");
+    fireEvent.click(only);
+    expect(only).toHaveAttribute("aria-checked", "true");
+    expect(only).toHaveClass("bg-primary-cta", "text-primary-cta-foreground");
+    expect(except).not.toHaveClass("bg-primary-cta");
     fireEvent.click(screen.getByRole("checkbox", { name: "Gamma" }));
     expect(screen.getByTestId("selection")).toHaveTextContent("gamma");
-    fireEvent.click(screen.getByRole("button", { name: "All, except these" }));
+    fireEvent.click(except);
     expect(screen.getByTestId("selection").textContent).not.toContain("alpha");
     expect(screen.getByTestId("selection").textContent).toContain("beta");
   });

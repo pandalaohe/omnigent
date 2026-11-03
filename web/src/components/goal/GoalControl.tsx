@@ -3,7 +3,6 @@ import { GoalIcon, TargetIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { Goal } from "@/lib/goalApi";
-import { cn } from "@/lib/utils";
 import { CommandGoalDialog } from "./CommandGoalDialog";
 import { GoalDialog } from "./GoalDialog";
 import { formatGoalStatus } from "./goalUtils";
@@ -47,11 +46,8 @@ export function GoalControl(props: GoalControlProps) {
           <Button
             type="button"
             size="sm"
-            variant={goal ? "secondary" : "ghost"}
-            className={cn(
-              "h-9 w-9 gap-0 px-0 text-sm md:h-8 @lg/composer-actions:w-auto @lg/composer-actions:gap-1.5 @lg/composer-actions:px-2",
-              goal && "border border-ring/30 text-foreground",
-            )}
+            variant={goal ? "default" : "outline"}
+            className="h-9 w-9 gap-0 px-0 text-sm md:h-8 @lg/composer-actions:w-auto @lg/composer-actions:gap-1.5 @lg/composer-actions:px-2"
             disabled={!conversationId || (commandMode && readOnly)}
             aria-pressed={commandMode ? undefined : goal != null}
             aria-label={
