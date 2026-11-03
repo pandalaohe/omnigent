@@ -24,7 +24,7 @@ import time
 import urllib.parse
 import uuid
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
@@ -13072,64 +13072,66 @@ def create_runner_app(
 
         async def _reap_native_pane(pane: PaneRef) -> None:
             conv_id = pane.conversation_id
-            _capture_codex_release(conv_id)
-            reaped = pane.instance
-            if reaped is None:
-                reaped = _pane_reaper_registry.get(conv_id, pane.terminal_name, "main")
-            # Launch and ensure paths hold this lock, so a message that re-creates
-            # the session waits for the reap, then starts its own pane, forwarder,
-            # helper server and relay instead of having them torn down here.
-            lock = _native_terminal_ensure_locks[pane.terminal_name].setdefault(
-                conv_id, asyncio.Lock()
-            )
-            async with lock:
-                current = _pane_reaper_registry.get(conv_id, pane.terminal_name, "main")
-                if current is not None and current is not reaped:
-                    _logger.info(
-                        "native pane reaper: pane for conversation %s was replaced after "
-                        "it was judged idle; leaving the new one",
-                        conv_id,
-                        extra={"session_id": conv_id},
-                    )
-                    raise RuntimeError(
-                        "native pane changed or became busy before retention release"
-                    )
-                # A message can reuse the pane while the reap waits for the lock.
-                if not pane.allow_busy_release and await _native_pane_is_busy(pane):
-                    _logger.info(
-                        "native pane reaper: pane for conversation %s became busy while "
-                        "the reap waited; leaving it",
-                        conv_id,
-                        extra={"session_id": conv_id},
-                    )
-                    raise RuntimeError(
-                        "native pane changed or became busy before retention release"
-                    )
-                outcome = await resource_registry.close_terminal_detailed(
-                    pane.conversation_id,
-                    pane.terminal_id,
-                    expected_instance=pane.instance,
+            with _codex_release_attempt(conv_id) as begin_teardown:
+                reaped = pane.instance
+                if reaped is None:
+                    reaped = _pane_reaper_registry.get(conv_id, pane.terminal_name, "main")
+                # Launch and ensure paths hold this lock, so a message that re-creates
+                # the session waits for the reap, then starts its own pane, forwarder,
+                # helper server and relay instead of having them torn down here.
+                lock = _native_terminal_ensure_locks[pane.terminal_name].setdefault(
+                    conv_id, asyncio.Lock()
                 )
-                if outcome == "generation_changed":
-                    raise RuntimeError("native pane generation changed before retention release")
-                if outcome == "close_failed":
-                    raise RuntimeError("native pane close failed before retention release")
-                if outcome == "absent" and pane.instance is not None:
-                    probe = await pane.instance.probe_alive()
-                    if probe is not False:
-                        raise NativePaneStillAlive(pane.instance, probe)
-                _capture_codex_release(conv_id)
-                await _native_runtime.teardown_codex_native_app_server(pane.conversation_id)
-                await _cancel_auto_forwarder_task(conv_id)
-                await _native_runtime.teardown_opencode_native_server(conv_id)
-                if binding := _session_comment_relays.get(conv_id):
-                    _discard_comment_relay(conv_id, binding.relay)
-                _publish_terminal_deleted_event(
-                    conversation_id=pane.conversation_id,
-                    terminal_name=pane.terminal_name,
-                    session_key="main",
-                    publish_event=_publish_event,
-                )
+                async with lock:
+                    current = _pane_reaper_registry.get(conv_id, pane.terminal_name, "main")
+                    if current is not None and current is not reaped:
+                        _logger.info(
+                            "native pane reaper: pane for conversation %s was replaced after "
+                            "it was judged idle; leaving the new one",
+                            conv_id,
+                            extra={"session_id": conv_id},
+                        )
+                        raise RuntimeError(
+                            "native pane changed or became busy before retention release"
+                        )
+                    # A message can reuse the pane while the reap waits for the lock.
+                    if not pane.allow_busy_release and await _native_pane_is_busy(pane):
+                        _logger.info(
+                            "native pane reaper: pane for conversation %s became busy while "
+                            "the reap waited; leaving it",
+                            conv_id,
+                            extra={"session_id": conv_id},
+                        )
+                        raise RuntimeError(
+                            "native pane changed or became busy before retention release"
+                        )
+                    outcome = await resource_registry.close_terminal_detailed(
+                        pane.conversation_id,
+                        pane.terminal_id,
+                        expected_instance=pane.instance,
+                    )
+                    if outcome == "generation_changed":
+                        raise RuntimeError(
+                            "native pane generation changed before retention release"
+                        )
+                    if outcome == "close_failed":
+                        raise RuntimeError("native pane close failed before retention release")
+                    if outcome == "absent" and pane.instance is not None:
+                        probe = await pane.instance.probe_alive()
+                        if probe is not False:
+                            raise NativePaneStillAlive(pane.instance, probe)
+                    begin_teardown()
+                    await _native_runtime.teardown_codex_native_app_server(pane.conversation_id)
+                    await _cancel_auto_forwarder_task(conv_id)
+                    await _native_runtime.teardown_opencode_native_server(conv_id)
+                    if binding := _session_comment_relays.get(conv_id):
+                        _discard_comment_relay(conv_id, binding.relay)
+                    _publish_terminal_deleted_event(
+                        conversation_id=pane.conversation_id,
+                        terminal_name=pane.terminal_name,
+                        session_key="main",
+                        publish_event=_publish_event,
+                    )
 
         app.state.native_pane_reaper = NativePaneReaper(
             list_native_panes=_native_panes_for_reaper,
@@ -13162,79 +13164,121 @@ def create_runner_app(
             raise RuntimeError("Codex backend changed during CLI release")
         return snapshot
 
+    @contextlib.contextmanager
+    def _codex_release_attempt(session_id: str) -> Iterator[Callable[[], None]]:
+        previous = _pending_codex_releases.get(session_id)
+        if previous is not None:
+            backend, incarnation, _ = previous
+            if backend is None or (
+                getattr(backend, "resident_incarnation_id", None) == incarnation
+                and backend.exit_confirmed
+            ):
+                _pending_codex_releases.pop(session_id, None)
+                previous = None
+        snapshot = _capture_codex_release(session_id)
+        teardown_started = False
+
+        def begin_teardown() -> None:
+            nonlocal teardown_started
+            _capture_codex_release(session_id)
+            teardown_started = True
+
+        try:
+            yield begin_teardown
+        finally:
+            backend, incarnation, _ = snapshot
+            same_incarnation = getattr(backend, "resident_incarnation_id", None) == incarnation
+            unconfirmed = backend is not None and (
+                not same_incarnation or not backend.exit_confirmed
+            )
+            replaced = not same_incarnation or (
+                _native_runtime._AUTO_CODEX_APP_SERVERS.get(session_id) is not backend
+            )
+            if _pending_codex_releases.get(session_id) is snapshot and not (
+                unconfirmed and (teardown_started or previous is snapshot or replaced)
+            ):
+                _pending_codex_releases.pop(session_id, None)
+
     async def _finish_cli_release(session_id: str) -> None:
         """Release non-terminal runtime pieces owned by one CLI session."""
         retrying = session_id in _pending_codex_releases
-        codex_backend, _, codex_launch_dir = _capture_codex_release(session_id)
-        if retrying and codex_backend is not None:
-            await codex_backend.close()
-            if not codex_backend.exit_confirmed:
+        with _codex_release_attempt(session_id) as begin_teardown:
+            codex_backend, _, codex_launch_dir = _capture_codex_release(session_id)
+            if retrying and codex_backend is not None:
+                begin_teardown()
+                await codex_backend.close()
+                if not codex_backend.exit_confirmed:
+                    raise RuntimeError("Codex exit is not confirmed before credential scrub")
+            resolved_codex_dir = await _codex_native_bridge_dir_for_session(session_id)
+            codex_bridge_dir = codex_launch_dir or resolved_codex_dir
+            _capture_codex_release(session_id)
+            begin_teardown()
+            if not await _cancel_auto_forwarder_task(session_id):
+                raise RuntimeError("native forwarder did not stop before runtime cleanup")
+            relay_binding = _session_comment_relays.pop(session_id, None)
+            if relay_binding is not None:
+                relay_binding.relay.close()
+            if process_manager is not None:
+                if await process_manager.release(session_id) is False:
+                    raise RuntimeError("harness subprocess did not exit during CLI release")
+            _capture_codex_release(session_id)
+            await _native_runtime.teardown_codex_native_app_server(session_id)
+            if codex_backend is not None and not codex_backend.exit_confirmed:
                 raise RuntimeError("Codex exit is not confirmed before credential scrub")
-        resolved_codex_dir = await _codex_native_bridge_dir_for_session(session_id)
-        codex_bridge_dir = codex_launch_dir or resolved_codex_dir
-        _capture_codex_release(session_id)
-        if not await _cancel_auto_forwarder_task(session_id):
-            raise RuntimeError("native forwarder did not stop before runtime cleanup")
-        relay_binding = _session_comment_relays.pop(session_id, None)
-        if relay_binding is not None:
-            relay_binding.relay.close()
-        if process_manager is not None:
-            if await process_manager.release(session_id) is False:
-                raise RuntimeError("harness subprocess did not exit during CLI release")
-        _capture_codex_release(session_id)
-        await _native_runtime.teardown_codex_native_app_server(session_id)
-        if codex_backend is not None and not codex_backend.exit_confirmed:
-            raise RuntimeError("Codex exit is not confirmed before credential scrub")
-        _capture_codex_release(session_id)
-        _pending_codex_releases.pop(session_id, None)
-        from omnigent.harnesses.codex_native.bridge import clear_active_child_turns
+            _capture_codex_release(session_id)
+            _pending_codex_releases.pop(session_id, None)
+            from omnigent.harnesses.codex_native.bridge import clear_active_child_turns
 
-        # A stopped forwarder can leave its backend's resumable bridge state behind.
-        if codex_bridge_dir.is_dir():
-            clear_active_child_turns(codex_bridge_dir)
-        # Resume still needs native history, undelivered items and cached attachments.
-        await _delete_native_bridge_dirs(
-            server_client=server_client,
-            session_id=session_id,
-            keep_attachment_caches=True,
-            keep_session_history=True,
-        )
-        if session_id in _session_histories:
-            _attachment_restore_pending.add(session_id)
-        from omnigent.runner.subagent_routing import shutdown_session_router
-        from omnigent.runner.tool_dispatch import forget_spawn_family
+            # A stopped forwarder can leave its backend's resumable bridge state behind.
+            if codex_bridge_dir.is_dir():
+                clear_active_child_turns(codex_bridge_dir)
+            # Resume still needs native history, undelivered items and cached attachments.
+            await _delete_native_bridge_dirs(
+                server_client=server_client,
+                session_id=session_id,
+                keep_attachment_caches=True,
+                keep_session_history=True,
+            )
+            if session_id in _session_histories:
+                _attachment_restore_pending.add(session_id)
+            from omnigent.runner.subagent_routing import shutdown_session_router
+            from omnigent.runner.tool_dispatch import forget_spawn_family
 
-        await asyncio.to_thread(shutdown_session_router, session_id)
-        forget_spawn_family(session_id)
+            await asyncio.to_thread(shutdown_session_router, session_id)
+            forget_spawn_family(session_id)
 
     async def _finish_retired(session_id: str, terminal_name: str, token: str) -> str | None:
-        _capture_codex_release(session_id)
-        try:
-            async with _cli_runtime_lock(session_id).exclusive(timeout=1.0):
-                if any(pane.conversation_id == session_id for pane in _native_panes_for_reaper()):
+        with _codex_release_attempt(session_id) as begin_teardown:
+            try:
+                async with _cli_runtime_lock(session_id).exclusive(timeout=1.0):
+                    if any(
+                        pane.conversation_id == session_id for pane in _native_panes_for_reaper()
+                    ):
+                        return None
+                    if not _cli_runtime_lifecycle.claim_reclaim(
+                        session_id, expected_runtime_token=token
+                    ):
+                        return None
+                    try:
+                        _capture_codex_release(session_id)
+                        begin_teardown()
+                        await _native_runtime.teardown_codex_native_app_server(session_id)
+                        _capture_codex_release(session_id)
+                        _publish_terminal_deleted_event(
+                            conversation_id=session_id,
+                            terminal_name=terminal_name,
+                            session_key="main",
+                            publish_event=_publish_event,
+                        )
+                        await _finish_cli_release(session_id)
+                    except Exception:
+                        _cli_runtime_lifecycle.finish_reclaim(session_id, present=True)
+                        _logger.exception("native pane retirement tail failed for %s", session_id)
+                        return _cli_runtime_lifecycle.runtime_token(session_id)
+                    _cli_runtime_lifecycle.finish_reclaim(session_id)
                     return None
-                if not _cli_runtime_lifecycle.claim_reclaim(
-                    session_id, expected_runtime_token=token
-                ):
-                    return None
-                try:
-                    _capture_codex_release(session_id)
-                    await _native_runtime.teardown_codex_native_app_server(session_id)
-                    _publish_terminal_deleted_event(
-                        conversation_id=session_id,
-                        terminal_name=terminal_name,
-                        session_key="main",
-                        publish_event=_publish_event,
-                    )
-                    await _finish_cli_release(session_id)
-                except Exception:
-                    _cli_runtime_lifecycle.finish_reclaim(session_id, present=True)
-                    _logger.exception("native pane retirement tail failed for %s", session_id)
-                    return _cli_runtime_lifecycle.runtime_token(session_id)
-                _cli_runtime_lifecycle.finish_reclaim(session_id)
-                return None
-        except TimeoutError:
-            return token
+            except TimeoutError:
+                return token
 
     @app.get("/v1/sessions/{session_id}/cli-retention")
     async def get_session_cli_retention(

@@ -163,7 +163,7 @@ async def test_idle_release_scrubs_pi_token_temporaries(
     assert not token_temp.exists()
 
 
-@pytest.mark.parametrize("sequence", ["label-lookup", "pane-reaper"])
+@pytest.mark.parametrize("sequence", ["label-lookup", "pane-reaper", "rejected-tail"])
 @pytest.mark.parametrize("confirmed", [False, True])
 async def test_idle_release_keeps_exit_evidence_after_real_teardown(
     tmp_path: Path,
@@ -224,7 +224,7 @@ async def test_idle_release_keeps_exit_evidence_after_real_teardown(
         resource_registry=SessionResourceRegistry(terminal_registry=terminals),
         server_client=client,  # type: ignore[arg-type]
     )
-    if sequence == "pane-reaper":
+    if sequence in {"pane-reaper", "rejected-tail"}:
         await app.state.native_pane_reaper._reap(
             PaneRef(
                 session_id,
@@ -234,6 +234,11 @@ async def test_idle_release_keeps_exit_evidence_after_real_teardown(
                 allow_busy_release=True,
             )
         )
+        if sequence == "rejected-tail":
+            assert (
+                await app.state.native_pane_reaper._finish_retired(session_id, "codex", "stale")
+                is None
+            )
     if not confirmed:
         with pytest.raises(RuntimeError, match="exit is not confirmed"):
             await app.state.finish_cli_release(session_id)
@@ -243,6 +248,102 @@ async def test_idle_release_keeps_exit_evidence_after_real_teardown(
         census_available = True
     await app.state.finish_cli_release(session_id)
     assert backend.exit_confirmed
+    assert not bridge.read_bridge_state(home).helper_stop_pending
+    assert bridge.read_active_child_turns(home, strict=True) == {}
+
+
+@pytest.mark.parametrize(
+    "sequence", ["legacy-reap", "rejected-token", "rejected-pane", "rejected-lock"]
+)
+async def test_codex_release_does_not_pin_a_completed_or_abandoned_incarnation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sequence: str
+) -> None:
+    import gc
+    import weakref
+    from types import SimpleNamespace
+
+    from omnigent.harnesses.codex_native import app_server, bridge
+    from omnigent.runner.native import orchestration
+    from omnigent.runner.resource_registry import (
+        SessionResourceRegistry,
+        _TerminalRoleRegistration,
+    )
+    from omnigent.terminals.registry import TerminalRegistry
+    from tests.harnesses.codex_native.app_server._support import _test_app_server
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "codex-native")
+    session_id = "conv_release_incarnations"
+    home = bridge.prepare_bridge_dir(session_id)
+
+    async def create_backend():
+        backend = _test_app_server(
+            tmp_path, bridge.codex_home_for_bridge_dir(home), home, tmp_path
+        )
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", "pass", start_new_session=True
+        )
+        await process.wait()
+        backend.proc = process
+        backend.process_group_id = process.pid
+        backend.process_registry_tag = "release-incarnations"
+        return backend
+
+    old = await create_backend()
+    monkeypatch.setattr(app_server, "_tagged_process_group_members", lambda *_: [])
+    monkeypatch.setattr(app_server, "unregister_codex_native_process", lambda *_: None)
+    monkeypatch.setattr(orchestration, "_AUTO_CODEX_APP_SERVERS", {session_id: old})
+    monkeypatch.setattr(orchestration, "_AUTO_CODEX_BRIDGE_DIRS", {session_id: home})
+    terminals = TerminalRegistry()
+    resources = SessionResourceRegistry(terminal_registry=terminals)
+    app = create_runner_app(
+        terminal_registry=terminals,
+        resource_registry=resources,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    reaper = app.state.native_pane_reaper
+    if sequence == "legacy-reap":
+        await reaper._reap(
+            PaneRef(session_id, "terminal_codex_main", "codex", home, allow_busy_release=True)
+        )
+    else:
+        token = app.state.cli_runtime_lifecycle.runtime_token(session_id)
+        if sequence == "rejected-pane":
+            pane = SimpleNamespace(
+                socket_path=home / "tmux.sock", diagnostic_id="successor", elevated=False
+            )
+            terminals._by_conversation[session_id] = {("codex", "main"): pane}
+            resources._terminal_roles[(session_id, "terminal_codex_main")] = (
+                _TerminalRoleRegistration("codex-native", "successor")
+            )
+        if sequence == "rejected-lock":
+            async with app.state.cli_runtime_lifecycle.lock_for(session_id).shared():
+                assert await reaper._finish_retired(session_id, "codex", token) == token
+        else:
+            supplied_token = token if sequence == "rejected-pane" else "stale"
+            assert await reaper._finish_retired(session_id, "codex", supplied_token) is None
+        terminals._by_conversation.pop(session_id, None)
+        await old.close()
+    assert old.exit_confirmed
+
+    resumed = await create_backend()
+    orchestration._AUTO_CODEX_APP_SERVERS[session_id] = resumed
+    orchestration._AUTO_CODEX_BRIDGE_DIRS[session_id] = home
+    old_reference = weakref.ref(old)
+    del old
+    gc.collect()
+    assert old_reference() is None
+    bridge.write_bridge_state(
+        home,
+        bridge.CodexNativeBridgeState(
+            session_id=session_id,
+            socket_path=str(resumed.socket_path),
+            thread_id="resumed_thread",
+            codex_home=str(bridge.codex_home_for_bridge_dir(home)),
+        ),
+    )
+    bridge.update_active_child_turn(home, "new_child", turn_id="new_turn")
+    await app.state.finish_cli_release(session_id)
+    assert resumed.exit_confirmed
     assert not bridge.read_bridge_state(home).helper_stop_pending
     assert bridge.read_active_child_turns(home, strict=True) == {}
 
