@@ -1459,8 +1459,7 @@ describe("ProjectSettingsDialog", () => {
     await pickOption("project-settings-host-model-h1", "Opus");
     expect(pairSyncs()).toHaveLength(1);
     expect(syncCatalogsMock).toHaveBeenCalledWith({ hostId: "h1", harness: "claude-native" });
-    fireEvent.click(screen.getByTestId("project-settings-host-effort-h1"));
-    fireEvent.click(await screen.findByRole("option", { name: "High" }));
+    fireEvent.click(screen.getByTestId("project-settings-host-effort-h1-high"));
     expect(pairSyncs()).toHaveLength(1);
 
     fireEvent.click(screen.getByTestId("project-settings-save"));
@@ -1580,7 +1579,8 @@ describe("ProjectSettingsDialog", () => {
       ),
     );
 
-    for (const field of ["model", "effort", "speed", "permission"]) {
+    fireEvent.click(screen.getByRole("button", { name: "Reset Effort" }));
+    for (const field of ["model", "speed", "permission"]) {
       fireEvent.click(screen.getByTestId(`project-settings-host-reset-${field}-h1`));
     }
     fireEvent.click(screen.getByTestId("project-settings-save"));
@@ -2156,7 +2156,6 @@ describe("ProjectSettingsDialog", () => {
 
   it.each([
     ["model", "Shared model"],
-    ["effort", "xHigh"],
     ["speed", "Standard"],
     ["permission", "Read Only"],
   ])("keeps inherited and explicit same-value %s selections distinct", async (field, label) => {
@@ -2216,6 +2215,52 @@ describe("ProjectSettingsDialog", () => {
     fireEvent.click(screen.getByRole("option", { name: "Default" }));
     expect(trigger).toHaveTextContent(label);
     expect(reset).toBeDisabled();
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        calling_defaults: { h1: { agent_id: "ag_codex_sdk" } },
+      }),
+    );
+  });
+
+  it("keeps inherited and explicit same-value effort selections distinct", async () => {
+    availableAgentsMock.mockReturnValue({ data: [codexSdkAgent()] });
+    listEntriesMock.mockResolvedValue([entry("h1", "/opt/work/example")]);
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { calling_defaults: { h1: { agent_id: "ag_codex_sdk" } } },
+    });
+    localStorage.setItem(
+      "omnigent:calling-defaults",
+      JSON.stringify({ h1: { codex: { model: "shared-model", effort: "xhigh" } } }),
+    );
+    const rows = [
+      catalogRow("h1", "codex", [
+        {
+          id: "shared-model",
+          displayName: "Shared model",
+          supportedReasoningEfforts: [{ reasoningEffort: "xhigh" }],
+        },
+      ]),
+    ];
+    listCatalogsMock.mockResolvedValue(rows);
+    syncCatalogsMock.mockResolvedValue(rows);
+    renderDialog();
+
+    const meter = await screen.findByTestId("project-settings-host-effort-h1");
+    const explicit = screen.getByTestId("project-settings-host-effort-h1-xhigh");
+    expect(meter).toHaveTextContent("Default");
+    expect(explicit).toHaveAttribute("aria-checked", "false");
+    expect(explicit.firstElementChild).toHaveClass("bg-companion/45");
+
+    fireEvent.click(explicit);
+    expect(meter).toHaveTextContent("xHigh");
+    fireEvent.click(screen.getByRole("button", { name: "Reset Effort" }));
+    expect(meter).toHaveTextContent("Default");
+    expect(explicit).toHaveFocus();
+    expect(screen.queryByRole("button", { name: "Reset Effort" })).toBeNull();
+
     fireEvent.click(screen.getByTestId("project-settings-save"));
     await waitFor(() =>
       expect(updateMock).toHaveBeenCalledWith("p_1", {
@@ -2317,7 +2362,7 @@ describe("ProjectSettingsDialog", () => {
       expect(screen.getByTestId("project-settings-host-model-h1")).toHaveTextContent(
         "project-model",
       );
-      await pickOption("project-settings-host-effort-h1", "High");
+      fireEvent.click(screen.getByTestId("project-settings-host-effort-h1-high"));
       fireEvent.click(screen.getByTestId("project-settings-host-speed-h1"));
       expect(screen.queryByRole("option", { name: "Fast" })).not.toBeInTheDocument();
       fireEvent.keyDown(screen.getByRole("listbox"), { key: "Escape" });

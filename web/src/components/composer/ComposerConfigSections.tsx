@@ -6,6 +6,7 @@ import {
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import { MenuLevelRow } from "@/components/ui/level-meter";
 import { type NativeModelLabelFields, nativeModelLabel } from "@/lib/composerModelLabel";
 import {
   MODEL_CATALOG_BROWSE_MIN,
@@ -43,6 +44,12 @@ export interface ComposerConfigSection {
   // loading/empty note. Page-local because it varies per surface.
   leading?: ReactNode;
   choices: ComposerConfigChoice[];
+  /** Opt-in energy-block effort row; the Default choice stays data-only. */
+  level?: {
+    label: string;
+    inherited?: string | null;
+    onUnset?: () => void;
+  };
 }
 
 function ConfigChoices({ choices }: { choices: readonly ComposerConfigChoice[] }) {
@@ -294,7 +301,29 @@ export function ComposerConfigSections({
           {index > 0 && <DropdownMenuSeparator />}
           <PickerSectionHeader>{section.header}</PickerSectionHeader>
           {section.leading}
-          {section === models && browseModels ? (
+          {section.level ? (
+            <MenuLevelRow
+              label={section.level.label}
+              options={section.choices
+                .filter((choice) => choice.key !== "__default__")
+                .map((choice) => ({
+                  value: choice.key,
+                  label: typeof choice.label === "string" ? choice.label : choice.key,
+                  testId: choice.testId,
+                }))}
+              value={
+                section.choices.find((choice) => choice.checked && choice.key !== "__default__")
+                  ?.key ?? null
+              }
+              inherited={section.level.inherited}
+              disabled={section.choices.some((choice) => choice.disabled)}
+              onChange={(next) => {
+                if (next === null) section.level?.onUnset?.();
+                else section.choices.find((choice) => choice.key === next)?.onSelect?.();
+              }}
+              onUnset={section.level.onUnset}
+            />
+          ) : section === models && browseModels ? (
             <ModelCatalogChoices testId={section.testId} choices={section.choices} />
           ) : (
             <ConfigChoices choices={section.choices} />

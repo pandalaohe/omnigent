@@ -1,11 +1,20 @@
+import { useState } from "react";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ComposerConfigSections,
   type ComposerConfigChoice,
   type ComposerConfigSection,
 } from "./ComposerConfigSections";
-import { DropdownMenu, DropdownMenuContent } from "@/components/ui/dropdown-menu";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+} from "@/components/ui/dropdown-menu";
 import { nativeModelLabel } from "@/lib/composerModelLabel";
 
 afterEach(cleanup);
@@ -227,6 +236,87 @@ describe("ComposerConfigSections", () => {
       within(screen.getByTestId("new-chat-landing-agent-models")).getByLabelText("Search models"),
     ).toBeInTheDocument();
   });
+});
+
+describe("effort level rows in a real Radix submenu", () => {
+  it.each([true, false])(
+    "moves focus by row and edits by lateral keys without closing (unset=%s)",
+    async (allowUnset) => {
+      const user = userEvent.setup();
+      function EffortSubmenu() {
+        const [value, setValue] = useState<string | null>("low");
+        return (
+          <DropdownMenu open>
+            <DropdownMenuContent>
+              <DropdownMenuSub>
+                <DropdownMenuSubTrigger>Configure</DropdownMenuSubTrigger>
+                <DropdownMenuSubContent>
+                  <DropdownMenuItem>Before row</DropdownMenuItem>
+                  <ComposerConfigSections
+                    efforts={{
+                      testId: "efforts",
+                      header: "Effort",
+                      level: {
+                        label: "Effort",
+                        onUnset: allowUnset ? () => setValue(null) : undefined,
+                      },
+                      choices: [
+                        {
+                          key: "__default__",
+                          label: "Default",
+                          checked: value === null,
+                          onSelect: () => setValue(null),
+                        },
+                        ...["low", "medium", "high"].map((level) => ({
+                          key: level,
+                          label: level[0].toUpperCase() + level.slice(1),
+                          checked: value === level,
+                          onSelect: () => setValue(level),
+                          testId: `effort-${level}`,
+                        })),
+                      ],
+                    }}
+                  />
+                  <DropdownMenuItem>After row</DropdownMenuItem>
+                </DropdownMenuSubContent>
+              </DropdownMenuSub>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        );
+      }
+
+      render(<EffortSubmenu />);
+      const trigger = screen.getByRole("menuitem", { name: "Configure" });
+      trigger.focus();
+      await user.keyboard("{ArrowRight}");
+      const efforts = await screen.findByTestId("efforts");
+      const row = within(efforts).getByRole("menuitem");
+      const before = screen.getByRole("menuitem", { name: "Before row" });
+      const after = screen.getByRole("menuitem", { name: "After row" });
+      expect(within(row).queryByRole("menuitemcheckbox", { name: "Default" })).toBeNull();
+
+      before.focus();
+      await user.keyboard("{ArrowDown}");
+      expect(row).toHaveFocus();
+      await user.keyboard("{ArrowDown}");
+      expect(after).toHaveFocus();
+      await user.keyboard("{ArrowUp}");
+      expect(row).toHaveFocus();
+      expect(screen.getByTestId("effort-low")).toHaveAttribute("aria-pressed", "true");
+
+      await user.keyboard("{ArrowRight}");
+      expect(screen.getByTestId("effort-medium")).toHaveAttribute("aria-pressed", "true");
+      expect(row).toHaveFocus();
+      await user.keyboard("{ArrowRight}{ArrowLeft}{ArrowLeft}");
+      expect(screen.getByTestId("effort-low")).toHaveAttribute("aria-pressed", "true");
+      expect(row).toHaveFocus();
+      await user.keyboard("{ArrowLeft}");
+      expect(row).toHaveTextContent(allowUnset ? "Default" : "Effort: Low");
+      expect(row).toHaveFocus();
+      expect(efforts).toBeVisible();
+      expect(screen.getAllByRole("menu")).toHaveLength(2);
+    },
+  );
 });
 
 // A Pi-style mixed catalog: Claude from two hosts, GPT, Gemini, GLM, Kimi, and

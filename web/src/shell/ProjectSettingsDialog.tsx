@@ -35,7 +35,8 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { EFFORT_SELECT_NONE, MODEL_SELECT_DEFAULT } from "@/components/HarnessConfigControls";
+import { MODEL_SELECT_DEFAULT } from "@/components/HarnessConfigControls";
+import { LevelMeter } from "@/components/ui/level-meter";
 import {
   Select,
   SelectContent,
@@ -575,48 +576,40 @@ function HostModelSelect({
   );
 }
 
-/** A "Default"-clearing effort dropdown over the harness's effort ladder. */
-function HostEffortSelect({
+/** A "Default"-clearing effort meter over the harness's effort ladder. */
+function HostEffortMeter({
   value,
   levels,
   testId,
   disabled,
   onOpen,
-  onOpenChange,
   onChange,
-  inheritLabel,
+  inherited,
 }: {
   value: string | null;
   levels: readonly string[];
   testId: string;
   disabled?: boolean;
   onOpen?: () => void;
-  onOpenChange?: (open: boolean) => void;
   onChange: (effort: string | null) => void;
-  inheritLabel?: string;
+  inherited?: string | null;
 }) {
   return (
-    <Select
-      value={value ?? EFFORT_SELECT_NONE}
-      onValueChange={onPick((next) => onChange(next === EFFORT_SELECT_NONE ? null : next))}
-      onOpenChange={(open) => {
-        if (open) onOpen?.();
-        onOpenChange?.(open);
-      }}
-      disabled={disabled}
-    >
-      <SelectTrigger className="h-8 w-full min-w-0" aria-label="Effort" data-testid={testId}>
-        <SelectValue>{value === null ? (inheritLabel ?? "Default") : undefined}</SelectValue>
-      </SelectTrigger>
-      <SelectContent position="popper" align="start" className="w-(--radix-select-trigger-width)">
-        <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
-        {levels.map((level) => (
-          <SelectItem key={level} value={level}>
-            {normalizeEffortLabel(level)}
-          </SelectItem>
-        ))}
-      </SelectContent>
-    </Select>
+    <div data-testid={testId} onFocusCapture={() => onOpen?.()}>
+      <LevelMeter
+        label="Effort"
+        options={levels.map((level) => ({
+          value: level,
+          label: normalizeEffortLabel(level),
+          testId: `${testId}-${level}`,
+        }))}
+        value={value}
+        inherited={inherited}
+        onChange={onChange}
+        disabled={disabled}
+        stretch
+      />
+    </div>
   );
 }
 
@@ -1767,17 +1760,15 @@ export function ProjectSettingsDialog({
         </Field>
         <Field label="Effort" hint="Default thinking effort for new sessions on this host">
           <div className="flex min-w-0 gap-1">
-            <HostEffortSelect
+            <HostEffortMeter
               value={set.effort}
               levels={levels}
-              inheritLabel={inheritedFieldLabel(row, harness, "effort")}
+              inherited={inheritedFor(row, harness, "effort").value ?? null}
               testId={`project-settings-host-effort-${row.hostId}`}
               disabled={isLoading || saving}
               onOpen={() => ensureCatalog(row.hostId, harness)}
-              onOpenChange={onDropdownOpenChange}
               onChange={(next) => setHarnessField(row.hostId, harness, "effort", next)}
             />
-            {resetField("effort")}
           </div>
         </Field>
         {(["speed", "permission"] as const).map((field) =>
@@ -2134,14 +2125,13 @@ export function ProjectSettingsDialog({
                       onOpenChange={onDropdownOpenChange}
                       onChange={(next) => setHarnessField(row.hostId, harness, "model", next)}
                     />
-                    <HostEffortSelect
+                    <HostEffortMeter
                       value={set.effort}
                       levels={levels}
-                      inheritLabel={inheritedFieldLabel(row, harness, "effort")}
+                      inherited={inheritedFor(row, harness, "effort").value ?? null}
                       testId={`project-settings-host-other-effort-${row.hostId}-${harness}`}
                       disabled={disabled}
                       onOpen={() => ensureCatalog(row.hostId, harness)}
-                      onOpenChange={onDropdownOpenChange}
                       onChange={(next) => setHarnessField(row.hostId, harness, "effort", next)}
                     />
                     {(["speed", "permission"] as const).map((field) => (

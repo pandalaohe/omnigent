@@ -245,6 +245,7 @@ describe("shared composer controls", () => {
         label="Codex configuration"
         model="GPT-5.6-Sol"
         effort="High"
+        effortLevel={{ level: 3, total: 5, title: "Effort: High" }}
         icon={<span data-testid="product-icon" />}
       />,
     );
@@ -261,6 +262,10 @@ describe("shared composer controls", () => {
       "GPT-5.6-Sol",
     );
     expect(screen.getByTestId("composer-agent-effort-value")).not.toHaveClass("hidden");
+    const glyph = screen.getByRole("img", { name: "Effort: High" });
+    expect(glyph.querySelectorAll(".bg-companion")).toHaveLength(3);
+    expect(screen.getByTestId("composer-agent-effort-glyph")).not.toHaveClass("hidden");
+    expect(screen.getByTestId("composer-agent-config-value")).not.toContainElement(glyph);
     expect(screen.getByTestId("product-icon")).toBeInTheDocument();
     expect(screen.getByTestId("composer-agent-config-value")).toHaveClass(
       COMPOSER_COLLAPSED_LABEL_CLASS,

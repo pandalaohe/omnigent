@@ -141,6 +141,15 @@ export function SideChatSettings({
   const supportsEffort = shouldShowEffortPicker(capabilities, family);
   const efforts = supportsEffort ? effortLevelsForConv(capabilities, options, model, family) : [];
   const showModels = kind !== null && options.length > 0;
+  const inheritedEffort = selectedModel?.defaultReasoningEffort ?? null;
+  const currentEffort = effort ?? inheritedEffort;
+  const effortLevel = efforts.length
+    ? {
+        level: efforts.findIndex((level) => level === currentEffort) + 1,
+        total: efforts.length,
+        title: `Effort: ${formatStatusEffortLabel(effort) ?? "Default"}`,
+      }
+    : undefined;
   if (
     !settingsSupported ||
     (nativeSession && (!nativeSide || draft)) ||
@@ -210,12 +219,14 @@ export function SideChatSettings({
             ? {
                 testId: "side-chat-efforts",
                 header: "Effort",
+                level: { label: "Effort", inherited: inheritedEffort },
                 choices: efforts.map((level) => ({
                   key: level,
                   label: formatStatusEffortLabel(level) ?? level,
                   checked: effort === level,
                   disabled,
                   onSelect: () => void save({ reasoningEffort: level }),
+                  testId: `side-chat-effort-${level}`,
                   data: { "data-effort-level": level },
                 })),
               }
@@ -238,6 +249,7 @@ export function SideChatSettings({
         label: "Side chat model and effort",
         model: compactModelTriggerLabel(modelLabel),
         effort: formatStatusEffortLabel(effort) ?? undefined,
+        effortLevel,
         icon: (
           <ComposerAgentIcon
             agent={{

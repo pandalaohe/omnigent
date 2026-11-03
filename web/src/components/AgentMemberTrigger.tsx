@@ -126,6 +126,19 @@ export function AgentMemberTrigger({
       : (modelOptions.find((option) => option.id === model)?.label ?? model);
   const effortLabel =
     effort !== null && effortLevels !== null ? normalizeEffortLabel(effort) : undefined;
+  const inheritedEffort =
+    (model === null
+      ? rows.find((option) => option.isDefault)
+      : rows.find((option) => option.id === model)
+    )?.defaultReasoningEffort ?? null;
+  const currentEffort = effort ?? inheritedEffort;
+  const effortLevel = effortLevels?.length
+    ? {
+        level: effortLevels.findIndex((level) => level === currentEffort) + 1,
+        total: effortLevels.length,
+        title: `Effort: ${effortLabel ?? "Default"}`,
+      }
+    : undefined;
   const memberHost = hosts?.find((host) => host.host_id === hostId);
   const hostLabel =
     hostId === null
@@ -194,6 +207,7 @@ export function AgentMemberTrigger({
         label: [harnessLabel, modelLabel, effortLabel, speedLabel].filter(Boolean).join(" · "),
         model: modelLabel,
         effort: [effortLabel, speedLabel].filter(Boolean).join(" · ") || undefined,
+        effortLevel,
         icon: <ComposerAgentIcon agent={{ name: "", harness }} sdkMarkClassName="size-[15px]" />,
         testIdPrefix: "agent-member",
         disabled,
@@ -369,6 +383,11 @@ export function AgentMemberTrigger({
             efforts={{
               testId: "agent-member-efforts",
               header: "Effort",
+              level: {
+                label: "Effort",
+                inherited: inheritedEffort,
+                onUnset: () => selectEffort(null),
+              },
               choices: [
                 {
                   key: DEFAULT_ROW_KEY,

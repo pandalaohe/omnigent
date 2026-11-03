@@ -2157,10 +2157,9 @@ describe("Antigravity fork controls", () => {
     fireEvent.click(screen.getByRole("option", { name: "Plan" }));
     fireEvent.click(screen.getByTestId("fork-session-config-model"));
     fireEvent.click(screen.getByRole("option", { name: "GPT OSS" }));
-    fireEvent.click(screen.getByTestId("fork-session-config-effort"));
-    expect(screen.queryByRole("option", { name: "High" })).toBeNull();
-    expect(screen.queryByRole("option", { name: "Low" })).toBeNull();
-    fireEvent.click(screen.getByRole("option", { name: "Medium" }));
+    expect(screen.queryByTestId("fork-session-config-effort-high")).toBeNull();
+    expect(screen.queryByTestId("fork-session-config-effort-low")).toBeNull();
+    fireEvent.click(screen.getByTestId("fork-session-config-effort-medium"));
     fireEvent.click(screen.getByTestId("fork-session-submit"));
     await waitFor(() => expect(forkSessionMock).toHaveBeenCalledOnce());
     expect(forkSessionMock.mock.calls[0][1]?.config).toEqual({

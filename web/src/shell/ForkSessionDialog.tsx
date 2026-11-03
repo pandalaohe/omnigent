@@ -41,6 +41,7 @@ import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { partitionAgentsByKind } from "@/lib/agentGrouping";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useSession } from "@/hooks/useSession";
+import { LevelMeter } from "@/components/ui/level-meter";
 import { effortLevelsFor, reconcileEffortOnModelChange } from "@/lib/modelEffortOptions";
 import { effectiveWorktree, type Session } from "@/lib/types";
 import { useHosts, useHostModelOptions, type Host } from "@/hooks/useHosts";
@@ -604,6 +605,11 @@ function ForkRunConfig({
         ) ?? []
       ).map((value) => ({ value, label: value[0].toUpperCase() + value.slice(1) }))
     : CLAUDE_NATIVE_EFFORTS;
+  const inheritedEffort =
+    (model === MODEL_SELECT_DEFAULT
+      ? modelOptions.find((option) => option.isDefault)
+      : modelOptions.find((option) => option.id === model)
+    )?.defaultReasoningEffort ?? null;
 
   return (
     <div className="flex flex-col gap-4" data-testid="fork-session-run-config">
@@ -635,28 +641,19 @@ function ForkRunConfig({
       {(hasPermission || hasAgyMode) && (
         <>
           <ForkConfigRow label="Effort">
-            <Select
-              value={effort}
-              onValueChange={changeEffort}
-              componentId="fork_session.config.effort"
-              valueHasNoPii
-            >
-              <SelectTrigger
-                className="w-full cursor-pointer text-sm"
-                data-testid="fork-session-config-effort"
-                aria-label="Reasoning effort"
-              >
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent position="popper" align="start" className={FORK_SELECT_ITEM_SM}>
-                <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
-                {effortOptions.map((e) => (
-                  <SelectItem key={e.value} value={e.value}>
-                    {e.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            <div className="w-full" data-testid="fork-session-config-effort">
+              <LevelMeter
+                label="Reasoning effort"
+                options={effortOptions.map((option) => ({
+                  ...option,
+                  testId: `fork-session-config-effort-${option.value}`,
+                }))}
+                value={effort === EFFORT_SELECT_NONE ? null : effort}
+                inherited={inheritedEffort}
+                onChange={(next) => changeEffort(next ?? EFFORT_SELECT_NONE)}
+                stretch
+              />
+            </div>
           </ForkConfigRow>
 
           {hasPermission && (

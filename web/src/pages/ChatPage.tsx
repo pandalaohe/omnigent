@@ -6046,22 +6046,45 @@ function SessionHarnessPicker({
     current: string | null,
     routed: boolean,
     onSelect: (effort: string) => void,
-  ): ComposerConfigSection => ({
-    testId: "composer-agent-efforts",
-    header: modelPickerKind === "pi" ? "Thinking level" : "Effort",
-    choices: levels.map((effort) => ({
-      key: effort,
-      label: formatStatusEffortLabel(effort) ?? effort,
-      checked: !routed && effort === current,
-      disabled: routed || busy || pendingModelChange !== null,
-      onSelect: () => onSelect(effort),
-      testId: `composer-agent-effort-${effort}`,
-      data: { "data-effort-level": effort },
-    })),
-  });
+    model: string | null | undefined,
+  ): ComposerConfigSection => {
+    const header = modelPickerKind === "pi" ? "Thinking level" : "Effort";
+    const inherited = model
+      ? (findNativeModelOption(codexModelOptions, model)?.defaultReasoningEffort ?? null)
+      : (codexModelOptions.find((option) => option.isDefault)?.defaultReasoningEffort ?? null);
+    return {
+      testId: "composer-agent-efforts",
+      header,
+      level: { label: header, inherited },
+      choices: levels.map((effort) => ({
+        key: effort,
+        label: formatStatusEffortLabel(effort) ?? effort,
+        checked: !routed && effort === current,
+        disabled: routed || busy || pendingModelChange !== null,
+        onSelect: () => onSelect(effort),
+        testId: `composer-agent-effort-${effort}`,
+        data: { "data-effort-level": effort },
+      })),
+    };
+  };
   const effortSection =
     showEffort && availableEfforts.length > 0
-      ? buildEffortSection(availableEfforts, selectedEffort, routingOn, selectEffort)
+      ? buildEffortSection(
+          availableEfforts,
+          selectedEffort,
+          routingOn,
+          selectEffort,
+          pickerSelectedModel,
+        )
+      : undefined;
+  const currentEffort = selectedEffort ?? effortSection?.level?.inherited ?? null;
+  const effortLevel =
+    effortSection && !routingOn
+      ? {
+          level: availableEfforts.findIndex((level) => level === currentEffort) + 1,
+          total: availableEfforts.length,
+          title: `${modelPickerKind === "pi" ? "Thinking level" : "Effort"}: ${effortLabel ?? "Default"}`,
+        }
       : undefined;
   const fusionSections: readonly ComposerConfigSection[] | undefined =
     composerFusion !== undefined && fusionSelected && !routingOn
@@ -6137,6 +6160,7 @@ function SessionHarnessPicker({
             staged?.effort ?? selectedEffort,
             cycleRoutingOn,
             stageEffort,
+            cycleModel,
           )
         : undefined;
   const applyCycle = () => {
@@ -6240,6 +6264,7 @@ function SessionHarnessPicker({
         label: "Configure session",
         model: label,
         effort: effortLabel ?? undefined,
+        effortLevel,
         icon: membersMenu ? (
           <UsersIcon className="size-4 shrink-0" aria-hidden="true" />
         ) : (
