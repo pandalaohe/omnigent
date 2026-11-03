@@ -2,7 +2,7 @@
 
 ``_native_startup_instructions_from_spec`` is the seam that turns a session's
 ``AgentSpec`` into the value passed to the managed-host launch paths'
-startup-additive channels: claude-native's ``--append-system-prompt``
+startup-additive channels: claude-native's ``--append-system-prompt-file``
 (``_auto_create_claude_terminal``) and codex-native's ``developer_instructions``
 (``_auto_create_codex_terminal``). It composes the author's text with the
 spec-level framework instructions that apply to every turn of the session —

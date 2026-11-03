@@ -3062,6 +3062,7 @@ def augment_claude_args(
     disallowed_tools: Sequence[str] = (),
     subagent_router_dir: Path | None = None,
     turn_routing: bool = False,
+    configured_args: tuple[str, ...] = (),
 ) -> list[str]:
     """
     Return Claude CLI args with Omnigent MCP/hook/skill injection.
@@ -3104,7 +3105,8 @@ def augment_claude_args(
         ``--setting-sources`` exactly as the SDK executor maps it onto
         ``setting_sources``. Defaults to ``"all"``.
     :param append_system_prompt: Composed startup instructions, appended
-        through Claude Code's native prompt flag or a private file.
+        through a private file (``--append-system-prompt-file``), or inline
+        (``--append-system-prompt``) when the caller passes its own prompt flag.
     :param allowed_tools: Optional narrowly scoped Claude tool names to merge
         into ``--allowedTools`` without replacing the user's allowlist.
     :param disallowed_tools: Optional Claude tool names to merge into
@@ -3118,6 +3120,8 @@ def augment_claude_args(
         Routing on, threaded to :func:`build_hook_settings` so the
         ``UserPromptSubmit`` first-message routing hook is registered.
         ``False`` keeps every prompt off the routing round trip.
+    :param configured_args: Configured harness args the launcher prepends to the
+        result; only checked for a caller prompt flag, never returned.
     :returns: Augmented argument list for the terminal resource.
     """
     mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
@@ -3151,8 +3155,11 @@ def augment_claude_args(
         ]
     )
     prompt_path = bridge_dir / "startup-instructions.txt"
-    # Large argv strings fail at exec on Linux; files preserve the full text.
-    if append_system_prompt and len(append_system_prompt.encode("utf-8")) >= 64 * 1024:
+    # tmux rejects a launch command over 16 KB and Linux caps argv, so pass startup text by file.
+    # With a caller prompt flag the text stays inline (Claude rejects both), so >16 KB still fails.
+    if append_system_prompt and not (
+        _has_prompt_flag(claude_args) or _has_prompt_flag(configured_args)
+    ):
         _write_text_file(prompt_path, append_system_prompt)
         args.extend(["--append-system-prompt-file", str(prompt_path)])
     else:
@@ -3222,6 +3229,16 @@ def _args_request_bypass_permissions(args: tuple[str, ...]) -> bool:
     return "--dangerously-skip-permissions" in args or (
         _arg_value(args, "--permission-mode") == "bypassPermissions"
     )
+
+
+def _has_prompt_flag(args: tuple[str, ...]) -> bool:
+    """Whether ``args`` carry a Claude prompt flag before a ``--``, in spaced or ``=`` form."""
+    for arg in args:
+        if arg == "--":
+            return False
+        if arg.partition("=")[0] in ("--append-system-prompt", "--append-system-prompt-file"):
+            return True
+    return False
 
 
 def _merge_allowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:

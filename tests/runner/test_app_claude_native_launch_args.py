@@ -17,6 +17,7 @@ import json
 import logging
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -656,7 +657,7 @@ def test_auto_harness_launch_names_the_routed_spawn_tool_and_preapproves_it(
     """
     args = _augmented(bridge_dir, auto_harness=True)
 
-    note = args[args.index("--append-system-prompt") + 1]
+    note = Path(args[args.index("--append-system-prompt-file") + 1]).read_text(encoding="utf-8")
     assert "mcp__omnigent__sys_session_create" in note
     assert "mcp__omnigent__sys_agent_list" in note
     # Bare spellings would send the model looking for a tool Claude does not
@@ -685,7 +686,7 @@ def test_pinned_harness_launch_argv_is_unchanged(bridge_dir: Path) -> None:
     )
 
     assert _augmented(bridge_dir, auto_harness=False) == baseline
-    assert "--append-system-prompt" not in baseline
+    assert "--append-system-prompt-file" not in baseline
     assert "--allowedTools" not in baseline
 
 
@@ -1331,6 +1332,7 @@ async def _auto_create_claude_terminal_for_test(
     session_id: str,
     workspace: Path,
     registry: object,
+    global_instructions: str | None = None,
 ) -> None:
     """
     Run ``_auto_create_claude_terminal`` with host config and diagnostics stubbed.
@@ -1339,6 +1341,7 @@ async def _auto_create_claude_terminal_for_test(
     :param session_id: Session id, e.g. ``"conv_seed_launch_env"``.
     :param workspace: Session workspace, e.g. the ``bridge_dir`` fixture.
     :param registry: Session resource registry double.
+    :param global_instructions: Startup text for the session, e.g. ``"Be brief."``.
     :returns: None. Raises whatever the auto-create path raises.
     """
     from unittest.mock import AsyncMock, Mock
@@ -1360,7 +1363,62 @@ async def _auto_create_claude_terminal_for_test(
         session_init=_claude_auto_create_session_init(session_id, workspace),
         auth_token_factory=lambda: None,
         resolve_launch_config=AsyncMock(return_value=None),
+        global_instructions=global_instructions,
     )
+
+
+@pytest.mark.parametrize("configured", [False, True], ids=["no-config-flag", "config-flag"])
+async def test_auto_create_claude_terminal_startup_text_follows_configured_prompt_flag(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    configured: bool,
+) -> None:
+    """
+    Configured ``harness.claude-native.args`` are prepended after augmentation, yet count.
+
+    Startup text goes by file unless the config carries its own prompt flag,
+    which Claude rejects beside a file flag; then it stays inline.
+
+    :param configured: Whether the configured args carry a prompt flag.
+    """
+    from unittest.mock import Mock
+
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+
+    launched: list[list[str]] = []
+
+    def record_launch(*, spec: Any, **_kwargs: object) -> None:
+        launched.append(list(spec.args))
+        raise RuntimeError("stop after launch")
+
+    registry = Mock(spec=SessionResourceRegistry)
+    registry.launch_required_terminal.side_effect = record_launch
+    config_args = ["--append-system-prompt", "configured"] if configured else ["--verbose"]
+    monkeypatch.setattr(
+        "omnigent.harness_startup_config.resolve_harness_args",
+        lambda _harness, cli_args, cfg=None: [*config_args, *cli_args],
+    )
+
+    with pytest.raises(RuntimeError, match="stop after launch"):
+        await _auto_create_claude_terminal_for_test(
+            monkeypatch,
+            session_id="conv_configured_prompt",
+            workspace=bridge_dir,
+            registry=registry,
+            global_instructions="Be brief.",
+        )
+
+    args = launched[0]
+    assert args[: len(config_args)] == config_args
+    if configured:
+        assert "--append-system-prompt-file" not in args
+        inline = [args[i + 1] for i, arg in enumerate(args) if arg == "--append-system-prompt"]
+        assert inline[0] == "configured"
+        assert "Be brief." in inline[1]
+    else:
+        assert "--append-system-prompt" not in args
+        prompt_path = Path(args[args.index("--append-system-prompt-file") + 1])
+        assert "Be brief." in prompt_path.read_text(encoding="utf-8")
 
 
 async def test_auto_create_claude_terminal_seeds_trust_with_launch_env(
