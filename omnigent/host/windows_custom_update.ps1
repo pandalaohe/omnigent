@@ -1,21 +1,18 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$InstructionPath,
-    [Parameter(Mandatory = $true)]
-    [string]$ResultPath,
-    [Parameter(Mandatory = $true)]
-    [string]$LogPath,
-    [Parameter(Mandatory = $true)]
-    [string]$LockPath,
-    [Parameter(Mandatory = $true)]
-    [string]$WrapperPath,
-    [Parameter(Mandatory = $true)]
-    [string]$OldCommit,
-    [Parameter(Mandatory = $true)]
-    [string]$TargetCommit,
-    [Parameter(Mandatory = $true)]
-    [string]$HostId,
-    [string]$ConstraintsDirectory = ''
+    [string]$ResultPath = '',
+    [string]$LogPath = '',
+    [string]$LockPath = '',
+    [string]$WrapperPath = '',
+    [string]$OldCommit = '',
+    [string]$TargetCommit = '',
+    [string]$HostId = '',
+    [string]$ConstraintsDirectory = '',
+    [switch]$RecoverOnly,
+    [switch]$ResumeAutostart,
+    [switch]$InstallerOnly,
+    [string]$TransactionPath = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -36,11 +33,13 @@ function Add-UpdateLog {
 function Invoke-CapturedProcess {
     param(
         [string[]]$Arguments,
-        [hashtable]$Environment = @{}
+        [hashtable]$Environment = @{},
+        [int]$TimeoutSeconds = 30,
+        [scriptblock]$OnWait = {}
     )
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $Arguments[0]
-    foreach ($argument in $Arguments[1..($Arguments.Count - 1)]) {
+    foreach ($argument in ($Arguments | Select-Object -Skip 1)) {
         $startInfo.ArgumentList.Add($argument)
     }
     $startInfo.UseShellExecute = $false
@@ -57,19 +56,48 @@ function Invoke-CapturedProcess {
     }
     $stdoutTask = $process.StandardOutput.ReadToEndAsync()
     $stderrTask = $process.StandardError.ReadToEndAsync()
-    $process.WaitForExit()
-    return [ordered]@{
-        ExitCode = $process.ExitCode
-        Stdout = $stdoutTask.GetAwaiter().GetResult()
-        Stderr = $stderrTask.GetAwaiter().GetResult()
+    try {
+        $deadline = [DateTimeOffset]::UtcNow.AddSeconds([Math]::Max(1, $TimeoutSeconds))
+        do {
+            & $OnWait
+            if ($process.WaitForExit(100)) { break }
+            if ([DateTimeOffset]::UtcNow -ge $deadline) {
+                try { $process.Kill($true) } catch [InvalidOperationException] {}
+                if (-not $process.WaitForExit(5000)) { throw 'Timed-out native command did not exit.' }
+                throw "Native command timed out after $TimeoutSeconds seconds: $($Arguments[0])"
+            }
+        } while ($true)
+        if (-not $stdoutTask.Wait(5000) -or -not $stderrTask.Wait(5000)) {
+            throw "Native command output did not close: $($Arguments[0])"
+        }
+        return [ordered]@{
+            ExitCode = $process.ExitCode
+            Stdout = $stdoutTask.GetAwaiter().GetResult()
+            Stderr = $stderrTask.GetAwaiter().GetResult()
+        }
+    } finally {
+        if (-not $process.HasExited) {
+            try { $process.Kill($true); [void]$process.WaitForExit(5000) } catch [InvalidOperationException] {}
+        }
+        $process.Dispose()
     }
 }
 
 function Restart-HostSupervisor {
-    param([string]$WrapperPath)
-    $output = & $WrapperPath start 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw "Host supervisor restart exited with status ${LASTEXITCODE}: $output"
+    param([string]$WrapperPath, [string]$Action = 'start',
+          [object]$Instruction = $null, [Collections.IDictionary]$Result = $null)
+    $capture = {
+        if ($Instruction -and $Result) { Save-ReplacementHostSnapshot $Instruction $Result }
+    }
+    $output = Invoke-CapturedProcess @(
+        (Get-Command pwsh).Source, '-NoProfile', '-Command',
+        '& $env:OMNIGENT_HOST_SERVICE_WRAPPER $env:OMNIGENT_HOST_SERVICE_ACTION; exit $LASTEXITCODE'
+    ) @{
+        OMNIGENT_HOST_SERVICE_WRAPPER = $WrapperPath
+        OMNIGENT_HOST_SERVICE_ACTION = $Action
+    } -TimeoutSeconds 30 -OnWait $capture
+    if ($output.ExitCode -ne 0) {
+        throw "Host supervisor $Action exited with status $($output.ExitCode): $($output.Stderr)"
     }
 }
 
@@ -147,6 +175,12 @@ function Test-PathHoldsToolVenv {
     if ($cliNorm -and $cmdNorm.Contains($cliNorm)) {
         return $true
     }
+    foreach ($loadedPath in $ProcessRow.LoadedPaths) {
+        $loadedNorm = ConvertTo-NormalizedWindowsPath ([string]$loadedPath)
+        if ($venvNorm -and $loadedNorm.StartsWith("$venvNorm\")) {
+            return $true
+        }
+    }
     $nameNorm = if ($ProcessRow.Name) { ([string]$ProcessRow.Name).ToLowerInvariant() } else { '' }
     if (-not $exeNorm -and -not $cmdNorm -and $nameNorm -in @('omni.exe', 'omnigent.exe', 'omni', 'omnigent')) {
         return $true
@@ -156,14 +190,27 @@ function Test-PathHoldsToolVenv {
 
 function Get-ProcessTable {
     $rows = @()
+    $loadedByPid = @{}
+    $createdByPid = @{}
+    foreach ($process in Get-Process -ErrorAction SilentlyContinue) {
+        try {
+            $createdByPid[[int]$process.Id] = $process.StartTime.ToFileTimeUtc() / 10000000.0 - 11644473600.0
+            $loadedByPid[[int]$process.Id] = @($process.Modules | ForEach-Object { $_.FileName })
+        } catch {
+            # Protected/exited processes may be uninspectable. Exclusive file
+            # access below is the final gate, including non-module file handles.
+        }
+    }
     try {
-        $rows = @(Get-CimInstance Win32_Process -ErrorAction Stop | ForEach-Object {
+        $rows = @(Get-CimInstance Win32_Process -OperationTimeoutSec 5 -ErrorAction Stop | ForEach-Object {
             [pscustomobject]@{
                 ProcessId = [int]$_.ProcessId
                 ParentProcessId = [int]$_.ParentProcessId
                 Name = [string]$_.Name
                 ExecutablePath = [string]$_.ExecutablePath
                 CommandLine = [string]$_.CommandLine
+                LoadedPaths = @($loadedByPid[[int]$_.ProcessId])
+                CreatedAt = [double]$createdByPid[[int]$_.ProcessId]
             }
         })
     }
@@ -177,6 +224,8 @@ function Get-ProcessTable {
                 Name = [string]$_.ProcessName
                 ExecutablePath = $exePath
                 CommandLine = ''
+                LoadedPaths = @($loadedByPid[[int]$_.Id])
+                CreatedAt = [double]$createdByPid[[int]$_.Id]
             }
         })
     }
@@ -186,100 +235,159 @@ function Get-ProcessTable {
     return $rows
 }
 
+function Get-WindowsProcessArguments {
+    param([object]$Row)
+    $matches = [regex]::Matches([string]$Row.CommandLine, '"[^"]*"|[^\s"]+')
+    $previousEnd = 0
+    foreach ($match in $matches) {
+        $gap = ([string]$Row.CommandLine).Substring($previousEnd, $match.Index - $previousEnd)
+        if ($gap.Trim() -or ($previousEnd -gt 0 -and -not $gap)) { return @() }
+        $previousEnd = $match.Index + $match.Length
+    }
+    if (([string]$Row.CommandLine).Substring($previousEnd).Trim()) { return @() }
+    return @($matches | ForEach-Object { $_.Value.Trim('"').Replace('/', '\').ToLowerInvariant() })
+}
+
+function Get-PowerShellFileInvocation {
+    param([object]$Row)
+    $exe = ConvertTo-NormalizedWindowsPath ([string]$Row.ExecutablePath)
+    if (($exe -split '\\')[-1] -ne 'pwsh.exe') { return $null }
+    $arguments = @(Get-WindowsProcessArguments $Row | Select-Object -Skip 1)
+    for ($index = 0; $index -lt $arguments.Count; $index++) {
+        $option = $arguments[$index]
+        if ($option -eq '-file' -and $index + 1 -lt $arguments.Count) {
+            return [pscustomobject]@{ Script = $arguments[$index + 1]; Arguments = @($arguments | Select-Object -Skip ($index + 2)) }
+        }
+        if ($option -in @('-nologo', '-noprofile', '-noninteractive')) { continue }
+        if ($option -in @('-executionpolicy', '-windowstyle') -and $index + 1 -lt $arguments.Count) { $index++; continue }
+        return $null
+    }
+    return $null
+}
+
+function Test-HostLauncher {
+    param([object]$Row, [string]$CliBinPath)
+    $arguments = @(Get-WindowsProcessArguments $Row | Select-Object -Skip 1)
+    $cli = ConvertTo-NormalizedWindowsPath $CliBinPath
+    $exe = ConvertTo-NormalizedWindowsPath ([string]$Row.ExecutablePath)
+    if ($exe -eq $cli -and $arguments.Count -gt 0 -and $arguments[0] -eq 'host') { return $true }
+    if (-not $cli.EndsWith('\.local\bin\omni.exe')) { return $false }
+    $homePrefix = $cli.Substring(0, $cli.Length - '\.local\bin\omni.exe'.Length)
+    $invoked = Get-PowerShellFileInvocation $Row
+    if ($invoked -and $invoked.Script -eq "$homePrefix\.omnigent\autostart\start-omnigenthostdefault.ps1") { return $true }
+    if (($exe -split '\\')[-1] -notin @('python.exe', 'pythonw.exe')) { return $false }
+    while ($arguments.Count -gt 0 -and $arguments[0] -in @('-i', '-u', '-b', '-e', '-s')) {
+        $arguments = @($arguments | Select-Object -Skip 1)
+    }
+    return $arguments.Count -gt 0 -and $arguments[0] -eq "$homePrefix\.omnigent\autostart\launch-omnigenthost.pyw"
+}
+
+function Test-HostDaemon {
+    param([object]$Row)
+    $exe = ConvertTo-NormalizedWindowsPath ([string]$Row.ExecutablePath)
+    if (($exe -split '\\')[-1] -notin @('python.exe', 'pythonw.exe')) { return $false }
+    $arguments = @(Get-WindowsProcessArguments $Row | Select-Object -Skip 1)
+    while ($arguments.Count -gt 0 -and $arguments[0] -in @('-i', '-u', '-b', '-e', '-s')) {
+        $arguments = @($arguments | Select-Object -Skip 1)
+    }
+    return $arguments.Count -ge 2 -and $arguments[0] -eq '-m' -and (
+        $arguments[1] -eq 'omnigent.host._daemon_entry' -or
+        ($arguments[1] -eq 'omnigent.cli' -and $arguments.Count -ge 3 -and $arguments[2] -eq 'host'))
+}
+
 function Get-StoppedHostTreePids {
-    param(
-        [object[]]$Processes,
-        [int[]]$StoppedHostPids,
-        [string]$ToolVenvPath,
-        [string]$CliBinPath,
-        [int[]]$ExcludedPids
-    )
+    param([object[]]$Processes, [int[]]$StoppedHostPids, [string]$ToolVenvPath,
+          [string]$CliBinPath, [int[]]$ExcludedPids)
     $byPid = @{}
-    $childrenByPpid = @{}
-    foreach ($proc in $Processes) {
-        $pidVal = [int]$proc.ProcessId
-        $ppidVal = [int]$proc.ParentProcessId
-        $byPid[$pidVal] = $proc
-        if (-not $childrenByPpid.ContainsKey($ppidVal)) {
-            $childrenByPpid[$ppidVal] = [System.Collections.Generic.List[int]]::new()
+    foreach ($row in $Processes) { $byPid[[int]$row.ProcessId] = $row }
+    $selected = [Collections.Generic.HashSet[int]]::new()
+    foreach ($seed in $StoppedHostPids) {
+        $row = $byPid[[int]$seed]
+        if (-not $row -or $row.CreatedAt -le 0 -or $seed -in $ExcludedPids -or
+            -not ((Test-HostDaemon $row) -or (Test-HostLauncher $row $CliBinPath))) { continue }
+        [void]$selected.Add([int]$seed)
+        $visited = [Collections.Generic.HashSet[int]]::new()
+        while ($row -and $visited.Add([int]$row.ParentProcessId)) {
+            $parent = $byPid[[int]$row.ParentProcessId]
+            if (-not $parent -or $parent.CreatedAt -le 0 -or $parent.CreatedAt -gt $row.CreatedAt -or $parent.ProcessId -in $ExcludedPids -or
+                -not (Test-HostLauncher $parent $CliBinPath)) { break }
+            [void]$selected.Add([int]$parent.ProcessId)
+            $row = $parent
         }
-        $childrenByPpid[$ppidVal].Add($pidVal)
     }
-
-    $excluded = [System.Collections.Generic.HashSet[int]]::new()
-    foreach ($id in $ExcludedPids) {
-        if ($id -gt 0) { [void]$excluded.Add([int]$id) }
-    }
-
-    $roots = [System.Collections.Generic.HashSet[int]]::new()
-    $deadSeeds = [System.Collections.Generic.HashSet[int]]::new()
-    foreach ($stoppedPid in $StoppedHostPids) {
-        if ($stoppedPid -le 0 -or $excluded.Contains([int]$stoppedPid)) { continue }
-        if (-not $byPid.ContainsKey([int]$stoppedPid)) {
-            [void]$deadSeeds.Add([int]$stoppedPid)
-            continue
-        }
-        $current = $byPid[[int]$stoppedPid]
-        $cmdLower = ([string]$current.CommandLine).ToLowerInvariant()
-        $nameLower = ([string]$current.Name).ToLowerInvariant()
-        $isHostIdentity = $cmdLower.Contains(' host') -or
-            $nameLower -in @('omni.exe', 'omnigent.exe', 'omni', 'omnigent') -or
-            (-not $cmdLower -and (Test-PathHoldsToolVenv -ProcessRow $current -ToolVenvPath $ToolVenvPath -CliBinPath $CliBinPath))
-        if ($isHostIdentity) {
-            [void]$roots.Add([int]$stoppedPid)
-            $visited = [System.Collections.Generic.HashSet[int]]::new()
-            while ($null -ne $current -and [int]$current.ParentProcessId -gt 0 -and -not $visited.Contains([int]$current.ParentProcessId)) {
-                $parentPid = [int]$current.ParentProcessId
-                [void]$visited.Add($parentPid)
-                if (-not $byPid.ContainsKey($parentPid) -or $excluded.Contains($parentPid)) { break }
-                $parent = $byPid[$parentPid]
-                if (Test-PathHoldsToolVenv -ProcessRow $parent -ToolVenvPath $ToolVenvPath -CliBinPath $CliBinPath) {
-                    [void]$roots.Add($parentPid)
-                    $current = $parent
-                    continue
-                }
-                break
+    do {
+        $changed = $false
+        foreach ($row in $Processes) {
+            if ($row.ProcessId -notin $ExcludedPids -and $selected.Contains([int]$row.ParentProcessId) -and
+                $row.CreatedAt -ge $byPid[[int]$row.ParentProcessId].CreatedAt -and
+                -not $selected.Contains([int]$row.ProcessId)) {
+                [void]$selected.Add([int]$row.ProcessId)
+                $changed = $true
             }
         }
-    }
+    } while ($changed)
+    return @($selected | Sort-Object)
+}
 
-    $cliNorm = ConvertTo-NormalizedWindowsPath $CliBinPath
-    $ownerHomePrefix = if ($cliNorm.EndsWith('\.local\bin\omni.exe')) {
-        $cliNorm.Substring(0, $cliNorm.Length - '\.local\bin\omni.exe'.Length) + '\'
-    } else {
-        ''
+function Get-UpdaterAncestorPids {
+    param([object[]]$Processes, [int]$HelperPid)
+    $byPid = @{}
+    foreach ($row in $Processes) { $byPid[[int]$row.ProcessId] = $row }
+    $protected = [Collections.Generic.HashSet[int]]::new()
+    [void]$protected.Add($HelperPid)
+    $current = $byPid[$HelperPid]
+    while ($current) {
+        $parent = $byPid[[int]$current.ParentProcessId]
+        if (-not $parent -or $parent.CreatedAt -le 0 -or
+            $parent.CreatedAt -gt $current.CreatedAt -or
+            -not $protected.Add([int]$parent.ProcessId)) { break }
+        $current = $parent
     }
-    foreach ($proc in $Processes) {
-        $pidVal = [int]$proc.ProcessId
-        if ($excluded.Contains($pidVal)) { continue }
-        $cmdLower = ([string]$proc.CommandLine).Replace('/', '\').ToLowerInvariant()
-        $isSupervisorScript = ($cmdLower.Contains('start-omnigenthostdefault.ps1') -or $cmdLower.Contains('launch-omnigenthost.pyw')) -and
-            (-not $ownerHomePrefix -or $cmdLower.Contains($ownerHomePrefix))
-        if ($isSupervisorScript) {
-            [void]$roots.Add($pidVal)
-        }
-        elseif ($deadSeeds.Contains([int]$proc.ParentProcessId) -and
-            (Test-PathHoldsToolVenv -ProcessRow $proc -ToolVenvPath $ToolVenvPath -CliBinPath $CliBinPath)) {
-            [void]$roots.Add($pidVal)
-        }
-    }
+    return @($protected)
+}
 
-    $tree = [System.Collections.Generic.HashSet[int]]::new()
-    $queue = [System.Collections.Generic.Queue[int]]::new()
-    foreach ($rootPid in $roots) { $queue.Enqueue($rootPid) }
-    while ($queue.Count -gt 0) {
-        $currentPid = $queue.Dequeue()
-        if ($tree.Contains($currentPid) -or $excluded.Contains($currentPid)) { continue }
-        [void]$tree.Add($currentPid)
-        if ($childrenByPpid.ContainsKey($currentPid)) {
-            foreach ($childPid in $childrenByPpid[$currentPid]) {
-                if (-not $tree.Contains($childPid) -and -not $excluded.Contains($childPid)) {
-                    $queue.Enqueue($childPid)
-                }
-            }
+function Get-ManagedHostSnapshot {
+    param([object]$Instruction)
+    $processes = @(Get-ProcessTable)
+    $seeds = @($processes | Where-Object {
+        ((Test-HostDaemon $_) -and (Test-PathHoldsToolVenv $_ $Instruction.tool_venv_path $Instruction.cli_bin_path)) -or
+        (Test-HostLauncher $_ $Instruction.cli_bin_path)
+    } | ForEach-Object { [int]$_.ProcessId })
+    # Startup invokes recovery before launching the Host. Its caller must
+    # survive recovery even though its exact script is a managed launcher.
+    $protected = @(Get-UpdaterAncestorPids $processes $PID)
+    $ids = @(Get-StoppedHostTreePids $processes $seeds $Instruction.tool_venv_path $Instruction.cli_bin_path $protected)
+    return @($processes | Where-Object { $_.ProcessId -in $ids -and $_.CreatedAt -gt 0 } |
+        ForEach-Object { [pscustomobject]@{ pid = [int]$_.ProcessId; created_at = [double]$_.CreatedAt } })
+}
+
+function Save-ReplacementHostSnapshot {
+    param([object]$Instruction, [Collections.IDictionary]$Result)
+    $identities = @($Result.recovery_processes | Where-Object { $null -ne $_ })
+    $changed = $false
+    foreach ($identity in Get-ManagedHostSnapshot $Instruction) {
+        if (-not @($identities | Where-Object { $_.pid -eq $identity.pid -and $_.created_at -eq $identity.created_at }).Count) {
+            $identities += $identity
+            $changed = $true
         }
     }
-    return @($tree | Where-Object { $byPid.ContainsKey($_) } | Sort-Object)
+    if ($changed) {
+        $Result.recovery_processes = $identities
+        Save-Transaction $Instruction $Result $Result.phase
+    }
+}
+
+function Stop-ProcessIdentity {
+    param([object]$Identity)
+    if ([double]$Identity.created_at -le 0) { return }
+    $process = Get-Process -Id ([int]$Identity.pid) -ErrorAction SilentlyContinue
+    if (-not $process) { return }
+    try {
+        $created = $process.StartTime.ToFileTimeUtc() / 10000000.0 - 11644473600.0
+        if ([Math]::Abs($created - [double]$Identity.created_at) -gt 0.00001) { return }
+        $process.Kill()
+        if (-not $process.WaitForExit(5000)) { throw "Process $($Identity.pid) did not exit." }
+    } finally { $process.Dispose() }
 }
 
 function Get-VenvLockingProcesses {
@@ -300,67 +408,352 @@ function Get-VenvLockingProcesses {
 }
 
 function Wait-CustomHostVenvReleased {
-    param(
-        [object]$Instruction,
-        [string]$LogPath,
-        [int]$HelperPid,
-        [int]$GraceSeconds = 2,
-        [int]$TimeoutSeconds = 15
-    )
+    param([object]$Instruction, [string]$LogPath, [int]$HelperPid,
+          [int]$GraceSeconds = 2, [int]$TimeoutSeconds = 15, [object[]]$Identities = @())
     $toolVenvPath = Get-ToolVenvPath $Instruction
     $cliBinPath = Get-CliBinPath $Instruction
-    $stoppedHostPids = @()
-    if ($null -ne $Instruction.previous_records) {
-        foreach ($record in $Instruction.previous_records) {
-            if ($null -ne $record.pid -and [int]$record.pid -gt 0) {
-                $stoppedHostPids += [int]$record.pid
-            }
-        }
+    $protected = @(Get-UpdaterAncestorPids @(Get-ProcessTable) $HelperPid)
+    if (-not $Identities.Count) {
+        $Identities = @($Instruction.previous_processes | Where-Object { $null -ne $_ })
     }
-
-    $graceDeadline = [DateTimeOffset]::UtcNow.AddSeconds($GraceSeconds)
-    while ([DateTimeOffset]::UtcNow -lt $graceDeadline) {
-        $processes = Get-ProcessTable
-        $treePids = Get-StoppedHostTreePids -Processes $processes -StoppedHostPids $stoppedHostPids -ToolVenvPath $toolVenvPath -CliBinPath $cliBinPath -ExcludedPids @($HelperPid)
-        if ($treePids.Count -eq 0) {
-            break
-        }
-        Start-Sleep -Milliseconds 100
+    if (-not $Identities.Count -and @($Instruction.previous_records | Where-Object { $null -ne $_ }).Count -gt 0) {
+        $processes = @(Get-ProcessTable)
+        $seeds = @($Instruction.previous_records | ForEach-Object { [int]$_.pid })
+        $ids = @(Get-StoppedHostTreePids $processes $seeds $toolVenvPath $cliBinPath @($HelperPid))
+        $Identities = @($processes | Where-Object { $_.ProcessId -in $ids } | ForEach-Object {
+            [pscustomobject]@{ pid = [int]$_.ProcessId; created_at = [double]$_.CreatedAt }
+        })
     }
-
-    $processes = Get-ProcessTable
-    $treePids = Get-StoppedHostTreePids -Processes $processes -StoppedHostPids $stoppedHostPids -ToolVenvPath $toolVenvPath -CliBinPath $cliBinPath -ExcludedPids @($HelperPid)
-    if ($treePids.Count -gt 0) {
-        Add-UpdateLog $LogPath "Stopping leftover Host tree process(es): $($treePids -join ', ')."
-        foreach ($targetPid in $treePids) {
-            Stop-Process -Id $targetPid -Force -ErrorAction SilentlyContinue
-        }
-    }
-
     $deadline = [DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
-    while ($true) {
-        $processes = Get-ProcessTable
-        $remainingTree = Get-StoppedHostTreePids -Processes $processes -StoppedHostPids $stoppedHostPids -ToolVenvPath $toolVenvPath -CliBinPath $cliBinPath -ExcludedPids @($HelperPid)
-        foreach ($targetPid in $remainingTree) {
-            Stop-Process -Id $targetPid -Force -ErrorAction SilentlyContinue
+    do {
+        foreach ($identity in $Identities) {
+            if ($identity.pid -notin $protected) { Stop-ProcessIdentity $identity }
         }
-        $locking = Get-VenvLockingProcesses -Processes $processes -ToolVenvPath $toolVenvPath -CliBinPath $cliBinPath -ExcludedPids @($HelperPid)
-        if ($locking.Count -eq 0) {
-            return
+        $locking = @(Get-VenvLockingProcesses @(Get-ProcessTable) $toolVenvPath $cliBinPath @($HelperPid))
+        $exclusiveError = ''
+        if (-not $locking.Count) {
+            try {
+                if (Test-Path -LiteralPath $toolVenvPath) { Assert-ToolFilesReleased $toolVenvPath }
+                foreach ($launcher in Get-ToolLaunchers $cliBinPath) {
+                    if (Test-Path -LiteralPath $launcher) {
+                        $handle = [IO.File]::Open($launcher, 'Open', 'ReadWrite', 'None')
+                        $handle.Dispose()
+                    }
+                }
+                return
+            } catch { $exclusiveError = $_.Exception.Message }
         }
         if ([DateTimeOffset]::UtcNow -ge $deadline) {
             $summary = ($locking | ForEach-Object { "$($_.Name) (pid $($_.ProcessId))" }) -join ', '
-            $recoverySteps = Format-RecoverySteps -Instruction $Instruction -WrapperPath ([string]$Instruction.wrapper_path)
-            throw "Cannot update custom Host while tool files are still in use by: $summary. Aborted before modifying the installation. Recovery: $recoverySteps"
+            throw "Installation files held by: $summary $exclusiveError. Unrelated holders were not terminated."
         }
         Start-Sleep -Milliseconds 100
+    } while ($true)
+}
+
+function Assert-ToolFilesReleased {
+    param([string]$ToolVenvPath)
+    if (-not $ToolVenvPath -or -not (Test-Path -LiteralPath $ToolVenvPath -PathType Container)) {
+        throw 'Cannot verify the existing tool environment; installation was not modified.'
+    }
+    # ReadWrite + FileShare.None also refuses mapped images whose loader has
+    # already closed its original file handle. Do not write through the handle.
+    foreach ($file in Get-ChildItem -LiteralPath $ToolVenvPath -File -Recurse -Force -ErrorAction Stop) {
+        try {
+            $handle = [IO.File]::Open($file.FullName, 'Open', 'ReadWrite', 'None')
+            $handle.Dispose()
+        } catch {
+            throw "Cannot release tool file '$($file.FullName)': $($_.Exception.Message). Installation was not modified."
+        }
+    }
+}
+
+function Get-ToolLaunchers {
+    param([string]$CliBinPath)
+    $directory = Split-Path -Parent $CliBinPath
+    return @((Join-Path $directory 'omni.exe'), (Join-Path $directory 'omnigent.exe'))
+}
+
+function Save-Transaction {
+    param([object]$Instruction, [Collections.IDictionary]$Result, [string]$Phase)
+    $Result.phase = $Phase
+    $Result.updated_at = [DateTimeOffset]::UtcNow.ToString('o')
+    if ($Instruction.result_path) { Write-JsonAtomic $Instruction.result_path $Result }
+    if ($Result.backup_path) {
+        Write-JsonAtomic (Join-Path (Split-Path -Parent $Result.backup_path) 'transaction.json') $Result
+    }
+}
+
+function Assert-TransactionPath {
+    param([string]$Path, [object]$Instruction)
+    $venv = [IO.Path]::GetFullPath([string]$Instruction.tool_venv_path)
+    $absolute = [IO.Path]::GetFullPath($Path)
+    if ((Split-Path -Parent $absolute) -ne (Split-Path -Parent $venv) -or
+        (Split-Path -Leaf $absolute) -notmatch ('^' + [regex]::Escape((Split-Path -Leaf $venv)) + '\.update-[0-9a-f]{32}$') -or
+        (Get-Item -LiteralPath $absolute -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw "Invalid transaction directory: $absolute"
+    }
+    return $absolute
+}
+
+function Enable-InstallerJob {
+    # The guard, not the updater or Host, owns this kill-on-close job. A killed
+    # guard cannot leave an installer child writing into the environment.
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class OmnigentInstallerJob {
+    [StructLayout(LayoutKind.Sequential)] struct Basic {
+        public long ProcessTime, JobTime;
+        public uint Flags;
+        public UIntPtr Min, Max;
+        public uint Count;
+        public UIntPtr Affinity;
+        public uint Priority, Scheduling;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct Extended {
+        public Basic Basic;
+        public ulong ReadOps, WriteOps, OtherOps, ReadBytes, WriteBytes, OtherBytes;
+        public UIntPtr ProcessMemory, JobMemory, PeakProcess, PeakJob;
+    }
+    [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr CreateJobObject(IntPtr a, string n);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool SetInformationJobObject(IntPtr j, int c, ref Extended i, uint s);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool AssignProcessToJobObject(IntPtr j, IntPtr p);
+    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+    static IntPtr job;
+    public static void Enable() {
+        job = CreateJobObject(IntPtr.Zero, null);
+        var info = new Extended();
+        info.Basic.Flags = 0x2000;
+        if (job == IntPtr.Zero || !SetInformationJobObject(job, 9, ref info, (uint)Marshal.SizeOf(info))
+            || !AssignProcessToJobObject(job, GetCurrentProcess()))
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+    }
+}
+'@
+    [OmnigentInstallerJob]::Enable()
+}
+
+function Invoke-Installer {
+    param([object]$Instruction, [string]$Transaction)
+    $owner = Get-Process -Id $PID
+    Write-JsonAtomic (Join-Path $Transaction 'installer-request.json') @{
+        parent_pid = $PID
+        parent_created_at = ($owner.StartTime.ToFileTimeUtc() / 10000000.0 - 11644473600.0)
+        arguments = @($Instruction.install_argv)
+    }
+    $guard = Invoke-CapturedProcess @(
+        (Get-Command pwsh).Source, '-NoProfile', '-File', $Instruction.helper_path,
+        '-InstructionPath', $InstructionPath, '-InstallerOnly', '-TransactionPath', $Transaction
+    ) -TimeoutSeconds 930
+    $output = Join-Path $Transaction 'installer-output.json'
+    if (-not (Test-Path -LiteralPath $output)) { throw "Installer guard failed: $($guard.Stderr)" }
+    return Get-Content -LiteralPath $output -Raw | ConvertFrom-Json
+}
+
+function Stop-InstallerGuard {
+    param([string]$Transaction, [object]$Instruction)
+    $identityPath = Join-Path $Transaction 'installer.json'
+    if (Test-Path -LiteralPath $identityPath) {
+        Stop-ProcessIdentity (Get-Content -LiteralPath $identityPath -Raw | ConvertFrom-Json)
+        return
+    }
+    foreach ($row in Get-ProcessTable) {
+        $invoked = Get-PowerShellFileInvocation $row
+        if ($invoked -and $invoked.Script -eq (ConvertTo-NormalizedWindowsPath $Instruction.helper_path) -and
+            $invoked.Arguments.Count -eq 5 -and
+            $invoked.Arguments[0] -eq '-instructionpath' -and
+            $invoked.Arguments[1] -eq (ConvertTo-NormalizedWindowsPath $InstructionPath) -and
+            $invoked.Arguments[2] -eq '-installeronly' -and
+            $invoked.Arguments[3] -eq '-transactionpath' -and
+            $invoked.Arguments[4] -eq (ConvertTo-NormalizedWindowsPath $Transaction)) {
+            Stop-ProcessIdentity ([pscustomobject]@{ pid = $row.ProcessId; created_at = $row.CreatedAt })
+        }
+    }
+}
+
+function Recover-InterruptedTransaction {
+    param([object]$Instruction, [Collections.IDictionary]$Result)
+    if (-not $Result.backup_path -or $Result.phase -eq 'completed' -or $Result.status -eq 'complete') { return }
+    if ($Result.phase -eq 'restored') {
+        if ($Result.status -eq 'running') {
+            $Result.status = 'failed'
+            $Result.error = 'Interrupted update had restored the previous installation.'
+            Save-Transaction $Instruction $Result 'restored'
+        }
+        Remove-Item -LiteralPath $Instruction.lock_path -Force -ErrorAction SilentlyContinue
+        return
+    }
+    $transaction = Assert-TransactionPath (Split-Path -Parent $Result.backup_path) $Instruction
+    if ([IO.Path]::GetFullPath($Result.backup_path) -ne (Join-Path $transaction 'previous')) {
+        throw 'Invalid backup path.'
+    }
+    $interruptedPhase = $Result.phase
+    $journal = Join-Path $transaction 'transaction.json'
+    if (Test-Path -LiteralPath $journal) {
+        $saved = Get-Content -LiteralPath $journal -Raw | ConvertFrom-Json -AsHashtable
+        if ($saved.phase -eq 'completed' -or $saved.status -eq 'complete') {
+            foreach ($key in $saved.Keys) { $Result[$key] = $saved[$key] }
+            Write-JsonAtomic $Instruction.result_path $Result
+            Remove-Item -LiteralPath $Instruction.lock_path -Force -ErrorAction SilentlyContinue
+            return
+        }
+        $Result.recovery_processes = @($Result.recovery_processes) + @($saved.recovery_processes) |
+            Where-Object { $null -ne $_ }
+    }
+    Stop-InstallerGuard $transaction $Instruction
+    Save-ReplacementHostSnapshot $Instruction $Result
+    $identities = @($Result.recovery_processes | Where-Object { $null -ne $_ })
+    Wait-CustomHostVenvReleased $Instruction $Instruction.log_path $PID -Identities $identities
+    Restore-ToolInstallation $Instruction $Result
+    $Result.status = 'failed'
+    $Result.interrupted_phase = $interruptedPhase
+    $Result.error = "Interrupted update recovered from phase '$interruptedPhase'."
+    Save-Transaction $Instruction $Result 'restored'
+    Remove-Item -LiteralPath $Instruction.lock_path -Force -ErrorAction SilentlyContinue
+}
+
+function Complete-Transaction {
+    param([object]$Instruction, [Collections.IDictionary]$Result)
+    Save-Transaction $Instruction $Result 'completed'
+    if ($Instruction.constraints_dir -and (Test-Path -LiteralPath $Instruction.constraints_dir)) {
+        $constraints = [IO.Path]::GetFullPath($Instruction.constraints_dir)
+        if ((Split-Path -Parent $constraints) -ne (Split-Path -Parent $InstructionPath) -or
+            (Split-Path -Leaf $constraints) -notlike 'locked-install-*') {
+            throw 'Invalid constraints retention path.'
+        }
+        $transaction = Assert-TransactionPath (Split-Path -Parent $Result.backup_path) $Instruction
+        Move-Item -LiteralPath $constraints -Destination (Join-Path $transaction 'constraints') -ErrorAction Stop
+    }
+    $venv = [IO.Path]::GetFullPath([string]$Instruction.tool_venv_path)
+    $transactions = @(Get-ChildItem -LiteralPath (Split-Path -Parent $venv) -Directory -Force |
+        Where-Object { $_.Name -match ('^' + [regex]::Escape((Split-Path -Leaf $venv)) + '\.update-[0-9a-f]{32}$') } |
+        ForEach-Object {
+            $journal = Join-Path $_.FullName 'transaction.json'
+            if (Test-Path -LiteralPath $journal) {
+                $receipt = Get-Content -LiteralPath $journal -Raw | ConvertFrom-Json
+                if ($receipt.phase -eq 'completed' -and $receipt.status -eq 'complete') {
+                    [pscustomobject]@{ Path = $_.FullName; Updated = $receipt.updated_at }
+                }
+            }
+        })
+    $current = [IO.Path]::GetFullPath((Split-Path -Parent $Result.backup_path))
+    foreach ($old in ($transactions | Where-Object { [IO.Path]::GetFullPath($_.Path) -ne $current })) {
+        $absolute = Assert-TransactionPath $old.Path $Instruction
+        if (@(Get-ChildItem -LiteralPath $absolute -Recurse -Force -Attributes ReparsePoint).Count) {
+            throw "Refusing retention cleanup through a reparse point: $absolute"
+        }
+        Assert-ToolFilesReleased $absolute
+        # The resolved GUID directory is a verified successful transaction in
+        # the same tool directory. Incomplete journals never enter this set.
+        Remove-Item -LiteralPath $absolute -Recurse -Force -ErrorAction Stop
+    }
+}
+
+function Restore-ToolInstallation {
+    param([object]$Instruction, [System.Collections.IDictionary]$Result)
+    $backup = [string]$Result.backup_path
+    if (-not $backup) { return }
+    $venv = [string]$Instruction.tool_venv_path
+    $transaction = Split-Path -Parent $backup
+    if (-not $Result.venv_restored) {
+        if (-not (Test-Path -LiteralPath $backup)) {
+            if ($Result.phase -in @('prepared', 'moving_old', 'restoring_venv') -and
+                (Test-Path -LiteralPath $venv -PathType Container)) {
+                $Result.venv_restored = $true
+            } else { throw "Previous installation missing at $backup." }
+        } else {
+            if (Test-Path -LiteralPath $venv) {
+                # Keep failed output for diagnosis. Never recursively remove a venv.
+                if (Test-Path -LiteralPath (Join-Path $transaction 'failed')) {
+                    throw 'Another replacement environment appeared during restoration.'
+                }
+                Move-Item -LiteralPath $venv -Destination (Join-Path $transaction 'failed') -ErrorAction Stop
+            }
+            Save-Transaction $Instruction $Result 'restoring_venv'
+            Move-Item -LiteralPath $backup -Destination $venv -ErrorAction Stop
+            $Result.venv_restored = $true
+        }
+        Save-Transaction $Instruction $Result 'restoring_launchers'
+    }
+    foreach ($launcher in Get-ToolLaunchers ([string]$Instruction.cli_bin_path)) {
+        $saved = Join-Path $transaction (Split-Path -Leaf $launcher)
+        if (Test-Path -LiteralPath $saved) {
+            Copy-Item -LiteralPath $saved -Destination $launcher -Force -ErrorAction Stop
+        }
+    }
+    $Result.restored = $true
+    Save-Transaction $Instruction $Result 'restored'
+}
+
+function Invoke-TransactionalInstall {
+    param(
+        [object]$Instruction,
+        [string]$TargetCommit,
+        [string]$LogPath,
+        [System.Collections.IDictionary]$Result
+    )
+    $venv = [IO.Path]::GetFullPath([string]$Instruction.tool_venv_path)
+    Assert-ToolFilesReleased $venv
+    $transaction = "$venv.update-$([guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Path $transaction -ErrorAction Stop | Out-Null
+    $Result.backup_path = Join-Path $transaction 'previous'
+    $Result.restored = $false
+    Save-Transaction $Instruction $Result 'prepared'
+    foreach ($launcher in Get-ToolLaunchers ([string]$Instruction.cli_bin_path)) {
+        if (Test-Path -LiteralPath $launcher) {
+            Copy-Item -LiteralPath $launcher -Destination $transaction -ErrorAction Stop
+        }
+    }
+    # If the rename is refused, uv never runs. The working venv stays untouched.
+    Save-Transaction $Instruction $Result 'moving_old'
+    Move-Item -LiteralPath $venv -Destination $Result.backup_path -ErrorAction Stop
+    Save-Transaction $Instruction $Result 'old_moved'
+    Add-UpdateLog $LogPath "Previous installation retained at $($Result.backup_path)."
+    try {
+        Add-UpdateLog $LogPath 'Running custom Host installer.'
+        Save-Transaction $Instruction $Result 'installing'
+        $install = Invoke-Installer $Instruction $transaction
+        if ($install.Stdout) { Add-UpdateLog $LogPath $install.Stdout.Trim() }
+        if ($install.Stderr) { Add-UpdateLog $LogPath $install.Stderr.Trim() }
+        if ($install.ExitCode -ne 0) {
+            throw "Installer exited with status $($install.ExitCode)."
+        }
+        Save-Transaction $Instruction $Result 'validating'
+        $probeArguments = @($Instruction.probe_argv | ForEach-Object { [string]$_ })
+        $probe = Invoke-CapturedProcess $probeArguments
+        $installedCommit = $probe.Stdout.Trim().ToLowerInvariant()
+        if ($probe.ExitCode -ne 0 -or $installedCommit -ne $TargetCommit) {
+            throw "Installation import/commit check failed (exit $($probe.ExitCode), commit '$installedCommit'): $($probe.Stderr)"
+        }
+        $versionArguments = @($Instruction.version_argv | ForEach-Object { [string]$_ })
+        if ($versionArguments.Count -eq 0) { throw 'Missing CLI version check.' }
+        $version = Invoke-CapturedProcess $versionArguments
+        $versionCommit = [regex]::Match($version.Stdout, '(?i)\(([0-9a-f]{8,40}),').Groups[1].Value
+        if ($version.ExitCode -ne 0 -or -not $versionCommit -or
+            -not $TargetCommit.StartsWith($versionCommit, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "CLI version check failed (exit $($version.ExitCode)): $($version.Stderr)"
+        }
+    } catch {
+        $failure = $_.Exception.Message
+        try {
+            if (Test-Path -LiteralPath (Join-Path $transaction 'installer-request.json')) {
+                Stop-InstallerGuard $transaction $Instruction
+                Wait-CustomHostVenvReleased $Instruction $LogPath $PID
+            }
+            Restore-ToolInstallation -Instruction $Instruction -Result $Result
+        }
+        catch { throw "$failure Restore incomplete; recovery files: '$transaction': $($_.Exception.Message)" }
+        throw "$failure Previous installation restored."
     }
 }
 
 function Test-HostReconnected {
-    param([object]$Instruction)
+    param([object]$Instruction, [int]$TimeoutSeconds = 30,
+          [Collections.IDictionary]$Result = $null)
     $statusArguments = @($Instruction.status_argv | ForEach-Object { [string]$_ })
-    $status = Invoke-CapturedProcess $statusArguments
+    $capture = { if ($Result) { Save-ReplacementHostSnapshot $Instruction $Result } }
+    $status = Invoke-CapturedProcess $statusArguments -TimeoutSeconds $TimeoutSeconds -OnWait $capture
     if ($status.ExitCode -ne 0) {
         return $false
     }
@@ -391,17 +784,107 @@ function Test-HostReconnected {
     return $false
 }
 
+function Wait-HostReconnected {
+    param([object]$Instruction, [Collections.IDictionary]$Result = $null)
+    $deadline = [DateTimeOffset]::UtcNow.AddSeconds(60)
+    do {
+        if ($Result) { Save-ReplacementHostSnapshot $Instruction $Result }
+        $remaining = [Math]::Max(1, [Math]::Min(30, [Math]::Ceiling(($deadline - [DateTimeOffset]::UtcNow).TotalSeconds)))
+        if (Test-HostReconnected $Instruction -TimeoutSeconds $remaining -Result $Result) { return $true }
+        if ([DateTimeOffset]::UtcNow -ge $deadline) { return $false }
+        Start-Sleep -Seconds 1
+    } while ($true)
+}
+
+if ($InstallerOnly) {
+    try {
+        $instruction = Get-Content -LiteralPath $InstructionPath -Raw | ConvertFrom-Json
+        $TransactionPath = Assert-TransactionPath $TransactionPath $instruction
+        Enable-InstallerJob
+        $self = Get-Process -Id $PID
+        Write-JsonAtomic (Join-Path $TransactionPath 'installer.json') @{
+            pid = $PID; created_at = ($self.StartTime.ToFileTimeUtc() / 10000000.0 - 11644473600.0)
+        }
+        $request = Get-Content -LiteralPath (Join-Path $TransactionPath 'installer-request.json') -Raw | ConvertFrom-Json
+        $owner = Get-Process -Id ([int]$request.parent_pid) -ErrorAction Stop
+        $created = $owner.StartTime.ToFileTimeUtc() / 10000000.0 - 11644473600.0
+        if ([Math]::Abs($created - [double]$request.parent_created_at) -gt 0.00001) {
+            throw 'Installer owner has exited or changed identity.'
+        }
+        $installEnvironment = @{ OMNIGENT_SKIP_WEB_UI = 'true'; OMNIGENT_BUILD_WEB_UI = '0' }
+        if ($instruction.skip_web_ui -eq $false) {
+            $installEnvironment.OMNIGENT_SKIP_WEB_UI = 'false'
+            $installEnvironment.OMNIGENT_BUILD_WEB_UI = '1'
+        }
+        $output = Invoke-CapturedProcess @($request.arguments | ForEach-Object { [string]$_ }) $installEnvironment -TimeoutSeconds 900
+    } catch {
+        $output = @{ ExitCode = 1; Stdout = ''; Stderr = $_.Exception.Message }
+    }
+    Write-JsonAtomic (Join-Path $TransactionPath 'installer-output.json') $output
+    exit 0
+}
+
+if ($RecoverOnly) {
+    if (-not (Test-Path -LiteralPath $InstructionPath)) { exit 0 }
+    $instruction = Get-Content -LiteralPath $InstructionPath -Raw | ConvertFrom-Json
+    if (-not (Test-Path -LiteralPath $instruction.result_path)) { exit 0 }
+    $recoveryLock = [IO.File]::Open(
+        "$($instruction.result_path).recovery.guard", 'OpenOrCreate', 'ReadWrite', 'None')
+    $activeOwner = $false
+    try {
+        $receipt = Get-Content -LiteralPath $instruction.result_path -Raw | ConvertFrom-Json -AsHashtable
+        if ($receipt.phase -ne 'completed' -and $receipt.status -ne 'complete') {
+            if (-not $receipt.backup_path) { exit 0 }
+            $owner = Get-Process -Id ([int]$receipt.helper_pid) -ErrorAction SilentlyContinue
+            if ($owner) {
+                $created = $owner.StartTime.ToFileTimeUtc() / 10000000.0 - 11644473600.0
+                if ([Math]::Abs($created - [double]$receipt.helper_created_at) -le 0.00001) {
+                    if ($receipt.phase -in @('starting_host', 'restored')) { exit 0 }
+                    $activeOwner = $true
+                    throw 'A custom Host update is still running.'
+                }
+            }
+            Recover-InterruptedTransaction $instruction $receipt
+        }
+        if ($ResumeAutostart -and $instruction.disabled_marker -and
+            ($receipt.restored -or $receipt.phase -eq 'completed' -or $receipt.status -eq 'complete')) {
+            $expected = Join-Path (Split-Path -Parent (Split-Path -Parent $InstructionPath)) 'autostart\disabled'
+            if ([IO.Path]::GetFullPath($instruction.disabled_marker) -ne [IO.Path]::GetFullPath($expected)) {
+                throw 'Invalid autostart marker path.'
+            }
+            Remove-Item -LiteralPath $instruction.disabled_marker -Force -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $instruction.disabled_marker) {
+                throw 'Could not remove the autostart disabled marker.'
+            }
+        }
+    } catch {
+        if ($receipt -and $receipt.backup_path -and -not $activeOwner -and
+            $receipt.phase -ne 'completed' -and $receipt.status -ne 'complete') {
+            $receipt.status = 'failed'
+            $receipt.error = $_.Exception.Message
+            Save-Transaction $instruction $receipt $receipt.phase
+        }
+        [Console]::Error.WriteLine($_.Exception.Message)
+        exit 1
+    } finally {
+        $recoveryLock.Dispose()
+    }
+    exit 0
+}
+
 $result = [ordered]@{
     schema_version = 1
     status = 'starting'
     old_commit = $OldCommit
     target_commit = $TargetCommit
     helper_pid = $PID
+    helper_created_at = ((Get-Process -Id $PID).StartTime.ToFileTimeUtc() / 10000000.0 - 11644473600.0)
     error = $null
     updated_at = [DateTimeOffset]::UtcNow.ToString('o')
 }
 $exitCode = 0
 $instruction = $null
+$restartAttempted = $false
 
 try {
     $instruction = Get-Content -LiteralPath $InstructionPath -Raw | ConvertFrom-Json
@@ -439,45 +922,21 @@ try {
         source_url = $instruction.rollback_source_url
     })
 
-    # Only an explicit false rebuilds the web UI; a missing field keeps the Host-only skip.
-    # Set either way so an inherited value cannot override the decision.
-    $installEnvironment = @{ OMNIGENT_SKIP_WEB_UI = 'true'; OMNIGENT_BUILD_WEB_UI = '0' }
-    if ($instruction.skip_web_ui -eq $false) {
-        $installEnvironment.OMNIGENT_SKIP_WEB_UI = 'false'
-        $installEnvironment.OMNIGENT_BUILD_WEB_UI = '1'
-    }
-    $installArguments = @($instruction.install_argv | ForEach-Object { [string]$_ })
-    Add-UpdateLog $LogPath "Running custom Host installer."
-    $install = Invoke-CapturedProcess $installArguments $installEnvironment
-    if ($install.Stdout) { Add-UpdateLog $LogPath $install.Stdout.Trim() }
-    if ($install.Stderr) { Add-UpdateLog $LogPath $install.Stderr.Trim() }
-    if ($install.ExitCode -ne 0) {
-        $recoverySteps = Format-RecoverySteps -Instruction $instruction -WrapperPath $WrapperPath
-        throw "Installer exited with status $($install.ExitCode). Recovery: $recoverySteps"
-    }
+    Invoke-TransactionalInstall -Instruction $instruction -TargetCommit $TargetCommit -LogPath $LogPath -Result $result
 
-    $probeArguments = @($instruction.probe_argv | ForEach-Object { [string]$_ })
-    $probe = Invoke-CapturedProcess $probeArguments
-    $installedCommit = $probe.Stdout.Trim().ToLowerInvariant()
-    if ($probe.ExitCode -ne 0 -or $installedCommit -ne $TargetCommit) {
-        throw "Installed commit '$installedCommit' did not match '$TargetCommit'."
-    }
-
-    Restart-HostSupervisor $WrapperPath
-    $reconnected = $false
-    $deadline = [DateTimeOffset]::UtcNow.AddSeconds(60)
-    while ([DateTimeOffset]::UtcNow -lt $deadline) {
-        if (Test-HostReconnected $instruction) {
-            $reconnected = $true
-            break
-        }
-        Start-Sleep -Seconds 1
-    }
-    if (-not $reconnected) {
+    Save-Transaction $instruction $result 'starting_host'
+    $restartAttempted = $true
+    Restart-HostSupervisor $WrapperPath -Instruction $instruction -Result $result
+    if (-not (Wait-HostReconnected $instruction $result)) {
         throw "The updated Host did not reconnect on its managed target within 60 seconds."
     }
 
     $result.status = 'complete'
+    try { Complete-Transaction $instruction $result }
+    catch {
+        $result.retention_error = $_.Exception.Message
+        Add-UpdateLog $LogPath "Retention diagnostic: $($result.retention_error)"
+    }
     Add-UpdateLog $LogPath "Custom Host update completed and reconnected."
 }
 catch {
@@ -490,8 +949,33 @@ catch {
     catch {
         [Console]::Error.WriteLine("Failed to write custom Host update log: $($_.Exception.Message)")
     }
+    if ($instruction -and $result.backup_path -and -not $result.restored) {
+        try {
+            if ($restartAttempted) {
+                Save-ReplacementHostSnapshot $instruction $result
+                $identities = @($result.recovery_processes | Where-Object { $null -ne $_ })
+                Save-Transaction $instruction $result 'rolling_back'
+                try { Restart-HostSupervisor $WrapperPath 'stop' }
+                catch { Add-UpdateLog $LogPath "Supervisor stop diagnostic: $($_.Exception.Message)" }
+                try {
+                    $stop = Invoke-CapturedProcess @([string]$instruction.cli_bin_path, 'host', 'stop', '--all', '--daemon-only', '--force')
+                    if ($stop.ExitCode -ne 0) { Add-UpdateLog $LogPath "Host stop diagnostic: exit $($stop.ExitCode)." }
+                } catch { Add-UpdateLog $LogPath "Host stop diagnostic: $($_.Exception.Message)" }
+                Wait-CustomHostVenvReleased -Instruction $instruction -LogPath $LogPath -HelperPid $PID -Identities $identities
+            }
+            Restore-ToolInstallation -Instruction $instruction -Result $result
+        } catch {
+            $result.error = "$($result.error) Restore failed: $($_.Exception.Message). Backup: $($result.backup_path)"
+        }
+    }
     try {
         Restart-HostSupervisor $WrapperPath
+        if ($result.restored) {
+            if (-not (Wait-HostReconnected $instruction)) {
+                throw 'The restored Host did not reconnect within 60 seconds.'
+            }
+            $result.recovery_status = 'online'
+        }
     }
     catch {
         $result.error = "$($result.error) Additionally failed to restart Host: $($_.Exception.Message)"
@@ -512,9 +996,7 @@ finally {
         [Console]::Error.WriteLine("Failed to write custom Host update result: $($_.Exception.Message)")
     }
     Remove-Item -LiteralPath $LockPath -Force -ErrorAction SilentlyContinue
-    if ($ConstraintsDirectory) {
-        Remove-Item -LiteralPath $ConstraintsDirectory -Recurse -Force -ErrorAction SilentlyContinue
-    }
+    # Keep constraints and transaction directories with the failure evidence.
 }
 
 exit $exitCode

@@ -53,7 +53,9 @@ def _managed_uv_tool(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     import omnigent.cli as cli_module
 
     monkeypatch.setattr(cli_module, "IS_WINDOWS", False)
-    monkeypatch.setattr(cli_module, "_uv_tool_receipt_path", lambda: tmp_path / "receipt.toml")
+    monkeypatch.setattr(
+        cli_module, "_uv_tool_receipt_path", lambda: tmp_path / "tool" / "receipt.toml"
+    )
     monkeypatch.setattr(cli_module, "_preflight_custom_host_supervisor", lambda: None)
     # Our hosts: a managed service and a host-only install without a web UI bundle.
     monkeypatch.setattr(cli_module, "_custom_host_has_service", lambda: True)
@@ -1295,8 +1297,112 @@ def test_windows_custom_helper_starting_receipt_blocks_concurrent_launcher(
     assert paths["lock"].exists()
 
 
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [
+        ('-NoProfile -File "{script}"', True),
+        ('-Command Get-Content "{script}"', False),
+        ('-File "{script}.bak"', False),
+        ('-File "{script}".bak', False),
+        ('-Command Write-Output -File "{script}"', False),
+    ],
+)
+def test_windows_host_launcher_requires_invoking_the_exact_script(
+    arguments: str, expected: bool
+) -> None:
+    import omnigent.cli as cli_module
+
+    script = r"C:\Profiles\user-a\.omnigent\autostart\Start-OmnigentHostDefault.ps1"
+    process = cli_module._WindowsProcessInfo(
+        pid=20,
+        ppid=1,
+        name="pwsh.exe",
+        exe=r"C:\PowerShell\pwsh.exe",
+        cmdline="pwsh.exe " + arguments.format(script=script),
+        created_at=1.0,
+    )
+    assert (
+        cli_module._windows_is_host_launcher(process, r"C:\Profiles\user-a\.local\bin\omni.exe")
+        is expected
+    )
+
+
+def test_windows_interrupted_update_requires_recovery_outside_the_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import omnigent.cli as cli_module
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    paths = cli_module._custom_host_update_paths()
+    paths["root"].mkdir(parents=True)
+    paths["lock"].write_text("")
+    paths["result"].write_text(
+        json.dumps(
+            {
+                "status": "failed",
+                "phase": "rolling_back",
+                "backup_path": "retained",
+            }
+        )
+    )
+    monkeypatch.setattr(
+        cli_module.subprocess,
+        "run",
+        lambda *_a, **_kw: pytest.fail("Recovery started in the live CLI"),
+    )
+    with pytest.raises(click.ClickException, match="independent recovery"):
+        cli_module._ensure_no_running_custom_host_helper()
+    assert paths["lock"].exists()
+
+
+def test_windows_recovery_rejects_a_wrapper_inside_the_tool_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import omnigent.cli as cli_module
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    tool = tmp_path / "tool"
+    monkeypatch.setattr(cli_module, "_custom_host_tool_venv_path", lambda: tool)
+    with pytest.raises(click.ClickException, match="outside the tool environment"):
+        cli_module._validate_windows_custom_host_recovery_paths(tool / "Scripts" / "service.cmd")
+    cli_module._validate_windows_custom_host_recovery_paths(tmp_path / "service.cmd")
+
+
+def test_windows_reconciliation_completes_both_durable_receipts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import omnigent.cli as cli_module
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    tool = tmp_path / "tool"
+    monkeypatch.setattr(cli_module, "_custom_host_tool_venv_path", lambda: tool)
+    transaction = tmp_path / ("tool.update-" + "d" * 32)
+    transaction.mkdir()
+    paths = cli_module._custom_host_update_paths()
+    paths["root"].mkdir(parents=True)
+    receipt = {
+        "status": "failed",
+        "phase": "rolling_back",
+        "old_commit": "a" * 40,
+        "target_commit": "b" * 40,
+        "backup_path": str(transaction / "previous"),
+    }
+    for path in (paths["result"], transaction / "transaction.json"):
+        path.write_text(json.dumps(receipt))
+    cli_module._reconcile_custom_host_update_result("b" * 40, persist=True)
+    for path in (paths["result"], transaction / "transaction.json"):
+        saved = json.loads(path.read_text())
+        assert saved["status"] == "complete"
+        assert saved["phase"] == "completed"
+
+
+@pytest.mark.parametrize("root_exits", [False, True])
 def test_windows_custom_update_stops_host_tree_and_waits_for_cli_parent(
     monkeypatch: pytest.MonkeyPatch,
+    root_exits: bool,
 ) -> None:
     """The helper waits on the CLI parent, ends the stopped Host tree, and ignores its own PID."""
     import omnigent.cli as cli_module
@@ -1311,13 +1417,14 @@ def test_windows_custom_update_stops_host_tree_and_waits_for_cli_parent(
         waited_parents.append(pid)
         alive_pids.discard(pid)
 
-    def _terminate(pid: int) -> None:
+    def _terminate(pid: int, _created_at: float) -> None:
         terminated.append(pid)
         alive_pids.discard(pid)
 
     def _processes() -> list[object]:
         rows = [
             cli_module._WindowsProcessInfo(
+                created_at=1.0,
                 pid=500,
                 ppid=400,
                 name="pwsh.exe",
@@ -1328,6 +1435,7 @@ def test_windows_custom_update_stops_host_tree_and_waits_for_cli_parent(
                 ),
             ),
             cli_module._WindowsProcessInfo(
+                created_at=1.0,
                 pid=501,
                 ppid=500,
                 name="omni.exe",
@@ -1335,6 +1443,7 @@ def test_windows_custom_update_stops_host_tree_and_waits_for_cli_parent(
                 cmdline=f'"{cli_bin}" host --server https://managed.example --non-interactive',
             ),
             cli_module._WindowsProcessInfo(
+                created_at=1.0,
                 pid=502,
                 ppid=501,
                 name="python.exe",
@@ -1342,6 +1451,7 @@ def test_windows_custom_update_stops_host_tree_and_waits_for_cli_parent(
                 cmdline=rf'"{tool_venv}\Scripts\python.exe" -m omnigent.cli host',
             ),
             cli_module._WindowsProcessInfo(
+                created_at=1.0,
                 pid=503,
                 ppid=502,
                 name="python.exe",
@@ -1349,6 +1459,7 @@ def test_windows_custom_update_stops_host_tree_and_waits_for_cli_parent(
                 cmdline=rf'"{tool_venv}\Scripts\python.exe" -m omnigent.runner',
             ),
             cli_module._WindowsProcessInfo(
+                created_at=1.0,
                 pid=600,
                 ppid=300,
                 name="python.exe",
@@ -1356,6 +1467,7 @@ def test_windows_custom_update_stops_host_tree_and_waits_for_cli_parent(
                 cmdline=rf'"{tool_venv}\Scripts\python.exe" -m omnigent.cli up',
             ),
             cli_module._WindowsProcessInfo(
+                created_at=1.0,
                 pid=700,
                 ppid=1,
                 name="python.exe",
@@ -1369,11 +1481,15 @@ def test_windows_custom_update_stops_host_tree_and_waits_for_cli_parent(
     monkeypatch.setattr(cli_module, "_terminate_windows_process", _terminate, raising=False)
     monkeypatch.setattr(cli_module, "_list_windows_processes", _processes, raising=False)
     monkeypatch.setattr(cli_module.time, "sleep", lambda _seconds: None)
+    captured = [proc for proc in _processes() if proc.pid in {500, 501, 502, 503}]
+    if root_exits:
+        alive_pids.difference_update({500, 501, 502})
 
     cli_module._wait_for_windows_custom_host_venv_release(
         tool_venv_path=tool_venv,
         cli_bin_path=cli_bin,
         stopped_host_pids=[502],
+        process_identities=captured,
         parent_pid=600,
         helper_pid=700,
         timeout_s=1.0,
@@ -1387,6 +1503,7 @@ def test_windows_custom_update_stops_host_tree_and_waits_for_cli_parent(
     # Recycled stopped-host PIDs and foreign-user supervisors are not selected.
     unrelated = [
         cli_module._WindowsProcessInfo(
+            created_at=1.0,
             pid=502,
             ppid=200,
             name="python.exe",
@@ -1394,6 +1511,7 @@ def test_windows_custom_update_stops_host_tree_and_waits_for_cli_parent(
             cmdline=rf'"{tool_venv}\Scripts\python.exe" unrelated_worker.py',
         ),
         cli_module._WindowsProcessInfo(
+            created_at=1.0,
             pid=900,
             ppid=800,
             name="pwsh.exe",
@@ -1445,6 +1563,7 @@ def test_windows_custom_update_aborts_before_uv_and_restarts_supervisor_when_ven
     def _processes() -> list[object]:
         rows = [
             cli_module._WindowsProcessInfo(
+                created_at=1.0,
                 pid=502,
                 ppid=501,
                 name="python.exe",
@@ -1452,6 +1571,7 @@ def test_windows_custom_update_aborts_before_uv_and_restarts_supervisor_when_ven
                 cmdline=rf'"{tool_venv}\Scripts\python.exe" -m omnigent.cli host',
             ),
             cli_module._WindowsProcessInfo(
+                created_at=1.0,
                 pid=888,
                 ppid=200,
                 name="python.exe",
@@ -1461,7 +1581,7 @@ def test_windows_custom_update_aborts_before_uv_and_restarts_supervisor_when_ven
         ]
         return [row for row in rows if row.pid in alive_pids]
 
-    def _terminate(pid: int) -> None:
+    def _terminate(pid: int, _created_at: float) -> None:
         terminated.append(pid)
         alive_pids.discard(pid)
 
@@ -1524,7 +1644,8 @@ def test_windows_custom_helper_instruction_and_recovery_steps_include_stopping_l
 
     old = "a" * 40
     new = "b" * 40
-    wrapper = Path(r"C:\Profiles\user-a\.local\bin\omni-host-service.cmd")
+    wrapper = tmp_path / "omni-host-service.cmd"
+    wrapper.write_text("@echo off\nexit /b 0\n")
     tool_venv = Path(r"C:\Profiles\user-a\AppData\Roaming\uv\tools\omnigent")
     cli_bin = Path(r"C:\Profiles\user-a\.local\bin\omni.exe")
     recovery_cmd = (
@@ -1645,6 +1766,7 @@ def test_windows_custom_update_reconciles_stale_failed_result_after_manual_recov
     assert f"Custom Host is up to date (git {recovered[:9]})." in up_to_date.output
     reconciled = json.loads(paths["result"].read_text())
     assert reconciled["status"] == "complete"
+    assert reconciled["phase"] == "completed"
     assert reconciled["target_commit"] == recovered
     assert reconciled["error"] is None
     assert not paths["lock"].exists()
@@ -1791,6 +1913,9 @@ def test_windows_custom_helper_survives_launcher_exit_and_completes(
     lock = tmp_path / "update.lock"
     rollback = tmp_path / "rollback.json"
     installed = tmp_path / "installed.txt"
+    tool_venv = tmp_path / "tool"
+    tool_venv.mkdir()
+    (tool_venv / "working.txt").write_text("old")
     wrapper = tmp_path / "omni-host-service.cmd"
     installer = tmp_path / "installer.py"
     status = tmp_path / "status.py"
@@ -1803,6 +1928,7 @@ def test_windows_custom_helper_survives_launcher_exit_and_completes(
         f"assert os.environ['OMNIGENT_SKIP_WEB_UI'] == {str(skip_web_ui).lower()!r}\n"
         f"assert os.environ['OMNIGENT_BUILD_WEB_UI'] == {'0' if skip_web_ui else '1'!r}\n"
         "pathlib.Path(sys.argv[1]).write_text('installed')\n"
+        f"pathlib.Path({str(tool_venv)!r}).mkdir()\n"
     )
     status.write_text(
         "import json\n"
@@ -1824,7 +1950,15 @@ def test_windows_custom_helper_survives_launcher_exit_and_completes(
                 "target_commit": new,
                 "host_id": host_id,
                 "previous_records": [{"target": target, "pid": 111}],
+                "tool_venv_path": str(tool_venv),
+                "cli_bin_path": str(tmp_path / ".local" / "bin" / "omni.exe"),
+                "helper_path": str(helper),
                 "probe_argv": [sys.executable, "-c", f"print('{new}')"],
+                "version_argv": [
+                    sys.executable,
+                    "-c",
+                    f"print('omnigent fixture ({new[:8]}, built fixture)')",
+                ],
                 "status_argv": [sys.executable, str(status)],
                 "wrapper_path": str(wrapper),
                 "rollback_path": str(rollback),
@@ -2495,3 +2629,29 @@ def test_plain_update_on_a_pinned_custom_install_preserves_the_pin(
     assert "For pinned releases, re-run the installer" in result.output
     assert "`omni up` follows the moving channel" in result.output
     assert "This install is pinned" not in result.output
+
+
+@windows_pwsh_only
+def test_windows_custom_update_native_transaction_and_file_locks(tmp_path: Path) -> None:
+    """Exercise native locks and failure recovery without touching an installed Host."""
+    uv = shutil.which("uv")
+    root = Path(__file__).parents[2]
+    native_uv = ["-PythonPath", sys.executable, "-UvPath", uv] if uv is not None else []
+    completed = subprocess.run(
+        [
+            str(_WINDOWS_PWSH),
+            "-NoProfile",
+            "-File",
+            str(Path(__file__).with_name("windows_custom_update_probe.ps1")),
+            "-HelperPath",
+            str(root / "omnigent" / "host" / "windows_custom_update.ps1"),
+            "-FixtureRoot",
+            str(tmp_path / "fixtures"),
+            *native_uv,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr

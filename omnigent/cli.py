@@ -10336,6 +10336,8 @@ class _WindowsProcessInfo:
     name: str
     exe: str = ""
     cmdline: str = ""
+    loaded_paths: tuple[str, ...] = ()
+    created_at: float = 0.0
 
 
 _CUSTOM_HOST_PARENT_EXIT_TIMEOUT_S = 120.0
@@ -10392,7 +10394,7 @@ def _windows_path_holds_tool_venv(
     tool_venv_path: Path | str,
     cli_bin_path: Path | str,
 ) -> bool:
-    """Return whether ``proc`` runs from the tool venv or ``~\\.local\\bin\\omni.exe``."""
+    """Detect executable/argv provenance and observable native-module or file holders."""
     venv_norm = _normalize_windows_fs_path(tool_venv_path)
     cli_norm = _normalize_windows_fs_path(cli_bin_path)
     exe_norm = _normalize_windows_fs_path(proc.exe) if proc.exe else ""
@@ -10405,6 +10407,12 @@ def _windows_path_holds_tool_venv(
     if venv_norm and venv_norm + "\\" in cmd_norm:
         return True
     if cli_norm and cli_norm in cmd_norm:
+        return True
+    if any(
+        _normalize_windows_fs_path(path).startswith(venv_norm + "\\")
+        for path in proc.loaded_paths
+        if venv_norm
+    ):
         return True
     return (
         not exe_norm
@@ -10424,7 +10432,7 @@ def _list_windows_processes() -> list[_WindowsProcessInfo]:
     if os.name != "nt":
         return []
     rows: list[_WindowsProcessInfo] = []
-    for proc in psutil.process_iter(["pid", "ppid", "name", "exe", "cmdline"]):
+    for proc in psutil.process_iter(["pid", "ppid", "name", "exe", "cmdline", "create_time"]):
         try:
             info = proc.info
             pid = int(info.get("pid") or 0)
@@ -10432,11 +10440,20 @@ def _list_windows_processes() -> list[_WindowsProcessInfo]:
                 continue
             cmdline_raw = info.get("cmdline")
             if isinstance(cmdline_raw, list):
-                cmdline = " ".join(str(part) for part in cmdline_raw)
+                cmdline = subprocess.list2cmdline([str(part) for part in cmdline_raw])
             elif isinstance(cmdline_raw, str):
                 cmdline = cmdline_raw
             else:
                 cmdline = ""
+            loaded_paths: set[str] = set()
+            # uv's base interpreter can load the tool's DLLs without naming
+            # its venv in either exe or argv. Keep partial observations if a
+            # process exits or denies inspection; the detached helper also
+            # checks exclusive access to every installation file.
+            with contextlib.suppress(psutil.Error, OSError):
+                loaded_paths.update(item.path for item in proc.memory_maps())
+            with contextlib.suppress(psutil.Error, OSError):
+                loaded_paths.update(item.path for item in proc.open_files())
             rows.append(
                 _WindowsProcessInfo(
                     pid=pid,
@@ -10444,6 +10461,8 @@ def _list_windows_processes() -> list[_WindowsProcessInfo]:
                     name=str(info.get("name") or ""),
                     exe=str(info.get("exe") or ""),
                     cmdline=cmdline,
+                    loaded_paths=tuple(loaded_paths),
+                    created_at=float(info.get("create_time") or 0),
                 )
             )
         except (psutil.Error, OSError, ValueError):
@@ -10451,10 +10470,77 @@ def _list_windows_processes() -> list[_WindowsProcessInfo]:
     return rows
 
 
-def _terminate_windows_process(pid: int) -> None:
-    """Force-stop one Windows process by PID."""
+def _terminate_windows_process(pid: int, created_at: float) -> None:
+    """Stop a captured process only while its creation identity still matches."""
     with contextlib.suppress(psutil.Error, OSError):
-        psutil.Process(pid).kill()
+        proc = psutil.Process(pid)
+        if created_at > 0 and proc.create_time() == created_at:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+def _windows_process_arguments(proc: _WindowsProcessInfo) -> list[str]:
+    """Split the quoted path arguments used by our Windows launchers; fail closed."""
+    arguments: list[str] = []
+    previous_end = 0
+    for match in re.finditer(r'"[^"]*"|[^\s"]+', proc.cmdline):
+        gap = proc.cmdline[previous_end : match.start()]
+        if gap.strip() or (arguments and not gap):
+            return []
+        arguments.append(match.group().strip('"').replace("/", "\\").casefold())
+        previous_end = match.end()
+    if proc.cmdline[previous_end:].strip():
+        return []
+    return arguments
+
+
+def _windows_is_host_daemon(proc: _WindowsProcessInfo) -> bool:
+    args = _windows_process_arguments(proc)[1:]
+    if _normalize_windows_fs_path(proc.exe).rsplit("\\", 1)[-1] not in {
+        "python.exe",
+        "pythonw.exe",
+    }:
+        return False
+    while args and args[0] in {"-i", "-u", "-b", "-e", "-s"}:
+        args = args[1:]
+    return args[:2] == ["-m", "omnigent.host._daemon_entry"] or args[:3] == [
+        "-m",
+        "omnigent.cli",
+        "host",
+    ]
+
+
+def _windows_is_host_launcher(proc: _WindowsProcessInfo, cli_bin_path: Path | str) -> bool:
+    """Identify a dedicated Host launcher/supervisor, independently of file holdings."""
+    args = _windows_process_arguments(proc)[1:]
+    cli = _normalize_windows_fs_path(cli_bin_path)
+    home = (
+        cli[: -len("\\.local\\bin\\omni.exe")] if cli.endswith("\\.local\\bin\\omni.exe") else ""
+    )
+    exe = _normalize_windows_fs_path(proc.exe)
+    if exe == cli and args[:1] == ["host"]:
+        return True
+    if not home:
+        return False
+    binary = exe.rsplit("\\", 1)[-1]
+    if binary == "pwsh.exe":
+        while args:
+            option = args.pop(0)
+            if option == "-file":
+                return bool(args) and args[0] == home + (
+                    "\\.omnigent\\autostart\\start-omnigenthostdefault.ps1"
+                )
+            if option in {"-nologo", "-noprofile", "-noninteractive"}:
+                continue
+            if option in {"-executionpolicy", "-windowstyle"} and args:
+                args.pop(0)
+                continue
+            return False
+    if binary in {"python.exe", "pythonw.exe"}:
+        while args and args[0] in {"-i", "-u", "-b", "-e", "-s"}:
+            args = args[1:]
+        return bool(args) and args[0] == home + "\\.omnigent\\autostart\\launch-omnigenthost.pyw"
+    return False
 
 
 def _wait_for_windows_pid_exit(pid: int, timeout_s: float) -> None:
@@ -10472,32 +10558,23 @@ def _windows_stopped_host_tree_pids(
     excluded_pids: set[int],
 ) -> list[int]:
     """Identify the stopped Host supervisor loop, ``omni.exe host``, and runner descendants."""
+    if not _normalize_windows_fs_path(tool_venv_path):
+        return []
     by_pid = {proc.pid: proc for proc in processes}
     children_by_ppid: dict[int, list[int]] = {}
     for proc in processes:
         children_by_ppid.setdefault(proc.ppid, []).append(proc.pid)
 
     roots: set[int] = set()
-    dead_stopped_seeds: set[int] = set()
     stopped_ids = {int(pid) for pid in stopped_host_pids if int(pid) > 0}
     for pid in stopped_ids:
         if pid in excluded_pids:
             continue
         current = by_pid.get(pid)
-        if current is None:
-            dead_stopped_seeds.add(pid)
+        if current is None or current.created_at <= 0:
             continue
-        cmd_lower = current.cmdline.casefold()
-        name_lower = current.name.casefold()
-        is_host_identity = (
-            " host" in cmd_lower
-            or name_lower in {"omni.exe", "omnigent.exe", "omni", "omnigent"}
-            or (
-                not cmd_lower
-                and _windows_path_holds_tool_venv(
-                    current, tool_venv_path=tool_venv_path, cli_bin_path=cli_bin_path
-                )
-            )
+        is_host_identity = _windows_is_host_daemon(current) or _windows_is_host_launcher(
+            current, cli_bin_path
         )
         if is_host_identity:
             roots.add(pid)
@@ -10507,35 +10584,23 @@ def _windows_stopped_host_tree_pids(
                 parent = by_pid.get(current.ppid)
                 if parent is None or parent.pid in excluded_pids:
                     break
-                if _windows_path_holds_tool_venv(
-                    parent,
-                    tool_venv_path=tool_venv_path,
-                    cli_bin_path=cli_bin_path,
+                if 0 < parent.created_at <= current.created_at and _windows_is_host_launcher(
+                    parent, cli_bin_path
                 ):
                     roots.add(parent.pid)
                     current = parent
                     continue
                 break
 
-    cli_norm = _normalize_windows_fs_path(cli_bin_path)
-    owner_home_prefix = (
-        cli_norm[: -len("\\.local\\bin\\omni.exe")] + "\\"
-        if cli_norm.endswith("\\.local\\bin\\omni.exe")
-        else ""
-    )
     for proc in processes:
         if proc.pid in excluded_pids:
             continue
-        cmd_lower = proc.cmdline.replace("/", "\\").casefold()
         is_supervisor_script = (
-            "start-omnigenthostdefault.ps1" in cmd_lower or "launch-omnigenthost.pyw" in cmd_lower
-        ) and (not owner_home_prefix or owner_home_prefix in cmd_lower)
-        if is_supervisor_script or (
-            proc.ppid in dead_stopped_seeds
-            and _windows_path_holds_tool_venv(
-                proc, tool_venv_path=tool_venv_path, cli_bin_path=cli_bin_path
-            )
-        ):
+            _windows_is_host_launcher(proc, cli_bin_path)
+            and _normalize_windows_fs_path(proc.exe) != _normalize_windows_fs_path(cli_bin_path)
+            and proc.created_at > 0
+        )
+        if is_supervisor_script:
             roots.add(proc.pid)
 
     tree: set[int] = set()
@@ -10546,7 +10611,11 @@ def _windows_stopped_host_tree_pids(
             continue
         tree.add(current_pid)
         for child_pid in children_by_ppid.get(current_pid, ()):
-            if child_pid not in tree and child_pid not in excluded_pids:
+            if (
+                child_pid not in tree
+                and child_pid not in excluded_pids
+                and by_pid[child_pid].created_at >= by_pid[current_pid].created_at > 0
+            ):
                 queue.append(child_pid)
     return sorted(pid for pid in tree if pid in by_pid)
 
@@ -10588,10 +10657,10 @@ def _windows_process_ancestor_pids(
         parent = by_pid.get(current.ppid)
         if parent is None:
             break
-        if _windows_path_holds_tool_venv(
-            parent,
-            tool_venv_path=tool_venv_path,
-            cli_bin_path=cli_bin_path,
+        if _normalize_windows_fs_path(parent.exe) == _normalize_windows_fs_path(
+            cli_bin_path
+        ) and _windows_path_holds_tool_venv(
+            parent, tool_venv_path=tool_venv_path, cli_bin_path=cli_bin_path
         ):
             ancestors.add(parent.pid)
         current = parent
@@ -10603,6 +10672,7 @@ def _wait_for_windows_custom_host_venv_release(
     tool_venv_path: Path | str,
     cli_bin_path: Path | str,
     stopped_host_pids: Sequence[int],
+    process_identities: Sequence[_WindowsProcessInfo] = (),
     parent_pid: int | None = None,
     helper_pid: int | None = None,
     allow_ancestor_cli: bool = False,
@@ -10620,6 +10690,18 @@ def _wait_for_windows_custom_host_venv_release(
     tree_excluded = set(base_excluded)
     if parent_pid is not None and parent_pid > 0:
         tree_excluded.add(parent_pid)
+    captured = list(process_identities)
+    if not captured:
+        initial = _list_windows_processes()
+        initial_tree = _windows_stopped_host_tree_pids(
+            initial,
+            stopped_host_pids=stopped_host_pids,
+            tool_venv_path=tool_venv_path,
+            cli_bin_path=cli_bin_path,
+            excluded_pids=tree_excluded,
+        )
+        captured = [proc for proc in initial if proc.pid in initial_tree]
+    captured_times = {proc.pid: proc.created_at for proc in captured if proc.created_at > 0}
 
     grace_deadline = time.monotonic() + max(grace_s, 0.0)
     while time.monotonic() < grace_deadline:
@@ -10641,7 +10723,7 @@ def _wait_for_windows_custom_host_venv_release(
             cli_bin_path=cli_bin_path,
             excluded_pids=tree_excluded | ancestors,
         )
-        if not host_tree:
+        if not host_tree and not any(proc.pid in captured_times for proc in processes):
             break
         time.sleep(0.05)
 
@@ -10656,14 +10738,9 @@ def _wait_for_windows_custom_host_venv_release(
         if allow_ancestor_cli and helper_pid is not None
         else set()
     )
-    for pid in _windows_stopped_host_tree_pids(
-        processes,
-        stopped_host_pids=stopped_host_pids,
-        tool_venv_path=tool_venv_path,
-        cli_bin_path=cli_bin_path,
-        excluded_pids=tree_excluded | ancestors,
-    ):
-        _terminate_windows_process(pid)
+    for pid, expected in captured_times.items():
+        if pid not in tree_excluded | ancestors:
+            _terminate_windows_process(pid, expected)
 
     deadline = time.monotonic() + max(timeout_s, 0.0)
     while True:
@@ -10678,14 +10755,9 @@ def _wait_for_windows_custom_host_venv_release(
             if allow_ancestor_cli and helper_pid is not None
             else set()
         )
-        for pid in _windows_stopped_host_tree_pids(
-            processes,
-            stopped_host_pids=stopped_host_pids,
-            tool_venv_path=tool_venv_path,
-            cli_bin_path=cli_bin_path,
-            excluded_pids=tree_excluded | ancestors,
-        ):
-            _terminate_windows_process(pid)
+        for pid, expected in captured_times.items():
+            if pid not in tree_excluded | ancestors:
+                _terminate_windows_process(pid, expected)
         locking = _windows_venv_locking_processes(
             processes,
             tool_venv_path=tool_venv_path,
@@ -10733,14 +10805,27 @@ def _reconcile_custom_host_update_result(
     reconciled: dict[str, object] = {
         **result,
         "status": "complete",
+        "phase": "completed",
         "target_commit": current_sha,
         "error": None,
     }
     if persist:
         paths = _custom_host_update_paths()
-        with contextlib.suppress(OSError):
-            atomic_write_json(paths["result"], reconciled)
-            paths["lock"].unlink(missing_ok=True)
+        backup = result.get("backup_path")
+        if isinstance(backup, str) and backup:
+            transaction = Path(backup).parent
+            venv = _custom_host_tool_venv_path().resolve()
+            if (
+                transaction.resolve().parent != venv.parent
+                or not re.fullmatch(
+                    re.escape(venv.name) + r"\.update-[0-9a-f]{32}", transaction.name
+                )
+                or Path(backup).name != "previous"
+            ):
+                raise click.ClickException("Invalid custom Host update transaction path.")
+            atomic_write_json(transaction / "transaction.json", reconciled)
+        atomic_write_json(paths["result"], reconciled)
+        paths["lock"].unlink(missing_ok=True)
     return reconciled
 
 
@@ -10788,8 +10873,6 @@ def _custom_host_update_launch_guard() -> Iterator[None]:
 def _ensure_no_running_custom_host_helper() -> None:
     """Refuse overlapping Windows helpers and clear only a stale lock."""
     lock_path = _custom_host_update_paths()["lock"]
-    if not lock_path.exists():
-        return
     result = _read_custom_host_update_result()
     status = result.get("status") if result is not None else None
     if status in {"starting", "running"}:
@@ -10807,6 +10890,16 @@ def _ensure_no_running_custom_host_helper() -> None:
             raise click.ClickException(
                 f"A custom Host update is already running (process pid {live_pid})."
             )
+    if (
+        result
+        and result.get("status") != "complete"
+        and result.get("backup_path")
+        and result.get("phase") not in {"completed", "restored"}
+    ):
+        raise click.ClickException(
+            "An interrupted update needs independent recovery. Exit this CLI, run "
+            "`omni-host-service start`, then retry the update. Previous files retained."
+        )
     lock_path.unlink(missing_ok=True)
 
 
@@ -10820,6 +10913,93 @@ def _copy_windows_custom_host_helper(target: Path) -> None:
     os.replace(temporary, target)
 
 
+def _arm_windows_custom_host_recovery(wrapper: Path, helper: Path, instruction: Path) -> None:
+    """Arm independent startup recovery before the working tool environment is moved."""
+    _validate_windows_custom_host_recovery_paths(wrapper)
+    marker = "REM omnigent custom update recovery"
+    text = wrapper.read_text(encoding="utf-8")
+    pwsh = shutil.which("pwsh")
+    if pwsh is None:
+        raise click.ClickException("PowerShell 7 is required for update recovery.")
+    command = f'"{pwsh}" -NoProfile -File "{helper}" -RecoverOnly -InstructionPath "{instruction}"'
+    if marker not in text:
+        temporary = wrapper.with_suffix(".recovery.tmp")
+        temporary.write_text(
+            f'@echo off\n{marker}\nif /I "%~1"=="start" (\n'
+            f"  {command}\n  if errorlevel 1 exit /b 1\n)\n{text}",
+            encoding="utf-8",
+        )
+        os.replace(temporary, wrapper)
+    # The default scheduled task starts its supervisor directly on logon.
+    # Arm that entry too; custom supervisors still recover via their wrapper.
+    default_wrapper = Path.home() / ".local" / "bin" / "omni-host-service.cmd"
+    startup = Path.home() / ".omnigent" / "autostart" / "Start-OmnigentHostDefault.ps1"
+    if wrapper == default_wrapper and startup.is_file():
+        # Keep CRLF intact: the parser's UTF-16 offsets refer to the file bytes.
+        startup_text = startup.read_bytes().decode("utf-8-sig")
+        startup_marker = "# omnigent custom update recovery"
+        if startup_marker not in startup_text:
+            ps_command = (
+                f"& '{pwsh.replace(chr(39), chr(39) * 2)}' -NoProfile -File "
+                f"'{str(helper).replace(chr(39), chr(39) * 2)}' -RecoverOnly "
+                f"-InstructionPath '{str(instruction).replace(chr(39), chr(39) * 2)}' "
+                "-ResumeAutostart\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\n"
+            )
+            temporary = startup.with_suffix(".recovery.tmp")
+            # A script param block (and #requires/using statements) must remain
+            # at the beginning. Ask PowerShell's parser for the body boundary.
+            parsed = subprocess.run(
+                [
+                    pwsh,
+                    "-NoProfile",
+                    "-Command",
+                    "$t=$null; $e=$null; "
+                    "$a=[Management.Automation.Language.Parser]::ParseFile("
+                    "$env:OMNIGENT_STARTUP_SCRIPT,[ref]$t,[ref]$e); "
+                    "if($e.Count){exit 1}; "
+                    "if($a.BeginBlock -or $a.ProcessBlock -or $a.CleanBlock){exit 1}; "
+                    "if($a.EndBlock.Statements.Count){$a.EndBlock.Statements[0].Extent.StartOffset}"
+                    "else{$a.Extent.EndOffset}",
+                ],
+                env={**os.environ, "OMNIGENT_STARTUP_SCRIPT": str(startup)},
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            if parsed.returncode:
+                raise click.ClickException("Cannot safely arm the Host startup script.")
+            # Parser offsets count UTF-16 code units, unlike Python string offsets.
+            offset = int(parsed.stdout.strip())
+            encoded = startup_text.encode("utf-16-le")
+            before = encoded[: offset * 2].decode("utf-16-le")
+            after = encoded[offset * 2 :].decode("utf-16-le")
+            temporary.write_bytes(
+                (before + "\n" + startup_marker + "\n" + ps_command + after).encode("utf-8")
+            )
+            os.replace(temporary, startup)
+
+
+def _validate_windows_custom_host_recovery_paths(wrapper: Path) -> None:
+    """Recovery entry points must survive moving the tool environment."""
+    venv = _custom_host_tool_venv_path().resolve()
+    paths = _custom_host_update_paths()
+    startup = Path.home() / ".omnigent" / "autostart" / "Start-OmnigentHostDefault.ps1"
+    if any(
+        path.resolve().is_relative_to(venv)
+        for path in (
+            wrapper,
+            paths["helper"],
+            paths["instruction"],
+            startup,
+        )
+    ):
+        raise click.ClickException(
+            "Windows Host recovery entries must be outside the tool environment. "
+            "Move the supervisor wrapper/data directory before updating."
+        )
+
+
 def _launch_windows_custom_host_update(
     *,
     install_command: str,
@@ -10831,6 +11011,7 @@ def _launch_windows_custom_host_update(
     wrapper: Path,
     rollback_source_url: str | None = None,
     skip_web_ui: bool = True,
+    process_identities: Sequence[_WindowsProcessInfo] = (),
 ) -> tuple[int, Path, Path]:
     """Start the detached helper that updates after this locked CLI exits."""
     import shlex
@@ -10866,8 +11047,10 @@ def _launch_windows_custom_host_update(
             constraints_dir = Path(tempfile.mkdtemp(prefix="locked-install-", dir=paths["root"]))
             install_args = _prepare_uv_git_install(install_args, constraints_dir)
         _copy_windows_custom_host_helper(paths["helper"])
+        _arm_windows_custom_host_recovery(wrapper, paths["helper"], paths["instruction"])
         paths["log"].write_text("", encoding="utf-8")
         probe_code = (
+            "import omnigent.cli, omnigent.runner._entry; "
             "from omnigent.update_check import _read_installed_wheel_info as r; "
             "i=r(); print((i.commit_sha or '') if i is not None else '')"
         )
@@ -10883,6 +11066,8 @@ def _launch_windows_custom_host_update(
             "schema_version": 1,
             "parent_pid": os.getpid(),
             "install_argv": install_args,
+            "helper_path": str(paths["helper"]),
+            "disabled_marker": str(Path.home() / ".omnigent" / "autostart" / "disabled"),
             "constraints_dir": str(constraints_dir) if constraints_dir is not None else "",
             "recovery_command": recovery_command,
             "recovery_steps": recovery_steps,
@@ -10894,7 +11079,13 @@ def _launch_windows_custom_host_update(
             "previous_records": [
                 {"target": record.target, "pid": record.pid} for record in previous_records
             ],
-            "probe_argv": [sys.executable, "-c", probe_code],
+            "previous_processes": [
+                {"pid": proc.pid, "created_at": proc.created_at}
+                for proc in process_identities
+                if proc.created_at > 0
+            ],
+            "probe_argv": [str(tool_venv_path / "Scripts" / "python.exe"), "-I", "-c", probe_code],
+            "version_argv": [cli_executable, "--version"],
             "status_argv": [cli_executable, "host", "status", "--json"],
             "wrapper_path": str(wrapper),
             "rollback_path": str(_custom_host_rollback_path()),
@@ -11087,11 +11278,13 @@ def _preflight_custom_host_supervisor() -> None:
     """Fail before draining sessions when no managed supervisor is installed."""
     if IS_WINDOWS:
         _ensure_no_running_custom_host_helper()
-        if _windows_host_service_wrapper() is None:
+        wrapper = _windows_host_service_wrapper()
+        if wrapper is None:
             raise click.ClickException(
                 "No managed Windows Host supervisor was found. Install our "
                 "omni-host-service wrapper before using custom self-update."
             )
+        _validate_windows_custom_host_recovery_paths(wrapper)
         return
 
     from omnigent.host.service import HostServiceError, _service_for_current_platform
@@ -11495,6 +11688,15 @@ def _host_update_custom_impl(
     paused: object | None = None
     if IS_WINDOWS:
         try:
+            processes = _list_windows_processes()
+            old_tree = _windows_stopped_host_tree_pids(
+                processes,
+                stopped_host_pids=[record.pid for record in previous_records],
+                tool_venv_path=_custom_host_tool_venv_path(),
+                cli_bin_path=_windows_custom_host_cli_path(shutil.which("omni")),
+                excluded_pids={os.getpid()},
+            )
+            process_identities = [proc for proc in processes if proc.pid in old_tree]
             paused = _pause_custom_host_supervisor()
             if not (
                 isinstance(paused, tuple)
@@ -11509,6 +11711,7 @@ def _host_update_custom_impl(
                     shutil.which("omni") or shutil.which("omnigent")
                 ),
                 stopped_host_pids=[record.pid for record in previous_records],
+                process_identities=process_identities,
                 helper_pid=os.getpid(),
                 allow_ancestor_cli=True,
             )
@@ -11522,6 +11725,7 @@ def _host_update_custom_impl(
                 wrapper=paused[1],
                 rollback_source_url=rollback_source,
                 skip_web_ui=not build_web_ui,
+                process_identities=process_identities,
             )
         except Exception:
             if paused is not None:
