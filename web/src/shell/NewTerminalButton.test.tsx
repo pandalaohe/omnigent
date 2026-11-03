@@ -115,12 +115,12 @@ describe("NewTerminalButton access gate", () => {
       </QueryClientProvider>,
     );
     fireEvent.pointerDown(screen.getByRole("button", { name: "Session menu" }), { button: 0 });
-    fireEvent.click(await screen.findByRole("menuitem", { name: "Admin (root)" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Admin" }));
     await waitFor(() => expect(created).toHaveBeenCalledWith("terminal:terminal_root"));
     expect(screen.queryByRole("menu")).toBeNull();
     client.clear();
   });
-  it("adds Admin (root) and sends elevated true for a capable owner", async () => {
+  it("adds Admin and sends elevated true for a capable owner", async () => {
     elevated.allowed = true;
     fetchMock.mockImplementation(async (_url, init) =>
       mockResponse(
@@ -143,7 +143,7 @@ describe("NewTerminalButton access gate", () => {
     renderButton(created);
     await screen.findByRole("button", { name: "Choose shell" });
     fireEvent.pointerDown(screen.getByRole("button", { name: "Choose shell" }), { button: 0 });
-    fireEvent.click(screen.getByRole("menuitem", { name: "Admin (root)" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Admin" }));
     await waitFor(() => expect(created).toHaveBeenCalledWith("terminal:terminal_root"));
     const post = fetchMock.mock.calls.find(([, init]) => init?.method === "POST");
     expect(JSON.parse(post?.[1].body)).toMatchObject({ terminal: "shell", elevated: true });

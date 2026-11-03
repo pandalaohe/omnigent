@@ -215,7 +215,7 @@ function SplitMenu({
           </DropdownMenuItem>
         ))}
         {canElevate && (
-          <DropdownMenuItem onSelect={() => onPick(shells[0], true)}>Admin (root)</DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => onPick(shells[0], true)}>Admin</DropdownMenuItem>
         )}
       </DropdownMenuContent>
     </DropdownMenu>

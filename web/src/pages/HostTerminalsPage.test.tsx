@@ -109,11 +109,11 @@ describe("host terminal page", () => {
       "aria-selected",
       "true",
     );
-    fireEvent.mouseDown(screen.getByRole("tab", { name: "root · bbbbbb" }), {
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Admin · bbbbbb" }), {
       button: 0,
       ctrlKey: false,
     });
-    expect(screen.getByRole("tab", { name: "root · bbbbbb" })).toHaveAttribute(
+    expect(screen.getByRole("tab", { name: "Admin · bbbbbb" })).toHaveAttribute(
       "aria-selected",
       "true",
     );
@@ -123,12 +123,12 @@ describe("host terminal page", () => {
     ]);
     view.dispose();
     view = mount();
-    await screen.findByRole("tab", { name: "root · bbbbbb" });
+    await screen.findByRole("tab", { name: "Admin · bbbbbb" });
     expect(vi.mocked(authenticatedFetch).mock.calls.every(([, init]) => !init?.method)).toBe(true);
     view.dispose();
   });
 
-  it("creates a root tab and closes only after confirmation", async () => {
+  it("creates an admin tab and closes only after confirmation", async () => {
     let live: HostTerminal[] = [];
     const requests: { method: string; body?: string | null }[] = [];
     vi.mocked(authenticatedFetch).mockImplementation(async (_, init) => {
@@ -147,16 +147,16 @@ describe("host terminal page", () => {
     const view = mount();
     await screen.findByText(/No open terminals/);
     await newMenu();
-    fireEvent.click(screen.getByRole("menuitem", { name: "Admin (root)" }));
-    expect(await screen.findByRole("tab", { name: "root · cccccc" })).toHaveAttribute(
+    fireEvent.click(screen.getByRole("menuitem", { name: "Admin" }));
+    expect(await screen.findByRole("tab", { name: "Admin · cccccc" })).toHaveAttribute(
       "aria-selected",
       "true",
     );
     expect(requests).toEqual([{ method: "POST", body: '{"elevated":true}' }]);
-    fireEvent.click(screen.getByRole("button", { name: "Close root · cccccc" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close Admin · cccccc" }));
     fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Cancel" }));
     expect(requests).toHaveLength(1);
-    fireEvent.click(screen.getByRole("button", { name: "Close root · cccccc" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close Admin · cccccc" }));
     fireEvent.click(
       within(screen.getByRole("dialog")).getByRole("button", { name: "Close terminal" }),
     );
@@ -174,7 +174,7 @@ describe("host terminal page", () => {
       const view = mount();
       await screen.findByText(/No open terminals/);
       await newMenu();
-      expect(screen.queryByRole("menuitem", { name: "Admin (root)" })).toBeNull();
+      expect(screen.queryByRole("menuitem", { name: "Admin" })).toBeNull();
       expect(screen.getByRole("menuitem", { name: "Shell" })).toBeVisible();
       view.dispose();
     },

@@ -47,7 +47,7 @@ function HostTerminals({ hostId }: { hostId: string }) {
   const denied =
     terminals.error instanceof ApiError && [401, 403, 404].includes(terminals.error.status);
   const label = (terminal: HostTerminal) =>
-    `${terminal.elevated ? "root" : "Shell"} · ${terminal.terminal_id.slice(0, 6)}`;
+    `${terminal.elevated ? "Admin" : "Shell"} · ${terminal.terminal_id.slice(0, 6)}`;
 
   function open(elevated: boolean) {
     close.reset();
@@ -96,9 +96,7 @@ function HostTerminals({ hostId }: { hostId: string }) {
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end">
             <DropdownMenuItem onSelect={() => open(false)}>Shell</DropdownMenuItem>
-            {canElevate && (
-              <DropdownMenuItem onSelect={() => open(true)}>Admin (root)</DropdownMenuItem>
-            )}
+            {canElevate && <DropdownMenuItem onSelect={() => open(true)}>Admin</DropdownMenuItem>}
           </DropdownMenuContent>
         </DropdownMenu>
       </header>
