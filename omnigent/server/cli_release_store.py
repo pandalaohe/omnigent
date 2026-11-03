@@ -159,6 +159,20 @@ class CliReleaseIntentStore:
                 session.flush()
             return _to_intent(row)
 
+    def list_for_host(self, host_id: str, *, limit: int = 20) -> list[CliReleaseIntent]:
+        """Return one Host's release intents, newest first, whatever their status."""
+        with self._session("list_for_host") as session:
+            rows = session.scalars(
+                select(SqlCliReleaseIntent)
+                .where(
+                    SqlCliReleaseIntent.workspace_id == current_workspace_id(),
+                    SqlCliReleaseIntent.host_id == host_id,
+                )
+                .order_by(SqlCliReleaseIntent.created_at.desc(), SqlCliReleaseIntent.id.desc())
+                .limit(limit)
+            ).all()
+            return [_to_intent(row) for row in rows]
+
     def list_due(self, *, now: int, limit: int = 200) -> list[CliReleaseIntent]:
         with self._session("list_due") as session:
             rows = session.scalars(

@@ -8,7 +8,6 @@
 
 import { useEffect } from "react";
 import {
-  ActivityIcon,
   ArchiveIcon,
   BotIcon,
   ArrowLeftIcon,
@@ -55,7 +54,6 @@ export type SettingsSectionId =
   | "policies"
   | "instructions"
   | "sharing"
-  | "system-status"
   | "archived"
   | "cli"
   | "updates";
@@ -75,7 +73,6 @@ const SECTION_IDS: readonly SettingsSectionId[] = [
   "policies",
   "instructions",
   "sharing",
-  "system-status",
   "archived",
   "cli",
   "updates",
@@ -184,7 +181,6 @@ export function settingsNavGroups(
     if (!isSingleUser) adminItems.push({ id: "members", label: "Members", icon: UsersIcon });
     adminItems.push({ id: "policies", label: "Policies", icon: ShieldCheckIcon });
     adminItems.push(instructions);
-    adminItems.push({ id: "system-status", label: "System status", icon: ActivityIcon });
     if (!isSingleUser) adminItems.push({ id: "sharing", label: "Sharing", icon: Share2Icon });
     groups.push({ title: "Admin", items: adminItems });
   }
@@ -257,7 +253,6 @@ const LEGACY_SETTINGS_SECTIONS: Record<string, { section: SettingsSectionId; anc
   "calling-defaults": { section: "harnesses", anchor: "calling-defaults" },
   "session-collab": { section: "general", anchor: "session-collab" },
   "context-usage": { section: "general", anchor: "context-usage" },
-  "runtime-resources": { section: "general", anchor: "runtime-resources" },
 };
 
 export function settingsLegacyDestination(
@@ -266,6 +261,15 @@ export function settingsLegacyDestination(
 ): string | null {
   const segments = pathname.split("/");
   const index = segments.lastIndexOf("settings");
+  // The System status settings form is gone: its values are edited on the
+  // page that shows them, so its links land there with the panel open.
+  if (index >= 0 && segments[index + 1] === "system-status") {
+    return `${segments.slice(0, index).join("/")}/system?monitor=1`;
+  }
+  // Idle CLI moved to each Host's card on the same page.
+  if (index >= 0 && segments[index + 1] === "runtime-resources") {
+    return `${segments.slice(0, index).join("/")}/system`;
+  }
   const legacy = LEGACY_SETTINGS_SECTIONS[segments[index + 1]];
   if (index < 0 || !legacy || (segments[index + 1] === "session-collab" && !sessionCollabEnabled))
     return null;

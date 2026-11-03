@@ -813,14 +813,13 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem(CONTEXT_INDICATOR_STORAGE_KEY)).toBe("compact");
   });
 
-  it("opens Host CLI retention from the old deep link", async () => {
+  it("moves the old Idle CLI deep link to the page that holds it", async () => {
+    // Idle CLI lives on each Host's card on /system: no General group is left
+    // to open, and the redirect carries the reader there.
     renderPage("/settings/runtime-resources");
 
-    expect(screen.getByRole("heading", { name: "Background processes" })).toBeInTheDocument();
-    expect(await screen.findByTestId("cli-retention-settings")).toHaveTextContent(
-      "Host-scoped idle CLI retention",
-    );
-    expect(screen.getByTestId("location")).toHaveTextContent("/settings/general");
+    await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent("/system"));
+    expect(screen.queryByTestId("cli-retention-settings")).toBeNull();
   });
 
   it("keeps polling and mobile controls together under shortcuts", () => {

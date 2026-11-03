@@ -144,7 +144,7 @@ describe("settingsNavGroups", () => {
     ).toEqual(["General", "Customize", "Desktop", "Archived"]);
   });
 
-  it("includes the Admin group (Members / Policies / Global instructions / System status / Sharing) for any admin, in accounts OR OIDC mode", () => {
+  it("includes the Admin group (Members / Policies / Global instructions / Sharing) for any admin, in accounts OR OIDC mode", () => {
     const ids = (accountsEnabled: boolean, isAdmin: boolean) =>
       settingsNavGroups(accountsEnabled, false, isAdmin)
         .flatMap((g) => g.items)
@@ -158,7 +158,6 @@ describe("settingsNavGroups", () => {
       "members",
       "policies",
       "instructions",
-      "system-status",
       "sharing",
     ]);
     // Admin under OIDC (accountsEnabled false) → still appears. This is the
@@ -168,7 +167,6 @@ describe("settingsNavGroups", () => {
       "members",
       "policies",
       "instructions",
-      "system-status",
       "sharing",
     ]);
   });
@@ -176,16 +174,12 @@ describe("settingsNavGroups", () => {
   it("drops Members and Sharing from the Admin group in single-user mode, keeping the server-wide sections", () => {
     // 4th arg is isSingleUser. Members (manage accounts) and Sharing (grant to
     // other users) are meaningless with no other users, so both are hidden;
-    // Policies, Global instructions and System status stay — all apply to the
-    // solo user's own sessions and server.
+    // Policies and Global instructions stay — both apply to the solo user's
+    // own sessions.
     const singleUserAdmin = settingsNavGroups(false, false, true, true).find(
       (g) => g.title === "Admin",
     );
-    expect(singleUserAdmin?.items.map((i) => i.id)).toEqual([
-      "policies",
-      "instructions",
-      "system-status",
-    ]);
+    expect(singleUserAdmin?.items.map((i) => i.id)).toEqual(["policies", "instructions"]);
   });
 
   it("includes the Sandbox Integrations item only when a connection is enabled", () => {
@@ -199,12 +193,13 @@ describe("settingsNavGroups", () => {
     expect(item(true)).toMatchObject({ id: "integrations", label: "Sandbox Integrations" });
   });
 
-  it("keeps the same 17 navigation destinations with collaboration on", () => {
+  it("keeps 16 navigation destinations with collaboration on", () => {
     const ids = settingsNavGroups(true, true, true, false, true, true).flatMap((group) =>
       group.items.map((item) => item.id),
     );
-    expect(ids).toHaveLength(17);
-    expect(new Set(ids).size).toBe(17);
+    // 17 before the System status settings section moved onto the page itself.
+    expect(ids).toHaveLength(16);
+    expect(new Set(ids).size).toBe(16);
     expect(ids).not.toEqual(
       expect.arrayContaining([
         "keep-warm",
@@ -541,9 +536,9 @@ describe("useSettingsRoute", () => {
     expect(settingsLegacyDestination("/ml/omnigent-embed/settings/calling-defaults", false)).toBe(
       "/ml/omnigent-embed/settings/harnesses#calling-defaults",
     );
-    expect(settingsLegacyDestination("/settings/runtime-resources", false)).toBe(
-      "/settings/general#runtime-resources",
-    );
+    // Idle CLI lives on each Host's card on /system now.
+    expect(settingsLegacyDestination("/settings/runtime-resources", false)).toBe("/system");
+    expect(settingsLegacyDestination("/settings/system-status", false)).toBe("/system?monitor=1");
     expect(settingsLegacyDestination("/settings/context-usage", false)).toBe(
       "/settings/general#context-usage",
     );

@@ -1,15 +1,11 @@
-// The admin "System status" settings section: loads the server thresholds,
-// saves an edit via PUT, surfaces a server validation error inline, edits the
-// workspace's default load lines and queue switch, and (in the health-check
-// sub-form) resolves the ops default agent, lists resolve problems and stores
-// a reset prompt in the shipped-default form.
+// The Monitor settings panel on /system: the workspace's default load lines and
+// the child-session queue switch, the ops health check, and the monitor's own
+// cost as a table.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-
-vi.mock("@/hooks/useIsAdmin", () => ({ useIsAdmin: () => true }));
 
 vi.mock("@/hooks/useAgents", () => ({
   useAgents: () => ({
@@ -17,7 +13,9 @@ vi.mock("@/hooks/useAgents", () => ({
   }),
 }));
 
-import { SystemStatusSettingsSection } from "./SettingsPage";
+import { MonitorSettingsDialog } from "./MonitorSettings";
+
+const MB = 1024 * 1024;
 
 const fetchMock = vi.fn();
 
@@ -69,6 +67,11 @@ const RESOLVE = {
   ],
 };
 
+const OVERHEAD = {
+  server: { cpu_pct: 0.1, mem_estimate_bytes: 6 * MB, estimated: true },
+  hosts: { host_1: { cpu_pct: 0.2, rss_delta: 18 * MB } },
+};
+
 function defaultFetch(input: RequestInfo | URL, _init?: RequestInit): Response {
   const url = String(input);
   if (url === "/v1/system/settings") return mockResponse(SETTINGS);
@@ -77,14 +80,19 @@ function defaultFetch(input: RequestInfo | URL, _init?: RequestInit): Response {
   return mockResponse({}, 404);
 }
 
-function renderSection() {
+function renderPanel(open = true, onOpenChange = vi.fn()) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
   return render(
     <QueryClientProvider client={client}>
       <MemoryRouter>
-        <SystemStatusSettingsSection />
+        <MonitorSettingsDialog
+          open={open}
+          onOpenChange={onOpenChange}
+          overhead={OVERHEAD}
+          hostNames={new Map([["host_1", "Worker"]])}
+        />
       </MemoryRouter>
     </QueryClientProvider>,
   );
@@ -115,84 +123,30 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe("SystemStatusSettingsSection thresholds", () => {
-  it("loads the server thresholds into the form", async () => {
-    renderSection();
-
-    expect(await screen.findByLabelText(/CPU threshold/)).toHaveValue(85);
-    expect(screen.getByLabelText(/Sustained window/)).toHaveValue(10);
-    expect(screen.getByLabelText(/Memory threshold/)).toHaveValue(90);
-    expect(screen.getByLabelText(/Disk threshold/)).toHaveValue(90);
-    expect(screen.getByLabelText(/Server 5xx failure rate/)).toHaveValue(5);
-    expect(fetchMock.mock.calls[0][0]).toBe("/v1/system/settings");
+describe("MonitorSettingsDialog", () => {
+  it("reads nothing until the panel opens", () => {
+    renderPanel(false);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("saves an edited threshold with PUT", async () => {
-    renderSection();
-
-    fireEvent.change(await screen.findByLabelText(/CPU threshold/), {
-      target: { value: "80" },
-    });
-    fireEvent.change(screen.getByLabelText(/Sustained window/), {
-      target: { value: "3" },
-    });
-    const form = screen.getByTestId("system-status-thresholds-form");
-    fireEvent.click(within(form).getByRole("button", { name: "Save" }));
-
-    await waitFor(() => expect(settingsPutCall()).toBeDefined());
-    const putInit = settingsPutCall()?.[1] as RequestInit;
-    expect(JSON.parse(String(putInit.body))).toEqual({
-      cpu_pct: 80,
-      cpu_sustain_min: 3,
-      mem_pct: 90,
-      disk_pct: 90,
-      server_5xx_pct: 5,
-    });
-  });
-
-  it("shows a server validation error inline", async () => {
-    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
-      if (String(input) === "/v1/system/settings" && init?.method === "PUT") {
-        return mockResponse(
-          { error: { message: "system-status setting 'cpu_pct' must be in (0, 100]" } },
-          400,
-        );
-      }
-      return defaultFetch(input, init);
-    });
-    renderSection();
-
-    fireEvent.change(await screen.findByLabelText(/CPU threshold/), {
-      target: { value: "0" },
-    });
-    const form = screen.getByTestId("system-status-thresholds-form");
-    fireEvent.click(within(form).getByRole("button", { name: "Save" }));
-
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      "system-status setting 'cpu_pct' must be in (0, 100]",
-    );
-  });
-});
-
-describe("LoadLinesSettingsForm", () => {
   it("loads the workspace default lines and the queue switch", async () => {
-    renderSection();
+    renderPanel();
 
     const form = await screen.findByTestId("load-lines-form");
-    expect(within(form).getByLabelText("Heavy-work line (per core)")).toHaveValue(4);
-    expect(within(form).getByLabelText("New-session line (per core)")).toHaveValue(5);
+    expect(within(form).getByLabelText("Heavy work (per core)")).toHaveValue(4);
+    expect(within(form).getByLabelText("No new session (per core)")).toHaveValue(5);
     expect(within(form).getByRole("switch", { name: "Queue new child sessions" })).toBeChecked();
     expect(within(form).getByRole("button", { name: "Save" })).toBeDisabled();
   });
 
   it("saves the default pair and the queue switch without touching host overrides", async () => {
-    renderSection();
+    renderPanel();
 
     const form = await screen.findByTestId("load-lines-form");
-    fireEvent.change(within(form).getByLabelText("Heavy-work line (per core)"), {
+    fireEvent.change(within(form).getByLabelText("Heavy work (per core)"), {
       target: { value: "3" },
     });
-    fireEvent.change(within(form).getByLabelText("New-session line (per core)"), {
+    fireEvent.change(within(form).getByLabelText("No new session (per core)"), {
       target: { value: "4.5" },
     });
     fireEvent.click(within(form).getByRole("switch", { name: "Queue new child sessions" }));
@@ -210,14 +164,14 @@ describe("LoadLinesSettingsForm", () => {
     ["6", "5", "The heavy-work line must be below the new-session line."],
     ["0", "5", "The heavy-work line must be above 0."],
     ["", "5", "Enter both lines as numbers."],
-  ])("refuses heavy %s / new-session %s before sending", async (heavy, newSession, message) => {
-    renderSection();
+  ])("refuses heavy %s / no-new-session %s before sending ", async (heavy, newSession, message) => {
+    renderPanel();
 
     const form = await screen.findByTestId("load-lines-form");
-    fireEvent.change(within(form).getByLabelText("Heavy-work line (per core)"), {
+    fireEvent.change(within(form).getByLabelText("Heavy work (per core)"), {
       target: { value: heavy },
     });
-    fireEvent.change(within(form).getByLabelText("New-session line (per core)"), {
+    fireEvent.change(within(form).getByLabelText("No new session (per core)"), {
       target: { value: newSession },
     });
     fireEvent.click(within(form).getByRole("button", { name: "Save" }));
@@ -226,36 +180,30 @@ describe("LoadLinesSettingsForm", () => {
     expect(settingsPutCall()).toBeUndefined();
   });
 
-  it("leaves the form out when the server predates load lines", async () => {
+  it("leaves the load-line form out when the server predates load lines", async () => {
     const { load_lines: _omitted, ...olderServer } = SETTINGS;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) =>
       String(input) === "/v1/system/settings"
         ? mockResponse(olderServer)
         : defaultFetch(input, init),
     );
-    renderSection();
+    renderPanel();
 
-    expect(await screen.findByLabelText(/CPU threshold/)).toHaveValue(85);
+    expect(await screen.findByTestId("health-check-form")).toBeInTheDocument();
     expect(screen.queryByTestId("load-lines-form")).toBeNull();
   });
 
-  it("lets the field's own limit refuse a new-session line above 64", async () => {
-    renderSection();
+  it("shows the monitor's own cost as a table, with no bare dash", async () => {
+    renderPanel();
 
-    const form = await screen.findByTestId("load-lines-form");
-    const newSession = within(form).getByLabelText("New-session line (per core)");
-    expect(newSession).toHaveAttribute("max", "64");
-    fireEvent.change(newSession, { target: { value: "65" } });
-    fireEvent.click(within(form).getByRole("button", { name: "Save" }));
-
-    await new Promise((resolve) => {
-      setTimeout(resolve, 0);
-    });
-    expect(settingsPutCall()).toBeUndefined();
+    const table = await screen.findByTestId("monitor-overhead-table");
+    expect(within(table).getByText("Server")).toBeInTheDocument();
+    expect(within(table).getByText("Worker")).toBeInTheDocument();
+    expect(within(table).getByText("6.0 MB (estimate)")).toBeInTheDocument();
+    expect(within(table).getByText("18 MB below start")).toBeInTheDocument();
+    expect(table).not.toHaveTextContent("—");
   });
-});
 
-describe("HealthCheckSettingsForm", () => {
   it("resolves the agent, lists resolve problems, and saves a reset prompt as null", async () => {
     const stored = {
       ...SETTINGS,
@@ -267,7 +215,7 @@ describe("HealthCheckSettingsForm", () => {
       if (url.startsWith("/v1/calling-defaults/resolve")) return mockResponse(RESOLVE);
       return defaultFetch(input, init);
     });
-    renderSection();
+    renderPanel();
 
     expect(await screen.findByLabelText("Prompt")).toHaveValue("Old custom prompt");
 
