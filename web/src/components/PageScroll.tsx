@@ -51,22 +51,23 @@ export function PageScroll({
   className,
   "data-testid": testId,
 }: PageScrollProps) {
-  // Padding is composed from the shared inset vars rather than the old fixed
-  // `pt-14 py-8`, so the bottom always clears the native bar + home indicator
-  // and the top always clears the header + notch — the bug those magic numbers
-  // missed. The padding lives on the scroll container so the last item can
-  // scroll up clear of the bar.
-  const style: CSSProperties = {
-    paddingTop: `calc(${extraTop}${clearHeader ? " + var(--omnigent-header-height)" : ""}${
+  // Narrow layouts reserve header clearance outside the scroll viewport. Desktop
+  // keeps its full-height scroll viewport and scrollable top padding.
+  const style = {
+    "--page-scroll-top-clearance": `calc(0px${clearHeader ? " + var(--omnigent-header-height)" : ""}${
       insetTop ? " + var(--omnigent-inset-top)" : ""
     })`,
+    "--page-scroll-extra-top": extraTop,
     paddingBottom: `calc(${extraBottom}${insetBottom ? " + var(--omnigent-inset-bottom)" : ""})`,
-  };
+  } as CSSProperties;
 
   return (
     <div
       data-testid={testId}
-      className={cn("min-h-0 w-full flex-1 overflow-y-auto", className)}
+      className={cn(
+        "min-h-0 w-full flex-1 overflow-y-auto mt-[var(--page-scroll-top-clearance)] pt-[var(--page-scroll-extra-top)] min-[1040px]:mt-0 min-[1040px]:pt-[calc(var(--page-scroll-top-clearance)_+_var(--page-scroll-extra-top))]",
+        className,
+      )}
       style={style}
     >
       <div className={cn("mx-auto w-full", maxWidthClassName, contentClassName)}>{children}</div>
