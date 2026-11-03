@@ -84,6 +84,71 @@ async def bind_ready(runtime, broker, relay, pid=None):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "fault", ["none", "other-path", "missing-loaded", "changed-loaded", "changed-file"]
+)
+async def test_scoped_registry_accepts_only_the_configured_bridge_file(
+    attestor_relay, tmp_path, fault
+):
+    from omnigent.permission_tiers.pi_tools import read_pi_tool_registry
+
+    runtime, broker, _relay, _source, _registry = attestor_relay
+    parent_expected = json.loads(
+        (runtime.path("session-a").parent / "permission_expected.json").read_text()
+    )
+    configured = Path(parent_expected["extension_path"])
+    source = configured
+    if fault == "other-path":
+        source = tmp_path / "other-bridge.js"
+        source.write_bytes(configured.read_bytes())
+    actor = broker.register_process(
+        os.getpid(), expected_identity=process_identity(os.getpid()), root=True
+    )
+    broker.handle(
+        actor, {"protocol": 1, "sequence": 1, "op": "bind", "loader": "root", "handle": "root"}
+    )
+    admission = actor.installations["root"]
+    _write_scope_registry(
+        admission,
+        [
+            {
+                "name": "fixture__echo",
+                "sourceInfo": {
+                    "path": str(source),
+                    "source": "cli",
+                    "scope": "temporary",
+                    "origin": "top-level",
+                },
+                "real_path": str(source),
+                "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            }
+        ],
+    )
+    path = admission.registry_dir / "permission_tools.json"
+    published = json.loads(path.read_text())
+    if fault == "missing-loaded":
+        published["loaded_extensions"] = [
+            row for row in published["loaded_extensions"] if row["path"] != str(source)
+        ]
+    elif fault == "changed-loaded":
+        published["loaded_extensions"][-1]["source_sha256"] = "0" * 64
+    elif fault == "changed-file":
+        configured.write_text("// changed bridge\n")
+    path.write_text(json.dumps(published))
+    record = runtime.pi_scopes.record(admission.principal)
+    registry = read_pi_tool_registry(
+        admission.registry_dir, runtime.state("session-a"), expected_binding=record.expected
+    )
+    if fault == "none":
+        assert not registry.reason and not registry.invalid_tools, registry
+        assert registry.bridge_tools == frozenset({"fixture__echo"})
+        assert runtime.acknowledge_pi_scope("session-a", admission.credential)
+    else:
+        assert registry.reason or registry.invalid_tools
+        assert not runtime.acknowledge_pi_scope("session-a", admission.credential)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "publication", ["pending", "ready", "changed-registry", "revoked", "state-write-retry"]
 )
 async def test_scoped_startup_keeps_root_blocked_until_complete_registration(

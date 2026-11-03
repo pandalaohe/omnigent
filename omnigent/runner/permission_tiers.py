@@ -332,6 +332,8 @@ class PermissionTierRuntime:
             )
             expected = {
                 **expected,
+                "bridge_extension_path": expected["extension_path"],
+                "bridge_extension_sha256": expected["extension_sha256"],
                 "extension_path": str(guard),
                 "extension_sha256": hashlib.sha256(guard.read_bytes()).hexdigest(),
             }

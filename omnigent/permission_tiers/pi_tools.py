@@ -159,6 +159,19 @@ def read_pi_tool_registry(
             raise ValueError("missing tool registrations")
         extensions: dict[str, str] = {}
         controls: list[str] = []
+        bridge_path = expected.get("bridge_extension_path")
+        bridge_sha256 = expected.get("bridge_extension_sha256")
+        if scoped and (bridge_path is not None or bridge_sha256 is not None):
+            if (
+                not isinstance(bridge_path, str)
+                or not Path(bridge_path).is_absolute()
+                or not isinstance(bridge_sha256, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", bridge_sha256)
+                or hashlib.sha256(_read_file(Path(bridge_path), require_nofollow=True)).hexdigest()
+                != bridge_sha256
+            ):
+                raise ValueError("changed scoped bridge identity")
+            controls.append(bridge_path)
         names: set[str] = set()
         invalid: set[str] = set()
         native_tools: dict[str, str] = {}
@@ -187,6 +200,16 @@ def read_pi_tool_registry(
                 if source.get("source") == "builtin" and path == f"builtin:{name}":
                     continue
                 if path in (str(guard), "<inline:omnigent-permission>"):
+                    bridge_tools.add(name)
+                    continue
+                if scoped and isinstance(bridge_path, str) and path == bridge_path:
+                    identity = loaded.get(bridge_path)
+                    if (
+                        identity is None
+                        or identity["resolved_path"] != bridge_path
+                        or identity["source_sha256"] != bridge_sha256
+                    ):
+                        raise ValueError("unbound scoped bridge source")
                     bridge_tools.add(name)
                     continue
                 if (
