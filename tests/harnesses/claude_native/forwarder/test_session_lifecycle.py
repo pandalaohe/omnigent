@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import queue
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,7 @@ from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     prepare_bridge_dir,
     read_active_session_id,
+    read_claude_session_id,
     record_hook_event,
     write_active_session_id,
 )
@@ -1234,9 +1236,10 @@ async def test_forwarder_mirrors_external_session_id_after_hook_event(
     After the bridge records a hook event carrying ``session_id``
     (every hook from Claude does), the forwarder's first loop pass
     PATCHes ``/v1/sessions/{id}`` with the captured value as
-    ``external_session_id``. This is the mirror PR 2's resume flow
-    depends on — without it, cold-resume has no way to recover the
-    claude-side session that the bridge captured locally.
+    ``external_session_id``, right after the owner-binding patch that
+    precedes it. This is the mirror PR 2's resume flow depends on —
+    without it, cold-resume has no way to recover the claude-side
+    session that the bridge captured locally.
     """
     bridge_dir = tmp_path / "bridge"
     record_hook_event(
@@ -1260,6 +1263,7 @@ async def test_forwarder_mirrors_external_session_id_after_hook_event(
         )
     )
     try:
+        binding_patch = await _get_recorded_request(server, method="PATCH")
         patch_request = await _get_recorded_request(server, method="PATCH")
     finally:
         task.cancel()
@@ -1269,9 +1273,15 @@ async def test_forwarder_mirrors_external_session_id_after_hook_event(
         server.server_close()
         thread.join(timeout=5.0)
 
-    # Path proves the PATCH targets the right session — a bug that
-    # PATCHed e.g. the agent record would route here with a
-    # different prefix.
+    # The owner binding is written first; both target this session, so a
+    # bug that PATCHed e.g. the agent record would show up here.
+    assert binding_patch["path"].split("?")[0] == "/v1/sessions/conv_abc"
+    assert json.loads(
+        binding_patch["body"]["labels"]["omnigent.claude_native.confirmed_session"]
+    ) == {
+        "omnigent_session_id": "conv_abc",
+        "claude_session_id": "a1b2c3d4-1234-5678-9abc-def012345678",
+    }
     assert patch_request["path"] == "/v1/sessions/conv_abc"
     # Body asserts the captured Claude id flowed through unchanged.
     # If the bridge state read returned the wrong key or the
@@ -1355,8 +1365,14 @@ async def test_forwarder_mirrors_external_session_id_at_most_once(
         )
     )
     try:
-        # The first PATCH MUST land — covered by the previous test;
-        # consume it so it doesn't pollute the residual-queue check.
+        # The owner binding goes first so it never lags the once-only external
+        # id; the existing external-id mirror follows in the same poll.
+        binding_patch = await _get_recorded_request(server, method="PATCH")
+        raw_binding = binding_patch["body"]["labels"]["omnigent.claude_native.confirmed_session"]
+        assert json.loads(raw_binding) == {
+            "omnigent_session_id": "conv_once",
+            "claude_session_id": "claude-sid-once",
+        }
         first_patch = await _get_recorded_request(server, method="PATCH")
         assert first_patch["body"]["external_session_id"] == "claude-sid-once"
         # Pump several POST requests through the loop — proves the
@@ -1385,6 +1401,128 @@ async def test_forwarder_mirrors_external_session_id_at_most_once(
     # across the ~3 iterations we forced. Asserting on the literal
     # list (not just length) gives a useful diff in failure output.
     assert leftover_patches == []
+
+
+@pytest.mark.asyncio
+async def test_forwarder_updates_confirmed_binding_after_external_mirror_latches(
+    tmp_path: Path,
+) -> None:
+    """A new confirmed Claude id updates its owner label after the one-shot external mirror."""
+    bridge_dir = tmp_path / "bridge"
+    first_transcript = tmp_path / "first.jsonl"
+    first_transcript.write_text("", encoding="utf-8")
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-sid-a",
+            "transcript_path": str(first_transcript),
+        },
+    )
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forwarder.forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_binding",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        first_binding = await _get_recorded_request(server, method="PATCH")
+        assert json.loads(
+            first_binding["body"]["labels"]["omnigent.claude_native.confirmed_session"]
+        ) == {
+            "omnigent_session_id": "conv_binding",
+            "claude_session_id": "claude-sid-a",
+        }
+        external_patch = await _get_recorded_request(server, method="PATCH")
+        assert external_patch["body"]["external_session_id"] == "claude-sid-a"
+
+        second_transcript = tmp_path / "second.jsonl"
+        second_transcript.write_text("", encoding="utf-8")
+        record_hook_event(
+            bridge_dir,
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "claude-sid-b",
+                "transcript_path": str(second_transcript),
+            },
+        )
+        second_binding = await _get_recorded_request(server, method="PATCH")
+        assert second_binding["body"].get("external_session_id") is None
+        assert json.loads(
+            second_binding["body"]["labels"]["omnigent.claude_native.confirmed_session"]
+        ) == {
+            "omnigent_session_id": "conv_binding",
+            "claude_session_id": "claude-sid-b",
+        }
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+
+@pytest.mark.asyncio
+async def test_forwarder_mirrors_external_id_when_owner_label_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed owner-label write must not hold back the once-only external id.
+
+    Retention cleanup cancels the forwarder and deletes the bridge, so the
+    server's external id is the only durable trace of the confirmed transcript
+    left afterwards. Gating that mirror on the label write loses it.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text("", encoding="utf-8")
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-sid-b",
+            "transcript_path": str(transcript),
+        },
+    )
+
+    async def _failing_label_patch(*_args: Any, **_kwargs: Any) -> None:
+        raise httpx.ConnectError("transient label write failure")
+
+    monkeypatch.setattr(forwarder, "patch_confirmed_claude_session", _failing_label_patch)
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forwarder.forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_survives",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        external_patch = await _get_recorded_request(server, method="PATCH")
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+    assert external_patch["body"] == {"external_session_id": "claude-sid-b"}
+    # Retention cleanup deletes the bridge; what the mirror just wrote is what a
+    # cold resume reads afterwards.
+    shutil.rmtree(bridge_dir)
+    assert read_claude_session_id(bridge_dir) is None
 
 
 @pytest.mark.asyncio

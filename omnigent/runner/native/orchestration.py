@@ -9869,19 +9869,28 @@ async def _auto_create_claude_terminal(
             )
     if rekeyed and rebind_bridge is not None:
         await rebind_bridge(session_id, bridge_id)
-    # Capture the previous claude_session_id from the bridge state file BEFORE
-    # prepare_bridge_dir unlinks it. read_claude_session_id reads _STATE_FILE,
-    # which prepare_bridge_dir removes as part of its refresh; reading it here
-    # lets the cold-resume fallback below use it when the server GET missed the
-    # external_session_id binding (e.g. workspace-scope ContextVar not set).
+    # Read the transcript binding before prepare_bridge_dir wipes it. A
+    # current-owned bridge can be newer than the server after /clear; a
+    # successor-owned bridge must not rebind this session.
     from omnigent.harnesses.claude_native.bridge import (
         bridge_dir_for_bridge_id as _bridge_dir_for_bridge_id,
     )
     from omnigent.harnesses.claude_native.bridge import (
+        read_active_session_id as _read_active_sid_pre_wipe,
+    )
+    from omnigent.harnesses.claude_native.bridge import (
         read_claude_session_id as _read_csid_pre_wipe,
     )
+    from omnigent.harnesses.claude_native.bridge import (
+        read_confirmed_claude_session_id as _read_confirmed_csid,
+    )
+    from omnigent.harnesses.claude_native.bridge import (
+        write_claude_session_id as _write_csid,
+    )
 
-    _pre_wipe_claude_sid = _read_csid_pre_wipe(_bridge_dir_for_bridge_id(bridge_id))
+    _pre_wipe_bridge_dir = _bridge_dir_for_bridge_id(bridge_id)
+    _pre_wipe_claude_sid = _read_csid_pre_wipe(_pre_wipe_bridge_dir)
+    _pre_wipe_bridge_is_current = _read_active_sid_pre_wipe(_pre_wipe_bridge_dir) == session_id
     # Resolved once here and reused below (env_spec) so the bridge's own
     # sys_os_* tools and the terminal process see the same sandbox — the
     # agent's declared os_env.sandbox, already overridden by any
@@ -9893,6 +9902,8 @@ async def _auto_create_claude_terminal(
         workspace=Path(workspace),
         sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
     )
+    if _pre_wipe_bridge_is_current and _pre_wipe_claude_sid is not None:
+        _write_csid(bridge_dir, _pre_wipe_claude_sid)
     # Cancel any surviving forwarder BEFORE wiping its cursor/seen state, else it
     # re-posts with fresh dedup state alongside the forwarder spawned below.
     await _cancel_auto_forwarder_task(session_id)
@@ -9942,6 +9953,20 @@ async def _auto_create_claude_terminal(
     session_model_override = launch_metadata.model_override
     session_launch_args = launch_metadata.terminal_launch_args
     session_external_id = launch_metadata.external_session_id
+    # True while the selected id is this session's own native binding: the server
+    # snapshot, its owner label, or a bridge this session still owns. A
+    # successor's bridge hint (upstream #11836) names another conversation's
+    # transcript: it may be resumed once, never written down as this session's.
+    session_external_id_is_owned = session_external_id is not None
+    confirmed_claude_sid = _read_confirmed_csid(launch_metadata.labels, session_id)
+    if _pre_wipe_bridge_is_current and _pre_wipe_claude_sid is not None:
+        session_external_id = _pre_wipe_claude_sid
+        session_external_id_is_owned = True
+    elif confirmed_claude_sid is not None:
+        # The server refuses to replace an existing external_session_id, so an
+        # owner-confirmed id is never older than the snapshot's value.
+        session_external_id = confirmed_claude_sid
+        session_external_id_is_owned = True
     fork_source_external_id = launch_metadata.fork_source_external_id
     fork_carry_history = launch_metadata.fork_carry_history
 
@@ -9951,6 +9976,7 @@ async def _auto_create_claude_terminal(
     # captured from the bridge state file before prepare_bridge_dir wiped it.
     if session_external_id is None and _pre_wipe_claude_sid is not None:
         session_external_id = _pre_wipe_claude_sid
+        session_external_id_is_owned = False
         _logger.info(
             "cold-resume fallback: server snapshot missing external_session_id, "
             "using local bridge hint: session=%s local_claude_sid=%s",
@@ -9958,6 +9984,20 @@ async def _auto_create_claude_terminal(
             _pre_wipe_claude_sid,
             extra={"session_id": session_id},
         )
+
+    if session_external_id is not None and session_external_id_is_owned:
+        if _read_csid_pre_wipe(bridge_dir) != session_external_id:
+            _write_csid(bridge_dir, session_external_id)
+        if server_client is not None and confirmed_claude_sid != session_external_id:
+            from omnigent.harnesses.claude_native.forwarder import (
+                patch_confirmed_claude_session,
+            )
+
+            await patch_confirmed_claude_session(
+                server_client,
+                session_id=session_id,
+                claude_session_id=session_external_id,
+            )
 
     # Preserve native local history and its cursor on same-host resume.
     # Reconstruct from Server only when no valid local transcript exists.
