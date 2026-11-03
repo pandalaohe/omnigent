@@ -2017,6 +2017,9 @@ def test_recursive_reads_covering_an_agent_root_are_refused(root: str) -> None:
         ("stat /opt/home/.pi/agent/skills/x/SKILL.md", "allowed"),
         ("jq . /opt/home/.pi/agent/skills/x/data.json", "allowed"),
         ("printf '%s' /opt/home/.pi/agent/skills/x/SKILL.md", "allowed"),
+        ("shasum /opt/home/.pi/agent/skills/x/SKILL.md", "allowed"),
+        ("tree /opt/home/.pi/agent/skills", "allowed"),
+        ("xxd -l 64 /opt/home/.pi/agent/skills/x/SKILL.md", "allowed"),
     ],
 )
 def test_read_only_shell_keeps_key_files_out(command: str, expected: str) -> None:
