@@ -288,6 +288,6 @@
  "path_reasons": {
   "protected": "Writes into a system or credential location. Write inside the workspace instead.",
   "control": "Refuses writes to Omnigent's permission files and this agent's guard files, and reads of them except for skills and settings under .pi and .agents. Leave them alone; the user changes the permission tier from the session header.",
-  "credential": "Refuses reading or writing auth.json and models.json. Ask the user for the value, or use a secret-blind helper."
+  "credential": "Refuses a read of a file that can carry a key: a name carrying auth, credential, secret, token, apikey, accounts or models, a dotenv file, or a .json directly in an agent root. Skills, notes, extensions and sessions stay readable."
  }
 }

@@ -1856,6 +1856,7 @@ def test_sed_script_grammar_uses_public_tier_decisions(script: str, writing: boo
 
 # --- Narrowed refusals: reads, cwd changes, expansions and delete depth ---
 
+SKILLS = "/opt/home/.pi/agent/skills"
 PI_CONTROLS = (
     "/opt/work/bridge",
     "/opt/home/.pi",
@@ -2030,6 +2031,8 @@ def test_read_only_shell_keeps_key_files_out(command: str, expected: str) -> Non
         ("bash", {"command": "mkdir -p /opt/home/.pi/agent/x"}),
         ("bash", {"command": "touch /opt/home/.pi/x"}),
         ("bash", {"command": "sed -i s/a/b/ /opt/home/.pi/agent/settings.json"}),
+        ("bash", {"command": "bash -c 'cat /opt/home/.pi/x'"}),
+        ("bash", {"command": "find /opt/home/.pi -delete"}),
         ("read", {"path": "/opt/work/bridge/permission_state.json"}),
         ("grep_search", {"SearchPath": "/opt/work"}),
     ],
@@ -2117,34 +2120,147 @@ def test_windows_critical_delete_depth_boundary(command: str, expected: Verdict)
     assert decision("auto", "run_command", {"CommandLine": command}, host).action == expected
 
 
-def test_read_only_shell_is_required_to_enter_a_control_path() -> None:
-    text = "sed -n 1,5p /opt/home/.pi/agent/skills/plan/SKILL.md"
-    assert decision("auto", "bash", {"command": text}, pi_host()).action == Verdict.ALLOW
-    assert (
-        decision("auto", "bash", {"command": "ls /opt/home/.pi/agent"}, pi_host()).rule_id is None
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        # A recursive shell read at or above an agent root, and a glob whose fixed
+        # prefix is one; a glob deep under skills stays readable.
+        ("rg . /opt/home/.pi/agent", "control-path"),
+        ("cat /opt/home/.pi/*/mo*dels.json", "control-path"),
+        ("cat /opt/home/.pi/agent/*", "control-path"),
+        ("cat /opt/home/.pi/agent/skills/x/*", None),
+        ("rg -n x /opt/home/.pi/agent/skills", None),
+        ("ls /opt/home", None),
+        ("sed -n 1,5p /opt/home/.pi/agent/skills/plan/SKILL.md", None),
+        ("tee /opt/home/.pi/note", "control-path"),
+    ],
+)
+def test_recursive_shell_reads_and_glob_prefixes(command: str, expected: str | None) -> None:
+    assert decision("auto", "bash", {"command": command}, pi_host()).rule_id == expected
+
+
+@pytest.mark.parametrize(
+    ("name", "args", "expected"),
+    [
+        # A recursive tool read naming a key-bearing file directly, and a search
+        # below an agent root, which stays allowed.
+        ("grep_search", {"SearchPath": SKILLS + "/x/models-store.json"}, "control-path"),
+        ("find_by_name", {"SearchDirectory": SKILLS + "/x/credentials.md"}, "control-path"),
+        ("grep_search", {"SearchPath": SKILLS + "/x"}, None),
+    ],
+)
+def test_tool_reads_name_key_files_directly(name: str, args: dict, expected: str | None) -> None:
+    assert decision("auto", name, args, pi_host()).rule_id == expected
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'export "TMPDIR=/var"; rm -rf "$TMPDIR/log"',
+        "export TMPDIR=/var; sh -c 'rm -rf \"$TMPDIR/log\"'",
+        'HOME=/tmp rm -rf "$HOME/project"',
+    ],
+)
+def test_a_same_command_assignment_disables_the_trusted_variable(command: str) -> None:
+    assert decision("auto", "bash", {"command": command}, pi_host()).rule_id == "unbound-write"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "{ cd /var; rm -rf log; }",
+        "{ cd /var; find log -delete; }",
+        "cd /var || cd /opt/work/project && rm -rf log",
+        "; ".join(["cd a"] * 8) + "; rm -rf x",
+    ],
+)
+def test_cwd_walk_reaches_every_cwd_a_command_can_run_in(command: str) -> None:
+    assert decision("auto", "bash", {"command": command}, pi_host()).rule_id in (
+        "critical-delete",
+        "unbound-write",
     )
-    assert (
-        decision(
-            "auto",
-            "bash",
-            {"command": "sed -n 1p /opt/home/.pi/agent/skills/*/SKILL.md"},
-            pi_host(),
-        ).rule_id
-        is None
+
+
+def test_many_cwds_do_not_multiply_resolution() -> None:
+    calls = 0
+
+    def counting(path: str) -> ResolvedPath:
+        nonlocal calls
+        calls += 1
+        return ResolvedPath(path, "directory" if path == "/opt/work/project" else "new-file")
+
+    host = posix_host(control_paths=PI_CONTROLS, resolver=counting)
+    command = "; ".join(["cd a"] * 8) + "; echo y > x"
+    assert decision("auto", "bash", {"command": command}, host).action == Verdict.ALLOW
+    assert calls < 80
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("rm -rf /var/log", "critical-delete"),
+        ("rm -rf /var/tmp", "critical-delete"),
+        ("rm -rf /var/folders/t/x/T", "critical-delete"),
+        ("rm -rf /var/tmp/pi-x", None),
+        ("rm -rf /var/folders/t/x/T/pi-1", None),
+    ],
+)
+def test_canonical_temporary_roots_keep_the_var_boundary(
+    command: str, expected: str | None
+) -> None:
+    """This host resolves /var to /private/var, so the boundaries must resolve too."""
+
+    def canonical(path: str) -> ResolvedPath:
+        final = "/private" + path if path == "/var" or path.startswith("/var/") else path
+        folders = ("/opt/work/project", "/private/var", "/private/var/tmp")
+        return ResolvedPath(final, "directory" if final in folders else "new-file")
+
+    host = posix_host(control_paths=PI_CONTROLS, resolver=canonical)
+    assert decision("auto", "bash", {"command": command}, host).rule_id == expected
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("rm -rf ~/x/{..,y}", "unbound-write"),
+        ("rm -rf ../build", "unbound-write"),
+        ("rm -rf /var\\\n/log", "critical-delete"),
+        ("unlink /var/log", "critical-delete"),
+        ('unlink "$OUTPUT"', "unbound-write"),
+        # The program name and its options are not delete operands.
+        ("cd /var && rm -rf /opt/work/project/build", None),
+    ],
+)
+def test_delete_operands_keep_only_real_targets(command: str, expected: str | None) -> None:
+    assert decision("auto", "bash", {"command": command}, pi_host()).rule_id == expected
+
+
+def test_typed_name_counts_even_when_the_link_resolves_elsewhere() -> None:
+    def linked(path: str) -> ResolvedPath:
+        final = path.rsplit("/", 1)[0] + "/key-store" if path.endswith("/x/models.json") else path
+        return ResolvedPath(final, "directory" if final == "/opt/work/project" else "new-file")
+
+    host = posix_host(control_paths=PI_CONTROLS, resolver=linked)
+    assert decision("auto", "read", {"path": SKILLS + "/x/models.json"}, host).rule_id == (
+        "control-path"
     )
-    assert (
-        decision("auto", "bash", {"command": "cat /opt/home/.pi/agent/*"}, pi_host()).rule_id
-        == "control-path"
+
+
+def test_windows_agent_roots_compare_without_case() -> None:
+    host = windows_host(
+        control_paths=(
+            "C:\\work\\control",
+            "C:\\work\\sample\\.pi",
+            "C:\\work\\sample\\.agents",
+        )
     )
-    assert (
-        decision("auto", "bash", {"command": "tee /opt/home/.pi/note"}, pi_host()).rule_id
-        == "control-path"
-    )
-    assert (
-        decision("auto", "bash", {"command": "bash -c 'cat /opt/home/.pi/x'"}, pi_host()).rule_id
-        == "control-path"
-    )
-    assert (
-        decision("auto", "bash", {"command": "find /opt/home/.pi -delete"}, pi_host()).rule_id
-        == "control-path"
-    )
+    result = decision("auto", "read", {"path": "C:\\work\\sample\\.PI\\settings.json"}, host)
+    assert result.rule_id == "control-path"
+
+
+def test_key_refusals_name_the_target() -> None:
+    path = SKILLS + "/x/token-usage.md"
+    result = decision("auto", "read", {"path": path}, pi_host())
+    assert result.rule_id == "control-path"
+    assert path in result.reason
+    assert "agent root" in result.reason
