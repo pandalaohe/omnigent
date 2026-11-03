@@ -253,7 +253,8 @@ async def test_idle_release_keeps_exit_evidence_after_real_teardown(
 
 
 @pytest.mark.parametrize(
-    "sequence", ["legacy-reap", "rejected-token", "rejected-pane", "rejected-lock"]
+    "sequence",
+    ["legacy-reap", "rejected-token", "rejected-pane", "rejected-lock", "overlapping-tail"],
 )
 async def test_codex_release_does_not_pin_a_completed_or_abandoned_incarnation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sequence: str
@@ -295,12 +296,55 @@ async def test_codex_release_does_not_pin_a_completed_or_abandoned_incarnation(
     monkeypatch.setattr(orchestration, "_AUTO_CODEX_BRIDGE_DIRS", {session_id: home})
     terminals = TerminalRegistry()
     resources = SessionResourceRegistry(terminal_registry=terminals)
+    server_client = NullServerClient()
     app = create_runner_app(
         terminal_registry=terminals,
         resource_registry=resources,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
+        server_client=server_client,  # type: ignore[arg-type]
     )
     reaper = app.state.native_pane_reaper
+    if sequence == "overlapping-tail":
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def get_labels(*_args, **_kwargs):
+            entered.set()
+            await release.wait()
+            return httpx.Response(200, json={"labels": {}})
+
+        monkeypatch.setattr(server_client, "get", get_labels)
+        operation = asyncio.create_task(app.state.finish_cli_release(session_id))
+        resumed = None
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            await old.close()
+            resumed = await create_backend()
+            close = Mock(wraps=resumed.close)
+            monkeypatch.setattr(resumed, "close", close)
+            orchestration._AUTO_CODEX_APP_SERVERS[session_id] = resumed
+            orchestration._AUTO_CODEX_BRIDGE_DIRS[session_id] = home
+            bridge.write_bridge_state(
+                home,
+                bridge.CodexNativeBridgeState(
+                    session_id=session_id,
+                    socket_path=str(resumed.socket_path),
+                    thread_id="resumed_thread",
+                    codex_home=str(bridge.codex_home_for_bridge_dir(home)),
+                ),
+            )
+            bridge.update_active_child_turn(home, "new_child", turn_id="new_turn")
+            assert await reaper._finish_retired(session_id, "codex", "stale") is None
+            release.set()
+            with pytest.raises(RuntimeError, match="Codex backend changed"):
+                await operation
+            close.assert_not_called()
+            assert bridge.read_bridge_state(home).helper_stop_pending
+            assert bridge.read_active_child_turns(home)["new_child"]["turn_id"] == "new_turn"
+        finally:
+            release.set()
+            await asyncio.gather(operation, return_exceptions=True)
+            if resumed is not None:
+                await resumed.close()
+        return
     if sequence == "legacy-reap":
         await reaper._reap(
             PaneRef(session_id, "terminal_codex_main", "codex", home, allow_busy_release=True)

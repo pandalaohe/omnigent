@@ -38,6 +38,8 @@ if TYPE_CHECKING:
     from omnigent.runner.mcp_manager import RunnerMcpManager
     from omnigent.terminals.registry import TerminalRegistry
 
+    type _CodexReleaseSnapshot = tuple[CodexNativeAppServer | None, str | None, Path | None]
+
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -2294,9 +2296,8 @@ def create_runner_app(
     _session_tool_schemas: dict[str, list[_JsonObject]] = {}  # session_id → cached tool schemas
     _session_mcp_spec_hash: dict[str, str] = {}  # session_id → last MCP spec hash
     _session_comment_relays: dict[str, _CommentRelayBinding] = {}
-    _pending_codex_releases: dict[
-        str, tuple[CodexNativeAppServer | None, str | None, Path | None]
-    ] = {}
+    _pending_codex_releases: dict[str, _CodexReleaseSnapshot] = {}
+    _active_codex_release_captures: set[int] = set()
 
     # Process-lifetime monotonic fill-generation counter per session id.
     # Incremented (never popped) at delete_session so a fill parked across a
@@ -13072,7 +13073,7 @@ def create_runner_app(
 
         async def _reap_native_pane(pane: PaneRef) -> None:
             conv_id = pane.conversation_id
-            with _codex_release_attempt(conv_id) as begin_teardown:
+            with _codex_release_attempt(conv_id) as (snapshot, begin_teardown):
                 reaped = pane.instance
                 if reaped is None:
                     reaped = _pane_reaper_registry.get(conv_id, pane.terminal_name, "main")
@@ -13083,6 +13084,7 @@ def create_runner_app(
                     conv_id, asyncio.Lock()
                 )
                 async with lock:
+                    _capture_codex_release(conv_id, snapshot)
                     current = _pane_reaper_registry.get(conv_id, pane.terminal_name, "main")
                     if current is not None and current is not reaped:
                         _logger.info(
@@ -13105,11 +13107,13 @@ def create_runner_app(
                         raise RuntimeError(
                             "native pane changed or became busy before retention release"
                         )
+                    _capture_codex_release(conv_id, snapshot)
                     outcome = await resource_registry.close_terminal_detailed(
                         pane.conversation_id,
                         pane.terminal_id,
                         expected_instance=pane.instance,
                     )
+                    _capture_codex_release(conv_id, snapshot)
                     if outcome == "generation_changed":
                         raise RuntimeError(
                             "native pane generation changed before retention release"
@@ -13118,12 +13122,16 @@ def create_runner_app(
                         raise RuntimeError("native pane close failed before retention release")
                     if outcome == "absent" and pane.instance is not None:
                         probe = await pane.instance.probe_alive()
+                        _capture_codex_release(conv_id, snapshot)
                         if probe is not False:
                             raise NativePaneStillAlive(pane.instance, probe)
                     begin_teardown()
                     await _native_runtime.teardown_codex_native_app_server(pane.conversation_id)
+                    _capture_codex_release(conv_id, snapshot)
                     await _cancel_auto_forwarder_task(conv_id)
+                    _capture_codex_release(conv_id, snapshot)
                     await _native_runtime.teardown_opencode_native_server(conv_id)
+                    _capture_codex_release(conv_id, snapshot)
                     if binding := _session_comment_relays.get(conv_id):
                         _discard_comment_relay(conv_id, binding.relay)
                     _publish_terminal_deleted_event(
@@ -13147,14 +13155,16 @@ def create_runner_app(
 
     def _capture_codex_release(
         session_id: str,
-    ) -> tuple[CodexNativeAppServer | None, str | None, Path | None]:
+        snapshot: _CodexReleaseSnapshot | None = None,
+    ) -> _CodexReleaseSnapshot:
         """Retain exit evidence before teardown can remove the backend registration."""
         current = _native_runtime._AUTO_CODEX_APP_SERVERS.get(session_id)
         current_dir = _native_runtime._AUTO_CODEX_BRIDGE_DIRS.get(session_id)
-        snapshot = _pending_codex_releases.setdefault(
-            session_id,
-            (current, getattr(current, "resident_incarnation_id", None), current_dir),
-        )
+        if snapshot is None:
+            snapshot = _pending_codex_releases.setdefault(
+                session_id,
+                (current, getattr(current, "resident_incarnation_id", None), current_dir),
+            )
         backend, incarnation, launch_dir = snapshot
         if (
             (current is not None and current is not backend)
@@ -13165,9 +13175,12 @@ def create_runner_app(
         return snapshot
 
     @contextlib.contextmanager
-    def _codex_release_attempt(session_id: str) -> Iterator[Callable[[], None]]:
+    def _codex_release_attempt(
+        session_id: str,
+    ) -> Iterator[tuple[_CodexReleaseSnapshot, Callable[[], None]]]:
         previous = _pending_codex_releases.get(session_id)
-        if previous is not None:
+        owns_capture = previous is None or id(previous) not in _active_codex_release_captures
+        if owns_capture and previous is not None:
             backend, incarnation, _ = previous
             if backend is None or (
                 getattr(backend, "resident_incarnation_id", None) == incarnation
@@ -13175,16 +13188,21 @@ def create_runner_app(
             ):
                 _pending_codex_releases.pop(session_id, None)
                 previous = None
-        snapshot = _capture_codex_release(session_id)
+        if owns_capture:
+            snapshot = _capture_codex_release(session_id)
+            _active_codex_release_captures.add(id(snapshot))
+        else:
+            assert previous is not None
+            snapshot = previous
         teardown_started = False
 
         def begin_teardown() -> None:
             nonlocal teardown_started
-            _capture_codex_release(session_id)
+            _capture_codex_release(session_id, snapshot)
             teardown_started = True
 
         try:
-            yield begin_teardown
+            yield snapshot, begin_teardown
         finally:
             backend, incarnation, _ = snapshot
             same_incarnation = getattr(backend, "resident_incarnation_id", None) == incarnation
@@ -13194,39 +13212,45 @@ def create_runner_app(
             replaced = not same_incarnation or (
                 _native_runtime._AUTO_CODEX_APP_SERVERS.get(session_id) is not backend
             )
-            if _pending_codex_releases.get(session_id) is snapshot and not (
-                unconfirmed and (teardown_started or previous is snapshot or replaced)
+            if owns_capture:
+                _active_codex_release_captures.discard(id(snapshot))
+            if (
+                owns_capture
+                and _pending_codex_releases.get(session_id) is snapshot
+                and not (unconfirmed and (teardown_started or previous is snapshot or replaced))
             ):
                 _pending_codex_releases.pop(session_id, None)
 
     async def _finish_cli_release(session_id: str) -> None:
         """Release non-terminal runtime pieces owned by one CLI session."""
         retrying = session_id in _pending_codex_releases
-        with _codex_release_attempt(session_id) as begin_teardown:
-            codex_backend, _, codex_launch_dir = _capture_codex_release(session_id)
+        with _codex_release_attempt(session_id) as (snapshot, begin_teardown):
+            codex_backend, _, codex_launch_dir = _capture_codex_release(session_id, snapshot)
             if retrying and codex_backend is not None:
                 begin_teardown()
                 await codex_backend.close()
+                _capture_codex_release(session_id, snapshot)
                 if not codex_backend.exit_confirmed:
                     raise RuntimeError("Codex exit is not confirmed before credential scrub")
             resolved_codex_dir = await _codex_native_bridge_dir_for_session(session_id)
             codex_bridge_dir = codex_launch_dir or resolved_codex_dir
-            _capture_codex_release(session_id)
+            _capture_codex_release(session_id, snapshot)
             begin_teardown()
             if not await _cancel_auto_forwarder_task(session_id):
                 raise RuntimeError("native forwarder did not stop before runtime cleanup")
+            _capture_codex_release(session_id, snapshot)
             relay_binding = _session_comment_relays.pop(session_id, None)
             if relay_binding is not None:
                 relay_binding.relay.close()
             if process_manager is not None:
                 if await process_manager.release(session_id) is False:
                     raise RuntimeError("harness subprocess did not exit during CLI release")
-            _capture_codex_release(session_id)
+            _capture_codex_release(session_id, snapshot)
             await _native_runtime.teardown_codex_native_app_server(session_id)
+            _capture_codex_release(session_id, snapshot)
             if codex_backend is not None and not codex_backend.exit_confirmed:
                 raise RuntimeError("Codex exit is not confirmed before credential scrub")
-            _capture_codex_release(session_id)
-            _pending_codex_releases.pop(session_id, None)
+            _capture_codex_release(session_id, snapshot)
             from omnigent.harnesses.codex_native.bridge import clear_active_child_turns
 
             # A stopped forwarder can leave its backend's resumable bridge state behind.
@@ -13239,16 +13263,18 @@ def create_runner_app(
                 keep_attachment_caches=True,
                 keep_session_history=True,
             )
+            _capture_codex_release(session_id, snapshot)
             if session_id in _session_histories:
                 _attachment_restore_pending.add(session_id)
             from omnigent.runner.subagent_routing import shutdown_session_router
             from omnigent.runner.tool_dispatch import forget_spawn_family
 
             await asyncio.to_thread(shutdown_session_router, session_id)
+            _capture_codex_release(session_id, snapshot)
             forget_spawn_family(session_id)
 
     async def _finish_retired(session_id: str, terminal_name: str, token: str) -> str | None:
-        with _codex_release_attempt(session_id) as begin_teardown:
+        with _codex_release_attempt(session_id) as (snapshot, begin_teardown):
             try:
                 async with _cli_runtime_lock(session_id).exclusive(timeout=1.0):
                     if any(
@@ -13260,10 +13286,10 @@ def create_runner_app(
                     ):
                         return None
                     try:
-                        _capture_codex_release(session_id)
+                        _capture_codex_release(session_id, snapshot)
                         begin_teardown()
                         await _native_runtime.teardown_codex_native_app_server(session_id)
-                        _capture_codex_release(session_id)
+                        _capture_codex_release(session_id, snapshot)
                         _publish_terminal_deleted_event(
                             conversation_id=session_id,
                             terminal_name=terminal_name,
@@ -13271,6 +13297,7 @@ def create_runner_app(
                             publish_event=_publish_event,
                         )
                         await _finish_cli_release(session_id)
+                        _capture_codex_release(session_id, snapshot)
                     except Exception:
                         _cli_runtime_lifecycle.finish_reclaim(session_id, present=True)
                         _logger.exception("native pane retirement tail failed for %s", session_id)
