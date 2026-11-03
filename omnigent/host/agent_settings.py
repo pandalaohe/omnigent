@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import stat
 import tempfile
@@ -440,6 +441,8 @@ def read_agent_settings(family: str, root: str | None) -> AgentSettingsView:
 
 
 def _validate_write_value(value: object) -> None:
+    if isinstance(value, float) and not math.isfinite(value):
+        raise AgentSettingsError("Setting values must be finite numbers.")
     if value is not None and not isinstance(value, (str, int, float, bool)):
         raise AgentSettingsError("Setting values must be strings, numbers, booleans, or null.")
 
@@ -483,12 +486,6 @@ def write_agent_setting(
         _write_undo(undo_path, records)
         _set(document, key, value)
         _atomic_write(path, _serialize(descriptor, document), snapshot)
-        fresh = _optional_snapshot(path)
-        if fresh is not None:
-            records = _read_undo(undo_path)
-            if key in records:
-                records[key]["revision"] = _revision_id(*fresh)
-                _write_undo(undo_path, records)
     except AgentSettingsError:
         raise
     except (OSError, UnicodeError, ValueError, tomlkit.exceptions.TOMLKitError) as exc:

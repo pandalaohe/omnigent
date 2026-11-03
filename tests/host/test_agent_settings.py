@@ -12,7 +12,10 @@ import pytest
 
 from omnigent.harnesses.claude_native import main as claude_native
 from omnigent.harnesses.codex_native import app_server as codex_app
-from omnigent.harnesses.pi_native.credentials import global_pi_agent_dir
+from omnigent.harnesses.pi_native.credentials import (
+    global_pi_agent_dir,
+    pi_own_login_model_options,
+)
 from omnigent.host import agent_settings
 from omnigent.host.agent_settings import (
     CHANGED_SINCE,
@@ -142,6 +145,18 @@ def test_write_cas_and_undo_refuse_later_changes(tmp_path: Path) -> None:
     with pytest.raises(AgentSettingsError, match=UNDO_CHANGED):
         agent_settings.undo_agent_setting("claude", str(root), "model")
     assert _field(after, "model")["value"] == "new-model"
+
+
+def test_non_finite_write_values_are_refused(tmp_path: Path) -> None:
+    root = tmp_path / "claude"
+    root.mkdir()
+    path = root / "settings.json"
+    path.write_text('{"model":"old-model"}\n', encoding="utf-8")
+    revision = agent_settings.read_agent_settings("claude", str(root))["revision"]
+    for value in (float("inf"), float("-inf"), float("nan")):
+        with pytest.raises(AgentSettingsError, match="finite"):
+            agent_settings.write_agent_setting("claude", str(root), "model", value, revision)
+    assert json.loads(path.read_text(encoding="utf-8"))["model"] == "old-model"
 
 
 def test_jsonc_and_symlink_are_read_only(tmp_path: Path) -> None:
@@ -310,6 +325,43 @@ def test_codex_probe_home_and_fingerprint_follow_record(
     assert second_fingerprint != first_fingerprint
     assert second_probe != first_probe
     assert 'model = "model-b"' in (second_probe / "config.toml").read_text(encoding="utf-8")
+
+
+def test_ambient_roots_do_not_override_the_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ambient_codex = tmp_path / "codex-ambient"
+    selected_codex = tmp_path / "codex-selected"
+    for root, model in ((ambient_codex, "ambient-model"), (selected_codex, "selected-model")):
+        root.mkdir()
+        (root / "config.toml").write_text(f'model = "{model}"\n', encoding="utf-8")
+    ambient_pi = tmp_path / "pi-ambient"
+    selected_pi = tmp_path / "pi-selected"
+    for root, provider in ((ambient_pi, "ambient"), (selected_pi, "selected")):
+        root.mkdir()
+        (root / "auth.json").write_text(
+            json.dumps({provider: {"type": "oauth"}}), encoding="utf-8"
+        )
+        (root / "models-store.json").write_text(
+            json.dumps({provider: {"models": [{"id": "model"}]}}), encoding="utf-8"
+        )
+    monkeypatch.setattr(codex_app, "_find_codex_cli", lambda: "/opt/work/bin/codex")
+    monkeypatch.setenv("CODEX_HOME", str(ambient_codex))
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(ambient_pi))
+    agent_settings.agent_settings_set_root("codex", str(selected_codex))
+    agent_settings.agent_settings_set_root("pi", str(selected_pi))
+
+    assert _codex_home_config_source_from_env() == selected_codex
+    probe = codex_app._probe_codex_home([])
+    assert 'model = "selected-model"' in (probe / "config.toml").read_text(encoding="utf-8")
+    launch = codex_app.NativeCodexLaunch([], None, None)
+    with_ambient = codex_app.codex_catalog_fingerprint(launch)
+    monkeypatch.delenv("CODEX_HOME")
+    assert codex_app.codex_catalog_fingerprint(launch) == with_ambient
+
+    assert global_pi_agent_dir() == selected_pi
+    assert global_pi_agent_dir(env={"PI_CODING_AGENT_DIR": str(ambient_pi)}) == selected_pi
+    assert [row["id"] for row in pi_own_login_model_options()] == ["selected/model"]
 
 
 def test_account_probes_use_selected_roots(

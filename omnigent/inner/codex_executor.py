@@ -1216,10 +1216,16 @@ def _codex_home_config_source_from_env() -> Path:
     """
     from omnigent.host.agent_settings import resolved_root
 
-    default_source = Path(resolved_root("codex") or str(Path.home() / ".codex"))
+    selected = resolved_root("codex")
+    if selected:
+        # One configured root wins over an inherited ``CODEX_HOME`` so the
+        # pre-launch probe reads the same login/config the editor and a newly
+        # launched runner use.
+        return Path(selected)
+    home_codex_home = Path.home() / ".codex"
     return _resolve_codex_home_config_source(
-        Path(os.environ.get("CODEX_HOME") or str(default_source)),
-        default_source,
+        Path(os.environ.get("CODEX_HOME") or str(home_codex_home)),
+        home_codex_home,
     )
 
 
