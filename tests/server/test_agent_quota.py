@@ -462,10 +462,14 @@ def test_window_ids_drive_pins_and_duplicate_labels_keep_their_own_pace(service)
         },
     ]
     service.report_account(
-        OWNER, "gw", usage_report(windows=windows, pinned_window="slow"), now=NOW
+        OWNER,
+        "gw",
+        usage_report(account_product="codex", windows=windows, pinned_window="slow"),
+        now=NOW,
     )
     tile = account(service.overview(OWNER, now=NOW), "gw")
     assert tile.deciding_window == "slow"
+    assert service.quotas(QuotaContext(OWNER, None), now=NOW)[1]["codex"].deciding_window == "slow"
     views = {window.id: window for window in tile.windows}
     assert views["fast"].pace_pct != views["slow"].pace_pct
     assert views["fast"].label == views["slow"].label == "days"
@@ -544,6 +548,23 @@ def test_old_empty_report_also_keeps_display_but_not_routing(service):
     assert tile.freshness == "old"
     assert tile.windows[0].percent_used == 85
     quota = service.quotas(QuotaContext(OWNER, None), now=NOW + 1)[1]["claude"]
+    assert quota.reason == "empty_report"
+
+
+def test_usage_off_allows_explicit_empty_claude_retraction(service):
+    service.usage_enabled = False
+    conversation = service.conversations.create_conversation()
+    now = time.time()
+    good = {**snapshot(now), "provider": "Claude"}
+    service.report_claude(conversation, good)
+    assert service.quotas(QuotaContext(RESERVED_USER_LOCAL, None))[1]["claude"].state == "tight"
+
+    service.report_claude(
+        conversation,
+        {"provider": "Claude", "captured_at": now + 1, "windows": []},
+    )
+    quota = service.quotas(QuotaContext(RESERVED_USER_LOCAL, None), now=now + 1)[1]["claude"]
+    assert quota.state == "unknown"
     assert quota.reason == "empty_report"
 
 
@@ -669,6 +690,14 @@ def test_empty_before_first_hydrate_still_loads_good_rings(db_uri):
     assert quota.reason == "empty_report"
     tile = account(second.overview(OWNER, now=NOW + 1), "claude")
     assert tile.windows[0].percent_used == 85
+
+    second.flush(now=NOW + 2, force=True)
+    third = service_with_store(db_uri, store)
+    tile = account(third.overview(OWNER, now=NOW + 2), "claude")
+    assert tile.windows[0].percent_used == 85
+    assert (
+        third.quotas(QuotaContext(OWNER, None), now=NOW + 2)[1]["claude"].reason == "empty_report"
+    )
 
 
 class MemorySnapshotStore:

@@ -245,7 +245,7 @@ class AgentQuotaService:
                 for window in snapshot.get("windows", [])
                 if isinstance(window, dict) and window.get("label") in {"5h", "w"}
             ]
-            if not legacy:
+            if not legacy and snapshot.get("windows") != []:
                 return
             snapshot = {**snapshot, "windows": legacy}
         self.report(context.owner_id, context.host_id, "claude", snapshot)
@@ -426,7 +426,8 @@ class AgentQuotaService:
                         {
                             "id": window.id,
                             "kind": window.kind,
-                            "label": window.label or window.id,
+                            "label": window.id,
+                            "aria_label": window.label or window.id,
                             "used_percent": window.percent_used,
                             "duration_mins": window.window_minutes,
                             "resets_at": window.resets_at,
@@ -1009,6 +1010,8 @@ class AgentQuotaService:
                     record,
                     ("snapshot", "read_at", "fresh_until", "pinned_window", "reset_marks"),
                 )
+                if dirty_key in self._dirty:
+                    self._dirty[dirty_key] = self._display[key]
             slots = {
                 (key[2], key[3])
                 for key, record in self._display.items()
