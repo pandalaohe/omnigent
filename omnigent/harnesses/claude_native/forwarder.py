@@ -64,6 +64,9 @@ from omnigent.harnesses.claude_native.bridge import (
     url_component,
     write_active_session_id,
 )
+from omnigent.harnesses.claude_native.bridge import (
+    transcript_tokens_by_model as _transcript_tokens_by_model,
+)
 from omnigent.harnesses.claude_native.diagnostics import ClaudeDebugLogFollower
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import sync_raw_status_context
@@ -1101,6 +1104,16 @@ def _provider_usage_limits_should_post(
         return current != previous
     elapsed = current_captured - previous_captured
     return elapsed < 0 or elapsed >= _PROVIDER_USAGE_LIMITS_REFRESH_INTERVAL_S
+
+
+#: The token buckets a per-model total carries — the cost ledger's usage names.
+_TOKEN_TOTAL_KEYS = (
+    "input_tokens",
+    "cached_tokens",
+    "cache_write_tokens",
+    "output_tokens",
+    "total_tokens",
+)
 
 
 @dataclass
@@ -4793,6 +4806,77 @@ def _session_cost_estimate(
     return max(candidates)
 
 
+def _transcript_tokens_by_model_cached(
+    transcript_path: Path,
+    *,
+    include_sidechains: bool,
+    cache: dict[Path, _TranscriptCostCacheEntry],
+) -> dict[str, dict[str, int]]:
+    """
+    Cumulative per-model token totals for one transcript.
+
+    Brings the transcript's cost cursor up to date first (the same call the
+    cost estimate makes, so an unchanged file costs nothing) and then sums the
+    ledger's deduplicated usage per model — one API response counted once, as
+    the cost estimate does.
+
+    :param transcript_path: Transcript JSONL path.
+    :param include_sidechains: ``False`` for a parent transcript (sub-agent
+        records are counted in their own transcripts), ``True`` for a
+        sub-agent's own transcript.
+    :param cache: Per-session cache from :func:`_transcript_cost_size_cached`;
+        mutated in place.
+    :returns: Model id to token counts; empty when nothing was parsed.
+    """
+    if (
+        _transcript_cost_size_cached(
+            transcript_path, include_sidechains=include_sidechains, cache=cache
+        )
+        is None
+        and transcript_path not in cache
+    ):
+        return {}
+    entry = cache.get(transcript_path)
+    if entry is None:
+        return {}
+    return _transcript_tokens_by_model(entry.ledger)
+
+
+def _session_tokens_by_model(
+    *,
+    parent_transcript_path: Path,
+    active_subagents: list[SubagentEntry],
+    cost_cache: dict[Path, _TranscriptCostCacheEntry],
+) -> dict[str, dict[str, int]]:
+    """
+    The parent's and every tracked sub-agent's token totals, summed per model.
+
+    This is the scope the cost estimate already uses (parent without
+    sidechains, plus each sub-agent's own transcript), so the tokens describe
+    the same usage the forwarded cost covers.
+
+    :param parent_transcript_path: Parent transcript JSONL path.
+    :param active_subagents: Sub-agents with a transcript on disk.
+    :param cost_cache: Per-session transcript cost cursor cache.
+    :returns: Model id to token counts; empty when nothing was parsed.
+    """
+    totals = _transcript_tokens_by_model_cached(
+        parent_transcript_path, include_sidechains=False, cache=cost_cache
+    )
+    subagents_dir = _subagents_dir_for_transcript(parent_transcript_path)
+    for entry in active_subagents:
+        sub_totals = _transcript_tokens_by_model_cached(
+            subagents_dir / f"agent-{entry.subagent_id}.jsonl",
+            include_sidechains=True,
+            cache=cost_cache,
+        )
+        for model, counts in sub_totals.items():
+            bucket = totals.setdefault(model, dict.fromkeys(_TOKEN_TOTAL_KEYS, 0))
+            for key in _TOKEN_TOTAL_KEYS:
+                bucket[key] += counts.get(key, 0)
+    return totals
+
+
 async def _forward_session_cost(
     *,
     client: httpx.AsyncClient,
@@ -4881,7 +4965,7 @@ async def _forward_session_cost(
     # lower transcript read (e.g. just after a rotation) and suppresses
     # steady-state churn. The two fields advance independently (policy_cost
     # moves mid-turn while display_cost/S is frozen).
-    payload: dict[str, float | str] = {}
+    payload: dict[str, object] = {}
     if display_cost is not None and (
         dedupe.posted_cost is None or display_cost > dedupe.posted_cost
     ):
@@ -4903,6 +4987,19 @@ async def _forward_session_cost(
         model = status_state.get("model")
         if isinstance(model, str) and model:
             payload["model"] = model
+    # Cumulative tokens per model, summed from the same transcript ledger (and
+    # sub-agent transcripts) the policy cost estimate uses. Claude posts cost
+    # with no token counts, so this is the only way the usage board can show a
+    # Claude session's tokens per model. Cumulative: a repeated or failed post
+    # can never double count, and the server keeps its own monotonic baseline.
+    tokens_by_model = await asyncio.to_thread(
+        _session_tokens_by_model,
+        parent_transcript_path=parent_transcript_path,
+        active_subagents=active_subagents,
+        cost_cache=cost_cache,
+    )
+    if tokens_by_model:
+        payload["cumulative_tokens_by_model"] = tokens_by_model
     try:
         await _post_external_session_usage(
             client,
@@ -8303,7 +8400,7 @@ async def _post_external_session_usage(
     client: httpx.AsyncClient,
     *,
     session_id: str,
-    usage: Mapping[str, float | str] | None,
+    usage: Mapping[str, object] | None,
     context_window: int | None = None,
     auto_compact_token_limit: int | None = None,
     provider_usage_limits: dict[str, object] | None = None,

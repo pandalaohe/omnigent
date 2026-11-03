@@ -375,6 +375,7 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.usage_hours_store import TokenGrowth, record_turn_usage
 from omnigent.util.cost_plan import (
     COST_CONTROL_LABEL_NAMESPACE,
     reserved_cost_control_keys,
@@ -2741,6 +2742,113 @@ def _utc_day(epoch_seconds: int) -> str:
     return datetime.fromtimestamp(epoch_seconds, tz=UTC).date().isoformat()
 
 
+#: Token buckets a ``usage_hours`` row stores, in the names a native harness
+#: reports them (``cached_tokens`` is Claude's cache-read count).
+_USAGE_HOUR_TOKEN_KEYS = (
+    "input_tokens",
+    "cached_tokens",
+    "cache_write_tokens",
+    "output_tokens",
+    "total_tokens",
+)
+
+
+def _parse_tokens_by_model(value: object) -> dict[str, dict[str, int]]:
+    """
+    Read a persisted per-model cumulative token map, dropping malformed parts.
+
+    :param value: ``session_usage["native_tokens_by_model"]``, or anything
+        else.
+    :returns: Model id to non-negative counts, always a dict.
+    """
+    if not isinstance(value, dict):
+        return {}
+    parsed: dict[str, dict[str, int]] = {}
+    for model, counts in value.items():
+        if not isinstance(model, str) or not isinstance(counts, dict):
+            continue
+        parsed[model] = {
+            key: max(0, int(raw))
+            for key, raw in counts.items()
+            if key in _USAGE_HOUR_TOKEN_KEYS and isinstance(raw, int) and not isinstance(raw, bool)
+        }
+    return parsed
+
+
+def _cumulative_tokens_by_model(data: Mapping[str, Any]) -> dict[str, dict[str, int]]:
+    """
+    Read ``cumulative_tokens_by_model`` from an ``external_session_usage`` post.
+
+    A Claude-native host sums its transcript ledger per model and posts the
+    totals with the cost of the same usage. An unknown or malformed model
+    entry is dropped rather than refused: an older or newer sender must never
+    cost the turn its usage record.
+
+    :param data: The event's ``data`` dict.
+    :returns: Model id to counts; empty when the field is absent or unusable.
+    """
+    raw = data.get("cumulative_tokens_by_model")
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, dict[str, int]] = {}
+    for model, counts in raw.items():
+        if not isinstance(model, str) or not model or len(model) > 128:
+            continue
+        if not isinstance(counts, dict):
+            continue
+        parsed: dict[str, int] = {}
+        for key in _USAGE_HOUR_TOKEN_KEYS:
+            count = counts.get(key)
+            if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+                parsed[key] = count
+        if parsed:
+            result[model] = parsed
+    return result
+
+
+def native_account_id(harness: str | None) -> str:
+    """
+    The usage account id for usage Omnigent recorded itself.
+
+    ``native:<agent key>`` namespaces native rows so a pushed account whose id
+    happens to equal an agent key can never overwrite them; when the harness
+    resolves to no registered agent the canonical harness spelling is used
+    instead, so the row still has a stable, non-empty account.
+
+    :param harness: Canonical harness name, e.g. ``"codex-native"``.
+    :returns: The account id, e.g. ``"native:codex"``.
+    """
+    from omnigent.runtime.instruction_layers import agent_key_for_harness
+    from omnigent.stores.usage_hours_store import NATIVE_ACCOUNT_PREFIX
+
+    if not harness:
+        return f"{NATIVE_ACCOUNT_PREFIX}unknown"
+    return f"{NATIVE_ACCOUNT_PREFIX}{agent_key_for_harness(harness) or harness}"
+
+
+def _session_owner_authority(
+    conv: Conversation | None,
+    conversation_store: ConversationStore,
+) -> Any | None:
+    """
+    Resolve the account a session's spend is attributed to.
+
+    A sub-agent without its own grant is attributed to its root session's
+    owner, so delegated spend is booked rather than silently dropped.
+
+    :param conv: The conversation row, or ``None``.
+    :param conversation_store: Store for the owner lookups.
+    :returns: The owner authority, or ``None`` when the session has no
+        grant on itself or its root.
+    """
+    if conv is None:
+        return None
+    owner = conversation_store.get_session_owner_authority(conv.id)
+    if owner is None and conv.root_conversation_id != conv.id:
+        owner = conversation_store.get_session_owner_authority(conv.root_conversation_id)
+    return owner
+
+
 def _record_daily_cost(
     conv: Conversation | None,
     delta_usd: float,
@@ -2766,11 +2874,7 @@ def _record_daily_cost(
     """
     if conv is None or delta_usd <= 0:
         return
-    owner = conversation_store.get_session_owner_authority(conv.id)
-    if owner is None and conv.root_conversation_id != conv.id:
-        # Sub-agent: no direct owner grant — fall back to the root session's
-        # owner so sub-agent spend is attributed rather than silently dropped.
-        owner = conversation_store.get_session_owner_authority(conv.root_conversation_id)
+    owner = _session_owner_authority(conv, conversation_store)
     if owner is None:
         return
     from omnigent.db.account_authority import target_account_scope
@@ -2778,6 +2882,163 @@ def _record_daily_cost(
 
     with target_account_scope(owner.user_id, owner.generation):
         conversation_store.add_daily_cost(owner.user_id, _utc_day(now_epoch()), delta_usd)
+
+
+def _record_usage_hours(
+    conv: Conversation | None,
+    conversation_store: ConversationStore,
+    *,
+    model: str | None,
+    growth: TokenGrowth,
+    cost_usd: float,
+    priced: bool,
+) -> None:
+    """Add one turn's usage to the hourly table, beside the daily rollup.
+
+    The hourly rows back every amount on the usage board. Attribution follows
+    :func:`_record_daily_cost`: the session's own owner grant, else its root's.
+    A session with neither is dropped, except on a single-user server
+    (:func:`local_single_user_enabled`), where the unauthenticated local user is
+    the only person there is and the board's owner is that same user.
+
+    The account is ``native:<agent key>``: usage Omnigent recorded itself, in a
+    namespace a pushed account can never overwrite.
+
+    Never raises into the turn: recording usage is bookkeeping, and a store
+    failure must not fail the request that produced the usage.
+
+    :param conv: The conversation row, or ``None`` (a no-op).
+    :param conversation_store: Store for the owner lookup.
+    :param model: The model the turn used, or ``None`` when unknown.
+    :param growth: This turn's token counts.
+    :param cost_usd: This turn's USD, meaningful only when *priced*.
+    :param priced: Whether *cost_usd* covers *growth*.
+    """
+    if conv is None:
+        return
+    if not growth.any() and (not priced or cost_usd <= 0):
+        return
+    owner = _session_owner_authority(conv, conversation_store)
+    if owner is not None:
+        owner_id = owner.user_id
+        generation = owner.generation
+    else:
+        from omnigent.server.auth import RESERVED_USER_LOCAL, local_single_user_enabled
+
+        if not local_single_user_enabled():
+            return
+        owner_id = RESERVED_USER_LOCAL
+        generation = None
+    from omnigent.db.account_authority import target_account_scope
+
+    host_id = conv.host_id or ""
+    harness = _resolve_harness(conv)
+    with target_account_scope(owner_id, generation):
+        record_turn_usage(
+            owner=owner_id,
+            account_id=native_account_id(harness),
+            model=model or "",
+            host_id=host_id,
+            harness=harness,
+            growth=growth,
+            cost_usd=cost_usd,
+            priced=priced,
+        )
+
+
+def _record_native_hours(
+    conv: Conversation | None,
+    conversation_store: ConversationStore,
+    *,
+    model: str | None,
+    old_tokens: Mapping[str, int],
+    current: Mapping[str, Any],
+    cost_growth: float,
+    priced: bool,
+    token_growth_by_model: Mapping[str, TokenGrowth],
+) -> None:
+    """Record one native report's growth as hourly rows.
+
+    Three shapes, all cumulative on the wire:
+
+    - **Per-model tokens** (Claude-native): one row per model, each carrying
+      its own token growth. Claude reports the cost of this same usage, so the
+      cost growth rides on the row of the model the statusLine names, which is
+      the model the flat totals attribute it to; the other models' rows carry
+      their tokens with no cost of their own.
+    - **Flat counters** (codex-native, Pi): one row on the active model with
+      the flat counter growth.
+    - **Cost only** (a Claude host whose statusLine total moved while no token
+      split is known): one row with the cost and no tokens.
+
+    :param conv: The conversation row, or ``None``.
+    :param conversation_store: Store for the owner lookup.
+    :param model: The report's active model.
+    :param old_tokens: The flat counters before this report.
+    :param current: The flat counters after it.
+    :param cost_growth: USD this report added to the session's cumulative cost.
+    :param priced: Whether that growth is priced.
+    :param token_growth_by_model: Per-model growth, empty when not reported.
+    """
+    if token_growth_by_model:
+        active = model or ""
+        attributed = False
+        for token_model, growth in token_growth_by_model.items():
+            if not growth.any():
+                continue
+            carries_cost = token_model == active and priced
+            if carries_cost:
+                attributed = True
+            _record_usage_hours(
+                conv,
+                conversation_store,
+                model=token_model,
+                growth=growth,
+                cost_usd=cost_growth if carries_cost else 0.0,
+                priced=priced,
+            )
+        if priced and cost_growth > 0 and not attributed:
+            # The active model has no token growth of its own this report, so
+            # the cost needs a row: a model switch mid-run, or a statusLine
+            # total that advanced without new transcript usage.
+            _record_usage_hours(
+                conv,
+                conversation_store,
+                model=active or None,
+                growth=TokenGrowth(),
+                cost_usd=cost_growth,
+                priced=True,
+            )
+        return
+    growth = TokenGrowth(
+        input_tokens=max(
+            0, int(current.get("input_tokens", 0) or 0) - old_tokens.get("input_tokens", 0)
+        ),
+        cached_tokens=max(
+            0,
+            int(current.get("cache_read_input_tokens", 0) or 0)
+            - old_tokens.get("cache_read_input_tokens", 0),
+        ),
+        cache_write_tokens=max(
+            0,
+            int(current.get("cache_creation_input_tokens", 0) or 0)
+            - old_tokens.get("cache_creation_input_tokens", 0),
+        ),
+        output_tokens=max(
+            0, int(current.get("output_tokens", 0) or 0) - old_tokens.get("output_tokens", 0)
+        ),
+        total_tokens=max(
+            0, int(current.get("total_tokens", 0) or 0) - old_tokens.get("total_tokens", 0)
+        ),
+    )
+    _record_usage_hours(
+        conv,
+        conversation_store,
+        model=model,
+        growth=growth,
+        cost_usd=cost_growth,
+        priced=priced,
+    )
 
 
 def _priced_cost_for_display(usage: dict[str, Any]) -> float | None:
@@ -14742,6 +15003,7 @@ async def _load_model_options_from_host(session_id: str, host_id: str, harness: 
 
 __all__ = [
     "FILE_CONTENT_CACHE_CONTROL",
+    "_USAGE_HOUR_TOKEN_KEYS",
     "Placement",
     "SessionLiveness",
     "_HostLaunchAttempt",
@@ -14791,6 +15053,7 @@ __all__ = [
     "_create_and_publish_codex_child",
     "_create_and_publish_devin_child",
     "_create_session_worktree",
+    "_cumulative_tokens_by_model",
     "_delete_stored_session_bundle_after_failure",
     "_derive_terminal_launch_args_from_spec",
     "_descendant_sessions",
@@ -14866,6 +15129,7 @@ __all__ = [
     "_parse_external_conversation_item",
     "_parse_session_create_metadata",
     "_parse_skill_slash_command",
+    "_parse_tokens_by_model",
     "_pending_elicitation_key",
     "_pending_elicitation_snapshot_for_session",
     "_permission_level_from_grants",
@@ -14928,6 +15192,8 @@ __all__ = [
     "_read_state_entry",
     "_read_upload_capped",
     "_record_daily_cost",
+    "_record_native_hours",
+    "_record_usage_hours",
     "_registered_runner_id",
     "_reject_reserved_cost_control_label_seed",
     "_reject_server_reserved_label_seed",
@@ -14993,5 +15259,6 @@ __all__ = [
     "effective_host_id",
     "effective_worktree",
     "elicitation_source",
+    "native_account_id",
     "prefetch_session_routing_catalogs",
 ]

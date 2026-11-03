@@ -289,6 +289,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
 # Lower-layer helpers (SSE builders, publishers, persistence, runner-forward
 # primitives) live in _sessions.helpers.
 from omnigent.server.routes._sessions.helpers import (
+    _USAGE_HOUR_TOKEN_KEYS,
     Placement,
     SessionLiveness,
     _antigravity_subagent_labels_from_body,
@@ -307,6 +308,7 @@ from omnigent.server.routes._sessions.helpers import (
     _create_and_publish_codex_child,
     _create_and_publish_devin_child,
     _create_session_worktree,
+    _cumulative_tokens_by_model,
     _delete_stored_session_bundle_after_failure,
     _derive_terminal_launch_args_from_spec,
     _devin_subagent_labels_from_body,
@@ -355,6 +357,7 @@ from omnigent.server.routes._sessions.helpers import (
     _owner_from_grants,
     _parse_background_tasks,
     _parse_external_conversation_item,
+    _parse_tokens_by_model,
     _pending_elicitation_snapshot_for_session,
     _permission_level_from_grants,
     _persist_native_policy_notice,
@@ -380,6 +383,8 @@ from omnigent.server.routes._sessions.helpers import (
     _query_host_runner_status,
     _read_state_entry,
     _record_daily_cost,
+    _record_native_hours,
+    _record_usage_hours,
     _reject_reserved_cost_control_label_seed,
     _reject_server_reserved_label_seed,
     _relay_persist,
@@ -502,6 +507,7 @@ from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.peer_message_store import PeerMessageStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
+from omnigent.stores.usage_hours_store import TokenGrowth
 from omnigent.telemetry import emit as _tel_emit
 from omnigent.telemetry.anon import anon_user_id as _tel_anon_user_id
 from omnigent.telemetry.anon import current_anon_user_id as _tel_current_anon
@@ -3346,6 +3352,21 @@ def _accumulate_session_usage(
     new_current = conversation_store.increment_session_usage(session_id, delta)
     # Per-user daily rollup (policy-gated; this is the per-turn delta).
     _record_daily_cost(conv, cost_delta, conversation_store)
+    # Hourly usage rows: the board's amounts, one row per model and hour.
+    _record_usage_hours(
+        conv,
+        conversation_store,
+        model=llm_model,
+        growth=TokenGrowth(
+            input_tokens=input_tokens,
+            cached_tokens=cache_read_input_tokens,
+            cache_write_tokens=cache_creation_input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+        ),
+        cost_usd=cost_delta,
+        priced=priced,
+    )
     return _priced_cost_for_display(new_current)
 
 
@@ -3449,7 +3470,14 @@ def _persist_native_cumulative_usage(
     cin = _coerce_cumulative_field(data, "cumulative_input_tokens", numeric=False)
     cout = _coerce_cumulative_field(data, "cumulative_output_tokens", numeric=False)
     ccache = _coerce_cumulative_field(data, "cumulative_cache_read_input_tokens", numeric=False)
-    if cost is None and policy_cost is None and cin is None and cout is None:
+    tokens_by_model = _cumulative_tokens_by_model(data)
+    if (
+        cost is None
+        and policy_cost is None
+        and cin is None
+        and cout is None
+        and not tokens_by_model
+    ):
         return None
 
     # Deliberately a FRESH read — never a caller-supplied row. This row is the
@@ -3482,6 +3510,9 @@ def _persist_native_cumulative_usage(
     # Old cumulative token totals, captured before the overwrites below so
     # per-model attribution can add only this report's growth (new - old).
     old_tokens = {key: int(current.get(key, 0) or 0) for key in _MODEL_TOKEN_KEYS}
+    # Baseline for the per-model token growth a Claude host reports with its
+    # cost: cumulative per model, so a retried or repeated post adds nothing.
+    old_tokens_by_model = _parse_tokens_by_model(current.get("native_tokens_by_model"))
     if cin is not None:
         # The reported input total is INCLUSIVE of cached tokens (codex's
         # ``inputTokens`` counts cache reads). Split the cached portion into
@@ -3535,6 +3566,11 @@ def _persist_native_cumulative_usage(
     # an unpriced turn. (The agent-cache lookup in ``_resolve_llm_model`` is
     # memoized, so resolving on cost-only polls is cheap.)
     has_tokens = cin is not None or cout is not None
+    # Whether THIS report's growth carries a cost. A reported cumulative cost
+    # covers it; so does a price for the model its tokens are priced with.
+    # Anything else records the growth as an unpriced row the board can fill
+    # once a price exists.
+    growth_priced = cost is not None
     needs_model = has_tokens or cost is not None
     model_name = (
         (
@@ -3564,16 +3600,20 @@ def _persist_native_cumulative_usage(
                 model_name, provider_config=provider_config, harness=harness
             )
             if pricing is not None:
-                # SET (cumulative) — price the running token totals.
-                # ``current`` carries the cache-read split when the harness
-                # reports it (codex-native does), so compute_llm_cost prices
-                # cache reads at their own rate; it falls back to the input
-                # rate for cache tokens when the catalog omits a cache price
-                # (e.g. ``databricks-*`` entries today).
-                # Monotonic, like the explicit-cost branch: token totals are
-                # also client-SET, so a lowered token report can't drop the
-                # priced cost below the persisted figure.
-                current["total_cost_usd"] = max(old_cost, compute_llm_cost(current, pricing))
+                # PER GROWTH, not the running total: this report's token growth
+                # is priced at the price in force now, so a mid-session model
+                # switch or a model that gains a price never reprices earlier
+                # usage. At a fixed price and model this equals pricing the
+                # running total, because compute_llm_cost is linear in each
+                # count. Growth is clamped >= 0 per bucket, so a fabricated
+                # low report can only leave the figure unchanged, never lower
+                # it — the same guarantee the previous ``max`` gave.
+                growth = {
+                    key: max(0, int(current.get(key, 0) or 0) - old_tokens[key])
+                    for key in _MODEL_TOKEN_KEYS
+                }
+                current["total_cost_usd"] = old_cost + compute_llm_cost(growth, pricing)
+                growth_priced = True
 
     # ADD this report's growth (new - old) to the active model, not the whole
     # cumulative total, so per-model buckets sum to the flat total across model
@@ -3600,6 +3640,32 @@ def _persist_native_cumulative_usage(
     if policy_cost is not None:
         current["policy_cost_usd"] = max(old_policy_cost, float(policy_cost))
 
+    # Per-model token growth a Claude host reports alongside its cost. The
+    # baseline is monotonic per model, so a retried post adds nothing and a
+    # shrunken report (a ``/clear``) contributes no negative growth.
+    token_growth_by_model: dict[str, TokenGrowth] = {}
+    if tokens_by_model:
+        merged_baseline = dict(old_tokens_by_model)
+        for token_model, counts in tokens_by_model.items():
+            prior = old_tokens_by_model.get(token_model, {})
+            token_growth_by_model[token_model] = TokenGrowth(
+                input_tokens=max(0, counts.get("input_tokens", 0) - prior.get("input_tokens", 0)),
+                cached_tokens=max(
+                    0, counts.get("cached_tokens", 0) - prior.get("cached_tokens", 0)
+                ),
+                cache_write_tokens=max(
+                    0, counts.get("cache_write_tokens", 0) - prior.get("cache_write_tokens", 0)
+                ),
+                output_tokens=max(
+                    0, counts.get("output_tokens", 0) - prior.get("output_tokens", 0)
+                ),
+                total_tokens=max(0, counts.get("total_tokens", 0) - prior.get("total_tokens", 0)),
+            )
+            merged_baseline[token_model] = {
+                key: max(counts.get(key, 0), prior.get(key, 0)) for key in _USAGE_HOUR_TOKEN_KEYS
+            }
+        current["native_tokens_by_model"] = merged_baseline
+
     conversation_store.set_session_usage(session_id, current)
     # Per-user daily rollup. Native reports cumulative totals, so the turn's
     # delta is the increase in cumulative cost. Uses the authoritative
@@ -3608,7 +3674,18 @@ def _persist_native_cumulative_usage(
     new_cost = float(current.get("total_cost_usd", 0.0) or 0.0)
     # Non-negative by the monotonic clamp above; ``max(0.0, ...)`` keeps the
     # daily rollup from ever being clawed back even if that invariant changes.
-    _record_daily_cost(conv, max(0.0, new_cost - old_cost), conversation_store)
+    cost_growth = max(0.0, new_cost - old_cost)
+    _record_daily_cost(conv, cost_growth, conversation_store)
+    _record_native_hours(
+        conv,
+        conversation_store,
+        model=model_name if isinstance(model_name, str) else None,
+        old_tokens=old_tokens,
+        current=current,
+        cost_growth=cost_growth,
+        priced=growth_priced,
+        token_growth_by_model=token_growth_by_model,
+    )
     return _priced_cost_for_display(current)
 
 

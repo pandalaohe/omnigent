@@ -1855,6 +1855,87 @@ class SqlUserDailyCost(OmnigentBase):
     updated_at: Mapped[int] = mapped_column(Integer)
 
 
+class SqlUsageHour(OmnigentBase):
+    """
+    SQLAlchemy model for the ``usage_hours`` table.
+
+    One row per (workspace, owner, account, UTC hour, model, host, basis,
+    priced): a running hourly total of LLM usage, written at the two points
+    where Omnigent already records a turn's spend (the relay path's
+    :func:`_accumulate_session_usage` and the native path's
+    :func:`_persist_native_cumulative_usage`) and by a pushed report's
+    ``activity``. Every amount, mark and per-model figure on the usage board
+    reads it; :class:`SqlUserDailyCost` stays the policy rollup and is not
+    rewritten by a later price.
+
+    :param owner_id: The account the usage is attributed to, e.g.
+        ``"alice@example.com"``; ``RESERVED_USER_LOCAL`` on a single-user
+        server whose sessions carry no grant.
+    :param account_id: The usage account: ``native:<agent key>`` for usage
+        Omnigent itself recorded, else a provider-reported account id.
+    :param hour_utc: Epoch seconds of the UTC hour start this usage fell in.
+        Bucketing is by record time, matching the daily rollup.
+    :param model: The model id the usage was priced with, or ``""`` when the
+        path knows none.
+    :param host_id: The host that ran the session, or ``""`` when unknown.
+        Part of the key, so the board can show a host share.
+    :param basis: How the money was incurred, frozen at write time so history
+        never changes with a later reading: ``metered``, ``subscription``,
+        ``estimate`` or ``unknown``.
+    :param priced: ``1`` when ``cost_usd`` covers this row's tokens; ``0``
+        keeps the token split in an unpriced row for a later one-time fill.
+    :param input_tokens: Non-cached input tokens (the contract
+        :func:`compute_llm_cost` expects).
+    :param cached_tokens: Cache-read input tokens, priced at their own rate.
+    :param cache_write_tokens: Cache-creation (cache-write) input tokens.
+    :param output_tokens: Output tokens.
+    :param total_tokens: The full count: input + cached + output.
+    :param requests: Reported request count, when the source has one.
+    :param failed: Reported failed request count, when the source has one.
+    :param reasons: JSON object of failure reason to count, when reported.
+    :param cost_usd: USD accumulated for this row; ``0.0`` on an unpriced row.
+    :param updated_at: Unix epoch seconds of the last increment.
+    """
+
+    __tablename__ = "usage_hours"
+
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    owner_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    account_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    # BIGINT: an epoch second overflows a 4-byte INTEGER in 2038, and a row
+    # lives up to the report bound (400 days), not forever.
+    hour_utc: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    # Empty string, never NULL: every key column is non-nullable so the
+    # dialect upserts compare on a plain equality.
+    model: Mapped[str] = mapped_column(String(128), primary_key=True, server_default="")
+    host_id: Mapped[str] = mapped_column(String(64), primary_key=True, server_default="")
+    basis: Mapped[str] = mapped_column(String(16), primary_key=True, server_default="unknown")
+    # 0/1 rather than BOOLEAN: a portable primary-key member on every engine.
+    priced: Mapped[int] = mapped_column(SmallInteger, primary_key=True, server_default="0")
+    input_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    cached_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    cache_write_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    output_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    total_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    requests: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    failed: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reasons: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cost_usd: Mapped[float] = mapped_column(Float, nullable=False, server_default="0")
+    updated_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        Index("ix_usage_hours_owner_hour", "workspace_id", "owner_id", "hour_utc"),
+        CheckConstraint("priced IN (0, 1)", name="ck_usage_hours_priced"),
+    )
+
+
 class SqlScheduledTask(OmnigentBase):
     """
     SQLAlchemy model for the ``scheduled_tasks`` table.

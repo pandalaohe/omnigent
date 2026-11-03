@@ -67,7 +67,10 @@ def test_pi_incomplete_cost_does_not_become_a_resume_baseline(
         store,
     )
     usage = _usage(store, conv.id)
-    assert usage["total_cost_usd"] == (2.0 if catalog_price is not None else 0.75)
+    # Priced per growth: the reported 0.75 stands, and the second report's 100
+    # new input tokens are priced at the catalog rate as they arrive (1.0)
+    # instead of repricing the whole running total the moment a price exists.
+    assert usage["total_cost_usd"] == (1.75 if catalog_price is not None else 0.75)
     assert usage["input_tokens"] == 200
     assert usage.get("native_cost_complete") is not True
     with pytest.raises(OmnigentError, match="cost_complete must be a bool"):

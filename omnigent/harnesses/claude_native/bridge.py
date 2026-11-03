@@ -4277,6 +4277,50 @@ def price_transcript_cost_ledger(ledger: TranscriptCostLedger) -> float | None:
     return total_cost
 
 
+def transcript_tokens_by_model(ledger: TranscriptCostLedger) -> dict[str, dict[str, int]]:
+    """
+    Sum a ledger's deduplicated usage per model.
+
+    One API response can write several transcript records repeating its usage;
+    the ledger already keeps one usage per response identity, so summing here
+    counts each response once. The result is the cumulative token total per
+    model that a host reports with the cost of the same usage — the board's
+    per-model split for a Claude session.
+
+    :param ledger: A transcript's cost ledger, up to date to the read cursor.
+    :returns: Model id to ``{"input_tokens", "cached_tokens",
+        "cache_write_tokens", "output_tokens", "total_tokens"}``. Empty when
+        the ledger holds no usage.
+    """
+    totals: dict[str, dict[str, int]] = {}
+    for records in ledger.usage_by_response.values():
+        if not records:
+            continue
+        # The ledger orders a response's records oldest first; the newest
+        # priceable record carries the authoritative counts.
+        _, model, usage = records[-1]
+        bucket = totals.setdefault(
+            model,
+            {
+                "input_tokens": 0,
+                "cached_tokens": 0,
+                "cache_write_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            },
+        )
+        input_tokens = int(usage.get("input_tokens", 0) or 0)
+        cached = int(usage.get("cache_read_input_tokens", 0) or 0)
+        cache_write = int(usage.get("cache_creation_input_tokens", 0) or 0)
+        output = int(usage.get("output_tokens", 0) or 0)
+        bucket["input_tokens"] += input_tokens
+        bucket["cached_tokens"] += cached
+        bucket["cache_write_tokens"] += cache_write
+        bucket["output_tokens"] += output
+        bucket["total_tokens"] += input_tokens + cached + cache_write + output
+    return totals
+
+
 def compute_transcript_cumulative_cost(
     transcript_path: Path,
     *,
