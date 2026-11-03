@@ -1357,8 +1357,21 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
           )}
         </div>
       ) : (
-        !conversion.isPending &&
-        !error && <p className="text-sm text-muted-foreground">Loading keep-warm settings…</p>
+        !conversion.isPending && (
+          <div className="space-y-2 rounded-lg border p-3 text-sm">
+            <p className="font-medium">Previous settings</p>
+            <p>
+              Default: main {preferences.default.main ? "on" : "off"} · children{" "}
+              {preferences.default.child ? "on" : "off"}
+            </p>
+            {Object.entries(preferences.agents).map(([key, row]) => (
+              <p key={key}>
+                {byKey.get(key)?.label ?? registry.legacyLabels[key] ?? key}: main{" "}
+                {row.main ? "on" : "off"} · children {row.child ? "on" : "off"}
+              </p>
+            ))}
+          </div>
+        )
       )}
       <div className="space-y-3 border-t pt-4">
         <p className="text-ui font-semibold">Offline hosts</p>
