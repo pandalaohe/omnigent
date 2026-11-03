@@ -1293,6 +1293,47 @@ async def test_antigravity_progress_does_not_spend_the_parent_wake(
 
 
 @pytest.mark.asyncio
+async def test_antigravity_failed_output_reaches_parent() -> None:
+    """The existing runner event route preserves a native failure's quota reason."""
+    parent_id, child_id = "quota_parent", "quota_child"
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    server = _WakeRecordingServerClient(parent_id)
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        server_client=server,  # type: ignore[arg-type]
+    )
+    fixture = Path(__file__).parents[1] / "fixtures/antigravity/steps/quota_error_message.json"
+    reason = json.loads(fixture.read_text())["errorMessage"]["error"]["userErrorMessage"]
+    subagent_work._session_inboxes_ref[parent_id] = inbox
+    subagent_work.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="antigravity",
+        title="quota worker",
+    )
+    try:
+        async with _runner_client(app) as client:
+            response = await client.post(
+                f"/v1/sessions/{child_id}/events",
+                json={
+                    "type": "external_session_status",
+                    "data": {"status": "failed", "output": f"[antigravity: {reason}]"},
+                },
+            )
+            assert response.status_code == 204, response.text
+            await asyncio.wait_for(server.wake_seen.wait(), 2)
+        assert inbox.qsize() == 1
+        delivered = inbox.get_nowait()
+        assert delivered["status"] == "failed"
+        assert reason in delivered["output"]
+        assert len(server.wake_posts) == 1
+        assert "failed" in server.wake_posts[0]["data"]["content"][0]["text"]
+    finally:
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
+
+
+@pytest.mark.asyncio
 async def test_external_status_for_untracked_session_does_not_wake() -> None:
     """
     Completing a session that is not a tracked sub-agent wakes nobody.

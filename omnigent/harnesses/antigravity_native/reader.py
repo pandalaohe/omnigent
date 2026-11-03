@@ -96,6 +96,7 @@ from omnigent.harnesses.antigravity_native.steps import (
     _tool_call_id,
     _trajectory_id,
     _user_input_text,
+    error_message_text,
     map_step_to_events,
     output_reasoning_delta_event,
     output_text_delta_event,
@@ -1269,6 +1270,7 @@ class _ReaderState:
     reasoning_prefixes: dict[int, str] = field(default_factory=dict)
     turn_active: bool = False
     turn_generation: int = 0
+    turn_error: str | None = None
     idle_ticks: int = 0
     last_work_at: float = field(default_factory=lambda: monotonic())
     last_text: str = ""
@@ -1560,8 +1562,16 @@ async def _commit_step(
     if key not in state.seen:
         if _is_user_turn_step(step):
             state.turn_generation += 1
+            state.turn_error = None
             state.idle_ticks = 0
             state.last_text = ""
+        elif state.turn_active and _is_settled(step):
+            if step.get("type") == "CORTEX_STEP_TYPE_ERROR_MESSAGE":
+                error = error_message_text(step)
+                if error is not None:
+                    state.turn_error = error
+            else:
+                state.turn_error = None
         text = _committed_planner_text(step)
         if text:
             state.last_text = text
@@ -1778,7 +1788,9 @@ async def _reconcile_idle_turn(
             state.idle_ticks + 1 if status == _CASCADE_RUN_STATUS_IDLE and steps is not None else 0
         )
         if state.turn_generation > 0 and state.idle_ticks >= _QUIESCENT_TICKS_TO_CLOSE:
-            event = _status_event(_STATUS_IDLE)
+            event = _status_event(_STATUS_FAILED if state.turn_error else _STATUS_IDLE)
+            if state.turn_error:
+                event.data["output"] = state.turn_error
         elif monotonic() - state.last_work_at >= _UNCONFIRMED_TURN_TIMEOUT_S:
             event = _status_event(_STATUS_FAILED)
             event.data["output"] = (

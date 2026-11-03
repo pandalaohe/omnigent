@@ -1,0 +1,18 @@
+{
+  "type": "CORTEX_STEP_TYPE_ERROR_MESSAGE",
+  "status": "CORTEX_STEP_STATUS_DONE",
+  "metadata": {
+    "sourceTrajectoryStepInfo": {
+      "trajectoryId": "quota-trajectory",
+      "stepIndex": 10
+    }
+  },
+  "errorMessage": {
+    "error": {
+      "userErrorMessage": "Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h26m5s.",
+      "shortError": "RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h26m5s."
+    },
+    "shouldShowUser": true
+  },
+  "_fixtureProvenance": "Projection of an existing native stored step, with neutral trajectory identity. Embedded CLI descriptors identify step type 17 as ERROR_MESSAGE, status 3 as DONE, and errorMessage.error.userErrorMessage as the user-facing reason. Internal error fields and unrelated metadata are omitted."
+}

@@ -5092,6 +5092,90 @@ async def test_supervise_reader_external_cancel_propagates_not_rotation(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("scenario", ["quota", "recovered", "retry", "next_success", "benign"])
+async def test_quota_outcome_at_idle_close(monkeypatch: pytest.MonkeyPatch, scenario: str) -> None:
+    """Recorded quota errors affect the existing idle close, never close on arrival."""
+    sink = _PostSink()
+    state = reader._ReaderState(seen=set(), interacted=set())
+    snapshot: list[dict[str, Any]] = []
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+    monkeypatch.setattr(reader, "get_available_models", lambda *args: {})
+    monkeypatch.setattr(reader, "get_trajectory_steps", lambda *args, **kw: list(snapshot))
+    monkeypatch.setattr(
+        reader,
+        "get_all_cascade_trajectories",
+        lambda *args, **kw: {
+            "trajectorySummaries": {_CASCADE_ID: {"status": "CASCADE_RUN_STATUS_IDLE"}}
+        },
+    )
+
+    async def no_interaction(*args: Any) -> None:
+        pass
+
+    async with httpx.AsyncClient(base_url="http://reader.test") as client:
+
+        async def commit(step: dict[str, Any]) -> None:
+            snapshot.append(step)
+            await reader._process_committed_step(
+                step,
+                client=client,
+                session_id=_SESSION_ID,
+                cascade_id=_CASCADE_ID,
+                state=state,
+                on_pending_interaction=no_interaction,
+            )
+
+        async def close() -> None:
+            for _ in range(2):
+                await reader._reconcile_idle_turn(
+                    port=4242,
+                    cascade_id=_CASCADE_ID,
+                    client=client,
+                    session_id=_SESSION_ID,
+                    state=state,
+                    on_pending_interaction=no_interaction,
+                )
+
+        error = _load("quota_error_message")
+        if scenario == "benign":
+            error["errorMessage"]["error"]["isBenign"] = True
+        await commit(_load("user_input"))
+        await commit(error)
+        assert sink.statuses() == ["running"], "an error must wait for the idle close"
+        assert state.turn_active
+        if scenario == "recovered":
+            await commit(_load("run_command_done"))
+        await close()
+        if scenario in {"retry", "next_success"}:
+            user = _load("user_input")
+            user["metadata"]["executionId"] = "second-user-turn"
+            await commit(user)
+            if scenario == "retry":
+                second_error = copy.deepcopy(error)
+                second_error["metadata"]["sourceTrajectoryStepInfo"]["stepIndex"] = 11
+                await commit(second_error)
+            else:
+                await commit(_load("stream_planner_text_done"))
+            await close()
+
+    expected = {
+        "quota": ["running", "failed"],
+        "recovered": ["running", "idle"],
+        "retry": ["running", "failed", "running", "failed"],
+        "next_success": ["running", "failed", "running", "idle"],
+        "benign": ["running", "idle"],
+    }
+    assert sink.statuses() == expected[scenario]
+    failures = [
+        data
+        for kind, data in sink.posts
+        if kind == "external_session_status" and data["status"] == "failed"
+    ]
+    for failure in failures:
+        assert "Individual quota reached." in failure["output"]
+        assert "Resets in 1h26m5s." in failure["output"]
+
+
 def test_cascade_is_idle_reads_agys_own_run_status() -> None:
     """
     The bound cascade's own ``CASCADE_RUN_STATUS`` is the quiescence signal.
