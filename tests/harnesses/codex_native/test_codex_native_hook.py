@@ -635,9 +635,14 @@ def test_answer_for_a_switched_session_opens_no_window(
     from omnigent.harnesses.codex_native import bridge
 
     read_state = bridge.read_bridge_state
+    switched = False
 
     def read_then_switch(path: Path) -> CodexNativeBridgeState | None:
+        nonlocal switched
         state = read_state(path)
+        if switched:
+            return state
+        switched = True
         write_bridge_state(
             path,
             CodexNativeBridgeState(

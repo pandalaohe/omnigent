@@ -2276,6 +2276,9 @@ async def test_native_subagent_message_uses_native_terminal_forward(
     assert re.fullmatch(r"[0-9a-f]{32}", forwarded_event["delivery_attempt_id"])
     assert isinstance(forwarded_event["input_enqueued_at_ms"], int)
     assert forwarded_event["input_enqueued_at_ms"] > 0
+    assert forwarded_event["input_admission_required"] is True
+    assert re.fullmatch(r"[0-9a-f]{32}", forwarded_event["input_id"])
+    assert forwarded_event["input_admission_deadline"] > 0
     from omnigent.runtime import get_agent_store
 
     parent_agent = get_agent_store().get(parent["agent_id"])
@@ -2304,6 +2307,9 @@ async def test_native_subagent_message_uses_native_terminal_forward(
                 "delivery_attempt_id": forwarded_event["delivery_attempt_id"],
                 "input_enqueued_at_ms": forwarded_event["input_enqueued_at_ms"],
                 "usage_admission": None,
+                "input_admission_required": True,
+                "input_id": forwarded_event["input_id"],
+                "input_admission_deadline": forwarded_event["input_admission_deadline"],
             },
         },
     ]

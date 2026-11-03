@@ -599,8 +599,17 @@ async def test_agy_reader_usage_replay_exports_linked_native_records(
         monkeypatch.setattr(spool, "append", interrupted_append)
         monkeypatch.setattr(reader, "_sleep", no_delay)
         monkeypatch.setattr(reader, "get_available_models", lambda _port: {})
+        monkeypatch.setattr(
+            reader,
+            "get_all_cascade_trajectories",
+            lambda _port, **_kwargs: {
+                "trajectorySummaries": {"native-cascade": {"status": "CASCADE_RUN_STATUS_IDLE"}}
+            },
+        )
         user = json.loads((fixtures / "user_input.json").read_text())
-        monkeypatch.setattr(reader, "get_trajectory_steps", lambda _port, _cascade: [user, step])
+        monkeypatch.setattr(
+            reader, "get_trajectory_steps", lambda _port, _cascade, **_kwargs: [user, step]
+        )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=_app(conversations, "antigravity-native")),
         base_url="https://omni.example.test",

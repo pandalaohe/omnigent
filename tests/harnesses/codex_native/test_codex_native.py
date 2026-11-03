@@ -2548,7 +2548,11 @@ def test_subscribe_until_ready_replays_completed_turn_status(
         "user",
         "assistant",
     ]
-    assert posted[2]["data"] == _expected_status_data("idle", "turn_123")
+    assert posted[2]["data"] == {
+        **_expected_status_data("idle", "turn_123"),
+        "input_id": "thread_123:turn_123:item_user",
+        "recovered": True,
+    }
     state = read_bridge_state(tmp_path)
     assert state is not None
     assert state.active_turn_id is None
@@ -3895,7 +3899,10 @@ def test_forwarder_recovers_user_before_recovered_agent_message_delta(tmp_path: 
     ]
     assert posted[0]["data"]["item_data"]["role"] == "user"
     assert posted[0]["data"]["item_data"]["content"][0]["text"] == "hello"
-    assert posted[1]["data"] == _expected_status_data("running", "turn_early")
+    assert posted[1]["data"] == {
+        **_expected_status_data("running", "turn_early"),
+        "input_id": "thread_123:turn_early:item_user",
+    }
     assert posted[2]["data"] == _expected_delta_data("Hello", "turn_early", "item_agent")
     assert [method for method, _ in fake_client.requests] == ["thread/resume"]
     assert forwarder_state.has_posted_user_message("turn_early")
@@ -5798,7 +5805,10 @@ def test_forwarder_routes_unregistered_child_command_approval_to_parent(
     assert posted == [
         (
             "/v1/sessions/conv_parent/hooks/codex-elicitation-request",
-            codex_event,
+            {
+                **codex_event,
+                "params": {**codex_event["params"], "omnigentParentThreadId": "thread_parent"},
+            },
         )
     ]
     assert fake_client.responses == [(15, {"decision": "accept"})]

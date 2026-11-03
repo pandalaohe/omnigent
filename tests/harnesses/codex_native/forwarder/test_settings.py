@@ -578,10 +578,14 @@ async def test_permission_sync_freezes_sent_version_and_serializes_concurrent_po
         await fwd._sync_codex_approval_mode_change(
             client, session_id="conv_x", forwarder_state=state
         )
-    assert [packet["data"]["approval_mode"] for packet in packets] == ["full-access", "unknown"]
-    assert all(
-        set(packet["data"]) == {"approval_mode", "permission_observation"} for packet in packets
-    )
+        if state.helper_control_task is not None:
+            await state.helper_control_task
+    observations = [packet["data"] for packet in packets if "approval_mode" in packet["data"]]
+    assert [data["approval_mode"] for data in observations] == ["full-access", "unknown"]
+    assert all(set(data) == {"approval_mode", "permission_observation"} for data in observations)
+    assert [packet["data"] for packet in packets if "approval_mode" not in packet["data"]] == [
+        {"helper_action": "tightening"}
+    ]
     assert state.posted_permission_observation == state.permission_observation
     assert state.terminal_launch_args == state.posted_terminal_launch_args == saved_args
 

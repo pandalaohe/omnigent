@@ -44,7 +44,6 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import RESERVED_USER_LOCAL, UnifiedAuthProvider
 from omnigent.server.host_registry import HostConnection
-from omnigent.server.routes import hosts as hosts_routes
 from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -583,22 +582,24 @@ async def test_workspace_only_failed_launch_never_removes_existing_tree(
 async def test_concurrent_source_launch_cannot_overtake_worktree_launch(
     register_host: RegisterHost,
     client: httpx.AsyncClient,
+    app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A source-directory launch cannot bind while worktree creation is pending."""
     create_gate = asyncio.Event()
     cap = register_host(create_gate=create_gate)
-    source_harness_resolved = asyncio.Event()
-    original_resolve = hosts_routes._resolve_agent_harness
+    source_launch_started = asyncio.Event()
+    original_launch = app.state.host_registry.startup_launch
 
-    async def _resolve_and_signal(*args: object, **kwargs: object) -> str | None:
-        harness = await original_resolve(*args, **kwargs)  # type: ignore[arg-type]
+    @contextlib.asynccontextmanager
+    async def _launch_and_signal(*args: Any, **kwargs: Any):
         if cap.create_started.is_set():
-            source_harness_resolved.set()
-        return harness
+            source_launch_started.set()
+        async with original_launch(*args, **kwargs) as admitted:
+            yield admitted
 
-    monkeypatch.setattr(hosts_routes, "_resolve_agent_harness", _resolve_and_signal)
+    monkeypatch.setattr(app.state.host_registry, "startup_launch", _launch_and_signal)
     session_id = await _bare_session(client, "wt-race-agent")
 
     worktree_launch = asyncio.create_task(
@@ -607,7 +608,8 @@ async def test_concurrent_source_launch_cannot_overtake_worktree_launch(
     await asyncio.wait_for(cap.create_started.wait(), timeout=budget(1.0))
 
     source_launch = asyncio.create_task(_launch(client, session_id, git=None))
-    await asyncio.wait_for(source_harness_resolved.wait(), timeout=budget(1.0))
+    await asyncio.wait_for(source_launch_started.wait(), timeout=budget(1.0))
+    assert not source_launch.done()
     create_gate.set()
 
     worktree_response, source_response = await asyncio.gather(worktree_launch, source_launch)

@@ -223,7 +223,10 @@ def test_forwarder_routes_unregistered_child_command_approval_to_parent(
     assert posted == [
         (
             "/v1/sessions/conv_parent/hooks/codex-elicitation-request",
-            codex_event,
+            {
+                **codex_event,
+                "params": {**codex_event["params"], "omnigentParentThreadId": "thread_parent"},
+            },
         )
     ]
     assert fake_client.responses == [(15, {"decision": "accept"})]

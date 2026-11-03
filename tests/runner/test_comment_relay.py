@@ -172,8 +172,11 @@ class _StubResourceRegistry:
         sandbox_override: str | None = None,
         parent_os_env: object | None = None,
         resource_role: str | None = None,
+        elevated: bool = False,
+        origin: str = "harness",
     ) -> SessionResourceView:
         """Return an auxiliary terminal resource view for a fake instance."""
+        del elevated, origin
         return await self._launch(
             session_id=session_id,
             terminal_name=terminal_name,

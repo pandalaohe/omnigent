@@ -838,7 +838,8 @@ async def test_native_backend_inventory_records_unknown_exit_without_retaining_o
         during = orchestration.native_backend_resident_inventory()
         assert len(during.owners) == 1
         assert during.owners[0].incarnation_id == before.owners[0].incarnation_id
-        assert during.owners[0].closing and not during.owners[0].registered
+        assert during.owners[0].closing
+        assert during.owners[0].registered is (harness == "codex-native")
         assert not during.owners[0].exit_confirmed
     finally:
         resume.set()
