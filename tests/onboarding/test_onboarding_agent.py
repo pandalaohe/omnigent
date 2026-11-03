@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,31 @@ def onboarding_agent_dir() -> Path:
     :returns: Absolute path to ``omnigent/onboarding/agent/``.
     """
     return Path(__file__).parent.parent.parent / "omnigent" / "onboarding" / "agent"
+
+
+def test_onboarding_agent_non_python_files_are_packaged() -> None:
+    """The onboarding agent's runtime data must be included in the wheel."""
+    agent_dir = onboarding_agent_dir()
+    pyproject_path = Path(__file__).parents[2] / "pyproject.toml"
+    with pyproject_path.open("rb") as pyproject_file:
+        pyproject = tomllib.load(pyproject_file)
+
+    package_data = pyproject["tool"]["setuptools"]["package-data"]
+    patterns = package_data.get("omnigent.onboarding.agent", [])
+    packaged = {
+        path.relative_to(agent_dir).as_posix()
+        for pattern in patterns
+        for path in agent_dir.glob(pattern)
+        if path.is_file()
+    }
+    expected = {
+        "AGENTS.md",
+        "config.yaml",
+        "skills/build-omnigent/SKILL.md",
+        "skills/detect-framework/SKILL.md",
+        "skills/omnigent-knowledge/SKILL.md",
+    }
+    assert expected <= packaged
 
 
 def test_onboarding_agent_parses_successfully(
