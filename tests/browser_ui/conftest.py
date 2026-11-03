@@ -236,7 +236,7 @@ def browser_contract(
         ("/v1/custom-agents", {"object": "list", "data": [], "has_more": False}),
         (
             re.compile(
-                rf"^{re.escape(browser_base_url)}/v1/sessions/[^/]+/standing-pass(?:\?.*)?$"
+                rf"^{re.escape(browser_base_url)}/v1/sessions/[^/]+/standing-(?:pass|approval)(?:\?.*)?$"
             ),
             lambda request: {
                 "root_id": unquote(urlparse(request.url).path.split("/")[-2]),

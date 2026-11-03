@@ -252,6 +252,27 @@ function mobileSyncValue(value: unknown): unknown | null {
   return { version: 2, enabled: raw.enabled, buttons: raw.buttons };
 }
 
+function sessionCollabSyncValue(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const raw = value as Record<string, unknown>;
+  if (!("standingPassDefault" in raw) && !("standingApprovalDefault" in raw)) return value;
+  const { standingApprovalDefault, standingPassDefault, ...rest } = raw;
+  return {
+    ...rest,
+    standingPassDefault:
+      standingPassDefault !== undefined ? standingPassDefault : standingApprovalDefault,
+  };
+}
+
+function normalizedSyncValue(
+  namespace: UserPreferenceNamespace,
+  value: unknown | null,
+): unknown | null {
+  if (namespace === "mobile_assistant") return mobileSyncValue(value);
+  if (namespace === "session_collab") return sessionCollabSyncValue(value);
+  return value;
+}
+
 function mobileDeviceState(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const raw = value as { position?: unknown; dock?: unknown };
@@ -267,7 +288,7 @@ function localNamespaceValue(namespace: UserPreferenceNamespace): unknown | null
   const raw = window.localStorage.getItem(storageKey);
   if (namespace === "context_indicator") return raw === "compact" ? "compact" : null;
   const parsed = safeParse(raw);
-  return namespace === "mobile_assistant" ? mobileSyncValue(parsed) : parsed;
+  return normalizedSyncValue(namespace, parsed);
 }
 
 export function collectLocalUserPreferences(): UserPreferencesEnvelope {
@@ -281,7 +302,7 @@ export function collectLocalUserPreferences(): UserPreferencesEnvelope {
 
 function applyNamespace(namespace: UserPreferenceNamespace, value: unknown | null): void {
   const { storageKey, eventName } = CATEGORY_CONFIG[namespace];
-  let storedValue = value;
+  let storedValue = normalizedSyncValue(namespace, value);
   if (namespace === "mobile_assistant") {
     const local = safeParse(window.localStorage.getItem(storageKey));
     const savedDeviceState = safeParse(
@@ -316,7 +337,7 @@ function serializedNamespaceValue(
   namespace: UserPreferenceNamespace,
   value: unknown | null,
 ): string {
-  return JSON.stringify(namespace === "mobile_assistant" ? mobileSyncValue(value) : value);
+  return JSON.stringify(normalizedSyncValue(namespace, value));
 }
 
 function latestNamespaceValue(namespace: UserPreferenceNamespace): unknown | null {
@@ -330,7 +351,7 @@ function hydrateServerEnvelope(envelope: UserPreferencesEnvelope): void {
   applyingServerPreferences = true;
   try {
     for (const namespace of Object.keys(CATEGORY_CONFIG) as UserPreferenceNamespace[]) {
-      const serverNamespace = envelope.settings[namespace] ?? null;
+      const serverNamespace = normalizedSyncValue(namespace, envelope.settings[namespace] ?? null);
       lastServerValues.set(namespace, serverNamespace);
       if (dirty.has(namespace)) {
         const retained = readDirtyValue(namespace);
@@ -699,7 +720,7 @@ export function queueUserPreferencePatch(
   ) {
     return;
   }
-  const syncValue = namespace === "mobile_assistant" ? mobileSyncValue(value) : value;
+  const syncValue = normalizedSyncValue(namespace, value);
   const serialized = JSON.stringify(syncValue);
   for (const waiter of patchWaiters) {
     if (waiter.namespace === namespace && waiter.serialized !== serialized) {

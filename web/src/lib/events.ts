@@ -1063,13 +1063,13 @@ export interface UiOpenFileEvent {
 
 // ── Union type for all events ────────────────────────────
 
-export interface SessionStandingPassEvent {
-  type: "session_standing_pass";
+export interface SessionStandingApprovalEvent {
+  type: "session_standing_approval";
   conversationId: string;
 }
 
 export type StreamEvent =
-  | SessionStandingPassEvent
+  | SessionStandingApprovalEvent
   | ResponseCreated
   | ResponseQueued
   | ResponseInProgress

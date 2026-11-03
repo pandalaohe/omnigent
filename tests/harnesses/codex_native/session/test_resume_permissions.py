@@ -126,7 +126,7 @@ def test_preload_codex_thread_for_resume_manages_subscription(
 @pytest.mark.parametrize(
     ("agent_pid", "expected_config"),
     [
-        (4242, {"shell_environment_policy.set.COLLAB_AGENT_PID": "4242"}),
+        (4242, {"shell_environment_policy.set.OMNIGENT_CODEX_APP_SERVER_PID": "4242"}),
         (None, None),
     ],
 )
@@ -177,7 +177,7 @@ def test_preload_codex_thread_agent_pid_beats_terminal_args(
             "thread_test",
             terminal_launch_args=(
                 "-c",
-                'shell_environment_policy.set.COLLAB_AGENT_PID="999"',
+                'shell_environment_policy.set.OMNIGENT_CODEX_APP_SERVER_PID="999"',
             ),
             agent_pid=4242,
         )
@@ -190,7 +190,7 @@ def test_preload_codex_thread_agent_pid_beats_terminal_args(
                 "threadId": "thread_test",
                 "excludeTurns": True,
                 "approvalsReviewer": "auto_review",
-                "config": {"shell_environment_policy.set.COLLAB_AGENT_PID": "4242"},
+                "config": {"shell_environment_policy.set.OMNIGENT_CODEX_APP_SERVER_PID": "4242"},
             },
         )
     ]

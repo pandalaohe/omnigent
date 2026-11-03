@@ -6,13 +6,16 @@ SQLite database.
 
 from __future__ import annotations
 
+import json
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 
 import pytest
+from sqlalchemy import select, update
 
-from omnigent.db.db_models import workspace_scope
+from omnigent.db.db_models import SqlGlobalInstructionRevision, workspace_scope
 from omnigent.runtime.instruction_layers import compose_role, compose_route, select_role_layers
 from omnigent.stores.global_instructions_store import InstructionRevisionConflict
 from omnigent.stores.global_instructions_store.sqlalchemy_store import (
@@ -33,6 +36,53 @@ def store(db_uri: str) -> SqlAlchemyGlobalInstructionsStore:
 def test_current_none_on_blank_store(store: SqlAlchemyGlobalInstructionsStore) -> None:
     """Nothing saved: ``current`` returns ``None``."""
     assert store.current() is None
+
+
+@pytest.mark.parametrize("stored_scope", ["mother", "parent"])
+def test_parent_scope_reads_both_spellings_and_writes_rollback_safe_history(store, stored_scope):
+    first = store.save("original", created_by=None, scope="parent")
+    with store._engine.begin() as connection:
+        row = connection.execute(
+            select(
+                SqlGlobalInstructionRevision.scope, SqlGlobalInstructionRevision.parent_revision_id
+            ).where(SqlGlobalInstructionRevision.id == first.id)
+        ).one()
+        assert row.scope == "mother"
+        assert (
+            row.parent_revision_id
+            == "empty:" + uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(["mother", "", ""])).hex
+        )
+        connection.execute(
+            update(SqlGlobalInstructionRevision)
+            .where(SqlGlobalInstructionRevision.id == first.id)
+            .values(scope=stored_scope)
+        )
+    assert store.current(scope="parent") == first
+    assert store.list_revisions(scope="parent") == [first]
+    assert store.list_layers() == [first]
+    assert store.latest_layers(None, None, role="parent") == [first]
+    cleared = store.save(
+        "", created_by=None, scope="parent", check_revision=True, expected_revision_id=first.id
+    )
+    assert store.current(scope="parent") == cleared
+    assert store.list_revisions(scope="parent") == [cleared, first]
+    assert store.list_layers() == [cleared]
+    with store._engine.connect() as connection:
+        row = connection.execute(
+            select(
+                SqlGlobalInstructionRevision.scope, SqlGlobalInstructionRevision.parent_revision_id
+            ).where(SqlGlobalInstructionRevision.id == cleared.id)
+        ).one()
+        assert row.scope == "mother"
+        assert row.parent_revision_id == first.id
+
+
+def test_legacy_parent_scope_alias_returns_new_scope_and_logs_once(store, caplog):
+    with caplog.at_level("INFO"):
+        revision = store.save("legacy caller", created_by=None, scope="mother")
+    assert revision.scope == "parent"
+    assert caplog.messages.count("legacy name used: mother") == 1
+    assert store.current(scope="parent") == revision
 
 
 def test_save_then_current_returns_revision(
@@ -88,10 +138,10 @@ def test_list_revisions_newest_first_with_limit(
         ("agent", "codex", ""),
         ("host", "", "host-a"),
         ("independent", "codex", "host-a"),
-        ("mother", "", ""),
-        ("mother", "codex", ""),
-        ("mother", "", "host-a"),
-        ("mother", "codex", "host-a"),
+        ("parent", "", ""),
+        ("parent", "codex", ""),
+        ("parent", "", "host-a"),
+        ("parent", "codex", "host-a"),
         ("child", "", ""),
         ("child", "codex", ""),
         ("child", "", "host-a"),
@@ -131,7 +181,7 @@ def test_routes_skip_missing_keys_and_restore_stack_after_clearing_independent(s
     assert compose_route(store.latest_layers(None, None)).text == "shared"
 
 
-@pytest.mark.parametrize("role", ["mother", "child"])
+@pytest.mark.parametrize("role", ["parent", "child"])
 @pytest.mark.parametrize("route_independent", [False, True])
 def test_latest_layers_reads_route_and_all_role_keys_in_one_session(
     store, monkeypatch, role, route_independent
@@ -211,9 +261,9 @@ def test_layer_reads_and_writes_are_workspace_scoped(store):
         ("host", "codex", "host-a"),
         ("independent", "codex", ""),
         ("independent", "", "host-a"),
-        ("mother", " codex", ""),
+        ("parent", " codex", ""),
         ("child", "", "host-a "),
-        ("mother", "a" * 65, ""),
+        ("parent", "a" * 65, ""),
         ("child", "", "h" * 65),
         ("agent", "  codex", ""),
         ("host", "", " "),

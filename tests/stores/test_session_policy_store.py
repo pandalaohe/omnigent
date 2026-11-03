@@ -7,8 +7,10 @@ and ``delete`` methods against a real SQLite database.
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 
+from omnigent.db.db_models import SqlPolicy
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -53,6 +55,36 @@ def other_session_id(db_uri: str) -> str:
 
 
 # ── create_session_policy ───────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("scope", ["session", "default"])
+@pytest.mark.parametrize("operation", ["create", "update"])
+@pytest.mark.parametrize("spelling", ["standing_pass", "standing_approval"])
+def test_approval_handler_reads_both_names_and_persists_old_path(
+    store, session_id, scope, operation, spelling
+) -> None:
+    old = "omnigent.policies.builtins.safety.ask_on_standing_pass_grant"
+    new = "omnigent.policies.builtins.safety.ask_on_standing_approval_grant"
+    handler = f"omnigent.policies.builtins.safety.ask_on_{spelling}_grant"
+    initial = (
+        handler if operation == "create" else "omnigent.policies.builtins.safety.ask_on_os_tools"
+    )
+    policy_id = "a" * 32
+    if scope == "default":
+        policy = store.create_default(policy_id, "Approval", "python", initial)
+        if operation == "update":
+            policy = store.update_default(policy_id, handler=handler)
+    else:
+        policy = store.create(policy_id, session_id, "Approval", "python", initial)
+        if operation == "update":
+            policy = store.update(policy_id, session_id, handler=handler)
+    assert policy.handler == new
+    with store._engine.begin() as connection:
+        persisted = connection.scalar(select(SqlPolicy.handler).where(SqlPolicy.id == policy_id))
+        assert persisted == old
+        connection.execute(update(SqlPolicy).where(SqlPolicy.id == policy_id).values(handler=new))
+    read = store.get_default(policy_id) if scope == "default" else store.get(policy_id, session_id)
+    assert read.handler == new
 
 
 def test_create_returns_policy_with_correct_fields(

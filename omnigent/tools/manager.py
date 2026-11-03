@@ -266,9 +266,9 @@ class ToolManager:
 
         for tool in (SysProjectSettingsReadTool(), SysProjectSettingsUpdateTool()):
             self._tools[tool.name()] = tool
-        from omnigent.tools.builtins.standing_pass import SysStandingPassTool
+        from omnigent.tools.builtins.standing_approval import SysStandingApprovalTool
 
-        self._tools[SysStandingPassTool.name()] = SysStandingPassTool()
+        self._tools[SysStandingApprovalTool.name()] = SysStandingApprovalTool()
         from omnigent.tools.builtins.host_restart import SysHostRestartTool
 
         self._tools[SysHostRestartTool.name()] = SysHostRestartTool()

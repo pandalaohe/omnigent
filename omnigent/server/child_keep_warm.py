@@ -33,8 +33,8 @@ the pass.
 The loop is shaped like :class:`~omnigent.server.peer_sweeper.PeerSweeper`:
 ``start``/``shutdown`` own one task, ``_run`` loops ``_tick`` plus
 ``asyncio.sleep`` swallowing errors, and tests drive ``_tick`` directly with
-an injected clock. Notices to the mother reuse the peer sweeper's
-``notify_line`` when wired, so they park, batch and drop for archived mothers
+an injected clock. Notices to the parent reuse the peer sweeper's
+``notify_line`` when wired, so they park, batch and drop for archived parents
 exactly like every other server notice.
 """
 
@@ -480,7 +480,7 @@ class _TickResult(NamedTuple):
     """One locked tick pass's deferred effects, applied after the lock.
 
     :param conv: The session row the pass read.
-    :param notices: Stop notices to send the mother.
+    :param notices: Stop notices to send the parent.
     :param touch: Whether to forward the episode-start touch.
     :param ping: ``(attempt_id, family, harness)`` when a ping goes out.
     """
@@ -496,7 +496,7 @@ class _ReceiptResult(NamedTuple):
 
     :param matched: Whether the receipt matched the pending attempt.
     :param conv: The session row, when the receipt matched.
-    :param notices: Stop notices to send the mother.
+    :param notices: Stop notices to send the parent.
     """
 
     matched: bool
@@ -1034,7 +1034,7 @@ class ChildKeepWarmSweeper:
         :param host_ok: Whether the session's host is live and advertises the
             ``keep_warm_v1`` capability (hostless local sessions count as
             supported).
-        :param notify_line: ``PeerSweeper.notify_line`` — the mother's parked
+        :param notify_line: ``PeerSweeper.notify_line`` — the parent's parked
             notice queue, or ``None`` when peer messaging is off (notices are
             then dropped; the label state still settles).
         :param interval: Seconds between ticks.
@@ -1549,7 +1549,7 @@ class ChildKeepWarmSweeper:
         busy = status == "running"
 
         # Rule 1: the session itself archived — drop it; the pill reads None
-        # and the label goes inert. An archived mother keeps the child
+        # and the label goes inert. An archived parent keeps the child
         # tracked so rule 7 can settle it cold silently.
         if conv.archived:
             self._drop_tracking(session_id)
@@ -1849,7 +1849,7 @@ class ChildKeepWarmSweeper:
 
         # Rule 7: cap and expiry settle tracked sessions whether or not they
         # are eligible to be pinged. An expired window under an archived
-        # mother or a switched-off agent goes cold silently.
+        # parent or a switched-off agent goes cold silently.
         tracked = session_id in self._tracked or (state is not None and state.s == "w")
         if state is not None and state.s == "w" and tracked:
             if state.c is not None and now - state.c >= max_s:
@@ -2165,7 +2165,7 @@ class ChildKeepWarmSweeper:
         return parsed[2] if parsed is not None else 0
 
     def _ancestor_archived(self, conv: Conversation) -> bool:
-        """Walk the parent chain for any archived ancestor (mother included)."""
+        """Walk the parent chain for any archived ancestor (parent included)."""
         seen = {conv.id}
         current = conv
         for _ in range(_MAX_PARENT_HOPS):
@@ -2244,7 +2244,7 @@ class ChildKeepWarmSweeper:
     async def _send_notices(
         self, conv: Conversation, notices: list[tuple[str, dict[str, int]]]
     ) -> None:
-        """Send one ``[System: ...]`` line per stop event to the mother."""
+        """Send one ``[System: ...]`` line per stop event to the parent."""
         parent_id = conv.parent_conversation_id
         if parent_id is None or self._notify_line is None:
             return

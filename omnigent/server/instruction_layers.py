@@ -95,7 +95,7 @@ def route_session_text(
     quota_resolver: Callable[[], str] | None = None,
 ) -> str | None:
     """Compose user layers and the exclusive role without changing the runner envelope."""
-    role = "child" if has_parent else "mother" if route.spawn else None
+    role = "child" if has_parent else "parent" if route.spawn else None
     layers = store.latest_layers(route.host_id, route.agent_key, role=role)
     text = compose_route(layers).text
     role_text = (
@@ -103,13 +103,13 @@ def route_session_text(
         if role
         else ""
     )
-    if role == "mother" and role_text.strip() and quota_resolver is not None:
+    if role == "parent" and role_text.strip() and quota_resolver is not None:
         quota_line = quota_resolver()
     result = compose_session_text(
         text,
         has_parent=has_parent,
         spawn=route.spawn,
-        mother_text=role_text if role == "mother" else "",
+        parent_text=role_text if role == "parent" else "",
         child_text=role_text if role == "child" else "",
         quota_line=quota_line,
     )
@@ -120,7 +120,7 @@ async def session_instructions_text(
     conversation: Conversation,
     *,
     quota_resolver: Callable[[Conversation], str] | None = None,
-    standing_pass_resolver: Callable[[Conversation], str] | None = None,
+    standing_approval_resolver: Callable[[Conversation], str] | None = None,
 ) -> str | None:
     """Return the newly initialized session's route text, or no injection if disabled."""
     store = get_global_instructions_store()
@@ -135,8 +135,8 @@ async def session_instructions_text(
             quota_resolver=(lambda: quota_resolver(conversation)) if quota_resolver else None,
         )
     pass_line = (
-        await asyncio.to_thread(standing_pass_resolver, conversation)
-        if standing_pass_resolver is not None
+        await asyncio.to_thread(standing_approval_resolver, conversation)
+        if standing_approval_resolver is not None
         else ""
     )
     return "\n\n".join(part for part in (text, pass_line) if part) or None

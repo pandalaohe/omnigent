@@ -983,7 +983,7 @@ class SqlCliReleaseIntent(ConversationBase):
 
 
 class SqlSessionSuccession(ConversationBase):
-    """Durable receipt for one session succession (old mother → new mother).
+    """Durable receipt for one session succession (old parent → new parent).
 
     The row is the recoverable membership record of the phased operation:
     ``direct_ids``/``moved_ids`` are JSON lists of the child sessions moved,

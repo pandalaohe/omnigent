@@ -9653,18 +9653,22 @@ def _call_mcp_tool(
 
 def _read_relay_tool_names(bridge_dir: Path) -> set[str]:
     """
-    Return active relay tool names.
+    Return active relay tool names, including callable hidden aliases.
 
     :param bridge_dir: Bridge directory path used to read
         ``tool_relay.json``.
-    :returns: Set of tool names currently advertised by the
-        per-turn relay, e.g. ``{"sys_terminal_launch"}``.
+    :returns: Set of callable names for the per-turn relay,
+        e.g. ``{"sys_terminal_launch"}``.
     """
-    return {
+    names = {
         name
         for name in (tool_spec.get("name") for tool_spec in _read_relay_tool_specs(bridge_dir))
         if isinstance(name, str) and name
     }
+    # Resumed sessions may still call the old name; keep it out of tools/list.
+    if "sys_standing_approval" in names:
+        names.add("sys_standing_pass")
+    return names
 
 
 def _read_relay_tool_specs(bridge_dir: Path) -> list[_JsonObject]:

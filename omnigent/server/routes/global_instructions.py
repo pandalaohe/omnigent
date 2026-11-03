@@ -350,17 +350,17 @@ def create_global_instructions_router(
             _key("agent", agent, "")
         if host_id or agent or spawn:
             layers = await asyncio.to_thread(
-                store.latest_layers, host_id, agent, role="mother" if spawn else None
+                store.latest_layers, host_id, agent, role="parent" if spawn else None
             )
             route_text = compose_route(layers).text
-            mother_text = (
-                compose_role(select_role_layers(layers, "mother", host_id, agent)) if spawn else ""
+            parent_text = (
+                compose_role(select_role_layers(layers, "parent", host_id, agent)) if spawn else ""
             )
             text = compose_session_text(
                 route_text,
                 has_parent=False,
                 spawn=spawn,
-                mother_text=mother_text,
+                parent_text=parent_text,
                 quota_line=await current_quota(request, user_id, host_id) if spawn else "",
             )
             result = _to_response(None)
@@ -384,7 +384,7 @@ def create_global_instructions_router(
                 )
             stale: list[str] = []
             role_independent = (
-                revision.scope in {"mother", "child"} and revision.agent_key and revision.host_id
+                revision.scope in {"parent", "child"} and revision.agent_key and revision.host_id
             )
             if (revision.scope == "independent" or role_independent) and revision.text.strip():
                 for shape, key, host in (

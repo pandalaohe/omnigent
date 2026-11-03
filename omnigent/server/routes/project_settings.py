@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from copy import deepcopy
 from dataclasses import asdict, replace
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Query, Request
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    StrictStr,
+    model_validator,
+)
 
 from omnigent.calling_defaults import (
     CallingResolution,
@@ -43,6 +52,7 @@ from omnigent.session_default_modes import mode_values, valid_mode
 from omnigent.util.reasoning_effort import efforts_for_harness
 
 _FIELDS = ("model", "effort", "speed", "permission")
+_logger = logging.getLogger(__name__)
 
 
 class _HarnessPatch(BaseModel):
@@ -71,7 +81,7 @@ class _HostPatch(BaseModel):
 _PassString = Annotated[StrictStr, Field(min_length=1, max_length=120, pattern=r"\S")]
 
 
-class _ProjectStandingPassPatch(BaseModel):
+class _ProjectStandingApprovalPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
     remove: Annotated[list[_PassString], Field(max_length=32)] | None = None
     exceptions: Annotated[list[_PassString], Field(max_length=5)] | None = None
@@ -80,7 +90,17 @@ class _ProjectStandingPassPatch(BaseModel):
 class _OrchestrationPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
     child_cap: Annotated[StrictInt, Field(gt=0)] | Literal["none"] | None = None
-    standing_pass: _ProjectStandingPassPatch = Field(default_factory=_ProjectStandingPassPatch)
+    standing_approval: _ProjectStandingApprovalPatch = Field(
+        default_factory=_ProjectStandingApprovalPatch,
+        validation_alias=AliasChoices("standing_approval", "standing_pass"),
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def log_legacy_name(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "standing_pass" in value:
+            _logger.info("legacy name used: standing_pass")
+        return value
 
 
 class _SettingsPatch(BaseModel):
@@ -144,21 +164,21 @@ def _apply_patch(config: dict[str, Any], body: _SettingsPatch) -> tuple[dict[str
             else:
                 orchestration["child_cap"] = patch.child_cap
             named.append("orchestration.child_cap")
-        if "standing_pass" in patch.model_fields_set:
-            stored = orchestration.get("standing_pass")
-            standing_pass = deepcopy(stored) if isinstance(stored, dict) else {}
+        if "standing_approval" in patch.model_fields_set:
+            stored = orchestration.get("standing_approval")
+            standing_approval = deepcopy(stored) if isinstance(stored, dict) else {}
             for field in ("remove", "exceptions"):
-                if field in patch.standing_pass.model_fields_set:
-                    value = getattr(patch.standing_pass, field)
+                if field in patch.standing_approval.model_fields_set:
+                    value = getattr(patch.standing_approval, field)
                     if value is None:
-                        standing_pass.pop(field, None)
+                        standing_approval.pop(field, None)
                     else:
-                        standing_pass[field] = value
-                    named.append(f"orchestration.standing_pass.{field}")
-            if standing_pass:
-                orchestration["standing_pass"] = standing_pass
+                        standing_approval[field] = value
+                    named.append(f"orchestration.standing_approval.{field}")
+            if standing_approval:
+                orchestration["standing_approval"] = standing_approval
             else:
-                orchestration.pop("standing_pass", None)
+                orchestration.pop("standing_approval", None)
         if orchestration:
             result["orchestration"] = orchestration
         else:

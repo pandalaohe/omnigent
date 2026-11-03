@@ -55,7 +55,7 @@ _PREFERENCE_MAX_STORED_BYTES = 65535
 
 
 def _without_retired_setup(config: dict[str, Any]) -> dict[str, Any]:
-    """Ignore the retired mother setup without altering other project defaults."""
+    """Ignore the retired parent setup without altering other project defaults."""
     orchestration = config.get("orchestration")
     if not isinstance(orchestration, dict) or "setup" not in orchestration:
         return config
@@ -69,6 +69,25 @@ def _without_retired_setup(config: dict[str, Any]) -> dict[str, Any]:
     return config
 
 
+def _approval_config(config: dict[str, Any], *, persisted: bool = False) -> dict[str, Any]:
+    orchestration = config.get("orchestration")
+    if not isinstance(orchestration, dict) or not {
+        "standing_pass",
+        "standing_approval",
+    }.intersection(orchestration):
+        return config
+    result = dict(config)
+    value = orchestration.get("standing_pass", orchestration.get("standing_approval"))
+    renamed = {
+        key: value
+        for key, value in orchestration.items()
+        if key not in {"standing_pass", "standing_approval"}
+    }
+    renamed["standing_pass" if persisted else "standing_approval"] = value
+    result["orchestration"] = renamed
+    return result
+
+
 def _encode_config(config: dict[str, Any] | None) -> str | None:
     """Pack a project's config dict into a compact JSON blob for storage.
 
@@ -80,7 +99,7 @@ def _encode_config(config: dict[str, Any] | None) -> str | None:
     :raises OmnigentError: ``INVALID_INPUT`` if the serialized config exceeds
         :data:`_CONFIG_MAX_SERIALIZED_LEN`.
     """
-    config = _without_retired_setup(config) if config else None
+    config = _approval_config(_without_retired_setup(config), persisted=True) if config else None
     if not config:
         return None
     blob = json.dumps(config, separators=(",", ":"))
@@ -106,7 +125,7 @@ def _decode_config(raw: str | None) -> dict[str, Any]:
     if not raw:
         return {}
     decoded = json.loads(raw)
-    return _without_retired_setup(decoded) if isinstance(decoded, dict) else {}
+    return _approval_config(_without_retired_setup(decoded)) if isinstance(decoded, dict) else {}
 
 
 def _to_entity(row: SqlProject) -> Project:

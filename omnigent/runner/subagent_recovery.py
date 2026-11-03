@@ -44,7 +44,7 @@ def _recovered_subagent_origin(snapshot: _SessionSnapshot) -> str | None:
     The in-memory origin map does not survive a runner restart. A readable
     snapshot whose wrapper label is not the codex-native internal one belongs
     to a child an Omnigent surface dispatched (or an ordinary child), so it is
-    allowed to wake even a Codex mother. An unreadable snapshot or a
+    allowed to wake even a Codex parent. An unreadable snapshot or a
     codex-internal thread returns ``None`` and keeps the wake suppressed; a
     delegated Codex thread is admitted by its own labels instead
     (``native_origin``), not by this dispatch origin.
@@ -125,7 +125,7 @@ def build_subagent_recovery(
         A drained child keeps its last delivered result key: a later terminal
         edge with a different key is a new turn and rebuilds the entry, while
         the same key (or no readable key) stays a duplicate. Rebuilt entries
-        are flow-neutral — recovery handles turns the mother did not dispatch,
+        are flow-neutral — recovery handles turns the parent did not dispatch,
         so it must not join a running flow; a child already in the run keeps
         its membership and is still held (``hold_child_wake``). The entry
         keeps the child's recorded origin and its effective host (the first

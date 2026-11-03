@@ -8,7 +8,7 @@ peer envelope: the newest assistant message equal to the edge output (X),
 the first non-meta user message older than it (E), and a window between
 them holding only assistant / reasoning / tool items. The result lets the
 runner hand the parent a silent copy instead of a result wake, and lets the
-blocked-approval notifier reach the peer sender instead of the mother.
+blocked-approval notifier reach the peer sender instead of the parent.
 
 Attribution errs toward waking: any doubt returns ``None`` so today's
 delivery path runs. Every fact read here is already in the child's
@@ -56,7 +56,7 @@ _SDK_PEER_TURN_WAIT_S = 5.0
 class PeerTurn:
     """The peer sender a child's settled turn is attributed to.
 
-    :param parent_session_id: The child's mother, who receives the copy.
+    :param parent_session_id: The child's parent, who receives the copy.
     :param peer_id: E's peer record id (the envelope's ``msg=``).
     :param result_item_id: X's transcript item id, the turn's answer.
     :param ref: E's header ``ref``.
@@ -168,7 +168,7 @@ def _verified_envelope(
 
     Verifies the single text block, a current-format header, the record's
     existence / receiver / state / sender, that the body and stored text
-    match in delivered form, that the sender is not the child's mother,
+    match in delivered form, that the sender is not the child's parent,
     and that the thread was not started by the child itself.
     """
     text = _single_text_block(data.content)

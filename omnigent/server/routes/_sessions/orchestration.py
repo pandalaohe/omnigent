@@ -1023,10 +1023,11 @@ async def _publish_and_wait_for_harness_elicitation(
             verdict is not None
             and verdict.action == "accept"
             and tool_name is not None
-            and tool_name.removeprefix("mcp__omnigent__") == "sys_standing_pass"
+            and tool_name.removeprefix("mcp__omnigent__")
+            in {"sys_standing_approval", "sys_standing_pass"}
             and isinstance(tool_input, dict)
         ):
-            from omnigent.server.standing_pass import remember_grant_approval
+            from omnigent.server.standing_approval import remember_grant_approval
 
             remember_grant_approval(session_id, tool_input, elicitation_id)
         return verdict
@@ -15570,7 +15571,7 @@ async def _create_session_from_existing_agent(
         for index, item in enumerate(body.initial_items):
             if item.type == "message" and item.data.get("role", "user") == "user":
                 body.initial_items[index] = await asyncio.to_thread(
-                    request.app.state.standing_pass_service.first_message, conv, item
+                    request.app.state.standing_approval_service.first_message, conv, item
                 )
                 break
     if host_load_hold and body.initial_items:

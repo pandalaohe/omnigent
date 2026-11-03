@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib as _hashlib
 import json as _json
+import logging as _logging
 import re as _re
 from typing import Literal
 
@@ -22,6 +23,7 @@ from omnigent.policies.schema import (
 )
 
 _ALLOW: PolicyResponse = {"result": "ALLOW"}
+_logger = _logging.getLogger(__name__)
 
 _SYS_OS_TOOLS = frozenset({"sys_os_read", "sys_os_write", "sys_os_edit", "sys_os_shell"})
 
@@ -392,9 +394,12 @@ def ask_on_host_restart(event: PolicyEvent) -> PolicyResponse:
     return {"result": "ASK", "reason": "Restart this host and end its runners and terminals?"}
 
 
-def ask_on_standing_pass_grant(event: PolicyEvent) -> PolicyResponse:
-    """Ask for the exact delta before an agent widens its mother's pass."""
-    if event.get("type") != "tool_call" or event.get("target") != "sys_standing_pass":
+def ask_on_standing_approval_grant(event: PolicyEvent) -> PolicyResponse:
+    """Ask for the exact delta before an agent widens its parent's approval."""
+    if event.get("type") != "tool_call" or event.get("target") not in {
+        "sys_standing_approval",
+        "sys_standing_pass",
+    }:
         return _ALLOW
     data = event.get("data")
     args = data.get("arguments") if isinstance(data, dict) else None
@@ -403,10 +408,16 @@ def ask_on_standing_pass_grant(event: PolicyEvent) -> PolicyResponse:
     return {
         "result": "ASK",
         "reason": (
-            "Grant these standing pass kinds for this mother session: "
+            "Grant these standing approval kinds for this parent session: "
             f"{_json.dumps(args.get('kinds', []))}. Approve?"
         ),
     }
+
+
+def ask_on_standing_pass_grant(event: PolicyEvent) -> PolicyResponse:
+    """Compatibility handler for existing policy rows through the expand release."""
+    _logger.info("legacy name used: ask_on_standing_pass_grant")
+    return ask_on_standing_approval_grant(event)
 
 
 def ask_on_project_settings_update(event: PolicyEvent) -> PolicyResponse:
@@ -973,10 +984,10 @@ POLICY_REGISTRY: list[dict[str, object]] = [
         "params_schema": None,
     },
     {
-        "handler": "omnigent.policies.builtins.safety.ask_on_standing_pass_grant",
+        "handler": "omnigent.policies.builtins.safety.ask_on_standing_approval_grant",
         "kind": "callable",
-        "name": "Standing Pass Grant Approval",
-        "description": "Requires approval of the exact standing pass kinds being granted.",
+        "name": "Standing Approval Grant Approval",
+        "description": "Requires approval of the exact standing approval kinds being granted.",
         "params_schema": None,
     },
     {

@@ -1,4 +1,4 @@
-"""Standing passes at persistence, init, tool and authenticated HTTP boundaries."""
+"""Standing approvals at persistence, init, tool and authenticated HTTP boundaries."""
 
 import asyncio
 import json
@@ -18,44 +18,45 @@ from tests.server.helpers import create_test_agent
 
 @pytest.fixture
 def passes(db_uri):
-    from omnigent.server.standing_pass import StandingPassService
+    from omnigent.server.standing_approval import StandingApprovalService
 
     store = SqlAlchemyConversationStore(db_uri)
     prefs = SqlAlchemyUserPreferencesStore(db_uri)
-    return StandingPassService(store, prefs_store=prefs)
+    return StandingApprovalService(store, prefs_store=prefs)
 
 
 def test_defaults_empty_snapshot_malformed_and_fork(passes, caplog):
-    from omnigent.server.standing_pass import STANDING_PASS_LABEL_KEY
+    from omnigent.server.standing_approval import STANDING_APPROVAL_LABEL_KEY
 
     root = passes.store.create_conversation()
     assert passes.line(root) == ""
-    empty = passes.store.get_conversation(root.id).labels[STANDING_PASS_LABEL_KEY]
+    empty = passes.store.get_conversation(root.id).labels[STANDING_APPROVAL_LABEL_KEY]
     passes.prefs_store.patch_namespace(
         RESERVED_USER_LOCAL,
         "session_collab",
-        {"standingPassDefault": ["install", "merge", "release"]},
+        {"standingApprovalDefault": ["install", "merge", "release"]},
     )
     assert passes.line(root) == ""
-    assert passes.store.get_conversation(root.id).labels[STANDING_PASS_LABEL_KEY] == empty
+    assert passes.store.get_conversation(root.id).labels[STANDING_APPROVAL_LABEL_KEY] == empty
     fresh = passes.store.create_conversation()
     assert passes.resolve(fresh)["kinds"] == ["install", "merge", "release"]
     passes.change(fresh, "revoke", ["install"], "user-item")
     assert "install" not in passes.resolve(fresh)["kinds"]
-    assert f"{STANDING_PASS_LABEL_KEY}.0" in passes.store.get_conversation(fresh.id).labels
+    assert f"{STANDING_APPROVAL_LABEL_KEY}.0" in passes.store.get_conversation(fresh.id).labels
     fork = passes.store.fork_conversation(fresh.id)
-    assert not any(key.startswith(STANDING_PASS_LABEL_KEY) for key in fork.labels)
+    assert not any(key.startswith(STANDING_APPROVAL_LABEL_KEY) for key in fork.labels)
     assert passes.resolve(fork)["kinds"] == ["install", "merge", "release"]
-    passes.store.set_labels(root.id, {STANDING_PASS_LABEL_KEY: "not json"})
+    passes.store.set_labels(root.id, {STANDING_APPROVAL_LABEL_KEY: "not json"})
     assert passes.line(root) == ""
-    assert "Invalid standing pass" in caplog.text
+    assert "Invalid standing approval" in caplog.text
 
 
-def test_project_removal_exceptions_and_no_later_default_changes(passes, db_uri):
+@pytest.mark.parametrize("config_key", ["standing_pass", "standing_approval"])
+def test_project_removal_exceptions_and_no_later_default_changes(passes, db_uri, config_key):
     from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 
     passes.prefs_store.patch_namespace(
-        RESERVED_USER_LOCAL, "session_collab", {"standingPassDefault": ["install", "merge"]}
+        RESERVED_USER_LOCAL, "session_collab", {"standingApprovalDefault": ["install", "merge"]}
     )
     passes.project_store = SqlAlchemyProjectStore(db_uri)
     project = passes.project_store.create(
@@ -64,7 +65,7 @@ def test_project_removal_exceptions_and_no_later_default_changes(passes, db_uri)
         None,
         {
             "orchestration": {
-                "standing_pass": {
+                config_key: {
                     "remove": ["install"],
                     "exceptions": ["production release", 'custom\nline "push"'],
                 }
@@ -78,13 +79,30 @@ def test_project_removal_exceptions_and_no_later_default_changes(passes, db_uri)
     assert '"custom line \\"push\\""' in line
     assert "\n" not in line
     passes.prefs_store.patch_namespace(
-        RESERVED_USER_LOCAL, "session_collab", {"standingPassDefault": ["release"]}
+        RESERVED_USER_LOCAL, "session_collab", {"standingApprovalDefault": ["release"]}
     )
     assert passes.resolve(root)["kinds"] == ["merge"]
 
 
+@pytest.mark.parametrize("config_key", ["standing_pass", "standing_approval"])
+@pytest.mark.parametrize("invalid", [None, False, [], "invalid"])
+def test_malformed_project_approval_disables_defaults(passes, db_uri, config_key, invalid):
+    from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+
+    passes.prefs_store.patch_namespace(
+        RESERVED_USER_LOCAL, "session_collab", {"standingApprovalDefault": ["install"]}
+    )
+    passes.project_store = SqlAlchemyProjectStore(db_uri)
+    project = passes.project_store.create(
+        "b" * 32, "Project", None, {"orchestration": {config_key: invalid}}
+    )
+    root = passes.store.create_conversation(project_id=project.id)
+    assert passes.resolve(root)["kinds"] == []
+    assert passes.resolve(root)["exceptions"] == []
+
+
 def test_cas_retries_preserve_concurrent_revokes(passes, monkeypatch):
-    from omnigent.server.standing_pass import StandingPassConflict
+    from omnigent.server.standing_approval import StandingApprovalConflict
 
     root = passes.store.create_conversation()
     passes.resolve(root)
@@ -104,34 +122,97 @@ def test_cas_retries_preserve_concurrent_revokes(passes, monkeypatch):
 
     def conflict(*args):
         attempts.append(args)
-        return False
+        return {}
 
     monkeypatch.setattr(passes.store, "mutate_label_group", conflict)
-    with pytest.raises(StandingPassConflict, match="all 5"):
+    with pytest.raises(StandingApprovalConflict, match="all 5"):
         passes.change(root, "revoke", ["release"], "retry")
     assert len(attempts) == 5
 
 
-async def test_empty_instructions_still_inject_mother_and_child(passes, monkeypatch):
+@pytest.mark.parametrize("prefix", ["omnigent.standing_pass", "omnigent.standing_approval"])
+@pytest.mark.parametrize("chunked", [False, True])
+def test_saved_labels_read_both_names_and_mutate_in_rollback_format(passes, prefix, chunked):
+    root = passes.store.create_conversation()
+    record = {"kinds": ["install"], "exceptions": [], "since": 1, "events": []}
+    encoded = json.dumps(record)
+    labels = (
+        {prefix: '{"chunks":2}', f"{prefix}.0": encoded[:40], f"{prefix}.1": encoded[40:]}
+        if chunked
+        else {prefix: encoded}
+    )
+    passes.store.set_labels(root.id, {**labels, "omnigent.standing_note": "keep"})
+    assert passes.resolve(root) == record
+    fork = passes.store.fork_conversation(root.id)
+    assert not any(key.startswith(prefix) for key in fork.labels)
+    assert fork.labels["omnigent.standing_note"] == "keep"
+    passes.change(root, "revoke", ["install"], "user-revoke")
+    stored = passes.store.get_conversation(root.id).labels
+    assert stored["omnigent.standing_note"] == "keep"
+    assert not any(key.startswith("omnigent.standing_approval") for key in stored)
+    head = json.loads(stored["omnigent.standing_pass"])
+    old_image_record = json.loads(
+        "".join(stored[f"omnigent.standing_pass.{i}"] for i in range(head["chunks"]))
+    )
+    assert old_image_record["kinds"] == []
+    assert old_image_record["events"][-1]["op"] == "revoke"
+
+
+async def test_legacy_http_route_logs_each_use_and_returns_new_text(client, caplog):
+    agent = await create_test_agent(client)
+    url = f"/v1/sessions/{agent['_session_id']}"
+    with caplog.at_level("INFO"):
+        read = await client.get(url + "/standing-pass")
+        assert read.status_code == 200, read.text
+        assert caplog.messages.count("legacy name used: /standing-pass") == 1
+        changed = await client.post(
+            url + "/standing-pass", json={"op": "revoke", "kinds": ["install"]}
+        )
+        assert changed.status_code == 200, changed.text
+        assert caplog.messages.count("legacy name used: /standing-pass") == 2
+        current = await client.get(url + "/standing-approval")
+        assert current.status_code == 200, current.text
+        assert "Standing approval (this parent session" in current.json()["line"]
+        assert caplog.messages.count("legacy name used: /standing-pass") == 2
+
+
+def test_saved_legacy_policy_handler_import_remains_guarded(caplog):
+    from importlib import import_module
+
+    handler = import_module("omnigent.policies.builtins.safety").ask_on_standing_pass_grant
+    with caplog.at_level("INFO"):
+        result = handler(
+            {
+                "type": "tool_call",
+                "target": "sys_standing_approval",
+                "data": {"arguments": {"op": "grant", "kinds": ["custom-kind"]}},
+            }
+        )
+    assert result["result"] == "ASK"
+    assert "custom-kind" in result["reason"]
+    assert caplog.messages.count("legacy name used: ask_on_standing_pass_grant") == 1
+
+
+async def test_empty_instructions_still_inject_parent_and_child(passes, monkeypatch):
     from omnigent.server.instruction_layers import session_instructions_text
-    from omnigent.server.standing_pass import STANDING_PASS_LABEL_KEY
+    from omnigent.server.standing_approval import STANDING_APPROVAL_LABEL_KEY
 
     passes.prefs_store.patch_namespace(
         RESERVED_USER_LOCAL,
         "session_collab",
-        {"standingPassDefault": ["install", "merge", "release"]},
+        {"standingApprovalDefault": ["install", "merge", "release"]},
     )
     root = passes.store.create_conversation()
     child = passes.store.create_conversation(parent_conversation_id=root.id, kind="sub_agent")
     monkeypatch.setattr(
         "omnigent.server.instruction_layers.get_global_instructions_store", lambda: None
     )
-    mother_text = await session_instructions_text(root, standing_pass_resolver=passes.line)
-    child_text = await session_instructions_text(child, standing_pass_resolver=passes.line)
-    assert mother_text == child_text
-    assert mother_text.startswith("Standing pass (this mother session, since ")
-    assert '"install", "merge", "release"' in mother_text
-    assert STANDING_PASS_LABEL_KEY not in passes.store.get_conversation(child.id).labels
+    parent_text = await session_instructions_text(root, standing_approval_resolver=passes.line)
+    child_text = await session_instructions_text(child, standing_approval_resolver=passes.line)
+    assert parent_text == child_text
+    assert parent_text.startswith("Standing approval (this parent session, since ")
+    assert '"install", "merge", "release"' in parent_text
+    assert STANDING_APPROVAL_LABEL_KEY not in passes.store.get_conversation(child.id).labels
 
 
 async def test_change_notice_only_running_descendants(passes):
@@ -149,10 +230,13 @@ async def test_change_notice_only_running_descendants(passes):
         children[2].id: "skipped_not_running",
     }
     post.assert_awaited_once()
-    assert "[System: standing pass changed: revoke" in post.await_args.args[1]
+    assert "[System: standing approval changed: revoke" in post.await_args.args[1]
 
 
-async def test_http_child_guard_reserved_labels_and_tool_transport(app, client, db_uri):
+@pytest.mark.parametrize("tool_name", ["sys_standing_approval", "sys_standing_pass"])
+async def test_http_child_guard_reserved_labels_and_tool_transport(
+    app, client, db_uri, caplog, tool_name
+):
     from omnigent.runner.tool_dispatch import _NATIVE_RELAY_BUILTIN_TOOLS, execute_tool
     from omnigent.spec import AgentSpec
     from omnigent.tools.manager import ToolManager
@@ -166,15 +250,15 @@ async def test_http_child_guard_reserved_labels_and_tool_transport(app, client, 
     child_id = created.json()["id"]
     for op in ["revoke", "grant"]:
         response = await client.post(
-            f"/v1/sessions/{child_id}/standing-pass", json={"op": op, "kinds": ["install"]}
+            f"/v1/sessions/{child_id}/standing-approval", json={"op": op, "kinds": ["install"]}
         )
         assert response.status_code == 403
     for method, path, payload in [
-        ("patch", f"/v1/sessions/{root_id}", {"labels": {"omnigent.standing_pass": "{}"}}),
+        ("patch", f"/v1/sessions/{root_id}", {"labels": {"omnigent.standing_approval": "{}"}}),
         (
             "post",
             "/v1/sessions",
-            {"agent_id": agent["id"], "labels": {"omnigent.standing_pass": "{}"}},
+            {"agent_id": agent["id"], "labels": {"omnigent.standing_approval": "{}"}},
         ),
     ]:
         response = await getattr(client, method)(path, json=payload)
@@ -182,19 +266,25 @@ async def test_http_child_guard_reserved_labels_and_tool_transport(app, client, 
     manager = ToolManager(AgentSpec(spec_version=1, spawn=False))
     try:
         advertised = {schema["function"]["name"] for schema in manager.get_tool_schemas()}
-        assert "sys_standing_pass" in advertised & _NATIVE_RELAY_BUILTIN_TOOLS
+        assert "sys_standing_approval" in advertised & _NATIVE_RELAY_BUILTIN_TOOLS
+        assert "sys_standing_pass" not in advertised
     finally:
         manager.shutdown()
-    result = json.loads(
-        await execute_tool(
-            tool_name="sys_standing_pass",
-            arguments='{"op":"read"}',
-            conversation_id=child_id,
-            server_client=client,
+    with caplog.at_level("INFO"):
+        result = json.loads(
+            await execute_tool(
+                tool_name=tool_name,
+                arguments='{"op":"read"}',
+                conversation_id=child_id,
+                server_client=client,
+                agent_spec=AgentSpec(spec_version=1),
+            )
         )
-    )
     assert result["root_id"] == root_id
     assert result["record"]["kinds"] == []
+    assert caplog.messages.count("legacy name used: sys_standing_pass") == (
+        tool_name == "sys_standing_pass"
+    )
 
 
 @pytest.mark.parametrize("action,expected", [("accept", ["install"]), ("decline", [])])
@@ -205,7 +295,7 @@ async def test_grant_accept_deny_binds_source_to_real_card(client, action, expec
     root_id = agent["_session_id"]
     task = asyncio.create_task(
         client.post(
-            f"/v1/sessions/{root_id}/standing-pass",
+            f"/v1/sessions/{root_id}/standing-approval",
             json={"op": "grant", "kinds": ["install"], "source": "forged-user-source"},
         )
     )
@@ -218,7 +308,7 @@ async def test_grant_accept_deny_binds_source_to_real_card(client, action, expec
     assert response.status_code == 202, response.text
     result = await asyncio.wait_for(task, 5)
     assert result.status_code == (200 if action == "accept" else 403), result.text
-    record = (await client.get(f"/v1/sessions/{root_id}/standing-pass")).json()["record"]
+    record = (await client.get(f"/v1/sessions/{root_id}/standing-approval")).json()["record"]
     assert record["kinds"] == expected
     if action == "accept":
         assert record["events"][-1]["source"] == f"approval:{card_id}"
@@ -238,7 +328,7 @@ async def test_first_child_message_gets_live_pass(app, client, db_uri, monkeypat
     monkeypatch.setattr(routes_events, "_ensure_runner_relay_ready", AsyncMock())
     agent = await create_test_agent(client)
     root_id = agent["_session_id"]
-    service = app.state.standing_pass_service
+    service = app.state.standing_approval_service
     root = service.store.get_conversation(root_id)
     service.change(root, "grant", ["install"], "approval:fixture")
     created = await client.post(
@@ -257,7 +347,7 @@ async def test_first_child_message_gets_live_pass(app, client, db_uri, monkeypat
     page = service.store.list_items(child_id, type="message")
     assert page.data
     content = page.data[0].data.content
-    assert content[0]["text"].startswith("Standing pass (this mother session")
+    assert content[0]["text"].startswith("Standing approval (this parent session")
     assert content[1]["text"] == "Do the task"
     assert received
 
@@ -287,7 +377,8 @@ def test_successor_carries_predecessor_after_child_move(passes, monkeypatch):
         passes.change(old, "grant", ["install"], "approval:late")
 
 
-async def test_policy_requires_exact_grant_and_skips_reads_and_revokes(passes):
+@pytest.mark.parametrize("tool_name", ["sys_standing_approval", "sys_standing_pass"])
+async def test_policy_requires_exact_grant_and_skips_reads_and_revokes(passes, tool_name):
     from omnigent.policies.types import EvaluationContext
     from omnigent.runtime.policies.builder import any_policies_apply, build_policy_engine
     from omnigent.spec import AgentSpec
@@ -301,7 +392,7 @@ async def test_policy_requires_exact_grant_and_skips_reads_and_revokes(passes):
         default_policies=None,
         policy_store=None,
         phase=Phase.TOOL_CALL,
-        tool_name="sys_standing_pass",
+        tool_name=tool_name,
     )
     engine = build_policy_engine(
         spec=spec, conversation_id=root.id, conversation_store=passes.store
@@ -310,9 +401,9 @@ async def test_policy_requires_exact_grant_and_skips_reads_and_revokes(passes):
         result = await engine.evaluate(
             EvaluationContext(
                 phase=Phase.TOOL_CALL,
-                tool_name="sys_standing_pass",
+                tool_name=tool_name,
                 content={
-                    "name": "sys_standing_pass",
+                    "name": tool_name,
                     "arguments": {"op": op, "kinds": ["custom-kind"]},
                 },
             )
@@ -322,7 +413,10 @@ async def test_policy_requires_exact_grant_and_skips_reads_and_revokes(passes):
             assert "custom-kind" in result.reason
 
 
-async def test_policy_approval_crosses_runner_hop_without_second_card(app, client, db_uri):
+@pytest.mark.parametrize("tool_name", ["sys_standing_approval", "sys_standing_pass"])
+async def test_policy_approval_crosses_runner_hop_without_second_card(
+    app, client, db_uri, tool_name
+):
     from omnigent.runner.tool_dispatch import execute_tool
     from omnigent.server._elicitation_registry import _harness_elicitation_registry
     from omnigent.server.routes._sessions.orchestration import (
@@ -332,7 +426,7 @@ async def test_policy_approval_crosses_runner_hop_without_second_card(app, clien
     from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 
     agent = await create_test_agent(client)
-    service = app.state.standing_pass_service
+    service = app.state.standing_approval_service
     conv = service.store.get_conversation(agent["_session_id"])
     args = {"op": "grant", "kinds": ["install"]}
     task = asyncio.create_task(
@@ -341,7 +435,7 @@ async def test_policy_approval_crosses_runner_hop_without_second_card(app, clien
             conv,
             SessionEventInput(
                 type="function_call",
-                data={"name": "sys_standing_pass", "arguments": json.dumps(args)},
+                data={"name": tool_name, "arguments": json.dumps(args)},
             ),
             service.store,
             SqlAlchemyAgentStore(db_uri),
@@ -359,7 +453,7 @@ async def test_policy_approval_crosses_runner_hop_without_second_card(app, clien
     assert await asyncio.wait_for(task, 5) is None
     result = await asyncio.wait_for(
         execute_tool(
-            tool_name="sys_standing_pass",
+            tool_name=tool_name,
             arguments=json.dumps(args),
             conversation_id=conv.id,
             server_client=client,
@@ -374,7 +468,7 @@ async def test_policy_approval_crosses_runner_hop_without_second_card(app, clien
 
 async def test_initial_items_seed_gets_pass_and_later_messages_do_not(app, client):
     agent = await create_test_agent(client)
-    service = app.state.standing_pass_service
+    service = app.state.standing_approval_service
     root = service.store.get_conversation(agent["_session_id"])
     service.change(root, "grant", ["install"], "approval:fixture")
     response = await client.post(
@@ -396,7 +490,7 @@ async def test_initial_items_seed_gets_pass_and_later_messages_do_not(app, clien
     assert response.status_code == 201, response.text
     child = service.store.get_conversation(response.json()["id"])
     content = service.store.list_items(child.id, type="message").data[0].data.content
-    assert content[0]["text"].startswith("Standing pass (this mother session")
+    assert content[0]["text"].startswith("Standing approval (this parent session")
     assert content[1]["text"] == "Initial task"
     from omnigent.server.schemas import SessionEventInput
 
@@ -433,10 +527,10 @@ async def test_prepared_successor_never_resolves_defaults_before_receipt(
     from omnigent.stores.conversation_store import ROTATE_REQUESTED_LABEL_KEY
     from tests.server.test_pi_successor import _source
 
-    service = app.state.standing_pass_service
+    service = app.state.standing_approval_service
     service.prefs_store = SqlAlchemyUserPreferencesStore(db_uri)
     service.prefs_store.patch_namespace(
-        RESERVED_USER_LOCAL, "session_collab", {"standingPassDefault": ["install"]}
+        RESERVED_USER_LOCAL, "session_collab", {"standingApprovalDefault": ["install"]}
     )
     source_id = (
         _source(service.store, harness=harness)
@@ -456,7 +550,7 @@ async def test_prepared_successor_never_resolves_defaults_before_receipt(
     record = service.resolve(successor)
     assert record["kinds"] == []
     assert record["events"][-1]["op"] == "revoke"
-    assert "omnigent.standing_pass" not in successor.labels
+    assert "omnigent.standing_approval" not in successor.labels
     # The source can still revoke or grant while terminal transfer is pending.
     service.change(source, "grant", ["merge"], "approval:during-transfer")
 
@@ -478,7 +572,7 @@ async def test_prepared_successor_never_resolves_defaults_before_receipt(
 
 
 async def test_failed_clear_candidate_stays_archived_and_new_attempt_is_stable(app, client):
-    service = app.state.standing_pass_service
+    service = app.state.standing_approval_service
     source = service.store.create_conversation(
         agent_id="a" * 32, runner_id="runner-test", harness_override="claude-native"
     )
@@ -504,20 +598,20 @@ async def test_mcp_accept_replay_cannot_restore_revoked_grant(app, client, db_ur
         _PendingPolicyAskWrites,
     )
     from omnigent.server.routes._sessions.helpers import _apply_pending_policy_ask_writes
-    from omnigent.server.standing_pass import consume_grant_approval
+    from omnigent.server.standing_approval import consume_grant_approval
     from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 
     agent = await create_test_agent(client)
-    service = app.state.standing_pass_service
+    service = app.state.standing_approval_service
     root = service.store.get_conversation(agent["_session_id"])
-    eid = "elicit_standing_pass_replay"
+    eid = "elicit_standing_approval_replay"
     args = {"op": "grant", "kinds": ["install"]}
     _pending_policy_ask_writes[eid] = _PendingPolicyAskWrites(
         state_updates=None,
         set_labels=None,
         from_mcp=True,
         reviewed_arguments=args,
-        mcp_call_identity=(root.id, "sys_standing_pass", None, None),
+        mcp_call_identity=(root.id, "sys_standing_approval", None, None),
     )
 
     async def accept():
@@ -532,7 +626,7 @@ async def test_mcp_accept_replay_cannot_restore_revoked_grant(app, client, db_ur
     try:
         await accept()
         granted = await asyncio.wait_for(
-            client.post(f"/v1/sessions/{root.id}/standing-pass", json=args), 2
+            client.post(f"/v1/sessions/{root.id}/standing-approval", json=args), 2
         )
         assert granted.status_code == 200, granted.text
         service.change(root, "revoke", ["install"], "user-revoke")

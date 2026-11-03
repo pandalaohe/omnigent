@@ -1,4 +1,4 @@
-"""Threshold-based child reminders, batched per mother with opt-in recovery."""
+"""Threshold-based child reminders, batched per parent with opt-in recovery."""
 
 from __future__ import annotations
 
@@ -264,7 +264,7 @@ class _IdleState:
 
 
 class ChildIdleSweeper:
-    """Observe only mothers whose runner tunnel belongs to this replica."""
+    """Observe only parents whose runner tunnel belongs to this replica."""
 
     def __init__(
         self,
@@ -535,7 +535,7 @@ class ChildIdleSweeper:
                 try:
                     await self._notify(parent_id, children, settings, harness_cache)
                 except Exception:
-                    _logger.exception("Could not notify mother %s of idle children", parent_id)
+                    _logger.exception("Could not notify parent %s of idle children", parent_id)
 
     async def _notify(
         self,
@@ -740,7 +740,7 @@ class ChildIdleSweeper:
             return
         previous: list[tuple[str, str, str]] = []
         # Reserve the attempt before posting: a lost response must not wake the
-        # mother again at the next tick. Definite non-delivery alone refunds it.
+        # parent again at the next tick. Definite non-delivery alone refunds it.
         for child, state in current:
             old_label = state.label()
             state.attempted, state.queued = now, 0

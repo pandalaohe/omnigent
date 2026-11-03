@@ -2181,7 +2181,7 @@ def register_peer_routes(
         return bool(online) and host_registry.host_supports_keep_warm(host_id)
 
     # The keep-warm sweeper runs whether or not peer messaging is on; without
-    # the peer sweeper its notices to the mother are simply dropped (the
+    # the peer sweeper its notices to the parent are simply dropped (the
     # label state still settles).
     child_keep_warm = ChildKeepWarmSweeper(
         conversation_store=conversation_store,

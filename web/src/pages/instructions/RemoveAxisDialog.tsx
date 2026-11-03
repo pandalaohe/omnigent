@@ -42,7 +42,7 @@ export function RemoveAxisDialog({
         {(
           [
             ["route", "Shared instructions"],
-            ["mother", "Mother"],
+            ["parent", "Parent"],
             ["child", "Child"],
           ] as const
         ).map(([grid, label]) => {

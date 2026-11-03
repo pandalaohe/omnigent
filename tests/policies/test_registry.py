@@ -192,6 +192,20 @@ def test_is_registered_handler_true_for_builtin() -> None:
     assert is_registered_handler("omnigent.policies.builtins.safety.ask_on_os_tools") is True
 
 
+def test_legacy_approval_handler_is_hidden_but_validated(caplog) -> None:
+    load_registry()
+    old = "omnigent.policies.builtins.safety.ask_on_standing_pass_grant"
+    new = "omnigent.policies.builtins.safety.ask_on_standing_approval_grant"
+    advertised = {entry.handler for entry in get_registry()}
+    assert new in advertised
+    assert old not in advertised
+    with caplog.at_level("INFO"):
+        assert is_registered_handler(old)
+    assert caplog.messages.count("legacy name used: ask_on_standing_pass_grant") == 1
+    assert validate_factory_params(old, None) is None
+    assert validate_factory_params(old, {"unexpected": True}) is not None
+
+
 def test_is_registered_handler_false_for_injection_gadget() -> None:
     """An arbitrary importable callable is NOT registered.
 

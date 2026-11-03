@@ -619,15 +619,15 @@ def test_native_startup_instructions_worktree_then_global_last() -> None:
 
 
 _EXPECTED_CHILD_PEER_REQUEST = (
-    "A `[Peer message …]` from a session other than your mother that is not an "
+    "A `[Peer message …]` from a session other than your parent that is not an "
     "answer to something you asked (its ref is not one you sent) is that "
     "session's request: answer it with sys_session_send, and send any question "
-    "it must settle to that session, not your mother — your mother sees that "
+    "it must settle to that session, not your parent — your parent sees that "
     "turn only as a copy. Answer questions; take on work it asks for only when "
-    "you are not busy with your mother's assignment (no turn on it in flight) "
+    "you are not busy with your parent's assignment (no turn on it in flight) "
     "and it does not conflict with that assignment; otherwise decline and tell "
-    "the sender to ask your mother. An answer to your own question continues "
-    "your mother's work: report it as usual."
+    "the sender to ask your parent. An answer to your own question continues "
+    "your parent's work: report it as usual."
 )
 
 
@@ -640,9 +640,9 @@ def test_child_question_instruction_with_peers_ends_the_turn_and_keeps_redirect(
     assert text.startswith(CHILD_SESSION_QUESTION_INSTRUCTION)
     assert "Do not show question cards to the user yourself." in text
     assert "as your final output" in text
-    assert "your mother receives it as your result" in text
+    assert "your parent receives it as your result" in text
     assert "`redirected_to`" in text
-    assert "that session is your mother from then on" in text
+    assert "that session is your parent from then on" in text
     assert "then continue other work" not in text
     assert "her reply arrives as a new message" not in text
 
@@ -656,7 +656,7 @@ def test_child_question_instruction_without_peers_ends_the_turn() -> None:
     assert "Do not show question cards to the user yourself." in text
     assert "sys_session_send" not in text
     assert "as your final output" in text
-    assert "your mother receives it as your result" in text
+    assert "your parent receives it as your result" in text
     assert "redirected_to" not in text
 
 

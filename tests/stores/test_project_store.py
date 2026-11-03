@@ -240,7 +240,7 @@ def test_create_persists_config(store: SqlAlchemyProjectStore) -> None:
     assert store.list(user_id="alice@example.com")[0].config == cfg
 
 
-@pytest.mark.parametrize("legacy_setup", ["Old mother setup", None, {"malformed": True}])
+@pytest.mark.parametrize("legacy_setup", ["Old parent setup", None, {"malformed": True}])
 @pytest.mark.parametrize("operation", ["rename", "config", "calling-defaults", "settings"])
 def test_retired_setup_is_ignored_and_removed_on_write(
     store: SqlAlchemyProjectStore, legacy_setup, operation: str
@@ -262,7 +262,7 @@ def test_retired_setup_is_ignored_and_removed_on_write(
         "custom": "keep",
         "orchestration": {
             "child_cap": 4,
-            "standing_pass": {"remove": ["install"], "exceptions": ["production"]},
+            "standing_approval": {"remove": ["install"], "exceptions": ["production"]},
         },
     }
     owner = "alice@example.com"
@@ -301,7 +301,13 @@ def test_retired_setup_is_ignored_and_removed_on_write(
         )
     with store._engine.connect() as connection:
         persisted = connection.execute(select(SqlProject.config)).scalar_one()
-    assert json.loads(persisted) == expected
+    assert json.loads(persisted) == {
+        "custom": "keep",
+        "orchestration": {
+            "child_cap": 4,
+            "standing_pass": {"remove": ["install"], "exceptions": ["production"]},
+        },
+    }
 
 
 def test_retired_setup_only_config_becomes_empty(store: SqlAlchemyProjectStore) -> None:

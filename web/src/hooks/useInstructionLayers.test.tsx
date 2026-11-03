@@ -36,7 +36,7 @@ it.each([
   ["agent", "codex", "", "agent"],
   ["host", "", "host-a", "host"],
   ["independent", "codex", "host-a", "independent"],
-  ...["mother", "child"].flatMap((scope) => [
+  ...["parent", "child"].flatMap((scope) => [
     [scope, "", "", "shared"],
     [scope, "codex", "", "agent"],
     [scope, "", "host-a", "host"],
@@ -118,7 +118,7 @@ it("loads revision history for just the selected layer", async () => {
   client.clear();
 });
 
-it.each(["route", "mother", "child"] as const)(
+it.each(["route", "parent", "child"] as const)(
   "orders %s axes first, then held axes, skipping unknown and removed hosts",
   (role) => {
     const hosts = ["host-a", "host-b", "host-c"].map((host_id) => ({ host_id })) as Host[];
@@ -156,7 +156,7 @@ it.each(["route", "mother", "child"] as const)(
     expect(axes.hostLayers.get("host-a")).toEqual([data.data[1]]);
   },
 );
-it.each(["route", "mother", "child"] as const)(
+it.each(["route", "parent", "child"] as const)(
   "excludes unknown-agent %s layers from a held host row's clear set",
   (role) => {
     const hostLayer = { scope: "host", host_id: "host-a", text: "Host text" };

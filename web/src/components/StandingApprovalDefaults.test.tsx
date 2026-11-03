@@ -4,7 +4,7 @@ import {
   readSessionCollabPreferences,
   writeSessionCollabPreferences,
 } from "@/lib/sessionCollabPreferences";
-import { StandingPassDefaults } from "./StandingPassDefaults";
+import { StandingApprovalDefaults } from "./StandingApprovalDefaults";
 
 vi.mock("@/lib/userPreferencesSync", () => ({ queueUserPreferencePatch: vi.fn() }));
 afterEach(() => {
@@ -12,10 +12,10 @@ afterEach(() => {
   localStorage.clear();
 });
 
-describe("standing pass defaults", () => {
+describe("standing approval defaults", () => {
   it("starts empty and preserves other collaboration preferences", () => {
     writeSessionCollabPreferences({ ...readSessionCollabPreferences(), childCap: 3 });
-    render(<StandingPassDefaults />);
+    render(<StandingApprovalDefaults />);
     expect(screen.getByRole("checkbox", { name: "Install" })).not.toBeChecked();
     fireEvent.click(screen.getByRole("checkbox", { name: "Install" }));
     expect(readSessionCollabPreferences()).toMatchObject({
@@ -27,9 +27,9 @@ describe("standing pass defaults", () => {
   });
 
   it("adds and removes custom kinds while preserving built-ins", () => {
-    render(<StandingPassDefaults />);
+    render(<StandingApprovalDefaults />);
     fireEvent.click(screen.getByRole("checkbox", { name: "Merge" }));
-    fireEvent.change(screen.getByLabelText("Extra standing pass kind"), {
+    fireEvent.change(screen.getByLabelText("Extra standing approval kind"), {
       target: { value: "  local   preview " },
     });
     fireEvent.click(screen.getByRole("button", { name: "Add kind" }));

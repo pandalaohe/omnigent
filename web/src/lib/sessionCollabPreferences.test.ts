@@ -1,7 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import type * as UserPreferencesSyncModule from "./userPreferencesSync";
+
 const { queuePatchMock } = vi.hoisted(() => ({ queuePatchMock: vi.fn() }));
-vi.mock("./userPreferencesSync", () => ({ queueUserPreferencePatch: queuePatchMock }));
+vi.mock("./userPreferencesSync", async (importOriginal) => ({
+  ...(await importOriginal<typeof UserPreferencesSyncModule>()),
+  queueUserPreferencePatch: queuePatchMock,
+}));
 
 import {
   readSessionCollabPreferences,
@@ -9,14 +14,20 @@ import {
   SESSION_COLLAB_STORAGE_KEY,
   writeSessionCollabPreferences,
 } from "./sessionCollabPreferences";
+import {
+  collectLocalUserPreferences,
+  initializeUserPreferencesSync,
+  resetUserPreferencesSyncForTests,
+} from "./userPreferencesSync";
 
 afterEach(() => {
   localStorage.clear();
+  resetUserPreferencesSyncForTests();
   queuePatchMock.mockReset();
 });
 
 describe("session collab preferences", () => {
-  it("normalizes standing pass kinds and preserves them on unrelated writes", () => {
+  it("normalizes standing approval kinds in both spellings and writes the rollback key", async () => {
     writeSessionCollabPreferences({
       ...SESSION_COLLAB_DEFAULTS,
       standingPassDefault: ["install", " local   preview ", "install"],
@@ -25,11 +36,42 @@ describe("session collab preferences", () => {
       "install",
       "local preview",
     ]);
+    expect(
+      JSON.parse(localStorage.getItem(SESSION_COLLAB_STORAGE_KEY) ?? "{}").standingPassDefault,
+    ).toEqual(["install", "local preview"]);
     writeSessionCollabPreferences({ ...readSessionCollabPreferences(), childCap: 2 });
     expect(readSessionCollabPreferences().standingPassDefault).toEqual([
       "install",
       "local preview",
     ]);
+    localStorage.setItem(
+      SESSION_COLLAB_STORAGE_KEY,
+      JSON.stringify({ standingApprovalDefault: ["merge", " release "] }),
+    );
+    expect(readSessionCollabPreferences().standingPassDefault).toEqual(["merge", "release"]);
+    expect(collectLocalUserPreferences().settings.session_collab).toEqual({
+      standingPassDefault: ["merge", " release "],
+    });
+    await initializeUserPreferencesSync(
+      {
+        version: 1,
+        settings: {
+          session_collab: { standingApprovalDefault: ["install"], childCap: 2 },
+        },
+      },
+      vi.fn(),
+      "alice",
+    );
+    expect(JSON.parse(localStorage.getItem(SESSION_COLLAB_STORAGE_KEY) ?? "{}")).toEqual({
+      childCap: 2,
+      standingPassDefault: ["install"],
+    });
+    expect(readSessionCollabPreferences().standingPassDefault).toEqual(["install"]);
+    localStorage.setItem(
+      SESSION_COLLAB_STORAGE_KEY,
+      JSON.stringify({ standingApprovalDefault: ["merge"], standingPassDefault: [] }),
+    );
+    expect(readSessionCollabPreferences().standingPassDefault).toEqual([]);
     localStorage.setItem(SESSION_COLLAB_STORAGE_KEY, JSON.stringify({ standingPassDefault: [""] }));
     expect(readSessionCollabPreferences().standingPassDefault).toEqual([]);
   });

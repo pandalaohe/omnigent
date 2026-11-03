@@ -1,4 +1,4 @@
-"""Mother-scoped advisory permissions, snapshotted independently of instructions."""
+"""Parent-scoped advisory permissions, snapshotted independently of instructions."""
 
 from __future__ import annotations
 
@@ -36,7 +36,10 @@ from omnigent.stores.project_store import ProjectStore
 if TYPE_CHECKING:
     from omnigent.server.schemas import SessionEventInput
 
-STANDING_PASS_LABEL_KEY = "omnigent.standing_pass"
+# Keep the expand release readable by the previous image.
+STANDING_APPROVAL_LABEL_KEY = "omnigent.standing_pass"
+STANDING_APPROVAL_READ_LABEL_KEYS = (STANDING_APPROVAL_LABEL_KEY, "omnigent.standing_approval")
+_STANDING_APPROVAL_GROUP_PREFIX = "omnigent.standing_"
 logger = logging.getLogger(__name__)
 
 
@@ -47,18 +50,18 @@ class PassEvent(TypedDict):
     at: int
 
 
-class StandingPass(TypedDict):
+class StandingApproval(TypedDict):
     kinds: list[str]
     exceptions: list[str]
     since: int
     events: list[PassEvent]
 
 
-class StandingPassConflict(RuntimeError):
+class StandingApprovalConflict(RuntimeError):
     """The pass changed in every compare-and-set attempt."""
 
 
-def pass_strings(value: Any, *, limit: int = 32) -> list[str]:
+def approval_strings(value: Any, *, limit: int = 32) -> list[str]:
     """Accept bounded, single-line strings without interpreting their vocabulary."""
     if not isinstance(value, list) or len(value) > limit:
         raise ValueError(f"expected a list with at most {limit} strings")
@@ -72,17 +75,17 @@ def pass_strings(value: Any, *, limit: int = 32) -> list[str]:
     return result
 
 
-def _empty() -> StandingPass:
+def _empty() -> StandingApproval:
     return {"kinds": [], "exceptions": [], "since": int(time.time()), "events": []}
 
 
-def _parse(raw: str) -> StandingPass:
+def _parse(raw: str) -> StandingApproval:
     try:
         value = json.loads(raw)
         if not isinstance(value, dict):
             raise ValueError("record must be an object")
-        kinds = pass_strings(value["kinds"])
-        exceptions = pass_strings(value["exceptions"], limit=5)
+        kinds = approval_strings(value["kinds"])
+        exceptions = approval_strings(value["exceptions"], limit=5)
         since = value["since"]
         events = value["events"]
         if (
@@ -99,41 +102,49 @@ def _parse(raw: str) -> StandingPass:
                 or type(event.get("at")) is not int
             ):
                 raise ValueError("invalid event")
-            pass_strings(event.get("kinds"))
+            approval_strings(event.get("kinds"))
         return {"kinds": kinds, "exceptions": exceptions, "since": since, "events": events}
     except (ValueError, KeyError, TypeError):
-        logger.warning("Invalid standing pass label; treating it as empty")
+        logger.warning("Invalid standing approval label; treating it as empty")
         return _empty()
 
 
 def _record_text(labels: dict[str, str]) -> str | None:
-    raw = labels.get(STANDING_PASS_LABEL_KEY)
-    if raw is None:
+    key = next((key for key in STANDING_APPROVAL_READ_LABEL_KEYS if key in labels), None)
+    if key is None:
         return None
+    raw = labels[key]
     try:
         head = json.loads(raw)
         if isinstance(head, dict) and type(head.get("chunks")) is int and head["chunks"] > 0:
-            return "".join(labels[f"{STANDING_PASS_LABEL_KEY}.{i}"] for i in range(head["chunks"]))
+            return "".join(labels[f"{key}.{i}"] for i in range(head["chunks"]))
     except (ValueError, KeyError):
         pass
     return raw
 
 
-def mutate_standing_pass(
+def _approval_labels(labels: dict[str, str]) -> dict[str, str]:
+    return {
+        key: value
+        for key, value in labels.items()
+        if any(
+            key == prefix or key.startswith(prefix + ".")
+            for prefix in STANDING_APPROVAL_READ_LABEL_KEYS
+        )
+    }
+
+
+def mutate_standing_approval(
     store: ConversationStore,
     root_id: str,
-    apply: Callable[[StandingPass | None], StandingPass],
-) -> StandingPass:
+    apply: Callable[[StandingApproval | None], StandingApproval],
+) -> StandingApproval:
     """CAS the whole record in one transaction across 256-character label rows."""
     for _ in range(5):
         root = store.get_conversation(root_id)
         if root is None:
             raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
-        expected = {
-            key: value
-            for key, value in root.labels.items()
-            if key.startswith(STANDING_PASS_LABEL_KEY)
-        }
+        expected = _approval_labels(root.labels)
         raw = _record_text(expected)
         record = apply(_parse(raw) if raw is not None else None)
         encoded = json.dumps(record, separators=(",", ":"), ensure_ascii=True)
@@ -141,8 +152,8 @@ def mutate_standing_pass(
             encoded[i : i + LABEL_VALUE_MAX_LEN]
             for i in range(0, len(encoded), LABEL_VALUE_MAX_LEN)
         ]
-        updates = {f"{STANDING_PASS_LABEL_KEY}.{i}": value for i, value in enumerate(chunks)}
-        updates[STANDING_PASS_LABEL_KEY] = json.dumps(
+        updates = {f"{STANDING_APPROVAL_LABEL_KEY}.{i}": value for i, value in enumerate(chunks)}
+        updates[STANDING_APPROVAL_LABEL_KEY] = json.dumps(
             {"chunks": len(chunks), "revision": uuid4().hex}
         )
 
@@ -150,21 +161,21 @@ def mutate_standing_pass(
             current: dict[str, str],
             expected: dict[str, str] = expected,
             updates: dict[str, str] = updates,
-            record: StandingPass = record,
+            record: StandingApproval = record,
         ) -> LabelGroupChange:
-            if current != expected:
+            if _approval_labels(current) != expected:
                 return LabelGroupChange(upserts={}, deletes=set())
             if record["events"] and record["events"][-1]["op"] in {"grant", "revoke"}:
                 _require_mutable_root(store, root_id)
-            return LabelGroupChange(upserts=updates, deletes=current.keys() - updates.keys())
+            return LabelGroupChange(upserts=updates, deletes=expected.keys() - updates.keys())
 
-        stored = store.mutate_label_group(root_id, STANDING_PASS_LABEL_KEY, change)
-        if stored == updates:
+        stored = store.mutate_label_group(root_id, _STANDING_APPROVAL_GROUP_PREFIX, change)
+        if _approval_labels(stored) == updates:
             return record
-    raise StandingPassConflict("standing pass changed during all 5 mutation attempts")
+    raise StandingApprovalConflict("standing approval changed during all 5 mutation attempts")
 
 
-def standing_pass_line(record: StandingPass) -> str:
+def standing_approval_line(record: StandingApproval) -> str:
     revoked = sorted(
         {kind for event in record["events"] if event["op"] == "revoke" for kind in event["kinds"]}
         - set(record["kinds"])
@@ -175,10 +186,10 @@ def standing_pass_line(record: StandingPass) -> str:
     exceptions = "; ".join(json.dumps(s, ensure_ascii=False) for s in record["exceptions"])
     kinds = ", ".join(json.dumps(s, ensure_ascii=False) for s in record["kinds"])
     return (
-        f"Standing pass (this mother session, since {since}): {kinds or 'none'}. "
+        f"Standing approval (this parent session, since {since}): {kinds or 'none'}. "
         f"Exceptions: {exceptions or 'none'}. Revoked: {', '.join(revoked) or 'none'}. "
         "Danger-list actions are never covered; "
-        "call sys_standing_pass read before a pass-kind action."
+        "call sys_standing_approval read before an approval-kind action."
     )
 
 
@@ -192,7 +203,7 @@ _approval_lock = threading.Lock()
 def remember_grant_approval(session_id: str, arguments: dict[str, Any], source: str) -> None:
     if arguments.get("op") != "grant":
         return
-    kinds = tuple(pass_strings(arguments.get("kinds", [])))
+    kinds = tuple(approval_strings(arguments.get("kinds", [])))
     with _approval_lock:
         _approved[(current_workspace_id(), session_id, kinds)] = source
 
@@ -206,7 +217,7 @@ def _require_mutable_root(store: ConversationStore, session_id: str) -> None:
     current = store.get_conversation(session_id)
     if current is None or current.parent_conversation_id is not None:
         raise OmnigentError(
-            "Only the mother session can change its pass", code=ErrorCode.FORBIDDEN
+            "Only the parent session can change its standing approval", code=ErrorCode.FORBIDDEN
         )
     if current.labels.get(SUCCEEDED_BY_LABEL_KEY):
         raise OmnigentError("Predecessor session is read-only", code=ErrorCode.FORBIDDEN)
@@ -215,7 +226,7 @@ def _require_mutable_root(store: ConversationStore, session_id: str) -> None:
         raise OmnigentError("Session succession is not complete", code=ErrorCode.CONFLICT)
 
 
-class StandingPassService:
+class StandingApprovalService:
     def __init__(
         self,
         store: ConversationStore,
@@ -231,20 +242,20 @@ class StandingPassService:
     def root(self, conversation: Conversation) -> Conversation:
         current = self.store.get_conversation(conversation.id)
         if current is None:
-            raise ValueError("standing pass session no longer exists")
+            raise ValueError("standing approval session no longer exists")
         conversation = current
         seen: set[str] = set()
         while conversation.parent_conversation_id:
             if conversation.id in seen:
-                raise ValueError("cycle in standing pass parent chain")
+                raise ValueError("cycle in standing approval parent chain")
             seen.add(conversation.id)
             parent = self.store.get_conversation(conversation.parent_conversation_id)
             if parent is None:
-                raise ValueError("standing pass parent no longer exists")
+                raise ValueError("standing approval parent no longer exists")
             conversation = parent
         return conversation
 
-    def resolve(self, conversation: Conversation) -> StandingPass:
+    def resolve(self, conversation: Conversation) -> StandingApproval:
         root = self.root(conversation)
         raw = _record_text(root.labels)
         if raw is not None:
@@ -265,7 +276,7 @@ class StandingPassService:
         receipt = self.store.get_succession(predecessor_id, root.id) if predecessor_id else None
         if predecessor_id and (prepared or receipt is not None):
             if predecessor is None:
-                raise ValueError("standing pass predecessor no longer exists")
+                raise ValueError("standing approval predecessor no longer exists")
             initial = deepcopy(self.resolve(predecessor))
             if receipt is None:
                 # Prepared successors may initialize before the source is frozen.
@@ -274,7 +285,7 @@ class StandingPassService:
             op, source = "carry", predecessor_id
         else:
             owner = collab_owner_for(root, self.store, self.permission_store)
-            defaults = read_collab_settings(self.prefs_store, owner).standing_pass_default
+            defaults = read_collab_settings(self.prefs_store, owner).standing_approval_default
             config: dict[str, Any] = {}
             if root.project_id and self.project_store is not None:
                 from omnigent.server.routes.sessions.routes_peer import effective_owner_id
@@ -285,12 +296,16 @@ class StandingPassService:
                 )
                 config = project.config if project is not None else {}
             orchestration = config.get("orchestration", {})
-            project_pass = (
-                orchestration.get("standing_pass", {}) if isinstance(orchestration, dict) else {}
+            project_approval = (
+                orchestration.get("standing_pass", orchestration.get("standing_approval", {}))
+                if isinstance(orchestration, dict)
+                else {}
             )
             try:
-                remove = pass_strings(project_pass.get("remove", []))
-                exceptions = pass_strings(project_pass.get("exceptions", []), limit=5)
+                if not isinstance(project_approval, dict):
+                    raise ValueError("project standing approval must be an object")
+                remove = approval_strings(project_approval.get("remove", []))
+                exceptions = approval_strings(project_approval.get("exceptions", []), limit=5)
             except (ValueError, AttributeError):
                 remove, exceptions = list(defaults), []
             initial = _empty()
@@ -300,10 +315,10 @@ class StandingPassService:
         initial["events"].append(
             {"op": op, "kinds": list(initial["kinds"]), "source": source, "at": int(time.time())}
         )
-        return mutate_standing_pass(self.store, root.id, lambda current: current or initial)
+        return mutate_standing_approval(self.store, root.id, lambda current: current or initial)
 
     def line(self, conversation: Conversation) -> str:
-        return standing_pass_line(self.resolve(conversation))
+        return standing_approval_line(self.resolve(conversation))
 
     def first_message(
         self, conversation: Conversation, body: SessionEventInput
@@ -328,19 +343,19 @@ class StandingPassService:
         op: Literal["revoke", "grant"],
         kinds: list[str],
         source: str,
-    ) -> StandingPass:
+    ) -> StandingApproval:
         self.require_mutable_root(conversation)
         self.resolve(conversation)
         event: PassEvent = {"op": op, "kinds": kinds, "source": source, "at": int(time.time())}
 
-        def apply(current: StandingPass | None) -> StandingPass:
+        def apply(current: StandingApproval | None) -> StandingApproval:
             assert current is not None
             if op == "grant" and any(
                 previous["op"] == "grant" and previous["source"] == source
                 for previous in current["events"]
             ):
                 raise OmnigentError(
-                    "Standing pass approval has already been used", code=ErrorCode.FORBIDDEN
+                    "Standing approval approval has already been used", code=ErrorCode.FORBIDDEN
                 )
             result = deepcopy(current)
             result["kinds"] = (
@@ -348,11 +363,11 @@ class StandingPassService:
                 if op == "grant"
                 else [kind for kind in current["kinds"] if kind not in kinds]
             )
-            pass_strings(result["kinds"])
+            approval_strings(result["kinds"])
             result["events"].append(event)
             return result
 
-        return mutate_standing_pass(self.store, conversation.id, apply)
+        return mutate_standing_approval(self.store, conversation.id, apply)
 
     def require_mutable_root(self, conversation: Conversation) -> None:
         _require_mutable_root(self.store, conversation.id)
@@ -360,12 +375,12 @@ class StandingPassService:
     async def steer(
         self,
         root_id: str,
-        record: StandingPass,
+        record: StandingApproval,
         post: Callable[[str, str], Awaitable[bool | None]],
     ) -> dict[str, str]:
         event = record["events"][-1]
         text = (
-            f"[System: standing pass changed: {event['op']} {json.dumps(event['kinds'])}; "
+            f"[System: standing approval changed: {event['op']} {json.dumps(event['kinds'])}; "
             f"current: {json.dumps(record['kinds'])}]"
         )
         outcomes: dict[str, str] = {}
@@ -390,6 +405,6 @@ class StandingPassService:
                     posted = await post(child.id, text)
                     outcomes[child.id] = "skipped_not_running" if posted is False else "steered"
                 except Exception:
-                    logger.exception("Standing pass notice failed for %s", child.id)
+                    logger.exception("Standing approval notice failed for %s", child.id)
                     outcomes[child.id] = "failed"
         return outcomes

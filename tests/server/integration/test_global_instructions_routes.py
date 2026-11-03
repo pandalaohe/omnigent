@@ -377,7 +377,7 @@ async def test_layer_routes_keep_independent_clear_and_history(
     assert removed_history.json()["data"][0]["text"] == "Host"
 
 
-@pytest.mark.parametrize("role", ["mother", "child"])
+@pytest.mark.parametrize("role", ["parent", "child"])
 async def test_role_independent_stale_sources_keep_role_and_route_separate(
     auth_client, db_uri, store, role, monkeypatch
 ):
@@ -391,7 +391,7 @@ async def test_role_independent_stale_sources_keep_role_and_route_separate(
     headers = _headers("admin@example.test")
     store.save("Role cell", created_by=None, scope=role, agent_key="codex", host_id=_OWN_HOST)
     store.save("Wrong agent", created_by=None, scope=role, agent_key="claude")
-    store.save("Wrong role", created_by=None, scope="child" if role == "mother" else "mother")
+    store.save("Wrong role", created_by=None, scope="child" if role == "parent" else "parent")
     store.save("Route changed", created_by=None)
 
     async def stale_layers():
@@ -422,10 +422,10 @@ async def test_legacy_spawn_get_composes_role_keys(auth_client, db_uri, store, r
         store.save(
             "Own route", created_by=None, scope="independent", agent_key="codex", host_id=_OWN_HOST
         )
-    store.save(" Mother ", created_by=None, scope="mother")
-    store.save(" Codex ", created_by=None, scope="mother", agent_key="codex")
-    store.save(" Host ", created_by=None, scope="mother", host_id=_OWN_HOST)
-    store.save("Other agent", created_by=None, scope="mother", agent_key="claude")
+    store.save(" Parent ", created_by=None, scope="parent")
+    store.save(" Codex ", created_by=None, scope="parent", agent_key="codex")
+    store.save(" Host ", created_by=None, scope="parent", host_id=_OWN_HOST)
+    store.save("Other agent", created_by=None, scope="parent", agent_key="claude")
 
     async def text(params):
         response = await auth_client.get("/v1/global-instructions", headers=headers, params=params)
@@ -434,14 +434,33 @@ async def test_legacy_spawn_get_composes_role_keys(auth_client, db_uri, store, r
 
     route = "Own route" if route_independent else " Route "
     params = {"host_id": _OWN_HOST, "agent": "codex", "spawn": "true"}
-    assert await text(params) == route + "\n\n Mother \n\n Codex \n\n Host "
+    assert await text(params) == route + "\n\n Parent \n\n Codex \n\n Host "
     store.save(
-        " Role cell ", created_by=None, scope="mother", agent_key="codex", host_id=_OWN_HOST
+        " Role cell ", created_by=None, scope="parent", agent_key="codex", host_id=_OWN_HOST
     )
     assert await text(params) == route + "\n\n Role cell "
     assert await text({**params, "spawn": "false"}) == route
-    assert await text({"spawn": "true"}) == " Route \n\n Mother "
+    assert await text({"spawn": "true"}) == " Route \n\n Parent "
     assert await text({}) == " Route "
+
+
+async def test_legacy_role_scope_is_hidden_from_api_output(auth_client, db_uri, caplog):
+    _make_user(db_uri, "admin@example.test", is_admin=True)
+    auth_client.headers.update(_headers("admin@example.test"))
+    with caplog.at_level("INFO"):
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_instruction_layer_update",
+                arguments=json.dumps(
+                    {"scope": "mother", "text": "Parent rules", "expected_revision_id": None}
+                ),
+                server_client=auth_client,
+            )
+        )
+    assert result["scope"] == "parent"
+    assert caplog.messages.count("legacy name used: mother") == 1
+    layers = (await auth_client.get("/v1/instruction-layers")).json()["data"]
+    assert [layer["scope"] for layer in layers] == ["parent"]
 
 
 @pytest.mark.parametrize(
@@ -453,7 +472,7 @@ async def test_legacy_spawn_get_composes_role_keys(auth_client, db_uri, store, r
         ("independent", "codex", _OWN_HOST),
         *[
             (role, agent, host)
-            for role in ("mother", "child")
+            for role in ("parent", "child")
             for agent, host in (("", ""), ("codex", ""), ("", _OWN_HOST), ("codex", _OWN_HOST))
         ],
     ],
@@ -589,7 +608,7 @@ async def test_layer_scope_and_host_authorization(
     ).status_code == 404
 
 
-@pytest.mark.parametrize("scope", ["shared", "mother", "child"])
+@pytest.mark.parametrize("scope", ["shared", "parent", "child"])
 async def test_large_layer_save_warns_only_newly_over_budget_routes(
     auth_client: httpx.AsyncClient,
     auth_app: FastAPI,
@@ -601,8 +620,8 @@ async def test_large_layer_save_warns_only_newly_over_budget_routes(
     HostStore(db_uri).upsert_on_connect(_OWN_HOST, "laptop", "admin@example.com")
     headers = _headers("admin@example.com")
     key = {"scope": scope, **({"agent_key": "codex"} if scope != "shared" else {})}
-    # Route sizes include mother text only for spawn-capable subjects.
-    if scope == "mother":
+    # Route sizes include parent text only for spawn-capable subjects.
+    if scope == "parent":
         from types import SimpleNamespace
 
         from omnigent.spec import AgentSpec
@@ -707,7 +726,7 @@ async def test_preview_loads_real_builtin_bundle_and_session_route(
     )
     store.save("Shared marker", created_by=None)
     store.save("Host marker", created_by=None, scope="host", host_id=_OWN_HOST)
-    store.save("Mother marker", created_by=None, scope="mother")
+    store.save("Parent marker", created_by=None, scope="parent")
     route = await auth_client.get(
         "/v1/instruction-layers/preview",
         params={"host_id": _OWN_HOST, "agent_key": "codex", "peer": "false"},
@@ -719,7 +738,7 @@ async def test_preview_loads_real_builtin_bundle_and_session_route(
     assert body["subject"]["name"] == descriptor.agent_name
     assert body["route"]["spawn"] is True
     assert body["text"].startswith("Author marker\n\n")
-    assert "Shared marker\n\nHost marker\n\nMother marker" in body["text"]
+    assert "Shared marker\n\nHost marker\n\nParent marker" in body["text"]
     conv = SqlAlchemyConversationStore(db_uri).create_conversation(
         host_id=_OWN_HOST,
         workspace="/opt/work/project",
@@ -735,14 +754,14 @@ async def test_preview_loads_real_builtin_bundle_and_session_route(
     assert session.status_code == 200, session.text
     assert session.json()["framework_unavailable"] is False
     assert session.json()["route"]["host_id"] == _OWN_HOST
-    assert "Shared marker\n\nHost marker\n\nMother marker" in session.json()["text"]
+    assert "Shared marker\n\nHost marker\n\nParent marker" in session.json()["text"]
     legacy = await auth_client.get(
         "/v1/global-instructions",
         params={"session_id": conv.id},
         headers=_headers("admin@example.com"),
     )
     assert legacy.status_code == 200, legacy.text
-    assert legacy.json()["text"] == "Shared marker\n\nHost marker\n\nMother marker"
+    assert legacy.json()["text"] == "Shared marker\n\nHost marker\n\nParent marker"
 
 
 async def test_acp_descriptor_drives_save_preview_size_and_runtime(

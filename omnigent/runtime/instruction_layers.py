@@ -136,7 +136,7 @@ def compose_route(layers: Sequence[GlobalInstructionRevision]) -> RouteInstructi
 
 def select_role_layers(
     revisions: Sequence[GlobalInstructionRevision],
-    role: Literal["mother", "child"],
+    role: Literal["parent", "child"],
     host_id: str | None,
     agent_key: str | None,
 ) -> list[GlobalInstructionRevision]:
@@ -166,7 +166,7 @@ def compose_session_text(
     *,
     has_parent: bool,
     spawn: bool,
-    mother_text: str = "",
+    parent_text: str = "",
     child_text: str = "",
     quota_line: str = "",
 ) -> str:
@@ -174,6 +174,6 @@ def compose_session_text(
     parts = [route_text]
     if has_parent:
         parts.append(child_text)
-    elif spawn and mother_text.strip():
-        parts.extend((mother_text, quota_line))
+    elif spawn and parent_text.strip():
+        parts.extend((parent_text, quota_line))
     return "\n\n".join(part for part in parts if part.strip())

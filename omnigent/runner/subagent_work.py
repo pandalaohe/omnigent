@@ -41,7 +41,7 @@ _logger = logging.getLogger("omnigent.runner.app")
 _SUBAGENT_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "stopped", "killed"})
 
 # Origin of a codex-native child thread. ``delegated`` is a thread Codex spawn
-# tooling created for work the mother asked for; ``unknown`` is anything the
+# tooling created for work the parent asked for; ``unknown`` is anything the
 # child's labels cannot prove — a ``/side`` side chat the user is reading, or a
 # thread whose spawn label is missing. Only ``delegated`` may wake a Codex
 # parent, so an unresolved origin keeps the thread silent (fail-closed).
@@ -109,7 +109,7 @@ SUBAGENT_DISPATCH_ID_LABEL_KEY = "omnigent.subagent.dispatch_id"
 SUBAGENT_DELIVERED_ID_LABEL_KEY = "omnigent.subagent.delivered_id"
 SUBAGENT_TERMINAL_STATUS_LABEL_KEY = "omnigent.subagent.terminal_status"
 SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY = "omnigent.subagent.activity_unverified"
-# Pins an undrained mother result across peer turns: "<work_id>:<status>:<item_id>".
+# Pins an undrained parent result across peer turns: "<work_id>:<status>:<item_id>".
 # Restart recovery uses its outcome and item instead of the newer peer result.
 SUBAGENT_RESULT_ITEM_LABEL_KEY = "omnigent.subagent.result_item"
 SUBAGENT_LAST_TASK_ERROR_LABEL_KEYS: tuple[str, ...] = (
@@ -202,7 +202,7 @@ class _SubagentWorkEntry:
         failure is a guess ("no start acknowledgment"), so a genuine
         terminal edge from the child afterwards must replace it.
     :param recovered: Whether recovery rebuilt this entry for a turn the
-        mother did not dispatch. Such an entry never reads as a mother
+        parent did not dispatch. Such an entry never reads as a parent
         dispatch, so a peer turn it is parented to is still kept as a copy.
     """
 
@@ -279,7 +279,7 @@ _drained_delivered_subagent_results: dict[str, str | None] = {}
 _seen_subagent_terminal_ids: dict[str, set[tuple[str, str, str]]] = {}
 # Per-child origin (``_SubagentWorkEntry.registered_by``) kept after the entry
 # is drained, so a recovery-rebuilt entry still knows the child was dispatched
-# by an Omnigent tool and a Codex mother is woken for its later turns.
+# by an Omnigent tool and a Codex parent is woken for its later turns.
 _subagent_work_origins: dict[str, str] = {}
 # Parent owning each child's retained state (drained result key or origin)
 # after its entry is gone. A drain removes the child from
@@ -293,9 +293,9 @@ _subagent_recovery_done: set[str] = set()
 _subagent_recovery_locks: dict[str, asyncio.Lock] = {}
 
 # Peer-turn copies: a settled child turn that answered a peer message from a
-# session other than its mother. Kept on the mother's runner as silent copies —
+# session other than its parent. Kept on the parent's runner as silent copies —
 # never a sub-agent result and never a wake — that a later inbox drain renders.
-# In-memory only: unread copies vanish on a restart (the mother's own undrained
+# In-memory only: unread copies vanish on a restart (the parent's own undrained
 # result survives through the result-item label).
 _peer_copies: dict[str, list[_JsonObject]] = {}
 # Copies dropped by the cap since the last pop, per parent.
@@ -442,11 +442,11 @@ def register_subagent_work(
         origin a previous entry already proved, so a later re-registration
         never downgrades it.
     :param flow_neutral: When ``True``, a fresh entry does not join the
-        parent's running flow. Recovery registers turns the mother did not
+        parent's running flow. Recovery registers turns the parent did not
         dispatch this way, so an undispatched result is held only when the
         child already belonged to the flow.
     :param recovered: When ``True``, the entry is rebuilt for a turn the
-        mother did not dispatch; see :attr:`_SubagentWorkEntry.recovered`.
+        parent did not dispatch; see :attr:`_SubagentWorkEntry.recovered`.
     :param prior_result_key: Last result present before this dispatch's message
         was posted. Its delayed terminal edge cannot complete this dispatch.
     :returns: The registered work entry.
@@ -536,7 +536,7 @@ def record_peer_copy(
     most :data:`_PEER_COPY_MAX_UNREAD` unread copies are kept per parent, the
     oldest dropped first and counted for the next drain.
 
-    :param parent_session_id: The mother session that receives the copy.
+    :param parent_session_id: The parent session that receives the copy.
     :param child_session_id: The child that answered the peer, e.g.
         ``"conv_child456"``.
     :param key: The peer turn's result item id.
@@ -573,7 +573,7 @@ def pop_peer_copies(parent_session_id: str) -> tuple[list[_JsonObject], int]:
     remembering each popped copy's status (bounded) so a later status change is
     recorded as a correction.
 
-    :param parent_session_id: The mother session, e.g. ``"conv_parent123"``.
+    :param parent_session_id: The parent session, e.g. ``"conv_parent123"``.
     :returns: ``(copies, dropped)`` — the unread copies oldest first and the
         number of copies dropped by the cap since the last pop.
     """
@@ -848,7 +848,7 @@ def entry_owes_parent_wake(entry: _SubagentWorkEntry, parent_harness: str | None
     registered still wakes it (D12).
 
     A Codex thread whose labels prove a delegated job is the one internal case
-    that owes a wake: the mother asked for that work and waits on its result,
+    that owes a wake: the parent asked for that work and waits on its result,
     like an Omnigent dispatch. A side chat, and any child whose origin the
     labels cannot prove, keeps the pre-existing suppression.
 
@@ -1123,7 +1123,7 @@ async def _recover_subagent_results_from_server(
     id. A terminal child whose two ids differ was never drained, so its
     result is rebuilt from the child transcript and queued again under the
     same dispatch id, letting the eventual drain close the loop. A peer-copy
-    label pins the mother's terminal status and result item across later turns.
+    label pins the parent's terminal status and result item across later turns.
 
     :param server_client: HTTP client connected to the Omnigent server.
     :param parent_id: Parent session whose inbox was recreated, e.g.
@@ -1159,7 +1159,7 @@ async def _recover_subagent_results_from_server(
         output: str | None = None
         result_key: str | None = None
         recover_status = status
-        # A pin preserves the mother's outcome across later peer turns.
+        # A pin preserves the parent's outcome across later peer turns.
         # A missing item skips only this child instead of using a newer answer.
         stamped_result = _stamped_result_item_id(label_map, dispatch_id)
         if stamped_result is not None:
@@ -1203,7 +1203,7 @@ async def _recover_subagent_results_from_server(
             wrapper_label=wrapper_label_from_labels(label_map),
             work_id=dispatch_id,
             # Only an Omnigent dispatch stamps a dispatch id, so the rebuilt
-            # entry may wake a Codex mother even after a restart wiped the
+            # entry may wake a Codex parent even after a restart wiped the
             # origin map.
             registered_by=_subagent_work_origins.get(child_id) or "recovery",
             native_origin=codex_native_origin_from_labels(label_map),
@@ -1259,7 +1259,7 @@ def mark_subagent_work_terminal(
     Delivery is keyed on the result, not the child: a terminal edge whose
     ``result_key`` (the last assistant item's server id) matches the last
     delivered one is a duplicate, while a different key is the child's next
-    turn and is delivered — even after the mother drained the prior result.
+    turn and is delivered — even after the parent drained the prior result.
     A missing key falls back to the old child-level dedup. Distinguishing a
     confirmed completion from a bare quiescence idle is the caller's job (the
     events route only reports ``completed`` for a confirmed turn-end or a

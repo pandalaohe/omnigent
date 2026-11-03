@@ -39,7 +39,7 @@ def _route_layers(
 def _layer_part(revision: GlobalInstructionRevision, *, sent: bool) -> dict[str, Any]:
     return {
         "kind": f"{revision.scope}_block"
-        if revision.scope in {"mother", "child"}
+        if revision.scope in {"parent", "child"}
         else "user_layers",
         "text": revision.text,
         "chars": len(revision.text),
@@ -78,7 +78,7 @@ def preview_instructions(
     """Render known delivery bytes and label every visible revision."""
     candidates = _route_layers(revisions, host_id, agent_key)
     effective = compose_route(candidates)
-    role = "child" if has_parent else "mother" if spawn else None
+    role = "child" if has_parent else "parent" if spawn else None
     role_layers = select_role_layers(revisions, role, host_id, agent_key) if role else []
     role_text = compose_role(role_layers)
     sent_layers = list(effective.revisions) + role_layers
@@ -86,12 +86,12 @@ def preview_instructions(
         effective.text,
         has_parent=has_parent,
         spawn=spawn,
-        mother_text=role_text if role == "mother" else "",
+        parent_text=role_text if role == "parent" else "",
         child_text=role_text if role == "child" else "",
         quota_line=quota_line,
     )
     sent_user_parts = [_layer_part(r, sent=True) for r in sent_layers]
-    if role == "mother" and role_layers and quota_line:
+    if role == "parent" and role_layers and quota_line:
         sent_user_parts.append(_framework_part(InstructionPart("quota_line", quota_line)))
     replaced = [_layer_part(r, sent=False) for r in candidates if r not in sent_layers]
     if spec is None:

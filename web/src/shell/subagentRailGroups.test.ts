@@ -65,8 +65,8 @@ describe("groupChildren", () => {
 
 describe("shortenPath", () => {
   it("collapses /Users/<u> and /home/<u> to ~", () => {
-    expect(shortenPath("/Users/me/projects/x")).toBe("~/projects/x");
-    expect(shortenPath("/home/me/projects/x")).toBe("~/projects/x");
+    expect(shortenPath("/Users/<u>/projects/x")).toBe("~/projects/x");
+    expect(shortenPath("/home/<u>/projects/x")).toBe("~/projects/x");
   });
 
   it("keeps only the last two segments when the result is still long", () => {

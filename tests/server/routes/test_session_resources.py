@@ -42,7 +42,7 @@ from omnigent.server.auth import (
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
 from omnigent.server.schemas import SessionEventInput
-from omnigent.server.standing_pass import StandingPassService
+from omnigent.server.standing_approval import StandingApprovalService
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import HostStore
@@ -557,8 +557,8 @@ def _sessions_app(conversation_store: _ConversationStore, **router_options: Any)
     host_registry = HostRegistry()
     app.state.test_conversation_store = conversation_store
     app.state.test_host_registry = host_registry
-    app.state.standing_pass_service = Mock(
-        spec=StandingPassService, first_message=lambda _conversation, body: body
+    app.state.standing_approval_service = Mock(
+        spec=StandingApprovalService, first_message=lambda _conversation, body: body
     )
 
     @app.exception_handler(OmnigentError)
@@ -2342,8 +2342,8 @@ def file_app(
     del runner_globals_reset
 
     test_app = FastAPI()
-    test_app.state.standing_pass_service = Mock(
-        spec=StandingPassService, first_message=lambda _conversation, body: body
+    test_app.state.standing_approval_service = Mock(
+        spec=StandingApprovalService, first_message=lambda _conversation, body: body
     )
     host_registry = HostRegistry()
     host_registry.register(

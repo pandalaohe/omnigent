@@ -1222,7 +1222,7 @@ class _CodexNativeLaunchConfig:
         the TUI footer) start at it instead of the shared config's default.
         ``None`` leaves Codex's configured effort in place.
     :param parent_session_id: The conversation's parent when this session is
-        a child, e.g. ``"conv_mother987"``. ``None`` for a top-level session;
+        a child, e.g. ``"conv_parent987"``. ``None`` for a top-level session;
         a child gets the child-role prompt line in its developer instructions.
     :param bridge_id: Id from the session's ``omnigent.codex_native.bridge_id``
         label, e.g. ``"conv_old"``, naming the bridge directory the executor
@@ -10468,7 +10468,7 @@ async def _auto_create_claude_terminal(
     from omnigent.runner.app import get_session_peer_messaging_enabled
     from omnigent.runtime.prompt import child_session_question_instruction
 
-    # Child role, not a tool limit: a child's question goes to its mother, so
+    # Child role, not a tool limit: a child's question goes to its parent, so
     # it loses AskUserQuestion. A top-level session keeps today's argv.
     is_child_session = (
         session_init is not None and session_init.snapshot.parent_session_id is not None

@@ -7487,7 +7487,7 @@ def test_populate_codex_home_config_refreshes_copied_agents(
 
 
 def test_populate_codex_home_config_resyncs_role_defaults(tmp_path: Path) -> None:
-    """An existing private ``config.toml`` gets lane-owned role defaults re-synced.
+    """An existing private ``config.toml`` gets host-configured role defaults re-synced.
 
     The persistent codex-native home reuses its copied ``config.toml`` across
     launches; host-side edits to the subagent role defaults must still arrive,
@@ -7544,7 +7544,7 @@ def test_populate_codex_home_config_resyncs_role_defaults(tmp_path: Path) -> Non
 def test_populate_codex_home_config_removes_dropped_role_defaults(tmp_path: Path) -> None:
     """Defaults the host removed disappear from the private copy on re-populate.
 
-    The two lane-owned keys mirror the host exactly — when the host's
+    The two host-configured keys mirror the host exactly — when the host's
     ``[agents]`` no longer sets them, the private copy must not keep stale
     values.
     """
@@ -7838,7 +7838,7 @@ def test_populate_codex_home_config_minimal_mode_skips_role_default_sync(
 ) -> None:
     """Minimal-mode re-populate never adds role defaults to an existing config.
 
-    The title worker's private config must not grow lane-owned defaults it
+    The title worker's private config must not grow host-configured defaults it
     never had, even when the host sets them.
     """
     import tomllib
@@ -8146,9 +8146,9 @@ def test_app_server_thread_start_config_carries_native_server_pid(
                 ):
                     pass
                 params = session._request.await_args_list[1].args[1]
-                assert params["config"]["shell_environment_policy.set.COLLAB_AGENT_PID"] == (
-                    "4242"
-                )
+                assert params["config"][
+                    "shell_environment_policy.set.OMNIGENT_CODEX_APP_SERVER_PID"
+                ] == ("4242")
                 key = "shell_environment_policy.set.OMNIGENT_RUNNER_PRIMARY_SESSION_ID"
                 if session_id:
                     assert params["config"][key] == session_id
@@ -8222,7 +8222,10 @@ def test_app_server_thread_start_config_omits_absent_native_server_pid(
                     pass
                 params = session._request.await_args_list[1].args[1]
                 if with_tools:
-                    assert "shell_environment_policy.set.COLLAB_AGENT_PID" not in params["config"]
+                    assert (
+                        "shell_environment_policy.set.OMNIGENT_CODEX_APP_SERVER_PID"
+                        not in params["config"]
+                    )
                 else:
                     assert "config" not in params
                 assert session._agent_pid is None
@@ -8232,7 +8235,9 @@ def test_app_server_thread_start_config_omits_absent_native_server_pid(
     _run(_t())
 
 
-@pytest.mark.parametrize("env_key", ["COLLAB_AGENT_PID", "collab_agent_pid"])
+@pytest.mark.parametrize(
+    "env_key", ["OMNIGENT_CODEX_APP_SERVER_PID", "omnigent_codex_app_server_pid"]
+)
 def test_app_server_spawn_env_drops_inherited_agent_pid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_key: str
 ) -> None:
@@ -8340,7 +8345,10 @@ def test_app_server_skips_native_pid_lookup_for_linux_sandbox(
                 ):
                     pass
                 params = session._request.await_args_list[1].args[1]
-                assert "shell_environment_policy.set.COLLAB_AGENT_PID" not in params["config"]
+                assert (
+                    "shell_environment_policy.set.OMNIGENT_CODEX_APP_SERVER_PID"
+                    not in params["config"]
+                )
                 assert session._agent_pid is None
                 assert native_pid_calls == []
             finally:

@@ -5,6 +5,7 @@ export function ProjectOrchestrationView({
 }: {
   orchestration: ProjectConfig["orchestration"];
 }) {
+  const standingApproval = orchestration?.standing_approval ?? orchestration?.standing_pass;
   return (
     <section
       aria-labelledby="project-orchestration-heading"
@@ -24,16 +25,12 @@ export function ProjectOrchestrationView({
             ? "Unlimited"
             : (orchestration?.child_cap ?? "Use account default")}
         </dd>
-        <dt className="text-muted-foreground">Removed pass kinds</dt>
-        <dd className="break-words">
-          {orchestration?.standing_pass?.remove?.join(", ") || "None"}
-        </dd>
-        <dt className="text-muted-foreground">Pass exceptions</dt>
+        <dt className="text-muted-foreground">Removed approval kinds</dt>
+        <dd className="break-words">{standingApproval?.remove?.join(", ") || "None"}</dd>
+        <dt className="text-muted-foreground">Approval exceptions</dt>
         <dd className="space-y-1 break-words">
-          {orchestration?.standing_pass?.exceptions?.length
-            ? orchestration.standing_pass.exceptions.map((exception) => (
-                <p key={exception}>{exception}</p>
-              ))
+          {standingApproval?.exceptions?.length
+            ? standingApproval.exceptions.map((exception) => <p key={exception}>{exception}</p>)
             : "None"}
         </dd>
       </dl>

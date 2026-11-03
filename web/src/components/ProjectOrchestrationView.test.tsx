@@ -12,7 +12,7 @@ describe("project orchestration view", () => {
       <ProjectOrchestrationView
         orchestration={{
           child_cap: "none",
-          standing_pass: { remove: ["install"], exceptions: ["server release"] },
+          standing_approval: { remove: ["install"], exceptions: ["server release"] },
         }}
       />,
     );

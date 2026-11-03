@@ -6,7 +6,7 @@ import json
 import uuid
 from typing import Literal
 
-from sqlalchemy import desc, func, select
+from sqlalchemy import case, desc, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased
 
@@ -76,7 +76,9 @@ class SqlAlchemyGlobalInstructionsStore(GlobalInstructionsStore):
             select(SqlGlobalInstructionRevision)
             .where(
                 SqlGlobalInstructionRevision.workspace_id == current_workspace_id(),
-                SqlGlobalInstructionRevision.scope == key.scope,
+                SqlGlobalInstructionRevision.scope.in_(("mother", "parent"))
+                if key.scope == "parent"
+                else SqlGlobalInstructionRevision.scope == key.scope,
                 SqlGlobalInstructionRevision.agent_key == key.agent_key,
                 SqlGlobalInstructionRevision.host_id == key.host_id,
             )
@@ -113,6 +115,7 @@ class SqlAlchemyGlobalInstructionsStore(GlobalInstructionsStore):
     ) -> GlobalInstructionRevision:
         """Append a revision and return it."""
         key = InstructionLayerKey(scope, agent_key, host_id)
+        stored_scope = "mother" if key.scope == "parent" else key.scope
 
         def write(session: Session) -> GlobalInstructionRevision:
             current = self._current(session, key)
@@ -125,7 +128,7 @@ class SqlAlchemyGlobalInstructionsStore(GlobalInstructionsStore):
                 current_id
                 or "empty:"
                 + uuid.uuid5(
-                    uuid.NAMESPACE_URL, json.dumps([key.scope, key.agent_key, key.host_id])
+                    uuid.NAMESPACE_URL, json.dumps([stored_scope, key.agent_key, key.host_id])
                 ).hex
             )
             row = SqlGlobalInstructionRevision(
@@ -133,7 +136,7 @@ class SqlAlchemyGlobalInstructionsStore(GlobalInstructionsStore):
                 text=text,
                 created_us=max(now_epoch_us(), current.created_us + 1 if current else 0),
                 created_by=created_by,
-                scope=key.scope,
+                scope=stored_scope,
                 agent_key=key.agent_key,
                 host_id=key.host_id,
                 parent_revision_id=parent_id,
@@ -179,12 +182,13 @@ class SqlAlchemyGlobalInstructionsStore(GlobalInstructionsStore):
     def list_layers(self) -> list[GlobalInstructionRevision]:
         """Read the newest row for each layer without resurrecting cleared text."""
         model = SqlGlobalInstructionRevision
+        scope = case((model.scope == "mother", "parent"), else_=model.scope)
         ranked = (
             select(
                 model,
                 func.row_number()
                 .over(
-                    partition_by=(model.scope, model.agent_key, model.host_id),
+                    partition_by=(scope, model.agent_key, model.host_id),
                     order_by=(desc(model.created_us), desc(model.id)),
                 )
                 .label("layer_rank"),
@@ -206,7 +210,7 @@ class SqlAlchemyGlobalInstructionsStore(GlobalInstructionsStore):
         host_id: str | None,
         agent_key: str | None,
         *,
-        role: Literal["mother", "child"] | None = None,
+        role: Literal["parent", "child", "mother"] | None = None,
     ) -> list[GlobalInstructionRevision]:
         """Read route and optional role keys in a single managed session."""
         keys = [InstructionLayerKey()]

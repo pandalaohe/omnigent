@@ -8677,9 +8677,11 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
   };
 
   switch (event.type) {
-    case "session_standing_pass":
+    case "session_standing_approval":
       if (event.conversationId === sourceConversationId) {
-        void queryClient?.invalidateQueries({ queryKey: ["standing-pass", event.conversationId] });
+        void queryClient?.invalidateQueries({
+          queryKey: ["standing-approval", event.conversationId],
+        });
       }
       return;
     case "response_completed":

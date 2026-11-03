@@ -28,9 +28,9 @@ def _revision(scope: str, text: str, *, agent_key: str = "", host_id: str = ""):
     )
 
 
-def test_codex_mother_column_does_not_leak_into_claude_preview():
+def test_codex_parent_column_does_not_leak_into_claude_preview():
     preview = preview_instructions(
-        [_revision("mother", "Codex only", agent_key="codex")],
+        [_revision("parent", "Codex only", agent_key="codex")],
         host_id="host_a",
         agent_key="claude",
         spec=None,
@@ -45,7 +45,7 @@ def test_codex_mother_column_does_not_leak_into_claude_preview():
     assert preview["parts"] == []
 
 
-@pytest.mark.parametrize("role", ["mother", "child"])
+@pytest.mark.parametrize("role", ["parent", "child"])
 @pytest.mark.parametrize("independent", [" \n", " Role cell "])
 @pytest.mark.parametrize("route_independent", [False, True])
 def test_preview_role_sources_keep_original_keys(role, independent, route_independent):
@@ -80,7 +80,7 @@ def test_preview_role_sources_keep_original_keys(role, independent, route_indepe
     expected = "\n\n".join(
         ["Own route" if route_independent else "Route"] + [r.text for r in selected]
     )
-    if role == "mother":
+    if role == "parent":
         expected += "\n\nQuota"
     assert preview["text"] == expected
     assert preview["total_chars"] == len(expected)
@@ -94,7 +94,7 @@ def test_preview_matches_composer_with_untrimmed_inner_layers(harness: str, quot
         _revision("shared", "  Shared  "),
         _revision("agent", "  Agent  ", agent_key="codex"),
         _revision("host", "  Host  ", host_id="host_a"),
-        _revision("mother", "  Mother  "),
+        _revision("parent", "  Parent  "),
     ]
     preview = preview_instructions(
         layers,
@@ -108,7 +108,7 @@ def test_preview_matches_composer_with_untrimmed_inner_layers(harness: str, quot
         peer=False,
         quota_line=quota,
     )
-    route = "  Shared  \n\n  Agent  \n\n  Host  \n\n  Mother  "
+    route = "  Shared  \n\n  Agent  \n\n  Host  \n\n  Parent  "
     if quota:
         route += "\n\n" + quota
     if harness == "codex-native":
@@ -127,7 +127,7 @@ def test_preview_matches_composer_with_untrimmed_inner_layers(harness: str, quot
         "shared",
         "agent",
         "host",
-        "mother",
+        "parent",
     ]
     assert all(
         p["sent"] and p["text"] is None
@@ -161,10 +161,10 @@ def test_role_blocks_follow_route_and_are_exclusive() -> None:
     spec = AgentSpec(spec_version=1, spawn=True)
     layers = [
         _revision("shared", "Route"),
-        _revision("mother", "Mother"),
+        _revision("parent", "Parent"),
         _revision("child", "Child"),
     ]
-    mother = preview_instructions(
+    parent = preview_instructions(
         layers,
         host_id=None,
         agent_key=None,
@@ -186,10 +186,10 @@ def test_role_blocks_follow_route_and_are_exclusive() -> None:
         spawn=True,
         peer=False,
     )
-    assert "Route\n\nMother" in mother["text"]
-    assert "Child" not in mother["text"]
+    assert "Route\n\nParent" in parent["text"]
+    assert "Child" not in parent["text"]
     assert "Route\n\nChild" in child["text"]
-    assert "Mother" not in child["text"]
+    assert "Parent" not in child["text"]
     assert child["parts"][-1]["sent"] is True
     assert child["parts"][-1]["kind"] == "child_question"
 

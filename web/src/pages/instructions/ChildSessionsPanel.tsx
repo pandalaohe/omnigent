@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ExceptionList } from "@/components/ExceptionList";
-import { StandingPassDefaults } from "@/components/StandingPassDefaults";
+import { StandingApprovalDefaults } from "@/components/StandingApprovalDefaults";
 import { HelpTip } from "@/components/HelpTip";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -262,7 +262,7 @@ export function ChildSessionsPanel() {
       <p className="mt-1 text-sm text-muted-foreground">
         Set your child-session limit and choose which quota window guides new child sessions.
       </p>
-      <StandingPassDefaults />
+      <StandingApprovalDefaults />
       <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <label className="block text-sm font-medium">
           Child session limit

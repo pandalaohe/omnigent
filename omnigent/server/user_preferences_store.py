@@ -468,6 +468,23 @@ def read_approval_timeout(
 SESSION_COLLAB_NAMESPACE = "session_collab"
 
 
+def _approval_preference(value: Any, *, persisted: bool = False) -> Any:
+    if not isinstance(value, dict) or not {
+        "standingPassDefault",
+        "standingApprovalDefault",
+    }.intersection(value):
+        return value
+    result = {
+        key: item
+        for key, item in value.items()
+        if key not in {"standingPassDefault", "standingApprovalDefault"}
+    }
+    result["standingPassDefault" if persisted else "standingApprovalDefault"] = value.get(
+        "standingPassDefault", value.get("standingApprovalDefault")
+    )
+    return result
+
+
 @dataclass(frozen=True)
 class CollabSettings:
     """
@@ -513,7 +530,7 @@ class CollabSettings:
     keep_warm_codex_interval_s: int = 1500
     keep_warm_max_s: int = 28800
     child_cap: int | None = None
-    standing_pass_default: list[str] = field(default_factory=list)
+    standing_approval_default: list[str] = field(default_factory=list)
     quota_tight_below_pct: float = 50
     quota_low_below_pct: float = 20
     quota_floor_pct: float | None = None
@@ -603,12 +620,15 @@ def _parse_collab_settings(value: Any) -> CollabSettings:
     if not isinstance(value, dict):
         return CollabSettings()
     resolved: dict[str, Any] = {}
-    from omnigent.server.standing_pass import pass_strings
+    from omnigent.server.standing_approval import approval_strings
 
     try:
-        resolved["standing_pass_default"] = pass_strings(value.get("standingPassDefault", []))
+        # The expand release still writes the old key, including explicit revocations.
+        resolved["standing_approval_default"] = approval_strings(
+            value.get("standingPassDefault", value.get("standingApprovalDefault", []))
+        )
     except ValueError:
-        resolved["standing_pass_default"] = []
+        resolved["standing_approval_default"] = []
     mode = value.get("sessionRestrictions")
     if isinstance(mode, str) and mode in {"off", "subagents", "all"}:
         resolved["session_restrictions"] = mode
@@ -1324,6 +1344,10 @@ def validate_preferences_envelope(envelope: Any) -> PreferencesEnvelope:
         "version": USER_PREFERENCE_VERSION,
         "settings": deepcopy(settings),
     }
+    if SESSION_COLLAB_NAMESPACE in copied["settings"]:
+        copied["settings"][SESSION_COLLAB_NAMESPACE] = _approval_preference(
+            copied["settings"][SESSION_COLLAB_NAMESPACE]
+        )
     child_idle = copied["settings"].get(CHILD_IDLE_NAMESPACE)
     if isinstance(child_idle, dict) and "checkinInstructions" in child_idle:
         child_idle["checkinInstructions"] = normalize_checkin_instructions(
@@ -1358,6 +1382,12 @@ def _encode_value(value: Any) -> str:
     )
 
 
+def _encode_namespace(namespace: str, value: Any) -> str:
+    if namespace == SESSION_COLLAB_NAMESPACE:
+        value = _approval_preference(value, persisted=True)
+    return _encode_value(value)
+
+
 def _read_settings(session: Session, user_id: str) -> tuple[dict[str, Any], bool]:
     """Read the user's namespace rows and whether an envelope was initialized.
 
@@ -1384,7 +1414,11 @@ def _read_settings(session: Session, user_id: str) -> tuple[dict[str, Any], bool
         if key == _ENVELOPE_VERSION_KEY:
             continue
         try:
-            settings[key[len(_SETTINGS_KEY_PREFIX) :]] = json.loads(text or "")
+            namespace = key[len(_SETTINGS_KEY_PREFIX) :]
+            value = json.loads(text or "")
+            settings[namespace] = (
+                _approval_preference(value) if namespace == SESSION_COLLAB_NAMESPACE else value
+            )
         except (TypeError, json.JSONDecodeError) as exc:
             raise UserPreferencesValidationError("stored preferences are invalid JSON") from exc
     return settings, bool(rows)
@@ -1542,7 +1576,7 @@ class SqlAlchemyUserPreferencesStore:
                     workspace_id=workspace_id,
                     user_id=user_id,
                     key=_settings_key(namespace),
-                    value=_encode_value(value),
+                    value=_encode_namespace(namespace, value),
                 )
                 for namespace, value in validated["settings"].items()
             )
@@ -1569,6 +1603,8 @@ class SqlAlchemyUserPreferencesStore:
         """Atomically shallow-merge one namespace, or delete it with NULL."""
         if namespace not in USER_PREFERENCE_NAMESPACES:
             raise UserPreferencesValidationError(f"unsupported preferences namespace: {namespace}")
+        if namespace == SESSION_COLLAB_NAMESPACE:
+            value = _approval_preference(value)
         if value is not None:
             _validate_json(value)
             if namespace == WORKTREE_LOCATION_NAMESPACE:
@@ -1626,7 +1662,7 @@ class SqlAlchemyUserPreferencesStore:
                     session,
                     user_id=user_id,
                     key=_settings_key(namespace),
-                    value=_encode_value(merged["settings"][namespace]),
+                    value=_encode_namespace(namespace, merged["settings"][namespace]),
                 )
             else:
                 session.execute(

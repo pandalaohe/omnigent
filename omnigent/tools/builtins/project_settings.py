@@ -17,7 +17,7 @@ class SysProjectSettingsReadTool(Tool):
             "available host/harness/model/mode choices, and catalog freshness. Use this before "
             "setting up project defaults. Reads do not run entry templates or setup hooks. "
             "Calling defaults apply to future sessions. The config also includes saved project "
-            "orchestration: child cap and standing-pass removals and exceptions."
+            "orchestration: child cap and standing-approval removals and exceptions."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -52,7 +52,7 @@ class SysProjectSettingsUpdateTool(Tool):
             "revision as expected_revision. Name leaves to change: project host_id, agent_id, "
             "model; or a host's workspace, agent_id and harness model, effort, speed, permission. "
             "Orchestration leaves: child_cap (positive integer or 'none'), "
-            "standing_pass.remove (up to 32 kinds) and standing_pass.exceptions "
+            "standing_approval.remove (up to 32 kinds) and standing_approval.exceptions "
             "(up to five exceptions), each a nonblank string of at most 120 characters. "
             "Child caps are read on subsequent child creates. "
             "Null removes only that override. A new entry may initialize its Agent from the "
@@ -89,7 +89,7 @@ class SysProjectSettingsUpdateTool(Tool):
                                         {"type": "null"},
                                     ]
                                 },
-                                "standing_pass": {
+                                "standing_approval": {
                                     "type": "object",
                                     "properties": {
                                         "remove": {

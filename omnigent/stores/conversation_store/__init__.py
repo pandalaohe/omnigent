@@ -462,6 +462,7 @@ CREATED_BY_SESSION_LABEL_KEY = "omnigent.created_by_session_id"
 #     viewers never held them; the clone mints its own key on first use.
 _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
     {
+        "omnigent.standing_approval",
         "omnigent.standing_pass",
         "omnigent.claude_native.bridge_id",
         "omnigent.codex_native.bridge_id",

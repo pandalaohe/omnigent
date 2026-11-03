@@ -67,8 +67,8 @@ async def test_project_update_approval_default_can_be_changed_only_by_admin_poli
     [
         {"setup": "Saved"},
         {"child_cap": None},
-        {"standing_pass": {"remove": None}},
-        {"standing_pass": {"exceptions": ["production release"]}},
+        {"standing_approval": {"remove": None}},
+        {"standing_approval": {"exceptions": ["production release"]}},
     ],
 )
 async def test_child_and_session_disabled_policy_cannot_remove_default_ask(

@@ -353,7 +353,7 @@ guardrails:
         "__ask_on_scheduled_task_change",
         "__ask_on_terminal_agent_access",
         "__ask_on_host_restart",
-        "__ask_on_standing_pass_grant",
+        "__ask_on_standing_approval_grant",
         "__ask_on_instruction_layer_update",
         "__ask_on_project_settings_update",
     ]
