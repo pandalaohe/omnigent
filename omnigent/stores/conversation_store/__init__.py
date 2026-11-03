@@ -1690,12 +1690,17 @@ class ConversationStore(ABC):
     @abstractmethod
     def update_detached_card(self, elicitation_id: str, **fields: Any) -> None:
         """Patch one record: ``state`` and ``delivery_text`` verbatim,
-        ``verdict`` and ``payload`` as dicts, ``expires_at`` in epoch seconds."""
+        ``verdict`` and ``payload`` as dicts, ``expires_at`` in epoch seconds.
+        A verdict's server answer_stamp atomically supersedes older answers;
+        superseded_ids also removes their not-yet-recorded pending rows."""
         ...
 
     @abstractmethod
-    def delete_detached_card(self, elicitation_id: str) -> None:
-        """Delete one record; a missing record is a no-op."""
+    def delete_detached_card(
+        self, elicitation_id: str, *, expected_verdict: dict[str, Any] | None = None
+    ) -> bool:
+        """Delete one record, optionally only if its live verdict still matches.
+        Return whether a record was deleted; a missing record is a no-op."""
         ...
 
     @abstractmethod

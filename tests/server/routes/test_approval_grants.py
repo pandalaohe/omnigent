@@ -47,3 +47,17 @@ def test_revoking_old_source_preserves_newer_same_key_grant() -> None:
     grants.put("conv_a", key, new, 60, source_id="elicit_new")
     grants.discard_if_source("conv_a", key, "elicit_old")
     assert grants.consume_with_source("conv_a", key) == (new, "elicit_new")
+
+
+def test_late_old_answer_cannot_replace_newer_live_answer() -> None:
+    grants = ApprovalGrants()
+    key = ("Bash", "pnpm build", "/repo")
+    old = ElicitationResult(action="accept", content={"feedback": "old"})
+    new = ElicitationResult(action="accept", content={"feedback": "new"})
+    grants.put("conv_a", key, new, 60, source_id="elicit_new", answered_at=2)
+    grants.put("conv_a", key, old, 60, source_id="elicit_old", answered_at=1)
+    grants.discard_older("conv_a", key, 1)
+    assert grants.consume_with_source("conv_a", key) == (new, "elicit_new")
+    grants.put("conv_a", key, new, 60, source_id="elicit_new", answered_at=2)
+    grants.discard_older("conv_a", key, 3)
+    assert grants.consume_with_source("conv_a", key) is None

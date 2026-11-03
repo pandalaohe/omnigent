@@ -67,8 +67,8 @@ class ApprovalGrants:
     A grant is written when the user accepts a deferred approval card
     and consumed by the next hook call carrying the exact same key; a
     session can never consume another session's grant. Expired entries
-    are pruned on access. A server restart drops every grant (accepted
-    tradeoff, same as every other in-memory elicitation).
+    are pruned on access. Server startup restores grants from their durable
+    card records after the in-memory cache is lost.
 
     :param clock: Monotonic clock; injectable for tests.
     """
@@ -76,7 +76,7 @@ class ApprovalGrants:
     def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
         self._clock = clock
         self._grants: dict[
-            tuple[str, tuple[str, ...]], tuple[ElicitationResult, float, str | None]
+            tuple[str, tuple[str, ...]], tuple[ElicitationResult, float, str | None, int]
         ] = {}
 
     def put(
@@ -87,9 +87,10 @@ class ApprovalGrants:
         ttl_s: float,
         *,
         source_id: str | None = None,
+        answered_at: int | None = None,
     ) -> None:
         """
-        Store one grant, replacing any prior grant for the same key.
+        Store one grant unless a later answer already superseded it.
 
         :param session_id: Session the approved call belongs to.
         :param key: Match key from :func:`claude_grant_key` /
@@ -98,15 +99,28 @@ class ApprovalGrants:
             grant-hit decision (remember / allow-all-edits / auto mode).
         :param ttl_s: Lifetime in seconds, e.g. ``86400``.
         :param source_id: Durable card id backing this grant, when available.
+        :param answered_at: Durable answer sequence, or a new local order when omitted.
         :returns: None.
         """
         self._prune()
-        self._grants[(session_id, key)] = (verdict, self._clock() + ttl_s, source_id)
+        now = self._clock()
+        previous = self._grants.get((session_id, key))
+        if answered_at is None:
+            answered_at = previous[3] + 1 if previous is not None else 0
+        if previous is not None and answered_at < previous[3]:
+            return
+        self._grants[(session_id, key)] = (verdict, now + ttl_s, source_id, answered_at)
 
     def discard_if_source(self, session_id: str, key: tuple[str, ...], source_id: str) -> None:
         """Revoke only a grant backed by this card, preserving a newer grant."""
         entry = self._grants.get((session_id, key))
         if entry is not None and entry[2] == source_id:
+            self._grants.pop((session_id, key), None)
+
+    def discard_older(self, session_id: str, key: tuple[str, ...], answered_at: int) -> None:
+        """Apply a denial without revoking a later acceptance."""
+        entry = self._grants.get((session_id, key))
+        if entry is not None and entry[3] < answered_at:
             self._grants.pop((session_id, key), None)
 
     def consume_with_source(
@@ -117,7 +131,7 @@ class ApprovalGrants:
         entry = self._grants.pop((session_id, key), None)
         if entry is None:
             return None
-        verdict, expires_at, source_id = entry
+        verdict, expires_at, source_id, _answered_at = entry
         if expires_at <= self._clock():
             return None
         return verdict, source_id
@@ -146,7 +160,7 @@ class ApprovalGrants:
         now = self._clock()
         expired = [
             grant_key
-            for grant_key, (_verdict, expires_at, _source_id) in self._grants.items()
+            for grant_key, (_verdict, expires_at, _source_id, _answered_at) in self._grants.items()
             if expires_at <= now
         ]
         for grant_key in expired:
