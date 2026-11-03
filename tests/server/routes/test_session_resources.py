@@ -1755,6 +1755,52 @@ async def test_create_terminal_rejects_default_shell_absent_from_host(
     assert fake_runner.calls == []
 
 
+@pytest.fixture
+def sdk_agent_on_silent_host(app: FastAPI, sdk_agent_spec: None) -> None:
+    """Bind the SDK session to a host that reported no shell inventory."""
+    session_id = "79b22ebd2309e48fdeb450c65611d51b"
+    conv = app.state.test_conversation_store._conversations[session_id]
+    conv.host_id = "host_silent_inventory"
+    conv.workspace = "/workspace"
+    app.state.test_host_registry.register(
+        conv.host_id,
+        object(),  # type: ignore[arg-type]
+        HostHelloFrame(
+            version="0.1.0-test",
+            frame_protocol_version=1,
+            name="silent-inventory",
+        ),
+        owner=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_terminal_keeps_default_shell_for_host_without_inventory(
+    client: httpx.AsyncClient,
+    sdk_agent_on_silent_host: None,
+) -> None:
+    """A host that never reported an inventory is not a host with no shells."""
+    terminal_resource = {
+        "id": "terminal_bash_u-1",
+        "object": "session.resource",
+        "type": "terminal",
+        "session_id": "79b22ebd2309e48fdeb450c65611d51b",
+        "name": "bash:u-1",
+        "environment": DEFAULT_ENVIRONMENT_ID,
+        "metadata": {"terminal_name": "bash", "session_key": "u-1", "running": True},
+    }
+    fake_runner = _FakeRunnerClient(payload=terminal_resource)
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.post(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals",
+        json={"terminal": "bash", "session_key": "u-1"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert len(fake_runner.calls) == 1
+
+
 @pytest.mark.asyncio
 async def test_create_terminal_offers_default_shell_to_hostless_agent_without_terminals(
     client: httpx.AsyncClient,

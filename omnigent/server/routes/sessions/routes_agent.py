@@ -151,7 +151,7 @@ def register_agent_routes(
             conversation_store,
             conversation=conv,
         )
-        terminals_override = None
+        terminals_override: list[str] | None = None
         if (
             conv.host_id is not None
             and host_registry is not None
