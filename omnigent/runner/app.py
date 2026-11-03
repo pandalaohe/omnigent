@@ -13212,6 +13212,15 @@ def create_runner_app(
             replaced = not same_incarnation or (
                 _native_runtime._AUTO_CODEX_APP_SERVERS.get(session_id) is not backend
             )
+            if (
+                not owns_capture
+                and _pending_codex_releases.get(session_id) is snapshot
+                and id(snapshot) not in _active_codex_release_captures
+            ):
+                # The owner timed out on the lifecycle lock and abandoned this
+                # capture while this borrower awaited backend closure; the
+                # surviving borrower may now retire it.
+                owns_capture = True
             if owns_capture:
                 _active_codex_release_captures.discard(id(snapshot))
             if (

@@ -254,7 +254,14 @@ async def test_idle_release_keeps_exit_evidence_after_real_teardown(
 
 @pytest.mark.parametrize(
     "sequence",
-    ["legacy-reap", "rejected-token", "rejected-pane", "rejected-lock", "overlapping-tail"],
+    [
+        "legacy-reap",
+        "rejected-token",
+        "rejected-pane",
+        "rejected-lock",
+        "overlapping-tail",
+        "ownerless-capture",
+    ],
 )
 async def test_codex_release_does_not_pin_a_completed_or_abandoned_incarnation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sequence: str
@@ -303,6 +310,79 @@ async def test_codex_release_does_not_pin_a_completed_or_abandoned_incarnation(
         server_client=server_client,  # type: ignore[arg-type]
     )
     reaper = app.state.native_pane_reaper
+    if sequence == "ownerless-capture":
+        # A failed teardown leaves an unconfirmed capture. The retiring owner
+        # claims it and times out on the lifecycle lock while the release
+        # caller borrows it and finishes the close; the completed backend must
+        # still become collectible.
+        entered, release_close = asyncio.Event(), asyncio.Event()
+        close_calls = 0
+        original_close = type(old).close
+
+        async def paused_close(self) -> None:
+            nonlocal close_calls
+            close_calls += 1
+            if close_calls == 2:
+                entered.set()
+                await release_close.wait()
+            await original_close(self)
+
+        monkeypatch.setattr(type(old), "close", paused_close)
+        census_available = False
+        monkeypatch.setattr(
+            app_server,
+            "_tagged_process_group_members",
+            lambda *_: [] if census_available else None,
+        )
+        try:
+            await app.state.finish_cli_release(session_id)
+        except RuntimeError as failure:
+            assert "exit is not confirmed" in str(failure)
+            # Drop the traceback: its frames still hold the borrowed capture,
+            # so only the abandoned pending record may keep the backend alive.
+            failure.__traceback__ = None
+        else:
+            raise AssertionError("failed teardown left a confirmed Codex exit")
+        assert not old.exit_confirmed
+
+        token = app.state.cli_runtime_lifecycle.runtime_token(session_id)
+        lock = app.state.cli_runtime_lifecycle.lock_for(session_id)
+        borrower = None
+        async with lock.shared():
+            retirement = asyncio.create_task(reaper._finish_retired(session_id, "codex", token))
+            try:
+                # The retirement attempt claims the capture synchronously and
+                # then parks on the exclusive lock, so wait for that waiter
+                # before lending the capture to the release caller.
+                for _ in range(200):
+                    if getattr(lock, "_waiters", None):
+                        break
+                    await asyncio.sleep(0)
+                else:
+                    raise AssertionError("retirement never parked on the lifecycle lock")
+                borrower = asyncio.create_task(app.state.finish_cli_release(session_id))
+                await asyncio.wait_for(entered.wait(), timeout=10)
+                # The owner times out and drops its ownership marker while the
+                # release caller still holds the shared lock and the close.
+                assert await asyncio.wait_for(retirement, timeout=10) == token
+                assert not borrower.done()
+                census_available = True
+                release_close.set()
+                await asyncio.wait_for(borrower, timeout=10)
+            finally:
+                release_close.set()
+                pending = [retirement] if borrower is None else [retirement, borrower]
+                await asyncio.gather(*pending, return_exceptions=True)
+        assert old.exit_confirmed
+
+        del pending, retirement, borrower
+        old_reference = weakref.ref(old)
+        del old
+        gc.collect()
+        assert old_reference() is None, (
+            "a completed Codex backend stayed reachable through the abandoned pending capture"
+        )
+        return
     if sequence == "overlapping-tail":
         entered, release = asyncio.Event(), asyncio.Event()
 
