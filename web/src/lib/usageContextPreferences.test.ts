@@ -658,6 +658,23 @@ describe("usage/context preferences", () => {
     expect(Object.keys(merged)).toHaveLength(4);
   });
 
+  it("does not collapse exact models across a different every-computer model value", () => {
+    const identity = { hostId: "host-a", agentName: "claude", harness: "claude-native" };
+    const exact = (model: string) => usageContextSourceKey({ ...identity, model });
+    const overrides = {
+      [exact("opus")]: { contextWindowTokens: 200_000, autoCompactBufferTokens: null },
+      [exact("sonnet")]: { contextWindowTokens: 200_000, autoCompactBufferTokens: null },
+      [usageContextLevelKey({ ...identity, model: "opus" }, "agent-model")]: {
+        contextWindowTokens: 300_000,
+        autoCompactBufferTokens: null,
+      },
+    };
+
+    expect(
+      proposeUsageContextCollapse({ ...DEFAULT_USAGE_CONTEXT_PREFERENCES, overrides }),
+    ).toEqual({ removed: [], added: {} });
+  });
+
   it("preserves an unknown level's empty record and future fields while ignoring it", () => {
     const unknown = '["host-a","codex","codex","","future"]';
     const entry = { contextWindowTokens: null, autoCompactBufferTokens: null, futureBuffer: 123 };

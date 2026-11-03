@@ -424,6 +424,19 @@ export function proposeUsageContextCollapse(preferences: UsageContextPreferences
       group.some(({ override }) => signature(override) !== signature(first.override))
     )
       continue;
+    const overrides = { ...normalized.overrides, [cellKey]: first.override };
+    for (const { key } of group) Reflect.deleteProperty(overrides, key);
+    const changed = group.some(({ key }) => {
+      const reported = { contextWindow: null, autoCompactTokenLimit: null };
+      const before = resolveUsageContext(normalized, key, reported);
+      const after = resolveUsageContext({ ...normalized, overrides }, key, reported);
+      return (
+        before.contextWindow.value !== after.contextWindow.value ||
+        before.buffer.value !== after.buffer.value ||
+        before.buffer.mode !== after.buffer.mode
+      );
+    });
+    if (changed) continue;
     removed.push(...group.map(({ key }) => key));
     added[cellKey] = first.override;
   }

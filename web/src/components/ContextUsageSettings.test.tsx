@@ -340,4 +340,162 @@ describe("ContextUsageSettings", () => {
     expect(screen.getByTestId("provider-usage-source-status")).toHaveTextContent("Open a session");
     expect(screen.getByLabelText("Show usage limits")).toBeInTheDocument();
   });
+
+  it("undoes only the records changed by Clear values below", async () => {
+    const cellKey = usageContextLevelKey(source, "cell");
+    const columnKey = usageContextLevelKey(source, "column");
+    store({ [cellKey]: value(100_000) });
+    renderSettings();
+
+    fireEvent.click(screen.getByTestId("layered-row-claude-claude-native"));
+    fireEvent.click(await screen.findByRole("button", { name: "Clear 1 value" }));
+    await waitFor(() => expect(readUsageContextPreferences().overrides[cellKey]).toBeUndefined());
+
+    fireEvent.change(screen.getByLabelText("Context total for all models of Claude Code"), {
+      target: { value: "250000" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save all models" }));
+    expect(readUsageContextPreferences().overrides[columnKey]).toMatchObject({
+      contextWindowTokens: 250_000,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+    await waitFor(() =>
+      expect(readUsageContextPreferences().overrides[cellKey]).toMatchObject({
+        contextWindowTokens: 100_000,
+      }),
+    );
+    expect(readUsageContextPreferences().overrides[columnKey]).toMatchObject({
+      contextWindowTokens: 250_000,
+    });
+  });
+
+  it("keeps a repeated buffer when the proposed cell total activates another buffer", () => {
+    const cellKey = usageContextLevelKey(source, "cell");
+    const corner = { hostId: "", agentName: "", harness: "", model: "" };
+    store({
+      [usageContextLevelKey(source, "column")]: value(100_000, 150_000),
+      [usageContextLevelKey(corner, "all")]: value(null, 20_000),
+    });
+    renderSettings();
+
+    fireEvent.click(cell("claude-claude-native", "host-a"));
+    fireEvent.change(screen.getByLabelText("Context total for Alpha × Claude Code"), {
+      target: { value: "200000" },
+    });
+    fireEvent.change(screen.getByLabelText("Compact buffer for Alpha × Claude Code"), {
+      target: { value: "20000" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(readUsageContextPreferences().overrides[cellKey]).toMatchObject({
+      contextWindowTokens: 200_000,
+      autoCompactBufferTokens: 20_000,
+      compactBufferMode: "tokens",
+    });
+  });
+
+  it("preserves Percent mode when its empty field retains an inactive token buffer", () => {
+    const cellKey = usageContextLevelKey(source, "cell");
+    store({
+      [cellKey]: {
+        contextWindowTokens: 100_000,
+        autoCompactBufferTokens: 20_000,
+        compactBufferMode: "percent",
+      },
+    });
+    renderSettings();
+
+    fireEvent.click(cell("claude-claude-native", "host-a"));
+    expect(screen.getByLabelText("Compact buffer for Alpha × Claude Code")).toHaveValue(null);
+    fireEvent.change(screen.getByLabelText("Context total for Alpha × Claude Code"), {
+      target: { value: "200000" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(readUsageContextPreferences().overrides[cellKey]).toMatchObject({
+      contextWindowTokens: 200_000,
+      autoCompactBufferTokens: 20_000,
+      compactBufferMode: "percent",
+    });
+  });
+
+  it("deduplicates each bulk-saved cell against its own inherited value", () => {
+    const cellKey = usageContextLevelKey(source, "cell");
+    const corner = { hostId: "", agentName: "", harness: "", model: "" };
+    store({ [usageContextLevelKey(corner, "all")]: value(300_000) });
+    renderSettings();
+
+    fireEvent.click(screen.getByRole("button", { name: "Select cells" }));
+    fireEvent.click(screen.getByTestId("layered-row-claude-claude-native"));
+    fireEvent.click(screen.getByRole("button", { name: "Set values" }));
+    fireEvent.change(screen.getByLabelText("Context total for the selection"), {
+      target: { value: "300000" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Apply to 2 selected" }));
+
+    expect(readUsageContextPreferences().overrides[cellKey]).toBeUndefined();
+  });
+
+  it("drills a focused model to its exact host record with the model draft", async () => {
+    const model = "claude-opus-5-5";
+    const exactKey = usageContextSourceKey({ ...source, model });
+    renderSettings(`/settings/general?ctx=${encodeURIComponent(exactKey)}#context-usage`);
+
+    fireEvent.change(await screen.findByLabelText(`Context total for ${model}`), {
+      target: { value: "420000" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Only on Alpha" }));
+    const drilled = await screen.findByLabelText("Context total for Claude Code on Alpha");
+    expect(drilled).toHaveValue(420_000);
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(readUsageContextPreferences().overrides[exactKey]).toMatchObject({
+      contextWindowTokens: 420_000,
+    });
+    expect(
+      readUsageContextPreferences().overrides[usageContextLevelKey(source, "cell")],
+    ).toBeUndefined();
+  });
+
+  it("names the validated buffer winner in a crossing clash", () => {
+    store({
+      [usageContextLevelKey(source, "cell")]: value(100_000),
+      [usageContextLevelKey(source, "column")]: value(null, 150_000),
+      [usageContextLevelKey({ ...source, agentName: "", harness: "" }, "host")]: value(
+        null,
+        20_000,
+      ),
+    });
+    renderSettings();
+
+    expect(
+      within(cell("claude-claude-native", "host-a")).getByLabelText(
+        "Warning: Compact buffer: Claude Code and Alpha differ; Alpha wins.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("counts and clears model records below the corner", async () => {
+    const cellKey = usageContextLevelKey(source, "cell");
+    const modelKey = usageContextLevelKey({ ...source, model: "claude-opus-5-5" }, "agent-model");
+    store({ [cellKey]: value(100_000), [modelKey]: value(200_000) });
+    renderSettings();
+
+    fireEvent.click(screen.getByRole("button", { name: /Edit All agents, all hosts/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Clear 2 values" }));
+
+    await waitFor(() => {
+      expect(readUsageContextPreferences().overrides[cellKey]).toBeUndefined();
+      expect(readUsageContextPreferences().overrides[modelKey]).toBeUndefined();
+    });
+  });
+
+  it("does not mark a reported reading as a value saved in the cell", () => {
+    mocks.contextWindow = 128_000;
+    renderSettings();
+
+    expect(cell("claude-claude-native", "host-a")).toHaveTextContent("128k · Auto");
+    expect(cell("claude-claude-native", "host-a").querySelector(".bg-pink-500")).toBeNull();
+  });
 });

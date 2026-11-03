@@ -63,6 +63,11 @@ interface Draft {
   mode: "tokens" | "percent";
 }
 
+interface UndoState {
+  overrides: Record<string, UsageContextOverride>;
+  keys: string[];
+}
+
 interface AgentIdentity {
   agentId: string | null;
   name: string;
@@ -131,14 +136,6 @@ function stateText(resolved: ResolvedUsageContext): string | null {
   const buffer = resolved.buffer.value;
   if (context === null && buffer === null) return null;
   return `${context === null ? "Auto" : formatTokenCountShort(context)} · ${bufferText(resolved)}`;
-}
-
-function sameValues(left: ResolvedUsageContext, right: ResolvedUsageContext): boolean {
-  return (
-    left.contextWindow.value === right.contextWindow.value &&
-    left.buffer.mode === right.buffer.mode &&
-    left.buffer.value === right.buffer.value
-  );
 }
 
 function agentRank(agent: AgentIdentity): number {
@@ -272,7 +269,7 @@ function recordFromDraft(
       contextWindowTokens: context,
       autoCompactBufferTokens: tokens,
       ...(percent !== null ? { autoCompactBufferPercent: percent } : {}),
-      ...(buffer !== null ? { compactBufferMode: draft.mode } : {}),
+      ...(tokens !== null || percent !== null ? { compactBufferMode: draft.mode } : {}),
     },
   };
 }
@@ -281,9 +278,10 @@ function recordFromDraft(
 function dropRepeatedFields(
   record: UsageContextOverride,
   inherited: ResolvedUsageContext,
+  inheritedContext: number | null,
 ): UsageContextOverride | null {
   const next: UsageContextOverride = { ...record };
-  if (next.contextWindowTokens === inherited.contextWindow.value) next.contextWindowTokens = null;
+  if (next.contextWindowTokens === inheritedContext) next.contextWindowTokens = null;
   const mode = next.compactBufferMode ?? "tokens";
   const active =
     mode === "percent" ? (next.autoCompactBufferPercent ?? null) : next.autoCompactBufferTokens;
@@ -293,6 +291,28 @@ function dropRepeatedFields(
     Reflect.deleteProperty(next, "compactBufferMode");
   }
   return usageContextHasValue(next) ? next : null;
+}
+
+/** Compare against inheritance with the proposed cell context, but without its buffer. */
+function dropRepeatedCellFields(
+  preferences: UsageContextPreferences,
+  source: UsageContextSource,
+  record: UsageContextOverride,
+): UsageContextOverride | null {
+  const key = usageContextLevelKey(source, "cell");
+  const contextOnly: UsageContextOverride = {
+    contextWindowTokens: record.contextWindowTokens,
+    autoCompactBufferTokens: null,
+  };
+  const withProposedContext = {
+    ...preferences,
+    overrides: { ...preferences.overrides, [key]: contextOnly },
+  };
+  return dropRepeatedFields(
+    record,
+    resolveUsageContextLevel(withProposedContext, source, "cell"),
+    inheritedUsageContext(preferences, source, "cell").contextWindow.value,
+  );
 }
 
 function Mark() {
@@ -430,7 +450,7 @@ function ValueFields({
     setError("");
     onSave(
       level === "cell" && outcome.record
-        ? dropRepeatedFields(outcome.record, inheritedUsageContext(preferences, source, "cell"))
+        ? dropRepeatedCellFields(preferences, source, outcome.record)
         : outcome.record,
     );
   };
@@ -479,7 +499,7 @@ export function ContextUsageSettings() {
   const [openEditor, setOpenEditor] = useState<LayeredLevel | null>(null);
   const [focusModel, setFocusModel] = useState<string | null>(null);
   const [missingSource, setMissingSource] = useState(false);
-  const [undo, setUndo] = useState<Record<string, UsageContextOverride> | null>(null);
+  const [undo, setUndo] = useState<UndoState | null>(null);
   const searchParams = useSearchParams()[0];
   const navigate = useNavigate();
   const location = useLocation();
@@ -596,31 +616,6 @@ export function ContextUsageSettings() {
     const source = sourceOf(rowById.get(at.row)!, columnById.get(at.col)!);
     return resolveUsageContextLevel(preferences, source, "cell", reportedFor(source));
   };
-  const inheritedAt = (at: LayeredLevel) => {
-    if (at.level === "corner") return inheritedUsageContext(preferences, CORNER_SOURCE, "all");
-    if (at.level === "row") {
-      const row = rowById.get(at.row)!;
-      return inheritedUsageContext(
-        preferences,
-        { hostId: "", agentName: row.name, harness: row.harness, model: "" },
-        "column",
-      );
-    }
-    if (at.level === "col") {
-      const column = columnById.get(at.col)!;
-      return inheritedUsageContext(
-        preferences,
-        { hostId: column.hostId, agentName: "", harness: "", model: "" },
-        "host",
-      );
-    }
-    return inheritedUsageContext(
-      preferences,
-      sourceOf(rowById.get(at.row)!, columnById.get(at.col)!),
-      "cell",
-    );
-  };
-  const markAt = (at: LayeredLevel) => !sameValues(resolveAt(at), inheritedAt(at));
   const levelAt = (at: LayeredLevel): UsageContextLevel =>
     at.level === "corner"
       ? "all"
@@ -654,16 +649,63 @@ export function ContextUsageSettings() {
     return cellKeys.get(`${at.row}\u0000${at.col}`) ?? null;
   };
 
+  const markAt = (at: LayeredLevel) => {
+    const key = keyAt(at);
+    return key ? usageContextHasValue(preferences.overrides[key]) : false;
+  };
+  const keysBelow = (at: LayeredLevel): string[] => {
+    const keys = new Set(
+      levelsBelow(store, at).flatMap((level) => {
+        const key = keyAt(level);
+        return key ? [key] : [];
+      }),
+    );
+    for (const [key, override] of Object.entries(preferences.overrides)) {
+      const record = usageContextRecordFromKey(key);
+      if (
+        !record ||
+        (record.level !== "model" && record.level !== "agent-model") ||
+        !usageContextHasValue(override)
+      )
+        continue;
+      const sameAgent =
+        record.source.agentName === sourceAt(at).agentName &&
+        record.source.harness === sourceAt(at).harness;
+      const below =
+        at.level === "corner" ||
+        (at.level === "row" && sameAgent) ||
+        (at.level === "col" &&
+          record.level === "model" &&
+          record.source.hostId === sourceAt(at).hostId) ||
+        (at.level === "cell" &&
+          record.level === "model" &&
+          sameAgent &&
+          record.source.hostId === sourceAt(at).hostId);
+      if (below) keys.add(key);
+    }
+    return [...keys];
+  };
+
   const writeOverrides = (overrides: Record<string, UsageContextOverride>) => {
-    setUndo(preferences.overrides);
+    const keys = [
+      ...new Set([...Object.keys(preferences.overrides), ...Object.keys(overrides)]),
+    ].filter((key) => preferences.overrides[key] !== overrides[key]);
+    setUndo({ overrides: preferences.overrides, keys });
     writeUsageContextPreferences({ ...preferences, overrides });
+  };
+  const restoreUndo = () => {
+    if (!undo) return;
+    const overrides = { ...preferences.overrides };
+    for (const key of undo.keys) {
+      if (Object.hasOwn(undo.overrides, key)) overrides[key] = undo.overrides[key]!;
+      else Reflect.deleteProperty(overrides, key);
+    }
+    writeUsageContextPreferences({ ...preferences, overrides });
+    setUndo(null);
   };
   const clearBelow = (at: LayeredLevel) => {
     const overrides = { ...preferences.overrides };
-    for (const level of levelsBelow(store, at)) {
-      const key = keyAt(level);
-      if (key) Reflect.deleteProperty(overrides, key);
-    }
+    for (const key of keysBelow(at)) Reflect.deleteProperty(overrides, key);
     writeOverrides(overrides);
   };
 
@@ -773,10 +815,7 @@ export function ContextUsageSettings() {
         cellKeys={cellKeys}
         undo={undo}
         onWrite={writeOverrides}
-        onUndo={() => {
-          if (undo) writeUsageContextPreferences({ ...preferences, overrides: undo });
-          setUndo(null);
-        }}
+        onUndo={restoreUndo}
         clear={clear}
       />
     ),
@@ -798,7 +837,7 @@ export function ContextUsageSettings() {
       if (winner === "reported") return "The agent reports its own";
       return `From ${levelLabel(winner as UsageContextLevel, source)}`;
     };
-    const belowCount = levelsBelow(store, at).length;
+    const belowCount = keysBelow(at).length;
     const props = editorProps(at);
     return (
       <LayeredEditor
@@ -813,10 +852,7 @@ export function ContextUsageSettings() {
             size="sm"
             className="min-h-11 md:min-h-7"
             disabled={!undo}
-            onClick={() => {
-              if (undo) writeUsageContextPreferences({ ...preferences, overrides: undo });
-              setUndo(null);
-            }}
+            onClick={restoreUndo}
           >
             Undo
           </Button>
@@ -987,13 +1023,10 @@ export function ContextUsageSettings() {
                   ? () => setUsageContextLevel(preferences, rowKeys.get(row.id)!, null)
                   : undefined
               }
-              clearBelowCount={levelsBelow(store, at).length}
+              clearBelowCount={keysBelow(at).length}
               onClearBelow={() => clearBelow(at)}
               undo={undo}
-              onUndo={() => {
-                if (undo) writeUsageContextPreferences({ ...preferences, overrides: undo });
-                setUndo(null);
-              }}
+              onUndo={restoreUndo}
             />
           );
         }}
@@ -1027,6 +1060,7 @@ function cellClash(
   const fromRow = preferences.overrides[usageContextLevelKey(source, "column")];
   const fromHost = preferences.overrides[usageContextLevelKey(source, "host")];
   const agentLabel = agentLabelOf(source);
+  const resolved = resolveUsageContextLevel(preferences, source, "cell");
   const lines: string[] = [];
   const fields = [
     { key: "contextWindowTokens" as const, label: "Context total" },
@@ -1037,7 +1071,15 @@ function cellClash(
     const rowValue = ownField(fromRow, field.key);
     const hostValue = ownField(fromHost, field.key);
     if (rowValue === null || hostValue === null || rowValue === hostValue) continue;
-    lines.push(`${field.label}: ${agentLabel} and ${column.label} differ; ${agentLabel} wins.`);
+    const winner =
+      field.key === "contextWindowTokens" ? resolved.contextWindow.level : resolved.buffer.level;
+    const winnerLabel =
+      winner === "column"
+        ? agentLabel
+        : winner === "host"
+          ? column.label
+          : usageContextLevelLabel(winner, { hostLabel: column.label, agentLabel });
+    lines.push(`${field.label}: ${agentLabel} and ${column.label} differ; ${winnerLabel} wins.`);
   }
   return lines.length ? lines.join("\n") : undefined;
 }
@@ -1055,7 +1097,7 @@ function SelectionActions({
   preferences: UsageContextPreferences;
   selected: readonly LayeredCellLevel[];
   cellKeys: Map<string, string>;
-  undo: Record<string, UsageContextOverride> | null;
+  undo: UndoState | null;
   onWrite: (overrides: Record<string, UsageContextOverride>) => void;
   onUndo: () => void;
   clear: () => void;
@@ -1080,7 +1122,12 @@ function SelectionActions({
     setError("");
     const overrides = { ...preferences.overrides };
     for (const key of keys) {
-      if (outcome.record) overrides[key] = outcome.record;
+      const record = usageContextRecordFromKey(key);
+      const deduped =
+        outcome.record && record?.level === "cell"
+          ? dropRepeatedCellFields(preferences, record.source, outcome.record)
+          : outcome.record;
+      if (deduped) overrides[key] = deduped;
       else Reflect.deleteProperty(overrides, key);
     }
     onWrite(overrides);
@@ -1178,7 +1225,7 @@ function AgentRowEditor({
   onClear?: () => void;
   clearBelowCount: number;
   onClearBelow: () => void;
-  undo: Record<string, UsageContextOverride> | null;
+  undo: UndoState | null;
   onUndo: () => void;
 }) {
   const labels = registrySourceLabels(registryItems, row.name, row.harness);
@@ -1200,7 +1247,7 @@ function AgentRowEditor({
   const [columnError, setColumnError] = useState("");
   const [modelError, setModelError] = useState("");
   const [drill, setDrill] = useState<{
-    level: "cell" | "host";
+    level: "model" | "cell" | "host";
     key: string;
     label: string;
     source: UsageContextSource;
@@ -1369,32 +1416,27 @@ function AgentRowEditor({
           <div className="flex flex-wrap gap-2">
             <Button
               type="button"
-              variant={drill?.level === "cell" ? "secondary" : "outline"}
+              variant={
+                drill?.level === "cell" || drill?.level === "model" ? "secondary" : "outline"
+              }
               size="sm"
               className="min-h-11 md:min-h-7"
-              aria-pressed={drill?.level === "cell"}
-              onClick={() =>
+              aria-pressed={drill?.level === "cell" || drill?.level === "model"}
+              onClick={() => {
+                const drillSource: UsageContextSource = {
+                  hostId: hostColumn.hostId,
+                  agentName: row.name,
+                  harness: row.harness,
+                  model: focusModel ?? "",
+                };
                 setDrill({
-                  level: "cell",
-                  key: usageContextLevelKey(
-                    {
-                      hostId: hostColumn.hostId,
-                      agentName: row.name,
-                      harness: row.harness,
-                      model: "",
-                    },
-                    "cell",
-                  ),
+                  level: focusModel ? "model" : "cell",
+                  key: usageContextLevelKey(drillSource, focusModel ? "model" : "cell"),
                   label: `${labels.agentLabel} on ${hostColumn.label}`,
-                  source: {
-                    hostId: hostColumn.hostId,
-                    agentName: row.name,
-                    harness: row.harness,
-                    model: "",
-                  },
-                  draft: columnDraft,
-                })
-              }
+                  source: drillSource,
+                  draft: focusModel ? modelDraft : columnDraft,
+                });
+              }}
             >
               Only on {hostColumn.label}
             </Button>

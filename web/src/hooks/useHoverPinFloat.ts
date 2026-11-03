@@ -11,9 +11,10 @@ const HOVER_CLOSE_DELAY_MS = 150;
  * pending close. Touch has no hover, so a tap pins it.
  */
 export function useHoverPinFloat() {
-  const [open, setOpen] = useState(false);
+  const [open, setOpenState] = useState(false);
   const closeTimerRef = useRef<number | null>(null);
   const pointerFocusRef = useRef(false);
+  const pinnedRef = useRef(false);
 
   useEffect(() => {
     return () => {
@@ -30,10 +31,17 @@ export function useHoverPinFloat() {
 
   function scheduleClose() {
     cancelClose();
+    if (pinnedRef.current) return;
     closeTimerRef.current = window.setTimeout(() => {
       closeTimerRef.current = null;
-      setOpen(false);
+      if (!pinnedRef.current) setOpenState(false);
     }, HOVER_CLOSE_DELAY_MS);
+  }
+
+  function setOpen(next: boolean) {
+    pinnedRef.current = next;
+    if (next) cancelClose();
+    setOpenState(next);
   }
 
   const triggerHandlers = {
@@ -46,7 +54,7 @@ export function useHoverPinFloat() {
         pointerFocusRef.current = false;
         return;
       }
-      setOpen(true);
+      setOpenState(true);
     },
     onBlur: () => {
       pointerFocusRef.current = false;
@@ -55,7 +63,7 @@ export function useHoverPinFloat() {
     onPointerEnter: (event: PointerEvent) => {
       if (event.pointerType !== "mouse") return;
       cancelClose();
-      setOpen(true);
+      setOpenState(true);
     },
     onPointerLeave: (event: PointerEvent) => {
       if (event.pointerType !== "mouse") return;

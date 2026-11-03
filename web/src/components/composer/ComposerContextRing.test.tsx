@@ -97,6 +97,9 @@ describe("ComposerContextRing", () => {
     // A click pins what hover opened: leaving the trigger no longer clears it.
     fireEvent.click(screen.getByTestId("composer-context-ring"));
     await user.unhover(screen.getByTestId("composer-context-ring"));
+    await new Promise((resolve) => {
+      setTimeout(resolve, 200);
+    });
     expect(screen.getByTestId("composer-context-float")).toBeInTheDocument();
 
     await user.keyboard("{Escape}");
