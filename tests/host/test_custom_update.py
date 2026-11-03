@@ -1549,6 +1549,7 @@ def test_windows_custom_update_aborts_before_uv_and_restarts_supervisor_when_ven
     events: list[str] = []
     terminated: list[int] = []
     alive_pids = {502, 888}
+    clock = [0.0]
 
     record = cli_module._HostDaemonRecord(
         pid=502,
@@ -1582,8 +1583,9 @@ def test_windows_custom_update_aborts_before_uv_and_restarts_supervisor_when_ven
         return [row for row in rows if row.pid in alive_pids]
 
     def _terminate(pid: int, _created_at: float) -> None:
-        terminated.append(pid)
-        alive_pids.discard(pid)
+        if pid in alive_pids:
+            terminated.append(pid)
+            alive_pids.discard(pid)
 
     monkeypatch.setattr(cli_module, "IS_WINDOWS", True)
     monkeypatch.setattr(cli_module, "_find_repo_root", lambda: None)
@@ -1610,7 +1612,10 @@ def test_windows_custom_update_aborts_before_uv_and_restarts_supervisor_when_ven
     )
     monkeypatch.setattr(cli_module, "_list_windows_processes", _processes, raising=False)
     monkeypatch.setattr(cli_module, "_terminate_windows_process", _terminate, raising=False)
-    monkeypatch.setattr(cli_module.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(cli_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        cli_module.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+    )
     monkeypatch.setattr(
         cli_module,
         "_pause_custom_host_supervisor",
