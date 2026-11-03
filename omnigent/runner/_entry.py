@@ -86,7 +86,13 @@ _runner_auth_factory: Callable[[], str | None] | None = None
 
 
 def _host_interactive_shells_from_env() -> list[str] | None:
-    """Read the host daemon's ordered shell inventory from runner wiring."""
+    """Read the host daemon's ordered shell inventory from runner wiring.
+
+    ``None`` when the daemon reported no inventory at all (a runner outside a
+    host, or unreadable wiring); an empty list when it reported a host with no
+    launchable shell. Callers that offer shells must keep those apart: no known
+    inventory may fall back to a default shell, a reported empty one may not.
+    """
     from omnigent.runner.identity import RUNNER_INTERACTIVE_SHELLS_ENV_VAR
 
     raw = os.environ.get(RUNNER_INTERACTIVE_SHELLS_ENV_VAR)
@@ -96,8 +102,7 @@ def _host_interactive_shells_from_env() -> list[str] | None:
         decoded = json.loads(raw)
     except json.JSONDecodeError:
         return None
-    shells = normalize_interactive_shells(decoded)
-    return shells or None
+    return normalize_interactive_shells(decoded)
 
 
 def _apply_host_interactive_shells(spec: AgentSpec) -> None:

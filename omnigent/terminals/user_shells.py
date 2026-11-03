@@ -16,8 +16,8 @@ if TYPE_CHECKING:
     from omnigent.inner.datamodel import AgentDef
     from omnigent.spec.types import AgentSpec
 
-#: Shell offered to the user when the session has no host inventory and the
-#: agent declares no ``terminals:``.
+#: Shell offered to the user when no host inventory is known and the agent
+#: declares no ``terminals:``.
 DEFAULT_USER_SHELL = "bash"
 
 
@@ -40,32 +40,41 @@ def session_offers_host_shells(agent_name: str | None, host_id: str | None) -> b
 def user_shell_terminals(
     spec: AgentSpec | AgentDef | None,
     *,
-    host_shells: Sequence[str] = (),
+    host_shells: Sequence[str] | None = None,
 ) -> dict[str, TerminalEnvSpec]:
     """Return the terminals a user may launch for *spec*, keyed by name.
 
-    Declared ``terminals:`` are offered as they are. A host's shells replace a
-    native wrapper's portable declarations, and are added when the agent
-    declares none, so a host-bound SDK session offers the shells a native one
-    does; those run unsandboxed, as the human's own shell. An agent that
-    declares none and has no host inventory gets a default ``bash`` that
-    inherits the agent's ``os_env``. Only the spec's own ``terminals:`` decide
-    the agent's ``sys_terminal_*`` tools, so none of this reaches the agent.
+    Declared ``terminals:`` are offered as they are and always win: a host shell
+    of the same name only adds the name, never its own command, arguments,
+    environment or sandbox. A host's inventory replaces a native wrapper's
+    portable declarations wholesale, and is added after the declared ones for
+    any other agent, so a host-bound SDK session offers the shells a native one
+    does; those run unsandboxed, as the human's own shell. Only when no host
+    inventory is known does an agent that declares none get the default
+    ``bash``, which inherits the agent's ``os_env``.
 
-    Callers that only need names (listing and the create gate) read the keys;
-    the runner launches the same mapping, so offer and validation cannot drift.
+    Besides the offer, only the spec's own ``terminals:`` decide the agent's
+    ``sys_terminal_*`` tools, so none of this reaches the agent. Callers that
+    only need names (listing and the create gate) read the keys; the runner
+    launches the same mapping, so offer and validation cannot drift.
 
     :param spec: The session agent's spec, or ``None`` when none resolves.
-    :param host_shells: The host's ordered shell inventory, empty for a hostless
-        session or a host that reported none.
+    :param host_shells: The host's ordered shell inventory. ``None`` means no
+        host inventory is known (a hostless session); an empty sequence means a
+        host was consulted and reports no shells, which offers none rather than
+        falling back to a shell that host cannot launch.
     :returns: Terminal specs in offer order; empty when *spec* is ``None``.
     """
     if spec is None:
         return {}
     declared = dict(spec.terminals or {})
-    if host_shells:
+    if host_shells is not None:
         host = native_shell_terminal_specs(list(host_shells))
-        return host if native_coding_agent_for_agent_name(spec.name) else {**declared, **host}
+        if native_coding_agent_for_agent_name(spec.name) is not None:
+            return host
+        for name, terminal in host.items():
+            declared.setdefault(name, terminal)
+        return declared
     if declared:
         return declared
     return {DEFAULT_USER_SHELL: TerminalEnvSpec(command=DEFAULT_USER_SHELL)}

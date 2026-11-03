@@ -755,7 +755,7 @@ def register_resource_routes(
         # it can actually run. The spec's own block is untouched, so the agent
         # gains no ``sys_terminal_*`` tool from the host inventory.
         terminals_map = user_shell_terminals(
-            agent_spec, host_shells=_host_interactive_shells_from_env() or ()
+            agent_spec, host_shells=_host_interactive_shells_from_env()
         )
         declared_terminal = terminals_map.get(terminal_name)
 

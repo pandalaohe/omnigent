@@ -1816,8 +1816,9 @@ def register_resources_routes(
 
         User-initiated creates are gated on the terminals the agent offers its
         users: the names declared in the agent spec's ``terminals:`` block, the
-        default user shell when it declares none, and a host-bound session's
-        host shells (see ``user_shell_terminals``). Native
+        default user shell when neither a host inventory nor a declaration
+        yields a name, and a host-bound session's host shells (see
+        ``user_shell_terminals``). Native
         harness bootstrap requests (marked ``ensure_native_terminal``
         or ``bridge_inject_dir`` — the ``omnigent claude`` / ``codex``
         wrappers launching the session's own CLI terminal) are exempt:
@@ -1868,27 +1869,27 @@ def register_resources_routes(
         )
         if not is_native_bootstrap:
             spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
-            offered = list(user_shell_terminals(spec))
+            host_shells: list[str] | None = None
             if (
                 spec is not None
                 and conv.host_id is not None
                 and host_registry is not None
                 and session_offers_host_shells(spec.name, conv.host_id)
             ):
-                reported = host_interactive_shells_for_request(
+                host_shells = host_interactive_shells_for_request(
                     conv.host_id,
                     host_registry=host_registry,
                     runner_router=runner_router or get_server_runner_router(),
                 )
-                if reported:
-                    offered = list(user_shell_terminals(spec, host_shells=reported))
+            offered = list(user_shell_terminals(spec, host_shells=host_shells))
             if body.get("terminal") not in offered:
                 raise OmnigentError(
                     (
                         f"Terminal {body.get('terminal')!r} is not offered by this "
                         f"agent. Terminals can only be created from the agent's "
-                        f"declared terminals, or its default shell when it declares "
-                        f"none; this agent offers: {offered or 'none'}."
+                        f"declared terminals, the selected host's shells, or its "
+                        f"default shell when neither yields a name; this agent "
+                        f"offers: {offered or 'none'}."
                     ),
                     code=ErrorCode.INVALID_INPUT,
                 )

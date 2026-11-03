@@ -403,8 +403,9 @@ def _to_agent_object(
     :param agent: The runtime agent entity.
     :param cache: Agent cache, or ``None`` in test setups.
     :param terminals_override: Selected host's shell inventory: it replaces a
-        native wrapper's portable declarations and is added when the spec
-        declares none.
+        native wrapper's portable declarations, is added after the declared
+        ones, and offers nothing when it is empty. ``None`` means no host
+        inventory is known.
     :param mcp_selection: Session MCP selection labels, when called for a session.
     :param mcp_registry_editable: Whether the caller can change session MCP selections.
     :param mcp_servers_editable: Whether the authenticated caller may mutate
@@ -432,11 +433,10 @@ def _to_agent_object(
             if description is None:
                 description = loaded.spec.description
             # Terminal names a user may open, in offer order: the declared
-            # ``terminals:``, or the default user shell when the spec declares
-            # none. The Web UI gates its "new terminal" affordance on this list.
-            terminals = list(
-                user_shell_terminals(loaded.spec, host_shells=terminals_override or ())
-            )
+            # ``terminals:``, or the selected host's shells, with the default
+            # user shell when no host inventory is known and nothing is
+            # declared. The Web UI gates its "new terminal" affordance on this.
+            terminals = list(user_shell_terminals(loaded.spec, host_shells=terminals_override))
             # Bundled suggestions stay available while the host catalog loads.
             skills = [
                 SkillSummary(name=s.name, description=s.description, display_name=s.display_name)

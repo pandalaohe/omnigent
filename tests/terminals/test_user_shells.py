@@ -75,6 +75,39 @@ def test_host_shells_replace_a_native_wrappers_portable_declarations() -> None:
     assert offered["bash"] is not portable["bash"]
 
 
+def test_host_shells_do_not_replace_a_declared_terminal() -> None:
+    """A declared terminal keeps its operator spec when the host has one too."""
+    declared_bash = TerminalEnvSpec(
+        command="bash", args=["-l"], env={"OPERATOR": "set"}, os_env="inherit"
+    )
+    offered = user_shell_terminals(
+        AgentSpec(spec_version=1, name="codex-sdk", terminals={"bash": declared_bash}),
+        host_shells=["zsh", "bash"],
+    )
+
+    assert list(offered) == ["bash", "zsh"]
+    assert offered["bash"] is declared_bash
+
+
+def test_host_with_no_shells_offers_no_default_shell() -> None:
+    """An empty host inventory is not the same as no host: no bash fallback."""
+    assert user_shell_terminals(AgentSpec(spec_version=1), host_shells=[]) == {}
+
+    declared = {"py": TerminalEnvSpec(command="python3")}
+    offered = user_shell_terminals(AgentSpec(spec_version=1, terminals=declared), host_shells=[])
+    assert list(offered) == ["py"]
+    assert offered["py"] is declared["py"]
+
+    # A native wrapper's portable declarations are only a hostless stand-in, so
+    # a host that reports nothing leaves nothing to offer.
+    native = AgentSpec(
+        spec_version=1,
+        name=CLAUDE_NATIVE_AGENT_NAME,
+        terminals={"bash": TerminalEnvSpec(command="bash")},
+    )
+    assert user_shell_terminals(native, host_shells=[]) == {}
+
+
 def test_host_shells_run_unsandboxed_as_the_users_own() -> None:
     offered = user_shell_terminals(AgentSpec(spec_version=1), host_shells=["pwsh"])
 
