@@ -35,6 +35,17 @@ function statusMap(entries: Record<string, ConversationStatus>): Map<string, Con
 }
 
 describe("buildStatusMap", () => {
+  it("notifies once when the server hands off a quiet offer, and never after an answer", () => {
+    const quiet = [conv("child", "running", { pending_elicitations_count: 0 })];
+    const shown = [conv("child", "running", { pending_elicitations_count: 1 })];
+    expect(detectNewElicitations(buildElicitationMap(quiet), quiet)).toEqual([]);
+    expect(detectNewElicitations(buildElicitationMap(quiet), shown).map((c) => c.id)).toEqual([
+      "child",
+    ]);
+    expect(detectNewElicitations(buildElicitationMap(shown), shown)).toEqual([]);
+    expect(detectNewElicitations(buildElicitationMap(shown), quiet)).toEqual([]);
+    expect(detectNewElicitations(new Map(), shown)).toEqual([]);
+  });
   it("keys each conversation's status by id", () => {
     const map = buildStatusMap([conv("a", "running"), conv("b", "idle")]);
     expect(map.get("a")).toBe("running");

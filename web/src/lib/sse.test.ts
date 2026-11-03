@@ -611,6 +611,51 @@ describe("parseEvent — response.compaction.in_progress", () => {
 });
 
 describe("parseEvent — response.elicitation_request", () => {
+  it("carries a validated parent offer through the block and render layers", () => {
+    const event = parseEvent("response.elicitation_request", {
+      elicitation_id: "offered",
+      params: {
+        triage: {
+          offer_id: "offer",
+          root_session_id: "parent",
+          mode: "answer",
+          state: "passed",
+          note: "请确认",
+          recommend: "approve",
+        },
+      },
+    });
+    expect(event).toMatchObject({
+      triage: {
+        offerId: "offer",
+        rootSessionId: "parent",
+        mode: "answer",
+        state: "passed",
+        note: "请确认",
+        recommend: "approve",
+      },
+    });
+    const malformed = parseEvent("response.elicitation_request", {
+      elicitation_id: "offered",
+      params: { triage: { state: "offered" } },
+    });
+    expect(malformed).not.toHaveProperty("triage");
+    expect(
+      parseEvent("response.elicitation_resolved", {
+        elicitation_id: "offered",
+        action: "accept",
+        reason: "Inside the brief",
+        answered_by: { session_id: "parent", title: "Parent review" },
+      }),
+    ).toMatchObject({
+      action: "accept",
+      answeredBy: {
+        sessionId: "parent",
+        title: "Parent review",
+        reason: "Inside the brief",
+      },
+    });
+  });
   it("carries the async-card fields off params", () => {
     // The card kind, context, approval ref, tool/cwd and mirrored-source
     // stamp ride on params extras; the renderer reads them from the event,

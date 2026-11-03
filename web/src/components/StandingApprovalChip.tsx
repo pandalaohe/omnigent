@@ -5,6 +5,9 @@ import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { changeStandingApproval, getStandingApproval } from "@/lib/standingApprovalApi";
 
+const kindLabel = (kind: string) =>
+  kind === "answer-child-approvals" ? "Answer child approvals" : kind;
+
 export function StandingApprovalChip({
   sessionId,
   readOnly = false,
@@ -87,14 +90,14 @@ export function StandingApprovalChip({
             {record.kinds.length === 0 && <p>No active kinds.</p>}
             {record.kinds.map((kind) => (
               <div key={kind} className="flex min-w-0 items-center justify-between gap-2">
-                <span className="min-w-0 break-words">{kind}</span>
+                <span className="min-w-0 break-words">{kindLabel(kind)}</span>
                 {editable && (
                   <Button
                     type="button"
                     size="sm"
                     variant="outline"
                     disabled={change.isPending}
-                    aria-label={`Revoke ${kind}`}
+                    aria-label={`Revoke ${kindLabel(kind)}`}
                     onClick={() => {
                       setError(null);
                       change.mutate({ op: "revoke", kind });
@@ -107,14 +110,16 @@ export function StandingApprovalChip({
             ))}
             {revoked.map((kind) => (
               <div key={kind} className="flex min-w-0 items-center justify-between gap-2">
-                <span className="min-w-0 break-words text-muted-foreground">{kind} (revoked)</span>
+                <span className="min-w-0 break-words text-muted-foreground">
+                  {kindLabel(kind)} (revoked)
+                </span>
                 {editable && (
                   <Button
                     type="button"
                     size="sm"
                     variant="outline"
                     disabled={change.isPending}
-                    aria-label={`Grant back ${kind}`}
+                    aria-label={`Grant back ${kindLabel(kind)}`}
                     onClick={() => {
                       setError(null);
                       change.mutate({ op: "grant", kind });

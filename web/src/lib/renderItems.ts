@@ -22,6 +22,7 @@ import type { TerminalAccessRequest } from "./terminalAccess";
 
 import type {
   AnyBlock,
+  ElicitationBlock,
   ErrorBlock,
   MessageContentBlock,
   NativeToolBlock,
@@ -136,6 +137,7 @@ export type RenderItem =
     }
   | {
       kind: "elicitation";
+      triage?: ElicitationBlock["triage"];
       terminalAccess?: TerminalAccessRequest | null;
       nativeDelivery?: NativePermissionDelivery;
       itemId: string | null;
@@ -149,6 +151,7 @@ export type RenderItem =
       url?: string | null;
       status: "pending" | "responded";
       response: {
+        answeredBy?: NonNullable<ElicitationBlock["response"]>["answeredBy"];
         action: "accept" | "decline" | "cancel" | "auto_resolved";
         reason?: "unanswered" | "timed_out";
         content?: Record<string, unknown>;
@@ -1765,6 +1768,7 @@ function buildAssistantItems(
     if (b.type === "elicitation") {
       items.push({
         kind: "elicitation",
+        triage: b.triage,
         ...(b.nativeDelivery ? { nativeDelivery: b.nativeDelivery } : {}),
         itemId: b.ctx.itemId,
         elicitationId: b.elicitationId,

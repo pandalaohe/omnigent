@@ -88,7 +88,7 @@ vi.mock("@/components/blocks/ApprovalCard", async (importActual) => {
     );
   return {
     ApprovalCard: (props: ComponentProps<typeof actual.ApprovalCard>) =>
-      props.nativeDelivery || props.permissionDirectories ? (
+      props.nativeDelivery || props.permissionDirectories || props.triage ? (
         <actual.ApprovalCard {...props} />
       ) : (
         <StubApprovalCard {...props} onSubmit={props.onSubmit!} />
@@ -265,6 +265,28 @@ describe("InboxPage states", () => {
 });
 
 describe("InboxPage approval items", () => {
+  it("shows the parent's passed note and recommendation in Inbox", async () => {
+    const row = conversation({ id: "child", title: "Child check" });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [
+        rawElicitation("passed", "Run check?", {
+          triage: {
+            offer_id: "offer",
+            root_session_id: "parent",
+            mode: "answer",
+            state: "passed",
+            note: "请确认这一次检查",
+            recommend: "decline",
+          },
+        }),
+      ],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    renderPage();
+    expect(await screen.findByText("请确认这一次检查")).toBeVisible();
+    expect(screen.getByText("Parent recommends: reject")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Approve" })).toBeVisible();
+  });
   it("renders an approval card for a session with a pending prompt", async () => {
     // WHY: a row with a pending count fetches its snapshot, whose parsed
     // elicitation becomes a card; the first card is expanded by default.

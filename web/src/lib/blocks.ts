@@ -17,6 +17,8 @@ import { nativeCodingAgentForAgentName } from "./nativeCodingAgents";
 import type { RoutingDecisionExtras } from "./routingDecision";
 import type {
   AgyPermission,
+  ApprovalTriage,
+  ApprovalAnswerer,
   CodexPersistMode,
   ElicitationSource,
   RememberScope,
@@ -622,6 +624,7 @@ export interface ResponseEndBlock {
  * dictates as the next stream events.
  */
 export interface ElicitationBlock {
+  triage?: ApprovalTriage;
   terminalAccess?: TerminalAccessRequest | null;
   nativeDelivery?: NativePermissionDelivery;
   /** Positive native resolution evidence; snapshot absence alone is insufficient. */
@@ -668,6 +671,7 @@ export interface ElicitationBlock {
    * can show that the session switched to auto-accept-edits mode.
    */
   response: {
+    answeredBy?: ApprovalAnswerer;
     action: "accept" | "decline" | "cancel" | "auto_resolved";
     /**
      * Refines `auto_resolved`: `"unanswered"` means the server cleared

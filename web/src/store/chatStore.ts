@@ -4859,6 +4859,11 @@ function pendingElicitationBlocksFromSnapshot(session: Session): AnyBlock[] {
  */
 async function reconcilePendingElicitations(id: string): Promise<void> {
   if (queryClient === null) return;
+  const cardsBeforeFetch = new Map(
+    (conversationRegistry.peek(id)?.getState().blocks ?? [])
+      .filter((block): block is ElicitationBlock => block.type === "elicitation")
+      .map((block) => [block.elicitationId, block]),
+  );
   const permissionBeforeFetch = useChatStore.getState().codexPermissionReadbacks[id];
   let session: Session;
   try {
@@ -4882,9 +4887,24 @@ async function reconcilePendingElicitations(id: string): Promise<void> {
       .map((e) => (typeof e.elicitation_id === "string" ? e.elicitation_id : null))
       .filter((x): x is string => x !== null),
   );
+  const pendingCards = pendingElicitationBlocksFromSnapshot(session);
   setterFor(id)((s) => {
     let changed = false;
     const blocks = s.blocks.map((b) => {
+      if (b.type === "elicitation" && b.status === "pending") {
+        const incoming = pendingCards.find(
+          (card): card is ElicitationBlock =>
+            card.type === "elicitation" && card.elicitationId === b.elicitationId,
+        );
+        if (
+          incoming &&
+          (b.triage || incoming.triage) &&
+          cardsBeforeFetch.get(b.elicitationId) === b
+        ) {
+          changed = true;
+          return { ...incoming, ctx: b.ctx };
+        }
+      }
       if (
         b.type === "elicitation" &&
         b.status === "pending" &&
@@ -5892,6 +5912,15 @@ function reconcileElicitationBlocks(
       (candidate): candidate is ElicitationBlock =>
         candidate.type === "elicitation" && candidate.elicitationId === b.elicitationId,
     );
+    if (
+      b.status === "pending" &&
+      currentDelivery &&
+      (b.triage || currentDelivery.triage) &&
+      preGapCards.get(b.elicitationId) === b
+    ) {
+      changed = true;
+      return { ...currentDelivery, ctx: b.ctx };
+    }
     if (b.nativeDelivery && preGapCards.get(b.elicitationId) !== b) return b;
     if (
       currentDelivery?.nativeDelivery &&
@@ -7471,6 +7500,10 @@ function revivePendingElicitationBlock(
     if (idx === -1) return {};
     const target = s.blocks[idx] as ElicitationBlock;
     if (target.nativeDeliveryResolved) return {};
+    if (target.status === "pending" && (target.triage || incoming.triage)) {
+      const updated = { ...incoming, ctx: target.ctx };
+      return { blocks: [...s.blocks.slice(0, idx), updated, ...s.blocks.slice(idx + 1)] };
+    }
     if (incoming.nativeDelivery) {
       if (target.status === "responded" && target.response?.action !== "auto_resolved") return {};
       const updated = { ...incoming, ctx: target.ctx };
@@ -7523,7 +7556,7 @@ export async function pumpStreamEvents(
     tapSessionEvents(
       rawEvents,
       id,
-      (elicitationId) => {
+      (resolution) => {
         // A fast native approval can resolve in the few milliseconds between
         // the reducer yielding its card and the next animation-frame flush.
         // `handleSessionEvent` can only update committed blocks, so settle the
@@ -7531,7 +7564,7 @@ export async function pumpStreamEvents(
         const at = buffer.findIndex(
           (block) =>
             block.type === "elicitation" &&
-            block.elicitationId === elicitationId &&
+            block.elicitationId === resolution.elicitationId &&
             block.status === "pending",
         );
         if (at === -1) return;
@@ -7539,7 +7572,11 @@ export async function pumpStreamEvents(
         buffer[at] = {
           ...target,
           status: "responded",
-          response: { action: "auto_resolved" },
+          response: {
+            action: resolution.action ?? "auto_resolved",
+            ...(resolution.reason ? { reason: resolution.reason } : {}),
+            ...(resolution.answeredBy ? { answeredBy: resolution.answeredBy } : {}),
+          },
         };
       },
       () => {
@@ -7709,7 +7746,14 @@ export async function pumpStreamEvents(
           (b) => b.type === "elicitation" && b.elicitationId === eid,
         );
         if (buffered !== -1) {
-          if (block.nativeDelivery) buffer[buffered] = { ...block, ctx: buffer[buffered].ctx };
+          const target = buffer[buffered];
+          if (
+            target.type === "elicitation" &&
+            target.status === "pending" &&
+            (block.nativeDelivery || block.triage || target.triage)
+          ) {
+            buffer[buffered] = { ...block, ctx: target.ctx };
+          }
           continue;
         }
         if (get().blocks.some((b) => b.type === "elicitation" && b.elicitationId === eid)) {
@@ -9694,7 +9738,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
             b.type === "elicitation" &&
             b.elicitationId === event.elicitationId &&
             !b.nativeDeliveryResolved &&
-            (b.status === "pending" || Boolean(b.nativeDelivery)),
+            (b.status === "pending" || Boolean(b.nativeDelivery) || Boolean(event.answeredBy)),
         );
         if (matchIdx === -1) return {};
         const target = s.blocks[matchIdx] as ElicitationBlock;
@@ -9712,6 +9756,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           response: {
             action: event.action ?? "auto_resolved",
             ...(event.reason ? { reason: event.reason } : {}),
+            ...(event.answeredBy ? { answeredBy: event.answeredBy } : {}),
           },
         };
         return {
@@ -9940,7 +9985,7 @@ function applyChildSessionUpdated(
 async function* tapSessionEvents(
   events: AsyncIterable<StreamEvent>,
   conversationId: string,
-  onElicitationResolved?: (elicitationId: string) => void,
+  onElicitationResolved?: (event: Extract<StreamEvent, { type: "elicitation_resolved" }>) => void,
   beforeTurnEdge?: () => void,
 ): AsyncIterable<StreamEvent> {
   for await (const event of events) {
@@ -9955,7 +10000,7 @@ async function* tapSessionEvents(
     }
     handleSessionEvent(event, conversationId);
     if (event.type === "elicitation_resolved") {
-      onElicitationResolved?.(event.elicitationId);
+      onElicitationResolved?.(event);
     }
     pushSseEvent(conversationId, event);
     yield event;

@@ -51,6 +51,7 @@ export function collectInboxItems(sources: InboxSource[]): InboxItem[] {
     for (const raw of pendingElicitations) {
       const evt = parseEvent("response.elicitation_request", raw);
       if (evt === null || evt.type !== "elicitation_request") continue;
+      if (evt.triage?.state === "offered") continue;
       if (seen.has(evt.elicitationId)) continue;
       seen.add(evt.elicitationId);
       items.push({

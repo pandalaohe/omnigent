@@ -84,6 +84,7 @@ import { routingExtrasFromWire } from "./routingDecision";
 import { providerUsageLimitsFromWire } from "./providerUsageLimits";
 import type {
   AgyPermission,
+  ApprovalTriage,
   BackgroundTaskInfo,
   CodexPersistMode,
   ElicitationSource,
@@ -292,6 +293,30 @@ export function* parseEventLines(lines: Iterable<string>): Iterable<StreamEvent>
     const event = parseEvent(parsed.event, parsed.data);
     if (event !== null) yield event;
   }
+}
+
+function parseApprovalTriage(raw: unknown): ApprovalTriage | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const value = raw as Record<string, unknown>;
+  if (
+    typeof value.offer_id !== "string" ||
+    !value.offer_id ||
+    typeof value.root_session_id !== "string" ||
+    !value.root_session_id ||
+    (value.mode !== "answer" && value.mode !== "note_only") ||
+    (value.state !== "offered" && value.state !== "passed" && value.state !== "unanswered")
+  )
+    return undefined;
+  return {
+    offerId: value.offer_id,
+    rootSessionId: value.root_session_id,
+    mode: value.mode,
+    state: value.state,
+    ...(typeof value.note === "string" ? { note: value.note } : {}),
+    ...(value.recommend === "approve" || value.recommend === "decline"
+      ? { recommend: value.recommend }
+      : {}),
+  };
 }
 
 /** Token/cost bucket keys on a `ModelUsage`, mapping wire (snake) to camel. */
@@ -1119,6 +1144,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     const params = data.params;
     if (!params || typeof params !== "object" || Array.isArray(params)) return null;
     const p = params as Record<string, unknown>;
+    const triage = parseApprovalTriage(p.triage);
     const requestedSchema = p.requestedSchema;
     const targetSessionId = p.target_session_id;
     const phase = String(p.phase ?? "");
@@ -1218,6 +1244,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     ];
     return {
       type: "elicitation_request",
+      ...(triage ? { triage } : {}),
       ...(parseTerminalAccess(p) ? { terminalAccess: parseTerminalAccess(p) } : {}),
       ...(p.native_delivery
         ? { nativeDelivery: parseNativePermissionDelivery(p.native_delivery) }
@@ -1279,9 +1306,24 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     if (typeof elicitationId !== "string" || !elicitationId) return null;
     const action = data.action;
     const hasVerdict = action === "accept" || action === "decline" || action === "cancel";
+    const actor = data.answered_by;
+    const answeredBy =
+      hasVerdict &&
+      actor &&
+      typeof actor === "object" &&
+      !Array.isArray(actor) &&
+      typeof (actor as Record<string, unknown>).session_id === "string" &&
+      typeof (actor as Record<string, unknown>).title === "string"
+        ? {
+            sessionId: (actor as Record<string, unknown>).session_id as string,
+            title: (actor as Record<string, unknown>).title as string,
+            reason: typeof data.reason === "string" ? data.reason : "",
+          }
+        : undefined;
     return {
       type: "elicitation_resolved",
       elicitationId,
+      ...(answeredBy ? { answeredBy } : {}),
       // Keep the verdict when present so the card can show it instead
       // of the ambiguous "Resolved elsewhere" pill.
       ...(hasVerdict ? { action } : {}),

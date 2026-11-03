@@ -487,6 +487,7 @@ export function InboxPage() {
         >
           <SessionLine title={title} detail={agentLabel !== title ? agentLabel : undefined} />
           <ApprovalCard
+            triage={item.elicitation.triage}
             elicitationId={elicitationId}
             message={item.elicitation.message}
             phase={item.elicitation.phase}

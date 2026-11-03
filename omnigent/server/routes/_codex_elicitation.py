@@ -667,6 +667,9 @@ def _codex_command_approval_params(
         "codex_method": method,
         "codex_request_id": request_id,
     }
+    # The display string loses argv boundaries; retain the raw list for approval inspection.
+    if isinstance(params.get("command"), list):
+        extras["command_argv"] = params["command"]
     if isinstance(command, str) and command:
         extras["command"] = command
     if isinstance(cwd, str) and cwd:

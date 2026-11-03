@@ -23,6 +23,7 @@ from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.entities import Conversation, ErrorData, NewConversationItem
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.pi_extension_ui import parse_approval_declaration
+from omnigent.policies.builtins._shell import SHELL_TOOLS
 from omnigent.policies.builtins.orchestration import (
     _RM_CRITICAL_DIRS,
     _RM_SYSTEM_PARENTS,
@@ -487,56 +488,116 @@ def _command_is_user_only(command: str) -> bool:
     return False
 
 
-def floor(params: Mapping[str, Any]) -> Literal["clear", "user_only"]:
+def _shell_action(params: Mapping[str, Any]) -> tuple[bool, str | None]:
+    """Read the complete action for each shell producer, never its display preview."""
     approval = _pi_approval(params)
     if approval is not None:
-        command = approval["command"]
-    elif params.get("tool_name") == "Bash":
-        command = params.get("command")
-        if not isinstance(command, str) or not command.strip():
-            return "user_only"
-    else:
+        return True, approval["command"]
+    phase = params.get("phase")
+    if phase == "codex_command_approval":
+        if "command_argv" in params:
+            argv = params["command_argv"]
+            if not isinstance(argv, list) or not argv or not all(isinstance(v, str) for v in argv):
+                return True, None
+            return True, shlex.join(argv)
+        return True, params.get("command")
+    if phase == "agy_permission":
+        return True, params.get("command")
+    tool = params.get("tool_name")
+    if phase == "pre_tool_use":
+        return (True, params.get("command")) if tool == "Bash" else (False, None)
+    if not isinstance(tool, str) or _tool_name(tool) not in SHELL_TOOLS:
+        return False, None
+    if phase == "permission_tier":
+        preview = params.get("content_preview")
+        if not isinstance(preview, str) or len(preview) >= 4096:
+            return True, None
+        try:
+            arguments = json.loads(preview)
+        except ValueError:
+            return True, None
+        return True, arguments.get("command") if isinstance(arguments, dict) else None
+    return True, params.get("command")
+
+
+def _tool_name(tool: str) -> str:
+    return tool.split("__", 2)[-1] if tool.startswith("mcp__") else tool
+
+
+def floor(params: Mapping[str, Any]) -> Literal["clear", "user_only"]:
+    shell, command = _shell_action(params)
+    if not shell:
         return "clear"
+    if not isinstance(command, str) or not command.strip():
+        return "user_only"
     return "user_only" if _command_is_user_only(command) else "clear"
 
 
+_BINARY_SOURCES = frozenset(
+    {
+        ("pre_tool_use", "claude_native_permission"),
+        ("permission_tier", "permission_tier_once"),
+        ("tool_call", "claude_sdk_permission"),
+        ("tool_call", "codex_sdk_permission"),
+    }
+)
+_CODEX_FILE_SOURCES = frozenset(
+    {
+        ("codex_file_change_approval", "codex_native_file_change_approval"),
+        ("codex_apply_patch_approval", "codex_native_apply_patch_approval"),
+    }
+)
+
+
 def classify_card(params: Mapping[str, Any]) -> Literal["answer", "note_only"] | None:
-    """S1 admits only declared Pi selects and Claude's binary permission hooks."""
+    """Offer only known single-use approval protocols with inspectable actions."""
     if params.get("native_delivery") is not None or params.get("requestedSchema"):
         return None
     phase, policy = params.get("phase"), params.get("policy_name")
-    if phase == "pi_extension_ui" and policy == "pi_native_extension_ui":
+    if not isinstance(phase, str) or not isinstance(policy, str):
+        return None
+    source = (phase, policy)
+    tool = params.get("tool_name")
+    if isinstance(tool, str) and tool.removeprefix("mcp__omnigent__") in USER_ONLY_TOOLS:
+        return None
+    if source == ("pi_extension_ui", "pi_native_extension_ui"):
         if _pi_approval(params) is None:
             return None
-        # Preserve Pi's select form for a human handoff; its two labels and
-        # single-use scope were validated against the producer declaration.
-    elif phase == "pre_tool_use" and policy == "claude_native_permission":
-        tool = params.get("tool_name")
+        # Preserve Pi's validated two-option form for a human handoff.
+    elif params.get("ask_user_question"):
+        return None
+    elif source in _BINARY_SOURCES:
         if (
             not isinstance(tool, str)
             or not tool
-            or tool.removeprefix("mcp__omnigent__") in USER_ONLY_TOOLS
+            or (phase != "pre_tool_use" and _tool_name(tool) in USER_ONLY_TOOLS)
         ):
             return None
-        if params.get("ask_user_question"):
+    elif source in _CODEX_FILE_SOURCES:
+        if params.get("grant_root"):
             return None
-    else:
+    elif source not in {
+        ("codex_command_approval", "codex_native_command_approval"),
+        ("agy_permission", "agy_native_permission"),
+    }:
         return None
     return "note_only" if floor(params) == "user_only" else "answer"
 
 
 def card_action(params: Mapping[str, Any]) -> tuple[str, bool]:
-    approval = _pi_approval(params)
+    shell, command = _shell_action(params)
     value = (
-        approval["command"]
-        if approval is not None
-        else params.get("command") or params.get("content_preview") or params.get("tool_name", "")
+        command
+        if shell and isinstance(command, str)
+        else (
+            params.get("command") or params.get("content_preview") or params.get("tool_name", "")
+        )
     )
     text = str(value)
     limit = 16 * 1024
-    preview_only = (
-        approval is None and not params.get("command") and bool(params.get("content_preview"))
-    )
+    preview_only = shell and (not isinstance(command, str) or not command.strip())
+    if not shell:
+        preview_only = not params.get("command") and bool(params.get("content_preview"))
     return text[:limit], len(text) > limit or preview_only
 
 

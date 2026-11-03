@@ -44,6 +44,22 @@ function makeRawElicitation(
 }
 
 describe("collectInboxItems", () => {
+  it("omits an offered card and includes the same card after handoff or deadline", () => {
+    const row = makeRow({ id: "child" });
+    for (const state of ["offered", "passed", "unanswered"]) {
+      const items = collectInboxItems([
+        {
+          row,
+          pendingElicitations: [
+            makeRawElicitation("offer", {
+              triage: { offer_id: "offer", root_session_id: "parent", mode: "answer", state },
+            }),
+          ],
+        },
+      ]);
+      expect(items).toHaveLength(state === "offered" ? 0 : 1);
+    }
+  });
   it("parses raw event dicts into items carrying the owning session's row", () => {
     const row = makeRow({
       id: "conv_a",

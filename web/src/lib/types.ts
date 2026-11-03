@@ -36,6 +36,21 @@ export interface RememberScope {
 /** Persistence scopes advertised by Codex for MCP tool approvals. */
 export type CodexPersistMode = "session" | "always";
 
+export interface ApprovalTriage {
+  offerId: string;
+  rootSessionId: string;
+  mode: "answer" | "note_only";
+  state: "offered" | "passed" | "unanswered";
+  note?: string;
+  recommend?: "approve" | "decline";
+}
+
+export interface ApprovalAnswerer {
+  sessionId: string;
+  title: string;
+  reason: string;
+}
+
 /**
  * System-stamped provenance of a mirrored elicitation card: which
  * session asked, what it is called, and (when resolvable) its agent,

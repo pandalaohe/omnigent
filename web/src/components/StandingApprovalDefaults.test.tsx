@@ -17,6 +17,7 @@ describe("standing approval defaults", () => {
     writeSessionCollabPreferences({ ...readSessionCollabPreferences(), childCap: 3 });
     render(<StandingApprovalDefaults />);
     expect(screen.getByRole("checkbox", { name: "Install" })).not.toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Answer child approvals" })).not.toBeChecked();
     fireEvent.click(screen.getByRole("checkbox", { name: "Install" }));
     expect(readSessionCollabPreferences()).toMatchObject({
       standingPassDefault: ["install"],
@@ -24,6 +25,8 @@ describe("standing approval defaults", () => {
     });
     fireEvent.click(screen.getByRole("checkbox", { name: "Install" }));
     expect(readSessionCollabPreferences().standingPassDefault).toEqual([]);
+    fireEvent.click(screen.getByRole("checkbox", { name: "Answer child approvals" }));
+    expect(readSessionCollabPreferences().standingPassDefault).toEqual(["answer-child-approvals"]);
   });
 
   it("adds and removes custom kinds while preserving built-ins", () => {

@@ -926,6 +926,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
             ? ctx(state, null, `${ELICITATION_RESPONSE_PREFIX}${event.elicitationId}`)
             : ctx(state),
         elicitationId: event.elicitationId,
+        triage: event.triage,
         ...(event.nativeDelivery ? { nativeDelivery: event.nativeDelivery } : {}),
         targetSessionId: event.targetSessionId,
         message: event.message,
