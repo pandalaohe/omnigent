@@ -5191,6 +5191,15 @@ def register_events_routes(
                 require_success=require_init_success,
                 trigger="web_message",
             )
+        # A legacy receiver cannot enforce the final execution fence.
+        if (active_retry_dispatch() is not None or active_final_dispatch() is not None) and (
+            runner_router is None
+            or not conv.runner_id
+            or not runner_router.runner_has_capability(
+                conv.runner_id, "subagent_retry_admission_v1"
+            )
+        ):
+            raise RetryDispatchRefused("runner_admission_unsupported")
         await _ensure_runner_relay_ready(
             session_id,
             conv.runner_id,
@@ -5319,15 +5328,6 @@ def register_events_routes(
                 raise OmnigentError(
                     "Invalid question reply comments.", code=ErrorCode.INVALID_INPUT
                 )
-        # A legacy receiver cannot enforce the final execution fence.
-        if (active_retry_dispatch() is not None or active_final_dispatch() is not None) and (
-            runner_router is None
-            or not conv.runner_id
-            or not runner_router.runner_has_capability(
-                conv.runner_id, "subagent_retry_admission_v1"
-            )
-        ):
-            raise RetryDispatchRefused("runner_admission_unsupported")
         dispatch = await _dispatch_session_event_to_runner(
             session_id,
             conv,

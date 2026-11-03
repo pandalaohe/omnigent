@@ -71,12 +71,17 @@ async def test_final_wake_refuses_legacy_receiver_before_dispatch(client, app, m
         transport=httpx.MockTransport(receiver), base_url="http://legacy-runner"
     ) as runner:
         monkeypatch.setattr(sessions, "_get_runner_client", AsyncMock(return_value=runner))
+        relay_ready = AsyncMock(
+            side_effect=AssertionError("legacy receiver reached stream relay before admission")
+        )
+        monkeypatch.setattr(sessions, "_ensure_runner_relay_ready", relay_ready)
         response = await client.post(
             f"/v1/sessions/{parent}/retry-chains/{chain.chain_id}/wake",
             json={"owner": owner.model_dump()},
         )
     assert response.status_code == 200, response.text
-    assert response.json()["reason"]["code"] == "runner_admission_unsupported"
+    assert response.json()["reason"]["code"] == "runner_admission_unsupported", response.text
+    relay_ready.assert_not_awaited()
     assert not forwarded and service.journal.get_final(chain.chain_id).wake_receipt is None
     assert service.journal.get_input(final.notice_id).state == "dispatching"
 
