@@ -1,9 +1,8 @@
-"""A policy added mid-session reaches native Claude hooks once the allow window ends.
+"""A policy added mid-session reaches native Claude hooks immediately.
 
-Runs this checkout's server with a 60 s native hook allow window and the
-PreToolUse command a Claude-native session installs. The command's shell check
-reads the clock with ``date``, so a ``date`` shim on PATH stands in for
-waiting out the window.
+Runs this checkout's server with a 60 s native hook allow window configured.
+Mandatory tier, restriction and grant checks must still keep every call on the
+server, so that configuration creates no reusable no-policy ALLOW window.
 
 Run without credentials::
 
@@ -15,7 +14,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import time
 from pathlib import Path
 
 import httpx
@@ -57,10 +55,10 @@ def _run_policy_hook(command: str, *, path: str) -> str:
     return result.stdout
 
 
-def test_policy_added_mid_session_applies_once_allow_window_ends(
+def test_policy_added_mid_session_applies_without_allow_window(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The window delays a new policy by at most 60 s; after that the server enforces it."""
+    """Mandatory checks bypass the configured window, so a new policy applies at once."""
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     config = tmp_path / "server.yaml"
@@ -81,10 +79,9 @@ def test_policy_added_mid_session_applies_once_allow_window_ends(
         command = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
         path = os.environ["PATH"]
 
-        # No policies yet: the server allows the call and opens a ~60 s window.
+        # No policies yet: the server allows the call with only the inert expiry marker.
         assert _run_policy_hook(command, path=path) == ""
-        expiry = int((bridge_dir / "policy_allow_until").read_text().split()[0])
-        assert 50 < expiry - time.time() <= 60
+        assert int((bridge_dir / "policy_allow_until").read_text().split()[0]) == 0
 
         # A policy added from outside the agent (web UI or API) denies every tool call.
         added = client.post(
@@ -98,15 +95,8 @@ def test_policy_added_mid_session_applies_once_allow_window_ends(
         )
         added.raise_for_status()
 
-        # Inside the window the hook still answers in the shell.
-        assert _run_policy_hook(command, path=path) == ""
-
-        # One second after the window: the hook asks the server, which denies.
-        clock = tmp_path / "clock"
-        clock.mkdir()
-        (clock / "date").write_text(f"#!/bin/sh\necho {expiry + 1}\n", encoding="utf-8")
-        (clock / "date").chmod(0o755)
-        denied = json.loads(_run_policy_hook(command, path=f"{clock}{os.pathsep}{path}"))
+        # With no reusable window, the very next hook asks the server and denies.
+        denied = json.loads(_run_policy_hook(command, path=path))
         assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"
         assert "Exceeded 0 tool calls" in denied["hookSpecificOutput"]["permissionDecisionReason"]
 

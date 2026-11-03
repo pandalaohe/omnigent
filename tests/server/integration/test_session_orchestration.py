@@ -14,6 +14,7 @@ from omnigent.stores.conversation_store import (
     CREATED_BY_SESSION_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
+    SUCCEEDED_BY_LABEL_KEY,
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
@@ -60,6 +61,8 @@ def orchestration_environment(monkeypatch, request):
     features = getattr(request, "param", None)
     if features is None:
         monkeypatch.setenv("OMNIGENT_FEATURES", "session_peer_messaging")
+    elif features == "-session_peer_messaging":
+        monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
     else:
         monkeypatch.setenv("OMNIGENT_FEATURES", f"{features},session_peer_messaging")
     return features
@@ -346,23 +349,51 @@ async def test_refusal_before_delivery(condition, auth_client, auth_app, peers, 
     assert not captured.get("posts")
 
 
+@pytest.mark.parametrize("superseded", [False, True])
+@pytest.mark.parametrize(
+    "orchestration_environment", [None, "-session_peer_messaging"], indirect=True
+)
 async def test_sharing_during_receiver_startup_blocks_delivery(
-    auth_client, peers, db_uri, monkeypatch
+    auth_client, peers, db_uri, monkeypatch, superseded
 ):
     from omnigent.server.routes import sessions
 
     source, target, captured = peers
     permissions = SqlAlchemyPermissionStore(db_uri)
     permissions.ensure_user("bob")
+    conversations = SqlAlchemyConversationStore(db_uri)
+    receiver_id = target["id"]
+    if superseded:
+        # A receiver whose succession link is still open forwards the message
+        # to its successor; the forward must re-run the same source checks.
+        successor = await _create_session_as(auth_client, "", "alice")
+        _bind_runner(db_uri, successor["id"])
+        receiver_id = successor["id"]
+        conversations.set_labels(target["id"], {SUCCEEDED_BY_LABEL_KEY: receiver_id})
+        # The durable path gates on the receiver's routing row, which the peer
+        # fixture only stamps for its own pair; without it the successor reads
+        # offline and the sharing hook is never reached.
+        conversations.touch_runner_liveness(
+            [conversations.get_conversation(receiver_id).runner_id], int(time.time())
+        )
+
+    relay_calls = 0
 
     async def share_while_starting(*args, **kwargs):
+        nonlocal relay_calls
+        relay_calls += 1
         permissions.grant("bob", source["id"], LEVEL_READ)
 
     monkeypatch.setattr(sessions, "_ensure_runner_relay_ready", share_while_starting)
     result = await _send(auth_client, source, target)
-    assert "error" in result, result
+    assert relay_calls == 1, result
+    # The relay hook runs after the admission check; the recheck behind it
+    # refuses the now-shared sender. The inline path answers with that error and
+    # the durable path records it on the peer record; neither may deliver.
+    assert "Shared sessions cannot" in json.dumps(result), result
+    assert result.get("disposition") != "delivered", result
     assert not any("/events" in path for path, _ in captured.get("posts", []))
-    items = await auth_client.get(f"/v1/sessions/{target['id']}/items")
+    items = await auth_client.get(f"/v1/sessions/{receiver_id}/items")
     assert "Please inspect" not in items.text
 
 

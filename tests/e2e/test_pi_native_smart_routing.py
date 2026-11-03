@@ -43,6 +43,7 @@ from tests._helpers.live_server import isolated_process_env
 from tests.e2e._harness_probes import cli_unavailable_reason
 from tests.e2e.conftest import configure_mock_llm, get_mock_requests
 from tests.e2e.omnigent._pexpect_harness import strip_ansi
+from tests.server.helpers import PERMISSION_TIERS_HEADERS
 
 pexpect = pytest.importorskip("pexpect")
 
@@ -165,17 +166,24 @@ def _launch_pi(env: dict[str, str]) -> tuple[Any, str, str]:
     transcript.parent.mkdir(parents=True, exist_ok=True)
     child.logfile_read = transcript.open("w")
     try:
-        child.expect(r"Web UI:\s*(\S+)", timeout=_LAUNCH_TIMEOUT)
+        child.expect(
+            r"(?:Web UI|Omnigent):[ \t]*(https?://[^\s\x1b]+/c/[0-9a-f]{32})",
+            timeout=_LAUNCH_TIMEOUT,
+        )
+        startup_output = strip_ansi(child.before or "")
         web_url = child.match.group(1)
         match = re.match(r"(https?://[^/]+)/c/(\S+)", web_url)
         assert match, f"could not parse Web UI url: {web_url!r}"
+        # The persistent footer can follow the first model render.
+        if _DEFAULT_MODEL not in startup_output:
+            child.expect(_DEFAULT_MODEL, timeout=_LAUNCH_TIMEOUT)
         return child, match.group(1), match.group(2)
     except pexpect.TIMEOUT as exc:
         child.logfile_read.flush()
         output = child.before or ""
         _teardown(child, env)
         raise AssertionError(
-            f"omnigent pi printed no Web UI line within {_LAUNCH_TIMEOUT}s "
+            f"omnigent pi did not publish its session link/model within {_LAUNCH_TIMEOUT}s "
             f"('Web UI' in the raw output: {'Web UI' in output}); transcript: {transcript}\n"
             f"{strip_ansi(output)[:2000]}\n...\n{strip_ansi(output)[-1000:]}"
         ) from exc
@@ -187,7 +195,9 @@ def _launch_pi(env: dict[str, str]) -> tuple[Any, str, str]:
 def _find_pi_pane(server: str, conv: str) -> tuple[str, str]:
     """Use only the terminal registered to this test's session."""
     response = httpx.get(
-        f"{server}/v1/sessions/{conv}/resources/terminals/terminal_pi_main", timeout=10
+        f"{server}/v1/sessions/{conv}/resources/terminals/terminal_pi_main",
+        timeout=10,
+        headers=PERMISSION_TIERS_HEADERS,
     )
     response.raise_for_status()
     metadata = response.json()["metadata"]
@@ -206,7 +216,7 @@ def _tmux_type(pane: tuple[str, str], text: str) -> None:
 
 
 def _snapshot(server: str, conv: str) -> dict[str, Any]:
-    resp = httpx.get(f"{server}/v1/sessions/{conv}", timeout=30)
+    resp = httpx.get(f"{server}/v1/sessions/{conv}", timeout=30, headers=PERMISSION_TIERS_HEADERS)
     resp.raise_for_status()
     return resp.json()
 
@@ -239,11 +249,17 @@ def _judge_call_count(mock: str) -> int:
 
 def _enable_smart_routing(server: str, conv: str) -> None:
     httpx.patch(
-        f"{server}/v1/sessions/{conv}", json={"cost_control_mode_override": "on"}, timeout=30
+        f"{server}/v1/sessions/{conv}",
+        json={"cost_control_mode_override": "on"},
+        timeout=30,
+        headers=PERMISSION_TIERS_HEADERS,
     ).raise_for_status()
     if _snapshot(server, conv).get("model_override"):
         httpx.patch(
-            f"{server}/v1/sessions/{conv}", json={"model_override": None}, timeout=30
+            f"{server}/v1/sessions/{conv}",
+            json={"model_override": None},
+            timeout=30,
+            headers=PERMISSION_TIERS_HEADERS,
         ).raise_for_status()
 
 
@@ -299,7 +315,9 @@ def _await_answer(child: Any, server: str, conv: str, marker: str) -> list[dict[
             raise AssertionError(
                 f"Pi CLI exited before {marker}; last mirrored items: {items[-8:]}"
             ) from exc
-        response = httpx.get(f"{server}/v1/sessions/{conv}/items", timeout=10)
+        response = httpx.get(
+            f"{server}/v1/sessions/{conv}/items", timeout=10, headers=PERMISSION_TIERS_HEADERS
+        )
         response.raise_for_status()
         items = response.json().get("data", [])
         if any(item.get("role") == "assistant" and marker in json.dumps(item) for item in items):
@@ -323,7 +341,6 @@ def test_pi_native_smart_routing_applies_pick(pi_home: Path, mock_llm: str, surf
     env = _env(pi_home)
     child, server, conv = _launch_pi(env)
     try:
-        child.expect(_DEFAULT_MODEL, timeout=_LAUNCH_TIMEOUT)
         _enable_smart_routing(server, conv)
         _configure_judge_from_options(mock_llm, server, conv)
         pane = _find_pi_pane(server, conv) if surface == "tui" else None
@@ -342,6 +359,7 @@ def test_pi_native_smart_routing_applies_pick(pi_home: Path, mock_llm: str, surf
                         },
                     },
                     timeout=30,
+                    headers=PERMISSION_TIERS_HEADERS,
                 )
                 assert response.status_code in (200, 202), response.text
 

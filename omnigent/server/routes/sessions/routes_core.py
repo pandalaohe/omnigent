@@ -2165,8 +2165,6 @@ def register_core_routes(
                 permission_store,
                 prefs,
             )
-            if not request.app.state.feature_flags.enabled(Feature.SESSION_PEER_MESSAGING):
-                raise OmnigentError("Peer messaging is disabled", code=ErrorCode.FORBIDDEN)
             refusal_text = await asyncio.to_thread(admit_open, request.app.state, owner)
             if refusal_text is not None:
                 raise HTTPException(status_code=429, detail=refusal_text)
@@ -2432,15 +2430,18 @@ def register_core_routes(
                     raise OmnigentError(
                         "The first task must be text", code=ErrorCode.INVALID_INPUT
                     )
-                orchestration_message(source.id, content[0].get("text"))
-                orchestrated_first_message = content[0]["text"]
-                if peer_send is None:
-                    raise OmnigentError(
-                        "Peer messaging is not configured", code=ErrorCode.INTERNAL_ERROR
-                    )
-                # A durable peer record owns the first task, so startup cannot
-                # also inject it as an ordinary user input.
-                body.initial_input = None
+                ordinary_message = orchestration_message(source.id, content[0].get("text"))
+                if request.app.state.feature_flags.enabled(Feature.SESSION_PEER_MESSAGING):
+                    orchestrated_first_message = content[0]["text"]
+                    if peer_send is None:
+                        raise OmnigentError(
+                            "Peer messaging is not configured", code=ErrorCode.INTERNAL_ERROR
+                        )
+                    # A durable peer record owns the first task, so startup cannot
+                    # also inject it as an ordinary user input.
+                    body.initial_input = None
+                else:
+                    body.initial_input = ordinary_message
             if body.host_type == "external":
                 placement = await asyncio.to_thread(
                     routing_host_session, source, conversation_store

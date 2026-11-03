@@ -1956,7 +1956,8 @@ def register_events_routes(
                 request.app.state, "subagent_retry_admission", None
             ) is not None:
                 body.data["_input_admission_required"] = True
-        if body.type == "session_message":
+        peer_message = body.type == "session_message"
+        if peer_message:
             if not isinstance(request, Request):
                 raise OmnigentError(
                     "Session messages require a runner HTTP request", code=ErrorCode.FORBIDDEN
@@ -1969,39 +1970,47 @@ def register_events_routes(
                 permission_store,
                 target_id=session_id,
             )
-            from omnigent.server.session_orchestration import (
-                orchestration_message,
-                orchestration_peer_acknowledgement,
-            )
-            from omnigent.server.user_preferences_store import read_collab_settings
+            from omnigent.server.session_orchestration import orchestration_message
 
             message = body.data.get("message")
-            orchestration_message(source.id, message)
+            ordinary_message = orchestration_message(source.id, message)
             assert isinstance(message, str)
-            # Re-address before durable admission: retrying after a peer record
-            # exists would collide with its duplicate and delivery fences.
-            if await _get_runner_client(session_id, runner_router) is None:
-                await _raise_if_runner_on_another_replica(
-                    conv, request.app.state, conversation_store
+            flags = feature_flags if feature_flags is not None else resolve_feature_flags()
+            if flags.enabled(Feature.SESSION_PEER_MESSAGING):
+                from omnigent.server.session_orchestration import (
+                    orchestration_peer_acknowledgement,
                 )
-            settings = await asyncio.to_thread(
-                read_collab_settings,
-                getattr(request.app.state, "user_preferences_store", None),
-                user_id,
-            )
-            result = await peer.send(
-                sender=source,
-                receiver_id=session_id,
-                text=message,
-                correlation_id=None,
-                wait_seconds=settings.undelivered_ttl_s,
-                require_init_success=require_init_success,
-                request=request,
-            )
-            return cast(dict[str, bool | str | None], orchestration_peer_acknowledgement(result))
+                from omnigent.server.user_preferences_store import read_collab_settings
+
+                # Re-address before durable admission: retrying after a peer record
+                # exists would collide with its duplicate and delivery fences.
+                if await _get_runner_client(session_id, runner_router) is None:
+                    await _raise_if_runner_on_another_replica(
+                        conv, request.app.state, conversation_store
+                    )
+                settings = await asyncio.to_thread(
+                    read_collab_settings,
+                    getattr(request.app.state, "user_preferences_store", None),
+                    user_id,
+                )
+                result = await peer.send(
+                    sender=source,
+                    receiver_id=session_id,
+                    text=message,
+                    correlation_id=None,
+                    wait_seconds=settings.undelivered_ttl_s,
+                    require_init_success=require_init_success,
+                    request=request,
+                )
+                return cast(
+                    dict[str, bool | str | None], orchestration_peer_acknowledgement(result)
+                )
+            body = ordinary_message
         # Inline peer delivery re-enters here with an ordinary message. Keep
         # upstream's source checks around runner startup and before persistence.
-        peer_message = trusted_peer and ORCHESTRATION_SOURCE_HEADER in request.headers
+        peer_message = peer_message or (
+            trusted_peer and ORCHESTRATION_SOURCE_HEADER in request.headers
+        )
         if peer_message:
             await asyncio.to_thread(
                 require_orchestration_source,
@@ -2070,6 +2079,13 @@ def register_events_routes(
                     )
                 await _authorized_conversation(request, target_id, acting_user_id=acting_user_id)
                 redirected = await _redirected_message(body, session_id, target_id)
+                # Carry an orchestration message's provenance to the successor:
+                # the conversion above replaced the ``session_message`` that
+                # marked it, so the forwarding call would skip the source
+                # rechecks this pass already ran against the old id. Only a body
+                # that passed ``require_orchestration_source`` sets it, and that
+                # body carries no peer-delivery metadata, so nothing else is
+                # trusted here.
                 ack = await _post_event_impl(
                     request,
                     target_id,
@@ -2077,7 +2093,7 @@ def register_events_routes(
                     in_flight=in_flight,
                     acting_user_id=acting_user_id,
                     require_init_success=require_init_success,
-                    trusted_peer=trusted_peer,
+                    trusted_peer=trusted_peer or peer_message,
                 )
                 return {**ack, "redirected_to": ack.get("redirected_to") or target_id}
         if body.type == "message" and _is_native_terminal_session(conv):

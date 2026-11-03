@@ -17,6 +17,7 @@ from tests.e2e._harness_probes import cli_unavailable_reason
 from tests.e2e.conftest import get_mock_requests
 from tests.e2e.omnigent._pi_mock_gateway import write_pi_gateway_config, write_pi_resource_bundle
 from tests.e2e.omnigent.conftest import configure_mock_llm, reset_mock_llm
+from tests.server.helpers import PERMISSION_TIERS_HEADERS
 
 _EXT_MARKER = "OMNI_PI_BUNDLE_EXT_ACTIVE"
 _AGENTSMD_MARKER = "OMNI_PI_BUNDLE_AGENTSMD_MARKER"
@@ -138,7 +139,9 @@ def test_pi_bundle_extensions_reach_session_cwd(
         server_cwd=omnigent_repo_root,
     ) as stack:
         stack.start_runner(env=env, cwd=omnigent_repo_root)
-        with httpx.Client(base_url=stack.base_url, timeout=30) as client:
+        with httpx.Client(
+            base_url=stack.base_url, timeout=30, headers=PERMISSION_TIERS_HEADERS
+        ) as client:
             session_id = _create_session(client, bundle, stack.runner_id)
             snapshot = _drive_turn_to_terminal(
                 client, session_id, "Introduce yourself in one sentence."
