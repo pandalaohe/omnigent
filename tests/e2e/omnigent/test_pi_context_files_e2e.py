@@ -121,8 +121,9 @@ def test_pi_run_prompt_settings(
     skill = pi_home / "skills" / "hidden" / "SKILL.md"
     skill.parent.mkdir(parents=True)
     skill.write_text("---\nname: hidden\ndescription: UNREQUESTED_SKILL_72DB\n---\nProbe.")
-    for name in ("AGENTS.md", "SYSTEM.md", "APPEND_SYSTEM.md"):
-        (pi_home / name).write_text("UNREQUESTED_GLOBAL_CONTEXT_72DB")
+    (pi_home / "AGENTS.md").write_text("GLOBAL_CONTEXT_5B8E")
+    (pi_home / "SYSTEM.md").write_text("GLOBAL_SYSTEM_72DB")
+    (pi_home / "APPEND_SYSTEM.md").write_text("UNREQUESTED_GLOBAL_APPEND_72DB")
     env = {
         **mock_credentials_env,
         "OMNIGENT_CONFIG_HOME": str(config_home),
@@ -159,14 +160,15 @@ def test_pi_run_prompt_settings(
             if message["role"] in ("system", "developer")
         )
         assert "UNREQUESTED_SKILL_72DB" not in system
-        assert "UNREQUESTED_GLOBAL_CONTEXT_72DB" not in system
+        assert "UNREQUESTED_GLOBAL_APPEND_72DB" not in system
+        assert ("GLOBAL_CONTEXT_5B8E" in system) is (enabled is not False)
+        assert ("GLOBAL_SYSTEM_72DB" in system) is (mode != "replace" and not custom_base)
         assert "AUTHORED_PROMPT_42D9" in system
         assert EMBEDDED_BROWSER_PRIORITY_INSTRUCTION in system
         assert ("ANCESTOR_CONTEXT_73D2" in system) is (enabled is not False)
         assert ("WORKSPACE_CONTEXT_94C1" in system) is (enabled is not False)
-        assert ("You are an expert coding assistant operating inside pi" in system) is (
-            mode != "replace" and not custom_base
-        )
+        # A preserved user or project SYSTEM.md supersedes Pi's built-in base.
+        assert "You are an expert coding assistant operating inside pi" not in system
         assert ("AMBIENT_BASE_82A6" in system) is (custom_base and mode != "replace")
         assert "AMBIENT_APPEND_31F7" not in system
         tools = {tool["function"]["name"]: tool["function"] for tool in request["tools"]}
