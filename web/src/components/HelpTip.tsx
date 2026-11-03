@@ -15,10 +15,12 @@ export function HelpTip({
   label,
   children,
   className,
+  icon,
 }: {
   label: string;
   children: ReactNode;
   className?: string;
+  icon?: ReactNode;
 }) {
   const { open, setOpen, triggerHandlers, contentHandlers } = useHoverPinFloat();
 
@@ -34,7 +36,7 @@ export function HelpTip({
           )}
           {...triggerHandlers}
         >
-          <CircleHelpIcon className="size-3.5" />
+          {icon ?? <CircleHelpIcon className="size-3.5" />}
         </button>
       </PopoverTrigger>
       <PopoverContent

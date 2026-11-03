@@ -9597,6 +9597,48 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             return session.execute(select(func.count()).select_from(rows)).scalar_one()
 
+    def agent_ids_with_sessions(self, template_label_key: str) -> set[str]:
+        """Distinct bound agent ids plus template labels, from the label table."""
+        with self._conv_session("list_agents_with_sessions") as session:
+            agent_ids = session.scalars(
+                select(SqlConversation.agent_id)
+                .where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.agent_id.is_not(None),
+                )
+                .distinct()
+            ).all()
+            template_ids = session.scalars(
+                select(SqlConversationLabel.value)
+                .where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.key == template_label_key,
+                )
+                .distinct()
+            ).all()
+        return {value for value in (*agent_ids, *template_ids) if value}
+
+    def agent_template_labels_with_sessions(self, template_label_key: str) -> dict[str, str]:
+        """Bound agent ids to template labels, from the conversation label index."""
+        with self._conv_session("list_agent_template_labels") as session:
+            rows = session.execute(
+                select(SqlConversation.agent_id, SqlConversationLabel.value)
+                .join(
+                    SqlConversationLabel,
+                    and_(
+                        SqlConversationLabel.workspace_id == SqlConversation.workspace_id,
+                        SqlConversationLabel.conversation_id == SqlConversation.id,
+                    ),
+                )
+                .where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.key == template_label_key,
+                    SqlConversation.agent_id.is_not(None),
+                )
+                .distinct()
+            ).all()
+        return {agent_id: label for agent_id, label in rows if agent_id and label}
+
     def has_other_live_session_in_workspace(
         self,
         *,
