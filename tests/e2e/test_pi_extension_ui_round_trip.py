@@ -28,6 +28,7 @@ from tests._helpers.session import (
 )
 from tests.e2e._harness_probes import skip_if_harness_cli_missing
 from tests.e2e.conftest import configure_mock_llm, get_mock_requests
+from tests.server.helpers import PERMISSION_TIERS_HEADERS
 
 _REPO = Path(__file__).resolve().parents[2]
 _MODEL = "claude-sonnet-4-5"
@@ -77,7 +78,7 @@ def test_real_pi_dialog_answers_and_continues(
             base_url=stack.base_url,
             timeout=30,
             trust_env=False,
-            headers={"x-omnigent-background-session-titles": "off"},
+            headers={**PERMISSION_TIERS_HEADERS, "x-omnigent-background-session-titles": "off"},
         ) as client,
     ):
         result = tmp_path / "answers.json"
