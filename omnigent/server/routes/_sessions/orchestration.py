@@ -3518,6 +3518,13 @@ def _persist_native_cumulative_usage(
     # replayed or rebased report below it bills nothing, and the count coming
     # back up is not charged a second time.
     billed_tokens = _parse_token_buckets(current.get("native_billed_tokens"))
+    if not billed_tokens:
+        # A session persisted before this build has counters and a cost but no
+        # mark. Seed it from those counters, so upgrading neither bills the
+        # history again nor charges it once a price appears. A brand-new
+        # session's counters are zero, so it still records its first report in
+        # full.
+        billed_tokens = dict(old_tokens)
     # Whether this session already carries usage from before this build: the
     # first report of such a session adopts its totals instead of backfilling
     # history into the current hour.

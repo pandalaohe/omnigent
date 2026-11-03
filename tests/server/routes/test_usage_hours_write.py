@@ -606,3 +606,51 @@ def test_upgraded_session_does_not_backfill_historical_tokens(
         row for row in hours.read(_OWNER, _this_hour(), _this_hour() + 3600) if row.total_tokens
     ]
     assert [row.input_tokens for row in token_rows] == [100_000]
+
+
+def test_missing_billing_mark_is_seeded_from_persisted_usage(
+    db_uri: str, hours: UsageHoursStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session persisted before the mark existed is not billed from zero.
+
+    The previous build wrote the counters and the cost but no billing mark, so
+    seeding it from those counters is what keeps an upgrade from charging the
+    whole history again: 1M persisted plus a 1.1M report at $1/M is $1.10, not
+    $2.10, and the daily rollup receives the $0.10 growth only.
+    """
+    _patch_price(monkeypatch, _price(1.0))
+    conv_id = _session(db_uri)
+    store = SqlAlchemyConversationStore(db_uri)
+    store.increment_session_usage(
+        conv_id,
+        {"input_tokens": 1_000_000, "total_tokens": 1_000_000, "total_cost_usd": 1.0},
+    )
+
+    _persist_native_cumulative_usage(
+        conv_id, {"cumulative_input_tokens": 1_100_000, "model": "m"}, store
+    )
+
+    assert _usage(store, conv_id)["total_cost_usd"] == pytest.approx(1.1)
+    assert store.get_daily_cost(_OWNER, _today()) == pytest.approx(0.1)
+    [row] = hours.read(_OWNER, _this_hour(), _this_hour() + 3600)
+    assert (row.input_tokens, row.cost_usd) == (100_000, pytest.approx(0.1))
+
+
+def test_missing_billing_mark_does_not_charge_unpriced_history(
+    db_uri: str, hours: UsageHoursStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unpriced history stays unpriced when a price appears for new tokens."""
+    _patch_price(monkeypatch, _price(1.0))
+    conv_id = _session(db_uri)
+    store = SqlAlchemyConversationStore(db_uri)
+    # Unpriced usage the previous build recorded: counters only, no cost key.
+    store.increment_session_usage(conv_id, {"input_tokens": 1_000_000, "total_tokens": 1_000_000})
+
+    _persist_native_cumulative_usage(
+        conv_id, {"cumulative_input_tokens": 1_100_000, "model": "m"}, store
+    )
+
+    assert _usage(store, conv_id)["total_cost_usd"] == pytest.approx(0.1)
+    assert store.get_daily_cost(_OWNER, _today()) == pytest.approx(0.1)
+    [row] = hours.read(_OWNER, _this_hour(), _this_hour() + 3600)
+    assert (row.input_tokens, row.cost_usd) == (100_000, pytest.approx(0.1))
