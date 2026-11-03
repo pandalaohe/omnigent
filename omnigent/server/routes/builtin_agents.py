@@ -554,11 +554,17 @@ def create_builtin_agents_router(
         agent_ids = await asyncio.to_thread(
             conversation_store.agent_ids_with_sessions, AGENT_TEMPLATE_ID_LABEL
         )
+        label_templates = await asyncio.to_thread(
+            conversation_store.agent_template_labels_with_sessions, AGENT_TEMPLATE_ID_LABEL
+        )
         mappable = [agent_id for agent_id in agent_ids if _AGENT_ID_PATTERN.fullmatch(agent_id)]
-        templates: dict[str, str] = {}
+        server_templates: dict[str, str] = {}
         if mappable:
-            templates = await asyncio.to_thread(agent_store.get_template_ids, sorted(mappable))
-            agent_ids = {templates.get(agent_id, agent_id) for agent_id in agent_ids}
+            server_templates = await asyncio.to_thread(
+                agent_store.get_template_ids, sorted(mappable)
+            )
+            agent_ids = {server_templates.get(agent_id, agent_id) for agent_id in agent_ids}
+        templates = {**label_templates, **server_templates}
         return {
             "agent_ids": sorted(agent_ids),
             "template_by_agent_id": dict(sorted(templates.items())),

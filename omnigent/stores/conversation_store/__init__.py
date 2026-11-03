@@ -3112,6 +3112,22 @@ class ConversationStore(ABC):
                 return ids
             after = page.last_id
 
+    def agent_template_labels_with_sessions(self, template_label_key: str) -> dict[str, str]:
+        """Map bound agent ids to their session's template label, archived included."""
+        labels: dict[str, str] = {}
+        after: str | None = None
+        while True:
+            page = self.list_conversations(
+                limit=1000, after=after, kind=None, include_archived=True
+            )
+            for conversation in page.data:
+                label = (conversation.labels or {}).get(template_label_key)
+                if conversation.agent_id and label:
+                    labels[conversation.agent_id] = label
+            if not page.has_more or page.last_id is None:
+                return labels
+            after = page.last_id
+
     @abstractmethod
     def has_other_live_session_in_workspace(
         self,

@@ -748,12 +748,17 @@ export function dropKeepWarmCellEquals(
   let next = { ...record };
   for (const field of fields) {
     if (next[field] === undefined) continue;
-    const own = options.normalize ? options.normalize(row, field, next[field]) : next[field];
     const candidate = { ...next };
     Reflect.deleteProperty(candidate, field);
     const without = setKeepWarmLayer(layers, at, candidate);
     const store = keepWarmLayeredStore(without, { row, ...identity });
-    if (Object.is(own, resolveField(store, row, host, field, options).value)) next = candidate;
+    const unchanged = fields.every((chosen) => {
+      const expected = record[chosen];
+      if (expected === undefined) return true;
+      const own = options.normalize ? options.normalize(row, chosen, expected) : expected;
+      return Object.is(own, resolveField(store, row, host, chosen, options).value);
+    });
+    if (unchanged) next = candidate;
   }
   return next;
 }

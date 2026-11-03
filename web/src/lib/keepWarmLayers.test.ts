@@ -160,6 +160,34 @@ describe("runtime identity lookup", () => {
       resolveKeepWarmRow(next, "custom-agent", "desktop", "codex", { harness: "codex" }).main,
     ).toBe(value);
   });
+
+  it.each([true, false])("rechecks every chosen field before another removal: %s", (value) => {
+    const layers: KeepWarmLayers = {
+      corner: { main: value, child: value },
+      hosts: {},
+      agents: {},
+      cells: { desktop: { "harness:codex": { main: !value, child: value } } },
+      hostWins: {},
+    };
+    const record = dropKeepWarmCellEquals(
+      { main: value, child: value },
+      layers,
+      "custom-agent",
+      "desktop",
+      "codex",
+      { harness: "codex" },
+    );
+    expect(record).toEqual({ child: value });
+    const next = setKeepWarmLayer(
+      layers,
+      { level: "cell", row: "custom-agent", col: "desktop" },
+      record,
+    );
+    const resolved = resolveKeepWarmRow(next, "custom-agent", "desktop", "codex", {
+      harness: "codex",
+    });
+    expect(resolved).toMatchObject({ main: value, child: value });
+  });
 });
 
 describe("keep-warm layer editing", () => {

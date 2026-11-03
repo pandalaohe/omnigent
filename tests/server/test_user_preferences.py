@@ -3173,6 +3173,7 @@ async def test_agents_with_sessions_route_lists_conversation_agents(
         response = await client.get("/v1/agents/with-sessions", headers={"x-test-user": owner})
     assert response.status_code == 200, response.text
     assert set(response.json()["agent_ids"]) == {"a" * 32, "b" * 32, "ca_library"}
+    assert response.json()["template_by_agent_id"] == {"b" * 32: "ca_library"}
 
 
 @pytest.mark.asyncio
