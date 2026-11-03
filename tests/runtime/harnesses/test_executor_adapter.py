@@ -3000,6 +3000,39 @@ def test_claude_sdk_question_card_keeps_full_questions() -> None:
     assert params.model_dump()["ask_user_question"] == payload
 
 
+@pytest.mark.parametrize("label", ["Claude", "Codex"])
+def test_sdk_permission_card_carries_complete_shell_action(label) -> None:
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.child_approvals import classify_card
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor(), harness_label=label)
+    command = "echo " + "x" * 400 + "; rm -rf /etc"
+    params = adapter._permission_card("mcp__omnigent__sys_os_shell", {"command": command})
+    data = params.model_dump()
+    assert data["tool_name"] == "mcp__omnigent__sys_os_shell"
+    assert data["command"] == command
+    assert classify_card(data) == "note_only"
+    assert (
+        classify_card(adapter._permission_card("Read", {"path": "src/app.py"}).model_dump())
+        == "answer"
+    )
+    scoped = adapter._permission_card("Read", {}, requested_schema={"type": "object"})
+    assert classify_card(scoped.model_dump()) is None
+
+
+@pytest.mark.asyncio
+async def test_sdk_policy_ask_remains_a_user_card() -> None:
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.child_approvals import classify_card
+    from omnigent.server.schemas import ElicitationResult
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _ElicitingTurnContext(ElicitationResult(action="accept"))
+    adapter._current_ctx = ctx
+    assert await adapter._stable_policy_elicitation_handler("Bash", {"command": "echo ready"})
+    assert classify_card(ctx.seen[0][1].model_dump()) is None
+
+
 @pytest.mark.asyncio
 async def test_elicitation_choice_handler_asks_for_one_button_per_option() -> None:
     """The card is asked for buttons, and the chosen label comes back.

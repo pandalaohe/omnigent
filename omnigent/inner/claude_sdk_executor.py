@@ -2086,6 +2086,7 @@ class ClaudeSDKExecutor(Executor):
         # the Omnigent elicitation system rather than silently allowed.
         # ``None`` until the adapter installs it on first use.
         self._elicitation_handler: ElicitationHandler | None = None
+        self._policy_elicitation_handler: ElicitationHandler | None = None
         # AskUserQuestion bridge installed by ExecutorAdapter; None until wired.
         self._ask_question_handler: AskQuestionHandler | None = None
         # Live Claude SDK clients keyed by Omnigent session id.
@@ -3667,7 +3668,7 @@ class ClaudeSDKExecutor(Executor):
             collapsed to a hard ALLOW/DENY by the server-side
             ``/policies/evaluate`` route. If a raw ASK reaches this callback
             (for example from a read-only evaluation path), this hook runs the
-            existing Omnigent elicitation handler before returning
+            policy-specific Omnigent elicitation handler before returning
             :class:`claude_agent_sdk.PermissionResultAllow` or DENY; without
             a handler it fails closed. Returns ``None`` when the call should
             be allowed to proceed (no policy evaluator wired, an
@@ -3696,7 +3697,7 @@ class ClaudeSDKExecutor(Executor):
             from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 
             reason = _verdict.reason or "Approval required by Omnigent TOOL_CALL policy"
-            if self._elicitation_handler is None:
+            if self._policy_elicitation_handler is None:
                 logger.warning(
                     "TOOL_CALL policy ASK had no elicitation handler; denying tool=%s reason=%s",
                     tool_name,
@@ -3704,7 +3705,7 @@ class ClaudeSDKExecutor(Executor):
                 )
                 return PermissionResultDeny(message=reason)
             logger.info("TOOL_CALL policy requested approval tool=%s reason=%s", tool_name, reason)
-            if await self._elicitation_handler(tool_name, tool_input):
+            if await self._policy_elicitation_handler(tool_name, tool_input):
                 return PermissionResultAllow()
             return PermissionResultDeny(message=reason)
         if _action == "POLICY_ACTION_DENY":

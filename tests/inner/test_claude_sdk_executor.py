@@ -6071,7 +6071,8 @@ class TestToolCallPolicyGate(unittest.TestCase):
                 return_value=self._verdict("POLICY_ACTION_ASK", reason="approval required")
             )
             elicit = AsyncMock(return_value=True)
-            executor._elicitation_handler = elicit
+            executor._policy_elicitation_handler = elicit
+            executor._elicitation_handler = AsyncMock(return_value=False)
 
             result = await executor._can_use_tool_gate(
                 "mcp__github__issue_write",
@@ -6081,6 +6082,7 @@ class TestToolCallPolicyGate(unittest.TestCase):
 
             self.assertIsInstance(result, PermissionResultAllow)
             elicit.assert_awaited_once_with("mcp__github__issue_write", {"title": "bug"})
+            executor._elicitation_handler.assert_not_awaited()
 
         _run(_t())
 
@@ -6093,7 +6095,7 @@ class TestToolCallPolicyGate(unittest.TestCase):
             executor._policy_evaluator = AsyncMock(
                 return_value=self._verdict("POLICY_ACTION_ASK", reason="approval required")
             )
-            executor._elicitation_handler = AsyncMock(return_value=False)
+            executor._policy_elicitation_handler = AsyncMock(return_value=False)
 
             result = await executor._can_use_tool_gate(
                 "mcp__github__issue_write",

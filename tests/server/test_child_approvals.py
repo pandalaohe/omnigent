@@ -2,7 +2,9 @@
 
 import asyncio
 import json
+import shutil
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -18,6 +20,14 @@ from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_run
 from omnigent.runner.tool_dispatch import execute_tool
 from omnigent.runtime import pending_elicitations
 from omnigent.server import child_approvals as approvals
+from omnigent.server.routes._antigravity_elicitation import (
+    to_elicitation_params as agy_params,
+)
+from omnigent.server.routes._antigravity_elicitation import (
+    to_interaction_payload,
+    to_tui_selection_keys,
+)
+from omnigent.server.routes._codex_elicitation import parse_codex_elicitation_request
 from omnigent.server.routes._sessions import helpers, orchestration
 from omnigent.server.routes.sessions import routes_hooks as hooks
 from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
@@ -58,6 +68,522 @@ def _claude_params(command="echo ready", tool="Bash", **extras):
         command=command,
         **extras,
     )
+
+
+def _codex_request(method, **params):
+    return parse_codex_elicitation_request({"id": 7, "method": method, "params": params})
+
+
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        (["git", "commit", "-m", "a; b"], "answer"),
+        (["rm", "-rf", "/etc"], "note_only"),
+        (["bash", "-lc", "echo ready"], "note_only"),
+        (["echo", ""], "answer"),
+        (["echo", 3], "note_only"),
+        ([], "note_only"),
+        (None, "note_only"),
+        ("echo ready", "answer"),
+        ("rm -rf /etc", "note_only"),
+    ],
+)
+@pytest.mark.parametrize(
+    "method", ["item/commandExecution/requestApproval", "execCommandApproval"]
+)
+def test_codex_source_floor_uses_complete_protocol_command(command, expected, method):
+    request = _codex_request(method, command=command)
+    params = request.params.model_dump()
+    assert approvals.classify_card(params) == expected
+    if isinstance(command, list):
+        assert params["command_argv"] == command
+    if command == ["git", "commit", "-m", "a; b"]:
+        assert approvals.card_action(params) == ("git commit -m 'a; b'", False)
+
+
+@pytest.mark.parametrize("method", ["item/fileChange/requestApproval", "applyPatchApproval"])
+@pytest.mark.parametrize("grant", [None, "/opt/work/project"])
+def test_codex_file_sources_keep_profile_widening_user_owned(method, grant):
+    request = _codex_request(method, grantRoot=grant, fileChanges={"src/app.py": {}})
+    assert approvals.classify_card(request.params.model_dump()) == (None if grant else "answer")
+
+
+@pytest.mark.parametrize("source", ["tier", "claude-sdk", "codex-sdk", "agy"])
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        ("echo ready", "answer"),
+        ("rm -rf /etc", "note_only"),
+        pytest.param("echo " + "x" * 4500 + "; rm -rf /etc", "note_only", id="truncated-preview"),
+        (None, "note_only"),
+    ],
+)
+def test_added_shell_sources_require_complete_actions(source, command, expected):
+    if source == "tier":
+        params = {
+            "phase": "permission_tier",
+            "policy_name": "permission_tier_once",
+            "tool_name": "bash",
+            "content_preview": json.dumps({"command": command})[:4096],
+        }
+    elif source == "agy":
+        params = agy_params(
+            {"kind": "permission", "spec": {"resource": {"target": command}}}
+        ).model_dump()
+    else:
+        params = {
+            "phase": "tool_call",
+            "policy_name": source.replace("-", "_") + "_permission",
+            "tool_name": "mcp__omnigent__sys_os_shell",
+            "command": command,
+            "content_preview": 'sys_os_shell({"command":"echo ready"})',
+        }
+    assert approvals.classify_card(params) == expected
+
+
+@pytest.mark.parametrize(
+    "phase,policy",
+    [
+        ("permission_tier", "permission_tier_once"),
+        ("tool_call", "claude_sdk_permission"),
+        ("tool_call", "codex_sdk_permission"),
+    ],
+)
+@pytest.mark.parametrize(
+    "tool", [None, "", "AskUserQuestion", "ExitPlanMode", "mcp__omnigent__sys_standing_pass"]
+)
+def test_added_tool_sources_do_not_offer_questions_or_missing_identity(phase, policy, tool):
+    assert (
+        approvals.classify_card({"phase": phase, "policy_name": policy, "tool_name": tool}) is None
+    )
+
+
+@pytest.mark.parametrize("decision", ["approve", "decline"])
+@pytest.mark.parametrize(
+    "method",
+    [
+        "item/commandExecution/requestApproval",
+        "execCommandApproval",
+        "item/fileChange/requestApproval",
+        "applyPatchApproval",
+    ],
+)
+async def test_codex_hook_delivers_parent_single_use_verdict(tree, monkeypatch, method, decision):
+    from omnigent.harnesses.codex_native.elicitation import codex_elicitation_id
+    from omnigent.server.routes import sessions
+
+    monkeypatch.setattr(
+        sessions,
+        "read_approval_timeout",
+        lambda *_: SimpleNamespace(
+            timeout_s=5,
+            stop_turn=False,
+            async_approvals=False,
+        ),
+    )
+    interrupt = AsyncMock()
+    monkeypatch.setattr(sessions, "_forward_session_change_to_runner", interrupt)
+    payload = {
+        "id": 7,
+        "method": method,
+        "params": {
+            "command": ["echo", "ready"],
+            "availableDecisions": [
+                "accept",
+                {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": ["echo"]}},
+            ],
+            "fileChanges": {"src/app.py": {}},
+        },
+    }
+    eid = codex_elicitation_id(tree.child_id, method, 7)
+    task = asyncio.create_task(
+        tree.client.post(
+            f"/v1/sessions/{tree.child_id}/hooks/codex-elicitation-request",
+            json=payload,
+        )
+    )
+    await poll_until_async(
+        lambda: pending_elicitations.lookup(eid, conversation_id=tree.child_id), timeout_s=5
+    )
+    assert await _answer(tree, decision, elicitation_id=eid) == {"status": "answered"}
+    response = await asyncio.wait_for(task, 5)
+    assert response.status_code == 200, response.text
+    expected = "accept" if decision == "approve" else "decline"
+    if method in {"execCommandApproval", "applyPatchApproval"}:
+        expected = "approved" if decision == "approve" else "denied"
+    assert response.json() == {"decision": expected}
+    assert interrupt.await_count == (1 if decision == "decline" else 0)
+
+
+@pytest.mark.parametrize("decision", ["approve", "decline"])
+async def test_agy_hook_parent_verdict_never_selects_persistent_scope(tree, monkeypatch, decision):
+    from omnigent.server.routes import sessions
+    from omnigent.server.schemas import ElicitationResult
+
+    interrupt = AsyncMock()
+    monkeypatch.setattr(sessions, "_forward_session_change_to_runner", interrupt)
+    spec = {"resource": {"target": "echo ready"}, "actionDescription": "Run echo"}
+    params = agy_params(
+        {"kind": "permission", "trajectory_id": "trajectory", "step_index": 1, "spec": spec}
+    )
+    task = asyncio.create_task(
+        tree.client.post(
+            f"/v1/sessions/{tree.child_id}/hooks/antigravity-elicitation-request",
+            json={"elicitation_id": "elicit_pi_dialog", "params": params.model_dump()},
+        )
+    )
+    await poll_until_async(lambda: _pending(tree) is not None, timeout_s=5)
+    assert await _answer(tree, decision) == {"status": "answered"}
+    response = await asyncio.wait_for(task, 5)
+    assert response.status_code == 200, response.text
+    verdict = ElicitationResult.model_validate(response.json())
+    assert verdict.content is None
+    assert set(verdict.meta) == {"omnigent_answered_by"}
+    assert verdict.meta["omnigent_answered_by"]["session_id"] == tree.root_id
+    assert to_interaction_payload("permission", verdict, spec) == {
+        "permission": {"allow": decision == "approve"}
+    }
+    assert to_tui_selection_keys("permission", verdict, spec) == [
+        "1" if decision == "approve" else "4",
+        "Enter",
+    ]
+    assert interrupt.await_count == (1 if decision == "decline" else 0)
+
+
+@pytest.mark.parametrize("decision", ["approve", "decline"])
+async def test_codex_deferred_parent_grant_is_attributed_and_consumed_once(
+    tree, monkeypatch, decision
+):
+    from omnigent.server.routes import sessions
+    from omnigent.server.routes._sessions.approval_grants import codex_command_grant_key
+
+    monkeypatch.setattr(
+        sessions,
+        "read_approval_timeout",
+        lambda *_: SimpleNamespace(
+            timeout_s=5,
+            stop_turn=False,
+            async_approvals=True,
+        ),
+    )
+    deliveries = []
+
+    async def delivered(session_id, text, **kwargs):
+        deliveries.append(text)
+        return True
+
+    monkeypatch.setattr(hooks, "_deliver_with_retry", delivered)
+    payload = {
+        "id": 7,
+        "method": "item/commandExecution/requestApproval",
+        "params": {
+            "command": ["git", "commit", "-m", "a; b"],
+            "cwd": "/opt/work/project",
+        },
+    }
+    url = f"/v1/sessions/{tree.child_id}/hooks/codex-elicitation-request"
+    response = await tree.client.post(url, json=payload)
+    assert response.status_code == 200, response.text
+    assert response.json() == {"decision": "decline"}
+    card = next(c for c in tree.store.list_detached_cards() if c.session_id == tree.child_id)
+    eid = card.elicitation_id
+    await poll_until_async(
+        lambda: pending_elicitations.lookup(eid, conversation_id=tree.child_id), timeout_s=5
+    )
+    assert await _answer(tree, decision, elicitation_id=eid) == {"status": "answered"}
+    expected_text = (
+        "granted by the parent session"
+        if decision == "approve"
+        else "denied by the parent session"
+    )
+    await poll_until_async(lambda: any(expected_text in text for text in deliveries), timeout_s=5)
+    assert all("denied by the user" not in text for text in deliveries)
+    key = codex_command_grant_key(payload["params"]["command"], "/opt/work/project")
+    if decision == "decline":
+        assert await hooks._consume_grant(tree.child_id, key, tree.store) is None
+        receipts = tree.store.list_items(tree.root_id, type="error").data
+        assert len(receipts) == 1
+        assert receipts[0].data.code == "child_approval_answered"
+        payload = json.loads(receipts[0].data.message)
+        assert payload["session_id"] == tree.child_id
+        assert payload["elicitation_id"] == eid
+        assert payload["decision"] == "decline"
+        return
+    retried = await tree.client.post(url, json={**payload, "id": 8})
+    assert retried.status_code == 200, retried.text
+    assert retried.json() == {"decision": "accept"}
+    assert await hooks._consume_grant(tree.child_id, key, tree.store) is None
+
+
+@pytest.mark.parametrize("decision", ["approve", "decline"])
+async def test_inprocess_codex_parent_answer_reaches_protocol_stdin(tree, decision):
+    from omnigent.inner.codex_executor import _CodexAppServerSession
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    seen = []
+
+    async def elicit(eid, params):
+        seen.append(eid)
+        return await orchestration._publish_and_wait_for_harness_elicitation(
+            None,
+            session_id=tree.child_id,
+            params=params,
+            timeout_s=5,
+            conversation_store=tree.store,
+            elicitation_id=eid,
+        )
+
+    adapter = ExecutorAdapter(executor_factory=lambda: None, harness_label="Codex")
+    adapter._current_ctx = SimpleNamespace(elicit=elicit)
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo",
+        cwd="/opt/work/project",
+        env={},
+        tool_executor=None,
+        raw_elicitation_handler=adapter._stable_raw_elicitation_handler,
+    )
+    writes = []
+    session._proc = SimpleNamespace(stdin=SimpleNamespace(write=writes.append, drain=AsyncMock()))
+    session.active_turn_id = "turn-1"
+    request = {
+        "id": 42,
+        "method": "item/commandExecution/requestApproval",
+        "params": {
+            "turnId": "turn-1",
+            "command": ["git", "commit", "-m", "a; b"],
+        },
+    }
+    task = asyncio.create_task(session._answer_server_request(request, "turn-1"))
+    await poll_until_async(
+        lambda: seen and pending_elicitations.lookup(seen[0], conversation_id=tree.child_id),
+        timeout_s=5,
+    )
+    pending = pending_elicitations.lookup(seen[0], conversation_id=tree.child_id)[1]["params"]
+    assert pending["triage"]["root_session_id"] == tree.root_id
+    assert pending["command_argv"] == request["params"]["command"]
+    assert await _answer(tree, decision, elicitation_id=seen[0]) == {"status": "answered"}
+    assert await asyncio.wait_for(task, 5) is True
+    assert [json.loads(data) for data in writes] == [
+        {
+            "id": 42,
+            "result": {"decision": "accept" if decision == "approve" else "decline"},
+        }
+    ]
+    assert pending_elicitations.lookup(seen[0], conversation_id=tree.child_id) is None
+
+
+@pytest.mark.parametrize("decision,label", [("approve", "Run once"), ("decline", "Block")])
+async def test_pi_native_extension_parent_answer_returns_selected_label(
+    tree, tmp_path, decision, label
+):
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension")
+    extension = (
+        Path(__file__).resolve().parents[2]
+        / "omnigent/resources/pi_native/omnigent_pi_native_extension.js"
+    )
+    script = r"""
+const fs = require("fs");
+const path = require("path");
+const readline = require("readline");
+const [extension, dir, sessionId, requestJson] = process.argv.slice(1);
+const inboxDir = path.join(dir, "inbox");
+fs.mkdirSync(inboxDir);
+const config = path.join(dir, "config.json");
+fs.writeFileSync(config, JSON.stringify({
+  serverUrl: "http://omnigent.test", sessionId, inboxDir, bridgeDir: dir,
+}));
+process.env.OMNIGENT_PI_NATIVE_CONFIG = config;
+const input = readline.createInterface({input: process.stdin});
+global.setInterval = () => ({unref() {}});
+global.fetch = async (url, opts) => {
+  if (!String(url).endsWith("/hooks/pi-extension-ui")) return {ok: true, status: 204};
+  const body = {path: new URL(url).pathname, body: JSON.parse(opts.body)};
+  process.stdout.write(JSON.stringify(body) + "\n");
+  const response = await new Promise(resolve => input.once("line", resolve));
+  return {ok: true, status: 200, text: async () => response};
+};
+const handlers = {};
+require(extension)({
+  on(name, handler) {handlers[name] = handler;}, registerCommand() {},
+  registerTool() {}, getAllTools() {return [];},
+});
+const ctx = {mode: "tui", ui: {
+  select() {throw new Error("unexpected native fallback");},
+  setStatus() {}, setTitle() {}, notify() {},
+}};
+(async () => {
+  await handlers.session_start({}, ctx);
+  const request = JSON.parse(requestJson);
+  const value = await ctx.ui.select(request.title, request.options, {timeout: 15000});
+  process.stdout.write(JSON.stringify({value}) + "\n");
+  input.close();
+})().catch(error => {process.stderr.write(String(error)); process.exitCode = 1; input.close();});
+"""
+    proc = await asyncio.create_subprocess_exec(
+        node,
+        "-e",
+        script,
+        str(extension),
+        str(tmp_path),
+        tree.child_id,
+        json.dumps(_pi_request()),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        envelope = json.loads(await asyncio.wait_for(proc.stdout.readline(), 10))
+        eid = envelope["body"]["elicitation_id"]
+        assert envelope["path"] == f"/v1/sessions/{tree.child_id}/hooks/pi-extension-ui"
+        task = asyncio.create_task(tree.client.post(envelope["path"], json=envelope["body"]))
+        await poll_until_async(
+            lambda: pending_elicitations.lookup(eid, conversation_id=tree.child_id), timeout_s=5
+        )
+        assert await _answer(tree, decision, elicitation_id=eid) == {"status": "answered"}
+        response = await asyncio.wait_for(task, 5)
+        assert response.status_code == 200, response.text
+        assert response.json()["value"] == label
+        proc.stdin.write((response.text + "\n").encode())
+        await proc.stdin.drain()
+        output, stderr = await asyncio.wait_for(proc.communicate(), 10)
+        assert proc.returncode == 0, stderr.decode()
+        assert json.loads(output) == {"value": label}
+        answers = tree.store.list_items(tree.child_id, type="message").data
+        assert len(answers) == 1
+        assert answers[0].data.user_authored is False
+        assert tree.root_id in answers[0].data.content[0]["text"]
+    finally:
+        if proc.returncode is None:
+            proc.terminate()
+            await proc.wait()
+
+
+@pytest.mark.parametrize("harness", ["pi", "pi-native"])
+@pytest.mark.parametrize("change_revision", [False, True])
+async def test_tier_parent_answer_revalidates_before_execution(
+    tree, monkeypatch, change_revision, harness
+):
+    from omnigent.permission_tiers import TierDecision, Verdict
+    from omnigent.server import permission_gate as gate
+    from omnigent.server.permission_tiers import (
+        PERMISSION_CAPABILITY_LABEL_KEY,
+        PERMISSION_CAPABILITY_VALUE,
+        BoundToolCall,
+        ConfirmedPermissionState,
+        permission_execution_host_id,
+    )
+
+    tree.store.set_runner_id(tree.child_id, "child-runner")
+    child = tree.store.get_conversation(tree.child_id)
+    tree.store.set_labels(
+        tree.child_id,
+        {
+            **ConfirmedPermissionState("ask", 2, "ready").labels(harness),
+            PERMISSION_CAPABILITY_LABEL_KEY: PERMISSION_CAPABILITY_VALUE,
+        },
+    )
+    arguments = {"command": "echo ready"}
+    binding = BoundToolCall.bind(
+        session_id=tree.child_id,
+        host_id=permission_execution_host_id(host_id=child.host_id, runner_id=child.runner_id),
+        call_id="tier-call",
+        name="bash",
+        arguments=arguments,
+        tier_revision=2,
+    )
+    inspection = gate.InspectedPermissionCall(binding, TierDecision(Verdict.ASK))
+    requests = []
+
+    def authorize(request):
+        body = json.loads(request.content)
+        if body["type"] == "permission_tier_authorize":
+            requests.append(body)
+        return httpx.Response(
+            200,
+            json={
+                "authorized": True,
+                "call_id": binding.call_id,
+                "tier_revision": 2,
+                "session_id": tree.child_id,
+                "host_id": binding.host_id,
+                "permission_tiers_capability": PERMISSION_CAPABILITY_VALUE,
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(authorize), base_url="http://runner"
+    ) as runner:
+        monkeypatch.setattr(helpers, "_get_runner_client", AsyncMock(return_value=runner))
+        task = asyncio.create_task(
+            gate.authorize_permission_call(
+                inspection,
+                request=None,
+                harness=harness,
+                arguments=arguments,
+                conversation_store=tree.store,
+                runner_router=None,
+            )
+        )
+        eid = binding.approval_id()
+        await poll_until_async(
+            lambda: pending_elicitations.lookup(eid, conversation_id=tree.child_id), timeout_s=5
+        )
+        if change_revision:
+            tree.store.set_labels(
+                tree.child_id, ConfirmedPermissionState("ask", 3, "ready").labels(harness)
+            )
+        assert await _answer(tree, elicitation_id=eid) == {"status": "answered"}
+        result = await asyncio.wait_for(task, 5)
+        assert result.action == (Verdict.DENY if change_revision else Verdict.ALLOW), result.reason
+        assert len(requests) == (0 if change_revision else 1)
+        replay = await gate.authorize_permission_call(
+            inspection,
+            request=None,
+            harness=harness,
+            arguments=arguments,
+            conversation_store=tree.store,
+            runner_router=None,
+        )
+        assert replay.action == Verdict.DENY
+
+
+@pytest.mark.parametrize("label", ["Claude", "Codex"])
+@pytest.mark.parametrize("decision", ["approve", "decline"])
+async def test_sdk_wait_receives_parent_verdict_and_cancellation(tree, label, decision):
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: None, harness_label=label)
+    seen, verdicts = [], []
+
+    async def elicit(eid, params):
+        seen.append(eid)
+        result = await orchestration._publish_and_wait_for_harness_elicitation(
+            None,
+            session_id=tree.child_id,
+            params=params,
+            timeout_s=5,
+            conversation_store=tree.store,
+            elicitation_id=eid,
+        )
+        verdicts.append(result)
+        return result
+
+    ctx = SimpleNamespace(elicit=elicit, cancelled=asyncio.Event())
+    adapter._current_ctx = ctx
+    task = asyncio.create_task(
+        adapter._stable_elicitation_handler("Bash", {"command": "echo ready"})
+    )
+    await poll_until_async(
+        lambda: seen and pending_elicitations.lookup(seen[0], conversation_id=tree.child_id),
+        timeout_s=5,
+    )
+    assert await _answer(tree, decision, elicitation_id=seen[0]) == {"status": "answered"}
+    assert await asyncio.wait_for(task, 5) == (decision == "approve")
+    assert ctx.cancelled.is_set() == (decision == "decline")
+    assert verdicts[0].content is None
+    assert set(verdicts[0].meta) == {"omnigent_answered_by"}
 
 
 @pytest.fixture(autouse=True)

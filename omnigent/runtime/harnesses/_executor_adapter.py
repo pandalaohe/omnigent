@@ -53,6 +53,7 @@ from omnigent.native.input_diagnostics import (
     input_delivery_scope,
     log_input_event,
 )
+from omnigent.policies.builtins._shell import SHELL_TOOLS
 from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runtime.harnesses._scaffold import HarnessApp, PolicyVerdictPayload, TurnContext
 from omnigent.runtime.prompt import dedupe_tool_output_images
@@ -317,6 +318,13 @@ class ExecutorAdapter(HarnessApp):
             executor._tool_executor = self._stable_tool_executor  # type: ignore[attr-defined]
         if getattr(executor, "_elicitation_handler", None) is None:
             executor._elicitation_handler = self._stable_elicitation_handler  # type: ignore[attr-defined]
+        if (
+            hasattr(executor, "_policy_elicitation_handler")
+            and executor._policy_elicitation_handler is None  # type: ignore[attr-defined]
+        ):
+            executor._policy_elicitation_handler = (  # type: ignore[attr-defined]
+                self._stable_policy_elicitation_handler
+            )
         # ACP-shaped executors also accept a choice bridge, to offer the agent's own
         # permission scopes; the others don't define the attribute at all.
         if (
@@ -1050,6 +1058,8 @@ class ExecutorAdapter(HarnessApp):
         self,
         tool_name: str,
         tool_input: dict[str, Any],
+        *,
+        phase: str = "tool_call",
     ) -> bool:
         """Stable bridge for tool-permission elicitation (``can_use_tool``).
 
@@ -1066,12 +1076,17 @@ class ExecutorAdapter(HarnessApp):
             return False
 
         elicitation_id = f"elicit_{secrets.token_hex(16)}"
-        params = self._permission_card(tool_name, tool_input)
+        params = self._permission_card(tool_name, tool_input, phase=phase)
         result = await ctx.elicit(elicitation_id, params)
         if result.action == "decline":
             # Signal via ctx.cancelled (the SDK swallows exceptions from control-request tasks).
             ctx.cancelled.set()
         return result.action == "accept"
+
+    async def _stable_policy_elicitation_handler(
+        self, tool_name: str, tool_input: dict[str, Any]
+    ) -> bool:
+        return await self._stable_elicitation_handler(tool_name, tool_input, phase="policy_ask")
 
     def _permission_card(
         self,
@@ -1103,6 +1118,11 @@ class ExecutorAdapter(HarnessApp):
         extras: dict[str, Any] = (
             {"ask_user_question": question_payload} if question_payload else {}
         )
+        extras["tool_name"] = tool_name
+        if _strip_mcp_tool_prefix(tool_name) in SHELL_TOOLS:
+            command = tool_input.get("command")
+            if isinstance(command, str):
+                extras["command"] = command
         return ElicitationRequestParams(
             mode="form",
             message=f"{label} wants to use **{tool_name}**",
