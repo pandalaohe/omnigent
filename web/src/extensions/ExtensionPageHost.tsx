@@ -9,7 +9,14 @@ export function ExtensionPageHost({ resolved }: { resolved: ResolvedExtensionPag
   const refresh = useRefreshExtensions();
   const { methods, events } = useExtensionHostServices(resolved.extension);
   if (resolved.page.kind === "external" || resolved.page.kind === "proxied")
-    return <ExternalPageView page={resolved.page} />;
+    return (
+      <ExternalPageView
+        page={resolved.page}
+        openSession={
+          resolved.page.kind === "proxied" ? methods["navigation.openSession"] : undefined
+        }
+      />
+    );
   if (resolved.page.kind !== undefined && resolved.page.kind !== "view") return <NotFoundPage />;
   return (
     <ExtensionViewHost

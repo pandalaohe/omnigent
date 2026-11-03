@@ -2,10 +2,16 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionCatalogItem, ExtensionExternalPage, ExtensionViewPage } from "./types";
 
-const { viewHostMock } = vi.hoisted(() => ({ viewHostMock: vi.fn() }));
+const { viewHostMock, hostOpenSessionMock } = vi.hoisted(() => ({
+  viewHostMock: vi.fn(),
+  hostOpenSessionMock: vi.fn(),
+}));
 vi.mock("./ExtensionProvider", () => ({ useRefreshExtensions: () => vi.fn() }));
 vi.mock("./services/useExtensionHostServices", () => ({
-  useExtensionHostServices: () => ({ methods: {}, events: {} }),
+  useExtensionHostServices: () => ({
+    methods: { "navigation.openSession": hostOpenSessionMock },
+    events: {},
+  }),
 }));
 vi.mock("./ExtensionViewHost", () => ({ ExtensionViewHost: viewHostMock }));
 vi.mock("@/pages/NotFoundPage", () => ({
@@ -24,10 +30,38 @@ const page: ExtensionExternalPage = {
   url: "https://dashboard.example.com/",
 };
 const extension = { id: "acme.dashboard" } as ExtensionCatalogItem;
+const proxiedUrl = "/v1/extensions/acme.dashboard/proxy/overview/";
+
+function openSessionMessage(sessionId: unknown = "conv_123") {
+  return {
+    source: "omnigent-extension",
+    type: "request",
+    requestId: "request-1",
+    method: "navigation.openSession",
+    params: { sessionId },
+  };
+}
+
+function postPageMessage(
+  data: unknown,
+  options: { origin?: string; source?: MessageEventSource | null } = {},
+) {
+  const frame = screen.getByTitle("Dashboard") as HTMLIFrameElement;
+  fireEvent(
+    window,
+    new MessageEvent("message", {
+      data,
+      origin: options.origin ?? window.location.origin,
+      source: options.source === undefined ? frame.contentWindow : options.source,
+    }),
+  );
+}
 
 beforeEach(() => {
   vi.stubGlobal("location", new URL("http://app.example.com/"));
+  vi.stubGlobal("navigator", { userActivation: { isActive: true } });
   viewHostMock.mockReset().mockReturnValue(<div>Browser view</div>);
+  hostOpenSessionMock.mockReset();
 });
 
 afterEach(() => {
@@ -59,6 +93,84 @@ describe("ExternalPageView", () => {
     expect(screen.getByTitle("Dashboard")).toHaveAttribute("src", url);
     expect(screen.getByRole("link", { name: "Open in new tab" })).toHaveAttribute("href", url);
   });
+
+  it("opens a session for a user-activated request from the proxied frame", () => {
+    const openSession = vi.fn();
+    render(
+      <ExternalPageView
+        page={{ ...page, kind: "proxied", url: proxiedUrl }}
+        openSession={openSession}
+      />,
+    );
+
+    postPageMessage(openSessionMessage());
+
+    expect(openSession).toHaveBeenCalledExactlyOnceWith(
+      { sessionId: "conv_123" },
+      expect.any(AbortSignal),
+    );
+  });
+
+  it("refuses a session request without transient user activation", () => {
+    vi.stubGlobal("navigator", { userActivation: { isActive: false } });
+    const openSession = vi.fn();
+    render(
+      <ExternalPageView
+        page={{ ...page, kind: "proxied", url: proxiedUrl }}
+        openSession={openSession}
+      />,
+    );
+
+    postPageMessage(openSessionMessage());
+
+    expect(openSession).not.toHaveBeenCalled();
+  });
+
+  it("refuses session requests from another origin or window", () => {
+    const openSession = vi.fn();
+    render(
+      <ExternalPageView
+        page={{ ...page, kind: "proxied", url: proxiedUrl }}
+        openSession={openSession}
+      />,
+    );
+
+    postPageMessage(openSessionMessage(), { origin: "https://other.example.com" });
+    postPageMessage(openSessionMessage(), { source: window });
+
+    expect(openSession).not.toHaveBeenCalled();
+  });
+
+  it("refuses every other host method", () => {
+    const openSession = vi.fn();
+    render(
+      <ExternalPageView
+        page={{ ...page, kind: "proxied", url: proxiedUrl }}
+        openSession={openSession}
+      />,
+    );
+
+    postPageMessage({ ...openSessionMessage(), method: "sessions.listPage" });
+
+    expect(openSession).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, null, "", 42, "x".repeat(257)])(
+    "refuses an invalid session id: %s",
+    (sessionId) => {
+      const openSession = vi.fn();
+      render(
+        <ExternalPageView
+          page={{ ...page, kind: "proxied", url: proxiedUrl }}
+          openSession={openSession}
+        />,
+      );
+
+      postPageMessage({ ...openSessionMessage(), params: { sessionId } });
+
+      expect(openSession).not.toHaveBeenCalled();
+    },
+  );
 
   it.each([
     "https://other.example.com/",
@@ -158,6 +270,30 @@ describe("ExternalPageView", () => {
 });
 
 describe("ExtensionPageHost", () => {
+  it("passes only the session-opening method to a proxied page", () => {
+    render(
+      <ExtensionPageHost
+        resolved={{ extension, page: { ...page, kind: "proxied", url: proxiedUrl } }}
+      />,
+    );
+
+    postPageMessage(openSessionMessage());
+
+    expect(hostOpenSessionMock).toHaveBeenCalledExactlyOnceWith(
+      { sessionId: "conv_123" },
+      expect.any(AbortSignal),
+    );
+    expect(viewHostMock).not.toHaveBeenCalled();
+  });
+
+  it("does not expose session opening to a direct external page", () => {
+    render(<ExtensionPageHost resolved={{ extension, page }} />);
+
+    postPageMessage(openSessionMessage(), { origin: "https://dashboard.example.com" });
+
+    expect(hostOpenSessionMock).not.toHaveBeenCalled();
+  });
+
   it("routes a proxied page without mounting the bundle host", () => {
     const url = "/v1/extensions/acme.dashboard/proxy/overview/";
     render(<ExtensionPageHost resolved={{ extension, page: { ...page, kind: "proxied", url } }} />);
