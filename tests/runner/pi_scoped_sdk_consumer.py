@@ -115,7 +115,7 @@ async def main():
                         side.bootstrap.close()
                         side.bootstrap = PiBootstrapBroker(runtime, "session-a")
                         side.bootstrap.attach_listener(relay._httpd, relay._advertised_url)
-                    await asyncio.sleep(0.4)
+                    await asyncio.sleep(0.4)  # custom-lint: disable=sleep-then-assert -- hold ACK
                     assert runtime.state("session-a").revision == 3
                     assert process_identity(process.pid) == identity
                 return {"executed": executed}

@@ -122,14 +122,20 @@ def test_read_plan_edit_and_single_call_ask() -> None:
 
 @pytest.mark.parametrize("tier", NON_FULL_TIERS)
 @pytest.mark.parametrize("background", [False, True], ids=["sync", "async"])
-@pytest.mark.parametrize("verified", [False, True], ids=["unverified", "verified"])
+@pytest.mark.parametrize(
+    "verified", [None, False, True], ids=["unregistered", "unverified", "verified"]
+)
 def test_pi_subagent_is_never_approvable_below_full(tier, background, verified):
-    host = posix_host(extension_tools={"subagent": "" if verified else "Unverified Pi extension"})
+    host = posix_host(
+        extension_tools={}
+        if verified is None
+        else {"subagent": "" if verified else "Unverified Pi extension"}
+    )
     arguments = {"agent": "worker", "task": "Read a.py", "async": background}
     assert decision("full", "subagent", arguments, host).action == Verdict.ALLOW
     result = decision(tier, "subagent", arguments, host)
     assert result.action == Verdict.DENY
-    assert result.reason == "Pi subagents are not yet governed by Omnigent permissions"
+    assert result.rule_id == "native-proof"
 
 
 @pytest.mark.parametrize(

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import http from "node:http";
+import {findPackageJSON} from "node:module";
 import {pathToFileURL} from "node:url";
 const [sdkRoot, locator, root, adapter, extension, mode="normal"] = process.argv.slice(2);
 let ackDispatch=false, definitionStarts=0;
@@ -17,7 +18,8 @@ http.request=function(url,options,callback){
  });
 };
 const sdk = await import(pathToFileURL(path.join(sdkRoot,"dist/index.js")).href);
-const {AssistantMessageEventStream} = await import(pathToFileURL(path.join(sdkRoot,"node_modules/@earendil-works/pi-ai/dist/utils/event-stream.js")).href);
+const aiRoot=path.dirname(findPackageJSON("@earendil-works/pi-ai",pathToFileURL(path.join(sdkRoot,"dist/index.js"))));
+const {AssistantMessageEventStream} = await import(pathToFileURL(path.join(aiRoot,"dist/utils/event-stream.js")).href);
 const {installScopedSdkFromHandoff} = await import(pathToFileURL(adapter).href);
 const dispose = mode==="missing-bootstrap" ? ()=>{} : await installScopedSdkFromHandoff(sdk, locator, {sdkVersion:JSON.parse(fs.readFileSync(path.join(sdkRoot,"package.json"))).version,sdkEntry:path.join(sdkRoot,"dist/index.js")});
 const bind=sdk.AgentSession.prototype.bindExtensions, observed=new WeakSet();

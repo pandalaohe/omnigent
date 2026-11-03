@@ -1312,7 +1312,7 @@ async def test_pi_subagent_denial_cannot_open_card_or_acquire_launch_lease(
         assert authorized.action.value == "DENY"
     assert cards == []
     assert decision.action.value == "DENY"
-    assert decision.reason == "Pi subagents are not yet governed by Omnigent permissions"
+    assert decision.rule_id == "native-proof"
     # Even a direct attempted approval cannot mint an execution lease.
     assert not runtime.authorize(
         "session-a",
@@ -1350,16 +1350,14 @@ def test_extension_scope_cannot_claim_builtin_read_permissions(tmp_path, scope):
 @pytest.mark.parametrize(
     ("tier", "expected"),
     [
-        ("auto", "ALLOW"),
-        ("ask", "ASK"),
-        ("accept-edits", "ASK"),
+        ("auto", "DENY"),
+        ("ask", "DENY"),
+        ("accept-edits", "DENY"),
         ("plan", "DENY"),
         ("full", "ALLOW"),
     ],
 )
-def test_legacy_pi_subagents_registry_keeps_provenance_without_native_exports(
-    tmp_path, tier, expected
-):
+def test_legacy_pi_subagents_registry_cannot_replace_native_proof(tmp_path, tier, expected):
     runtime, source, registry = _extension_runtime(tmp_path, tier, name="subagent")
     (source.parent / "package.json").write_text(
         json.dumps({"name": "pi-subagents", "version": "0.79.0"})

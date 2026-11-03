@@ -468,6 +468,7 @@ def _canonical_json(value: object) -> str:
         )
     raise ValueError("Native proof requires JSON values")
 
+
 def _native_digest(arguments: Mapping[str, object]) -> str:
     return hashlib.sha256(_canonical_json(arguments).encode("utf-8")).hexdigest()
 
@@ -2143,9 +2144,15 @@ def decide_tier(tier: PermissionTier, intent: ToolIntent, rules: RelaxedRules) -
             )
         if tier == "full":
             return TierDecision(Verdict.ALLOW)
-        if intent.native_status == NativeSupportStatus.FAILED:
+        if intent.native_status == NativeSupportStatus.FAILED or (
+            intent.name == "subagent" and intent.native_status is None
+        ):
             return TierDecision(
-                Verdict.DENY, intent.detail or "Native support proof failed", "native-proof"
+                Verdict.DENY,
+                "Native support proof is missing"
+                if intent.native_status is None
+                else intent.detail or "Native support proof failed",
+                "native-proof",
             )
         active, _, _, control_reason, protected_reason = _validated_rules(rules)
         context = intent.context
