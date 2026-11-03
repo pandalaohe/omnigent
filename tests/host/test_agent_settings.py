@@ -327,41 +327,66 @@ def test_codex_probe_home_and_fingerprint_follow_record(
     assert 'model = "model-b"' in (second_probe / "config.toml").read_text(encoding="utf-8")
 
 
-def test_ambient_roots_do_not_override_the_record(
+def _pi_agent_dir(root: Path, provider: str) -> None:
+    root.mkdir()
+    (root / "auth.json").write_text(json.dumps({provider: {"type": "oauth"}}), encoding="utf-8")
+    (root / "models-store.json").write_text(
+        json.dumps({provider: {"models": [{"id": "model"}]}}), encoding="utf-8"
+    )
+
+
+def test_ambient_codex_home_does_not_override_the_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    ambient_codex = tmp_path / "codex-ambient"
-    selected_codex = tmp_path / "codex-selected"
-    for root, model in ((ambient_codex, "ambient-model"), (selected_codex, "selected-model")):
+    ambient = tmp_path / "codex-ambient"
+    selected = tmp_path / "codex-selected"
+    for root, model in ((ambient, "ambient-model"), (selected, "selected-model")):
         root.mkdir()
         (root / "config.toml").write_text(f'model = "{model}"\n', encoding="utf-8")
-    ambient_pi = tmp_path / "pi-ambient"
-    selected_pi = tmp_path / "pi-selected"
-    for root, provider in ((ambient_pi, "ambient"), (selected_pi, "selected")):
-        root.mkdir()
-        (root / "auth.json").write_text(
-            json.dumps({provider: {"type": "oauth"}}), encoding="utf-8"
-        )
-        (root / "models-store.json").write_text(
-            json.dumps({provider: {"models": [{"id": "model"}]}}), encoding="utf-8"
-        )
     monkeypatch.setattr(codex_app, "_find_codex_cli", lambda: "/opt/work/bin/codex")
-    monkeypatch.setenv("CODEX_HOME", str(ambient_codex))
-    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(ambient_pi))
-    agent_settings.agent_settings_set_root("codex", str(selected_codex))
-    agent_settings.agent_settings_set_root("pi", str(selected_pi))
+    monkeypatch.setenv("CODEX_HOME", str(ambient))
+    agent_settings.agent_settings_set_root("codex", str(selected))
 
-    assert _codex_home_config_source_from_env() == selected_codex
+    assert _codex_home_config_source_from_env() == selected
     probe = codex_app._probe_codex_home([])
     assert 'model = "selected-model"' in (probe / "config.toml").read_text(encoding="utf-8")
     launch = codex_app.NativeCodexLaunch([], None, None)
     with_ambient = codex_app.codex_catalog_fingerprint(launch)
     monkeypatch.delenv("CODEX_HOME")
     assert codex_app.codex_catalog_fingerprint(launch) == with_ambient
+    # The Codex model-list probe itself is not launched: this proves the
+    # probe-home builder and the fingerprint that probe consumes, not a
+    # `codex` CLI run.
 
-    assert global_pi_agent_dir() == selected_pi
-    assert global_pi_agent_dir(env={"PI_CODING_AGENT_DIR": str(ambient_pi)}) == selected_pi
+
+def test_ambient_pi_agent_dir_does_not_override_the_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ambient = tmp_path / "pi-ambient"
+    selected = tmp_path / "pi-selected"
+    _pi_agent_dir(ambient, "ambient")
+    _pi_agent_dir(selected, "selected")
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(ambient))
+    agent_settings.agent_settings_set_root("pi", str(selected))
+
+    assert global_pi_agent_dir() == selected
     assert [row["id"] for row in pi_own_login_model_options()] == ["selected/model"]
+
+
+def test_explicit_pi_agent_dir_env_keeps_priority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    explicit = tmp_path / "pi-explicit"
+    selected = tmp_path / "pi-selected"
+    explicit.mkdir()
+    _pi_agent_dir(selected, "selected")
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path / "pi-ambient"))
+    agent_settings.agent_settings_set_root("pi", str(selected))
+
+    assert global_pi_agent_dir(env={"PI_CODING_AGENT_DIR": str(explicit)}) == explicit
+    # PiExecutor._build_env_and_dir passes its cleaned session env, which does
+    # not set the root; the record then seeds the managed dir.
+    assert global_pi_agent_dir(env={}) == selected
 
 
 def test_account_probes_use_selected_roots(

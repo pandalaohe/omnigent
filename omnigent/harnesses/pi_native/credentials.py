@@ -460,17 +460,19 @@ def global_pi_agent_dir(
 ) -> Path:
     """Return Pi's own agent config root (``~/.pi/agent`` by default).
 
-    The configured ``harness.pi.config_root`` record wins over an inherited
-    ``PI_CODING_AGENT_DIR`` so the pre-launch catalog reads the same login the
-    editor and a launched Pi use; without a record the environment override
-    still applies.
+    An explicit *env* mapping is a caller's launch environment and keeps its
+    ``PI_CODING_AGENT_DIR``. When this reads the process environment itself,
+    the configured ``harness.pi.config_root`` record wins over an inherited
+    value, so the pre-launch catalog reads the same login the editor uses;
+    the environment override still applies when no record is set.
     """
-    from omnigent.host.agent_settings import resolved_root
-
-    override = (resolved_root("pi") or "").strip()
+    override = "" if env is None else env.get(PI_CODING_AGENT_DIR_ENV_VAR, "").strip()
     if not override:
-        source_env = os.environ if env is None else env
-        override = source_env.get(PI_CODING_AGENT_DIR_ENV_VAR, "").strip()
+        from omnigent.host.agent_settings import resolved_root
+
+        override = (resolved_root("pi") or "").strip()
+    if not override and env is None:
+        override = os.environ.get(PI_CODING_AGENT_DIR_ENV_VAR, "").strip()
     root = Path(override).expanduser() if override else Path.home() / ".pi" / "agent"
     return workspace / root if workspace is not None and not root.is_absolute() else root
 
