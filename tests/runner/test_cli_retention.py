@@ -163,6 +163,90 @@ async def test_idle_release_scrubs_pi_token_temporaries(
     assert not token_temp.exists()
 
 
+@pytest.mark.parametrize("sequence", ["label-lookup", "pane-reaper"])
+@pytest.mark.parametrize("confirmed", [False, True])
+async def test_idle_release_keeps_exit_evidence_after_real_teardown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sequence: str,
+    confirmed: bool,
+) -> None:
+    from omnigent.harnesses.codex_native import app_server, bridge
+    from omnigent.runner.native import orchestration
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+    from omnigent.terminals.registry import TerminalRegistry
+    from tests.harnesses.codex_native.app_server._support import _test_app_server
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "codex-native")
+    session_id = "conv_exit_evidence"
+    home = bridge.prepare_bridge_dir(session_id)
+    codex_home = bridge.codex_home_for_bridge_dir(home)
+    backend = _test_app_server(tmp_path, codex_home, home, tmp_path)
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", "pass", start_new_session=True
+    )
+    await process.wait()
+    backend.proc = process
+    backend.process_group_id = process.pid
+    backend.process_registry_tag = "release-exit-evidence"
+    census_available = confirmed
+    monkeypatch.setattr(
+        app_server, "_tagged_process_group_members", lambda *_: [] if census_available else None
+    )
+    monkeypatch.setattr(app_server, "unregister_codex_native_process", lambda *_: None)
+    monkeypatch.setattr(orchestration, "_AUTO_CODEX_APP_SERVERS", {session_id: backend})
+    monkeypatch.setattr(orchestration, "_AUTO_CODEX_BRIDGE_DIRS", {session_id: home})
+    bridge.write_bridge_state(
+        home,
+        bridge.CodexNativeBridgeState(
+            session_id=session_id,
+            socket_path=str(backend.socket_path),
+            thread_id="parent_thread",
+            codex_home=str(codex_home),
+        ),
+    )
+    bridge.update_active_child_turn(home, "old_child", turn_id="old_turn")
+    client = NullServerClient()
+    lookup_entered = False
+
+    async def get_labels(url, **kwargs):
+        nonlocal lookup_entered
+        if not lookup_entered:
+            lookup_entered = True
+            await orchestration.teardown_codex_native_app_server(session_id)
+        return httpx.Response(200, json={"labels": {}})
+
+    if sequence == "label-lookup":
+        monkeypatch.setattr(client, "get", get_labels)
+    terminals = TerminalRegistry()
+    app = create_runner_app(
+        terminal_registry=terminals,
+        resource_registry=SessionResourceRegistry(terminal_registry=terminals),
+        server_client=client,  # type: ignore[arg-type]
+    )
+    if sequence == "pane-reaper":
+        await app.state.native_pane_reaper._reap(
+            PaneRef(
+                session_id,
+                "terminal_codex_main",
+                "codex",
+                tmp_path / "tmux.sock",
+                allow_busy_release=True,
+            )
+        )
+    if not confirmed:
+        with pytest.raises(RuntimeError, match="exit is not confirmed"):
+            await app.state.finish_cli_release(session_id)
+        assert not backend.exit_confirmed
+        assert bridge.read_bridge_state(home).helper_stop_pending
+        assert bridge.read_active_child_turns(home)["old_child"]["turn_id"] == "old_turn"
+        census_available = True
+    await app.state.finish_cli_release(session_id)
+    assert backend.exit_confirmed
+    assert not bridge.read_bridge_state(home).helper_stop_pending
+    assert bridge.read_active_child_turns(home, strict=True) == {}
+
+
 @pytest.mark.parametrize("parent_link", [False, True])
 async def test_idle_credential_scrub_never_follows_links_out(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, parent_link: bool

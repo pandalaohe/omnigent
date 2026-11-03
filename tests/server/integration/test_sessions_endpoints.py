@@ -12544,7 +12544,17 @@ async def test_stop_session_surfaces_runner_failure_as_error(
 
 async def test_pending_codex_restriction_survives_relaunch_arguments(
     client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Saved restrictions reach native resume after a confirmed idle release."""
+    import sys
+
+    from omnigent.harnesses.codex_native import app_server, bridge
+    from omnigent.runner import create_runner_app
+    from omnigent.runner.native import orchestration
+    from tests.harnesses.codex_native.app_server._support import _test_app_server
+
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "POST":
             return httpx.Response(
@@ -12572,6 +12582,66 @@ async def test_pending_codex_restriction_survives_relaunch_arguments(
     assert response.json()["error"] == "codex_helper_stop_pending"
     assert "--dangerously-bypass-approvals-and-sandbox" not in snapshot["terminal_launch_args"]
     assert "read-only" in snapshot["terminal_launch_args"]
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "codex-native")
+    session_id = session["id"]
+    home = bridge.prepare_bridge_dir(session_id)
+    codex_home = bridge.codex_home_for_bridge_dir(home)
+    history = codex_home / "sessions" / "rollout.jsonl"
+    history.parent.mkdir(parents=True)
+    history.write_text("native history")
+    backend = _test_app_server(tmp_path, codex_home, home, tmp_path)
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", "pass", start_new_session=True
+    )
+    await process.wait()
+    backend.proc = process
+    backend.process_group_id = process.pid
+    backend.process_registry_tag = "release-permission-lifecycle"
+    monkeypatch.setattr(app_server, "_tagged_process_group_members", lambda *_: [])
+    monkeypatch.setattr(app_server, "unregister_codex_native_process", lambda *_: None)
+    monkeypatch.setattr(orchestration, "_AUTO_CODEX_APP_SERVERS", {session_id: backend})
+    monkeypatch.setattr(orchestration, "_AUTO_CODEX_BRIDGE_DIRS", {session_id: home})
+    bridge.write_bridge_state(
+        home,
+        bridge.CodexNativeBridgeState(
+            session_id=session_id,
+            socket_path=str(backend.socket_path),
+            thread_id="parent_thread",
+            codex_home=str(codex_home),
+        ),
+    )
+    bridge.update_active_child_turn(home, "old_child", turn_id="old_turn")
+    app = create_runner_app(server_client=client)
+    await app.state.finish_cli_release(session_id)
+    assert backend.exit_confirmed
+    assert history.read_text() == "native history"
+    assert not bridge.read_bridge_state(home).helper_stop_pending
+    assert bridge.read_active_child_turns(home, strict=True) == {}
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://test")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path))
+    launch = await orchestration._codex_native_launch_config(
+        session_id=session_id, server_client=client
+    )
+    rpc = AsyncMock(spec=app_server.CodexAppServerClient)
+    rpc.request.return_value = {"result": {}}
+    monkeypatch.setattr(app_server, "client_for_transport", lambda *_args, **_kwargs: rpc)
+    await app_server.preload_codex_thread_for_resume(
+        "ws://127.0.0.1:1234",
+        "parent_thread",
+        terminal_launch_args=launch.terminal_launch_args,
+        cwd=launch.workspace,
+    )
+    rpc.request.assert_awaited_once_with(
+        "thread/resume",
+        {
+            "threadId": "parent_thread",
+            "excludeTurns": True,
+            "sandbox": "read-only",
+            "approvalPolicy": "on-request",
+        },
+    )
 
 
 async def test_stop_session_no_runner_settles_stale_child_and_parent_badge(

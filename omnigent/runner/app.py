@@ -2294,7 +2294,9 @@ def create_runner_app(
     _session_tool_schemas: dict[str, list[_JsonObject]] = {}  # session_id → cached tool schemas
     _session_mcp_spec_hash: dict[str, str] = {}  # session_id → last MCP spec hash
     _session_comment_relays: dict[str, _CommentRelayBinding] = {}
-    _pending_codex_releases: dict[str, CodexNativeAppServer] = {}
+    _pending_codex_releases: dict[
+        str, tuple[CodexNativeAppServer | None, str | None, Path | None]
+    ] = {}
 
     # Process-lifetime monotonic fill-generation counter per session id.
     # Incremented (never popped) at delete_session so a fill parked across a
@@ -13070,6 +13072,7 @@ def create_runner_app(
 
         async def _reap_native_pane(pane: PaneRef) -> None:
             conv_id = pane.conversation_id
+            _capture_codex_release(conv_id)
             reaped = pane.instance
             if reaped is None:
                 reaped = _pane_reaper_registry.get(conv_id, pane.terminal_name, "main")
@@ -13115,6 +13118,7 @@ def create_runner_app(
                     probe = await pane.instance.probe_alive()
                     if probe is not False:
                         raise NativePaneStillAlive(pane.instance, probe)
+                _capture_codex_release(conv_id)
                 await _native_runtime.teardown_codex_native_app_server(pane.conversation_id)
                 await _cancel_auto_forwarder_task(conv_id)
                 await _native_runtime.teardown_opencode_native_server(conv_id)
@@ -13139,31 +13143,36 @@ def create_runner_app(
     else:
         app.state.native_pane_reaper = None
 
+    def _capture_codex_release(
+        session_id: str,
+    ) -> tuple[CodexNativeAppServer | None, str | None, Path | None]:
+        """Retain exit evidence before teardown can remove the backend registration."""
+        current = _native_runtime._AUTO_CODEX_APP_SERVERS.get(session_id)
+        current_dir = _native_runtime._AUTO_CODEX_BRIDGE_DIRS.get(session_id)
+        snapshot = _pending_codex_releases.setdefault(
+            session_id,
+            (current, getattr(current, "resident_incarnation_id", None), current_dir),
+        )
+        backend, incarnation, launch_dir = snapshot
+        if (
+            (current is not None and current is not backend)
+            or (current_dir is not None and current_dir is not launch_dir)
+            or getattr(backend, "resident_incarnation_id", None) != incarnation
+        ):
+            raise RuntimeError("Codex backend changed during CLI release")
+        return snapshot
+
     async def _finish_cli_release(session_id: str) -> None:
         """Release non-terminal runtime pieces owned by one CLI session."""
-        if pending := _pending_codex_releases.get(session_id):
-            await pending.close()
-            if not pending.exit_confirmed:
+        retrying = session_id in _pending_codex_releases
+        codex_backend, _, codex_launch_dir = _capture_codex_release(session_id)
+        if retrying and codex_backend is not None:
+            await codex_backend.close()
+            if not codex_backend.exit_confirmed:
                 raise RuntimeError("Codex exit is not confirmed before credential scrub")
-            _pending_codex_releases.pop(session_id)
         resolved_codex_dir = await _codex_native_bridge_dir_for_session(session_id)
-        # Capture before forwarder cancellation can remove the registered backend.
-        codex_backend = _native_runtime._AUTO_CODEX_APP_SERVERS.get(session_id)
-        codex_launch_dir = _native_runtime._AUTO_CODEX_BRIDGE_DIRS.get(session_id)
         codex_bridge_dir = codex_launch_dir or resolved_codex_dir
-        codex_incarnation = getattr(codex_backend, "resident_incarnation_id", None)
-
-        def codex_backend_changed() -> bool:
-            current = _native_runtime._AUTO_CODEX_APP_SERVERS.get(session_id)
-            current_dir = _native_runtime._AUTO_CODEX_BRIDGE_DIRS.get(session_id)
-            return (
-                (current is not None and current is not codex_backend)
-                or (current_dir is not None and current_dir is not codex_launch_dir)
-                or getattr(codex_backend, "resident_incarnation_id", None) != codex_incarnation
-            )
-
-        if codex_backend is not None:
-            _pending_codex_releases[session_id] = codex_backend
+        _capture_codex_release(session_id)
         if not await _cancel_auto_forwarder_task(session_id):
             raise RuntimeError("native forwarder did not stop before runtime cleanup")
         relay_binding = _session_comment_relays.pop(session_id, None)
@@ -13172,13 +13181,11 @@ def create_runner_app(
         if process_manager is not None:
             if await process_manager.release(session_id) is False:
                 raise RuntimeError("harness subprocess did not exit during CLI release")
-        if codex_backend_changed():
-            raise RuntimeError("Codex backend changed during CLI release")
+        _capture_codex_release(session_id)
         await _native_runtime.teardown_codex_native_app_server(session_id)
         if codex_backend is not None and not codex_backend.exit_confirmed:
             raise RuntimeError("Codex exit is not confirmed before credential scrub")
-        if codex_backend_changed():
-            raise RuntimeError("Codex backend changed during CLI release")
+        _capture_codex_release(session_id)
         _pending_codex_releases.pop(session_id, None)
         from omnigent.harnesses.codex_native.bridge import clear_active_child_turns
 
@@ -13201,6 +13208,7 @@ def create_runner_app(
         forget_spawn_family(session_id)
 
     async def _finish_retired(session_id: str, terminal_name: str, token: str) -> str | None:
+        _capture_codex_release(session_id)
         try:
             async with _cli_runtime_lock(session_id).exclusive(timeout=1.0):
                 if any(pane.conversation_id == session_id for pane in _native_panes_for_reaper()):
@@ -13210,6 +13218,7 @@ def create_runner_app(
                 ):
                     return None
                 try:
+                    _capture_codex_release(session_id)
                     await _native_runtime.teardown_codex_native_app_server(session_id)
                     _publish_terminal_deleted_event(
                         conversation_id=session_id,
