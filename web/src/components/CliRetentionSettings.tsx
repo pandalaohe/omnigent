@@ -27,7 +27,6 @@ import {
   type CliRetentionFamilyStats,
   type Host,
   type HostCliRelease,
-  type HostCliRetentionResponse,
   useHostCliReleases,
   useHostCliRetention,
   useReplaceHostCliRetention,
@@ -37,14 +36,6 @@ import { useArchiveWorktreePreference } from "@/lib/archiveWorktreePreferences";
 import { Link } from "@/lib/routing";
 import { relativeTime } from "@/lib/relativeTime";
 import { cn } from "@/lib/utils";
-
-interface RetentionDraft {
-  hostId: string;
-  sourceRevision: number;
-  idleThresholdMinutes: string;
-  maxIdleClis: string;
-  closeOnArchive: boolean;
-}
 
 const STATUS_LABELS: Record<CliRetentionApplicationStatus, string> = {
   legacy: "Using the built-in rule",
@@ -57,32 +48,19 @@ const STATUS_LABELS: Record<CliRetentionApplicationStatus, string> = {
   applied: "Applied",
 };
 
-function draftFromResponse(hostId: string, response: HostCliRetentionResponse): RetentionDraft {
-  // The response's policy is what the Runner applies, configured or not, so
-  // the fields start from it rather than from a second set of defaults.
-  return {
-    hostId,
-    sourceRevision: response.revision,
-    idleThresholdMinutes: String(response.policy.idle_threshold_minutes),
-    maxIdleClis:
-      response.policy.max_idle_clis === null ? "" : String(response.policy.max_idle_clis),
-    closeOnArchive: response.policy.close_on_archive,
-  };
-}
-
 function parseInteger(value: string, min: number, max: number): number | null {
   if (!/^\d+$/.test(value.trim())) return null;
   const parsed = Number(value);
   return Number.isSafeInteger(parsed) && parsed >= min && parsed <= max ? parsed : null;
 }
 
-function isDraftDirty(draft: RetentionDraft, response: HostCliRetentionResponse): boolean {
-  const baseline = draftFromResponse(draft.hostId, response);
-  return (
-    draft.idleThresholdMinutes !== baseline.idleThresholdMinutes ||
-    draft.maxIdleClis !== baseline.maxIdleClis ||
-    draft.closeOnArchive !== baseline.closeOnArchive
-  );
+/**
+ * The threshold and the cap as typed. `null` means "show what the Host holds",
+ * so a saved answer replaces the text without a second state to reconcile.
+ */
+interface RetentionTexts {
+  idle: string | null;
+  cap: string | null;
 }
 
 function familyLabel(family: string): string {
@@ -113,7 +91,7 @@ function applicationDetail(status: CliRetentionApplicationStatus, configured: bo
   }
   switch (status) {
     case "legacy":
-      return "This Host keeps the built-in idle rule until you save a policy here.";
+      return "No policy is saved for this Host; the built-in rule decides when its idle main sessions close.";
     case "host_offline":
       return "You can save changes now. They apply when this Host reconnects.";
     case "other_replica":
@@ -136,13 +114,13 @@ function requestFailureText(error: unknown): string {
     return error instanceof Error ? error.message : "The request could not be completed.";
   }
   if (error.failure === "conflict") {
-    return "These settings changed elsewhere. Reload the current policy before saving again.";
+    return "This Host's policy changed elsewhere, so this change was not saved. The newer values are showing now; set it again if you still want it.";
   }
   if (error.failure === "busy") {
-    return "CLI retention is reconciling now. Your draft is intact; retry in a moment.";
+    return "CLI retention is reconciling now. Try again in a moment.";
   }
   if (error.failure === "host_offline") {
-    return "The Host went offline before the request completed. Your draft is still here.";
+    return "The Host went offline before the request completed. Try again when it reconnects.";
   }
   if (error.failure === "other_replica") {
     return "This Host is connected through another server. Retry after it reconnects.";
@@ -253,33 +231,35 @@ export function CliRetentionFold({ host }: { host: Host }) {
   const retentionQuery = useHostCliRetention(host.host_id, open);
   const replacePolicy = useReplaceHostCliRetention(host.host_id);
   const resetPolicy = useResetHostCliRetention(host.host_id);
-  const [draft, setDraft] = useState<RetentionDraft | null>(null);
+  const [texts, setTexts] = useState<RetentionTexts>({ idle: null, cap: null });
+  const [rowError, setRowError] = useState<string | null>(null);
   const [confirmBuiltIn, setConfirmBuiltIn] = useState(false);
 
   const response = retentionQuery.data;
+  // A saved answer (ours or another tab's) replaces whatever was typed.
+  const responseRevision = response?.revision;
   useEffect(() => {
-    if (response === undefined) return;
-    setDraft((current) =>
-      current === null || !isDraftDirty(current, response)
-        ? draftFromResponse(host.host_id, response)
-        : current,
-    );
-  }, [response, host.host_id]);
+    setTexts({ idle: null, cap: null });
+    setRowError(null);
+  }, [responseRevision]);
 
   // A member who does not own this Host gets no fold; the card keeps its other
   // lines. Until the route answers, the fold stays closed and empty.
   const archivePreference = useArchiveWorktreePreference();
   const gitRemovesWorktrees = (archivePreference.preference.data?.mode ?? "never") !== "never";
 
-  const dirty = draft !== null && response !== undefined && isDraftDirty(draft, response);
-  const needsSave = response !== undefined && (!response.configured || dirty);
-  const remoteChanged =
-    draft !== null && response !== undefined && draft.sourceRevision !== response.revision;
-  const idleThreshold = draft ? parseInteger(draft.idleThresholdMinutes, 1, 10_080) : null;
-  const trimmedLimit = draft?.maxIdleClis.trim() ?? "";
-  const limitIsBlank = trimmedLimit === "";
-  const maxIdle = draft && !limitIsBlank ? parseInteger(draft.maxIdleClis, 0, 100) : null;
-  const valid = draft !== null && idleThreshold !== null && (limitIsBlank || maxIdle !== null);
+  const configured = response?.configured ?? false;
+  const stored = response?.policy ?? null;
+  // An unconfigured Host shows the built-in policy as placeholders only: nothing
+  // is stored for it, and its idle main sessions are still closed by the
+  // built-in timeout, so an empty field must not read as a saved no-limit one.
+  const builtInIdle = stored === null ? "" : String(stored.idle_threshold_minutes);
+  const builtInCap =
+    stored === null || stored.max_idle_clis === null ? "" : String(stored.max_idle_clis);
+  const idleText = texts.idle ?? (configured ? builtInIdle : "");
+  const capText = texts.cap ?? (configured ? builtInCap : "");
+  const capPlaceholder = builtInCap === "" ? "No limit" : builtInCap;
+  const savedCapIsUnlimited = configured && stored !== null && stored.max_idle_clis === null;
   const families = useMemo(
     () =>
       Object.entries(response?.runtime?.families ?? {}).sort(([left], [right]) =>
@@ -288,46 +268,69 @@ export function CliRetentionFold({ host }: { host: Host }) {
     [response?.runtime?.families],
   );
 
-  const clearMutationState = () => {
-    replacePolicy.reset();
-    resetPolicy.reset();
-  };
-  const updateDraft = (patch: Partial<RetentionDraft>) => {
-    clearMutationState();
-    setDraft((current) => (current ? { ...current, ...patch } : current));
+  /**
+   * Persist one valid change at once. Every field edits its own value, so a
+   * save here is the value itself rather than a second click on a Save button.
+   */
+  const commit = (patch: {
+    idleThresholdMinutes?: number;
+    maxIdleClis?: number | null;
+    closeOnArchive?: boolean;
+  }) => {
+    if (stored === null || response === undefined) return;
+    const policy = {
+      version: 1 as const,
+      idle_threshold_minutes: patch.idleThresholdMinutes ?? stored.idle_threshold_minutes,
+      max_idle_clis: "maxIdleClis" in patch ? (patch.maxIdleClis ?? null) : stored.max_idle_clis,
+      close_on_archive: patch.closeOnArchive ?? stored.close_on_archive,
+    };
+    const unchanged =
+      policy.idle_threshold_minutes === stored.idle_threshold_minutes &&
+      policy.max_idle_clis === stored.max_idle_clis &&
+      policy.close_on_archive === stored.close_on_archive;
+    if (unchanged && configured) {
+      setTexts({ idle: null, cap: null });
+      setRowError(null);
+      return;
+    }
+    setRowError(null);
+    replacePolicy.mutate(
+      { expected_revision: response.revision, policy },
+      {
+        onError: (failure) => setRowError(requestFailureText(failure)),
+        onSuccess: () => setTexts({ idle: null, cap: null }),
+      },
+    );
   };
 
-  const reloadCurrent = async () => {
-    clearMutationState();
-    const result = await retentionQuery.refetch();
-    if (result.isError !== true && result.data) {
-      setDraft(draftFromResponse(host.host_id, result.data));
+  const commitIdle = () => {
+    if (texts.idle === null) return;
+    const typed = parseInteger(texts.idle, 1, 10_080);
+    if (typed === null) {
+      setRowError("Enter whole minutes from 1 to 10,080.");
+      return;
     }
+    commit({ idleThresholdMinutes: typed });
   };
 
-  const save = async () => {
-    if (!draft || idleThreshold === null || (!limitIsBlank && maxIdle === null)) return;
-    try {
-      const next = await replacePolicy.mutateAsync({
-        expected_revision: draft.sourceRevision,
-        policy: {
-          version: 1,
-          idle_threshold_minutes: idleThreshold,
-          max_idle_clis: limitIsBlank ? null : maxIdle,
-          close_on_archive: draft.closeOnArchive,
-        },
-      });
-      setDraft(draftFromResponse(draft.hostId, next));
-    } catch {
-      // React Query owns the rendered error while the local draft stays intact.
+  const commitCap = () => {
+    if (texts.cap === null) return;
+    if (texts.cap.trim() === "") {
+      commit({ maxIdleClis: null });
+      return;
     }
+    const typed = parseInteger(texts.cap, 0, 100);
+    if (typed === null) {
+      setRowError("Enter a limit from 0 to 100, or leave it blank for no limit.");
+      return;
+    }
+    commit({ maxIdleClis: typed });
   };
 
   const restoreBuiltInRule = async () => {
-    if (!draft) return;
+    if (stored === null || response === undefined) return;
     try {
-      const next = await resetPolicy.mutateAsync(draft.sourceRevision);
-      setDraft(draftFromResponse(draft.hostId, next));
+      await resetPolicy.mutateAsync(response.revision);
       setConfirmBuiltIn(false);
     } catch {
       // React Query owns the rendered error while the current policy stays visible.
@@ -358,7 +361,7 @@ export function CliRetentionFold({ host }: { host: Host }) {
         <p className="mt-2 text-sm text-muted-foreground">Reading this Host's policy…</p>
       )}
       {/* A Host this user does not own answers nothing here, so it shows no fold. */}
-      {open && response !== undefined && draft !== null && (
+      {open && response !== undefined && stored !== null && (
         <div className="mt-3 flex flex-col gap-3">
           <p className="text-sm text-muted-foreground">
             {applicationDetail(applicationStatus, response.configured)}
@@ -389,7 +392,11 @@ export function CliRetentionFold({ host }: { host: Host }) {
                 sessions close after their own idle timeout, not this number.
               </>
             }
-            note="This Host's own value; other Hosts keep theirs."
+            note={
+              configured
+                ? "This Host's own value; other Hosts keep theirs."
+                : "The built-in rule still closes idle main sessions on its own timeout; a value here takes that over for this Host."
+            }
           >
             <Input
               aria-label="Count a CLI as idle after, in minutes"
@@ -399,9 +406,18 @@ export function CliRetentionFold({ host }: { host: Host }) {
               max={10_080}
               step={1}
               disabled={isBusy}
-              value={draft.idleThresholdMinutes}
-              onChange={(event) => updateDraft({ idleThresholdMinutes: event.target.value })}
-              aria-invalid={idleThreshold === null}
+              placeholder={builtInIdle}
+              value={idleText}
+              onChange={(event) =>
+                setTexts((current) => ({ ...current, idle: event.target.value }))
+              }
+              onBlur={commitIdle}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && event.target instanceof HTMLInputElement) {
+                  event.preventDefault();
+                  commitIdle();
+                }
+              }}
             />
             <span className="text-sm text-muted-foreground">minutes</span>
           </SettingRow>
@@ -422,13 +438,21 @@ export function CliRetentionFold({ host }: { host: Host }) {
                 min={0}
                 max={100}
                 step={1}
-                placeholder="No limit"
+                placeholder={capPlaceholder}
                 disabled={isBusy}
-                value={draft.maxIdleClis}
-                onChange={(event) => updateDraft({ maxIdleClis: event.target.value })}
-                aria-invalid={!limitIsBlank && maxIdle === null}
+                value={capText}
+                onChange={(event) =>
+                  setTexts((current) => ({ ...current, cap: event.target.value }))
+                }
+                onBlur={commitCap}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && event.target instanceof HTMLInputElement) {
+                    event.preventDefault();
+                    commitCap();
+                  }
+                }}
               />
-              {limitIsBlank && (
+              {savedCapIsUnlimited && (
                 <span
                   className="inline-flex items-center gap-1 text-amber-700 dark:text-amber-400"
                   data-testid="cli-limit-warning"
@@ -454,9 +478,9 @@ export function CliRetentionFold({ host }: { host: Host }) {
           >
             <Switch
               aria-label="Close CLI on archive"
-              checked={gitRemovesWorktrees ? true : draft.closeOnArchive}
+              checked={gitRemovesWorktrees ? true : (stored?.close_on_archive ?? true)}
               disabled={isBusy || gitRemovesWorktrees}
-              onCheckedChange={(checked) => updateDraft({ closeOnArchive: checked })}
+              onCheckedChange={(checked) => commit({ closeOnArchive: checked })}
             />
           </SettingRow>
           {gitRemovesWorktrees && (
@@ -510,54 +534,26 @@ export function CliRetentionFold({ host }: { host: Host }) {
             )}
           </div>
           <RecentReleases hostId={host.host_id} open={open} />
-          {remoteChanged && (
-            <div className="flex flex-col gap-2 rounded-lg border border-amber-500/40 bg-amber-500/5 p-3 text-sm sm:flex-row sm:items-center sm:justify-between">
-              <span>The saved policy changed while you were editing. Reload it before saving.</span>
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                onClick={() => void reloadCurrent()}
-              >
-                Reload current policy
-              </Button>
-            </div>
-          )}
-          {replaceErrorText(replacePolicy.error) !== null && (
+          {(rowError !== null || replaceErrorText(replacePolicy.error) !== null) && (
             <p role="alert" className="text-sm text-destructive">
-              {replaceErrorText(replacePolicy.error)}
-            </p>
-          )}
-          {!valid && (
-            <p role="alert" className="text-sm text-destructive">
-              Use whole minutes from 1 to 10,080, and a limit from 0 to 100 or leave it blank.
+              {rowError ?? replaceErrorText(replacePolicy.error)}
             </p>
           )}
           <div className="flex flex-col-reverse gap-2 border-t pt-3 sm:flex-row sm:items-center sm:justify-between">
             <span className="text-sm text-muted-foreground" aria-live="polite">
-              {dirty ? "Unsaved changes" : response.configured ? null : "No policy saved here yet"}
+              {(replacePolicy.isPending || resetPolicy.isPending) && "Saving…"}
             </span>
-            <div className="flex flex-wrap justify-end gap-2">
-              {response.configured && (
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  disabled={isBusy || remoteChanged}
-                  onClick={() => setConfirmBuiltIn(true)}
-                >
-                  Use the built-in rule
-                </Button>
-              )}
+            {response.configured && (
               <Button
                 type="button"
+                variant="outline"
                 size="sm"
-                disabled={!needsSave || !valid || isBusy || remoteChanged}
-                onClick={() => void save()}
+                disabled={isBusy}
+                onClick={() => setConfirmBuiltIn(true)}
               >
-                {replacePolicy.isPending ? "Saving…" : "Save"}
+                Use the built-in rule
               </Button>
-            </div>
+            )}
           </div>
           <Dialog open={confirmBuiltIn} onOpenChange={setConfirmBuiltIn}>
             <DialogContent>
@@ -582,10 +578,10 @@ export function CliRetentionFold({ host }: { host: Host }) {
                 <Button
                   type="button"
                   variant="destructive"
-                  disabled={resetPolicy.isPending || remoteChanged}
+                  disabled={resetPolicy.isPending}
                   onClick={() => void restoreBuiltInRule()}
                 >
-                  {resetPolicy.isPending ? "Restoring…" : "Use the built-in rule"}
+                  {resetPolicy.isPending ? "Restoring…" : "Switch to the built-in rule"}
                 </Button>
               </DialogFooter>
             </DialogContent>

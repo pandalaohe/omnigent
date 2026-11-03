@@ -78,7 +78,7 @@ vi.mock("@/hooks/useSidebarData", () => {
   return { useLoadedConversations: () => loaded };
 });
 
-import { SystemStatusPage } from "./SystemStatusPage";
+import { fanOutLabels, SystemStatusPage } from "./SystemStatusPage";
 
 const MB = 1024 * 1024;
 
@@ -921,6 +921,25 @@ describe("SystemStatusPage host load", () => {
     );
   });
 
+  it("keeps Reset to default's own action on Enter", () => {
+    mocks.update.mutate = vi.fn((_patch: unknown, options?: { onSuccess?: () => void }) =>
+      options?.onSuccess?.(),
+    );
+    const row = renderLoad({ lines: { heavy: 2, new_session: 8 }, lines_source: "host" });
+    fireEvent.click(within(row).getByTestId("host-load-tick-heavy"));
+    const reset = screen.getByRole("button", { name: "Reset to default" });
+    reset.focus();
+    fireEvent.keyDown(reset, { key: "Enter" });
+    fireEvent.click(reset);
+
+    // One call: the reset. Enter must not also submit the form as a save.
+    expect(mocks.update.mutate).toHaveBeenCalledTimes(1);
+    expect(mocks.update.mutate).toHaveBeenCalledWith(
+      { load_lines: { hosts: { host_1: null } } },
+      expect.anything(),
+    );
+  });
+
   it("offers no reset to a host that follows the default", () => {
     const row = renderLoad({});
     fireEvent.click(within(row).getByTestId("host-load-tick-heavy"));
@@ -939,6 +958,36 @@ describe("SystemStatusPage host load", () => {
       "load lines require 0 < heavy < new_session <= 64",
     );
     expect(screen.getByTestId("host-line-form-heavy")).toBeInTheDocument();
+  });
+});
+
+describe("fanOutLabels", () => {
+  it("moves two labels apart while their marks keep their places", () => {
+    // Heavy work 4.9 and No new session 5 on a 300 px ruler: 196 px and 200 px
+    // apart naturally, far closer than one label is wide.
+    const natural = [196, 200];
+    const placed = fanOutLabels(natural, 34, 300);
+
+    expect(placed[0]).toBeLessThan(natural[0]);
+    expect(placed[1]).toBeGreaterThan(natural[1]);
+    expect(placed[1] - placed[0]).toBeGreaterThanOrEqual(34);
+    // The marks themselves are not moved by this.
+    expect(natural).toEqual([196, 200]);
+  });
+
+  it("leaves labels alone when they already clear each other", () => {
+    expect(fanOutLabels([60, 200], 34, 300)).toEqual([60, 200]);
+  });
+
+  it("keeps both labels inside the ruler at an edge", () => {
+    const placed = fanOutLabels([294, 297], 34, 300);
+    expect(Math.min(...placed)).toBeGreaterThanOrEqual(0);
+    expect(Math.max(...placed)).toBeLessThanOrEqual(300);
+    expect(placed[1] - placed[0]).toBeGreaterThanOrEqual(34);
+  });
+
+  it("does nothing before the ruler has a width", () => {
+    expect(fanOutLabels([10, 12], 34, 0)).toEqual([10, 12]);
   });
 });
 
@@ -1010,6 +1059,33 @@ describe("SystemStatusPage alert lines", () => {
     );
 
     expect(mocks.update.mutate).toHaveBeenCalledWith({ mem_pct: 75 }, expect.anything());
+  });
+
+  it("sends the stored percentage back unchanged when only the window moves", () => {
+    mocks.settings.current = { data: { ...settingsView, cpu_pct: 85.555 } };
+    mocks.status.current = {
+      data: makeView({ server: true }),
+      isLoading: false,
+      isError: false,
+      error: null,
+    };
+    mocks.update.mutate = vi.fn();
+    renderPage();
+    // The label rounds for reading; the field holds what the server stored.
+    const card = screen.getByTestId("system-status-server-card");
+    expect(within(card).getByTestId("alert-cpu_pct")).toHaveTextContent("alert 85.56%");
+    fireEvent.click(within(card).getByTestId("alert-cpu_pct"));
+    const percent = screen.getByLabelText("Alert when CPU is above, in percent");
+    expect(percent).toHaveValue(85.555);
+    fireEvent.change(screen.getByLabelText("Sustained window, in minutes"), {
+      target: { value: "3" },
+    });
+    fireEvent.submit(percent.closest("form")!);
+
+    expect(mocks.update.mutate).toHaveBeenCalledWith(
+      { cpu_pct: 85.555, cpu_sustain_min: 3 },
+      expect.anything(),
+    );
   });
 
   it("refuses a percentage outside the range in place", () => {

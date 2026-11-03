@@ -5,7 +5,16 @@
 // A member receives `server: null` and only their own hosts — the page just
 // renders what the permission-filtered response contains.
 
-import { Fragment, memo, useEffect, useMemo, useState, type ReactNode } from "react";
+import {
+  Fragment,
+  memo,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+  type RefObject,
+} from "react";
 import { ChevronDownIcon, ChevronRightIcon } from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
 import { Sparkline } from "@/components/Sparkline";
@@ -177,7 +186,9 @@ function MetricAlert({
   const spec = ALERT_SPECS[field];
   const update = useUpdateSystemStatusSettings();
   const [open, setOpen] = useState(false);
-  const [percent, setPercent] = useState(() => formatThreshold(threshold));
+  // The stored number, not its rounded label: changing only the window must send
+  // the percentage back exactly as it came.
+  const [percent, setPercent] = useState(() => String(threshold));
   const [minutes, setMinutes] = useState(() =>
     sustainMinutes === undefined ? "" : String(sustainMinutes),
   );
@@ -186,7 +197,7 @@ function MetricAlert({
   // Every open starts from what the server has, so a refused edit leaves no draft.
   useEffect(() => {
     if (open) return;
-    setPercent(formatThreshold(threshold));
+    setPercent(String(threshold));
     setMinutes(sustainMinutes === undefined ? "" : String(sustainMinutes));
     setError(null);
   }, [open, threshold, sustainMinutes]);
@@ -245,8 +256,11 @@ function MetricAlert({
             if (event.key === "Escape") {
               event.preventDefault();
               setOpen(false);
+              return;
             }
-            if (event.key === "Enter") {
+            // Enter saves from a value field; on a button it would replace that
+            // button's own action.
+            if (event.key === "Enter" && event.target instanceof HTMLInputElement) {
               event.preventDefault();
               save();
             }
@@ -782,6 +796,61 @@ function tickPosition(point: number, lines: SystemLoadLinePair): number {
   return Math.min(96, Math.max(4, scalePosition(point, lines)));
 }
 
+/** Room between two tick labels when their lines sit close together, in px. */
+const TICK_LABEL_GAP_PX = 34;
+
+/**
+ * Move tick labels apart until none is closer than `gap` to its neighbour while
+ * keeping their order; the marks on the bar keep the true positions. Two lines
+ * a few hundredths apart (4.9 and 5) would otherwise draw their numbers on top
+ * of each other.
+ */
+export function fanOutLabels(positions: number[], gap: number, width: number): number[] {
+  if (positions.length < 2 || width <= 0) return positions;
+  const order = positions
+    .map((position, index) => ({ position, index }))
+    .sort((left, right) => left.position - right.position);
+  const placed = order.map((entry) => entry.position);
+  for (let index = 1; index < placed.length; index += 1) {
+    const overlap = placed[index - 1] + gap - placed[index];
+    if (overlap <= 0) continue;
+    placed[index - 1] -= overlap / 2;
+    placed[index] += overlap / 2;
+  }
+  // Keep every label's centre inside the ruler, then restore the gap the clamp
+  // just squeezed, spreading leftwards from the right edge.
+  const half = gap / 2;
+  for (let index = 0; index < placed.length; index += 1) {
+    placed[index] = Math.min(width - half, Math.max(half, placed[index]));
+  }
+  const last = placed.length - 1;
+  if (placed[last] > width - half) placed[last] = width - half;
+  for (let index = last; index > 0; index -= 1) {
+    if (placed[index] - placed[index - 1] < gap) placed[index - 1] = placed[index] - gap;
+  }
+  const out = [...positions];
+  order.forEach((entry, index) => {
+    out[entry.index] = Math.max(0, placed[index]);
+  });
+  return out;
+}
+
+/** The ruler's own width, so tick labels can be laid out in real pixels. */
+function useRulerWidth(ref: RefObject<HTMLDivElement | null>): number {
+  const [width, setWidth] = useState(0);
+  useEffect(() => {
+    const node = ref.current;
+    if (node === null) return;
+    const measure = () => setWidth(node.getBoundingClientRect().width);
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [ref]);
+  return width;
+}
+
 type LineName = "heavy" | "new_session";
 
 const LINE_TITLES: Record<LineName, string> = {
@@ -849,9 +918,11 @@ function HostLineEditor({
         if (event.key === "Escape") {
           event.preventDefault();
           onClose();
+          return;
         }
-        // Enter saves; the implicit submit is suppressed so nothing sends twice.
-        if (event.key === "Enter") {
+        // Enter saves from the value field only, so a focused Reset keeps its
+        // own action; the implicit submit is suppressed so nothing sends twice.
+        if (event.key === "Enter" && event.target instanceof HTMLInputElement) {
           event.preventDefault();
           save();
         }
@@ -913,11 +984,28 @@ function LoadRuler({
   isAdmin: boolean;
 }) {
   const [editing, setEditing] = useState<LineName | null>(null);
+  const ticksRef = useRef<HTMLDivElement | null>(null);
+  const width = useRulerWidth(ticksRef);
   const hasOwnLines = host.lines_source === "host";
+  const lineNames = Object.keys(LINE_TITLES) as LineName[];
+  const natural = lineNames.map((line) => (tickPosition(lines[line], lines) / 100) * width);
+  const placed = width > 0 ? fanOutLabels(natural, TICK_LABEL_GAP_PX, width) : null;
   return (
     <div className="mt-2" data-testid="host-load-ruler">
-      <div className="relative h-6">
-        {(Object.keys(LINE_TITLES) as LineName[]).map((line) => {
+      <div className="relative h-6" ref={ticksRef}>
+        {placed !== null &&
+          lineNames.map((line, index) => (
+            // The mark keeps the value's own place when the label beside it has
+            // to move over to clear its neighbour.
+            <span
+              key={line}
+              aria-hidden="true"
+              className="absolute bottom-0 h-2 w-px bg-current opacity-40"
+              data-testid={`host-load-mark-${line}`}
+              style={{ left: `${natural[index]}px` }}
+            />
+          ))}
+        {lineNames.map((line, index) => {
           const tone =
             line === "heavy"
               ? "text-amber-700 dark:text-amber-400"
@@ -927,7 +1015,10 @@ function LoadRuler({
             <div
               key={line}
               className="absolute top-0 -translate-x-1/2"
-              style={{ left: `${tickPosition(lines[line], lines)}%` }}
+              style={{
+                left:
+                  placed === null ? `${tickPosition(lines[line], lines)}%` : `${placed[index]}px`,
+              }}
             >
               {isAdmin ? (
                 <Popover

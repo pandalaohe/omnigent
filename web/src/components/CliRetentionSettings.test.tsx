@@ -1,7 +1,7 @@
-// One Host's idle-CLI fold: what it shows before and after a policy exists,
-// the blank-is-no-limit rule, the draft that survives a concurrent change, the
-// built-in-rule reset, the Git lock on Close CLI on archive, and the release
-// log in words instead of wire names.
+// One Host's idle-CLI fold. The state it shows is the policy the Runner uses:
+// nothing stored for a Host still on the built-in rule, and the built-in values
+// only as placeholders. Every valid edit persists at once — there is no Save —
+// and an invalid one is refused without a request.
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -13,12 +13,7 @@ const legacyResponse = (): HostCliRetentionResponse => ({
   contract_version: 1,
   configured: false,
   revision: 0,
-  policy: {
-    version: 1,
-    idle_threshold_minutes: 60,
-    max_idle_clis: null,
-    close_on_archive: true,
-  },
+  policy: { version: 1, idle_threshold_minutes: 60, max_idle_clis: null, close_on_archive: true },
   runtime: null,
   application: { status: "legacy", policy_revision: 0, observed_at: null },
 });
@@ -41,6 +36,11 @@ const appliedResponse = (): HostCliRetentionResponse => ({
   application: { status: "applied", policy_revision: 4, observed_at: 1_900_000_000 },
 });
 
+const unlimitedResponse = (): HostCliRetentionResponse => ({
+  ...appliedResponse(),
+  policy: { ...appliedResponse().policy, max_idle_clis: null },
+});
+
 const mocks = vi.hoisted(() => ({
   response: null as HostCliRetentionResponse | null,
   releases: [] as HostCliRelease[],
@@ -48,9 +48,6 @@ const mocks = vi.hoisted(() => ({
   replace: vi.fn(),
   resetPolicy: vi.fn(),
   refetch: vi.fn(),
-  replaceError: null as unknown,
-  replacePending: false,
-  resetPending: false,
   archiveMode: "never" as "never" | "green_only" | "yellow_too",
   enabled: [] as boolean[],
 }));
@@ -76,14 +73,15 @@ vi.mock("@/hooks/useHosts", async () => {
       error: null,
     }),
     useReplaceHostCliRetention: () => ({
+      mutate: mocks.replace,
       mutateAsync: mocks.replace,
-      isPending: mocks.replacePending,
-      error: mocks.replaceError,
+      isPending: false,
+      error: null,
       reset: vi.fn(),
     }),
     useResetHostCliRetention: () => ({
       mutateAsync: mocks.resetPolicy,
-      isPending: mocks.resetPending,
+      isPending: false,
       error: null,
       reset: vi.fn(),
     }),
@@ -99,20 +97,18 @@ vi.mock("@/lib/archiveWorktreePreferences", () => ({
 
 import { CliRetentionFold } from "./CliRetentionSettings";
 
-const HOST: Host = {
-  host_id: "host-a",
-  name: "Laptop",
-  owner: "alice",
-  status: "online",
-};
+const HOST: Host = { host_id: "host-a", name: "Laptop", owner: "alice", status: "online" };
 
-function openFold() {
+/**
+ * Open the fold and let its toggle land: a summary click dispatches `toggle`
+ * as a task, so a synchronous query would read the closed state.
+ */
+async function renderFold() {
   const view = render(
     <MemoryRouter>
       <CliRetentionFold host={HOST} />
     </MemoryRouter>,
   );
-  // jsdom reports a summary click but does not always flip the details element.
   const summary = view.container.querySelector("summary");
   if (summary === null) throw new Error("the fold has no summary");
   const details = summary.parentElement as HTMLDetailsElement;
@@ -121,6 +117,11 @@ function openFold() {
     details.open = true;
     fireEvent(details, new Event("toggle"));
   }
+  await waitFor(() => expect(details.open).toBe(true));
+  await waitFor(() =>
+    expect(screen.getByTestId("cli-retention-host-a")).toHaveAttribute("open", ""),
+  );
+  return view;
 }
 
 const idleInput = () => screen.getByLabelText("Count a CLI as idle after, in minutes");
@@ -133,12 +134,9 @@ beforeEach(() => {
   mocks.replace.mockReset();
   mocks.resetPolicy.mockReset();
   mocks.refetch.mockReset();
-  mocks.replaceError = null;
-  mocks.replacePending = false;
-  mocks.resetPending = false;
   mocks.archiveMode = "never";
   mocks.enabled = [];
-  mocks.replace.mockImplementation(async () => appliedResponse());
+  mocks.replace.mockImplementation(() => undefined);
   mocks.resetPolicy.mockImplementation(async () => legacyResponse());
   mocks.refetch.mockImplementation(async () => ({ data: mocks.response }));
 });
@@ -157,34 +155,156 @@ describe("CliRetentionFold", () => {
     expect(screen.queryByLabelText("Count a CLI as idle after, in minutes")).toBeNull();
   });
 
-  it("shows the values the runtime uses before any policy is saved, blank meaning no limit", async () => {
-    openFold();
+  it("holds no values for a Host still on the built-in rule, and says so", async () => {
+    await renderFold();
 
-    expect(await screen.findByLabelText("Count a CLI as idle after, in minutes")).toHaveValue(60);
-    // The stored policy is null, so the field is blank rather than a made-up 10.
+    // Nothing is stored, so the built-in numbers are placeholders only: the
+    // Host's idle main sessions are still closed by the built-in timeout.
+    expect(idleInput()).toHaveValue(null);
+    expect(idleInput()).toHaveAttribute("placeholder", "60");
     expect(limitInput()).toHaveValue(null);
-    expect(screen.getByTestId("cli-limit-warning")).toHaveTextContent("No limit");
+    expect(limitInput()).toHaveAttribute("placeholder", "No limit");
+    expect(screen.queryByTestId("cli-limit-warning")).toBeNull();
     expect(screen.getByTestId("cli-retention-status-host-a")).toHaveTextContent(
       "Using the built-in rule",
     );
+    expect(screen.getByText(/No policy is saved for this Host/)).toBeInTheDocument();
+    expect(screen.getByText(/takes that over for this Host/)).toBeInTheDocument();
+    // No Save button anywhere: the fields themselves persist.
+    expect(screen.queryByRole("button", { name: /^Save/ })).toBeNull();
+  });
 
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
-    await waitFor(() =>
-      expect(mocks.replace).toHaveBeenCalledWith({
+  it("persists a typed threshold at once, and nothing when it did not change", async () => {
+    mocks.response = appliedResponse();
+    await renderFold();
+
+    fireEvent.change(idleInput(), { target: { value: "90" } });
+    expect(mocks.replace).not.toHaveBeenCalled();
+    fireEvent.blur(idleInput());
+
+    expect(mocks.replace).toHaveBeenCalledWith(
+      {
+        expected_revision: 4,
+        policy: {
+          version: 1,
+          idle_threshold_minutes: 90,
+          max_idle_clis: 10,
+          close_on_archive: true,
+        },
+      },
+      expect.anything(),
+    );
+
+    mocks.replace.mockClear();
+    fireEvent.change(idleInput(), { target: { value: "60" } });
+    fireEvent.blur(idleInput());
+    expect(mocks.replace).not.toHaveBeenCalled();
+  });
+
+  it("persists on Enter from a value field", async () => {
+    mocks.response = appliedResponse();
+    await renderFold();
+
+    fireEvent.change(limitInput(), { target: { value: "6" } });
+    fireEvent.keyDown(limitInput(), { key: "Enter" });
+
+    expect(mocks.replace).toHaveBeenCalledWith(
+      {
+        expected_revision: 4,
+        policy: {
+          version: 1,
+          idle_threshold_minutes: 60,
+          max_idle_clis: 6,
+          close_on_archive: true,
+        },
+      },
+      expect.anything(),
+    );
+  });
+
+  it("takes the policy over on the first edit of a Host on the built-in rule", async () => {
+    await renderFold();
+
+    fireEvent.change(idleInput(), { target: { value: "120" } });
+    fireEvent.blur(idleInput());
+
+    expect(mocks.replace).toHaveBeenCalledWith(
+      {
         expected_revision: 0,
+        policy: {
+          version: 1,
+          idle_threshold_minutes: 120,
+          max_idle_clis: null,
+          close_on_archive: true,
+        },
+      },
+      expect.anything(),
+    );
+  });
+
+  it("refuses an out-of-range threshold in place, without a request", async () => {
+    await renderFold();
+
+    fireEvent.change(idleInput(), { target: { value: "0" } });
+    fireEvent.blur(idleInput());
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Enter whole minutes from 1 to 10,080.");
+    expect(mocks.replace).not.toHaveBeenCalled();
+    expect(idleInput()).toHaveValue(0);
+  });
+
+  it("clears the cap to no limit by emptying the field", async () => {
+    mocks.response = appliedResponse();
+    await renderFold();
+
+    fireEvent.change(limitInput(), { target: { value: "" } });
+    fireEvent.blur(limitInput());
+
+    expect(mocks.replace).toHaveBeenCalledWith(
+      {
+        expected_revision: 4,
         policy: {
           version: 1,
           idle_threshold_minutes: 60,
           max_idle_clis: null,
           close_on_archive: true,
         },
-      }),
+      },
+      expect.anything(),
+    );
+  });
+
+  it("warns that no limit keeps idle CLIs resident, only once a policy holds one", async () => {
+    mocks.response = unlimitedResponse();
+    await renderFold();
+
+    expect(screen.getByTestId("cli-limit-warning")).toHaveTextContent("No limit");
+    expect(limitInput()).toHaveValue(null);
+  });
+
+  it("persists the close-on-archive switch at once", async () => {
+    mocks.response = appliedResponse();
+    await renderFold();
+
+    fireEvent.click(screen.getByRole("switch", { name: "Close CLI on archive" }));
+
+    expect(mocks.replace).toHaveBeenCalledWith(
+      {
+        expected_revision: 4,
+        policy: {
+          version: 1,
+          idle_threshold_minutes: 60,
+          max_idle_clis: 10,
+          close_on_archive: false,
+        },
+      },
+      expect.anything(),
     );
   });
 
   it("shows the applied state once and counts each family", async () => {
     mocks.response = appliedResponse();
-    openFold();
+    await renderFold();
 
     await screen.findByTestId("cli-family-table");
     expect(screen.getAllByText("Applied")).toHaveLength(1);
@@ -193,89 +313,17 @@ describe("CliRetentionFold", () => {
     expect(within(table).getByText("Codex")).toBeInTheDocument();
     expect(within(table).getAllByText("Within limit")).toHaveLength(2);
     expect(within(table).getByText("8 / 10")).toBeInTheDocument();
-    expect(screen.getByText(/^Read /)).toBeInTheDocument();
-  });
-
-  it("takes a number as the limit and drops the warning", async () => {
-    mocks.response = appliedResponse();
-    openFold();
-
-    const limit = await screen.findByLabelText("Keep at most, per family");
-    expect(screen.queryByTestId("cli-limit-warning")).toBeNull();
-    fireEvent.change(limit, { target: { value: "6" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
-
-    await waitFor(() =>
-      expect(mocks.replace).toHaveBeenCalledWith({
-        expected_revision: 4,
-        policy: {
-          version: 1,
-          idle_threshold_minutes: 60,
-          max_idle_clis: 6,
-          close_on_archive: true,
-        },
-      }),
-    );
-  });
-
-  it("refuses an out-of-range idle threshold without sending it", async () => {
-    openFold();
-
-    fireEvent.change(await screen.findByLabelText("Count a CLI as idle after, in minutes"), {
-      target: { value: "0" },
-    });
-    expect(screen.getByRole("alert")).toHaveTextContent(
-      "Use whole minutes from 1 to 10,080, and a limit from 0 to 100 or leave it blank.",
-    );
-    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
-    expect(mocks.replace).not.toHaveBeenCalled();
-  });
-
-  it("keeps the draft when the saved policy changes underneath, and reloads on request", async () => {
-    mocks.response = appliedResponse();
-    const view = render(
-      <MemoryRouter>
-        <CliRetentionFold host={HOST} />
-      </MemoryRouter>,
-    );
-    const summary = view.container.querySelector("summary")!;
-    const details = summary.parentElement as HTMLDetailsElement;
-    fireEvent.click(summary);
-    if (!details.open) {
-      details.open = true;
-      fireEvent(details, new Event("toggle"));
-    }
-    fireEvent.change(await screen.findByLabelText("Count a CLI as idle after, in minutes"), {
-      target: { value: "90" },
-    });
-
-    mocks.response = {
-      ...appliedResponse(),
-      revision: 5,
-      policy: { ...appliedResponse().policy, idle_threshold_minutes: 75 },
-    };
-    view.rerender(
-      <MemoryRouter>
-        <CliRetentionFold host={HOST} />
-      </MemoryRouter>,
-    );
-
-    expect(idleInput()).toHaveValue(90);
-    expect(screen.getByText(/saved policy changed while you were editing/i)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
-
-    fireEvent.click(screen.getByRole("button", { name: "Reload current policy" }));
-    await waitFor(() => expect(idleInput()).toHaveValue(75));
   });
 
   it("asks before handing this Host back to the built-in rule", async () => {
     mocks.response = appliedResponse();
-    openFold();
+    await renderFold();
 
     fireEvent.click(await screen.findByRole("button", { name: "Use the built-in rule" }));
     const dialog = screen.getByRole("dialog", { name: "Use the built-in idle rule?" });
     expect(mocks.resetPolicy).not.toHaveBeenCalled();
-    fireEvent.click(within(dialog).getByRole("button", { name: "Use the built-in rule" }));
+    // The confirm answers and the trigger that opened it stay distinguishable.
+    fireEvent.click(within(dialog).getByRole("button", { name: "Switch to the built-in rule" }));
 
     await waitFor(() => expect(mocks.resetPolicy).toHaveBeenCalledWith(4));
   });
@@ -283,7 +331,7 @@ describe("CliRetentionFold", () => {
   it("locks Close CLI on archive when Git already removes worktrees, and shows the way there", async () => {
     mocks.archiveMode = "green_only";
     mocks.response = appliedResponse();
-    openFold();
+    await renderFold();
 
     const toggle = await screen.findByRole("switch", { name: "Close CLI on archive" });
     expect(toggle).toBeDisabled();
@@ -313,7 +361,7 @@ describe("CliRetentionFold", () => {
         target_session_id: "conv_fedcba9876543210",
       },
     ];
-    openFold();
+    await renderFold();
 
     const log = await screen.findByTestId("cli-release-log");
     expect(log).toHaveTextContent("Over the idle limit");
@@ -328,7 +376,7 @@ describe("CliRetentionFold", () => {
   });
 
   it("says so when nothing has been released on this Host", async () => {
-    openFold();
+    await renderFold();
     expect(
       await screen.findByText("No CLI has been released on this Host yet."),
     ).toBeInTheDocument();

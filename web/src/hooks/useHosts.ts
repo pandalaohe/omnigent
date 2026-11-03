@@ -386,6 +386,11 @@ export function useReplaceHostCliRetention(hostId: string | null) {
       queryClient.setQueryData(hostCliRetentionQueryKey(hostId), response);
       void queryClient.invalidateQueries({ queryKey: hostCliRetentionQueryKey(hostId) });
     },
+    // A refused write (a revision that moved, a Host that went offline) shows
+    // the Host's current values rather than the ones it just rejected.
+    onError: () => {
+      void queryClient.invalidateQueries({ queryKey: hostCliRetentionQueryKey(hostId) });
+    },
   });
 }
 
