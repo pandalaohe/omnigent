@@ -2144,6 +2144,9 @@ def test_windows_critical_delete_depth_boundary(command: str, expected: Verdict)
         ("echo scanning && rg . /opt/home/.pi/agent", "control-path"),
         ("grep -R . /opt/home/.pi/agent", "control-path"),
         ("echo scanning && sed -n 1p /opt/home/.pi/agent/skills/x/SKILL.md", None),
+        ("LC_ALL=C rg . /opt/home/.pi/agent", "control-path"),
+        ("command rg . /opt/home/.pi/agent", "control-path"),
+        ("LC_ALL=C sed -n 1p /opt/home/.pi/agent/skills/x/SKILL.md", None),
         # An ancestor of an agent root, and dotfiles above it, stay readable.
         ("grep -R . /opt/home", None),
         ("cat /opt/home/.*/*.json", None),
@@ -2251,6 +2254,10 @@ def test_canonical_temporary_roots_keep_the_var_boundary(
         # After -- every value is an operand.
         ("cd /var && rm -- -log", "critical-delete"),
         ("cd /var && rm -rf -- log", "critical-delete"),
+        # find acts on its search roots, so a predicate argument is not a target.
+        ("cd /var && find -type f -delete", "critical-delete"),
+        ("cd / && find -type f -delete", "critical-delete"),
+        ("cd /var/tmp/pi-x && find -type f -delete", None),
     ],
 )
 def test_delete_operands_keep_only_real_targets(command: str, expected: str | None) -> None:
@@ -2310,3 +2317,14 @@ def test_typed_and_resolved_reads_are_checked_separately(
 
     host = posix_host(control_paths=PI_CONTROLS, resolver=linked)
     assert decision("auto", "read", {"path": typed}, host).rule_id == expected
+
+
+def test_a_relative_typed_path_is_absolutized_before_its_own_check() -> None:
+    def linked(path: str) -> ResolvedPath:
+        final = "/opt/work/project/copy" if path == "/opt/home/.pi/agent/models.json" else path
+        kind = "directory" if path in ("/opt/work/project", "/opt/home/.pi/agent") else "new-file"
+        return ResolvedPath(final, kind)
+
+    host = replace(replace(pi_host(), cwd="/opt/home/.pi/agent"), resolver=linked)
+    assert decision("auto", "read", {"path": "models.json"}, host).rule_id == "control-path"
+    assert decision("auto", "read", {"path": "notes.md"}, host).action == Verdict.ALLOW

@@ -1757,24 +1757,29 @@ def _command_paths(
         )
         paths.extend(inner_paths)
         recursive_paths.extend(inner_recursive)
-    reading = ""
+    segments: list[list[str]] = [[]]
     for token in tokens:
         if not token or token in (";", "&&", "||", "|", ">", ">>", "<", "(", ")", "\n"):
-            reading = ""
+            if segments[-1]:
+                segments.append([])
             continue
-        if token.startswith("-"):
-            continue
-        reading = reading or _command_name(token)
-        if token == "$HOME" or token.startswith("$HOME/"):
-            token = context.home + token[5:]
-        elif token == "${HOME}" or token.startswith("${HOME}/"):
-            token = context.home + token[7:]
-        if "$" in token or "=" in token:
-            continue
-        # Globs stay literal so a read of a globbed directory is still visible.
-        paths.append(_resolve(token, context).path)
-        if reading in _RECURSIVE_SHELL_READS:
-            recursive_paths.append(paths[-1])
+        segments[-1].append(token)
+    for segment in segments:
+        offset = _command_offset(segment)
+        reading = _command_name(segment[offset]) if offset < len(segment) else ""
+        for token in segment:
+            if token.startswith("-"):
+                continue
+            if token == "$HOME" or token.startswith("$HOME/"):
+                token = context.home + token[5:]
+            elif token == "${HOME}" or token.startswith("${HOME}/"):
+                token = context.home + token[7:]
+            if "$" in token or "=" in token:
+                continue
+            # Globs stay literal so a read of a globbed directory is still visible.
+            paths.append(_resolve(token, context).path)
+            if reading in _RECURSIVE_SHELL_READS:
+                recursive_paths.append(paths[-1])
     return tuple(paths), tuple(recursive_paths)
 
 
@@ -2091,9 +2096,17 @@ def _write_operands(
         if command == "find" and any(
             value.split("=", 1)[0] in _FIND_ACTIONS for value in arguments
         ):
-            # find -delete and -exec act on every match under its search roots, `.` by default.
-            operands = [value for value in conservative[offset + 1 :] if not value.startswith("-")]
-            return operands or ["."]
+            # A delete acts on every match under find's search roots: the operands before the
+            # first predicate, or `.` when it names none. A predicate argument is never a target.
+            if _delete_segment(tokens):
+                roots = []
+                for value in conservative[offset + 1 :]:
+                    if value.startswith(("-", "(", "!")):
+                        break
+                    roots.append(value)
+                return roots or ["."]
+            # Other actions (-exec, -fprint) keep every value, so their targets stay visible.
+            return [value for value in conservative[offset + 1 :] if not value.startswith("-")]
         if command == "tee":
             if offset or not posix_shell:
                 return conservative
@@ -2295,7 +2308,11 @@ def _control_refusal(
     target = intent.target
     if intent.kind == ToolKind.READ and target is not None:
         recursive = intent.name in _RECURSIVE_READS
-        for path in dict.fromkeys((intent.target_text or target.path, target.path)):
+        try:
+            typed = _absolute(intent.target_text, context) if intent.target_text else ""
+        except ValueError:
+            typed = ""
+        for path in dict.fromkeys((typed or target.path, target.path)):
             if not (
                 _under(path, control, windows) or (recursive and _under(control, path, windows))
             ):
