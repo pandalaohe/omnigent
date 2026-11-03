@@ -2,6 +2,7 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const { spawnSync } = require("child_process");
 const permissionToolSources = require("./permission_tool_registry.cjs");
 let permissionToolRegistry = null;
 
@@ -102,6 +103,35 @@ function readConfig() {
   } catch (_err) {
     return null;
   }
+}
+
+function nativeRetryAdmission(config, request) {
+  if (!config?.bridgeDir || !config?.autoRetryPython) return null;
+  if (request.action === "prompt" && request.text !== "retry") {
+    const target = path.join(config.bridgeDir, "auto-retry-intervention.json");
+    const temporary = `${target}.${crypto.randomBytes(8).toString("hex")}.tmp`;
+    const value = JSON.stringify({ id: crypto.randomBytes(16).toString("hex") });
+    try {
+      fs.writeFileSync(temporary, value, { mode: 0o600 });
+      fs.renameSync(temporary, target);
+    } catch (_error) {
+      try {
+        fs.writeFileSync(target, value, { flag: "r+" });
+        fs.truncateSync(target, Buffer.byteLength(value));
+      }
+      catch (_error) { fs.utimesSync(target, new Date(), new Date()); }
+    } finally {
+      try { fs.unlinkSync(temporary); } catch (_error) {}
+    }
+  }
+  const result = spawnSync(config.autoRetryPython, [
+    "-m", "omnigent.native.auto_retry", "--bridge-dir", config.bridgeDir,
+  ], {
+    input: JSON.stringify({ ...request, session_id: config.sessionId }),
+    encoding: "utf8", timeout: 5000, windowsHide: true,
+  });
+  if (result.status !== 0) throw new Error("native_retry_admission_unavailable");
+  return JSON.parse(result.stdout);
 }
 
 function writeConfig(config) {
@@ -2181,6 +2211,8 @@ module.exports = function (pi) {
   // Response id shared across a turn's ``running`` → ``idle`` status pair.
   // Kept separate from activeResponseId, which turn_start overwrites.
   let turnStatusResponseId = null;
+  let turnInputId = null;
+  let nextInputAdmission = null;
   let turnResult = null;
   let turnOutcomeController = new AbortController();
   // Dedicated loop-state flag, set on agent_start / cleared on agent_end. Used
@@ -3326,10 +3358,10 @@ module.exports = function (pi) {
     // this loop and can still arm/replay; agent_end clears once the loop
     // completes. See F18.
     clearPendingInterrupt();
-    await flushPreviews();
-    previewDisabled = false;
     turnOutcomeController.abort();
     turnOutcomeController = new AbortController();
+    await flushPreviews();
+    previewDisabled = false;
     agentRunning = true;
     turnResult = null;
     setOmnigentStatus(config, ctx, "running");
@@ -3347,6 +3379,8 @@ module.exports = function (pi) {
     streamingMessageOrdinal = 0;
     // Pin the status response_id for this agent loop through agent_end.
     turnStatusResponseId = `pi-${Date.now()}-${++sequence}`;
+    nativeRetryAdmission(config, { action: "status", turn_id: turnStatusResponseId, idle: false });
+    turnInputId = null;
     await postEvent(config, {
       type: "external_session_status",
       data: {
@@ -3362,6 +3396,8 @@ module.exports = function (pi) {
     const outcomeSignal = turnOutcomeController.signal;
     const endResponseId =
       turnStatusResponseId ?? `pi-${Date.now()}-${++sequence}`;
+    const endInputId = turnInputId;
+    nativeRetryAdmission(config, { action: "status", turn_id: endResponseId, idle: true });
     const result = turnResult;
     const drainedHistory = compacting ? Promise.resolve(true) : history.flush();
     clearPendingInterrupt();
@@ -3397,7 +3433,9 @@ module.exports = function (pi) {
     // Pi continues queued steering after agent_end; the parent's dispatch is still active.
     if (outcome === "completed" && ctx?.hasPendingMessages?.()) return;
     const deliveryFailed = !drained || (Boolean(result?.output) && !result.item?.accepted);
-    const status = deliveryFailed || outcome === "failed" ? "failed" : "idle";
+    const finalOutcome = outcome === "cancelled" ? "cancelled"
+      : deliveryFailed ? "failed" : outcome;
+    const status = finalOutcome === "failed" ? "failed" : "idle";
     const output = deliveryFailed
       ? "Omnigent could not save the Pi turn output; see host logs."
       : (result?.output ?? (cancelled ? "" : "Pi turn ended without a final response."));
@@ -3406,8 +3444,9 @@ module.exports = function (pi) {
         type: "external_session_status",
         data: {
           status, response_id: endResponseId,
-          turn_completed: !deliveryFailed && outcome === "completed",
-          turn_outcome: deliveryFailed ? "failed" : outcome,
+          turn_id: endResponseId, input_id: endInputId,
+          turn_completed: finalOutcome === "completed",
+          turn_outcome: finalOutcome,
           output,
           ...(status === "failed" ? { failure_detail: output } : {}),
         },
@@ -3551,6 +3590,18 @@ module.exports = function (pi) {
 
   pi.on("input", async (event, ctx) => {
     rememberContext(ctx);
+    try {
+      nextInputAdmission = nativeRetryAdmission(config, { action: "prompt", text: event?.text ?? "" });
+    } catch (error) {
+      ctx?.ui?.notify?.(error.message, "error");
+      nextInputAdmission = null;
+      if (event?.text === "retry") return { action: "handled" };
+    }
+    if (nextInputAdmission?.block) {
+      ctx?.ui?.notify?.(nextInputAdmission.reason, "info");
+      nextInputAdmission = null;
+      return { action: "handled" };
+    }
     setOmnigentStatus(config, ctx, "running");
     const text = event && typeof event.text === "string" ? event.text : "";
     if (!text) return;
@@ -3587,13 +3638,26 @@ module.exports = function (pi) {
         ? `timestamp:${message.timestamp}` : `callback:${++sequence}`;
       const sourceId = boundedSourceId(`pi:user:${identity}:${fingerprint(text)}`);
       if (postedMessages.has(sourceId)) return;
+      const autoRetry = nextInputAdmission?.auto_retry;
+      const nativeGeneration = nextInputAdmission?.native_generation;
+      nextInputAdmission = null;
+      turnInputId = autoRetry?.input_id ?? sourceId;
+      await postEvent(config, {
+        type: "external_session_status",
+        data: {
+          status: "running", turn_id: turnStatusResponseId, input_id: turnInputId,
+          ...(nativeGeneration ? { native_generation: nativeGeneration } : {}),
+        },
+      });
       history.enqueue(
         {
           response_id: `pi-consumed-user-${identity}:${fingerprint(text)}`,
           item_type: "message",
+          ...(autoRetry ? { input_id: autoRetry.input_id, input_turn_id: turnStatusResponseId } : {}),
           item_data: {
             role: "user",
             content: [{ type: "input_text", text }],
+            ...(autoRetry ? { stable_id: autoRetry.input_id, auto_retry: autoRetry } : {}),
           },
         },
         sourceId,

@@ -19,6 +19,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_bridge_state,
     read_certificate_failure,
     record_certificate_failure,
+    update_active_turn_id,
     write_bridge_state,
 )
 from tests.harnesses.codex_native.forwarder._support import (
@@ -1001,6 +1002,25 @@ async def test_post_turn_status_edge_surfaces_generic_error_output() -> None:
     assert data["output"] == "model stream broke"
     # Generic errors do not demand re-auth.
     assert "reauth_required" not in data
+
+
+@pytest.mark.asyncio
+async def test_terminal_input_receipt_is_bound_to_its_native_turn(tmp_path: Path) -> None:
+    _seed_active_turn(tmp_path, "first")
+    update_active_turn_id(tmp_path, "first", input_id="accepted-input-first")
+    client = _RecordingClient()
+    for turn in ("first", "second"):
+        await fwd._post_turn_status_edge(
+            client,
+            "conv_x",
+            fwd._CodexTurnStatusEdge(status="failed", turn_id=turn, source="turn/failed"),
+            bridge_dir=tmp_path,
+        )
+    first, second = [body["data"] for _, body in client.posts]
+    assert first["response_id"] == "codex_first"
+    assert first["input_id"] == "accepted-input-first"
+    assert second["response_id"] == "codex_second"
+    assert "input_id" not in second
 
 
 @pytest.mark.asyncio

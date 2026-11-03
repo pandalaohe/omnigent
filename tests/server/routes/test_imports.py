@@ -133,6 +133,13 @@ async def test_import_session_creates_normal_session_and_blocks_duplicate(
         ],
     }
 
+    for imported in payload["items"]:
+        imported["data"]["auto_retry"] = {
+            "chain_id": "a" * 32,
+            "input_id": "b" * 32,
+            "attempt": 1,
+            "of": 3,
+        }
     created = await client.post("/v1/imports", json=payload)
     repeated = await client.post("/v1/imports", json=payload)
 
@@ -153,6 +160,7 @@ async def test_import_session_creates_normal_session_and_blocks_duplicate(
     items = await client.get(f"/v1/sessions/{session_id}/items")
     assert items.status_code == 200
     assert [item["type"] for item in items.json()["data"]] == ["message", "message"]
+    assert all("auto_retry" not in item for item in items.json()["data"])
 
 
 async def test_import_dedupes_against_native_session(

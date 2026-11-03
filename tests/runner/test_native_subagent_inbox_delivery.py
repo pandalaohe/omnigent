@@ -1579,13 +1579,20 @@ async def test_recovered_pending_child_outlives_launch_timeout_and_delivers_orig
     assert payload["status"] == "completed"
     assert payload["output"] == "review complete: LGTM"
     await _cleanup_drained_subagent_work(payload, server_client=server)
+    assert payload["terminal"]["recovered"] is True
+    assert payload["terminal"]["turn_id"] is None
+    assert payload["terminal"]["input_id"] is None
     server.patch.assert_any_await(
         f"/v1/sessions/{CHILD_SESSION_ID}",
         json={
             "labels": {
+                "omnigent.subagent.result_identity.turn_id": "",
+                "omnigent.subagent.result_identity.input_id": "",
+                "omnigent.subagent.result_identity.input_generation": "",
+                "omnigent.subagent.result_identity.event_kind": "turn_terminal",
                 subagent_work.SUBAGENT_RESULT_ITEM_LABEL_KEY: (
                     f"{DISPATCH_ID}:completed:item_original"
-                )
+                ),
             }
         },
         timeout=30.0,

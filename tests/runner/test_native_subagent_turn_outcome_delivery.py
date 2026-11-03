@@ -79,7 +79,7 @@ class _Rig:
         )
 
     def close(self) -> None:
-        subagent_work.unregister_subagent_work(self.child_id)
+        subagent_work.unregister_subagent_work_for_session(self.child_id)
         subagent_work._session_inboxes_ref.pop(self.parent_id, None)
         self.runner_app._session_event_queues_ref.pop(self.parent_id, None)
         self.runner_app._session_event_queues_ref.pop(self.child_id, None)
@@ -105,6 +105,39 @@ class _Rig:
 
 
 @pytest.mark.asyncio
+async def test_failed_turn_identity_distinguishes_same_error_and_late_duplicates() -> None:
+    rig = _Rig("claude-native")
+    try:
+        async with _runner_client(rig.app, permission_harness=rig.harness) as client:
+            await rig.create_child_session(client)
+            for turn in ("first", "second", "first", "second"):
+                response = await rig.post_status(
+                    client,
+                    {
+                        "status": "failed",
+                        "response_id": f"response-{turn}",
+                        "input_id": f"input-{turn}",
+                        "input_generation": 1 if turn == "first" else 2,
+                        "output": "same provider failure",
+                    },
+                )
+                assert response.status_code == 204
+        results = rig.drained()
+        assert len(results) == 2
+        assert [result["terminal"]["turn_id"] for result in results] == [
+            "response-first",
+            "response-second",
+        ]
+        assert [result["terminal"]["input_id"] for result in results] == [
+            "input-first",
+            "input-second",
+        ]
+        assert all(result["terminal"]["event_kind"] == "turn_terminal" for result in results)
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("harness", ["claude-native", "pi-native"])
 async def test_quiescence_idle_for_outcome_confirming_harness_delivers_nothing(
     harness: str,
@@ -112,7 +145,7 @@ async def test_quiescence_idle_for_outcome_confirming_harness_delivers_nothing(
     """Quiescence or compaction clears runner activity without completing the dispatch."""
     rig = _Rig(harness)
     try:
-        async with _runner_client(rig.app, permission_harness=rig.harness) as client:
+        async with _runner_client(rig.app, permission_harness=harness) as client:
             await rig.create_child_session(client)
             for data in ({"status": "running"}, {"status": "idle", "output": "partial text"}):
                 resp = await rig.post_status(client, data)

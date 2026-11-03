@@ -39,6 +39,53 @@ _TINY_PNG_DATA_URI = f"data:image/png;base64,{_TINY_PNG_B64}"
 _TINY_PNG_BYTES = base64.b64decode(_TINY_PNG_B64)
 
 
+async def test_stale_automatic_retry_never_pastes_and_returns_receipt(tmp_path, monkeypatch):
+    from omnigent.native.auto_retry import (
+        AutoRetryGuard,
+        admit_prompt,
+        auto_retry_scope,
+        observe_turn,
+        read_receipt,
+    )
+
+    snapshot = observe_turn(tmp_path, "child", "failed-turn", idle=True)
+    guard = AutoRetryGuard(
+        session_id="child",
+        chain_id="c" * 32,
+        input_id="a" * 32,
+        expected_turn_id="failed-turn",
+        expected_input_generation=4,
+        expected_native_generation=snapshot.generation,
+        admission_deadline=time.time() + 60,
+        attempt=1,
+        of=3,
+    )
+    admit_prompt(tmp_path, "child", "replacement", turn_id="human-turn")
+    observe_turn(tmp_path, "child", "human-turn", idle=True)
+    monkeypatch.setattr(claude_bridge, "_claude_turn_running", lambda *args: False)
+    monkeypatch.setattr(
+        claude_bridge, "_run_tmux", lambda *args: pytest.fail("stale retry reached tmux")
+    )
+
+    def inject(bridge, *, content):
+        claude_bridge._paste_and_submit(
+            bridge, "unused.sock", "main", text=content, needle=content
+        )
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", inject)
+    with auto_retry_scope(guard):
+        events = [
+            event
+            async for event in ClaudeNativeExecutor(tmp_path).run_turn(
+                [{"role": "user", "content": "retry"}], [], ""
+            )
+        ]
+    assert isinstance(events[0], ExecutorError) and events[0].undelivered
+    assert events[0].code == "superseded_by_human_input"
+    assert events[0].preserve_session
+    assert read_receipt(tmp_path, guard.input_id).state == "rejected"
+
+
 @pytest.mark.asyncio
 async def test_run_turn_injects_user_message_without_streaming_transcript(
     monkeypatch: pytest.MonkeyPatch,

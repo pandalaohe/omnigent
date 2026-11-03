@@ -87,6 +87,7 @@ async def restore_pending_inputs(
                 stable_id=item.id,
                 created_by=item.created_by,
                 background_titles_enabled=bool(options and options.background_titles_enabled),
+                auto_retry=item.data.auto_retry if isinstance(item.data, MessageData) else None,
             )
             conv = await asyncio.to_thread(store.get_conversation, session_id)
             if conv is not None and conv.labels.get(STARTUP_LABEL) == "cancelled":

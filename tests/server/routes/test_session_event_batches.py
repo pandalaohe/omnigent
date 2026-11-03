@@ -191,8 +191,8 @@ def _make_client(store: _RecordingStore, **router_options: Any) -> TestClient:
     """FastAPI test client with auth and permissions disabled."""
     router = create_sessions_router(
         conversation_store=store,  # type: ignore[arg-type]
-        agent_store=MagicMock(),
-        runner_router=None,
+        agent_store=router_options.pop("agent_store", MagicMock()),
+        runner_router=router_options.pop("runner_router", None),
         auth_provider=None,
         permission_store=None,
         **router_options,

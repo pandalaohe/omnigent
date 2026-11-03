@@ -7421,19 +7421,36 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
         forwarded.clear()
         status_resp = await client.post(
             f"/v1/sessions/{child['id']}/events",
-            json={"type": "external_session_status", "data": {"status": "idle"}},
+            json={
+                "type": "external_session_status",
+                "data": {
+                    "status": "idle",
+                    "response_id": "resp_native_done",
+                    "input_id": "native-input",
+                    "input_generation": 999,
+                },
+            },
         )
 
     assert status_resp.status_code == 202, status_resp.text
     child_snapshot = await client.get(f"/v1/sessions/{child['id']}")
     assert child_snapshot.status_code == 200, child_snapshot.text
     assert child_snapshot.json()["labels"]["omnigent.subagent.terminal_status"] == "completed"
+    labels = child_snapshot.json()["labels"]
+    assert labels["omnigent.subagent.identity.turn_id"] == "resp_native_done"
+    assert labels["omnigent.subagent.identity.input_id"] == "native-input"
+    assert labels["omnigent.subagent.identity.input_generation"] == ""
     assert forwarded == [
         {
             "path": f"/v1/sessions/{child['id']}/events",
             "body": {
                 "type": "external_session_status",
-                "data": {"status": "idle", "output": "AP_NATIVE_DONE"},
+                "data": {
+                    "status": "idle",
+                    "output": "AP_NATIVE_DONE",
+                    "response_id": "resp_native_done",
+                    "input_id": "native-input",
+                },
                 "model_override": None,
                 "tools": None,
                 "created_by": None,
@@ -13165,10 +13182,12 @@ async def test_terminal_edge_during_interrupt_delivery_wins_over_late_publish(
 @pytest.mark.parametrize("event_type", ["interrupt", "stop_session"])
 async def test_interrupt_codex_side_chat_targets_its_turn_on_parent_runner(
     client: httpx.AsyncClient,
+    db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
     case: str,
     event_type: str,
 ) -> None:
+    from omnigent.entities.subagent_retry import ControlInputReference
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes._sessions.common import (
         _interrupt_fenced_sessions,
@@ -13176,6 +13195,7 @@ async def test_interrupt_codex_side_chat_targets_its_turn_on_parent_runner(
         _session_status_cache,
     )
     from omnigent.server.routes.sessions import routes_events
+    from omnigent.stores.subagent_retry_store.sqlalchemy_store import SqlAlchemySubagentRetryStore
 
     agent = await create_test_agent(client)
     parent = await _create_session(
@@ -13236,6 +13256,14 @@ async def test_interrupt_codex_side_chat_targets_its_turn_on_parent_runner(
         assert response.status_code == expected_status, response.text
         if case in ("request", "request_idle", "cache", "failure"):
             assert get_runner.await_args.args[0] == parent["id"]
+            assert len(forwarded) == 1
+            control = ControlInputReference.model_validate(forwarded[0][1]["input_control"])
+            assert control.session_id == child_id
+            receipt = SqlAlchemySubagentRetryStore(db_uri).get_input(control.input_id)
+            assert receipt is not None and receipt.target_id == child_id
+            assert receipt.kind == "control"
+            # A server 503 leaves delivery ambiguous until the receiver reconciles it.
+            assert receipt.state == ("prepared" if case == "failure" else "accepted")
             assert forwarded == [
                 (
                     f"/v1/sessions/{parent['id']}/events",
@@ -13243,6 +13271,7 @@ async def test_interrupt_codex_side_chat_targets_its_turn_on_parent_runner(
                         "type": "interrupt",
                         "codex_side_thread_id": "thread_side",
                         "codex_side_turn_id": "turn_side",
+                        "input_control": control.model_dump(),
                     },
                 )
             ]

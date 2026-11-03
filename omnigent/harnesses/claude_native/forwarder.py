@@ -24,6 +24,7 @@ import httpx
 
 from omnigent.debug_logging import debug_event
 from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.entities.subagent_terminal import TerminalEnvelope
 from omnigent.errors import ErrorCode
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
@@ -40,6 +41,7 @@ from omnigent.harnesses.claude_native.bridge import (
     _transcript_items_from_entry,
     _transcript_timestamp,
     accumulate_transcript_cost,
+    correlate_retry_input,
     price_transcript_cost_ledger,
     read_active_session_id,
     read_bridge_id,
@@ -6323,10 +6325,20 @@ async def _forward_available_status_events(
                 session_id=session_id,
                 status=status,
                 response_id=response_id,
+                native_generation=record.native_generation,
                 # The ``Stop`` hook fires exactly once per finished turn and
                 # never on an interrupt, so its ``idle`` edge is a confirmed
                 # turn completion, unlike quiescence-derived idles.
                 turn_completed=True if status == "idle" else None,
+                terminal=TerminalEnvelope.from_data(
+                    session_id,
+                    parent_id=None,
+                    status="completed" if status == "idle" else "failed",
+                    data={
+                        "turn_id": record.terminal_turn_id or response_id,
+                        "input_id": record.terminal_input_id,
+                    },
+                ),
                 # Only the ``Stop`` (idle) edge carries an authoritative
                 # background-shell count — ``0`` clears the tally, ``N`` sets it.
                 # This is the one thing the status file cannot report: its
@@ -7333,6 +7345,7 @@ async def _forward_transcript_item_batch(
         if retry_tracker.retry_delay_s(retry_key) is not None:
             return updated
         try:
+            item = await asyncio.to_thread(correlate_retry_input, bridge_dir, session_id, item)
             await _post_external_conversation_item(
                 client,
                 session_id=session_id,
@@ -8025,6 +8038,11 @@ async def _post_external_conversation_item(
                     "item_data": item_data,
                     "response_id": item.response_id,
                     "source_id": item.source_id,
+                    **(
+                        {"input_id": item.retry_input_id, "input_turn_id": item.retry_turn_id}
+                        if item.retry_input_id is not None
+                        else {}
+                    ),
                     **(
                         {"subagent_return_id": item.subagent_return_id}
                         if item.subagent_return_id is not None

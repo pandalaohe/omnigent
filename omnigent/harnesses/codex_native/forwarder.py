@@ -64,6 +64,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_codex_config_model,
     read_mcp_startup,
     record_child_usage_baseline,
+    record_retry_source,
     resolve_codex_auto_compact_token_limit,
     settle_pending_mcp_startup,
     update_active_child_turn,
@@ -912,6 +913,7 @@ class _CodexForwarderState:
     synced_item_keys: set[str] = field(default_factory=set)
     surfaced_terminal_error_turns: set[str] = field(default_factory=set)
     posted_user_turns: set[str] = field(default_factory=set)
+    input_ids_by_turn: dict[str, str] = field(default_factory=dict)
     user_message_copy_balance: dict[tuple[str, str, str], int] = field(default_factory=dict)
     resume_echo_thread_ids: set[str] = field(default_factory=set)
     posted_tool_calls: set[str] = field(default_factory=set)
@@ -1287,7 +1289,7 @@ class _CodexForwarderState:
         """
         self.subscribed_child_threads.add(thread_id)
 
-    def note_user_message_posted(self, turn_id: str) -> None:
+    def note_user_message_posted(self, turn_id: str, input_id: str | None = None) -> None:
         """
         Record that a turn's user message has been posted to AP.
 
@@ -1295,6 +1297,8 @@ class _CodexForwarderState:
         :returns: None.
         """
         self.posted_user_turns.add(turn_id)
+        if input_id is not None:
+            self.input_ids_by_turn[turn_id] = input_id
 
     def has_posted_user_message(self, turn_id: str) -> bool:
         """
@@ -3897,7 +3901,14 @@ async def _post_resume_turn_status(
     if thread_id is None:
         return
     edge = _resume_turn_status_edge_for_latest_turn(bridge_dir, thread_id, turns)
-    await _post_turn_status_edge(client, session_id, edge)
+    input_id = None
+    if edge is not None and edge.turn_id is not None:
+        user_item = _find_turn_user_message({"result": {"thread": {"turns": turns}}}, edge.turn_id)
+        if user_item is not None:
+            input_id = _source_id({"threadId": thread_id, "turnId": edge.turn_id}, user_item)
+    await _post_turn_status_edge(
+        client, session_id, edge, input_id=input_id, recovered=True, bridge_dir=bridge_dir
+    )
 
 
 def _resume_turn_status_edge_for_latest_turn(
@@ -5094,6 +5105,8 @@ async def _maybe_fail_turn_on_certificate_failure(
                     kind=_CODEX_ERROR_KIND_GENERIC,
                 ),
             ),
+            forwarder_state=forwarder_state,
+            bridge_dir=bridge_dir,
         )
         await usage_coalescer.flush()
     return True
@@ -5196,6 +5209,7 @@ async def _maybe_handle_turn_event(
                     )
                 except Exception:
                     _logger.warning("Could not read the Codex rollout's last model", exc_info=True)
+            await _ensure_user_message_posted(client, session_id, params, forwarder_state)
             edge = _CodexTurnStatusEdge(
                 status="failed",
                 turn_id=turn_id,
@@ -5215,7 +5229,10 @@ async def _maybe_handle_turn_event(
                 forwarder_state.defer_terminal_edge_callback = None
                 defer_cb(session_id, edge)
             else:
-                await _post_turn_status_edge(client, session_id, edge)
+                await _post_turn_status_edge(
+                    client, session_id, edge,
+                    forwarder_state=forwarder_state, bridge_dir=bridge_dir,
+                )
             await usage_coalescer.flush()
         return True
     if method == "turn/started":
@@ -5538,6 +5555,7 @@ async def _handle_terminal_turn_boundary_inner(
         forwarder_state.forget_user_message_copies(terminal_turn_id)
     handled = terminal.handled
     if terminal.edge is not None:
+        await _ensure_user_message_posted(client, session_id, params, forwarder_state)
         defer_cb = (
             forwarder_state.defer_terminal_edge_callback if forwarder_state is not None else None
         )
@@ -5545,7 +5563,13 @@ async def _handle_terminal_turn_boundary_inner(
             forwarder_state.defer_terminal_edge_callback = None
             defer_cb(session_id, terminal.edge)
         else:
-            await _post_turn_status_edge(client, session_id, terminal.edge)
+            await _post_turn_status_edge(
+                client,
+                session_id,
+                terminal.edge,
+                forwarder_state=forwarder_state,
+                bridge_dir=bridge_dir,
+            )
     if handled:
         await elicitation_tracker.resolve_by_terminal_turn_event(
             client,
@@ -6831,7 +6855,7 @@ async def _handle_turn_started(
     :returns: None.
     """
     edge = _turn_started_status_edge(bridge_dir, params)
-    await _post_turn_status_edge(client, session_id, edge)
+    await _post_turn_status_edge(client, session_id, edge, bridge_dir=bridge_dir)
 
 
 def _turn_started_status_edge(
@@ -7053,6 +7077,8 @@ def _claim_completed_item(
     params: _JsonObject,
     item: _JsonObject,
     forwarder_state: _CodexForwarderState | None,
+    *,
+    retry_input_id: str | None = None,
 ) -> str | None:
     """
     Claim one completed Codex transcript item for Omnigent posting.
@@ -7081,7 +7107,11 @@ def _claim_completed_item(
     turn_id = turn_id if isinstance(turn_id, str) and turn_id else "turn"
     if is_anon:
         forwarder_state.advance_anon_counter(thread_id, turn_id)
-    elif item.get("type") == "userMessage" and isinstance(item.get("content"), list):
+    elif (
+        item.get("type") == "userMessage"
+        and isinstance(item.get("content"), list)
+        and retry_input_id is None
+    ):
         content = json.dumps(item["content"], sort_keys=True)
         content_digest = hashlib.sha256(content.encode()).hexdigest()
         resumed = _CODEX_RESUME_POSITION_ITEM_ID.fullmatch(str(item.get("id"))) is not None
@@ -7206,16 +7236,19 @@ async def _handle_completed_item_inner(
                 if forwarder_state is not None:
                     forwarder_state.compaction_item_persisted = True
         return
-    source_id = _claim_completed_item(params, item, forwarder_state)
+    retry_input_id = _recorded_retry_input_id(bridge_dir, session_id, params, item)
+    source_id = _claim_completed_item(params, item, forwarder_state, retry_input_id=retry_input_id)
     if source_id is None:
         return
     if item_type == "userMessage":
         await _reconcile_async_question_replies(client, session_id, params, item, forwarder_state)
-        posted = await _post_user_message(client, session_id, params, item, source_id=source_id)
+        posted = await _post_user_message(
+            client, session_id, params, item, source_id=source_id, bridge_dir=bridge_dir
+        )
         if posted and forwarder_state is not None:
             turn_id = _turn_id_from_payload(params)
             if turn_id:
-                forwarder_state.note_user_message_posted(turn_id)
+                forwarder_state.note_user_message_posted(turn_id, retry_input_id or source_id)
         return
     if item_type == "agentMessage":
         # User-before-assistant ordering guarantee. On a fresh thread the
@@ -8300,7 +8333,9 @@ async def _handle_agent_message_delta(
         edge = _delta_recovery_status_edge(bridge_dir, params, turn_id)
         if edge is not None:
             await _ensure_user_message_posted(client, session_id, params, forwarder_state)
-            await _post_turn_status_edge(client, session_id, edge)
+            await _post_turn_status_edge(
+                client, session_id, edge, forwarder_state=forwarder_state, bridge_dir=bridge_dir
+            )
             _record_partial_text_delta(
                 forwarder_state,
                 turn_id=turn_id,
@@ -8367,7 +8402,9 @@ async def _handle_plan_delta(
         edge = _delta_recovery_status_edge(bridge_dir, params, turn_id)
         if edge is not None:
             await _ensure_user_message_posted(client, session_id, params, forwarder_state)
-            await _post_turn_status_edge(client, session_id, edge)
+            await _post_turn_status_edge(
+                client, session_id, edge, forwarder_state=forwarder_state, bridge_dir=bridge_dir
+            )
             _record_partial_text_delta(
                 forwarder_state,
                 turn_id=turn_id,
@@ -8454,7 +8491,12 @@ async def _ensure_user_message_posted(
         "turnId": turn_id,
         "item": user_item,
     }
-    source_id = _claim_completed_item(recovered_params, user_item, forwarder_state)
+    retry_input_id = _recorded_retry_input_id(
+        forwarder_state.child_usage_baseline_dir, session_id, recovered_params, user_item
+    )
+    source_id = _claim_completed_item(
+        recovered_params, user_item, forwarder_state, retry_input_id=retry_input_id
+    )
     if source_id is None:
         return
     await _reconcile_async_question_replies(
@@ -8466,8 +8508,29 @@ async def _ensure_user_message_posted(
         recovered_params,
         user_item,
         source_id=source_id,
+        bridge_dir=forwarder_state.child_usage_baseline_dir,
     ):
-        forwarder_state.note_user_message_posted(turn_id)
+        forwarder_state.note_user_message_posted(turn_id, retry_input_id or source_id)
+
+
+def _recorded_retry_input_id(
+    bridge_dir: Path | None, session_id: str, params: _JsonObject, item: _JsonObject
+) -> str | None:
+    state = read_bridge_state(bridge_dir) if bridge_dir is not None else None
+    input_id = item.get("clientId")
+    turn_id = _turn_id_from_payload(params)
+    if (
+        state is not None
+        and (state.session_id, state.thread_id) == (session_id, _thread_id_from_params(params))
+        and isinstance(input_id, str)
+        and isinstance(item.get("id"), str)
+        and bool(item["id"])
+        and input_id in state.retry_inputs
+        and turn_id is not None
+        and state.retry_inputs[input_id] in {None, turn_id}
+    ):
+        return input_id
+    return None
 
 
 def _find_turn_user_message(response: CodexMessage, turn_id: str) -> _JsonObject | None:
@@ -8500,6 +8563,7 @@ async def _post_user_message(
     item: _JsonObject,
     *,
     source_id: str | None = None,
+    bridge_dir: Path | None = None,
 ) -> bool:
     """
     Persist a Codex user message observed from the TUI.
@@ -8536,13 +8600,34 @@ async def _post_user_message(
             session_id,
             _source_id(params, item),
         )
+    input_id = _recorded_retry_input_id(bridge_dir, session_id, params, item)
+    if text != "retry" or has_file_block:
+        input_id = None
+    input_turn_id = f"codex_{_turn_id_from_payload(params)}" if input_id is not None else None
+    vendor_source = source_id or _source_id(params, item)
+    if input_id is not None:
+        assert bridge_dir is not None
+        try:
+            vendor_source = record_retry_source(
+                bridge_dir,
+                session_id=session_id,
+                thread_id=_thread_id_from_params(params) or "",
+                input_id=input_id,
+                turn_id=_turn_id_from_payload(params) or "",
+                source_id=vendor_source,
+            )
+        except (OSError, ValueError):
+            _logger.warning("Codex retry source could not be retained", exc_info=True)
+            return False
     return await _post_external_item(
         client,
         session_id,
         item_type="message",
         item_data=item_data,
         response_id=_response_id(params),
-        source_id=source_id or _source_id(params, item),
+        source_id=vendor_source,
+        input_id=input_id,
+        input_turn_id=input_turn_id,
     )
 
 
@@ -9066,6 +9151,8 @@ async def _post_external_item(
     response_id: str,
     message_id: str | None = None,
     source_id: str | None = None,
+    input_id: str | None = None,
+    input_turn_id: str | None = None,
 ) -> bool:
     """
     Post one external conversation item to AP.
@@ -9092,6 +9179,9 @@ async def _post_external_item(
         data["message_id"] = message_id
     if source_id is not None:
         data["source_id"] = _bounded_source_id(source_id)
+    if input_id is not None:
+        data["input_id"] = input_id
+        data["input_turn_id"] = input_turn_id
 
     async def _post() -> httpx.Response | None:
         return await _post_session_event(
@@ -9141,6 +9231,10 @@ async def _post_status(
     compaction_model: str | None = None,
     selected_model: str | None = None,
     parent_turn_consumed: bool = False,
+    turn_id: str | None = None,
+    input_id: str | None = None,
+    recovered: bool = False,
+    native_generation: int | None = None,
 ) -> bool:
     """
     Publish a native Codex status edge.
@@ -9165,6 +9259,14 @@ async def _post_status(
     :returns: None.
     """
     data: _JsonObject = {"status": status}
+    if native_generation is not None:
+        data["native_generation"] = native_generation
+    if turn_id is not None and turn_id != response_id:
+        data["turn_id"] = turn_id
+    if input_id is not None:
+        data["input_id"] = input_id
+    if recovered:
+        data["recovered"] = True
     if response_id is not None:
         data["response_id"] = response_id
     if output is not None:
@@ -9190,6 +9292,11 @@ async def _post_turn_status_edge(
     client: httpx.AsyncClient,
     session_id: str,
     edge: _CodexTurnStatusEdge | None,
+    *,
+    forwarder_state: _CodexForwarderState | None = None,
+    recovered: bool = False,
+    input_id: str | None = None,
+    bridge_dir: Path | None = None,
 ) -> None:
     """
     Publish one Codex turn lifecycle edge if a valid edge was derived.
@@ -9231,6 +9338,20 @@ async def _post_turn_status_edge(
             ),
         ),
     )
+    native_generation = None
+    if bridge_dir is not None and edge.turn_id is not None:
+        from omnigent.native.auto_retry import get_snapshot
+
+        snapshot = get_snapshot(bridge_dir, session_id)
+        if snapshot.turn_id == f"codex_{edge.turn_id}":
+            native_generation = snapshot.generation
+        bridge_state = read_bridge_state(bridge_dir)
+        if bridge_state is not None and bridge_state.input_turn_id == edge.turn_id:
+            input_id = bridge_state.input_id
+        if edge.status in {"idle", "failed"}:
+            from omnigent.native.auto_retry import observe_turn
+
+            observe_turn(bridge_dir, session_id, f"codex_{edge.turn_id}", idle=True)
     response_id = _response_id(_params_with_turn_id({}, edge.turn_id)) if edge.turn_id else None
     output: str | None = None
     reauth_required = False
@@ -9249,6 +9370,15 @@ async def _post_turn_status_edge(
         compaction_model=edge.compaction_model,
         selected_model=edge.selected_model,
         parent_turn_consumed=edge.parent_turn_consumed,
+        turn_id=response_id,
+        input_id=input_id
+        or (
+            forwarder_state.input_ids_by_turn.get(edge.turn_id)
+            if forwarder_state is not None and edge.turn_id is not None
+            else None
+        ),
+        recovered=recovered,
+        native_generation=native_generation,
     )
     if delivered and edge.on_delivered is not None:
         edge.on_delivered()

@@ -201,6 +201,10 @@ def _clean_subagent_registry() -> Iterator[None]:
     """
     from omnigent.runner import subagent_work
 
+    saved_terminal_ids = {
+        child: set(keys) for child, keys in subagent_work._seen_subagent_terminal_ids.items()
+    }
+    subagent_work._seen_subagent_terminal_ids.clear()
     saved = (
         dict(subagent_work._subagent_work_by_child),
         {k: set(v) for k, v in subagent_work._subagent_work_by_parent.items()},
@@ -228,6 +232,8 @@ def _clean_subagent_registry() -> Iterator[None]:
     try:
         yield
     finally:
+        subagent_work._seen_subagent_terminal_ids.clear()
+        subagent_work._seen_subagent_terminal_ids.update(saved_terminal_ids)
         subagent_work._subagent_work_by_child.clear()
         subagent_work._subagent_work_by_child.update(saved[0])
         subagent_work._subagent_work_by_parent.clear()

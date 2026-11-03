@@ -55,6 +55,7 @@ import threading
 import time
 import unicodedata
 import urllib.parse
+import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from concurrent.futures import CancelledError as FutureCancelledError
@@ -113,6 +114,7 @@ if TYPE_CHECKING:
     from omnigent.inner.os_env import OSEnvironment
     from omnigent.inner.terminal import TerminalInstance
     from omnigent.llms.context_window import ModelPricing
+    from omnigent.native.auto_retry import PromptAdmission
 
 from omnigent.inner.hook_scripts.subagent_router import (
     AGENT_TOOL_MATCHER as CLAUDE_SUBAGENT_TOOL_MATCHER,
@@ -1024,6 +1026,10 @@ class ClaudeTranscriptItem:
     subagent_return_id: str | None = None
     agent_message_candidate: bool = False
     failure_context: FailureContext | None = None
+    native_prompt_id: str | None = None
+    native_session_id: str | None = None
+    retry_input_id: str | None = None
+    retry_turn_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1273,6 +1279,12 @@ class ClaudeHookRecord:
     failure_message: str | None = None
     failure_context: FailureContext | None = None
     usage_admission_id: str | None = None
+    terminal_turn_id: str | None = None
+    terminal_input_id: str | None = None
+    native_generation: int | None = None
+    prompt_id: str | None = None
+    retry_session_id: str | None = None
+    retry_input_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -3345,7 +3357,9 @@ def record_policy_eval_fallback(
             )
 
 
-def record_hook_event(bridge_dir: Path, payload: _JsonObject) -> None:
+def record_hook_event(
+    bridge_dir: Path, payload: _JsonObject, *, input_admission: PromptAdmission | None = None
+) -> None:
     """
     Record one Claude Code hook payload in the bridge directory.
 
@@ -3373,6 +3387,26 @@ def record_hook_event(bridge_dir: Path, payload: _JsonObject) -> None:
             state["usage_admission_id"] = payload.get("admission_id")
         if is_parent and event_name in {"Stop", "StopFailure"}:
             payload = {**payload, "admission_id": state.get("usage_admission_id")}
+        if is_parent and event_name == "UserPromptSubmit" and "admission_id" not in payload:
+            receipt_id = uuid.uuid4().hex
+            state["terminal_identity"] = {
+                "native_generation": input_admission.native_generation
+                if input_admission
+                else None,
+                "turn_id": input_admission.turn_id
+                if input_admission
+                else f"claude_turn_{receipt_id}",
+                "input_id": input_admission.auto_retry["input_id"]
+                if input_admission and input_admission.auto_retry
+                else receipt_id,
+            }
+            if input_admission:
+                payload = {**payload, "native_generation": input_admission.native_generation}
+                if input_admission.auto_retry:
+                    payload["auto_retry"] = input_admission.auto_retry
+                    payload["retry_session_id"] = read_active_session_id(bridge_dir)
+        if is_parent and event_name in {"UserPromptSubmit", "Stop", "StopFailure"}:
+            payload = {**payload, "terminal_identity": state.get("terminal_identity")}
         envelope = {
             "recorded_at": time.time(),
             "payload": payload,
@@ -3421,6 +3455,15 @@ def record_hook_event(bridge_dir: Path, payload: _JsonObject) -> None:
             state["accepted_input_tmux"] = _tmux_input_identity(bridge_dir)
         state["updated_at"] = time.time()
         _write_json_file(bridge_dir / _STATE_FILE, state)
+        if is_parent and event_name in {"UserPromptSubmit", "Stop", "StopFailure"}:
+            identity = state.get("terminal_identity")
+            active = read_active_session_id(bridge_dir)
+            if active and isinstance(identity, dict) and isinstance(identity.get("turn_id"), str):
+                from omnigent.native.auto_retry import observe_turn
+
+                observe_turn(
+                    bridge_dir, active, identity["turn_id"], idle=event_name != "UserPromptSubmit"
+                )
 
 
 def read_transcript_path(bridge_dir: Path) -> Path | None:
@@ -4310,6 +4353,32 @@ def read_hook_events_since_with_position(
     )
 
 
+def correlate_retry_input(
+    bridge_dir: Path, session_id: str, item: ClaudeTranscriptItem
+) -> ClaudeTranscriptItem:
+    """Join an automatic admission to its vendor record using the prompt identity."""
+    if not item.native_prompt_id or not item.native_session_id:
+        return item
+    matches = [
+        record
+        for record in read_hook_events_since_with_position(bridge_dir, 0).records
+        if record.event_name == "UserPromptSubmit"
+        and record.agent_id is None
+        and record.claude_session_id == item.native_session_id
+        and record.prompt_id == item.native_prompt_id
+        and record.retry_session_id == session_id
+        and isinstance(record.retry_input_id, str)
+        and re.fullmatch(r"[0-9a-f]{32}", record.retry_input_id)
+        and record.terminal_turn_id
+    ]
+    if len(matches) != 1:
+        return item
+    record = matches[0]
+    return replace(
+        item, retry_input_id=record.retry_input_id, retry_turn_id=record.terminal_turn_id
+    )
+
+
 def read_hook_events_from_offset(
     bridge_dir: Path,
     byte_offset: int,
@@ -4563,7 +4632,33 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         failure_message = (
             _display_text(raw_details, is_api_error=True) if raw_details is not None else None
         )
+    identity = payload.get("terminal_identity") if isinstance(payload, dict) else None
+    marker = payload.get("auto_retry") if isinstance(payload, dict) else None
     return ClaudeHookRecord(
+        prompt_id=payload.get("prompt_id") if isinstance(payload, dict) else None,
+        retry_session_id=payload.get("retry_session_id") if isinstance(payload, dict) else None,
+        retry_input_id=(
+            marker.get("input_id")
+            if isinstance(marker, dict)
+            and isinstance(identity, dict)
+            and marker.get("input_id") == identity.get("input_id")
+            else None
+        ),
+        native_generation=(
+            identity.get("native_generation")
+            if isinstance(identity, dict) and type(identity.get("native_generation")) is int
+            else None
+        ),
+        terminal_turn_id=(
+            identity.get("turn_id")
+            if isinstance(identity, dict) and isinstance(identity.get("turn_id"), str)
+            else None
+        ),
+        terminal_input_id=(
+            identity.get("input_id")
+            if isinstance(identity, dict) and isinstance(identity.get("input_id"), str)
+            else None
+        ),
         usage_admission_id=payload.get("admission_id")
         if isinstance(payload, dict) and isinstance(payload.get("admission_id"), str)
         else None,
@@ -4942,6 +5037,13 @@ def _paste_and_submit(
         never leaves the input box after repeated submit Enters, or if a
         prompt appears after the submit Enter.
     """
+    from omnigent.native.auto_retry import current_guard, prepare_submission
+
+    if current_guard() is not None:
+        running = _claude_turn_running(bridge_dir, socket_path, tmux_target)
+        prepare_submission(
+            bridge_dir, native_idle=None if running is None else not running, text=text
+        )
     delivery_diagnostics.start_attempt()
     tmux_info = _tmux_input_identity(bridge_dir)
     startup_submit = (
@@ -4968,7 +5070,10 @@ def _paste_and_submit(
     with tempfile.NamedTemporaryFile(
         dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
     ) as paste_file:
-        paste_file.write(_paste_payload_bytes(text + "\n"))
+        # The guarded single word cannot end in a backslash; keep its hook text exact.
+        paste_file.write(
+            _paste_payload_bytes(text if current_guard() is not None else text + "\n")
+        )
         paste_path = paste_file.name
     try:
         _run_tmux(socket_path, "load-buffer", "-b", "omnigent-paste", paste_path)
@@ -10681,13 +10786,31 @@ def _transcript_items_from_entry(
         return current_response_id, []
     role = message.get("role")
     if role == "user":
-        return _user_transcript_items_from_entry(
+        response_id, items = _user_transcript_items_from_entry(
             entry,
             line_number=line_number,
             record_offset=record_offset,
             agent_name=agent_name,
             current_response_id=current_response_id,
         )
+        return response_id, [
+            replace(
+                item,
+                native_prompt_id=entry.get("promptId")
+                if isinstance(entry.get("promptId"), str)
+                else None,
+                native_session_id=entry.get("sessionId")
+                if isinstance(entry.get("sessionId"), str)
+                else None,
+            )
+            if item.item_type == "message"
+            and item.data.get("role") == "user"
+            and not item.data.get("is_meta")
+            and isinstance(entry.get("promptId"), str)
+            and isinstance(entry.get("sessionId"), str)
+            else item
+            for item in items
+        ]
     if role == "assistant":
         return _assistant_transcript_items_from_entry(
             entry,

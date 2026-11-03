@@ -52,6 +52,7 @@ from omnigent.entities.conversation import (
     parse_item_data,
 )
 from omnigent.entities.permission import SessionPermission
+from omnigent.entities.subagent_terminal import TurnIdentity
 from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
 from omnigent.harness_availability import (
     HARNESS_BINARY_MISSING,
@@ -453,6 +454,12 @@ from omnigent.server.subagent_activity import (
     claude_subagent_completion_markers,
     record_claude_subagent_return,
     record_subagent_activity,
+)
+from omnigent.server.subagent_retry_admission import (
+    active_final_dispatch,
+    active_retry_dispatch,
+    claim_retry_forward,
+    native_retry_marker,
 )
 from omnigent.server.user_preferences_store import read_worktree_path_template
 from omnigent.session_default_modes import (
@@ -5034,6 +5041,56 @@ async def _persist_external_conversation_item_unlocked(
             raise OmnigentError(
                 "Invalid native child recovery cursor", code=ErrorCode.INVALID_INPUT
             )
+    existing = (
+        await asyncio.to_thread(
+            conversation_store.find_idempotent_item, session_id, item.idempotency_key
+        )
+        if item.idempotency_key is not None
+        else None
+    )
+    saved_marker = (
+        existing.data.auto_retry
+        if existing is not None and isinstance(existing.data, MessageData)
+        else None
+    )
+    correlated_retry = body.data.get("input_id") is not None
+    if saved_marker is not None or correlated_retry:
+        if not (
+            isinstance(item.data, MessageData)
+            and item.data.role == "user"
+            and not item.data.is_meta
+            and item.idempotency_key is not None
+            and _message_text(item.data.content) == "retry"
+        ):
+            raise OmnigentError("Invalid native retry echo", code=ErrorCode.INVALID_INPUT)
+        marker = saved_marker
+        if correlated_retry:
+            if existing is not None and (
+                saved_marker is None or saved_marker.input_id != body.data["input_id"]
+            ):
+                raise OmnigentError("Native source input changed", code=ErrorCode.CONFLICT)
+            marker = await asyncio.to_thread(
+                native_retry_marker,
+                conversation_store,
+                session_id,
+                body.data["input_id"],
+                body.data.get("input_turn_id"),
+                body.data["source_id"].strip(),
+                body.data.get("item_data", {}).get("auto_retry"),
+            )
+            if existing is not None and saved_marker != marker:
+                raise OmnigentError("Native source input changed", code=ErrorCode.CONFLICT)
+        assert marker is not None
+        supplied_marker = body.data.get("item_data", {}).get("auto_retry")
+        if supplied_marker is not None and supplied_marker != marker.model_dump(mode="json"):
+            raise OmnigentError("Native retry marker changed", code=ErrorCode.INVALID_INPUT)
+        item = item.model_copy(
+            update={"data": item.data.model_copy(update={"auto_retry": marker})}
+        )
+        if existing is not None and not existing.matches_native_replay(item, exact_source=True):
+            raise OmnigentError("Native source data changed", code=ErrorCode.CONFLICT)
+    if "recovery_after" in body.data:
+        after = body.data["recovery_after"]
         historical = item.model_copy(update={"native_recovery": True, "recovery_after": after})
         try:
             persisted = (
@@ -5052,9 +5109,6 @@ async def _persist_external_conversation_item_unlocked(
         # NEWER identical queued message and mark everything queued in between
         # as undelivered. Items that never touch the queue skip the lookup; their
         # retries are absorbed by the idempotent append below.
-        existing = await asyncio.to_thread(
-            conversation_store.find_idempotent_item, session_id, item.idempotency_key
-        )
         if existing is not None:
             return existing.id, True
     if _drains_pending_inputs(item):
@@ -5098,7 +5152,19 @@ async def _persist_external_conversation_item_unlocked(
         # to the oldest entry, except for Kiro, whose prompt text is exact.
         text = _message_text(item.data.content) or ""
         agent_message_candidate = body.data.get("agent_message_candidate") is True
-        matched = pending_inputs.resolve_matching_text(session_id, text, hold=True)
+        if item.data.auto_retry is not None:
+            pending_id = pending_inputs.pending_id_for_stable_id(
+                session_id, item.data.auto_retry.input_id
+            )
+            matched = pending_inputs.MatchedDrain(
+                matched=pending_inputs.resolve(session_id, pending_id, hold=True)
+                if pending_id is not None
+                else None,
+                skipped=[],
+                match_method="input_id",
+            )
+        else:
+            matched = pending_inputs.resolve_matching_text(session_id, text, hold=True)
         drained = matched.matched
         match_method = matched.match_method
         original_held = [*matched.skipped, *matched.uncertain]
@@ -5128,6 +5194,7 @@ async def _persist_external_conversation_item_unlocked(
         try:
             if (
                 drained is None
+                and item.data.auto_retry is None
                 and not agent_message_candidate
                 and not _is_kiro_native_session(conv)
             ):
@@ -5596,7 +5663,9 @@ async def _settle_undelivered_native_input(
     item = NewConversationItem(
         type="message",
         response_id=response_id or generate_task_id(),
-        data=MessageData(role="user", content=drained.content, user_authored=True),
+        data=MessageData(
+            role="user", content=drained.content, user_authored=True, auto_retry=drained.auto_retry
+        ),
         created_by=drained.created_by,
         stable_id=drained.stable_id,
         replaces_pending_id=drained.stable_id,
@@ -5709,7 +5778,12 @@ def _build_skipped_native_items(
             NewConversationItem(
                 type="message",
                 response_id=turn_id,
-                data=MessageData(role="user", content=skipped.content, user_authored=True),
+                data=MessageData(
+                    role="user",
+                    content=skipped.content,
+                    user_authored=True,
+                    auto_retry=skipped.auto_retry,
+                ),
                 created_by=skipped.created_by,
                 stable_id=uuid.uuid5(
                     uuid.NAMESPACE_URL,
@@ -5793,6 +5867,8 @@ async def _enrich_terminal_status_with_subagent_output(
         context.setdefault("detail_source", "external_status_failure_detail")
         return {**data, "output": failure_detail.strip()}
     existing = data.get("output")
+    if status == "idle" and data.get("turn_completed") is True and isinstance(existing, str):
+        return data
     if isinstance(existing, str) and existing.strip():
         if status == "failed":
             context.setdefault("detail_source", "external_status_output")
@@ -8292,6 +8368,10 @@ async def _persist_native_terminal_failure(
     :param failure_context: Normalized cause metadata from the runner's ensure response.
     :returns: Store-assigned id of the consumed user message item.
     """
+    if active_retry_dispatch() is not None or active_final_dispatch() is not None:
+        from omnigent.server.subagent_retry_admission import RetryDispatchRefused
+
+        raise RetryDispatchRefused("launch_refused")
     turn_id = generate_task_id()
     user_item = _build_new_item(body, turn_id, created_by=created_by)
     persisted_items = await asyncio.to_thread(
@@ -8523,12 +8603,18 @@ def _build_native_terminal_message_event(
     }
     if agent_revision is not None:
         event["agent_revision"] = agent_revision
+    if data.auto_retry is not None:
+        event["auto_retry"] = data.auto_retry.model_dump(mode="json")
     # The web's stable id for this message rides along so the runner can name
     # it on a turn that fails before the harness receives it; the relay then
     # settles exactly that queued entry (see _settle_undelivered_native_input).
     raw_stable_id = body.data.get("stable_id")
     if isinstance(raw_stable_id, str) and re.fullmatch(r"[0-9a-f]{32}", raw_stable_id):
         event["stable_id"] = raw_stable_id
+    if body.data.get("_input_admission_required") is True:
+        event["input_admission_required"] = True
+        event["input_id"] = event.get("stable_id") or uuid.uuid4().hex
+        event["input_admission_deadline"] = time.time() + _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S
     event.update(input_attributes(input_delivery))
     # Carry the persisted override in-band like the non-native forwards: a
     # runner whose session cache is cold (fresh process, missed init) must
@@ -8645,6 +8731,9 @@ async def _forward_native_terminal_message(
     try:
         if startup_context is not None:
             startup_context.forward_started = True
+        await claim_retry_forward(
+            session_id, event, deadline=time.time() + _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S
+        )
         resp = await runner_client.post(
             f"/v1/sessions/{session_id}/events?stream=true"
             if harness == "claude-native" and body.data.get("confirm_delivery") is True
@@ -8748,6 +8837,11 @@ async def _persist_session_event(
     :returns: The store-assigned item id.
     """
     import uuid
+
+    if active_retry_dispatch() is not None or active_final_dispatch() is not None:
+        from omnigent.server.subagent_retry_admission import RetryDispatchRefused
+
+        raise RetryDispatchRefused("not_forwarded")
 
     turn_id = f"turn_{uuid.uuid4().hex}"
     item = _build_new_item(body, turn_id)
@@ -9236,6 +9330,8 @@ async def _forward_event_to_runner(
     item = _build_new_item(body, turn_id, created_by=created_by, adopt_stable_id=True)
     item = item.model_copy(update={"replaces_pending_id": startup_input_id})
     sdk_peer = body.data.get("peer_delivery") is not None
+    retry_guard = active_retry_dispatch()
+    final_input = active_final_dispatch()
     annotation_lookup = getattr(conversation_store, "annotation_receipt_for_item", None)
     annotation_pending = bool(
         startup_input_id is not None
@@ -9271,12 +9367,18 @@ async def _forward_event_to_runner(
         ):
             raise HTTPException(409, "Startup input owner changed")
         persisted_items = [canonical]
-    elif sdk_peer:
+    elif sdk_peer or retry_guard is not None or final_input is not None:
         # The peer store owns undelivered input. Only an SDK accepted receipt
         # may put it in conversation history, where recovery could replay it.
         persisted_items = [
             ConversationItem(
-                id=body.data["peer_delivery"]["attempt_id"],
+                id=retry_guard.input_id
+                if retry_guard
+                else (
+                    final_input.input_id
+                    if final_input
+                    else body.data["peer_delivery"]["attempt_id"]
+                ),
                 type=item.type,
                 response_id=turn_id,
                 data=item.data,
@@ -9392,6 +9494,21 @@ async def _forward_event_to_runner(
         # resolved copy — id-based dedup, not a role/content guess.
         "persisted_item_id": persisted_items[0].id,
     }
+    runner_body.pop("recovered", None)
+    runner_body.pop("input_generation", None)
+    runner_body.pop("_input_admission_required", None)
+    if body.data.get("_input_admission_required") is True:
+        runner_body["input_admission_required"] = True
+        runner_body["input_id"] = persisted_items[0].id
+    if conv.parent_conversation_id is not None:
+        runner_body.update(
+            turn_id="turn_" + persisted_items[0].id,
+            input_id=persisted_items[0].id,
+        )
+        identity = TurnIdentity.from_data(runner_body)
+        await asyncio.to_thread(
+            conversation_store.set_labels, session_id, identity.identity_labels()
+        )
     runner_body.pop("startup_attempt", None)
     runner_body.pop("startup_required", None)
     if startup_required or startup_attempt is not None:
@@ -9758,6 +9875,11 @@ async def _forward_event_to_runner(
     try:
         if startup_context is not None:
             startup_context.forward_started = True
+        if runner_body.get("input_admission_required") is True:
+            runner_body["input_admission_deadline"] = time.time() + _RUNNER_FORWARD_TIMEOUT.read
+        await claim_retry_forward(
+            session_id, runner_body, deadline=time.time() + _RUNNER_FORWARD_TIMEOUT.read
+        )
         _forward_resp = await runner_client.post(
             f"/v1/sessions/{session_id}/events",
             json=runner_body,
@@ -9773,6 +9895,10 @@ async def _forward_event_to_runner(
         # status rather than via ``raise_for_status`` so the runner-client fakes
         # that only expose ``status_code`` behave as they do in production.
         if _forward_resp.status_code >= 400:
+            if retry_guard is not None:
+                from omnigent.server.subagent_retry_admission import RetryDispatchRefused
+
+                raise RetryDispatchRefused("runner_refused")
             if startup_context is not None:
                 startup_context.forward_rejected = True
             if sdk_peer or startup_attempt is not None:
@@ -10454,6 +10580,9 @@ async def _dispatch_session_event_to_runner_impl(
                 stable_id=web_stable_id,
                 background_titles_enabled=background_titles_enabled,
                 admission_id=usage_admission["admission_id"] if usage_admission else None,
+                auto_retry=(
+                    guard.metadata if (guard := active_retry_dispatch()) is not None else None
+                ),
             )
             if queues_message
             else None

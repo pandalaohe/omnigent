@@ -31,6 +31,7 @@ from pathlib import Path
 
 import httpx
 
+from omnigent.entities.subagent_terminal import TerminalEnvelope
 from omnigent.native._native_forwarder_health import (
     note_post_success as note_native_post_success,
 )
@@ -186,6 +187,8 @@ async def post_external_session_status(
     failure_detail: str | None = None,
     failure_context: object = None,
     turn_completed: bool | None = None,
+    terminal: TerminalEnvelope | None = None,
+    native_generation: int | None = None,
 ) -> None:
     """Post one ``external_session_status`` event to the Sessions API.
 
@@ -232,6 +235,21 @@ async def post_external_session_status(
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
     data: dict[str, object] = {"status": status}
+    if native_generation is not None:
+        data["native_generation"] = native_generation
+    if terminal is not None:
+        identity = terminal.model_dump(
+            exclude={"child_id", "parent_id", "status", "error"}, exclude_none=True
+        )
+        if identity.get("turn_id") == response_id:
+            identity.pop("turn_id", None)
+        if terminal.event_kind == "turn_terminal":
+            identity.pop("event_kind", None)
+        if not terminal.recovered:
+            identity.pop("recovered", None)
+        data.update(identity)
+        if terminal.error is not None:
+            data["terminal_error"] = terminal.error
     if output:
         data["output"] = output
     if failure_detail:

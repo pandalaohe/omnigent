@@ -20,6 +20,7 @@ import time
 import tomllib
 from collections.abc import Callable, Iterator, Mapping, MutableMapping
 from dataclasses import dataclass, replace
+from dataclasses import field as dataclass_field
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -215,6 +216,10 @@ class CodexNativeBridgeState:
     usage_turn_id: str | None = None
     permission_profile: str | None = None
     helper_stop_pending: bool = False
+    input_id: str | None = None
+    input_turn_id: str | None = None
+    retry_inputs: dict[str, str | None] = dataclass_field(default_factory=dict)
+    retry_sources: dict[str, str] = dataclass_field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1370,6 +1375,13 @@ def _write_bridge_state_unlocked(bridge_dir: Path, state: CodexNativeBridgeState
                     "cwd": state.cwd,
                     **({"helper_stop_pending": True} if state.helper_stop_pending else {}),
                     **(
+                        {"input_id": state.input_id, "input_turn_id": state.input_turn_id}
+                        if state.input_id is not None
+                        else {}
+                    ),
+                    **({"retry_inputs": state.retry_inputs} if state.retry_inputs else {}),
+                    **({"retry_sources": state.retry_sources} if state.retry_sources else {}),
+                    **(
                         {
                             "usage_admission_id": state.usage_admission_id,
                             "usage_turn_id": state.usage_turn_id,
@@ -1405,6 +1417,15 @@ def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
         previous = read_bridge_state(bridge_dir)
         if previous is not None and previous.helper_stop_pending:
             state = replace(state, helper_stop_pending=True)
+        if previous is not None and (previous.session_id, previous.thread_id) == (
+            state.session_id,
+            state.thread_id,
+        ):
+            state = replace(
+                state,
+                retry_inputs={**state.retry_inputs, **previous.retry_inputs},
+                retry_sources={**state.retry_sources, **previous.retry_sources},
+            )
         _write_bridge_state_unlocked(bridge_dir, state)
     # A new or rotated session's policies were never checked.
     policy_allow_cache.invalidate(bridge_dir)
@@ -1974,6 +1995,33 @@ def read_bridge_state_result(bridge_dir: Path) -> CodexNativeBridgeStateRead:
             thread_id=thread_id,
             codex_home=codex_home,
             active_turn_id=parsed_active_turn_id,
+            input_id=raw.get("input_id") if isinstance(raw.get("input_id"), str) else None,
+            input_turn_id=raw.get("input_turn_id")
+            if isinstance(raw.get("input_turn_id"), str)
+            else None,
+            retry_inputs={
+                key: value
+                for key, value in (
+                    raw["retry_inputs"].items()
+                    if isinstance(raw.get("retry_inputs"), dict)
+                    else ()
+                )
+                if isinstance(key, str)
+                and re.fullmatch(r"[0-9a-f]{32}", key)
+                and (value is None or (isinstance(value, str) and value))
+            },
+            retry_sources={
+                key: value
+                for key, value in (
+                    raw["retry_sources"].items()
+                    if isinstance(raw.get("retry_sources"), dict)
+                    else ()
+                )
+                if isinstance(key, str)
+                and re.fullmatch(r"[0-9a-f]{32}", key)
+                and isinstance(value, str)
+                and value
+            },
             cwd=cwd if isinstance(cwd, str) and cwd else None,
             usage_admission_id=raw.get("usage_admission_id")
             if isinstance(raw.get("usage_admission_id"), str)
@@ -2009,7 +2057,64 @@ def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
     return state is not None and state.session_id == session_id
 
 
-def update_active_turn_id(bridge_dir: Path, active_turn_id: str | None) -> None:
+def record_retry_input(
+    bridge_dir: Path,
+    *,
+    session_id: str,
+    thread_id: str,
+    input_id: str,
+    turn_id: str | None = None,
+) -> None:
+    """Retain automatic RPC identity before echo and after a forwarder restart."""
+    if re.fullmatch(r"[0-9a-f]{32}", input_id) is None or turn_id == "":
+        raise ValueError("Invalid native retry input identity")
+    with _bridge_state_lock(bridge_dir):
+        state = read_bridge_state(bridge_dir)
+        if state is None or (state.session_id, state.thread_id) != (session_id, thread_id):
+            raise ValueError("Native retry bridge identity changed")
+        previous = state.retry_inputs.get(input_id)
+        if previous is not None and previous != turn_id:
+            raise ValueError("Native retry input turn changed")
+        inputs = {**state.retry_inputs, input_id: turn_id}
+        _write_bridge_state_unlocked(bridge_dir, replace(state, retry_inputs=inputs))
+
+
+def record_retry_source(
+    bridge_dir: Path,
+    *,
+    session_id: str,
+    thread_id: str,
+    input_id: str,
+    turn_id: str,
+    source_id: str,
+) -> str:
+    """Keep the first observed vendor source across live and resume aliases."""
+    prefix = f"{thread_id}:{turn_id}:"
+    with _bridge_state_lock(bridge_dir):
+        state = read_bridge_state(bridge_dir)
+        if (
+            state is None
+            or (state.session_id, state.thread_id) != (session_id, thread_id)
+            or input_id not in state.retry_inputs
+            or state.retry_inputs[input_id] not in {None, turn_id}
+            or not turn_id
+            or not source_id.startswith(prefix)
+        ):
+            raise ValueError("Native retry source identity changed")
+        source = state.retry_sources.get(input_id, source_id)
+        if not source.startswith(prefix):
+            raise ValueError("Native retry source turn changed")
+        if input_id not in state.retry_sources:
+            _write_bridge_state_unlocked(
+                bridge_dir,
+                replace(state, retry_sources={**state.retry_sources, input_id: source}),
+            )
+        return source
+
+
+def update_active_turn_id(
+    bridge_dir: Path, active_turn_id: str | None, *, input_id: str | None = None
+) -> None:
     """
     Update the active Codex turn id in bridge state.
 
@@ -2020,14 +2125,18 @@ def update_active_turn_id(bridge_dir: Path, active_turn_id: str | None) -> None:
     """
     with _bridge_state_lock(bridge_dir):
         state = read_bridge_state(bridge_dir)
-        # An accepted steer often returns the turn already saved here. Rewriting
-        # it can fail on a full disk after Codex has accepted the message.
-        if state is None or state.active_turn_id == active_turn_id:
+        if state is None:
             return
-        _write_bridge_state_unlocked(
-            bridge_dir,
-            replace(state, active_turn_id=active_turn_id),
+        updated = replace(
+            state,
+            active_turn_id=active_turn_id,
+            input_id=input_id if input_id is not None else state.input_id,
+            input_turn_id=active_turn_id if input_id is not None else state.input_turn_id,
         )
+        # Avoid rewriting an accepted steer on a full disk, while still binding
+        # a newly accepted input to a turn that was already active.
+        if updated != state:
+            _write_bridge_state_unlocked(bridge_dir, updated)
 
 
 def record_usage_admission(
@@ -2102,7 +2211,13 @@ def update_thread_id(bridge_dir: Path, thread_id: str, active_turn_id: str | Non
             return
         _write_bridge_state_unlocked(
             bridge_dir,
-            replace(state, thread_id=thread_id, active_turn_id=active_turn_id),
+            replace(
+                state,
+                thread_id=thread_id,
+                active_turn_id=active_turn_id,
+                retry_inputs=state.retry_inputs if state.thread_id == thread_id else {},
+                retry_sources=state.retry_sources if state.thread_id == thread_id else {},
+            ),
         )
 
 

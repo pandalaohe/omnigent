@@ -388,7 +388,10 @@ def test_forwarder_recovers_user_before_recovered_agent_message_delta(tmp_path: 
     ]
     assert posted[0]["data"]["item_data"]["role"] == "user"
     assert posted[0]["data"]["item_data"]["content"][0]["text"] == "hello"
-    assert posted[1]["data"] == _expected_status_data("running", "turn_early")
+    assert posted[1]["data"] == {
+        **_expected_status_data("running", "turn_early"),
+        "input_id": "thread_123:turn_early:item_user",
+    }
     assert posted[2]["data"] == _expected_delta_data("Hello", "turn_early", "item_agent")
     assert [method for method, _ in fake_client.requests] == ["thread/resume"]
     assert forwarder_state.has_posted_user_message("turn_early")

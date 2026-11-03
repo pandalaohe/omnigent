@@ -78,6 +78,88 @@ def test_codex_terminal_interactive_requires_thread_and_enabled_composer(
     assert codex_terminal_interactive(bridge_dir, "Codex is starting") is False
 
 
+def test_retry_input_identity_survives_restart_and_later_inputs(bridge_dir, tmp_path):
+    write_bridge_state(
+        bridge_dir,
+        CodexNativeBridgeState(
+            session_id="child",
+            socket_path="/opt/work/app.sock",
+            thread_id="thread",
+            codex_home=str(tmp_path / "home"),
+        ),
+    )
+    for input_id, turn_id in (("a" * 32, "turn-1"), ("b" * 32, "turn-2")):
+        codex_native_bridge.record_retry_input(
+            bridge_dir,
+            session_id="child",
+            thread_id="thread",
+            input_id=input_id,
+        )
+        assert read_bridge_state(bridge_dir).retry_inputs[input_id] is None
+        codex_native_bridge.record_retry_input(
+            bridge_dir,
+            session_id="child",
+            thread_id="thread",
+            input_id=input_id,
+            turn_id=turn_id,
+        )
+        source = f"thread:{turn_id}:vendor-{input_id}"
+        assert (
+            codex_native_bridge.record_retry_source(
+                bridge_dir,
+                session_id="child",
+                thread_id="thread",
+                input_id=input_id,
+                turn_id=turn_id,
+                source_id=source,
+            )
+            == source
+        )
+        assert (
+            codex_native_bridge.record_retry_source(
+                bridge_dir,
+                session_id="child",
+                thread_id="thread",
+                input_id=input_id,
+                turn_id=turn_id,
+                source_id=f"thread:{turn_id}:item-1",
+            )
+            == source
+        )
+    update_active_turn_id(bridge_dir, "human-turn", input_id="human")
+    write_bridge_state(
+        bridge_dir,
+        CodexNativeBridgeState(
+            session_id="child",
+            socket_path="/opt/work/app.sock",
+            thread_id="thread",
+            codex_home=str(tmp_path / "home"),
+        ),
+    )
+    assert read_bridge_state(bridge_dir).retry_inputs == {"a" * 32: "turn-1", "b" * 32: "turn-2"}
+    assert read_bridge_state(bridge_dir).retry_sources == {
+        "a" * 32: "thread:turn-1:vendor-" + "a" * 32,
+        "b" * 32: "thread:turn-2:vendor-" + "b" * 32,
+    }
+    for session_id, thread_id, turn_id in (
+        ("other", "thread", "turn-1"),
+        ("child", "other", "turn-1"),
+        ("child", "thread", "other"),
+    ):
+        with pytest.raises(ValueError):
+            codex_native_bridge.record_retry_input(
+                bridge_dir,
+                session_id=session_id,
+                thread_id=thread_id,
+                input_id="a" * 32,
+                turn_id=turn_id,
+            )
+    assert read_bridge_state(bridge_dir).retry_inputs["a" * 32] == "turn-1"
+    codex_native_bridge.update_thread_id(bridge_dir, "replacement-thread")
+    assert read_bridge_state(bridge_dir).retry_inputs == {}
+    assert read_bridge_state(bridge_dir).retry_sources == {}
+
+
 def test_codex_mcp_config_overrides_isolate_the_bridge_interpreter(tmp_path: Path) -> None:
     """codex launches serve-mcp with ``-I`` so the workspace can't shadow omnigent.
 

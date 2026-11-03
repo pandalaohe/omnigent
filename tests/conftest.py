@@ -507,6 +507,12 @@ def pytest_addoption(parser):
         help="Databricks config profile for integration tests",
     )
     parser.addoption(
+        "--codex-native-binary",
+        action="append",
+        default=None,
+        help="Codex executable for protocol checks; repeat to compare, PATH selects the CI pin",
+    )
+    parser.addoption(
         "--llm-api-key",
         action="store",
         default=None,

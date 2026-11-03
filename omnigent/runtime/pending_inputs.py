@@ -1,5 +1,8 @@
 """In-process index of un-consumed web-composer user messages.
 
+Automatic retry entries are settled by their admitted input identity and do
+not participate in ordinary text/FIFO matching.
+
 Backs the optimistic "queued message" bubble for native-terminal
 sessions (claude-native / codex-native) so it survives a client
 re-bind. Ordinary native sends are forwarded into the vendor TUI before
@@ -121,6 +124,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
 from omnigent.db.workspace_cache import WorkspaceScopedCache
+from omnigent.entities.conversation import AutoRetryMetadata
 from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
 from omnigent.native.input_diagnostics import input_attributes, log_input_event
 
@@ -256,6 +260,7 @@ class DrainedInput:
     admission_id: str | None = None
     uncertain: bool = False
     injected_prefix: str | None = None
+    auto_retry: AutoRetryMetadata | None = None
 
 
 @dataclass
@@ -335,6 +340,7 @@ class _Entry:
     lifecycle_response_id: str | None = None
     admission_id: str | None = None
     injected_prefix: str | None = None
+    auto_retry: AutoRetryMetadata | None = None
 
 
 # Per-conversation mapping conversation_id → {pending_id: entry}. The
@@ -386,6 +392,7 @@ def record(
     background_titles_enabled: bool = True,
     admission_id: str | None = None,
     injected_prefix: str | None = None,
+    auto_retry: AutoRetryMetadata | None = None,
 ) -> str:
     """
     Record an un-consumed web-composer user message.
@@ -409,6 +416,8 @@ def record(
         directly as the persisted item's id so the store-level append is
         idempotent across client retries. ``None`` for clients that do not
         send one.
+    :param auto_retry: Trusted marker from retry admission or a saved input;
+        its input id must equal ``stable_id``.
     :returns: The index-assigned pending id, e.g. ``"pending_a1b2c3"``.
 
     Beyond :data:`_MAX_ENTRIES_PER_CONVERSATION` unheld entries the oldest
@@ -416,6 +425,8 @@ def record(
     sized by it) stays bounded without touching entries a persist in progress
     must be able to put back.
     """
+    if auto_retry is not None and auto_retry.input_id != stable_id:
+        raise ValueError("Automatic input metadata requires its stable input id")
     with _lock:
         _evict_stale_locked(conversation_id, _now())
         # If a live entry already carries this stable_id, return its pending_id
@@ -434,6 +445,7 @@ def record(
             background_titles_enabled=background_titles_enabled,
             admission_id=admission_id,
             injected_prefix=injected_prefix,
+            auto_retry=auto_retry,
         )
         entries = _pending.setdefault(conversation_id, {})
         entries[pending_id] = entry
@@ -655,7 +667,7 @@ def classify_missing_native_record(entry: DrainedInput) -> DrainedInput:
     return replace(entry, cause_class="unknown", reason_code=reason_code)
 
 
-def resolve(conversation_id: str, pending_id: str) -> DrainedInput | None:
+def resolve(conversation_id: str, pending_id: str, *, hold: bool = False) -> DrainedInput | None:
     """
     Drop a pending entry by id and return it.
 
@@ -674,7 +686,13 @@ def resolve(conversation_id: str, pending_id: str) -> DrainedInput | None:
         entries = _pending.get(conversation_id)
         if entries is None:
             return None
-        entry = entries.pop(pending_id, None)
+        entry = entries.get(pending_id)
+        if entry is not None and hold:
+            if entry.held:
+                return None
+            entry.held = True
+        else:
+            entries.pop(pending_id, None)
         if not entries:
             _pending.pop(conversation_id, None)
         return _drained_input(entry) if entry is not None else None
@@ -783,7 +801,11 @@ def resolve_oldest_for_mirrored_text(
             return None
         # Insertion order = FIFO; the first live, unheld key is the oldest entry.
         oldest_id = next(
-            (pid for pid, entry in entries.items() if not entry.held and not entry.interrupted),
+            (
+                pid
+                for pid, entry in entries.items()
+                if not entry.held and not entry.interrupted and entry.auto_retry is None
+            ),
             None,
         )
         if oldest_id is None:
@@ -889,6 +911,7 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         lifecycle_response_id=drained.lifecycle_response_id,
         admission_id=drained.admission_id,
         injected_prefix=drained.injected_prefix,
+        auto_retry=drained.auto_retry,
     )
     with _lock:
         entries = _pending.get(conversation_id, {})
@@ -962,7 +985,11 @@ def resolve_matching_text(
         entries = _pending.get(conversation_id)
         if entries is None:
             return MatchedDrain(matched=None, skipped=[])
-        ordered = [(pid, entry) for pid, entry in entries.items() if not entry.held]
+        ordered = [
+            (pid, entry)
+            for pid, entry in entries.items()
+            if not entry.held and entry.auto_retry is None
+        ]
         texts = [
             _shell_command_text(entry.content)
             if shell_command
@@ -1089,6 +1116,11 @@ def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
                 "pending_id": entry.pending_id,
                 "content": copy.deepcopy(entry.content),
                 **({"created_by": entry.created_by} if entry.created_by is not None else {}),
+                **(
+                    {"auto_retry": entry.auto_retry.model_dump(mode="json")}
+                    if entry.auto_retry is not None
+                    else {}
+                ),
             }
             for entry in entries.values()
             if not entry.interrupted
@@ -1114,6 +1146,7 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         lifecycle_response_id=entry.lifecycle_response_id,
         admission_id=entry.admission_id,
         injected_prefix=entry.injected_prefix,
+        auto_retry=entry.auto_retry,
     )
 
 

@@ -31,9 +31,11 @@ from omnigent.codex_approval_modes import CodexPermissionObservation
 from omnigent.entities import (
     DEFAULT_GENERATED_TITLE_MAX_CHARS,
     USER_SESSION_TITLE_MAX_CHARS,
+    AutoRetryMetadata,
     ConversationItem,
 )
 from omnigent.entities.session_startup import SessionStartupStatus
+from omnigent.entities.subagent_retry import InputExecutionClaim, RetryExecutionGuard
 from omnigent.inner.native_attachments import reject_authored_framework_notices
 from omnigent.startup_protocol import StartupAttemptRef, StartupObservation
 
@@ -1376,6 +1378,13 @@ class CreateResponseRequest(BaseModel):
     # Trusted runner control metadata; excluded from the public request schema.
     startup_attempt: SkipJsonSchema[StartupAttemptRef | None] = None
     startup_required: SkipJsonSchema[bool] = False
+    input_admission_required: SkipJsonSchema[bool] = False
+    input_id: SkipJsonSchema[str | None] = None
+    retry_guard: SkipJsonSchema[RetryExecutionGuard | None] = None
+    auto_retry: SkipJsonSchema[AutoRetryMetadata | None] = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    input_admission_deadline: SkipJsonSchema[float | None] = None
     # Server-side identity of the native web input, independent of native transcript matching.
     input_stable_id: str | None = None
     pending_id: str | None = None
@@ -1404,6 +1413,16 @@ class CreateResponseRequest(BaseModel):
     parallel_tool_calls: bool | None = None
     max_tool_calls: int | None = None
     top_logprobs: int | None = None
+
+    @model_validator(mode="after")
+    def _validate_retry_marker(self) -> CreateResponseRequest:
+        if self.auto_retry is not None and (
+            self.retry_guard is None
+            or self.input_id != self.retry_guard.input_id
+            or self.auto_retry != self.retry_guard.metadata
+        ):
+            raise ValueError("Automatic retry marker requires its matching execution guard")
+        return self
 
     @model_validator(mode="after")
     def _require_model_for_new_conversations(self) -> CreateResponseRequest:
@@ -5917,6 +5936,14 @@ class StartupClaimRequestEvent(_SSEEventBase):
     boundary: Literal["executor_construct", "executor_prepare"]
 
 
+class InputExecutionClaimEvent(_SSEEventBase):
+    """Final harness input admission; consumed by the owning runner only."""
+
+    type: Literal["input.execution.claim"] = "input.execution.claim"
+    claim_id: str = Field(min_length=1, max_length=128)
+    claim: InputExecutionClaim
+
+
 HarnessStreamEvent = (
     ServerStreamEvent
     | InjectionConsumedEvent
@@ -5927,6 +5954,7 @@ HarnessStreamEvent = (
     | SubagentToolCallEvent
     | StartupProofEvent
     | StartupClaimRequestEvent
+    | InputExecutionClaimEvent
 )
 
 

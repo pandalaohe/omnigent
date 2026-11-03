@@ -1599,6 +1599,7 @@ def test_compaction_snapshot_orders_history_and_tolerates_receipts(
   let release;
   global.fetch = async (_url, request) => {
     const body = JSON.parse(request.body);
+    if (body.type !== "external_conversation_item") return {ok: true, status: 204};
     posted.push(body);
     if (body.data.item_type === "message") {
       await new Promise(resolve => { release = resolve; });
@@ -1720,7 +1721,10 @@ def test_history_retry_stops_before_exceeding_elapsed_budget(tmp_path: Path) -> 
         + r"""
 (async () => {
   const started = Date.now();
-  global.fetch = async () => {
+  global.fetch = async (_url, request) => {
+    if (JSON.parse(request.body).type !== "external_conversation_item") {
+      return {ok: true, status: 204};
+    }
     fetchCalls += 1;
     now += 5000;
     return { ok: false, status: 503 };
@@ -1881,6 +1885,10 @@ def test_history_outage_does_not_delay_hooks_and_coalesces_callbacks(
         "no-response",
         "tool-abort",
         "early-abort",
+        "aborted-rejected",
+        "aborted-deadline",
+        "interrupt-rejected",
+        "interrupt-deadline",
     ],
 )
 def test_turn_outcome_waits_for_history_but_idle_does_not(tmp_path: Path, mode: str) -> None:
@@ -1889,17 +1897,25 @@ def test_turn_outcome_waits_for_history_but_idle_does_not(tmp_path: Path, mode: 
         + r"""
 (async () => {
   const mode = process.argv[3];
-  const aborted = ['aborted', 'tool-abort', 'early-abort'].includes(mode);
+  const aborted = ['aborted', 'tool-abort', 'early-abort'].includes(mode) ||
+    mode.startsWith('aborted-') || mode.startsWith('interrupt-');
+  const rejected = mode.endsWith('rejected');
+  const deadline = mode.endsWith('deadline');
   let release;
+  let expireHistory;
   let completionAttempts = 0;
-  global.setTimeout = (callback, delay, ...args) =>
-    originalSetTimeout(callback, delay === 30000 && mode === 'deadline' ? 50 : delay, ...args);
+  global.setTimeout = (callback, delay, ...args) => {
+    if (delay !== 30000) return originalSetTimeout(callback, delay, ...args);
+    // Fire the history deadline only after checking the pending barrier.
+    expireHistory = () => callback(...args);
+    return {};
+  };
   global.fetch = async (_url, request) => {
     const body = JSON.parse(request.body);
     posted.push(body);
     if (body.type === 'external_conversation_item') {
       await new Promise(resolve => { release = resolve; });
-      return {ok: mode !== 'rejected', status: mode === 'rejected' ? 400 : 204};
+      return {ok: !rejected, status: rejected ? 400 : 204};
     }
     if (body.type === 'external_session_status' && body.data.status !== 'running') {
       completionAttempts++;
@@ -1907,22 +1923,26 @@ def test_turn_outcome_waits_for_history_but_idle_does_not(tmp_path: Path, mode: 
     return {ok: true, status: 204};
   };
   await handlers.agent_start({}, ctx);
-  if (mode.endsWith('-abort')) ctx.signal = AbortSignal.abort();
+  if (mode.endsWith('-abort') || mode.startsWith('interrupt-')) {
+    ctx.signal = AbortSignal.abort();
+  }
   if (!['no-response', 'early-abort'].includes(mode)) {
     await handlers.message_end({message: {role: 'assistant', timestamp: 20,
-      stopReason: mode === 'tool-abort' ? 'toolUse' : mode === 'aborted' ? 'aborted'
+      stopReason: mode === 'tool-abort' ? 'toolUse' : mode.startsWith('aborted') ? 'aborted'
         : mode === 'model-error' ? 'error' : 'stop',
       errorMessage: mode === 'model-error' ? 'Provider refused this turn' : undefined,
       content: mode === 'empty' ? [] : [{type: 'text', text: 'current result'}],
     }}, ctx);
   }
   const finished = handlers.agent_end({}, ctx);
-  await new Promise(setImmediate);
+  await settleHistory();
   if (!['empty', 'no-response', 'early-abort'].includes(mode)) {
     assert.equal(completionAttempts, 0);
   }
   assert.ok(posted.some(e => e.type === 'subagent.status' && e.data.idle === true));
-  if (mode === 'deadline') {
+  if (deadline) {
+    assert.equal(typeof expireHistory, 'function');
+    expireHistory();
     await finished;
     release();
   } else {
@@ -1930,15 +1950,18 @@ def test_turn_outcome_waits_for_history_but_idle_does_not(tmp_path: Path, mode: 
     await finished;
   }
   const terminal = posted.filter(e => e.type === 'external_session_status').at(-1).data;
-  const failed = ['rejected', 'deadline', 'model-error', 'no-response'].includes(mode);
+  const failed = !aborted &&
+    ['rejected', 'deadline', 'model-error', 'no-response'].includes(mode);
   assert.equal(terminal.status, failed ? 'failed' : 'idle');
   assert.equal(terminal.turn_completed, !failed && !aborted);
   const expectedOutcome = failed ? 'failed' : aborted ? 'cancelled' : 'completed';
   assert.equal(terminal.turn_outcome, expectedOutcome);
+  assert.equal(terminal.turn_id, terminal.response_id);
+  assert.equal(terminal.input_id, null);
   assert.equal(terminal.output, ['empty', 'early-abort'].includes(mode) ? ''
     : mode === 'no-response'
     ? 'Pi turn ended without a final response.' : mode === 'model-error'
-    ? 'Pi model error: Provider refused this turn' : failed
+    ? 'Pi model error: Provider refused this turn' : (rejected || deadline)
     ? 'Omnigent could not save the Pi turn output; see host logs.' : 'current result');
   if (failed) assert.equal(terminal.failure_detail, terminal.output);
   assert.equal(completionAttempts, 1);

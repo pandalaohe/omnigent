@@ -355,3 +355,6 @@ async def test_pi_peer_child_reports_its_attempt_for_server_attribution() -> Non
         "attempt_id": ATTEMPT,
     }
     assert server.terminal_posts[-1]["response_id"] == "peer_response"
+    assert server.terminal_posts[-1]["input_id"] == ATTEMPT
+    assert server.terminal_posts[-1]["event_kind"] == "turn_terminal"
+    assert len(server.terminal_posts) == 1

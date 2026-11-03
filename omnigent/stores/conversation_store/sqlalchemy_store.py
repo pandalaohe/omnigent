@@ -196,6 +196,7 @@ from omnigent.stores.project_store.sqlalchemy_store import (
     assert_project_name_admits,
     project_archive_op_is_current,
 )
+from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY
 
 _logger = logging.getLogger(__name__)
 
@@ -2406,6 +2407,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         def write(session: Session) -> None:
             if project_name and self._conv_engine is self._engine:
                 assert_project_name_admits(session, project_name, user_id=owner)
+            if CLOSED_LABEL_KEY in stable_updates:
+                self._lock_conversation(session, conversation_id)
             _upsert_labels(session, conversation_id, stable_updates, stamp)
 
         if project_name and self._conv_engine is not self._engine:

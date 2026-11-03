@@ -25,6 +25,14 @@ from omnigent.inner.executor import (
     TurnComplete,
 )
 from omnigent.inner.native_attachments import attachment_reference_line
+from omnigent.native.auto_retry import (
+    NativeRetryRejected,
+    claim_execution,
+    current_guard,
+    get_snapshot,
+    prepare_submission,
+    submission_scope,
+)
 
 
 class PiNativeExecutor(Executor):
@@ -78,7 +86,13 @@ class PiNativeExecutor(Executor):
             return False
         async with self._enqueue_lock:
             await asyncio.to_thread(self._refresh_auth_headers)
-            enqueue_user_message(self._bridge_dir, text)
+            try:
+                self._prepare_retry(text)
+                await claim_execution()
+            except NativeRetryRejected:
+                return False
+            with submission_scope(self._bridge_dir):
+                enqueue_user_message(self._bridge_dir, text)
         return True
 
     async def run_turn(
@@ -113,10 +127,25 @@ class PiNativeExecutor(Executor):
         model = config.model if config is not None else None
         async with self._enqueue_lock:
             await asyncio.to_thread(self._refresh_auth_headers)
-            if model:
-                enqueue_model_change(self._bridge_dir, model)
-            enqueue_user_message(self._bridge_dir, text)
+            try:
+                self._prepare_retry(text)
+                await claim_execution()
+            except NativeRetryRejected as exc:
+                yield ExecutorError(
+                    message=exc.reason, code=exc.reason, undelivered=True, preserve_session=True
+                )
+                return
+            with submission_scope(self._bridge_dir):
+                if model:
+                    enqueue_model_change(self._bridge_dir, model)
+                enqueue_user_message(self._bridge_dir, text)
         yield TurnComplete(response=None)
+
+    def _prepare_retry(self, text: str) -> None:
+        guard = current_guard()
+        if guard is not None:
+            snapshot = get_snapshot(self._bridge_dir, guard.session_id)
+            prepare_submission(self._bridge_dir, native_idle=snapshot.idle, text=text)
 
     def _refresh_auth_headers(self) -> None:
         """

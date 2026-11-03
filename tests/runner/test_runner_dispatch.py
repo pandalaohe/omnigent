@@ -11324,6 +11324,26 @@ def test_format_async_task_item_nonempty_subagent_completion_shows_output() -> N
     assert "produced no output" not in line
 
 
+@pytest.mark.parametrize("status", ["completed", "failed", "cancelled", "stopped", "killed"])
+def test_format_async_task_item_keeps_identity_diagnostic_out_of_parent_text(status: str) -> None:
+    from omnigent.runner.tool_dispatch import _format_async_task_item
+
+    payload = {
+        "type": "sub_agent",
+        "handle_id": "native-child",
+        "agent": "worker",
+        "title": "native",
+        "status": status,
+        "output": "native result",
+        "identity_diagnostic": "terminal_identity_unavailable: turn_id, input_id",
+    }
+    line = _format_async_task_item(payload)
+
+    assert "worker:native" in line and "native result" in line
+    assert "terminal_identity_unavailable" not in line
+    assert payload["identity_diagnostic"] == "terminal_identity_unavailable: turn_id, input_id"
+
+
 def test_format_async_task_item_truncated_subagent_output_names_retrieval_path() -> None:
     """
     A sub-agent handoff cut by the inbox delivery cap tells the parent how
@@ -12921,6 +12941,55 @@ async def test_on_proxy_stream_end_spares_superseded_response() -> None:
         with contextlib.suppress(asyncio.CancelledError):
             await newer
         app.state.active_turns.pop(conv, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["failed", "cancelled", "desync", "pre-response"])
+async def test_sdk_terminal_retains_owner_response_before_marker_cleanup(outcome: str) -> None:
+    child, parent = "child-owner-identity", "parent-owner-identity"
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    app = create_runner_app(
+        process_manager=_RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([])),
+        server_client=NullServerClient(),
+    )
+    subagent_work._session_inboxes_ref[parent] = inbox
+    subagent_work.register_subagent_work(
+        parent_session_id=parent, child_session_id=child, agent="worker", title="identity"
+    )
+    try:
+        app.state.begin_turn_slot(
+            child, {"turn_id": "admitted-turn", "input_id": "admitted-input"}
+        )
+        if outcome != "pre-response":
+            app.state.live_response_id[child] = "response-owner"
+        else:
+            app.state.turn_identities[child]["input_generation"] = 2
+        if outcome in {"failed", "cancelled"}:
+            app.state.turn_identities.pop(child)
+        if outcome == "cancelled":
+            app.state.interrupted_sessions.add(child)
+        app.state.on_proxy_stream_end(
+            child,
+            owner_response_id="response-owner" if outcome != "pre-response" else None,
+            error={
+                "code": "runner_turn_context_desync" if outcome == "desync" else "provider_error",
+                "message": "failed",
+            }
+            if outcome != "cancelled"
+            else None,
+        )
+        result = inbox.get_nowait()
+        assert result["status"] == ("cancelled" if outcome == "cancelled" else "failed")
+        assert result["terminal"]["turn_id"] == (
+            "response-owner" if outcome in {"failed", "cancelled"} else "admitted-turn"
+        )
+        if outcome in {"desync", "pre-response"}:
+            assert result["terminal"]["input_id"] == "admitted-input"
+        assert result["terminal"]["event_kind"] == "turn_terminal"
+        assert child not in app.state.live_response_id
+    finally:
+        subagent_work.unregister_subagent_work_for_session(child)
+        subagent_work._session_inboxes_ref.pop(parent, None)
 
 
 @pytest.mark.parametrize("replacement", ["none", "task", "stream", "finished"])
@@ -16344,6 +16413,12 @@ async def test_sys_session_create_waits_for_child_registration(registration_stat
                 server_client=server_client,
                 conversation_id="conv_caller",
             )
+            terminal = subagent_work.get_subagent_work("conv_register_child")
+            if registration_status != 200:
+                assert terminal is not None
+                assert terminal.terminal.event_kind == "dispatch_failed"
+                assert terminal.terminal.turn_id is None
+                assert terminal.terminal.error["code"] == "child_registration_failed"
         finally:
             subagent_work.unregister_subagent_work("conv_register_child")
 

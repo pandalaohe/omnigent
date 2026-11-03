@@ -8215,6 +8215,29 @@ async def test_channel_server_relays_active_omnigent_tools(
 
 
 @pytest.mark.asyncio
+async def test_create_without_spec_validates_arguments_without_loading_runner_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runner import tool_dispatch
+
+    def unexpected_flag_lookup(_conversation_id: str | None) -> bool:
+        raise AssertionError("A missing agent spec does not need the runner's tool surface")
+
+    monkeypatch.setattr(tool_dispatch, "_peer_messaging_enabled_for", unexpected_flag_lookup)
+    monkeypatch.setattr(tool_dispatch, "_session_open_enabled_for", unexpected_flag_lookup)
+    for arguments, expected in (
+        ({"unknown": True}, "unknown argument(s): unknown"),
+        ({"agent_id": "ag_x"}, "sys_session_create requires server access"),
+    ):
+        result = await tool_dispatch.execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(arguments),
+            conversation_id="parent",
+        )
+        assert expected in json.loads(result)["error"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("slow_phase", ["create", "message"])
 @pytest.mark.parametrize("message_status", [202, 503])
 async def test_session_create_relay_waits_for_created_handle(

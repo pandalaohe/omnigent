@@ -14,11 +14,13 @@ if TYPE_CHECKING:
 import httpx
 from fastapi import FastAPI
 
+from omnigent.entities.subagent_terminal import TerminalEnvelope
 from omnigent.runner.subagent_work import (
     _SUBAGENT_TERMINAL_STATUSES,
     _deliver_subagent_completion,
     _drained_delivered_subagent_results,
     _recover_subagent_results_from_server,
+    _seen_subagent_terminal_ids,
     _subagent_recovery_done,
     _subagent_recovery_locks,
     _subagent_work_by_child,
@@ -60,7 +62,11 @@ class _ScheduleSubagentWakeFn(Protocol):
 
 class _EnsureSubagentWorkEntryFn(Protocol):
     def __call__(
-        self, conv_id: str, *, result_key: str | None = None
+        self,
+        conv_id: str,
+        *,
+        result_key: str | None = None,
+        terminal: TerminalEnvelope | None = None,
     ) -> Coroutine[Any, Any, _SubagentWorkEntry | None]: ...
 
 
@@ -111,6 +117,7 @@ def build_subagent_recovery(
         conv_id: str,
         *,
         result_key: str | None = None,
+        terminal: TerminalEnvelope | None = None,
     ) -> _SubagentWorkEntry | None:
         """
         Rebuild a lost work entry for a child, or return the existing one.
@@ -130,7 +137,11 @@ def build_subagent_recovery(
             return existing
         if conv_id in _drained_delivered_subagent_results:
             drained_key = _drained_delivered_subagent_results[conv_id]
-            if result_key is None or result_key == drained_key:
+            identity_key = terminal.identity_key if terminal is not None else None
+            if identity_key is not None:
+                if identity_key in _seen_subagent_terminal_ids.get(conv_id, set()):
+                    return None
+            elif result_key is None or result_key == drained_key:
                 return None
         try:
             snapshot = await _session_snapshot(conv_id)
@@ -201,6 +212,8 @@ def build_subagent_recovery(
         :returns: None.
         """
         for entry in list_subagent_work(parent_id):
+            if entry.retry_chain_id is not None:
+                continue
             if entry.status not in _SUBAGENT_TERMINAL_STATUSES or entry.delivered:
                 continue
             if _deliver_subagent_completion(entry).delivered_now:
@@ -225,6 +238,11 @@ def build_subagent_recovery(
         :returns: None.
         """
         _session_inboxes.setdefault(parent_id, asyncio.Queue())
+        retry_runtime = getattr(app.state, "subagent_retry_runtime", None)
+        if retry_runtime is not None:
+            retry_runtime.on_delivered = getattr(app.state, "retry_final_delivered", None)
+            if not await retry_runtime.recover_parent(parent_id):
+                return
         _deliver_retained_subagent_results(parent_id)
         if parent_id in _subagent_recovery_done:
             return
@@ -300,8 +318,15 @@ def build_subagent_recovery(
             for entry in list(_subagent_work_by_child.values())
             if entry.status == "waiting"
         }
+        retry_runtime = getattr(app.state, "subagent_retry_runtime", None)
+        retry_parents = (
+            await retry_runtime.pending_parents() if retry_runtime is not None else set()
+        )
+        parents.update(retry_parents)
         for parent_id in parents:
-            if not any(entry.status == "waiting" for entry in list_subagent_work(parent_id)):
+            if parent_id not in retry_parents and not any(
+                entry.status == "waiting" for entry in list_subagent_work(parent_id)
+            ):
                 continue
             _subagent_recovery_done.discard(parent_id)
             await _recover_undrained_subagent_results(parent_id)

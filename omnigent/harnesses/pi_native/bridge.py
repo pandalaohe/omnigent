@@ -8,6 +8,7 @@ import hashlib
 import itertools
 import json
 import os
+import sys
 import tempfile
 import time
 import uuid
@@ -391,6 +392,7 @@ def write_extension_files(
         "serverUrl": server_url.rstrip("/"),
         "conversationUrl": conversation_url,
         "bridgeDir": str(bridge_dir),
+        "autoRetryPython": sys.executable,
         "inboxDir": str(bridge_dir / _INBOX_DIR),
         "authHeaders": auth_headers or {},
         "tools": tools or [],

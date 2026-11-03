@@ -654,7 +654,11 @@ def test_subscribe_until_ready_retries_no_rollout_and_replays_messages(
         "assistant",
     ]
 
-    assert posted[2]["data"] == _expected_status_data("running", "turn_123")
+    assert posted[2]["data"] == {
+        **_expected_status_data("running", "turn_123"),
+        "input_id": "thread_123:turn_123:item_user",
+        "recovered": True,
+    }
     state = read_bridge_state(tmp_path)
     assert state is not None and state.active_turn_id == "turn_123"
 
@@ -797,7 +801,11 @@ def test_subscribe_until_ready_replays_completed_turn_status(
         "user",
         "assistant",
     ]
-    assert posted[2]["data"] == _expected_status_data("idle", "turn_123")
+    assert posted[2]["data"] == {
+        **_expected_status_data("idle", "turn_123"),
+        "input_id": "thread_123:turn_123:item_user",
+        "recovered": True,
+    }
     state = read_bridge_state(tmp_path)
     assert state is not None
     assert state.active_turn_id is None

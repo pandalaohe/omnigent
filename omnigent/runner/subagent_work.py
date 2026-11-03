@@ -23,6 +23,12 @@ from fastapi.responses import JSONResponse
 
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
 from omnigent.debug_logging import runner_primary_session_id
+from omnigent.entities.subagent_retry import InboxOwnerFence, RetryFinal
+from omnigent.entities.subagent_terminal import (
+    RESULT_IDENTITY_LABEL_PREFIX,
+    TERMINAL_IDENTITY_LABEL_PREFIX,
+    TerminalEnvelope,
+)
 from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 from omnigent.runner.policy_proxy import _ASK_GATE_DELIVERY_TIMEOUT
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -227,6 +233,10 @@ class _SubagentWorkEntry:
     launch_timed_out: bool = False
     recovered: bool = False
     parent_turn_consumed: bool = False
+    terminal: TerminalEnvelope | None = None
+    retry_chain_id: str | None = None
+    retry_owner: InboxOwnerFence | None = None
+    retry_final: RetryFinal | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -249,6 +259,8 @@ class _SubagentDeliveryAck:
     delivered: bool
     delivered_now: bool
     reason: str
+    chain_id: str | None = None
+    pending: asyncio.Task[_SubagentDeliveryAck] | None = None
 
 
 _subagent_work_by_child: dict[str, _SubagentWorkEntry] = {}
@@ -264,6 +276,7 @@ _held_successions: dict[str, list[_JsonObject]] = {}
 # Drained children's last delivered result keys. A later terminal edge whose
 # result key matches is a duplicate; a different key is the child's next turn.
 _drained_delivered_subagent_results: dict[str, str | None] = {}
+_seen_subagent_terminal_ids: dict[str, set[tuple[str, str, str]]] = {}
 # Per-child origin (``_SubagentWorkEntry.registered_by``) kept after the entry
 # is drained, so a recovery-rebuilt entry still knows the child was dispatched
 # by an Omnigent tool and a Codex mother is woken for its later turns.
@@ -717,11 +730,13 @@ def unregister_subagent_work_for_session(session_id: str) -> None:
     :returns: None.
     """
     unregister_subagent_work(session_id)
+    _seen_subagent_terminal_ids.pop(session_id, None)
     _drained_delivered_subagent_results.pop(session_id, None)
     _subagent_work_origins.pop(session_id, None)
     _subagent_retained_state_parents.pop(session_id, None)
     _in_flight_send_locks.pop(session_id, None)
     for child_id in list(_subagent_work_by_parent.get(session_id, set())):
+        _seen_subagent_terminal_ids.pop(child_id, None)
         _subagent_work_by_child.pop(child_id, None)
         _drained_delivered_subagent_results.pop(child_id, None)
         _subagent_work_origins.pop(child_id, None)
@@ -732,6 +747,7 @@ def unregister_subagent_work_for_session(session_id: str) -> None:
     for child_id, parent_id in list(_subagent_retained_state_parents.items()):
         if parent_id != session_id:
             continue
+        _seen_subagent_terminal_ids.pop(child_id, None)
         _drained_delivered_subagent_results.pop(child_id, None)
         _subagent_work_origins.pop(child_id, None)
         _subagent_retained_state_parents.pop(child_id, None)
@@ -995,7 +1011,7 @@ async def _list_child_sessions(
 
 
 async def _fetch_latest_assistant_item(
-    server_client: httpx.AsyncClient, session_id: str
+    server_client: httpx.AsyncClient, session_id: str, *, response_id: str | None = None
 ) -> tuple[str | None, str] | None:
     """
     Return the latest turn's newest assistant message as ``(id, text)``.
@@ -1016,6 +1032,8 @@ async def _fetch_latest_assistant_item(
     while True:
         page = await _get_recovery_page(server_client, f"/v1/sessions/{session_id}/items", params)
         for item in page.get("data", []):
+            if response_id is not None and item.get("response_id") != response_id:
+                continue
             item_type = item.get("type")
             if item_type == "message" and item.get("is_meta") is True:
                 continue
@@ -1028,10 +1046,10 @@ async def _fetch_latest_assistant_item(
                         for block in item.get("content", [])
                         if block.get("type") in {"output_text", "text"} and block.get("text")
                     )
-                if item.get("role") == "user":
+                if item.get("role") == "user" and response_id is None:
                     return None
                 continue
-            if item_type in {"function_call", "function_call_output"}:
+            if item_type in {"function_call", "function_call_output"} and response_id is None:
                 return None
         if not page.get("has_more") or not page.get("last_id"):
             return None
@@ -1128,9 +1146,10 @@ async def _recover_subagent_results_from_server(
         if status not in _SUBAGENT_TERMINAL_STATUSES and not interrupted:
             continue
         existing = get_subagent_work(child_id)
-        if (existing is not None and existing.status != "waiting") or (
-            child_id in _drained_delivered_subagent_results
-        ):
+        if (
+            existing is not None
+            and (existing.status != "waiting" or existing.retry_chain_id is not None)
+        ) or (child_id in _drained_delivered_subagent_results):
             continue
         labels = child.get("labels")
         label_map = labels if isinstance(labels, dict) else {}
@@ -1188,13 +1207,27 @@ async def _recover_subagent_results_from_server(
             # origin map.
             registered_by=_subagent_work_origins.get(child_id) or "recovery",
             native_origin=codex_native_origin_from_labels(label_map),
+            recovered=True,
         )
         if interrupted:
             # This dispatch already existed; a local launch timeout cannot judge it.
             entry.status = "waiting"
             continue
         ack = mark_subagent_work_terminal(
-            child_id, status=recover_status, output=output, result_key=result_key
+            child_id,
+            status=recover_status,
+            output=output,
+            result_key=result_key,
+            terminal=TerminalEnvelope.from_labels(
+                child_id,
+                parent_id=parent_id,
+                status=recover_status,
+                labels=label_map,
+                error=error if isinstance(error, dict) and stamped_result is None else None,
+                prefix=RESULT_IDENTITY_LABEL_PREFIX
+                if stamped_result is not None
+                else TERMINAL_IDENTITY_LABEL_PREFIX,
+            ),
         )
         if ack.delivered_now:
             schedule_wake(entry)
@@ -1218,6 +1251,7 @@ def mark_subagent_work_terminal(
     output: str | None,
     result_key: str | None = None,
     only_if_work_id: str | None = None,
+    terminal: TerminalEnvelope | None = None,
 ) -> _SubagentDeliveryAck:
     """
     Mark a sub-agent dispatch terminal and notify the parent inbox.
@@ -1254,6 +1288,18 @@ def mark_subagent_work_terminal(
             f"{sorted(_SUBAGENT_TERMINAL_STATUSES)}; got {status!r}"
         )
     entry = _subagent_work_by_child.get(child_session_id)
+    if terminal is not None and terminal.child_id != child_session_id:
+        raise ValueError("terminal identity belongs to another child")
+    identity_key = terminal.identity_key if terminal is not None else None
+    if identity_key is not None and identity_key in _seen_subagent_terminal_ids.get(
+        child_session_id, set()
+    ):
+        return _SubagentDeliveryAck(
+            entry=entry,
+            delivered=True,
+            delivered_now=False,
+            reason=_SUBAGENT_DELIVERY_ALREADY_DELIVERED,
+        )
     if entry is None:
         if child_session_id in _drained_delivered_subagent_results:
             drained_key = _drained_delivered_subagent_results[child_session_id]
@@ -1289,7 +1335,18 @@ def mark_subagent_work_terminal(
             delivered_now=False,
             reason=_SUBAGENT_DELIVERY_SUPERSEDED_DISPATCH,
         )
-    if result_key is not None and result_key == entry.prior_result_key:
+    new_terminal_identity = identity_key is not None and (
+        entry.terminal is None or entry.terminal.identity_key != identity_key
+    )
+    if terminal is None:
+        terminal = TerminalEnvelope.from_data(
+            child_session_id,
+            parent_id=entry.parent_session_id,
+            status=status,
+            error={"message": output} if status == "failed" and output else None,
+        )
+    entry.terminal = terminal.model_copy(update={"parent_id": entry.parent_session_id})
+    if identity_key is None and result_key is not None and result_key == entry.prior_result_key:
         # A user-started turn may have ended without delivering to the parent.
         # Acknowledge its late edge without settling the parent's newer work.
         return _SubagentDeliveryAck(
@@ -1304,7 +1361,11 @@ def mark_subagent_work_terminal(
     # failure report for that same result still escalates below: the key
     # names the turn, and a completed record for it may be the watcher's
     # quiescence edge that the real failure must replace.
-    same_key = result_key is not None and entry.delivered_result_key == result_key
+    same_key = (
+        identity_key is None
+        and result_key is not None
+        and entry.delivered_result_key == result_key
+    )
     failure_escalates = (
         same_key and status in {"failed", "stopped", "killed"} and entry.status == "completed"
     )
@@ -1345,7 +1406,7 @@ def mark_subagent_work_terminal(
         if entry.delivered:
             # A new key (checked above) on a delivered terminal entry is the
             # child's next turn: reopen and deliver (D9).
-            if result_key is not None:
+            if result_key is not None or new_terminal_identity:
                 entry.status = status
                 entry.output = output
                 entry.completed_at = time.time()
@@ -1396,9 +1457,10 @@ def _deliver_subagent_completion(
             delivered_now=False,
             reason=_SUBAGENT_DELIVERY_ALREADY_DELIVERED,
         )
-    if _is_quiet_output(entry.output):
+    if entry.retry_final is None and _is_quiet_output(entry.output):
         entry.delivered = True
         entry.delivered_result_key = result_key
+        _remember_terminal_identity(entry)
         return _SubagentDeliveryAck(
             entry=entry,
             delivered=True,
@@ -1434,6 +1496,22 @@ def _deliver_subagent_completion(
         "output": output,
         "placement_label": entry.placement_label,
     }
+    if entry.terminal is not None:
+        payload["terminal"] = entry.terminal.model_dump(mode="json")
+        if entry.terminal.identity_diagnostic is not None:
+            payload["identity_diagnostic"] = entry.terminal.identity_diagnostic
+    if entry.retry_final is not None and entry.retry_owner is not None:
+        payload["auto_retry"] = {
+            "chain_id": entry.retry_final.chain_id,
+            "attempts": entry.retry_final.attempts,
+            "of": entry.retry_final.limit,
+            "reason": entry.retry_final.outcome.reason,
+        }
+        payload["retry_final"] = {
+            "chain_id": entry.retry_final.chain_id,
+            "result_id": entry.retry_final.result_id,
+            "owner": entry.retry_owner.model_dump(mode="json"),
+        }
     held = _held_successions.get(entry.parent_session_id)
     if held is not None:
         # A successor still waiting for its opening message must not be woken
@@ -1441,6 +1519,7 @@ def _deliver_subagent_completion(
         held.append(payload)
         entry.delivered = True
         entry.delivered_result_key = result_key
+        _remember_terminal_identity(entry)
         return _SubagentDeliveryAck(
             entry=entry,
             delivered=True,
@@ -1463,12 +1542,20 @@ def _deliver_subagent_completion(
     inbox.put_nowait(payload)
     entry.delivered = True
     entry.delivered_result_key = result_key
+    _remember_terminal_identity(entry)
     return _SubagentDeliveryAck(
         entry=entry,
         delivered=True,
         delivered_now=True,
         reason=_SUBAGENT_DELIVERY_DELIVERED,
     )
+
+
+def _remember_terminal_identity(entry: _SubagentWorkEntry) -> None:
+    key = entry.terminal.identity_key if entry.terminal is not None else None
+    if key is not None:
+        _seen_subagent_terminal_ids.setdefault(entry.child_session_id, set()).add(key)
+        _subagent_retained_state_parents[entry.child_session_id] = entry.parent_session_id
 
 
 def reap_stalled_subagent_launches(
@@ -1526,6 +1613,13 @@ def reap_stalled_subagent_launches(
         deliver(
             entry.child_session_id,
             status="failed",
+            terminal=TerminalEnvelope(
+                child_id=entry.child_session_id,
+                parent_id=entry.parent_session_id,
+                status="failed",
+                event_kind="dispatch_failed",
+                error={"code": "launch_ack_timeout", "message": "No start acknowledgment."},
+            ),
             output=(
                 f"Error: no start acknowledgment for sub-agent {entry.agent!r} "
                 f"title {entry.title!r} within {budget:.0f}s of dispatch. "
@@ -1739,7 +1833,7 @@ def _subagent_delivery_not_confirmed_response(
     :returns: A 503 JSON response when delivery is not confirmed, or ``None``
         when the status can be acknowledged.
     """
-    if ack.delivered:
+    if ack.delivered or ack.reason in {"held", "superseded"}:
         return None
     if ack.reason == _SUBAGENT_DELIVERY_SUPERSEDED_DISPATCH:
         # A delayed op intentionally dropped because a newer send replaced the
@@ -1758,7 +1852,7 @@ def _subagent_delivery_not_confirmed_response(
             "Sub-agent terminal status arrived, but the parent inbox is missing on this runner."
         ),
     }
-    detail = detail_by_reason[reason]
+    detail = detail_by_reason.get(reason, "Sub-agent terminal delivery is pending reconciliation.")
     return JSONResponse(
         status_code=503,
         content={
