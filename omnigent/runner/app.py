@@ -7886,6 +7886,7 @@ def create_runner_app(
                             legacy_local_execution=True,
                         ),
                         origin_receipt=event.get("pi_origin_receipt"),
+                        execution_operation_id=event.get("execution_operation_id"),
                     )
                     return {
                         **decision_payload(decision),
@@ -10939,6 +10940,7 @@ def create_runner_app(
                         legacy_local_execution=local_execution,
                     ),
                     origin_receipt=body.get("pi_origin_receipt"),
+                    execution_operation_id=body.get("execution_operation_id"),
                 )
             except (KeyError, OSError, TypeError, ValueError):
                 return JSONResponse(status_code=409, content={"error": "permission_tier_stale"})

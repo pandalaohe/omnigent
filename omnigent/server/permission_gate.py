@@ -58,6 +58,7 @@ async def inspect_permission_call(
     runner_router: RunnerRouter | None,
     local_execution: bool = True,
     origin_receipt: object = None,
+    execution_operation_id: object = None,
 ) -> InspectedPermissionCall:
     """Only the authenticated executing runner may supply filesystem facts."""
     if harness is None and any(
@@ -106,6 +107,11 @@ async def inspect_permission_call(
                 "expected_revision": state.revision,
                 "local_execution": local_execution,
                 **({"pi_origin_receipt": origin_receipt} if origin_receipt is not None else {}),
+                **(
+                    {"execution_operation_id": execution_operation_id}
+                    if execution_operation_id is not None
+                    else {}
+                ),
             },
             timeout=10.0,
         )

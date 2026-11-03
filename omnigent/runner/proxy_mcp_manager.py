@@ -40,6 +40,7 @@ from omnigent.runner.mcp_execution_registry import (
     McpExecutionRegistry,
 )
 from omnigent.runner.mcp_manager import McpSchemasResult
+from omnigent.runner.pi_scope_relay import PiMcpExecution, current_pi_mcp_execution
 from omnigent.runner.tool_dispatch import MCP_PROXY_CALL_TIMEOUT_S
 from omnigent.spec.types import AgentSpec
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -338,24 +339,28 @@ class ProxyMcpManager:
                 c.name for c in spec.mcp_servers if c.transport == "registry"
             }
 
-        operation_id = f"mcpop_{uuid.uuid4().hex}"
+        scoped = current_pi_mcp_execution(self._session_id, tool_name, arguments)
+        operation_id = scoped.operation_id if scoped else f"mcpop_{uuid.uuid4().hex}"
+        retained_id = scoped.retained_operation_id if scoped else operation_id
         registry = self._execution_registry
         if registry is not None:
-            registry.retain_operation(self._session_id, operation_id)
+            registry.retain_operation(self._session_id, retained_id)
         try:
-            return await self._call_tool_with_operation(tool_name, arguments, operation_id)
+            return await self._call_tool_with_operation(tool_name, arguments, operation_id, scoped)
         finally:
             if registry is not None:
-                registry.release_operation(self._session_id, operation_id)
+                registry.release_operation(self._session_id, retained_id)
 
     async def _call_tool_with_operation(
         self,
         tool_name: str,
         arguments: _JsonObject,
         operation_id: str,
+        scoped: PiMcpExecution | None = None,
     ) -> str:
         """Run one proxy call under an already-retained operation id."""
         request_id = 1
+        retained_id = scoped.retained_operation_id if scoped else operation_id
         service, separator, upstream_name = tool_name.partition("__")
         managed = bool(separator and service in self._registry_services)
         wire_name = upstream_name if managed else tool_name
@@ -396,7 +401,7 @@ class ProxyMcpManager:
                         server_generation=request_generation,
                         observed_server_generation=pending_approvals.current_server_generation(),
                         operation_retained=registry is not None
-                        and registry.has_operation(self._session_id, operation_id),
+                        and registry.has_operation(self._session_id, retained_id),
                         reattach_trigger=reattach_trigger[:80]
                         if reattach_trigger is not None
                         else None,
@@ -413,6 +418,7 @@ class ProxyMcpManager:
                     "name": wire_name,
                     "arguments": arguments,
                     MCP_OPERATION_ID_PARAM: operation_id,
+                    **(scoped.proxy_params() if scoped else {}),
                 },
             }
 
@@ -425,7 +431,7 @@ class ProxyMcpManager:
             started = monotonic()
             trigger = type(cause).__name__ if cause is not None else "detached_response"
             registry = self._execution_registry
-            if registry is None or not registry.has_operation(self._session_id, operation_id):
+            if registry is None or not registry.has_operation(self._session_id, retained_id):
                 _record_failure(
                     cause,
                     phase="server_reattach",
@@ -598,6 +604,7 @@ class ProxyMcpManager:
                         "name": wire_name,
                         "arguments": arguments,
                         MCP_OPERATION_ID_PARAM: operation_id,
+                        **(scoped.proxy_params() if scoped else {}),
                         "requestState": request_state,
                         "inputResponses": {
                             elicitation_id: _input_response(

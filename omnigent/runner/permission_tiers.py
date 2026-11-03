@@ -727,6 +727,7 @@ class PermissionTierRuntime:
         expected_revision: int,
         local_execution: bool = True,
         origin_receipt: object = None,
+        execution_operation_id: object = None,
     ) -> tuple[BoundToolCall, TierDecision]:
         state = self.state(session_id)
         if state is None or state.status != "ready" or state.revision != expected_revision:
@@ -744,6 +745,26 @@ class PermissionTierRuntime:
         )
         if call_id in self._finished.get(session_id, set()):
             raise ValueError("Tool call already finished")
+        if execution_operation_id is not None:
+            lease = self._leases.get(session_id, {}).get(call_id)
+            if (
+                pi_scope is None
+                or not isinstance(execution_operation_id, str)
+                or lease is None
+                or lease.operation_id != execution_operation_id
+                or "rpc" not in lease.steps
+                or not self.matches_authorized_call(
+                    session_id,
+                    call_id=call_id,
+                    revision=expected_revision,
+                    arguments_digest=binding.arguments_digest,
+                    name=name,
+                    arguments=arguments,
+                    origin_receipt=origin_receipt,
+                )
+            ):
+                raise ValueError("Pi MCP execution continuation is unavailable")
+            return binding, TierDecision(Verdict.ALLOW)
         if call_id in self._leases.get(session_id, {}):
             raise ValueError("Tool call is already executing")
         saved_arguments = json.loads(

@@ -120,6 +120,8 @@ class Harness:
         mcp_manager: _FakeMcpManager | None = None,
         process_manager: _FakeProcessManager | None = None,
         spec_resolver: object | None = None,
+        permission_tiers: PermissionTierRuntime | None = None,
+        harness: str = "claude-sdk",
     ) -> None:
         self.app = FastAPI()
         self.mcp_manager = mcp_manager
@@ -161,13 +163,13 @@ class Harness:
             _resolve_session_spec_entry=_resolve_entry,
             _session_agent_ids=self.agent_ids,
             _session_async_tasks=self.async_tasks,
-            _session_harness_name=lambda sid: "claude-sdk",
+            _session_harness_name=lambda sid: harness,
             _session_inboxes=self.inboxes,
             _session_runtime_cwd=_runtime_cwd,
             _session_spec_cache=self.spec_cache,
             filesystem_registry=None,
             mcp_execution_registry=self.registry,
-            permission_tiers=PermissionTierRuntime(),
+            permission_tiers=permission_tiers or PermissionTierRuntime(),
             mcp_manager=mcp_manager,  # type: ignore[arg-type]
             process_manager=process_manager,  # type: ignore[arg-type]
             resource_registry=SessionResourceRegistry(),

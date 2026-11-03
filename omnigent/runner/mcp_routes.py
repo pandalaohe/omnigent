@@ -187,7 +187,7 @@ def register_mcp_routes(
 
             nested_body = cast("_JsonObject", {**body, "_omnigent_operation": None})
             nested_body.pop("_omnigent_operation")
-            nested_body["_omnigent_retained_operation"] = {**operation, "id": operation_id}
+            nested_body["_omnigent_retained_operation"] = operation
             execution_started: dict[str, bool] = {"value": False}
             nested_body["_omnigent_execution_started"] = execution_started
 
@@ -207,7 +207,9 @@ def register_mcp_routes(
                 finally:
                     if execution_started["value"]:
                         permission = nested_body.get("_omnigent_permission")
-                        if isinstance(permission, dict):
+                        if isinstance(permission, dict) and not operation_step.startswith(
+                            "pi-mcp:"
+                        ):
                             permission_tiers.finish(
                                 session_id,
                                 call_id=permission.get("call_id"),

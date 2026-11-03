@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, cast
 
 from omnigent.permission_tiers.pi_private import public_pi_value
 from omnigent.permission_tiers.pi_tools import read_pi_tool_registry
@@ -14,6 +16,41 @@ from omnigent.server.permission_tiers import BoundToolCall
 
 if TYPE_CHECKING:
     from omnigent.runner.permission_tiers import PermissionTierRuntime
+
+
+@dataclass(frozen=True)
+class PiMcpExecution:
+    binding: BoundToolCall
+    operation_id: str
+    retained_operation_id: str
+    origin_receipt: str = field(repr=False)
+
+    def proxy_params(self) -> dict[str, str]:
+        return {
+            "_omnigent_permission_call_id": self.binding.call_id,
+            "_omnigent_pi_origin_receipt": self.origin_receipt,
+        }
+
+
+_mcp_execution: ContextVar[PiMcpExecution | None] = ContextVar("pi_mcp_execution", default=None)
+
+
+def current_pi_mcp_execution(
+    session_id: str, name: str, arguments: dict[str, object]
+) -> PiMcpExecution | None:
+    execution = _mcp_execution.get()
+    if execution is not None:
+        actual = BoundToolCall.bind(
+            session_id=session_id,
+            host_id=execution.binding.host_id,
+            call_id=execution.binding.call_id,
+            name=name,
+            arguments=arguments,
+            tier_revision=execution.binding.tier_revision,
+        )
+        if actual != execution.binding:
+            raise ValueError("Pi MCP dispatch does not match its scoped call")
+    return execution
 
 
 class PiScopeRelay:
@@ -149,8 +186,31 @@ class PiScopeRelay:
             origin_receipt=payload.get("pi_origin_receipt"),
         ):
             raise ValueError("Pi RPC execution unavailable")
-        # No scheduling point between the live execution fence and dispatch entry.
-        result = await tool_executor(name, arguments)
+        operation_id = cast(str, payload["operation_id"])
+        binding = receipt.binding
+        execution = PiMcpExecution(
+            binding,
+            operation_id,
+            self.runtime.pi_operation_id(
+                self.session_id,
+                operation_id,
+                {
+                    "call_id": binding.call_id,
+                    "revision": binding.tier_revision,
+                    "arguments_digest": binding.arguments_digest,
+                    "pi_origin_receipt": receipt.token,
+                },
+                name=name,
+                arguments=arguments,
+            ),
+            receipt.token,
+        )
+        token = _mcp_execution.set(execution)
+        try:
+            # No scheduling point between the live execution fence and dispatch entry.
+            result = await tool_executor(name, arguments)
+        finally:
+            _mcp_execution.reset(token)
         projected = public_pi_value(result)
         return {"result": projected}
 
