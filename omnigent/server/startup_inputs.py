@@ -518,10 +518,7 @@ class ManagedStartupInputs:
                 wake.set()
                 return
             worker.cancel()
-        if connection is None or (
-            not connection.registered_with_managed_token
-            and getattr(app.state, "startup_admission", None) is None
-        ):
+        if connection is None:
             return
         wake = asyncio.Event()
 
@@ -690,6 +687,9 @@ class ManagedStartupInputs:
                 self._deliveries[key] = task
             return head.status == "in_progress"
         if state == "pending" and conv.runner_id is None:
+            # Policy-off recovery on an ordinary host only drains saved inputs.
+            if admission is None and not connection.registered_with_managed_token:
+                return False
             # The launch bound this host on a replica without its tunnel, so it
             # could not start the runner; start it here.
             from omnigent.server.routes.sessions import _launch_runner_on_host
