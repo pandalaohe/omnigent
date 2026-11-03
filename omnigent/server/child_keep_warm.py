@@ -1347,18 +1347,36 @@ class ChildKeepWarmSweeper:
                 self._migrated_owners.add(owner)
         settings = await asyncio.to_thread(read_keep_warm_settings, preferences_store, owner)
         max_low, max_high = KEEP_WARM_MAX_BOUNDS_S
-        rows = (
-            [row for cells in settings.cells.values() for row in cells.values()]
-            if settings.cells is not None
-            else [*settings.agents.values(), settings.default]
-        )
-        for row in rows:
-            clamped = min(max(row.max_s, max_low), max_high)
-            self._scan_window_s = max(self._scan_window_s, clamped + _SLACK_S)
-            # A session untouched for N can still need a tick when its N edge
-            # passes, so the candidate window must cover the longest N too.
-            if row.cold_after_s is not None and row.cold_after_s > 0:
-                self._scan_window_s = max(self._scan_window_s, row.cold_after_s + _SLACK_S)
+        layers = settings.layers
+        if layers is not None:
+            records = [
+                layers.corner,
+                *layers.hosts.values(),
+                *layers.agents.values(),
+                *[record for rows in layers.cells.values() for record in rows.values()],
+            ]
+            for record in records:
+                max_s = record.get("maxSeconds")
+                if isinstance(max_s, int) and not isinstance(max_s, bool):
+                    clamped = min(max(max_s, max_low), max_high)
+                    self._scan_window_s = max(self._scan_window_s, clamped + _SLACK_S)
+                cold_after_s = record.get("coldAfterSeconds")
+                if isinstance(cold_after_s, int) and not isinstance(cold_after_s, bool):
+                    if cold_after_s > 0:
+                        self._scan_window_s = max(self._scan_window_s, cold_after_s + _SLACK_S)
+        else:
+            rows = (
+                [row for cells in settings.cells.values() for row in cells.values()]
+                if settings.cells is not None
+                else [*settings.agents.values(), settings.default]
+            )
+            for row in rows:
+                clamped = min(max(row.max_s, max_low), max_high)
+                self._scan_window_s = max(self._scan_window_s, clamped + _SLACK_S)
+                # A session untouched for N can still need a tick when its N edge
+                # passes, so the candidate window must cover the longest N too.
+                if row.cold_after_s is not None and row.cold_after_s > 0:
+                    self._scan_window_s = max(self._scan_window_s, row.cold_after_s + _SLACK_S)
         cache[owner] = settings
         return settings
 
@@ -1424,14 +1442,24 @@ class ChildKeepWarmSweeper:
                 by_session[conv.id] = None
                 continue
             template_id = conv.labels.get(AGENT_TEMPLATE_ID_LABEL)
-            if settings.cells is None and template_id in settings.agents:
+            if (
+                settings.layers is None
+                and settings.cells is None
+                and template_id in settings.agents
+            ):
                 by_session[conv.id] = settings.agents[template_id].cold_after_s
                 continue
-            if settings.cells is None and conv.agent_id in settings.agents:
+            if (
+                settings.layers is None
+                and settings.cells is None
+                and conv.agent_id in settings.agents
+            ):
                 by_session[conv.id] = settings.agents[conv.agent_id].cold_after_s
                 continue
-            if settings.cells is None and not any(
-                key.startswith("harness:") for key in settings.agents
+            if (
+                settings.layers is None
+                and settings.cells is None
+                and not any(key.startswith("harness:") for key in settings.agents)
             ):
                 by_session[conv.id] = settings.default.cold_after_s
                 continue

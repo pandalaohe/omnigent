@@ -15,6 +15,7 @@ export interface LayeredEditorProps {
   trigger: ReactElement;
   title: string;
   children: ReactNode;
+  open?: boolean;
   from?: string;
   savedHere?: boolean;
   useInheritedLabel?: string;
@@ -32,6 +33,7 @@ export function LayeredEditor({
   trigger,
   title,
   children,
+  open,
   from,
   savedHere,
   useInheritedLabel,
@@ -44,7 +46,7 @@ export function LayeredEditor({
   onOpenChange,
 }: LayeredEditorProps) {
   return (
-    <Popover onOpenChange={onOpenChange}>
+    <Popover open={open} onOpenChange={onOpenChange}>
       <PopoverTrigger asChild>{trigger}</PopoverTrigger>
       <PopoverContent
         align="start"

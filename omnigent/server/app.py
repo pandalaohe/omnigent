@@ -4320,6 +4320,7 @@ def create_app(
     class KeepWarmConversionRequest(BaseModel):
         model_config = ConfigDict(extra="forbid", strict=True)
         dry_run: bool
+        target: Literal["cells", "layers"] = "cells"
 
     def _keep_warm_conversion_snapshot(
         owner: str,
@@ -4451,6 +4452,7 @@ def create_app(
                 dry_run=body.dry_run,
                 create_if_missing=create_if_missing,
                 legacy_native_agents=legacy_native_agents,
+                target=body.target,
             )
         except UserPreferencesUserNotFoundError as exc:
             raise StarletteHTTPException(

@@ -9597,6 +9597,27 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             return session.execute(select(func.count()).select_from(rows)).scalar_one()
 
+    def agent_ids_with_sessions(self, template_label_key: str) -> set[str]:
+        """Distinct bound agent ids plus template labels, from the label table."""
+        with self._conv_session("list_agents_with_sessions") as session:
+            agent_ids = session.scalars(
+                select(SqlConversation.agent_id)
+                .where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.agent_id.is_not(None),
+                )
+                .distinct()
+            ).all()
+            template_ids = session.scalars(
+                select(SqlConversationLabel.value)
+                .where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.key == template_label_key,
+                )
+                .distinct()
+            ).all()
+        return {value for value in (*agent_ids, *template_ids) if value}
+
     def has_other_live_session_in_workspace(
         self,
         *,

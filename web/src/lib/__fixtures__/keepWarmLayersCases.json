@@ -1,0 +1,270 @@
+{
+  "cases": [
+    {
+      "scenario": 1,
+      "name": "Host column flows down",
+      "layers": {
+        "corner": { "main": true, "maxSeconds": 14400 },
+        "hosts": { "desktop": { "main": false } },
+        "agents": { "codex": {} },
+        "cells": { "desktop": { "codex": {} } },
+        "hostWins": {}
+      },
+      "row": "codex",
+      "agentId": "codex",
+      "harness": "codex",
+      "family": "codex",
+      "host": "desktop",
+      "expected": {
+        "main": false,
+        "child": false,
+        "intervalSeconds": 1500,
+        "maxSeconds": 14400,
+        "coldAfterSeconds": null
+      },
+      "clashes": []
+    },
+    {
+      "scenario": 2,
+      "name": "Cell beats header",
+      "layers": {
+        "corner": { "main": true },
+        "hosts": { "desktop": { "main": false } },
+        "agents": { "codex": {} },
+        "cells": { "desktop": { "codex": { "main": true } } },
+        "hostWins": {}
+      },
+      "row": "codex",
+      "agentId": "codex",
+      "harness": "codex",
+      "family": "codex",
+      "host": "desktop",
+      "expected": {
+        "main": true,
+        "child": false,
+        "intervalSeconds": 1500,
+        "maxSeconds": 14400,
+        "coldAfterSeconds": null
+      },
+      "clashes": []
+    },
+    {
+      "scenario": 3,
+      "name": "Agent beats unmarked host",
+      "layers": {
+        "corner": {},
+        "hosts": { "desktop": { "maxSeconds": 7200 } },
+        "agents": { "codex": { "maxSeconds": 28800 } },
+        "cells": { "desktop": { "codex": {} } },
+        "hostWins": {}
+      },
+      "row": "codex",
+      "agentId": "codex",
+      "harness": "codex",
+      "family": "codex",
+      "host": "desktop",
+      "expected": {
+        "main": false,
+        "child": false,
+        "intervalSeconds": 1500,
+        "maxSeconds": 28800,
+        "coldAfterSeconds": null
+      },
+      "clashes": [{ "field": "maxSeconds", "winner": "row" }]
+    },
+    {
+      "scenario": 4,
+      "name": "Marked host beats agent",
+      "layers": {
+        "corner": {},
+        "hosts": { "desktop": { "maxSeconds": 7200 } },
+        "agents": { "codex": { "maxSeconds": 28800 } },
+        "cells": { "desktop": { "codex": {} } },
+        "hostWins": { "desktop": true }
+      },
+      "row": "codex",
+      "agentId": "codex",
+      "harness": "codex",
+      "family": "codex",
+      "host": "desktop",
+      "expected": {
+        "main": false,
+        "child": false,
+        "intervalSeconds": 1500,
+        "maxSeconds": 7200,
+        "coldAfterSeconds": null
+      },
+      "clashes": [{ "field": "maxSeconds", "winner": "col" }]
+    },
+    {
+      "scenario": 5,
+      "name": "Marked host with the field unset",
+      "layers": {
+        "corner": {},
+        "hosts": { "desktop": {} },
+        "agents": { "codex": { "maxSeconds": 28800 } },
+        "cells": { "desktop": { "codex": {} } },
+        "hostWins": { "desktop": true }
+      },
+      "row": "codex",
+      "agentId": "codex",
+      "harness": "codex",
+      "family": "codex",
+      "host": "desktop",
+      "expected": {
+        "main": false,
+        "child": false,
+        "intervalSeconds": 1500,
+        "maxSeconds": 28800,
+        "coldAfterSeconds": null
+      },
+      "clashes": []
+    },
+    {
+      "scenario": 6,
+      "name": "Value only an agent can hold",
+      "layers": {
+        "corner": {},
+        "hosts": { "desktop": { "intervalSeconds": 120 } },
+        "agents": { "codex": { "intervalSeconds": 1200 } },
+        "cells": { "desktop": { "codex": {} } },
+        "hostWins": { "desktop": true }
+      },
+      "row": "codex",
+      "agentId": "codex",
+      "harness": "codex",
+      "family": "codex",
+      "host": "desktop",
+      "expected": {
+        "main": false,
+        "child": false,
+        "intervalSeconds": 1200,
+        "maxSeconds": 14400,
+        "coldAfterSeconds": null
+      },
+      "clashes": []
+    },
+    {
+      "scenario": 7,
+      "name": "Agent cannot use a held value",
+      "layers": {
+        "corner": {},
+        "hosts": { "desktop": { "maxSeconds": 28800 } },
+        "agents": { "harness:pi": {} },
+        "cells": { "desktop": { "harness:pi": {} } },
+        "hostWins": { "desktop": true }
+      },
+      "row": "harness:pi",
+      "harness": "pi",
+      "family": "pi",
+      "host": "desktop",
+      "expected": {
+        "main": false,
+        "child": false,
+        "intervalSeconds": 1800,
+        "maxSeconds": 1800,
+        "coldAfterSeconds": null
+      },
+      "clashes": []
+    },
+    {
+      "scenario": 8,
+      "name": "Two marked hosts use their own columns",
+      "layers": {
+        "corner": {},
+        "hosts": {
+          "desktop": { "maxSeconds": 7200 },
+          "server": { "maxSeconds": 3600 }
+        },
+        "agents": { "codex": { "maxSeconds": 28800 } },
+        "cells": { "desktop": { "codex": {} }, "server": { "codex": {} } },
+        "hostWins": { "desktop": true, "server": true }
+      },
+      "row": "codex",
+      "agentId": "codex",
+      "harness": "codex",
+      "family": "codex",
+      "host": "server",
+      "expected": {
+        "main": false,
+        "child": false,
+        "intervalSeconds": 1500,
+        "maxSeconds": 3600,
+        "coldAfterSeconds": null
+      },
+      "clashes": [{ "field": "maxSeconds", "winner": "col" }]
+    },
+    {
+      "scenario": 9,
+      "name": "Header keeps a value equal to the corner",
+      "layers": {
+        "corner": { "main": true },
+        "hosts": { "desktop": { "main": false } },
+        "agents": { "codex": { "main": true } },
+        "cells": { "desktop": { "codex": {} } },
+        "hostWins": {}
+      },
+      "row": "codex",
+      "agentId": "codex",
+      "harness": "codex",
+      "family": "codex",
+      "host": "desktop",
+      "expected": {
+        "main": true,
+        "child": false,
+        "intervalSeconds": 1500,
+        "maxSeconds": 14400,
+        "coldAfterSeconds": null
+      },
+      "clashes": [{ "field": "main", "winner": "row" }]
+    },
+    {
+      "scenario": 37,
+      "name": "A value the agent would clamp",
+      "layers": {
+        "corner": {},
+        "hosts": {},
+        "agents": { "codex": {} },
+        "cells": { "": { "codex": { "intervalSeconds": 60 } } },
+        "hostWins": {}
+      },
+      "row": "codex",
+      "agentId": "codex",
+      "harness": "codex",
+      "family": "codex",
+      "host": "",
+      "expected": {
+        "main": false,
+        "child": false,
+        "intervalSeconds": 300,
+        "maxSeconds": 14400,
+        "coldAfterSeconds": null
+      },
+      "clashes": []
+    },
+    {
+      "scenario": 41,
+      "name": "A row with no cold value keeps the platform rule",
+      "layers": {
+        "corner": { "coldAfterSeconds": 3600 },
+        "hosts": {},
+        "agents": { "codex": { "coldAfterSeconds": null } },
+        "cells": {},
+        "hostWins": {}
+      },
+      "row": "codex",
+      "agentId": "codex",
+      "harness": "codex",
+      "family": "codex",
+      "host": "",
+      "expected": {
+        "main": false,
+        "child": false,
+        "intervalSeconds": 1500,
+        "maxSeconds": 14400,
+        "coldAfterSeconds": null
+      },
+      "clashes": []
+    }
+  ]
+}
