@@ -140,9 +140,9 @@ export function TerminalKeyRow({
 
   const pressRef = useRef<ActiveKeyPress | null>(null);
   const pagerRef = useRef<PagerSwipeStart | null>(null);
-  const pointerHandledRef = useRef(false);
+  const activePointerIdRef = useRef<number | null>(null);
   const keyboardDraggedRef = useRef(false);
-  const keyboardStartRef = useRef<{ x: number; y: number } | null>(null);
+  const keyboardStartRef = useRef<{ pointerId: number; x: number; y: number } | null>(null);
 
   const stopPress = useCallback(() => {
     const active = pressRef.current;
@@ -160,6 +160,7 @@ export function TerminalKeyRow({
     stopPress();
     pagerRef.current = null;
     keyboardStartRef.current = null;
+    activePointerIdRef.current = null;
   }, [stopPress]);
 
   useEffect(() => {
@@ -189,6 +190,9 @@ export function TerminalKeyRow({
     if (event.button !== 0) return;
     // Prevent focus from leaving the terminal or calling up the software keyboard.
     event.preventDefault();
+    if (activePointerIdRef.current !== null && activePointerIdRef.current !== event.pointerId) {
+      return;
+    }
 
     const target = event.target as HTMLElement | null;
     if (!target) return;
@@ -196,6 +200,13 @@ export function TerminalKeyRow({
     const buttonEl = target.closest<HTMLButtonElement>("button[data-key-id]");
     const keyId = buttonEl && !buttonEl.disabled ? buttonEl.dataset.keyId : undefined;
     const item = keyId ? items.find((candidate) => candidate.id === keyId) : undefined;
+    const inPager = Boolean(target.closest("[data-pager]"));
+
+    if (!inPager && (disabled || !buttonEl || buttonEl.disabled || !item)) {
+      return;
+    }
+
+    activePointerIdRef.current = event.pointerId;
 
     try {
       if (item?.kind === "action" && buttonEl) {
@@ -207,7 +218,7 @@ export function TerminalKeyRow({
       // Synthetic test events may not register an active pointer id.
     }
 
-    if (target.closest("[data-pager]")) {
+    if (inPager) {
       pagerRef.current = {
         pointerId: event.pointerId,
         startX: event.clientX,
@@ -221,12 +232,15 @@ export function TerminalKeyRow({
 
     if (item.kind === "action") {
       keyboardDraggedRef.current = false;
-      keyboardStartRef.current = { x: event.clientX, y: event.clientY };
+      keyboardStartRef.current = {
+        pointerId: event.pointerId,
+        x: event.clientX,
+        y: event.clientY,
+      };
       return;
     }
 
     stopPress();
-    pointerHandledRef.current = true;
     const press: ActiveKeyPress = {
       item,
       pointerId: event.pointerId,
@@ -252,16 +266,20 @@ export function TerminalKeyRow({
   };
 
   const handlePointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (activePointerIdRef.current !== null && event.pointerId !== activePointerIdRef.current) {
+      return;
+    }
     const kbStart = keyboardStartRef.current;
     if (
       kbStart &&
+      kbStart.pointerId === event.pointerId &&
       Math.hypot(event.clientX - kbStart.x, event.clientY - kbStart.y) >= TERMINAL_DRAG_SLOP_PX
     ) {
       keyboardDraggedRef.current = true;
     }
 
     const press = pressRef.current;
-    if (!press) return;
+    if (!press || press.pointerId !== event.pointerId) return;
     if (
       Math.hypot(event.clientX - press.startX, event.clientY - press.startY) >=
       TERMINAL_DRAG_SLOP_PX
@@ -279,10 +297,14 @@ export function TerminalKeyRow({
   };
 
   const handlePointerUp = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (activePointerIdRef.current !== null && event.pointerId !== activePointerIdRef.current) {
+      return;
+    }
+    activePointerIdRef.current = null;
     keyboardStartRef.current = null;
     const pager = pagerRef.current;
     pagerRef.current = null;
-    if (pager) {
+    if (pager && pager.pointerId === event.pointerId) {
       const dx = event.clientX - pager.startX;
       const dy = event.clientY - pager.startY;
       if (Math.abs(dx) >= TERMINAL_SWIPE_THRESHOLD_PX && Math.abs(dx) > Math.abs(dy)) {
@@ -296,7 +318,7 @@ export function TerminalKeyRow({
     }
 
     const press = pressRef.current;
-    if (!press) return;
+    if (!press || press.pointerId !== event.pointerId) return;
     const { item, moved, repeated } = press;
     stopPress();
     if (!moved && !repeated) {
@@ -304,7 +326,10 @@ export function TerminalKeyRow({
     }
   };
 
-  const handlePointerCancel = () => {
+  const handlePointerCancel = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (activePointerIdRef.current !== null && event.pointerId !== activePointerIdRef.current) {
+      return;
+    }
     cancelAll();
   };
 
@@ -332,10 +357,6 @@ export function TerminalKeyRow({
       return;
     }
 
-    if (pointerHandledRef.current) {
-      pointerHandledRef.current = false;
-      return;
-    }
     if (event.detail === 0 && item.kind === "key") {
       fireKey(item);
     }
@@ -372,7 +393,7 @@ export function TerminalKeyRow({
           aria-pressed={isKeyboardAction ? isActive : undefined}
           onClick={(event) => handleButtonClick(item, event)}
           className={cn(
-            "flex h-[44px] min-w-[44px] items-center justify-center rounded-[7px] border border-border bg-background px-1 font-mono text-[12px] font-semibold text-foreground transition-colors select-none touch-manipulation",
+            "flex h-[44px] min-w-[44px] items-center justify-center rounded-[7px] border border-border bg-background px-1 font-mono text-[12px] font-semibold text-foreground transition-colors select-none touch-none",
             "active:bg-muted disabled:pointer-events-none disabled:opacity-45",
             isActive && "border-primary/50 bg-primary/15 text-primary",
           )}
@@ -403,7 +424,7 @@ export function TerminalKeyRow({
         paddingRight: "max(8px, var(--key-row-safe-r, var(--omnigent-safe-right, 0px)))",
       }}
       className={cn(
-        "shrink-0 border-t border-border bg-card pt-[2px] pb-0 select-none touch-manipulation",
+        "shrink-0 border-t border-border bg-card pt-[2px] pb-0 select-none touch-none",
         "[:is([data-ios-native],[data-android-native])_[data-testid=terminals-panel]_&]:[--key-row-safe-l:0px]",
         "[:is([data-ios-native],[data-android-native])_[data-testid=terminals-panel]_&]:[--key-row-safe-r:0px]",
       )}
@@ -420,7 +441,7 @@ export function TerminalKeyRow({
           data-pager
           role="group"
           aria-label={`More keys, page ${clampedPage + 1} of ${pageCount}. Swipe left or right.`}
-          className="grid grid-cols-6 gap-[2px] @min-[35rem]:col-span-6"
+          className="grid grid-cols-6 gap-[2px] touch-none @min-[35rem]:col-span-6"
         >
           {renderCells(secondRowPage, `page-${clampedPage}`)}
         </div>
@@ -428,21 +449,12 @@ export function TerminalKeyRow({
       <div
         data-testid="terminal-key-row-dots"
         aria-hidden="true"
-        onClick={() => {
-          if (disabled || pageCount <= 1) return;
-          setPage((current) => (current + 1) % pageCount);
-        }}
         className="flex h-[6px] items-center justify-center gap-1 @min-[35rem]:h-[8px]"
       >
         {Array.from({ length: pageCount }, (_, index) => (
           <i
             key={index}
             data-page-dot={String(index)}
-            onClick={(event) => {
-              event.stopPropagation();
-              if (disabled) return;
-              setPage(index);
-            }}
             className={cn(
               "block h-[3px] rounded-full transition-all",
               index === clampedPage ? "w-[10px] bg-muted-foreground" : "w-[3px] bg-border",

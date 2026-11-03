@@ -182,6 +182,42 @@ describe("TerminalKeyRow", () => {
     expect(bar).toHaveAttribute("data-page", "0");
   });
 
+  it("clamps the page at both ends and tells a page swipe from a tap and a diagonal drag", () => {
+    const { session, sessionRef } = makeSessionMock(false);
+    render(<TerminalKeyRow sessionRef={sessionRef} keyboardUp={false} />);
+    const pager = screen.getByTestId("terminal-key-row-pager");
+
+    // Swipe right on the first page: nothing to go back to, no key fired.
+    fireEvent.pointerDown(pager, { button: 0, pointerId: 20, clientX: 100, clientY: 70 });
+    fireEvent.pointerUp(pager, { pointerId: 20, clientX: 160, clientY: 70 });
+    expect(screen.getByTestId("terminal-key-row")).toHaveAttribute("data-page", "0");
+    expect(session.sendSoftKey).not.toHaveBeenCalled();
+
+    // Swipe left twice: the second one is already on the last page.
+    for (const pointerId of [21, 22]) {
+      fireEvent.pointerDown(pager, { button: 0, pointerId, clientX: 200, clientY: 70 });
+      fireEvent.pointerUp(pager, { pointerId, clientX: 140, clientY: 70 });
+    }
+    expect(screen.getByTestId("terminal-key-row")).toHaveAttribute("data-page", "1");
+    expect(session.sendSoftKey).not.toHaveBeenCalled();
+
+    // A 40 px diagonal drag with a larger vertical part is neither a page nor a key.
+    const homeBtn = screen.getByRole("button", { name: "Home" });
+    fireEvent.pointerDown(homeBtn, { button: 0, pointerId: 23, clientX: 100, clientY: 60 });
+    fireEvent.pointerMove(homeBtn, { pointerId: 23, clientX: 140, clientY: 110 });
+    fireEvent.pointerUp(homeBtn, { pointerId: 23, clientX: 140, clientY: 110 });
+    expect(screen.getByTestId("terminal-key-row")).toHaveAttribute("data-page", "1");
+    expect(session.sendSoftKey).not.toHaveBeenCalled();
+
+    // A 5 px movement is still a tap: the key fires and the page does not move.
+    fireEvent.pointerDown(homeBtn, { button: 0, pointerId: 24, clientX: 100, clientY: 60 });
+    fireEvent.pointerMove(homeBtn, { pointerId: 24, clientX: 105, clientY: 63 });
+    fireEvent.pointerUp(homeBtn, { pointerId: 24, clientX: 105, clientY: 63 });
+    expect(screen.getByTestId("terminal-key-row")).toHaveAttribute("data-page", "1");
+    expect(session.sendSoftKey).toHaveBeenCalledTimes(1);
+    expect(session.sendSoftKey).toHaveBeenLastCalledWith("home", undefined, { focus: false });
+  });
+
   it("disables all keys while reconnecting", () => {
     const { session, sessionRef } = makeSessionMock(false);
     render(<TerminalKeyRow sessionRef={sessionRef} keyboardUp={false} disabled={true} />);
@@ -196,5 +232,48 @@ describe("TerminalKeyRow", () => {
     fireEvent.click(screen.getByRole("button", { name: "Keyboard" }));
     expect(session.sendSoftKey).not.toHaveBeenCalled();
     expect(session.focus).not.toHaveBeenCalled();
+  });
+
+  it("enforces single-pointer ownership and preserves detail===0 accessible activation after cancelled drags", () => {
+    const { session, sessionRef } = makeSessionMock(false);
+    render(<TerminalKeyRow sessionRef={sessionRef} keyboardUp={false} />);
+
+    const bar = screen.getByTestId("terminal-key-row");
+    const pager = screen.getByTestId("terminal-key-row-pager");
+    expect(bar.className).toContain("touch-none");
+    expect(pager.className).toContain("touch-none");
+
+    const upBtn = screen.getByRole("button", { name: "↑" });
+    const ctrlCBtn = screen.getByRole("button", { name: "^C" });
+
+    // Finger 1 presses ↑; finger 2 presses ^C while finger 1 is down.
+    fireEvent.pointerDown(upBtn, { button: 0, pointerId: 1, clientX: 20, clientY: 20 });
+    fireEvent.pointerDown(ctrlCBtn, { button: 0, pointerId: 2, clientX: 200, clientY: 20 });
+    // Finger 2 move/up is ignored; releasing finger 1 dispatches ↑, never ^C.
+    fireEvent.pointerMove(ctrlCBtn, { pointerId: 2, clientX: 240, clientY: 20 });
+    fireEvent.pointerUp(ctrlCBtn, { pointerId: 2, clientX: 240, clientY: 20 });
+    expect(session.sendSoftKey).not.toHaveBeenCalled();
+
+    fireEvent.pointerUp(upBtn, { pointerId: 1, clientX: 20, clientY: 20 });
+    expect(session.sendSoftKey).toHaveBeenCalledTimes(1);
+    expect(session.sendSoftKey).toHaveBeenLastCalledWith("arrowUp", undefined, { focus: false });
+
+    // Drag Esc >= 10px and cancel/release, then activate Tab with detail === 0 (keyboard/screen-reader).
+    session.sendSoftKey.mockClear();
+    const escBtn = screen.getByRole("button", { name: "Esc" });
+    const tabBtn = screen.getByRole("button", { name: "Tab" });
+    fireEvent.pointerDown(escBtn, { button: 0, pointerId: 3, clientX: 10, clientY: 10 });
+    fireEvent.pointerMove(escBtn, { pointerId: 3, clientX: 30, clientY: 10 });
+    fireEvent.pointerCancel(escBtn, { pointerId: 3 });
+    expect(session.sendSoftKey).not.toHaveBeenCalled();
+
+    fireEvent.click(tabBtn, { detail: 0 });
+    expect(session.sendSoftKey).toHaveBeenCalledTimes(1);
+    expect(session.sendSoftKey).toHaveBeenLastCalledWith("tab", undefined, { focus: false });
+
+    // Pointer-originated click (detail === 1) on a soft key is ignored because pointerUp handles it.
+    session.sendSoftKey.mockClear();
+    fireEvent.click(tabBtn, { detail: 1 });
+    expect(session.sendSoftKey).not.toHaveBeenCalled();
   });
 });

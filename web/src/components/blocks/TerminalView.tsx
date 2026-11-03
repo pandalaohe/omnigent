@@ -305,9 +305,24 @@ export function TerminalView({
   const isPhone = useIsPhone();
   const isPhoneRef = useRef(isPhone);
   isPhoneRef.current = isPhone;
-  const terminalEnded = (state.kind === "closed" && !reconnectPending) || state.kind === "error";
+  // Track whether this terminal has already tried a keyless re-dial after a
+  // 4400 wrong-replica close. If keyless still fails with 4400, the host is
+  // genuinely unreachable — stop retrying.
+  const keylessRef = useRef(false);
+  // The reconnect effect below owns the decision; replicating it here keeps the
+  // bar mounted (keys disabled in place) across a transport drop instead of
+  // unmounting for the frame before `reconnectPending` is set, which would
+  // reset the key-row page and blink the terminal height.
+  const willAutoReconnect =
+    state.kind === "closed" &&
+    ((state.code === WS_CLOSE_WRONG_REPLICA && isDatabricksWorkspace() && !keylessRef.current) ||
+      (isReconnectableTerminalClose(state.code) &&
+        (reconnectAttemptsRef.current < RECONNECT_BACKOFF_MS.length ||
+          (connectedAtRef.current !== null &&
+            Date.now() - connectedAtRef.current >= RECONNECT_STABLE_MS))));
+  const terminalEnded = state.kind === "closed" && !reconnectPending && !willAutoReconnect;
   const canShowKeyRows = isPhone && !readOnly && showKeyRows && active && !terminalEnded;
-  const { overlap, keyboardUp, roomPx, rootWidth } = useTerminalKeyboardRoom(
+  const { overlap, keyboardUp, roomPx, rootWidth, paddingBottomPx } = useTerminalKeyboardRoom(
     rootRef,
     canShowKeyRows,
     reservesBottomSafeArea,
@@ -353,10 +368,6 @@ export function TerminalView({
     window.addEventListener(TERMINAL_SOFT_KEY_EVENT, handleSoftKey);
     return () => window.removeEventListener(TERMINAL_SOFT_KEY_EVENT, handleSoftKey);
   }, [readOnly]);
-  // Track whether this terminal has already tried a keyless re-dial after a
-  // 4400 wrong-replica close. If keyless still fails with 4400, the host is
-  // genuinely unreachable — stop retrying.
-  const keylessRef = useRef(false);
   // Bumped by every attach so an in-flight attach can tell it has been
   // superseded — a ref callback can re-run for the *same* node, which
   // leaves no other way to retire the previous attempt's async work.
@@ -822,10 +833,6 @@ export function TerminalView({
     };
   }, [state, disposeActiveSession, sessionId, hostId]);
 
-  const safeBottom = reservesBottomSafeArea
-    ? "var(--term-safe-b, var(--omnigent-safe-bottom, env(safe-area-inset-bottom, 0px)))"
-    : "0px";
-
   // `isolate` scopes the status overlay's z-index to this surface so it
   // can't paint over body-portaled UI such as the header's session menu.
   return (
@@ -838,13 +845,7 @@ export function TerminalView({
       data-keyboard-overlap={canShowKeyRows ? String(overlap) : undefined}
       data-keyboard-up={canShowKeyRows ? String(keyboardUp) : undefined}
       className="relative isolate flex min-h-0 flex-1 flex-col @container [:is([data-ios-native],[data-android-native])_[data-testid=terminals-panel]_&]:[--term-safe-b:0px]"
-      style={
-        canShowKeyRows
-          ? {
-              paddingBottom: `max(${overlap}px, ${keyboardUp ? "0px" : safeBottom})`,
-            }
-          : undefined
-      }
+      style={canShowKeyRows ? { paddingBottom: `${paddingBottomPx}px` } : undefined}
     >
       {visibleClipboardPrompt !== null && (
         <TerminalClipboardPrompt

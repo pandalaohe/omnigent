@@ -2,18 +2,17 @@
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import textwrap
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import httpx
+import pytest
 from playwright.sync_api import Browser, Locator, Page, Route, expect
-
-if TYPE_CHECKING:
-    pass
 
 _KEYECHO_SOURCE = textwrap.dedent(
     """\
@@ -196,10 +195,22 @@ def _terminal_screen_text(page: Page) -> str:
     )
 
 
+def _assert_key_bytes(
+    mode_name: str,
+    label: str,
+    by_soft: str | None,
+    by_phys: str | None,
+    expected: str,
+) -> None:
+    assert by_soft == expected, f"{mode_name} {label}: got {by_soft!r}, expected {expected!r}"
+    assert by_soft == by_phys, f"{mode_name} {label}: soft {by_soft!r} != physical {by_phys!r}"
+
+
 def test_mobile_terminal_keys_byte_delivery_app_cursor_and_gestures(
     browser: Browser,
     terminal_session: tuple[str, str],
     tmp_path: Path,
+    request: pytest.FixtureRequest,
 ) -> None:
     """Verify every key on both pages in zsh/bash modes, vim/less, and gestures."""
     base_url, session_id = terminal_session
@@ -219,7 +230,10 @@ def test_mobile_terminal_keys_byte_delivery_app_cursor_and_gestures(
     )
     assert resp.status_code < 300, resp.text
 
-    record_dir = tmp_path / "videos"
+    configured_video_dir = os.environ.get(
+        "OMNIGENT_TERMINAL_KEYS_VIDEO_DIR"
+    ) or request.config.getoption("output", default=None)
+    record_dir = Path(configured_video_dir) if configured_video_dir else (tmp_path / "videos")
     record_dir.mkdir(parents=True, exist_ok=True)
 
     context = browser.new_context(
@@ -319,21 +333,23 @@ def test_mobile_terminal_keys_byte_delivery_app_cursor_and_gestures(
             c1 = len(_lines(normal_log))
             _tap_soft_key(bar.get_by_role("button", name=label, exact=True))
             by_soft = _read_back(page, normal_log, c1)
-            assert by_soft == expected_normal, (
-                f"Normal mode {label}: got {by_soft!r}, expected {expected_normal!r}"
-            )
-            assert by_soft == by_phys, (
-                f"Normal mode {label}: soft {by_soft!r} != physical {by_phys!r}"
-            )
+            _assert_key_bytes("Normal mode", label, by_soft, by_phys, expected_normal)
             assert not page.evaluate(
                 "() => document.activeElement?.classList?.contains('xterm-helper-textarea')"
                 " ?? false"
             ), f"Soft key {label} must not focus xterm-helper-textarea"
 
-        # Negative check: normal-mode Home must not emit application-cursor Home (1b4f48).
+        # Negative / red-proof check (§4.2): tapping a deliberately wrong key (End instead of Home,
+        # or comparing against application-cursor Home 1b4f48) fails _assert_key_bytes.
         pager = bar.locator('[data-testid="terminal-key-row-pager"]')
         _swipe_pager(pager, -80)
         expect(bar).to_have_attribute("data-page", "1")
+
+        c_wrong = len(_lines(normal_log))
+        _tap_soft_key(bar.get_by_role("button", name="End", exact=True))
+        wrong_soft = _read_back(page, normal_log, c_wrong)
+        with pytest.raises(AssertionError):
+            _assert_key_bytes("Normal mode", "Home", wrong_soft, "1b5b48", "1b5b48")
 
         for label, physical, expected_normal, expected_app in _PAGE_1_KEYS:
             textarea.focus()
@@ -345,16 +361,10 @@ def test_mobile_terminal_keys_byte_delivery_app_cursor_and_gestures(
             c1 = len(_lines(normal_log))
             _tap_soft_key(bar.get_by_role("button", name=label, exact=True))
             by_soft = _read_back(page, normal_log, c1)
-            assert by_soft == expected_normal, (
-                f"Normal mode {label}: got {by_soft!r}, expected {expected_normal!r}"
-            )
-            assert by_soft == by_phys, (
-                f"Normal mode {label}: soft {by_soft!r} != physical {by_phys!r}"
-            )
+            _assert_key_bytes("Normal mode", label, by_soft, by_phys, expected_normal)
             if label in ("Home", "End"):
-                assert by_soft != expected_app, (
-                    f"Normal mode {label} must differ from app mode {expected_app!r}"
-                )
+                with pytest.raises(AssertionError):
+                    _assert_key_bytes("Normal mode", label, by_soft, expected_app, expected_app)
 
         # Swipe right > 36px flips back to Page 0 without firing a key.
         before_swipe_lines = len(_lines(normal_log))
@@ -453,7 +463,7 @@ def test_mobile_terminal_keys_byte_delivery_app_cursor_and_gestures(
 
         _stop_echo(page, textarea)
 
-        # 2. Application cursor mode (\x1b[?1h) in bash: verify Up, Down, Left, Right, Home, End.
+        # 2. Application cursor mode (\x1b[?1h) in bash: verify all 15 byte-producing keys.
         textarea.focus()
         page.keyboard.type("bash\n")
         page.wait_for_timeout(250)
@@ -462,8 +472,6 @@ def test_mobile_terminal_keys_byte_delivery_app_cursor_and_gestures(
         textarea.evaluate("el => el.blur()")
 
         for label, physical, _, expected_app in _PAGE_0_KEYS:
-            if label not in ("↑", "↓", "←", "→"):
-                continue
             textarea.focus()
             c0 = len(_lines(app_log))
             page.keyboard.press(physical)
@@ -473,18 +481,11 @@ def test_mobile_terminal_keys_byte_delivery_app_cursor_and_gestures(
             c1 = len(_lines(app_log))
             _tap_soft_key(bar.get_by_role("button", name=label, exact=True))
             by_soft = _read_back(page, app_log, c1)
-            assert by_soft == expected_app, (
-                f"App mode {label}: got {by_soft!r}, expected {expected_app!r}"
-            )
-            assert by_soft == by_phys, (
-                f"App mode {label}: soft {by_soft!r} != physical {by_phys!r}"
-            )
+            _assert_key_bytes("App mode", label, by_soft, by_phys, expected_app)
 
         _swipe_pager(pager, -80)
         expect(bar).to_have_attribute("data-page", "1")
         for label, physical, _, expected_app in _PAGE_1_KEYS:
-            if label not in ("Home", "End"):
-                continue
             textarea.focus()
             c0 = len(_lines(app_log))
             page.keyboard.press(physical)
@@ -494,12 +495,7 @@ def test_mobile_terminal_keys_byte_delivery_app_cursor_and_gestures(
             c1 = len(_lines(app_log))
             _tap_soft_key(bar.get_by_role("button", name=label, exact=True))
             by_soft = _read_back(page, app_log, c1)
-            assert by_soft == expected_app, (
-                f"App mode {label}: got {by_soft!r}, expected {expected_app!r}"
-            )
-            assert by_soft == by_phys, (
-                f"App mode {label}: soft {by_soft!r} != physical {by_phys!r}"
-            )
+            _assert_key_bytes("App mode", label, by_soft, by_phys, expected_app)
 
         _swipe_pager(pager, 80)
         expect(bar).to_have_attribute("data-page", "0")

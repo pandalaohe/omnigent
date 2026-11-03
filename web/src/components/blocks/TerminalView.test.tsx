@@ -1866,6 +1866,28 @@ describe("TerminalView phone key rows", () => {
     });
     expect(keyRow).toHaveAttribute("aria-disabled", "false");
 
+    // Swipe pager to page 1 and verify transient error + transport close (1006)
+    // keep the exact same DOM node disabled in place without resetting page.
+    const pager = screen.getByTestId("terminal-key-row-pager");
+    fireEvent.pointerDown(pager, { button: 0, pointerId: 1, clientX: 200, clientY: 70 });
+    fireEvent.pointerMove(pager, { pointerId: 1, clientX: 120, clientY: 70 });
+    fireEvent.pointerUp(pager, { pointerId: 1, clientX: 120, clientY: 70 });
+    expect(keyRow).toHaveAttribute("data-page", "1");
+
+    act(() => {
+      terminalSessionMock.instances[0].onState({ kind: "error" });
+    });
+    expect(screen.getByTestId("terminal-key-row")).toBe(keyRow);
+    expect(keyRow).toHaveAttribute("aria-disabled", "true");
+    expect(keyRow).toHaveAttribute("data-page", "1");
+
+    act(() => {
+      terminalSessionMock.instances[0].onState({ kind: "closed", code: 1006, reason: "transport" });
+    });
+    expect(screen.getByTestId("terminal-key-row")).toBe(keyRow);
+    expect(keyRow).toHaveAttribute("aria-disabled", "true");
+    expect(keyRow).toHaveAttribute("data-page", "1");
+
     // Deliberate close (1000) hides the key row
     act(() => {
       terminalSessionMock.instances[0].onState({ kind: "closed", code: 1000, reason: "" });

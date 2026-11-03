@@ -10,6 +10,8 @@ export interface TerminalKeyboardRoom {
   keyboardUp: boolean;
   roomPx: number;
   rootWidth: number;
+  /** Bottom room this surface reserves inside its own box, in pixels. */
+  paddingBottomPx: number;
 }
 
 const DISABLED_ROOM: TerminalKeyboardRoom = {
@@ -17,7 +19,24 @@ const DISABLED_ROOM: TerminalKeyboardRoom = {
   keyboardUp: false,
   roomPx: Number.POSITIVE_INFINITY,
   rootWidth: 0,
+  paddingBottomPx: 0,
 };
+
+/**
+ * Resolve a pixel length from the first custom property that is set. The callers
+ * pass the same precedence the stylesheet would use, so the number measured here
+ * is the number the layout applies.
+ */
+function resolveCssPx(element: Element, names: readonly string[]): number {
+  const style = window.getComputedStyle(element);
+  for (const name of names) {
+    const raw = style.getPropertyValue(name).trim();
+    if (!raw) continue;
+    const value = Number.parseFloat(raw);
+    if (Number.isFinite(value)) return Math.max(0, value);
+  }
+  return 0;
+}
 
 /**
  * Measure the visible bottom edge of the viewport against a TerminalView root.
@@ -25,6 +44,12 @@ const DISABLED_ROOM: TerminalKeyboardRoom = {
  * Unifies the iOS native bridge height (`getIOSKeyboardViewportHeight`),
  * `window.visualViewport`, and `window.innerHeight` into a single bottom-edge
  * overlap measurement coalesced by `requestAnimationFrame`.
+ *
+ * `paddingBottomPx` is the whole reservation this surface owns — `max(overlap,
+ * safe bottom when the keyboard is down)` — and `TerminalView` applies it as its
+ * inline bottom padding, so the measured value and the layout cannot disagree.
+ * `--term-safe-b: 0px`, set where an ancestor already reserves the inset, wins
+ * over `--omnigent-inset-bottom`.
  */
 export function useTerminalKeyboardRoom(
   root: RefObject<HTMLElement | null>,
@@ -36,10 +61,6 @@ export function useTerminalKeyboardRoom(
   useLayoutEffect(() => {
     const el = root.current;
     if (!enabled || !el || typeof window === "undefined") {
-      if (el) {
-        el.removeAttribute("data-keyboard-overlap");
-        el.removeAttribute("data-keyboard-up");
-      }
       setRoom((prev) => (prev === DISABLED_ROOM ? prev : DISABLED_ROOM));
       return;
     }
@@ -65,43 +86,22 @@ export function useTerminalKeyboardRoom(
         window.scrollTo(0, 0);
       }
 
-      current.setAttribute("data-keyboard-overlap", String(overlap));
-      current.setAttribute("data-keyboard-up", String(keyboardUp));
-
-      let safeBottomPx = 0;
-      if (reservesBottomSafeArea && !keyboardUp) {
-        const computed = window.getComputedStyle(current);
-        if (computed.getPropertyValue("--term-safe-b").trim() !== "0px") {
-          const prevInlinePadding = current.style.paddingBottom;
-          if (prevInlinePadding) {
-            current.style.paddingBottom =
-              "var(--term-safe-b, var(--omnigent-safe-bottom, env(safe-area-inset-bottom, 0px)))";
-          }
-          const resolvedPadding =
-            parseFloat(window.getComputedStyle(current).paddingBottom || "0") || 0;
-          if (current.style.paddingBottom !== prevInlinePadding) {
-            current.style.paddingBottom = prevInlinePadding;
-          }
-          const varPx =
-            parseFloat(computed.getPropertyValue("--omnigent-inset-bottom") || "0") ||
-            parseFloat(computed.getPropertyValue("--omnigent-safe-bottom") || "0") ||
-            parseFloat(computed.getPropertyValue("--omnigent-android-safe-area-bottom") || "0") ||
-            0;
-          safeBottomPx = Math.max(resolvedPadding, varPx);
-        }
-      }
-      const appliedPadding = Math.max(overlap, keyboardUp ? 0 : safeBottomPx);
+      const safeBottomPx = reservesBottomSafeArea
+        ? resolveCssPx(current, ["--term-safe-b", "--omnigent-inset-bottom"])
+        : 0;
+      const paddingBottomPx = Math.max(overlap, keyboardUp ? 0 : safeBottomPx);
       const rawHeight = rect.height > 0 || rect.bottom > 0 ? rect.height : window.innerHeight;
-      const roomPx = Math.max(0, Math.round(rawHeight - appliedPadding));
+      const roomPx = Math.max(0, Math.round(rawHeight - paddingBottomPx));
       const rootWidth = rect.width > 0 ? Math.round(rect.width) : window.innerWidth;
 
       setRoom((prev) =>
         prev.overlap === overlap &&
         prev.keyboardUp === keyboardUp &&
         prev.roomPx === roomPx &&
-        prev.rootWidth === rootWidth
+        prev.rootWidth === rootWidth &&
+        prev.paddingBottomPx === paddingBottomPx
           ? prev
-          : { overlap, keyboardUp, roomPx, rootWidth },
+          : { overlap, keyboardUp, roomPx, rootWidth, paddingBottomPx },
       );
     };
 
