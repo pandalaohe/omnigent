@@ -1,7 +1,6 @@
 import { QueryClient } from "@tanstack/react-query";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  PROJECT_ICON_MAX_LENGTH,
   cachedProjectSummaries,
   createProjectSummary,
   listProjectSummaries,
@@ -25,12 +24,12 @@ describe("projectSummary", () => {
     });
     expect(Object.keys(summary).sort()).toEqual(["icon", "id", "name"]);
     expect(summary.name).toHaveLength(100);
-    // 41 characters; the longest installed Tabler id, so no bound cuts one.
+    // 41 characters; the longest installed Tabler id, untouched by the summary.
     expect(summary.icon).toBe("tabler:device-ipad-horizontal-exclamation");
     expect(projectSummary({ id: "proj_2", name: "Plain" }).icon).toBeNull();
   });
 
-  it("drops an over-long icon instead of shortening it", () => {
+  it("passes a stored icon through whole", () => {
     expect(
       projectSummary({ id: "p", name: "P", config: { icon: "tabler:brand-github" } }).icon,
     ).toBe("tabler:brand-github");
@@ -38,9 +37,6 @@ describe("projectSummary", () => {
     const sequence = "\u{1F468}\u200D\u{1F469}\u200D\u{1F467}\u200D\u{1F466}".repeat(2);
     expect(sequence.length).toBeGreaterThan(16);
     expect(projectSummary({ id: "p", name: "P", config: { icon: sequence } }).icon).toBe(sequence);
-
-    const tooLong = "i".repeat(PROJECT_ICON_MAX_LENGTH + 1);
-    expect(projectSummary({ id: "p", name: "P", config: { icon: tooLong } }).icon).toBeNull();
   });
 });
 

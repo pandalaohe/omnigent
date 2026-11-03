@@ -5,12 +5,6 @@ import type { ExtensionProjectSummary } from "../types";
 import { ExtensionHostServiceError } from "./errors";
 
 export const PROJECT_NAME_MAX_LENGTH = 100;
-/**
- * Whole-value bound: every Emoji sequence and the longest installed `tabler:<name>`
- * (41 characters) fits; an over-long value is dropped, not shortened, so it never
- * becomes a different valid-looking id.
- */
-export const PROJECT_ICON_MAX_LENGTH = 64;
 const PROJECT_ID_MAX_LENGTH = 256;
 const PROJECT_ERROR_MAX_LENGTH = 200;
 
@@ -26,10 +20,7 @@ export function projectSummary(project: Project): ExtensionProjectSummary {
   return {
     id,
     name: name.slice(0, PROJECT_NAME_MAX_LENGTH),
-    icon:
-      typeof icon === "string" && icon.length > 0 && icon.length <= PROJECT_ICON_MAX_LENGTH
-        ? icon
-        : null,
+    icon: typeof icon === "string" && icon.length > 0 ? icon : null,
   };
 }
 

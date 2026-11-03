@@ -80,8 +80,7 @@ Display it while loading, start `listPage` with no `after` cursor, and merge fet
 rows by ID. Once pagination completes, discard preview-only rows.
 
 The projects API returns the current user's projects as ID, name, and icon.
-An icon is the stored value as is — an Emoji sequence or a `tabler:<name>` id —
-and one longer than 64 characters is dropped (`null`), never shortened.
+An icon is the stored value as is — an Emoji sequence or a `tabler:<name>` id.
 `projects.create` makes an empty project from a trimmed name of at most 100
 characters — the same operation as the sidebar's **New project** button — and
 the host refreshes the shell's project list afterwards.
