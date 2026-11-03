@@ -902,7 +902,7 @@ def _seed_isolated_agy_nux_state(real_home: Path, iso_gemini: Path) -> None:
 
     Copies the real marker when present without overwriting per-session edits.
     Any unacknowledged or future notices are auto-dismissed by the TUI readiness
-    gate (:data:`_AGY_DISMISS_MARKER`).
+    gate (:func:`_agy_notice_footer`).
 
     :param real_home: The user's real home directory.
     :param iso_gemini: The bridge-owned ``--gemini_dir`` being seeded.
@@ -1367,9 +1367,11 @@ _AGY_IDLE_MARKER = "? for shortcuts"
 # a mid-turn steer; submission itself is verified by draft disappearance, NOT by
 # this marker (footer text can change across agy builds or be truncated).
 _AGY_ACTIVE_MARKER = "esc to cancel"
-# agy notice banner footer (e.g. NUX announcement modals). Auto-dismissed with
-# Escape so overlay banners never swallow input intended for the composer.
-_AGY_DISMISS_MARKER = re.compile(r"\besc to dismiss\b", re.IGNORECASE)
+# agy notice banner footer (e.g. NUX announcement modals), matched as chrome on
+# the pane's bottom edge. Reply text and transcript rows that mention the phrase
+# are ordinary content; an overlay notice owns the last line because it covers
+# the composer.
+_AGY_NOTICE_FOOTER_RE = re.compile(r"^[│┃|]?\s*esc to dismiss\s*$", re.IGNORECASE)
 _AGY_MODE_HINT_RE = re.compile(r"^[A-Z][a-z]*(?:-[a-z]+)* mode: .+ \(shift\+tab to cycle\)$")
 # agy can replace pasted text with a placeholder such as
 # ``[Pasted text #1 +17 lines]`` or ``[Pasted text #3 1034 chars]``. Its appearance
@@ -1710,6 +1712,20 @@ def _agy_turn_running(pane: str) -> bool:
     return _AGY_ACTIVE_MARKER in pane
 
 
+def _agy_notice_footer(pane: str) -> bool:
+    """Return whether agy's bottom edge is a notice footer instead of the composer.
+
+    Only the last non-empty line is examined: a mounted composer footer (idle or
+    active) is always the bottom edge, while transcript rows, quoted replies and
+    drafts that mention the phrase sit above it.
+
+    :param pane: Captured tmux pane text.
+    :returns: Whether the last non-empty line is a notice footer.
+    """
+    lines = [line for line in pane.splitlines() if line.strip()]
+    return bool(lines and _AGY_NOTICE_FOOTER_RE.match(lines[-1].strip()))
+
+
 def _draft_in_input_region(
     pane: str, needle: str, baseline_region: str, *, tail_needle: str = ""
 ) -> bool:
@@ -1803,13 +1819,13 @@ def _wait_for_agy_prompt_ready(socket_path: str, tmux_target: str, *, timeout_s:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         pane = _capture_pane(socket_path, tmux_target)
-        if _AGY_DISMISS_MARKER.search(pane):
+        if _AGY_IDLE_MARKER in pane or _AGY_ACTIVE_MARKER in pane:
+            return
+        if _agy_notice_footer(pane):
             _logger.info("agy TUI showing dismissable notice banner; auto-dismissing with Escape")
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
             time.sleep(_TMUX_POLL_INTERVAL_S)
             continue
-        if _AGY_IDLE_MARKER in pane or _AGY_ACTIVE_MARKER in pane:
-            return
         time.sleep(_TMUX_POLL_INTERVAL_S)
 
 
@@ -2008,7 +2024,11 @@ def _paste_and_submit(
         pasted draft never renders, or the submit never starts a turn.
     """
     pane = _capture_pane(socket_path, tmux_target)
-    if _AGY_DISMISS_MARKER.search(pane):
+    if (
+        _AGY_IDLE_MARKER not in pane
+        and _AGY_ACTIVE_MARKER not in pane
+        and _agy_notice_footer(pane)
+    ):
         _logger.info("agy TUI showing dismissable notice banner; auto-dismissing with Escape")
         _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
         time.sleep(_TMUX_POLL_INTERVAL_S)
