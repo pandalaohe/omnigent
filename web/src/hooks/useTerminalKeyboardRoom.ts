@@ -9,17 +9,18 @@ export interface TerminalKeyboardRoom {
   overlap: number;
   keyboardUp: boolean;
   roomPx: number;
-  rootWidth: number;
   /** Bottom room this surface reserves inside its own box, in pixels. */
   paddingBottomPx: number;
+  /** Width inside the key row's side safe-area padding, in pixels. */
+  keyRowWidth: number;
 }
 
 const DISABLED_ROOM: TerminalKeyboardRoom = {
   overlap: 0,
   keyboardUp: false,
   roomPx: Number.POSITIVE_INFINITY,
-  rootWidth: 0,
   paddingBottomPx: 0,
+  keyRowWidth: 0,
 };
 
 /**
@@ -27,13 +28,19 @@ const DISABLED_ROOM: TerminalKeyboardRoom = {
  * pass the same precedence the stylesheet would use, so the number measured here
  * is the number the layout applies.
  */
-function resolveCssPx(element: Element, names: readonly string[]): number {
-  const style = window.getComputedStyle(element);
+function resolveCssPx(
+  style: CSSStyleDeclaration,
+  probe: HTMLElement,
+  names: readonly string[],
+): number {
   for (const name of names) {
     const raw = style.getPropertyValue(name).trim();
     if (!raw) continue;
     const value = Number.parseFloat(raw);
     if (Number.isFinite(value)) return Math.max(0, value);
+    probe.style.height = raw;
+    const resolved = Number.parseFloat(window.getComputedStyle(probe).height);
+    if (Number.isFinite(resolved)) return Math.max(0, resolved);
   }
   return 0;
 }
@@ -65,6 +72,12 @@ export function useTerminalKeyboardRoom(
       return;
     }
 
+    const lengthProbe = document.createElement("div");
+    lengthProbe.setAttribute("aria-hidden", "true");
+    lengthProbe.style.cssText =
+      "position:absolute;top:0;left:0;width:0;height:0;padding:0;border:0;visibility:hidden;pointer-events:none;";
+    el.appendChild(lengthProbe);
+
     let rafId: number | null = null;
     let scheduled = false;
 
@@ -86,22 +99,35 @@ export function useTerminalKeyboardRoom(
         window.scrollTo(0, 0);
       }
 
+      const style = window.getComputedStyle(current);
       const safeBottomPx = reservesBottomSafeArea
-        ? resolveCssPx(current, ["--term-safe-b", "--omnigent-inset-bottom"])
+        ? resolveCssPx(style, lengthProbe, ["--term-safe-b", "--omnigent-inset-bottom"])
         : 0;
       const paddingBottomPx = Math.max(overlap, keyboardUp ? 0 : safeBottomPx);
       const rawHeight = rect.height > 0 || rect.bottom > 0 ? rect.height : window.innerHeight;
       const roomPx = Math.max(0, Math.round(rawHeight - paddingBottomPx));
-      const rootWidth = rect.width > 0 ? Math.round(rect.width) : window.innerWidth;
+      const measuredWidth = rect.width > 0 ? rect.width : window.innerWidth;
+      const safeLeftPx = resolveCssPx(style, lengthProbe, [
+        "--key-row-safe-l",
+        "--omnigent-safe-left",
+      ]);
+      const safeRightPx = resolveCssPx(style, lengthProbe, [
+        "--key-row-safe-r",
+        "--omnigent-safe-right",
+      ]);
+      const keyRowWidth = Math.max(
+        0,
+        measuredWidth - Math.max(8, safeLeftPx) - Math.max(8, safeRightPx),
+      );
 
       setRoom((prev) =>
         prev.overlap === overlap &&
         prev.keyboardUp === keyboardUp &&
         prev.roomPx === roomPx &&
-        prev.rootWidth === rootWidth &&
-        prev.paddingBottomPx === paddingBottomPx
+        prev.paddingBottomPx === paddingBottomPx &&
+        prev.keyRowWidth === keyRowWidth
           ? prev
-          : { overlap, keyboardUp, roomPx, rootWidth, paddingBottomPx },
+          : { overlap, keyboardUp, roomPx, paddingBottomPx, keyRowWidth },
       );
     };
 
@@ -140,6 +166,7 @@ export function useTerminalKeyboardRoom(
       window.removeEventListener("resize", schedule);
       window.removeEventListener("orientationchange", schedule);
       resizeObserver?.disconnect();
+      lengthProbe.remove();
     };
   }, [enabled, reservesBottomSafeArea, root]);
 

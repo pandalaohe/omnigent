@@ -62,6 +62,16 @@ describe("TerminalKeyRow", () => {
     ]);
   });
 
+  it("scopes one-row container queries to the width inside side safe-area padding", () => {
+    const { sessionRef } = makeSessionMock();
+    render(<TerminalKeyRow sessionRef={sessionRef} keyboardUp={false} />);
+
+    const content = screen.getByTestId("terminal-key-row").firstElementChild;
+    expect(content).toHaveClass("@container");
+    expect(content?.firstElementChild).toHaveClass("@min-[35rem]:grid-cols-12");
+    expect(content?.lastElementChild).toHaveClass("@min-[35rem]:h-[8px]");
+  });
+
   it("prevents focus shift on pointerDown and sends soft keys on pointerUp with { focus: false }", () => {
     const { session, sessionRef } = makeSessionMock(false);
     render(<TerminalKeyRow sessionRef={sessionRef} keyboardUp={false} />);

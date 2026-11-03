@@ -322,12 +322,12 @@ export function TerminalView({
             Date.now() - connectedAtRef.current >= RECONNECT_STABLE_MS))));
   const terminalEnded = state.kind === "closed" && !reconnectPending && !willAutoReconnect;
   const canShowKeyRows = isPhone && !readOnly && showKeyRows && active && !terminalEnded;
-  const { overlap, keyboardUp, roomPx, rootWidth, paddingBottomPx } = useTerminalKeyboardRoom(
+  const { overlap, keyboardUp, roomPx, keyRowWidth, paddingBottomPx } = useTerminalKeyboardRoom(
     rootRef,
     canShowKeyRows,
     reservesBottomSafeArea,
   );
-  const barHeight = rootWidth >= 560 ? 55 : 99;
+  const barHeight = keyRowWidth >= 560 ? 55 : 99;
   const hasBar = canShowKeyRows && roomPx >= barHeight + 108;
 
   useEffect(() => {
@@ -844,7 +844,7 @@ export function TerminalView({
       data-terminal-theme={isDark ? "dark" : "light"}
       data-keyboard-overlap={canShowKeyRows ? String(overlap) : undefined}
       data-keyboard-up={canShowKeyRows ? String(keyboardUp) : undefined}
-      className="relative isolate flex min-h-0 flex-1 flex-col @container [:is([data-ios-native],[data-android-native])_[data-testid=terminals-panel]_&]:[--term-safe-b:0px]"
+      className="relative isolate flex min-h-0 flex-1 flex-col @container [:is([data-ios-native],[data-android-native])_[data-testid=terminals-panel]_&]:[--term-safe-b:0px] [:is([data-ios-native],[data-android-native])_[data-testid=terminals-panel]_&]:[--key-row-safe-l:0px] [:is([data-ios-native],[data-android-native])_[data-testid=terminals-panel]_&]:[--key-row-safe-r:0px]"
       style={canShowKeyRows ? { paddingBottom: `${paddingBottomPx}px` } : undefined}
     >
       {visibleClipboardPrompt !== null && (

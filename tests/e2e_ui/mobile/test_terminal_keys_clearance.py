@@ -678,7 +678,12 @@ def _measure_and_assert(
 
     # --- Assertion 7: Room rule ---
     root_w = round(snap["viewRect"]["width"])
-    bar_h_expected = 55 if root_w >= 560 else 99
+    if shell in ("ios", "android") and surface == "terminals-panel":
+        side_padding = 16
+    else:
+        side_padding = max(8, safe["left"]) + max(8, safe["right"])
+    key_row_width = root_w - side_padding
+    bar_h_expected = 55 if key_row_width >= 560 else 99
     room_px = round(snap["viewRect"]["height"] - snap["paddingBottomPx"])
     should_show_bar = room_px >= bar_h_expected + 108
 

@@ -423,44 +423,42 @@ export function TerminalKeyRow({
         paddingLeft: "max(8px, var(--key-row-safe-l, var(--omnigent-safe-left, 0px)))",
         paddingRight: "max(8px, var(--key-row-safe-r, var(--omnigent-safe-right, 0px)))",
       }}
-      className={cn(
-        "shrink-0 border-t border-border bg-card pt-[2px] pb-0 select-none touch-none",
-        "[:is([data-ios-native],[data-android-native])_[data-testid=terminals-panel]_&]:[--key-row-safe-l:0px]",
-        "[:is([data-ios-native],[data-android-native])_[data-testid=terminals-panel]_&]:[--key-row-safe-r:0px]",
-      )}
+      className="shrink-0 border-t border-border bg-card pt-[2px] pb-0 select-none touch-none"
     >
-      <div className="grid grid-cols-1 gap-[2px] @min-[35rem]:grid-cols-12">
-        <div
-          data-testid="terminal-key-row-primary"
-          className="grid grid-cols-6 gap-[2px] @min-[35rem]:col-span-6"
-        >
-          {renderCells(firstRow, "row1")}
+      <div className="@container">
+        <div className="grid grid-cols-1 gap-[2px] @min-[35rem]:grid-cols-12">
+          <div
+            data-testid="terminal-key-row-primary"
+            className="grid grid-cols-6 gap-[2px] @min-[35rem]:col-span-6"
+          >
+            {renderCells(firstRow, "row1")}
+          </div>
+          <div
+            data-testid="terminal-key-row-pager"
+            data-pager
+            role="group"
+            aria-label={`More keys, page ${clampedPage + 1} of ${pageCount}. Swipe left or right.`}
+            className="grid grid-cols-6 gap-[2px] touch-none @min-[35rem]:col-span-6"
+          >
+            {renderCells(secondRowPage, `page-${clampedPage}`)}
+          </div>
         </div>
         <div
-          data-testid="terminal-key-row-pager"
-          data-pager
-          role="group"
-          aria-label={`More keys, page ${clampedPage + 1} of ${pageCount}. Swipe left or right.`}
-          className="grid grid-cols-6 gap-[2px] touch-none @min-[35rem]:col-span-6"
+          data-testid="terminal-key-row-dots"
+          aria-hidden="true"
+          className="flex h-[6px] items-center justify-center gap-1 @min-[35rem]:h-[8px]"
         >
-          {renderCells(secondRowPage, `page-${clampedPage}`)}
+          {Array.from({ length: pageCount }, (_, index) => (
+            <i
+              key={index}
+              data-page-dot={String(index)}
+              className={cn(
+                "block h-[3px] rounded-full transition-all",
+                index === clampedPage ? "w-[10px] bg-muted-foreground" : "w-[3px] bg-border",
+              )}
+            />
+          ))}
         </div>
-      </div>
-      <div
-        data-testid="terminal-key-row-dots"
-        aria-hidden="true"
-        className="flex h-[6px] items-center justify-center gap-1 @min-[35rem]:h-[8px]"
-      >
-        {Array.from({ length: pageCount }, (_, index) => (
-          <i
-            key={index}
-            data-page-dot={String(index)}
-            className={cn(
-              "block h-[3px] rounded-full transition-all",
-              index === clampedPage ? "w-[10px] bg-muted-foreground" : "w-[3px] bg-border",
-            )}
-          />
-        ))}
       </div>
     </div>
   );

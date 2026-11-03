@@ -1930,4 +1930,22 @@ describe("TerminalView phone key rows", () => {
     });
     expect(screen.getByTestId("terminal-key-row")).toBeInTheDocument();
   });
+
+  it("uses width after side safe areas for the one-row room floor", async () => {
+    stubPhoneViewport(844, 390);
+    stubRootRect(590.8, 180);
+
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await act(async () => {});
+
+    const view = screen.getByTestId("terminal-view");
+    view.style.setProperty("--omnigent-safe-left", "47px");
+    view.style.setProperty("--omnigent-safe-right", "47px");
+    act(() => {
+      window.dispatchEvent(new Event("resize"));
+    });
+
+    // 590.8 - 47 - 47 = 496.8px: two rows need 99 + 108px, not 55 + 108px.
+    expect(screen.queryByTestId("terminal-key-row")).toBeNull();
+  });
 });

@@ -107,8 +107,8 @@ describe("useTerminalKeyboardRoom", () => {
       overlap: 0,
       keyboardUp: false,
       roomPx: Number.POSITIVE_INFINITY,
-      rootWidth: 0,
       paddingBottomPx: 0,
+      keyRowWidth: 0,
     });
   });
 
@@ -126,8 +126,8 @@ describe("useTerminalKeyboardRoom", () => {
       overlap: 300,
       keyboardUp: true,
       roomPx: 788 - 300,
-      rootWidth: 390,
       paddingBottomPx: 300,
+      keyRowWidth: 374,
     });
 
     // Small browser bar shift (50px <= 80px): overlap is 50, but keyboardUp stays false
@@ -139,8 +139,8 @@ describe("useTerminalKeyboardRoom", () => {
       overlap: 50,
       keyboardUp: false,
       roomPx: 788 - 50,
-      rootWidth: 390,
       paddingBottomPx: 50,
+      keyRowWidth: 374,
     });
   });
 
@@ -159,8 +159,8 @@ describe("useTerminalKeyboardRoom", () => {
       overlap: 336,
       keyboardUp: true,
       roomPx: 788 - 336,
-      rootWidth: 390,
       paddingBottomPx: 336,
+      keyRowWidth: 374,
     });
     expect(window.scrollTo).not.toHaveBeenCalled();
   });
@@ -194,8 +194,8 @@ describe("useTerminalKeyboardRoom", () => {
       overlap: 0,
       keyboardUp: false,
       roomPx: 488 - 34,
-      rootWidth: 390,
       paddingBottomPx: 34,
+      keyRowWidth: 374,
     });
   });
 
@@ -209,6 +209,30 @@ describe("useTerminalKeyboardRoom", () => {
     renderHook(() => useTerminalKeyboardRoom(rootRef, true, true));
 
     expect(window.scrollTo).toHaveBeenCalledWith(0, 0);
+  });
+
+  it("resolves a calc() safe-area inset to computed pixels", () => {
+    vi.stubGlobal("innerWidth", 390);
+    vi.stubGlobal("innerHeight", 844);
+    vi.stubGlobal("visualViewport", createStubVisualViewport(390, 844, 0));
+
+    const rootRef = makeRoot(
+      { top: 56, bottom: 844, width: 390, height: 788 },
+      "calc(34px + 0px * 0)",
+    );
+    const computedStyle = window.getComputedStyle.bind(window);
+    vi.spyOn(window, "getComputedStyle").mockImplementation((element, pseudo) => {
+      const style = computedStyle(element, pseudo);
+      if (element !== rootRef.current) {
+        Object.defineProperty(style, "height", { value: "34px", configurable: true });
+      }
+      return style;
+    });
+
+    const { result } = renderHook(() => useTerminalKeyboardRoom(rootRef, true, true));
+
+    expect(result.current.paddingBottomPx).toBe(34);
+    expect(result.current.roomPx).toBe(788 - 34);
   });
 
   it("lets --term-safe-b: 0px override the inherited inset where an ancestor reserves it", () => {
