@@ -188,6 +188,109 @@ async def test_admission_off_ordinary_host_delivers_saved_followups(app, db_uri)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("entrypoint", ["recover", "deliver_session"])
+async def test_admission_off_reconciles_accepted_first_input_before_followup(
+    app, db_uri, entrypoint
+):
+    conversations = SqlAlchemyConversationStore(db_uri)
+    startups, conv, initial, attempt, _body = opening(conversations, preparing_from=(None, None))
+    assert attempt is not None
+    assert attempt.attempt_id is not None and attempt.runtime_id is not None
+    from omnigent.entities.session_startup import StartupReceipt
+
+    conversations.set_host_id(conv.id, attempt.host_id, "/opt/work/project")
+    assert startups.bind_dispatch(
+        attempt.id,
+        attempt.attempt_id,
+        runtime_id=attempt.runtime_id,
+        source="codex",
+        vendor_session_id="thread",
+        vendor_turn_id="turn",
+    )
+    assert conversations.transition_pending_input(
+        conv.id, initial.id, expected="in_progress", status="incomplete"
+    )
+    # The durable receipt commits; the server stops before its reconciliation.
+    assert startups.observe(
+        StartupReceipt(
+            startup_id=attempt.id,
+            attempt_id=attempt.attempt_id,
+            input_id=initial.id,
+            runtime_id=attempt.runtime_id,
+            phase="input_accepted",
+            source="codex",
+            vendor_session_id="thread",
+            vendor_turn_id="turn",
+        )
+    )
+    [followup] = conversations.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id=PENDING_INPUT_RESPONSE_ID,
+                status="in_progress",
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": "followup"}]
+                ),
+            )
+        ],
+    )
+    conversations.set_labels(conv.id, {STARTUP_LABEL: "ready"})
+    app.state.startup_store = startups
+    assert app.state.startup_admission is None
+    hosts = HostRegistry()
+    connection = hosts.register(
+        attempt.host_id,
+        AsyncMock(),
+        HostHelloFrame(version="test", frame_protocol_version=1, name="ordinary-host", runners=[]),
+        owner=None,
+        registered_with_managed_token=False,
+    )
+    restarted = ManagedStartupInputs(conversations, hosts)
+    dispatched = []
+
+    async def dispatch(
+        context: StartupInputContext, session_id: str, event: SessionEventInput
+    ) -> dict[str, bool | str | None]:
+        assert context.input_id == followup.id
+        assert await context.claim(conversations, session_id)
+        dispatched.append(context.input_id)
+        conversations.append(
+            session_id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id="turn_followup",
+                    status="completed",
+                    stable_id=context.input_id,
+                    replaces_pending_id=context.input_id,
+                    data=MessageData(role="user", content=event.data["content"]),
+                )
+            ],
+        )
+        return {"item_id": context.input_id}
+
+    restarted.dispatch = dispatch
+    if entrypoint == "recover":
+        assert await restarted._recover_session(app, conv.id, connection)
+        await asyncio.gather(*restarted._deliveries.values())
+    else:
+        assert await restarted.deliver_session(app, conv.id) == 1
+    await restarted._recover_session(app, conv.id, connection)
+
+    assert dispatched == [followup.id]
+    first = conversations.get_item(conv.id, initial.id)
+    assert first is not None and first.response_id == f"turn_{attempt.attempt_id}"
+    assert conversations.list_pending_inputs(conv.id) == []
+    conv = conversations.get_conversation(conv.id)
+    assert conv is not None
+    assert STARTUP_LABEL not in conv.labels
+    assert not await restarted.accepts(conv, app)
+    await restarted.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_admission_off_ordinary_host_does_not_launch_pending_session(
     app, db_uri, monkeypatch
 ):

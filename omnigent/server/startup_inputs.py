@@ -145,7 +145,8 @@ async def _startup_allows_delivery(
         return True
     pending = await asyncio.to_thread(conversations.list_pending_inputs, session_id)
     if policy_disabled and (
-        current.state in ("queued", "starting", "verifying", "uncertain", "blocked", "cancelling")
+        current.state in ("queued", "starting", "uncertain", "blocked", "cancelling")
+        or (current.state == "verifying" and not current.input_accepted)
         or any(item.id == current.input_id for item in pending)
     ):
         return False
@@ -579,10 +580,10 @@ class ManagedStartupInputs:
         ):
             return False
         admission = getattr(app.state, "startup_admission", None)
-        if admission is not None:
-            startup = await asyncio.to_thread(admission.startups.for_session, session_id)
-            if startup is not None:
-                await reconcile_accepted_startup_input(self.conversations, startup)
+        startups = getattr(app.state, "startup_store", None)
+        startup = await asyncio.to_thread(startups.for_session, session_id) if startups else None
+        if startup is not None:
+            await reconcile_accepted_startup_input(self.conversations, startup)
         state = conv.labels.get(STARTUP_LABEL)
         if state == "failed":
             return False
@@ -637,8 +638,6 @@ class ManagedStartupInputs:
 
                     task.add_done_callback(clear_annotation_delivery)
                 return False
-        admission = getattr(app.state, "startup_admission", None)
-        startups = getattr(app.state, "startup_store", None)
         current = await asyncio.to_thread(startups.for_session, session_id) if startups else None
         released = current is not None and current.release_receipt is not None
         if (
@@ -869,6 +868,10 @@ class ManagedStartupInputs:
 
     async def deliver_session(self, app: Any, session_id: str) -> int:
         """Drain saved inputs in order, including hostless children on a parent runner."""
+        startups = getattr(app.state, "startup_store", None)
+        startup = await asyncio.to_thread(startups.for_session, session_id) if startups else None
+        if startup is not None:
+            await reconcile_accepted_startup_input(self.conversations, startup)
         delivered = 0
         while True:
             items = await asyncio.to_thread(self.conversations.list_pending_inputs, session_id)
