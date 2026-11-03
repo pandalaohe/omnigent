@@ -3083,7 +3083,7 @@ def test_runner_exit_error_redacts_credential_values(tmp_path: Path) -> None:
 async def test_runner_exit_error_drops_chopped_first_line_and_oversized_single_line(
     tmp_path: Path,
 ) -> None:
-    """Tail reader drops mid-line slices while keeping line-aligned, CRLF, and lossy UTF-8 lines."""
+    """Drop mid-line slices while keeping line-aligned, CRLF, and lossy UTF-8 lines."""
     log = tmp_path / "runner-chopped.log"
     chopped_payload = "sibling-session-text /opt/work/omnigent/fork/wt/other_pretask.md " * 80
     log.write_text(
@@ -3122,11 +3122,11 @@ async def test_runner_exit_error_drops_chopped_first_line_and_oversized_single_l
     assert "fatal aligned cause" in aligned_error
     assert "earlier line" not in aligned_error
 
-    # CRLF: mid-line CRLF slice drops the fragment; split between \r and \n also keeps trailing ERROR.
+    # A mid-line CRLF slice drops the fragment; splitting between \r and \n keeps ERROR.
     crlf_mid_log = tmp_path / "runner-crlf-mid.log"
     crlf_mid_log.write_bytes(
         f"INFO  11-02 20:46:55.000 runner.app | {chopped_payload}\r\n"
-        "ERROR 11-02 20:46:56.000 runner.app | crlf error line\r\n".encode("utf-8")
+        "ERROR 11-02 20:46:56.000 runner.app | crlf error line\r\n".encode()
     )
     crlf_mid_error = _runner_exit_error(1, crlf_mid_log)
     assert "other_pretask.md" not in crlf_mid_error
