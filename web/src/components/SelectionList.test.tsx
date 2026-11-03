@@ -86,6 +86,11 @@ describe("SelectionList", () => {
     fireEvent.click(except);
     expect(screen.getByTestId("selection").textContent).not.toContain("alpha");
     expect(screen.getByTestId("selection").textContent).toContain("beta");
+
+    fireEvent.keyDown(except, { key: "ArrowDown" });
+    expect(only).toHaveFocus();
+    fireEvent.keyDown(only, { key: "ArrowUp" });
+    expect(except).toHaveFocus();
   });
 
   it("focuses the intended virtual row after skipping a disabled item", () => {

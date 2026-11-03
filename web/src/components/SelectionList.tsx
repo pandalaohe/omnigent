@@ -162,6 +162,7 @@ export function SelectionList(props: Props) {
     setMenuOpen(false);
   };
   const handleKey = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.defaultPrevented) return;
     if (event.key === "ArrowDown" || event.key === "ArrowUp") {
       if (!rowItems.length) return;
       event.preventDefault();

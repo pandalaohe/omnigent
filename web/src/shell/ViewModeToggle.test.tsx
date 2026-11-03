@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
@@ -10,9 +11,16 @@ import {
   type TerminalFirstContextValue,
 } from "./TerminalFirstContext";
 
-const { isMobileMock } = vi.hoisted(() => ({ isMobileMock: vi.fn(() => false) }));
+const { isMobileMock, trackClickMock } = vi.hoisted(() => ({
+  isMobileMock: vi.fn(() => false),
+  trackClickMock: vi.fn(),
+}));
 vi.mock("@/hooks/useIsMobileViewport", () => ({
   useIsMobileViewport: () => isMobileMock(),
+}));
+vi.mock("@/lib/analytics", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  useOmnigentAnalytics: () => ({ trackClick: trackClickMock }),
 }));
 
 function makeCtx(overrides: Partial<TerminalFirstContextValue> = {}): TerminalFirstContextValue {
@@ -46,12 +54,12 @@ function renderToggle(ctx: TerminalFirstContextValue | null) {
 
 /** The Chat segment — icon-only, so it's addressed by its accessible name. */
 function chatSegment() {
-  return screen.getByRole("button", { name: /^chat view$/i });
+  return screen.getByRole("radio", { name: /^chat view$/i });
 }
 
 /** The Terminal segment. Its name doubles as the starting-up explanation. */
 function terminalSegment() {
-  return screen.getByRole("button", { name: /^terminal (view|is starting up…)$/i });
+  return screen.getByRole("radio", { name: /^terminal (view|is starting up…)$/i });
 }
 
 /** Renders the menu-items variant inside an open dropdown so the items mount. */
@@ -87,7 +95,9 @@ afterEach(() => {
 describe("ViewModeToggle", () => {
   it("renders both segments for terminal-first sessions", () => {
     renderToggle(makeCtx());
-    expect(screen.getByRole("group", { name: /switch between chat and terminal/i })).toBeVisible();
+    expect(
+      screen.getByRole("radiogroup", { name: /switch between chat and terminal/i }),
+    ).toBeVisible();
     expect(chatSegment()).toBeVisible();
     expect(terminalSegment()).toBeVisible();
   });
@@ -125,25 +135,28 @@ describe("ViewModeToggle", () => {
     }
   });
 
-  it("presses only the active segment in the chat view", () => {
+  it("checks only the active segment and gives it the one tab stop in chat view", () => {
     renderToggle(makeCtx({ view: "chat" }));
-    expect(chatSegment()).toHaveAttribute("aria-pressed", "true");
-    expect(terminalSegment()).toHaveAttribute("aria-pressed", "false");
+    expect(chatSegment()).toHaveAttribute("aria-checked", "true");
+    expect(chatSegment()).toHaveAttribute("tabindex", "0");
+    expect(terminalSegment()).toHaveAttribute("aria-checked", "false");
+    expect(terminalSegment()).toHaveAttribute("tabindex", "-1");
   });
 
-  it("uses the neutral primary pair for the selected segment", () => {
+  it("uses the neutral primary pair and readable unselected text", () => {
     renderToggle(makeCtx({ view: "chat" }));
-    expect(screen.getByTestId("view-mode-toggle")).toHaveClass("bg-muted");
-    expect(chatSegment()).toHaveAttribute("data-variant", "default");
+    expect(
+      screen.getByRole("radiogroup", { name: /switch between chat and terminal/i }),
+    ).toHaveClass("bg-muted");
     expect(chatSegment()).toHaveClass("bg-primary-cta", "text-primary-cta-foreground");
-    expect(terminalSegment()).toHaveAttribute("data-variant", "ghost");
-    expect(terminalSegment()).not.toHaveClass("bg-primary-cta");
+    expect(terminalSegment()).toHaveClass("text-foreground/90");
+    expect(terminalSegment()).not.toHaveClass("bg-primary-cta", "text-muted-foreground");
   });
 
-  it("presses only the active segment in the terminal view", () => {
+  it("checks only the active segment in the terminal view", () => {
     renderToggle(makeCtx({ view: "terminal" }));
-    expect(terminalSegment()).toHaveAttribute("aria-pressed", "true");
-    expect(chatSegment()).toHaveAttribute("aria-pressed", "false");
+    expect(terminalSegment()).toHaveAttribute("aria-checked", "true");
+    expect(chatSegment()).toHaveAttribute("aria-checked", "false");
   });
 
   it("switches to the terminal view in one click — no menu to open", () => {
@@ -160,12 +173,53 @@ describe("ViewModeToggle", () => {
     expect(setView).toHaveBeenCalledWith("chat");
   });
 
+  it("keeps the existing component analytics when a segment is chosen", () => {
+    renderToggle(makeCtx({ view: "chat" }));
+    fireEvent.click(terminalSegment());
+    expect(trackClickMock).toHaveBeenCalledWith("chat.header.view_terminal", "button");
+  });
+
+  it("uses arrow keys to change the view and keep focus on the selected radio", () => {
+    const setViewMock = vi.fn();
+    function StatefulToggle() {
+      const [view, setView] = useState<TerminalFirstContextValue["view"]>("chat");
+      return (
+        <TerminalFirstContextProvider
+          value={makeCtx({
+            view,
+            setView: (next) => {
+              setViewMock(next);
+              setView(next);
+            },
+          })}
+        >
+          <ViewModeToggle />
+        </TerminalFirstContextProvider>
+      );
+    }
+    render(
+      <TooltipProvider>
+        <StatefulToggle />
+      </TooltipProvider>,
+    );
+    const chat = screen.getByTestId("view-mode-chat");
+    const terminal = screen.getByTestId("view-mode-terminal");
+
+    fireEvent.keyDown(chat, { key: "ArrowRight" });
+    expect(setViewMock).toHaveBeenCalledWith("terminal");
+    expect(terminal).toHaveFocus();
+    expect(terminal).toHaveAttribute("aria-checked", "true");
+    expect(terminal).toHaveAttribute("tabindex", "0");
+    expect(chat).toHaveAttribute("tabindex", "-1");
+  });
+
   it("names each segment on hover so the icon-only control is legible", async () => {
     renderToggle(makeCtx({ view: "chat" }));
     expect(chatSegment()).toHaveAttribute("aria-keyshortcuts", `${ARIA_MOD_KEY}+Alt+\\`);
-    // Radix opens on a real pointer move over the trigger (the wrapper span),
-    // so a bare pointerEnter on the button wouldn't surface the tooltip.
-    fireEvent.pointerMove(chatSegment().parentElement!, { pointerType: "mouse" });
+    // The styled tooltip stays on the icon content inside the shared radio.
+    fireEvent.pointerMove(chatSegment().querySelector('[data-slot="tooltip-trigger"]')!, {
+      pointerType: "mouse",
+    });
     const tooltip = await screen.findByRole("tooltip");
     expect(tooltip).toHaveTextContent("Chat view");
     expect(tooltip).toHaveClass("menu-surface", "bg-popover", "text-popover-foreground");
@@ -185,7 +239,9 @@ describe("ViewModeToggle", () => {
 
     const chat = chatSegment();
     expect(chat).toHaveAttribute("aria-keyshortcuts", "Control+Shift+J");
-    fireEvent.pointerMove(chat.parentElement!, { pointerType: "mouse" });
+    fireEvent.pointerMove(chat.querySelector('[data-slot="tooltip-trigger"]')!, {
+      pointerType: "mouse",
+    });
     const tooltip = await screen.findByRole("tooltip");
     expect(
       Array.from(tooltip.querySelectorAll('[data-slot="kbd"]'), (key) => key.textContent),

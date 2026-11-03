@@ -1,11 +1,12 @@
+import { useEffect, useRef, type ReactNode } from "react";
 import { CheckIcon, Loader2Icon, MessagesSquareIcon, TerminalIcon } from "lucide-react";
 import { useShortcutHint } from "@/components/KeyboardShortcut";
-import { Button } from "@/components/ui/button";
+import { Segmented } from "@/components/ui/segmented";
 import { DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useViewModeToggleHotkey } from "@/hooks/useViewModeToggleHotkey";
-import { cn } from "@/lib/utils";
+import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useTerminalFirst } from "./TerminalFirstContext";
 
 const ignoreViewChange = () => {};
@@ -32,7 +33,17 @@ const ignoreViewChange = () => {};
 export function ViewModeToggle({ hotkeyEnabled = true, alwaysVisible = false } = {}) {
   const ctx = useTerminalFirst();
   const isMobile = useIsMobileViewport();
+  const segmentedRef = useRef<HTMLDivElement>(null);
+  const { trackClick } = useOmnigentAnalytics();
   const shortcutHint = useShortcutHint("toggleViewMode");
+  const shortcutAria = shortcutHint.aria;
+  useEffect(() => {
+    const radios = segmentedRef.current?.querySelectorAll<HTMLElement>('[role="radio"]');
+    radios?.forEach((radio) => {
+      if (shortcutAria) radio.setAttribute("aria-keyshortcuts", shortcutAria);
+      else radio.removeAttribute("aria-keyshortcuts");
+    });
+  }, [shortcutAria]);
   useViewModeToggleHotkey({
     enabled: Boolean(hotkeyEnabled && ctx?.isTerminalFirst && !ctx.isShellView),
     view: ctx?.view ?? "chat",
@@ -46,91 +57,67 @@ export function ViewModeToggle({ hotkeyEnabled = true, alwaysVisible = false } =
   const terminalLabel = terminalStartingUp ? "Terminal is starting up…" : "Terminal view";
 
   return (
-    <div
-      role="group"
-      aria-label="Switch between chat and terminal"
-      data-testid="view-mode-toggle"
-      // Desktop-only — mobile folds the switch into the header kebab.
-      className="flex h-6 w-[74px] shrink-0 items-center gap-0.5 rounded-[6px] bg-muted p-0"
-    >
-      <ViewModeSegment
-        label="Chat view"
-        active={view === "chat"}
-        onClick={() => setView("chat")}
-        testId="view-mode-chat"
-        componentId="chat.header.view_chat"
-        shortcutHint={shortcutHint}
-      >
-        <MessagesSquareIcon className="size-4" />
-      </ViewModeSegment>
-      <ViewModeSegment
-        label={terminalLabel}
-        active={view === "terminal"}
-        onClick={() => setView("terminal")}
-        testId="view-mode-terminal"
-        componentId="chat.header.view_terminal"
-        shortcutHint={shortcutHint}
-      >
-        {terminalStartingUp ? (
-          <Loader2Icon className="size-4 animate-spin" aria-hidden />
-        ) : (
-          <TerminalIcon className="size-4" />
-        )}
-      </ViewModeSegment>
+    <div ref={segmentedRef} data-testid="view-mode-toggle" className="shrink-0">
+      <Segmented
+        label="Switch between chat and terminal"
+        options={[
+          {
+            value: "chat",
+            label: (
+              <ViewModeOptionLabel label="Chat view" shortcutHint={shortcutHint}>
+                <MessagesSquareIcon className="size-4" aria-hidden />
+              </ViewModeOptionLabel>
+            ),
+            title: "Chat view",
+            testId: "view-mode-chat",
+          },
+          {
+            value: "terminal",
+            label: (
+              <ViewModeOptionLabel label={terminalLabel} shortcutHint={shortcutHint}>
+                {terminalStartingUp ? (
+                  <Loader2Icon className="size-4 animate-spin" aria-hidden />
+                ) : (
+                  <TerminalIcon className="size-4" aria-hidden />
+                )}
+              </ViewModeOptionLabel>
+            ),
+            title: terminalLabel,
+            testId: "view-mode-terminal",
+          },
+        ]}
+        value={view}
+        onChange={(next) => {
+          trackClick(
+            next === "chat" ? "chat.header.view_chat" : "chat.header.view_terminal",
+            "button",
+          );
+          setView(next);
+        }}
+      />
     </div>
   );
 }
 
-/**
- * One segment of the switcher: an icon-only button whose name lives in a
- * tooltip. `aria-pressed` (not a radio) so each segment reads as an
- * independent toggle to AT, matching how it behaves — clicking the active
- * segment is a no-op rather than a selection change.
- */
-function ViewModeSegment({
+/** Icon content for one radio; the existing styled hotkey tooltip stays with the segment. */
+function ViewModeOptionLabel({
   label,
-  active,
-  onClick,
-  testId,
-  componentId,
   shortcutHint,
   children,
 }: {
   label: string;
-  active: boolean;
-  onClick: () => void;
-  testId: string;
-  componentId: string;
   shortcutHint: { keys: string[]; aria: string | undefined };
-  children: React.ReactNode;
+  children: ReactNode;
 }) {
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <span className="inline-flex">
-          <Button
-            type="button"
-            variant={active ? "default" : "ghost"}
-            size="icon-xs"
-            aria-label={label}
-            aria-pressed={active}
-            aria-keyshortcuts={shortcutHint.aria}
-            onClick={onClick}
-            data-testid={testId}
-            componentId={componentId}
-            className={cn(
-              "h-6 w-9 rounded-[6px] border px-2.5 py-0",
-              active
-                ? "border-transparent shadow-sm"
-                : "border-transparent text-muted-foreground hover:bg-foreground/10 hover:text-foreground",
-            )}
-          >
-            {children}
-          </Button>
+        <span className="inline-flex items-center justify-center">
+          {children}
+          <span className="sr-only">{label}</span>
         </span>
       </TooltipTrigger>
-      {/* Bottom placement: the header sits at top-0, so a top-side tooltip
-          would render above the viewport edge and get clipped. */}
+      {/* Bottom placement keeps the header tooltip inside the viewport. */}
       <TooltipContent side="bottom" shortcut={shortcutHint.keys}>
         <span>{label}</span>
       </TooltipContent>
