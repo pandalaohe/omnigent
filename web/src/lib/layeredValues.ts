@@ -199,8 +199,9 @@ export function levelsBelow<F extends string>(
   for (const [row, record] of Object.entries(store.rows)) {
     if (holdsValue(record)) levels.push({ level: "row", row });
   }
-  for (const [col, record] of Object.entries(store.cols)) {
-    if (holdsValue(record) || store.hostWins?.[col]) levels.push({ level: "col", col });
+  const columnIds = new Set([...Object.keys(store.cols), ...Object.keys(store.hostWins ?? {})]);
+  for (const col of columnIds) {
+    if (holdsValue(store.cols[col]) || store.hostWins?.[col]) levels.push({ level: "col", col });
   }
   for (const [col, rows] of Object.entries(store.cells)) {
     for (const [row, record] of Object.entries(rows)) {

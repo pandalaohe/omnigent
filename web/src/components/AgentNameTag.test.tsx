@@ -39,14 +39,14 @@ describe("AgentNameTag", () => {
     ["claude-sdk", "SDK"],
     ["codex-native", "Native"],
     ["acp:hermes", "ACP"],
-    ["pi-rpc", "RPC"],
+    ["pi", "RPC"],
   ])("maps %s to %s", (harness, mark) => {
     render(<AgentNameTag agentId={null} name="Agent" harness={harness} />);
     expect(screen.getByTestId("agent-name-mark")).toHaveTextContent(mark);
   });
 
   it("can render only the mark", () => {
-    render(<AgentNameTag agentId={null} name="Research" harness="pi-rpc" markOnly />);
+    render(<AgentNameTag agentId={null} name="Research" harness="pi" markOnly />);
     expect(screen.getByTestId("agent-name-mark")).toHaveTextContent("RPC");
     expect(screen.queryByText("Research")).toBeNull();
   });

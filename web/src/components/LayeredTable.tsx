@@ -1,4 +1,4 @@
-import { useState, type ReactElement, type ReactNode } from "react";
+import { useEffect, useState, type ReactElement, type ReactNode } from "react";
 
 import { Button } from "@/components/ui/button";
 import type { LayeredLevel } from "@/lib/layeredValues";
@@ -68,11 +68,6 @@ export function LayeredTable({
 }: LayeredTableProps) {
   const [selecting, setSelecting] = useState(false);
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
-  const selectedLevels: LayeredCellLevel[] = [...selected].map((key) => {
-    const [row, col] = JSON.parse(key) as [string, string];
-    return { level: "cell", row, col };
-  });
-
   const availableLevels: LayeredCellLevel[] = rows.flatMap((row) =>
     columns.flatMap((col) =>
       renderCell(row.id, col.id).unavailable
@@ -80,6 +75,21 @@ export function LayeredTable({
         : [{ level: "cell" as const, row: row.id, col: col.id }],
     ),
   );
+  const availableKeys = new Set(availableLevels.map(({ row, col }) => selectionKey(row, col)));
+  const selectedLevels: LayeredCellLevel[] = [...selected]
+    .filter((key) => availableKeys.has(key))
+    .map((key) => {
+      const [row, col] = JSON.parse(key) as [string, string];
+      return { level: "cell", row, col };
+    });
+
+  useEffect(() => {
+    const available = new Set(availableLevels.map(({ row, col }) => selectionKey(row, col)));
+    setSelected((current) => {
+      const next = new Set([...current].filter((key) => available.has(key)));
+      return next.size === current.size ? current : next;
+    });
+  }, [availableLevels]);
 
   function toggleCells(levels: readonly LayeredCellLevel[]) {
     const keys = levels.map(({ row, col }) => selectionKey(row, col));
@@ -147,7 +157,7 @@ export function LayeredTable({
 
   const selectionCount = (
     <span className="text-sm text-muted-foreground" aria-live="polite">
-      {selected.size} selected
+      {selectedLevels.length} selected
     </span>
   );
 

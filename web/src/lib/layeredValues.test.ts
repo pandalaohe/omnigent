@@ -163,6 +163,17 @@ describe("layered resolver boundaries", () => {
     expect(levelsBelow(store, { level: "cell", row: "codex", col: "desktop" })).toEqual([]);
   });
 
+  it("includes a column that holds only Host wins in corner Clear", () => {
+    const store: LayeredStore<"state"> = {
+      corner: {},
+      rows: {},
+      cols: {},
+      cells: {},
+      hostWins: { desktop: true },
+    };
+    expect(levelsBelow(store, { level: "corner" })).toEqual([{ level: "col", col: "desktop" }]);
+  });
+
   it("distinguishes Native on Windows from an unavailable ACP agent", () => {
     expect(missingCellText("claude-native", "win32")).toBe("Not on Windows");
     expect(missingCellText("acp:hermes", "win32")).toBe("Not installed here");

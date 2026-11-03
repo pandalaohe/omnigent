@@ -14,7 +14,7 @@ export interface AgentNameTagProps {
 }
 
 function plainMark(harness: string | null): string {
-  if (harness === "pi-rpc") return "RPC";
+  if (harness === "pi" || harness === "pi-rpc") return "RPC";
   const sdk = harness && (harness.endsWith("-sdk") || Object.hasOwn(BRAIN_HARNESS_LABELS, harness));
   const section = harnessSection(sdk ? "cli-subprocess" : null, harness);
   if (section === "native") return "Native";

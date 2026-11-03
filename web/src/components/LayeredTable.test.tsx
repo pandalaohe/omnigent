@@ -334,6 +334,23 @@ describe("LayeredTable and LayeredEditor", () => {
     expect(screen.getByTestId("layered-cell-codex-desktop")).toHaveTextContent("Off");
   });
 
+  it("removes a newly unavailable cell from selection and bulk actions", async () => {
+    const user = userEvent.setup();
+    const { rerender } = render(<StatefulTable />);
+    await user.click(screen.getByRole("button", { name: "Select cells" }));
+    await user.click(screen.getByTestId("layered-cell-codex-desktop"));
+    expect(screen.getByText("1 selected")).toBeVisible();
+
+    rerender(<StatefulTable unavailable={{ "codex/desktop": "Not installed here" }} />);
+    expect(screen.getByText("0 selected")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Use inherited" }));
+
+    rerender(<StatefulTable />);
+    const restored = screen.getByTestId("layered-cell-codex-desktop");
+    expect(restored).toHaveTextContent("On");
+    expect(restored.querySelector(".bg-pink-500")).not.toBeNull();
+  });
+
   it("clears lower values and Host-wins marks, then Undo restores both", async () => {
     const user = userEvent.setup();
     render(
