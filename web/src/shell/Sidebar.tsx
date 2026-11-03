@@ -207,7 +207,7 @@ import { PermissionsModal } from "@/components/PermissionsModal";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { ArchiveProjectDialog, restoreProjectWithNotice } from "@/components/ArchiveProjectDialog";
 import { ProjectRowIcon } from "./ProjectPicker";
-import { EmojiPicker } from "@/components/ProjectIconPicker";
+import { ProjectIconPicker } from "@/components/ProjectIconPicker";
 import {
   BackgroundActivityBadge,
   ColdIdleDot,
@@ -216,6 +216,7 @@ import {
 } from "@/components/SessionStateBadge";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useActiveRootSessionId } from "@/hooks/useSession";
+import { ProjectIconGlyph } from "@/lib/tablerIcon";
 import { useSessionNavigationPreferences } from "@/hooks/useSessionNavigationPreferences";
 import { useNewSessionTarget } from "@/hooks/useNewSessionTarget";
 import {
@@ -1945,7 +1946,9 @@ function ProjectFolder({
         title={name}
         icon={
           icon ? (
-            <span className="text-[14px] leading-none">{icon}</span>
+            <span className="text-[14px] leading-none">
+              <ProjectIconGlyph icon={icon} />
+            </span>
           ) : expanded ? (
             <FolderOpenIcon
               className={cn(
@@ -8788,7 +8791,9 @@ function useProjectFolderMenu(
                     )}
                   >
                     {displayIcon ? (
-                      <span className="text-xl leading-none">{displayIcon}</span>
+                      <span className="text-xl leading-none">
+                        <ProjectIconGlyph icon={displayIcon} />
+                      </span>
                     ) : (
                       <SmilePlusIcon className="size-4 text-brand-accent" />
                     )}
@@ -8837,7 +8842,7 @@ function useProjectFolderMenu(
                       </Button>
                     </div>
                   ) : null}
-                  <EmojiPicker
+                  <ProjectIconPicker
                     onSelect={(native) => {
                       setPendingIcon(native);
                       setEmojiOpen(false);

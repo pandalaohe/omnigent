@@ -1,18 +1,17 @@
-// Emoji icon picker for projects. Two exports:
-//   - `EmojiPicker`: a themed emoji-mart picker, code-split so its ~600KB
-//     dataset never lands in the main bundle (loaded on first open).
-//   - `ProjectLandingIcon`: the big project-header icon on the new-chat landing
-//     — pink folder by default, the chosen emoji in a gray tile once set, with
-//     hover-revealed edit/remove affordances (the OMNI-3742 design).
+// Project icon picker and the new-chat landing tile. Emoji-mart stays lazy;
+// Tabler shapes and tags load through their own chunks on demand.
 
 import { type CSSProperties, lazy, Suspense, useState } from "react";
 import { FolderIcon, Loader2Icon, PencilIcon, Trash2Icon } from "lucide-react";
 
-import { Button } from "@/components/ui/button";
+import { TablerIconPicker } from "@/components/TablerIconPicker";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
+import { Button } from "@/components/ui/button";
 import { Popover, PopoverAnchor, PopoverContent } from "@/components/ui/popover";
+import { Segmented } from "@/components/ui/segmented";
 import { useUpdateProjectConfig } from "@/hooks/useConversations";
 import type { ProjectConfig } from "@/lib/projectsApi";
+import { ProjectIconGlyph } from "@/lib/tablerIcon";
 import { cn } from "@/lib/utils";
 
 // Both the picker component and its dataset are dynamically imported so they
@@ -21,11 +20,49 @@ import { cn } from "@/lib/utils";
 const Picker = lazy(() => import("@emoji-mart/react"));
 const loadEmojiData = async () => (await import("@emoji-mart/data")).default;
 
-/** A themed emoji-mart picker. Calls `onSelect` with the chosen unicode glyph. */
-export function EmojiPicker({ onSelect }: { onSelect: (native: string) => void }) {
+/** Full Tabler set by default, with the existing Emoji picker one tab away. */
+export function ProjectIconPicker({ onSelect }: { onSelect: (value: string) => void }) {
+  const [tab, setTab] = useState<"icons" | "emoji">("icons");
+  return (
+    <div
+      data-testid="project-icon-picker"
+      className="flex w-[min(352px,calc(100vw-16px))] flex-col overflow-hidden rounded-lg bg-popover text-popover-foreground"
+      style={{ height: "var(--emoji-picker-height, 420px)" }}
+    >
+      <div className="shrink-0 border-b p-2">
+        <Segmented
+          label="Project icon type"
+          options={[
+            { value: "icons", label: "Icons", testId: "project-icon-tab-icons" },
+            { value: "emoji", label: "Emoji", testId: "project-icon-tab-emoji" },
+          ]}
+          value={tab}
+          onChange={setTab}
+          stretch
+        />
+      </div>
+      <div className="flex min-h-0 flex-1 flex-col">
+        {tab === "icons" ? (
+          <TablerIconPicker onSelect={onSelect} />
+        ) : (
+          // emoji-mart's height rule reads this variable; inside the tab it must
+          // fill the body below the tab bar, not the whole picker again.
+          <div
+            className="flex min-h-0 flex-1 flex-col"
+            style={{ "--emoji-picker-height": "100%" } as CSSProperties}
+          >
+            <EmojiPicker onSelect={onSelect} />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function EmojiPicker({ onSelect }: { onSelect: (native: string) => void }) {
   const mode = useResolvedThemeMode();
   return (
-    <Suspense fallback={<div className="h-[420px] w-[352px]" aria-hidden />}>
+    <Suspense fallback={<div className="h-full w-full" aria-hidden />}>
       <Picker
         data={loadEmojiData}
         onEmojiSelect={(emoji: { native: string }) => onSelect(emoji.native)}
@@ -131,7 +168,9 @@ export function ProjectLandingIcon({
             {update.isPending ? (
               <Loader2Icon className="size-6 animate-spin text-muted-foreground" />
             ) : icon ? (
-              <span className="text-[30px] leading-none">{icon}</span>
+              <span className="text-[30px] leading-none">
+                <ProjectIconGlyph icon={icon} />
+              </span>
             ) : (
               <FolderIcon className="size-6 text-brand-accent" />
             )}
@@ -148,9 +187,9 @@ export function ProjectLandingIcon({
               "--emoji-picker-height": "min(420px, var(--radix-popover-content-available-height))",
             } as CSSProperties
           }
-          className="emoji-picker-popover w-auto border-0 bg-transparent p-0 shadow-none ring-0"
+          className="emoji-picker-popover w-auto p-0"
         >
-          <EmojiPicker onSelect={save} />
+          <ProjectIconPicker onSelect={save} />
         </PopoverContent>
       </Popover>
     </span>
