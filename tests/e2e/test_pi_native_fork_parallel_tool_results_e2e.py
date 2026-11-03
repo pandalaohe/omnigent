@@ -1,4 +1,4 @@
-"""A real Pi fork must retain paired parallel tools and mixed assistant text."""
+"""Real Pi forks and cold resumes must keep tool results paired with their calls."""
 
 from __future__ import annotations
 
@@ -24,7 +24,6 @@ from omnigent.harnesses.pi_native.bridge import bridge_dir_for_session_id
 from omnigent.harnesses.pi_native.main import _SESSION_LABELS, _materialize_pi_agent_spec
 from omnigent.inner._proc import process_alive
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
-from tests._helpers.host import isolated_host
 from tests._helpers.live_server import terminate_process
 from tests._helpers.server_runner import ServerRunner, server_runner
 from tests._helpers.session import (
@@ -82,6 +81,31 @@ def _parallel_response(workspace: Path) -> str:
 
 def _is_summarizer_request(body: dict[str, Any]) -> bool:
     return "context summarization assistant" in json.dumps(body.get("system", ""))
+
+
+def _cold_resume_pi_terminal(client: httpx.Client, stack: ServerRunner, session_id: str) -> None:
+    """Stop Pi, remove its local session files, and start it again from stored items."""
+    terminal_url = f"/v1/sessions/{session_id}/resources/terminals"
+    terminal = client.get(f"{terminal_url}/terminal_pi_main").json()["metadata"]
+    client.delete(f"{terminal_url}/terminal_pi_main").raise_for_status()
+    has_session = [
+        "tmux",
+        "-S",
+        terminal["tmux_socket"],
+        "has-session",
+        "-t",
+        terminal["tmux_target"],
+    ]
+    _wait(lambda: subprocess.run(has_session, capture_output=True, timeout=10).returncode != 0)
+    bridge = stack.runner_home / ".omnigent/pi-native" / bridge_dir_for_session_id(session_id).name
+    session_files = list((bridge / "sessions").glob("*.jsonl"))
+    assert session_files, "Pi must have written a native session before cold resume"
+    for session_file in session_files:
+        session_file.unlink()
+    client.post(
+        terminal_url,
+        json={"terminal": "pi", "session_key": "main", "ensure_native_terminal": True},
+    ).raise_for_status()
 
 
 @pytest.fixture
@@ -345,32 +369,10 @@ def test_pi_native_fork_rebuild_keeps_parallel_tool_results_adjacent(
         fork.raise_for_status()
         fork_id = fork.json()["id"]
         session_ids.append(fork_id)
-        # A fork is unbound; use the directory-picker's validated host launch.
-        # Keep the helper-owned identity while installing this fixture's provider.
-        command = [
-            sys.executable,
-            "-c",
-            "import json,os,runpy,sys,yaml; from pathlib import Path; "
-            "p=Path(os.environ['OMNIGENT_CONFIG_HOME'])/'config.yaml'; "
-            "config=yaml.safe_load(p.read_text()); "
-            "config.update(json.loads(Path(sys.argv[1]).read_text())); "
-            "p.write_text(yaml.safe_dump(config)); "
-            "sys.argv=['omnigent.host._daemon_entry','--server',sys.argv[2]]; "
-            "runpy.run_module('omnigent.host._daemon_entry',run_name='__main__')",
-            str(tmp_path / "config" / "config.yaml"),
-            str(client.base_url),
-        ]
-        with isolated_host(tmp_path / "fork-host", str(client.base_url), command=command) as host:
-            host.wait_online(client)
-            launched = client.post(
-                f"/v1/hosts/{host.host_id}/runners",
-                json={"session_id": fork_id, "workspace": str(tmp_path / "workspace")},
-                timeout=120,
-            )
-            launched.raise_for_status()
-            send_message(fork_id, "What did the tools return?")
-            reply = "RESPONSES-RESUME-3" if resume_api == "responses" else "FORK-RESUME-OK"
-            _wait(lambda: items_with_reply(fork_id, reply))
+        bind_session_runner(client.patch, "", fork_id, runner_id)
+        send_message(fork_id, "What did the tools return?")
+        reply = "RESPONSES-RESUME-3" if resume_api == "responses" else "FORK-RESUME-OK"
+        _wait(lambda: items_with_reply(fork_id, reply))
 
         assert len(requests) == 3
         assert all(json.dumps(request).count(instructions) == 1 for request in requests)
@@ -388,37 +390,7 @@ def test_pi_native_fork_rebuild_keeps_parallel_tool_results_adjacent(
                 assert all(f"{name}-contents" in json.dumps(history) for name in ("alpha", "beta"))
 
             assert_responses_history()
-            terminal_url = f"/v1/sessions/{fork_id}/resources/terminals"
-            terminal = client.get(f"{terminal_url}/terminal_pi_main").json()["metadata"]
-            client.delete(f"{terminal_url}/terminal_pi_main").raise_for_status()
-            _wait(
-                lambda: (
-                    subprocess.run(
-                        [
-                            "tmux",
-                            "-S",
-                            terminal["tmux_socket"],
-                            "has-session",
-                            "-t",
-                            terminal["tmux_target"],
-                        ],
-                        capture_output=True,
-                        timeout=10,
-                    ).returncode
-                    != 0
-                )
-            )
-            bridge = (
-                tmp_path / "home/.omnigent/pi-native" / bridge_dir_for_session_id(fork_id).name
-            )
-            session_files = list((bridge / "sessions").glob("*.jsonl"))
-            assert session_files, "The fork must have written a native session before cold resume"
-            for session_file in session_files:
-                session_file.unlink()
-            client.post(
-                terminal_url,
-                json={"terminal": "pi", "session_key": "main", "ensure_native_terminal": True},
-            ).raise_for_status()
+            _cold_resume_pi_terminal(client, stack, fork_id)
             send_message(fork_id, "Continue after a cold resume without rerunning the tools.")
             _wait(lambda: items_with_reply(fork_id, "RESPONSES-RESUME-4"))
             assert len(requests) == 4
