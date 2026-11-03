@@ -1192,7 +1192,8 @@ def test_up_is_short_spelling_of_host_update_custom() -> None:
 
     assert result.exit_code == 0, result.output
     assert "--rollback" in result.output
-    assert "Update this managed Host from our fork-only custom channel." in result.output
+    assert "Update this Host from the custom channel." in result.output
+    assert "--no-web-ui" in result.output
 
 
 def test_help_hides_extras_gated_harness_when_sdk_missing(

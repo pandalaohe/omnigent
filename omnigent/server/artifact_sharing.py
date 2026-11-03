@@ -156,7 +156,7 @@ def gate_key_id(gate_key: str) -> str:
 
 
 def _insert_default_if_absent(session: Session, workspace_id: int, owner: str) -> None:
-    """Seed an absent sharing row with the documented default.
+    """Seed an absent sharing row with the documented default (external off).
 
     Raced first writes each attempt the insert; exactly one wins and the
     other's conflict clause is a no-op, so both then lock and merge the row
@@ -173,7 +173,7 @@ def _insert_default_if_absent(session: Session, workspace_id: int, owner: str) -
         "user_id": owner,
         "key": ARTIFACT_SHARING_PREFERENCE_KEY,
         "value": _encode_record(
-            SharingRecord(external=True, code_hash=None, gate_key=generate_gate_key())
+            SharingRecord(external=False, code_hash=None, gate_key=generate_gate_key())
         ),
     }
     dialect = session.get_bind().dialect.name
@@ -245,7 +245,7 @@ class ArtifactSharingStore:
         :param owner: User id whose record is read, e.g.
             ``"alice@example.com"`` or the reserved local user.
         :returns: The record, or ``None`` (absent / malformed — both mean the
-            documented default: external on, no code).
+            documented default: external off, no code).
         """
         with self._read_session()("read_sharing") as session:
             raw = session.scalar(
@@ -323,7 +323,7 @@ class ArtifactSharingStore:
             ):
                 gate_key = current.gate_key
             record = SharingRecord(
-                external=(current.external if current is not None else True)
+                external=(current.external if current is not None else False)
                 if external is None
                 else external,
                 code_hash=code_hash,

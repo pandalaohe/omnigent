@@ -853,7 +853,7 @@ def register_artifact_routes(
         """Apply the owner's external-access gate.
 
         Decision order (design §2.5): an unexpired panel token passes; a
-        valid grant passes; an open gate (no record, or no code) passes; an
+        valid grant passes; an open gate (external on, no code) passes; an
         authorized logged-in visitor and a remembered browser are redirected
         onto a fresh grant; otherwise the share-code form or the sign-in
         page answers. An owner that cannot be resolved fails closed like a
@@ -883,17 +883,16 @@ def register_artifact_routes(
                     record,
                 )
             return _forbidden_page(request), record
-        # Gate open: no record (the user default is external on, no code) or
-        # external on with no code. A URL whose grant is bad is evaluated
-        # here as a bare one.
-        if record is None or (record.external and record.code_hash is None):
+        # Gate open: external on with no code. No record is the user default,
+        # external off. A URL whose grant is bad is evaluated here as a bare one.
+        if record is not None and record.external and record.code_hash is None:
             return None, record
         if _is_login(user_id) and await _identity_allowed(request, claims):
             return (
                 _grant_redirect(request, token, relpath, session_key, gate_key_identifier),
                 record,
             )
-        if not record.external:
+        if record is None or not record.external:
             return _forbidden_page(request), record
         cookie_name = remember_cookie_name(owner, secure=request.url.scheme == "https")
         cookie = request.cookies.get(cookie_name)
@@ -1233,9 +1232,9 @@ def register_artifact_routes(
         # one; an open gate carries none, so the frame URL stays bare.
         grant: str | None = None
         frame_grant = ""
-        if record is not None and (not record.external or record.code_hash is not None):
+        if record is None or not record.external or record.code_hash is not None:
             now = now_epoch()
-            gate_key_identifier = gate_key_id(record.gate_key)
+            gate_key_identifier = gate_key_id(record.gate_key) if record is not None else ""
             grant = mint_grant(session_key, token, gate_key_identifier, now)
             frame_grant = f"~{mint_grant(session_key, h_token, gate_key_identifier, now)}"
         frame_url = (
@@ -1647,7 +1646,7 @@ def register_artifact_routes(
         """
         Return the caller's external-access settings summary.
 
-        No row means the defaults: external access on, no share code, visitor
+        No row means the defaults: external access off, no share code, visitor
         comments on. The stored code hash and gate key never leave the server.
 
         :param request: The incoming request, for the caller identity.
@@ -1658,7 +1657,7 @@ def register_artifact_routes(
         owner = _require_user(request, auth_provider) or RESERVED_USER_LOCAL
         record = await asyncio.to_thread(_get_sharing_store().read_sharing, owner)
         return {
-            "external": record.external if record is not None else True,
+            "external": record.external if record is not None else False,
             "share_code_set": record is not None and record.code_hash is not None,
             "allow_comments": record.allow_comments if record is not None else True,
         }
@@ -1830,7 +1829,7 @@ def register_artifact_routes(
                     if not admitted:
                         user_id = _get_user_id(request, auth_provider)
                         admitted = _is_login(user_id) and await _identity_allowed(request, claims)
-                elif record is None or (record.external and record.code_hash is None):
+                elif record is not None and record.external and record.code_hash is None:
                     # Open gate: admitted without a grant.
                     admitted = True
                 if not admitted:

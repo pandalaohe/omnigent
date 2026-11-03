@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 DISABLE_TELEMETRY_ENV_VAR = "OMNIGENT_DISABLE_TELEMETRY"
+# Usage telemetry is opt-in in this distribution; the opt-outs below still win.
+ENABLE_TELEMETRY_ENV_VAR = "OMNIGENT_ENABLE_TELEMETRY"
 CI_ENV_VARS = frozenset(
     {
         "CI",
@@ -24,7 +26,9 @@ CI_ENV_VARS = frozenset(
 
 
 def is_disabled_by_env(env: Mapping[str, str]) -> bool:
-    """Check usage-telemetry opt-outs without reading config or cached state."""
+    """Check usage-telemetry opt-in and opt-outs without reading config or cached state."""
+    if env.get(ENABLE_TELEMETRY_ENV_VAR, "").strip().lower() not in ("1", "true", "yes"):
+        return True
     if env.get("OMNIGENT_ANALYTICS", "").strip() == "0":
         return True
     for name in ("DISABLE_TELEMETRY", DISABLE_TELEMETRY_ENV_VAR):

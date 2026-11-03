@@ -89,6 +89,16 @@ def test_read_sharing_without_a_row_is_none(db_uri: str) -> None:
     assert ArtifactSharingStore(db_uri).read_sharing("alice") is None
 
 
+def test_first_write_without_external_keeps_external_off(db_uri: str) -> None:
+    """A first write that leaves ``external`` out stores the default: off."""
+    store = ArtifactSharingStore(db_uri)
+
+    record = store.write_sharing("alice", share_code="open-sesame")
+
+    assert record.external is False
+    assert store.read_sharing("alice") == record
+
+
 def test_write_sharing_merges_and_regenerates_the_gate_key(db_uri: str) -> None:
     """Absent update fields keep values; every write rotates the gate key."""
     store = ArtifactSharingStore(db_uri)
@@ -211,7 +221,7 @@ def test_write_sharing_raises_when_the_update_matches_no_row(
     ],
 )
 def test_malformed_row_reads_as_no_row(db_uri: str, value: str) -> None:
-    """A damaged row degrades to the open default instead of erroring."""
+    """A damaged row degrades to the closed default instead of erroring."""
     engine = get_or_create_engine(db_uri)
     maker = make_named_managed_session_maker(engine, query_name_prefix="test.artifact_sharing")
     with maker("insert_malformed_row") as session:

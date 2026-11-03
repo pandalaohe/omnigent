@@ -153,3 +153,7 @@ Copyright (c) 2011-2012 by Selectel. Copyright (c) 2012-2017 by pyte authors and
 
 psycopg - https://pypi.org/project/psycopg/
 Copyright (C) 2003-2019 Federico Di Gregorio. Copyright (C) 2020-2021 The Psycopg Team.
+
+________________
+
+omnigent-wukong is an unofficial distribution of Omnigent (https://github.com/omnigent-ai/omnigent), modified by pandalaohe (https://github.com/pandalaohe). It is not affiliated with or endorsed by the Omnigent project or Databricks. Each omnigent-wukong release lists the files it modified in MODIFIED_FILES.txt and describes the changes in MODIFICATIONS.md.
