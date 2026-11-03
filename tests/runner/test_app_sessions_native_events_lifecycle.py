@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 
+import httpx
 import pytest
 
 from omnigent.entities.session_resources import SessionResourceView
@@ -41,6 +42,46 @@ from tests.runner.conftest import (
 )
 from tests.runner.helpers import NullServerClient
 from tests.runner.native_helpers import _harness_spec
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [200, 404, 409])
+async def test_approval_forward_preserves_harness_delivery_status(status):
+    app, pm = await _build_app_for_spec(_harness_spec("pi"))
+    forwarded = []
+
+    async def receive(request):
+        import json
+
+        forwarded.append(json.loads(request.content))
+        return httpx.Response(status, json={"received": status == 200})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(receive), base_url="http://harness"
+    ) as harness:
+        pm._client = harness
+        async with _runner_client(app) as client:
+            response = await client.post(
+                "/v1/sessions/child/events",
+                json={
+                    "type": "approval",
+                    "data": {
+                        "elicitation_id": "elicit_pi_dialog",
+                        "action": "accept",
+                        "content": {"0": "Run once"},
+                    },
+                },
+            )
+    assert response.status_code == status
+    assert response.json() == {"received": status == 200}
+    assert forwarded == [
+        {
+            "type": "approval",
+            "elicitation_id": "elicit_pi_dialog",
+            "action": "accept",
+            "content": {"0": "Run once"},
+        }
+    ]
 
 
 class _EventRecordingServerClient(NullServerClient):

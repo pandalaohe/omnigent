@@ -170,6 +170,7 @@ def test_builtin_names_size_matches_registry() -> None:
                 "sys_host_restart",
                 "sys_standing_approval",
                 "sys_standing_pass",
+                "sys_approval_answer",
                 "ui_open_file",
             }
         )

@@ -285,6 +285,7 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     "sys_project_settings_update": None,
     "sys_standing_approval": None,
     "sys_standing_pass": None,
+    "sys_approval_answer": None,
     "sys_host_restart": None,
     # ``sys_list_models`` is auto-registered by
     # ``ToolManager._register_sub_agent_tools`` with the dispatch grant

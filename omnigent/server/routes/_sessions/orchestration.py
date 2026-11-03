@@ -395,6 +395,7 @@ from omnigent.server.routes._sessions.helpers import (
     _routing_decision_item_from_sse,
     _runner_supports_side_chat_settings,
     _RunnerForwardResult,
+    _same_parked_question,
     _seed_missing_title_from_user_message,
     _session_background_activity_count,
     _session_status_from_cache,
@@ -531,7 +532,7 @@ def _harness_elicitation_request_fingerprint(params: ElicitationRequestParams) -
         ``"9f86d081..."``.
     """
     canonical = json.dumps(
-        params.model_dump(mode="json"),
+        params.model_dump(mode="json", exclude={"triage"}),
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -1048,6 +1049,11 @@ async def _publish_and_wait_for_harness_elicitation(
         resolved_elsewhere=asyncio.Event(),
         request_fingerprint=request_fingerprint,
     )
+    from omnigent.server.child_approvals import card_lock
+
+    publication_lock = card_lock(session_id, elicitation_id)
+    await publication_lock.acquire()
+    publication_locked = True
     _harness_elicitation_registry[elicitation_id] = future
     _harness_elicitation_owners[elicitation_id] = session_id
     _harness_parked_elicitations[elicitation_id] = parked
@@ -1086,15 +1092,20 @@ async def _publish_and_wait_for_harness_elicitation(
             params=params,
         )
         event_payload = event.model_dump()
-        session_stream.publish(session_id, event_payload)
-        published_request = True
+        offer_ticket = None
         if conversation_store is not None:
-            await asyncio.to_thread(
-                _publish_elicitation_request_to_ancestors,
-                conversation_store,
-                session_id,
-                event_payload,
+            from omnigent.server.child_approvals import publish_request_locked
+
+            offer_ticket = await publish_request_locked(
+                session_id, event_payload, conversation_store
             )
+        else:
+            session_stream.publish(session_id, event_payload)
+        published_request = True
+        publication_lock.release()
+        publication_locked = False
+        if offer_ticket is not None:
+            offer_ticket.deliver()
         if published is not None:
             published.set()
         disconnect_task: asyncio.Task[Any] | None = None
@@ -1127,30 +1138,23 @@ async def _publish_and_wait_for_harness_elicitation(
                 and timeout_snapshot.stop_enabled
                 and timeout_snapshot.stop is not None
             ):
-                # Deadline, not disconnect and not terminal. Decide
-                # synchronously, before the cleanup awaits below, so an
-                # approval that lands from here on is refused by the
-                # timed-out record rather than resolving a wait the
-                # server already ended.
-                if future.done() and future.exception() is None:
-                    # An answer accepted before the decision wins.
-                    settled = True
-                    verdict = future.result()
-                    settled_action = getattr(verdict, "action", None)
-                    _drop_harness_elicitation_timeout(elicitation_id)
-                    return approved_verdict(verdict)
-                # Only the wait still holding the registry entry may take
-                # the decision: a retry re-parks over it, and a
-                # proxy-stranded older wait must neither stop the turn the
-                # retry is carrying nor double the stop when nobody answers.
-                existing_timed_out = _harness_pre_resolved_elicitations.get(elicitation_id)
-                if _harness_elicitation_registry.get(elicitation_id) is future and not (
-                    existing_timed_out is not None and existing_timed_out.timed_out
-                ):
-                    _mark_harness_elicitation_timed_out(
-                        session_id, elicitation_id, request_fingerprint
-                    )
-                    stop_callback = timeout_snapshot.stop
+                async with card_lock(session_id, elicitation_id):
+                    # A receipt and verdict already holding the lock win;
+                    # otherwise the tombstone refuses a late answer.
+                    if future.done() and future.exception() is None:
+                        settled = True
+                        verdict = future.result()
+                        settled_action = getattr(verdict, "action", None)
+                        _drop_harness_elicitation_timeout(elicitation_id)
+                        return approved_verdict(verdict)
+                    existing_timed_out = _harness_pre_resolved_elicitations.get(elicitation_id)
+                    if _harness_elicitation_registry.get(elicitation_id) is future and not (
+                        existing_timed_out is not None and existing_timed_out.timed_out
+                    ):
+                        _mark_harness_elicitation_timed_out(
+                            session_id, elicitation_id, request_fingerprint
+                        )
+                        stop_callback = timeout_snapshot.stop
         finally:
             for race_task in race_tasks:
                 if not race_task.done():
@@ -1218,54 +1222,68 @@ async def _publish_and_wait_for_harness_elicitation(
             _drop_harness_elicitation_timeout(elicitation_id)
         return None
     finally:
+        if publication_locked:
+            publication_lock.release()
         if published is not None:
             published.set()
-        # Pop only our own entries — a hook retry may have re-parked
-        # this id with a new future while this wait was unwinding.
-        if _harness_elicitation_registry.get(elicitation_id) is future:
-            _harness_elicitation_registry.pop(elicitation_id, None)
-            _harness_elicitation_owners.pop(elicitation_id, None)
-        delivery = getattr(params, "native_delivery", None)
-        deferring_clear = published_request and (
-            not settled or (delivery is not None and settled_action is not None)
-        )
-        # A deferred clear keeps the parked record alive for the grace so a
-        # terminal-side resolution that is still in flight can still land on
-        # it; that task owns the pop. Popping here instead is what made a
-        # CLI-answered question expire: the answer severs the poll
-        # instantly, while the mirrored tool result proving it was answered
-        # needs a transcript poll plus a POST, so it always arrived after
-        # the record it had to correlate against was gone. The owners entry
-        # is still dropped above, which keeps the web-verdict path from
-        # reaching this record — only the terminal correlation can.
-        if not deferring_clear and _harness_parked_elicitations.get(elicitation_id) is parked:
-            _harness_parked_elicitations.pop(elicitation_id, None)
-        if deferring_clear:
-            # Severed without an answer — defer the clear (scheduled
-            # before any await so handler cancellation can't skip it).
-            _schedule_deferred_elicitation_clear(
-                session_id,
-                elicitation_id,
-                conversation_store,
-                parked=parked,
-                native_delivery_attempt=delivery["attempt"] if delivery is not None else None,
+        async with card_lock(session_id, elicitation_id):
+            current_future = _harness_elicitation_registry.get(elicitation_id)
+            current_parked = _harness_parked_elicitations.get(elicitation_id)
+            owns_generation = current_future is future or (
+                current_future is None and (current_parked is None or current_parked is parked)
             )
-        elif published_request:
-            _publish_elicitation_resolved(
-                session_id,
-                elicitation_id,
-                action=settled_action,
-                reason=settled_reason,
-            )
-            if conversation_store is not None:
-                await asyncio.to_thread(
-                    _publish_elicitation_resolved_to_ancestors,
-                    conversation_store,
-                    session_id,
-                    elicitation_id,
-                    settled_action,
-                    settled_reason,
+            if owns_generation:
+                # Pop only our own entries — a hook retry may have re-parked
+                # this id with a new future while this wait was unwinding.
+                if _harness_elicitation_registry.get(elicitation_id) is future:
+                    _harness_elicitation_registry.pop(elicitation_id, None)
+                    _harness_elicitation_owners.pop(elicitation_id, None)
+                delivery = getattr(params, "native_delivery", None)
+                deferring_clear = published_request and (
+                    not settled or (delivery is not None and settled_action is not None)
                 )
+                # A deferred clear keeps the parked record alive for the grace so a
+                # terminal-side resolution that is still in flight can still land on
+                # it; that task owns the pop. Popping here instead is what made a
+                # CLI-answered question expire: the answer severs the poll
+                # instantly, while the mirrored tool result proving it was answered
+                # needs a transcript poll plus a POST, so it always arrived after
+                # the record it had to correlate against was gone. The owners entry
+                # is still dropped above, which keeps the web-verdict path from
+                # reaching this record — only the terminal correlation can.
+                if (
+                    not deferring_clear
+                    and _harness_parked_elicitations.get(elicitation_id) is parked
+                ):
+                    _harness_parked_elicitations.pop(elicitation_id, None)
+                if deferring_clear:
+                    # Severed without an answer — defer the clear (scheduled
+                    # before any await so handler cancellation can't skip it).
+                    _schedule_deferred_elicitation_clear(
+                        session_id,
+                        elicitation_id,
+                        conversation_store,
+                        parked=parked,
+                        native_delivery_attempt=delivery["attempt"]
+                        if delivery is not None
+                        else None,
+                    )
+                elif published_request:
+                    _publish_elicitation_resolved(
+                        session_id,
+                        elicitation_id,
+                        action=settled_action,
+                        reason=settled_reason,
+                    )
+                    if conversation_store is not None:
+                        await asyncio.to_thread(
+                            _publish_elicitation_resolved_to_ancestors,
+                            conversation_store,
+                            session_id,
+                            elicitation_id,
+                            settled_action,
+                            settled_reason,
+                        )
 
 
 def start_detached_elicitation(
@@ -1409,59 +1427,70 @@ def _schedule_deferred_elicitation_clear(
                 resolved_in_terminal = True
             except TimeoutError:
                 pass
+
+        from omnigent.server.child_approvals import card_lock
+
+        async with card_lock(session_id, elicitation_id):
+            current = _harness_parked_elicitations.get(elicitation_id)
+            if parked is not None and current is not None and current is not parked:
+                if resolved_in_terminal and _same_parked_question(parked, current):
+                    current.resolved_elsewhere.set()
+                return
             parked_is_current = _harness_parked_elicitations.get(elicitation_id) is parked
             if parked_is_current:
                 _harness_parked_elicitations.pop(elicitation_id, None)
-        if elicitation_id in _harness_elicitation_registry:
-            # Re-parked — the new wait owns the eventual clear. Hand it the
-            # terminal's answer, whose only other carrier was the record
-            # just popped: its own race is watching a fresh Event, and the
-            # mirrored result that proved the answer will not be sent twice.
-            if resolved_in_terminal:
-                current = _harness_parked_elicitations.get(elicitation_id)
-                if current is not None:
-                    current.resolved_elsewhere.set()
-            return
-        if native_delivery_attempt is not None:
-            if not parked_is_current:
-                return  # A reconnect owns its own delivery grace, even for the same attempt.
-            entry = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
-            if (
-                entry is None
-                or entry[1].get("params", {}).get("native_delivery", {}).get("attempt")
-                != native_delivery_attempt
-            ):
-                return  # A receipt or a newer delivery attempt superseded this wait.
-        if resolved_in_terminal and elicitation_id not in _harness_pre_resolved_elicitations:
-            # Keep the terminal-side tombstone the resolve helper would have
-            # written had the record already been gone. A hook retry can
-            # re-park after this clear (it backs off between POSTs), and
-            # without the tombstone it re-publishes an answered question and
-            # waits out its own timeout.
-            #
-            # Never over an existing one. ``resolved_elsewhere`` has two
-            # producers, and the web verdict is the other: it sets the event
-            # AND writes a verdict-carrying tombstone, so when a cancellation
-            # lands between that verdict and ``settled`` being read, this
-            # clear sees the event set and would replace the user's answer
-            # with a no-verdict tombstone. The retry would then fail-ask a
-            # question that was already approved.
-            _prune_pre_resolved_harness_elicitations()
-            _harness_pre_resolved_elicitations[elicitation_id] = _PreResolvedHarnessElicitation(
-                session_id=session_id,
-                created_at=time.time(),
-            )
-            _prune_pre_resolved_harness_elicitations()
-        reason = None if resolved_in_terminal else "unanswered"
-        _publish_elicitation_resolved(session_id, elicitation_id, reason=reason)
-        if conversation_store is not None:
-            await asyncio.to_thread(
-                _publish_elicitation_resolved_to_ancestors,
-                conversation_store,
-                session_id,
-                elicitation_id,
-                reason=reason,
-            )
+            if elicitation_id in _harness_elicitation_registry:
+                # Re-parked — the new wait owns the eventual clear. Hand it the
+                # terminal's answer, whose only other carrier was the record
+                # just popped: its own race is watching a fresh Event, and the
+                # mirrored result that proved the answer will not be sent twice.
+                if resolved_in_terminal:
+                    current = _harness_parked_elicitations.get(elicitation_id)
+                    if current is not None and _same_parked_question(parked, current):
+                        current.resolved_elsewhere.set()
+                return
+            if native_delivery_attempt is not None:
+                if not parked_is_current:
+                    return  # A reconnect owns its own delivery grace, even for the same attempt.
+                entry = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
+                if (
+                    entry is None
+                    or entry[1].get("params", {}).get("native_delivery", {}).get("attempt")
+                    != native_delivery_attempt
+                ):
+                    return  # A receipt or a newer delivery attempt superseded this wait.
+            if resolved_in_terminal and elicitation_id not in _harness_pre_resolved_elicitations:
+                # Keep the terminal-side tombstone the resolve helper would have
+                # written had the record already been gone. A hook retry can
+                # re-park after this clear (it backs off between POSTs), and
+                # without the tombstone it re-publishes an answered question and
+                # waits out its own timeout.
+                #
+                # Never over an existing one. ``resolved_elsewhere`` has two
+                # producers, and the web verdict is the other: it sets the event
+                # AND writes a verdict-carrying tombstone, so when a cancellation
+                # lands between that verdict and ``settled`` being read, this
+                # clear sees the event set and would replace the user's answer
+                # with a no-verdict tombstone. The retry would then fail-ask a
+                # question that was already approved.
+                _prune_pre_resolved_harness_elicitations()
+                _harness_pre_resolved_elicitations[elicitation_id] = (
+                    _PreResolvedHarnessElicitation(
+                        session_id=session_id,
+                        created_at=time.time(),
+                    )
+                )
+                _prune_pre_resolved_harness_elicitations()
+            reason = None if resolved_in_terminal else "unanswered"
+            _publish_elicitation_resolved(session_id, elicitation_id, reason=reason)
+            if conversation_store is not None:
+                await asyncio.to_thread(
+                    _publish_elicitation_resolved_to_ancestors,
+                    conversation_store,
+                    session_id,
+                    elicitation_id,
+                    reason=reason,
+                )
 
     clear_coroutine = _clear_after_grace()
     try:
@@ -2656,10 +2685,13 @@ def _build_session_list_item(
         # decrement) must not override it. Gating on runner_id keeps the
         # cross-replica fallback where it's needed while making the unbound
         # path index-only and free of the persist-lag race.
-        pending_elicitations_count=(
-            max(pending_count, conv.pending_elicitation_count or 0)
-            if conv.runner_id is not None
-            else pending_count
+        pending_elicitations_count=pending_elicitations.display_count(
+            conv.id,
+            (
+                max(pending_count, conv.pending_elicitation_count or 0)
+                if conv.runner_id is not None
+                else pending_count
+            ),
         ),
         child_pending_elicitations_count=child_pending_count,
         pending_elicitation_key=pending_key,
@@ -4076,9 +4108,16 @@ async def _persist_elicitation_answer(
             "[redacted]" if secret else "; ".join(value) if isinstance(value, list) else str(value)
         )
         answers.append({"question": text, "answer": answer})
+    actor = (result.meta or {}).get("omnigent_answered_by")
     payload = {"elicitation_id": elicitation_id, "action": result.action, "answers": answers}
+    if actor is not None:
+        payload["answered_by"] = actor
     text = "[System: Question answered]\n" + json.dumps(payload, ensure_ascii=False)
-    fingerprint = hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            {key: value for key, value in params.items() if key != "triage"}, sort_keys=True
+        ).encode()
+    ).hexdigest()
     stable_id = hashlib.sha256(
         f"elicitation_answer:{session_id}:{elicitation_id}:{fingerprint}".encode()
     ).hexdigest()[:32]
@@ -4087,7 +4126,7 @@ async def _persist_elicitation_answer(
         response_id=generate_task_id(),
         data=MessageData(
             role="user",
-            user_authored=True,
+            user_authored=actor is None,
             content=[
                 {"type": "input_text", "text": text},
                 *(
@@ -4204,7 +4243,10 @@ async def _resolve_elicitation_locked(
     runner_router: RunnerRouter | None,
     conversation_store: ConversationStore | None = None,
     file_store: FileStore | None = None,
-) -> None:
+    *,
+    answered_by: dict[str, str] | None = None,
+    skip_runner_forward: bool = False,
+) -> Literal["won", "already_resolved"]:
     """
     Resolve one outstanding elicitation from an approval payload.
 
@@ -4262,6 +4304,16 @@ async def _resolve_elicitation_locked(
     # malformed body. A missing id degrades gracefully below (no Future
     # matches, no resolved event published) rather than 500-ing the
     # client — the runner forward still fires so the runner can reject.
+    # Attribution can only be supplied by the server's authenticated parent
+    # answer path, never by a user's resolve payload or a runner's metadata.
+    meta = dict(data["_meta"]) if isinstance(data.get("_meta"), dict) else {}
+    meta.pop("omnigent_answered_by", None)
+    if answered_by is not None:
+        meta["omnigent_answered_by"] = answered_by
+    if meta:
+        data["_meta"] = meta
+    else:
+        data.pop("_meta", None)
     elicitation_id = data.get("elicitation_id", "")
     # A timed-out id belongs to a wait the server already ended. Refuse
     # the answer before the live-future and unknown-id branches can
@@ -4289,6 +4341,8 @@ async def _resolve_elicitation_locked(
         ),
         None,
     )
+    if answered_by is not None and pending_entry is None:
+        return "already_resolved"
     reuse_verdict = False
     if (
         pending_entry is None
@@ -4334,7 +4388,7 @@ async def _resolve_elicitation_locked(
     if isinstance(elicitation_id, str) and await _resolve_native_delivery(
         session_id, elicitation_id, data, conversation_store
     ):
-        return
+        return "won"
     if conversation_store is not None and pending_entry is not None:
         params = pending_entry.get("params")
         try:
@@ -4445,7 +4499,9 @@ async def _resolve_elicitation_locked(
     # The verdict rides along so the parent-side resolution notice
     # states how the gate was answered instead of a bare "resolved".
     if isinstance(elicitation_id, str) and elicitation_id:
-        _publish_elicitation_resolved(session_id, elicitation_id, action=data.get("action"))
+        _publish_elicitation_resolved(
+            session_id, elicitation_id, action=data.get("action"), answered_by=answered_by
+        )
         if conversation_store is not None:
             await asyncio.to_thread(
                 _publish_elicitation_resolved_to_ancestors,
@@ -4453,10 +4509,13 @@ async def _resolve_elicitation_locked(
                 session_id,
                 elicitation_id,
                 data.get("action"),
+                answered_by=answered_by,
             )
     # Runner-side elicitations (policy approvals, scaffold dispatch)
     # resolve when the canonical approval event reaches the runner.
-    await _forward_approval_to_runner(session_id, data, runner_router)
+    if not skip_runner_forward:
+        await _forward_approval_to_runner(session_id, data, runner_router)
+    return "won"
 
 
 def _spawn_native_approval_popup_forward(
@@ -12365,32 +12424,36 @@ async def _relay_runner_stream_once(
                                 },
                             }
                     if evt_type == "response.elicitation_request":
-                        session_stream.publish(session_id, event)
-                        await asyncio.to_thread(
-                            _publish_elicitation_request_to_ancestors,
-                            conversation_store,
-                            session_id,
-                            event,
-                        )
+                        from omnigent.server.child_approvals import publish_request
+
+                        # Only the server stamps offers. Reconnects adopt a live
+                        # indexed stamp; a runner cannot choose its answerer.
+                        event = {**event, "params": {**event.get("params", {})}}
+                        event["params"].pop("triage", None)
+                        await publish_request(session_id, event, conversation_store)
                         continue
                     if evt_type == "response.elicitation_resolved":
-                        from omnigent.server.terminal_agent_access import (
-                            release_terminal_access_request,
-                        )
+                        from omnigent.server.child_approvals import card_lock
 
-                        if isinstance(event.get("elicitation_id"), str):
-                            release_terminal_access_request(session_id, event["elicitation_id"])
-                        session_stream.publish(session_id, event)
                         elicitation_id = event.get("elicitation_id")
                         if isinstance(elicitation_id, str) and elicitation_id:
-                            await asyncio.to_thread(
-                                _publish_elicitation_resolved_to_ancestors,
-                                conversation_store,
-                                session_id,
-                                elicitation_id,
-                                event.get("action"),
-                                reason=event.get("reason"),
-                            )
+                            async with card_lock(session_id, elicitation_id):
+                                _publish_elicitation_resolved(
+                                    session_id,
+                                    elicitation_id,
+                                    action=event.get("action"),
+                                    reason=event.get("reason"),
+                                )
+                                await asyncio.to_thread(
+                                    _publish_elicitation_resolved_to_ancestors,
+                                    conversation_store,
+                                    session_id,
+                                    elicitation_id,
+                                    event.get("action"),
+                                    reason=event.get("reason"),
+                                )
+                        else:
+                            session_stream.publish(session_id, event)
                         continue
                     session_stream.publish(session_id, event)
 

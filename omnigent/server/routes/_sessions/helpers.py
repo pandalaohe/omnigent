@@ -139,6 +139,7 @@ from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_parked_elicitations,
     _harness_pre_resolved_elicitations,
+    _ParkedHarnessElicitation,
     _PreResolvedHarnessElicitation,
 )
 from omnigent.server.auth import (
@@ -1098,6 +1099,73 @@ def _signal_terminal_resolved_harness_elicitation(*args: Any, **kwargs: Any) -> 
     return _facade._signal_terminal_resolved_harness_elicitation(*args, **kwargs)
 
 
+_terminal_resolution_tasks: WorkspaceScopedCache[str, asyncio.Task[None]] = WorkspaceScopedCache()
+
+
+def _same_parked_question(
+    first: _ParkedHarnessElicitation | None, second: _ParkedHarnessElicitation | None
+) -> bool:
+    """Prove identity without relying on a potentially truncated display preview."""
+    return (
+        first is not None
+        and second is not None
+        and first.session_id == second.session_id
+        and first.request_fingerprint is not None
+        and first.request_fingerprint == second.request_fingerprint
+        and first.tool_name is not None
+        and first.tool_name == second.tool_name
+        and isinstance(first.tool_input, dict)
+        and first.tool_input == second.tool_input
+    )
+
+
+def _serialize_terminal_resolution(
+    session_id: str,
+    elicitation_id: str,
+    parked: _ParkedHarnessElicitation | None,
+    apply: Callable[[], None],
+) -> None:
+    """Keep synchronous signals immediate unless a card verdict already owns the lock."""
+    from omnigent.server.child_approvals import card_lock
+
+    lock = card_lock(session_id, elicitation_id)
+    if not lock.locked():
+        apply()
+        return
+
+    async def after_verdict() -> None:
+        async with lock:
+            current = _harness_parked_elicitations.get(elicitation_id)
+            if current is parked:
+                apply()
+            elif (
+                parked is not None
+                and current is not None
+                and parked.session_id == session_id
+                and _same_parked_question(parked, current)
+            ):
+                # A retry replaced the waiter before this queued native receipt.
+                # Previews can collide; also require the full tool identity/input.
+                apply()
+                current.resolved_elsewhere.set()
+
+    key = secrets.token_hex(16)
+    coroutine = after_verdict()
+    try:
+        task = asyncio.create_task(coroutine)
+    except BaseException:
+        coroutine.close()
+        raise
+    _terminal_resolution_tasks[key] = task
+
+    def finished(done: asyncio.Task[None]) -> None:
+        _terminal_resolution_tasks.pop(key, None)
+        if not done.cancelled() and done.exception() is not None:
+            _logger.error("Terminal approval resolution failed", exc_info=done.exception())
+
+    task.add_done_callback(finished)
+
+
 def _signal_terminal_resolved_harness_elicitation_impl(
     session_id: str,
     tool_name: str,
@@ -1146,8 +1214,8 @@ def _signal_terminal_resolved_harness_elicitation_impl(
         ``{"command": "ls"}``, or ``None`` if unavailable.
     """
     candidates = [
-        parked
-        for parked in _harness_parked_elicitations.values()
+        (elicitation_id, parked)
+        for elicitation_id, parked in _harness_parked_elicitations.items()
         if parked.session_id == session_id
         and parked.tool_name == tool_name
         and not parked.resolved_elsewhere.is_set()
@@ -1155,9 +1223,11 @@ def _signal_terminal_resolved_harness_elicitation_impl(
     if not candidates:
         return
     mirrored_input = _canonical_tool_input(tool_input)
-    for parked in candidates:
+    for elicitation_id, parked in candidates:
         if _canonical_tool_input(parked.tool_input) == mirrored_input:
-            parked.resolved_elsewhere.set()
+            _serialize_terminal_resolution(
+                session_id, elicitation_id, parked, parked.resolved_elsewhere.set
+            )
             return
     # No exact input match. Correlation is exact-only: resolving a
     # same-named-but-different-input prompt here would clear the wrong
@@ -1354,29 +1424,33 @@ def _signal_harness_elicitation_resolved_by_id(
             "Elicitation does not belong to this session.",
             code=ErrorCode.INVALID_INPUT,
         )
-    entry = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
-    native_delivery = entry is not None and entry[1].get("params", {}).get("native_delivery")
-    # A native receipt confirms delivery, so a re-park must not replay its web verdict.
-    if parked is None or native_delivery:
-        # A timed-out record is a refusal, not a tombstone: replacing it
-        # with an ordinary one would let a late answer through. Only its
-        # own session may leave it alone; a foreign signal is vetoed as
-        # with a parked record.
-        existing = _harness_pre_resolved_elicitations.get(elicitation_id)
-        if existing is not None and existing.timed_out:
-            if existing.session_id != session_id:
-                raise OmnigentError(
-                    "Elicitation does not belong to this session.",
-                    code=ErrorCode.INVALID_INPUT,
-                )
-            return
-        _harness_pre_resolved_elicitations[elicitation_id] = _PreResolvedHarnessElicitation(
-            session_id=session_id,
-            created_at=time.time(),
-        )
-        _prune_pre_resolved_harness_elicitations()
-    if parked is not None:
-        parked.resolved_elsewhere.set()
+
+    def apply() -> None:
+        entry = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
+        native_delivery = entry is not None and entry[1].get("params", {}).get("native_delivery")
+        # A native receipt confirms delivery, so a re-park must not replay its web verdict.
+        if parked is None or native_delivery:
+            # A timed-out record is a refusal, not a tombstone: replacing it
+            # with an ordinary one would let a late answer through. Only its
+            # own session may leave it alone; a foreign signal is vetoed as
+            # with a parked record.
+            existing = _harness_pre_resolved_elicitations.get(elicitation_id)
+            if existing is not None and existing.timed_out:
+                if existing.session_id != session_id:
+                    raise OmnigentError(
+                        "Elicitation does not belong to this session.",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                return
+            _harness_pre_resolved_elicitations[elicitation_id] = _PreResolvedHarnessElicitation(
+                session_id=session_id,
+                created_at=time.time(),
+            )
+            _prune_pre_resolved_harness_elicitations()
+        if parked is not None:
+            parked.resolved_elsewhere.set()
+
+    _serialize_terminal_resolution(session_id, elicitation_id, parked, apply)
 
 
 def _format_sse(event_type: str, data: dict[str, Any]) -> str:
@@ -1711,6 +1785,9 @@ async def _child_pending_elicitations_by_parent(
             child_counts[child_id] = max(index_count, child.pending_elicitation_count or 0)
         else:
             child_counts[child_id] = index_count
+        child_counts[child_id] = pending_elicitations.display_count(
+            child_id, child_counts[child_id]
+        )
     if liveness_lookup is not None:
         pending_child_ids = [cid for cid, count in child_counts.items() if count > 0]
         if pending_child_ids:
@@ -2084,6 +2161,8 @@ def _publish_elicitation_resolved_to_ancestors(
     elicitation_id: str,
     action: str | None = None,
     reason: str | None = None,
+    *,
+    answered_by: dict[str, str] | None = None,
 ) -> None:
     """
     Mirror an elicitation-resolved event into each ancestor stream.
@@ -2099,12 +2178,14 @@ def _publish_elicitation_resolved_to_ancestors(
         mirrors; see :func:`_publish_elicitation_resolved`.
     """
     ancestor_ids = _ancestor_session_ids(conv_store, session_id)
+    if answered_by is None:
+        answered_by = _elicitation_answer_actor(session_id, elicitation_id)
     with _ancestor_elicitation_mirror_lock:
         if pending_elicitations.lookup(elicitation_id, conversation_id=session_id) is not None:
             return  # The child re-asked under this id; its request mirror owns the card.
         for ancestor_id in ancestor_ids:
             _publish_elicitation_resolved(
-                ancestor_id, elicitation_id, action=action, reason=reason
+                ancestor_id, elicitation_id, action=action, reason=reason, answered_by=answered_by
             )
 
 
@@ -3824,11 +3905,21 @@ _VALID_ELICITATION_ACTIONS: tuple[str, ...] = ("accept", "decline", "cancel")
 _VALID_ELICITATION_RESOLVED_REASONS: tuple[str, ...] = ("unanswered", "timed_out")
 
 
+def _elicitation_answer_actor(session_id: str, elicitation_id: str) -> dict[str, str] | None:
+    record = _harness_pre_resolved_elicitations.get(elicitation_id)
+    if record is None or record.session_id != session_id or record.result is None:
+        return None
+    actor = (record.result.meta or {}).get("omnigent_answered_by")
+    return actor if isinstance(actor, dict) else None
+
+
 def _publish_elicitation_resolved(
     session_id: str,
     elicitation_id: str,
     action: str | None = None,
     reason: str | None = None,
+    *,
+    answered_by: dict[str, str] | None = None,
 ) -> None:
     """
     Universal "approval done" signal — single publish drives both
@@ -3853,6 +3944,8 @@ def _publish_elicitation_resolved(
     """
     from omnigent.server.terminal_agent_access import release_terminal_access_request
 
+    if answered_by is None:
+        answered_by = _elicitation_answer_actor(session_id, elicitation_id)
     release_terminal_access_request(session_id, elicitation_id)
     payload: dict[str, Any] = {
         "type": "response.elicitation_resolved",
@@ -3862,6 +3955,9 @@ def _publish_elicitation_resolved(
         payload["action"] = action
     elif reason in _VALID_ELICITATION_RESOLVED_REASONS:
         payload["reason"] = reason
+    if answered_by is not None:
+        payload["answered_by"] = {key: answered_by[key] for key in ("session_id", "title")}
+        payload["reason"] = answered_by["reason"]
     session_stream.publish(session_id, payload)
 
 
@@ -13707,7 +13803,9 @@ def _child_session_summary_from_conversation(
         # Surface the sub-agent's parked-elicitation count from the same
         # in-memory index that feeds the sidebar badge, so the Agents
         # rail can flag a child that's awaiting user input.
-        pending_elicitations_count=pending_elicitations.count_for(conv.id),
+        pending_elicitations_count=pending_elicitations.display_count(
+            conv.id, pending_elicitations.count_for(conv.id)
+        ),
         # The model routing picked for this child, reported only when a
         # decision actually produced it: a user-pinned model_override is not a
         # routed model, and reporting one with a null decision id makes the

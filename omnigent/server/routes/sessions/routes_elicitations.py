@@ -27,6 +27,7 @@ from omnigent.server.auth import (
     LEVEL_EDIT,
     AuthProvider,
 )
+from omnigent.server.child_approvals import ApprovalAnswer, answer
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
 )
@@ -76,6 +77,40 @@ def register_elicitations_routes(
     runner_tunnel_tokens: frozenset[str] | None = None,
 ) -> None:
     """Register the elicitations routes on router."""
+
+    @router.post(
+        "/sessions/{caller_id}/child-approvals/{target_id}/{elicitation_id}",
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def answer_child_approval(
+        request: Request,
+        caller_id: str,
+        target_id: str,
+        elicitation_id: str,
+        body: ApprovalAnswer,
+    ) -> dict[str, str]:
+        from omnigent.errors import ErrorCode, OmnigentError
+        from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+
+        caller = await asyncio.to_thread(conversation_store.get_conversation, caller_id)
+        token = request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER)
+        try:
+            bound = token_bound_runner_id(token) if token else None
+        except RuntimeError:
+            bound = None
+        if caller is None or not caller.runner_id or bound != caller.runner_id:
+            raise OmnigentError("The caller's bound runner is required", code=ErrorCode.FORBIDDEN)
+        await _require_access_and_level(
+            _get_user_id(request, auth_provider),
+            target_id,
+            ELICITATION_RESOLVE_LEVEL,
+            permission_store,
+            conversation_store,
+        )
+        return await answer(
+            caller, target_id, elicitation_id, body, conversation_store, runner_router, file_store
+        )
 
     @router.post(
         "/sessions/{session_id}/elicitations/{elicitation_id}/resolve",

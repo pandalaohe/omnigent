@@ -73,7 +73,7 @@ _executor: ThreadPoolExecutor | None = None
 # in-memory caches these writes mirror; entries live for the process.
 _last_status: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 # Last count persisted per session, for dedupe.
-_last_pending: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+_last_pending: WorkspaceScopedCache[str, tuple[int, int]] = WorkspaceScopedCache()
 # This process's own last touch_runner_liveness() stamp per runner id.
 # Never erased by clear_runner_liveness — only configure() resets it.
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by globally-unique runner_id
@@ -344,14 +344,17 @@ def persist_pending_count(conversation_id: str, count: int) -> None:
     :param conversation_id: Session/conversation identifier.
     :param count: Outstanding elicitations, ``>= 0``.
     """
-    if _store is None or _last_pending.get(conversation_id) == count:
+    from omnigent.runtime.pending_elicitations import display_count
+
+    signature = (count, display_count(conversation_id, count))
+    if _store is None or _last_pending.get(conversation_id) == signature:
         return
-    _last_pending[conversation_id] = count
+    _last_pending[conversation_id] = signature
 
     def _evict() -> None:
         # See persist_live_status._evict: keep the dedupe cache honest so a
         # dropped count write can be re-attempted by the next publish.
-        if _last_pending.get(conversation_id) == count:
+        if _last_pending.get(conversation_id) == signature:
             _last_pending.pop(conversation_id, None)
 
     submit(

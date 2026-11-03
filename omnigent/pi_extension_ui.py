@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
@@ -13,6 +14,44 @@ FIRE_AND_FORGET_METHODS: frozenset[str] = frozenset(
 
 POLICY_NAME = "pi_native_extension_ui"
 PHASE = "pi_extension_ui"
+APPROVAL_DECLARATION_PREFIX = "omnigent-approval/1 "
+
+
+def parse_approval_declaration(req: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+    """Read a producer's exact, single-use shell approval; malformed dialogs stay intact."""
+    title = req.get("title")
+    title = title if isinstance(title, str) else ""
+    first, _, remaining = title.partition("\n")
+    if req.get("method") != "select" or not first.startswith(APPROVAL_DECLARATION_PREFIX):
+        return None, title
+    try:
+        value = json.loads(first[len(APPROVAL_DECLARATION_PREFIX) :])
+    except (ValueError, RecursionError):
+        return None, title
+    if not isinstance(value, dict):
+        return None, title
+    if value.keys() - {"scope", "action", "command", "cwd", "approve", "deny"}:
+        return None, title
+    command, approve, deny = (value.get(key) for key in ("command", "approve", "deny"))
+    if (
+        value.get("scope") != "once"
+        or value.get("action") != "shell"
+        or not isinstance(command, str)
+        or not command.strip()
+        or len(command.encode("utf-8")) > 16 * 1024
+        or not isinstance(approve, str)
+        or not approve
+        or not isinstance(deny, str)
+        or not deny
+        or approve == deny
+        or not isinstance(req.get("options"), list)
+        or len(req["options"]) != 2
+        or not all(isinstance(option, str) for option in req["options"])
+        or set(req["options"]) != {approve, deny}
+        or ("cwd" in value and not isinstance(value["cwd"], str))
+    ):
+        return None, title
+    return value, remaining
 
 
 def is_dialog_method(method: object) -> bool:
@@ -40,6 +79,11 @@ def to_elicitation_params(req: dict[str, Any]) -> ElicitationRequestParams:
         raise ValueError(f"Unsupported Pi extension UI method: {method!r}")
 
     extras: dict[str, Any] = {"pi_extension_ui": req}
+    approval, title = parse_approval_declaration(req)
+    display_req = req
+    if approval is not None:
+        extras["approval"] = approval
+        display_req = {**req, "title": title}
     if method == "confirm":
         return ElicitationRequestParams(
             mode="form",
@@ -51,8 +95,8 @@ def to_elicitation_params(req: dict[str, Any]) -> ElicitationRequestParams:
             **extras,
         )
 
-    extras["ask_user_question"] = _ask_user_question(req, method)
-    title = _confirm_message(req, default="Pi needs your input")
+    extras["ask_user_question"] = _ask_user_question(display_req, method)
+    title = _confirm_message(display_req, default="Pi needs your input")
     return ElicitationRequestParams(
         mode="form",
         message=title,
@@ -79,6 +123,10 @@ def to_ui_response(
             "id": req_id,
             "confirmed": accepted,
         }
+    approval, _ = parse_approval_declaration(req)
+    if approval is not None and result is not None and result.action == "decline":
+        if (result.content or {}).get("0") == approval["deny"]:
+            return {"type": "extension_ui_response", "id": req_id, "value": approval["deny"]}
     if result is None or result.action != "accept":
         return {"type": "extension_ui_response", "id": req_id, "cancelled": True}
     value = _accepted_text(req, result)
