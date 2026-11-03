@@ -13146,8 +13146,22 @@ def create_runner_app(
             if not pending.exit_confirmed:
                 raise RuntimeError("Codex exit is not confirmed before credential scrub")
             _pending_codex_releases.pop(session_id)
+        resolved_codex_dir = await _codex_native_bridge_dir_for_session(session_id)
         # Capture before forwarder cancellation can remove the registered backend.
         codex_backend = _native_runtime._AUTO_CODEX_APP_SERVERS.get(session_id)
+        codex_launch_dir = _native_runtime._AUTO_CODEX_BRIDGE_DIRS.get(session_id)
+        codex_bridge_dir = codex_launch_dir or resolved_codex_dir
+        codex_incarnation = getattr(codex_backend, "resident_incarnation_id", None)
+
+        def codex_backend_changed() -> bool:
+            current = _native_runtime._AUTO_CODEX_APP_SERVERS.get(session_id)
+            current_dir = _native_runtime._AUTO_CODEX_BRIDGE_DIRS.get(session_id)
+            return (
+                (current is not None and current is not codex_backend)
+                or (current_dir is not None and current_dir is not codex_launch_dir)
+                or getattr(codex_backend, "resident_incarnation_id", None) != codex_incarnation
+            )
+
         if codex_backend is not None:
             _pending_codex_releases[session_id] = codex_backend
         if not await _cancel_auto_forwarder_task(session_id):
@@ -13158,10 +13172,19 @@ def create_runner_app(
         if process_manager is not None:
             if await process_manager.release(session_id) is False:
                 raise RuntimeError("harness subprocess did not exit during CLI release")
+        if codex_backend_changed():
+            raise RuntimeError("Codex backend changed during CLI release")
         await _native_runtime.teardown_codex_native_app_server(session_id)
         if codex_backend is not None and not codex_backend.exit_confirmed:
             raise RuntimeError("Codex exit is not confirmed before credential scrub")
+        if codex_backend_changed():
+            raise RuntimeError("Codex backend changed during CLI release")
         _pending_codex_releases.pop(session_id, None)
+        from omnigent.harnesses.codex_native.bridge import clear_active_child_turns
+
+        # A stopped forwarder can leave its backend's resumable bridge state behind.
+        if codex_bridge_dir.is_dir():
+            clear_active_child_turns(codex_bridge_dir)
         # Resume still needs native history, undelivered items and cached attachments.
         await _delete_native_bridge_dirs(
             server_client=server_client,

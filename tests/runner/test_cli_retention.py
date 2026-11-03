@@ -328,14 +328,14 @@ async def test_idle_release_history_still_expires_or_deletes(
 ) -> None:
     """Kept native histories retain their dead-owner TTL and explicit delete path."""
     from omnigent.native import native_bridge_common
-    from omnigent.runner.native import orchestration
 
     bridge = importlib.import_module(f"omnigent.harnesses.{family}_native.bridge")
     monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / family)
     session_id = "conv_retained_history"
     labels = {label_key: "rotated-bridge"} if label_key else {}
+    server_client = NullServerClient()
     monkeypatch.setattr(
-        orchestration, "_session_labels_for_runner_spawn", AsyncMock(return_value=labels)
+        server_client, "get", AsyncMock(return_value=httpx.Response(200, json={"labels": labels}))
     )
     bridge_id = "rotated-bridge" if label_key else session_id
     if family == "hermes":
@@ -346,9 +346,23 @@ async def test_idle_release_history_still_expires_or_deletes(
     history = bridge_dir / history_path
     history.parent.mkdir(parents=True, exist_ok=True)
     history.write_text("native history")
-    app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
+    if family == "codex":
+        bridge.write_bridge_state(
+            bridge_dir,
+            bridge.CodexNativeBridgeState(
+                session_id=session_id,
+                socket_path=str(bridge_dir / "old.sock"),
+                thread_id="parent_thread",
+                codex_home=str(bridge.codex_home_for_bridge_dir(bridge_dir)),
+            ),
+        )
+        bridge.update_active_child_turn(bridge_dir, "old_child", turn_id="old_turn")
+    app = create_runner_app(server_client=server_client)  # type: ignore[arg-type]
     await app.state.finish_cli_release(session_id)
     assert history.read_text() == "native history"
+    if family == "codex":
+        assert not bridge.read_bridge_state(bridge_dir).helper_stop_pending
+        assert bridge.read_active_child_turns(bridge_dir, strict=True) == {}
 
     now = 2_000_000_000.0
     monkeypatch.setattr(native_bridge_common.time, "time", lambda: now)
@@ -473,6 +487,66 @@ async def test_idle_release_preserves_codex_resume_history(
     assert "reply saved during outage" in resumed.read_text()
     if history_available:
         assert server_items, "the undelivered reply must reach server history before resume"
+
+
+@pytest.mark.parametrize("stale_child_turn", [False, True])
+async def test_idle_release_does_not_revoke_resumed_codex_helpers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stale_child_turn: bool
+) -> None:
+    """A retired backend's helper state must not reach its resumed native session."""
+    from omnigent.harnesses.codex_native import bridge
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "codex-native")
+    session_id = "conv_helper_resume"
+    bridge_dir = bridge.prepare_bridge_dir(session_id)
+    history = bridge.codex_home_for_bridge_dir(bridge_dir) / "sessions" / "rollout.jsonl"
+    history.parent.mkdir(parents=True)
+    history.write_text("saved native history")
+    old_state = bridge.CodexNativeBridgeState(
+        session_id=session_id,
+        socket_path=str(bridge_dir / "old.sock"),
+        thread_id="parent_thread",
+        codex_home=str(bridge.codex_home_for_bridge_dir(bridge_dir)),
+    )
+    bridge.write_bridge_state(bridge_dir, old_state)
+    bridge.clear_active_child_turns(bridge_dir)
+    if stale_child_turn:
+        bridge.update_active_child_turn(
+            bridge_dir, "old_child", session_id="conv_child", turn_id="old_turn"
+        )
+    else:
+        bridge.set_helper_stop_pending(bridge_dir, True)
+
+    app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
+    app.state.native_pane_reaper = _FakePaneReaper()
+    async with _runner_client(app) as client:
+        snapshot = await client.get(
+            f"/v1/sessions/{session_id}/cli-retention",
+            params={"idle_threshold_seconds": 60, "host_id": "host-a", "policy_revision": 1},
+        )
+        released = await client.post(
+            f"/v1/sessions/{session_id}/cli-retention/release",
+            json={
+                "reason": "idle_pool_overflow",
+                "idle_threshold_seconds": 60,
+                "expected_activity_token": "pane:activity-1",
+                "runtime_generation": snapshot.json()["runtime_generation"],
+                "host_id": "host-a",
+                "policy_revision": 1,
+            },
+        )
+    assert released.json()["status"] == "released"
+    assert history.read_text() == "saved native history"
+    bridge.write_bridge_state(bridge_dir, old_state)
+    resumed = bridge.read_bridge_state(bridge_dir)
+    assert resumed is not None
+    assert (
+        resumed.helper_stop_pending,
+        bridge.read_active_child_turns(bridge_dir, strict=True),
+    ) == (
+        False,
+        {},
+    )
 
 
 class _FakePaneReaper:

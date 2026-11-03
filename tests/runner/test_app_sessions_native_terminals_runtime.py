@@ -5080,9 +5080,10 @@ async def test_codex_app_server_teardown_forgets_the_launch_bridge_dir(tmp_path:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("confirmed", [False, True])
-@pytest.mark.parametrize("replacement", [False, True])
+@pytest.mark.parametrize("replacement", [None, "close", "cancel"])
+@pytest.mark.parametrize("idle_release", [False, True])
 async def test_ordinary_codex_close_clears_helper_state_without_tree_signals(
-    tmp_path, monkeypatch, confirmed, replacement
+    tmp_path, monkeypatch, confirmed, replacement, idle_release
 ):
     from types import SimpleNamespace
 
@@ -5104,27 +5105,42 @@ async def test_ordinary_codex_close_clears_helper_state_without_tree_signals(
     monkeypatch.setitem(orchestration._AUTO_CODEX_APP_SERVERS, session_id, backend)
     monkeypatch.setitem(orchestration._AUTO_CODEX_BRIDGE_DIRS, session_id, tmp_path)
 
+    def replace_backend():
+        orchestration._AUTO_CODEX_APP_SERVERS[session_id] = SimpleNamespace(exit_confirmed=False)
+        codex_native_bridge.update_active_child_turn(tmp_path, "new_thread", turn_id="new_turn")
+
     async def close(*_args):
-        if replacement:
-            orchestration._AUTO_CODEX_APP_SERVERS[session_id] = SimpleNamespace(
-                exit_confirmed=False
-            )
-            codex_native_bridge.update_active_child_turn(
-                tmp_path, "new_thread", turn_id="new_turn"
-            )
+        if replacement == "close":
+            replace_backend()
+
+    async def cancel(*_args):
+        if replacement == "cancel":
+            replace_backend()
+        return True
 
     monkeypatch.setattr(orchestration, "_close_native_backend", close)
+    monkeypatch.setattr(orchestration, "_cancel_auto_forwarder_task", cancel)
     monkeypatch.setattr(
         _proc,
         "_signal_identities",
         lambda *_args, **_kwargs: pytest.fail("ordinary close must not use tightening cleanup"),
     )
-    await orchestration.teardown_codex_native_app_server(session_id)
+    if idle_release:
+        app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
+        if replacement or not confirmed:
+            with pytest.raises(
+                RuntimeError, match=r"Codex (exit is not confirmed|backend changed)"
+            ):
+                await app.state.finish_cli_release(session_id)
+        else:
+            await app.state.finish_cli_release(session_id)
+    else:
+        await orchestration.teardown_codex_native_app_server(session_id)
     assert bool(codex_native_bridge.read_active_child_turns(tmp_path)) == (
-        replacement or not confirmed
+        bool(replacement) or not confirmed
     )
     assert codex_native_bridge.read_bridge_state(tmp_path).helper_stop_pending == (
-        replacement or not confirmed
+        bool(replacement) or not confirmed
     )
     if replacement:
         assert "new_thread" in codex_native_bridge.read_active_child_turns(tmp_path)
