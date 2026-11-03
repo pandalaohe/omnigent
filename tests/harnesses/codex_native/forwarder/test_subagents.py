@@ -351,6 +351,12 @@ class CodexChildForwarderTest(unittest.IsolatedAsyncioTestCase):
                 await self.changed.wait()
             return events
 
+    def assert_parent_bridge_unchanged(self):
+        current = json.loads((self.bridge_dir / "state.json").read_text())
+        # Helper ownership shares this file; parent turn and transport state must stay intact.
+        self.assertIsInstance(current.pop("helper_stop_pending", False), bool)
+        self.assertEqual(current, json.loads(self.parent_bridge))
+
     async def test_child_command_start_and_output_are_live_and_completion_is_deduplicated(
         self,
     ):
@@ -379,7 +385,7 @@ class CodexChildForwarderTest(unittest.IsolatedAsyncioTestCase):
             [item["item_type"] for item in self.events_of_type("external_conversation_item")],
             ["function_call", "function_call_output"],
         )
-        self.assertEqual((self.bridge_dir / "state.json").read_bytes(), self.parent_bridge)
+        self.assert_parent_bridge_unchanged()
         self.assertTrue(all(path == "/v1/sessions/session-a/events" for path, _ in self.posts))
 
     async def test_siblings_keep_text_reasoning_and_tool_output_separate(self):
@@ -420,7 +426,7 @@ class CodexChildForwarderTest(unittest.IsolatedAsyncioTestCase):
                 self.events_of_type("external_tool_output_delta", session)[0]["delta"],
                 text,
             )
-        self.assertEqual((self.bridge_dir / "state.json").read_bytes(), self.parent_bridge)
+        self.assert_parent_bridge_unchanged()
         self.assertFalse(any(path == "/v1/sessions/parent/events" for path, _ in self.posts))
 
     async def test_child_file_changes_reach_shared_observer_without_parent_state_changes(self):
@@ -471,7 +477,7 @@ class CodexChildForwarderTest(unittest.IsolatedAsyncioTestCase):
                     "tool_response": {"type": "success"},
                 },
             )
-        self.assertEqual((self.bridge_dir / "state.json").read_bytes(), self.parent_bridge)
+        self.assert_parent_bridge_unchanged()
         self.assertFalse(any(path == "/v1/sessions/parent/events" for path, _ in self.posts))
 
     async def test_interruption_flushes_and_persists_child_text_and_rejects_late_deltas(
@@ -494,7 +500,7 @@ class CodexChildForwarderTest(unittest.IsolatedAsyncioTestCase):
         await self.event("item/commandExecution/outputDelta", itemId="command", delta="stale")
         await self.state.close_child_streams()
         self.assertEqual(len(self.posts), before)
-        self.assertEqual((self.bridge_dir / "state.json").read_bytes(), self.parent_bridge)
+        self.assert_parent_bridge_unchanged()
 
     async def test_unknown_threads_are_ignored_and_shutdown_drains_known_children(self):
         await self.event(
@@ -540,4 +546,4 @@ class CodexChildForwarderTest(unittest.IsolatedAsyncioTestCase):
             ["running", "failed"],
         )
         self.assertFalse(self.events_of_type("external_tool_output_delta"))
-        self.assertEqual((self.bridge_dir / "state.json").read_bytes(), self.parent_bridge)
+        self.assert_parent_bridge_unchanged()

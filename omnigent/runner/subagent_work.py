@@ -88,6 +88,9 @@ _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX = "missing_parent_inbox"
 # A result whose own text marks it routine (``[quiet]``): recorded as delivered
 # with its key stored, but no inbox entry or wake is raised for it.
 _SUBAGENT_DELIVERY_QUIET = "quiet"
+# A codex-native helper result already consumed by ``collabAgentToolCall`` inside
+# an active parent turn: recorded as delivered without a duplicate inbox entry or wake.
+_SUBAGENT_DELIVERY_CONSUMED = "parent_turn_consumed"
 # A delayed terminal op (an interrupt's grace-timer cancel) whose originating
 # dispatch has since been replaced by a newer send on the reused child session.
 # Dropped without touching the newer dispatch so an old timer never cancels it.
@@ -223,6 +226,7 @@ class _SubagentWorkEntry:
     last_remote_check_monotonic: float | None = None
     launch_timed_out: bool = False
     recovered: bool = False
+    parent_turn_consumed: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -646,6 +650,7 @@ def mark_subagent_work_started(child_session_id: str) -> _SubagentWorkEntry | No
         return None
     if entry.recovery_result is not None:
         entry.recovery_turn_started = True
+    entry.parent_turn_consumed = False
     if entry.status in {"launching", "waiting"}:
         entry.status = "running"
     return entry
@@ -752,6 +757,16 @@ def list_subagent_work(parent_session_id: str) -> list[_SubagentWorkEntry]:
     return sorted(entries, key=lambda entry: entry.created_at)
 
 
+def list_active_codex_native_work(parent_session_id: str) -> list[_SubagentWorkEntry]:
+    """Active work sharing this parent's native Codex backend."""
+    return [
+        entry
+        for entry in list_subagent_work(parent_session_id)
+        if entry.status in {"launching", "running", "waiting"}
+        and is_codex_native_subagent_wrapper(entry.wrapper_label)
+    ]
+
+
 # Harness whose sub-agents live as threads inside the parent's own app-server.
 _CODEX_NATIVE_HARNESS = "codex-native"
 
@@ -831,6 +846,8 @@ def entry_owes_parent_wake(entry: _SubagentWorkEntry, parent_harness: str | None
     )
     if not codex_internal or entry.registered_by is not None:
         return True
+    if entry.parent_turn_consumed:
+        return False
     # A native wrapper already proves the child belongs to a Codex app-server,
     # so an unresolved parent harness stays admitted; a parent recorded as a
     # different harness keeps its thread suppressed, as before.
@@ -1387,6 +1404,15 @@ def _deliver_subagent_completion(
             delivered=True,
             delivered_now=False,
             reason=_SUBAGENT_DELIVERY_QUIET,
+        )
+    if entry.parent_turn_consumed and entry.registered_by is None:
+        entry.delivered = True
+        entry.delivered_result_key = result_key
+        return _SubagentDeliveryAck(
+            entry=entry,
+            delivered=True,
+            delivered_now=False,
+            reason=_SUBAGENT_DELIVERY_CONSUMED,
         )
     output = entry.output
     if output is None:

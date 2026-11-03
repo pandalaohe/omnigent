@@ -693,3 +693,42 @@ async def test_stranded_wake_rescue_posts_for_a_delegated_native_child(
 
     assert len(server.wakes) == 1
     assert "sys_read_inbox" in server.wakes[0]["data"]["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_delegated_native_child_consumed_in_parent_turn_suppresses_inbox_and_wake(
+    _clean_subagent_registry: None,
+) -> None:
+    """T35: a delegated codex-native child marked consumed queues no inbox item and no wake."""
+    subagent_work._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    server = _OriginServerClient(
+        _child_body(_DELEGATED_LABELS), items=[_assistant_item("item_consumed", "4")]
+    )
+    app = _build_app(server)
+
+    async with _runner_client(app) as client:
+        await _init_mother(client)
+        resp = await client.post(
+            f"/v1/sessions/{CHILD_SESSION_ID}/events",
+            json={
+                "type": "external_session_status",
+                "data": {
+                    "status": "idle",
+                    "turn_completed": True,
+                    "output": "4",
+                    "parent_turn_consumed": True,
+                },
+            },
+        )
+        assert resp.status_code == 204, resp.text
+        await asyncio.sleep(0.05)
+        await app.state.catch_up_scan()
+        await asyncio.sleep(0.05)
+
+    entry = subagent_work.get_subagent_work(CHILD_SESSION_ID)
+    assert entry is not None
+    assert entry.parent_turn_consumed is True
+    assert subagent_work.entry_owes_parent_wake(entry, "codex-native") is False
+    assert subagent_work.latest_wake_eligible_subagent_work([entry], "codex-native") is None
+    assert subagent_work._session_inboxes_ref[PARENT_SESSION_ID].qsize() == 0
+    assert server.wakes == []

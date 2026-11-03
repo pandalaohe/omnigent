@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
 
 import httpx
+import psutil
 from fastapi.responses import JSONResponse, Response
 
 from omnigent.debug_logging import debug_event
@@ -72,6 +73,11 @@ _CLAUDE_MODEL_CONFIRM_TIMEOUT_S = 10.0
 
 
 _CLAUDE_MODEL_CONFIRM_POLL_S = 0.25
+
+_CODEX_HELPER_STOP_TIMEOUT_S = 1.0
+_CODEX_HELPER_STOP_POLL_S = 0.05
+_CODEX_HELPER_CLOSE_TIMEOUT_S = 1.0
+_CODEX_HELPER_PROCESS_GRACE_S = 0.15
 
 
 # A session woken for a control may still be booting its TUI, so typing waits for
@@ -313,6 +319,7 @@ class NativeControls:
     handle_claude_native_slash_command: Callable[..., Coroutine[Any, Any, Response]]
     handle_claude_sdk_compact: Callable[[str], Coroutine[Any, Any, Response]]
     handle_codex_native_approval_mode_change: Callable[[str, str], Coroutine[Any, Any, Response]]
+    stop_codex_native_helpers: Callable[..., Coroutine[Any, Any, bool]]
     handle_codex_native_clear: Callable[[str], Coroutine[Any, Any, Response]]
     handle_codex_native_compact: Callable[[str], Coroutine[Any, Any, Response]]
     handle_codex_native_cost_popup: _HandleCodexNativeCostPopupFn
@@ -381,6 +388,7 @@ def build_native_controls(
     _session_spec_cache: dict[str, _SpecEntry | None],
     resource_registry: SessionResourceRegistry,
     server_client: httpx.AsyncClient,
+    _finish_codex_native_helpers: Callable[..., Coroutine[Any, Any, bool]],
 ) -> NativeControls:
     """Build the native-harness control handlers over the runner app's session state.
 
@@ -867,6 +875,187 @@ def build_native_controls(
             },
         )
 
+    async def _stop_codex_native_helpers(
+        conv_id: str,
+        reason: str = "tightening",
+        discovered: dict[str, dict[str, str | None]] | None = None,
+    ) -> bool:
+        discovered = discovered or {}
+        lock = _codex_terminal_ensure_locks.setdefault(conv_id, asyncio.Lock())
+        async with lock:
+            from omnigent.harnesses.codex_native.app_server import client_for_transport
+            from omnigent.harnesses.codex_native.bridge import (
+                clear_active_child_turns,
+                read_active_child_turns,
+            )
+            from omnigent.inner import _proc
+            from omnigent.runner.native.orchestration import (
+                _AUTO_CODEX_APP_SERVERS,
+                teardown_codex_native_app_server,
+            )
+
+            backend = _AUTO_CODEX_APP_SERVERS.get(conv_id)
+            incarnation = getattr(backend, "resident_incarnation_id", None)
+
+            def owns_backend() -> bool:
+                current = _AUTO_CODEX_APP_SERVERS.get(conv_id)
+                return (current is None or current is backend) and getattr(
+                    backend, "resident_incarnation_id", None
+                ) == incarnation
+
+            bridge, bridge_dir = await _codex_native_bridge_state_and_dir_for_session(
+                conv_id, action="helper revocation"
+            )
+            inventory_unknown = reason == "recovery"
+            children = dict(discovered)
+            try:
+                children.update(read_active_child_turns(bridge_dir, strict=True))
+            except FileNotFoundError:
+                inventory_unknown |= bool(getattr(bridge, "helper_stop_pending", False))
+            except (OSError, ValueError):
+                inventory_unknown = True
+            if not owns_backend():
+                return False
+            from omnigent.runner.subagent_work import list_active_codex_native_work
+
+            for entry in list_active_codex_native_work(conv_id):
+                entry.parent_turn_consumed = True
+            if (
+                not children
+                and not list_active_codex_native_work(conv_id)
+                and not getattr(bridge, "helper_stop_pending", False)
+                and not inventory_unknown
+            ):
+                return True
+            confirmed = False
+            try:
+                async with asyncio.timeout(_CODEX_HELPER_STOP_TIMEOUT_S):
+                    if not inventory_unknown and not discovered and bridge is not None:
+                        client = client_for_transport(
+                            bridge.socket_path, client_name="omnigent-codex-native-runner"
+                        )
+                        try:
+                            await client.connect()
+                            for tid, info in read_active_child_turns(
+                                bridge_dir, strict=True
+                            ).items():
+                                if not info.get("turn_id"):
+                                    break
+                                await client.request(
+                                    "turn/interrupt", {"threadId": tid, "turnId": info["turn_id"]}
+                                )
+                            else:
+                                while read_active_child_turns(
+                                    bridge_dir
+                                ) or list_active_codex_native_work(conv_id):
+                                    await asyncio.sleep(_CODEX_HELPER_STOP_POLL_S)
+                                confirmed = True
+                        finally:
+                            with contextlib.suppress(Exception):
+                                await asyncio.wait_for(
+                                    client.close(), timeout=_CODEX_HELPER_STOP_POLL_S
+                                )
+            except (TimeoutError, OSError, ValueError, RuntimeError):
+                pass
+            retired = not confirmed
+            if retired:
+                # Capture before closing: shell commands may own separate process groups.
+                identities: dict[int, float] = {}
+                try:
+                    if (
+                        owns_backend()
+                        and backend is not None
+                        and backend.proc is not None
+                        and backend.proc.returncode is None
+                    ):
+                        identities = await asyncio.to_thread(
+                            _proc.snapshot_process_tree,
+                            backend.proc.pid,
+                            backend.process_start_stamp,
+                        )
+                except (OSError, RuntimeError, psutil.Error):
+                    pass
+                if not owns_backend():
+                    return False
+                try:
+                    async with asyncio.timeout(_CODEX_HELPER_CLOSE_TIMEOUT_S):
+                        await teardown_codex_native_app_server(conv_id, clear_helpers=False)
+                except (TimeoutError, RuntimeError):
+                    pass
+                await asyncio.to_thread(_proc._signal_identities, identities, force=False)
+                await asyncio.sleep(_CODEX_HELPER_PROCESS_GRACE_S)
+                await asyncio.to_thread(_proc._signal_identities, identities, force=True)
+                await asyncio.sleep(_CODEX_HELPER_PROCESS_GRACE_S)
+                survivors = await asyncio.to_thread(_proc.surviving_process_snapshot, identities)
+                confirmed = bool(identities) and not survivors
+                if backend is not None and confirmed and owns_backend():
+                    # Complete the existing close receipt after the snapshotted survivors exit.
+                    with contextlib.suppress(TimeoutError, RuntimeError):
+                        async with asyncio.timeout(_CODEX_HELPER_CLOSE_TIMEOUT_S):
+                            await backend.close()
+                if owns_backend():
+                    from omnigent.harnesses.codex_native.bridge import (
+                        record_app_server_stopped,
+                        write_bridge_startup_error,
+                    )
+
+                    if confirmed:
+                        record_app_server_stopped(bridge_dir)
+                    else:
+                        write_bridge_startup_error(
+                            bridge_dir,
+                            "Helper stop is unconfirmed; reconnect the Codex backend.",
+                            code="codex_helpers_stop_unconfirmed",
+                        )
+                if survivors:
+                    reason += f"; unconfirmed process PIDs: {sorted(survivors)}"
+            try:
+                async with asyncio.timeout(1.5):
+                    confirmed = await _finish_codex_native_helpers(
+                        conv_id, bridge_dir, reason, confirmed, children, owns_backend, retired
+                    )
+            except TimeoutError:
+                confirmed = False
+            if retired and owns_backend():
+                clear_active_child_turns(bridge_dir)
+            return confirmed
+
+    async def _current_codex_native_approval_mode(conv_id: str) -> str | None:
+        from omnigent.codex_approval_modes import codex_permission_preset_from_thread_settings
+        from omnigent.harnesses.codex_native.app_server import client_for_transport
+        from omnigent.harnesses.codex_native.bridge import read_active_child_turns
+
+        client = None
+        try:
+            async with asyncio.timeout(_CODEX_HELPER_STOP_TIMEOUT_S):
+                bridge, bridge_dir = await _codex_native_bridge_state_and_dir_for_session(
+                    conv_id, action="current helper authority"
+                )
+                from omnigent.runner.subagent_work import list_active_codex_native_work
+
+                if not read_active_child_turns(bridge_dir) and not list_active_codex_native_work(
+                    conv_id
+                ):
+                    return "full-access"
+                if bridge is None:
+                    return None
+                client = client_for_transport(
+                    bridge.socket_path, client_name="omnigent-codex-native-runner"
+                )
+                await client.connect()
+                response = await client.request("thread/resume", {"threadId": bridge.thread_id})
+                result = response.get("result")
+                return codex_permission_preset_from_thread_settings(result)
+        except Exception:
+            _logger.warning(
+                "Current Codex authority could not be confirmed for %s", conv_id, exc_info=True
+            )
+            return None
+        finally:
+            if client is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(client.close(), timeout=_CODEX_HELPER_STOP_POLL_S)
+
     async def _handle_codex_native_approval_mode_change(
         conv_id: str,
         mode: str,
@@ -896,6 +1085,15 @@ def build_native_controls(
                 content={
                     "error": "codex_native_approval_mode_failed",
                     "detail": "Codex terminal is not running; reconnect first.",
+                },
+            )
+        previous_mode = await _current_codex_native_approval_mode(conv_id)
+        if previous_mode is None and preset.value != "full-access":
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "codex_authority_unavailable",
+                    "detail": "Current mode could not be read; retry the switch.",
                 },
             )
         try:
@@ -984,11 +1182,29 @@ def build_native_controls(
                 except Exception:
                     _logger.warning("Failed to select Codex permission profile row", exc_info=True)
                 try:
-                    await apply_codex_thread_permissions(
-                        bridge.socket_path, bridge.thread_id, bridge.permission_profile
+                    await asyncio.wait_for(
+                        apply_codex_thread_permissions(
+                            bridge.socket_path, bridge.thread_id, bridge.permission_profile
+                        ),
+                        timeout=_CODEX_HELPER_STOP_TIMEOUT_S,
                     )
                 except Exception:
                     _logger.warning("Failed to apply Codex permission profile", exc_info=True)
+        from omnigent.sdk_permission_modes import codex_approval_mode_tightens
+
+        if preset.value != "full-access" and codex_approval_mode_tightens(
+            previous_mode, preset.value
+        ):
+            if not await _stop_codex_native_helpers(conv_id):
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": "codex_helper_stop_pending",
+                        "detail": (
+                            "Mode saved for the next turn; some helper stops are unconfirmed."
+                        ),
+                    },
+                )
         return JSONResponse(status_code=200, content={"approval_mode": preset.value})
 
     async def _codex_native_model_options(conv_id: str) -> list[_JsonObject]:
@@ -2730,6 +2946,7 @@ def build_native_controls(
         handle_claude_native_slash_command=_handle_claude_native_slash_command,
         handle_claude_sdk_compact=_handle_claude_sdk_compact,
         handle_codex_native_approval_mode_change=_handle_codex_native_approval_mode_change,
+        stop_codex_native_helpers=_stop_codex_native_helpers,
         handle_codex_native_clear=_handle_codex_native_clear,
         handle_codex_native_compact=_handle_codex_native_compact,
         handle_codex_native_cost_popup=_handle_codex_native_cost_popup,

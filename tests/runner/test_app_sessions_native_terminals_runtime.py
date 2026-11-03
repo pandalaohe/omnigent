@@ -5079,6 +5079,58 @@ async def test_codex_app_server_teardown_forgets_the_launch_bridge_dir(tmp_path:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("confirmed", [False, True])
+@pytest.mark.parametrize("replacement", [False, True])
+async def test_ordinary_codex_close_clears_helper_state_without_tree_signals(
+    tmp_path, monkeypatch, confirmed, replacement
+):
+    from types import SimpleNamespace
+
+    from omnigent.inner import _proc
+    from omnigent.runner.native import orchestration
+
+    session_id = "conv_idle"
+    codex_native_bridge.write_bridge_state(
+        tmp_path,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=session_id,
+            thread_id="thread_parent",
+            socket_path="ws://127.0.0.1:1234",
+            codex_home=str(tmp_path / "home"),
+        ),
+    )
+    codex_native_bridge.update_active_child_turn(tmp_path, "thread_child", turn_id="turn_child")
+    backend = SimpleNamespace(exit_confirmed=confirmed)
+    monkeypatch.setitem(orchestration._AUTO_CODEX_APP_SERVERS, session_id, backend)
+    monkeypatch.setitem(orchestration._AUTO_CODEX_BRIDGE_DIRS, session_id, tmp_path)
+
+    async def close(*_args):
+        if replacement:
+            orchestration._AUTO_CODEX_APP_SERVERS[session_id] = SimpleNamespace(
+                exit_confirmed=False
+            )
+            codex_native_bridge.update_active_child_turn(
+                tmp_path, "new_thread", turn_id="new_turn"
+            )
+
+    monkeypatch.setattr(orchestration, "_close_native_backend", close)
+    monkeypatch.setattr(
+        _proc,
+        "_signal_identities",
+        lambda *_args, **_kwargs: pytest.fail("ordinary close must not use tightening cleanup"),
+    )
+    await orchestration.teardown_codex_native_app_server(session_id)
+    assert bool(codex_native_bridge.read_active_child_turns(tmp_path)) == (
+        replacement or not confirmed
+    )
+    assert codex_native_bridge.read_bridge_state(tmp_path).helper_stop_pending == (
+        replacement or not confirmed
+    )
+    if replacement:
+        assert "new_thread" in codex_native_bridge.read_active_child_turns(tmp_path)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("binding_token", [None, "native-forwarder-binding-test"])
 @pytest.mark.parametrize(
     "profile_enabled,update_fails", [(False, False), (True, False), (True, True)]

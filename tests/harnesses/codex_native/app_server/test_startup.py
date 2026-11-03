@@ -1379,6 +1379,7 @@ async def test_session_app_server_launches_through_the_configured_wrapper(
         stderr.feed_eof()
         proc = AsyncMock()
         proc.stderr = stderr
+        proc.pid = 2147483647
         return proc
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)

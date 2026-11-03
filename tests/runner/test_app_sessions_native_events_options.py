@@ -55,6 +55,48 @@ def _isolate_anthropic_default_model_env(monkeypatch: pytest.MonkeyPatch) -> Non
         monkeypatch.delenv(var, raising=False)
 
 
+@pytest.mark.parametrize("confirmed", [True, False])
+async def test_codex_helper_mode_change_waits_for_harness(monkeypatch, confirmed):
+    app, pm = await _build_app_for_spec(_harness_spec("codex"))
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_post = pm._client.post
+    forwarded = []
+
+    async def post(url, *, json, timeout=None):
+        if json.get("type") != "codex_approval_mode_change":
+            return await original_post(url, json=json, timeout=timeout)
+        forwarded.append((url, json))
+        entered.set()
+        await release.wait()
+        return httpx.Response(
+            200, json={"approval_mode": "read-only", "helpers_stopped": confirmed}
+        )
+
+    monkeypatch.setattr(pm._client, "post", post)
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions",
+            json={"session_id": "sdk-session", "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert response.status_code == 201, response.text
+        body = {"type": "codex_approval_mode_change", "approval_mode": "read-only"}
+        change = asyncio.create_task(client.post("/v1/sessions/sdk-session/events", json=body))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            assert not change.done()
+            release.set()
+            response = await asyncio.wait_for(change, timeout=1)
+        finally:
+            release.set()
+            change.cancel()
+            await asyncio.gather(change, return_exceptions=True)
+    assert forwarded == [("/v1/sessions/sdk-session/events", body)]
+    assert response.status_code == (200 if confirmed else 409), response.text
+    if not confirmed:
+        assert response.json()["error"] == "codex_helper_stop_pending"
+        assert "next turn" in response.json()["detail"]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "effort_value",
@@ -459,6 +501,15 @@ async def test_sdk_mode_snapshot_and_event_reach_next_turn(
         _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
     ]
     harness_client = _ScriptedHarnessClient(frames)
+    original_post = harness_client.post
+
+    async def acknowledge_control(url, *, json, timeout=None):
+        result = await original_post(url, json=json, timeout=timeout)
+        if json.get("type") == "codex_approval_mode_change":
+            return httpx.Response(200, json={"helpers_stopped": True})
+        return result
+
+    monkeypatch.setattr(harness_client, "post", acknowledge_control)
     app = create_runner_app(
         process_manager=_FakeProcessManager(harness_client),  # type: ignore[arg-type]
         spec_resolver=_resolver,
@@ -4618,3 +4669,497 @@ async def test_codex_workspace_switch_selects_generated_profile(
             )
         else:
             assert actions[-2:] == ["escape", "update"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "drained",
+        "pending",
+        "pending-restart",
+        "hung",
+        "native-full",
+        "native-read-only",
+        "full-unknown",
+    ],
+)
+async def test_codex_native_approval_mode_tighten_stops_running_helpers_or_returns_409(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+) -> None:
+    """T24: tightening codex-native approval mode interrupts active helpers or returns 409."""
+    from types import SimpleNamespace
+
+    from omnigent.harnesses.codex_native import app_server, bridge
+    from tests.runner.helpers import make_test_terminal_instance
+
+    conv_id = "8864122f95f2f013c9599f4014725784"
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    state = bridge.CodexNativeBridgeState(
+        session_id=conv_id,
+        socket_path="ws://127.0.0.1:1234",
+        thread_id="thread_parent",
+        codex_home=str(tmp_path / "home"),
+    )
+    bridge.write_bridge_state(bridge_dir, state)
+    bridge.update_active_child_turn(
+        bridge_dir,
+        "thread_helper_t24",
+        session_id="conv_helper_t24",
+        turn_id="turn_helper_t24",
+        status="running",
+    )
+
+    monkeypatch.setattr(bridge, "bridge_dir_for_bridge_id", lambda _: bridge_dir)
+    monkeypatch.setattr(native_controls, "_CODEX_HELPER_STOP_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(native_controls, "_CODEX_HELPER_STOP_POLL_S", 0.01)
+    monkeypatch.setattr(native_controls, "_CODEX_HELPER_PROCESS_GRACE_S", 0.01)
+    selected = ""
+
+    def _tmux(_socket: str, *args: str) -> None:
+        nonlocal selected
+        if selected == "Full Access" and args[-1] == "1":
+            return
+        if args[-1] in {"1", "2", "3", "4"} and "-l" in args:
+            selected = {
+                "1": "Ask for approval",
+                "2": "Approve for me",
+                "3": "Full Access",
+                "4": "Read Only",
+            }[args[-1]]
+
+    def _capture(*_args: object) -> str:
+        if selected:
+            return "Permissions updated to " + selected
+        return "1. Ask for approval\n2. Approve for me\n3. Full Access\n4. Read Only"
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", _tmux)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", _capture)
+    monkeypatch.setattr(
+        native_controls, "time", SimpleNamespace(monotonic=time.monotonic, sleep=lambda _: None)
+    )
+
+    interrupted: list[tuple[str, dict[str, Any]]] = []
+    drain_tasks: list[asyncio.Task] = []
+    interrupt_requested = asyncio.Event()
+    release_terminal = asyncio.Event()
+
+    async def _terminal_frame() -> None:
+        from omnigent.harnesses.codex_native import forwarder
+
+        await release_terminal.wait()
+        assert bridge.read_active_child_turns(bridge_dir)
+        async with httpx.AsyncClient(
+            base_url="http://test",
+            transport=httpx.MockTransport(lambda _: httpx.Response(202, json={"queued": False})),
+        ) as event_client:
+            fs = forwarder._CodexForwarderState(parent_session_id=conv_id)
+            fs.note_child_thread("thread_helper_t24", "conv_helper_t24")
+            tracker = forwarder._CodexElicitationTaskTracker()
+            try:
+                await forwarder._handle_event(
+                    event_client,
+                    session_id=conv_id,
+                    bridge_dir=bridge_dir,
+                    event={
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": "thread_helper_t24",
+                            "turn": {
+                                "id": "turn_helper_t24",
+                                "status": "interrupted",
+                                "items": [],
+                            },
+                        },
+                    },
+                    expected_thread_id="thread_parent",
+                    forwarder_state=fs,
+                    usage_coalescer=forwarder._SessionUsageCoalescer(event_client, conv_id),
+                    elicitation_tracker=tracker,
+                )
+            finally:
+                await tracker.close()
+                await fs.close_child_streams()
+
+    class _FakeClient:
+        async def connect(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if method == "thread/resume":
+                if scenario == "full-unknown":
+                    raise RuntimeError("temporary read failure")
+                return {
+                    "result": {
+                        "approvalPolicy": "never" if scenario == "native-full" else "on-request",
+                        "sandboxPolicy": {
+                            "type": "readOnly"
+                            if scenario == "native-read-only"
+                            else "workspaceWrite"
+                        },
+                    }
+                }
+            interrupted.append((method, params))
+            if scenario == "hung":
+                await asyncio.Event().wait()
+            if scenario == "drained":
+                interrupt_requested.set()
+                drain_tasks.append(asyncio.create_task(_terminal_frame()))
+            return {"result": {}}
+
+    monkeypatch.setattr(
+        app_server,
+        "client_for_transport",
+        lambda _sock, **_kwargs: _FakeClient(),
+    )
+    terminals = TerminalRegistry()
+    terminals._by_conversation.setdefault(conv_id, {})[("codex", "main")] = (
+        make_test_terminal_instance("codex", "main", tmp_path)
+    )
+    app, _ = await _build_app_for_spec(_harness_spec("codex-native"), terminal_registry=terminals)
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert created.status_code == 201, created.text
+        if scenario == "native-full":
+            bridge.clear_active_child_turn(bridge_dir, "thread_helper_t24")
+            initial = await client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={"type": "codex_approval_mode_change", "approval_mode": "ask-for-approval"},
+            )
+            assert initial.status_code == 200, initial.text
+            bridge.update_active_child_turn(
+                bridge_dir,
+                "thread_helper_t24",
+                session_id="conv_helper_t24",
+                turn_id="turn_helper_t24",
+                status="running",
+            )
+            selected = ""
+        try:
+            operation = asyncio.create_task(
+                client.post(
+                    f"/v1/sessions/{conv_id}/events",
+                    json={
+                        "type": "codex_approval_mode_change",
+                        "approval_mode": "full-access"
+                        if scenario == "full-unknown"
+                        else ("approve-for-me" if scenario.startswith("native-") else "read-only"),
+                    },
+                )
+            )
+            if scenario == "drained":
+                await asyncio.wait_for(interrupt_requested.wait(), timeout=0.5)
+                assert not operation.done(), "RPC acknowledgement is not terminal confirmation"
+                release_terminal.set()
+            # This branch only reselects Full Access; no helper-stop deadline is exercised.
+            response = await asyncio.wait_for(
+                operation, timeout=3.0 if scenario == "full-unknown" else 0.5
+            )
+        except TimeoutError:
+            pytest.fail("helper revocation RPC exceeded the bounded response budget")
+        if scenario == "pending-restart":
+            restarted_app, _ = await _build_app_for_spec(
+                _harness_spec("codex-native"), terminal_registry=terminals
+            )
+            async with _runner_client(restarted_app) as restarted:
+                created_again = await restarted.post(
+                    "/v1/sessions",
+                    json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+                )
+                assert created_again.status_code == 201
+                retry = await restarted.post(
+                    f"/v1/sessions/{conv_id}/events",
+                    json={
+                        "type": "message",
+                        "content": [{"type": "input_text", "text": "continue"}],
+                    },
+                )
+                assert retry.status_code != 409, retry.text
+                assert len(interrupted) == 1
+        elif scenario == "pending":
+            retry = await client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={"type": "message", "content": [{"type": "input_text", "text": "continue"}]},
+            )
+            assert retry.status_code != 409, retry.text
+            assert len(interrupted) == 1, "next work must not retry revocation"
+    await asyncio.gather(*drain_tasks)
+    expected_interrupt = [
+        ("turn/interrupt", {"threadId": "thread_helper_t24", "turnId": "turn_helper_t24"})
+    ]
+    assert interrupted == (
+        [] if scenario in {"native-read-only", "full-unknown"} else expected_interrupt
+    )
+    assert response.status_code == (
+        200 if scenario in {"drained", "native-read-only", "full-unknown"} else 409
+    ), response.text
+    if scenario not in {"drained", "native-read-only", "full-unknown"}:
+        assert response.json()["error"] == "codex_helper_stop_pending"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner", ["thread_parent", "unrelated", None])
+async def test_unregistered_elicitation_interrupt_validates_native_thread_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    owner: str | None,
+) -> None:
+    from omnigent.harnesses.codex_native import app_server, bridge
+
+    conv_id = "8864122f95f2f013c9599f4014725784"
+    bridge_dir = tmp_path / "bridge"
+    bridge.write_bridge_state(
+        bridge_dir,
+        bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path="ws://127.0.0.1:1234",
+            thread_id="thread_parent",
+            codex_home=str(tmp_path / "home"),
+        ),
+    )
+    monkeypatch.setattr(bridge, "bridge_dir_for_bridge_id", lambda _: bridge_dir)
+    calls = []
+
+    class Client:
+        async def connect(self):
+            pass
+
+        async def close(self):
+            pass
+
+        async def request(self, method, params):
+            calls.append((method, params))
+            if method == "thread/read":
+                return (
+                    {
+                        "result": {
+                            "thread": {
+                                "source": {
+                                    "subAgent": {"thread_spawn": {"parent_thread_id": owner}}
+                                }
+                            }
+                        }
+                    }
+                    if owner
+                    else {"result": None}
+                )
+            return {"result": {}}
+
+    monkeypatch.setattr(app_server, "client_for_transport", lambda *_args, **_kwargs: Client())
+    app, _ = await _build_app_for_spec(_harness_spec("codex-native"))
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert created.status_code == 201
+        response = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={
+                "type": "interrupt",
+                "codex_side_thread_id": "thread_helper",
+                "codex_side_turn_id": "turn_helper",
+                "codex_elicitation_interrupt": True,
+            },
+        )
+    assert response.status_code == (202 if owner == "thread_parent" else 409), response.text
+    assert any(method == "turn/interrupt" for method, _params in calls) == (
+        owner == "thread_parent"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        "recycled",
+        "exited",
+        "hint",
+        "empty-recovery",
+        "late",
+        "slow-report",
+        "replacement-report",
+        "spawn-during-report",
+    ],
+)
+async def test_codex_helper_stop_ownership_and_finalization(tmp_path, monkeypatch, case):
+    from types import SimpleNamespace
+
+    from omnigent.harnesses.codex_native import app_server, bridge, forwarder
+    from omnigent.inner import _proc
+    from omnigent.runner import subagent_work
+    from omnigent.runner.native import orchestration
+
+    parent = "conv_stop_boundary"
+    bridge.write_bridge_state(
+        tmp_path,
+        bridge.CodexNativeBridgeState(
+            session_id=parent,
+            socket_path="ws://127.0.0.1:1234",
+            thread_id="parent_thread",
+            codex_home=str(tmp_path / "home"),
+        ),
+    )
+    if case not in {"hint", "empty-recovery"}:
+        bridge.update_active_child_turn(
+            tmp_path, "child_thread", session_id="child", turn_id="child_turn"
+        )
+    monkeypatch.setattr(bridge, "bridge_dir_for_bridge_id", lambda _: tmp_path)
+    monkeypatch.setattr(
+        native_controls,
+        "_CODEX_HELPER_STOP_TIMEOUT_S",
+        1.0 if case in {"slow-report", "replacement-report", "spawn-during-report"} else 0.02,
+    )
+    monkeypatch.setattr(native_controls, "_CODEX_HELPER_PROCESS_GRACE_S", 0.001)
+    closed, signals, reports, child_posts = [], [], [], []
+    backend = SimpleNamespace(
+        proc=SimpleNamespace(pid=4242, returncode=0 if case == "exited" else None),
+        process_start_stamp=100.0,
+        resident_incarnation_id="old",
+        exit_confirmed=False,
+    )
+
+    async def close():
+        closed.append(True)
+        backend.exit_confirmed = True
+
+    backend.close = close
+    monkeypatch.setitem(orchestration._AUTO_CODEX_APP_SERVERS, parent, backend)
+
+    async def teardown(*_args, **_kwargs):
+        await close()
+        orchestration._AUTO_CODEX_APP_SERVERS.pop(parent, None)
+
+    monkeypatch.setattr(orchestration, "teardown_codex_native_app_server", teardown)
+    monkeypatch.setattr(
+        _proc.psutil,
+        "Process",
+        lambda pid: SimpleNamespace(
+            pid=pid,
+            children=lambda **_: [],
+            create_time=lambda: 200.0 if case == "recycled" else 100.0,
+        ),
+    )
+    monkeypatch.setattr(_proc, "_signal_identities", lambda ids, **_: signals.extend(ids))
+    monkeypatch.setattr(_proc, "surviving_process_snapshot", lambda _: {})
+
+    async def post(self, url, **kwargs):
+        body = kwargs.get("json", {})
+        if body.get("type") == "external_session_status":
+            child_posts.append(url)
+        if (
+            body.get("type") == "external_conversation_item"
+            and body.get("data", {}).get("item_type") == "error"
+        ):
+            reports.append(body)
+            if case == "slow-report":
+                await asyncio.sleep(1.1)
+            if case == "replacement-report":
+                orchestration._AUTO_CODEX_APP_SERVERS[parent] = SimpleNamespace(
+                    resident_incarnation_id="new"
+                )
+            if case in {"replacement-report", "spawn-during-report"}:
+                bridge.update_active_child_turn(
+                    tmp_path, "new_thread", session_id="new_child", turn_id="new_turn"
+                )
+        return self._Response()
+
+    monkeypatch.setattr(NullServerClient, "post", post)
+
+    class Client:
+        async def connect(self):
+            pass
+
+        async def close(self):
+            pass
+
+        async def request(self, method, params):
+            assert method == "turn/interrupt"
+            if case == "late":
+                bridge.update_active_child_turn(
+                    tmp_path, "late_thread", session_id="late_child", turn_id="late_turn"
+                )
+                subagent_work.register_subagent_work(
+                    parent_session_id=parent,
+                    child_session_id="late_child",
+                    agent="Codex",
+                    title="late",
+                    wrapper_label="codex-native-ui-subagent",
+                )
+            if case in {"slow-report", "replacement-report", "spawn-during-report"}:
+                async with httpx.AsyncClient(
+                    base_url="http://test",
+                    transport=httpx.MockTransport(lambda _: httpx.Response(202, json={})),
+                ) as event_client:
+                    fs = forwarder._CodexForwarderState(parent_session_id=parent)
+                    fs.note_child_thread("child_thread", "child")
+                    tracker = forwarder._CodexElicitationTaskTracker()
+                    try:
+                        await forwarder._handle_event(
+                            event_client,
+                            session_id=parent,
+                            bridge_dir=tmp_path,
+                            event={
+                                "method": "turn/completed",
+                                "params": {
+                                    "threadId": "child_thread",
+                                    "turn": {"id": "child_turn", "status": "interrupted"},
+                                },
+                            },
+                            expected_thread_id="parent_thread",
+                            forwarder_state=fs,
+                            usage_coalescer=forwarder._SessionUsageCoalescer(event_client, parent),
+                            elicitation_tracker=tracker,
+                        )
+                    finally:
+                        await tracker.close()
+                        await fs.close_child_streams()
+            return {"result": {}}
+
+    monkeypatch.setattr(app_server, "client_for_transport", lambda *_, **__: Client())
+    app, _ = await _build_app_for_spec(_harness_spec("codex-native"))
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions",
+            json={"session_id": parent, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert created.status_code == 201
+        response = await asyncio.wait_for(
+            client.post(
+                f"/v1/sessions/{parent}/events",
+                json={
+                    "type": "codex_helpers_stop",
+                    "reason": "recovery" if case in {"hint", "empty-recovery"} else "tightening",
+                    "children": {"hint_thread": {"session_id": "hint_child", "turn_id": None}}
+                    if case == "hint"
+                    else {},
+                },
+            ),
+            3,
+        )
+        assert response.status_code == 200
+        if case in {"recycled", "exited"}:
+            assert signals == [], "unverified root must not authorize any ancestry signals"
+            assert response.json() == {"helpers_stopped": False}
+        elif case == "hint":
+            assert closed, "a discovered unknown helper cannot count as an empty successful drain"
+            assert any("hint_child" in path for path in child_posts)
+        elif case == "empty-recovery":
+            assert closed, "incomplete ownership requires stop/report even without child IDs"
+        elif case == "late":
+            assert subagent_work.get_subagent_work("late_child").status == "failed"
+            assert any("late_child" in path for path in child_posts)
+        else:
+            assert closed == [], "reporting must not destroy a responsive backend"
+            if case in {"replacement-report", "spawn-during-report"}:
+                assert "new_thread" in bridge.read_active_child_turns(tmp_path)
+        assert len(reports) == 1

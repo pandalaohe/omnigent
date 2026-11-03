@@ -458,6 +458,39 @@ async def test_create_session_without_title_returns_none(
     assert session["title"] is None
 
 
+async def test_codex_helper_pending_stop_saves_restriction_without_effective_event(
+    client, monkeypatch
+):
+    agent = await create_test_agent(
+        client, executor={"type": "omnigent", "config": {"harness": "codex"}}
+    )
+    session = await _create_session(client, agent["id"])
+    published = []
+    _capture_published(monkeypatch, published)
+
+    def pending(request):
+        if request.method != "POST":
+            return httpx.Response(204)
+        return httpx.Response(
+            409,
+            json={
+                "error": "codex_helper_stop_pending",
+                "detail": "Mode saved for the next turn; helper stop is not confirmed.",
+            },
+        )
+
+    async with _runtime_runner(pending):
+        response = await client.patch(
+            f"/v1/sessions/{session['id']}", json={"approval_mode": "read-only"}
+        )
+    assert response.status_code == 409, response.text
+    assert response.json()["error"] == "codex_helper_stop_pending"
+    assert "next turn" in response.text
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["labels"]["omnigent.codex_sdk.approval_mode"] == "read-only"
+    assert all(event["type"] != "session.codex_approval_mode" for _, event in published)
+
+
 @pytest.mark.parametrize(
     ("harness", "field", "value", "label_key"),
     [
@@ -12411,6 +12444,7 @@ async def test_stop_session_forwards_stop_session_event_to_runner(
     [
         # Runner reachable but it couldn't kill the session (503 leg).
         "runner_503",
+        "unconfirmed",
         # WS tunnel closed mid-POST: a BARE ConnectionError, not an httpx.HTTPError.
         "bare_connection_error",
     ],
@@ -12442,6 +12476,16 @@ async def test_stop_session_surfaces_runner_failure_as_error(
         if failure_mode == "bare_connection_error":
             # What WSTunnelTransport raises when the tunnel closes mid-request.
             raise ConnectionError("tunnel closed mid-request")
+        if failure_mode == "unconfirmed":
+            return httpx.Response(
+                200,
+                json={
+                    "cancelled": False,
+                    "stopped": False,
+                    "cancel_confirmed": False,
+                    "stop_route": "parent_session_interrupt",
+                },
+            )
         # Shape the runner's _handle_claude_native_stop 503 emits when
         # kill_session can't reach the tmux pane.
         return httpx.Response(503, json={"error": "claude_native_stop_failed"})
@@ -12464,10 +12508,13 @@ async def test_stop_session_surfaces_runner_failure_as_error(
 
     # RUNNER_UNAVAILABLE → 503. A 202 here would mean the failure was
     # swallowed and the UI would falsely report success.
-    assert resp.status_code == 503, (
+    assert resp.status_code == (409 if failure_mode == "unconfirmed" else 503), (
         f"A runner 503 on stop_session must surface as a non-2xx to the "
         f"client (RUNNER_UNAVAILABLE → 503), got {resp.status_code}: {resp.text}"
     )
+    if failure_mode == "unconfirmed":
+        assert resp.json()["detail"]["cancel_confirmed"] is False
+        assert resp.json()["detail"]["stop_route"] == "parent_session_interrupt"
     # The failed stop also lifts the just-installed turn fence: the turn
     # keeps running and nothing else would ever lift it, so leaving it set
     # would silently drop the rest of the turn (live + durable).
@@ -12476,6 +12523,38 @@ async def test_stop_session_surfaces_runner_failure_as_error(
     assert session["id"] not in _interrupt_fenced_sessions, (
         "a failed stop_session must remove the interrupt fence it installed"
     )
+
+
+async def test_pending_codex_restriction_survives_relaunch_arguments(
+    client: httpx.AsyncClient,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(
+                409,
+                json={
+                    "error": "codex_helper_stop_pending",
+                    "detail": "Mode saved for the next turn",
+                },
+            )
+        return httpx.Response(204)
+
+    async with _runtime_runner(handler):
+        agent = await create_test_agent(client)
+        session = await _create_session(
+            client,
+            agent["id"],
+            labels={"omnigent.ui": "terminal", "omnigent.wrapper": "codex-native-ui"},
+            terminal_launch_args=["--dangerously-bypass-approvals-and-sandbox"],
+        )
+        response = await client.patch(
+            f"/v1/sessions/{session['id']}", json={"approval_mode": "read-only"}
+        )
+        snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert response.status_code == 409, response.text
+    assert response.json()["error"] == "codex_helper_stop_pending"
+    assert "--dangerously-bypass-approvals-and-sandbox" not in snapshot["terminal_launch_args"]
+    assert "read-only" in snapshot["terminal_launch_args"]
 
 
 async def test_stop_session_no_runner_settles_stale_child_and_parent_badge(

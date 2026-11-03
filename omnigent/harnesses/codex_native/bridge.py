@@ -79,6 +79,8 @@ _MCP_STARTUP_FILE = "mcp_startup.json"
 # across forwarder restarts because resumed threads report their totals again.
 _CHILD_USAGE_BASELINES_FILE = "child_usage_baselines.json"
 _CHILD_USAGE_BASELINES_LOCK_FILE = "child_usage_baselines.lock"
+_ACTIVE_CHILD_TURNS_FILE = "active_child_turns.json"
+_ACTIVE_CHILD_TURNS_LOCK_FILE = "active_child_turns.lock"
 
 # Startup states mirrored from Codex's ``McpServerStartupState`` enum.
 MCP_STARTUP_STARTING = "starting"
@@ -212,6 +214,7 @@ class CodexNativeBridgeState:
     usage_admission_id: str | None = None
     usage_turn_id: str | None = None
     permission_profile: str | None = None
+    helper_stop_pending: bool = False
 
 
 @dataclass(frozen=True)
@@ -1365,6 +1368,7 @@ def _write_bridge_state_unlocked(bridge_dir: Path, state: CodexNativeBridgeState
                     "codex_home": state.codex_home,
                     "active_turn_id": state.active_turn_id,
                     "cwd": state.cwd,
+                    **({"helper_stop_pending": True} if state.helper_stop_pending else {}),
                     **(
                         {
                             "usage_admission_id": state.usage_admission_id,
@@ -1398,6 +1402,9 @@ def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
     :returns: None.
     """
     with _bridge_state_lock(bridge_dir):
+        previous = read_bridge_state(bridge_dir)
+        if previous is not None and previous.helper_stop_pending:
+            state = replace(state, helper_stop_pending=True)
         _write_bridge_state_unlocked(bridge_dir, state)
     # A new or rotated session's policies were never checked.
     policy_allow_cache.invalidate(bridge_dir)
@@ -1482,6 +1489,7 @@ def clear_bridge_state(bridge_dir: Path) -> None:
             _STARTUP_TIMEOUT_FILE,
             _MCP_STARTUP_FILE,
             _EGRESS_CERTIFICATE_FILE,
+            _ACTIVE_CHILD_TURNS_FILE,
         ):
             try:
                 (bridge_dir / name).unlink()
@@ -1976,6 +1984,7 @@ def read_bridge_state_result(bridge_dir: Path) -> CodexNativeBridgeStateRead:
             permission_profile=permission_profile
             if isinstance(permission_profile, str) and permission_profile
             else None,
+            helper_stop_pending=raw.get("helper_stop_pending") is True,
         ),
         "ready",
     )
@@ -2162,4 +2171,120 @@ def clear_active_turn_id_if_matches(
             replace(state, active_turn_id=None),
         )
         _run_on_cleared()
+        return True
+
+
+def set_helper_stop_pending(bridge_dir: Path, pending: bool) -> None:
+    """Keep revocation outstanding across runner and forwarder reconnects."""
+    with _bridge_state_lock(bridge_dir):
+        state = read_bridge_state(bridge_dir)
+        if state is not None:
+            _write_bridge_state_unlocked(bridge_dir, replace(state, helper_stop_pending=pending))
+
+
+def clear_active_child_turns(bridge_dir: Path) -> None:
+    """Retire helper inventory after its backend is released or revocation finishes."""
+    with _bridge_state_lock(bridge_dir, _ACTIVE_CHILD_TURNS_LOCK_FILE):
+        _write_active_child_turns_unlocked(bridge_dir, {})
+    set_helper_stop_pending(bridge_dir, False)
+
+
+def read_active_child_turns(
+    bridge_dir: Path, *, strict: bool = False
+) -> dict[str, dict[str, str | None]]:
+    """Read active child helper threads and their turn ids from the bridge directory."""
+    if bridge_dir == Path():
+        return {}
+    path = bridge_dir / _ACTIVE_CHILD_TURNS_FILE
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        if strict:
+            raise
+        return {}
+    if not isinstance(raw, dict):
+        if strict:
+            raise ValueError("Invalid Codex helper inventory")
+        return {}
+    result: dict[str, dict[str, str | None]] = {}
+    for thread_id, info in raw.items():
+        if not isinstance(thread_id, str) or not thread_id or not isinstance(info, dict):
+            if strict:
+                raise ValueError("Invalid Codex helper inventory entry")
+            continue
+        session_id = info.get("session_id")
+        turn_id = info.get("turn_id")
+        status = info.get("status")
+        result[thread_id] = {
+            "session_id": session_id if isinstance(session_id, str) and session_id else None,
+            "turn_id": turn_id if isinstance(turn_id, str) and turn_id else None,
+            "status": status if isinstance(status, str) and status else None,
+        }
+    return result
+
+
+def _write_active_child_turns_unlocked(
+    bridge_dir: Path, entries: Mapping[str, dict[str, str | None]]
+) -> None:
+    """Atomically write ``active_child_turns.json`` under the active-child-turns lock."""
+    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = bridge_dir / _ACTIVE_CHILD_TURNS_FILE
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{_ACTIVE_CHILD_TURNS_FILE}.", dir=str(bridge_dir))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(dict(entries), handle, sort_keys=True)
+            handle.write("\n")
+        os.replace(tmp_name, path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+
+
+def update_active_child_turn(
+    bridge_dir: Path,
+    thread_id: str,
+    *,
+    session_id: str | None = None,
+    turn_id: str | None = None,
+    status: str | None = None,
+) -> None:
+    """Record or update an active child helper thread and turn in the bridge directory."""
+    if not thread_id or bridge_dir == Path():
+        return
+    set_helper_stop_pending(bridge_dir, True)
+    with _bridge_state_lock(bridge_dir, _ACTIVE_CHILD_TURNS_LOCK_FILE):
+        entries = read_active_child_turns(bridge_dir)
+        existing = entries.get(thread_id) or {}
+        entries[thread_id] = {
+            "session_id": session_id if session_id is not None else existing.get("session_id"),
+            "turn_id": turn_id if turn_id is not None else existing.get("turn_id"),
+            "status": status if status is not None else (existing.get("status") or "running"),
+        }
+        _write_active_child_turns_unlocked(bridge_dir, entries)
+
+
+def clear_active_child_turn(
+    bridge_dir: Path,
+    thread_id: str,
+    completed_turn_id: str | None = None,
+) -> bool:
+    """Remove a child helper thread from ``active_child_turns.json`` when its turn ends."""
+    if not thread_id or bridge_dir == Path():
+        return False
+    with _bridge_state_lock(bridge_dir, _ACTIVE_CHILD_TURNS_LOCK_FILE):
+        entries = read_active_child_turns(bridge_dir)
+        existing = entries.get(thread_id)
+        if existing is None:
+            return False
+        current_turn_id = existing.get("turn_id")
+        if (
+            completed_turn_id is not None
+            and current_turn_id is not None
+            and current_turn_id != completed_turn_id
+        ):
+            return False
+        entries.pop(thread_id, None)
+        _write_active_child_turns_unlocked(bridge_dir, entries)
+        if not entries:
+            set_helper_stop_pending(bridge_dir, False)
         return True

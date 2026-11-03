@@ -423,7 +423,10 @@ def test_terminate_tree_stops_the_process() -> None:
 
 
 @pytest.mark.skipif(os.name != "posix", reason="setsid is POSIX-only")
-def test_kill_tree_reaps_descendant_that_left_process_group(tmp_path: Path) -> None:
+@pytest.mark.parametrize("snapshot", [False, True])
+def test_kill_tree_reaps_descendant_that_left_process_group(
+    tmp_path: Path, snapshot: bool
+) -> None:
     child_pid_path = tmp_path / "setsid-child.pid"
     script = (
         "import os, pathlib, time\n"
@@ -452,13 +455,26 @@ def test_kill_tree_reaps_descendant_that_left_process_group(tmp_path: Path) -> N
         assert child_pid_path.exists()
         child_pid = int(child_pid_path.read_text())
 
-        _proc.kill_tree(proc)
-        proc.wait(timeout=5)
+        if snapshot:
+            identities = _proc.snapshot_process_tree(
+                proc.pid, _proc._process_start_stamp(psutil.Process(proc.pid))
+            )
+            assert child_pid in identities
+            proc.kill()
+            proc.wait(timeout=5)
+            assert _proc.process_alive(child_pid)
+            _proc._signal_identities(identities, force=False)
+            _proc._signal_identities(identities, force=True)
+        else:
+            _proc.kill_tree(proc)
+            proc.wait(timeout=5)
 
         deadline = time.monotonic() + 5
         while _proc.process_alive(child_pid) and time.monotonic() < deadline:
             time.sleep(0.02)
         assert not _proc.process_alive(child_pid)
+        if snapshot:
+            assert not _proc.surviving_process_snapshot(identities)
     finally:
         if proc.poll() is None:
             proc.kill()

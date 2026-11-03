@@ -6854,3 +6854,75 @@ async def test_pi_extension_ui_hook_malformed_body_400(
         assert response.status_code == 400, response.text
         if elicitation_id == "elicit_pi_" + "e" * 32:
             assert sessions_route._harness_elicitation_owners[elicitation_id] == "another_session"
+
+
+@pytest.mark.parametrize("registered", [True, False])
+async def test_codex_helper_elicitation_decline_forwards_side_thread_interrupt_to_parent(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    registered: bool,
+) -> None:
+    """T32: declining a codex-native helper card interrupts the helper turn via parent."""
+    forwarded: list[tuple[str, dict[str, Any]]] = []
+
+    async def _record(*args: Any, **_kwargs: Any) -> None:
+        forwarded.append((args[0], args[2]))
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.routes_hooks._forward_session_change_to_runner",
+        _record,
+    )
+    agent = await create_test_agent(client, "test-codex-helper-decline")
+    parent_id = await _create_session(client, agent["id"])
+    child_id = parent_id
+    if registered:
+        start_resp = await client.post(
+            f"/v1/sessions/{parent_id}/events",
+            json={
+                "type": "external_codex_subagent_start",
+                "data": {
+                    "thread_id": "thread_helper_t32",
+                    "tool_call_id": "call_t32",
+                    "agent_nickname": "Archimedes",
+                    "agent_role": "worker",
+                },
+            },
+        )
+        assert start_resp.status_code == 202, start_resp.text
+        child_id = start_resp.json()["child_session_id"]
+
+    payload = {
+        "id": 91,
+        "method": "item/fileChange/requestApproval",
+        "params": {
+            "threadId": "thread_helper_t32",
+            "turnId": "turn_helper_t32",
+            **({"omnigentParentThreadId": "thread_parent"} if not registered else {}),
+            "itemId": "patch_t32",
+            "grantRoot": "/repo/app",
+            "reason": "write file",
+        },
+    }
+    drain_task = asyncio.create_task(_drain_until_elicitation(child_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(f"/v1/sessions/{child_id}/hooks/codex-elicitation-request", json=payload)
+    )
+    event = await drain_task
+    verdict = await _post_approval(client, child_id, event["elicitation_id"], "decline")
+    assert verdict.status_code == 202, verdict.text
+    async with asyncio.timeout(1.0):
+        response = await hook_task
+    assert response.status_code == 200, response.text
+    assert response.json() == {"decision": "decline"}
+    assert forwarded == [
+        (
+            parent_id,
+            {
+                "type": "interrupt",
+                "codex_side_thread_id": "thread_helper_t32",
+                "codex_side_turn_id": "turn_helper_t32",
+                "codex_elicitation_interrupt": True,
+            },
+        )
+    ]

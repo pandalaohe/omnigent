@@ -9835,6 +9835,25 @@ def create_runner_app(
             extra={"session_id": conversation_id},
         )
         _side_thread_id = body.get("codex_side_thread_id") if isinstance(body, dict) else None
+        if body_type == "codex_helpers_stop":
+            children = body.get("children", {})
+            if (
+                not isinstance(children, dict)
+                or len(children) > 512
+                or any(
+                    not isinstance(tid, str)
+                    or not isinstance(info, dict)
+                    or any(
+                        value is not None and not isinstance(value, str) for value in info.values()
+                    )
+                    for tid, info in children.items()
+                )
+            ):
+                return JSONResponse(status_code=400, content={"error": "invalid_helper_inventory"})
+            stopped = await _native_controls.stop_codex_native_helpers(
+                conversation_id, str(body.get("reason", "recovery")), children
+            )
+            return JSONResponse(content={"helpers_stopped": stopped})
         if _side_thread_id:
             # Side-chat controls use the parent's bridge but target the child's
             # thread, leaving the parent's turn and message buffer untouched.
@@ -9849,6 +9868,17 @@ def create_runner_app(
             _side_turn_id = body.get("codex_side_turn_id")
             _side_text = ""
             if body_type == "interrupt":
+                if not isinstance(_side_turn_id, str) or not _side_turn_id:
+                    from omnigent.harnesses.codex_native.bridge import read_active_child_turns
+
+                    _, _side_bridge_dir = await _codex_native_bridge_state_and_dir_for_session(
+                        conversation_id, action="side chat turn"
+                    )
+                    _side_turn_id = (
+                        read_active_child_turns(_side_bridge_dir)
+                        .get(str(_side_thread_id), {})
+                        .get("turn_id")
+                    )
                 if not isinstance(_side_turn_id, str) or not _side_turn_id:
                     return JSONResponse(
                         status_code=400,
@@ -9880,12 +9910,59 @@ def create_runner_app(
                         "detail": "Codex /side follow-up requires a loaded parent Codex bridge.",
                     },
                 )
+            if (
+                body.get("codex_elicitation_interrupt") is True
+                and _side_thread_id == _side_state.thread_id
+            ):
+                result = await _native_interrupt_runner.interrupt("codex-native", conversation_id)
+                return result if result is not None else Response(status_code=204)
             _side_client = client_for_transport(
                 _side_state.socket_path, client_name="omnigent-codex-native-runner"
             )
             try:
                 await _side_client.connect()
                 if body_type == "interrupt":
+                    from omnigent.harnesses.codex_native.bridge import read_active_child_turns
+
+                    _, owner_bridge_dir = await _codex_native_bridge_state_and_dir_for_session(
+                        conversation_id, action="elicitation thread ownership"
+                    )
+                    if (
+                        body.get("codex_elicitation_interrupt") is True
+                        and _side_thread_id != _side_state.thread_id
+                        and str(_side_thread_id) not in read_active_child_turns(owner_bridge_dir)
+                    ):
+                        owner_response = await _side_client.request(
+                            "thread/read", {"threadId": _side_thread_id, "includeTurns": False}
+                        )
+                        owner_result = owner_response.get("result")
+                        owner_thread = (
+                            owner_result.get("thread") if isinstance(owner_result, dict) else None
+                        )
+                        owner_source = (
+                            owner_thread.get("source") if isinstance(owner_thread, dict) else None
+                        )
+                        owner_subagent = (
+                            owner_source.get("subAgent")
+                            if isinstance(owner_source, dict)
+                            else None
+                        )
+                        owner_spawn = (
+                            owner_subagent.get("thread_spawn")
+                            if isinstance(owner_subagent, dict)
+                            else None
+                        )
+                        if (
+                            not isinstance(owner_spawn, dict)
+                            or owner_spawn.get("parent_thread_id") != _side_state.thread_id
+                        ):
+                            return JSONResponse(
+                                status_code=409,
+                                content={
+                                    "error": "codex_child_ownership_unconfirmed",
+                                    "detail": "Interrupt thread does not belong to this session.",
+                                },
+                            )
                     await side_chat.interrupt_side_turn(
                         _side_client, str(_side_thread_id), _side_turn_id
                     )
@@ -10557,6 +10634,27 @@ def create_runner_app(
                 recovered_entry = await _ensure_subagent_work_entry(
                     conversation_id, result_key=result_key
                 )
+                if isinstance(data, dict) and data.get("parent_turn_consumed") is True:
+                    _consumed_entry = recovered_entry or get_subagent_work(conversation_id)
+                    if _consumed_entry is not None and _consumed_entry.registered_by is None:
+                        _consumed_entry.parent_turn_consumed = True
+                        _parent_id = _consumed_entry.parent_session_id
+                        _parent_inbox = _session_inboxes.get(_parent_id)
+                        if _parent_inbox is not None and not _parent_inbox.empty():
+                            _kept_items: list[_JsonObject] = []
+                            while not _parent_inbox.empty():
+                                _item = _parent_inbox.get_nowait()
+                                if _item.get("task_id") != conversation_id:
+                                    _kept_items.append(_item)
+                            for _item in _kept_items:
+                                _parent_inbox.put_nowait(_item)
+                        if (
+                            latest_wake_eligible_subagent_work(
+                                list_subagent_work(_parent_id), _session_harness_name(_parent_id)
+                            )
+                            is None
+                        ):
+                            _stranded_wake_parents.discard(_parent_id)
             interrupt_pending = False
             interrupt_work_id: str | None = None
             if status == "idle" and terminal_status is None and turn_completed is not True:
@@ -10629,6 +10727,10 @@ def create_runner_app(
                     recovered_entry = await _ensure_subagent_work_entry(
                         conversation_id, result_key=result_key
                     )
+                    if isinstance(data, dict) and data.get("parent_turn_consumed") is True:
+                        _consumed_entry = recovered_entry or get_subagent_work(conversation_id)
+                        if _consumed_entry is not None and _consumed_entry.registered_by is None:
+                            _consumed_entry.parent_turn_consumed = True
                 if status == "idle" and interrupt_pending:
                     # Interrupt with no confirming edge, resolved to the CURRENT
                     # dispatch (``resolve_pending_interrupt`` only reports pending
@@ -11298,6 +11400,39 @@ def create_runner_app(
                         content={"error": "invalid_input", "detail": "Invalid approval_mode"},
                     )
                 _session_approval_mode[conversation_id] = mode
+                helpers_stopped = True
+                if process_manager is not None:
+                    try:
+                        harness_client = await process_manager.get_client(conversation_id, "any")
+                        result = await harness_client.post(
+                            f"/v1/sessions/{conversation_id}/events",
+                            json={"type": "codex_approval_mode_change", "approval_mode": mode},
+                            timeout=3.0,
+                        )
+                        helpers_stopped = (
+                            result.status_code == 200
+                            and result.json().get("helpers_stopped") is True
+                        )
+                    except NoLiveHarnessError:
+                        pass
+                    except Exception:
+                        helpers_stopped = False
+                        _logger.warning(
+                            "Codex helper revocation unconfirmed for %s",
+                            conversation_id,
+                            exc_info=True,
+                        )
+                if not helpers_stopped:
+                    return JSONResponse(
+                        status_code=409,
+                        content={
+                            "error": "codex_helper_stop_pending",
+                            "detail": (
+                                "Mode saved for the next turn; helper stop is not confirmed. "
+                                "Retry the mode change before relying on the tighter permissions."
+                            ),
+                        },
+                    )
                 return JSONResponse(content={"approval_mode": mode})
             if harness == "codex-native":
                 mode = body.get("approval_mode") if isinstance(body, dict) else None
@@ -11787,6 +11922,84 @@ def create_runner_app(
     _require_os_env = _resource_routes.require_os_env
     _resolve_conversation_id = _resource_routes.resolve_conversation_id
 
+    async def _finish_codex_native_helpers(
+        parent: str,
+        bridge_dir: Path,
+        reason: str,
+        confirmed: bool,
+        children: dict[str, dict[str, str | None]],
+        owns_backend: Callable[[], bool],
+        retired: bool,
+    ) -> bool:
+        from omnigent.harnesses.codex_native.bridge import read_active_child_turns
+
+        if retired and owns_backend():
+            children.update(read_active_child_turns(bridge_dir))
+            for entry in _subagent_work.list_active_codex_native_work(parent):
+                children.setdefault(entry.child_session_id, {"session_id": entry.child_session_id})
+                entry.parent_turn_consumed = True
+                mark_subagent_work_terminal(entry.child_session_id, status="failed", output="")
+        confirmed &= owns_backend()
+        ids = {sid for row in children.values() if (sid := row.get("session_id"))}
+        summary = (
+            f"Codex helpers {'stopped' if confirmed else 'stop unconfirmed'} after {reason}: "
+            + ", ".join(sorted(ids) or children or {"unknown helpers": {}})
+            + ". Running helper work may be lost. Commands detached before the process "
+            "snapshot are outside this cleanup."
+        )
+
+        async def post_child(child: str) -> None:
+            response = await server_client.post(
+                f"/v1/sessions/{child}/events",
+                json={
+                    "type": "external_session_status",
+                    "data": {"status": "failed", "output": summary, "parent_turn_consumed": True},
+                },
+                timeout=0.5,
+            )
+            response.raise_for_status()
+
+        child_ids = sorted(ids) if owns_backend() else []
+        receipts = await asyncio.gather(
+            *(post_child(child) for child in child_ids), return_exceptions=True
+        )
+        failed = [
+            child
+            for child, result in zip(child_ids, receipts, strict=True)
+            if isinstance(result, BaseException)
+        ]
+        if failed:
+            confirmed = False
+            summary += f" Public helper status unconfirmed: {failed}."
+        _session_inboxes.setdefault(parent, asyncio.Queue()).put_nowait(
+            {"type": "system_notice", "message": summary}
+        )
+        report_id = hashlib.sha256(json.dumps(children, sort_keys=True).encode()).hexdigest()
+        try:
+            response = await server_client.post(
+                f"/v1/sessions/{parent}/events",
+                json={
+                    "type": "external_conversation_item",
+                    "data": {
+                        "item_type": "error",
+                        "source_id": f"codex-helpers:{report_id}",
+                        "item_data": {
+                            "source": "execution",
+                            "code": "codex_helpers_stopped"
+                            if confirmed
+                            else "codex_helpers_stop_unconfirmed",
+                            "message": summary,
+                        },
+                    },
+                },
+                timeout=0.5,
+            )
+            response.raise_for_status()
+        except httpx.HTTPError:
+            _logger.warning("Codex helper stop report could not be persisted for %s", parent)
+            return False
+        return confirmed
+
     _native_controls = build_native_controls(
         _active_turns=_active_turns,
         _background_tasks=_background_tasks,
@@ -11824,6 +12037,7 @@ def create_runner_app(
         _session_spec_cache=_session_spec_cache,
         resource_registry=resource_registry,
         server_client=server_client,
+        _finish_codex_native_helpers=_finish_codex_native_helpers,
     )
     _codex_native_model_options = _native_controls.codex_native_model_options
     _handle_antigravity_native_permission_mode_change = (

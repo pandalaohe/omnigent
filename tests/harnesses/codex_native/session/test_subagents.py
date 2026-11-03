@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,596 @@ from tests.harnesses.codex_native.session._support import (
 )
 
 # ── Codex subagent tracking and dedup ────────────────────────────────────────
+
+
+@asynccontextmanager
+async def _review_event_context():
+    posted = []
+
+    def handler(request):
+        posted.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(202, json={"queued": False})
+
+    async with httpx.AsyncClient(
+        base_url="http://test", transport=httpx.MockTransport(handler)
+    ) as client:
+        tracker = _elicitation_tracker()
+        usage = _usage_coalescer(client)
+        try:
+            yield client, posted, tracker, usage
+        finally:
+            await tracker.close()
+            await usage.flush()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tighten", [False, True])
+async def test_native_permission_frames_revoke_only_on_tightening(tmp_path, tighten):
+    state = codex_native_forwarder._CodexForwarderState(parent_session_id="conv_parent")
+    full = {"approvalPolicy": "never", "sandboxPolicy": {"type": "dangerFullAccess"}}
+    ask = {
+        "approvalPolicy": "on-request",
+        "approvalsReviewer": "user",
+        "sandboxPolicy": {"type": "workspaceWrite"},
+    }
+    settings = [full, ask, ask] if tighten else [ask, full, full]
+    async with _review_event_context() as (client, posted, tracker, usage):
+        for fields in settings:
+            await codex_native_forwarder._handle_event(
+                client,
+                session_id="conv_parent",
+                bridge_dir=tmp_path,
+                event={
+                    "method": "thread/settings/updated",
+                    "params": {"threadId": "thread_parent", "threadSettings": fields},
+                },
+                expected_thread_id="thread_parent",
+                forwarder_state=state,
+                usage_coalescer=usage,
+                elicitation_tracker=tracker,
+            )
+        if state.helper_control_task is not None:
+            await state.helper_control_task
+        controls = [body for _, body in posted if body.get("data", {}).get("helper_action")]
+        modes = [
+            body["data"]["approval_mode"]
+            for _, body in posted
+            if "approval_mode" in body.get("data", {})
+        ]
+        assert modes == (
+            ["full-access", "ask-for-approval"] if tighten else ["ask-for-approval", "full-access"]
+        )
+        assert len(controls) == int(tighten)
+        if tighten:
+            assert controls[0]["data"]["helper_action"] == "tightening"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "terminal",
+        "consumed",
+        "consumed-completed",
+        "deferred",
+        "running",
+        "unreadable",
+        "corrupt",
+        "hung",
+        "discovered",
+        "historical",
+        "earlier-running",
+        "overflow",
+        "consumed-newer",
+    ],
+)
+async def test_reconnect_reconciles_once_without_preloaded_mapping(tmp_path, scenario):
+    from omnigent.harnesses.codex_native import bridge
+
+    bridge.write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_parent",
+            socket_path="ws://127.0.0.1:1234",
+            thread_id="thread_parent",
+            codex_home=str(tmp_path / "home"),
+        ),
+    )
+    bridge.update_active_child_turn(
+        tmp_path, "thread_child", session_id="conv_child", turn_id="turn_child"
+    )
+    if scenario == "corrupt":
+        (tmp_path / "active_child_turns.json").write_text("{")
+    parent_turn = {"id": "turn_parent", "status": "completed", "items": []}
+    if scenario in {"consumed", "consumed-completed", "deferred", "consumed-newer"}:
+        parent_turn.update(
+            status="completed" if scenario == "consumed-completed" else "inProgress",
+            items=[
+                {
+                    "id": "wait",
+                    "type": "collabAgentToolCall",
+                    "tool": "wait",
+                    "status": "inProgress" if scenario == "deferred" else "completed",
+                    "receiverThreadIds": ["thread_child"],
+                    "agentsStates": {
+                        "thread_child": {
+                            "status": "running" if scenario == "deferred" else "completed"
+                        }
+                    },
+                }
+            ],
+        )
+    calls = []
+
+    parent_turns = [parent_turn]
+    if scenario == "historical":
+        parent_turns.insert(
+            0,
+            {
+                "id": "old_parent",
+                "status": "completed",
+                "items": [
+                    {
+                        "type": "collabAgentToolCall",
+                        "receiverThreadIds": ["thread_child"],
+                        "agentsStates": {"thread_child": {"status": "completed"}},
+                    }
+                ],
+            },
+        )
+    if scenario == "discovered":
+        parent_turn["items"] = [
+            {"type": "collabAgentToolCall", "receiverThreadIds": ["thread_unknown"]}
+        ]
+    if scenario == "earlier-running":
+        parent_turns.insert(
+            0,
+            {
+                "id": "old_parent",
+                "status": "completed",
+                "items": [
+                    {
+                        "type": "collabAgentToolCall",
+                        "receiverThreadIds": ["thread_unknown"],
+                        "agentsStates": {"thread_unknown": {"status": "running"}},
+                    }
+                ],
+            },
+        )
+    if scenario == "overflow":
+        parent_turn["items"] = [
+            {
+                "type": "collabAgentToolCall",
+                "receiverThreadIds": [f"thread_{i}" for i in range(513)],
+            }
+        ]
+
+    class Client(_FakeCodexAppServerClient):
+        async def request(self, method, params):
+            calls.append((method, params))
+            if method == "thread/resume":
+                return {"result": {"thread": {"id": "thread_parent", "turns": []}}}
+            if params["threadId"] == "thread_parent":
+                return {"result": {"thread": {"id": "thread_parent", "turns": parent_turns}}}
+            if scenario == "hung":
+                await asyncio.Event().wait()
+            if scenario == "unreadable":
+                raise RuntimeError("unavailable")
+            return {
+                "result": {
+                    "thread": {
+                        "id": "thread_child",
+                        "turns": [
+                            {
+                                "id": "turn_new" if scenario == "consumed-newer" else "turn_child",
+                                "status": "inProgress" if scenario == "running" else "completed",
+                                "items": [],
+                            }
+                        ],
+                    }
+                }
+            }
+
+    state = codex_native_forwarder._CodexForwarderState(
+        parent_session_id="conv_parent", child_usage_baseline_dir=tmp_path
+    )
+    if scenario == "consumed-completed":
+        state.completed_parent_turn_ids.add("turn_parent")
+    async with _review_event_context() as (client, posted, tracker, usage):
+        await asyncio.wait_for(
+            codex_native_forwarder._subscribe_until_ready(
+                Client(),
+                client,
+                session_id="conv_parent",
+                bridge_dir=tmp_path,
+                thread_id="thread_parent",
+                usage_coalescer=usage,
+                elicitation_tracker=tracker,
+                forwarder_state=state,
+            ),
+            timeout=2,
+        )
+        controls = [body for _, body in posted if body.get("data", {}).get("helper_action")]
+
+        def terminal():
+            return [
+                body
+                for path, body in posted
+                if path.endswith("conv_child/events")
+                and body.get("type") == "external_session_status"
+                and body["data"].get("status") == "idle"
+            ]
+
+        if scenario in {
+            "running",
+            "unreadable",
+            "corrupt",
+            "hung",
+            "discovered",
+            "earlier-running",
+            "overflow",
+        }:
+            assert len(controls) == 1
+            assert controls[0]["data"]["helper_action"] == "recovery"
+            assert len(controls[0]["data"].get("children", {})) <= 512
+            if scenario == "discovered":
+                assert "thread_unknown" in controls[0]["data"].get("children", {})
+        elif scenario == "deferred":
+            assert len(terminal()) == 1
+            assert not terminal()[0]["data"].get("parent_turn_consumed", False)
+            await codex_native_forwarder._handle_event(
+                client,
+                session_id="conv_parent",
+                bridge_dir=tmp_path,
+                event={
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread_parent",
+                        "turn": {"id": "turn_parent", "status": "completed"},
+                    },
+                },
+                usage_coalescer=usage,
+                elicitation_tracker=tracker,
+                expected_thread_id="thread_parent",
+                forwarder_state=state,
+            )
+            assert len(terminal()) == 1
+        else:
+            assert len(terminal()) == 1
+            assert terminal()[0]["data"].get("parent_turn_consumed", False) == (
+                scenario in {"consumed", "consumed-completed"}
+            )
+        count = len(calls)
+        await asyncio.sleep(0.06)  # custom-lint: disable=sleep-then-assert -- observe no retries
+        assert len(calls) == count, "recovery must not leave a retry task"
+        await state.close_child_streams()
+
+
+@pytest.mark.asyncio
+async def test_native_tightening_keeps_terminal_consumer_responsive(tmp_path):
+    from omnigent.harnesses.codex_native import bridge
+
+    state = codex_native_forwarder._CodexForwarderState(parent_session_id="conv_parent")
+    state.note_child_thread("thread_child", "conv_child")
+    bridge.update_active_child_turn(
+        tmp_path, "thread_child", session_id="conv_child", turn_id="turn_child"
+    )
+    requested, completed = asyncio.Event(), asyncio.Event()
+
+    async def handler(request):
+        body = json.loads(request.content)
+        if body.get("data", {}).get("helper_action"):
+            requested.set()
+            await completed.wait()
+        return httpx.Response(202, json={"queued": False})
+
+    async with httpx.AsyncClient(
+        base_url="http://test", transport=httpx.MockTransport(handler)
+    ) as client:
+        tracker, usage = _elicitation_tracker(), _usage_coalescer(client)
+
+        async def frame(method, params):
+            await codex_native_forwarder._handle_event(
+                client,
+                session_id="conv_parent",
+                bridge_dir=tmp_path,
+                event={"method": method, "params": params},
+                expected_thread_id="thread_parent",
+                forwarder_state=state,
+                usage_coalescer=usage,
+                elicitation_tracker=tracker,
+            )
+
+        try:
+            for policy, sandbox in [
+                ("never", "dangerFullAccess"),
+                ("on-request", "workspaceWrite"),
+            ]:
+                await asyncio.wait_for(
+                    frame(
+                        "thread/settings/updated",
+                        {
+                            "threadId": "thread_parent",
+                            "threadSettings": {
+                                "approvalPolicy": policy,
+                                "approvalsReviewer": "user",
+                                "sandboxPolicy": {"type": sandbox},
+                            },
+                        },
+                    ),
+                    timeout=0.2,
+                )
+            await asyncio.wait_for(requested.wait(), 0.2)
+            await frame(
+                "turn/completed",
+                {
+                    "threadId": "thread_child",
+                    "turn": {"id": "turn_child", "status": "interrupted"},
+                },
+            )
+            assert not bridge.read_active_child_turns(tmp_path)
+        finally:
+            completed.set()
+            await tracker.close()
+            await state.close_child_streams()
+
+
+@pytest.mark.asyncio
+async def test_native_tightening_keeps_one_ordered_followup_while_reporting(tmp_path):
+    state = codex_native_forwarder._CodexForwarderState(parent_session_id="conv_parent")
+    first_entered, first_release = asyncio.Event(), asyncio.Event()
+    calls, active, peak = 0, 0, 0
+
+    async def handler(request):
+        nonlocal calls, active, peak
+        if json.loads(request.content).get("data", {}).get("helper_action"):
+            calls += 1
+            active += 1
+            peak = max(peak, active)
+            if calls == 1:
+                first_entered.set()
+                await first_release.wait()
+            active -= 1
+        return httpx.Response(202, json={"queued": False})
+
+    async with httpx.AsyncClient(
+        base_url="http://test", transport=httpx.MockTransport(handler)
+    ) as client:
+        tracker, usage = _elicitation_tracker(), _usage_coalescer(client)
+
+        async def permission(policy, sandbox):
+            await codex_native_forwarder._handle_event(
+                client,
+                session_id="conv_parent",
+                bridge_dir=tmp_path,
+                event={
+                    "method": "thread/settings/updated",
+                    "params": {
+                        "threadId": "thread_parent",
+                        "threadSettings": {
+                            "approvalPolicy": policy,
+                            "approvalsReviewer": "user",
+                            "sandboxPolicy": {"type": sandbox},
+                        },
+                    },
+                },
+                expected_thread_id="thread_parent",
+                forwarder_state=state,
+                usage_coalescer=usage,
+                elicitation_tracker=tracker,
+            )
+
+        try:
+            await permission("never", "dangerFullAccess")
+            await permission("on-request", "workspaceWrite")
+            await asyncio.wait_for(first_entered.wait(), 1)
+            for _ in range(2):
+                await permission("never", "dangerFullAccess")
+                await permission("on-request", "workspaceWrite")
+            first_release.set()
+            await asyncio.wait_for(state.helper_control_task, 1)
+            assert calls == 2, "distinct tightenings during reporting need one coalesced followup"
+            assert peak == 1, "controls must stay ordered"
+        finally:
+            first_release.set()
+            await tracker.close()
+            await state.close_child_streams()
+
+
+@pytest.mark.asyncio
+async def test_resume_does_not_restore_an_already_delivered_terminal(tmp_path):
+    from omnigent.harnesses.codex_native import bridge
+
+    state = codex_native_forwarder._CodexForwarderState(
+        parent_session_id="conv_parent", child_usage_baseline_dir=tmp_path
+    )
+    state.note_child_thread("thread_child", "conv_child")
+    bridge.update_active_child_turn(
+        tmp_path, "thread_child", session_id="conv_child", turn_id="turn_child"
+    )
+    turn = {"id": "turn_child", "status": "completed", "items": []}
+    async with _review_event_context() as (client, posted, tracker, usage):
+        await codex_native_forwarder._handle_event(
+            client,
+            session_id="conv_parent",
+            bridge_dir=tmp_path,
+            event={
+                "method": "turn/completed",
+                "params": {"threadId": "thread_child", "turn": turn},
+            },
+            expected_thread_id="thread_parent",
+            forwarder_state=state,
+            usage_coalescer=usage,
+            elicitation_tracker=tracker,
+        )
+        assert not bridge.read_active_child_turns(tmp_path)
+        await codex_native_forwarder._apply_child_resume(
+            client,
+            parent_session_id="conv_parent",
+            child_session_id="conv_child",
+            child_thread_id="thread_child",
+            response={"result": {"thread": {"id": "thread_child", "turns": [turn]}}},
+            forwarder_state=state,
+        )
+        assert not bridge.read_active_child_turns(tmp_path)
+        assert (
+            sum(
+                body.get("type") == "external_session_status"
+                and path.endswith("conv_child/events")
+                for path, body in posted
+            )
+            == 1
+        )
+        await state.close_child_streams()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["parent", "child"])
+async def test_retryable_error_preserves_helper_control_and_wait(
+    tmp_path: Path, target: str
+) -> None:
+    from omnigent.harnesses.codex_native.bridge import (
+        read_active_child_turns,
+        update_active_child_turn,
+    )
+
+    state = codex_native_forwarder._CodexForwarderState(parent_session_id="conv_parent")
+    state.note_child_thread("thread_child", "conv_child")
+    state.active_parent_turn_id = "turn_parent"
+    state.in_flight_collab_calls_by_thread["thread_child"] = {"wait"}
+    update_active_child_turn(
+        tmp_path, "thread_child", session_id="conv_child", turn_id="turn_child"
+    )
+    async with _review_event_context() as (client, _posted, tracker, usage):
+        await codex_native_forwarder._handle_event(
+            client,
+            session_id="conv_parent",
+            bridge_dir=tmp_path,
+            event={
+                "method": "error",
+                "params": {
+                    "threadId": f"thread_{target}",
+                    "turnId": f"turn_{target}",
+                    "willRetry": True,
+                    "error": {"message": "retry"},
+                },
+            },
+            usage_coalescer=usage,
+            elicitation_tracker=tracker,
+            expected_thread_id="thread_parent",
+            forwarder_state=state,
+        )
+    assert read_active_child_turns(tmp_path)["thread_child"]["turn_id"] == "turn_child"
+    assert state.active_parent_turn_id == "turn_parent"
+    assert state.in_flight_collab_calls_by_thread == {"thread_child": {"wait"}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["inProgress", "completed"])
+async def test_child_resume_recovers_control_and_terminal_delivery(
+    tmp_path: Path, status: str
+) -> None:
+    from omnigent.harnesses.codex_native.bridge import (
+        read_active_child_turns,
+        update_active_child_turn,
+    )
+
+    response = _child_resume_response()
+    response["result"]["thread"]["turns"][-1].update(id="turn_current", status=status)
+    state = codex_native_forwarder._CodexForwarderState(parent_session_id="conv_parent")
+    state.child_usage_baseline_dir = tmp_path
+    state.note_child_thread("thread_child", "conv_child")
+    update_active_child_turn(tmp_path, "thread_child", session_id="conv_child", turn_id="turn_old")
+    async with _review_event_context() as (client, posted, _tracker, _usage):
+        await codex_native_forwarder._apply_child_resume(
+            client,
+            parent_session_id="conv_parent",
+            child_session_id="conv_child",
+            child_thread_id="thread_child",
+            response=response,
+            forwarder_state=state,
+        )
+    if status == "inProgress":
+        assert read_active_child_turns(tmp_path)["thread_child"]["turn_id"] == "turn_current"
+    else:
+        assert not read_active_child_turns(tmp_path)
+        assert any(
+            body.get("type") == "external_session_status" and body["data"].get("status") == "idle"
+            for _path, body in posted
+        )
+
+
+@pytest.mark.asyncio
+async def test_child_terminal_error_waits_for_parent_consumption(tmp_path: Path) -> None:
+    state = codex_native_forwarder._CodexForwarderState(parent_session_id="conv_parent")
+    state.note_child_thread("thread_child", "conv_child")
+    state.active_parent_turn_id = "turn_parent"
+    state.in_flight_collab_calls_by_thread["thread_child"] = {"wait"}
+    async with _review_event_context() as (client, posted, tracker, usage):
+        await codex_native_forwarder._handle_event(
+            client,
+            session_id="conv_parent",
+            bridge_dir=tmp_path,
+            event={
+                "method": "error",
+                "params": {
+                    "threadId": "thread_child",
+                    "turnId": "turn_child",
+                    "willRetry": False,
+                    "error": {"message": "failed"},
+                },
+            },
+            usage_coalescer=usage,
+            elicitation_tracker=tracker,
+            expected_thread_id="thread_parent",
+            forwarder_state=state,
+        )
+        assert not any(
+            body.get("type") == "external_session_status"
+            and body["data"].get("status") == "failed"
+            for _path, body in posted
+        )
+        assert "thread_child" in state.deferred_child_terminal_edges
+        await state.close_child_streams()
+
+
+@pytest.mark.asyncio
+async def test_announced_child_approval_carries_native_owner_without_mirror(
+    tmp_path: Path,
+) -> None:
+    from omnigent.harnesses.codex_native.bridge import read_active_child_turns
+    from tests._helpers.polling import poll_until_async
+
+    state = codex_native_forwarder._CodexForwarderState(parent_session_id="conv_parent")
+    state.note_pending_child_thread("thread_child", "thread_parent")
+    fake = _FakeCodexAppServerClient()
+    async with _review_event_context() as (client, posted, tracker, usage):
+        await codex_native_forwarder._handle_event(
+            client,
+            session_id="conv_parent",
+            bridge_dir=tmp_path,
+            event={
+                "id": 7,
+                "method": "item/fileChange/requestApproval",
+                "params": {"threadId": "thread_child", "turnId": "turn_child", "itemId": "patch"},
+            },
+            usage_coalescer=usage,
+            elicitation_tracker=tracker,
+            expected_thread_id="thread_parent",
+            forwarder_state=state,
+            codex_client=fake,
+        )
+        await poll_until_async(
+            lambda: any(
+                path.endswith("/hooks/codex-elicitation-request") for path, _body in posted
+            ),
+            timeout_s=1,
+        )
+        hook = next(
+            body for path, body in posted if path.endswith("/hooks/codex-elicitation-request")
+        )
+        assert hook["params"]["omnigentParentThreadId"] == "thread_parent"
+    assert read_active_child_turns(tmp_path)["thread_child"]["turn_id"] == "turn_child"
 
 
 def _collab_item_completed_event(
@@ -1029,3 +1620,272 @@ def test_forwarder_resolves_child_thread_elicitation_on_child_session(
     assert "/v1/sessions/conv_parent/events" not in posted_paths, (
         f"resolution must not target the parent session; got {posted_paths}"
     )
+
+
+def test_forwarder_marks_child_status_consumed_when_collab_wait_completes_in_active_parent_turn(
+    tmp_path: Path,
+) -> None:
+    """T35: real Codex 0.164.0 spawnAgent + wait sequence marks child terminal edge consumed."""
+    fake_client = _FakeCodexAppServerClient()
+    state = codex_native_forwarder._CodexForwarderState(
+        parent_session_id="conv_parent",
+        codex_client=fake_client,  # type: ignore[arg-type]
+    )
+    child_status_posts: list[dict[str, object]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        if body.get("type") == "external_codex_subagent_start":
+            return httpx.Response(202, json={"child_session_id": "conv_child"})
+        if (
+            request.url.path == "/v1/sessions/conv_child/events"
+            and body.get("type") == "external_session_status"
+        ):
+            child_status_posts.append(body.get("data", {}))
+        return httpx.Response(202, json={"queued": False})
+
+    frames: list[dict[str, object]] = [
+        {
+            "method": "turn/started",
+            "params": {
+                "threadId": "thread_parent",
+                "turn": {"id": "turn_parent_1", "status": "inProgress", "items": []},
+            },
+        },
+        {
+            "method": "item/started",
+            "params": {
+                "threadId": "thread_parent",
+                "turnId": "turn_parent_1",
+                "item": {
+                    "type": "collabAgentToolCall",
+                    "id": "call_spawn_1",
+                    "tool": "spawnAgent",
+                    "status": "inProgress",
+                    "senderThreadId": "thread_parent",
+                    "receiverThreadIds": ["thread_child"],
+                    "prompt": "Compute 2+2",
+                    "agentsStates": {"thread_child": {"status": "pendingInit", "message": None}},
+                },
+            },
+        },
+        {
+            "method": "turn/started",
+            "params": {
+                "threadId": "thread_child",
+                "turn": {
+                    "id": "turn_child_1",
+                    "rootTurnId": "turn_parent_1",
+                    "status": "inProgress",
+                    "items": [],
+                },
+            },
+        },
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread_parent",
+                "turnId": "turn_parent_1",
+                "item": {
+                    "type": "collabAgentToolCall",
+                    "id": "call_spawn_1",
+                    "tool": "spawnAgent",
+                    "status": "completed",
+                    "senderThreadId": "thread_parent",
+                    "receiverThreadIds": ["thread_child"],
+                    "prompt": "Compute 2+2",
+                    "agentsStates": {"thread_child": {"status": "pendingInit", "message": None}},
+                },
+            },
+        },
+        {
+            "method": "item/started",
+            "params": {
+                "threadId": "thread_parent",
+                "turnId": "turn_parent_1",
+                "item": {
+                    "type": "collabAgentToolCall",
+                    "id": "call_wait_1",
+                    "tool": "wait",
+                    "status": "inProgress",
+                    "senderThreadId": "thread_parent",
+                    "receiverThreadIds": ["thread_child"],
+                    "agentsStates": {},
+                },
+            },
+        },
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread_child",
+                "turn": {
+                    "id": "turn_child_1",
+                    "rootTurnId": "turn_parent_1",
+                    "status": "completed",
+                    "items": [],
+                },
+            },
+        },
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread_parent",
+                "turnId": "turn_parent_1",
+                "item": {
+                    "type": "collabAgentToolCall",
+                    "id": "call_wait_1",
+                    "tool": "wait",
+                    "status": "completed",
+                    "senderThreadId": "thread_parent",
+                    "receiverThreadIds": ["thread_child"],
+                    "agentsStates": {"thread_child": {"status": "completed", "message": "4"}},
+                },
+            },
+        },
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread_parent",
+                "turn": {"id": "turn_parent_1", "status": "completed", "items": []},
+            },
+        },
+    ]
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            elicitation_tracker = _elicitation_tracker()
+            usage_coalescer = _usage_coalescer(client)
+            for frame in frames:
+                await codex_native_forwarder._handle_event(
+                    client,
+                    session_id="conv_parent",
+                    bridge_dir=tmp_path,
+                    usage_coalescer=usage_coalescer,
+                    elicitation_tracker=elicitation_tracker,
+                    event=frame,
+                    expected_thread_id="thread_parent",
+                    codex_client=fake_client,  # type: ignore[arg-type]
+                    forwarder_state=state,
+                )
+            await state.close_child_streams()
+            await elicitation_tracker.close()
+
+    asyncio.run(run())
+
+    idle_posts = [post for post in child_status_posts if post.get("status") == "idle"]
+    assert idle_posts, f"expected child idle status posts, got {child_status_posts}"
+    assert all(post.get("parent_turn_consumed") is True for post in idle_posts), (
+        f"every child idle edge in the consumed turn must carry parent_turn_consumed: {idle_posts}"
+    )
+
+
+def test_forwarder_keeps_unconsumed_child_status_when_parent_turn_ended_first(
+    tmp_path: Path,
+) -> None:
+    """T36: when the parent turn ends before the helper finishes, consumed flag is absent."""
+    fake_client = _FakeCodexAppServerClient()
+    state = codex_native_forwarder._CodexForwarderState(
+        parent_session_id="conv_parent",
+        codex_client=fake_client,  # type: ignore[arg-type]
+    )
+    child_status_posts: list[dict[str, object]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        if body.get("type") == "external_codex_subagent_start":
+            return httpx.Response(202, json={"child_session_id": "conv_child"})
+        if (
+            request.url.path == "/v1/sessions/conv_child/events"
+            and body.get("type") == "external_session_status"
+        ):
+            child_status_posts.append(body.get("data", {}))
+        return httpx.Response(202, json={"queued": False})
+
+    frames: list[dict[str, object]] = [
+        {
+            "method": "turn/started",
+            "params": {
+                "threadId": "thread_parent",
+                "turn": {"id": "turn_parent_1", "status": "inProgress", "items": []},
+            },
+        },
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread_parent",
+                "turnId": "turn_parent_1",
+                "item": {
+                    "type": "collabAgentToolCall",
+                    "id": "call_spawn_bg",
+                    "tool": "spawnAgent",
+                    "status": "completed",
+                    "senderThreadId": "thread_parent",
+                    "receiverThreadIds": ["thread_child"],
+                    "prompt": "Background task",
+                    "agentsStates": {"thread_child": {"status": "running", "message": None}},
+                },
+            },
+        },
+        {
+            "method": "turn/started",
+            "params": {
+                "threadId": "thread_child",
+                "turn": {
+                    "id": "turn_child_1",
+                    "rootTurnId": "turn_parent_1",
+                    "status": "inProgress",
+                    "items": [],
+                },
+            },
+        },
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread_parent",
+                "turn": {"id": "turn_parent_1", "status": "completed", "items": []},
+            },
+        },
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread_child",
+                "turn": {
+                    "id": "turn_child_1",
+                    "rootTurnId": "turn_parent_1",
+                    "status": "completed",
+                    "items": [],
+                },
+            },
+        },
+    ]
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            elicitation_tracker = _elicitation_tracker()
+            usage_coalescer = _usage_coalescer(client)
+            for frame in frames:
+                await codex_native_forwarder._handle_event(
+                    client,
+                    session_id="conv_parent",
+                    bridge_dir=tmp_path,
+                    usage_coalescer=usage_coalescer,
+                    elicitation_tracker=elicitation_tracker,
+                    event=frame,
+                    expected_thread_id="thread_parent",
+                    codex_client=fake_client,  # type: ignore[arg-type]
+                    forwarder_state=state,
+                )
+            await state.close_child_streams()
+            await elicitation_tracker.close()
+
+    asyncio.run(run())
+
+    idle_posts = [post for post in child_status_posts if post.get("status") == "idle"]
+    assert len(idle_posts) == 1
+    assert "parent_turn_consumed" not in idle_posts[0]

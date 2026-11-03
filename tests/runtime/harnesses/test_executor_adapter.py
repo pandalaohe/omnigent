@@ -3452,6 +3452,86 @@ async def test_raw_elicitation_handler_returns_verdict_without_cancelling_turn()
     assert await adapter._stable_raw_elicitation_handler(params) is None
 
 
+@pytest.mark.parametrize("state", ["active", "cancelled", "replaced", "stale-generation"])
+async def test_codex_helper_callback_checks_owning_context(monkeypatch, state):
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from omnigent.inner.executor import ExecutorCallbackScope, executor_callback_scope
+    from omnigent.runtime.harnesses import _executor_adapter
+    from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
+
+    adapter = _executor_adapter.ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = SimpleNamespace(
+        cancelled=asyncio.Event(),
+        elicit=AsyncMock(return_value=ElicitationResult(action="accept")),
+    )
+    adapter._current_ctx = ctx
+    adapter._current_agent = "agent"
+    adapter._pending_mcp_call_ids.append("parent-call")
+    if state == "cancelled":
+        ctx.cancelled.set()
+    elif state == "replaced":
+        adapter._current_ctx = SimpleNamespace(cancelled=asyncio.Event())
+    dispatch = AsyncMock(return_value={"ok": True})
+    monkeypatch.setattr(_executor_adapter, "_bridge_one_dispatch", dispatch)
+    token = executor_callback_scope.set(
+        ExecutorCallbackScope(ctx, lambda: state != "stale-generation", "helper-call")
+    )
+    try:
+        result = await adapter._stable_tool_executor("sys_capture_echo", {})
+        approval = await adapter._stable_raw_elicitation_handler(
+            ElicitationRequestParams(mode="form", message="Approve")
+        )
+    finally:
+        executor_callback_scope.reset(token)
+    if state == "active":
+        assert result == {"ok": True}
+        assert dispatch.await_args.kwargs["call_id"] == "helper-call"
+        assert approval.action == "accept"
+    else:
+        assert "error" in result
+        assert approval is None
+        dispatch.assert_not_awaited()
+        ctx.elicit.assert_not_awaited()
+    assert list(adapter._pending_mcp_call_ids) == ["parent-call"]
+
+
+@pytest.mark.parametrize("confirmed", [True, False])
+async def test_codex_helper_mode_control_is_authenticated_bound_and_awaited(confirmed):
+    from unittest.mock import AsyncMock, Mock
+
+    from omnigent.inner.codex_executor import CodexExecutor
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    factory = Mock(side_effect=AssertionError("control must not start an executor"))
+    adapter = ExecutorAdapter(factory, session_key="sdk-session")
+    app = adapter.build()
+    app.state.conversation_id = "session"
+    app.state.harness_auth_token = "test-auth"
+    body = {"type": "codex_approval_mode_change", "approval_mode": "read-only"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://harness"
+    ) as client:
+        route = "/v1/sessions/session/events"
+        assert (await client.post(route, json=body)).status_code == 401
+        client.headers["Authorization"] = "Bearer test-auth"
+        assert (await client.post("/v1/sessions/other/events", json=body)).status_code == 404
+        assert (await client.post(route, json=body)).json()["helpers_stopped"] is True
+        executor = CodexExecutor(codex_path="/opt/work/bin/codex")
+        executor.change_approval_mode = AsyncMock(return_value=confirmed)
+        adapter._executor = executor
+        response = await client.post(route, json=body)
+        assert response.status_code == 200
+        assert response.json() == {"approval_mode": "read-only", "helpers_stopped": confirmed}
+        executor.change_approval_mode.assert_awaited_once_with("sdk-session", "read-only")
+        invalid = await client.post(route, json={**body, "approval_mode": "invalid"})
+        assert invalid.status_code == 400
+        assert executor.change_approval_mode.await_count == 1
+    factory.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_resident_inventory_read_is_authenticated_bound_and_never_constructs():
     from unittest.mock import Mock
