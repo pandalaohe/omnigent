@@ -6244,6 +6244,7 @@ function SessionHarnessPicker({
   );
   return (
     <HarnessPicker
+      contentClassName={isMobile && configOpen ? "w-[calc(100vw-1.5rem)]" : undefined}
       cyclePreview={
         preview === "models"
           ? cycleModelSection

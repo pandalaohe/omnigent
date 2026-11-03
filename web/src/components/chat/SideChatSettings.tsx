@@ -237,6 +237,7 @@ export function SideChatSettings({
   );
   return (
     <HarnessPicker
+      contentClassName={isMobile ? "w-[calc(100vw-1.5rem)]" : undefined}
       open={menuOpen}
       onOpenChange={(open) => {
         if (!open || !disabled) setMenuOpen(open);

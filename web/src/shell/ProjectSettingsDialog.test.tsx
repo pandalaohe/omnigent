@@ -2269,6 +2269,59 @@ describe("ProjectSettingsDialog", () => {
     );
   });
 
+  it("draws the effective model's default effort while the meter is unset", async () => {
+    availableAgentsMock.mockReturnValue({ data: [codexSdkAgent()] });
+    listEntriesMock.mockResolvedValue([entry("h1", "/opt/work/example")]);
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: {
+        calling_defaults: {
+          h1: { agent_id: "ag_codex_sdk", harnesses: { codex: { model: "gpt-6-sol" } } },
+        },
+      },
+    });
+    const rows = [
+      catalogRow("h1", "codex", [
+        {
+          id: "gpt-6-sol",
+          displayName: "GPT-6 Sol",
+          isDefault: true,
+          defaultReasoningEffort: "high",
+          supportedReasoningEfforts: [
+            { reasoningEffort: "low" },
+            { reasoningEffort: "medium" },
+            { reasoningEffort: "high" },
+            { reasoningEffort: "xhigh" },
+          ],
+        },
+      ]),
+    ];
+    listCatalogsMock.mockResolvedValue(rows);
+    syncCatalogsMock.mockResolvedValue(rows);
+    renderDialog();
+
+    const meter = await screen.findByTestId("project-settings-host-effort-h1");
+    expect(meter).toHaveTextContent("Default");
+    for (const level of ["low", "medium", "high"]) {
+      expect(
+        screen.getByTestId(`project-settings-host-effort-h1-${level}`).firstElementChild,
+      ).toHaveClass("bg-companion/45");
+    }
+    expect(
+      screen.getByTestId("project-settings-host-effort-h1-xhigh").firstElementChild,
+    ).not.toHaveClass("bg-companion/45");
+
+    // The old Reset button's id rides on the meter's reset control.
+    expect(screen.queryByTestId("project-settings-host-reset-effort-h1")).toBeNull();
+    fireEvent.click(screen.getByTestId("project-settings-host-effort-h1-high"));
+    const reset = screen.getByTestId("project-settings-host-reset-effort-h1");
+    expect(reset).toHaveTextContent("Reset Effort");
+    fireEvent.click(reset);
+    expect(meter).toHaveTextContent("Default");
+    expect(screen.queryByTestId("project-settings-host-reset-effort-h1")).toBeNull();
+  });
+
   it("shows Default for unresolved fields in primary and other harness rows", async () => {
     availableAgentsMock.mockReturnValue({ data: [codexSdkAgent()] });
     listEntriesMock.mockResolvedValue([entry("h1", "/opt/work/example")]);

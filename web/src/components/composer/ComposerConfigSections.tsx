@@ -49,6 +49,8 @@ export interface ComposerConfigSection {
     label: string;
     inherited?: string | null;
     onUnset?: () => void;
+    /** Id of the old Default row, carried by the row's reset control. */
+    unsetTestId?: string;
   };
 }
 
@@ -302,27 +304,37 @@ export function ComposerConfigSections({
           <PickerSectionHeader>{section.header}</PickerSectionHeader>
           {section.leading}
           {section.level ? (
-            <MenuLevelRow
-              label={section.level.label}
-              options={section.choices
-                .filter((choice) => choice.key !== "__default__")
-                .map((choice) => ({
-                  value: choice.key,
-                  label: typeof choice.label === "string" ? choice.label : choice.key,
-                  testId: choice.testId,
-                }))}
-              value={
-                section.choices.find((choice) => choice.checked && choice.key !== "__default__")
-                  ?.key ?? null
-              }
-              inherited={section.level.inherited}
-              disabled={section.choices.some((choice) => choice.disabled)}
-              onChange={(next) => {
-                if (next === null) section.level?.onUnset?.();
-                else section.choices.find((choice) => choice.key === next)?.onSelect?.();
+            <div
+              className="contents"
+              ref={(node) => {
+                if (node === null || section.level?.unsetTestId === undefined) return;
+                node
+                  .querySelector(`button[aria-label="Reset ${section.level.label}"]`)
+                  ?.setAttribute("data-testid", section.level.unsetTestId);
               }}
-              onUnset={section.level.onUnset}
-            />
+            >
+              <MenuLevelRow
+                label={section.level.label}
+                options={section.choices
+                  .filter((choice) => choice.key !== "__default__")
+                  .map((choice) => ({
+                    value: choice.key,
+                    label: typeof choice.label === "string" ? choice.label : choice.key,
+                    testId: choice.testId,
+                  }))}
+                value={
+                  section.choices.find((choice) => choice.checked && choice.key !== "__default__")
+                    ?.key ?? null
+                }
+                inherited={section.level.inherited}
+                disabled={section.choices.some((choice) => choice.disabled)}
+                onChange={(next) => {
+                  if (next === null) section.level?.onUnset?.();
+                  else section.choices.find((choice) => choice.key === next)?.onSelect?.();
+                }}
+                onUnset={section.level.onUnset}
+              />
+            </div>
           ) : section === models && browseModels ? (
             <ModelCatalogChoices testId={section.testId} choices={section.choices} />
           ) : (

@@ -322,6 +322,19 @@ function effortLevelsForSet(
   return levels;
 }
 
+/** Inherited effort, else the default effort the effective model advertises. */
+function inheritedEffortForSet(
+  inherited: string | null,
+  models: readonly NativeModelOption[],
+  effectiveModel: string | null,
+): string | null {
+  if (inherited !== null) return inherited;
+  const model = effectiveModel
+    ? models.find((row) => row.id === effectiveModel)
+    : models.find((row) => row.isDefault);
+  return model?.defaultReasoningEffort ?? null;
+}
+
 /** The canonical harness an agent runs, or null for an unknown bundle. */
 function agentHarness(agent: AvailableAgent): string | null {
   return nativeCodingAgentForAvailableAgent(agent)?.harness ?? agent.harness ?? null;
@@ -585,6 +598,7 @@ function HostEffortMeter({
   onOpen,
   onChange,
   inherited,
+  resetTestId,
 }: {
   value: string | null;
   levels: readonly string[];
@@ -593,9 +607,20 @@ function HostEffortMeter({
   onOpen?: () => void;
   onChange: (effort: string | null) => void;
   inherited?: string | null;
+  /** Id of the Reset button this meter replaces. */
+  resetTestId?: string;
 }) {
   return (
-    <div data-testid={testId} onFocusCapture={() => onOpen?.()}>
+    <div
+      data-testid={testId}
+      onFocusCapture={() => onOpen?.()}
+      ref={(node) => {
+        if (node === null || resetTestId === undefined) return;
+        node
+          .querySelector('button[aria-label="Reset Effort"]')
+          ?.setAttribute("data-testid", resetTestId);
+      }}
+    >
       <LevelMeter
         label="Effort"
         options={levels.map((level) => ({
@@ -1763,8 +1788,13 @@ export function ProjectSettingsDialog({
             <HostEffortMeter
               value={set.effort}
               levels={levels}
-              inherited={inheritedFor(row, harness, "effort").value ?? null}
+              inherited={inheritedEffortForSet(
+                inheritedFor(row, harness, "effort").value,
+                models,
+                effectiveModel,
+              )}
               testId={`project-settings-host-effort-${row.hostId}`}
+              resetTestId={`project-settings-host-reset-effort-${row.hostId}`}
               disabled={isLoading || saving}
               onOpen={() => ensureCatalog(row.hostId, harness)}
               onChange={(next) => setHarnessField(row.hostId, harness, "effort", next)}
@@ -2128,7 +2158,11 @@ export function ProjectSettingsDialog({
                     <HostEffortMeter
                       value={set.effort}
                       levels={levels}
-                      inherited={inheritedFor(row, harness, "effort").value ?? null}
+                      inherited={inheritedEffortForSet(
+                        inheritedFor(row, harness, "effort").value,
+                        models,
+                        effectiveModel,
+                      )}
                       testId={`project-settings-host-other-effort-${row.hostId}-${harness}`}
                       disabled={disabled}
                       onOpen={() => ensureCatalog(row.hostId, harness)}

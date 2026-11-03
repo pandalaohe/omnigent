@@ -2186,7 +2186,11 @@ export function AgentHarnessPicker({
       contentAlign={contentAlign}
       contentSide="bottom"
       contentSideOffset={6}
-      contentClassName={cn(showConfig && "composer-agent-config-menu", contentClassName)}
+      contentClassName={cn(
+        showConfig && "composer-agent-config-menu",
+        contentClassName,
+        showConfig && "w-[calc(100vw-1.5rem)]",
+      )}
       configOpen={configAgentId !== null}
       onInitialSelectionFocus={
         focusConfigAgentId === null
@@ -4776,6 +4780,7 @@ export function NewChatLandingScreen() {
             label: effortHeader,
             inherited: pickerInheritedEffort,
             onUnset: () => selectPickerEffort(EFFORT_SELECT_NONE),
+            unsetTestId: "new-chat-landing-agent-effort-default",
           },
           choices: [
             {

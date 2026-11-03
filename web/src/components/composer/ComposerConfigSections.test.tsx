@@ -238,6 +238,57 @@ describe("ComposerConfigSections", () => {
   });
 });
 
+describe("level row test ids", () => {
+  it("puts the old Default row's id on the reset control, and only while a level is set", async () => {
+    function EffortRow() {
+      const [value, setValue] = useState<string | null>(null);
+      return (
+        <DropdownMenu open>
+          <DropdownMenuContent>
+            <ComposerConfigSections
+              efforts={{
+                testId: "efforts",
+                header: "Effort",
+                level: {
+                  label: "Effort",
+                  onUnset: () => setValue(null),
+                  unsetTestId: "efforts-default",
+                },
+                choices: [
+                  {
+                    key: "__default__",
+                    label: "Default",
+                    checked: value === null,
+                    onSelect: () => setValue(null),
+                  },
+                  ...["low", "high"].map((level) => ({
+                    key: level,
+                    label: level,
+                    checked: value === level,
+                    onSelect: () => setValue(level),
+                    testId: `efforts-${level}`,
+                  })),
+                ],
+              }}
+            />
+          </DropdownMenuContent>
+        </DropdownMenu>
+      );
+    }
+
+    render(<EffortRow />);
+    expect(screen.queryByTestId("efforts-default")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("efforts-high"));
+    const reset = await screen.findByTestId("efforts-default");
+    expect(reset).toHaveTextContent("Reset Effort");
+
+    fireEvent.click(reset);
+    expect(screen.queryByTestId("efforts-default")).toBeNull();
+    expect(screen.getByTestId("efforts")).toHaveTextContent("Effort: Default");
+  });
+});
+
 describe("effort level rows in a real Radix submenu", () => {
   it.each([true, false])(
     "moves focus by row and edits by lateral keys without closing (unset=%s)",

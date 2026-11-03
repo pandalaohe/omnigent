@@ -387,6 +387,7 @@ export function AgentMemberTrigger({
                 label: "Effort",
                 inherited: inheritedEffort,
                 onUnset: () => selectEffort(null),
+                unsetTestId: "agent-member-effort-default",
               },
               choices: [
                 {

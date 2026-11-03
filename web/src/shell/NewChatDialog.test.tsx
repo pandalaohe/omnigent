@@ -5276,7 +5276,11 @@ describe("NewChatLandingScreen", () => {
     const menus = screen.getAllByRole("menu");
     expect(menus).toHaveLength(2);
     expect(menus[0]).toBe(rootMenu);
-    expect(menus[1]).toHaveClass("w-[13.75rem]", "composer-agent-config-menu");
+    expect(menus[1]).toHaveClass(
+      "w-[13.75rem]",
+      "max-md:w-[calc(100vw-1.5rem)]",
+      "composer-agent-config-menu",
+    );
     expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent("Opus 4.8");
     expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent("Sonnet 4.6");
     expect(screen.getByTestId("new-chat-landing-agent-models").textContent).not.toContain("`");
