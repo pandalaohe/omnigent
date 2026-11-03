@@ -1742,20 +1742,17 @@ async def forward_claude_transcript_to_session(
                         cost_cache = {}
                         await asyncio.sleep(poll_interval_s)
                         continue
-                    # The durable owner binding is written before the one-shot
-                    # external_session_id mirror and holds it open until written:
-                    # launch prefers the label and the server refuses to replace an
-                    # existing external id, so a server value that ran ahead of a
-                    # failed label update could never be superseded.
+                    # The durable owner binding goes first. The one-shot
+                    # external_session_id mirror stays independent of it: retention
+                    # cleanup deletes the bridge, so a failing label write must not
+                    # also cost the server-side id that then outlives it.
                     confirmed_binding = await _maybe_mirror_confirmed_claude_session(
                         client=client,
                         session_id=current_session_id,
                         bridge_dir=bridge_dir,
                         confirmed_binding=confirmed_binding,
                     )
-                    if not external_session_id_mirrored and _confirmed_binding_holds_current_id(
-                        bridge_dir, confirmed_binding
-                    ):
+                    if not external_session_id_mirrored:
                         external_session_id_mirrored = await _maybe_mirror_external_session_id(
                             client=client,
                             session_id=current_session_id,
@@ -5801,17 +5798,6 @@ async def _maybe_mirror_confirmed_claude_session(
         )
         return confirmed_binding
     return binding
-
-
-def _confirmed_binding_holds_current_id(
-    bridge_dir: Path,
-    confirmed_binding: tuple[str, str] | None,
-) -> bool:
-    """Return whether the owner label already carries the bridge's current Claude id."""
-    claude_session_id = read_claude_session_id(bridge_dir)
-    return claude_session_id is None or (
-        confirmed_binding is not None and confirmed_binding[1] == claude_session_id
-    )
 
 
 async def _maybe_mirror_external_session_id(

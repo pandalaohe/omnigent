@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import queue
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,7 @@ from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     prepare_bridge_dir,
     read_active_session_id,
+    read_claude_session_id,
     record_hook_event,
     write_active_session_id,
 )
@@ -1468,15 +1470,15 @@ async def test_forwarder_updates_confirmed_binding_after_external_mirror_latches
 
 
 @pytest.mark.asyncio
-async def test_forwarder_holds_external_id_mirror_behind_owner_binding(
+async def test_forwarder_mirrors_external_id_when_owner_label_write_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The once-only external id is not written ahead of the durable owner label.
+    """A failed owner-label write must not hold back the once-only external id.
 
-    Launch prefers the owner label and the server refuses to replace an existing
-    external id, so a mirror that ran while the label update was failing could
-    never be superseded: the stale label would win every later resume.
+    Retention cleanup cancels the forwarder and deletes the bridge, so the
+    server's external id is the only durable trace of the confirmed transcript
+    left afterwards. Gating that mirror on the label write loses it.
     """
     bridge_dir = tmp_path / "bridge"
     transcript = tmp_path / "session.jsonl"
@@ -1485,42 +1487,21 @@ async def test_forwarder_holds_external_id_mirror_behind_owner_binding(
         bridge_dir,
         {
             "hook_event_name": "SessionStart",
-            "session_id": "claude-sid-held",
+            "session_id": "claude-sid-b",
             "transcript_path": str(transcript),
         },
     )
-    events: list[str] = []
 
-    async def _binding_patch(
-        client: httpx.AsyncClient,
-        *,
-        session_id: str,
-        claude_session_id: str,
-    ) -> None:
-        del client, session_id, claude_session_id
-        if "binding_failed" in events:
-            events.append("binding_ok")
-            return
-        events.append("binding_failed")
+    async def _failing_label_patch(*_args: Any, **_kwargs: Any) -> None:
         raise httpx.ConnectError("transient label write failure")
 
-    async def _external_patch(
-        client: httpx.AsyncClient,
-        *,
-        session_id: str,
-        external_session_id: str,
-    ) -> None:
-        del client, session_id, external_session_id
-        events.append("external")
-
-    monkeypatch.setattr(forwarder, "patch_confirmed_claude_session", _binding_patch)
-    monkeypatch.setattr(forwarder, "_patch_external_session_id", _external_patch)
+    monkeypatch.setattr(forwarder, "patch_confirmed_claude_session", _failing_label_patch)
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
         forwarder.forward_claude_transcript_to_session(
             base_url=base_url,
             headers={},
-            session_id="conv_held",
+            session_id="conv_survives",
             bridge_dir=bridge_dir,
             agent_name="claude-native-ui",
             start_at_end=False,
@@ -1528,9 +1509,7 @@ async def test_forwarder_holds_external_id_mirror_behind_owner_binding(
         )
     )
     try:
-        deadline = asyncio.get_running_loop().time() + 5.0
-        while "external" not in events and asyncio.get_running_loop().time() < deadline:
-            await asyncio.sleep(0.01)
+        external_patch = await _get_recorded_request(server, method="PATCH")
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -1539,10 +1518,11 @@ async def test_forwarder_holds_external_id_mirror_behind_owner_binding(
         server.server_close()
         thread.join(timeout=5.0)
 
-    assert events[:1] == ["binding_failed"]
-    assert "binding_ok" in events, f"the label write never succeeded: {events!r}"
-    assert "external" in events, f"the external id was never mirrored: {events!r}"
-    assert events.index("external") > events.index("binding_ok")
+    assert external_patch["body"] == {"external_session_id": "claude-sid-b"}
+    # Retention cleanup deletes the bridge; what the mirror just wrote is what a
+    # cold resume reads afterwards.
+    shutil.rmtree(bridge_dir)
+    assert read_claude_session_id(bridge_dir) is None
 
 
 @pytest.mark.asyncio
