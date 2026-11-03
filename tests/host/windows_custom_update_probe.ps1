@@ -57,6 +57,78 @@ Check 'a holder controller and its unrelated worker are not kill roots' {
     $tree = @(Get-StoppedHostTreePids $rows @(11) 'C:\Tools\omnigent' 'C:\Bin\omni.exe' @())
     if ($tree.Count -ne 1 -or $tree[0] -ne 11) { throw "Controller incorrectly authorized: $tree" }
 }
+Check 'script mentions do not authorize Host or installer termination' {
+    $cli = 'C:\Profiles\fixture\.local\bin\omni.exe'
+    $script = 'C:\Profiles\fixture\.omnigent\autostart\Start-OmnigentHostDefault.ps1'
+    foreach ($command in @(
+        "pwsh.exe -Command Get-Content '$script'",
+        "pwsh.exe -File `"$script.bak`"",
+        "pwsh.exe -File `"$script`".bak",
+        "pwsh.exe -Command Write-Output -File '$script'"
+    )) {
+        $row = [pscustomobject]@{
+            Name = 'pwsh.exe'; ExecutablePath = 'C:\PowerShell\pwsh.exe'
+            CommandLine = $command
+        }
+        if (Test-HostLauncher $row $cli) { throw "Incidental text authorized termination: $command" }
+    }
+}
+Check 'installer fallback requires the exact invoked helper and argument positions' {
+    $scenario = Join-Path $FixtureRoot 'installer-selector'
+    New-Item -ItemType Directory -Force -Path $scenario | Out-Null
+    $InstructionPath = Join-Path $scenario 'instruction.json'
+    $transaction = Join-Path $scenario 'transaction'
+    $instruction = [pscustomobject]@{ helper_path = $HelperPath }
+    $rows = @(
+        [pscustomobject]@{
+            ProcessId = 100; CreatedAt = 1.0; Name = 'pwsh.exe'
+            ExecutablePath = 'C:\PowerShell\pwsh.exe'
+            CommandLine = "pwsh.exe -Command Get-Content '$HelperPath' '-InstallerOnly' '$transaction'"
+        },
+        [pscustomobject]@{
+            ProcessId = 101; CreatedAt = 2.0; Name = 'pwsh.exe'
+            ExecutablePath = 'C:\PowerShell\pwsh.exe'
+            CommandLine = "pwsh.exe -NoProfile -File `"$HelperPath`" -InstructionPath `"$InstructionPath`" -InstallerOnly -TransactionPath `"$transaction`""
+        }
+    )
+    $selected = [Collections.Generic.List[int]]::new()
+    function Get-ProcessTable { return $rows }
+    function Stop-ProcessIdentity { param([object]$Identity) $selected.Add([int]$Identity.pid) }
+    Stop-InstallerGuard $transaction $instruction
+    if ($selected.Count -ne 1 -or $selected[0] -ne 101) { throw "Wrong installer kill authority: $selected" }
+}
+Check 'a reconciled complete receipt never restores the previous installation' {
+    $result = [ordered]@{ status = 'complete'; phase = 'rolling_back'; backup_path = 'unused' }
+    Recover-InterruptedTransaction ([pscustomobject]@{}) $result
+    if ($result.phase -ne 'rolling_back') { throw 'Terminal receipt was changed.' }
+}
+Check 'startup recovery protects its caller but not the replacement Host' {
+    $cli = 'C:\Profiles\fixture\.local\bin\omni.exe'
+    $startupPid = $PID + 1
+    $replacementPid = $PID + 2
+    $rows = @(
+        [pscustomobject]@{
+            ProcessId = $startupPid; ParentProcessId = 1; CreatedAt = 1.0
+            Name = 'pwsh.exe'; ExecutablePath = 'C:\PowerShell\pwsh.exe'
+            CommandLine = 'pwsh.exe -File "C:\Profiles\fixture\.omnigent\autostart\Start-OmnigentHostDefault.ps1"'
+        },
+        [pscustomobject]@{
+            ProcessId = $PID; ParentProcessId = $startupPid; CreatedAt = 2.0
+            Name = 'pwsh.exe'; ExecutablePath = 'C:\PowerShell\pwsh.exe'
+            CommandLine = 'pwsh.exe -File "C:\Data\update.ps1" -RecoverOnly'
+        },
+        [pscustomobject]@{
+            ProcessId = $replacementPid; ParentProcessId = 1; CreatedAt = 1.0
+            Name = 'python.exe'; ExecutablePath = 'C:\Tools\omnigent\Scripts\python.exe'
+            CommandLine = 'python.exe -m omnigent.host._daemon_entry'
+        }
+    )
+    function Get-ProcessTable { return $rows }
+    $protected = @(Get-UpdaterAncestorPids $rows $PID)
+    if ($protected -notcontains $startupPid -or $protected -contains $replacementPid) { throw 'Wrong protected caller chain.' }
+    $snapshot = @(Get-ManagedHostSnapshot ([pscustomobject]@{ tool_venv_path = 'C:\Tools\omnigent'; cli_bin_path = $cli }))
+    if ($snapshot.Count -ne 1 -or $snapshot[0].pid -ne $replacementPid) { throw 'Recovery selected its own startup caller.' }
+}
 Check 'native timeout terminates and reaps its child tree' {
     $hang = Join-Path $FixtureRoot 'hang.ps1'
     $childFile = Join-Path $FixtureRoot 'hanging-child.pid'
@@ -308,7 +380,7 @@ if ($PythonPath -and $UvPath) {
             $PythonPath, (Join-Path $PSScriptRoot 'windows_custom_update_uv_probe.py'),
             ([IO.Path]::GetFullPath($HelperPath)), (Join-Path $FixtureRoot 'real-uv'),
             $UvPath, (Get-Command pwsh).Source
-        ) -TimeoutSeconds 480
+        ) -TimeoutSeconds 900
         Write-Output $completed.Stdout
         if ($completed.ExitCode -ne 0) { throw $completed.Stderr }
     }

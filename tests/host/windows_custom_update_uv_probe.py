@@ -21,7 +21,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 
-def identity_and_wrapper_checks(root: Path, helper: Path) -> None:
+def identity_and_wrapper_checks(root: Path, helper: Path) -> dict:
     """Execute actual Python selectors and wrapper generation without importing the CLI."""
     source = Path(__file__).parents[2] / "omnigent" / "cli.py"
     names = {
@@ -29,10 +29,18 @@ def identity_and_wrapper_checks(root: Path, helper: Path) -> None:
         "_normalize_windows_fs_path",
         "_windows_path_holds_tool_venv",
         "_windows_is_host_launcher",
+        "_windows_process_arguments",
+        "_windows_is_host_daemon",
         "_windows_stopped_host_tree_pids",
         "_terminate_windows_process",
         "_list_windows_processes",
         "_arm_windows_custom_host_recovery",
+        "_validate_windows_custom_host_recovery_paths",
+        "_wait_for_windows_custom_host_venv_release",
+        "_windows_venv_locking_processes",
+        "_reconcile_custom_host_update_result",
+        "_ensure_no_running_custom_host_helper",
+        "_valid_git_sha",
     }
     tree = ast.parse(source.read_text())
     nodes = [node for node in tree.body if getattr(node, "name", "") in names]
@@ -46,6 +54,11 @@ def identity_and_wrapper_checks(root: Path, helper: Path) -> None:
         "os": os,
         "shutil": shutil,
         "click": SimpleNamespace(ClickException=RuntimeError),
+        "time": time,
+        "subprocess": subprocess,
+        "_CUSTOM_HOST_VENV_RELEASE_TIMEOUT_S": 15.0,
+        "_CUSTOM_HOST_TREE_GRACE_S": 2.0,
+        "_CUSTOM_HOST_PARENT_EXIT_TIMEOUT_S": 120.0,
     }
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), namespace)
     row = namespace["_WindowsProcessInfo"]
@@ -81,6 +94,15 @@ def identity_and_wrapper_checks(root: Path, helper: Path) -> None:
         excluded_pids=set(),
     )
     assert selected == [11, 13], selected
+    startup_path = r"C:\Profiles\fixture\.omnigent\autostart\Start-OmnigentHostDefault.ps1"
+    for command in (
+        f'pwsh.exe -Command Get-Content "{startup_path}"',
+        f'pwsh.exe -File "{startup_path}.bak"',
+        f'pwsh.exe -File "{startup_path}".bak',
+    ):
+        assert not namespace["_windows_is_host_launcher"](
+            row(20, 1, "pwsh.exe", r"C:\PowerShell\pwsh.exe", command, (), 5.0), cli
+        ), "Incidental script text authorized process termination"
     killed = []
     namespace["psutil"] = SimpleNamespace(
         Error=OSError,
@@ -109,21 +131,117 @@ def identity_and_wrapper_checks(root: Path, helper: Path) -> None:
         observed[0], tool_venv_path=venv, cli_bin_path=cli
     )
     namespace["os"] = os
+    child = row(
+        30,
+        29,
+        "python.exe",
+        r"C:\Python\python.exe",
+        "worker.py",
+        (venv + r"\Lib\worker.pyd",),
+        2.0,
+    )
+    alive = [child]
+    stopped = []
+    namespace["_list_windows_processes"] = lambda: alive[:]
+
+    def stop_captured(pid: int, created: float) -> None:
+        if alive and pid == child.pid and created == child.created_at:
+            stopped.append(pid)
+            alive.clear()
+
+    namespace["_terminate_windows_process"] = stop_captured
+    namespace["_wait_for_windows_custom_host_venv_release"](
+        tool_venv_path=venv,
+        cli_bin_path=cli,
+        stopped_host_pids=[29],
+        process_identities=[child],
+        timeout_s=1,
+        grace_s=0,
+    )
+    assert stopped == [30], "Captured child was lost after its root exited"
     wrapper = root / ".local" / "bin" / "omni-host-service.cmd"
     startup = root / ".omnigent" / "autostart" / "Start-OmnigentHostDefault.ps1"
     startup.parent.mkdir(parents=True, exist_ok=True)
-    startup.write_text("Write-Output 'fixture boot started'\n")
+    startup.write_text(
+        "#requires -Version 7.0\n"
+        "param([string]$Message = 'fixture boot started')\nWrite-Output $Message\n"
+    )
     instruction = root / ".omnigent" / "updates" / "instruction.json"
     instruction.parent.mkdir(parents=True, exist_ok=True)
+    namespace["_custom_host_tool_venv_path"] = lambda: root / "tools" / "omnigent"
+    namespace["_custom_host_update_paths"] = lambda: {
+        "helper": helper,
+        "instruction": instruction,
+        "result": root / "reconcile.json",
+        "lock": root / "reconcile.lock",
+    }
     with patch.object(Path, "home", return_value=root):
+        try:
+            namespace["_validate_windows_custom_host_recovery_paths"](
+                root / "tools" / "omnigent" / "Scripts" / "supervisor.cmd"
+            )
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("A recovery wrapper inside the movable venv was accepted")
         namespace["_arm_windows_custom_host_recovery"](wrapper, helper, instruction)
         armed = wrapper.read_bytes()
         namespace["_arm_windows_custom_host_recovery"](wrapper, helper, instruction)
         assert wrapper.read_bytes() == armed, "Wrapper arming was not idempotent"
     assert "-RecoverOnly" in startup.read_text() and "-ResumeAutostart" in startup.read_text()
-    print(
-        "PASS Python holder/kill separation, PID identity, native-map collector and startup hooks"
+    parsed = subprocess.run(
+        [
+            shutil.which("pwsh"),
+            "-NoProfile",
+            "-Command",
+            "$t=$null;$e=$null;[void][Management.Automation.Language.Parser]::ParseFile("
+            "$env:PROBE_STARTUP,[ref]$t,[ref]$e);if($e.Count){$e;exit 1}",
+        ],
+        env={**os.environ, "PROBE_STARTUP": str(startup)},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
     )
+    assert parsed.returncode == 0, parsed.stdout + parsed.stderr
+    transaction = root / "tools" / ("omnigent.update-" + "d" * 32)
+    transaction.mkdir()
+    receipt = {
+        "status": "failed",
+        "phase": "rolling_back",
+        "old_commit": "a" * 40,
+        "target_commit": "b" * 40,
+        "backup_path": str(transaction / "previous"),
+        "error": "Installer failed",
+    }
+    namespace["_read_custom_host_update_result"] = lambda: receipt
+    paths = namespace["_custom_host_update_paths"]()
+    paths["lock"].write_text("")
+    with patch.dict(
+        sys.modules,
+        {
+            "omnigent.install_ledger": SimpleNamespace(
+                atomic_write_json=lambda path, value: path.write_text(json.dumps(value)),
+            )
+        },
+    ):
+        reconciled = namespace["_reconcile_custom_host_update_result"]("b" * 40, persist=True)
+    for saved in (paths["result"], transaction / "transaction.json"):
+        assert json.loads(saved.read_text())["phase"] == "completed"
+    namespace["_read_custom_host_update_result"] = lambda: reconciled
+    namespace["_ensure_no_running_custom_host_helper"]()
+    namespace["_read_custom_host_update_result"] = lambda: receipt
+    try:
+        namespace["_ensure_no_running_custom_host_helper"]()
+    except RuntimeError as error:
+        assert "independent recovery" in str(error), str(error)
+    else:
+        raise AssertionError("A live CLI attempted synchronous recovery")
+    print(
+        "PASS Python process authority, orphan cleanup, terminal reconciliation, "
+        "independent recovery and param startup"
+    )
+    return namespace
 
 
 def process_alive(pid: int) -> bool:
@@ -154,6 +272,8 @@ def run(helper: Path, fixtures: Path, uv: str, pwsh: str) -> None:
         "helper-killed-missing",
         "helper-killed-child",
         "helper-killed-boot",
+        "helper-killed-rollback",
+        "reconciled-healthy",
     ):
         root = fixtures / mode
         root.mkdir(parents=True)
@@ -215,7 +335,8 @@ def run(helper: Path, fixtures: Path, uv: str, pwsh: str) -> None:
                 "        if VERSION == '0.0.2' and os.environ['PROBE_MODE'] ="
                 "= 'status-hangs': time.sleep(120)\n"
                 f"        online = not ({mode!r} in "
-                "('reconnect-fails','child-survives-stop','stop-fails') and VERSION == '0.0.2')\n"
+                "('reconnect-fails','child-survives-stop','stop-fails',"
+                "'helper-killed-rollback') and VERSION == '0.0.2')\n"
                 "        print(json.dumps({'daemons': [{'host_id': 'fixture', 'pid': 222,\n"
                 "            'process': 'online', 'host_status': 'online'}] if online else []}))\n"
             )
@@ -282,7 +403,7 @@ def run(helper: Path, fixtures: Path, uv: str, pwsh: str) -> None:
             "with (root/'supervisor-actions.txt').open('a') as f: f.write(sys.argv[1]+'\\n')\n"
             "version=(root/'tools/omnigent/Lib/site-packages/omnigent/_version.txt').read_text()\n"
             "if sys.argv[1]=='start' and version=='0.0.2' and os.environ["
-            "'PROBE_MODE'] in ('child-survives-stop','stop-fails'):\n"
+            "'PROBE_MODE'] in ('child-survives-stop','stop-fails','helper-killed-rollback'):\n"
             "    subprocess.Popen([str(root/'tools/omnigent/Scripts/pytho"
             "n.exe'),'-I','-m','omnigent.host._daemon_entry'],creationfla"
             "gs=subprocess.CREATE_NO_WINDOW,stdin=subprocess.DEVNULL,stdo"
@@ -297,19 +418,32 @@ def run(helper: Path, fixtures: Path, uv: str, pwsh: str) -> None:
             f'@echo off\r\n"{sys.executable}" "{supervisor}" %*\r\nexit /b %errorlevel%\r\n'
         )
         fixture_helper = root / "helper.ps1"
-        fixture_helper.write_text(
+        helper_text = (
             helper.read_text()
             .replace("UtcNow.AddSeconds(60)", "UtcNow.AddSeconds(0)")
             .replace("TimeoutSeconds = 30", "TimeoutSeconds = 1")
             .replace("-TimeoutSeconds 30", "-TimeoutSeconds 5")
         )
-        identity_and_wrapper_checks(root, fixture_helper)
+        if mode == "helper-killed-rollback":
+            point = (
+                "                Wait-CustomHostVenvReleased -Instruction $instruction "
+                "-LogPath $LogPath -HelperPid $PID -Identities $identities"
+            )
+            assert point in helper_text
+            helper_text = helper_text.replace(
+                point,
+                "                [IO.File]::WriteAllText("
+                "(Join-Path $env:PROBE_ROOT 'rollback-ready'), 'ready')\n"
+                "                Start-Sleep -Seconds 120\n" + point,
+            )
+        fixture_helper.write_text(helper_text)
+        namespace = identity_and_wrapper_checks(root, fixture_helper)
         result = root / "result.json"
         log = root / "update.log"
         lock = root / "update.lock"
         instruction = root / ".omnigent" / "updates" / "instruction.json"
         install_args = [*installer, str(wheels[1])]
-        if mode.startswith("helper-killed"):
+        if mode in {"helper-killed-missing", "helper-killed-child", "helper-killed-boot"}:
             stalled = root / "stalled-installer.py"
             stalled.write_text(
                 "import ctypes,os,pathlib,shutil,subprocess,sys,time\n"
@@ -389,17 +523,22 @@ def run(helper: Path, fixtures: Path, uv: str, pwsh: str) -> None:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            deadline = time.monotonic() + 20
-            while (
-                not (root / "installer.pid").exists()
-                and process.poll() is None
-                and time.monotonic() < deadline
-            ):
-                time.sleep(0.02)
-            assert (root / "installer.pid").exists(), (
-                result.read_text() if result.exists() else "no receipt"
+            deadline = time.monotonic() + 60
+            ready = root / (
+                "rollback-ready" if mode == "helper-killed-rollback" else "installer.pid"
             )
-            installer_pid = int((root / "installer.pid").read_text())
+            while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert ready.exists(), result.read_text() if result.exists() else "no receipt"
+            installer_pid = (
+                int((root / "host-child.pid").read_text())
+                if mode == "helper-killed-rollback"
+                else int((root / "installer.pid").read_text())
+            )
+            if mode == "helper-killed-rollback":
+                assert not process_alive(int((root / "host.pid").read_text()))
+                persisted = json.loads(result.read_text(encoding="utf-8-sig"))
+                assert any(p["pid"] == installer_pid for p in persisted["recovery_processes"])
             process.kill()
             process.wait(timeout=5)
             assert process_alive(installer_pid), "Fixture did not leave a surviving installer"
@@ -433,15 +572,45 @@ def run(helper: Path, fixtures: Path, uv: str, pwsh: str) -> None:
                 )
         else:
             completed = invoke(helper_argv)
+        if mode == "reconciled-healthy":
+            receipt = json.loads(result.read_text(encoding="utf-8-sig"))
+            receipt.update(status="failed", phase="rolling_back", error="Restore blocked")
+            result.write_text(json.dumps(receipt))
+            (Path(receipt["backup_path"]).parent / "transaction.json").write_text(
+                json.dumps(receipt)
+            )
+            namespace["_read_custom_host_update_result"] = lambda result=result: json.loads(
+                result.read_text()
+            )
+            namespace["_custom_host_update_paths"] = lambda result=result, lock=lock: {
+                "result": result,
+                "lock": lock,
+            }
+            with patch.dict(
+                sys.modules,
+                {
+                    "omnigent.install_ledger": SimpleNamespace(
+                        atomic_write_json=lambda path, value: path.write_text(json.dumps(value)),
+                    )
+                },
+            ):
+                namespace["_reconcile_custom_host_update_result"]("b" * 40, persist=True)
+            healthy = (venv / "uv-receipt.toml").read_bytes()
+            resumed = invoke(
+                [pwsh, "-NoProfile", "-Command", "& $env:PROBE_WRAPPER start; exit $LASTEXITCODE"]
+            )
+            assert resumed.returncode == 0, resumed.stderr
+            assert (venv / "uv-receipt.toml").read_bytes() == healthy
         payload = json.loads(result.read_text(encoding="utf-8-sig"))
-        expected = "complete" if mode == "success" else "failed"
+        succeeded = mode in {"success", "reconciled-healthy"}
+        expected = "complete" if succeeded else "failed"
         assert payload["status"] == expected, (payload, completed.stderr)
         if not mode.startswith("helper-killed"):
-            assert completed.returncode == (0 if mode == "success" else 1), completed.stderr
+            assert completed.returncode == (0 if succeeded else 1), completed.stderr
         version = invoke([str(omni), "--version"])
         assert version.returncode == 0, version.stderr
-        assert version.stdout.startswith("omnigent " + ("0.0.2" if mode == "success" else "0.0.1"))
-        if mode != "success":
+        assert version.stdout.startswith("omnigent " + ("0.0.2" if succeeded else "0.0.1"))
+        if not succeeded:
             assert payload["restored"], payload
             if not mode.startswith("helper-killed"):
                 assert payload["recovery_status"] == "online", payload

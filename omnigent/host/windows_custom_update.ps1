@@ -34,7 +34,8 @@ function Invoke-CapturedProcess {
     param(
         [string[]]$Arguments,
         [hashtable]$Environment = @{},
-        [int]$TimeoutSeconds = 30
+        [int]$TimeoutSeconds = 30,
+        [scriptblock]$OnWait = {}
     )
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $Arguments[0]
@@ -56,11 +57,16 @@ function Invoke-CapturedProcess {
     $stdoutTask = $process.StandardOutput.ReadToEndAsync()
     $stderrTask = $process.StandardError.ReadToEndAsync()
     try {
-        if (-not $process.WaitForExit([Math]::Max(1, $TimeoutSeconds) * 1000)) {
-            try { $process.Kill($true) } catch [InvalidOperationException] {}
-            if (-not $process.WaitForExit(5000)) { throw 'Timed-out native command did not exit.' }
-            throw "Native command timed out after $TimeoutSeconds seconds: $($Arguments[0])"
-        }
+        $deadline = [DateTimeOffset]::UtcNow.AddSeconds([Math]::Max(1, $TimeoutSeconds))
+        do {
+            & $OnWait
+            if ($process.WaitForExit(100)) { break }
+            if ([DateTimeOffset]::UtcNow -ge $deadline) {
+                try { $process.Kill($true) } catch [InvalidOperationException] {}
+                if (-not $process.WaitForExit(5000)) { throw 'Timed-out native command did not exit.' }
+                throw "Native command timed out after $TimeoutSeconds seconds: $($Arguments[0])"
+            }
+        } while ($true)
         if (-not $stdoutTask.Wait(5000) -or -not $stderrTask.Wait(5000)) {
             throw "Native command output did not close: $($Arguments[0])"
         }
@@ -70,19 +76,26 @@ function Invoke-CapturedProcess {
             Stderr = $stderrTask.GetAwaiter().GetResult()
         }
     } finally {
+        if (-not $process.HasExited) {
+            try { $process.Kill($true); [void]$process.WaitForExit(5000) } catch [InvalidOperationException] {}
+        }
         $process.Dispose()
     }
 }
 
 function Restart-HostSupervisor {
-    param([string]$WrapperPath, [string]$Action = 'start')
+    param([string]$WrapperPath, [string]$Action = 'start',
+          [object]$Instruction = $null, [Collections.IDictionary]$Result = $null)
+    $capture = {
+        if ($Instruction -and $Result) { Save-ReplacementHostSnapshot $Instruction $Result }
+    }
     $output = Invoke-CapturedProcess @(
         (Get-Command pwsh).Source, '-NoProfile', '-Command',
         '& $env:OMNIGENT_HOST_SERVICE_WRAPPER $env:OMNIGENT_HOST_SERVICE_ACTION; exit $LASTEXITCODE'
     ) @{
         OMNIGENT_HOST_SERVICE_WRAPPER = $WrapperPath
         OMNIGENT_HOST_SERVICE_ACTION = $Action
-    } -TimeoutSeconds 30
+    } -TimeoutSeconds 30 -OnWait $capture
     if ($output.ExitCode -ne 0) {
         throw "Host supervisor $Action exited with status $($output.ExitCode): $($output.Stderr)"
     }
@@ -222,22 +235,64 @@ function Get-ProcessTable {
     return $rows
 }
 
+function Get-WindowsProcessArguments {
+    param([object]$Row)
+    $matches = [regex]::Matches([string]$Row.CommandLine, '"[^"]*"|[^\s"]+')
+    $previousEnd = 0
+    foreach ($match in $matches) {
+        $gap = ([string]$Row.CommandLine).Substring($previousEnd, $match.Index - $previousEnd)
+        if ($gap.Trim() -or ($previousEnd -gt 0 -and -not $gap)) { return @() }
+        $previousEnd = $match.Index + $match.Length
+    }
+    if (([string]$Row.CommandLine).Substring($previousEnd).Trim()) { return @() }
+    return @($matches | ForEach-Object { $_.Value.Trim('"').Replace('/', '\').ToLowerInvariant() })
+}
+
+function Get-PowerShellFileInvocation {
+    param([object]$Row)
+    $exe = ConvertTo-NormalizedWindowsPath ([string]$Row.ExecutablePath)
+    if (($exe -split '\\')[-1] -ne 'pwsh.exe') { return $null }
+    $arguments = @(Get-WindowsProcessArguments $Row | Select-Object -Skip 1)
+    for ($index = 0; $index -lt $arguments.Count; $index++) {
+        $option = $arguments[$index]
+        if ($option -eq '-file' -and $index + 1 -lt $arguments.Count) {
+            return [pscustomobject]@{ Script = $arguments[$index + 1]; Arguments = @($arguments | Select-Object -Skip ($index + 2)) }
+        }
+        if ($option -in @('-nologo', '-noprofile', '-noninteractive')) { continue }
+        if ($option -in @('-executionpolicy', '-windowstyle') -and $index + 1 -lt $arguments.Count) { $index++; continue }
+        return $null
+    }
+    return $null
+}
+
 function Test-HostLauncher {
     param([object]$Row, [string]$CliBinPath)
-    $cmd = ([string]$Row.CommandLine).Replace('/', '\').ToLowerInvariant()
+    $arguments = @(Get-WindowsProcessArguments $Row | Select-Object -Skip 1)
     $cli = ConvertTo-NormalizedWindowsPath $CliBinPath
     $exe = ConvertTo-NormalizedWindowsPath ([string]$Row.ExecutablePath)
-    if ($exe -eq $cli -and $cmd -match '\s+host(?:\s|$)') { return $true }
+    if ($exe -eq $cli -and $arguments.Count -gt 0 -and $arguments[0] -eq 'host') { return $true }
     if (-not $cli.EndsWith('\.local\bin\omni.exe')) { return $false }
     $homePrefix = $cli.Substring(0, $cli.Length - '\.local\bin\omni.exe'.Length)
-    return (([string]$Row.Name).ToLowerInvariant() -in @('pwsh.exe', 'python.exe', 'pythonw.exe')) -and
-        ($cmd.Contains("$homePrefix\.omnigent\autostart\start-omnigenthostdefault.ps1") -or
-         $cmd.Contains("$homePrefix\.omnigent\autostart\launch-omnigenthost.pyw"))
+    $invoked = Get-PowerShellFileInvocation $Row
+    if ($invoked -and $invoked.Script -eq "$homePrefix\.omnigent\autostart\start-omnigenthostdefault.ps1") { return $true }
+    if (($exe -split '\\')[-1] -notin @('python.exe', 'pythonw.exe')) { return $false }
+    while ($arguments.Count -gt 0 -and $arguments[0] -in @('-i', '-u', '-b', '-e', '-s')) {
+        $arguments = @($arguments | Select-Object -Skip 1)
+    }
+    return $arguments.Count -gt 0 -and $arguments[0] -eq "$homePrefix\.omnigent\autostart\launch-omnigenthost.pyw"
 }
 
 function Test-HostDaemon {
     param([object]$Row)
-    return ([string]$Row.CommandLine) -match '(?i)(?:^|\s)-m\s+omnigent\.(host\._daemon_entry|cli\s+host)(?:\s|$)'
+    $exe = ConvertTo-NormalizedWindowsPath ([string]$Row.ExecutablePath)
+    if (($exe -split '\\')[-1] -notin @('python.exe', 'pythonw.exe')) { return $false }
+    $arguments = @(Get-WindowsProcessArguments $Row | Select-Object -Skip 1)
+    while ($arguments.Count -gt 0 -and $arguments[0] -in @('-i', '-u', '-b', '-e', '-s')) {
+        $arguments = @($arguments | Select-Object -Skip 1)
+    }
+    return $arguments.Count -ge 2 -and $arguments[0] -eq '-m' -and (
+        $arguments[1] -eq 'omnigent.host._daemon_entry' -or
+        ($arguments[1] -eq 'omnigent.cli' -and $arguments.Count -ge 3 -and $arguments[2] -eq 'host'))
 }
 
 function Get-StoppedHostTreePids {
@@ -274,15 +329,52 @@ function Get-StoppedHostTreePids {
     return @($selected | Sort-Object)
 }
 
+function Get-UpdaterAncestorPids {
+    param([object[]]$Processes, [int]$HelperPid)
+    $byPid = @{}
+    foreach ($row in $Processes) { $byPid[[int]$row.ProcessId] = $row }
+    $protected = [Collections.Generic.HashSet[int]]::new()
+    [void]$protected.Add($HelperPid)
+    $current = $byPid[$HelperPid]
+    while ($current) {
+        $parent = $byPid[[int]$current.ParentProcessId]
+        if (-not $parent -or $parent.CreatedAt -le 0 -or
+            $parent.CreatedAt -gt $current.CreatedAt -or
+            -not $protected.Add([int]$parent.ProcessId)) { break }
+        $current = $parent
+    }
+    return @($protected)
+}
+
 function Get-ManagedHostSnapshot {
     param([object]$Instruction)
     $processes = @(Get-ProcessTable)
     $seeds = @($processes | Where-Object {
-        (Test-HostDaemon $_) -and (Test-PathHoldsToolVenv $_ $Instruction.tool_venv_path $Instruction.cli_bin_path)
+        ((Test-HostDaemon $_) -and (Test-PathHoldsToolVenv $_ $Instruction.tool_venv_path $Instruction.cli_bin_path)) -or
+        (Test-HostLauncher $_ $Instruction.cli_bin_path)
     } | ForEach-Object { [int]$_.ProcessId })
-    $ids = @(Get-StoppedHostTreePids $processes $seeds $Instruction.tool_venv_path $Instruction.cli_bin_path @($PID))
+    # Startup invokes recovery before launching the Host. Its caller must
+    # survive recovery even though its exact script is a managed launcher.
+    $protected = @(Get-UpdaterAncestorPids $processes $PID)
+    $ids = @(Get-StoppedHostTreePids $processes $seeds $Instruction.tool_venv_path $Instruction.cli_bin_path $protected)
     return @($processes | Where-Object { $_.ProcessId -in $ids -and $_.CreatedAt -gt 0 } |
         ForEach-Object { [pscustomobject]@{ pid = [int]$_.ProcessId; created_at = [double]$_.CreatedAt } })
+}
+
+function Save-ReplacementHostSnapshot {
+    param([object]$Instruction, [Collections.IDictionary]$Result)
+    $identities = @($Result.recovery_processes | Where-Object { $null -ne $_ })
+    $changed = $false
+    foreach ($identity in Get-ManagedHostSnapshot $Instruction) {
+        if (-not @($identities | Where-Object { $_.pid -eq $identity.pid -and $_.created_at -eq $identity.created_at }).Count) {
+            $identities += $identity
+            $changed = $true
+        }
+    }
+    if ($changed) {
+        $Result.recovery_processes = $identities
+        Save-Transaction $Instruction $Result $Result.phase
+    }
 }
 
 function Stop-ProcessIdentity {
@@ -320,6 +412,7 @@ function Wait-CustomHostVenvReleased {
           [int]$GraceSeconds = 2, [int]$TimeoutSeconds = 15, [object[]]$Identities = @())
     $toolVenvPath = Get-ToolVenvPath $Instruction
     $cliBinPath = Get-CliBinPath $Instruction
+    $protected = @(Get-UpdaterAncestorPids @(Get-ProcessTable) $HelperPid)
     if (-not $Identities.Count) {
         $Identities = @($Instruction.previous_processes | Where-Object { $null -ne $_ })
     }
@@ -334,7 +427,7 @@ function Wait-CustomHostVenvReleased {
     $deadline = [DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
         foreach ($identity in $Identities) {
-            if ($identity.pid -ne $HelperPid) { Stop-ProcessIdentity $identity }
+            if ($identity.pid -notin $protected) { Stop-ProcessIdentity $identity }
         }
         $locking = @(Get-VenvLockingProcesses @(Get-ProcessTable) $toolVenvPath $cliBinPath @($HelperPid))
         $exclusiveError = ''
@@ -459,17 +552,21 @@ function Invoke-Installer {
 }
 
 function Stop-InstallerGuard {
-    param([string]$Transaction)
+    param([string]$Transaction, [object]$Instruction)
     $identityPath = Join-Path $Transaction 'installer.json'
     if (Test-Path -LiteralPath $identityPath) {
         Stop-ProcessIdentity (Get-Content -LiteralPath $identityPath -Raw | ConvertFrom-Json)
         return
     }
     foreach ($row in Get-ProcessTable) {
-        $cmd = ([string]$row.CommandLine).Replace('/', '\').ToLowerInvariant()
-        if ($cmd.Contains('-installeronly') -and
-            $cmd.Contains((ConvertTo-NormalizedWindowsPath $Transaction)) -and
-            $row.Name -eq 'pwsh.exe') {
+        $invoked = Get-PowerShellFileInvocation $row
+        if ($invoked -and $invoked.Script -eq (ConvertTo-NormalizedWindowsPath $Instruction.helper_path) -and
+            $invoked.Arguments.Count -eq 5 -and
+            $invoked.Arguments[0] -eq '-instructionpath' -and
+            $invoked.Arguments[1] -eq (ConvertTo-NormalizedWindowsPath $InstructionPath) -and
+            $invoked.Arguments[2] -eq '-installeronly' -and
+            $invoked.Arguments[3] -eq '-transactionpath' -and
+            $invoked.Arguments[4] -eq (ConvertTo-NormalizedWindowsPath $Transaction)) {
             Stop-ProcessIdentity ([pscustomobject]@{ pid = $row.ProcessId; created_at = $row.CreatedAt })
         }
     }
@@ -477,7 +574,7 @@ function Stop-InstallerGuard {
 
 function Recover-InterruptedTransaction {
     param([object]$Instruction, [Collections.IDictionary]$Result)
-    if (-not $Result.backup_path -or $Result.phase -eq 'completed') { return }
+    if (-not $Result.backup_path -or $Result.phase -eq 'completed' -or $Result.status -eq 'complete') { return }
     if ($Result.phase -eq 'restored') {
         if ($Result.status -eq 'running') {
             $Result.status = 'failed'
@@ -492,8 +589,21 @@ function Recover-InterruptedTransaction {
         throw 'Invalid backup path.'
     }
     $interruptedPhase = $Result.phase
-    Stop-InstallerGuard $transaction
-    $identities = @(Get-ManagedHostSnapshot $Instruction)
+    $journal = Join-Path $transaction 'transaction.json'
+    if (Test-Path -LiteralPath $journal) {
+        $saved = Get-Content -LiteralPath $journal -Raw | ConvertFrom-Json -AsHashtable
+        if ($saved.phase -eq 'completed' -or $saved.status -eq 'complete') {
+            foreach ($key in $saved.Keys) { $Result[$key] = $saved[$key] }
+            Write-JsonAtomic $Instruction.result_path $Result
+            Remove-Item -LiteralPath $Instruction.lock_path -Force -ErrorAction SilentlyContinue
+            return
+        }
+        $Result.recovery_processes = @($Result.recovery_processes) + @($saved.recovery_processes) |
+            Where-Object { $null -ne $_ }
+    }
+    Stop-InstallerGuard $transaction $Instruction
+    Save-ReplacementHostSnapshot $Instruction $Result
+    $identities = @($Result.recovery_processes | Where-Object { $null -ne $_ })
     Wait-CustomHostVenvReleased $Instruction $Instruction.log_path $PID -Identities $identities
     Restore-ToolInstallation $Instruction $Result
     $Result.status = 'failed'
@@ -628,7 +738,7 @@ function Invoke-TransactionalInstall {
         $failure = $_.Exception.Message
         try {
             if (Test-Path -LiteralPath (Join-Path $transaction 'installer-request.json')) {
-                Stop-InstallerGuard $transaction
+                Stop-InstallerGuard $transaction $Instruction
                 Wait-CustomHostVenvReleased $Instruction $LogPath $PID
             }
             Restore-ToolInstallation -Instruction $Instruction -Result $Result
@@ -639,9 +749,11 @@ function Invoke-TransactionalInstall {
 }
 
 function Test-HostReconnected {
-    param([object]$Instruction, [int]$TimeoutSeconds = 30)
+    param([object]$Instruction, [int]$TimeoutSeconds = 30,
+          [Collections.IDictionary]$Result = $null)
     $statusArguments = @($Instruction.status_argv | ForEach-Object { [string]$_ })
-    $status = Invoke-CapturedProcess $statusArguments -TimeoutSeconds $TimeoutSeconds
+    $capture = { if ($Result) { Save-ReplacementHostSnapshot $Instruction $Result } }
+    $status = Invoke-CapturedProcess $statusArguments -TimeoutSeconds $TimeoutSeconds -OnWait $capture
     if ($status.ExitCode -ne 0) {
         return $false
     }
@@ -673,11 +785,12 @@ function Test-HostReconnected {
 }
 
 function Wait-HostReconnected {
-    param([object]$Instruction)
+    param([object]$Instruction, [Collections.IDictionary]$Result = $null)
     $deadline = [DateTimeOffset]::UtcNow.AddSeconds(60)
     do {
+        if ($Result) { Save-ReplacementHostSnapshot $Instruction $Result }
         $remaining = [Math]::Max(1, [Math]::Min(30, [Math]::Ceiling(($deadline - [DateTimeOffset]::UtcNow).TotalSeconds)))
-        if (Test-HostReconnected $Instruction -TimeoutSeconds $remaining) { return $true }
+        if (Test-HostReconnected $Instruction -TimeoutSeconds $remaining -Result $Result) { return $true }
         if ([DateTimeOffset]::UtcNow -ge $deadline) { return $false }
         Start-Sleep -Seconds 1
     } while ($true)
@@ -716,7 +829,7 @@ if ($RecoverOnly) {
         "$($instruction.result_path).recovery.guard", 'OpenOrCreate', 'ReadWrite', 'None')
     try {
         $receipt = Get-Content -LiteralPath $instruction.result_path -Raw | ConvertFrom-Json -AsHashtable
-        if ($receipt.phase -eq 'completed' -or -not $receipt.backup_path) { exit 0 }
+        if ($receipt.phase -eq 'completed' -or $receipt.status -eq 'complete' -or -not $receipt.backup_path) { exit 0 }
         $activeOwner = $false
         $owner = Get-Process -Id ([int]$receipt.helper_pid) -ErrorAction SilentlyContinue
         if ($owner) {
@@ -802,8 +915,8 @@ try {
 
     Save-Transaction $instruction $result 'starting_host'
     $restartAttempted = $true
-    Restart-HostSupervisor $WrapperPath
-    if (-not (Wait-HostReconnected $instruction)) {
+    Restart-HostSupervisor $WrapperPath -Instruction $instruction -Result $result
+    if (-not (Wait-HostReconnected $instruction $result)) {
         throw "The updated Host did not reconnect on its managed target within 60 seconds."
     }
 
@@ -828,8 +941,8 @@ catch {
     if ($instruction -and $result.backup_path -and -not $result.restored) {
         try {
             if ($restartAttempted) {
-                $identities = @(Get-ManagedHostSnapshot $instruction)
-                $result.recovery_processes = $identities
+                Save-ReplacementHostSnapshot $instruction $result
+                $identities = @($result.recovery_processes | Where-Object { $null -ne $_ })
                 Save-Transaction $instruction $result 'rolling_back'
                 try { Restart-HostSupervisor $WrapperPath 'stop' }
                 catch { Add-UpdateLog $LogPath "Supervisor stop diagnostic: $($_.Exception.Message)" }
