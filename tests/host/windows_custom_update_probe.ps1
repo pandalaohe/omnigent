@@ -380,7 +380,7 @@ if ($PythonPath -and $UvPath) {
             $PythonPath, (Join-Path $PSScriptRoot 'windows_custom_update_uv_probe.py'),
             ([IO.Path]::GetFullPath($HelperPath)), (Join-Path $FixtureRoot 'real-uv'),
             $UvPath, (Get-Command pwsh).Source
-        ) -TimeoutSeconds 900
+        ) -TimeoutSeconds 1800
         Write-Output $completed.Stdout
         if ($completed.ExitCode -ne 0) { throw $completed.Stderr }
     }

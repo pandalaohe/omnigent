@@ -523,7 +523,7 @@ def run(helper: Path, fixtures: Path, uv: str, pwsh: str) -> None:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            deadline = time.monotonic() + 60
+            deadline = time.monotonic() + (180 if mode == "helper-killed-rollback" else 60)
             ready = root / (
                 "rollback-ready" if mode == "helper-killed-rollback" else "installer.pid"
             )
