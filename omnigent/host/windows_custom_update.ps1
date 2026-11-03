@@ -827,29 +827,36 @@ if ($RecoverOnly) {
     if (-not (Test-Path -LiteralPath $instruction.result_path)) { exit 0 }
     $recoveryLock = [IO.File]::Open(
         "$($instruction.result_path).recovery.guard", 'OpenOrCreate', 'ReadWrite', 'None')
+    $activeOwner = $false
     try {
         $receipt = Get-Content -LiteralPath $instruction.result_path -Raw | ConvertFrom-Json -AsHashtable
-        if ($receipt.phase -eq 'completed' -or $receipt.status -eq 'complete' -or -not $receipt.backup_path) { exit 0 }
-        $activeOwner = $false
-        $owner = Get-Process -Id ([int]$receipt.helper_pid) -ErrorAction SilentlyContinue
-        if ($owner) {
-            $created = $owner.StartTime.ToFileTimeUtc() / 10000000.0 - 11644473600.0
-            if ([Math]::Abs($created - [double]$receipt.helper_created_at) -le 0.00001) {
-                if ($receipt.phase -in @('starting_host', 'restored')) { exit 0 }
-                $activeOwner = $true
-                throw 'A custom Host update is still running.'
+        if ($receipt.phase -ne 'completed' -and $receipt.status -ne 'complete') {
+            if (-not $receipt.backup_path) { exit 0 }
+            $owner = Get-Process -Id ([int]$receipt.helper_pid) -ErrorAction SilentlyContinue
+            if ($owner) {
+                $created = $owner.StartTime.ToFileTimeUtc() / 10000000.0 - 11644473600.0
+                if ([Math]::Abs($created - [double]$receipt.helper_created_at) -le 0.00001) {
+                    if ($receipt.phase -in @('starting_host', 'restored')) { exit 0 }
+                    $activeOwner = $true
+                    throw 'A custom Host update is still running.'
+                }
             }
+            Recover-InterruptedTransaction $instruction $receipt
         }
-        Recover-InterruptedTransaction $instruction $receipt
-        if ($ResumeAutostart -and $receipt.restored -and $instruction.disabled_marker) {
+        if ($ResumeAutostart -and $instruction.disabled_marker -and
+            ($receipt.restored -or $receipt.phase -eq 'completed' -or $receipt.status -eq 'complete')) {
             $expected = Join-Path (Split-Path -Parent (Split-Path -Parent $InstructionPath)) 'autostart\disabled'
             if ([IO.Path]::GetFullPath($instruction.disabled_marker) -ne [IO.Path]::GetFullPath($expected)) {
                 throw 'Invalid autostart marker path.'
             }
             Remove-Item -LiteralPath $instruction.disabled_marker -Force -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $instruction.disabled_marker) {
+                throw 'Could not remove the autostart disabled marker.'
+            }
         }
     } catch {
-        if ($receipt -and $receipt.backup_path -and -not $activeOwner) {
+        if ($receipt -and $receipt.backup_path -and -not $activeOwner -and
+            $receipt.phase -ne 'completed' -and $receipt.status -ne 'complete') {
             $receipt.status = 'failed'
             $receipt.error = $_.Exception.Message
             Save-Transaction $instruction $receipt $receipt.phase

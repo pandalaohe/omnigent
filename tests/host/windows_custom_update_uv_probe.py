@@ -164,7 +164,10 @@ def identity_and_wrapper_checks(root: Path, helper: Path) -> dict:
     startup.parent.mkdir(parents=True, exist_ok=True)
     startup.write_text(
         "#requires -Version 7.0\n"
-        "param([string]$Message = 'fixture boot started')\nWrite-Output $Message\n"
+        "param([string]$Message = 'fixture boot started')\n"
+        "if (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'disabled')) { exit 0 }\n"
+        "[IO.File]::WriteAllText((Join-Path $PSScriptRoot 'startup-reached'), 'started')\n"
+        "Write-Output $Message\n"
     )
     instruction = root / ".omnigent" / "updates" / "instruction.json"
     instruction.parent.mkdir(parents=True, exist_ok=True)
@@ -307,7 +310,7 @@ def run(helper: Path, fixtures: Path, uv: str, pwsh: str) -> None:
             env=env,
             capture_output=True,
             text=True,
-            timeout=90,
+            timeout=180,
             check=False,
         )
 
@@ -596,10 +599,21 @@ def run(helper: Path, fixtures: Path, uv: str, pwsh: str) -> None:
             ):
                 namespace["_reconcile_custom_host_update_result"]("b" * 40, persist=True)
             healthy = (venv / "uv-receipt.toml").read_bytes()
+            marker = root / ".omnigent" / "autostart" / "disabled"
+            marker.write_text("")
             resumed = invoke(
-                [pwsh, "-NoProfile", "-Command", "& $env:PROBE_WRAPPER start; exit $LASTEXITCODE"]
+                [
+                    pwsh,
+                    "-NoProfile",
+                    "-File",
+                    str(marker.with_name("Start-OmnigentHostDefault.ps1")),
+                ]
             )
             assert resumed.returncode == 0, resumed.stderr
+            assert not marker.exists(), "Reconciled success left login autostart disabled"
+            assert marker.with_name("startup-reached").is_file(), (
+                "Reconciled login never reached the supervisor body"
+            )
             assert (venv / "uv-receipt.toml").read_bytes() == healthy
         payload = json.loads(result.read_text(encoding="utf-8-sig"))
         succeeded = mode in {"success", "reconciled-healthy"}

@@ -97,10 +97,55 @@ Check 'installer fallback requires the exact invoked helper and argument positio
     Stop-InstallerGuard $transaction $instruction
     if ($selected.Count -ne 1 -or $selected[0] -ne 101) { throw "Wrong installer kill authority: $selected" }
 }
-Check 'a reconciled complete receipt never restores the previous installation' {
-    $result = [ordered]@{ status = 'complete'; phase = 'rolling_back'; backup_path = 'unused' }
-    Recover-InterruptedTransaction ([pscustomobject]@{}) $result
-    if ($result.phase -ne 'rolling_back') { throw 'Terminal receipt was changed.' }
+Check 'reconciled success resumes login without restoring the previous installation' {
+    $scenario = Join-Path $FixtureRoot 'reconciled-login'
+    $updates = Join-Path $scenario '.omnigent\updates'
+    $autostart = Join-Path $scenario '.omnigent\autostart'
+    $venv = Join-Path $scenario 'tools\omnigent'
+    $backup = "$venv.update-$('d' * 32)\previous"
+    New-Item -ItemType Directory -Path $updates, $autostart, $venv, $backup -Force | Out-Null
+    $marker = Join-Path $autostart 'disabled'
+    $current = Join-Path $venv 'working.txt'
+    $previous = Join-Path $backup 'working.txt'
+    [IO.File]::WriteAllText($marker, '')
+    [IO.File]::WriteAllText($current, 'healthy')
+    [IO.File]::WriteAllText($previous, 'previous')
+    $instructionPath = Join-Path $updates 'instruction.json'
+    $resultPath = Join-Path $updates 'result.json'
+    Write-JsonAtomic $instructionPath @{
+        result_path = $resultPath; disabled_marker = $marker
+        tool_venv_path = $venv
+    }
+    Write-JsonAtomic $resultPath @{
+        status = 'complete'; phase = 'rolling_back'; backup_path = $backup
+    }
+    $recoveryArguments = @(
+        (Get-Command pwsh).Source, '-NoProfile', '-File', ([IO.Path]::GetFullPath($HelperPath)),
+        '-InstructionPath', $instructionPath, '-RecoverOnly', '-ResumeAutostart'
+    )
+    foreach ($attempt in 1..2) {
+        $recovery = Invoke-CapturedProcess $recoveryArguments
+        if ($recovery.ExitCode -ne 0) { throw "Reconciled login failed: $($recovery.Stderr)" }
+        if (Test-Path -LiteralPath $marker) { throw 'Reconciled success left login autostart disabled.' }
+    }
+    [IO.File]::WriteAllText($marker, '')
+    $heldMarker = [IO.File]::Open($marker, 'Open', 'Read', 'None')
+    try {
+        $blocked = Invoke-CapturedProcess $recoveryArguments
+        if ($blocked.ExitCode -eq 0) { throw 'A held disabled marker was reported as removed.' }
+        $saved = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
+        if ($saved.status -ne 'complete') { throw 'Marker cleanup failure invalidated a healthy install.' }
+    } finally { $heldMarker.Dispose() }
+    $retried = Invoke-CapturedProcess $recoveryArguments
+    if ($retried.ExitCode -ne 0 -or (Test-Path -LiteralPath $marker)) {
+        throw 'Marker cleanup did not recover after the lock was released.'
+    }
+    if ([IO.File]::ReadAllText($current) -ne 'healthy' -or
+        [IO.File]::ReadAllText($previous) -ne 'previous') {
+        throw 'Terminal recovery replaced the healthy install or changed its backup.'
+    }
+    $saved = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
+    if ($saved.status -ne 'complete') { throw 'Successful reconciliation receipt was changed.' }
 }
 Check 'startup recovery protects its caller but not the replacement Host' {
     $cli = 'C:\Profiles\fixture\.local\bin\omni.exe'
