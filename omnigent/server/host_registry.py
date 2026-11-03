@@ -47,6 +47,7 @@ from omnigent.harness_availability import HarnessAvailability
 from omnigent.host.frames import (
     CAP_CODEX_SIDE_CHAT,
     CAP_KEEP_WARM,
+    HostAgentSettingsResultFrame,
     HostContextInventoryV2ResultFrame,
     HostHelloFrame,
     HostMcpServersResultFrame,
@@ -634,6 +635,9 @@ class HostConnection:
     pending_mcp_servers: dict[str, asyncio.Future[HostMcpServersResultFrame]] = field(
         default_factory=dict,
     )
+    pending_agent_settings: dict[str, asyncio.Future[HostAgentSettingsResultFrame]] = field(
+        default_factory=dict,
+    )
     pending_owner_inventory: dict[str, asyncio.Future[HostOwnerInventoryResultFrame]] = field(
         default_factory=dict,
     )
@@ -784,6 +788,7 @@ class HostRegistry:
                 _fail_pending_mcp_tools(old)
                 _fail_pending_skills(old)
                 _fail_pending_mcp_servers(old)
+                _fail_pending_inventory(old.pending_agent_settings, old.host_id)
                 _fail_pending_inventory(old.pending_owner_inventory, old.host_id)
                 _fail_pending_inventory(old.pending_context_inventory, old.host_id)
                 _fail_pending_folder_facts(old)
@@ -840,6 +845,7 @@ class HostRegistry:
         _fail_pending_mcp_tools(removed)
         _fail_pending_skills(removed)
         _fail_pending_mcp_servers(removed)
+        _fail_pending_inventory(removed.pending_agent_settings, removed.host_id)
         _fail_pending_inventory(removed.pending_owner_inventory, removed.host_id)
         _fail_pending_inventory(removed.pending_context_inventory, removed.host_id)
         _fail_pending_folder_facts(removed)

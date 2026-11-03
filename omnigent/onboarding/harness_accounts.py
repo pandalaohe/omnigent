@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import threading
 import time
+from collections.abc import Mapping
 from queue import Empty, Queue
 from typing import Any, cast
 
@@ -29,6 +31,7 @@ class _StdioJsonRpc:
         self,
         timeout_s: float = _PROBE_TIMEOUT_S,
         cancel_event: threading.Event | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> None:
         codex = shutil.which("codex")
         if codex is None:
@@ -44,6 +47,7 @@ class _StdioJsonRpc:
             stderr=subprocess.DEVNULL,
             text=True,
             bufsize=1,
+            env=dict(env) if env is not None else None,
             **_proc.spawn_kwargs(),
         )
         _proc.remember_process_group(self._proc)
@@ -124,6 +128,7 @@ def _codex_account(
     refresh_token: bool = False,
     deadline: float,
     cancel_event: threading.Event | None,
+    env: Mapping[str, str] | None = None,
 ) -> HarnessAccount | None:
     if shutil.which("codex") is None:
         return None
@@ -132,6 +137,7 @@ def _codex_account(
         rpc = _StdioJsonRpc(
             max(0.0, deadline - time.monotonic()),
             cancel_event=cancel_event,
+            env=env,
         )
         rpc.request(
             "initialize",
@@ -174,6 +180,7 @@ def _run_json_command(
     *,
     deadline: float,
     cancel_event: threading.Event | None,
+    env: Mapping[str, str] | None = None,
 ) -> tuple[int, dict[str, Any] | None]:
     if cancel_event is not None and cancel_event.is_set():
         return 1, None
@@ -187,6 +194,7 @@ def _run_json_command(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            env=dict(env) if env is not None else None,
             **_proc.spawn_kwargs(),
         )
         _proc.remember_process_group(process)
@@ -220,7 +228,10 @@ def _run_json_command(
 
 
 def _claude_account(
-    *, deadline: float, cancel_event: threading.Event | None
+    *,
+    deadline: float,
+    cancel_event: threading.Event | None,
+    env: Mapping[str, str] | None = None,
 ) -> HarnessAccount | None:
     claude = shutil.which("claude")
     if claude is None:
@@ -229,6 +240,7 @@ def _claude_account(
         [claude, "auth", "status", "--json"],
         deadline=deadline,
         cancel_event=cancel_event,
+        env=env,
     )
     if payload is None:
         return {"kind": "unknown"}
@@ -253,7 +265,12 @@ def _claude_account(
     return account
 
 
-def _pi_account(*, deadline: float, cancel_event: threading.Event | None) -> HarnessAccount | None:
+def _pi_account(
+    *,
+    deadline: float,
+    cancel_event: threading.Event | None,
+    env: Mapping[str, str] | None = None,
+) -> HarnessAccount | None:
     pi = shutil.which("pi")
     if pi is None:
         return None
@@ -268,6 +285,7 @@ def _pi_account(*, deadline: float, cancel_event: threading.Event | None) -> Har
             [pi, "auth", "check", "--provider", provider_id, "--json"],
             deadline=deadline,
             cancel_event=cancel_event,
+            env=env,
         )
         if return_code != 0 or payload is None or payload.get("status") != "ready":
             continue
@@ -304,22 +322,29 @@ def probe_harness_account(
     refresh_codex: bool = False,
     timeout_s: float = _PROBE_TIMEOUT_S,
     cancel_event: threading.Event | None = None,
+    config_root: str | None = None,
 ) -> HarnessAccount | None:
     """Probe one supported harness account without exposing credential material."""
+    from omnigent.host.agent_settings import agent_settings_launch_env
+
     deadline = time.monotonic() + timeout_s
+    env = {**os.environ, **agent_settings_launch_env(harness, root=config_root)}
     probes = {
         "codex": lambda: _codex_account(
             refresh_token=refresh_codex,
             deadline=deadline,
             cancel_event=cancel_event,
+            env=env,
         ),
         "claude": lambda: _claude_account(
             deadline=deadline,
             cancel_event=cancel_event,
+            env=env,
         ),
         "pi": lambda: _pi_account(
             deadline=deadline,
             cancel_event=cancel_event,
+            env=env,
         ),
         "opencode": _opencode_account,
     }

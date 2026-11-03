@@ -1214,10 +1214,12 @@ def _codex_home_config_source_from_env() -> Path:
     :returns: Host Codex home to read ``auth.json`` and ``config.toml`` from,
         e.g. ``Path.home() / ".codex"`` or an explicit user ``CODEX_HOME``.
     """
-    home_codex_home = Path.home() / ".codex"
+    from omnigent.host.agent_settings import resolved_root
+
+    default_source = Path(resolved_root("codex") or str(Path.home() / ".codex"))
     return _resolve_codex_home_config_source(
-        Path(os.environ.get("CODEX_HOME") or str(home_codex_home)),
-        home_codex_home,
+        Path(os.environ.get("CODEX_HOME") or str(default_source)),
+        default_source,
     )
 
 

@@ -1375,9 +1375,14 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     :param claude_config: The resolved launch config, or ``None``.
     :returns: A stable fingerprint string.
     """
+    from omnigent.host.agent_settings import agent_settings_launch_env
     from omnigent.models.model_catalog_store import binary_identity, fingerprint_of
     from omnigent.onboarding.ambient import claude_managed_model_picker
 
+    settings_root = agent_settings_launch_env("claude").get("CLAUDE_CONFIG_DIR")
+    settings_root = (
+        settings_root or os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
+    )
     command, launch_args = _claude_model_probe_launch(claude_config, stream_input=True)
     ambient_gateway = None
     if claude_config is None:
@@ -1386,6 +1391,7 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     return fingerprint_of(
         "claude-native",
         "control-picker-v3",
+        settings_root,
         sorted(claude_config.env.items()) if claude_config is not None else None,
         claude_config.api_key_helper if claude_config is not None else None,
         claude_config.model if claude_config is not None else None,
@@ -1626,6 +1632,9 @@ def build_native_claude_terminal_env(
         terminal_env[_CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV] = "true"
         terminal_env[_CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV] = "1"
         terminal_env[_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV] = "1"
+    from omnigent.host.agent_settings import agent_settings_launch_env
+
+    terminal_env.update(agent_settings_launch_env("claude"))
     configured_base_url = (
         claude_config.env.get(_UCODE_CLAUDE_BASE_URL_ENV) if claude_config is not None else None
     )

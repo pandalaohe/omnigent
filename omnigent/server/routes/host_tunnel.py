@@ -37,6 +37,7 @@ from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.host.frames import (
     CAP_HARNESS_ACCOUNTS,
     IMPORT_SESSION_MAX_CONNECTION_REASSEMBLED_CHARS,
+    HostAgentSettingsResultFrame,
     HostCodexRateLimitsFrame,
     HostConnectionErrorFrame,
     HostContextInventoryV2ResultFrame,
@@ -1414,6 +1415,11 @@ async def _receive_loop(
             mcp_future = conn.pending_mcp_servers.pop(frame.request_id, None)
             if mcp_future is not None and not mcp_future.done():
                 mcp_future.set_result(frame)
+            continue
+        if isinstance(frame, HostAgentSettingsResultFrame):
+            settings_future = conn.pending_agent_settings.pop(frame.request_id, None)
+            if settings_future is not None and not settings_future.done():
+                settings_future.set_result(frame)
             continue
         if isinstance(frame, HostOwnerInventoryResultFrame):
             owner_future = conn.pending_owner_inventory.pop(frame.request_id, None)

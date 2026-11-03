@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import shutil
 from dataclasses import dataclass
 from typing import Any, cast
@@ -25,7 +26,10 @@ class CodexDeviceLogin:
 class CodexLoginSession:
     """One persistent Codex app-server used for a device login."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, config_root: str | None = None) -> None:
+        from omnigent.host.agent_settings import agent_settings_launch_env
+
+        self._env = {**os.environ, **agent_settings_launch_env("codex", root=config_root)}
         self._process: asyncio.subprocess.Process | None = None
         self._reader: asyncio.Task[None] | None = None
         self._stderr: asyncio.Task[None] | None = None
@@ -70,6 +74,7 @@ class CodexLoginSession:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=self._env,
         )
         self._reader = asyncio.create_task(self._reader_loop())
         self._stderr = asyncio.create_task(self._drain_stderr())
@@ -200,12 +205,15 @@ async def claude_logout() -> None:
     claude = shutil.which("claude")
     if claude is None:
         raise RuntimeError("claude is not installed")
+    from omnigent.host.agent_settings import agent_settings_launch_env
+
     process = await asyncio.create_subprocess_exec(
         claude,
         "auth",
         "logout",
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
+        env={**os.environ, **agent_settings_launch_env("claude")},
     )
     try:
         return_code = await asyncio.wait_for(process.wait(), timeout=_RPC_TIMEOUT_S)

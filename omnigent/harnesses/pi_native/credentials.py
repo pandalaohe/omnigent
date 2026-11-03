@@ -465,6 +465,10 @@ def global_pi_agent_dir(
     """
     source_env = os.environ if env is None else env
     override = source_env.get(PI_CODING_AGENT_DIR_ENV_VAR, "").strip()
+    if not override:
+        from omnigent.host.agent_settings import resolved_root
+
+        override = resolved_root("pi") or ""
     root = Path(override).expanduser() if override else Path.home() / ".pi" / "agent"
     return workspace / root if workspace is not None and not root.is_absolute() else root
 

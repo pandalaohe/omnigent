@@ -5953,6 +5953,7 @@ def create_app(
                 if startup_admission is not None
                 else None,
                 harness_install=app.state.harness_install,
+                catalog_store=host_model_catalog_cache_store,
             ),
             prefix="/v1",
             tags=["hosts"],

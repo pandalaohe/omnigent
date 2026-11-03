@@ -79,6 +79,7 @@ async def _sync_pair(
     semaphore: asyncio.Semaphore,
     host_id: str,
     harness: str,
+    refresh: str | None = None,
 ) -> None:
     """Refresh one ``(host, harness)`` catalog, recording failures as errors."""
     async with semaphore:
@@ -87,6 +88,7 @@ async def _sync_pair(
                 host_registry=host_registry,
                 host_conn=host_conn,
                 harness=harness,
+                **({"refresh": refresh} if refresh else {}),
             )
         except HTTPException as exc:
             detail = str(exc.detail) if exc.detail else str(exc)
