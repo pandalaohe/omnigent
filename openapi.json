@@ -810,6 +810,42 @@
         "title": "ArtifactOpenRequestEvent",
         "type": "object"
       },
+      "AutoRetryMetadata": {
+        "additionalProperties": false,
+        "description": "Visible input correlation; execution still requires a trusted admission receipt.",
+        "properties": {
+          "attempt": {
+            "format": "int64",
+            "minimum": 1.0,
+            "title": "Attempt",
+            "type": "integer"
+          },
+          "chain_id": {
+            "pattern": "^[0-9a-f]{32}$",
+            "title": "Chain Id",
+            "type": "string"
+          },
+          "input_id": {
+            "pattern": "^[0-9a-f]{32}$",
+            "title": "Input Id",
+            "type": "string"
+          },
+          "of": {
+            "format": "int64",
+            "minimum": 1.0,
+            "title": "Of",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "chain_id",
+          "input_id",
+          "attempt",
+          "of"
+        ],
+        "title": "AutoRetryMetadata",
+        "type": "object"
+      },
       "AutomaticSessionRenameRequest": {
         "additionalProperties": false,
         "description": "Proposed title for a framework or agent-initiated rename.",
@@ -5968,6 +6004,16 @@
       "MessageData": {
         "description": "Data for a message item (user or assistant).\n\n**Parameters**\n\n- `agent` \u2014 Agent name (required for assistant messages, absent for user). Serialized as `\"model\"` in JSON.",
         "properties": {
+          "auto_retry": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AutoRetryMetadata"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "content": {
             "description": "Heterogeneous content blocks, e.g. `[{\"type\": \"input_text\", \"text\": \"Hello\"}]`.",
             "items": {
@@ -14489,7 +14535,7 @@
     },
     "/api/version": {
       "get": {
-        "description": "Return the installed omnigent package version.\n\nUsed by the web UI to include version info in bug reports.\n\n**Returns:** `{\"version\": \"<semver string>\"}`, e.g. `{\"version\": \"0.1.0\"}`.",
+        "description": "Return the installed omnigent package version.\n\nUsed by the web UI to include version info in bug reports.\n\n**Returns:** `{\"version\": \"<semver string>\"}`, e.g. `{\"version\": \"0.1.0\"}`; a stamped distribution build adds `\"distribution\"`, e.g. `\"0.21.0-wukong.12\"`.",
         "operationId": "version_api_version_get",
         "responses": {
           "200": {
