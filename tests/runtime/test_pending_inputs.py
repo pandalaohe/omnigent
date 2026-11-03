@@ -34,6 +34,57 @@ import pytest
 from omnigent.runtime import pending_inputs
 
 
+@pytest.mark.parametrize("pasted", [False, True])
+@pytest.mark.parametrize("hold", [False, True])
+def test_recorded_prefix_matches_without_changing_the_users_words(
+    pasted: bool, hold: bool
+) -> None:
+    prefix = "[System: shell] The user opened bash · user-shell.\n\n"
+    original = prefix + "my own words" if pasted else "my own words"
+    content = [_text_block(original)]
+    pending = pending_inputs.record("conv", content, injected_prefix=prefix)
+    assert pending_inputs.snapshot_for("conv")[0]["content"] == content
+    matched = pending_inputs.resolve_matching_text("conv", prefix + original, hold=hold)
+    assert matched.match_method == "injected_prefix_text"
+    assert matched.matched is not None
+    assert matched.matched.pending_id == pending
+    assert matched.matched.content == content
+    pending_inputs.restore("conv", matched.matched)
+    rematched = pending_inputs.resolve_matching_text("conv", prefix + original)
+    assert rematched.match_method == "injected_prefix_text"
+    assert not pending_inputs.has_pending("conv")
+
+
+def test_plain_exact_match_wins_over_a_recorded_prefix() -> None:
+    prefix = "[System: shell] Some words\n\n"
+    first = pending_inputs.record("conv", [_text_block("hello")], injected_prefix=prefix)
+    second = pending_inputs.record("conv", [_text_block(prefix + "hello")])
+    matched = pending_inputs.resolve_matching_text("conv", prefix + "hello")
+    assert matched.match_method == "normalized_text"
+    assert matched.matched is not None and matched.matched.pending_id == second
+    assert matched.skipped[0].pending_id == first
+
+
+@pytest.mark.parametrize("attachment_first", [False, True])
+@pytest.mark.parametrize("kind", ["input_image", "input_file"])
+def test_recorded_prefix_and_attachment_markers_preserve_content_order(
+    attachment_first: bool, kind: str
+) -> None:
+    prefix = "[System: shell] The user opened bash · shell.\n\n"
+    text = _text_block("[Attached: /opt/work/pasted.png] my pasted words")
+    attachment = {"type": kind, "file_id": "image", "filename": "image.png"}
+    blocks = [attachment, text] if attachment_first else [text, attachment]
+    pending_inputs.record("conv", blocks, injected_prefix=prefix)
+    marker = "[Attached: /opt/work/materialized.png]"
+    mirror = prefix + "\n\n".join(
+        [marker, text["text"]] if attachment_first else [text["text"], marker]
+    )
+    matched = pending_inputs.resolve_matching_text("conv", mirror)
+    assert matched.match_method == "injected_prefix_text"
+    assert matched.matched is not None and matched.matched.content == blocks
+    assert not pending_inputs.has_pending("conv")
+
+
 def test_unknown_delivery_stage_is_observable_without_overwriting_state(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

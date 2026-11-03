@@ -115,6 +115,18 @@ class _ResolvedInstance:
     lock: threading.Lock
 
 
+def _terminal_tool_result(result: dict[str, Any], instance: TerminalInstance | None) -> str:
+    """Keep user-owned sockets out of tool errors while retaining pane contents."""
+    error = result.get("error")
+    if instance is not None and instance.origin == "user" and isinstance(error, str):
+        socket = str(instance.socket_path)
+        # Command diagnostics JSON-encode paths; start failures use raw paths.
+        for spelling in (json.dumps(socket)[1:-1], socket):
+            error = error.replace(spelling, "<redacted terminal socket>")
+        result = {**result, "error": error}
+    return json.dumps(result)
+
+
 def _format_launch_envelope(
     validated: _ValidatedLaunchArgs,
     instance: TerminalInstance,
@@ -140,8 +152,13 @@ def _format_launch_envelope(
         {
             "terminal": validated.terminal_name,
             "session": validated.session_key,
-            **({} if instance.elevated else {"tmux_socket": str(instance.socket_path)}),
+            **(
+                {}
+                if instance.elevated or instance.origin == "user"
+                else {"tmux_socket": str(instance.socket_path)}
+            ),
             "instance_id": instance.instance_id,
+            "origin": instance.origin,
             "elevated": instance.elevated,
             "agent_access": instance.agent_access if instance.elevated else True,
             "has_os_env": instance.os_env is not None,
@@ -474,6 +491,10 @@ def _resolve_running_instance(
         from omnigent.terminals.elevation import AGENT_ACCESS_REQUIRED
 
         return json.dumps({"error": AGENT_ACCESS_REQUIRED})
+    if tool_name == "sys_terminal_send" and instance.origin == "user" and not instance.elevated:
+        from omnigent.terminals.elevation import USER_SHELL_READ_ONLY
+
+        return json.dumps({"error": USER_SHELL_READ_ONLY})
     return _ResolvedInstance(instance=instance, parsed=parsed, lock=lock)
 
 
@@ -687,6 +708,10 @@ class SysTerminalLaunchTool(Tool):
             a JSON-encoded error envelope (``str``) on a known
             recoverable failure.
         """
+        # A failed relaunch may remove the existing user instance from the registry.
+        existing = self._registry.get(
+            conversation_id, validated.terminal_name, validated.session_key
+        )
         try:
             return asyncio.run(
                 self._registry.launch(
@@ -709,7 +734,7 @@ class SysTerminalLaunchTool(Tool):
             # surface as these. Wrap in the LLM-facing JSON envelope
             # so the LLM can recover (e.g. by adjusting cwd / sandbox).
             _logger.exception("sys_terminal_launch failed")
-            return json.dumps({"error": f"launch failed: {exc}"})
+            return _terminal_tool_result({"error": f"launch failed: {exc}"}, existing)
 
     def _validate_launch_args(self, arguments: str) -> str | _ValidatedLaunchArgs:
         """
@@ -880,8 +905,8 @@ class SysTerminalSendTool(Tool):
                 # errors land here. Wrap so the LLM sees a structured
                 # error and can decide whether to relaunch the terminal.
                 _logger.exception("sys_terminal_send failed")
-                return json.dumps({"error": f"send failed: {exc}"})
-        return json.dumps(result)
+                result = {"error": f"send failed: {exc}"}
+        return _terminal_tool_result(result, resolved.instance)
 
 
 class SysTerminalReadTool(Tool):
@@ -937,7 +962,11 @@ class SysTerminalReadTool(Tool):
             return resolved
 
         scrollback_raw = resolved.parsed.get("scrollback", 0)
-        if not isinstance(scrollback_raw, int) or scrollback_raw < 0:
+        if (
+            isinstance(scrollback_raw, bool)
+            or not isinstance(scrollback_raw, int)
+            or scrollback_raw < 0
+        ):
             return json.dumps({"error": "'scrollback' must be a non-negative integer"})
 
         # Hold the per-instance lock so a concurrent ``send`` can't
@@ -958,8 +987,8 @@ class SysTerminalReadTool(Tool):
             except (RuntimeError, OSError, ValueError) as exc:
                 # tmux capture-pane subprocess failures land here.
                 _logger.exception("sys_terminal_read failed")
-                return json.dumps({"error": f"read failed: {exc}"})
-        return json.dumps(result)
+                result = {"error": f"read failed: {exc}"}
+        return _terminal_tool_result(result, resolved.instance)
 
 
 class SysTerminalListTool(Tool):
@@ -988,7 +1017,8 @@ class SysTerminalListTool(Tool):
         """:returns: LLM-facing description."""
         return (
             "List the conversation's active terminal sessions, with their "
-            "running state and tmux socket paths."
+            "running state and available tmux socket paths; includes shells the user opened; "
+            "those can be read, not typed into or closed. Admin shells require access approval."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -1083,6 +1113,11 @@ class SysTerminalCloseTool(Tool):
         session_key = parsed["session"]
         instance = self._registry.get(conversation_id, terminal_name, session_key)
 
+        if instance is not None and instance.origin == "user" and not instance.elevated:
+            from omnigent.terminals.elevation import USER_SHELL_READ_ONLY
+
+            return json.dumps({"error": USER_SHELL_READ_ONLY})
+
         # Acquire the per-instance lock BEFORE asking the registry
         # to close. This serializes against any in-flight send/read
         # holding the same lock, so the actual ``instance.close()``
@@ -1116,7 +1151,7 @@ class SysTerminalCloseTool(Tool):
             else:
                 closed = _do_close()
         except _CloseFailed as exc:
-            return json.dumps({"error": f"close failed: {exc}"})
+            return _terminal_tool_result({"error": f"close failed: {exc}"}, instance)
 
         return json.dumps(
             {
@@ -1212,9 +1247,10 @@ def _describe_entry(
         "running": instance.running,
         "has_os_env": instance.os_env is not None,
         "instance_id": instance.instance_id,
+        "origin": instance.origin,
         "elevated": instance.elevated,
         "agent_access": instance.agent_access if instance.elevated else True,
     }
-    if not instance.elevated:
+    if not instance.elevated and instance.origin != "user":
         result["tmux_socket"] = str(instance.socket_path)
     return result

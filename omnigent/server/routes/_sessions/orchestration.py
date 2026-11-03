@@ -138,7 +138,7 @@ from omnigent.sdk_permission_modes import (
     CODEX_SDK_APPROVAL_MODE_LABEL_KEY,
     CODEX_SDK_APPROVAL_MODES,
 )
-from omnigent.server import session_live_state, shutdown_state
+from omnigent.server import session_live_state, shell_notes, shutdown_state
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -5170,6 +5170,10 @@ async def _persist_external_conversation_item_unlocked(
             raise
         if drained is not None:
             cleared_pending_id = drained.pending_id
+            if match_method == "injected_prefix_text":
+                item = item.model_copy(
+                    update={"data": item.data.model_copy(update={"content": drained.content})}
+                )
             item = _merge_pending_file_blocks(item, drained.content)
             # A text match preserves the sender recorded at POST time. FIFO
             # settlement alone does not establish authorship of the mirror.
@@ -5223,7 +5227,7 @@ async def _persist_external_conversation_item_unlocked(
             update={
                 "replaces_pending_id": drained.stable_id,
                 "annotation_delivery_confirmed": match_method
-                in ("normalized_text", "attachment_normalized_text"),
+                in ("normalized_text", "attachment_normalized_text", "injected_prefix_text"),
             }
         )
     # Build the batch: skipped entries first (their positions must precede
@@ -9741,6 +9745,16 @@ async def _forward_event_to_runner(
     # The runner's sessions-native POST returns 202 immediately
     # and starts the turn as a background task. No streaming
     # response to drain — events flow through GET /stream.
+    taken_notes = (
+        shell_notes.take(session_id)
+        if shell_notes.SHELL_NOTE_HARNESSES
+        and shell_notes.eligible(body.type, body.data, conv.labels)
+        and await _resolve_harness_async(conv) in shell_notes.SHELL_NOTE_HARNESSES
+        else None
+    )
+    if taken_notes is not None:
+        runner_body["content"] = shell_notes.prepend(runner_body["content"], taken_notes.prefix)
+    shell_forwarded = False
     try:
         if startup_context is not None:
             startup_context.forward_started = True
@@ -9803,6 +9817,7 @@ async def _forward_event_to_runner(
                 f"Runner rejected the message: {_reject_detail}",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
+        shell_forwarded = True
         # Publish input.consumed AFTER the forward succeeds —
         # the runner has the message and will start the turn.
         if annotation_pending:
@@ -9925,6 +9940,12 @@ async def _forward_event_to_runner(
             "The runner may be restarting — retry or spawn a new session.",
             code=ErrorCode.RUNNER_UNAVAILABLE,
         ) from exc
+
+    finally:
+        if not shell_forwarded and taken_notes is not None:
+            shell_notes.restore(session_id, taken_notes)
+        elif taken_notes is not None:
+            shell_notes.release(session_id, taken_notes)
 
     return persisted_items[0].id
 
@@ -10444,10 +10465,7 @@ async def _dispatch_session_event_to_runner_impl(
         )
         if pending_id is not None:
             log_input_event(
-                _logger,
-                "native_input_enqueued",
-                session_id=session_id,
-                attributes=input_delivery,
+                _logger, "native_input_enqueued", session_id=session_id, attributes=input_delivery
             )
         # ── Server-side routing for native terminal sessions ────────
         # Same logic as the SDK path in _forward_event_to_runner: if
@@ -10568,15 +10586,44 @@ async def _dispatch_session_event_to_runner_impl(
         # dropping the first message). model_override alone is applied only
         # at spawn, so the in-band switch is what makes routing take on an
         # already-running pane.
+        note_enabled = bool(shell_notes.SHELL_NOTE_HARNESSES) and (
+            await _native_pane_harness(conv) in shell_notes.SHELL_NOTE_HARNESSES
+        )
+        taken_notes = (
+            shell_notes.take(session_id)
+            if queues_message
+            and note_enabled
+            and shell_notes.eligible(body.type, body.data, conv.labels)
+            else None
+        )
         forwarded = False
         try:
+            if taken_notes is not None and (
+                pending_id is None
+                or not pending_inputs.set_injected_prefix(
+                    session_id, pending_id, taken_notes.prefix
+                )
+            ):
+                shell_notes.restore(session_id, taken_notes)
+                taken_notes = None
+            forward_body = body
+            if taken_notes is not None:
+                assert isinstance(content, list)
+                forward_body = body.model_copy(
+                    update={
+                        "data": {
+                            **body.data,
+                            "content": shell_notes.prepend(content, taken_notes.prefix),
+                        }
+                    }
+                )
             if pending_id is not None:
                 pending_inputs.mark_delivery_stage(session_id, pending_id, "forward_requested")
             await _forward_native_terminal_message(
                 runner_client,
                 session_id,
                 conv,
-                body,
+                forward_body,
                 file_store=file_store,
                 artifact_store=artifact_store,
                 # The executor speaks the pane's own vocabulary, so it takes the
@@ -10612,6 +10659,10 @@ async def _dispatch_session_event_to_runner_impl(
         finally:
             if not forwarded and pending_id is not None:
                 pending_inputs.resolve(session_id, pending_id)
+            if not forwarded and taken_notes is not None:
+                shell_notes.restore(session_id, taken_notes)
+            elif taken_notes is not None:
+                shell_notes.release(session_id, taken_notes)
         # Emit the routing chip AFTER forwarding the message to the
         # terminal so the live SSE stream delivers the user bubble
         # (echoed back by the CLI) before the chip.

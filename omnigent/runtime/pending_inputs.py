@@ -255,6 +255,7 @@ class DrainedInput:
     lifecycle_response_id: str | None = None
     admission_id: str | None = None
     uncertain: bool = False
+    injected_prefix: str | None = None
 
 
 @dataclass
@@ -333,6 +334,7 @@ class _Entry:
     native_turn_id: str | None = None
     lifecycle_response_id: str | None = None
     admission_id: str | None = None
+    injected_prefix: str | None = None
 
 
 # Per-conversation mapping conversation_id → {pending_id: entry}. The
@@ -383,6 +385,7 @@ def record(
     *,
     background_titles_enabled: bool = True,
     admission_id: str | None = None,
+    injected_prefix: str | None = None,
 ) -> str:
     """
     Record an un-consumed web-composer user message.
@@ -430,11 +433,22 @@ def record(
             stable_id=stable_id,
             background_titles_enabled=background_titles_enabled,
             admission_id=admission_id,
+            injected_prefix=injected_prefix,
         )
         entries = _pending.setdefault(conversation_id, {})
         entries[pending_id] = entry
         _evict_beyond_cap(entries)
     return pending_id
+
+
+def set_injected_prefix(conversation_id: str, pending_id: str, prefix: str) -> bool:
+    """Record the actual forwarded prefix without re-admitting a stable input."""
+    with _lock:
+        entry = _pending.get(conversation_id, {}).get(pending_id)
+        if entry is None or entry.held:
+            return False
+        entry.injected_prefix = prefix
+        return True
 
 
 def _evict_beyond_cap(entries: dict[str, _Entry]) -> None:
@@ -874,6 +888,7 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         native_turn_id=drained.native_turn_id,
         lifecycle_response_id=drained.lifecycle_response_id,
         admission_id=drained.admission_id,
+        injected_prefix=drained.injected_prefix,
     )
     with _lock:
         entries = _pending.get(conversation_id, {})
@@ -963,6 +978,15 @@ def resolve_matching_text(
         interrupted = [entry.interrupted for _pid, entry in ordered]
         match_index = _first_match(texts, exact_needle, interrupted)
         match_method = "normalized_text"
+        if match_index is None and not shell_command:
+            candidates = [
+                index
+                for index, (_pid, entry) in enumerate(ordered)
+                if _matches_injected_prefix(entry, exact_needle)
+            ]
+            match_index = _prefer_live(candidates, interrupted)
+            if match_index is not None:
+                match_method = "injected_prefix_text"
         if match_index is None:
             match_method = "attachment_normalized_text"
             marker_matches: list[int] = []
@@ -1089,6 +1113,7 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         native_turn_id=entry.native_turn_id,
         lifecycle_response_id=entry.lifecycle_response_id,
         admission_id=entry.admission_id,
+        injected_prefix=entry.injected_prefix,
     )
 
 
@@ -1104,6 +1129,33 @@ def _content_text(content: list[dict[str, Any]]) -> str:
             if isinstance(text, str):
                 parts.append(text)
     return "\n".join(parts)
+
+
+def _matches_injected_prefix(entry: _Entry, mirror: str) -> bool:
+    """Match recorded text and attachment markers in their forwarded block order."""
+    if not entry.injected_prefix:
+        return False
+    prefix = _collapse_whitespace(entry.injected_prefix)
+    if not mirror.startswith(prefix + " "):
+        return False
+    remaining = mirror[len(prefix) :].lstrip()
+    for block in entry.content:
+        if block.get("type") in _ATTACHMENT_BLOCK_TYPES:
+            stripped = _strip_generated_markers(remaining, 1)
+            if stripped == remaining:
+                return False
+            remaining = stripped
+        elif block.get("type") in {"input_text", "text", "output_text"}:
+            expected = _collapse_whitespace(block.get("text", ""))
+            if not expected:
+                continue
+            if remaining == expected:
+                remaining = ""
+            elif remaining.startswith(expected + " "):
+                remaining = remaining[len(expected) :].lstrip()
+            else:
+                return False
+    return not remaining
 
 
 def _first_match(texts: list[str], needle: str, interrupted: list[bool]) -> int | None:

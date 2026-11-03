@@ -229,8 +229,9 @@ async def test_saved_input_survives_service_recreation_and_dispatches_once(
         await runner.aclose()
 
 
+@pytest.mark.parametrize("with_shell_note", [False, True])
 async def test_annotation_uses_native_saved_input_dispatch_and_transcript_receipt(
-    startup_env: _Env, db_uri: str, monkeypatch: pytest.MonkeyPatch
+    startup_env: _Env, db_uri: str, monkeypatch: pytest.MonkeyPatch, with_shell_note: bool
 ) -> None:
     """The annotation CAS feeds the production native runner callback once."""
     from omnigent.server.annotation_batch import INTRO
@@ -301,13 +302,25 @@ async def test_annotation_uses_native_saved_input_dispatch_and_transcript_receip
             == "uncertain"
         )
         assert pending_inputs.pending_id_for_stable_id(session_id, str(receipt["item_id"]))
+        prefix = "[System: shell] The user opened bash · user-shell in this session.\n\n"
+        if with_shell_note:
+            pending_id = pending_inputs.pending_id_for_stable_id(
+                session_id, str(receipt["item_id"])
+            )
+            assert pending_id is not None
+            assert pending_inputs.set_injected_prefix(session_id, pending_id, prefix)
+        echoed_content = (
+            [{"type": "input_text", "text": prefix}, *pending[0].data.content]
+            if with_shell_note
+            else pending[0].data.content
+        )
         echoed = await env.client.post(
             f"/v1/sessions/{session_id}/events",
             json={
                 "type": "external_conversation_item",
                 "data": {
                     "item_type": "message",
-                    "item_data": {"role": "user", "content": pending[0].data.content},
+                    "item_data": {"role": "user", "content": echoed_content},
                     "response_id": "resp_annotation_echo",
                 },
             },

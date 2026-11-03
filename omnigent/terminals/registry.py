@@ -45,6 +45,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
+from typing import Literal
 from urllib.parse import quote
 from uuid import uuid4
 
@@ -289,6 +290,7 @@ class TerminalRegistry:
         program_status_app: str | None = None,
         elevated: bool = False,
         agent_invocation: bool = False,
+        origin: Literal["user", "agent", "harness"] = "harness",
     ) -> TerminalInstance:
         """Launch a terminal session, or return the existing one.
 
@@ -381,6 +383,7 @@ class TerminalRegistry:
         stage = "terminal_spawn"
         try:
             created.instance.elevated = elevated
+            created.instance.origin = "agent" if agent_invocation else origin
             created.instance.program_status_app = program_status_app
             created.instance.lifecycle_trace.transfer_session(conversation_id)
             await created.instance.launch(cwd=created.cwd)

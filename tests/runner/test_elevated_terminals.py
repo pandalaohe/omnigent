@@ -47,6 +47,7 @@ def admin(tmp_path: Path):
     registry = TerminalRegistry()
     instance = make_test_terminal_instance("bash", "admin", tmp_path)
     instance.elevated = True
+    instance.origin = "user"
     registry._by_conversation["session"] = {("bash", "admin"): instance}
     registry._instance_locks[("session", "bash", "admin")] = threading.Lock()
     return registry, instance

@@ -3331,6 +3331,7 @@ class _StubTerminalInstance:
     def __init__(self, running: bool = True) -> None:
         self.running = running
         self.instance_id = "terminal-instance"
+        self.origin = "harness"
         self.elevated = False
         self.agent_access = True
         # ``None`` => the view uses the default environment id, so we
