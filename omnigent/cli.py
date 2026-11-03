@@ -10451,7 +10451,8 @@ def _list_windows_processes() -> list[_WindowsProcessInfo]:
             # process exits or denies inspection; the detached helper also
             # checks exclusive access to every installation file.
             with contextlib.suppress(psutil.Error, OSError):
-                loaded_paths.update(item.path for item in proc.memory_maps())
+                memory_maps = proc.memory_maps()  # pyrefly: ignore[missing-attribute]
+                loaded_paths.update(item.path for item in memory_maps)
             with contextlib.suppress(psutil.Error, OSError):
                 loaded_paths.update(item.path for item in proc.open_files())
             rows.append(
