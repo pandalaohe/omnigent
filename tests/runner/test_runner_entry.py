@@ -94,6 +94,17 @@ def test_host_interactive_shells_from_env_normalizes_inventory(
     assert _host_interactive_shells_from_env() == ["zsh", "bash"]
 
 
+def test_host_interactive_shells_from_env_keeps_a_reported_empty_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host that reports no shell is not the same as no host wiring."""
+    monkeypatch.setenv(RUNNER_INTERACTIVE_SHELLS_ENV_VAR, "[]")
+    assert _host_interactive_shells_from_env() == []
+
+    monkeypatch.delenv(RUNNER_INTERACTIVE_SHELLS_ENV_VAR)
+    assert _host_interactive_shells_from_env() is None
+
+
 def test_apply_host_interactive_shells_only_replaces_native_wrappers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
