@@ -397,6 +397,76 @@ async def test_real_rpc_launcher_rebinds_fresh_process_without_unlocking_startup
         await executor.close()
 
 
+@pytest.mark.asyncio
+async def test_runner_initializes_and_rebinds_real_scoped_pi_harness(tmp_path, monkeypatch):
+    from omnigent.inner import pi_harness
+    from omnigent.inner.pi_executor import PiExecutor
+    from tests.runner.conftest import _build_app_for_spec
+    from tests.runner.helpers import permission_session_init_payload
+    from tests.runner.native_helpers import _harness_spec
+
+    pi = shutil.which("pi")
+    if pi is None:
+        pytest.skip("the pinned Pi SDK is required")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    app, manager = await _build_app_for_spec(_harness_spec("pi"))
+    executor = PiExecutor(
+        cwd=str(workspace), pi_path=pi, context_files=False, permission_controlled=True
+    )
+    monkeypatch.setattr(pi_harness, "_build_pi_executor", lambda: executor)
+    harness_app = pi_harness.create_app()
+    harness_app.state.conversation_id = "production-pi"
+    harness_app.state.harness_auth_token = "nonsecret-fixture"
+    payload = permission_session_init_payload(
+        {"session_id": "production-pi", "agent_id": "test-agent"},
+        harness="pi",
+        snapshot={"workspace": str(workspace)},
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=harness_app),
+        base_url="http://harness",
+        headers={"Authorization": "Bearer nonsecret-fixture"},
+    ) as harness_client:
+        manager._client = harness_client
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            try:
+                response = await client.post("/v1/sessions", json=payload)
+                assert response.status_code == 201, response.text
+                runtime = app.state.permission_tiers
+                first = runtime.pi_scopes.parent_scope("production-pi")
+                assert first.status == "ready"
+                assert runtime.state("production-pi").status == "ready"
+                assert "process_capability" not in response.text
+                assert "pi_attestor_" not in response.text
+                rpc = executor._session_states["production-pi"].rpc
+                assert rpc is not None and rpc.process is not None
+                first_identity = process_identity(rpc.process.pid)
+                response = await client.post("/v1/sessions", json=payload)
+                assert response.status_code == 201, response.text
+                current = runtime.pi_scopes.parent_scope("production-pi")
+                assert current.status == "ready"
+                assert (
+                    current.admission.principal.launch_epoch
+                    != first.admission.principal.launch_epoch
+                )
+                assert first.status == "revoked"
+                replacement = executor._session_states["production-pi"].rpc
+                assert replacement is not None and replacement.process is not None
+                assert process_identity(replacement.process.pid) != first_identity
+                assert (
+                    await replacement.request(
+                        {"type": "get_state", "id": "ready"}, expected="get_state"
+                    )
+                    is not None
+                )
+            finally:
+                await client.delete("/v1/sessions/production-pi")
+                await executor.close()
+
+
 @pytest.mark.parametrize(
     "fault", ["session", "remote", "port", "empty", "long", "nonstring", "extra"]
 )

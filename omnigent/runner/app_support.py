@@ -23,6 +23,7 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.bridge import ClaudeNativeToolRelay
+    from omnigent.runner.pi_scope_relay import PiScopeRelay
 
 _logger = logging.getLogger("omnigent.runner.app")
 
@@ -123,6 +124,7 @@ class _CommentRelayBinding:
     bridge_dir: Path
     peer_messaging_enabled: bool = False
     session_open_enabled: bool = False
+    pi_scope_relay: PiScopeRelay | None = dataclasses.field(default=None, repr=False)
 
 
 def _require_full_native_lock_coverage(

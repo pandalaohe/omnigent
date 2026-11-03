@@ -4506,6 +4506,23 @@ class PiExecutor(Executor):
             if not session_key or session_key == "__default__":
                 raise ValueError("Pi permission session is not bound")
             self._permission_session_id = session_key
+            if session_key in self._scoped_launchers or session_key in self._scoped_handoffs:
+                permission = read_host_permission_state(
+                    bridge_dir_for_session_id(session_key) / HOST_PERMISSION_STATE_FILE
+                )
+                if permission.session_id != session_key:
+                    raise PiPermissionBootstrapError("Pi permission state has wrong session")
+                if permission.tier == "full":
+                    # Existing Node wrappers retain their scoped context until exit.
+                    initial_peer = self._peer_initial.pop(session_key, None)
+                    try:
+                        await self.close_session(session_key)
+                    finally:
+                        if initial_peer is not None:
+                            self._peer_initial[session_key] = initial_peer
+                    self._scoped_launchers.pop(session_key, None)
+                    self._scoped_handoffs.pop(session_key, None)
+                    state = self._session_states.setdefault(session_key, _PiSessionState())
 
         effective_model = model
         effective_tool_names = tuple(

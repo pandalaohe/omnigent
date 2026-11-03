@@ -792,6 +792,38 @@ async def _runner_client(
                     return_value=True,
                 )
             )
+            if harness == "pi":
+                from omnigent.harnesses.pi_native.bridge import prepare_permission_installation
+                from omnigent.runner.pi_bootstrap import PiBootstrapBroker
+                from tests.runner.test_permission_tier_runtime import _publish_scope
+
+                original_descriptor = PiBootstrapBroker.launcher_descriptor
+
+                def vendor_registration(broker: PiBootstrapBroker) -> dict[str, object]:
+                    descriptor = original_descriptor(broker)
+                    runtime = broker.runtime
+                    bridge = runtime.path(broker.session_id).parent
+                    source = bridge / "fixture-bridge.js"
+                    source.write_text("// fake vendor installation\n")
+                    prepare_permission_installation(
+                        bridge, session_id=broker.session_id, harness="pi", extension=source
+                    )
+                    admission = runtime.begin_pi_scope_launch(broker.session_id, native_guard=True)
+                    _publish_scope(
+                        runtime,
+                        admission,
+                        [
+                            {
+                                "name": "read",
+                                "sourceInfo": {"source": "builtin", "path": "builtin:read"},
+                            }
+                        ],
+                    )
+                    return descriptor
+
+                stack.enter_context(
+                    patch.object(PiBootstrapBroker, "launcher_descriptor", vendor_registration)
+                )
         client_type = _CurrentServerClient if harness in TIER_HARNESSES else httpx.AsyncClient
         async with client_type(transport=transport, base_url="http://runner") as client:
             yield client

@@ -189,7 +189,7 @@ def _write_scope_registry(admission, tools):
 
 def _publish_scope(runtime, admission, tools):
     _write_scope_registry(admission, tools)
-    ready = runtime.acknowledge_pi_scope("session-a", admission.credential)
+    ready = runtime.acknowledge_pi_scope(admission.principal.root_session_id, admission.credential)
     assert ready
     record = runtime.pi_scopes.record(admission.principal)
     if record.native_classifier is None:
@@ -204,6 +204,86 @@ def _publish_scope(runtime, admission, tools):
                 binding, NativeSupportStatus.ATTESTED, inputs=(snapshot,)
             ),
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("vendor", ["scoped", "legacy-ack", "failed", "full", "no-descriptor"])
+async def test_runner_pi_bootstrap_requires_private_configuration_and_registration(
+    tmp_path, monkeypatch, vendor
+):
+    from omnigent.harnesses.pi_native.bridge import prepare_permission_installation
+    from omnigent.runner.pi_bootstrap import PiBootstrapBroker
+    from tests.runner.conftest import _build_app_for_spec
+    from tests.runner.helpers import permission_session_init_payload
+    from tests.runner.native_helpers import _harness_spec
+
+    app, manager = await _build_app_for_spec(_harness_spec("pi"))
+    runtime = app.state.permission_tiers
+    monkeypatch.setattr(runtime, "_verify_installation", lambda *_: None)
+    if vendor == "no-descriptor":
+
+        def unavailable(_self):
+            raise ValueError("fixture launcher unavailable")
+
+        monkeypatch.setattr(PiBootstrapBroker, "launcher_descriptor", unavailable)
+    original_post = manager._client.post
+    phases = []
+    launcher_fields = []
+
+    async def bootstrap(url, **kwargs):
+        if url != "/v1/permission-tier/bootstrap":
+            return await original_post(url, **kwargs)
+        body = kwargs["json"]
+        phases.append(body.get("phase"))
+        launcher_fields.append(set(body.get("launcher", {})))
+        assert runtime.state("cold-pi").status == "blocked"
+        if vendor == "scoped" and body.get("phase") == "configure":
+            bridge = runtime.path("cold-pi").parent
+            source = bridge / "fixture-bridge.js"
+            source.write_text("// vendor bridge fixture\n")
+            prepare_permission_installation(
+                bridge, session_id="cold-pi", harness="pi", extension=source
+            )
+            admission = runtime.begin_pi_scope_launch("cold-pi", native_guard=True)
+            _publish_scope(
+                runtime,
+                admission,
+                [{"name": "read", "sourceInfo": {"source": "builtin", "path": "builtin:read"}}],
+            )
+        return httpx.Response(200, json={"installed": vendor != "failed"})
+
+    monkeypatch.setattr(manager._client, "post", bootstrap)
+    payload = permission_session_init_payload(
+        {"session_id": "cold-pi", "agent_id": "test-agent"},
+        harness="pi",
+        snapshot={
+            "workspace": str(tmp_path),
+            "labels": ConfirmedPermissionState(
+                "full" if vendor == "full" else "auto", 1, "blocked"
+            ).labels("pi"),
+        },
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        try:
+            response = await client.post("/v1/sessions", json=payload)
+            success = vendor in ("scoped", "full")
+            assert response.status_code == (201 if success else 503)
+            assert runtime.state("cold-pi").status == ("ready" if success else "blocked")
+            if vendor == "full":
+                assert phases == [None]
+                assert launcher_fields == [set()]
+            elif vendor == "no-descriptor":
+                assert phases == []
+            else:
+                assert phases == ["configure"]
+                assert launcher_fields == [
+                    {"protocol", "session_id", "endpoint", "process_capability"}
+                ]
+                assert runtime.pi_scope_protocol_active("cold-pi") is success
+        finally:
+            await client.delete("/v1/sessions/cold-pi")
 
 
 @pytest.mark.parametrize(

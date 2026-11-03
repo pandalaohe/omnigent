@@ -89,7 +89,7 @@ from omnigent.harness_startup_config import resolve_harness_path
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import Executor, ExecutorConfig
 from omnigent.inner.os_env_serialization import decode_sandbox_spec
-from omnigent.inner.pi_executor import PiExecutor, _pi_thinking_from_config
+from omnigent.inner.pi_executor import PiExecutor, _pi_thinking_from_config, _PiScopedLauncher
 from omnigent.inner.pi_settings import PiSdkLoaderUnavailableError
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 from omnigent.util.json_types import JsonValue
@@ -356,6 +356,8 @@ def create_app() -> FastAPI:
         FastAPI app-boot crash).
     """
 
+    scoped_launcher: _PiScopedLauncher | None = None
+
     def build_executor() -> Executor:
         # A restarted harness has not seen bootstrap; its runner binding is stable.
         session_id = getattr(app.state, "conversation_id", None)
@@ -374,6 +376,8 @@ def create_app() -> FastAPI:
 
         if isinstance(executor, PiExecutor):
             executor._pi_session_event = report_pi_session_event
+            if scoped_launcher is not None:
+                executor._scoped_launchers[session_id] = scoped_launcher
         return executor
 
     adapter = ExecutorAdapter(executor_factory=build_executor)
@@ -413,6 +417,7 @@ def create_app() -> FastAPI:
             return JSONResponse({"applied": True})
 
     async def bootstrap_permission_tier(request: Request) -> Response:
+        nonlocal scoped_launcher
         denied = adapter._check_auth(request)
         if denied is not None:
             return denied
@@ -448,6 +453,8 @@ def create_app() -> FastAPI:
             installed = isinstance(
                 executor, PiExecutor
             ) and await executor.bootstrap_permission_tier(session_id)
+            if installed and isinstance(executor, PiExecutor):
+                scoped_launcher = executor._scoped_launchers.get(session_id)
         except PiSdkLoaderUnavailableError:
             _logger.warning("Pi permission bootstrap failed", exc_info=True)
             return JSONResponse(
