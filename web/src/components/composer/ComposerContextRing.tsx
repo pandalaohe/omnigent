@@ -1,11 +1,15 @@
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { Button } from "@/components/ui/button";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useContextIndicatorMode } from "@/hooks/useContextIndicatorMode";
+import { useHoverPinFloat } from "@/hooks/useHoverPinFloat";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import { formatTokenCount } from "@/lib/formatCost";
+import { useNavigate } from "@/lib/routing";
 import {
   resolveUsageContext,
-  usageContextSourceFromKey,
   usageContextLevelLabel,
+  usageContextSettingsHref,
+  usageContextSourceFromKey,
 } from "@/lib/usageContextPreferences";
 import { cn } from "@/lib/utils";
 
@@ -19,6 +23,10 @@ const RING_CIRCUMFERENCE = 2 * Math.PI * 5.5;
  * error, so the ring never escalates to warning/destructive colors. Self-nulls
  * when there is nothing to show, so the landing/pre-session window (no context
  * figures) renders nothing.
+ *
+ * The float reads the numbers and offers one entry; it edits nothing. A hover
+ * shows it, a tap pins it (phones have no hover), and a click beside it or
+ * Escape clears it, like every `?` in settings.
  *
  * @param contextWindow - Total context window in tokens; ``<= 0``/``null``
  *   renders nothing (``0/0`` would be ``NaN%``).
@@ -39,13 +47,15 @@ export function ComposerContextRing({
 }) {
   const mode = useContextIndicatorMode();
   const preferences = useUsageContextPreferences();
+  const { open, setOpen, triggerHandlers, contentHandlers } = useHoverPinFloat();
+  const navigate = useNavigate();
   const limits = resolveUsageContext(preferences, sourceKey, {
     contextWindow,
     autoCompactTokenLimit,
   });
   const source = usageContextSourceFromKey(sourceKey);
   const labels = {
-    hostLabel: source?.hostId || "Server",
+    hostLabel: source?.hostId || "No host",
     agentLabel: source?.agentName || source?.harness || "Agent",
   };
   const compactMode =
@@ -61,23 +71,29 @@ export function ComposerContextRing({
     return null;
 
   const pct = Math.min(tokensUsed / denominator, 1);
-  // Arc, %, label, and tooltip all encode context USED: a fresh session
-  // shows an empty ring at 0% and the ring fills as context is consumed.
+  // Arc, %, label, and float all encode context USED: a fresh session shows an
+  // empty ring at 0% and the ring fills as context is consumed.
   const usedArc = pct * RING_CIRCUMFERENCE;
   const usedPct = Math.round(pct * 100);
   const budget = compactMode ? "compact budget" : "context";
 
   return (
-    <Tooltip>
-      <TooltipTrigger asChild>
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
         <button
           type="button"
           data-testid="composer-context-ring"
           className={cn(
-            "flex shrink-0 items-center rounded-full bg-transparent p-0 text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:ring-offset-2 focus-visible:ring-offset-background",
+            "flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-full bg-transparent p-0 text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:ring-offset-2 focus-visible:ring-offset-background md:min-h-6 md:min-w-6",
             className,
           )}
           aria-label={`${usedPct}% of ${budget} used`}
+          {...triggerHandlers}
+          onClick={(event) => {
+            // A click pins the float; Escape or a click beside it clears it.
+            event.preventDefault();
+            setOpen(true);
+          }}
         >
           {/* Tight stroke bounds keep the visible icon-to-label gap consistent. */}
           <svg viewBox="1.5 1.5 13 13" width="13" height="13" fill="none" aria-hidden="true">
@@ -98,29 +114,49 @@ export function ComposerContextRing({
             )}
           </svg>
         </button>
-      </TooltipTrigger>
-      <TooltipContent side="top" className="flex-col items-start gap-0 px-3 py-2 text-left text-sm">
+      </PopoverTrigger>
+      <PopoverContent
+        side="top"
+        align="end"
+        data-pop=""
+        data-testid="composer-context-float"
+        className="w-[min(18rem,calc(100vw-1rem))] flex-col items-stretch gap-2 text-sm"
+        onOpenAutoFocus={(event) => event.preventDefault()}
+        onCloseAutoFocus={(event) => event.preventDefault()}
+        {...contentHandlers}
+      >
         <p className="tabular-nums text-ui leading-tight">
           {usedPct}% {budget} used
         </p>
         <p className="tabular-nums text-neutral-400 leading-tight dark:text-muted-foreground">
           {formatTokenCount(tokensUsed)} / {formatTokenCount(denominator)} tokens
         </p>
-        <p className="text-xs text-muted-foreground">
+        <p className="text-sm text-muted-foreground">
           Context · {usageContextLevelLabel(limits.contextWindow.level, labels)}
         </p>
-        <p className="text-xs text-muted-foreground">
+        <p className="text-sm text-muted-foreground">
           Buffer {limits.buffer.value?.toLocaleString() ?? "Auto"}
           {limits.buffer.mode === "percent" && limits.buffer.value != null ? "%" : ""} ·{" "}
           {usageContextLevelLabel(limits.buffer.level, labels)}
         </p>
         {limits.ignored.map((item) => (
-          <p key={item.level} className="text-xs text-muted-foreground">
+          <p key={item.level} className="text-sm text-muted-foreground">
             Ignored {usageContextLevelLabel(item.level, labels)}: {item.reason}; using{" "}
             {usageContextLevelLabel(limits.buffer.level, labels)}.
           </p>
         ))}
-      </TooltipContent>
-    </Tooltip>
+        <Button
+          type="button"
+          size="sm"
+          className="mt-1 min-h-11 w-full md:min-h-8"
+          onClick={() => {
+            setOpen(false);
+            navigate(usageContextSettingsHref(sourceKey));
+          }}
+        >
+          Change context values
+        </Button>
+      </PopoverContent>
+    </Popover>
   );
 }

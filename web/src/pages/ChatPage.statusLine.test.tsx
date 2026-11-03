@@ -13,6 +13,8 @@ import type * as FileViewerContextModule from "@/shell/FileViewerContext";
 import type * as UseHarnessInventoryModule from "@/hooks/useHarnessInventory";
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
+import userEvent from "@testing-library/user-event";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { CONTEXT_INDICATOR_STORAGE_KEY } from "@/lib/contextIndicatorPreferences";
 import { USAGE_CONTEXT_STORAGE_KEY, usageContextSourceKey } from "@/lib/usageContextPreferences";
@@ -171,9 +173,11 @@ function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) 
 
 function renderComposer(overrides: Partial<Parameters<typeof Composer>[0]> = {}) {
   return render(
-    <TooltipProvider>
-      <Composer {...composerProps(overrides)} />
-    </TooltipProvider>,
+    <MemoryRouter initialEntries={["/c/session-line"]}>
+      <TooltipProvider>
+        <Composer {...composerProps(overrides)} />
+      </TooltipProvider>
+    </MemoryRouter>,
   );
 }
 
@@ -436,7 +440,7 @@ describe("Composer status line (branch + context ring)", () => {
     renderComposer();
 
     const trigger = screen.getByLabelText("25% of compact budget used");
-    fireEvent.pointerMove(trigger, { pointerType: "mouse" });
+    await userEvent.setup().hover(trigger);
 
     await waitFor(() => expect(screen.getByText("20K / 80K tokens")).toBeInTheDocument());
     expect(screen.queryByText("20,000 / 80,000 tokens · 25%")).toBeNull();

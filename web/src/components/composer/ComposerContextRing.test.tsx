@@ -1,26 +1,44 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { TooltipProvider } from "@/components/ui/tooltip";
-import { ComposerContextRing } from "./ComposerContextRing";
+import { queueUserPreferencePatch } from "@/lib/userPreferencesSync";
 import {
   DEFAULT_USAGE_CONTEXT_PREFERENCES,
-  writeUsageContextPreferences,
-  usageContextSourceKey,
+  readUsageContextPreferences,
+  USAGE_CONTEXT_STORAGE_KEY,
   usageContextLevelKey,
+  usageContextSettingsHref,
+  usageContextSourceKey,
+  writeUsageContextPreferences,
 } from "@/lib/usageContextPreferences";
 
-function renderRing(contextWindow: number | null, tokensUsed: number | null) {
+vi.mock("@/lib/userPreferencesSync", () => ({ queueUserPreferencePatch: vi.fn() }));
+
+const mocks = vi.hoisted(() => ({ navigate: vi.fn() }));
+
+vi.mock("@/lib/routing", () => ({
+  useNavigate: () => mocks.navigate,
+}));
+
+import { ComposerContextRing } from "./ComposerContextRing";
+
+function renderRing(contextWindow: number | null, tokensUsed: number | null, sourceKey = "") {
   return render(
-    <TooltipProvider>
-      <ComposerContextRing contextWindow={contextWindow} tokensUsed={tokensUsed} />
-    </TooltipProvider>,
+    <ComposerContextRing
+      contextWindow={contextWindow}
+      tokensUsed={tokensUsed}
+      sourceKey={sourceKey}
+    />,
   );
 }
 
 afterEach(cleanup);
-beforeEach(() => localStorage.clear());
+beforeEach(() => {
+  localStorage.clear();
+  vi.mocked(queueUserPreferencePatch).mockClear();
+  mocks.navigate.mockClear();
+});
 
 describe("ComposerContextRing", () => {
   it("renders nothing when the context window is unknown or zero", () => {
@@ -35,21 +53,9 @@ describe("ComposerContextRing", () => {
   it("keeps usage text out of the bar while preserving an accessible percentage", () => {
     renderRing(1000, 123);
     expect(screen.getByTestId("composer-context-ring")).not.toHaveTextContent("12%");
-    expect(screen.getByTestId("composer-context-ring")).toHaveClass("shrink-0");
+    expect(screen.getByTestId("composer-context-ring")).toHaveClass("shrink-0", "min-w-11");
     expect(screen.getByTestId("composer-context-ring")).not.toHaveClass("gap-1");
     expect(screen.getByLabelText("12% of context used")).toBeInTheDocument();
-  });
-
-  it("shows the actual context usage in the tooltip", async () => {
-    const user = userEvent.setup();
-    renderRing(1000, 123);
-    await user.tab();
-    expect(screen.getByTestId("composer-context-ring")).toHaveFocus();
-    expect(await screen.findByText("12% context used")).toBeInTheDocument();
-    expect(screen.getByText("123 / 1K tokens")).toHaveClass(
-      "text-neutral-400",
-      "dark:text-muted-foreground",
-    );
   });
 
   it("fits the SVG to the painted ring so its padding does not widen the label gap", () => {
@@ -75,7 +81,48 @@ describe("ComposerContextRing", () => {
     expect(ring.className).not.toMatch(/text-(warning|destructive)/);
   });
 
-  it("uses layered values in the ring and explains invalid buffer fallback", async () => {
+  it("shows the float on hover, pins it on a click, and clears it beside or with Escape", async () => {
+    const user = userEvent.setup();
+    renderRing(1000, 123);
+    expect(screen.queryByTestId("composer-context-float")).not.toBeInTheDocument();
+
+    await user.hover(screen.getByTestId("composer-context-ring"));
+    expect(await screen.findByText("12% context used")).toBeInTheDocument();
+    expect(screen.getByText("123 / 1K tokens")).toHaveClass(
+      "text-neutral-400",
+      "dark:text-muted-foreground",
+    );
+    expect(screen.getByRole("button", { name: "Change context values" })).toBeInTheDocument();
+
+    // A click pins what hover opened: leaving the trigger no longer clears it.
+    fireEvent.click(screen.getByTestId("composer-context-ring"));
+    await user.unhover(screen.getByTestId("composer-context-ring"));
+    expect(screen.getByTestId("composer-context-float")).toBeInTheDocument();
+
+    await user.keyboard("{Escape}");
+    expect(screen.queryByTestId("composer-context-float")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("composer-context-ring"));
+    expect(screen.getByTestId("composer-context-float")).toBeInTheDocument();
+    await user.click(document.body);
+    expect(screen.queryByTestId("composer-context-float")).not.toBeInTheDocument();
+  });
+
+  it("pins the float on a tap and jumps to this session's row in Settings", async () => {
+    const source = { hostId: "host-a", agentName: "codex", harness: "codex", model: "gpt-x" };
+    const sourceKey = usageContextSourceKey(source);
+    renderRing(1000, 123, sourceKey);
+
+    fireEvent.click(screen.getByTestId("composer-context-ring"));
+    const button = screen.getByRole("button", { name: "Change context values" });
+    expect(button).toHaveClass("min-h-11");
+    expect(screen.getByTestId("composer-context-ring")).toHaveClass("min-h-11", "min-w-11");
+
+    fireEvent.click(button);
+    expect(mocks.navigate).toHaveBeenCalledWith(usageContextSettingsHref(sourceKey));
+  });
+
+  it("uses the layered values and explains an ignored buffer below the entry", async () => {
     const source = { hostId: "host-a", agentName: "codex", harness: "codex", model: "gpt-x" };
     writeUsageContextPreferences({
       ...DEFAULT_USAGE_CONTEXT_PREFERENCES,
@@ -90,23 +137,32 @@ describe("ComposerContextRing", () => {
         },
       },
     });
-    localStorage.setItem("omnigent:context-indicator-mode", "compact");
+    localStorage.setItem("omnigent:context-indicator-mode", "compact-key-unused");
     render(
-      <TooltipProvider>
-        <ComposerContextRing
-          contextWindow={200_000}
-          autoCompactTokenLimit={190_000}
-          tokensUsed={190_000}
-          sourceKey={usageContextSourceKey(source)}
-        />
-      </TooltipProvider>,
+      <ComposerContextRing
+        contextWindow={200_000}
+        autoCompactTokenLimit={190_000}
+        tokensUsed={190_000}
+        sourceKey={usageContextSourceKey(source)}
+      />,
     );
-    expect(screen.getByLabelText("50% of compact budget used")).toBeInTheDocument();
-    await userEvent.setup().tab();
+    await userEvent.setup().hover(screen.getByTestId("composer-context-ring"));
     expect(await screen.findByText("Context · host-a × codex")).toBeInTheDocument();
-    expect(screen.getByText("Buffer 20,000 · codex · all hosts")).toBeInTheDocument();
+    expect(screen.getByText("Buffer 20,000 · codex, all hosts")).toBeInTheDocument();
     expect(
-      screen.getByText("Ignored host-a × codex: buffer ≥ context; using codex · all hosts."),
+      screen.getByText("Ignored host-a × codex: buffer ≥ context; using codex, all hosts."),
     ).toBeInTheDocument();
+  });
+
+  it("never writes a saved value from the composer", async () => {
+    const user = userEvent.setup();
+    const source = { hostId: "host-a", agentName: "codex", harness: "codex", model: "gpt-x" };
+    renderRing(1000, 123, usageContextSourceKey(source));
+    await user.hover(screen.getByTestId("composer-context-ring"));
+    await user.click(screen.getByTestId("composer-context-ring"));
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(localStorage.getItem(USAGE_CONTEXT_STORAGE_KEY)).toBeNull();
+    expect(readUsageContextPreferences().overrides).toEqual({});
+    expect(queueUserPreferencePatch).not.toHaveBeenCalled();
   });
 });

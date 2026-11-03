@@ -2856,7 +2856,7 @@ function GeneralSection() {
             </Link>
           )}
           <Link to="#context-usage" className="text-primary underline underline-offset-2">
-            Display &amp; usage
+            Saved context values
           </Link>
           <Link to="#runtime-resources" className="text-primary underline underline-offset-2">
             Background processes
@@ -2922,7 +2922,7 @@ function GeneralSection() {
           testId="settings-group-display-usage"
           className="max-w-none"
         >
-          <ExpandableSettings id="context-usage" title="Context & usage">
+          <ExpandableSettings id="context-usage" title="Saved context values">
             <div className="flex flex-col gap-6">
               <CompactProgressIndicatorControl />
               <ContextUsageSettings />

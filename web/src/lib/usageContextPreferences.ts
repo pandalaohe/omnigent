@@ -7,6 +7,8 @@ import {
 export const USAGE_CONTEXT_STORAGE_KEY = "omnigent:usage-context-preferences";
 export const USAGE_CONTEXT_CHANGED_EVENT = "omnigent:usage-context-preferences-changed";
 const MAX_PROVIDER_USAGE_SOURCES = 24;
+/** Levels whose keys exist, so a key carrying any other tag stays stored and unread. */
+const KNOWN_LEVELS: readonly string[] = ["agent-model", "cell", "column", "host", "all"];
 
 export interface UsageContextOverride {
   contextWindowTokens: number | null;
@@ -90,8 +92,7 @@ export function normalizeUsageContextPreferences(value: unknown): UsageContextPr
           Array.isArray(parts) &&
           parts.length === 5 &&
           parts.every((part) => typeof part === "string") &&
-          parts[4] !== "cell" &&
-          parts[4] !== "column"
+          !KNOWN_LEVELS.includes(parts[4] as string)
         ) {
           overrides[key] = candidate as UsageContextOverride;
           continue;
@@ -195,11 +196,15 @@ export function usageContextSourceFromKey(sourceKey: string): UsageContextSource
   }
 }
 
-export type UsageContextLevel = "model" | "cell" | "column";
+export type UsageContextLevel = "model" | "agent-model" | "cell" | "column" | "host" | "all";
 export type UsageContextValueLevel = UsageContextLevel | "reported";
 
 export function usageContextLevelKey(source: UsageContextSource, level: UsageContextLevel): string {
   if (level === "model") return usageContextSourceKey(source);
+  if (level === "agent-model")
+    return JSON.stringify(["", source.agentName, source.harness, source.model, "agent-model"]);
+  if (level === "host") return JSON.stringify([source.hostId, "", "", "", "host"]);
+  if (level === "all") return JSON.stringify(["", "", "", "", "all"]);
   return JSON.stringify([
     level === "column" ? "" : source.hostId,
     source.agentName,
@@ -207,6 +212,17 @@ export function usageContextLevelKey(source: UsageContextSource, level: UsageCon
     "",
     level,
   ]);
+}
+
+/** A level's own fields first, then the levels it inherits from, then the agent's report. */
+export function usageContextLevelsAt(level: UsageContextLevel): UsageContextLevel[] {
+  if (level === "model") return ["model", "agent-model", "cell", "column", "host", "all"];
+  // A value for every host cannot inherit from one host's cell or column.
+  if (level === "agent-model") return ["agent-model", "column", "all"];
+  if (level === "cell") return ["cell", "column", "host", "all"];
+  if (level === "column") return ["column", "all"];
+  if (level === "host") return ["host", "all"];
+  return ["all"];
 }
 
 /** Unknown levels remain stored but have no display or resolution semantics. */
@@ -223,14 +239,22 @@ export function usageContextRecordFromKey(
       parts.some((part) => typeof part !== "string")
     )
       return null;
-    const [hostId, agentName, harness, modelName, level] = parts;
-    if (
-      modelName !== "" ||
-      (level !== "cell" && level !== "column") ||
-      (level === "column" && hostId !== "")
-    )
-      return null;
-    return { source: { hostId, agentName, harness, model: "" }, level };
+    const [hostId, agentName, harness, modelName, level] = parts as [
+      string,
+      string,
+      string,
+      string,
+      string,
+    ];
+    if (level === "agent-model") {
+      if (hostId !== "" || !modelName) return null;
+      return { source: { hostId, agentName, harness, model: modelName }, level };
+    }
+    if (!KNOWN_LEVELS.includes(level) || modelName !== "") return null;
+    if (level === "host" && (agentName !== "" || harness !== "")) return null;
+    if (level === "all" && (hostId !== "" || agentName !== "" || harness !== "")) return null;
+    if (level === "column" && hostId !== "") return null;
+    return { source: { hostId, agentName, harness, model: "" }, level: level as UsageContextLevel };
   } catch {
     return null;
   }
@@ -240,10 +264,19 @@ export function usageContextLevelLabel(
   level: UsageContextValueLevel,
   labels: { hostLabel: string; agentLabel: string },
 ): string {
-  if (level === "model") return "model override";
+  if (level === "model") return "this model";
+  if (level === "agent-model") return `${labels.agentLabel}, every host`;
   if (level === "cell") return `${labels.hostLabel} × ${labels.agentLabel}`;
-  if (level === "column") return `${labels.agentLabel} · all hosts`;
+  if (level === "column") return `${labels.agentLabel}, all hosts`;
+  if (level === "host") return `all agents on ${labels.hostLabel}`;
+  if (level === "all") return "all agents, all hosts";
   return "reported";
+}
+
+/** The composer ring's one entry: this session's row in Settings, opened on its model. */
+export function usageContextSettingsHref(sourceKey: string): string {
+  const query = new URLSearchParams({ ctx: sourceKey });
+  return `/settings/general?${query.toString()}#context-usage`;
 }
 
 export interface ResolvedUsageContext {
@@ -259,18 +292,51 @@ export function resolveUsageContext(
   reported: { contextWindow: number | null; autoCompactTokenLimit: number | null },
 ): ResolvedUsageContext {
   const record = usageContextRecordFromKey(sourceKey);
-  const levels: UsageContextLevel[] =
-    record?.level === "column"
-      ? ["column"]
-      : record?.level === "cell"
-        ? ["cell", "column"]
-        : ["model", "cell", "column"];
-  const candidates = record
-    ? levels.map((level) => ({
+  return resolveUsageContextAt(
+    preferences,
+    record?.source ?? null,
+    record ? usageContextLevelsAt(record.level) : [],
+    reported,
+  );
+}
+
+/** Resolve what one level would use, before anything below it is read. */
+export function resolveUsageContextLevel(
+  preferences: UsageContextPreferences,
+  source: UsageContextSource,
+  level: UsageContextLevel,
+  reported: { contextWindow: number | null; autoCompactTokenLimit: number | null } = {
+    contextWindow: null,
+    autoCompactTokenLimit: null,
+  },
+): ResolvedUsageContext {
+  return resolveUsageContextAt(preferences, source, usageContextLevelsAt(level), reported);
+}
+
+/** What a level would use if it held no value of its own. */
+export function inheritedUsageContext(
+  preferences: UsageContextPreferences,
+  source: UsageContextSource,
+  level: UsageContextLevel,
+): ResolvedUsageContext {
+  return resolveUsageContextAt(preferences, source, usageContextLevelsAt(level).slice(1), {
+    contextWindow: null,
+    autoCompactTokenLimit: null,
+  });
+}
+
+function resolveUsageContextAt(
+  preferences: UsageContextPreferences,
+  source: UsageContextSource | null,
+  levels: readonly UsageContextLevel[],
+  reported: { contextWindow: number | null; autoCompactTokenLimit: number | null },
+): ResolvedUsageContext {
+  const candidates = !source
+    ? []
+    : levels.map((level) => ({
         level,
-        override: preferences.overrides[usageContextLevelKey(record.source, level)],
-      }))
-    : [];
+        override: preferences.overrides[usageContextLevelKey(source, level)],
+      }));
   let contextWindow: ResolvedUsageContext["contextWindow"] = {
     value: reported.contextWindow,
     level: "reported",
@@ -439,6 +505,28 @@ export function writeUsageContextOverride(
   } else {
     overrides[sourceKey] = normalizedOverride;
   }
+  writeUsageContextPreferences({ ...preferences, version: 6, overrides });
+}
+
+/** Whether a saved record holds any value at all. A buffer unit alone does not count. */
+export function usageContextHasValue(override: UsageContextOverride | undefined): boolean {
+  return (
+    !!override &&
+    (positiveInteger(override.contextWindowTokens) !== null ||
+      nonNegativeInteger(override.autoCompactBufferTokens) !== null ||
+      bufferPercent(override.autoCompactBufferPercent) !== null)
+  );
+}
+
+/** Replace one level's record whole; `null` deletes it. */
+export function setUsageContextLevel(
+  preferences: UsageContextPreferences,
+  sourceKey: string,
+  override: UsageContextOverride | null,
+): void {
+  const overrides = { ...preferences.overrides };
+  if (override) overrides[sourceKey] = override;
+  else Reflect.deleteProperty(overrides, sourceKey);
   writeUsageContextPreferences({ ...preferences, version: 6, overrides });
 }
 

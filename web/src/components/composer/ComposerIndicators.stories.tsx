@@ -167,12 +167,18 @@ export const SubagentStatesAndNavigation: Story = {
   play: ({ canvasElement }) => openIndicator(canvasElement, "subagent-task-pill"),
 };
 
+const withRouter = (Story: ComponentType) => (
+  <StoryQueryRouter route="/c/conversation-story">
+    <Story />
+  </StoryQueryRouter>
+);
+
 export const ContextRingCompact: Story = {
-  decorators: [compactIndicatorEnvironment],
+  decorators: [withRouter, compactIndicatorEnvironment],
   render: () => <CompactIndicatorRow />,
 };
 
 export const ContextRingNarrow: Story = {
-  decorators: [compactIndicatorEnvironment],
+  decorators: [withRouter, compactIndicatorEnvironment],
   render: () => <CompactIndicatorRow narrow />,
 };
