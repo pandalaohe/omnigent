@@ -868,12 +868,9 @@ export function ContextUsageSettings() {
       </div>
 
       <div className="flex flex-wrap items-start justify-between gap-3 border-t border-border pt-4">
-        <div className="min-w-0">
-          <h4 className="text-ui font-medium">Saved context values</h4>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Rules for every model, new ones included. A session's ring sets one model.
-          </p>
-        </div>
+        <p className="min-w-0 max-w-2xl text-sm text-muted-foreground">
+          Rules for every model, new ones included. A session's ring sets one model.
+        </p>
         <SavedContextSources
           preferences={preferences}
           hosts={hosts}
