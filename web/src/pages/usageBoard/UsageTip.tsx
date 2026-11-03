@@ -99,13 +99,19 @@ interface UsageTipProps {
   /** The trigger's content; rendered inside a span so it can sit in a tile. */
   children: ReactNode;
   className?: string;
+  /**
+   * Open on a tap, not only on hover. A board tile leaves this off so the tap
+   * goes through to the account's detail page; a detail-page ring turns it on,
+   * because there is nowhere else for that tap to go.
+   */
+  tapOpens?: boolean;
 }
 
 /**
  * Hover/focus wrapper for a data card. The trigger never swallows a click, so
  * on a tile the tap that opens the tip on desktop still navigates on a phone.
  */
-export function UsageTip({ model, children, className }: UsageTipProps) {
+export function UsageTip({ model, children, className, tapOpens = false }: UsageTipProps) {
   const [open, setOpen] = useState(false);
   const closeTimer = useRef<number | null>(null);
 
@@ -135,7 +141,10 @@ export function UsageTip({ model, children, className }: UsageTipProps) {
     <Popover
       open={open}
       onOpenChange={(next) => {
-        if (!next) setOpen(false);
+        // A trigger click asks to open; only the surfaces that own that tap
+        // accept it, so a tile's click still navigates.
+        if (next && !tapOpens) return;
+        setOpen(next);
       }}
     >
       <PopoverTrigger asChild>
@@ -195,7 +204,7 @@ export function UsageTipButton({
           type="button"
           aria-label={label}
           className={cn(
-            "inline-flex min-h-6 items-center gap-1 rounded px-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground",
+            "inline-flex min-h-11 items-center gap-1 rounded px-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground md:min-h-6",
             className,
           )}
           onClick={(event) => event.stopPropagation()}

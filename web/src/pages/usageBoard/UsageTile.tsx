@@ -78,6 +78,9 @@ export function UsageTile({
         aria-label={tileLabel(account, picks, stale)}
         onClick={activate}
         onKeyDown={(event) => {
+          // Only the tile itself: a nested control's Enter or Space must not be
+          // swallowed into a navigation.
+          if (event.target !== event.currentTarget) return;
           if (event.key === "Enter" || event.key === " ") {
             event.preventDefault();
             activate();
@@ -128,6 +131,7 @@ export function UsageTile({
       aria-label={tileLabel(account, picks, stale)}
       onClick={activate}
       onKeyDown={(event) => {
+        if (event.target !== event.currentTarget) return;
         if (event.key === "Enter" || event.key === " ") {
           event.preventDefault();
           activate();
@@ -206,7 +210,7 @@ export function UsageTile({
           <div className="flex items-center">
             <button
               type="button"
-              className="grid size-7 place-items-center rounded text-muted-foreground hover:text-foreground"
+              className="grid min-h-11 min-w-11 place-items-center rounded text-muted-foreground hover:text-foreground md:min-h-7 md:min-w-7"
               aria-label={`Move ${name} back`}
               onClick={(event) => {
                 event.stopPropagation();
@@ -217,7 +221,7 @@ export function UsageTile({
             </button>
             <button
               type="button"
-              className="grid size-7 place-items-center rounded text-muted-foreground hover:text-foreground"
+              className="grid min-h-11 min-w-11 place-items-center rounded text-muted-foreground hover:text-foreground md:min-h-7 md:min-w-7"
               aria-label={`Move ${name} forward`}
               onClick={(event) => {
                 event.stopPropagation();

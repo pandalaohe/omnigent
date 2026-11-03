@@ -6,7 +6,7 @@ import { useOmnigentPageView } from "@/lib/analytics";
 import { PageLoading } from "@/components/PageLoading";
 import { Spinner } from "@/components/ui/spinner";
 import { ChunkLoadErrorBoundary } from "@/components/ChunkLoadErrorBoundary";
-import { isFeatureEnabled, type FeatureKey } from "@/lib/capabilities";
+import { isFeatureEnabled, usageBoardAvailable, type FeatureKey } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
 import { ExtensionPageRoute } from "@/extensions/ExtensionPageRoute";
@@ -241,12 +241,22 @@ function AppRoutes({ basename }: AppProps) {
               </FeatureGatedPage>
             }
           />
-          <Route path={`${prefix}/usage/board`} element={<UsageBoardPage />} />
-          <Route path={`${prefix}/usage/board/:accountId`} element={<UsageBoardAccountPage />} />
-          <Route
-            path={`${prefix}/usage/board/:accountId/settings`}
-            element={<UsageBoardAccountSettingsPage />}
-          />
+          {/* The board's routes exist only where the deployment allows the
+              module: with usage.enabled false the server serves no usage route,
+              so a registered page would only offer a dead surface. */}
+          {usageBoardAvailable(info) && (
+            <>
+              <Route path={`${prefix}/usage/board`} element={<UsageBoardPage />} />
+              <Route
+                path={`${prefix}/usage/board/:accountId`}
+                element={<UsageBoardAccountPage />}
+              />
+              <Route
+                path={`${prefix}/usage/board/:accountId/settings`}
+                element={<UsageBoardAccountSettingsPage />}
+              />
+            </>
+          )}
           <Route path={`${prefix}/system`} element={<SystemStatusPage />} />
           <Route path={`${prefix}/hosts/:hostId/terminals`} element={<HostTerminalsPage />} />
           {/* Settings renders into the chat outlet so the conversations

@@ -28,6 +28,7 @@ import { patchUsageBoardPreferences } from "@/lib/usageContextPreferences";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import { cn } from "@/lib/utils";
 
+import { buildConnectCommand } from "./usageBoardConnect";
 import { UsageRing } from "./UsageRing";
 import { useUsageOverview, type UsageWindowView } from "./usageBoardData";
 
@@ -219,28 +220,23 @@ function ColourLine({
   const samples = [10, 30, 50, 70, 90];
   return (
     <div className="flex flex-col gap-2">
-      <div className="relative h-8 w-full max-w-[420px]">
-        <div className="absolute inset-x-0 top-2.5 flex h-2.5 gap-0.5 overflow-hidden rounded-full">
+      {/* Two handles on one reading, each on its own row: an overlay range that
+          covers the other one would take the pointer for whichever sits on top,
+          so a drag could never reach the handle underneath. */}
+      <div className="h-2.5 w-full max-w-[420px] overflow-hidden rounded-full">
+        <div className="flex h-full gap-0.5">
           <span className="flex-1 bg-destructive/45" style={{ flexGrow: low }} />
           <span className="flex-1 bg-warning/45" style={{ flexGrow: Math.max(0, tight - low) }} />
           <span className="flex-1 bg-success/45" style={{ flexGrow: Math.max(0, 100 - tight) }} />
         </div>
-        <input
-          type="range"
-          min={0}
-          max={100}
-          step={5}
-          value={low}
-          aria-label={`Red below a pace of ${low}`}
-          onChange={(event) =>
-            onChange({
-              tight: Math.max(tight, Number(event.target.value)),
-              low: Number(event.target.value),
-              floor,
-            })
-          }
-          className="absolute inset-x-0 top-0 h-8 w-full appearance-none bg-transparent"
-        />
+      </div>
+      <label className="flex max-w-[420px] flex-col gap-1 text-xs text-muted-foreground">
+        <span className="flex items-center justify-between gap-2">
+          <span>
+            Amber below <b className="text-warning">{tight}</b>
+          </span>
+          <span className="text-[11px]">pace</span>
+        </span>
         <input
           type="range"
           min={0}
@@ -255,18 +251,36 @@ function ColourLine({
               floor,
             })
           }
-          className="absolute inset-y-0 left-0 w-full appearance-none bg-transparent opacity-0"
+          className="h-6 w-full accent-[var(--warning)]"
         />
-      </div>
+      </label>
+      <label className="flex max-w-[420px] flex-col gap-1 text-xs text-muted-foreground">
+        <span className="flex items-center justify-between gap-2">
+          <span>
+            Red below <b className="text-destructive">{low}</b>
+          </span>
+          <span className="text-[11px]">pace</span>
+        </span>
+        <input
+          type="range"
+          min={0}
+          max={100}
+          step={5}
+          value={low}
+          aria-label={`Red below a pace of ${low}`}
+          onChange={(event) =>
+            onChange({
+              tight: Math.max(tight, Number(event.target.value)),
+              low: Number(event.target.value),
+              floor,
+            })
+          }
+          className="h-6 w-full accent-[var(--destructive)]"
+        />
+      </label>
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-muted-foreground">
-        <span>
-          Amber below <b className="text-warning">{tight}</b>
-        </span>
-        <span>
-          Red below <b className="text-destructive">{low}</b>
-        </span>
         <span className="flex items-center gap-1.5">
-          <label htmlFor="usage-floor">Red below</label>
+          <label htmlFor="usage-floor">Red below, percent left</label>
           <Input
             id="usage-floor"
             inputMode="numeric"
@@ -287,12 +301,12 @@ function ColourLine({
           <span>% left</span>
         </span>
       </div>
-      <div className="flex flex-wrap items-center gap-1.5" aria-hidden="true">
+      <div className="flex flex-wrap items-center gap-2.5" aria-hidden="true">
         {samples.map((used) => (
           <UsageRing
             key={used}
             window={{ ...sampleWindow(used), state: sampleState(used, tight, low, floor) }}
-            size={34}
+            size={46}
             showName={false}
           />
         ))}
@@ -305,13 +319,7 @@ function ConnectDialog() {
   const [copied, setCopied] = useState(false);
   const origin =
     typeof window === "undefined" ? "https://omnigent.example" : window.location.origin;
-  const command = [
-    `curl -X PUT ${origin}/v1/me/usage/accounts/my-gateway \\`,
-    '  -H "Authorization: Bearer $TOKEN" \\',
-    "  -H 'Content-Type: application/json' \\",
-    `  -d '{"observed_at":"'"$(date +%s)"'","windows":[`,
-    '        {"id":"month","percent_used":41,"window_minutes":43200,"resets_at":1764547200}]}\'',
-  ].join("\n");
+  const command = buildConnectCommand(origin);
 
   async function copy() {
     try {

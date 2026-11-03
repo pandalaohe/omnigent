@@ -52,20 +52,34 @@ export function boardBands(
   return bands;
 }
 
-/** Materialise the current arrangement so a first edit has something to edit. */
+/**
+ * The stored arrangement with every current account written into it, so an
+ * account that arrived after the arrangement was made is a real member and not
+ * only a leftover the renderer appends.
+ */
 export function seedBands(
   board: UsageBoardPreferences,
   accounts: UsageAccountView[],
 ): UsageBoardBand[] {
-  if (board.bands.length > 0) return board.bands;
-  return [
-    {
-      id: IMPLICIT_BAND_ID,
-      name: IMPLICIT_BAND_NAME,
-      accounts: onBoardAccounts(board, accounts).map((account) => account.id),
-      open: true,
-    },
-  ];
+  const placed = new Set<string>();
+  for (const band of board.bands) for (const id of band.accounts) placed.add(id);
+  const unplaced = onBoardAccounts(board, accounts).filter((account) => !placed.has(account.id));
+  if (board.bands.length === 0) {
+    return [
+      {
+        id: IMPLICIT_BAND_ID,
+        name: IMPLICIT_BAND_NAME,
+        accounts: unplaced.map((account) => account.id),
+        open: true,
+      },
+    ];
+  }
+  if (unplaced.length === 0) return board.bands;
+  return board.bands.map((band, index) =>
+    index === board.bands.length - 1
+      ? { ...band, accounts: [...band.accounts, ...unplaced.map((account) => account.id)] }
+      : band,
+  );
 }
 
 /** Swap a tile with its neighbour in its own band, else hand it to the next band. */

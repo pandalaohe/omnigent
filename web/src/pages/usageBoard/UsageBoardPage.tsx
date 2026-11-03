@@ -123,7 +123,10 @@ export function UsageBoardPage() {
               aria-label="Arrange groups and order"
               title="Arrange"
               onClick={() => {
-                update({ bands: seedBands(board, accounts) });
+                // Arranging needs the ring view: a compact row has no room for
+                // handles, and switching here is one line instead of a second
+                // arrangement layout.
+                update({ bands: seedBands(board, accounts), density: "std" });
                 setArranging(true);
               }}
             >

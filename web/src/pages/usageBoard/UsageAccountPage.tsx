@@ -78,7 +78,7 @@ export function UsageAccountPage() {
       {account ? (
         <>
           <div className="mb-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
-            <UsageTip model={readingTip(account)}>
+            <UsageTip model={readingTip(account)} tapOpens>
               <span className="inline-flex items-center gap-1">
                 {account.kind === "native" ? (
                   <LaptopIcon className="size-3.5" aria-hidden="true" />
@@ -151,6 +151,7 @@ export function UsageAccountPage() {
                                   stale: stale || empty,
                                   auto: !pinnedId || pinnedId === "auto",
                                 })}
+                                tapOpens
                               >
                                 <UsageRing
                                   window={window}

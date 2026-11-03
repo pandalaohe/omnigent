@@ -133,7 +133,7 @@ export function UsageRing({
       </svg>
       <span className="relative flex flex-col items-center leading-none">
         {showName && window ? (
-          <span className="mb-0.5 max-w-[86%] truncate px-0.5 text-[10.5px] text-muted-foreground">
+          <span className="mb-0.5 w-full truncate px-1 text-center text-[10.5px] text-muted-foreground">
             {windowName(window)}
           </span>
         ) : null}

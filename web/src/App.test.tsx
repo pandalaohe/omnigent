@@ -150,6 +150,21 @@ function renderRoute(
   );
 }
 
+describe("Usage board routes", () => {
+  it("stays unregistered when the deployment turns the module off", () => {
+    renderRoute("/usage/board", {}, { ...FALLBACK_SERVER_INFO, usage_board_enabled: false });
+    expect(screen.getByText("not found")).toBeInTheDocument();
+  });
+
+  it.each(["/usage/board", "/usage/board/codex", "/usage/board/codex/settings"])(
+    "registers %s once the deployment allows it",
+    (path) => {
+      renderRoute(path, {}, { ...FALLBACK_SERVER_INFO, usage_board_enabled: true });
+      expect(screen.queryByText("not found")).toBeNull();
+    },
+  );
+});
+
 describe("Canvas route", () => {
   it("shows a spinner, not 'not found', while server info is still loading", () => {
     renderRoute("/canvas", {}, "loading");
