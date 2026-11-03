@@ -14079,6 +14079,198 @@
         "title": "Usage",
         "type": "object"
       },
+      "UsageAccountView": {
+        "properties": {
+          "age_s": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Age S"
+          },
+          "band": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Band"
+          },
+          "deciding_window": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deciding Window"
+          },
+          "details_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Details Url"
+          },
+          "display_name": {
+            "title": "Display Name",
+            "type": "string"
+          },
+          "freshness": {
+            "enum": [
+              "fresh",
+              "old",
+              "none"
+            ],
+            "title": "Freshness",
+            "type": "string"
+          },
+          "hosts": {
+            "items": {
+              "$ref": "#/components/schemas/UsageHostView"
+            },
+            "title": "Hosts",
+            "type": "array"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "native",
+              "account"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "mark": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mark"
+          },
+          "pace_pct": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pace Pct"
+          },
+          "period": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UsagePeriodView"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "plan": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plan"
+          },
+          "product": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Product"
+          },
+          "read_at": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Read At"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "renews_at": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Renews At"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          },
+          "windows": {
+            "items": {
+              "$ref": "#/components/schemas/UsageWindowView"
+            },
+            "title": "Windows",
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "display_name",
+          "state",
+          "freshness"
+        ],
+        "title": "UsageAccountView",
+        "type": "object"
+      },
       "UsageDetails": {
         "description": "Breakdown of output token usage.",
         "properties": {
@@ -14091,6 +14283,129 @@
           }
         },
         "title": "UsageDetails",
+        "type": "object"
+      },
+      "UsageHostView": {
+        "properties": {
+          "host_id": {
+            "title": "Host Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "read_at": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Read At"
+          },
+          "windows": {
+            "items": {
+              "$ref": "#/components/schemas/UsageWindowView"
+            },
+            "title": "Windows",
+            "type": "array"
+          }
+        },
+        "required": [
+          "host_id",
+          "name"
+        ],
+        "title": "UsageHostView",
+        "type": "object"
+      },
+      "UsageOverview": {
+        "properties": {
+          "accounts": {
+            "items": {
+              "$ref": "#/components/schemas/UsageAccountView"
+            },
+            "title": "Accounts",
+            "type": "array"
+          },
+          "agents": {
+            "additionalProperties": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Agents",
+            "type": "object"
+          },
+          "generated_at": {
+            "format": "double",
+            "title": "Generated At",
+            "type": "number"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "format": "int64",
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "tiers": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "format": "double",
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "title": "Tiers",
+            "type": "object"
+          }
+        },
+        "required": [
+          "generated_at",
+          "tiers",
+          "accounts",
+          "agents"
+        ],
+        "title": "UsageOverview",
+        "type": "object"
+      },
+      "UsagePeriodView": {
+        "properties": {
+          "days": {
+            "format": "double",
+            "title": "Days",
+            "type": "number"
+          },
+          "moved_from": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Moved From"
+          },
+          "start": {
+            "format": "double",
+            "title": "Start",
+            "type": "number"
+          }
+        },
+        "required": [
+          "start",
+          "days"
+        ],
+        "title": "UsagePeriodView",
         "type": "object"
       },
       "UsageReport": {
@@ -14147,6 +14462,175 @@
           }
         },
         "title": "UsageReport",
+        "type": "object"
+      },
+      "UsageWindowView": {
+        "properties": {
+          "ahead_pts": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ahead Pts"
+          },
+          "group": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Group"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label"
+          },
+          "limit_value": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Limit Value"
+          },
+          "pace_pct": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pace Pct"
+          },
+          "past_reset": {
+            "default": false,
+            "title": "Past Reset",
+            "type": "boolean"
+          },
+          "percent_used": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Percent Used"
+          },
+          "remaining_pct": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Remaining Pct"
+          },
+          "resets_at": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resets At"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          },
+          "time_left_s": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Time Left S"
+          },
+          "unit": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unit"
+          },
+          "used_value": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Used Value"
+          },
+          "window_minutes": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Window Minutes"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "state"
+        ],
+        "title": "UsageWindowView",
         "type": "object"
       },
       "UserPreferencesEnvelope": {
@@ -18810,6 +19294,604 @@
         "tags": [
           "sessions"
         ]
+      }
+    },
+    "/v1/me/usage": {
+      "get": {
+        "operationId": "read_usage_v1_me_usage_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsageOverview"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Read Usage"
+      }
+    },
+    "/v1/me/usage/accounts/{account_id}": {
+      "delete": {
+        "operationId": "delete_usage_account_v1_me_usage_accounts__account_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "account_id",
+            "required": true,
+            "schema": {
+              "title": "Account Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Usage Account"
+      },
+      "put": {
+        "operationId": "report_usage_account_v1_me_usage_accounts__account_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "account_id",
+            "required": true,
+            "schema": {
+              "title": "Account Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$defs": {
+                  "ActivityHour": {
+                    "properties": {
+                      "cost_basis": {
+                        "default": "metered",
+                        "enum": [
+                          "metered",
+                          "estimate"
+                        ],
+                        "title": "Cost Basis",
+                        "type": "string"
+                      },
+                      "cost_usd": {
+                        "anyOf": [
+                          {
+                            "anyOf": [
+                              {
+                                "type": "number"
+                              },
+                              {
+                                "type": "integer"
+                              }
+                            ],
+                            "ge": 0
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Cost Usd"
+                      },
+                      "failed": {
+                        "anyOf": [
+                          {
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Failed"
+                      },
+                      "hour": {
+                        "exclusiveMinimum": 0,
+                        "title": "Hour",
+                        "type": "integer"
+                      },
+                      "model": {
+                        "anyOf": [
+                          {
+                            "maxLength": 128,
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Model"
+                      },
+                      "reasons": {
+                        "anyOf": [
+                          {
+                            "additionalProperties": {
+                              "type": "integer"
+                            },
+                            "type": "object"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Reasons"
+                      },
+                      "requests": {
+                        "anyOf": [
+                          {
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Requests"
+                      },
+                      "tokens": {
+                        "anyOf": [
+                          {
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Tokens"
+                      }
+                    },
+                    "required": [
+                      "hour"
+                    ],
+                    "title": "ActivityHour",
+                    "type": "object"
+                  },
+                  "ReportModel": {
+                    "properties": {
+                      "id": {
+                        "title": "Id",
+                        "type": "string"
+                      },
+                      "input_per_million": {
+                        "anyOf": [
+                          {
+                            "anyOf": [
+                              {
+                                "type": "number"
+                              },
+                              {
+                                "type": "integer"
+                              }
+                            ],
+                            "ge": 0
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Input Per Million"
+                      },
+                      "output_per_million": {
+                        "anyOf": [
+                          {
+                            "anyOf": [
+                              {
+                                "type": "number"
+                              },
+                              {
+                                "type": "integer"
+                              }
+                            ],
+                            "ge": 0
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Output Per Million"
+                      }
+                    },
+                    "required": [
+                      "id"
+                    ],
+                    "title": "ReportModel",
+                    "type": "object"
+                  },
+                  "UsageWindow": {
+                    "properties": {
+                      "group": {
+                        "anyOf": [
+                          {
+                            "maxLength": 32,
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Group"
+                      },
+                      "id": {
+                        "maxLength": 32,
+                        "minLength": 1,
+                        "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$",
+                        "title": "Id",
+                        "type": "string"
+                      },
+                      "kind": {
+                        "default": "other",
+                        "enum": [
+                          "session",
+                          "weekly",
+                          "weekly_model",
+                          "monthly",
+                          "other"
+                        ],
+                        "title": "Kind",
+                        "type": "string"
+                      },
+                      "label": {
+                        "anyOf": [
+                          {
+                            "maxLength": 32,
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Label"
+                      },
+                      "limit_value": {
+                        "anyOf": [
+                          {
+                            "anyOf": [
+                              {
+                                "type": "number"
+                              },
+                              {
+                                "type": "integer"
+                              }
+                            ],
+                            "ge": 0
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Limit Value"
+                      },
+                      "percent_used": {
+                        "anyOf": [
+                          {
+                            "anyOf": [
+                              {
+                                "type": "number"
+                              },
+                              {
+                                "type": "integer"
+                              }
+                            ],
+                            "ge": 0,
+                            "le": 100
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Percent Used"
+                      },
+                      "resets_at": {
+                        "anyOf": [
+                          {
+                            "anyOf": [
+                              {
+                                "type": "number"
+                              },
+                              {
+                                "type": "integer"
+                              }
+                            ],
+                            "gt": 0
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Resets At"
+                      },
+                      "unit": {
+                        "anyOf": [
+                          {
+                            "maxLength": 8,
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Unit"
+                      },
+                      "used_value": {
+                        "anyOf": [
+                          {
+                            "anyOf": [
+                              {
+                                "type": "number"
+                              },
+                              {
+                                "type": "integer"
+                              }
+                            ],
+                            "ge": 0
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Used Value"
+                      },
+                      "window_minutes": {
+                        "anyOf": [
+                          {
+                            "exclusiveMinimum": 0,
+                            "maximum": 2628000,
+                            "type": "integer"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Window Minutes"
+                      }
+                    },
+                    "required": [
+                      "id"
+                    ],
+                    "title": "UsageWindow",
+                    "type": "object"
+                  }
+                },
+                "properties": {
+                  "activity": {
+                    "anyOf": [
+                      {
+                        "items": {
+                          "$ref": "#/$defs/ActivityHour"
+                        },
+                        "maxItems": 500,
+                        "type": "array"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Activity"
+                  },
+                  "band": {
+                    "anyOf": [
+                      {
+                        "maxLength": 32,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Band"
+                  },
+                  "details_url": {
+                    "anyOf": [
+                      {
+                        "format": "uri",
+                        "maxLength": 2083,
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Details Url"
+                  },
+                  "display_name": {
+                    "anyOf": [
+                      {
+                        "maxLength": 64,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Display Name"
+                  },
+                  "fresh_until": {
+                    "anyOf": [
+                      {
+                        "anyOf": [
+                          {
+                            "type": "number"
+                          },
+                          {
+                            "type": "integer"
+                          }
+                        ],
+                        "gt": 0
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Fresh Until"
+                  },
+                  "host_id": {
+                    "anyOf": [
+                      {
+                        "maxLength": 128,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Host Id"
+                  },
+                  "models": {
+                    "anyOf": [
+                      {
+                        "items": {
+                          "$ref": "#/$defs/ReportModel"
+                        },
+                        "maxItems": 128,
+                        "type": "array"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Models"
+                  },
+                  "observed_at": {
+                    "anyOf": [
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "integer"
+                      }
+                    ],
+                    "gt": 0,
+                    "title": "Observed At"
+                  },
+                  "pinned_window": {
+                    "anyOf": [
+                      {
+                        "maxLength": 32,
+                        "minLength": 1,
+                        "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$",
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Pinned Window"
+                  },
+                  "plan": {
+                    "anyOf": [
+                      {
+                        "maxLength": 64,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Plan"
+                  },
+                  "product": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Product"
+                  },
+                  "renews_at": {
+                    "anyOf": [
+                      {
+                        "anyOf": [
+                          {
+                            "type": "number"
+                          },
+                          {
+                            "type": "integer"
+                          }
+                        ],
+                        "gt": 0
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Renews At"
+                  },
+                  "schema_version": {
+                    "const": 1,
+                    "default": 1,
+                    "title": "Schema Version",
+                    "type": "integer"
+                  },
+                  "status": {
+                    "default": "available",
+                    "enum": [
+                      "available",
+                      "unavailable"
+                    ],
+                    "title": "Status",
+                    "type": "string"
+                  },
+                  "windows": {
+                    "items": {
+                      "$ref": "#/$defs/UsageWindow"
+                    },
+                    "maxItems": 16,
+                    "title": "Windows",
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "observed_at",
+                  "windows"
+                ],
+                "title": "UsageReport",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Report Usage Account"
       }
     },
     "/v1/policies": {

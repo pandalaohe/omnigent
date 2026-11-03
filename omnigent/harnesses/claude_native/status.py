@@ -72,33 +72,56 @@ def normalize_status_payload(payload: dict[str, object]) -> dict[str, object] | 
         model_id = model.strip()
     if model_id is not None:
         record["model"] = model_id
-    # Claude Code 2.1.80+ exposes plan usage on statusLine stdin. Keep only
-    # the comparable 5-hour and 7-day allowance windows; credentials and
-    # account identity never enter the bridge file or server event.
+    # Claude Code exposes each plan window independently. Preserve absence and
+    # carry the gateway spend values without account identity.
     rate_limits = payload.get("rate_limits")
     if isinstance(rate_limits, dict):
         windows: list[dict[str, object]] = []
         for key, label, aria_label, duration_mins in (
             ("five_hour", "5h", "5 hour", 300),
             ("seven_day", "w", "weekly", 10_080),
+            ("spend_limit", "spend", "spend", None),
         ):
             candidate = rate_limits.get(key)
             if not isinstance(candidate, dict):
                 continue
             used = candidate.get("used_percentage")
-            if isinstance(used, bool) or not isinstance(used, (int, float)):
+            used_usd = candidate.get("used_usd")
+            if (isinstance(used, bool) or not isinstance(used, (int, float))) and (
+                isinstance(used_usd, bool) or not isinstance(used_usd, (int, float))
+            ):
                 continue
-            if used < 0 or used > 100:
-                continue
-            window: dict[str, object] = {
-                "label": label,
-                "aria_label": aria_label,
-                "used_percent": float(used),
-                "duration_mins": duration_mins,
-            }
+            window: dict[str, object] = {"label": label, "aria_label": aria_label}
+            if not isinstance(used, bool) and isinstance(used, (int, float)) and used >= 0:
+                window["used_percent"] = min(100.0, float(used))
+            if duration_mins is not None:
+                window["duration_mins"] = duration_mins
+            elif candidate.get("period") in {"daily", "weekly", "monthly"}:
+                window["duration_mins"] = {
+                    "daily": 1440,
+                    "weekly": 10_080,
+                    "monthly": 43_200,
+                }[str(candidate["period"])]
             resets_at = candidate.get("resets_at")
             if isinstance(resets_at, int) and not isinstance(resets_at, bool) and resets_at > 0:
                 window["resets_at"] = resets_at
+            if (
+                not isinstance(used_usd, bool)
+                and isinstance(used_usd, (int, float))
+                and used_usd >= 0
+            ):
+                window["used_value"] = float(used_usd)
+                window["unit"] = "USD"
+            limit_usd = candidate.get("limit_usd")
+            if (
+                not isinstance(limit_usd, bool)
+                and isinstance(limit_usd, (int, float))
+                and limit_usd >= 0
+                and "used_value" in window
+            ):
+                window["limit_value"] = float(limit_usd)
+            if "used_percent" not in window and "used_value" not in window:
+                continue
             windows.append(window)
         if windows:
             record["provider_usage_limits"] = {

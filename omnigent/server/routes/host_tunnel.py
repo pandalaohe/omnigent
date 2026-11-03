@@ -24,7 +24,7 @@ import threading
 import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import anyio
@@ -104,6 +104,9 @@ from omnigent.server.tunnel_handshake import receive_tunnel_hello
 from omnigent.stores import ConversationStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.session_startup_store import SessionStartupStore
+
+if TYPE_CHECKING:
+    from omnigent.server.agent_quota import AgentQuotaService
 
 _logger = logging.getLogger(__name__)
 
@@ -188,6 +191,7 @@ def create_host_tunnel_router(
     runner_exit_reports: RunnerExitReports | None = None,
     conversation_store: ConversationStore | None = None,
     startup_store: SessionStartupStore | None = None,
+    agent_quota_service: AgentQuotaService | None = None,
     harness_install: HarnessInstallGate = False,
 ) -> APIRouter:
     """Build the router hosting the ``/hosts/{id}/tunnel`` WS endpoint.
@@ -526,6 +530,7 @@ def create_host_tunnel_router(
                         on_host_update,
                         conversation_store,
                         startup_store,
+                        agent_quota_service,
                     ),
                     name=f"host-receive:{host_id}",
                 )
@@ -888,6 +893,7 @@ async def _receive_loop(
     on_host_update: Callable[[str, str | None], Awaitable[None]] | None,
     conversation_store: ConversationStore | None,
     startup_store: SessionStartupStore | None = None,
+    agent_quota_service: AgentQuotaService | None = None,
 ) -> None:
     """Receive host frames and route results to pending futures.
 
@@ -993,6 +999,13 @@ async def _receive_loop(
             # Delivered Host-local account state: already schema-validated and
             # stripped of auth/account fields by the shared frame decoder.
             conn.hello.codex_rate_limits = frame.codex_rate_limits
+            if agent_quota_service is not None and frame.codex_rate_limits is not None:
+                agent_quota_service.note_reading(
+                    conn.owner or RESERVED_USER_LOCAL,
+                    host_id,
+                    "codex",
+                    frame.codex_rate_limits,
+                )
             continue
 
         if isinstance(frame, HostStartupClaimFrame):

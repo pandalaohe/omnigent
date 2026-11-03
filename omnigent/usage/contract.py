@@ -1,0 +1,213 @@
+"""Versioned usage reports and the read-side view contract."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Annotated, Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, StrictFloat, StrictInt, model_validator
+
+_Id = Annotated[
+    str,
+    Field(min_length=1, max_length=32, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$"),
+]
+_Number = Annotated[StrictFloat | StrictInt, Field(allow_inf_nan=False)]
+
+
+class UsageWindow(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: _Id
+    kind: Literal["session", "weekly", "weekly_model", "monthly", "other"] = "other"
+    label: str | None = Field(default=None, max_length=32)
+    group: str | None = Field(default=None, max_length=32)
+    percent_used: Annotated[_Number, Field(ge=0, le=100)] | None = None
+    window_minutes: Annotated[StrictInt, Field(gt=0, le=2_628_000)] | None = None
+    resets_at: Annotated[_Number, Field(gt=0)] | None = None
+    used_value: Annotated[_Number, Field(ge=0)] | None = None
+    limit_value: Annotated[_Number, Field(ge=0)] | None = None
+    unit: str | None = Field(default=None, max_length=8)
+
+    @model_validator(mode="after")
+    def has_measurement(self) -> UsageWindow:
+        if self.percent_used is None and self.used_value is None:
+            raise ValueError("a window needs percent_used or used_value")
+        if self.limit_value is not None and self.used_value is None:
+            raise ValueError("limit_value needs used_value")
+        return self
+
+
+class ActivityHour(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    hour: Annotated[StrictInt, Field(gt=0)]
+    model: str | None = Field(default=None, max_length=128)
+    requests: Annotated[StrictInt, Field(ge=0)] | None = None
+    failed: Annotated[StrictInt, Field(ge=0)] | None = None
+    reasons: dict[str, int] | None = None
+    tokens: Annotated[StrictInt, Field(ge=0)] | None = None
+    cost_usd: Annotated[_Number, Field(ge=0)] | None = None
+    cost_basis: Literal["metered", "estimate"] = "metered"
+
+    @model_validator(mode="after")
+    def bounded_reasons(self) -> ActivityHour:
+        if self.reasons is not None:
+            if len(self.reasons) > 16 or any(len(name) > 64 for name in self.reasons):
+                raise ValueError("reasons allows at most 16 names of at most 64 characters")
+            if any(type(count) is not int or count < 0 for count in self.reasons.values()):
+                raise ValueError("reason counts must be non-negative integers")
+        return self
+
+
+class ReportModel(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    input_per_million: Annotated[_Number, Field(ge=0)] | None = None
+    output_per_million: Annotated[_Number, Field(ge=0)] | None = None
+
+
+class UsageReport(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    schema_version: Literal[1] = 1
+    observed_at: Annotated[_Number, Field(gt=0)]
+    status: Literal["available", "unavailable"] = "available"
+    fresh_until: Annotated[_Number, Field(gt=0)] | None = None
+    windows: Annotated[list[UsageWindow], Field(max_length=16)]
+    pinned_window: _Id | None = None
+    display_name: str | None = Field(default=None, max_length=64)
+    plan: str | None = Field(default=None, max_length=64)
+    band: str | None = Field(default=None, max_length=32)
+    details_url: HttpUrl | None = None
+    renews_at: Annotated[_Number, Field(gt=0)] | None = None
+    product: str | None = None
+    host_id: str | None = Field(default=None, max_length=128)
+    activity: Annotated[list[ActivityHour] | None, Field(max_length=500)] = None
+    models: Annotated[list[ReportModel] | None, Field(max_length=128)] = None
+
+    @model_validator(mode="after")
+    def window_ids_and_pin(self) -> UsageReport:
+        ids = [window.id for window in self.windows]
+        if len(set(ids)) != len(ids):
+            raise ValueError("window ids must be unique")
+        if self.pinned_window is not None and self.pinned_window not in ids:
+            raise ValueError("pinned_window must name a reported window")
+        return self
+
+    def stored(self) -> dict[str, Any]:
+        return self.model_dump(mode="json", exclude_none=True)
+
+
+class UsageWindowView(BaseModel):
+    id: str
+    kind: str
+    label: str | None = None
+    group: str | None = None
+    percent_used: float | None = None
+    remaining_pct: float | None = None
+    window_minutes: int | None = None
+    resets_at: float | None = None
+    time_left_s: float | None = None
+    pace_pct: float | None = None
+    state: str
+    ahead_pts: float | None = None
+    used_value: float | None = None
+    limit_value: float | None = None
+    unit: str | None = None
+    past_reset: bool = False
+
+
+class UsageHostView(BaseModel):
+    host_id: str
+    name: str
+    read_at: float | None = None
+    windows: list[UsageWindowView] = Field(default_factory=list)
+
+
+class UsagePeriodView(BaseModel):
+    start: float
+    days: float
+    moved_from: float | None = None
+
+
+class UsageAccountView(BaseModel):
+    id: str
+    kind: Literal["native", "account"]
+    display_name: str
+    plan: str | None = None
+    band: str | None = None
+    product: str | None = None
+    details_url: str | None = None
+    renews_at: float | None = None
+    state: str
+    reason: str | None = None
+    deciding_window: str | None = None
+    pace_pct: float | None = None
+    read_at: float | None = None
+    age_s: float | None = None
+    freshness: Literal["fresh", "old", "none"]
+    mark: dict[str, Any] | None = None
+    period: UsagePeriodView | None = None
+    windows: list[UsageWindowView] = Field(default_factory=list)
+    hosts: list[UsageHostView] = Field(default_factory=list)
+
+
+class UsageOverview(BaseModel):
+    schema_version: Literal[1] = 1
+    generated_at: float
+    tiers: dict[str, float | None]
+    accounts: list[UsageAccountView]
+    agents: dict[str, dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class UsagePeriod:
+    start: float
+    days: float
+    window_id: str | None
+    rolling: bool = False
+
+
+def window_start(window: UsageWindow, now: float) -> tuple[float, float] | None:
+    if window.resets_at is None or window.window_minutes is None:
+        return None
+    length = window.window_minutes * 60.0
+    reset = float(window.resets_at)
+    return (reset if reset <= now else reset - length, length)
+
+
+def period_of(windows: list[UsageWindow], now: float) -> UsagePeriod:
+    usable = [window for window in windows if window_start(window, now) is not None]
+    weekly = [window for window in usable if window.kind == "weekly"]
+    if not weekly:
+        weekly = [window for window in usable if window.kind == "weekly_model"]
+    if not weekly:
+        weekly = [window for window in usable if window.window_minutes == 10_080]
+    if weekly:
+        window = min(weekly, key=lambda item: float(item.resets_at or 0))
+        start, length = window_start(window, now) or (now - 7 * 86400, 7 * 86400.0)
+        return UsagePeriod(start, length / 86400, window.id)
+    monthly = [
+        window
+        for window in usable
+        if window.kind == "monthly"
+        or (window.window_minutes is not None and 40_320 <= window.window_minutes <= 44_640)
+    ]
+    if monthly:
+        window = min(monthly, key=lambda item: float(item.resets_at or 0))
+        start, length = window_start(window, now) or (now - 30 * 86400, 30 * 86400.0)
+        return UsagePeriod(start, length / 86400, window.id)
+    return UsagePeriod(now - 30 * 86400, 30.0, None, rolling=True)
+
+
+def next_mark(previous: Mapping[str, Any] | None, start: float, length: float) -> dict[str, Any]:
+    if previous is None or previous.get("start") is None:
+        return {"start": start, "moved_from": None}
+    old_start = float(previous["start"])
+    if abs(start - old_start) <= 3600:
+        return dict(previous)
+    if start >= old_start + length - 3600:
+        return {"start": start, "moved_from": None}
+    return {"start": start, "moved_from": old_start}

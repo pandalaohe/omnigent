@@ -28,7 +28,8 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
 )
-from omnigent.server.auth import LEVEL_OWNER
+from omnigent.server.agent_quota import AgentQuotaService, QuotaContext
+from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes._host_launch import HostLaunchTarget, resolve_host_launch
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
@@ -105,6 +106,7 @@ def _build_host_api_app(
     db_uri: str,
     *,
     harness_install: bool | Callable[[], bool] | None = None,
+    agent_quota_service: AgentQuotaService | None = None,
 ) -> tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore]:
     """Build one replica's app over *db_uri*.
 
@@ -125,6 +127,7 @@ def _build_host_api_app(
         create_host_tunnel_router(
             registry,
             host_store,
+            agent_quota_service=agent_quota_service,
             harness_install=False if harness_install is None else harness_install,
         ),
         prefix="/v1",
@@ -320,6 +323,53 @@ async def test_codex_rate_limits_refresh_is_available_only_from_live_host(
         response = await client.get(f"/v1/hosts/{_HOST_ID}/codex-rate-limits")
         assert response.status_code == 200
         assert response.json() == {"rate_limits": None}
+
+
+async def test_codex_reading_outlives_disconnect_for_display_only(db_uri: str) -> None:
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+    service = AgentQuotaService(conversation_store, None, None, None, HostStore(db_uri))
+    app, registry, _hs, _cs = _build_host_api_app(db_uri, agent_quota_service=service)
+    comm = await _connect_host(app, registry)
+    snapshot = {
+        "captured_at": int(time.time()),
+        "limits": [
+            {
+                "limit_id": "codex",
+                "windows": [
+                    {
+                        "kind": "primary",
+                        "used_percent": 25,
+                        "window_duration_mins": 300,
+                        "resets_at": int(time.time()) + 1000,
+                    }
+                ],
+            }
+        ],
+    }
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(HostCodexRateLimitsFrame(codex_rate_limits=snapshot)),
+        }
+    )
+    for _ in range(50):
+        overview = service.overview(RESERVED_USER_LOCAL)
+        codex = next(item for item in overview.accounts if item.id == "codex")
+        if codex.windows:
+            break
+        await asyncio.sleep(0.01)
+    assert codex.windows[0].percent_used == 25
+
+    await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+    for _ in range(50):
+        if registry.get(_HOST_ID) is None:
+            break
+        await asyncio.sleep(0.01)
+    assert "codex" not in service.quotas(QuotaContext(RESERVED_USER_LOCAL, _HOST_ID))[1]
+    codex = next(
+        item for item in service.overview(RESERVED_USER_LOCAL).accounts if item.id == "codex"
+    )
+    assert codex.windows[0].percent_used == 25
 
 
 async def test_list_hosts_reports_sandbox_provider_for_managed_host(

@@ -33,7 +33,14 @@ from omnigent.server.server_config import (
     load_server_config,
     resolve_config_path,
     session_title_instructions,
+    usage_enabled,
 )
+
+
+def test_usage_gate_defaults_on_and_only_explicit_false_disables():
+    assert usage_enabled({}) is True
+    assert usage_enabled({"usage": {}}) is True
+    assert usage_enabled({"usage": {"enabled": False}}) is False
 
 
 def _image_bytes(image_format: str, *, size: tuple[int, int] = (2, 2)) -> bytes:

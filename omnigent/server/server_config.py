@@ -54,6 +54,12 @@ SESSION_TITLE_INSTRUCTIONS_KEY = "session_title_instructions"
 SESSION_TITLE_INSTRUCTIONS_MAX_CHARS = 4_000
 
 
+def usage_enabled(config: Mapping[str, Any]) -> bool:
+    """Deployment gate for usage routes and recording; existing quota routing stays on."""
+    raw = config.get("usage")
+    return not isinstance(raw, Mapping) or raw.get("enabled", True) is not False
+
+
 @dataclass(frozen=True)
 class StartupAdmissionPolicy:
     host_resident_limit: int | None

@@ -1,26 +1,29 @@
-"""Token-free quota reporting and the session-owner's live quota evidence."""
+"""Quota reporting and owner-scoped usage readings."""
 
 from __future__ import annotations
 
 import asyncio
+import re
 import time
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, HTTPException, Request, Response
-from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt
+from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, ValidationError
 from sqlalchemy.exc import StatementError
 
 from omnigent.harness_plugins import native_agents
 from omnigent.quota_pace import accept_snapshot
-from omnigent.server.agent_quota import AgentQuotaService
+from omnigent.server.agent_quota import AgentQuotaService, UsageAccountLimitError
 from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.stores.host_store import HostStore
+from omnigent.usage.contract import UsageOverview, UsageReport
 
 _Number = Annotated[StrictFloat | StrictInt, Field(allow_inf_nan=False)]
 _Period = Annotated[
     str, Field(min_length=1, max_length=32, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
 ]
+_ACCOUNT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
 
 
 class QuotaReportWindow(BaseModel):
@@ -76,6 +79,81 @@ def create_agent_quota_router(
         await asyncio.to_thread(
             service.report, owner, body.host_id, product, body.model_dump(), now=now
         )
+        return Response(status_code=204)
+
+    def require_usage() -> None:
+        if not service.usage_enabled:
+            raise HTTPException(404, "Not found")
+
+    async def reject_report(owner: str, account_id: str) -> None:
+        await asyncio.to_thread(service.note_rejected, owner, account_id)
+
+    @router.put(
+        "/me/usage/accounts/{account_id}",
+        status_code=204,
+        openapi_extra={
+            "requestBody": {
+                "required": True,
+                "content": {"application/json": {"schema": UsageReport.model_json_schema()}},
+            }
+        },
+    )
+    async def report_usage_account(request: Request, account_id: str) -> Response:
+        require_usage()
+        owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
+        if _ACCOUNT_ID.fullmatch(account_id) is None:
+            raise HTTPException(422, "Invalid usage account id")
+        try:
+            payload: Any = await request.json()
+            body = UsageReport.model_validate(payload)
+        except (ValueError, ValidationError):
+            await reject_report(owner, account_id)
+            raise HTTPException(422, "Invalid usage report") from None
+        now = time.time()
+        if not accept_snapshot(body.observed_at, now=now):
+            await reject_report(owner, account_id)
+            raise HTTPException(422, "observed_at must be within the last hour or 300s ahead")
+        products = {agent.key for agent in native_agents()}
+        if body.product is not None and body.product not in products:
+            await reject_report(owner, account_id)
+            raise HTTPException(422, "Unknown coding-agent product")
+        if body.host_id is not None:
+            try:
+                host = (
+                    await asyncio.to_thread(host_store.get_host, body.host_id)
+                    if host_store is not None
+                    else None
+                )
+            except (StatementError, ValueError):
+                host = None
+            if host is None or (auth_provider is not None and host.user_id != owner):
+                raise HTTPException(404, "Host not found")
+        try:
+            await asyncio.to_thread(service.report_account, owner, account_id, body, now=now)
+        except UsageAccountLimitError as exc:
+            raise HTTPException(409, str(exc)) from None
+        return Response(status_code=204)
+
+    @router.get("/me/usage", response_model=UsageOverview)
+    async def read_usage(request: Request) -> Response:
+        require_usage()
+        from fastapi.responses import JSONResponse
+
+        owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
+        overview = await asyncio.to_thread(service.overview, owner)
+        return JSONResponse(
+            overview.model_dump(mode="json"), headers={"Cache-Control": "private, no-store"}
+        )
+
+    @router.delete("/me/usage/accounts/{account_id}", status_code=204)
+    async def delete_usage_account(request: Request, account_id: str) -> Response:
+        require_usage()
+        owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
+        if _ACCOUNT_ID.fullmatch(account_id) is None:
+            raise HTTPException(422, "Invalid usage account id")
+        deleted = await asyncio.to_thread(service.delete_account, owner, account_id)
+        if not deleted:
+            raise HTTPException(404, "Usage account not found")
         return Response(status_code=204)
 
     @router.get("/sessions/{session_id}/agent-quota", include_in_schema=False)
