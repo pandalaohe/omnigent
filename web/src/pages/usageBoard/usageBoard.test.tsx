@@ -10,7 +10,11 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ServerInfo } from "@/lib/capabilities";
-import { DEFAULT_USAGE_CONTEXT_PREFERENCES } from "@/lib/usageContextPreferences";
+import type * as UsageBoardDataModule from "./usageBoardData";
+import {
+  DEFAULT_USAGE_CONTEXT_PREFERENCES,
+  type UsageBoardPreferences,
+} from "@/lib/usageContextPreferences";
 
 import { UsageBoardRoute } from "./UsageBoardRoute";
 import { usageBoardData } from "./usageBoardFixtures";
@@ -24,12 +28,12 @@ const mocks = vi.hoisted(() => ({
   board: {
     current: {
       enabled: true,
-      density: "std" as "std" | "mini",
+      density: "std",
       bands: [],
       windows: {},
       renewals: {},
       hidden: [],
-    },
+    } as UsageBoardPreferences,
   },
   collab: { current: undefined as unknown },
 }));
@@ -40,7 +44,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
 }));
 
 vi.mock("./usageBoardData", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("./usageBoardData")>()),
+  ...(await importOriginal<typeof UsageBoardDataModule>()),
   useUsageOverview: () => mocks.overview.current,
 }));
 
@@ -61,7 +65,7 @@ const SERVER_INFO = {
 
 const LOADED = { isPending: false, error: null, refetch: vi.fn(), data: { accounts: [] } };
 
-function renderRoute(view: "board" | "account" | "account_settings", path = "/usage/board") {
+function renderRoute(path = "/usage/board") {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={client}>
@@ -129,7 +133,7 @@ describe("formatting", () => {
 describe("board", () => {
   it("draws one tile per account with its ring, countdown and window name", async () => {
     mocks.overview.current = { ...LOADED, data: usageBoardData() };
-    renderRoute("board");
+    renderRoute();
     const tiles = await screen.findAllByTestId("usage-tile");
     expect(tiles.length).toBe(5);
     // The deciding window is the one on the tile: 5h, not the less urgent 7d.
@@ -143,7 +147,7 @@ describe("board", () => {
 
   it("shows a dashed ring and no figure for an account never read", async () => {
     mocks.overview.current = { ...LOADED, data: usageBoardData() };
-    renderRoute("board");
+    renderRoute();
     const tile = (await screen.findByText("Grok")).closest("[data-account]") as HTMLElement;
     const ring = within(tile as HTMLElement).getByTestId("usage-ring");
     expect(ring.getAttribute("data-state")).toBe("none");
@@ -153,7 +157,7 @@ describe("board", () => {
 
   it("dims an old reading and writes how long ago it was read", async () => {
     mocks.overview.current = { ...LOADED, data: usageBoardData() };
-    renderRoute("board");
+    renderRoute();
     const tile = (await screen.findByText("Claude")).closest("[data-account]") as HTMLElement;
     expect(within(tile).getByText("3 h")).toBeTruthy();
     const ring = within(tile).getByTestId("usage-ring");
@@ -165,7 +169,7 @@ describe("board", () => {
 
   it("renders a value-only window as a dashed ring with the figure, not a percent", async () => {
     mocks.overview.current = { ...LOADED, data: usageBoardData() };
-    renderRoute("board");
+    renderRoute();
     const tile = (await screen.findByText("LiteLLM")).closest("[data-account]") as HTMLElement;
     expect(within(tile).getByText("41 USD")).toBeTruthy();
     expect(within(tile).queryByText("%")).toBeNull();
@@ -173,7 +177,7 @@ describe("board", () => {
 
   it("takes a tap on a tile straight to the account's detail page", async () => {
     mocks.overview.current = { ...LOADED, data: usageBoardData() };
-    renderRoute("board");
+    renderRoute();
     const tile = (await screen.findByText("Codex")).closest("[data-account]") as HTMLElement;
     tile.click();
     await waitFor(() => {
@@ -185,7 +189,7 @@ describe("board", () => {
 
   it("keeps settings controls off the board and the detail page", async () => {
     mocks.overview.current = { ...LOADED, data: usageBoardData() };
-    renderRoute("board");
+    renderRoute();
     await screen.findAllByTestId("usage-tile");
     expect(screen.queryAllByRole("switch").length).toBe(0);
     expect(screen.queryAllByRole("radio").length).toBe(0);
@@ -194,44 +198,44 @@ describe("board", () => {
   it("leaves an account the user switched off off the board, keeping its page", async () => {
     mocks.overview.current = { ...LOADED, data: usageBoardData() };
     mocks.board.current = { ...mocks.board.current, hidden: ["codex"] };
-    renderRoute("board");
+    renderRoute();
     await screen.findAllByTestId("usage-tile");
     expect(screen.queryByText("Codex")).toBeNull();
     cleanup();
     // A bookmark to the account still resolves: the switch hides it from the
     // board, it does not delete its reading.
-    renderRoute("account", "/usage/board/codex");
+    renderRoute("/usage/board/codex");
     expect(await screen.findByRole("heading", { level: 1 })).toBeTruthy();
   });
 
   it("says an unknown account is gone rather than rendering an empty page", async () => {
     mocks.overview.current = { ...LOADED, data: usageBoardData() };
-    renderRoute("account", "/usage/board/nobody");
+    renderRoute("/usage/board/nobody");
     expect(await screen.findByText("This account is not on the board any more.")).toBeTruthy();
   });
 
   it("tells the visitor where the switch is when the module is off for them", () => {
     mocks.board.current = { ...mocks.board.current, enabled: false };
-    renderRoute("board");
+    renderRoute();
     expect(screen.getByText("Usage board is off")).toBeTruthy();
     expect(screen.getByText("Turn it on in Settings")).toBeTruthy();
   });
 
   it("says the deployment turned the module off rather than showing an empty board", () => {
     mocks.info.current = { usage_board_enabled: false } as unknown as ServerInfo;
-    renderRoute("board");
+    renderRoute();
     expect(screen.getByText("Usage board is off on this server")).toBeTruthy();
   });
 
   it("shows the loading state while the first read is in flight", () => {
     mocks.overview.current = { ...LOADED, isPending: true, data: undefined };
-    renderRoute("board");
+    renderRoute();
     expect(screen.getByText("Reading your usage…")).toBeTruthy();
   });
 
   it("reports a failed read instead of drawing an empty board", () => {
     mocks.overview.current = { ...LOADED, error: new Error("Usage read failed (500)") };
-    renderRoute("board");
+    renderRoute();
     expect(screen.getByText("Usage could not be read")).toBeTruthy();
     expect(screen.getByText("Usage read failed (500)")).toBeTruthy();
   });
@@ -239,14 +243,14 @@ describe("board", () => {
   it("renders a compact row with the same reading", async () => {
     mocks.overview.current = { ...LOADED, data: usageBoardData() };
     mocks.board.current = { ...mocks.board.current, density: "mini" };
-    renderRoute("board");
+    renderRoute();
     const tiles = await screen.findAllByTestId("usage-tile");
     expect(tiles[0].className).toContain("min-h-[54px]");
   });
 
   it("opens the account's settings without a control on the display page", async () => {
     mocks.overview.current = { ...LOADED, data: usageBoardData() };
-    renderRoute("account_settings", "/usage/board/codex/settings");
+    renderRoute("/usage/board/codex/settings");
     expect(await screen.findByRole("heading", { level: 1 })).toBeTruthy();
     // The preview tile and the two rows that apply at once; no Save button.
     expect(screen.queryAllByRole("switch").length).toBe(0);

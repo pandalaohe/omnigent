@@ -100,10 +100,10 @@ export function UsageRing({
             cy={50}
             r={44}
             fill="none"
-            stroke={window ? color : "var(--border)"}
+            stroke={window ? color : "var(--foreground)"}
             strokeWidth={3}
             strokeDasharray="6 6"
-            opacity={window ? 0.8 : 1}
+            opacity={window ? 0.8 : 0.42}
           />
         ) : (
           <>
@@ -133,7 +133,7 @@ export function UsageRing({
       </svg>
       <span className="relative flex flex-col items-center leading-none">
         {showName && window ? (
-          <span className="mb-0.5 max-w-[70%] truncate text-[10.5px] text-muted-foreground">
+          <span className="mb-0.5 max-w-[86%] truncate px-0.5 text-[10.5px] text-muted-foreground">
             {windowName(window)}
           </span>
         ) : null}
