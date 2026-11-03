@@ -5230,8 +5230,11 @@ async def _maybe_handle_turn_event(
                 defer_cb(session_id, edge)
             else:
                 await _post_turn_status_edge(
-                    client, session_id, edge,
-                    forwarder_state=forwarder_state, bridge_dir=bridge_dir,
+                    client,
+                    session_id,
+                    edge,
+                    forwarder_state=forwarder_state,
+                    bridge_dir=bridge_dir,
                 )
             await usage_coalescer.flush()
         return True
