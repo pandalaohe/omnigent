@@ -146,16 +146,20 @@ describe("ContextUsageSettings", () => {
   it("names the agents with their integration mark and shows the saved value in the cell", () => {
     store({ [usageContextLevelKey(source, "cell")]: value(300_000, 20_000) });
     renderSettings();
-    console.log("CELL:", cell("claude-claude-native", "host-a").outerHTML);
 
     const table = screen.getByRole("table", { name: "Saved context values" });
     expect(within(table).getByText("Claude Code")).toBeInTheDocument();
     expect(within(table).getByText("Codex")).toBeInTheDocument();
-    expect(cell("claude-claude-native", "host-a")).toHaveTextContent("300k · 20k");
+    expect(cell("claude-claude-native", "host-a")).toHaveTextContent("300k20k");
+    expect(cell("claude-claude-native", "host-a")).toHaveAccessibleName(
+      "Edit claude on Alpha: context 300000 tokens, compact buffer 20000 tokens, set here",
+    );
     expect(cell("claude-claude-native", "host-a").querySelector(".bg-pink-500")).not.toBeNull();
-    // A cell with nothing anywhere shows what the agent reports, in italics.
-    expect(cell("codex-codex", "host-a")).toHaveTextContent("Auto");
-    expect(cell("codex-codex", "host-a").querySelector(".italic")).not.toBeNull();
+    expect(cell("codex-codex", "host-a")).toHaveTextContent("––");
+    expect(cell("codex-codex", "host-a")).toHaveAccessibleName(
+      "Edit codex on Alpha: context Auto, compact buffer Auto",
+    );
+    expect(cell("codex-codex", "host-a")).not.toHaveTextContent("Auto");
   });
 
   it("shows the corner on a row with no value of its own anywhere", () => {
@@ -165,12 +169,10 @@ describe("ContextUsageSettings", () => {
     });
     renderSettings();
 
-    expect(cell("claude-claude-native", "host-a")).toHaveTextContent("550k · Auto");
-    // Inherited from a level above, so it carries the arrow and stays a button.
-    expect(cell("claude-claude-native", "host-a").querySelector("svg")).not.toBeNull();
+    expect(cell("claude-claude-native", "host-a")).toHaveTextContent("550k–");
     expect(cell("claude-claude-native", "host-a").querySelector(".bg-pink-500")).toBeNull();
     expect(screen.getByRole("button", { name: /Edit All agents, all hosts/ })).toHaveTextContent(
-      "550k · Auto",
+      "All550k–",
     );
   });
 
@@ -193,7 +195,15 @@ describe("ContextUsageSettings", () => {
     expect(
       readUsageContextPreferences().overrides[usageContextLevelKey(source, "cell")],
     ).toMatchObject({ contextWindowTokens: 300_000 });
-    expect(cell("claude-claude-native", "host-a")).toHaveTextContent("300k · Auto");
+    expect(cell("claude-claude-native", "host-a")).toHaveTextContent("300k–");
+
+    fireEvent.change(input, { target: { value: "123456" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(cell("claude-claude-native", "host-a")).toHaveTextContent("123456–");
+    expect(cell("claude-claude-native", "host-a")).not.toHaveTextContent("123.5k");
+    expect(cell("claude-claude-native", "host-a")).toHaveAccessibleName(
+      "Edit claude on Alpha: context 123456 tokens, compact buffer Auto, set here",
+    );
   });
 
   it("orders the cell after its own value, then the agent, then the computer, then all", () => {
@@ -206,15 +216,37 @@ describe("ContextUsageSettings", () => {
     ).toBeInTheDocument();
   });
 
-  it("counts the model values saved for one cell", () => {
+  it("counts the model values saved for one cell in a small frame", () => {
     store({
       [usageContextSourceKey({ ...source, hostId: "host-a", model: "claude-opus-5-5" })]:
         value(100_000),
       [usageContextSourceKey({ ...source, hostId: "host-a", model: "claude-sonnet-5" })]:
         value(200_000),
+      [usageContextSourceKey({ ...source, hostId: "host-a", model: "claude-haiku-5" })]:
+        value(300_000),
     });
     renderSettings();
-    expect(cell("claude-claude-native", "host-a")).toHaveTextContent("2 models");
+    expect(cell("claude-claude-native", "host-a")).toHaveTextContent("3M");
+    expect(cell("claude-claude-native", "host-a")).toHaveAccessibleName(
+      expect.stringContaining("3 saved model values"),
+    );
+  });
+
+  it("keeps a hand-entered percentage in the buffer frame", () => {
+    store({
+      [usageContextLevelKey(source, "cell")]: {
+        contextWindowTokens: 200_000,
+        autoCompactBufferTokens: null,
+        autoCompactBufferPercent: 12.5,
+        compactBufferMode: "percent",
+      },
+    });
+    renderSettings();
+
+    expect(cell("claude-claude-native", "host-a")).toHaveTextContent("200k12.5%");
+    expect(cell("claude-claude-native", "host-a")).toHaveAccessibleName(
+      "Edit claude on Alpha: context 200000 tokens, compact buffer 12.5%, set here",
+    );
   });
 
   it("marks a cell whose two headers disagree and names the winner", () => {
@@ -224,7 +256,7 @@ describe("ContextUsageSettings", () => {
     });
     renderSettings();
     expect(
-      within(cell("claude-claude-native", "host-a")).getByLabelText(
+      within(cell("claude-claude-native", "host-a").closest("td")!).getByLabelText(
         "Warning: Context total: Claude Code and Alpha differ; Claude Code wins.",
       ),
     ).toBeInTheDocument();
@@ -470,7 +502,7 @@ describe("ContextUsageSettings", () => {
     renderSettings();
 
     expect(
-      within(cell("claude-claude-native", "host-a")).getByLabelText(
+      within(cell("claude-claude-native", "host-a").closest("td")!).getByLabelText(
         "Warning: Compact buffer: Claude Code and Alpha differ; Alpha wins.",
       ),
     ).toBeInTheDocument();
@@ -495,7 +527,7 @@ describe("ContextUsageSettings", () => {
     mocks.contextWindow = 128_000;
     renderSettings();
 
-    expect(cell("claude-claude-native", "host-a")).toHaveTextContent("128k · Auto");
+    expect(cell("claude-claude-native", "host-a")).toHaveTextContent("128k–");
     expect(cell("claude-claude-native", "host-a").querySelector(".bg-pink-500")).toBeNull();
   });
 });

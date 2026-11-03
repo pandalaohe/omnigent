@@ -15,6 +15,7 @@ export interface LayeredEditorProps {
   trigger: ReactElement;
   title: string;
   children: ReactNode;
+  /** Controlled open state, for an editor the page opens without a click. */
   open?: boolean;
   from?: string;
   savedHere?: boolean;
@@ -25,8 +26,6 @@ export interface LayeredEditorProps {
   onClearBelow?: () => void;
   actions?: ReactNode;
   contentClassName?: string;
-  /** Controlled open state, for an editor the page opens without a click. */
-  open?: boolean;
   onOpenChange?: (open: boolean) => void;
 }
 
@@ -45,7 +44,6 @@ export function LayeredEditor({
   onClearBelow,
   actions,
   contentClassName,
-  open,
   onOpenChange,
 }: LayeredEditorProps) {
   return (

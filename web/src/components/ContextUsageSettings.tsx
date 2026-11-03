@@ -1,9 +1,13 @@
-import { ArrowUpIcon } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type ReactElement } from "react";
 
 import { AgentNameTag } from "@/components/AgentNameTag";
 import { LayeredEditor } from "@/components/LayeredEditor";
-import { LayeredTable, type LayeredCellLevel } from "@/components/LayeredTable";
+import {
+  LayeredChip,
+  LayeredOwn,
+  LayeredTable,
+  type LayeredCellLevel,
+} from "@/components/LayeredTable";
 import { SavedContextSources } from "@/components/SavedContextSources";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -124,18 +128,25 @@ function draftOf(override: UsageContextOverride | undefined): Draft {
   };
 }
 
-function bufferText(resolved: ResolvedUsageContext): string {
-  const value = resolved.buffer.value;
-  if (value === null) return "Auto";
-  return resolved.buffer.mode === "percent" ? `${value}%` : formatTokenCountShort(value);
+/** Compact only when the shorthand does not round away entered digits. */
+function contextTokenText(value: number): string {
+  const compact = formatTokenCountShort(value);
+  const divisor = { k: 1_000, m: 1_000_000, b: 1_000_000_000 }[compact.at(-1) ?? ""];
+  if (!divisor) return compact;
+  return Number(compact.slice(0, -1)) * divisor === value ? compact : String(value);
 }
 
-/** `Context · buffer` in the units the runtime uses, or null when nothing resolves. */
-function stateText(resolved: ResolvedUsageContext): string | null {
+function stateSummary(resolved: ResolvedUsageContext, mark: boolean, models = 0): string {
   const context = resolved.contextWindow.value;
   const buffer = resolved.buffer.value;
-  if (context === null && buffer === null) return null;
-  return `${context === null ? "Auto" : formatTokenCountShort(context)} · ${bufferText(resolved)}`;
+  return [
+    `context ${context === null ? "Auto" : `${context} tokens`}`,
+    `compact buffer ${buffer === null ? "Auto" : resolved.buffer.mode === "percent" ? `${buffer}%` : `${buffer} tokens`}`,
+    mark ? "set here" : "",
+    models > 0 ? `${models} saved model ${models === 1 ? "value" : "values"}` : "",
+  ]
+    .filter(Boolean)
+    .join(", ");
 }
 
 function agentRank(agent: AgentIdentity): number {
@@ -315,22 +326,51 @@ function dropRepeatedCellFields(
   );
 }
 
-function Mark() {
-  return <span aria-hidden="true" className="size-1.5 shrink-0 rounded-full bg-pink-500" />;
-}
-
-/** A cell or header state: set here, inherited from a level above, or the agent's own report. */
-function LevelState({ resolved, mark }: { resolved: ResolvedUsageContext; mark: boolean }) {
-  const text = stateText(resolved);
-  const reported =
-    resolved.contextWindow.level === "reported" && resolved.buffer.level === "reported";
-  if (reported) return <span className="italic text-muted-foreground">{text ?? "Auto"}</span>;
-  if (text === null) return <span className="italic text-muted-foreground">Auto</span>;
-  if (mark) return <span className="tabular-nums">{text}</span>;
+/** Fixed total/buffer slots; a blank mark slot keeps inherited values aligned. */
+function LevelState({
+  resolved,
+  mark,
+  models = 0,
+}: {
+  resolved: ResolvedUsageContext;
+  mark: boolean;
+  models?: number;
+}) {
+  const context = resolved.contextWindow.value;
+  const buffer = resolved.buffer.value;
+  const values = (
+    <span className="inline-flex items-center gap-1">
+      <span data-context-slot="total">
+        <LayeredChip tone="first" title={`Context total: ${context ?? "Auto"}`}>
+          {context === null ? "–" : contextTokenText(context)}
+        </LayeredChip>
+      </span>
+      <span data-context-slot="buffer">
+        <LayeredChip
+          tone="second"
+          title={`Compact buffer: ${buffer ?? "Auto"}${resolved.buffer.mode === "percent" && buffer !== null ? "%" : ""}`}
+        >
+          {buffer === null
+            ? "–"
+            : resolved.buffer.mode === "percent"
+              ? `${buffer}%`
+              : contextTokenText(buffer)}
+        </LayeredChip>
+      </span>
+      {models > 0 && (
+        <span data-context-slot="models">
+          <LayeredChip title={`${models} saved model ${models === 1 ? "value" : "values"}`}>
+            {models}M
+          </LayeredChip>
+        </span>
+      )}
+    </span>
+  );
+  if (mark) return <LayeredOwn>{values}</LayeredOwn>;
   return (
-    <span className="inline-flex min-w-0 items-center gap-1 tabular-nums text-muted-foreground">
-      <ArrowUpIcon aria-hidden="true" className="size-3 shrink-0" />
-      <span className="min-w-0">{text}</span>
+    <span className="inline-flex items-center gap-1.5">
+      <span aria-hidden="true" className="size-1.5 shrink-0" />
+      {values}
     </span>
   );
 }
@@ -504,6 +544,7 @@ export function ContextUsageSettings() {
   const navigate = useNavigate();
   const location = useLocation();
   const consumedRef = useRef<string | null>(null);
+  const focusEditorRef = useRef(false);
 
   const table = useMemo(() => {
     const live: AgentIdentity | null =
@@ -710,6 +751,7 @@ export function ContextUsageSettings() {
   };
 
   const openAt = (at: LayeredLevel, model: string | null) => {
+    focusEditorRef.current = true;
     setFocusModel(model);
     setOpenEditor(at);
   };
@@ -718,6 +760,7 @@ export function ContextUsageSettings() {
   const editorProps = (at: LayeredLevel) => ({
     open: sameLevel(openEditor, at),
     onOpenChange: (next: boolean) => {
+      focusEditorRef.current = false;
       if (next) setOpenEditor(at);
       else if (sameLevel(openEditor, at)) {
         setOpenEditor(null);
@@ -759,6 +802,8 @@ export function ContextUsageSettings() {
   // anchored past the viewport edge cannot be reached.
   useEffect(() => {
     if (!openEditor) return;
+    const focusFirstField = focusEditorRef.current;
+    focusEditorRef.current = false;
     const selector =
       openEditor.level === "corner"
         ? '[data-testid="layered-corner"]'
@@ -769,6 +814,8 @@ export function ContextUsageSettings() {
             : `[data-testid="layered-cell-${openEditor.row}-${openEditor.col}"]`;
     const timer = window.setTimeout(() => {
       document.querySelector(selector)?.scrollIntoView({ block: "center", inline: "center" });
+      if (focusFirstField)
+        document.querySelector<HTMLInputElement>('[data-pop][data-state="open"] input')?.focus();
     }, 0);
     return () => window.clearTimeout(timer);
   }, [openEditor]);
@@ -881,6 +928,27 @@ export function ContextUsageSettings() {
     );
   };
 
+  const savedSourcesTools = (
+    <SavedContextSources
+      preferences={preferences}
+      hosts={hosts}
+      registryItems={registry.items}
+      currentSourceKey={sessionKey}
+      initialSource={
+        liveAgentName && liveHarness
+          ? {
+              hostId: liveHostId ?? "",
+              agentName: liveAgentName,
+              harness: liveHarness,
+              model: "",
+            }
+          : rows[0]
+            ? { hostId: "", agentName: rows[0].name, harness: rows[0].harness, model: "" }
+            : null
+      }
+    />
+  );
+
   return (
     <div className="grid gap-5">
       <div className="flex items-start justify-between gap-6">
@@ -903,30 +971,6 @@ export function ContextUsageSettings() {
         />
       </div>
 
-      <div className="flex flex-wrap items-start justify-between gap-3 border-t border-border pt-4">
-        <p className="min-w-0 max-w-2xl text-sm text-muted-foreground">
-          Rules for every model, new ones included. A session's ring sets one model.
-        </p>
-        <SavedContextSources
-          preferences={preferences}
-          hosts={hosts}
-          registryItems={registry.items}
-          currentSourceKey={sessionKey}
-          initialSource={
-            liveAgentName && liveHarness
-              ? {
-                  hostId: liveHostId ?? "",
-                  agentName: liveAgentName,
-                  harness: liveHarness,
-                  model: "",
-                }
-              : rows[0]
-                ? { hostId: "", agentName: rows[0].name, harness: rows[0].harness, model: "" }
-                : null
-          }
-        />
-      </div>
-
       {missingSource ? (
         <p className="text-sm text-muted-foreground" data-testid="context-missing-source">
           This session's agent is not listed here.
@@ -936,13 +980,34 @@ export function ContextUsageSettings() {
       <LayeredTable
         label="Saved context values"
         testId="saved-context-sources"
+        className="border-t border-border pt-4"
         cornerLabel="All agents, all hosts"
-        cornerMark={markAt({ level: "corner" })}
+        cornerContent="All"
+        cornerSummary={stateSummary(resolveAt({ level: "corner" }), markAt({ level: "corner" }))}
         cornerDetail={
           <LevelState
             resolved={resolveAt({ level: "corner" })}
             mark={markAt({ level: "corner" })}
           />
+        }
+        note="Rules for every model, new ones included. A session's ring sets one model."
+        tools={savedSourcesTools}
+        legend={
+          <>
+            <span className="inline-flex items-center gap-1">
+              <LayeredChip tone="first">200k</LayeredChip>
+              context
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <LayeredChip tone="second">10%</LayeredChip>
+              buffer
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <LayeredChip>3M</LayeredChip>
+              saved models
+            </span>
+            <span>– Auto</span>
+          </>
         }
         rows={rows.map((row) => {
           const at: LayeredLevel = { level: "row", row: row.id };
@@ -957,7 +1022,7 @@ export function ContextUsageSettings() {
               />
             ),
             detail: <LevelState resolved={resolveAt(at)} mark={markAt(at)} />,
-            mark: markAt(at),
+            summary: stateSummary(resolveAt(at), markAt(at)),
           };
         })}
         columns={columns.map((column) => {
@@ -967,7 +1032,7 @@ export function ContextUsageSettings() {
             label: column.label,
             content: column.label,
             detail: <LevelState resolved={resolveAt(at)} mark={markAt(at)} />,
-            mark: markAt(at),
+            summary: stateSummary(resolveAt(at), markAt(at)),
           };
         })}
         renderCell={(rowId, colId) => {
@@ -988,17 +1053,8 @@ export function ContextUsageSettings() {
             );
           }).length;
           return {
-            content: (
-              <span className="flex min-w-0 flex-wrap items-center gap-x-1.5">
-                <LevelState resolved={resolveAt(at)} mark={markAt(at)} />
-                {models > 0 ? (
-                  <span className="rounded-full bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
-                    {models} {models === 1 ? "model" : "models"}
-                  </span>
-                ) : null}
-              </span>
-            ),
-            mark: markAt(at),
+            content: <LevelState resolved={resolveAt(at)} mark={markAt(at)} models={models} />,
+            summary: stateSummary(resolveAt(at), markAt(at), models),
             clash: cellClash(source, column, preferences, agentLabelOf),
           };
         }}
@@ -1032,19 +1088,6 @@ export function ContextUsageSettings() {
         }}
         selectionActions={renderSelectionActions}
       />
-
-      <p className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-muted-foreground">
-        <span className="inline-flex items-center gap-1">
-          <ArrowUpIcon aria-hidden="true" className="size-3" />
-          From a level above
-        </span>
-        <span className="inline-flex items-center gap-1">
-          <Mark />
-          Set here
-        </span>
-        <span className="italic">Auto</span>
-        <span>Context · buffer, in tokens</span>
-      </p>
     </div>
   );
 }
