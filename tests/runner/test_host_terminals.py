@@ -38,6 +38,7 @@ class _RecordingTerminalRegistry:
         pass
 
 
+@pytest.mark.posix_only
 def test_standalone_posix_host_shell_spec_stays_a_login_shell(tmp_path: Path) -> None:
     """The actual standalone host spec launches POSIX shells with ``-l``."""
     registry = _RecordingTerminalRegistry()
@@ -47,6 +48,20 @@ def test_standalone_posix_host_shell_spec_stays_a_login_shell(tmp_path: Path) ->
         assert response.status_code == 201, response.text
     assert len(registry.specs) == 1
     assert registry.specs[0].args == ["-l"]
+
+
+def test_standalone_explicit_empty_inventory_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An explicit empty inventory must not rediscover a host shell."""
+    monkeypatch.setattr(
+        "omnigent.runner.host_terminals.installed_interactive_shells",
+        Mock(side_effect=AssertionError("unexpected inventory discovery")),
+    )
+    with pytest.raises(ValueError, match="inventory is empty"):
+        create_host_terminal_app(
+            home=tmp_path, shells=[], terminal_registry=_RecordingTerminalRegistry()
+        )
 
 
 def test_standalone_windows_powershell_spec_suppresses_banner(

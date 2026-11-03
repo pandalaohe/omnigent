@@ -223,6 +223,7 @@ def test_windows_terminal_support_keeps_an_empty_inventory_empty(
     assert host._host_terminals_supported() is False
 
 
+@pytest.mark.posix_only
 def test_posix_terminal_support_still_requires_tmux_and_inventory(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

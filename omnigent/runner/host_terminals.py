@@ -37,6 +37,8 @@ def create_host_terminal_app(
     created: dict[str, int] = {}
     idle_since = time.monotonic()
     mutations = 0
+    if shells is not None and not shells:
+        raise ValueError("host shell inventory is empty")
     shell = (shells or installed_interactive_shells())[0]
     base_spec = native_shell_terminal_specs([shell])[shell]
     if base_spec.os_env is None or isinstance(base_spec.os_env, str):
