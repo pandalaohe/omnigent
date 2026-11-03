@@ -9859,19 +9859,22 @@ async def _auto_create_claude_terminal(
             )
     if rekeyed and rebind_bridge is not None:
         await rebind_bridge(session_id, bridge_id)
-    # Capture the previous claude_session_id from the bridge state file BEFORE
-    # prepare_bridge_dir unlinks it. read_claude_session_id reads _STATE_FILE,
-    # which prepare_bridge_dir removes as part of its refresh; reading it here
-    # lets the cold-resume fallback below use it when the server GET missed the
-    # external_session_id binding (e.g. workspace-scope ContextVar not set).
+    # Read the transcript binding before prepare_bridge_dir wipes it. A
+    # current-owned bridge can be newer than the server after /clear; a
+    # successor-owned bridge must not rebind this session.
     from omnigent.harnesses.claude_native.bridge import (
         bridge_dir_for_bridge_id as _bridge_dir_for_bridge_id,
+    )
+    from omnigent.harnesses.claude_native.bridge import (
+        read_active_session_id as _read_active_sid_pre_wipe,
     )
     from omnigent.harnesses.claude_native.bridge import (
         read_claude_session_id as _read_csid_pre_wipe,
     )
 
-    _pre_wipe_claude_sid = _read_csid_pre_wipe(_bridge_dir_for_bridge_id(bridge_id))
+    _pre_wipe_bridge_dir = _bridge_dir_for_bridge_id(bridge_id)
+    _pre_wipe_claude_sid = _read_csid_pre_wipe(_pre_wipe_bridge_dir)
+    _pre_wipe_bridge_is_current = _read_active_sid_pre_wipe(_pre_wipe_bridge_dir) == session_id
     # Resolved once here and reused below (env_spec) so the bridge's own
     # sys_os_* tools and the terminal process see the same sandbox — the
     # agent's declared os_env.sandbox, already overridden by any
@@ -9932,6 +9935,8 @@ async def _auto_create_claude_terminal(
     session_model_override = launch_metadata.model_override
     session_launch_args = launch_metadata.terminal_launch_args
     session_external_id = launch_metadata.external_session_id
+    if _pre_wipe_bridge_is_current and _pre_wipe_claude_sid is not None:
+        session_external_id = _pre_wipe_claude_sid
     fork_source_external_id = launch_metadata.fork_source_external_id
     fork_carry_history = launch_metadata.fork_carry_history
 

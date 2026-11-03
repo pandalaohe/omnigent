@@ -3874,19 +3874,33 @@ async def test_auto_create_claude_fork_preserves_history_in_another_workspace(
         assert source_path.read_text(encoding="utf-8") == source_text + "\n"
 
 
+@pytest.mark.parametrize(
+    ("server_claude_sid", "current_bridge", "expect_server_sid"),
+    [
+        (None, True, False),
+        ("02857840-6362-408f-b41f-309e396ed7c6", True, False),
+        ("02857840-6362-408f-b41f-309e396ed7c6", False, True),
+    ],
+    ids=[
+        "missing-server-binding",
+        "current-bridge-newer-than-server",
+        "foreign-bridge-does-not-override",
+    ],
+)
 @pytest.mark.asyncio
-async def test_auto_create_claude_terminal_cold_resume_fallback_uses_pre_wipe_bridge_sid(
+async def test_auto_create_claude_terminal_cold_resume_selects_current_bridge_sid(
+    server_claude_sid: str | None,
+    current_bridge: bool,
+    expect_server_sid: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Fallback fires when server GET omits external_session_id but local bridge has it.
+    """Only the current session's pre-wipe bridge sid overrides its server id.
 
-    Simulates the workspace-scope miss (ES-2065116): the server snapshot
-    returns no external_session_id, but the bridge state.json from the
-    previous launch holds a claude_session_id. The runner must read it
-    *before* prepare_bridge_dir wipes the file and use it as the resume
-    hint, so _ensure_local_claude_resume_transcript is called with the
-    local sid and --resume is passed.
+    The server snapshot may omit external_session_id or retain the id from
+    before ``/clear``. When the bridge config still belongs to this session,
+    its state.json identifies the transcript live at shutdown. A successor's
+    bridge must not rebind the superseded session to its own new transcript.
     """
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
@@ -3903,6 +3917,16 @@ async def test_auto_create_claude_terminal_cold_resume_fallback_uses_pre_wipe_br
     pre_bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     (pre_bridge_dir / "state.json").write_text(
         json.dumps({"claude_session_id": prior_claude_sid}), encoding="utf-8"
+    )
+    (pre_bridge_dir / "bridge.json").write_text(
+        json.dumps(
+            {
+                "active_session_id": (
+                    session_id if current_bridge else "16b56b3db496417b4413c44e9a7a6478"
+                )
+            }
+        ),
+        encoding="utf-8",
     )
 
     synth_calls: list[str] = []
@@ -3942,7 +3966,10 @@ async def test_auto_create_claude_terminal_cold_resume_fallback_uses_pre_wipe_br
     )
 
     class _NullBindingServerClient(NullServerClient):
-        """Server client whose session snapshot omits external_session_id."""
+        """Server client with a missing or stale external_session_id."""
+
+        def __init__(self, external_session_id: str | None) -> None:
+            self._external_session_id = external_session_id
 
         async def get(self, url: str, **kwargs: Any) -> NullServerClient._Response:
             del kwargs
@@ -3954,10 +3981,15 @@ async def test_auto_create_claude_terminal_cold_resume_fallback_uses_pre_wipe_br
 
                 return _LabelsResponse()
 
-            # Session snapshot has no external_session_id (workspace-scope miss).
+            snapshot = (
+                {}
+                if self._external_session_id is None
+                else {"external_session_id": self._external_session_id}
+            )
+
             class _SnapResponse(NullServerClient._Response):
                 def json(self) -> dict[str, Any]:
-                    return {}
+                    return snapshot
 
             return _SnapResponse()
 
@@ -3987,17 +4019,16 @@ async def test_auto_create_claude_terminal_cold_resume_fallback_uses_pre_wipe_br
         session_id,
         _FakeResourceRegistry(),
         lambda _sid, _evt: None,
-        server_client=_NullBindingServerClient(),  # type: ignore[arg-type]
+        server_client=_NullBindingServerClient(server_claude_sid),  # type: ignore[arg-type]
     )
 
     await asyncio.sleep(0)
 
-    # The fallback must have fired: synthesis is called with the local bridge
-    # sid, not skipped (which would leave the user with no context).
-    assert synth_calls == [prior_claude_sid], (
-        f"Expected synthesis with prior claude sid {prior_claude_sid!r}; "
-        f"got {synth_calls!r}. The fallback may be reading the bridge dir "
-        "after prepare_bridge_dir already wiped state.json."
+    expected_resume_sid = server_claude_sid if expect_server_sid else prior_claude_sid
+    assert synth_calls == [expected_resume_sid], (
+        f"Expected synthesis with resume sid {expected_resume_sid!r}; "
+        f"got {synth_calls!r}. A current bridge must supply the transcript "
+        "live at shutdown without letting a foreign bridge rebind this session."
     )
     # The forwarder must start past the replayed transcript (same as a
     # normal cold resume where the server returned the binding directly).
