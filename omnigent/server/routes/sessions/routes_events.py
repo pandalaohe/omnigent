@@ -1906,36 +1906,42 @@ def register_events_routes(
                 permission_store,
                 target_id=session_id,
             )
-            from omnigent.server.session_orchestration import (
-                orchestration_message,
-                orchestration_peer_acknowledgement,
-            )
-            from omnigent.server.user_preferences_store import read_collab_settings
+            from omnigent.server.session_orchestration import orchestration_message
 
             message = body.data.get("message")
-            orchestration_message(source.id, message)
+            ordinary_message = orchestration_message(source.id, message)
             assert isinstance(message, str)
-            # Re-address before durable admission: retrying after a peer record
-            # exists would collide with its duplicate and delivery fences.
-            if await _get_runner_client(session_id, runner_router) is None:
-                await _raise_if_runner_on_another_replica(
-                    conv, request.app.state, conversation_store
+            flags = feature_flags if feature_flags is not None else resolve_feature_flags()
+            if flags.enabled(Feature.SESSION_PEER_MESSAGING):
+                from omnigent.server.session_orchestration import (
+                    orchestration_peer_acknowledgement,
                 )
-            settings = await asyncio.to_thread(
-                read_collab_settings,
-                getattr(request.app.state, "user_preferences_store", None),
-                user_id,
-            )
-            result = await peer.send(
-                sender=source,
-                receiver_id=session_id,
-                text=message,
-                correlation_id=None,
-                wait_seconds=settings.undelivered_ttl_s,
-                require_init_success=require_init_success,
-                request=request,
-            )
-            return cast(dict[str, bool | str | None], orchestration_peer_acknowledgement(result))
+                from omnigent.server.user_preferences_store import read_collab_settings
+
+                # Re-address before durable admission: retrying after a peer record
+                # exists would collide with its duplicate and delivery fences.
+                if await _get_runner_client(session_id, runner_router) is None:
+                    await _raise_if_runner_on_another_replica(
+                        conv, request.app.state, conversation_store
+                    )
+                settings = await asyncio.to_thread(
+                    read_collab_settings,
+                    getattr(request.app.state, "user_preferences_store", None),
+                    user_id,
+                )
+                result = await peer.send(
+                    sender=source,
+                    receiver_id=session_id,
+                    text=message,
+                    correlation_id=None,
+                    wait_seconds=settings.undelivered_ttl_s,
+                    require_init_success=require_init_success,
+                    request=request,
+                )
+                return cast(
+                    dict[str, bool | str | None], orchestration_peer_acknowledgement(result)
+                )
+            body = ordinary_message
         # Inline peer delivery re-enters here with an ordinary message. Keep
         # upstream's source checks around runner startup and before persistence.
         peer_message = trusted_peer and ORCHESTRATION_SOURCE_HEADER in request.headers
