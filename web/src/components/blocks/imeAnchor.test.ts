@@ -7,7 +7,6 @@ import {
   findInverseCell,
   findRowContentEnd,
   resolveFallbackAnchor,
-  resolveImeAnchor,
 } from "./imeAnchor";
 
 type CellMark = "inv" | "norm";
@@ -105,24 +104,6 @@ describe("findInverseCell (scan order and isolation)", () => {
   });
 });
 
-describe("resolveImeAnchor (heuristic vs hardware fallback)", () => {
-  it("reports heuristic with the inverse-cell coords when found", () => {
-    expect(resolveImeAnchor({ col: 3, row: 1 }, { col: 9, row: 2 })).toEqual({
-      source: "heuristic",
-      col: 3,
-      row: 1,
-    });
-  });
-
-  it("falls back to the hardware cursor when no inverse cell exists", () => {
-    expect(resolveImeAnchor(null, { col: 9, row: 2 })).toEqual({
-      source: "hardware",
-      col: 9,
-      row: 2,
-    });
-  });
-});
-
 describe("findRowContentEnd (exclusive content-end column)", () => {
   it("returns the column after the last visible cell", () => {
     const line = fakeLine([">", " ", "l", "s", " ", " "]);
@@ -152,7 +133,6 @@ describe("resolveFallbackAnchor (ConPTY-parked cursor heuristic, swept caret)", 
   ) => ({
     cols: opts.cols ?? 80,
     rows: opts.rows ?? 10,
-    viewportY: 0,
     hardwareCursor: { col: opts.col ?? 79, row: opts.row ?? 2 },
     lineAt: () => (line ? fakeLine(line) : undefined),
   });
@@ -374,6 +354,55 @@ describe("attachImeHeuristic (DOM integration)", () => {
     expect(textarea.style.getPropertyPriority("left")).toBe("important");
     expect(compositionView.style.getPropertyValue("left")).toBe("48px");
     expect(compositionView.style.getPropertyValue("top")).toBe("20px");
+  });
+
+  it("follows content-end renders while ConPTY keeps sweeping away the caret", () => {
+    const { terminal, textarea, compositionView, setLine, fireRender } = setup({
+      lines: [[">", " ", "a", "norm", "norm", "norm", "norm", "norm", "norm", "norm"]],
+      cursorX: 9,
+      cursorY: 0,
+      cellW: 8,
+    });
+    const attached = attachImeHeuristic(terminal as unknown as Terminal);
+    try {
+      textarea.dispatchEvent(new Event("compositionstart"));
+      expect(textarea.style.left).toBe("24px");
+      expect(compositionView.style.left).toBe("24px");
+      setLine(0, [">", " ", "a", "b", "c", "norm", "norm", "norm", "norm", "norm"]);
+      fireRender();
+      expect(textarea.style.left).toBe("40px");
+      expect(compositionView.style.left).toBe("40px");
+
+      // A visible inverse caret now owns the same position, then briefly disappears.
+      setLine(0, [">", " ", "a", "b", "c", "inv", "norm", "norm", "norm", "norm"]);
+      fireRender();
+      setLine(0, [">", "norm", "norm", "norm", "norm", "norm", "norm", "norm", "norm", "norm"]);
+      fireRender();
+      expect(textarea.style.left).toBe("40px");
+      expect(compositionView.style.left).toBe("40px");
+    } finally {
+      attached.detach();
+    }
+  });
+
+  it("releases the content-end pin when the hardware cursor returns to the input", () => {
+    const { terminal, textarea, compositionView, buffer, fireRender } = setup({
+      lines: [[">", " ", "a", "norm", "norm", "norm", "norm", "norm", "norm", "norm"]],
+      cursorX: 9,
+      cursorY: 0,
+      cellW: 8,
+    });
+    const attached = attachImeHeuristic(terminal as unknown as Terminal);
+    try {
+      textarea.dispatchEvent(new Event("compositionstart"));
+      expect(textarea.style.left).toBe("24px");
+      buffer.cursorX = 3;
+      fireRender();
+      expect(textarea.style.left).toBe("");
+      expect(compositionView.style.left).toBe("");
+    } finally {
+      attached.detach();
+    }
   });
 
   it("anchors at the row start when the parked row is entirely blank (swept caret)", () => {

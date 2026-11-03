@@ -65,14 +65,6 @@ export function findInverseCell(
   return null;
 }
 
-export function resolveImeAnchor(
-  hit: { col: number; row: number } | null,
-  hardwareCursor: { col: number; row: number },
-): ImeAnchor {
-  if (!hit) return { source: "hardware", col: hardwareCursor.col, row: hardwareCursor.row };
-  return { source: "heuristic", col: hit.col, row: hit.row };
-}
-
 export function findRowContentEnd(line: ImeBufferLineLike | undefined): number | null {
   if (!line) return null;
   for (let x = line.length - 1; x >= 0; x--) {
@@ -91,7 +83,6 @@ export function findRowContentEnd(line: ImeBufferLineLike | undefined): number |
 export interface AnchorFallbackContext {
   cols: number;
   rows: number;
-  viewportY: number;
   hardwareCursor: { col: number; row: number };
   lineAt: (viewportRow: number) => ImeBufferLineLike | undefined;
 }
@@ -156,7 +147,7 @@ export function attachImeHeuristic(terminal: Terminal, options: AttachOptions = 
   }
 
   let composing = false;
-  let pinned: { left: string; top: string } | null = null;
+  let pinned: { left: string; top: string; source: ImeAnchorSource } | null = null;
   let renderDisposable: { dispose: () => void } | null = null;
 
   const reapply = (el: HTMLElement) => {
@@ -174,15 +165,30 @@ export function attachImeHeuristic(terminal: Terminal, options: AttachOptions = 
     return computeCellSize(screen, terminal.cols, terminal.rows, rc ?? undefined);
   };
 
-  function pin(anchor: ImeAnchor) {
+  function releasePin() {
+    if (!pinned) return;
+    for (const element of [textarea!, compositionView!]) {
+      element.style.removeProperty("left");
+      element.style.removeProperty("top");
+    }
+    pinned = null;
+  }
+
+  function applyAnchor(anchor: ImeAnchor) {
+    if (anchor.source === "hardware") {
+      releasePin();
+      onAnchor?.(anchor);
+      return;
+    }
     const { w, h } = cellSize();
     const col = Math.min(Math.max(anchor.col, 0), terminal.cols - 1);
     const row = Math.min(Math.max(anchor.row, 0), terminal.rows - 1);
     const left = `${Math.round(col * w)}px`;
     const top = `${Math.round(row * h)}px`;
-    if (pinned && pinned.left === left && pinned.top === top) return;
+    if (pinned && pinned.left === left && pinned.top === top && pinned.source === anchor.source)
+      return;
 
-    pinned = { left, top };
+    pinned = { left, top, source: anchor.source };
     textarea!.style.setProperty("left", left, "important");
     textarea!.style.setProperty("top", top, "important");
     compositionView!.style.setProperty("left", left, "important");
@@ -195,19 +201,19 @@ export function attachImeHeuristic(terminal: Terminal, options: AttachOptions = 
     if (!composing) return;
 
     const hit = findInverseCell(terminal.buffer.active, terminal.rows, requireIsolatedCell);
-    if (!hit) {
-      return;
+    if (hit) {
+      applyAnchor({ source: "heuristic", col: hit.col, row: hit.row });
+    } else if (pinned?.source === "contentEnd") {
+      // Inverse carets can disappear during redraw; only content-end pins follow the fallback.
+      applyAnchor(resolveCursorAnchor());
     }
-
-    pin({ source: "heuristic", col: hit.col, row: hit.row });
   }
 
-  function resolveStartAnchor(): ImeAnchor {
+  function resolveCursorAnchor(): ImeAnchor {
     const buffer = terminal.buffer.active;
     const fallback = resolveFallbackAnchor({
       cols: terminal.cols,
       rows: terminal.rows,
-      viewportY: buffer.viewportY,
       hardwareCursor: { col: buffer.cursorX, row: buffer.cursorY },
       lineAt: (row) => buffer.getLine(buffer.viewportY + row),
     });
@@ -218,30 +224,14 @@ export function attachImeHeuristic(terminal: Terminal, options: AttachOptions = 
     composing = true;
 
     const hit = findInverseCell(terminal.buffer.active, terminal.rows, requireIsolatedCell);
-    if (hit) {
-      recomputeAndPin();
-    } else {
-      const anchor = resolveStartAnchor();
-      if (anchor.source === "hardware") {
-        pinned = null;
-        onAnchor?.(anchor);
-      } else {
-        pin(anchor);
-      }
-    }
+    applyAnchor(hit ? { source: "heuristic", ...hit } : resolveCursorAnchor());
 
     renderDisposable = terminal.onRender(() => recomputeAndPin());
   }
 
   function onCompositionEnd() {
     composing = false;
-    if (pinned) {
-      for (const element of [textarea!, compositionView!]) {
-        element.style.removeProperty("left");
-        element.style.removeProperty("top");
-      }
-    }
-    pinned = null;
+    releasePin();
     renderDisposable?.dispose();
     renderDisposable = null;
   }
