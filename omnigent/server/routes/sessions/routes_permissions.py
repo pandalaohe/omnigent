@@ -18,7 +18,6 @@ from omnigent.entities import (
     Agent,
 )
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.native.native_coding_agents import native_coding_agent_for_agent_name
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server._elicitation_registry import (
@@ -69,6 +68,7 @@ from omnigent.spec.types import (
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.terminals.user_shells import user_shell_terminals
 
 
 class _PermissionListResponse(TypedDict):
@@ -402,8 +402,9 @@ def _to_agent_object(
 
     :param agent: The runtime agent entity.
     :param cache: Agent cache, or ``None`` in test setups.
-    :param terminals_override: Selected host's shell inventory. Applied only
-        when the loaded spec is a recognized native wrapper.
+    :param terminals_override: Selected host's shell inventory: it replaces a
+        native wrapper's portable declarations and is added when the spec
+        declares none.
     :param mcp_selection: Session MCP selection labels, when called for a session.
     :param mcp_registry_editable: Whether the caller can change session MCP selections.
     :param mcp_servers_editable: Whether the authenticated caller may mutate
@@ -430,13 +431,11 @@ def _to_agent_object(
             harness = loaded.spec.executor.harness_kind
             if description is None:
                 description = loaded.spec.description
-            # Declared terminal names, in spec order — the Web UI
-            # gates its "new terminal" affordance on this list.
-            terminals = (
-                list(terminals_override)
-                if terminals_override is not None
-                and native_coding_agent_for_agent_name(loaded.spec.name) is not None
-                else list(loaded.spec.terminals or {})
+            # Terminal names a user may open, in offer order: the declared
+            # ``terminals:``, or the default user shell when the spec declares
+            # none. The Web UI gates its "new terminal" affordance on this list.
+            terminals = list(
+                user_shell_terminals(loaded.spec, host_shells=terminals_override or ())
             )
             # Bundled suggestions stay available while the host catalog loads.
             skills = [

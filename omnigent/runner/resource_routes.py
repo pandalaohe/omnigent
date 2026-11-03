@@ -76,6 +76,7 @@ from omnigent.runner.session_runtime_lifecycle import (
 from omnigent.runner.startup_admission import StartupAdmission
 from omnigent.spec.types import AgentSpec
 from omnigent.terminals.conpty_bridge import bridge_terminal_to_websocket
+from omnigent.terminals.user_shells import user_shell_terminals
 from omnigent.terminals.ws_common import WS_CLOSE_TERMINAL_NOT_FOUND
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -748,11 +749,15 @@ def register_resource_routes(
         agent_spec = await _resolve_session_agent_spec(session_id)
         agent_os_env = getattr(agent_spec, "os_env", None) if agent_spec is not None else None
 
-        declared_terminal = None
-        terminals_map = {}
-        if agent_spec is not None:
-            terminals_map = getattr(agent_spec, "terminals", None) or {}
-            declared_terminal = terminals_map.get(terminal_name)
+        from omnigent.runner._entry import _host_interactive_shells_from_env
+
+        # The declared ``terminals:``, plus this host's shells for a user shell
+        # it can actually run. The spec's own block is untouched, so the agent
+        # gains no ``sys_terminal_*`` tool from the host inventory.
+        terminals_map = user_shell_terminals(
+            agent_spec, host_shells=_host_interactive_shells_from_env() or ()
+        )
+        declared_terminal = terminals_map.get(terminal_name)
 
         if (
             declared_terminal is None

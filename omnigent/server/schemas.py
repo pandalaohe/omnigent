@@ -531,14 +531,15 @@ class AgentObject(BaseModel):
         when given ``session_id``, merges the session's bundled skills.
         Empty list when the spec
         bundles no skills or when the bundle cannot be loaded.
-    :param terminals: Terminal names declared in the spec's
-        ``terminals:`` block, in declaration order, e.g.
-        ``["shell"]``. The Web UI gates its "new terminal"
-        affordance on this list (creation is only offered for
-        agents with terminal access) and offers these names as
-        the launchable choices. Empty list when the spec
-        declares no terminals or when the bundle cannot be
-        loaded.
+    :param terminals: Terminal names a user may open for this
+        agent, in offer order, as ``omnigent.terminals.user_shells``
+        resolves them: the spec's declared ``terminals:``
+        (e.g. ``["shell"]``), the session host's shells when the
+        caller resolves a host-bound session, or the default shell
+        (``["bash"]``) when neither yields a name. The Web UI gates
+        its "new terminal" affordance on this list and offers these
+        names as the launchable choices. Empty list when the bundle
+        cannot be loaded.
     :param members: Roster projected from the bundle: the lead
         (root spec) first, then each sub-agent, each as
         ``{name, description, harness, model, reasoning_effort,

@@ -19,7 +19,6 @@ from fastapi.responses import Response
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCode, OmnigentError
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.mcp_selection import MCP_SELECTION_HEADER, MCP_SELECTION_PREFIX, selected_mcp_spec
-from omnigent.native.native_coding_agents import native_coding_agent_for_agent_name
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
@@ -88,6 +87,7 @@ from omnigent.server.schemas import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.terminals.user_shells import session_offers_host_shells
 
 
 def register_agent_routes(
@@ -155,14 +155,13 @@ def register_agent_routes(
         if (
             conv.host_id is not None
             and host_registry is not None
-            and native_coding_agent_for_agent_name(agent.name) is not None
+            and session_offers_host_shells(agent.name, conv.host_id)
         ):
-            normalized = host_interactive_shells_for_request(
+            terminals_override = host_interactive_shells_for_request(
                 conv.host_id,
                 host_registry=host_registry,
                 runner_router=runner_router or get_server_runner_router(),
             )
-            terminals_override = normalized or None
         result = await asyncio.to_thread(
             _to_agent_object,
             agent,
