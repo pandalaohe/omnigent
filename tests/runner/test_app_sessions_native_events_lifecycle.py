@@ -1712,6 +1712,7 @@ async def test_codex_native_model_options_query_model_list(
         "route-added",
         "route-same",
         "legacy-home",
+        "legacy-home-routed",
     ],
 )
 async def test_codex_model_catalog_writeback_uses_session_provider(
@@ -1730,7 +1731,7 @@ async def test_codex_model_catalog_writeback_uses_session_provider(
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     route_file = tmp_path / ".codex-route" / "current.toml"
     route_file.parent.mkdir()
-    if case in {"route-changed", "route-removed", "route-same"}:
+    if case in {"route-changed", "route-removed", "route-same", "legacy-home-routed"}:
         route_file.write_text(
             'model_provider = "custom"\n[model_providers.custom]\n'
             'name = "Gateway"\nbase_url = "https://route-a.example/v1"\n'
@@ -1788,7 +1789,7 @@ async def test_codex_model_catalog_writeback_uses_session_provider(
     source = tmp_path / "source"
     source.mkdir()
     (source / "config.toml").write_text('model = "second-picker"\n')
-    if case == "legacy-home":
+    if case in {"legacy-home", "legacy-home-routed"}:
         (codex_home / "config.toml").write_text('model = "second-picker"\n')
     _populate_codex_home_config(codex_home, source, minimal_config=False)
     if case in {"route-changed", "route-added"}:
@@ -1870,7 +1871,8 @@ async def test_codex_model_catalog_writeback_uses_session_provider(
             for provider in ("default", "other"):
                 expected = (
                     live_rows
-                    if provider == profile and case in {"default", "other", "route-same"}
+                    if provider == profile
+                    and case in {"default", "other", "route-same", "legacy-home"}
                     else catalogs[provider]
                 )
                 assert (

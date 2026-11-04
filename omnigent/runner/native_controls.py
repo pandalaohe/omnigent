@@ -1265,9 +1265,12 @@ def build_native_controls(
                 return
             launch = await asyncio.to_thread(resolve_native_codex_launch, model=None, spec=spec)
             fingerprint = codex_catalog_fingerprint(launch)
-            # Older private homes have no route record; their live rows cannot
-            # safely identify the host's current shared catalog.
-            route_identity = (codex_home / _CODEX_HOME_ROUTE_RECORD).read_text(encoding="utf-8")
+            try:
+                route_identity = (codex_home / _CODEX_HOME_ROUTE_RECORD).read_text(
+                    encoding="utf-8"
+                )
+            except FileNotFoundError:
+                route_identity = "none"
             if route_identity != (_codex_current_route_identity() or "none"):
                 return
             stored = model_catalog_store.read_catalog("codex-native", fingerprint)
