@@ -1,4 +1,5 @@
 import { useLoadedConversations } from "@/hooks/useSidebarData";
+import { NewChatChoiceNotice } from "@/pages/settings/sessionChoice/NewChatChoiceNotice";
 import { useComposerContext } from "@/hooks/useComposerContext";
 import { useSlashCompletion } from "@/hooks/useSlashCompletion";
 import { useMcpRegistrySelection } from "@/hooks/useMcpRegistry";
@@ -8778,6 +8779,12 @@ export function NewChatLandingScreen() {
           />
         </fieldset>
         <div className="mt-1 flex w-full flex-col gap-1" data-testid="new-chat-landing-notices">
+          <NewChatChoiceNotice
+            host={selectedHostId}
+            agent={effectiveAgentId}
+            model={pickedModel}
+            enabled={!sandboxSelected && !autoRoutingSelected}
+          />
           {selectedNativeHarness === "antigravity-native" && !autoRoutingSelected && (
             <p role="note" className="text-xs text-muted-foreground">
               {AGY_RESTRICTED_HOOK_RULE}

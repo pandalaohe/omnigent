@@ -931,6 +931,7 @@ class AgentQuotaService:
             freshness=freshness,
             period=period_view,
             windows=window_views,
+            models=(record.get("report") or {}).get("models") or [],
         )
 
     @staticmethod

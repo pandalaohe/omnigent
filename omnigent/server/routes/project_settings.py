@@ -87,9 +87,15 @@ class _ProjectStandingApprovalPatch(BaseModel):
     exceptions: Annotated[list[_PassString], Field(max_length=5)] | None = None
 
 
+class _ProjectChoicePin(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    pin: Annotated[StrictStr, Field(min_length=1, max_length=32)]
+
+
 class _OrchestrationPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
     child_cap: Annotated[StrictInt, Field(gt=0)] | Literal["none"] | None = None
+    session_choice: Literal["off"] | _ProjectChoicePin | None = None
     standing_approval: _ProjectStandingApprovalPatch = Field(
         default_factory=_ProjectStandingApprovalPatch,
         validation_alias=AliasChoices("standing_approval", "standing_pass"),
@@ -164,6 +170,16 @@ def _apply_patch(config: dict[str, Any], body: _SettingsPatch) -> tuple[dict[str
             else:
                 orchestration["child_cap"] = patch.child_cap
             named.append("orchestration.child_cap")
+        if "session_choice" in patch.model_fields_set:
+            if patch.session_choice is None:
+                orchestration.pop("session_choice", None)
+            else:
+                orchestration["session_choice"] = (
+                    patch.session_choice.model_dump()
+                    if isinstance(patch.session_choice, _ProjectChoicePin)
+                    else patch.session_choice
+                )
+            named.append("orchestration.session_choice")
         if "standing_approval" in patch.model_fields_set:
             stored = orchestration.get("standing_approval")
             standing_approval = deepcopy(stored) if isinstance(stored, dict) else {}

@@ -54,6 +54,7 @@ class Preset(_DocumentModel):
 
 class Row(_DocumentModel):
     preset: Identifier | None = None
+    name: Annotated[StrictStr, Field(min_length=1)] | None = None
     links: Annotated[tuple[Link, ...], Field(min_length=1)]
     weight: Annotated[int, Field(strict=True, ge=1, le=9)] | None = None
     adjusted: StrictBool = False

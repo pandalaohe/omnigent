@@ -425,6 +425,15 @@ def account(overview, account_id):
     return next(item for item in overview.accounts if item.id == account_id)
 
 
+def test_reported_models_are_account_display_suggestions(service):
+    service.report_account(
+        OWNER, "plan", usage_report(models=[{"id": "model-a"}, {"id": "model-b"}]), now=NOW
+    )
+    tile = account(service.overview(OWNER, now=NOW), "plan")
+    assert [model.id for model in tile.models] == ["model-a", "model-b"]
+    assert "plan" not in {tile.id for tile in service.overview("other", now=NOW).accounts}
+
+
 def test_push_value_and_percent_windows_stay_out_of_agents(service):
     report = usage_report(
         windows=[

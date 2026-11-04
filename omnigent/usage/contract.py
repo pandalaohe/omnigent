@@ -152,6 +152,7 @@ class UsageAccountView(BaseModel):
     period: UsagePeriodView | None = None
     windows: list[UsageWindowView] = Field(default_factory=list)
     hosts: list[UsageHostView] = Field(default_factory=list)
+    models: list[ReportModel] = Field(default_factory=list)
 
 
 class UsageOverview(BaseModel):

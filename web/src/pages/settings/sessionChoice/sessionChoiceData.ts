@@ -11,10 +11,12 @@ export interface ChoiceLink {
 }
 export interface ChoiceRow {
   preset?: string | null;
+  name?: string | null;
   links: ChoiceLink[];
   weight?: number | null;
   adjusted?: boolean;
 }
+export type ChoicePreset = SessionChoiceDocument["presets"][number];
 export interface ChoiceWorkType {
   id: string;
   label: string;
@@ -52,6 +54,7 @@ export const EMPTY_CHOICE: SessionChoiceDocument = {
   abilityOrder: [],
 };
 export interface ChoiceMeters {
+  products?: Record<string, string | null>;
   meters: UsageAccountView[];
   running: Record<string, string[]>;
   floors: Record<string, { until: "reset" | "manual"; active: boolean }>;
@@ -68,10 +71,11 @@ export async function choiceRequest<T>(path = "", init?: RequestInit): Promise<T
     );
   return data as T;
 }
-export function useSessionChoiceDocument() {
+export function useSessionChoiceDocument({ enabled = true }: { enabled?: boolean } = {}) {
   return useQuery({
     queryKey: ["sessionChoice"],
     queryFn: () => choiceRequest<ChoiceEnvelope>(),
+    enabled,
     retry: false,
   });
 }

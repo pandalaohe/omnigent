@@ -201,6 +201,43 @@ async def test_orchestration_patches_only_named_leaves(settings_app):
 
 
 @pytest.mark.asyncio
+async def test_project_choice_off_pin_and_inheritance_keep_other_orchestration(settings_app):
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=settings_app), base_url="http://test"
+    ) as client:
+        project_id = await _make_project(client)
+        await client.patch(
+            f"/v1/projects/{project_id}",
+            json={"config": {"orchestration": {"child_cap": 3}, "custom": "keep"}},
+        )
+        url = f"/v1/projects/{project_id}/settings"
+        for choice in ("off", {"pin": "code"}, None):
+            revision = (await client.get(url)).json()["revision"]
+            response = await client.put(
+                url,
+                json={
+                    "expected_revision": revision,
+                    "orchestration": {"session_choice": choice},
+                },
+            )
+            assert response.status_code == 200, response.text
+            config = response.json()["config"]
+            assert config["custom"] == "keep"
+            assert config["orchestration"]["child_cap"] == 3
+            assert config["orchestration"].get("session_choice") == choice
+        for choice in (True, "on", {"pin": ""}, {"pin": "code", "extra": 1}):
+            revision = (await client.get(url)).json()["revision"]
+            response = await client.put(
+                url,
+                json={
+                    "expected_revision": revision,
+                    "orchestration": {"session_choice": choice},
+                },
+            )
+            assert response.status_code == 422, response.text
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "patch",
     [

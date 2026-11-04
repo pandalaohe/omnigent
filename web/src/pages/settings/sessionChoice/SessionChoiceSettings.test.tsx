@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { SessionChoiceSettings } from "./SessionChoiceSettings";
 import { EMPTY_CHOICE, type ChoiceMeters } from "./sessionChoiceData";
@@ -24,6 +25,7 @@ vi.mock("./sessionChoiceData", async (original) => ({
 vi.mock("./QuotaPreferencesSettings", () => ({
   QuotaPreferencesSettings: () => <div>Quota display controls</div>,
 }));
+vi.mock("./ChoicePolicySettings", () => ({ ChoicePolicySettings: () => null }));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: () => ({
     data: [
@@ -61,9 +63,11 @@ afterEach(() => {
 });
 function mount() {
   return render(
-    <MemoryRouter>
-      <SessionChoiceSettings />
-    </MemoryRouter>,
+    <QueryClientProvider client={new QueryClient()}>
+      <MemoryRouter>
+        <SessionChoiceSettings />
+      </MemoryRouter>
+    </QueryClientProvider>,
   );
 }
 
@@ -116,6 +120,38 @@ it("offers a retry when the settings read fails", async () => {
   mount();
   fireEvent.click(await screen.findByRole("button", { name: "Retry" }));
   expect(mocks.refetch).toHaveBeenCalledOnce();
+});
+
+it("retains a dirty draft and its original revision when a background read changes", async () => {
+  const view = mount();
+  fireEvent.click(await screen.findByRole("switch", { name: "Session choice" }));
+  mocks.document.current = {
+    isPending: false,
+    refetch: mocks.refetch,
+    data: { revision: "changed-elsewhere", settings: structuredClone(EMPTY_CHOICE) },
+  };
+  view.rerender(
+    <QueryClientProvider client={new QueryClient()}>
+      <MemoryRouter>
+        <SessionChoiceSettings />
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+  expect(screen.getByRole("switch", { name: "Session choice" })).toBeChecked();
+  mocks.request.mockRejectedValueOnce(new Error("Conflict"));
+  fireEvent.click(screen.getByRole("button", { name: "Save session choice" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("Conflict");
+  expect(JSON.parse(mocks.request.mock.calls[0][1].body).expected_revision).toBe("revision-a");
+});
+
+it("clears a draft to the empty document only when it is saved", async () => {
+  mocks.request.mockResolvedValue({ settings: EMPTY_CHOICE, revision: "revision-b" });
+  mount();
+  fireEvent.click(await screen.findByRole("button", { name: "Clear" }));
+  expect(mocks.request).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "Save session choice" }));
+  await waitFor(() => expect(mocks.request).toHaveBeenCalled());
+  expect(JSON.parse(mocks.request.mock.calls[0][1].body).settings).toEqual(EMPTY_CHOICE);
 });
 
 it("saves tile reserve and concurrency separately from the immediate floor control", async () => {

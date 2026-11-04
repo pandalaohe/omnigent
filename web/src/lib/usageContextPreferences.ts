@@ -36,6 +36,8 @@ export interface UsageContextPreferences {
   lastProviderUsageLimits: Record<string, ProviderUsageLimitsSnapshot>;
   /** The Usage board's display preferences. */
   board: UsageBoardPreferences;
+  /** Account display labels; these never participate in session selection. */
+  shownModels?: Record<string, string>;
 }
 
 export interface UsageContextSource {
@@ -120,6 +122,7 @@ export function normalizeUsageContextPreferences(value: unknown): UsageContextPr
     overrides?: unknown;
     lastProviderUsageLimits?: unknown;
     board?: unknown;
+    shownModels?: unknown;
   };
   const overrides: Record<string, UsageContextOverride> = {};
   if (raw.overrides && typeof raw.overrides === "object") {
@@ -202,6 +205,21 @@ export function normalizeUsageContextPreferences(value: unknown): UsageContextPr
     overrides,
     lastProviderUsageLimits,
     board: normalizeUsageBoardPreferences(raw.board),
+    ...(raw.shownModels && typeof raw.shownModels === "object"
+      ? {
+          shownModels: Object.fromEntries(
+            Object.entries(raw.shownModels)
+              .filter(
+                ([id, label]) =>
+                  id.length > 0 &&
+                  id.length <= 128 &&
+                  typeof label === "string" &&
+                  label.length <= 128,
+              )
+              .slice(0, 64),
+          ) as Record<string, string>,
+        }
+      : {}),
   };
 }
 
@@ -580,6 +598,7 @@ function isDefault(preferences: UsageContextPreferences): boolean {
     preferences.showProviderUsageLimits &&
     Object.keys(preferences.overrides).length === 0 &&
     Object.keys(preferences.lastProviderUsageLimits).length === 0 &&
+    Object.keys(preferences.shownModels ?? {}).length === 0 &&
     isDefaultUsageBoardPreferences(preferences.board)
   );
 }

@@ -89,6 +89,24 @@ class SysProjectSettingsUpdateTool(Tool):
                                         {"type": "null"},
                                     ]
                                 },
+                                "session_choice": {
+                                    "anyOf": [
+                                        {"type": "string", "enum": ["off"]},
+                                        {
+                                            "type": "object",
+                                            "properties": {
+                                                "pin": {
+                                                    "type": "string",
+                                                    "minLength": 1,
+                                                    "maxLength": 32,
+                                                }
+                                            },
+                                            "required": ["pin"],
+                                            "additionalProperties": False,
+                                        },
+                                        {"type": "null"},
+                                    ]
+                                },
                                 "standing_approval": {
                                     "type": "object",
                                     "properties": {

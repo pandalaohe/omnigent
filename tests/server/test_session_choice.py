@@ -54,6 +54,18 @@ def save(store, value, revision=None):
     return store.replace_session_choice(OWNER, value, revision)
 
 
+def test_saved_row_name_is_a_snapshot_and_survives_preset_rename(db_uri):
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    value = document()
+    value["hosts"]["host-a"]["implementation"][0][0]["name"] = "Original code"
+    initial = save(store, value)
+    value["presets"][0]["name"] = "Renamed code"
+    saved = save(store, value, initial["revision"])
+    row = saved["settings"]["hosts"]["host-a"]["implementation"][0][0]
+    assert row["name"] == "Original code"
+    assert row["adjusted"] is False
+
+
 def test_revision_is_atomic_and_other_preferences_survive(db_uri):
     store = SqlAlchemyUserPreferencesStore(db_uri)
     store.patch_namespace(OWNER, "session_collab", {"childCap": 3})
@@ -247,6 +259,11 @@ async def test_floor_controls_and_preview_use_owner_tiles_without_changing_docum
 
         assert state_for(app).counters == {}
         meters = await client.get(url + f"/meters?host_id={host}")
+        assert (
+            meters.json()["products"]["codex-native"]
+            == meters.json()["products"]["codex"]
+            == "codex"
+        )
         assert meters.json()["floors"]["account-a"]["active"]
         assert (
             await client.post(url + "/floor", json={"tile": "missing", "off": True})

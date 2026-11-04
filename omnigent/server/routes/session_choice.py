@@ -73,6 +73,7 @@ def create_session_choice_router(
     async def meters(request: Request, host_id: str) -> dict[str, Any]:
         from dataclasses import asdict
 
+        from omnigent.runtime.instruction_layers import instruction_agents
         from omnigent.server.session_choice_runtime import context_request, inputs
         from omnigent.server.user_preferences_store import read_collab_settings
 
@@ -87,6 +88,9 @@ def create_session_choice_router(
             inputs, request.app, settings, context, time.time()
         )
         return {
+            "products": {
+                harness: agent.key for agent in instruction_agents() for harness in agent.harnesses
+            },
             "meters": [reading.model_dump(mode="json") for reading in readings.values()],
             "running": running,
             "floors": {

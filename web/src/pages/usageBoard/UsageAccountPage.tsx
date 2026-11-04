@@ -15,6 +15,7 @@ import { Button } from "@/components/ui/button";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { cn } from "@/lib/utils";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
+import { QuotaFloorControl } from "@/pages/settings/sessionChoice/QuotaFloorControl";
 
 import { UsageBoardFrame } from "./UsageBoardFrame";
 import { UsageRing } from "./UsageRing";
@@ -106,6 +107,10 @@ export function UsageAccountPage() {
                 Open the provider
               </a>
             ) : null}
+          </div>
+
+          <div className="mb-3">
+            <QuotaFloorControl tile={account.id} label={account.display_name} account={account} />
           </div>
 
           <div className="grid gap-2.5 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.25fr)] lg:items-start">

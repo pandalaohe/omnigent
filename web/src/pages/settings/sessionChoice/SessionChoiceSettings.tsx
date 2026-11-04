@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { Link } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -16,9 +17,13 @@ import {
   type SessionChoiceDocument,
 } from "./sessionChoiceData";
 import { QuotaPreferencesSettings } from "./QuotaPreferencesSettings";
+import { ChoicePolicySettings } from "./ChoicePolicySettings";
 
 export function SessionChoiceSettings() {
   const info = useServerInfo();
+  const queryClient = useQueryClient();
+  const dirty = useRef(false);
+  const draftRevision = useRef("");
   const document = useSessionChoiceDocument();
   const hosts = useHosts();
   const [draft, setDraft] = useState<SessionChoiceDocument | null>(null);
@@ -28,7 +33,10 @@ export function SessionChoiceSettings() {
   const [saved, setSaved] = useState<string | null>(null);
   const meters = useChoiceMeters(host);
   useEffect(() => {
-    if (document.data) setDraft(document.data.settings ?? structuredClone(EMPTY_CHOICE));
+    if (document.data && !dirty.current) {
+      setDraft(document.data.settings ?? structuredClone(EMPTY_CHOICE));
+      draftRevision.current = document.data.revision;
+    }
   }, [document.data]);
   const selectedHost = hosts.data?.find((item) => item.host_id === host);
   const hostIds = [
@@ -49,9 +57,11 @@ export function SessionChoiceSettings() {
       const result = await choiceRequest<ChoiceEnvelope>("", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ settings: draft, expected_revision: document.data.revision }),
+        body: JSON.stringify({ settings: draft, expected_revision: draftRevision.current }),
       });
       setDraft(result.settings ?? structuredClone(EMPTY_CHOICE));
+      dirty.current = false;
+      draftRevision.current = result.revision;
       await document.refetch();
       setSaved(
         result.corrected?.length
@@ -65,6 +75,7 @@ export function SessionChoiceSettings() {
     }
   }
   function patch(next: Partial<SessionChoiceDocument>) {
+    dirty.current = true;
     setDraft((current) => (current ? { ...current, ...next } : current));
     setSaved(null);
   }
@@ -80,6 +91,7 @@ export function SessionChoiceSettings() {
         body: JSON.stringify({ tile, off: mode !== "kept", keep: mode === "manual" }),
       });
       await meters.refetch();
+      await queryClient.invalidateQueries({ queryKey: ["sessionChoiceFloors"] });
       setSaved("Saved reserve mode.");
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : "Could not change reserve mode.");
@@ -144,6 +156,18 @@ export function SessionChoiceSettings() {
           No strategy for {selectedHost.name}. Creates use the current defaults.
         </p>
       )}
+      <ChoicePolicySettings
+        key={host}
+        document={draft}
+        host={host}
+        meters={meters.data?.meters ?? []}
+        products={meters.data?.products ?? {}}
+        onChange={(next) => {
+          dirty.current = true;
+          setDraft(next);
+          setSaved(null);
+        }}
+      />
       <details className="border-t border-border pt-3">
         <summary className="cursor-pointer text-sm font-medium">Limits</summary>
         <div className="mt-3 overflow-x-auto">
@@ -238,6 +262,11 @@ export function SessionChoiceSettings() {
                                 value={reserve.window}
                                 onChange={(event) => updateReserve({ window: event.target.value })}
                               >
+                                {!windows.some((item) => item.id === reserve.window) && (
+                                  <option value={reserve.window}>
+                                    {reserve.window} (not reported)
+                                  </option>
+                                )}
                                 {windows.map((item) => (
                                   <option key={item.id} value={item.id}>
                                     {item.label ?? item.id}
@@ -264,6 +293,31 @@ export function SessionChoiceSettings() {
                           <p className="mt-1 text-xs text-muted-foreground">
                             This reading has no selected window.
                           </p>
+                        )}
+                        {reserve && draft.workTypes.length > 0 && (
+                          <details className="mt-1">
+                            <summary className="cursor-pointer text-xs text-muted-foreground">
+                              Exempt work types
+                            </summary>
+                            <div className="mt-1 flex flex-wrap gap-2">
+                              {draft.workTypes.map((work) => (
+                                <label key={work.id} className="flex items-center gap-1 text-xs">
+                                  <input
+                                    type="checkbox"
+                                    checked={limits.reserveExempt?.includes(work.id) ?? false}
+                                    onChange={(event) =>
+                                      limit(tile.id, {
+                                        reserveExempt: event.target.checked
+                                          ? [...(limits.reserveExempt ?? []), work.id]
+                                          : limits.reserveExempt?.filter((id) => id !== work.id),
+                                      })
+                                    }
+                                  />
+                                  {work.label}
+                                </label>
+                              ))}
+                            </div>
+                          </details>
                         )}
                       </td>
                       <td className="py-3 pr-3 tabular-nums">
@@ -322,6 +376,17 @@ export function SessionChoiceSettings() {
         <Button onClick={() => void save()} disabled={saving}>
           {saving ? "Saving…" : "Save session choice"}
         </Button>
+        <Button
+          variant="ghost"
+          disabled={saving}
+          onClick={() => {
+            dirty.current = true;
+            setDraft(structuredClone(EMPTY_CHOICE));
+            setSaved(null);
+          }}
+        >
+          Clear
+        </Button>
         {saved && (
           <span role="status" className="text-sm text-muted-foreground">
             {saved}
@@ -336,7 +401,18 @@ export function SessionChoiceSettings() {
       {error && (
         <p role="alert" className="text-sm text-destructive">
           {error}{" "}
-          <button className="underline" type="button" onClick={() => void document.refetch()}>
+          <button
+            className="underline"
+            type="button"
+            onClick={async () => {
+              const result = await document.refetch();
+              if (result.data) {
+                dirty.current = false;
+                draftRevision.current = result.data.revision;
+                setDraft(result.data.settings ?? structuredClone(EMPTY_CHOICE));
+              }
+            }}
+          >
             Reload
           </button>
         </p>
