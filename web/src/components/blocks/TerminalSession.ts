@@ -16,7 +16,11 @@ import { type FontWeight, type ITheme, type IWindowsPty, Terminal } from "@xterm
 import "@xterm/xterm/css/xterm.css";
 import { withBasePath } from "@/lib/basePath";
 import { type CodeFont, codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences";
-import type { TerminalSoftKeyEventDetail } from "@/lib/mobileAssistantPreferences";
+import {
+  terminalDataForChord,
+  type TerminalSoftKeyEventDetail,
+} from "@/lib/mobileAssistantPreferences";
+import type { ShortcutChord } from "@/lib/keyboardShortcutPreferences";
 import { TerminalImeInput } from "./TerminalImeInput";
 import { parseHttpUrl } from "@/lib/openLinkInApp";
 import { terminalSurfaceColors } from "@/lib/terminalPalette";
@@ -27,6 +31,12 @@ import { TerminalLinkProvider } from "./TerminalLinkProvider";
 import { attachImeHeuristic, type Detached } from "./imeAnchor";
 
 const TERMINAL_BOLD_WEIGHT_OFFSET = 300;
+
+export type StickyState = "off" | "once" | "locked";
+export interface StickyModifiers {
+  ctrl: StickyState;
+  alt: StickyState;
+}
 
 export function terminalSoftKeyPayload(
   action: TerminalSoftKeyEventDetail["action"],
@@ -703,6 +713,9 @@ export class TerminalSession {
   /** Fractional wheel lines carried across events (see {@link wheelReportPayload}). */
   private wheelPartialLines = 0;
   private readonly imeInput: TerminalImeInput;
+  private stickyModifiers: StickyModifiers = { ctrl: "off", alt: "off" };
+  private readonly stickyListeners = new Set<(next: StickyModifiers) => void>();
+  private sendingSoftKey = false;
   private imeAnchor: Detached | null = null;
   /** Start of the tracked one-finger touch, or ``null`` when none is active. */
   private touchStart: { x: number; y: number } | null = null;
@@ -890,7 +903,9 @@ export class TerminalSession {
     };
     this.imeInput = new TerminalImeInput(this.term);
     this.dataDispose = this.term.onData((d) => {
-      if (!this.imeInput.consumeData(d)) sendInput(d);
+      if (!this.imeInput.consumeData(d)) {
+        sendInput(this.sendingSoftKey ? d : this.applyStickyModifiers(d));
+      }
     });
 
     this.term.attachCustomKeyEventHandler((e) => {
@@ -1031,20 +1046,77 @@ export class TerminalSession {
   sendSoftKey(
     action: TerminalSoftKeyEventDetail["action"],
     data?: string,
-    options?: { focus?: boolean },
+    options?: { focus?: boolean; chord?: ShortcutChord },
   ): void {
     if (!this.imeInput.beforeSoftKey()) return;
-    if (data !== undefined) {
-      this.imeInput.sendSoftInput(data);
-    } else {
-      this.term.input(
-        terminalSoftKeyPayload(action, this.term.modes.applicationCursorKeysMode),
-        true,
-      );
+    let payload = data;
+    if (options?.chord) {
+      const modifiers = [...options.chord.modifiers];
+      if (this.stickyModifiers.ctrl !== "off") modifiers.push("control");
+      if (this.stickyModifiers.alt !== "off") modifiers.push("alt");
+      payload = terminalDataForChord({ ...options.chord, modifiers }) ?? payload;
     }
+    // Explicit payloads are final; only keyboard data needs the sticky transform.
+    this.sendingSoftKey = true;
+    try {
+      if (payload !== undefined) {
+        this.imeInput.sendSoftInput(payload);
+      } else {
+        this.term.input(
+          terminalSoftKeyPayload(action, this.term.modes.applicationCursorKeysMode),
+          true,
+        );
+      }
+    } finally {
+      this.sendingSoftKey = false;
+    }
+    if (options?.chord) this.consumeStickyModifiers();
     if (options?.focus !== false) {
       this.term.focus();
     }
+  }
+
+  setStickyModifiers(next: StickyModifiers): void {
+    this.stickyModifiers = next;
+  }
+
+  onStickyConsumed(listener: (next: StickyModifiers) => void): () => void {
+    this.stickyListeners.add(listener);
+    return () => this.stickyListeners.delete(listener);
+  }
+
+  private consumeStickyModifiers(): void {
+    const { ctrl, alt } = this.stickyModifiers;
+    if (ctrl !== "once" && alt !== "once") return;
+    this.stickyModifiers = {
+      ctrl: ctrl === "once" ? "off" : ctrl,
+      alt: alt === "once" ? "off" : alt,
+    };
+    for (const listener of this.stickyListeners) listener(this.stickyModifiers);
+  }
+
+  private applyStickyModifiers(data: string): string {
+    const { ctrl, alt } = this.stickyModifiers;
+    if (
+      (ctrl === "off" && alt === "off") ||
+      this.imeInput.isComposing ||
+      data.includes("\x1b") ||
+      data.includes("\x7f")
+    )
+      return data;
+    let result = data;
+    if (data.length === 1 && data.charCodeAt(0) < 128) {
+      const code = data.toUpperCase().charCodeAt(0);
+      if (ctrl !== "off") {
+        if (code >= 64 && code <= 95) result = String.fromCharCode(code & 31);
+        else if (data === " ") result = "\x00";
+        else if (data === "?") result = "\x7f";
+        else if (data === "/") result = "\x1f";
+      }
+      if (alt !== "off") result = `\x1b${result}`;
+    }
+    this.consumeStickyModifiers();
+    return result;
   }
 
   /** Enable clipboard bridging only for the visible, interactive surface. */
@@ -1104,6 +1176,7 @@ export class TerminalSession {
     this.imeInput.dispose();
     this.imeAnchor?.detach();
     this.dataDispose.dispose();
+    this.stickyListeners.clear();
     this.osc52Dispose.dispose();
     try {
       this.ws.close();

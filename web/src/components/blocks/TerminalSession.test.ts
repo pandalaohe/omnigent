@@ -903,6 +903,126 @@ describe("TerminalSession", () => {
     session.dispose();
   });
 
+  it("applies one-shot and locked modifiers to keyboard input, notifying the row on consumption", () => {
+    const { socket, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    socket.open();
+    socket.sent = [];
+    const consumed = vi.fn();
+    const unsubscribe = session.onStickyConsumed(consumed);
+
+    session.setStickyModifiers({ ctrl: "once", alt: "off" });
+    term.input("r", true);
+    term.input("c", true);
+    expect(consumed).toHaveBeenCalledWith({ ctrl: "off", alt: "off" });
+    session.setStickyModifiers({ ctrl: "locked", alt: "once" });
+    term.input("c", true);
+    term.input("d", true);
+    expect(consumed).toHaveBeenLastCalledWith({ ctrl: "locked", alt: "off" });
+    session.setStickyModifiers({ ctrl: "off", alt: "off" });
+    term.input("x", true);
+
+    expect(socket.sent.map((frame) => new TextDecoder().decode(frame as Uint8Array))).toEqual([
+      "\x12",
+      "c",
+      "\x1b\x03",
+      "\x04",
+      "x",
+    ]);
+    unsubscribe();
+    session.dispose();
+  });
+
+  it("preserves escape sequences and DEL, but clears a one-shot on committed Chinese or pasted text", () => {
+    const { socket, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    socket.open();
+    socket.sent = [];
+    const consumed = vi.fn();
+    session.onStickyConsumed(consumed);
+    session.setStickyModifiers({ ctrl: "once", alt: "off" });
+    term.input("\x7f", true);
+    term.input("\x1b[A", true);
+    expect(consumed).not.toHaveBeenCalled();
+    term.input("中文", true);
+    expect(consumed).toHaveBeenCalledExactlyOnceWith({ ctrl: "off", alt: "off" });
+    term.input("r", true);
+    session.setStickyModifiers({ ctrl: "once", alt: "once" });
+    term.input("paste", true);
+    term.input("c", true);
+    expect(socket.sent.map((frame) => new TextDecoder().decode(frame as Uint8Array))).toEqual([
+      "\x7f",
+      "\x1b[A",
+      "中文",
+      "r",
+      "paste",
+      "c",
+    ]);
+    session.dispose();
+  });
+
+  it("encodes row chords once and consumes one-shots even on fallback", () => {
+    const { socket, session } = makeSession();
+    socket.open();
+    socket.sent = [];
+    session.setStickyModifiers({ ctrl: "once", alt: "off" });
+    session.sendSoftKey("arrowLeft", undefined, {
+      focus: false,
+      chord: { code: "ArrowLeft", modifiers: [] },
+    });
+    session.setStickyModifiers({ ctrl: "off", alt: "once" });
+    session.sendSoftKey("enter", "\x03", {
+      focus: false,
+      chord: { code: "KeyC", modifiers: ["control"] },
+    });
+    session.setStickyModifiers({ ctrl: "once", alt: "off" });
+    session.sendSoftKey("tab", undefined, {
+      focus: false,
+      chord: { code: "Tab", modifiers: [] },
+    });
+    session.sendSoftKey("enter", "r");
+    expect(socket.sent.map((frame) => new TextDecoder().decode(frame as Uint8Array))).toEqual([
+      "\x1b[1;5D",
+      "\x1b\x03",
+      "\t",
+      "r",
+    ]);
+    session.dispose();
+  });
+
+  it("keeps an unsupported Alt+Tab row chord plain instead of transforming it twice", () => {
+    const { socket, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    socket.open();
+    socket.sent = [];
+    session.setStickyModifiers({ ctrl: "off", alt: "once" });
+    session.sendSoftKey("tab", undefined, {
+      focus: false,
+      chord: { code: "Tab", modifiers: [] },
+    });
+    term.input("p", true);
+    expect(socket.sent.map((frame) => new TextDecoder().decode(frame as Uint8Array))).toEqual([
+      "\t",
+      "p",
+    ]);
+    session.dispose();
+  });
+
+  it("passes explicit text unchanged while retaining the modifier for the next keyboard input", () => {
+    const { socket, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    socket.open();
+    socket.sent = [];
+    session.setStickyModifiers({ ctrl: "once", alt: "off" });
+    session.sendSoftKey("enter", "q", { focus: false });
+    term.input("r", true);
+    expect(socket.sent.map((frame) => new TextDecoder().decode(frame as Uint8Array))).toEqual([
+      "q",
+      "\x12",
+    ]);
+    session.dispose();
+  });
+
   it("enables OSC 8 file links while keeping activation in the app handler", () => {
     const { session } = makeSession();
     const term = (session as unknown as { term: Terminal }).term;

@@ -1,4 +1,4 @@
-import { Keyboard } from "lucide-react";
+import { Keyboard, LockKeyhole } from "lucide-react";
 import {
   useCallback,
   useEffect,
@@ -11,9 +11,18 @@ import {
 import type { ShortcutChord } from "@/lib/keyboardShortcutPreferences";
 import { softKeyForChord, terminalDataForChord } from "@/lib/mobileAssistantPreferences";
 import { cn } from "@/lib/utils";
-import type { TerminalSession } from "./TerminalSession";
+import type { StickyModifiers, TerminalSession } from "./TerminalSession";
+
+type PressableItem = Extract<TerminalKeyRowItem, { kind: "key" | "modifier" }>;
 
 export type TerminalKeyRowItem =
+  | {
+      id: string;
+      label: string;
+      kind: "modifier";
+      modifier: keyof StickyModifiers;
+      repeat?: false;
+    }
   | {
       id: string;
       label: string;
@@ -34,11 +43,7 @@ export const TERMINAL_REPEAT_INTERVAL_MS = 80;
 export const TERMINAL_DRAG_SLOP_PX = 10;
 export const TERMINAL_SWIPE_THRESHOLD_PX = 36;
 
-/**
- * Fixed default terminal key list for Slice S1 (Ctrl and Alt sticky modifier
- * slots land in S5). First 6 keys populate Row 1; remaining keys fill 6-slot
- * pages in Row 2.
- */
+/** First 6 keys populate Row 1; remaining keys fill 6-slot pages in Row 2. */
 export const DEFAULT_TERMINAL_KEY_ITEMS: readonly TerminalKeyRowItem[] = [
   // Row 1 (fixed)
   { id: "esc", label: "Esc", kind: "key", chord: { code: "Escape", modifiers: [] } },
@@ -77,11 +82,13 @@ export const DEFAULT_TERMINAL_KEY_ITEMS: readonly TerminalKeyRowItem[] = [
     repeat: true,
   },
   { id: "slash", label: "/", kind: "key", chord: { code: "Slash", modifiers: [] } },
-  { id: "pgup", label: "PgUp", kind: "key", chord: { code: "PageUp", modifiers: [] } },
+  { id: "ctrl", label: "Ctrl", kind: "modifier", modifier: "ctrl" },
   // Row 2, Page 2
+  { id: "pgup", label: "PgUp", kind: "key", chord: { code: "PageUp", modifiers: [] } },
   { id: "pgdn", label: "PgDn", kind: "key", chord: { code: "PageDown", modifiers: [] } },
   { id: "home", label: "Home", kind: "key", chord: { code: "Home", modifiers: [] } },
   { id: "end", label: "End", kind: "key", chord: { code: "End", modifiers: [] } },
+  { id: "alt", label: "Alt", kind: "modifier", modifier: "alt" },
   { id: "ctrl-d", label: "^D", kind: "key", chord: { code: "KeyD", modifiers: ["control"] } },
 ];
 
@@ -93,7 +100,7 @@ export interface TerminalKeyRowProps {
 }
 
 interface ActiveKeyPress {
-  item: Extract<TerminalKeyRowItem, { kind: "key" }>;
+  item: PressableItem;
   pointerId: number;
   startX: number;
   startY: number;
@@ -112,16 +119,21 @@ interface PagerSwipeStart {
 export function sendTerminalKeyRowItem(
   session: TerminalSession | null,
   item: Extract<TerminalKeyRowItem, { kind: "key" }>,
+  sticky?: StickyModifiers,
 ): void {
   if (!session) return;
+  const options =
+    sticky && (sticky.ctrl !== "off" || sticky.alt !== "off")
+      ? { focus: false, chord: item.chord }
+      : { focus: false };
   const softKey = softKeyForChord(item.chord);
   if (softKey) {
-    session.sendSoftKey(softKey, undefined, { focus: false });
+    session.sendSoftKey(softKey, undefined, options);
     return;
   }
   const data = terminalDataForChord(item.chord);
   if (data !== null) {
-    session.sendSoftKey("enter", data, { focus: false });
+    session.sendSoftKey("enter", data, options);
   }
 }
 
@@ -136,6 +148,23 @@ export function TerminalKeyRow({
     Math.ceil(Math.max(0, items.length - TERMINAL_KEY_ROW_COLS) / TERMINAL_KEY_ROW_COLS),
   );
   const [page, setPage] = useState(0);
+  const [sticky, setSticky] = useState<StickyModifiers>({ ctrl: "off", alt: "off" });
+  const stickyRef = useRef(sticky);
+  const updateSticky = useCallback((next: StickyModifiers) => {
+    stickyRef.current = next;
+    setSticky(next);
+  }, []);
+
+  useEffect(() => {
+    const session = sessionRef.current;
+    if (disabled || !session) return;
+    session.setStickyModifiers(stickyRef.current);
+    const unsubscribe = session.onStickyConsumed(updateSticky);
+    return () => {
+      unsubscribe();
+      session.setStickyModifiers({ ctrl: "off", alt: "off" });
+    };
+  }, [disabled, sessionRef, updateSticky]);
   const clampedPage = Math.max(0, Math.min(page, pageCount - 1));
 
   const pressRef = useRef<ActiveKeyPress | null>(null);
@@ -179,11 +208,23 @@ export function TerminalKeyRow({
   }, [cancelAll]);
 
   const fireKey = useCallback(
-    (item: Extract<TerminalKeyRowItem, { kind: "key" }>) => {
+    (item: PressableItem) => {
       if (disabled) return;
-      sendTerminalKeyRowItem(sessionRef.current, item);
+      const session = sessionRef.current;
+      if (!session) return;
+      if (item.kind === "modifier") {
+        const state = stickyRef.current[item.modifier];
+        const next: StickyModifiers = {
+          ...stickyRef.current,
+          [item.modifier]: state === "off" ? "once" : state === "once" ? "locked" : "off",
+        };
+        session.setStickyModifiers(next);
+        updateSticky(next);
+      } else {
+        sendTerminalKeyRowItem(session, item, stickyRef.current);
+      }
     },
-    [disabled, sessionRef],
+    [disabled, sessionRef, updateSticky],
   );
 
   const handlePointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
@@ -357,7 +398,7 @@ export function TerminalKeyRow({
       return;
     }
 
-    if (event.detail === 0 && item.kind === "key") {
+    if (event.detail === 0 && item.kind !== "action") {
       fireKey(item);
     }
   };
@@ -382,7 +423,8 @@ export function TerminalKeyRow({
         );
       }
       const isKeyboardAction = item.kind === "action" && item.action === "keyboard";
-      const isActive = isKeyboardAction && keyboardUp;
+      const modifierState = item.kind === "modifier" ? sticky[item.modifier] : "off";
+      const isActive = (isKeyboardAction && keyboardUp) || modifierState !== "off";
       return (
         <button
           key={item.id}
@@ -390,18 +432,27 @@ export function TerminalKeyRow({
           data-key-id={item.id}
           disabled={disabled}
           aria-label={item.label}
-          aria-pressed={isKeyboardAction ? isActive : undefined}
+          aria-pressed={isKeyboardAction || item.kind === "modifier" ? isActive : undefined}
+          data-sticky-state={item.kind === "modifier" ? modifierState : undefined}
+          title={item.kind === "modifier" ? `${item.label}: ${modifierState}` : undefined}
           onClick={(event) => handleButtonClick(item, event)}
           className={cn(
             "flex h-[44px] min-w-[44px] items-center justify-center rounded-[7px] border border-border bg-background px-1 font-mono text-[12px] font-semibold text-foreground transition-colors select-none touch-none",
             "active:bg-muted disabled:pointer-events-none disabled:opacity-45",
-            isActive && "border-primary/50 bg-primary/15 text-primary",
+            isKeyboardAction && isActive && "border-primary/50 bg-primary/15 text-primary",
+            modifierState !== "off" &&
+              "border-primary-cta bg-primary-cta text-primary-cta-foreground",
           )}
         >
           {isKeyboardAction ? (
             <Keyboard className="size-3.5 shrink-0" aria-hidden="true" />
           ) : (
-            <span className="truncate">{item.label}</span>
+            <>
+              <span className="truncate">{item.label}</span>
+              {modifierState === "locked" && (
+                <LockKeyhole className="ml-0.5 size-3 shrink-0" aria-hidden="true" />
+              )}
+            </>
           )}
         </button>
       );

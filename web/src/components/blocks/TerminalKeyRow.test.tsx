@@ -1,12 +1,14 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_TERMINAL_KEY_ITEMS, TerminalKeyRow } from "./TerminalKeyRow";
-import type { TerminalSession } from "./TerminalSession";
+import type { StickyModifiers, TerminalSession } from "./TerminalSession";
 
 function makeSessionMock(focused = false) {
   let isFocusedState = focused;
   const session = {
     sendSoftKey: vi.fn(),
+    setStickyModifiers: vi.fn(),
+    onStickyConsumed: vi.fn((_listener: (next: StickyModifiers) => void) => vi.fn()),
     focus: vi.fn(() => {
       isFocusedState = true;
     }),
@@ -32,10 +34,8 @@ describe("TerminalKeyRow", () => {
     vi.restoreAllMocks();
   });
 
-  it("renders the 16 default keys without Ctrl or Alt and shows page 1 by default", () => {
-    expect(DEFAULT_TERMINAL_KEY_ITEMS).toHaveLength(16);
-    expect(DEFAULT_TERMINAL_KEY_ITEMS.map((item) => item.id)).not.toContain("ctrl");
-    expect(DEFAULT_TERMINAL_KEY_ITEMS.map((item) => item.id)).not.toContain("alt");
+  it("renders the 18 default keys with Ctrl on page 1 and Alt on page 2", () => {
+    expect(DEFAULT_TERMINAL_KEY_ITEMS).toHaveLength(18);
 
     const { sessionRef } = makeSessionMock();
     render(<TerminalKeyRow sessionRef={sessionRef} keyboardUp={false} />);
@@ -58,8 +58,43 @@ describe("TerminalKeyRow", () => {
       "left",
       "right",
       "slash",
-      "pgup",
+      "ctrl",
     ]);
+  });
+
+  it("cycles Ctrl through once, locked, and off without sending bytes or changing focus", () => {
+    const { session, sessionRef } = makeSessionMock(true);
+    render(<TerminalKeyRow sessionRef={sessionRef} keyboardUp={true} />);
+    const ctrl = screen.getByRole("button", { name: "Ctrl" });
+    expect(ctrl).toHaveAttribute("aria-pressed", "false");
+    tapButton(ctrl);
+    expect(ctrl).toHaveAttribute("data-sticky-state", "once");
+    expect(ctrl).toHaveClass("bg-primary-cta", "text-primary-cta-foreground");
+    tapButton(ctrl);
+    expect(ctrl).toHaveAttribute("data-sticky-state", "locked");
+    expect(ctrl.querySelector("svg")).not.toBeNull();
+    tapButton(ctrl);
+    expect(ctrl).toHaveAttribute("aria-pressed", "false");
+    expect(session.setStickyModifiers).toHaveBeenLastCalledWith({ ctrl: "off", alt: "off" });
+    expect(session.sendSoftKey).not.toHaveBeenCalled();
+    expect(session.focus).not.toHaveBeenCalled();
+    expect(session.blur).not.toHaveBeenCalled();
+  });
+
+  it("reflects keyboard consumption, retains locked state, and clears the session on unmount", () => {
+    const { session, sessionRef } = makeSessionMock();
+    const { unmount } = render(<TerminalKeyRow sessionRef={sessionRef} keyboardUp={false} />);
+    tapButton(screen.getByRole("button", { name: "Ctrl" }));
+    tapButton(screen.getByRole("button", { name: "←" }));
+    expect(session.sendSoftKey).toHaveBeenLastCalledWith("arrowLeft", undefined, {
+      focus: false,
+      chord: { code: "ArrowLeft", modifiers: [] },
+    });
+    const listener = session.onStickyConsumed.mock.calls[0][0];
+    act(() => listener({ ctrl: "off", alt: "locked" }));
+    expect(screen.getByRole("button", { name: "Ctrl" })).toHaveAttribute("aria-pressed", "false");
+    unmount();
+    expect(session.setStickyModifiers).toHaveBeenLastCalledWith({ ctrl: "off", alt: "off" });
   });
 
   it("scopes one-row container queries to the width inside side safe-area padding", () => {
@@ -70,6 +105,36 @@ describe("TerminalKeyRow", () => {
     expect(content).toHaveClass("@container");
     expect(content?.firstElementChild).toHaveClass("@min-[35rem]:grid-cols-12");
     expect(content?.lastElementChild).toHaveClass("@min-[35rem]:h-[8px]");
+  });
+
+  it("binds when a session connects late and rebinds across the connecting state on redial", () => {
+    const first = makeSessionMock();
+    const sessionRef = { current: null as TerminalSession | null };
+    const { rerender } = render(
+      <TerminalKeyRow sessionRef={sessionRef} keyboardUp={false} disabled />,
+    );
+    sessionRef.current = first.sessionRef.current;
+    rerender(<TerminalKeyRow sessionRef={sessionRef} keyboardUp={false} />);
+    expect(first.session.onStickyConsumed).toHaveBeenCalledOnce();
+    const ctrl = screen.getByRole("button", { name: "Ctrl" });
+    tapButton(ctrl);
+    act(() => first.session.onStickyConsumed.mock.calls[0][0]({ ctrl: "off", alt: "off" }));
+    expect(ctrl).toHaveAttribute("data-sticky-state", "off");
+    tapButton(ctrl);
+    tapButton(ctrl);
+    rerender(<TerminalKeyRow sessionRef={sessionRef} keyboardUp={false} disabled />);
+    expect(first.session.setStickyModifiers).toHaveBeenLastCalledWith({ ctrl: "off", alt: "off" });
+    const second = makeSessionMock();
+    sessionRef.current = second.sessionRef.current;
+    rerender(<TerminalKeyRow sessionRef={sessionRef} keyboardUp={false} />);
+    expect(second.session.onStickyConsumed).toHaveBeenCalledOnce();
+    expect(second.session.setStickyModifiers).toHaveBeenLastCalledWith({
+      ctrl: "locked",
+      alt: "off",
+    });
+    expect(ctrl).toHaveAttribute("data-sticky-state", "locked");
+    tapButton(ctrl);
+    expect(second.session.setStickyModifiers).toHaveBeenLastCalledWith({ ctrl: "off", alt: "off" });
   });
 
   it("prevents focus shift on pointerDown and sends soft keys on pointerUp with { focus: false }", () => {
@@ -177,7 +242,7 @@ describe("TerminalKeyRow", () => {
         .getAllByRole("button")
         .slice(6)
         .map((b) => b.getAttribute("data-key-id")),
-    ).toEqual(["pgdn", "home", "end", "ctrl-d"]);
+    ).toEqual(["pgup", "pgdn", "home", "end", "alt", "ctrl-d"]);
 
     tapButton(screen.getByRole("button", { name: "Home" }), 11, 80, 70);
     expect(session.sendSoftKey).toHaveBeenCalledWith("home", undefined, { focus: false });
