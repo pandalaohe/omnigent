@@ -16311,7 +16311,8 @@ async def test_hook_evaluate_stops_with_its_caller(
             if phase == "parked":
                 await asyncio.wait_for(cancelled.wait(), timeout=1.0)
             else:
-                await asyncio.sleep(0.5)
+                # Observe beyond the 0.3s retry delay to detect a forbidden later POST.
+                await asyncio.sleep(0.5)  # custom-lint: disable=sleep-then-assert -- retry window
                 assert calls == 1, "a stopped call must not be retried after recovery"
         finally:
             release.set()
