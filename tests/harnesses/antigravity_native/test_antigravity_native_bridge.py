@@ -1434,6 +1434,11 @@ _AGY_TASK_ROWS = {
         "  ● [12:45:28] sleep 600 && echo done... running\n"
         "  ● [12:46:02] tail -f build.log... running"
     ),
+    "overflow": (
+        "  ● [12:46:02] tail -f build.log... running\n"
+        "  ● [12:45:28] sleep 600 && echo done... running\n"
+        "  ↓ 1 more"
+    ),
 }
 
 
