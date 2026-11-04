@@ -6684,7 +6684,13 @@ def _usable_composer_height(socket_path: str, tmux_target: str) -> Iterator[bool
             _INJECTION_CANCEL_EVENT.reset(token)
 
 
-def _capture_pane(socket_path: str, tmux_target: str, *, join_wrapped: bool = False) -> str:
+def _capture_pane(
+    socket_path: str,
+    tmux_target: str,
+    *,
+    join_wrapped: bool = False,
+    preserve_styles: bool = False,
+) -> str:
     """
     Capture the current visible contents of a tmux pane.
 
@@ -6698,6 +6704,7 @@ def _capture_pane(socket_path: str, tmux_target: str, *, join_wrapped: bool = Fa
     :param join_wrapped: Join rows the pane wrapped at its width back into one
         line (``capture-pane -J``), so an address wider than the pane reads
         back whole.
+    :param preserve_styles: Include ANSI styles to distinguish input from dim placeholders.
     :returns: The pane's visible text, or ``""`` if capture failed.
     """
     import subprocess
@@ -6710,6 +6717,8 @@ def _capture_pane(socket_path: str, tmux_target: str, *, join_wrapped: bool = Fa
     args = ["tmux", "-S", socket_path, "capture-pane", "-t", tmux_target, "-p"]
     if join_wrapped:
         args.append("-J")
+    if preserve_styles:
+        args.append("-e")
     try:
         proc = subprocess.run(
             args,

@@ -80,6 +80,10 @@ _CODEX_HELPER_CLOSE_TIMEOUT_S = 1.0
 _CODEX_HELPER_PROCESS_GRACE_S = 0.15
 
 
+class _CodexPermissionSwitchRefused(RuntimeError):
+    """An expected refusal with fixed, client-safe guidance."""
+
+
 # A session woken for a control may still be booting its TUI, so typing waits for
 # the prompt, capped so the rest fits the server's ~20s wait for the control.
 _CLAUDE_CONTROL_PROMPT_WAIT_S = 9.0
@@ -1126,6 +1130,11 @@ def build_native_controls(
                 str(instance.socket_path),
                 instance.tmux_target,
                 preset.label,
+            )
+        except _CodexPermissionSwitchRefused as exc:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "codex_native_approval_mode_failed", "detail": str(exc)},
             )
         except (RuntimeError, ValueError) as exc:
             return JSONResponse(
@@ -2548,6 +2557,9 @@ def build_native_controls(
         # read-only permission profile) and their order can vary, so the digit is
         # read from the live popup. Unread popups cannot supply a safe digit.
         # Returns False only when a readable popup has no row for this label.
+        from rich.console import Console
+        from rich.text import Text
+
         from omnigent.codex_approval_modes import (
             CODEX_NATIVE_PERMISSION_PRESETS,
             codex_permissions_menu,
@@ -2555,16 +2567,40 @@ def build_native_controls(
         from omnigent.harnesses.claude_native.bridge import _capture_pane, _run_tmux
         from omnigent.harnesses.codex_native.bridge import _codex_composer_interactive
 
-        pane = _capture_pane(socket_path, target)
-        footer = "\n".join(pane.splitlines()[-3:])
+        styled_pane = Text.from_ansi(_capture_pane(socket_path, target, preserve_styles=True))
+        pane = styled_pane.plain
+        footer = pane.splitlines()[-3:]
         # At an idle composer, Escape can enter transcript browsing; there,
         # /permissions becomes a search. Leave overlays to the terminal user.
-        if not _codex_composer_interactive(pane) or not any(
-            hint in footer for hint in ("? for shortcuts", "esc again to edit previous message")
+        if not _codex_composer_interactive(pane) or any(
+            row.strip().startswith(("Browsing transcript", "Find:")) for row in footer
         ):
-            raise RuntimeError(
+            raise _CodexPermissionSwitchRefused(
                 "Return to Codex's message input in the Terminal view, closing any "
                 "open menu or transcript search, then change the permission mode again."
+            )
+        # Empty input renders a dim placeholder. Plain capture cannot distinguish
+        # it from an identical draft, and the footer may contain a status line.
+        composer = next(
+            row for row in reversed(styled_pane.split("\n")) if row.plain.lstrip().startswith("›")
+        )
+        console = Console()
+        start = composer.plain.index("›")
+        text_offsets = [
+            offset
+            for offset in range(start + 1, len(composer))
+            if not composer.plain[offset].isspace()
+        ]
+        if (
+            composer.get_style_at_offset(console, start).dim
+            or not text_offsets
+            or not all(
+                composer.get_style_at_offset(console, offset).dim for offset in text_offsets
+            )
+        ):
+            raise _CodexPermissionSwitchRefused(
+                "Send or clear any unsent draft and close open menus in Codex's Terminal view "
+                "before changing the permission mode. Your input has not been changed."
             )
         _run_tmux(socket_path, "send-keys", "-t", target, "C-u")
         _run_tmux(socket_path, "send-keys", "-l", "-t", target, "/permissions")
@@ -2618,7 +2654,7 @@ def build_native_controls(
                 _run_tmux(socket_path, "send-keys", "-t", target, "Escape")
                 return False
         else:
-            raise RuntimeError(
+            raise _CodexPermissionSwitchRefused(
                 "Codex's permission popup could not be read. No option was selected; "
                 "check the Terminal view before trying again."
             )

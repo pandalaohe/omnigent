@@ -4564,6 +4564,10 @@ async def test_events_compact_on_claude_sdk_buffered_compact_failed_fallback() -
         ("ask-for-approval", "composer", 200),
         ("approve-for-me", "escape-armed", 200),
         ("full-access", "composer", 200),
+        ("ask-for-approval", "statusline", 200),
+        ("approve-for-me", "draft", 503),
+        ("approve-for-me", "placeholder-draft", 503),
+        ("approve-for-me", "multiline-draft", 503),
         ("ask-for-approval", "browsing", 503),
         ("approve-for-me", "search", 503),
         ("full-access", "missing-popup", 503),
@@ -4610,7 +4614,14 @@ async def test_codex_permission_switch_preserves_terminal_state(
         elif current == "popup" and key in labels and selected is None:
             selected = labels[key]
 
-    def capture(*_args: object) -> str:
+    def capture(*_args: object, preserve_styles: bool = False) -> str:
+        if current in {"draft", "placeholder-draft", "multiline-draft"}:
+            text = {
+                "draft": "Keep this unsent draft",
+                "placeholder-draft": "Ask Codex to do anything",
+                "multiline-draft": "\n  Keep this second line",
+            }[current]
+            return "› " + text + "\n\n  model · branch"
         if current in {"browsing", "search"}:
             return "› Ask Codex to do anything\n" + (
                 "Browsing transcript · esc back" if current == "browsing" else "Find: permissions"
@@ -4625,10 +4636,21 @@ async def test_codex_permission_switch_preserves_terminal_state(
             return "Update Model Permissions\n" + "\n".join(
                 f"{digit}. {label}" for digit, label in labels.items()
             )
-        return "› Ask Codex to do anything\n" + (
-            "esc again to edit previous message"
-            if current == "escape-armed"
-            else "? for shortcuts"
+        prompt = (
+            "› \x1b[2mAsk Codex to do anything\x1b[0m"
+            if preserve_styles
+            else "› Ask Codex to do anything"
+        )
+        return (
+            prompt
+            + "\n"
+            + (
+                "esc again to edit previous message"
+                if current == "escape-armed"
+                else "model · branch"
+                if current == "statusline"
+                else "? for shortcuts"
+            )
         )
 
     monkeypatch.setattr(claude_native_bridge, "_run_tmux", tmux)
@@ -4662,8 +4684,10 @@ async def test_codex_permission_switch_preserves_terminal_state(
         )
     else:
         assert response.json()["detail"]
-    if screen in {"browsing", "search", "busy"}:
+    if screen in {"browsing", "search", "busy", "draft", "placeholder-draft", "multiline-draft"}:
         assert keys == [], "A refused switch must leave the terminal and running turn alone"
+    if screen in {"draft", "placeholder-draft", "multiline-draft"}:
+        assert "draft" in response.json()["detail"]
     if screen == "missing-popup":
         assert selected is None
         assert not any(key.isdigit() for key in keys), "An unread popup cannot supply a menu digit"
@@ -4734,14 +4758,20 @@ async def test_codex_workspace_switch_selects_generated_profile(
         elif key == "Escape":
             actions.append("escape")
 
-    def capture(*_args: object) -> str:
+    def capture(*_args: object, preserve_styles: bool = False) -> str:
         if selected is not None:
-            return (
-                f"Permissions updated to {preset.label}\n"
-                "› Ask Codex to do anything\n? for shortcuts"
+            prompt = (
+                "› \x1b[2mAsk Codex to do anything\x1b[0m"
+                if preserve_styles
+                else "› Ask Codex to do anything"
             )
+            return f"Permissions updated to {preset.label}\n{prompt}\n? for shortcuts"
         if opens == 0:
-            return "› Ask Codex to do anything\n? for shortcuts"
+            return (
+                "› \x1b[2mAsk Codex to do anything\x1b[0m\n? for shortcuts"
+                if preserve_styles
+                else "› Ask Codex to do anything\n? for shortcuts"
+            )
         return ("3. omnigent-workspace\n" if ambiguous else "") + "\n".join(
             f"{digit}. {label}" for digit, label in digits.items() if row or digit != "7"
         )
@@ -4854,7 +4884,7 @@ async def test_codex_native_approval_mode_tighten_stops_running_helpers_or_retur
                 "4": "Read Only",
             }[args[-1]]
 
-    def _capture(*_args: object) -> str:
+    def _capture(*_args: object, preserve_styles: bool = False) -> str:
         if selected:
             return (
                 "Permissions updated to "
@@ -4862,7 +4892,11 @@ async def test_codex_native_approval_mode_tighten_stops_running_helpers_or_retur
                 + "\n› Ask Codex to do anything\n? for shortcuts"
             )
         if not popup_open:
-            return "› Ask Codex to do anything\n? for shortcuts"
+            return (
+                "› \x1b[2mAsk Codex to do anything\x1b[0m\n? for shortcuts"
+                if preserve_styles
+                else "› Ask Codex to do anything\n? for shortcuts"
+            )
         return "1. Ask for approval\n2. Approve for me\n3. Full Access\n4. Read Only"
 
     monkeypatch.setattr(claude_native_bridge, "_run_tmux", _tmux)
