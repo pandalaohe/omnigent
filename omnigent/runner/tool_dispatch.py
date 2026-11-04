@@ -539,6 +539,9 @@ _INSTRUCTION_LAYER_TOOLS = frozenset(
     {"sys_instruction_layers_read", "sys_instruction_layer_update"}
 )
 _PROJECT_SETTINGS_TOOLS = frozenset({"sys_project_settings_read", "sys_project_settings_update"})
+_SESSION_CHOICE_TOOLS = frozenset(
+    {"sys_session_choice_read", "sys_session_choice_update", "sys_quota_floor"}
+)
 _STANDING_APPROVAL_TOOLS = frozenset({"sys_standing_approval", "sys_standing_pass"})
 _APPROVAL_ANSWER_TOOLS = frozenset({"sys_approval_answer"})
 
@@ -626,6 +629,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _POLICY_TOOLS
     | _INSTRUCTION_LAYER_TOOLS
     | _PROJECT_SETTINGS_TOOLS
+    | _SESSION_CHOICE_TOOLS
     | _STANDING_APPROVAL_TOOLS
     | _APPROVAL_ANSWER_TOOLS
     | _SCHEDULED_TASK_TOOLS
@@ -1130,6 +1134,7 @@ _ALL_LOCAL_TOOLS = (
     | _POLICY_TOOLS
     | _INSTRUCTION_LAYER_TOOLS
     | _PROJECT_SETTINGS_TOOLS
+    | _SESSION_CHOICE_TOOLS
     | _STANDING_APPROVAL_TOOLS
     | _APPROVAL_ANSWER_TOOLS
     | _SCHEDULED_TASK_TOOLS
@@ -7622,6 +7627,36 @@ async def _execute_project_settings_tool(
         return json.dumps({"error": f"{tool_name}: {exc}"})
 
 
+async def _execute_session_choice_tool(
+    tool_name: str,
+    arguments: str,
+    *,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    if server_client is None:
+        return json.dumps({"error": f"{tool_name} requires server access"})
+    try:
+        args = json.loads(arguments)
+        if not isinstance(args, dict):
+            raise ValueError("arguments must be an object")
+        url = "/v1/me/session-choice"
+        if tool_name == "sys_session_choice_update":
+            response = await server_client.put(url, json=args, timeout=30.0)
+        elif tool_name == "sys_quota_floor":
+            response = await server_client.post(url + "/floor", json=args, timeout=30.0)
+        else:
+            if args:
+                raise ValueError("read takes no arguments")
+            response = await server_client.get(url, timeout=30.0)
+        if response.status_code != 200:
+            return json.dumps(
+                {"error": f"server returned {response.status_code}", "details": response.text}
+            )
+        return json.dumps(response.json())
+    except (ValueError, httpx.HTTPError) as exc:
+        return json.dumps({"error": f"{tool_name}: {exc}"})
+
+
 async def _execute_policy_tool(
     tool_name: str,
     arguments: str,
@@ -9416,8 +9451,7 @@ async def _agent_quotas_via_rest(
         async with asyncio.timeout(2):
             response = await client.get(f"/v1/sessions/{conversation_id}/agent-quota")
             response.raise_for_status()
-            payload = _string_object_dict(response.json()) or {}
-            return _string_object_dict(payload.get("agents")) or {}
+            return _string_object_dict(response.json()) or {}
     except Exception:  # noqa: BLE001 — quota is advisory, discovery remains usable
         return {}
 
@@ -9652,7 +9686,8 @@ async def _agent_list_via_rest(
         row["available_on_host"] = available
         row["unavailable_reason"] = reason
         product = agent_key_for_harness(_optional_string(row.get("harness")))
-        quota = _string_object_dict(quotas.get(product)) if product else None
+        quota_map = _string_object_dict(quotas.get("agents")) or {}
+        quota = _string_object_dict(quota_map.get(product)) if product else None
         if quota is not None:
             quota = dict(quota)
             windows = quota.get("windows")
@@ -9664,7 +9699,7 @@ async def _agent_list_via_rest(
                 )
                 quota["windows"] = evidence[:4]
         row["quota"] = quota
-    return _bounded_discovery_result(
+    result = _bounded_discovery_result(
         listing,
         limit=limit,
         cursor_state=cursor_state,
@@ -9680,6 +9715,10 @@ async def _agent_list_via_rest(
             ),
         },
     )
+    choice = _string_object_dict(quotas.get("session_choice"))
+    if choice is not None:
+        return json.dumps({**json.loads(result), "session_choice": choice})
+    return result
 
 
 def _project_agent_list(
@@ -11168,6 +11207,10 @@ async def execute_tool(
             )
         elif tool_name in _INSTRUCTION_LAYER_TOOLS:
             output = await _execute_instruction_layer_tool(
+                tool_name, arguments, server_client=server_client
+            )
+        elif tool_name in _SESSION_CHOICE_TOOLS:
+            output = await _execute_session_choice_tool(
                 tool_name, arguments, server_client=server_client
             )
         elif tool_name in _PROJECT_SETTINGS_TOOLS:

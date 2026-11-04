@@ -93,6 +93,7 @@ def route_session_text(
     has_parent: bool,
     quota_line: str = "",
     quota_resolver: Callable[[], str] | None = None,
+    choice_line: str = "",
 ) -> str | None:
     """Compose user layers and the exclusive role without changing the runner envelope."""
     role = "child" if has_parent else "parent" if route.spawn else None
@@ -103,7 +104,7 @@ def route_session_text(
         if role
         else ""
     )
-    if role == "parent" and role_text.strip() and quota_resolver is not None:
+    if role == "parent" and role_text.strip() and quota_resolver is not None and not choice_line:
         quota_line = quota_resolver()
     result = compose_session_text(
         text,
@@ -113,7 +114,7 @@ def route_session_text(
         child_text=role_text if role == "child" else "",
         quota_line=quota_line,
     )
-    return result or None
+    return "\n\n".join(part for part in (result, choice_line) if part) or None
 
 
 async def session_instructions_text(
@@ -121,19 +122,33 @@ async def session_instructions_text(
     *,
     quota_resolver: Callable[[Conversation], str] | None = None,
     standing_approval_resolver: Callable[[Conversation], str] | None = None,
+    session_choice_resolver: Callable[[Conversation], str] | None = None,
 ) -> str | None:
     """Return the newly initialized session's route text, or no injection if disabled."""
     store = get_global_instructions_store()
     text = None
+    route = (
+        await resolve_instruction_route(conversation)
+        if store is not None or session_choice_resolver
+        else None
+    )
+    choice_line = (
+        await asyncio.to_thread(session_choice_resolver, conversation)
+        if route and route.spawn and session_choice_resolver
+        else ""
+    )
     if store is not None:
-        route = await resolve_instruction_route(conversation)
+        assert route is not None
         text = await asyncio.to_thread(
             route_session_text,
             store,
             route,
             has_parent=conversation.parent_conversation_id is not None,
             quota_resolver=(lambda: quota_resolver(conversation)) if quota_resolver else None,
+            choice_line=choice_line,
         )
+    elif choice_line:
+        text = choice_line
     pass_line = (
         await asyncio.to_thread(standing_approval_resolver, conversation)
         if standing_approval_resolver is not None

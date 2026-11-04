@@ -97,3 +97,43 @@ async def test_child_and_session_disabled_policy_cannot_remove_default_ask(
         )
     )
     assert result.action == PolicyAction.ASK
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("configured,enabled", [(False, False), (True, True), (True, False)])
+async def test_session_choice_update_approval_is_default_and_admin_configurable(
+    conversation_store, db_uri, configured, enabled
+):
+    conversation = conversation_store.create_conversation()
+    policies = SqlAlchemyPolicyStore(db_uri)
+    handler = "omnigent.policies.builtins.safety.ask_on_session_choice_update"
+    if configured:
+        policies.create_default("c" * 32, "choice approval", "python", handler, enabled=enabled)
+    spec = AgentSpec(spec_version=1)
+    engine = build_policy_engine(
+        spec=spec,
+        conversation_id=conversation.id,
+        conversation_store=conversation_store,
+        policy_store=policies,
+    )
+    for name in ("sys_session_choice_read", "sys_session_choice_update", "sys_quota_floor"):
+        result = await engine.evaluate(
+            EvaluationContext(
+                phase=Phase.TOOL_CALL,
+                tool_name=name,
+                content={"name": name, "arguments": {"settings": None}},
+            )
+        )
+        assert result.action == (
+            PolicyAction.ASK
+            if name.endswith("update") and (not configured or enabled)
+            else PolicyAction.ALLOW
+        )
+    assert any_policies_apply(
+        spec=spec,
+        conversation_id=conversation.id,
+        default_policies=None,
+        policy_store=None,
+        phase=Phase.TOOL_CALL,
+        tool_name="sys_session_choice_update",
+    )

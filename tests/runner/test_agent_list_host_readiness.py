@@ -176,6 +176,7 @@ async def test_discovery_quota_failure_is_advisory(quota_status):
             return httpx.Response(
                 quota_status,
                 json={
+                    "session_choice": {"enabled": True, "work_types": ["work"]},
                     "agents": {
                         "codex": {
                             "state": "low",
@@ -183,7 +184,7 @@ async def test_discovery_quota_failure_is_advisory(quota_status):
                             "deciding_window": "7d",
                             "windows": [],
                         }
-                    }
+                    },
                 },
             )
         return httpx.Response(200, json={"data": []})
@@ -201,6 +202,8 @@ async def test_discovery_quota_failure_is_advisory(quota_status):
         )
     quota = result["builtins"][0]["quota"]
     assert (quota["state"] if quota else None) == ("low" if quota_status == 200 else None)
+    if quota_status == 200:
+        assert result["session_choice"] == {"enabled": True, "work_types": ["work"]}
 
 
 @pytest.mark.asyncio

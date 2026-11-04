@@ -1164,6 +1164,8 @@ class SysSessionCreateTool(Tool):
             enforced in the runner handler (the schema can't express
             "at most one of two fields" portably across providers).
         """
+        from omnigent.tools.builtins.session_choice import choice_arguments
+
         return {
             "type": "function",
             "function": {
@@ -1194,6 +1196,7 @@ class SysSessionCreateTool(Tool):
                                 "child's host."
                             ),
                         },
+                        **choice_arguments(),
                         "config_path": {
                             "type": "string",
                             "description": (

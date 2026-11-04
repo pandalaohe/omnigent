@@ -43,6 +43,13 @@ class ChoicePreview(BaseModel):
     differ_from: str | None = None
 
 
+class QuotaFloorChange(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    tile: StrictStr
+    off: bool
+    keep: bool = False
+
+
 def create_session_choice_router(
     store: SqlAlchemyUserPreferencesStore | None, auth_provider: AuthProvider | None
 ) -> APIRouter:
@@ -60,6 +67,87 @@ def create_session_choice_router(
         if host is None or (auth_provider is not None and host.user_id != owner):
             raise HTTPException(404, "Host not found")
         return owner
+
+    @router.get("/me/session-choice/meters")
+    async def meters(request: Request, host_id: str) -> dict[str, Any]:
+        from dataclasses import asdict
+
+        from omnigent.server.session_choice_runtime import context_request, inputs
+        from omnigent.server.user_preferences_store import read_collab_settings
+
+        owner = await owned_host(request, host_id)
+        settings = (
+            await asyncio.to_thread(read_collab_settings, preferences(), owner)
+        ).session_choice
+        context = await asyncio.to_thread(
+            context_request, request.app, owner, host_id, settings, None, preview=True
+        )
+        readings, running, floors = await asyncio.to_thread(
+            inputs, request.app, settings, context, time.time()
+        )
+        return {
+            "meters": [reading.model_dump(mode="json") for reading in readings.values()],
+            "running": running,
+            "floors": {
+                pool: {
+                    **asdict(entry),
+                    "active": floor_off_active(entry, readings.get(pool), time.time()),
+                }
+                for pool, entry in floors.items()
+            },
+        }
+
+    @router.get("/me/session-choice/floor")
+    async def read_floors(request: Request) -> dict[str, Any]:
+        from dataclasses import asdict
+
+        owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
+        entries = await asyncio.to_thread(preferences().choice_floor_off, owner)
+        return {pool: asdict(entry) for pool, entry in entries.items()}
+
+    @router.post("/me/session-choice/floor", dependencies=[Depends(require_json_content_type)])
+    async def change_floor(request: Request, body: QuotaFloorChange) -> dict[str, Any]:
+        from omnigent.server.agent_quota import QuotaContext
+        from omnigent.server.session_choice import FloorOff
+
+        owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
+        entry = None
+        if body.off:
+            if body.keep:
+                entry = FloorOff(until="manual")
+            else:
+                readings = await asyncio.to_thread(
+                    request.app.state.agent_quota_service.pool_readings, QuotaContext(owner, None)
+                )
+                reading = readings.get(body.tile)
+                windows = (
+                    {
+                        window.id: (window.resets_at, window.percent_used)
+                        for window in reading.windows
+                        if window.resets_at is not None
+                        and window.percent_used is not None
+                        and not window.past_reset
+                    }
+                    if reading and reading.freshness == "fresh"
+                    else {}
+                )
+                if not windows:
+                    raise HTTPException(409, "No fresh reading: there is no reset to wait for.")
+                entry = FloorOff(windows=windows)
+        accounts_mode = (
+            isinstance(auth_provider, UnifiedAuthProvider) and auth_provider._source == "accounts"
+        )
+        try:
+            await asyncio.to_thread(
+                preferences().set_choice_floor_off,
+                owner,
+                body.tile,
+                entry,
+                create_if_missing=not accounts_mode,
+            )
+        except UserPreferencesUserNotFoundError as exc:
+            raise HTTPException(401, "Account no longer exists") from exc
+        return await read_floors(request)
 
     @router.post("/me/session-choice/preview")
     async def preview(request: Request, body: ChoicePreview) -> dict[str, Any]:

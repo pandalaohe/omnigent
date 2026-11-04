@@ -183,6 +183,83 @@ async def test_api_registered_owner_scoped_revision_and_field_errors(db_uri, tmp
         assert (await client.get(url)).status_code == 401
 
 
+@pytest.mark.asyncio
+async def test_floor_controls_and_preview_use_owner_tiles_without_changing_document(
+    db_uri, tmp_path
+):
+    import time
+
+    from omnigent.stores.host_store import HostStore
+    from omnigent.usage.contract import UsageReport
+
+    hosts = HostStore(db_uri)
+    host = "1" * 32
+    hosts.upsert_on_connect(host, "sample-host", OWNER)
+    app = _preferences_app(db_uri, tmp_path, host_store=hosts)
+    agent_id = "a" * 32
+    app.state.agent_store.create(agent_id, "code", "test:///bundle")
+    settings = document()
+    settings["hosts"] = {host: settings["hosts"]["host-a"]}
+    settings["presets"][0]["links"][0]["agent"] = agent_id
+    settings["hosts"][host]["implementation"][0][0]["links"][0]["agent"] = agent_id
+    now = time.time()
+    app.state.agent_quota_service.report_account(
+        OWNER,
+        "account-a",
+        UsageReport.model_validate(
+            {
+                "observed_at": now,
+                "windows": [
+                    {
+                        "id": "7d",
+                        "percent_used": 90,
+                        "window_minutes": 10080,
+                        "resets_at": now + 4 * 86400,
+                    }
+                ],
+            }
+        ),
+        now=now,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+        headers={"X-Test-User": OWNER},
+    ) as client:
+        url = "/v1/me/session-choice"
+        revision = (await client.get(url)).json()["revision"]
+        saved = await client.put(url, json={"settings": settings, "expected_revision": revision})
+        assert saved.status_code == 200, saved.text
+        revision = saved.json()["revision"]
+        preview = await client.post(url + "/preview", json={"host_id": host})
+        assert preview.status_code == 200 and preview.json()["outcome"] == "hold", preview.text
+        floor = await client.post(url + "/floor", json={"tile": "account-a", "off": True})
+        assert floor.status_code == 200, floor.text
+        assert floor.json()["account-a"]["until"] == "reset"
+        assert (await client.get(url)).json()["revision"] == revision
+        for _ in range(2):
+            preview = await client.post(url + "/preview", json={"host_id": host})
+            assert preview.json()["outcome"] == "pick", preview.text
+        from omnigent.server.session_choice import state_for
+
+        assert state_for(app).counters == {}
+        meters = await client.get(url + f"/meters?host_id={host}")
+        assert meters.json()["floors"]["account-a"]["active"]
+        assert (
+            await client.post(url + "/floor", json={"tile": "missing", "off": True})
+        ).status_code == 409
+        assert (
+            await client.post(
+                url + "/floor", json={"tile": "account-a", "off": True, "keep": True}
+            )
+        ).json()["account-a"]["until"] == "manual"
+        assert (
+            await client.post(url + "/floor", json={"tile": "account-a", "off": False})
+        ).json() == {}
+        result = await client.put(url, json={"settings": settings, "expected_revision": revision})
+        assert result.status_code == 200, result.text
+
+
 NOW = 2_000_000
 
 

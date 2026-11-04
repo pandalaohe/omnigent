@@ -78,6 +78,8 @@ class SysSessionOpenTool(Tool):
             sub-dict. ``project`` / ``host`` / ``agent`` are required;
             the rest are optional.
         """
+        from omnigent.tools.builtins.session_choice import choice_arguments
+
         return {
             "type": "function",
             "function": {
@@ -86,6 +88,7 @@ class SysSessionOpenTool(Tool):
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        **choice_arguments(),
                         "project": {
                             "type": "string",
                             "description": (
@@ -199,7 +202,7 @@ class SysSessionOpenTool(Tool):
                             ),
                         },
                     },
-                    "required": ["project", "host", "agent"],
+                    "required": ["project", "host"],
                     "additionalProperties": False,
                 },
             },

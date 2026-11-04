@@ -80,6 +80,7 @@ vi.mock("@/hooks/useAgentRegistry", () => ({
 }));
 
 import { ChildSessionsPanel } from "./ChildSessionsPanel";
+import { QuotaPreferencesSettings } from "@/pages/settings/sessionChoice/QuotaPreferencesSettings";
 import { readChildIdlePreferences, writeChildIdlePreferences } from "@/lib/childIdlePreferences";
 import {
   readSessionCollabPreferences,
@@ -218,12 +219,9 @@ describe("ChildSessionsPanel", () => {
     await waitFor(() => expect(editor).toHaveValue("Server value"));
   });
 
-  it("saves child controls without dropping existing collaboration preferences", () => {
-    writeSessionCollabPreferences({ ...SESSION_COLLAB_DEFAULTS, relayDepthMax: 3 });
-    render(<ChildSessionsPanel />);
-    fireEvent.change(screen.getByRole("textbox", { name: /Child session limit/ }), {
-      target: { value: "4" },
-    });
+  it("moves quota controls without dropping child or collaboration preferences", () => {
+    writeSessionCollabPreferences({ ...SESSION_COLLAB_DEFAULTS, relayDepthMax: 3, childCap: 4 });
+    render(<QuotaPreferencesSettings />);
     fireEvent.change(screen.getByRole("textbox", { name: /Tight below/ }), {
       target: { value: "45.5" },
     });
@@ -242,7 +240,7 @@ describe("ChildSessionsPanel", () => {
     fireEvent.change(screen.getByRole("textbox", { name: /Claude Code period/ }), {
       target: { value: "7d" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Save child settings" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save quota display" }));
 
     expect(readSessionCollabPreferences()).toMatchObject({
       relayDepthMax: 3,
@@ -265,7 +263,7 @@ describe("ChildSessionsPanel", () => {
       ...SESSION_COLLAB_DEFAULTS,
       quotaPeriods: { codex: "7d" },
     });
-    render(<ChildSessionsPanel />);
+    render(<QuotaPreferencesSettings />);
     fireEvent.click(screen.getByText("Deciding period"));
     expect(screen.getByRole("textbox", { name: "All products" })).toHaveValue("");
     expect(screen.getByText("7d")).toBeInTheDocument();
@@ -277,7 +275,7 @@ describe("ChildSessionsPanel", () => {
     fireEvent.change(screen.getByRole("textbox", { name: /Kite period/ }), {
       target: { value: "month" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Save child settings" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save quota display" }));
     expect(readSessionCollabPreferences()).toMatchObject({
       quotaPeriodDefault: null,
       quotaPeriods: { codex: "7d", kite: "month" },
@@ -285,21 +283,21 @@ describe("ChildSessionsPanel", () => {
   });
 
   it("requires a period before saving an added exception", () => {
-    render(<ChildSessionsPanel />);
+    render(<QuotaPreferencesSettings />);
     fireEvent.click(screen.getByText("Deciding period"));
     fireEvent.click(screen.getByRole("button", { name: "Add exception" }));
     fireEvent.click(screen.getByRole("button", { name: /Kite.*Native CLI/ }));
-    fireEvent.click(screen.getByRole("button", { name: "Save child settings" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save quota display" }));
     expect(screen.getByRole("alert")).toHaveTextContent("Enter a period for each exception");
     expect(queuePatchMock).not.toHaveBeenCalled();
   });
 
   it("keeps invalid thresholds in the draft until corrected", () => {
-    render(<ChildSessionsPanel />);
+    render(<QuotaPreferencesSettings />);
     fireEvent.change(screen.getByRole("textbox", { name: /Low below/ }), {
       target: { value: "60" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Save child settings" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save quota display" }));
     expect(screen.getByRole("alert")).toHaveTextContent("0 < low < tight");
     expect(readSessionCollabPreferences()).toEqual(SESSION_COLLAB_DEFAULTS);
     expect(queuePatchMock).not.toHaveBeenCalled();
@@ -307,7 +305,7 @@ describe("ChildSessionsPanel", () => {
     fireEvent.change(screen.getByRole("textbox", { name: /Low below/ }), {
       target: { value: "10" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Save child settings" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save quota display" }));
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(readSessionCollabPreferences().quotaLowBelowPct).toBe(10);
   });

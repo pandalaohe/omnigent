@@ -2054,6 +2054,7 @@ def create_app(
         tunnel_registry,
         server_version=_server_version(),
         quota_resolver=agent_quota_service.line,
+        session_choice_resolver=agent_quota_service.session_choice_line,
         standing_approval_resolver=standing_approval_service.line,
         peer_messaging_enabled=resolved_feature_flags.enabled(Feature.SESSION_PEER_MESSAGING),
         peer_messaging_resolver=partial(

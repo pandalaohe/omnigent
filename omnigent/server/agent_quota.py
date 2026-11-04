@@ -606,14 +606,25 @@ class AgentQuotaService:
     def payload(self, conversation: Conversation) -> dict[str, Any]:
         from omnigent.harness_plugins import native_agents
 
-        tiers, quotas = self.quotas(self.context(conversation))
+        context = self.context(conversation)
+        tiers, quotas = self.quotas(context)
         # Missing reports are explicit at the API boundary; instruction lines
         # still enumerate only products with an actual source in this scope.
         missing = AgentQuota("unknown", None, None, (), reason="no_report")
+        from omnigent.server.session_choice import active_on, generated_line
+
+        choice = read_collab_settings(self.preferences, context.owner_id).session_choice
         return {
             "tiers": asdict(tiers),
             "agents": {
                 agent.key: asdict(quotas.get(agent.key, missing)) for agent in native_agents()
+            },
+            "session_choice": {
+                "enabled": active_on(choice, context.host_id or ""),
+                "work_types": [work.id for work in choice.work_types],
+                "instruction": generated_line(choice)
+                if active_on(choice, context.host_id or "")
+                else None,
             },
         }
 
@@ -1137,6 +1148,65 @@ class AgentQuotaService:
         now = time.time()
         tiers, quotas = self.quotas(context, now=now)
         return quota_line(quotas, tiers, now=now) or ""
+
+    def session_choice_line(self, conversation: Conversation) -> str:
+        from omnigent.server.session_choice import (
+            active_on,
+            floor_off_active,
+            generated_line,
+            ordered_links,
+        )
+
+        text = ""
+        try:
+            context = self.context(conversation)
+            settings = read_collab_settings(self.preferences, context.owner_id).session_choice
+            if not active_on(settings, context.host_id or ""):
+                return ""
+            text = generated_line(settings)
+            readings = self.pool_readings(context)
+            pools = dict.fromkeys(link.meter for link in ordered_links(settings) if link.meter)
+            now = time.time()
+            floors = (
+                self.preferences.choice_floor_off(context.owner_id) if self.preferences else {}
+            )
+            quota = []
+            released = []
+            use_up = []
+            for pool in pools:
+                reading = readings.get(pool)
+                if (
+                    reading is not None
+                    and reading.freshness == "fresh"
+                    and reading.state not in {"ok", "unknown"}
+                ):
+                    window = next(
+                        (item for item in reading.windows if item.id == reading.deciding_window),
+                        None,
+                    )
+                    remaining = (
+                        f" {window.remaining_pct:g}%"
+                        if window and window.remaining_pct is not None
+                        else ""
+                    )
+                    detail = f"{reading.deciding_window or ''}{remaining}".strip()
+                    quota.append(f"{pool} {reading.state} {detail}".strip())
+                entry = floors.get(pool)
+                if entry is not None and floor_off_active(entry, reading, now):
+                    (use_up if entry.until == "manual" else released).append(pool)
+            parts = [text]
+            if quota:
+                parts.append("Quota: " + "; ".join(quota) + ".")
+            if use_up:
+                parts.append("Use up: " + ", ".join(use_up) + ".")
+            if released:
+                parts.append("Floor off: " + ", ".join(released) + " until reset.")
+            return " ".join(parts)
+        except Exception:
+            _logger.warning(
+                "Session choice instructions unavailable for %s", conversation.id, exc_info=True
+            )
+            return text
 
     def line(self, conversation: Conversation, owner_hint: str | None = None) -> str:
         """An advisory-source failure must leave the user's instruction text intact."""

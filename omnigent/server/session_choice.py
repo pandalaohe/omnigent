@@ -334,6 +334,20 @@ def active_on(settings: SessionChoice, host: str) -> bool:
     return settings.enabled and bool(settings.work_types) and bool(settings.hosts.get(host))
 
 
+def generated_line(settings: SessionChoice) -> str:
+    ids = "|".join(work.id for work in settings.work_types)
+    definitions = " ".join(
+        f"{work.id}: {work.definition}" for work in settings.work_types if work.definition
+    )
+    text = (
+        f"Session choice is on: open sessions with sys_session_create(work_type=<{ids}>); "
+        "the app picks agent, model and effort and returns why. Do not read quota to choose. "
+        "Name agent_id only if the user did (user_named=true) or with choice_reason; "
+        "otherwise it is ignored."
+    )
+    return f"{text} {definitions}" if definitions else text
+
+
 def resolve_work_type(
     settings: SessionChoice, name: str | None
 ) -> tuple[WorkType, tuple[str, ...]]:

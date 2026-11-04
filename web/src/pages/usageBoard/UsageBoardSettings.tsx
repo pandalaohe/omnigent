@@ -3,6 +3,7 @@
 // outside source. Display routes never render any of it.
 
 import { useState } from "react";
+import { Link } from "@/lib/routing";
 import { CopyIcon, PlugIcon, SunIcon } from "lucide-react";
 
 import { HelpTip } from "@/components/HelpTip";
@@ -99,6 +100,12 @@ export function UsageBoardSettings() {
 
   return (
     <div className="flex flex-col">
+      <Link
+        to="/settings/general#session-choice"
+        className="py-2 text-sm text-primary underline underline-offset-2"
+      >
+        Session choice settings
+      </Link>
       <div className="flex min-h-[46px] flex-wrap items-center justify-between gap-2 py-2">
         <span className="text-sm">Usage board</span>
         <span className="flex items-center gap-2">
