@@ -61,6 +61,8 @@ def _seed_active_turn(bridge_dir: Path, turn_id: str) -> None:
         ("userPromptSubmit", "failed", "idle"),
         ("userPromptSubmit", "completed", "idle"),
         ("preToolUse", "blocked", "idle"),
+        ("preToolUse", "stopped", "failed"),
+        (None, "stopped", "failed"),
         (None, None, "idle"),
     ],
 )
@@ -120,6 +122,7 @@ async def test_hook_stopped_turn_reports_failure_before_empty_completion(
         assert "verification hook stopped this turn" in statuses[0]["output"]
         assert "Resolve the hook refusal before retrying." in statuses[0]["output"]
         assert "MODEL_ONLY_CONTEXT" not in statuses[0]["output"]
+        assert "/opt/work/hooks.json" not in statuses[0]["output"]
         assert "reauth_required" not in statuses[0]
     else:
         assert "output" not in statuses[0]
@@ -157,7 +160,16 @@ async def test_hook_stop_cannot_fail_another_active_turn(
 
 
 @pytest.mark.parametrize(
-    "pending", ["none", "owed", "other-session", "other-turn", "extra-refusal"]
+    "pending",
+    [
+        "none",
+        "owed",
+        "other-session",
+        "other-turn",
+        "extra-refusal",
+        "owed-stopped",
+        "owed-tool-stop",
+    ],
 )
 def test_hook_stop_exempts_only_its_owed_routing_replay(tmp_path: Path, pending: str) -> None:
     reason = routed_prompt_block_reason("routed-model")
@@ -175,7 +187,13 @@ def test_hook_stop_exempts_only_its_owed_routing_replay(tmp_path: Path, pending:
     error = fwd._terminal_error_from_hook_run(
         {
             "turnId": "turn_123",
-            "run": {"eventName": "userPromptSubmit", "status": "blocked", "entries": entries},
+            "run": {
+                "eventName": "preToolUse" if pending == "owed-tool-stop" else "userPromptSubmit",
+                "status": "stopped"
+                if pending in {"owed-stopped", "owed-tool-stop"}
+                else "blocked",
+                "entries": entries,
+            },
         },
         bridge_dir=tmp_path,
         session_id="conv_x",

@@ -16,14 +16,17 @@ outside this runner.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
+from omnigent.harnesses.codex_native import forwarder as codex_forwarder
 from omnigent.runner import create_runner_app, subagent_work
 from omnigent.spec.types import AgentSpec, ExecutorSpec
+from tests._helpers.polling import poll_until_async
 from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient
 from tests.runner.helpers import NullServerClient
 
@@ -693,6 +696,142 @@ async def test_stranded_wake_rescue_posts_for_a_delegated_native_child(
 
     assert len(server.wakes) == 1
     assert "sys_read_inbox" in server.wakes[0]["data"]["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "event_name,hook_status", [("userPromptSubmit", "blocked"), ("preToolUse", "stopped")]
+)
+async def test_native_wait_cannot_consume_a_hook_refusal(
+    tmp_path: Path, _clean_subagent_registry: None, event_name: str, hook_status: str
+) -> None:
+    """An empty native wait result cannot acknowledge a hook's failure detail."""
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    subagent_work._session_inboxes_ref[PARENT_SESSION_ID] = inbox
+    server = _OriginServerClient(_child_body(_DELEGATED_LABELS))
+    app = _build_app(server)
+    state = codex_forwarder._CodexForwarderState(parent_session_id=PARENT_SESSION_ID)
+    state.note_child_thread("thread_child", CHILD_SESSION_ID)
+    state.active_parent_turn_id = "turn_parent"
+    wait = {
+        "threadId": "thread_parent",
+        "turnId": "turn_parent",
+        "item": {
+            "type": "collabAgentToolCall",
+            "id": "native-wait",
+            "tool": "wait",
+            "status": "inProgress",
+            "senderThreadId": "thread_parent",
+            "receiverThreadIds": ["thread_child"],
+            "agentsStates": {},
+        },
+    }
+    message = "A hook stopped this worker; action required"
+    frames = [
+        {
+            "method": "turn/started",
+            "params": {"threadId": "thread_child", "turn": {"id": "turn_child"}},
+        },
+        {"method": "item/started", "params": wait},
+        {
+            "method": "hook/completed",
+            "params": {
+                "threadId": "thread_child",
+                "turnId": "turn_child",
+                "run": {
+                    "id": "stop-hook",
+                    "eventName": event_name,
+                    "status": hook_status,
+                    "sourcePath": "/opt/work/hooks.json",
+                    "entries": [{"kind": "warning", "text": message}],
+                },
+            },
+        },
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread_child",
+                "turn": {"id": "turn_child", "status": "completed", "items": []},
+            },
+        },
+        {
+            "method": "item/completed",
+            "params": {
+                **wait,
+                "item": {
+                    **wait["item"],
+                    "status": "completed",
+                    "agentsStates": {"thread_child": {"status": "completed", "message": None}},
+                },
+            },
+        },
+    ]
+    async with _runner_client(app) as client:
+        await _init_mother(client)
+        usage = codex_forwarder._SessionUsageCoalescer(client, PARENT_SESSION_ID)
+        tracker = codex_forwarder._CodexElicitationTaskTracker()
+        try:
+            for frame in frames:
+                await codex_forwarder._handle_event(
+                    client,
+                    session_id=PARENT_SESSION_ID,
+                    bridge_dir=tmp_path,
+                    event=frame,
+                    usage_coalescer=usage,
+                    elicitation_tracker=tracker,
+                    expected_thread_id="thread_parent",
+                    forwarder_state=state,
+                )
+            assert inbox.qsize() == 1
+            result = inbox.get_nowait()
+            assert result["status"] == "failed"
+            assert message in result["output"]
+            assert "/opt/work/hooks.json" not in result["output"]
+            await poll_until_async(lambda: server.wakes, timeout_s=2)
+            assert len(server.wakes) == 1
+            notice = server.wakes[0]["data"]["content"][0]["text"]
+            assert "finished (failed)" in notice and message in notice
+            assert "/opt/work/hooks.json" not in notice
+            next_wait = {**wait, "item": {**wait["item"], "id": "next-wait"}}
+            for frame in (
+                {
+                    "method": "turn/started",
+                    "params": {"threadId": "thread_child", "turn": {"id": "next_turn"}},
+                },
+                {"method": "item/started", "params": next_wait},
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread_child",
+                        "turn": {"id": "next_turn", "status": "completed", "items": []},
+                    },
+                },
+                {
+                    "method": "item/completed",
+                    "params": {
+                        **frames[-1]["params"],
+                        "item": {
+                            **frames[-1]["params"]["item"],
+                            "id": "next-wait",
+                        },
+                    },
+                },
+            ):
+                await codex_forwarder._handle_event(
+                    client,
+                    session_id=PARENT_SESSION_ID,
+                    bridge_dir=tmp_path,
+                    event=frame,
+                    usage_coalescer=usage,
+                    elicitation_tracker=tracker,
+                    expected_thread_id="thread_parent",
+                    forwarder_state=state,
+                )
+            assert inbox.empty(), "the next normal native result is consumed without a new wake"
+            assert len(server.wakes) == 1
+        finally:
+            await tracker.close()
+            await state.close_child_streams()
 
 
 @pytest.mark.asyncio
