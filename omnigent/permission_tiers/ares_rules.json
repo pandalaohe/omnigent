@@ -163,9 +163,9 @@
   {
    "id": "critical-delete",
    "name": "Root/system/home/credential delete",
-   "pattern": "\\b(?:rm|Remove-Item|del|rd|rmdir|erase)(?:\\.exe)?\\b[^\\n|;&]*\\s+[\"']?(?:/(?:$|[\\s'\"*])|/(?:etc|usr|bin|sbin|boot|root|home|var)(?:[/\\s'\"*]|$)|[A-Za-z]:[/\\\\](?:$|[\\s'\"*]|(?:Windows|Users|Program\\s+Files)(?:[/\\\\\\s'\"*]|$))|~(?:[/\\\\\\s'\"*]|$)|[^\\s'\"|;&]*(?:\\.ssh|\\.aws|credentials)(?:[/\\\\\\s'\"*]|$))",
+   "pattern": "\\b(?:rm|Remove-Item|del|rd|rmdir|erase)(?:\\.exe)?\\b[^\\n|;&]*\\s+[\"']?(?:/(?:$|[\\s'\"*])|/(?:etc|usr|bin|sbin|boot|root)(?:[/\\s'\"*]|$)|[A-Za-z]:[/\\\\](?:$|[\\s'\"*]|(?:Windows|Program\\s+Files)(?:[/\\\\\\s'\"*]|$))|[^\\s'\"|;&]*(?:\\.ssh|\\.aws|credentials)(?:[/\\\\\\s'\"*]|$))",
    "ignore_case": true,
-   "reason": "Deletes a root, system, home or credential directory. Delete only specific paths inside the workspace."
+   "reason": "Deletes a root, system or credential directory. Deletes below a home or temporary root are checked against the bound path, not this pattern."
   },
   {
    "id": "macos-disk-destroy",
@@ -287,6 +287,7 @@
  },
  "path_reasons": {
   "protected": "Writes into a system or credential location. Write inside the workspace instead.",
-  "control": "Writes to Omnigent's permission files for this session. Leave them alone; the user changes the permission tier from the session header."
+  "control": "Refuses writes to Omnigent's permission files and this agent's guard files, and reads of them except for skills and settings under .pi and .agents. Leave them alone; the user changes the permission tier from the session header.",
+  "credential": "Refuses a read of a file that can carry a key: a name carrying auth, credential, secret, token, apikey, accounts or models, a dotenv file, or a .json directly in an agent root. Skills, notes, extensions and sessions stay readable."
  }
 }

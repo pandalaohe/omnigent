@@ -795,22 +795,17 @@ def test_shell_continued_write_target_does_not_bind_as_workspace_file() -> None:
         "cd /opt/work/project && echo x > out.log; echo x > other.log",
         "cd /opt/work/project && tee $OUTPUT",
         "cd /opt/work/project && echo x > `printf /usr/local/r`",
-        "cd /opt/work/project && printf x | tee `printf /usr/local/r`",
         "echo x > `printf /usr/local/r`",
         'echo x > "$OUTPUT"',
         "echo x > " + "\\\n" + "report.log",
     ],
 )
-def test_legal_unbound_shell_writes_retain_approval_and_full_tiers(command: str) -> None:
+def test_unresolved_write_targets_keep_tiers_and_proceed(command: str) -> None:
+    """A write whose target cannot be bound still runs below auto and at auto."""
     assert decision("ask", "bash", {"command": command}).action == Verdict.ASK
     assert decision("plan", "bash", {"command": command}).action == Verdict.DENY
     assert decision("accept-edits", "bash", {"command": command}).action == Verdict.ASK
-    result = decision("auto", "bash", {"command": command})
-    assert result.action == Verdict.DENY
-    assert result.reason.endswith(
-        "write with absolute literal paths: no cd except a literal absolute "
-        "cd /dir && prefix, no tee / redirect to $ targets"
-    )
+    assert decision("auto", "bash", {"command": command}).action == Verdict.ALLOW
     assert decision("full", "bash", {"command": command}).action == Verdict.ALLOW
 
     def failed_resolution(path: str) -> ResolvedPath:
@@ -823,6 +818,32 @@ def test_legal_unbound_shell_writes_retain_approval_and_full_tiers(command: str)
             ).action
             == Verdict.DENY
         )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'rm -rf "$OUTPUT"',
+        "rm -rf `printf /usr/local/r`",
+        "rm -rf $(ls)",
+        'cd "$D" && rm -rf out',
+        "cd - && rm -rf out",
+        'find "$D" -delete',
+    ],
+)
+def test_unresolved_delete_targets_stay_refused(command: str) -> None:
+    """A recursive delete of an unresolved target is the accident this guards."""
+    for tier in NON_FULL_TIERS:
+        result = decision(tier, "bash", {"command": command})
+        assert result.action == Verdict.DENY
+        assert result.rule_id == "unbound-write"
+    assert decision("full", "bash", {"command": command}).action == Verdict.ALLOW
+
+
+def test_unresolved_target_keeps_a_literal_protected_path() -> None:
+    """A target that cannot be bound still fails on a path it spells out literally."""
+    command = "cd /opt/work/project && printf x | tee `printf /usr/local/r`"
+    assert decision("auto", "bash", {"command": command}).rule_id == "protected-path"
 
 
 @pytest.mark.parametrize(
@@ -1746,11 +1767,11 @@ def test_sed_invalid_calls_and_existing_unbound_targets_stay_closed() -> None:
             tuple(decision(tier, "bash", {"command": command}).action for tier in PERMISSION_TIERS)
             == expected
         )
-    command = "echo x > `printf /usr/local/r`"
+    command = "echo x > `printf /opt/work/project/r`"
     intent = adapt_tool_call("bash", {"command": command}, posix_host())
-    assert intent.status == "unknown"
-    assert "expansion" in intent.detail
-    assert decision("auto", "bash", {"command": command}).action == Verdict.DENY
+    assert intent.status == "ok"
+    assert intent.unbound_write is False
+    assert decision("auto", "bash", {"command": command}).action == Verdict.ALLOW
 
     def failed_resolution(path: str) -> ResolvedPath:
         raise OSError("Cannot resolve target")
@@ -1831,3 +1852,479 @@ def test_sed_script_grammar_uses_public_tier_decisions(script: str, writing: boo
         assert result.action == action
         if writing and tier != "full":
             assert result.rule_id == "unbound-write"
+
+
+# --- Narrowed refusals: reads, cwd changes, expansions and delete depth ---
+
+SKILLS = "/opt/home/.pi/agent/skills"
+PI_CONTROLS = (
+    "/opt/work/bridge",
+    "/opt/home/.pi",
+    "/opt/home/.agents",
+    "/opt/work/project/.pi",
+    "/opt/work/project/.agents",
+)
+
+
+def pi_host(**changes: object) -> TrustedHostContext:
+    """A Pi session host: its control paths are skills, guard files and the bridge."""
+
+    def resolve(path: str) -> ResolvedPath:
+        directories = (
+            "/opt/work/project",
+            "/opt/home/.pi/agent",
+            "/opt/home/.pi/agent/skills",
+            "/opt/home/.agents/skills",
+            "/opt/work/project/.pi/agent",
+            "/opt/work/project/build",
+            "/var/tmp",
+            "/var/log",
+        )
+        return ResolvedPath(path, "directory" if path in directories else "new-file")
+
+    return replace(
+        posix_host(
+            control_paths=PI_CONTROLS,
+            resolver=resolve,
+            environment={"TMPDIR": "/var/folders/t/x/T/"},
+        ),
+        **changes,
+    )
+
+
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Skill-body reads through the read tools and through read-only shell.
+        "sed -n 1,60p /opt/home/.pi/agent/skills/wiki-ops/SKILL.md",
+        "rg --files /opt/home/.pi/agent/skills",
+        "find /opt/home/.pi/agent/skills -name '*.md'",
+        "cat /opt/home/.agents/skills/plan/SKILL.md",
+        # A scratch variable and a redirect into it.
+        'SCRATCH="${TMPDIR%/}/pi-s"; mkdir -p "$SCRATCH"; node x.mjs > "$SCRATCH/out.json"',
+        # Literal cwd changes mixed with writes.
+        "mkdir -p build && cd /opt/work/project && cat > probe.py <<'EOF'\nprint(1)\nEOF",
+        "cp a.py b.py && cd /opt/work && ls",
+        'scratch=/tmp/x; mkdir "$scratch"; cd "$scratch"; touch f',
+        "cd /opt/work/project && ls; pwd",
+        "cd /opt/work/project && { ls; pwd; }",
+        "cd build && echo x > report.log",
+        "cd $D && echo x > out.log",
+        'echo x > "$OUTPUT"',
+        "echo x > `printf /opt/work/project/r`",
+        # Trusted variables and deletes inside their own roots.
+        "mkdir -p $TMPDIR/pi-x/a",
+        "rm -rf $TMPDIR/pi-x",
+        "rm -rf /var/tmp/pi-x",
+        "rm -rf ~/project/build",
+        "rm -rf ~/project/build/cache",
+    ],
+)
+def test_narrowed_shell_refusals_now_run(command: str, platform: str) -> None:
+    result = decision("auto", "bash", {"command": command}, pi_host(platform=platform))
+    assert result.action == Verdict.ALLOW, result.reason
+
+
+@pytest.mark.parametrize(
+    ("name", "args"),
+    [
+        ("read", {"path": "/opt/home/.pi/AGENTS.md"}),
+        ("read", {"path": "/opt/home/.pi/agent/skills/plan/SKILL.md"}),
+        ("read", {"path": "/opt/home/.pi/agent/extensions/collab-guard/index.ts"}),
+        ("read", {"path": "/opt/home/.pi/agent/missions/m1.md"}),
+        (
+            "read",
+            {"path": "/opt/home/.pi/agent/sessions/2026-11-03T07-56-01-754Z_01a1.jsonl"},
+        ),
+        ("read", {"path": "/opt/home/.pi/agent/skills/plan/references/patterns.md"}),
+        ("read", {"path": "/opt/home/.agents/skills/plan/SKILL.md"}),
+        ("read", {"path": "/opt/work/project/.agents/skills/x/SKILL.md"}),
+        ("read", {"path": "/opt/work/project/.pi/extensions/injected.js"}),
+        ("grep_search", {"SearchPath": "/opt/home/.pi/agent/skills"}),
+        ("find_by_name", {"SearchDirectory": "/opt/work/project/.agents/skills"}),
+        ("load_skill", {"name": "plan"}),
+    ],
+)
+def test_control_path_reads_are_allowed(name: str, args: dict) -> None:
+    for tier in PERMISSION_TIERS:
+        assert decision(tier, name, args, pi_host()).action == Verdict.ALLOW
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        # Key-bearing names, at the agent roots and at any depth.
+        "/opt/home/.pi/agent/auth.json",
+        "/opt/home/.pi/agent/models.json",
+        "/opt/home/.pi/agent/models-store.json",
+        "/opt/home/.pi/agent/antigravity-accounts.json",
+        "/opt/home/.pi/agent/models.json.bak-20261102",
+        "/opt/home/.pi/mcp-auth.json",
+        "/opt/home/.pi/agent/skills/x/token-usage.md",
+        "/opt/home/.pi/agent/skills/x/credentials-policy.md",
+        "/opt/home/.pi/agent/skills/x/AuthNotes.md",
+        "/opt/home/.pi/agent/skills/x/secret-plans.md",
+        "/opt/home/.pi/agent/missions/apikeys.md",
+        "/opt/home/.pi/agent/.env",
+        "/opt/home/.pi/agent/skills/x/.env.local",
+        "/opt/work/project/.pi/agent/apikeys.json",
+        "/opt/work/project/.agents/skills/y/secret.md",
+        # Any .json sitting directly in an agent root, key word or not.
+        "/opt/home/.pi/agent/settings.json",
+        "/opt/home/.pi/mcp.json",
+        "/opt/work/project/.pi/agent/config.json",
+    ],
+)
+def test_key_bearing_reads_are_refused(path: str) -> None:
+    for tier in NON_FULL_TIERS:
+        result = decision(tier, "read", {"path": path}, pi_host())
+        assert result.action == Verdict.DENY
+        assert result.rule_id == "control-path"
+    assert decision("full", "read", {"path": path}, pi_host()).action == Verdict.ALLOW
+
+
+@pytest.mark.parametrize(
+    "root",
+    ["/opt/home/.pi", "/opt/home/.pi/agent", "/opt/home", "/opt/home/.agents"],
+)
+def test_recursive_reads_covering_an_agent_root_are_refused(root: str) -> None:
+    for name in ("grep_search", "find_by_name"):
+        for tier in NON_FULL_TIERS:
+            result = decision(tier, name, {"SearchPath": root, "SearchDirectory": root}, pi_host())
+            assert result.action == Verdict.DENY
+            assert result.rule_id == "control-path"
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("cat /opt/home/.pi/agent/*", "refused"),
+        ("cat /opt/home/.pi/agent/models-store.json", "refused"),
+        ("cat /opt/home/.pi/agent/models.json.bak-1", "refused"),
+        ("cat /opt/home/.pi/agent/skills/x/token.md", "refused"),
+        ("cat /opt/home/.pi/agent/skills/*token*", "refused"),
+        ("rg models.json /opt/home/.pi/agent", "refused"),
+        ("cd /opt/home/.pi/agent && cat models.json", "refused"),
+        ("sed -n 1,60p /opt/home/.pi/agent/skills/wiki-ops/SKILL.md", "allowed"),
+        ("rg --files /opt/home/.pi/agent/skills", "allowed"),
+        ("find /opt/home/.pi/agent/skills -name '*.md'", "allowed"),
+        ("cat /opt/home/.pi/AGENTS.md", "allowed"),
+        ("sed -n 1p /opt/home/.pi/agent/skills/*/SKILL.md", "allowed"),
+        ("rg token /opt/home/.pi/agent/skills", "allowed"),
+        ("ls /opt/home/.pi/agent", "allowed"),
+        ("tail -n 5 /opt/home/.pi/agent/skills/x/SKILL.md", "allowed"),
+        ("stat /opt/home/.pi/agent/skills/x/SKILL.md", "allowed"),
+        ("jq . /opt/home/.pi/agent/skills/x/data.json", "allowed"),
+        ("printf '%s' /opt/home/.pi/agent/skills/x/SKILL.md", "allowed"),
+        ("shasum /opt/home/.pi/agent/skills/x/SKILL.md", "allowed"),
+        ("tree /opt/home/.pi/agent/skills", "allowed"),
+        ("xxd -l 64 /opt/home/.pi/agent/skills/x/SKILL.md", "allowed"),
+    ],
+)
+def test_read_only_shell_keeps_key_files_out(command: str, expected: str) -> None:
+    result = decision("auto", "bash", {"command": command}, pi_host())
+    if expected == "refused":
+        assert (result.action, result.rule_id) == (Verdict.DENY, "control-path")
+    else:
+        assert result.action == Verdict.ALLOW, result.reason
+
+
+@pytest.mark.parametrize(
+    ("name", "args"),
+    [
+        ("write", {"path": "/opt/home/.pi/agent/settings.json", "content": "{}"}),
+        ("write", {"path": "/opt/home/.pi/agent/skills/x/SKILL.md", "content": "x"}),
+        ("bash", {"command": "mkdir -p /opt/home/.pi/agent/x"}),
+        ("bash", {"command": "touch /opt/home/.pi/x"}),
+        ("bash", {"command": "sed -i s/a/b/ /opt/home/.pi/agent/settings.json"}),
+        ("bash", {"command": "bash -c 'cat /opt/home/.pi/x'"}),
+        ("bash", {"command": "find /opt/home/.pi -delete"}),
+        ("read", {"path": "/opt/work/bridge/permission_state.json"}),
+        ("grep_search", {"SearchPath": "/opt/work"}),
+    ],
+)
+def test_control_path_refusals_that_remain(name: str, args: dict) -> None:
+    for tier in NON_FULL_TIERS:
+        result = decision(tier, name, args, pi_host())
+        assert result.action == Verdict.DENY
+        assert result.rule_id == "control-path"
+    assert decision("full", name, args, pi_host()).action == Verdict.ALLOW
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "rm -rf ~",
+        "rm -rf ~/x",
+        "rm -rf ~/*",
+        "rm -rf $HOME",
+        "rm -rf /",
+        "rm -rf /*",
+        "rm -rf /etc",
+        "rm -rf /etc/passwd",
+        "rm -rf /usr/local/x",
+        "rm -rf /bin",
+        "rm -rf /sbin/x",
+        "rm -rf /boot",
+        "rm -rf /root/.cache",
+        "rm -rf /home",
+        "rm -rf /Users/sample",
+        "rm -rf /Users/sample/x",
+        "rm -rf /var",
+        "rm -rf /var/log",
+        "rm -rf /var/tmp",
+        "rm -rf /var/folders/t/x",
+        "rm -rf /var/folders/t/x/T",
+        "rm -rf ~/.ssh",
+        "rm -rf ~/Library/Keychains",
+    ],
+)
+def test_critical_delete_boundary_stays_refused(command: str) -> None:
+    result = decision("auto", "bash", {"command": command}, pi_host())
+    assert result.action == Verdict.DENY
+    assert result.rule_id in ("critical-delete", "protected-path")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "rm -rf ~/project/build",
+        "rm -rf /Users/sample/x/y",
+        "rm -rf /var/tmp/pi-x",
+        "rm -rf /var/folders/t/x/T/pi-1",
+        "rm -rf /tmp/pi-x",
+        "rm -rf /opt/work/project/build",
+        "rm -rf build",
+        "rm -rf node_modules",
+        'find /opt/work/project/build -name "*.o" -delete',
+    ],
+)
+def test_critical_delete_boundary_lets_specific_paths_through(command: str) -> None:
+    assert decision("auto", "bash", {"command": command}, pi_host()).action == Verdict.ALLOW
+
+
+def test_critical_delete_names_the_path_it_refuses() -> None:
+    result = decision("auto", "bash", {"command": "rm -rf /var/log"}, pi_host())
+    assert result.rule_id == "critical-delete"
+    assert "/var/log" in result.reason
+    assert "temporary roots" in result.reason
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        (r"Remove-Item -LiteralPath:C:\Users\sample", Verdict.DENY),
+        (r"Remove-Item -LiteralPath:C:\Users\sample\proj", Verdict.DENY),
+        (r"Remove-Item -LiteralPath:C:\Work\project\build", Verdict.ALLOW),
+        (r"Remove-Item -LiteralPath:C:\Windows\report", Verdict.DENY),
+        (r"Remove-Item -LiteralPath:C:\Windows", Verdict.DENY),
+        (r"Remove-Item -LiteralPath:C:\Work\project\build\x", Verdict.ALLOW),
+    ],
+)
+def test_windows_critical_delete_depth_boundary(command: str, expected: Verdict) -> None:
+    host = windows_host()
+    assert decision("auto", "run_command", {"CommandLine": command}, host).action == expected
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        # A recursive shell read at or above an agent root, and a glob whose fixed
+        # prefix is one; a glob deep under skills stays readable.
+        ("rg . /opt/home/.pi/agent", "control-path"),
+        ("cat /opt/home/.pi/*/mo*dels.json", "control-path"),
+        ("cat /opt/home/.pi/agent/*", "control-path"),
+        ("cat /opt/home/.pi/agent/skills/x/*", None),
+        ("rg -n x /opt/home/.pi/agent/skills", None),
+        ("ls /opt/home", None),
+        ("sed -n 1,5p /opt/home/.pi/agent/skills/plan/SKILL.md", None),
+        ("tee /opt/home/.pi/note", "control-path"),
+        # Recursion is read off the segment that runs the command, not the first word.
+        ("echo scanning && rg . /opt/home/.pi/agent", "control-path"),
+        ("grep -R . /opt/home/.pi/agent", "control-path"),
+        ("echo scanning && sed -n 1p /opt/home/.pi/agent/skills/x/SKILL.md", None),
+        ("LC_ALL=C rg . /opt/home/.pi/agent", "control-path"),
+        ("command rg . /opt/home/.pi/agent", "control-path"),
+        ("LC_ALL=C sed -n 1p /opt/home/.pi/agent/skills/x/SKILL.md", None),
+        # An ancestor of an agent root, and dotfiles above it, stay readable.
+        ("grep -R . /opt/home", None),
+        ("cat /opt/home/.*/*.json", None),
+    ],
+)
+def test_recursive_shell_reads_and_glob_prefixes(command: str, expected: str | None) -> None:
+    assert decision("auto", "bash", {"command": command}, pi_host()).rule_id == expected
+
+
+@pytest.mark.parametrize(
+    ("name", "args", "expected"),
+    [
+        # A recursive tool read naming a key-bearing file directly, and a search
+        # below an agent root, which stays allowed.
+        ("grep_search", {"SearchPath": SKILLS + "/x/models-store.json"}, "control-path"),
+        ("find_by_name", {"SearchDirectory": SKILLS + "/x/credentials.md"}, "control-path"),
+        ("grep_search", {"SearchPath": SKILLS + "/x"}, None),
+    ],
+)
+def test_tool_reads_name_key_files_directly(name: str, args: dict, expected: str | None) -> None:
+    assert decision("auto", name, args, pi_host()).rule_id == expected
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'export "TMPDIR=/var"; rm -rf "$TMPDIR/log"',
+        "export TMPDIR=/var; sh -c 'rm -rf \"$TMPDIR/log\"'",
+        'HOME=/tmp rm -rf "$HOME/project"',
+    ],
+)
+def test_a_same_command_assignment_disables_the_trusted_variable(command: str) -> None:
+    assert decision("auto", "bash", {"command": command}, pi_host()).rule_id == "unbound-write"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "{ cd /var; rm -rf log; }",
+        "{ cd /var; find log -delete; }",
+        "cd /var || cd /opt/work/project && rm -rf log",
+        "; ".join(["cd a"] * 8) + "; rm -rf x",
+        # A wrapper keeps the unknown cwd, so its relative delete stays unbound.
+        "cd /var; cd a; cd b; cd c; sh -c 'rm -rf log'",
+    ],
+)
+def test_cwd_walk_reaches_every_cwd_a_command_can_run_in(command: str) -> None:
+    assert decision("auto", "bash", {"command": command}, pi_host()).rule_id in (
+        "critical-delete",
+        "unbound-write",
+    )
+
+
+def test_many_cwds_do_not_multiply_resolution() -> None:
+    calls = 0
+
+    def counting(path: str) -> ResolvedPath:
+        nonlocal calls
+        calls += 1
+        return ResolvedPath(path, "directory" if path == "/opt/work/project" else "new-file")
+
+    host = posix_host(control_paths=PI_CONTROLS, resolver=counting)
+    command = "; ".join(["cd a"] * 8) + "; echo y > x"
+    assert decision("auto", "bash", {"command": command}, host).action == Verdict.ALLOW
+    assert calls < 80
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("rm -rf /var/log", "critical-delete"),
+        ("rm -rf /var/tmp", "critical-delete"),
+        ("rm -rf /var/folders/t/x/T", "critical-delete"),
+        ("rm -rf /var/tmp/pi-x", None),
+        ("rm -rf /var/folders/t/x/T/pi-1", None),
+    ],
+)
+def test_canonical_temporary_roots_keep_the_var_boundary(
+    command: str, expected: str | None
+) -> None:
+    """This host resolves /var to /private/var, so the boundaries must resolve too."""
+
+    def canonical(path: str) -> ResolvedPath:
+        final = "/private" + path if path == "/var" or path.startswith("/var/") else path
+        folders = ("/opt/work/project", "/private/var", "/private/var/tmp")
+        return ResolvedPath(final, "directory" if final in folders else "new-file")
+
+    host = posix_host(control_paths=PI_CONTROLS, resolver=canonical)
+    assert decision("auto", "bash", {"command": command}, host).rule_id == expected
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("rm -rf ~/x/{..,y}", "unbound-write"),
+        ("rm -rf ../build", "unbound-write"),
+        ("rm -rf /var\\\n/log", "critical-delete"),
+        ("unlink /var/log", "critical-delete"),
+        ('unlink "$OUTPUT"', "unbound-write"),
+        # The program name and its options are not delete operands.
+        ("cd /var && rm -rf /opt/work/project/build", None),
+        # find without a path operand searches the current directory.
+        ("cd /var && find -delete", "critical-delete"),
+        ("cd /var && find . -delete", "critical-delete"),
+        # After -- every value is an operand.
+        ("cd /var && rm -- -log", "critical-delete"),
+        ("cd /var && rm -rf -- log", "critical-delete"),
+        # find acts on its search roots, so a predicate argument is not a target.
+        ("cd /var && find -type f -delete", "critical-delete"),
+        ("cd / && find -type f -delete", "critical-delete"),
+        ("cd /var/tmp/pi-x && find -type f -delete", None),
+    ],
+)
+def test_delete_operands_keep_only_real_targets(command: str, expected: str | None) -> None:
+    assert decision("auto", "bash", {"command": command}, pi_host()).rule_id == expected
+
+
+def test_typed_name_counts_even_when_the_link_resolves_elsewhere() -> None:
+    def linked(path: str) -> ResolvedPath:
+        final = path.rsplit("/", 1)[0] + "/key-store" if path.endswith("/x/models.json") else path
+        return ResolvedPath(final, "directory" if final == "/opt/work/project" else "new-file")
+
+    host = posix_host(control_paths=PI_CONTROLS, resolver=linked)
+    assert decision("auto", "read", {"path": SKILLS + "/x/models.json"}, host).rule_id == (
+        "control-path"
+    )
+
+
+def test_windows_agent_roots_compare_without_case() -> None:
+    host = windows_host(
+        control_paths=(
+            "C:\\work\\control",
+            "C:\\work\\sample\\.pi",
+            "C:\\work\\sample\\.agents",
+        )
+    )
+    result = decision("auto", "read", {"path": "C:\\work\\sample\\.PI\\settings.json"}, host)
+    assert result.rule_id == "control-path"
+
+
+def test_key_refusals_name_the_target() -> None:
+    path = SKILLS + "/x/token-usage.md"
+    result = decision("auto", "read", {"path": path}, pi_host())
+    assert result.rule_id == "control-path"
+    assert path in result.reason
+    assert "agent root" in result.reason
+    shell = decision("auto", "bash", {"command": "cat " + SKILLS + "/../models.json"}, pi_host())
+    assert shell.rule_id == "control-path"
+    assert SKILLS + "/../models.json" in shell.reason
+
+
+@pytest.mark.parametrize(
+    ("typed", "final", "expected"),
+    [
+        # A typed key name counts even when a link resolves outside the agent tree.
+        (SKILLS + "/x/models.json", "/opt/work/notes/x", "control-path"),
+        # A typed root-level json counts even when it resolves below skills.
+        ("/opt/home/.pi/agent/settings.json", SKILLS + "/x/s", "control-path"),
+        (SKILLS + "/x/notes.md", SKILLS + "/x/notes.md", None),
+    ],
+)
+def test_typed_and_resolved_reads_are_checked_separately(
+    typed: str, final: str, expected: str | None
+) -> None:
+    def linked(path: str) -> ResolvedPath:
+        kind = "directory" if path == "/opt/work/project" else "new-file"
+        return ResolvedPath(final if path == typed else path, kind)
+
+    host = posix_host(control_paths=PI_CONTROLS, resolver=linked)
+    assert decision("auto", "read", {"path": typed}, host).rule_id == expected
+
+
+def test_a_relative_typed_path_is_absolutized_before_its_own_check() -> None:
+    def linked(path: str) -> ResolvedPath:
+        final = "/opt/work/project/copy" if path == "/opt/home/.pi/agent/models.json" else path
+        kind = "directory" if path in ("/opt/work/project", "/opt/home/.pi/agent") else "new-file"
+        return ResolvedPath(final, kind)
+
+    host = replace(replace(pi_host(), cwd="/opt/home/.pi/agent"), resolver=linked)
+    assert decision("auto", "read", {"path": "models.json"}, host).rule_id == "control-path"
+    assert decision("auto", "read", {"path": "notes.md"}, host).action == Verdict.ALLOW
