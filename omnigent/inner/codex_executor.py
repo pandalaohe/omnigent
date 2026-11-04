@@ -1364,6 +1364,38 @@ def _sync_codex_windows_sandbox(source_config: Path, dest_config: Path) -> None:
                 logger.warning("could not remove temporary Codex config %s (%s)", tmp_name, exc)
 
 
+def _apply_codex_current_route(config_path: Path) -> None:
+    """Apply the host's current route to a newly copied session config."""
+    import tomlkit
+    import tomlkit.exceptions
+
+    route_path = Path.home() / ".codex-route" / "current.toml"
+    try:
+        route = tomlkit.parse(route_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    except (OSError, UnicodeError, ValueError, tomlkit.exceptions.TOMLKitError) as exc:
+        logger.warning("Codex current route skipped: %s", type(exc).__name__)
+        return
+    try:
+        document = tomlkit.parse(config_path.read_text(encoding="utf-8"))
+        for key, value in route.items():
+            if key not in {"route", "remove"}:
+                document[key] = value
+        for dotted_key in route.get("remove", []):
+            parts = dotted_key.split(".")
+            parent = document
+            for part in parts[:-1]:
+                parent = parent.get(part)
+                if not isinstance(parent, MutableMapping):
+                    break
+            else:
+                parent.pop(parts[-1], None)
+        config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
+    except (OSError, UnicodeError, ValueError, tomlkit.exceptions.TOMLKitError) as exc:
+        logger.warning("Codex current route skipped: %s", type(exc).__name__)
+
+
 def _populate_codex_home_config(
     target_dir: Path,
     source_dir: Path,
@@ -1433,6 +1465,7 @@ def _populate_codex_home_config(
         sandbox used to write a network-denied bundled catalog.
     :param runtime_bin: Selected snapshot offered to a configured wrapper.
     """
+    config_existed = (target_dir / "config.toml").exists()
     if required_brokered_probe is not None:
         codex_path, cwd, os_env = required_brokered_probe
         probe = prepare_codex_catalog_probe(
@@ -1635,6 +1668,8 @@ def _populate_codex_home_config(
                 )
                 if catalog_path is not None:
                     set_codex_model_catalog_path(dest_path, catalog_path)
+            if not config_existed and include_credentials and not minimal_config:
+                _apply_codex_current_route(dest_path)
 
 
 def materialize_codex_provider_config(
