@@ -1,5 +1,4 @@
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
 import { choiceRequest } from "./sessionChoiceData";
 
 export function NewChatChoiceNotice({
@@ -13,11 +12,6 @@ export function NewChatChoiceNotice({
   model?: string | null;
   enabled?: boolean;
 }) {
-  const [settled, setSettled] = useState(false);
-  useEffect(() => {
-    const timer = window.setTimeout(() => setSettled(true), 500);
-    return () => window.clearTimeout(timer);
-  }, [host, agent, model]);
   const notice = useQuery({
     queryKey: ["sessionChoiceNotice", host, agent, model],
     queryFn: ({ signal }) =>
@@ -25,7 +19,7 @@ export function NewChatChoiceNotice({
         `/notice?${new URLSearchParams({ host_id: host!, agent_id: agent!, ...(model ? { model } : {}) })}`,
         { signal },
       ),
-    enabled: enabled && settled && !!host && !!agent && !!model,
+    enabled: enabled && !!host && !!agent,
     retry: false,
     staleTime: 30_000,
     refetchOnWindowFocus: false,
