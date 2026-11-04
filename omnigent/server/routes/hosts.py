@@ -1376,6 +1376,38 @@ def create_hosts_router(
             raise HTTPException(status_code=403, detail="not your host")
         return _cli_retention_response(host)
 
+    @router.get("/hosts/{host_id}/cli-releases")
+    async def list_host_cli_releases(
+        request: Request, host_id: str, limit: int = Query(default=20, ge=1, le=100)
+    ) -> dict[str, Any]:
+        """Return this Host's CLI release records, newest first.
+
+        Read-only: the rows are written by archive and idle-pool release, so
+        this route only answers what already happened on this Host.
+        """
+        user_id = require_user(request, auth_provider)
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.user_id != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+        intent_store = getattr(request.app.state, "cli_release_intent_store", None)
+        if intent_store is None:
+            return {"data": []}
+        intents = await asyncio.to_thread(intent_store.list_for_host, host_id, limit=limit)
+        return {
+            "data": [
+                {
+                    "created_at": intent.created_at,
+                    "reason": intent.reason,
+                    "family": intent.family,
+                    "status": intent.status,
+                    "target_session_id": intent.target_session_id,
+                }
+                for intent in intents
+            ]
+        }
+
     @router.put(
         "/hosts/{host_id}/cli-retention",
         response_model_exclude_unset=True,

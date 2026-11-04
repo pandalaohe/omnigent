@@ -7,6 +7,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as SystemStatusModule from "@/hooks/useSystemStatus";
+import type * as HostsModule from "@/hooks/useHosts";
 import type { Host } from "@/hooks/useHosts";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
@@ -42,7 +43,20 @@ vi.mock("@/hooks/useSystemStatus", async (importOriginal) => ({
 }));
 
 vi.mock("@/hooks/useIsAdmin", () => ({ useIsAdmin: () => mocks.isAdmin.current }));
-vi.mock("@/hooks/useHosts", () => ({ useHosts: () => ({ data: mocks.hosts.current }) }));
+vi.mock("@/hooks/useHosts", async (importOriginal) => ({
+  ...(await importOriginal<typeof HostsModule>()),
+  useHosts: () => ({ data: mocks.hosts.current }),
+  // The idle-CLI fold on each owned card is covered by its own test file; here
+  // it only needs to exist without a request.
+  useHostCliRetention: () => ({ data: undefined, isLoading: false, isError: false }),
+  useHostCliReleases: () => ({ data: [], isLoading: false, isError: false }),
+  useReplaceHostCliRetention: () => ({ mutateAsync: vi.fn(), isPending: false, error: null }),
+  useResetHostCliRetention: () => ({ mutateAsync: vi.fn(), isPending: false, error: null }),
+}));
+vi.mock("@/lib/archiveWorktreePreferences", () => ({
+  useArchiveWorktreePreference: () => ({ preference: { data: { mode: "never" } } }),
+}));
+vi.mock("@/hooks/useAgents", () => ({ useAgents: () => ({ data: [] }) }));
 vi.mock("@/lib/identity", async (importOriginal) => ({
   ...(await importOriginal<typeof IdentityModule>()),
   authenticatedFetch: vi.fn(),
@@ -64,7 +78,7 @@ vi.mock("@/hooks/useSidebarData", () => {
   return { useLoadedConversations: () => loaded };
 });
 
-import { SystemStatusPage } from "./SystemStatusPage";
+import { fanOutLabels, SystemStatusPage } from "./SystemStatusPage";
 
 const MB = 1024 * 1024;
 
@@ -382,7 +396,7 @@ describe("SystemStatusPage", () => {
     ).not.toBeInTheDocument();
     client.clear();
   });
-  it("renders findings, the server card, host states and the overhead footer", () => {
+  it("renders findings, the server card and host states, with no page subtitle", () => {
     mocks.status.current = {
       data: makeView({ server: true }),
       isLoading: false,
@@ -396,15 +410,17 @@ describe("SystemStatusPage", () => {
     const serverCard = screen.getByTestId("system-status-server-card");
     expect(within(serverCard).getByText("12.0%")).toBeInTheDocument();
     expect(within(serverCard).getByText("14")).toBeInTheDocument();
+    // Disk is the server's data-dir usage, the metric its alert line governs.
+    expect(within(serverCard).getByText("40.0%")).toBeInTheDocument();
 
     expect(within(screen.getByTestId("host-card-host_1")).getByText("Laptop")).toBeInTheDocument();
     expect(screen.getByText("Last seen 2h ago.")).toBeInTheDocument();
     expect(screen.getByText("Update host to see resources.")).toBeInTheDocument();
 
-    const overhead = screen.getByTestId("system-status-overhead");
-    expect(overhead).toHaveTextContent("Monitor overhead");
-    expect(overhead).toHaveTextContent("memory (estimate)");
-    expect(overhead).toHaveTextContent("resident increase (upper bound)");
+    // The subtitle that restated the page is gone; the overhead table lives in
+    // Monitor settings now.
+    expect(screen.queryByText(/Resources on this server and on every visible host/)).toBeNull();
+    expect(screen.queryByTestId("system-status-overhead")).toBeNull();
   });
 
   it("hides the server card for a member (server: null)", () => {
@@ -493,7 +509,7 @@ describe("SystemStatusPage", () => {
     expect(screen.getByText("2 other processes")).toHaveAttribute("title", "2 other processes");
   });
 
-  it("renders each row's uptime and names hosts in the overhead footer", () => {
+  it("renders each row's uptime", () => {
     // Uptime is minute-granular, so start on a minute boundary for exact labels.
     vi.useFakeTimers({ now: new Date("2026-09-30T12:00:00Z") });
     mocks.status.current = {
@@ -517,10 +533,6 @@ describe("SystemStatusPage", () => {
     // A null start time (folded row) and a missing one (older host) both show "—".
     expect(uptimeCell("2 other processes")).toHaveTextContent("—");
     expect(uptimeCell("host daemon")).toHaveTextContent("—");
-
-    const overhead = screen.getByTestId("system-status-overhead");
-    expect(overhead).toHaveTextContent("Laptop");
-    expect(overhead).not.toHaveTextContent("host_1");
   });
 
   it("advances a process row's uptime once a minute despite the memoized tree", () => {
@@ -561,7 +573,8 @@ describe("SystemStatusPage", () => {
 
     mocks.isAdmin.current = true;
     renderPage();
-    expect(screen.getAllByRole("button", { name: "Run health check" })).toHaveLength(2);
+    // One action, in the page header: the findings banner keeps no copy of it.
+    expect(screen.getAllByRole("button", { name: "Run health check" })).toHaveLength(1);
   });
 
   it("shows the host sample age while the snapshot is fresh", () => {
@@ -718,27 +731,38 @@ describe("SystemStatusPage host load", () => {
     expect(levelText).toHaveTextContent(label);
     expect(levelText).toHaveAttribute("data-level", level);
     expect(row).toHaveTextContent(
-      perCore === null ? "— per core" : `${perCore.toFixed(2)} per core`,
+      perCore === null ? "No reading per core" : `${perCore.toFixed(2)} per core`,
     );
   });
 
-  it("shows load per core with the load and cores it divides, and both lines", () => {
+  it("draws the ruler with a numbered tick per line and the load on it", () => {
     const row = renderLoad({});
 
     expect(row).toHaveTextContent("0.93 per core");
     expect(within(row).getByTestId("host-load-equiv")).toHaveTextContent("(11.1 / 12 cores)");
     expect(within(row).getByTestId("host-load-equiv")).not.toHaveAttribute("title");
-    expect(row).toHaveTextContent("Heavy-work line 4");
-    expect(row).toHaveTextContent("New-session line 5");
-    expect(within(row).getByTestId("host-load-lines-source")).toHaveTextContent("Default");
+    expect(within(row).getByTestId("host-load-tick-heavy")).toHaveTextContent("4");
+    expect(within(row).getByTestId("host-load-tick-new_session")).toHaveTextContent("5");
+    // The lines are named under the scale, and the old Default word is gone.
+    expect(row).toHaveTextContent("Heavy work");
+    expect(row).toHaveTextContent("No new session");
+    expect(row).not.toHaveTextContent("Default");
     // Scale runs to 1.5 x the new-session line: 4 / 7.5 and 5 / 7.5.
     expect(within(row).getByTestId("host-load-heavy-mark").style.left).toBe(`${(4 / 7.5) * 100}%`);
     expect(within(row).getByTestId("host-load-new-session-mark").style.left).toBe(
       `${(5 / 7.5) * 100}%`,
     );
     expect(within(row).getByTestId("host-load-marker").style.left).toBe(`${(0.93 / 7.5) * 100}%`);
+    // A host following the default carries no own-lines mark.
+    expect(within(row).queryByTestId("host-load-own-lines")).toBeNull();
     // The old raw-load metric is gone from the metric grid.
     expect(within(screen.getByTestId("host-card-host_1")).queryByText("9.8")).toBeNull();
+  });
+
+  it("marks a host that sets its own lines", () => {
+    const row = renderLoad({ lines: { heavy: 2, new_session: 8 }, lines_source: "host" });
+    expect(within(row).getByTestId("host-load-own-lines")).toHaveTextContent("Own lines");
+    expect(within(row).getByTestId("host-load-tick-heavy")).toHaveTextContent("2");
   });
 
   it("pins a load past the scale to its end and drops the marker without a reading", () => {
@@ -750,6 +774,7 @@ describe("SystemStatusPage host load", () => {
     expect(within(unknown).queryByTestId("host-load-marker")).toBeNull();
     expect(within(unknown).queryByTestId("host-load-equiv")).toBeNull();
     expect(within(unknown).getByTestId("host-load-scale")).toBeInTheDocument();
+    expect(unknown).toHaveTextContent("No reading per core");
   });
 
   it("marks a Windows load as an estimate", () => {
@@ -796,9 +821,9 @@ describe("SystemStatusPage host load", () => {
 
     const row = screen.getByTestId("host-load-host_2");
     expect(within(row).getByTestId("host-load-level")).toHaveTextContent("Incomplete data");
-    expect(row).toHaveTextContent("Heavy-work line 3");
+    expect(within(row).getByTestId("host-load-tick-heavy")).toHaveTextContent("3");
     expect(within(row).queryByTestId("host-load-marker")).toBeNull();
-    expect(within(row).getByRole("button", { name: "Edit lines" })).toBeInTheDocument();
+    expect(within(row).getByTestId("host-load-own-lines")).toBeInTheDocument();
   });
 
   it("counts queued child sessions only when there are some", () => {
@@ -806,90 +831,89 @@ describe("SystemStatusPage host load", () => {
     expect(within(row).getByTestId("host-load-queued")).toHaveTextContent(
       "2 child sessions queued",
     );
+    expect(within(row).getByTestId("host-load-queued")).toHaveTextContent("below No new session");
     cleanup();
 
     const none = renderLoad({});
     expect(within(none).queryByTestId("host-load-queued")).toBeNull();
   });
 
-  it("renders the card for an admin whose server sends no load lines in settings", () => {
-    mocks.settings.current = { data: { cpu_pct: 85 } };
-    const row = renderLoad({});
-    fireEvent.click(within(row).getByRole("button", { name: "Edit lines" }));
-    expect(within(row).getByRole("checkbox", { name: "Follow the default" })).toBeChecked();
-  });
-
-  it("offers Edit lines to admins only", () => {
+  it("gives a member plain numbers, with nothing to open", () => {
     mocks.isAdmin.current = false;
-    const member = renderLoad({});
-    expect(within(member).queryByRole("button", { name: "Edit lines" })).toBeNull();
-    cleanup();
-
-    mocks.isAdmin.current = true;
-    const admin = renderLoad({});
-    expect(within(admin).getByRole("button", { name: "Edit lines" })).toBeInTheDocument();
-  });
-
-  it("refuses a heavy-work line at or above the new-session line without saving", () => {
     const row = renderLoad({});
-    fireEvent.click(within(row).getByRole("button", { name: "Edit lines" }));
-    fireEvent.click(within(row).getByRole("checkbox", { name: /Follow the default/ }));
-    fireEvent.change(within(row).getByLabelText("Heavy-work line (per core)"), {
-      target: { value: "5" },
-    });
-    fireEvent.change(within(row).getByLabelText("New-session line (per core)"), {
-      target: { value: "5" },
-    });
-    fireEvent.click(within(row).getByRole("button", { name: "Save" }));
 
-    expect(within(row).getByRole("alert")).toHaveTextContent(
-      "The heavy-work line must be below the new-session line.",
-    );
+    const tick = within(row).getByTestId("host-load-tick-heavy");
+    expect(tick.tagName).toBe("SPAN");
+    expect(tick).toHaveTextContent("4");
+    expect(within(row).queryByRole("button", { name: /line, currently/ })).toBeNull();
+    fireEvent.click(tick);
+    expect(within(row).queryByRole("alert")).toBeNull();
     expect(mocks.update.mutate).not.toHaveBeenCalled();
   });
 
-  it("saves a per-host override, then closes the editor", () => {
+  // The line editor opens in a portal, so it is queried from the screen while
+  // the ruler itself stays scoped to the card's row.
+  it("opens one host's line from its tick, saving only that host's pair", () => {
     mocks.update.mutate = vi.fn((_patch: unknown, options?: { onSuccess?: () => void }) =>
       options?.onSuccess?.(),
     );
     const row = renderLoad({});
-    fireEvent.click(within(row).getByRole("button", { name: "Edit lines" }));
-    const heavy = within(row).getByLabelText("Heavy-work line (per core)");
-    expect(heavy).toBeDisabled();
-    fireEvent.click(within(row).getByRole("checkbox", { name: /Follow the default/ }));
-    expect(heavy).toHaveValue(4);
-    fireEvent.change(heavy, { target: { value: "3" } });
-    fireEvent.change(within(row).getByLabelText("New-session line (per core)"), {
-      target: { value: "6.5" },
-    });
-    fireEvent.click(within(row).getByRole("button", { name: "Save" }));
+    fireEvent.click(within(row).getByTestId("host-load-tick-heavy"));
+
+    const input = screen.getByLabelText("Heavy work (per core)");
+    expect(input).toHaveValue(4);
+    fireEvent.change(input, { target: { value: "3" } });
+    fireEvent.submit(screen.getByTestId("host-line-form-heavy"));
 
     expect(mocks.update.mutate).toHaveBeenCalledWith(
-      { load_lines: { hosts: { host_1: { heavy: 3, new_session: 6.5 } } } },
+      { load_lines: { hosts: { host_1: { heavy: 3, new_session: 5 } } } },
       expect.anything(),
     );
-    expect(within(row).queryByTestId("host-lines-form-host_1")).toBeNull();
+    expect(screen.queryByTestId("host-line-form-heavy")).toBeNull();
+    // The card's own tick is still the saved value until the data refetches.
+    expect(within(row).getByTestId("host-load-tick-new_session")).toHaveTextContent("5");
   });
 
-  it("returns an overridden host to the default and shows the default's values", () => {
-    mocks.settings.current = {
-      data: {
-        load_lines: { default: { heavy: 3, new_session: 4.5 }, hosts: {}, queue_enabled: true },
-      },
-    };
-    const row = renderLoad({ lines: { heavy: 2, new_session: 8 }, lines_source: "host" });
-    expect(within(row).getByTestId("host-load-lines-source")).toHaveTextContent(
-      "Set for this host",
-    );
-    fireEvent.click(within(row).getByRole("button", { name: "Edit lines" }));
-    const follow = within(row).getByRole("checkbox", { name: /Follow the default \(3 \/ 4\.5\)/ });
-    expect(follow).not.toBeChecked();
-    expect(within(row).getByLabelText("Heavy-work line (per core)")).toHaveValue(2);
+  it("saves on Enter and closes on Esc", () => {
+    mocks.update.mutate = vi.fn();
+    const row = renderLoad({});
+    fireEvent.click(within(row).getByTestId("host-load-tick-new_session"));
+    const input = screen.getByLabelText("No new session (per core)");
+    fireEvent.change(input, { target: { value: "6" } });
+    fireEvent.keyDown(input, { key: "Enter" });
 
-    fireEvent.click(follow);
-    expect(within(row).getByLabelText("Heavy-work line (per core)")).toHaveValue(3);
-    expect(within(row).getByLabelText("New-session line (per core)")).toHaveValue(4.5);
-    fireEvent.click(within(row).getByRole("button", { name: "Save" }));
+    expect(mocks.update.mutate).toHaveBeenCalledWith(
+      { load_lines: { hosts: { host_1: { heavy: 4, new_session: 6 } } } },
+      expect.anything(),
+    );
+    // Enter does not close by itself: the editor closes when the save lands.
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(screen.queryByTestId("host-line-form-new_session")).toBeNull();
+  });
+
+  it("refuses an invalid line in place and keeps the value", () => {
+    const row = renderLoad({});
+    fireEvent.click(within(row).getByTestId("host-load-tick-heavy"));
+    const input = screen.getByLabelText("Heavy work (per core)");
+    fireEvent.change(input, { target: { value: "6" } });
+    fireEvent.submit(screen.getByTestId("host-line-form-heavy"));
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "The heavy-work line must be below the new-session line.",
+    );
+    expect(mocks.update.mutate).not.toHaveBeenCalled();
+    expect(input).toHaveValue(6);
+    // The ruler still shows the saved value.
+    expect(within(row).getByTestId("host-load-tick-heavy")).toHaveTextContent("4");
+  });
+
+  it("resets an overridden host to the default from the editor", () => {
+    mocks.update.mutate = vi.fn((_patch: unknown, options?: { onSuccess?: () => void }) =>
+      options?.onSuccess?.(),
+    );
+    const row = renderLoad({ lines: { heavy: 2, new_session: 8 }, lines_source: "host" });
+    fireEvent.click(within(row).getByTestId("host-load-tick-heavy"));
+    fireEvent.click(screen.getByRole("button", { name: "Reset to default" }));
 
     expect(mocks.update.mutate).toHaveBeenCalledWith(
       { load_lines: { hosts: { host_1: null } } },
@@ -897,17 +921,256 @@ describe("SystemStatusPage host load", () => {
     );
   });
 
+  it("keeps Reset to default's own action on Enter", () => {
+    mocks.update.mutate = vi.fn((_patch: unknown, options?: { onSuccess?: () => void }) =>
+      options?.onSuccess?.(),
+    );
+    const row = renderLoad({ lines: { heavy: 2, new_session: 8 }, lines_source: "host" });
+    fireEvent.click(within(row).getByTestId("host-load-tick-heavy"));
+    const reset = screen.getByRole("button", { name: "Reset to default" });
+    reset.focus();
+    fireEvent.keyDown(reset, { key: "Enter" });
+    fireEvent.click(reset);
+
+    // One call: the reset. Enter must not also submit the form as a save.
+    expect(mocks.update.mutate).toHaveBeenCalledTimes(1);
+    expect(mocks.update.mutate).toHaveBeenCalledWith(
+      { load_lines: { hosts: { host_1: null } } },
+      expect.anything(),
+    );
+  });
+
+  it("offers no reset to a host that follows the default", () => {
+    const row = renderLoad({});
+    fireEvent.click(within(row).getByTestId("host-load-tick-heavy"));
+    expect(screen.queryByRole("button", { name: "Reset to default" })).toBeNull();
+  });
+
   it("shows a server refusal inside the editor", () => {
     mocks.update.mutate = vi.fn((_patch: unknown, options?: { onError?: (e: Error) => void }) =>
       options?.onError?.(new Error("load lines require 0 < heavy < new_session <= 64")),
     );
     const row = renderLoad({});
-    fireEvent.click(within(row).getByRole("button", { name: "Edit lines" }));
-    fireEvent.click(within(row).getByRole("button", { name: "Save" }));
+    fireEvent.click(within(row).getByTestId("host-load-tick-heavy"));
+    fireEvent.submit(screen.getByTestId("host-line-form-heavy"));
 
-    expect(within(row).getByRole("alert")).toHaveTextContent(
+    expect(screen.getByRole("alert")).toHaveTextContent(
       "load lines require 0 < heavy < new_session <= 64",
     );
-    expect(within(row).getByTestId("host-lines-form-host_1")).toBeInTheDocument();
+    expect(screen.getByTestId("host-line-form-heavy")).toBeInTheDocument();
+  });
+});
+
+describe("fanOutLabels", () => {
+  it("moves two labels apart while their marks keep their places", () => {
+    // Heavy work 4.9 and No new session 5 on a 300 px ruler: 196 px and 200 px
+    // apart naturally, far closer than one label is wide.
+    const natural = [196, 200];
+    const placed = fanOutLabels(natural, 34, 300);
+
+    expect(placed[0]).toBeLessThan(natural[0]);
+    expect(placed[1]).toBeGreaterThan(natural[1]);
+    expect(placed[1] - placed[0]).toBeGreaterThanOrEqual(34);
+    // The marks themselves are not moved by this.
+    expect(natural).toEqual([196, 200]);
+  });
+
+  it("leaves labels alone when they already clear each other", () => {
+    expect(fanOutLabels([60, 200], 34, 300)).toEqual([60, 200]);
+  });
+
+  it("keeps both labels inside the ruler at an edge", () => {
+    const placed = fanOutLabels([294, 297], 34, 300);
+    expect(Math.min(...placed)).toBeGreaterThanOrEqual(0);
+    expect(Math.max(...placed)).toBeLessThanOrEqual(300);
+    expect(placed[1] - placed[0]).toBeGreaterThanOrEqual(34);
+  });
+
+  it("does nothing before the ruler has a width", () => {
+    expect(fanOutLabels([10, 12], 34, 0)).toEqual([10, 12]);
+  });
+});
+
+describe("SystemStatusPage alert lines", () => {
+  const settingsView = {
+    cpu_pct: 85,
+    cpu_sustain_min: 10,
+    mem_pct: 90,
+    disk_pct: 90,
+    server_5xx_pct: 5,
+  };
+
+  function renderWithSettings() {
+    mocks.settings.current = { data: settingsView };
+    mocks.status.current = {
+      data: makeView({ server: true }),
+      isLoading: false,
+      isError: false,
+      error: null,
+    };
+    renderPage();
+    return screen.getByTestId("system-status-server-card");
+  }
+
+  it("writes each alert line under the metric it governs, once each", () => {
+    const card = renderWithSettings();
+
+    expect(within(card).getByTestId("alert-cpu_pct")).toHaveTextContent("alert 85%");
+    expect(within(card).getByTestId("alert-mem_pct")).toHaveTextContent("alert 90%");
+    expect(within(card).getByTestId("alert-disk_pct")).toHaveTextContent("alert 90%");
+    expect(within(card).getByTestId("alert-server_5xx_pct")).toHaveTextContent("alert 5%");
+    // One editing place: no second copy on a host card.
+    expect(
+      within(screen.getByTestId("host-card-host_1")).queryByTestId("alert-cpu_pct"),
+    ).toBeNull();
+  });
+
+  it("saves the CPU line with its sustained window, and says every host shares it", () => {
+    const card = renderWithSettings();
+    mocks.update.mutate = vi.fn((_patch: unknown, options?: { onSuccess?: () => void }) =>
+      options?.onSuccess?.(),
+    );
+    fireEvent.click(within(card).getByTestId("alert-cpu_pct"));
+
+    expect(screen.getByText(/Every host shares this line/)).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Alert when CPU is above, in percent"), {
+      target: { value: "80" },
+    });
+    fireEvent.change(screen.getByLabelText("Sustained window, in minutes"), {
+      target: { value: "3" },
+    });
+    fireEvent.submit(screen.getByLabelText("Alert when CPU is above, in percent").closest("form")!);
+
+    expect(mocks.update.mutate).toHaveBeenCalledWith(
+      { cpu_pct: 80, cpu_sustain_min: 3 },
+      expect.anything(),
+    );
+  });
+
+  it("sends one field for a single-number line", () => {
+    const card = renderWithSettings();
+    mocks.update.mutate = vi.fn();
+    fireEvent.click(within(card).getByTestId("alert-mem_pct"));
+    fireEvent.change(screen.getByLabelText("Alert when Memory is above, in percent"), {
+      target: { value: "75" },
+    });
+    fireEvent.submit(
+      screen.getByLabelText("Alert when Memory is above, in percent").closest("form")!,
+    );
+
+    expect(mocks.update.mutate).toHaveBeenCalledWith({ mem_pct: 75 }, expect.anything());
+  });
+
+  it("sends the stored percentage back unchanged when only the window moves", () => {
+    mocks.settings.current = { data: { ...settingsView, cpu_pct: 85.555 } };
+    mocks.status.current = {
+      data: makeView({ server: true }),
+      isLoading: false,
+      isError: false,
+      error: null,
+    };
+    mocks.update.mutate = vi.fn();
+    renderPage();
+    // The label rounds for reading; the field holds what the server stored.
+    const card = screen.getByTestId("system-status-server-card");
+    expect(within(card).getByTestId("alert-cpu_pct")).toHaveTextContent("alert 85.56%");
+    fireEvent.click(within(card).getByTestId("alert-cpu_pct"));
+    const percent = screen.getByLabelText("Alert when CPU is above, in percent");
+    expect(percent).toHaveValue(85.555);
+    fireEvent.change(screen.getByLabelText("Sustained window, in minutes"), {
+      target: { value: "3" },
+    });
+    fireEvent.submit(percent.closest("form")!);
+
+    expect(mocks.update.mutate).toHaveBeenCalledWith(
+      { cpu_pct: 85.555, cpu_sustain_min: 3 },
+      expect.anything(),
+    );
+  });
+
+  it("refuses a percentage outside the range in place", () => {
+    const card = renderWithSettings();
+    fireEvent.click(within(card).getByTestId("alert-disk_pct"));
+    const input = screen.getByLabelText("Alert when Disk is above, in percent");
+    fireEvent.change(input, { target: { value: "0" } });
+    fireEvent.submit(input.closest("form")!);
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Enter a percentage above 0 and at most 100.",
+    );
+    expect(mocks.update.mutate).not.toHaveBeenCalled();
+  });
+
+  it("closes on Esc without saving", () => {
+    const card = renderWithSettings();
+    fireEvent.click(within(card).getByTestId("alert-server_5xx_pct"));
+    const input = screen.getByLabelText("Alert when 5xx failure rate is above, in percent");
+    fireEvent.change(input, { target: { value: "9" } });
+    fireEvent.keyDown(input, { key: "Escape" });
+
+    expect(screen.queryByLabelText("Alert when 5xx failure rate is above, in percent")).toBeNull();
+    expect(mocks.update.mutate).not.toHaveBeenCalled();
+  });
+
+  it("leaves a member with no alert line to open", () => {
+    mocks.isAdmin.current = false;
+    mocks.status.current = {
+      data: makeView({ server: true }),
+      isLoading: false,
+      isError: false,
+      error: null,
+    };
+    renderPage();
+
+    expect(screen.queryByTestId("alert-cpu_pct")).toBeNull();
+  });
+});
+
+describe("SystemStatusPage chart and panel entry", () => {
+  it("labels the alert line in a gutter that opens nothing", () => {
+    mocks.settings.current = { data: { cpu_pct: 85 } };
+    mocks.status.current = {
+      data: makeView({ server: true }),
+      isLoading: false,
+      isError: false,
+      error: null,
+    };
+    renderPage();
+
+    const label = within(screen.getByTestId("system-status-server-card")).getByTestId(
+      "sparkline-threshold-label",
+    );
+    expect(label).toHaveTextContent("85%");
+    fireEvent.click(label);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.queryByLabelText(/Alert when/)).toBeNull();
+    expect(document.activeElement).toBe(document.body);
+  });
+
+  it("opens Monitor settings from the header, and from ?monitor=1", async () => {
+    mocks.status.current = {
+      data: makeView({ server: true }),
+      isLoading: false,
+      isError: false,
+      error: null,
+    };
+    renderPage();
+    fireEvent.click(screen.getByRole("button", { name: "Monitor settings" }));
+    expect(await screen.findByRole("dialog", { name: "Monitor settings" })).toBeInTheDocument();
+    cleanup();
+
+    // The old Settings link lands here with the panel already open.
+    mocks.settings.current = {
+      data: { cpu_pct: 85, health_check: {}, default_health_check_prompt: "" },
+    };
+    const client = new QueryClient();
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={["/system?monitor=1"]}>
+          <SystemStatusPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(await screen.findByRole("dialog", { name: "Monitor settings" })).toBeInTheDocument();
   });
 });

@@ -1,6 +1,14 @@
-import { useEffect, useMemo, useState } from "react";
-import { AlertTriangleIcon, CheckCircle2Icon, Clock3Icon, RotateCcwIcon } from "lucide-react";
+// One Host's idle-CLI retention, shown as a fold on its System status card:
+// the policy this Host owns (idle threshold, per-family cap, close on
+// archive), the counts the Runner last reported, and the releases that have
+// happened here. The policy is stored per Host, so this panel needs no Host
+// picker: the card it sits on is the Host.
 
+import { useEffect, useMemo, useState } from "react";
+import { AlertTriangleIcon } from "lucide-react";
+
+import { HelpTip } from "@/components/HelpTip";
+import { SettingRow } from "@/components/SettingsFields";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -17,26 +25,21 @@ import {
   CliRetentionRequestError,
   type CliRetentionApplicationStatus,
   type CliRetentionFamilyStats,
-  type HostCliRetentionResponse,
+  type Host,
+  type HostCliRelease,
+  useHostCliReleases,
   useHostCliRetention,
-  useHosts,
   useReplaceHostCliRetention,
   useResetHostCliRetention,
 } from "@/hooks/useHosts";
+import { useArchiveWorktreePreference } from "@/lib/archiveWorktreePreferences";
+import { Link } from "@/lib/routing";
+import { relativeTime } from "@/lib/relativeTime";
 import { cn } from "@/lib/utils";
 
-interface RetentionDraft {
-  hostId: string;
-  sourceRevision: number;
-  idleThresholdMinutes: string;
-  maxIdleClis: string;
-  unlimited: boolean;
-  closeOnArchive: boolean;
-}
-
 const STATUS_LABELS: Record<CliRetentionApplicationStatus, string> = {
-  legacy: "Using legacy rules",
-  host_offline: "Waiting for Host",
+  legacy: "Using the built-in rule",
+  host_offline: "Waiting for the Host",
   other_replica: "Available on another replica",
   pending: "Waiting to apply",
   unknown: "Runtime unknown",
@@ -45,42 +48,19 @@ const STATUS_LABELS: Record<CliRetentionApplicationStatus, string> = {
   applied: "Applied",
 };
 
-function draftFromResponse(hostId: string, response: HostCliRetentionResponse): RetentionDraft {
-  if (!response.configured) {
-    return {
-      hostId,
-      sourceRevision: response.revision,
-      idleThresholdMinutes: "60",
-      maxIdleClis: "10",
-      unlimited: false,
-      closeOnArchive: true,
-    };
-  }
-  return {
-    hostId,
-    sourceRevision: response.revision,
-    idleThresholdMinutes: String(response.policy.idle_threshold_minutes),
-    maxIdleClis:
-      response.policy.max_idle_clis === null ? "10" : String(response.policy.max_idle_clis),
-    unlimited: response.policy.max_idle_clis === null,
-    closeOnArchive: response.policy.close_on_archive,
-  };
-}
-
 function parseInteger(value: string, min: number, max: number): number | null {
   if (!/^\d+$/.test(value.trim())) return null;
   const parsed = Number(value);
   return Number.isSafeInteger(parsed) && parsed >= min && parsed <= max ? parsed : null;
 }
 
-function isDraftDirty(draft: RetentionDraft, response: HostCliRetentionResponse): boolean {
-  const baseline = draftFromResponse(draft.hostId, response);
-  return (
-    draft.idleThresholdMinutes !== baseline.idleThresholdMinutes ||
-    draft.unlimited !== baseline.unlimited ||
-    (!draft.unlimited && draft.maxIdleClis !== baseline.maxIdleClis) ||
-    draft.closeOnArchive !== baseline.closeOnArchive
-  );
+/**
+ * The threshold and the cap as typed. `null` means "show what the Host holds",
+ * so a saved answer replaces the text without a second state to reconcile.
+ */
+interface RetentionTexts {
+  idle: string | null;
+  cap: string | null;
 }
 
 function familyLabel(family: string): string {
@@ -90,9 +70,9 @@ function familyLabel(family: string): string {
 
 function applicationLabel(status: CliRetentionApplicationStatus, configured: boolean): string {
   if (!configured) {
-    if (status === "pending") return "Restoring legacy rules";
-    if (status === "partial") return "Partially restored legacy rules";
-    if (status === "host_offline") return "Restoring when Host reconnects";
+    if (status === "pending") return "Restoring the built-in rule";
+    if (status === "partial") return "Partially restored the built-in rule";
+    if (status === "host_offline") return "Restoring when the Host reconnects";
   }
   return STATUS_LABELS[status];
 }
@@ -100,32 +80,32 @@ function applicationLabel(status: CliRetentionApplicationStatus, configured: boo
 function applicationDetail(status: CliRetentionApplicationStatus, configured: boolean): string {
   if (!configured) {
     if (status === "pending") {
-      return "The Host policy was removed, but no current reset result confirms that retained runtimes returned to legacy cleanup.";
+      return "The Host policy was removed, but no current result confirms that retained CLIs went back to the built-in rule.";
     }
     if (status === "partial") {
-      return "Some runtimes returned to legacy cleanup, while unavailable runtimes still need to be reset.";
+      return "Some CLIs went back to the built-in rule, while CLIs that were unreachable still need that reset.";
     }
     if (status === "host_offline") {
-      return "The Host policy was removed. Runtime cleanup will be confirmed after this Host reconnects.";
+      return "The Host policy was removed. Cleanup will be confirmed after this Host reconnects.";
     }
   }
   switch (status) {
     case "legacy":
-      return "Existing pane and harness lifetime rules remain in control until you save a Host policy.";
+      return "No policy is saved for this Host; the built-in rule decides when its idle main sessions close.";
     case "host_offline":
-      return "You can save changes now. They will apply when this Host reconnects.";
+      return "You can save changes now. They apply when this Host reconnects.";
     case "other_replica":
-      return "This Host is connected through another Server replica. Refresh after routing recovers.";
+      return "This Host is connected through another server. Refresh after it reconnects.";
     case "pending":
-      return "The policy is saved and waiting for its next Runner reconciliation.";
+      return "The policy is saved and waits for the next Runner check.";
     case "partial":
       return "Some bound sessions could not confirm the current policy.";
     case "unsupported":
-      return "The bound runtimes do not support managed CLI retention yet.";
+      return "The CLIs bound here do not support managed idle retention yet.";
     case "unknown":
-      return "The Server could not verify current Runner state.";
+      return "The server could not read the current Runner state.";
     case "applied":
-      return "The current policy revision has been observed by the Runner pool.";
+      return "The Runner pool has this revision.";
   }
 }
 
@@ -134,108 +114,152 @@ function requestFailureText(error: unknown): string {
     return error instanceof Error ? error.message : "The request could not be completed.";
   }
   if (error.failure === "conflict") {
-    return "These settings changed elsewhere. Reload the current policy before saving again.";
+    return "This Host's policy changed elsewhere, so this change was not saved. The newer values are showing now; set it again if you still want it.";
   }
   if (error.failure === "busy") {
-    return "CLI retention is reconciling now. Your draft is intact; retry in a moment.";
+    return "CLI retention is reconciling now. Try again in a moment.";
   }
   if (error.failure === "host_offline") {
-    return "The Host went offline before the request completed. Your draft is still here.";
+    return "The Host went offline before the request completed. Try again when it reconnects.";
   }
   if (error.failure === "other_replica") {
-    return "This Host is connected through another Server replica. Retry after routing recovers.";
+    return "This Host is connected through another server. Retry after it reconnects.";
   }
   return error.message;
 }
 
 function observedLabel(epochSeconds: number | null | undefined): string {
-  if (epochSeconds == null) return "No runtime observation yet";
-  return `Observed ${new Intl.DateTimeFormat(undefined, {
+  if (epochSeconds == null) return "No reading yet";
+  return `Read ${new Intl.DateTimeFormat(undefined, {
     dateStyle: "medium",
     timeStyle: "short",
   }).format(new Date(epochSeconds * 1_000))}`;
 }
 
-function FamilyRow({
+function releaseReasonLabel(reason: HostCliRelease["reason"]): string {
+  return reason === "archive" ? "Session archived" : "Over the idle limit";
+}
+
+function releaseStatusLabel(status: string): string | null {
+  if (status === "completed") return null;
+  if (status === "claimed") return "releasing";
+  if (status === "pending") return "waiting";
+  if (status === "cancelled") return "cancelled";
+  return status;
+}
+
+function CountRow({
   family,
   stats,
   maxIdleClis,
-  status,
 }: {
   family: string;
   stats: CliRetentionFamilyStats;
   maxIdleClis: number | null;
-  status: CliRetentionApplicationStatus;
 }) {
-  const state =
-    status === "applied" && maxIdleClis !== null && stats.idle > maxIdleClis
-      ? "Releasing excess"
-      : STATUS_LABELS[status];
+  const overLimit = maxIdleClis !== null && stats.idle > maxIdleClis;
   return (
-    <div className="grid gap-3 px-4 py-4 sm:grid-cols-[minmax(8rem,1fr)_minmax(15rem,2fr)_auto] sm:items-center">
-      <div className="flex items-center gap-3 font-medium">
-        <span className="flex size-8 items-center justify-center rounded-lg bg-muted text-xs text-muted-foreground">
-          {familyLabel(family).slice(0, 2)}
-        </span>
-        {familyLabel(family)}
+    <tr className="border-b last:border-b-0">
+      <td className="py-1.5 pr-3">{familyLabel(family)}</td>
+      <td className="py-1.5 pr-3 text-right tabular-nums">
+        {stats.idle} / {maxIdleClis === null ? "No limit" : maxIdleClis}
+      </td>
+      <td className="py-1.5 pr-3 text-right tabular-nums text-muted-foreground">{stats.active}</td>
+      <td className="py-1.5 pr-3 text-right tabular-nums text-muted-foreground">
+        {stats.below_threshold}
+      </td>
+      <td className={cn("py-1.5 text-right", overLimit && "text-amber-700 dark:text-amber-400")}>
+        {overLimit ? "Releasing" : "Within limit"}
+      </td>
+    </tr>
+  );
+}
+
+function RecentReleases({ hostId, open }: { hostId: string; open: boolean }) {
+  const releases = useHostCliReleases(hostId, open);
+  return (
+    <div className="mt-4" data-testid={`cli-recent-releases-${hostId}`}>
+      <div className="mb-1 flex items-center gap-1.5">
+        <h4 className="text-ui font-normal md:font-medium">Recent releases</h4>
+        <HelpTip label="About recent releases" className="size-11 md:size-4">
+          A CLI is released when you archive a session, or when it has been idle longest and its
+          family is over the limit. These are this Host's latest records.
+        </HelpTip>
       </div>
-      <div>
-        <p className="text-ui font-medium tabular-nums">
-          {stats.idle} / {maxIdleClis === null ? "Unlimited" : maxIdleClis}{" "}
-          <span className="text-sm font-normal text-muted-foreground">idle at threshold</span>
+      {releases.isLoading ? (
+        <p className="text-sm text-muted-foreground">Reading the release log…</p>
+      ) : releases.isError ? (
+        <p className="text-sm text-destructive">{requestFailureText(releases.error)}</p>
+      ) : (releases.data ?? []).length === 0 ? (
+        <p className="rounded-lg border border-dashed p-3 text-sm text-muted-foreground">
+          No CLI has been released on this Host yet.
         </p>
-        <p className="mt-0.5 text-sm text-muted-foreground">
-          Active {stats.active} · Below threshold {stats.below_threshold} · Total {stats.total}
-        </p>
-      </div>
-      <span className="w-fit rounded-full bg-muted px-2.5 py-1 text-xs font-medium text-muted-foreground">
-        {state}
-      </span>
+      ) : (
+        <ul
+          className="max-h-40 overflow-y-auto rounded-lg border bg-muted/20 px-3 py-2 font-mono text-xs"
+          data-testid="cli-release-log"
+        >
+          {(releases.data ?? []).map((release) => {
+            const state = releaseStatusLabel(release.status);
+            return (
+              <li key={`${release.target_session_id}:${release.created_at}`} className="py-0.5">
+                <span className="text-muted-foreground">
+                  {relativeTime(release.created_at * 1000)} ago
+                </span>{" "}
+                {releaseReasonLabel(release.reason)}
+                {release.family !== null && <> · {familyLabel(release.family)}</>}
+                {state !== null && <span className="text-muted-foreground"> · {state}</span>}{" "}
+                <Link to={`/c/${release.target_session_id}`} className="underline">
+                  Open session
+                </Link>
+              </li>
+            );
+          })}
+        </ul>
+      )}
     </div>
   );
 }
 
-export function CliRetentionSettings() {
-  const hostsQuery = useHosts();
-  const hosts = useMemo(() => hostsQuery.data ?? [], [hostsQuery.data]);
-  const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
-  const [draft, setDraft] = useState<RetentionDraft | null>(null);
-  const [confirmLegacy, setConfirmLegacy] = useState(false);
-  const retentionQuery = useHostCliRetention(selectedHostId, selectedHostId !== null);
-  const replacePolicy = useReplaceHostCliRetention(selectedHostId);
-  const resetPolicy = useResetHostCliRetention(selectedHostId);
-
-  useEffect(() => {
-    if (hosts.length === 0) {
-      setSelectedHostId(null);
-      return;
-    }
-    setSelectedHostId((current) =>
-      current && hosts.some((host) => host.host_id === current) ? current : hosts[0]!.host_id,
-    );
-  }, [hosts]);
-
-  useEffect(() => {
-    const response = retentionQuery.data;
-    if (selectedHostId === null || response === undefined) return;
-    setDraft((current) => {
-      if (current?.hostId !== selectedHostId || !isDraftDirty(current, response)) {
-        return draftFromResponse(selectedHostId, response);
-      }
-      return current;
-    });
-  }, [retentionQuery.data, selectedHostId]);
+/**
+ * One Host's idle-CLI policy fold. Rendering is gated on the retention route
+ * answering, so a Host that belongs to someone else shows no fold at all and
+ * the route's own access rule is the only one.
+ */
+export function CliRetentionFold({ host }: { host: Host }) {
+  const [open, setOpen] = useState(false);
+  const retentionQuery = useHostCliRetention(host.host_id, open);
+  const replacePolicy = useReplaceHostCliRetention(host.host_id);
+  const resetPolicy = useResetHostCliRetention(host.host_id);
+  const [texts, setTexts] = useState<RetentionTexts>({ idle: null, cap: null });
+  const [rowError, setRowError] = useState<string | null>(null);
+  const [confirmBuiltIn, setConfirmBuiltIn] = useState(false);
 
   const response = retentionQuery.data;
-  const selectedHost = hosts.find((host) => host.host_id === selectedHostId);
-  const dirty = draft !== null && response !== undefined && isDraftDirty(draft, response);
-  const needsSave = response !== undefined && (!response.configured || dirty);
-  const remoteChanged =
-    draft !== null && response !== undefined && draft.sourceRevision !== response.revision;
-  const idleThreshold = draft ? parseInteger(draft.idleThresholdMinutes, 1, 10_080) : null;
-  const maxIdle = draft?.unlimited ? null : draft ? parseInteger(draft.maxIdleClis, 0, 100) : null;
-  const valid = draft !== null && idleThreshold !== null && (draft.unlimited || maxIdle !== null);
-  const replaceError = replacePolicy.error;
+  // A saved answer (ours or another tab's) replaces whatever was typed.
+  const responseRevision = response?.revision;
+  useEffect(() => {
+    setTexts({ idle: null, cap: null });
+    setRowError(null);
+  }, [responseRevision]);
+
+  // A member who does not own this Host gets no fold; the card keeps its other
+  // lines. Until the route answers, the fold stays closed and empty.
+  const archivePreference = useArchiveWorktreePreference();
+  const gitRemovesWorktrees = (archivePreference.preference.data?.mode ?? "never") !== "never";
+
+  const configured = response?.configured ?? false;
+  const stored = response?.policy ?? null;
+  // An unconfigured Host shows the built-in policy as placeholders only: nothing
+  // is stored for it, and its idle main sessions are still closed by the
+  // built-in timeout, so an empty field must not read as a saved no-limit one.
+  const builtInIdle = stored === null ? "" : String(stored.idle_threshold_minutes);
+  const builtInCap =
+    stored === null || stored.max_idle_clis === null ? "" : String(stored.max_idle_clis);
+  const idleText = texts.idle ?? (configured ? builtInIdle : "");
+  const capText = texts.cap ?? (configured ? builtInCap : "");
+  const capPlaceholder = builtInCap === "" ? "No limit" : builtInCap;
+  const savedCapIsUnlimited = configured && stored !== null && stored.max_idle_clis === null;
   const families = useMemo(
     () =>
       Object.entries(response?.runtime?.families ?? {}).sort(([left], [right]) =>
@@ -244,125 +268,111 @@ export function CliRetentionSettings() {
     [response?.runtime?.families],
   );
 
-  const clearMutationState = () => {
-    replacePolicy.reset();
-    resetPolicy.reset();
-  };
-  const updateDraft = (patch: Partial<RetentionDraft>) => {
-    clearMutationState();
-    setDraft((current) => (current ? { ...current, ...patch } : current));
-  };
-
-  const reloadCurrent = async () => {
-    clearMutationState();
-    const result = await retentionQuery.refetch();
-    if (selectedHostId && result.isError !== true && result.data) {
-      setDraft(draftFromResponse(selectedHostId, result.data));
+  /**
+   * Persist one valid change at once. Every field edits its own value, so a
+   * save here is the value itself rather than a second click on a Save button.
+   */
+  const commit = (patch: {
+    idleThresholdMinutes?: number;
+    maxIdleClis?: number | null;
+    closeOnArchive?: boolean;
+  }) => {
+    if (stored === null || response === undefined) return;
+    const policy = {
+      version: 1 as const,
+      idle_threshold_minutes: patch.idleThresholdMinutes ?? stored.idle_threshold_minutes,
+      max_idle_clis: "maxIdleClis" in patch ? (patch.maxIdleClis ?? null) : stored.max_idle_clis,
+      close_on_archive: patch.closeOnArchive ?? stored.close_on_archive,
+    };
+    const unchanged =
+      policy.idle_threshold_minutes === stored.idle_threshold_minutes &&
+      policy.max_idle_clis === stored.max_idle_clis &&
+      policy.close_on_archive === stored.close_on_archive;
+    if (unchanged && configured) {
+      setTexts({ idle: null, cap: null });
+      setRowError(null);
+      return;
     }
+    setRowError(null);
+    replacePolicy.mutate(
+      { expected_revision: response.revision, policy },
+      {
+        onError: (failure) => setRowError(requestFailureText(failure)),
+        onSuccess: () => setTexts({ idle: null, cap: null }),
+      },
+    );
   };
 
-  const save = async () => {
-    if (!draft || idleThreshold === null || (!draft.unlimited && maxIdle === null)) return;
-    try {
-      const next = await replacePolicy.mutateAsync({
-        expected_revision: draft.sourceRevision,
-        policy: {
-          version: 1,
-          idle_threshold_minutes: idleThreshold,
-          max_idle_clis: draft.unlimited ? null : maxIdle,
-          close_on_archive: draft.closeOnArchive,
-        },
-      });
-      setDraft(draftFromResponse(draft.hostId, next));
-    } catch {
-      // React Query owns the rendered error while the local draft stays intact.
+  const commitIdle = () => {
+    if (texts.idle === null) return;
+    const typed = parseInteger(texts.idle, 1, 10_080);
+    if (typed === null) {
+      setRowError("Enter whole minutes from 1 to 10,080.");
+      return;
     }
+    commit({ idleThresholdMinutes: typed });
   };
 
-  const restoreLegacy = async () => {
-    if (!draft) return;
+  const commitCap = () => {
+    if (texts.cap === null) return;
+    if (texts.cap.trim() === "") {
+      commit({ maxIdleClis: null });
+      return;
+    }
+    const typed = parseInteger(texts.cap, 0, 100);
+    if (typed === null) {
+      setRowError("Enter a limit from 0 to 100, or leave it blank for no limit.");
+      return;
+    }
+    commit({ maxIdleClis: typed });
+  };
+
+  const restoreBuiltInRule = async () => {
+    if (stored === null || response === undefined) return;
     try {
-      const next = await resetPolicy.mutateAsync(draft.sourceRevision);
-      setDraft(draftFromResponse(draft.hostId, next));
-      setConfirmLegacy(false);
+      await resetPolicy.mutateAsync(response.revision);
+      setConfirmBuiltIn(false);
     } catch {
       // React Query owns the rendered error while the current policy stays visible.
     }
   };
 
-  if (hostsQuery.isLoading) {
-    return <p className="text-sm text-muted-foreground">Loading Hosts…</p>;
-  }
-  if (hostsQuery.isError) {
-    return <p className="text-sm text-destructive">Could not load Hosts.</p>;
-  }
-  if (hosts.length === 0) {
-    return (
-      <div className="rounded-lg border border-dashed p-5 text-sm text-muted-foreground">
-        Connect a Host to configure idle CLI retention.
-      </div>
-    );
-  }
-
-  const applicationStatus = response?.application.status ?? "unknown";
   const isBusy = replacePolicy.isPending || resetPolicy.isPending;
+  const applicationStatus = response?.application.status ?? "unknown";
+  const statusText =
+    response === undefined ? null : applicationLabel(applicationStatus, response.configured);
 
   return (
-    <div className="grid gap-5" data-testid="cli-retention-settings">
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
-        <div>
-          <h2 className="text-ui font-medium">Idle CLI retention</h2>
-          <p className="mt-1 max-w-3xl text-sm text-muted-foreground">
-            A CLI enters its family pool only after the idle threshold. When a family exceeds its
-            limit, Omnigent releases the instance that has been idle longest.
+    <details
+      className="mt-3 border-t pt-2"
+      data-testid={`cli-retention-${host.host_id}`}
+      open={open}
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
+      <summary className="flex cursor-pointer items-center gap-1 text-sm text-muted-foreground hover:text-foreground">
+        Idle CLIs
+        {statusText !== null && (
+          <span className="ml-1 text-xs" data-testid={`cli-retention-status-${host.host_id}`}>
+            {statusText}
+          </span>
+        )}
+      </summary>
+      {open && retentionQuery.isLoading && response === undefined && (
+        <p className="mt-2 text-sm text-muted-foreground">Reading this Host's policy…</p>
+      )}
+      {/* A Host this user does not own answers nothing here, so it shows no fold. */}
+      {open && response !== undefined && stored !== null && (
+        <div className="mt-3 flex flex-col gap-3">
+          <p className="text-sm text-muted-foreground">
+            {applicationDetail(applicationStatus, response.configured)}
           </p>
-        </div>
-        <label className="grid min-w-56 gap-1 text-sm font-medium">
-          Host
-          <select
-            aria-label="Host"
-            disabled={isBusy}
-            className="h-9 rounded-md border border-input bg-background px-3 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
-            value={selectedHostId ?? ""}
-            onChange={(event) => {
-              clearMutationState();
-              setDraft(null);
-              setSelectedHostId(event.target.value);
-            }}
-          >
-            {hosts.map((host) => (
-              <option key={host.host_id} value={host.host_id}>
-                {host.name} · {host.status === "online" ? "Online" : "Offline"}
-              </option>
-            ))}
-          </select>
-        </label>
-      </div>
-
-      {retentionQuery.isLoading && !response ? (
-        <p className="text-sm text-muted-foreground">Loading retention policy…</p>
-      ) : retentionQuery.isError && !response ? (
-        <div className="flex items-center justify-between gap-3 rounded-lg border border-destructive/40 bg-destructive/5 p-4 text-sm">
-          <span>{requestFailureText(retentionQuery.error)}</span>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={() => void retentionQuery.refetch()}
-          >
-            Retry
-          </Button>
-        </div>
-      ) : response && draft ? (
-        <>
           {retentionQuery.isError && (
             <div
               role="alert"
-              className="flex flex-col gap-3 rounded-lg border border-amber-500/40 bg-amber-500/5 p-4 text-sm sm:flex-row sm:items-center sm:justify-between"
+              className="flex flex-col gap-2 rounded-lg border border-amber-500/40 bg-amber-500/5 p-3 text-sm sm:flex-row sm:items-center sm:justify-between"
             >
               <span>
-                Showing the last successful policy and runtime. Refresh failed:{" "}
-                {requestFailureText(retentionQuery.error)}
+                Showing the last reading. Refresh failed: {requestFailureText(retentionQuery.error)}
               </span>
               <Button
                 type="button"
@@ -370,242 +380,195 @@ export function CliRetentionSettings() {
                 variant="outline"
                 onClick={() => void retentionQuery.refetch()}
               >
-                Retry refresh
+                Retry
               </Button>
             </div>
           )}
-          <div
-            className={cn(
-              "flex items-start gap-3 rounded-lg border p-4 text-sm",
-              applicationStatus === "applied"
-                ? "border-emerald-500/30 bg-emerald-500/5"
-                : "border-amber-500/30 bg-amber-500/5",
-            )}
+          <SettingRow
+            label="Count a CLI as idle after"
+            hint={
+              <>
+                Time without work before a CLI joins its idle pool. This covers main sessions; child
+                sessions close after their own idle timeout, not this number.
+              </>
+            }
+            note={
+              configured
+                ? "This Host's own value; other Hosts keep theirs."
+                : "The built-in rule still closes idle main sessions on its own timeout; a value here takes that over for this Host."
+            }
           >
-            {applicationStatus === "applied" ? (
-              <CheckCircle2Icon className="mt-0.5 size-4 shrink-0 text-emerald-600" />
-            ) : (
-              <Clock3Icon className="mt-0.5 size-4 shrink-0 text-amber-600" />
-            )}
-            <div>
-              <p className="font-medium">
-                {applicationLabel(applicationStatus, response.configured)}
-              </p>
-              <p className="mt-0.5 text-muted-foreground">
-                {applicationDetail(applicationStatus, response.configured)}
-              </p>
-            </div>
-          </div>
-
-          <div className="divide-y rounded-xl border bg-card">
-            <div className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
-              <div>
-                <label htmlFor="cli-idle-threshold" className="text-sm font-medium">
-                  Idle threshold
-                </label>
-                <p className="mt-1 text-sm text-muted-foreground">
-                  Time without work before a CLI counts toward its idle family pool.
-                </p>
-              </div>
-              <div className="flex items-center gap-2">
-                <Input
-                  id="cli-idle-threshold"
-                  aria-label="Idle threshold in minutes"
-                  className="w-28 text-right tabular-nums"
-                  type="number"
-                  min={1}
-                  max={10_080}
-                  step={1}
-                  disabled={isBusy}
-                  value={draft.idleThresholdMinutes}
-                  onChange={(event) => updateDraft({ idleThresholdMinutes: event.target.value })}
-                  aria-invalid={idleThreshold === null}
-                />
-                <span className="w-16 text-sm text-muted-foreground">minutes</span>
-              </div>
-            </div>
-
-            <div className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
-              <div>
-                <label htmlFor="cli-idle-limit" className="text-sm font-medium">
-                  Idle CLI limit
-                </label>
-                <p className="mt-1 text-sm text-muted-foreground">
-                  Applied separately to each family. Active and below-threshold CLIs do not count.
-                </p>
-              </div>
-              <div className="flex flex-wrap items-center justify-end gap-2">
-                <Input
-                  id="cli-idle-limit"
-                  aria-label="Idle CLI limit per family"
-                  className="w-24 text-right tabular-nums"
-                  type="number"
-                  min={0}
-                  max={100}
-                  step={1}
-                  disabled={draft.unlimited || isBusy}
-                  value={draft.maxIdleClis}
-                  onChange={(event) => updateDraft({ maxIdleClis: event.target.value })}
-                  aria-invalid={!draft.unlimited && maxIdle === null}
-                />
-                <span className="text-sm text-muted-foreground">per family</span>
-                <label className="ml-2 flex items-center gap-2 text-sm">
-                  <input
-                    type="checkbox"
-                    disabled={isBusy}
-                    checked={draft.unlimited}
-                    onChange={(event) => updateDraft({ unlimited: event.target.checked })}
-                  />
-                  Unlimited
-                </label>
-              </div>
-            </div>
-
-            <div className="flex items-center justify-between gap-5 p-4">
-              <div>
-                <label htmlFor="cli-close-on-archive" className="text-sm font-medium">
-                  Close CLI on archive
-                </label>
-                <p className="mt-1 text-sm text-muted-foreground">
-                  Stop the session and its child work, then release the CLI. Conversation history
-                  and the workspace remain available.
-                </p>
-              </div>
-              <Switch
-                id="cli-close-on-archive"
-                aria-label="Close CLI on archive"
-                checked={draft.closeOnArchive}
-                disabled={isBusy}
-                onCheckedChange={(checked) => updateDraft({ closeOnArchive: checked })}
-              />
-            </div>
-          </div>
-
-          <div className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-sm text-muted-foreground">
-            <AlertTriangleIcon className="mt-0.5 size-4 shrink-0 text-amber-600" />
-            Retained idle CLIs keep Runners, terminals, and related processes available. Watch this
-            Host's memory use, especially with a high or unlimited cap.
-          </div>
-
-          {remoteChanged && (
-            <div className="flex flex-col gap-3 rounded-lg border border-amber-500/40 bg-amber-500/5 p-4 text-sm sm:flex-row sm:items-center sm:justify-between">
-              <span>The saved policy changed while you were editing. Reload it before saving.</span>
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                onClick={() => void reloadCurrent()}
-              >
-                Reload current policy
-              </Button>
-            </div>
-          )}
-          {replaceError && (
-            <div
-              role="alert"
-              className="rounded-lg border border-destructive/40 bg-destructive/5 p-4 text-sm text-destructive"
+            <Input
+              aria-label="Count a CLI as idle after, in minutes"
+              className="w-20 text-right tabular-nums"
+              type="number"
+              min={1}
+              max={10_080}
+              step={1}
+              disabled={isBusy}
+              placeholder={builtInIdle}
+              value={idleText}
+              onChange={(event) =>
+                setTexts((current) => ({ ...current, idle: event.target.value }))
+              }
+              onBlur={commitIdle}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && event.target instanceof HTMLInputElement) {
+                  event.preventDefault();
+                  commitIdle();
+                }
+              }}
+            />
+            <span className="text-sm text-muted-foreground">minutes</span>
+          </SettingRow>
+          <div className="pl-6">
+            <SettingRow
+              label="Keep at most"
+              hint={
+                <>
+                  Applied to each CLI family on its own. Active CLIs and CLIs below the idle
+                  threshold do not count. Leave it blank for no limit.
+                </>
+              }
             >
-              {requestFailureText(replaceError)}
-            </div>
-          )}
-          {!valid && (
-            <p role="alert" className="text-sm text-destructive">
-              Use whole minutes from 1 to 10,080 and a per-family limit from 0 to 100.
+              <Input
+                aria-label="Keep at most, per family"
+                className="w-20 text-right tabular-nums"
+                type="number"
+                min={0}
+                max={100}
+                step={1}
+                placeholder={capPlaceholder}
+                disabled={isBusy}
+                value={capText}
+                onChange={(event) =>
+                  setTexts((current) => ({ ...current, cap: event.target.value }))
+                }
+                onBlur={commitCap}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && event.target instanceof HTMLInputElement) {
+                    event.preventDefault();
+                    commitCap();
+                  }
+                }}
+              />
+              {savedCapIsUnlimited && (
+                <span
+                  className="inline-flex items-center gap-1 text-amber-700 dark:text-amber-400"
+                  data-testid="cli-limit-warning"
+                >
+                  <AlertTriangleIcon className="size-3.5 shrink-0" aria-hidden="true" />
+                  <span className="text-sm">No limit</span>
+                  <HelpTip label="About no limit" className="size-11 md:size-4">
+                    Every idle CLI stays until this Host runs out of memory, or until you archive
+                    its session.
+                  </HelpTip>
+                </span>
+              )}
+            </SettingRow>
+          </div>
+          <SettingRow
+            label="Close CLI on archive"
+            hint={
+              <>
+                Stop the session and its child work, then release its CLI. Conversation history and
+                the workspace stay.
+              </>
+            }
+          >
+            <Switch
+              aria-label="Close CLI on archive"
+              checked={gitRemovesWorktrees ? true : (stored?.close_on_archive ?? true)}
+              disabled={isBusy || gitRemovesWorktrees}
+              onCheckedChange={(checked) => commit({ closeOnArchive: checked })}
+            />
+          </SettingRow>
+          {gitRemovesWorktrees && (
+            <p
+              className="pl-6 text-sm text-muted-foreground"
+              data-testid="cli-close-on-archive-locked"
+            >
+              Locked on, because Git already removes worktrees when you archive a session.{" "}
+              <Button asChild variant="link" size="sm" className="h-auto px-0">
+                <Link to="/settings/git">Change Worktrees on archive</Link>
+              </Button>
             </p>
           )}
-
           <div>
-            <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-              <h3 className="text-sm font-medium">Current idle pools</h3>
+            <div className="mb-1 flex flex-wrap items-center justify-between gap-2">
+              <h4 className="text-ui font-normal md:font-medium">Idle CLIs now</h4>
               <span className="text-xs text-muted-foreground">
                 {observedLabel(response.runtime?.observed_at ?? response.application.observed_at)}
               </span>
             </div>
             {response.configured && families.length > 0 ? (
-              <div className="divide-y overflow-hidden rounded-xl border bg-card">
-                {families.map(([family, stats]) => (
-                  <FamilyRow
-                    key={family}
-                    family={family}
-                    stats={stats}
-                    maxIdleClis={response.policy.max_idle_clis}
-                    status={applicationStatus}
-                  />
-                ))}
+              <div className="overflow-x-auto rounded-lg border px-3">
+                <table className="w-full text-sm" data-testid="cli-family-table">
+                  <thead>
+                    <tr className="border-b text-sm text-muted-foreground">
+                      <th className="py-1.5 pr-3 text-left font-medium">CLI</th>
+                      <th className="py-1.5 pr-3 text-right font-medium">Idle / limit</th>
+                      <th className="py-1.5 pr-3 text-right font-medium">Working</th>
+                      <th className="py-1.5 pr-3 text-right font-medium">Not idle yet</th>
+                      <th className="py-1.5 text-right font-medium">Next</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {families.map(([family, stats]) => (
+                      <CountRow
+                        key={family}
+                        family={family}
+                        stats={stats}
+                        maxIdleClis={response.policy.max_idle_clis}
+                      />
+                    ))}
+                  </tbody>
+                </table>
               </div>
             ) : (
-              <div className="rounded-xl border border-dashed p-5 text-sm text-muted-foreground">
+              <p className="rounded-lg border border-dashed p-3 text-sm text-muted-foreground">
                 {response.configured
-                  ? "No supported resident CLI runtimes were observed for this Host."
-                  : "Runtime family counts will appear after you save a Host policy."}
-              </div>
+                  ? "No resident CLI was observed for this Host."
+                  : "Counts appear after you save a policy here."}
+              </p>
             )}
           </div>
-
-          <div className="flex flex-col-reverse gap-3 border-t pt-4 sm:flex-row sm:items-center sm:justify-between">
-            <div className="text-sm text-muted-foreground" aria-live="polite">
-              {dirty
-                ? "Unsaved changes"
-                : response.configured
-                  ? `Saved · ${STATUS_LABELS[applicationStatus]}`
-                  : applicationStatus === "legacy"
-                    ? "Legacy rules active · Save to make this Host policy the owner"
-                    : `${applicationLabel(applicationStatus, false)} · Runtime reset is not fully confirmed`}
-              {selectedHost ? ` · ${selectedHost.name}` : ""}
-            </div>
-            <div className="flex flex-wrap justify-end gap-2">
-              {response.configured && (
-                <Button
-                  type="button"
-                  variant="outline"
-                  disabled={isBusy || remoteChanged}
-                  onClick={() => setConfirmLegacy(true)}
-                >
-                  <RotateCcwIcon className="size-4" />
-                  Restore legacy rules
-                </Button>
-              )}
+          <RecentReleases hostId={host.host_id} open={open} />
+          {(rowError !== null || replaceErrorText(replacePolicy.error) !== null) && (
+            <p role="alert" className="text-sm text-destructive">
+              {rowError ?? replaceErrorText(replacePolicy.error)}
+            </p>
+          )}
+          <div className="flex flex-col-reverse gap-2 border-t pt-3 sm:flex-row sm:items-center sm:justify-between">
+            <span className="text-sm text-muted-foreground" aria-live="polite">
+              {(replacePolicy.isPending || resetPolicy.isPending) && "Saving…"}
+            </span>
+            {response.configured && (
               <Button
                 type="button"
-                disabled={!needsSave || !valid || isBusy || remoteChanged}
-                onClick={() => void save()}
+                variant="outline"
+                size="sm"
+                disabled={isBusy}
+                onClick={() => setConfirmBuiltIn(true)}
               >
-                {replacePolicy.isPending ? "Saving…" : "Save"}
+                Use the built-in rule
               </Button>
-            </div>
+            )}
           </div>
-
-          <Dialog open={confirmLegacy} onOpenChange={setConfirmLegacy}>
+          <Dialog open={confirmBuiltIn} onOpenChange={setConfirmBuiltIn}>
             <DialogContent>
               <DialogHeader>
-                <DialogTitle>Restore legacy CLI rules?</DialogTitle>
+                <DialogTitle>Use the built-in idle rule?</DialogTitle>
                 <DialogDescription>
-                  This removes the Host policy and returns retained panes and harnesses to the
-                  existing TTL cleanup rules. Their configured legacy timeouts will control when
-                  idle CLI processes close.
+                  This removes the policy on this Host. Retained CLIs go back to the built-in idle
+                  timeout, which decides when they close.
                 </DialogDescription>
               </DialogHeader>
               <DialogFooter>
-                {remoteChanged && (
-                  <div className="mb-2 flex w-full flex-col items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-left text-sm">
-                    <span>The saved policy changed after this confirmation opened.</span>
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      onClick={() => void reloadCurrent()}
-                    >
-                      Reload current policy
-                    </Button>
-                  </div>
-                )}
                 {resetPolicy.error && (
-                  <div
-                    role="alert"
-                    className="mb-2 w-full rounded-md border border-destructive/40 bg-destructive/5 p-3 text-left text-sm text-destructive"
-                  >
+                  <p role="alert" className="mb-2 w-full text-left text-sm text-destructive">
                     {requestFailureText(resetPolicy.error)}
-                  </div>
+                  </p>
                 )}
                 <DialogClose asChild>
                   <Button type="button" variant="outline">
@@ -615,16 +578,20 @@ export function CliRetentionSettings() {
                 <Button
                   type="button"
                   variant="destructive"
-                  disabled={resetPolicy.isPending || remoteChanged}
-                  onClick={() => void restoreLegacy()}
+                  disabled={resetPolicy.isPending}
+                  onClick={() => void restoreBuiltInRule()}
                 >
-                  {resetPolicy.isPending ? "Restoring…" : "Restore legacy rules"}
+                  {resetPolicy.isPending ? "Restoring…" : "Switch to the built-in rule"}
                 </Button>
               </DialogFooter>
             </DialogContent>
           </Dialog>
-        </>
-      ) : null}
-    </div>
+        </div>
+      )}
+    </details>
   );
+}
+
+function replaceErrorText(error: unknown): string | null {
+  return error === null || error === undefined ? null : requestFailureText(error);
 }

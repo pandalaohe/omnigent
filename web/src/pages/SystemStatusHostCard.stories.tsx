@@ -112,10 +112,10 @@ function HostGrid({ isAdmin }: { isAdmin: boolean }) {
             key={entry.host_id}
             host={entry}
             threshold={85}
+            thresholdLabel="85%"
             sessionTitles={new Map()}
             nowMs={Date.now()}
             isAdmin={isAdmin}
-            defaultLines={DEFAULT_LINES}
           />
         ))}
       </div>

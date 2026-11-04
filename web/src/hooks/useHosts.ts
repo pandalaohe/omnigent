@@ -386,6 +386,11 @@ export function useReplaceHostCliRetention(hostId: string | null) {
       queryClient.setQueryData(hostCliRetentionQueryKey(hostId), response);
       void queryClient.invalidateQueries({ queryKey: hostCliRetentionQueryKey(hostId) });
     },
+    // A refused write (a revision that moved, a Host that went offline) shows
+    // the Host's current values rather than the ones it just rejected.
+    onError: () => {
+      void queryClient.invalidateQueries({ queryKey: hostCliRetentionQueryKey(hostId) });
+    },
   });
 }
 
@@ -410,6 +415,37 @@ export function useResetHostCliRetention(hostId: string | null) {
       queryClient.setQueryData(hostCliRetentionQueryKey(hostId), response);
       void queryClient.invalidateQueries({ queryKey: hostCliRetentionQueryKey(hostId) });
     },
+  });
+}
+
+export interface HostCliRelease {
+  /** Epoch seconds when the release was recorded. */
+  created_at: number;
+  /** Why the runtime was released: an archive, or the idle-pool cap. */
+  reason: "archive" | "idle_pool_overflow";
+  family: string | null;
+  status: string;
+  target_session_id: string;
+}
+
+export const hostCliReleasesQueryKey = (hostId: string | null) =>
+  ["host-cli-releases", hostId] as const;
+
+async function fetchHostCliReleases(hostId: string): Promise<HostCliRelease[]> {
+  const res = await authenticatedFetch(`/v1/hosts/${encodeURIComponent(hostId)}/cli-releases`);
+  if (!res.ok) throw await cliRetentionError(res);
+  const body = (await res.json()) as { data?: HostCliRelease[] };
+  return body.data ?? [];
+}
+
+/** This Host's CLI release records, newest first; read only, so it is fetched on demand. */
+export function useHostCliReleases(hostId: string | null, enabled = true) {
+  return useQuery({
+    queryKey: hostCliReleasesQueryKey(hostId),
+    queryFn: () => fetchHostCliReleases(hostId as string),
+    enabled: enabled && hostId !== null,
+    staleTime: 15_000,
+    retry: false,
   });
 }
 
