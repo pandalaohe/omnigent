@@ -161,6 +161,12 @@ def test_sidebar_page_scroll_viewport_clears_mobile_navigation(
 ) -> None:
     page.set_viewport_size({"width": 390, "height": 844})
     page.goto(f"{pages_url}{route}")
+    if route == "/settings/system-status":
+        expect(page).to_have_url(f"{pages_url}/system?monitor=1")
+        monitor = page.get_by_role("dialog", name="Monitor settings", exact=True)
+        expect(monitor).to_be_visible()
+        expect(monitor).to_be_in_viewport()
+        monitor.get_by_role("button", name="Close", exact=True).click()
     title = page.get_by_role("heading", name=heading, level=1, exact=True)
     expect(title).to_be_visible()
     if page.locator(".app-shell").get_attribute("data-sidebar-open") == "true":
@@ -511,12 +517,18 @@ def test_page_clearance_uses_shared_threshold(
     page.on("pageerror", lambda error: errors.append(str(error)))
     page.set_viewport_size({"width": 768, "height": 390})
     page.goto(f"{pages_url}{route}")
+    if route == "/settings/system-status":
+        expect(page).to_have_url(f"{pages_url}/system?monitor=1")
+        monitor = page.get_by_role("dialog", name="Monitor settings", exact=True)
+        expect(monitor).to_be_visible()
+        expect(monitor).to_be_in_viewport()
+        monitor.get_by_role("button", name="Close", exact=True).click()
     expect(page.get_by_role("heading", name=heading, level=1, exact=True)).to_be_visible()
     if route == "/usage":
         expect(page.get_by_text("Total cost", exact=True)).to_be_visible()
     elif route == "/system":
         expect(page.get_by_text("No hosts connected.", exact=True)).to_be_visible()
-    pinned_settings_sidebar = route.startswith("/settings/")
+    pinned_settings_sidebar = route.startswith("/settings/") and route != "/settings/system-status"
     first_disjoint = 768
     if not pinned_settings_sidebar:
         lower, upper = 768, 1440

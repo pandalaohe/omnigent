@@ -84,7 +84,7 @@ export function ComposerContextRing({
           type="button"
           data-testid="composer-context-ring"
           className={cn(
-            "flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-full bg-transparent p-0 text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:ring-offset-2 focus-visible:ring-offset-background md:min-h-6 md:min-w-6",
+            "relative flex size-6 shrink-0 items-center justify-center rounded-full bg-transparent p-0 text-muted-foreground after:absolute after:-inset-2.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:ring-offset-2 focus-visible:ring-offset-background md:after:inset-0",
             className,
           )}
           aria-label={`${usedPct}% of ${budget} used`}
