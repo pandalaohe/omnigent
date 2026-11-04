@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 import tomllib
@@ -57,6 +58,39 @@ def test_populate_syncs_approved_value_and_restart_is_noop(
     assert path.read_bytes() == result
     assert path.stat() == before
     assert (source / "config.toml").read_text() == _SOURCE
+
+
+@pytest.mark.parametrize("profile", [False, True], ids=["base", "inline-profile"])
+@pytest.mark.parametrize("relative", [False, True], ids=["absolute", "relative"])
+def test_initial_copy_keeps_source_catalog_paths(
+    homes: tuple[Path, Path], profile: bool, relative: bool
+) -> None:
+    source, target = homes
+    catalog = source / "models.json"
+    catalog.write_text('{"models": []}')
+    setting = json.dumps(catalog.name if relative else str(catalog))
+    layer = "[profiles.work]\n" if profile else ""
+    original = f"{layer}model_catalog_json = {setting} # user catalog\n"
+    (source / "config.toml").write_text(original)
+    path = target / "config.toml"
+    assert (
+        codex_config_sync.sync_codex_config(
+            source / "config.toml", path, minimal_config=False, include_credentials=True
+        )
+        == "created"
+    )
+    copied = path.read_text()
+    data = tomllib.loads(copied)
+    selected = data["profiles"]["work"] if profile else data
+    assert selected["model_catalog_json"] == str(catalog)
+    assert Path(selected["model_catalog_json"]).read_text() == '{"models": []}'
+    assert "# user catalog" in copied
+    assert (source / "config.toml").read_text() == original
+    path.write_text('model_catalog_json = "session.json"\n')
+    codex_config_sync.sync_codex_config(
+        source / "config.toml", path, minimal_config=False, include_credentials=True
+    )
+    assert tomllib.loads(path.read_text())["model_catalog_json"] == "session.json"
 
 
 @pytest.mark.parametrize(

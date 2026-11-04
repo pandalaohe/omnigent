@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -95,3 +96,62 @@ async def test_codex_source_catalog_and_default(
     assert [row["id"] for row in rows if row.get("isDefault")] == [expected_default]
     assert config_path.read_text() == config
     assert not marker.exists()
+
+
+@pytest.mark.skipif(shutil.which("codex") is None, reason="requires the Codex CLI")
+@pytest.mark.parametrize("relative", [False, True], ids=["absolute-catalog", "relative-catalog"])
+async def test_private_catalog_launch_keeps_thread_and_policy_hooks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, relative: bool
+) -> None:
+    """A copied user catalog must load before native threads and policy hooks."""
+    codex = shutil.which("codex")
+    assert codex is not None
+    source = tmp_path / "source"
+    source.mkdir()
+    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path)}
+    bundled = subprocess.run(
+        [codex, "debug", "models", "--bundled"],
+        capture_output=True,
+        check=True,
+        env={**env, "CODEX_HOME": str(source)},
+        timeout=15,
+    ).stdout
+    catalog = source / "models.json"
+    catalog.write_bytes(bundled)
+    model = next(
+        row["slug"] for row in json.loads(bundled)["models"] if row["visibility"] == "list"
+    )
+    original = (
+        f"model = {json.dumps(model)}\n"
+        f"model_catalog_json = {json.dumps(catalog.name if relative else str(catalog))}\n"
+        'model_provider = "local"\n'
+        '[model_providers.local]\nname = "Local"\n'
+        'base_url = "http://127.0.0.1:1/v1"\nwire_api = "responses"\n'
+        "requires_openai_auth = false\n"
+    )
+    (source / "config.toml").write_text(original)
+    monkeypatch.setenv("CODEX_HOME", str(source))
+    private = tmp_path / "private"
+    socket = tmp_path / "app-server.sock"
+    server = app_server.CodexNativeAppServer(
+        codex_path=codex,
+        socket_path=socket,
+        codex_home=private,
+        env=env,
+        config_overrides=[],
+        cwd=tmp_path,
+        bridge_dir=tmp_path / "bridge",
+        reconcile_process_registry=False,
+    )
+    client = app_server.CodexAppServerClient(socket)
+    try:
+        await asyncio.wait_for(server.start(), timeout=45)
+        await client.connect()
+        response = await client.request("thread/start", {"cwd": str(tmp_path), "ephemeral": True})
+        assert "error" not in response, response
+        assert response["result"]["thread"]["id"]
+        assert server.policy_hook_disabled_reason is None, server.policy_hook_disabled_reason
+    finally:
+        await client.close()
+        await server.close()
+    assert (source / "config.toml").read_text() == original

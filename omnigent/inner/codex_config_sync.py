@@ -18,11 +18,31 @@ import tomlkit.exceptions
 import yaml
 
 from omnigent.config import load_global_config
+from omnigent.harnesses.codex_native.launch_args import absolute_codex_path
 
 _logger = logging.getLogger(__name__)
 _LEAF = "auto_review.extra_policy"
 _STANCE_KEYS = ("approval_policy", "sandbox_mode", "approvals_reviewer", "default_permissions")
 SyncResult = Literal["created", "unchanged", "updated", "conflict"]
+
+
+def normalize_codex_catalog_paths(document: MutableMapping, source_home: Path) -> bool:
+    """Keep base and inline-profile catalogs anchored to the copied config's home."""
+    layers: list[MutableMapping] = [document]
+    profiles = document.get("profiles")
+    if isinstance(profiles, MutableMapping):
+        layers.extend(
+            profile for profile in profiles.values() if isinstance(profile, MutableMapping)
+        )
+    changed = False
+    for layer in layers:
+        catalog = layer.get("model_catalog_json")
+        if isinstance(catalog, str) and catalog:
+            resolved = absolute_codex_path(catalog, source_home)
+            if catalog != resolved:
+                layer["model_catalog_json"] = resolved
+                changed = True
+    return changed
 
 
 def _revision(info: os.stat_result) -> tuple[int, ...]:
@@ -136,6 +156,8 @@ def sync_codex_config(
         else:
             text = target_snapshot[1].decode("utf-8") if target_snapshot else ""
         document = tomlkit.parse(text)
+        if target_snapshot is None and include_credentials:
+            normalize_codex_catalog_paths(document, source.parent)
         for key in _STANCE_KEYS:
             if key in source_data:
                 if document.get(key) != source_data[key]:
