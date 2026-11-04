@@ -1166,8 +1166,14 @@ def host_interactive_shells_for_request(
     *,
     host_registry: HostRegistry,
     runner_router: RunnerRouter | None,
-) -> list[str]:
-    """Return this replica's host shells or signal a misrouted request."""
+) -> list[str] | None:
+    """Return this replica's host shells or signal a misrouted request.
+
+    ``None`` means the host never reported an inventory (an older daemon), which
+    callers must keep apart from a reported empty one: with no known inventory
+    the declared or default shell still applies, while an empty inventory offers
+    no host shell.
+    """
     if (
         host_registry.get(host_id) is None
         and runner_router is not None
@@ -1177,7 +1183,10 @@ def host_interactive_shells_for_request(
             "host shell inventory is on another replica",
             code=ErrorCode.WRONG_REPLICA,
         )
-    return normalize_interactive_shells(host_registry.interactive_shells(host_id))
+    reported = host_registry.interactive_shells(host_id)
+    if reported is None:
+        return None
+    return normalize_interactive_shells(reported)
 
 
 def set_server_host_registry(host_registry: HostRegistry | None) -> None:

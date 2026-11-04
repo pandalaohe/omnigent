@@ -783,7 +783,8 @@ def build_agent_bundle(
         "arguments": {"max_cost_usd": 1.0}}}}}``. ``None`` omits it.
     :param terminals: Optional ``terminals:`` block written verbatim
         into the spec, e.g. ``{"shell": {"command": "bash"}}``.
-        ``None`` omits it (the agent has no terminal access).
+        ``None`` omits it (no declared terminals and no ``sys_terminal_*``
+        tools; the workspace rail still offers the default user shell).
     :param include_llm: Whether to include the default ``llm:`` block.
         Set ``False`` for model-less harness tests.
     :returns: A gzipped tar archive containing the generated

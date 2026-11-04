@@ -5591,7 +5591,18 @@ async def test_session_agent_terminals_follow_selected_host(
 
     custom_response = await client.get(f"/v1/sessions/{custom_session['id']}/agent")
     assert custom_response.status_code == 200, custom_response.text
-    assert custom_response.json()["terminals"] == ["bash"]
+    # Declared names stay offered, and the host's shells are added after them.
+    assert custom_response.json()["terminals"] == ["bash", "zsh"]
+
+    sdk_agent = await create_test_agent(client, name="codex-sdk")
+    sdk_session = await _create_session(client, sdk_agent["id"])
+    SqlAlchemyConversationStore(db_uri).set_host_id(
+        sdk_session["id"], host_id=host_id, workspace="/tmp/sdk"
+    )
+
+    sdk_response = await client.get(f"/v1/sessions/{sdk_session['id']}/agent")
+    assert sdk_response.status_code == 200, sdk_response.text
+    assert sdk_response.json()["terminals"] == ["zsh", "bash"]
 
 
 @pytest.mark.parametrize("cached_inventory", [False, True])
@@ -5658,8 +5669,15 @@ async def test_host_shell_inventory_miss_returns_wrong_replica(
         custom_session["id"], host_id=host_id, workspace="/tmp/custom"
     )
     custom_response = await client.get(f"/v1/sessions/{custom_session['id']}/agent")
-    assert custom_response.status_code == 200
-    assert custom_response.json()["terminals"] == ["zsh"]
+    # A host-bound session's offer needs this replica's inventory whatever the
+    # spec declares, so the same re-addressing signal applies here.
+    assert custom_response.status_code == 400
+    assert custom_response.json()["error"]["code"] == "wrong_replica"
+
+    hostless_session = await _create_session(client, custom_agent["id"])
+    hostless_response = await client.get(f"/v1/sessions/{hostless_session['id']}/agent")
+    assert hostless_response.status_code == 200
+    assert hostless_response.json()["terminals"] == ["zsh"]
 
 
 async def test_claude_native_session_discoverable_with_terminal_metadata(

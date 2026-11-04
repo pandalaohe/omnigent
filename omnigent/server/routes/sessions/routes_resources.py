@@ -44,7 +44,6 @@ from omnigent.entities import (
 from omnigent.entities.session_resources import session_resource_view_to_dict
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.native.native_coding_agents import (
-    native_coding_agent_for_agent_name,
     native_coding_agent_for_terminal_name,
 )
 from omnigent.runner.routing import RunnerRouter, routing_host_id
@@ -129,6 +128,10 @@ from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.session_pull_request_store import SessionPullRequestLimitError
+from omnigent.terminals.user_shells import (
+    session_offers_host_shells,
+    user_shell_terminals,
+)
 
 if TYPE_CHECKING:
     from omnigent.inner.native_attachments import FilesystemAttachmentPolicy
@@ -1811,9 +1814,11 @@ def register_resources_routes(
         already-running ``(terminal, session_key)`` returns the
         existing resource.
 
-        User-initiated creates are gated on the agent's terminal
-        access: the requested ``terminal`` must be one of the names
-        declared in the agent spec's ``terminals:`` block. Native
+        User-initiated creates are gated on the terminals the agent offers its
+        users: the names declared in the agent spec's ``terminals:`` block, the
+        default user shell when neither a host inventory nor a declaration
+        yields a name, and a host-bound session's host shells (see
+        ``user_shell_terminals``). Native
         harness bootstrap requests (marked ``ensure_native_terminal``
         or ``bridge_inject_dir`` — the ``omnigent claude`` / ``codex``
         wrappers launching the session's own CLI terminal) are exempt:
@@ -1830,8 +1835,8 @@ def register_resources_routes(
             ``session_key``.
         :returns: The terminal resource object.
         :raises OmnigentError: 400 when the requested terminal is not
-            declared by the agent spec (or the agent has no
-            ``terminals:`` block at all).
+            offered by the agent spec (or no spec resolves for the
+            session).
         """
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
         body = await request.json()
@@ -1864,26 +1869,27 @@ def register_resources_routes(
         )
         if not is_native_bootstrap:
             spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
-            declared = list(spec.terminals or {}) if spec is not None else []
+            host_shells: list[str] | None = None
             if (
                 spec is not None
                 and conv.host_id is not None
                 and host_registry is not None
-                and native_coding_agent_for_agent_name(spec.name) is not None
+                and session_offers_host_shells(spec.name, conv.host_id)
             ):
-                reported = host_interactive_shells_for_request(
+                host_shells = host_interactive_shells_for_request(
                     conv.host_id,
                     host_registry=host_registry,
                     runner_router=runner_router or get_server_runner_router(),
                 )
-                if reported:
-                    declared = reported
-            if body.get("terminal") not in declared:
+            offered = list(user_shell_terminals(spec, host_shells=host_shells))
+            if body.get("terminal") not in offered:
                 raise OmnigentError(
                     (
-                        f"Terminal {body.get('terminal')!r} is not declared by this "
-                        f"agent. Terminals can only be created for agents whose spec "
-                        f"declares them; this agent declares: {declared or 'none'}."
+                        f"Terminal {body.get('terminal')!r} is not offered by this "
+                        f"agent. Terminals can only be created from the agent's "
+                        f"declared terminals, the selected host's shells, or its "
+                        f"default shell when neither yields a name; this agent "
+                        f"offers: {offered or 'none'}."
                     ),
                     code=ErrorCode.INVALID_INPUT,
                 )

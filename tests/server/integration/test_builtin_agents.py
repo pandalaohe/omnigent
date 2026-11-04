@@ -25,6 +25,7 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
+from omnigent.terminals.user_shells import DEFAULT_USER_SHELL
 from tests.server.helpers import build_agent_bundle
 
 pytestmark = pytest.mark.asyncio
@@ -337,6 +338,33 @@ async def test_list_builtin_agents_exposes_declared_terminals_from_spec(
     # Both declared names in spec order — proves the spec's terminals
     # block traversed the load → AgentObject path verbatim.
     assert entry["terminals"] == ["shell", "py"]
+
+
+async def test_list_builtin_agents_offers_default_shell_without_declared_terminals(
+    agent_store: SqlAlchemyAgentStore,
+    artifact_store: LocalArtifactStore,
+    agents_client: httpx.AsyncClient,
+) -> None:
+    """
+    An agent declaring no ``terminals:`` still reports the default user shell.
+
+    The rail's "new terminal" affordance is gated on a non-empty list, so an
+    empty one would hide the shell a user can open without any declaration.
+    """
+    bundle = build_agent_bundle(name="plain-agent")
+    _register_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_id="6a87d1f3e3b6df8c7a2e0a7e2a3f4c15",
+        name="plain-agent",
+        bundle=bundle,
+    )
+
+    resp = await agents_client.get("/v1/agents")
+
+    assert resp.status_code == 200, resp.text
+    entry = next(a for a in resp.json()["data"] if a["id"] == "6a87d1f3e3b6df8c7a2e0a7e2a3f4c15")
+    assert entry["terminals"] == [DEFAULT_USER_SHELL]
 
 
 async def test_list_builtin_agents_exposes_bundled_skills_from_spec(
