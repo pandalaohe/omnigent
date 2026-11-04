@@ -730,7 +730,10 @@ class AgentQuotaService:
             native_records, key=lambda item: item[2].get("read_at") or 0, default=None
         )
         base_record = record
-        if report is not None:
+        if report is not None and (
+            latest_native is None
+            or (record.get("read_at") or 0) >= (latest_native[2].get("read_at") or 0)
+        ):
             windows = report.windows
         elif latest_native is not None:
             base_record = latest_native[2]
@@ -756,33 +759,35 @@ class AgentQuotaService:
             view.details_url = str(report.details_url) if report.details_url else None
             view.renews_at = report.renews_at
         host_id = record.get("host_id")
-        if isinstance(host_id, str):
-            view.hosts = [
-                UsageHostView(
-                    host_id=host_id,
-                    name=self._host_name(host_id),
-                    read_at=record.get("read_at"),
-                    windows=view.windows,
-                )
-            ]
-        view.hosts.extend(
+        host_readings = {
+            native_host: (
+                native_record,
+                _native_windows(native_record.get("snapshot") or {}, str(record["product"])),
+            )
+            for native_host, _, native_record in native_records
+        }
+        if report is not None and isinstance(host_id, str):
+            native_record = host_readings.get(host_id, ({}, []))[0]
+            if (record.get("read_at") or 0) >= (native_record.get("read_at") or 0):
+                host_readings[host_id] = (record, report.windows)
+        view.hosts = [
             UsageHostView(
                 host_id=native_host or "",
                 name=self._host_name(native_host),
                 read_at=native_record.get("read_at"),
                 windows=self._window_views(
-                    _native_windows(native_record.get("snapshot") or {}, str(record["product"])),
+                    windows,
                     self._freshness(native_record, now) == "fresh",
                     now,
                     tiers,
                     None,
                 )[0],
             )
-            for native_host, _, native_record in sorted(
-                (entry for entry in native_records if entry[0] != host_id),
+            for native_host, (native_record, windows) in sorted(
+                host_readings.items(),
                 key=lambda entry: entry[0] or "",
             )
-        )
+        ]
         return view
 
     def _account_view(

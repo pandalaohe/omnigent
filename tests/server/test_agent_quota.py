@@ -512,6 +512,40 @@ def test_linked_account_includes_native_host_readings(service):
     assert tile.hosts[0].windows[0].percent_used == 85
 
 
+@pytest.mark.parametrize("native_host", [HOST, "b" * 32])
+def test_linked_account_uses_the_newest_reading_per_host(service, native_host):
+    report = usage_report(account_product="claude", host_id=HOST)
+    service.report_account(OWNER, "claude", report, now=NOW)
+    later = NOW + 3601
+    service.report(OWNER, native_host, "claude", snapshot(later, used=58), now=later)
+
+    tile = account(service.overview(OWNER, now=later), "claude")
+    assert tile.windows[0].percent_used == 58
+    assert tile.read_at == later
+    assert tile.freshness == "fresh"
+    hosts = {host.host_id: host for host in tile.hosts}
+    assert len(tile.hosts) == len({HOST, native_host})
+    assert hosts[native_host].windows[0].percent_used == 58
+    assert hosts[native_host].read_at == later
+    if native_host != HOST:
+        assert hosts[HOST].windows[0].percent_used == 40
+        assert hosts[HOST].read_at == NOW
+
+    service.report_account(
+        OWNER, "claude", report.model_copy(update={"observed_at": later + 1}), now=later + 1
+    )
+    tile = account(service.overview(OWNER, now=later + 1), "claude")
+    assert tile.windows[0].percent_used == 40
+    assert tile.read_at == later + 1
+    hosts = {host.host_id: host for host in tile.hosts}
+    assert len(tile.hosts) == len({HOST, native_host})
+    assert hosts[HOST].windows[0].percent_used == 40
+    assert hosts[HOST].read_at == later + 1
+    if native_host != HOST:
+        assert hosts[native_host].windows[0].percent_used == 58
+        assert hosts[native_host].read_at == later
+
+
 def test_overview_includes_live_native_codex_evidence(service):
     native = {
         "captured_at": NOW,
