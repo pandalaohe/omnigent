@@ -17,12 +17,14 @@ import math
 import re
 import time
 from collections.abc import Iterable, Mapping
+from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Literal, TypeAlias
 
 import zstandard
+from pydantic import ValidationError
 from sqlalchemy import LargeBinary, delete, select, type_coerce
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -41,6 +43,7 @@ from omnigent.db.utils import (
 )
 from omnigent.host.git_worktree import WorktreeError, validate_worktree_path_template
 from omnigent.server.auth import RESERVED_USER_LOCAL
+from omnigent.server.session_choice import SessionChoice
 
 logger = logging.getLogger(__name__)
 
@@ -537,6 +540,7 @@ class CollabSettings:
     quota_floor_pct: float | None = None
     quota_period_default: str | None = None
     quota_periods: dict[str, str] = field(default_factory=dict)
+    session_choice: SessionChoice = field(default_factory=SessionChoice)
 
 
 _CollabFieldKind: TypeAlias = Literal["bool", "positive_int"]
@@ -621,6 +625,11 @@ def _parse_collab_settings(value: Any) -> CollabSettings:
     if not isinstance(value, dict):
         return CollabSettings()
     resolved: dict[str, Any] = {}
+    from omnigent.server.session_choice import parse_session_choice
+
+    if "sessionChoice" in value:
+        with suppress(ValidationError):
+            resolved["session_choice"] = parse_session_choice(value["sessionChoice"])
     from omnigent.server.standing_approval import approval_strings
 
     try:
@@ -1936,6 +1945,9 @@ class SqlAlchemyUserPreferencesStore:
         loser retries into the winner's envelope.
         """
         validated = validate_preferences_envelope(envelope)
+        collab = validated["settings"].get(SESSION_COLLAB_NAMESPACE)
+        if isinstance(collab, dict):
+            collab.pop("sessionChoice", None)
         worktree_location = validated["settings"].get(WORKTREE_LOCATION_NAMESPACE)
         if worktree_location is not None:
             _validate_worktree_location(worktree_location)
@@ -1988,6 +2000,8 @@ class SqlAlchemyUserPreferencesStore:
             raise UserPreferencesValidationError(f"unsupported preferences namespace: {namespace}")
         if namespace == SESSION_COLLAB_NAMESPACE:
             value = _approval_preference(value)
+            if isinstance(value, dict):
+                value = {key: item for key, item in value.items() if key != "sessionChoice"}
         if value is not None:
             _validate_json(value)
             if namespace == WORKTREE_LOCATION_NAMESPACE:
@@ -2027,6 +2041,12 @@ class SqlAlchemyUserPreferencesStore:
                 )
             if value is None:
                 if (
+                    namespace == SESSION_COLLAB_NAMESPACE
+                    and isinstance(existing, dict)
+                    and "sessionChoice" in existing
+                ):
+                    settings[namespace] = {"sessionChoice": existing["sessionChoice"]}
+                elif (
                     namespace == KEEP_WARM_NAMESPACE
                     and isinstance(existing, dict)
                     and isinstance(existing.get("cells"), dict)
@@ -2050,6 +2070,12 @@ class SqlAlchemyUserPreferencesStore:
                         settings[namespace] = {**existing, **deepcopy(value)}
                 else:
                     settings[namespace] = deepcopy(value)
+                    if (
+                        namespace == SESSION_COLLAB_NAMESPACE
+                        and isinstance(existing, dict)
+                        and "sessionChoice" in existing
+                    ):
+                        settings[namespace] = {"sessionChoice": existing["sessionChoice"]}
             if namespace == RUNNER_LOG_WARNINGS_NAMESPACE:
                 stored = settings.get(namespace)
                 if isinstance(stored, dict):
@@ -2075,6 +2101,79 @@ class SqlAlchemyUserPreferencesStore:
         return run_write_transaction(
             self._write_session, "patch_user_preferences_namespace", write
         )
+
+    def session_choice(self, user_id: str) -> dict[str, Any]:
+        from omnigent.server.session_choice import choice_revision
+
+        envelope = self.get(user_id)
+        collab = (envelope or {}).get("settings", {}).get(SESSION_COLLAB_NAMESPACE)
+        value = collab.get("sessionChoice") if isinstance(collab, dict) else None
+        return {"settings": value, "revision": choice_revision(value)}
+
+    def replace_session_choice(
+        self,
+        user_id: str,
+        value: Any,
+        expected_revision: str,
+        *,
+        create_if_missing: bool = True,
+    ) -> dict[str, Any]:
+        """Compare and replace only the choice document under the preference lock."""
+        from omnigent.server.session_choice import (
+            ChoiceRevisionConflict,
+            choice_document,
+            choice_revision,
+            normalize_rows,
+            parse_session_choice,
+        )
+
+        incoming = parse_session_choice(value) if value is not None else None
+
+        def write(session: Session) -> dict[str, Any]:
+            _require_user_row(session, user_id, create_if_missing)
+            self._upsert_row(
+                session,
+                user_id=user_id,
+                key=_ENVELOPE_VERSION_KEY,
+                value=_encode_value(USER_PREFERENCE_VERSION),
+            )
+            settings, _ = _read_settings(session, user_id)
+            collab = settings.get(SESSION_COLLAB_NAMESPACE)
+            collab = dict(collab) if isinstance(collab, dict) else {}
+            previous = collab.get("sessionChoice")
+            if choice_revision(previous) != expected_revision:
+                raise ChoiceRevisionConflict(
+                    "Session choice changed. Read it again before saving."
+                )
+            stored = None
+            if previous is not None:
+                with suppress(ValidationError):
+                    stored = parse_session_choice(previous)
+            corrected: list[str] = []
+            document = None
+            if incoming is not None:
+                normalized, corrected = normalize_rows(incoming, stored)
+                document = choice_document(normalized)
+                collab["sessionChoice"] = document
+            else:
+                collab.pop("sessionChoice", None)
+            settings[SESSION_COLLAB_NAMESPACE] = collab
+            validated = _assemble_envelope(settings)
+            self._upsert_row(
+                session,
+                user_id=user_id,
+                key=_settings_key(SESSION_COLLAB_NAMESPACE),
+                value=_encode_namespace(
+                    SESSION_COLLAB_NAMESPACE, validated["settings"][SESSION_COLLAB_NAMESPACE]
+                ),
+            )
+            return {
+                "settings": document,
+                "revision": choice_revision(document),
+                "corrected": corrected,
+            }
+
+        return run_write_transaction(self._write_session, "replace_session_choice", write)
 
     def convert_keep_warm(
         self,

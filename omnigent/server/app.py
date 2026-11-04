@@ -4224,6 +4224,14 @@ def create_app(
             )
         return user_preferences_store
 
+    from omnigent.server.routes.session_choice import create_session_choice_router
+
+    app.include_router(
+        create_session_choice_router(user_preferences_store, auth_provider),
+        prefix="/v1",
+        tags=["session_choice"],
+    )
+
     def _preferences_owner(request: Request) -> tuple[str, bool]:
         owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
         from omnigent.server.auth import UnifiedAuthProvider
