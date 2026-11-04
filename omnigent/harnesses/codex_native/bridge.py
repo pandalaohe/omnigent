@@ -2402,6 +2402,6 @@ def clear_active_child_turn(
             return False
         entries.pop(thread_id, None)
         _write_active_child_turns_unlocked(bridge_dir, entries)
-        if not entries:
-            set_helper_stop_pending(bridge_dir, False)
-        return True
+    if not entries:
+        set_helper_stop_pending(bridge_dir, False)
+    return True
