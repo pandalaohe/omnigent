@@ -45,6 +45,21 @@ export const CODEX_APPROVAL_PRESETS: readonly CodexRuntimeApprovalPreset[] = [
 /** Runtime picker uses the same list; the UI disables Read Only transitions. */
 export const CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS = CODEX_APPROVAL_PRESETS;
 
+export const CODEX_CONFIGURED_PERMISSIONS_LABEL_KEY =
+  "omnigent.codex_native.configured_permissions";
+
+export const CODEX_CONFIGURED_PERMISSION_OPTION = {
+  value: "configured",
+  label: "Configured permissions",
+  description: "Use the current Codex source configuration when starting a new session",
+} as const;
+
+/** Source configuration is selectable at launch; runtime callers disable its row. */
+export const CODEX_NATIVE_RUNTIME_PERMISSION_OPTIONS = [
+  CODEX_CONFIGURED_PERMISSION_OPTION,
+  ...CODEX_APPROVAL_PRESETS,
+];
+
 // A session launched read-only still reports it as its live mode, so it keeps
 // a label even though the picker can't switch into it.
 

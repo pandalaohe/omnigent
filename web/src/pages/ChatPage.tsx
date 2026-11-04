@@ -370,7 +370,7 @@ import {
   isClaudeNativeSession,
 } from "@/lib/claudePermissionMode";
 import {
-  CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS,
+  CODEX_NATIVE_RUNTIME_PERMISSION_OPTIONS,
   codexApprovalModeLabel,
   codexPermissionReadback,
   codexPermissionObservationFromSession,
@@ -2780,7 +2780,8 @@ export function CodexPermissionReadbackChip({
         value={readback.value}
         selectedValue={readback.selectedValue}
         harness="codex-native"
-        options={CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS}
+        options={CODEX_NATIVE_RUNTIME_PERMISSION_OPTIONS}
+        disabledOptions={["read-only", "configured"]}
         readback={readback}
         disabled
         disabledReason="Change permission modes in the Chat view"
@@ -3219,7 +3220,7 @@ function ComposerImpl(
         : devinPermissionControl
           ? DEVIN_NATIVE_PERMISSION_MODES
           : CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES
-      : CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS);
+      : CODEX_NATIVE_RUNTIME_PERMISSION_OPTIONS);
   const permissionLabel = showClaudePermissionMode
     ? tierPermissionControl
       ? composerSession?.permissionTierState === "blocked"
@@ -3250,7 +3251,7 @@ function ComposerImpl(
       ? claudePermissionMode === "full"
         ? mode !== "full"
         : mode === "full"
-      : sessionHarness === "codex-native" && mode === "read-only";
+      : sessionHarness === "codex-native" && (mode === "read-only" || mode === "configured");
   const cyclePermissionOptions = permissionOptions.filter(
     (option) => !permissionOptionDisabled(option.value),
   );
@@ -5089,7 +5090,7 @@ function ComposerImpl(
                             )
                             .map((option) => option.value)
                         : showCodexApprovalMode && sessionHarness === "codex-native"
-                          ? ["read-only"]
+                          ? ["read-only", "configured"]
                           : []
                     }
                     disabled={

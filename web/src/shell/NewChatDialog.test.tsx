@@ -7595,12 +7595,40 @@ describe("NewChatLandingScreen", () => {
         .getAllByRole("menuitemradio")
         .map((item) => item.textContent),
     ).toEqual([
+      "Configured permissions",
       "Ask for approval",
       "Approve for me",
       "Full Access",
       "Read Only",
       "Bypass approvals & sandbox",
     ]);
+  });
+
+  it("creates Codex with current source permissions after leaving a preset or bypass", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    selectAgent("a2");
+    pickPermissionOption("full-access");
+    pickPermissionOption("bypass");
+    pickPermissionOption("configured");
+    expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
+      "Permission mode: Configured permissions",
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "run the build" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string);
+    expect(body.labels["omnigent.wrapper"]).toBe("codex-native-ui");
+    expect(body.labels["omnigent.codex_native.configured_permissions"]).toBe("1");
+    expect(body.terminal_launch_args ?? []).toEqual([]);
+    expect(body.labels["omnigent.codex_native.bypass_sandbox"]).toBeUndefined();
+    expect(body.approval_mode).toBeUndefined();
   });
 
   it("offers the Codex effort ladder in the gear modal and sends the pick as reasoning_effort", async () => {

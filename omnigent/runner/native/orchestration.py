@@ -2052,6 +2052,27 @@ async def _codex_native_launch_config(
         _bid = labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY)
         if isinstance(_bid, str) and _bid:
             bridge_id = _bid
+    from omnigent.codex_approval_modes import CODEX_CONFIGURED_PERMISSIONS_LABEL_KEY
+    from omnigent.harnesses.codex_native.launch_args import codex_launch_args_set_permission
+
+    if (
+        isinstance(labels, dict)
+        and labels.get(CODEX_CONFIGURED_PERMISSIONS_LABEL_KEY) == "1"
+        and not codex_launch_args_set_permission(terminal_launch_args or ())
+    ):
+        from omnigent.harnesses.codex_native.app_server import _bridged_codex_config
+
+        source = await asyncio.to_thread(_bridged_codex_config, None)
+        if source is None:
+            raise RuntimeError("Codex source configuration could not be read")
+        # Suppress the bare-launch auto reviewer default without saving a
+        # snapshot: every launch resolves the reviewer's current source value.
+        reviewer = source.get("approvals_reviewer", "user")
+        terminal_launch_args = [
+            *(terminal_launch_args or ()),
+            "-c",
+            f"approvals_reviewer={json.dumps(reviewer)}",
+        ]
     # One derivation of the session's Smart Routing class, shared with the SDK
     # codex path, so "pinned" and "auto-harness" mean the same on both.
     routing_class = routing_class_from_snapshot(

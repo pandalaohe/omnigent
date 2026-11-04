@@ -95,8 +95,12 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   background refresh and CLI/configuration fingerprint invalidation retained.
 - `permission-mode`: the harness's native approval modes; the current mode is
   marked and the choice persists. Codex shares Ask for approval, Approve for me,
-  Full Access and Read Only across its pickers and presets. Native Read Only is
-  launch-only, so its running-session choice is disabled.
+  Full Access and Read Only across its pickers and presets. Native Codex also
+  offers Configured permissions at creation to use the current source config.
+  Configured permissions and Read Only show Start a new session in the running
+  picker. A busy Codex turn refuses permission changes without interruption;
+  terminal menus/search must be closed before switching, and an unread popup
+  reports failure without guessing a selection.
 - `permission-mode-hotkey`: Shift+Tab in the in-session composer for Claude,
   Codex, and Devin native sessions steps through every mode in the chip's menu,
   including Full Access and Dangerous, wrapping while the chip is clickable. States:
