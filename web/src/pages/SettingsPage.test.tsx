@@ -544,8 +544,13 @@ describe("SettingsPage", () => {
           JSON.stringify(
             input.endsWith("/keep_warm/convert")
               ? {
-                  cells: { "": {}, h1: {}, h2: {} },
-                  columns: ["harness:claude-native"],
+                  layers: {
+                    corner: {},
+                    hosts: { "": {}, h1: {}, h2: {} },
+                    agents: {},
+                    cells: {},
+                    hostWins: {},
+                  },
                   already: true,
                 }
               : input.endsWith("/harnesses")
@@ -557,9 +562,9 @@ describe("SettingsPage", () => {
     );
     renderPage("/settings/general#keep-warm");
     const table = await screen.findByRole("table", {
-      name: "Keep-warm settings by host and agent",
+      name: "Keep-warm by agent and host",
     });
-    for (const hostLabel of ["Server", "Hawk", "Owl"])
+    for (const hostLabel of ["No host", "Hawk", "Owl"])
       expect(
         within(table).getByRole("columnheader", { name: new RegExp(hostLabel) }),
       ).toBeInTheDocument();
@@ -587,13 +592,11 @@ describe("SettingsPage", () => {
     });
     try {
       renderPage("/settings/general#context-usage");
-      const table = await screen.findByRole("table", {
-        name: "Saved context sources by computer and agent",
-      });
-      expect(within(table).getAllByRole("columnheader")).toHaveLength(5);
+      const table = await screen.findByRole("table", { name: "Saved context values" });
+      expect(within(table).getAllByRole("rowheader")).toHaveLength(4);
       for (const agentName of ["A", "B", "C", "D"])
         expect(
-          within(table).getByRole("button", { name: `Edit ${agentName} · Pi · all hosts` }),
+          within(table).getByRole("button", { name: new RegExp(`^Edit ${agentName}:`) }),
         ).toBeInTheDocument();
       expect(table.closest('[data-testid="settings-group-display-usage"]')).toHaveClass(
         "max-w-none",

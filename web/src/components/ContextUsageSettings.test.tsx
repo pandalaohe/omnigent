@@ -1,26 +1,30 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import {
-  readUsageContextPreferences,
-  usageContextSourceKey,
-  usageContextLevelKey,
-  DEFAULT_USAGE_CONTEXT_PREFERENCES,
-  writeUsageContextPreferences,
-  USAGE_CONTEXT_STORAGE_KEY,
-} from "@/lib/usageContextPreferences";
-import type { ProviderUsageLimitsSnapshot } from "@/lib/providerUsageLimits";
+import type { Host } from "@/hooks/useHosts";
 import type { RegistryItem } from "@/hooks/useAgentRegistry";
+import type { ProviderUsageLimitsSnapshot } from "@/lib/providerUsageLimits";
+import {
+  DEFAULT_USAGE_CONTEXT_PREFERENCES,
+  readUsageContextPreferences,
+  usageContextLevelKey,
+  usageContextSourceKey,
+  writeUsageContextPreferences,
+  type UsageContextOverride,
+} from "@/lib/usageContextPreferences";
 
 const mocks = vi.hoisted(() => ({
   conversationId: "session-1" as string | null,
-  agentName: "polly" as string | null,
-  harness: "pi" as string | null,
-  model: "model-a" as string | null,
+  agentName: "claude" as string | null,
+  harness: "claude-native" as string | null,
+  model: "claude-opus-5-5" as string | null,
   contextWindow: 330_000 as number | null,
   autoCompactTokenLimit: null as number | null,
   providerUsageLimits: null as ProviderUsageLimitsSnapshot | null,
   registryItems: [] as RegistryItem[],
+  hosts: [] as Host[],
+  sessionHostId: "host-a" as string | null,
 }));
 
 vi.mock("@/store/chatStore", () => ({
@@ -37,7 +41,11 @@ vi.mock("@/store/chatStore", () => ({
 }));
 
 vi.mock("@/hooks/useSession", () => ({
-  useSession: () => ({ session: { hostId: "host-friendly" }, isLoading: false, error: null }),
+  useSession: () => ({
+    session: mocks.sessionHostId === null ? null : { hostId: mocks.sessionHostId },
+    isLoading: false,
+    error: null,
+  }),
 }));
 
 vi.mock("@/hooks/useAgentRegistry", async (importOriginal) => ({
@@ -45,419 +53,559 @@ vi.mock("@/hooks/useAgentRegistry", async (importOriginal) => ({
   useAgentRegistry: () => ({ items: mocks.registryItems }),
 }));
 
-vi.mock("@/hooks/useHosts", () => ({
-  useHosts: () => ({
-    data: [
-      {
-        host_id: "host-friendly",
-        name: "Office MacBook",
-        owner: "alice",
-        status: "online",
-      },
-    ],
-  }),
+vi.mock("@/hooks/useHosts", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  useHosts: () => ({ data: mocks.hosts }),
   useCodexRateLimits: () => ({ data: null, isLoading: false }),
 }));
 
 import { ContextUsageSettings } from "./ContextUsageSettings";
 
+const POLY: RegistryItem = {
+  key: "agent-claude",
+  name: "claude",
+  label: "Claude Code",
+  section: "yours",
+  harness: "claude-native",
+  description: null,
+  deployed: true,
+  source: "library",
+};
+const CODEX: RegistryItem = {
+  key: "harness:codex",
+  name: "codex",
+  label: "Codex",
+  section: "sdk",
+  harness: "codex",
+  description: null,
+  deployed: true,
+  source: "builtin",
+};
+
+const HOSTS: Host[] = [
+  { host_id: "host-a", name: "Alpha", owner: "alice", status: "online", platform: "darwin" },
+  {
+    host_id: "host-win",
+    name: "Windows box",
+    owner: "alice",
+    status: "online",
+    platform: "win32",
+    configured_harnesses: { "claude-native": true },
+  },
+];
+
+const source = { hostId: "host-a", agentName: "claude", harness: "claude-native", model: "" };
+
+function value(contextWindowTokens: number | null, buffer: number | null = null) {
+  return { contextWindowTokens, autoCompactBufferTokens: buffer };
+}
+
+function store(overrides: Record<string, UsageContextOverride>) {
+  writeUsageContextPreferences({ ...DEFAULT_USAGE_CONTEXT_PREFERENCES, overrides });
+}
+
+function LocationProbe() {
+  const location = useLocation();
+  return (
+    <span data-testid="location">
+      {location.pathname}
+      {location.search}
+      {location.hash}
+    </span>
+  );
+}
+
+function renderSettings(entry = "/settings/general#context-usage") {
+  return render(
+    <MemoryRouter initialEntries={[entry]}>
+      <ContextUsageSettings />
+      <LocationProbe />
+    </MemoryRouter>,
+  );
+}
+
+function cell(row: string, col: string) {
+  return screen.getByTestId(`layered-cell-${row}-${col}`);
+}
+
+beforeEach(() => {
+  localStorage.clear();
+  mocks.conversationId = "session-1";
+  mocks.agentName = "claude";
+  mocks.harness = "claude-native";
+  mocks.model = "claude-opus-5-5";
+  mocks.contextWindow = 330_000;
+  mocks.autoCompactTokenLimit = null;
+  mocks.providerUsageLimits = null;
+  mocks.registryItems = [POLY, CODEX];
+  mocks.hosts = HOSTS;
+  mocks.sessionHostId = "host-a";
+});
+
 describe("ContextUsageSettings", () => {
-  beforeEach(() => {
-    localStorage.clear();
-    mocks.conversationId = "session-1";
-    mocks.agentName = "polly";
-    mocks.harness = "pi";
-    mocks.model = "model-a";
-    mocks.contextWindow = 330_000;
-    mocks.autoCompactTokenLimit = null;
-    mocks.providerUsageLimits = null;
-    mocks.registryItems = [];
+  it("names the agents with their integration mark and shows the saved value in the cell", () => {
+    store({ [usageContextLevelKey(source, "cell")]: value(300_000, 20_000) });
+    renderSettings();
+
+    const table = screen.getByRole("table", { name: "Saved context values" });
+    expect(within(table).getByText("Claude Code")).toBeInTheDocument();
+    expect(within(table).getByText("Codex")).toBeInTheDocument();
+    expect(cell("claude-claude-native", "host-a")).toHaveTextContent("300k20k");
+    expect(cell("claude-claude-native", "host-a")).toHaveAccessibleName(
+      "Edit claude on Alpha: context 300000 tokens, compact buffer 20000 tokens, set here",
+    );
+    expect(cell("claude-claude-native", "host-a").querySelector(".bg-pink-500")).not.toBeNull();
+    expect(cell("codex-codex", "host-a")).toHaveTextContent("––");
+    expect(cell("codex-codex", "host-a")).toHaveAccessibleName(
+      "Edit codex on Alpha: context Auto, compact buffer Auto",
+    );
+    expect(cell("codex-codex", "host-a")).not.toHaveTextContent("Auto");
   });
 
-  it("uses registry labels for the active source", () => {
-    mocks.registryItems = [
-      {
-        key: "agent-polly",
-        name: "polly",
-        label: "Polly · library",
-        section: "yours",
-        harness: "pi",
-        description: null,
-        deployed: true,
-        source: "library",
-      },
-      {
-        key: "harness:pi",
-        label: "Pi SDK",
-        section: "sdk",
-        harness: "pi",
-        description: null,
-        deployed: true,
-        source: "builtin",
-      },
-    ];
-    render(<ContextUsageSettings />);
-    expect(screen.getByText("Polly · library")).toBeInTheDocument();
-    expect(screen.getByText("Pi SDK")).toBeInTheDocument();
+  it("shows the corner on a row with no value of its own anywhere", () => {
+    store({
+      [usageContextLevelKey({ ...source, hostId: "", agentName: "", harness: "" }, "all")]:
+        value(550_000),
+    });
+    renderSettings();
+
+    expect(cell("claude-claude-native", "host-a")).toHaveTextContent("550k–");
+    expect(cell("claude-claude-native", "host-a").querySelector(".bg-pink-500")).toBeNull();
+    expect(screen.getByRole("button", { name: /Edit All agents, all hosts/ })).toHaveTextContent(
+      "All550k–",
+    );
   });
 
-  it("shows friendly source names and keeps overrides scoped to the exact source", async () => {
-    const { rerender } = render(<ContextUsageSettings />);
+  it("saves a cell against the level it inherits and drops a value that repeats it", () => {
+    store({ [usageContextLevelKey(source, "column")]: value(400_000) });
+    renderSettings();
 
-    expect(screen.getAllByText("Office MacBook")).toHaveLength(2);
-    expect(screen.getByText("Pi")).toBeInTheDocument();
-    expect(screen.queryByText("host-friendly")).not.toBeInTheDocument();
-    expect(screen.getByTestId("provider-usage-source-status")).toHaveTextContent("No data");
-    expect(screen.getByTestId("provider-usage-source-status")).toHaveAttribute(
-      "title",
-      expect.stringContaining("No usage limits received from Pi"),
-    );
-
-    const contextInput = screen.getByLabelText("Context window override in tokens");
-    const bufferInput = screen.getByLabelText("Automatic Compact buffer in tokens");
-    expect(contextInput).toHaveAttribute("placeholder", "330000");
-
-    fireEvent.change(contextInput, { target: { value: "330000" } });
-    fireEvent.blur(contextInput);
-    fireEvent.change(bufferInput, { target: { value: "33000" } });
-    fireEvent.blur(bufferInput);
-
-    const firstKey = usageContextSourceKey({
-      hostId: "host-friendly",
-      agentName: "polly",
-      harness: "pi",
-      model: "model-a",
-    });
-    await waitFor(() =>
-      expect(readUsageContextPreferences().overrides[firstKey]).toEqual({
-        contextWindowTokens: 330_000,
-        autoCompactBufferTokens: 33_000,
-      }),
-    );
-    expect(screen.getByText(/Compact 297k/)).toBeInTheDocument();
-
-    mocks.model = "model-b";
-    rerender(<ContextUsageSettings />);
-    await waitFor(() => expect(contextInput).toHaveValue(null));
-    expect(bufferInput).toHaveValue(null);
-
-    fireEvent.change(bufferInput, { target: { value: "40000" } });
-    fireEvent.blur(bufferInput);
-    const secondKey = usageContextSourceKey({
-      hostId: "host-friendly",
-      agentName: "polly",
-      harness: "pi",
-      model: "model-b",
-    });
-    await waitFor(() => {
-      const saved = readUsageContextPreferences().overrides;
-      expect(saved[firstKey]).toEqual({
-        contextWindowTokens: 330_000,
-        autoCompactBufferTokens: 33_000,
+    const saveCell = (typedValue: string) => {
+      fireEvent.click(cell("claude-claude-native", "host-a"));
+      fireEvent.change(screen.getByLabelText("Context total for Alpha × Claude Code"), {
+        target: { value: typedValue },
       });
-      expect(saved[secondKey]).toEqual({
-        contextWindowTokens: null,
-        autoCompactBufferTokens: 40_000,
-      });
-    });
-    expect(screen.getByTestId("saved-context-sources")).toHaveTextContent("Saved sources");
-    expect(screen.getByTestId("saved-context-sources")).toHaveTextContent("2 model overrides");
-    expect(screen.getByTestId("saved-context-sources")).not.toHaveTextContent("model-a");
-    expect(screen.getByText(/2 sources saved/)).toBeInTheDocument();
-    expect(screen.getByText(/Manual values change only this indicator/)).toBeInTheDocument();
-  });
-
-  it("clears the current source inputs when its saved row is deleted", async () => {
-    render(<ContextUsageSettings />);
-
-    const contextInput = screen.getByLabelText("Context window override in tokens");
-    const bufferInput = screen.getByLabelText("Automatic Compact buffer in tokens");
-    fireEvent.change(contextInput, { target: { value: "330000" } });
-    fireEvent.blur(contextInput);
-    fireEvent.change(bufferInput, { target: { value: "33000" } });
-    fireEvent.blur(bufferInput);
-
-    await waitFor(() =>
-      expect(screen.getByTestId("saved-context-sources")).toHaveTextContent("1 model override"),
-    );
-    fireEvent.click(screen.getByRole("button", { name: "Manage saved sources" }));
-
-    fireEvent.click(screen.getByRole("button", { name: "Delete Office MacBook polly model-a" }));
-    const dialog = screen.getByRole("dialog", { name: "Delete saved source?" });
-    fireEvent.click(within(dialog).getByRole("button", { name: "Delete" }));
-    fireEvent.click(
-      within(screen.getByRole("dialog", { name: "Manage saved sources" })).getByRole("button", {
-        name: "Close",
-      }),
-    );
-
-    await waitFor(() => expect(contextInput).toHaveValue(null));
-    expect(bufferInput).toHaveValue(null);
-    expect(screen.getByTestId("saved-context-sources")).toHaveTextContent("0 model overrides");
-  });
-
-  it("shows the reported Compact buffer as the input placeholder", () => {
-    mocks.contextWindow = 330_000;
-    mocks.autoCompactTokenLimit = 297_000;
-
-    render(<ContextUsageSettings />);
-
-    expect(screen.getByLabelText("Automatic Compact buffer in tokens")).toHaveAttribute(
-      "placeholder",
-      "33000",
-    );
-  });
-
-  it("marks the selected buffer unit with the neutral primary pair", async () => {
-    render(<ContextUsageSettings />);
-    const group = screen.getByRole("radiogroup", { name: "Buffer unit" });
-    const tokens = within(group).getByRole("radio", { name: "Tokens" });
-    const percent = within(group).getByRole("radio", { name: "Percent" });
-
-    expect(tokens).toHaveAttribute("aria-checked", "true");
-    expect(tokens).toHaveClass("bg-primary-cta", "text-primary-cta-foreground");
-    expect(percent).toHaveAttribute("aria-checked", "false");
-    expect(percent).not.toHaveClass("bg-primary-cta");
-
-    fireEvent.click(percent);
-    await waitFor(() => expect(percent).toHaveAttribute("aria-checked", "true"));
-    expect(percent).toHaveClass("bg-primary-cta", "text-primary-cta-foreground");
-    expect(tokens).toHaveAttribute("aria-checked", "false");
-    expect(tokens).not.toHaveClass("bg-primary-cta");
-  });
-
-  it("keeps both manual buffer units, accepts zero, and rejects a token buffer at capacity", async () => {
-    mocks.contextWindow = 100_000;
-    render(<ContextUsageSettings />);
-    const key = usageContextSourceKey({
-      hostId: "host-friendly",
-      agentName: "polly",
-      harness: "pi",
-      model: "model-a",
-    });
-    const context = screen.getByLabelText("Context window override in tokens");
-    fireEvent.change(context, { target: { value: "100000" } });
-    fireEvent.blur(context);
-    const tokens = screen.getByLabelText("Automatic Compact buffer in tokens");
-    fireEvent.change(tokens, { target: { value: "20000" } });
-    fireEvent.blur(tokens);
-
-    fireEvent.click(
-      within(screen.getByRole("radiogroup", { name: "Buffer unit" })).getByRole("radio", {
-        name: "Percent",
-      }),
-    );
-    const percent = screen.getByLabelText("Compact buffer percent");
-    fireEvent.change(percent, { target: { value: "10" } });
-    fireEvent.blur(percent);
-    await waitFor(() =>
-      expect(readUsageContextPreferences().overrides[key]).toMatchObject({
-        autoCompactBufferTokens: 20_000,
-        autoCompactBufferPercent: 10,
-        compactBufferMode: "percent",
-      }),
-    );
-    expect(screen.getByText(/Compact 90k/)).toBeInTheDocument();
-
-    fireEvent.change(percent, { target: { value: "0" } });
-    fireEvent.blur(percent);
-    await waitFor(() =>
-      expect(readUsageContextPreferences().overrides[key]?.autoCompactBufferPercent).toBe(0),
-    );
-    fireEvent.click(
-      within(screen.getByRole("radiogroup", { name: "Buffer unit" })).getByRole("radio", {
-        name: "Tokens",
-      }),
-    );
-    const tokensAgain = screen.getByLabelText("Automatic Compact buffer in tokens");
-    expect(tokensAgain).toHaveValue(20000);
-    fireEvent.change(tokensAgain, { target: { value: "100000" } });
-    fireEvent.blur(tokensAgain);
-    expect(screen.getByRole("alert")).toHaveTextContent("less than the context total");
-    expect(readUsageContextPreferences().overrides[key]?.autoCompactBufferTokens).toBe(20_000);
-
-    fireEvent.change(tokensAgain, { target: { value: "50000" } });
-    fireEvent.blur(tokensAgain);
-    await waitFor(() =>
-      expect(readUsageContextPreferences().overrides[key]?.autoCompactBufferTokens).toBe(50_000),
-    );
-    fireEvent.change(context, { target: { value: "50000" } });
-    fireEvent.blur(context);
-    expect(screen.getByRole("alert")).toHaveTextContent("must exceed");
-    expect(readUsageContextPreferences().overrides[key]?.contextWindowTokens).toBe(100_000);
-
-    fireEvent.change(context, { target: { value: "100000" } });
-    fireEvent.blur(context);
-    fireEvent.change(tokensAgain, { target: { value: "0" } });
-    fireEvent.blur(tokensAgain);
-    await waitFor(() =>
-      expect(readUsageContextPreferences().overrides[key]).toMatchObject({
-        autoCompactBufferTokens: 0,
-        autoCompactBufferPercent: 0,
-        compactBufferMode: "tokens",
-      }),
-    );
-  });
-
-  it("validates a buffer edit against the saved total after rejecting an invalid total draft", () => {
-    const key = usageContextSourceKey({
-      hostId: "host-friendly",
-      agentName: "polly",
-      harness: "pi",
-      model: "model-a",
-    });
-    localStorage.setItem(
-      USAGE_CONTEXT_STORAGE_KEY,
-      JSON.stringify({
-        version: 5,
-        showProviderUsageLimits: true,
-        overrides: { [key]: { contextWindowTokens: 100_000, autoCompactBufferTokens: 20_000 } },
-        lastProviderUsageLimits: {},
-      }),
-    );
-    mocks.contextWindow = 330_000;
-    render(<ContextUsageSettings />);
-
-    const context = screen.getByLabelText("Context window override in tokens");
-    fireEvent.change(context, { target: { value: "0" } });
-    fireEvent.blur(context);
-    expect(readUsageContextPreferences().overrides[key]?.contextWindowTokens).toBe(100_000);
-
-    const buffer = screen.getByLabelText("Automatic Compact buffer in tokens");
-    fireEvent.change(buffer, { target: { value: "150000" } });
-    fireEvent.blur(buffer);
-    expect(screen.getByRole("alert")).toHaveTextContent("less than the context total");
-    expect(readUsageContextPreferences().overrides[key]?.autoCompactBufferTokens).toBe(20_000);
-  });
-
-  it("does not present an expired cached usage snapshot as current", () => {
-    mocks.agentName = "claude-native";
-    mocks.harness = "claude-native";
-    mocks.providerUsageLimits = {
-      provider: "Claude",
-      capturedAt: Math.floor(Date.now() / 1000) - 3601,
-      windows: [{ label: "5h", ariaLabel: "5 hour", usedPercent: 12 }],
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
     };
 
-    render(<ContextUsageSettings />);
+    fireEvent.click(cell("claude-claude-native", "host-a"));
+    const empty = screen.getByLabelText("Context total for Alpha × Claude Code");
+    expect(empty).toHaveAttribute("placeholder", "400000");
+    expect(screen.getByText("From Claude Code, all hosts")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
 
-    expect(screen.getByTestId("provider-usage-source-status")).toHaveTextContent("No data");
-    expect(screen.getByTestId("provider-usage-source-status")).toHaveAttribute(
-      "title",
-      expect.stringContaining("No usage limits received"),
+    saveCell("400000");
+    expect(
+      readUsageContextPreferences().overrides[usageContextLevelKey(source, "cell")],
+    ).toBeUndefined();
+
+    saveCell("300000");
+    expect(
+      readUsageContextPreferences().overrides[usageContextLevelKey(source, "cell")],
+    ).toMatchObject({ contextWindowTokens: 300_000 });
+    expect(cell("claude-claude-native", "host-a")).toHaveTextContent("300k–");
+
+    saveCell("123456");
+    expect(cell("claude-claude-native", "host-a")).toHaveTextContent("123456–");
+    expect(cell("claude-claude-native", "host-a")).not.toHaveTextContent("123.5k");
+    expect(cell("claude-claude-native", "host-a")).toHaveAccessibleName(
+      "Edit claude on Alpha: context 123456 tokens, compact buffer Auto, set here",
     );
   });
 
-  it("edits only the selected level and logical field while showing inherited provenance", () => {
-    const source = { hostId: "host-friendly", agentName: "polly", harness: "pi", model: "model-a" };
-    const key = usageContextSourceKey(source);
-    const cell = usageContextLevelKey(source, "cell");
-    const column = usageContextLevelKey(source, "column");
-    writeUsageContextPreferences({
-      ...DEFAULT_USAGE_CONTEXT_PREFERENCES,
-      overrides: {
-        [cell]: { contextWindowTokens: 400_000, autoCompactBufferTokens: 20_000 },
-        [column]: { contextWindowTokens: 500_000, autoCompactBufferTokens: 30_000 },
+  it("orders the cell after its own value, then the agent, then the computer, then all", () => {
+    renderSettings();
+    fireEvent.click(cell("claude-claude-native", "host-a"));
+    fireEvent.click(screen.getByRole("button", { name: /^About .*Alpha/ }));
+    expect(
+      screen.getByText(
+        "This cell, then Claude Code, all hosts, then all agents on Alpha, then all agents, all hosts.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("saves on Enter and closes, and shows an error without closing", () => {
+    renderSettings();
+    fireEvent.click(cell("claude-claude-native", "host-a"));
+    const input = screen.getByLabelText("Context total for Alpha × Claude Code");
+
+    fireEvent.change(input, { target: { value: "-5" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(screen.getByRole("alert")).toHaveTextContent("Enter a positive context total.");
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+
+    fireEvent.change(input, { target: { value: "300000" } });
+    expect(screen.getByText("Not saved yet")).toBeInTheDocument();
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(
+      readUsageContextPreferences().overrides[usageContextLevelKey(source, "cell")],
+    ).toMatchObject({ contextWindowTokens: 300_000 });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("drops an agent row's typed value on Cancel", () => {
+    renderSettings();
+    fireEvent.click(screen.getByTestId("layered-row-claude-claude-native"));
+    fireEvent.change(screen.getByLabelText("Context total for all models of Claude Code"), {
+      target: { value: "250000" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    fireEvent.click(screen.getByTestId("layered-row-claude-claude-native"));
+    expect(screen.getByLabelText("Context total for all models of Claude Code")).toHaveValue(null);
+    expect(readUsageContextPreferences().overrides).toEqual({});
+  });
+
+  it("counts the model values saved for one cell in a small frame", () => {
+    store({
+      [usageContextSourceKey({ ...source, hostId: "host-a", model: "claude-opus-5-5" })]:
+        value(100_000),
+      [usageContextSourceKey({ ...source, hostId: "host-a", model: "claude-sonnet-5" })]:
+        value(200_000),
+      [usageContextSourceKey({ ...source, hostId: "host-a", model: "claude-haiku-5" })]:
+        value(300_000),
+    });
+    renderSettings();
+    expect(cell("claude-claude-native", "host-a")).toHaveTextContent("3M");
+    expect(cell("claude-claude-native", "host-a")).toHaveAccessibleName(
+      expect.stringContaining("3 saved model values"),
+    );
+  });
+
+  it("keeps a hand-entered percentage in the buffer frame", () => {
+    store({
+      [usageContextLevelKey(source, "cell")]: {
+        contextWindowTokens: 200_000,
+        autoCompactBufferTokens: null,
+        autoCompactBufferPercent: 12.5,
+        compactBufferMode: "percent",
       },
     });
-    render(<ContextUsageSettings />);
-    const context = screen.getByLabelText("Context window override in tokens");
-    expect(context).toHaveValue(null);
-    expect(screen.getByLabelText("Automatic Compact buffer in tokens")).toHaveValue(null);
-    expect(screen.getByTestId("current-source-resolution")).toHaveTextContent(
-      "Context 400,000 · Office MacBook × polly",
+    renderSettings();
+
+    expect(cell("claude-claude-native", "host-a")).toHaveTextContent("200k12.5%");
+    expect(cell("claude-claude-native", "host-a")).toHaveAccessibleName(
+      "Edit claude on Alpha: context 200000 tokens, compact buffer 12.5%, set here",
     );
-    fireEvent.change(context, { target: { value: "300000" } });
-    fireEvent.blur(context);
-    expect(readUsageContextPreferences().overrides[key]).toEqual({
-      contextWindowTokens: 300_000,
-      autoCompactBufferTokens: null,
-    });
-    expect(screen.getByTestId("current-source-resolution")).toHaveTextContent(
-      "Context 300,000 · model override",
-    );
-    expect(screen.getByTestId("current-source-resolution")).toHaveTextContent(
-      "Buffer 20,000 · Office MacBook × polly",
-    );
-    fireEvent.click(screen.getByRole("combobox", { name: "Edit source level" }));
-    fireEvent.click(screen.getByRole("option", { name: "polly · all hosts" }));
-    expect(context).toHaveValue(500000);
-    fireEvent.change(context, { target: { value: "600000" } });
-    fireEvent.blur(context);
-    expect(readUsageContextPreferences().overrides[column]).toEqual({
-      contextWindowTokens: 600_000,
-      autoCompactBufferTokens: 30_000,
-    });
-    expect(readUsageContextPreferences().overrides[cell]?.contextWindowTokens).toBe(400_000);
-    expect(readUsageContextPreferences().overrides[key]?.contextWindowTokens).toBe(300_000);
   });
 
-  it("shows ignored inherited buffer levels and the reported fallback", () => {
-    const source = { hostId: "host-friendly", agentName: "polly", harness: "pi", model: "model-a" };
-    writeUsageContextPreferences({
-      ...DEFAULT_USAGE_CONTEXT_PREFERENCES,
-      overrides: {
-        [usageContextLevelKey(source, "column")]: {
-          contextWindowTokens: null,
-          autoCompactBufferTokens: 150_000,
-        },
+  it("marks a cell whose two headers disagree and names the winner", () => {
+    store({
+      [usageContextLevelKey(source, "column")]: value(400_000),
+      [usageContextLevelKey({ ...source, agentName: "", harness: "" }, "host")]: value(500_000),
+    });
+    renderSettings();
+    expect(
+      within(cell("claude-claude-native", "host-a").closest("td")!).getByLabelText(
+        "Warning: Context total: Claude Code and Alpha differ; Claude Code wins.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("shows a host where the agent cannot run as text, not a button", () => {
+    renderSettings();
+    expect(screen.getByText("Not on Windows")).toBeInTheDocument();
+    expect(screen.getByText("Not installed here")).toBeInTheDocument();
+  });
+
+  it("opens this session's row on its model and clears ctx from the URL", async () => {
+    const exact = usageContextSourceKey({ ...source, hostId: "host-a", model: "claude-opus-5-5" });
+    renderSettings(`/settings/general?ctx=${encodeURIComponent(exact)}#context-usage`);
+
+    const input = await screen.findByLabelText("Context total for claude-opus-5-5");
+    expect(input).toHaveFocus();
+    expect(screen.getByText("This session's model")).toBeInTheDocument();
+    expect(screen.getByRole("dialog")).toHaveTextContent("Claude Code, all hosts");
+    await waitFor(() =>
+      expect(screen.getByTestId("location")).toHaveTextContent("/settings/general#context-usage"),
+    );
+    expect(screen.getByTestId("location")).not.toHaveTextContent("ctx=");
+  });
+
+  it("focuses the all-models fields when the session has no model", async () => {
+    const exact = usageContextSourceKey({ ...source, model: "" });
+    renderSettings(`/settings/general?ctx=${encodeURIComponent(exact)}#context-usage`);
+    expect(
+      await screen.findByLabelText("Context total for all models of Claude Code"),
+    ).toHaveFocus();
+    expect(screen.queryByLabelText(/this session's model/)).not.toBeInTheDocument();
+  });
+
+  it("says so and opens nothing when the session's agent has no row", async () => {
+    const exact = usageContextSourceKey({
+      hostId: "host-a",
+      agentName: "gone",
+      harness: "pi",
+      model: "m",
+    });
+    renderSettings(`/settings/general?ctx=${encodeURIComponent(exact)}#context-usage`);
+    expect(await screen.findByTestId("context-missing-source")).toHaveTextContent(
+      "This session's agent is not listed here.",
+    );
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.getByRole("table", { name: "Saved context values" })).toBeInTheDocument();
+  });
+
+  it("carries a typed value one step down to the cell without saving it", async () => {
+    renderSettings(
+      `/settings/general?ctx=${encodeURIComponent(usageContextSourceKey({ ...source, model: "" }))}#context-usage`,
+    );
+    const allModels = await screen.findByLabelText("Context total for all models of Claude Code");
+    fireEvent.change(allModels, { target: { value: "250000" } });
+
+    fireEvent.click(screen.getByRole("button", { name: "Only on Alpha" }));
+    const cellInput = await screen.findByLabelText("Context total for Claude Code on Alpha");
+    expect(cellInput).toHaveValue(250_000);
+    expect(readUsageContextPreferences().overrides).toEqual({});
+    // One level is in view; going back finds the row's own value still unsaved.
+    expect(screen.queryByLabelText("Context total for all models of Claude Code")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Claude Code, all hosts" }));
+    expect(screen.getByLabelText("Context total for all models of Claude Code")).toHaveValue(
+      250_000,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Only on Alpha" }));
+    expect(readUsageContextPreferences().overrides).toEqual({});
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(
+      readUsageContextPreferences().overrides[usageContextLevelKey(source, "cell")],
+    ).toMatchObject({ contextWindowTokens: 250_000 });
+  });
+
+  it("keeps a level's stored value when stepping to it with nothing typed", async () => {
+    const cellKey = usageContextLevelKey(source, "cell");
+    store({ [cellKey]: value(100_000) });
+    renderSettings();
+
+    fireEvent.click(screen.getByTestId("layered-row-claude-claude-native"));
+    fireEvent.click(screen.getByRole("button", { name: "Only on Alpha" }));
+    expect(screen.getByLabelText("Context total for Claude Code on Alpha")).toHaveValue(100_000);
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear this level" }));
+    await waitFor(() => expect(readUsageContextPreferences().overrides[cellKey]).toBeUndefined());
+    expect(screen.getByLabelText("Context total for Claude Code on Alpha")).toHaveValue(null);
+  });
+
+  it("lists a model value in the agent row with its scope and removes it", async () => {
+    const modelKey = usageContextLevelKey({ ...source, model: "claude-opus-5-5" }, "agent-model");
+    store({ [modelKey]: value(200_000) });
+    renderSettings(
+      `/settings/general?ctx=${encodeURIComponent(usageContextSourceKey({ ...source, model: "claude-opus-5-5" }))}#context-usage`,
+    );
+
+    expect(await screen.findByText("Saved for one model")).toBeInTheDocument();
+    expect(screen.getAllByText("claude-opus-5-5").length).toBeGreaterThan(0);
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Remove the value for claude-opus-5-5 on Every computer",
+      }),
+    );
+    await waitFor(() => expect(readUsageContextPreferences().overrides[modelKey]).toBeUndefined());
+  });
+
+  it("applies one value to the selected cells and undoes it", async () => {
+    store({ [usageContextLevelKey(source, "cell")]: value(100_000) });
+    renderSettings();
+
+    fireEvent.click(screen.getByRole("button", { name: "Select cells" }));
+    fireEvent.click(screen.getByTestId("layered-row-claude-claude-native"));
+    fireEvent.click(screen.getByRole("button", { name: "Set values" }));
+    fireEvent.change(screen.getByLabelText("Context total for the selection"), {
+      target: { value: "600000" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Apply to 1 selected" }));
+    expect(
+      readUsageContextPreferences().overrides[usageContextLevelKey(source, "cell")],
+    ).toMatchObject({ contextWindowTokens: 600_000 });
+
+    fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+    expect(
+      readUsageContextPreferences().overrides[usageContextLevelKey(source, "cell")],
+    ).toMatchObject({ contextWindowTokens: 100_000 });
+  });
+
+  it("keeps the usage limits row and shows no provider reading without a harness session", () => {
+    mocks.harness = null;
+    renderSettings();
+    expect(screen.getByTestId("provider-usage-source-status")).toHaveTextContent("Open a session");
+    expect(screen.getByLabelText("Show usage limits")).toBeInTheDocument();
+  });
+
+  it("undoes only the records changed by Clear values below", async () => {
+    const cellKey = usageContextLevelKey(source, "cell");
+    const columnKey = usageContextLevelKey(source, "column");
+    store({ [cellKey]: value(100_000) });
+    renderSettings();
+
+    fireEvent.click(screen.getByTestId("layered-row-claude-claude-native"));
+    fireEvent.click(await screen.findByRole("button", { name: "Clear 1 value" }));
+    await waitFor(() => expect(readUsageContextPreferences().overrides[cellKey]).toBeUndefined());
+
+    fireEvent.change(screen.getByLabelText("Context total for all models of Claude Code"), {
+      target: { value: "250000" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(readUsageContextPreferences().overrides[columnKey]).toMatchObject({
+      contextWindowTokens: 250_000,
+    });
+
+    fireEvent.click(screen.getByTestId("layered-row-claude-claude-native"));
+    fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+    await waitFor(() =>
+      expect(readUsageContextPreferences().overrides[cellKey]).toMatchObject({
+        contextWindowTokens: 100_000,
+      }),
+    );
+    expect(readUsageContextPreferences().overrides[columnKey]).toMatchObject({
+      contextWindowTokens: 250_000,
+    });
+  });
+
+  it("keeps a repeated buffer when the proposed cell total activates another buffer", () => {
+    const cellKey = usageContextLevelKey(source, "cell");
+    const corner = { hostId: "", agentName: "", harness: "", model: "" };
+    store({
+      [usageContextLevelKey(source, "column")]: value(100_000, 150_000),
+      [usageContextLevelKey(corner, "all")]: value(null, 20_000),
+    });
+    renderSettings();
+
+    fireEvent.click(cell("claude-claude-native", "host-a"));
+    fireEvent.change(screen.getByLabelText("Context total for Alpha × Claude Code"), {
+      target: { value: "200000" },
+    });
+    fireEvent.change(screen.getByLabelText("Compact buffer for Alpha × Claude Code"), {
+      target: { value: "20000" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(readUsageContextPreferences().overrides[cellKey]).toMatchObject({
+      contextWindowTokens: 200_000,
+      autoCompactBufferTokens: 20_000,
+      compactBufferMode: "tokens",
+    });
+  });
+
+  it("preserves Percent mode when its empty field retains an inactive token buffer", () => {
+    const cellKey = usageContextLevelKey(source, "cell");
+    store({
+      [cellKey]: {
+        contextWindowTokens: 100_000,
+        autoCompactBufferTokens: 20_000,
+        compactBufferMode: "percent",
       },
     });
-    mocks.autoCompactTokenLimit = 300_000;
-    render(<ContextUsageSettings />);
-    const context = screen.getByLabelText("Context window override in tokens");
-    fireEvent.change(context, { target: { value: "100000" } });
-    fireEvent.blur(context);
-    expect(screen.getByTestId("current-source-resolution")).toHaveTextContent(
-      "Buffer 30,000 · reported",
-    );
-    expect(screen.getByTestId("current-source-resolution")).toHaveTextContent(
-      "Ignored polly · all hosts: buffer ≥ context; using reported.",
-    );
+    renderSettings();
+
+    fireEvent.click(cell("claude-claude-native", "host-a"));
+    expect(screen.getByLabelText("Compact buffer for Alpha × Claude Code")).toHaveValue(null);
+    fireEvent.change(screen.getByLabelText("Context total for Alpha × Claude Code"), {
+      target: { value: "200000" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(readUsageContextPreferences().overrides[cellKey]).toMatchObject({
+      contextWindowTokens: 200_000,
+      autoCompactBufferTokens: 20_000,
+      compactBufferMode: "percent",
+    });
   });
 
-  it.each([true, false])(
-    "copies the exact model through Use current source while editing a column (column saved: %s)",
-    (hasColumn) => {
-      const source = {
-        hostId: "host-friendly",
-        agentName: "polly",
-        harness: "pi",
-        model: "model-a",
-      };
-      const exact = usageContextSourceKey(source);
-      const target = usageContextSourceKey({ ...source, model: "model-b" });
-      const column = usageContextLevelKey(source, "column");
-      const exactOverride = { contextWindowTokens: 300_000, autoCompactBufferTokens: 10_000 };
-      const columnOverride = { contextWindowTokens: 500_000, autoCompactBufferTokens: 20_000 };
-      writeUsageContextPreferences({
-        ...DEFAULT_USAGE_CONTEXT_PREFERENCES,
-        overrides: {
-          [exact]: exactOverride,
-          [target]: { contextWindowTokens: 200_000, autoCompactBufferTokens: 5_000 },
-          ...(hasColumn ? { [column]: columnOverride } : {}),
-        },
-      });
-      render(<ContextUsageSettings />);
-      fireEvent.click(screen.getByRole("combobox", { name: "Edit source level" }));
-      fireEvent.click(screen.getByRole("option", { name: "polly · all hosts" }));
-      expect(screen.getByLabelText("Context window override in tokens")).toHaveValue(
-        hasColumn ? 500_000 : null,
-      );
-      fireEvent.click(screen.getByRole("button", { name: "Manage saved sources" }));
-      fireEvent.click(
-        screen.getByRole("checkbox", { name: "Select Office MacBook polly model-b" }),
-      );
-      const useCurrent = screen.getByRole("button", { name: "Use current source" });
-      expect(useCurrent).toBeEnabled();
-      fireEvent.click(useCurrent);
-      expect(screen.getByLabelText("Context total")).toHaveValue(300_000);
-      expect(screen.getByLabelText("Compact buffer")).toHaveValue(10_000);
-      fireEvent.click(screen.getByRole("button", { name: "Apply to 1 selected" }));
-      const saved = readUsageContextPreferences().overrides;
-      expect(saved[target]).toEqual(exactOverride);
-      expect(saved[exact]).toEqual(exactOverride);
-      expect(saved[column]).toEqual(hasColumn ? columnOverride : undefined);
-    },
-  );
+  it("deduplicates each bulk-saved cell against its own inherited value", () => {
+    const cellKey = usageContextLevelKey(source, "cell");
+    const corner = { hostId: "", agentName: "", harness: "", model: "" };
+    store({ [usageContextLevelKey(corner, "all")]: value(300_000) });
+    renderSettings();
+
+    fireEvent.click(screen.getByRole("button", { name: "Select cells" }));
+    fireEvent.click(screen.getByTestId("layered-row-claude-claude-native"));
+    fireEvent.click(screen.getByRole("button", { name: "Set values" }));
+    fireEvent.change(screen.getByLabelText("Context total for the selection"), {
+      target: { value: "300000" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Apply to 2 selected" }));
+
+    expect(readUsageContextPreferences().overrides[cellKey]).toBeUndefined();
+  });
+
+  it("drills a focused model to its exact host record with the model draft", async () => {
+    const model = "claude-opus-5-5";
+    const exactKey = usageContextSourceKey({ ...source, model });
+    renderSettings(`/settings/general?ctx=${encodeURIComponent(exactKey)}#context-usage`);
+
+    fireEvent.change(await screen.findByLabelText(`Context total for ${model}`), {
+      target: { value: "420000" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Only on Alpha" }));
+    const drilled = await screen.findByLabelText("Context total for Claude Code on Alpha");
+    expect(drilled).toHaveValue(420_000);
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(readUsageContextPreferences().overrides[exactKey]).toMatchObject({
+      contextWindowTokens: 420_000,
+    });
+    expect(
+      readUsageContextPreferences().overrides[usageContextLevelKey(source, "cell")],
+    ).toBeUndefined();
+  });
+
+  it("names the validated buffer winner in a crossing clash", () => {
+    store({
+      [usageContextLevelKey(source, "cell")]: value(100_000),
+      [usageContextLevelKey(source, "column")]: value(null, 150_000),
+      [usageContextLevelKey({ ...source, agentName: "", harness: "" }, "host")]: value(
+        null,
+        20_000,
+      ),
+    });
+    renderSettings();
+
+    expect(
+      within(cell("claude-claude-native", "host-a").closest("td")!).getByLabelText(
+        "Warning: Compact buffer: Claude Code and Alpha differ; Alpha wins.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("uses reported capacity when naming the buffer clash winner", () => {
+    mocks.contextWindow = 100_000;
+    store({
+      [usageContextLevelKey(source, "column")]: value(null, 150_000),
+      [usageContextLevelKey({ ...source, agentName: "", harness: "" }, "host")]: value(
+        null,
+        20_000,
+      ),
+    });
+    renderSettings();
+
+    expect(cell("claude-claude-native", "host-a")).toHaveTextContent("100k20k");
+    expect(
+      within(cell("claude-claude-native", "host-a").closest("td")!).getByLabelText(
+        "Warning: Compact buffer: Claude Code and Alpha differ; Alpha wins.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("counts and clears model records below the corner", async () => {
+    const cellKey = usageContextLevelKey(source, "cell");
+    const modelKey = usageContextLevelKey({ ...source, model: "claude-opus-5-5" }, "agent-model");
+    store({ [cellKey]: value(100_000), [modelKey]: value(200_000) });
+    renderSettings();
+
+    fireEvent.click(screen.getByRole("button", { name: /Edit All agents, all hosts/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Clear 2 values" }));
+
+    await waitFor(() => {
+      expect(readUsageContextPreferences().overrides[cellKey]).toBeUndefined();
+      expect(readUsageContextPreferences().overrides[modelKey]).toBeUndefined();
+    });
+  });
+
+  it("does not mark a reported reading as a value saved in the cell", () => {
+    mocks.contextWindow = 128_000;
+    renderSettings();
+
+    expect(cell("claude-claude-native", "host-a")).toHaveTextContent("128k–");
+    expect(cell("claude-claude-native", "host-a").querySelector(".bg-pink-500")).toBeNull();
+  });
 });

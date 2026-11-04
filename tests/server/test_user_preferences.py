@@ -3488,3 +3488,43 @@ async def test_keep_warm_conversion_api_reports_size_counts_without_writing(
             assert "11 hosts" in response.json()["detail"]
             assert "columns" in response.json()["detail"] and "cells" in response.json()["detail"]
             assert store.get(owner) == before
+
+
+def test_usage_context_round_trips_every_saved_level(db_uri: str) -> None:
+    """Context keys for model, model-everywhere, cell, agent, computer and all survive."""
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    source = ["host-a", "claude", "claude-native", "claude-opus-5-5"]
+    value = {
+        "version": 6,
+        "showProviderUsageLimits": True,
+        "overrides": {
+            json.dumps(source): {"contextWindowTokens": 100_000, "autoCompactBufferTokens": None},
+            json.dumps(["", "claude", "claude-native", "claude-opus-5-5", "agent-model"]): {
+                "contextWindowTokens": 200_000,
+                "autoCompactBufferTokens": 20_000,
+            },
+            json.dumps(["host-a", "claude", "claude-native", "", "cell"]): {
+                "contextWindowTokens": 300_000,
+                "autoCompactBufferTokens": None,
+            },
+            json.dumps(["", "claude", "claude-native", "", "column"]): {
+                "contextWindowTokens": 400_000,
+                "autoCompactBufferTokens": None,
+            },
+            json.dumps(["host-a", "", "", "", "host"]): {
+                "contextWindowTokens": 500_000,
+                "autoCompactBufferTokens": None,
+            },
+            json.dumps(["", "", "", "", "all"]): {
+                "contextWindowTokens": 600_000,
+                "autoCompactBufferTokens": None,
+                "compactBufferMode": "percent",
+                "autoCompactBufferPercent": 10,
+            },
+        },
+        "lastProviderUsageLimits": {},
+    }
+
+    store.patch_namespace("alice@example.com", "usage_context", value)
+
+    assert store.get("alice@example.com")["settings"]["usage_context"] == value

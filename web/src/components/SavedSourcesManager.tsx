@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -17,11 +17,11 @@ import {
   deleteUsageContextOverrides,
   fixedBufferFitsCapacity,
   patchUsageContextOverrides,
-  usageContextRecordFromKey,
-  usageContextLevelKey,
-  resolveUsageContext,
-  usageContextLevelLabel,
   proposeUsageContextCollapse,
+  resolveUsageContext,
+  usageContextLevelKey,
+  usageContextLevelLabel,
+  usageContextRecordFromKey,
   writeUsageContextPreferences,
   type UsageContextOverride,
   type UsageContextOverridePatch,
@@ -52,9 +52,10 @@ interface SavedContextSourceRow {
   agentLabel: string;
   harnessLabel: string;
   modelLabel: string;
+  levelLabel: string;
   rowLabel: string;
   source: UsageContextSource;
-  level: "model" | "cell" | "column";
+  level: "model" | "agent-model" | "cell" | "column" | "host" | "all";
 }
 
 const NO_REGISTRY_ITEMS: readonly RegistryItem[] = [];
@@ -66,14 +67,13 @@ function describeSource(
 ) {
   const hostLabel = source.hostId
     ? (hosts.find((host) => host.host_id === source.hostId)?.name ?? source.hostId)
-    : "Server";
+    : "No host";
   const { agentLabel, harnessLabel } = registrySourceLabels(
     registryItems,
     source.agentName,
     source.harness,
   );
-  const modelLabel = source.model || "Auto model";
-  return { hostLabel, agentLabel, harnessLabel, modelLabel };
+  return { hostLabel, agentLabel, harnessLabel, modelLabel: source.model || "Every model" };
 }
 
 function SourceResolution({
@@ -117,69 +117,61 @@ function SourceResolution({
 export function SavedSourcesManager({
   preferences,
   initialSource,
-  initialLevel = "cell",
-  sources,
   currentSourceKey,
   hosts,
   registryItems = NO_REGISTRY_ITEMS,
-  currentOverride,
   reportedContextWindow = null,
   reportedAutoCompactTokenLimit = null,
 }: {
   preferences: UsageContextPreferences;
   initialSource: UsageContextSource;
-  initialLevel?: "cell" | "column";
-  sources: UsageContextSource[];
   currentSourceKey: string;
   hosts: Host[];
   registryItems?: readonly RegistryItem[];
-  currentOverride: UsageContextOverride;
   reportedContextWindow?: number | null;
   reportedAutoCompactTokenLimit?: number | null;
 }) {
   const [activeSource, setActiveSource] = useState(initialSource);
-  const [showColumn, setShowColumn] = useState(initialLevel === "column");
-  const [keptProposal, setKeptProposal] = useState(false);
-  const proposal = proposeUsageContextCollapse(preferences);
-  const records = { ...preferences.overrides };
-  for (const source of sources) {
-    const cellKey = usageContextLevelKey(source, "cell");
-    records[cellKey] ??= { contextWindowTokens: null, autoCompactBufferTokens: null };
-    const columnKey = usageContextLevelKey(source, "column");
-    records[columnKey] ??= { contextWindowTokens: null, autoCompactBufferTokens: null };
-  }
-  const rows: SavedContextSourceRow[] = Object.entries(records).flatMap(([key, override]) => {
-    const record = usageContextRecordFromKey(key);
-    if (!record) return [];
-    const labels = describeSource(record.source, hosts, registryItems);
-    const modelLabel =
-      record.level === "model"
-        ? labels.modelLabel
-        : record.level === "cell"
-          ? "All models"
-          : "All hosts";
-    return [
-      {
-        key,
-        override,
-        ...labels,
-        modelLabel,
-        source: record.source,
-        level: record.level,
-        rowLabel: `${labels.hostLabel} ${labels.agentLabel} ${modelLabel}`,
-      },
-    ];
-  });
-  const [selectedKeys, setSelectedKeys] = useState<string[]>([]);
-  const [editingKey, setEditingKey] = useState<string | null>(null);
-  const [editContext, setEditContext] = useState("");
-  const [editBuffer, setEditBuffer] = useState("");
-  const [editPercent, setEditPercent] = useState("");
-  const [editMode, setEditMode] = useState<"tokens" | "percent">("tokens");
-  const editBaselineRef = useRef<UsageContextOverride>({
+  const currentOverride: UsageContextOverride = preferences.overrides[currentSourceKey] ?? {
     contextWindowTokens: null,
     autoCompactBufferTokens: null,
-  });
+  };
+  const [keptProposal, setKeptProposal] = useState(false);
+  const proposal = proposeUsageContextCollapse(preferences);
+  const current = usageContextRecordFromKey(currentSourceKey)?.source ?? initialSource;
+  const rows: SavedContextSourceRow[] = Object.entries(preferences.overrides).flatMap(
+    ([key, override]) => {
+      const record = usageContextRecordFromKey(key);
+      if (!record) return [];
+      const labels = describeSource(record.source, hosts, registryItems);
+      const scope =
+        record.level === "agent-model"
+          ? "Every computer"
+          : record.level === "cell"
+            ? "This computer"
+            : record.level === "column"
+              ? "Every computer"
+              : record.level === "model"
+                ? labels.hostLabel
+                : "Every agent";
+      return [
+        {
+          key,
+          override,
+          ...labels,
+          modelLabel:
+            record.level === "model" || record.level === "agent-model"
+              ? labels.modelLabel
+              : "Every model",
+          levelLabel: scope,
+          source: record.source,
+          level: record.level,
+          rowLabel: `${labels.hostLabel} ${labels.agentLabel} ${labels.modelLabel}`,
+        },
+      ];
+    },
+  );
+  const [selectedKeys, setSelectedKeys] = useState<string[]>([]);
   const [deleteKeys, setDeleteKeys] = useState<string[] | null>(null);
   const [batchContext, setBatchContext] = useState("");
   const [batchBuffer, setBatchBuffer] = useState("");
@@ -189,62 +181,66 @@ export function SavedSourcesManager({
   const [batchContextAuto, setBatchContextAuto] = useState(false);
   const [batchBufferAuto, setBatchBufferAuto] = useState(false);
 
+  const hostAgents = new Map<string, Map<string, UsageContextSource>>();
+  const addScope = (source: UsageContextSource) => {
+    if (!source.agentName) return;
+    const agents = hostAgents.get(source.hostId) ?? new Map<string, UsageContextSource>();
+    agents.set(usageContextLevelKey(source, "cell"), { ...source, model: "" });
+    hostAgents.set(source.hostId, agents);
+  };
+  for (const row of rows) addScope(row.source);
+  addScope(initialSource);
+  addScope(current);
+  const hostIds = [...hostAgents.keys()].sort((left, right) =>
+    (left
+      ? describeSource({ ...current, hostId: left }, hosts, registryItems).hostLabel
+      : "No host"
+    ).localeCompare(
+      right
+        ? describeSource({ ...current, hostId: right }, hosts, registryItems).hostLabel
+        : "No host",
+    ),
+  );
+  const wideRows = rows.filter((row) => row.level === "host" || row.level === "all");
   const visibleRows = rows
     .filter(
       (row) =>
         row.source.agentName === activeSource.agentName &&
         row.source.harness === activeSource.harness &&
-        (showColumn
-          ? row.level === "column"
-          : row.level !== "column" && row.source.hostId === activeSource.hostId),
+        (row.level === "agent-model"
+          ? true
+          : row.level === "column"
+            ? false
+            : row.source.hostId === activeSource.hostId),
     )
     .sort((left, right) => Number(right.level === "cell") - Number(left.level === "cell"));
-  const modelRows = visibleRows.filter((row) => row.level === "model");
+  const modelRows = visibleRows.filter(
+    (row) => row.level === "model" || row.level === "agent-model",
+  );
+  const columnRows = rows.filter(
+    (row) =>
+      row.level === "column" &&
+      row.source.agentName === activeSource.agentName &&
+      row.source.harness === activeSource.harness,
+  );
   const activeLabels = describeSource(activeSource, hosts, registryItems);
-  const columnKey = usageContextLevelKey(activeSource, "column");
-  const column = preferences.overrides[columnKey];
-  const hostIds = [...new Set(sources.map((source) => source.hostId))];
+  const labelsFor = (source: UsageContextSource) => ({
+    hostLabel: describeSource(source, hosts, registryItems).hostLabel,
+    agentLabel: describeSource(source, hosts, registryItems).agentLabel,
+  });
   // JSON array keys never contain a literal newline, so joining keeps the
   // effect dependency stable without re-running on every render.
   const visibleKeySignature = modelRows.map((row) => row.key).join("\n");
 
   useEffect(() => {
     const visible = new Set(visibleKeySignature === "" ? [] : visibleKeySignature.split("\n"));
-    setSelectedKeys((current) => {
-      const next = current.filter(
+    setSelectedKeys((currentKeys) => {
+      const next = currentKeys.filter(
         (key) => visible.has(key) && Object.hasOwn(preferences.overrides, key),
       );
-      return next.length === current.length ? current : next;
+      return next.length === currentKeys.length ? currentKeys : next;
     });
   }, [visibleKeySignature, preferences.overrides]);
-
-  const editingRow = rows.find((row) => row.key === editingKey) ?? null;
-  const editingRowExists = editingRow !== null;
-  const editingRowContext = editingRow?.override.contextWindowTokens;
-  const editingRowBuffer = editingRow?.override.autoCompactBufferTokens;
-  const editingRowPercent = editingRow?.override.autoCompactBufferPercent;
-  const editingRowMode = editingRow?.override.compactBufferMode;
-
-  useEffect(() => {
-    if (editingKey === null) return;
-    const baseline = editBaselineRef.current;
-    if (
-      !editingRowExists ||
-      editingRowContext !== baseline.contextWindowTokens ||
-      editingRowBuffer !== baseline.autoCompactBufferTokens ||
-      editingRowPercent !== baseline.autoCompactBufferPercent ||
-      editingRowMode !== baseline.compactBufferMode
-    ) {
-      setEditingKey(null);
-    }
-  }, [
-    editingKey,
-    editingRowExists,
-    editingRowContext,
-    editingRowBuffer,
-    editingRowPercent,
-    editingRowMode,
-  ]);
 
   const selectedKeySet = new Set(selectedKeys);
   const allShownSelected =
@@ -262,42 +258,6 @@ export function SavedSourcesManager({
     bufferValue(batchMode === "percent" ? batchPercent : batchBuffer, batchMode === "percent") ===
       null &&
     !batchModeSelected;
-  const editContextValue = positiveNumber(editContext);
-  const editTokenValue = bufferValue(editBuffer, false);
-  const editPercentValue = bufferValue(editPercent, true);
-  const editInvalid =
-    (editContext.trim() !== "" && editContextValue === null) ||
-    (editBuffer.trim() !== "" && editTokenValue === null) ||
-    (editPercent.trim() !== "" && editPercentValue === null) ||
-    (editMode === "tokens" &&
-      !fixedBufferFitsCapacity(
-        editTokenValue,
-        editingRow
-          ? resolveUsageContext(
-              {
-                ...preferences,
-                overrides: {
-                  ...preferences.overrides,
-                  [editingRow.key]: {
-                    ...editingRow.override,
-                    contextWindowTokens: editContextValue,
-                  },
-                },
-              },
-              editingRow.key,
-              {
-                contextWindow: editingRow.key === currentSourceKey ? reportedContextWindow : null,
-                autoCompactTokenLimit: null,
-              },
-            ).contextWindow.value
-          : null,
-      ));
-  const editSaveDisabled =
-    editInvalid ||
-    (editContextValue === null &&
-      editTokenValue === null &&
-      editPercentValue === null &&
-      editMode !== "percent");
   const batchContextValue = batchContextAuto ? null : positiveNumber(batchContext);
   const batchTokenValue = batchBufferAuto ? null : bufferValue(batchBuffer, false);
   const batchPercentValue = batchBufferAuto ? null : bufferValue(batchPercent, true);
@@ -348,58 +308,25 @@ export function SavedSourcesManager({
   });
 
   const toggleRow = (key: string, checked: boolean) => {
-    setSelectedKeys((current) =>
+    setSelectedKeys((currentKeys) =>
       checked
-        ? current.includes(key)
-          ? current
-          : [...current, key]
-        : current.filter((candidate) => candidate !== key),
+        ? currentKeys.includes(key)
+          ? currentKeys
+          : [...currentKeys, key]
+        : currentKeys.filter((candidate) => candidate !== key),
     );
   };
 
   const toggleAllShown = (checked: boolean) => {
-    setSelectedKeys((current) => {
+    setSelectedKeys((currentKeys) => {
       if (!checked) {
         const shown = new Set(modelRows.map((row) => row.key));
-        return current.filter((key) => !shown.has(key));
+        return currentKeys.filter((key) => !shown.has(key));
       }
-      const merged = [...current];
+      const merged = [...currentKeys];
       for (const row of modelRows) if (!merged.includes(row.key)) merged.push(row.key);
       return merged;
     });
-  };
-
-  const startEdit = (row: SavedContextSourceRow) => {
-    editBaselineRef.current = {
-      contextWindowTokens: row.override.contextWindowTokens,
-      autoCompactBufferTokens: row.override.autoCompactBufferTokens,
-      autoCompactBufferPercent: row.override.autoCompactBufferPercent,
-      compactBufferMode: row.override.compactBufferMode,
-    };
-    setEditingKey(row.key);
-    setEditContext(row.override.contextWindowTokens?.toString() ?? "");
-    setEditBuffer(row.override.autoCompactBufferTokens?.toString() ?? "");
-    setEditPercent(row.override.autoCompactBufferPercent?.toString() ?? "");
-    setEditMode(row.override.compactBufferMode ?? "tokens");
-  };
-
-  const saveEdit = () => {
-    if (!editingRow) return;
-    if (editSaveDisabled) return;
-    const patch: UsageContextOverridePatch = {};
-    if (editContextValue !== editingRow.override.contextWindowTokens)
-      patch.contextWindowTokens = editContextValue;
-    if (
-      editMode !== (editingRow.override.compactBufferMode ?? "tokens") ||
-      editTokenValue !== editingRow.override.autoCompactBufferTokens ||
-      editPercentValue !== (editingRow.override.autoCompactBufferPercent ?? null)
-    ) {
-      patch.compactBufferMode = editMode;
-      patch.autoCompactBufferTokens = editTokenValue;
-      patch.autoCompactBufferPercent = editPercentValue;
-    }
-    patchUsageContextOverrides(preferences, [editingRow.key], patch);
-    setEditingKey(null);
   };
 
   const applyToSelected = () => {
@@ -456,9 +383,9 @@ export function SavedSourcesManager({
   return (
     <div className="grid min-h-0 gap-4">
       {!keptProposal && proposal.removed.length > 0 ? (
-        <div className="flex flex-wrap items-center gap-2 border-b border-border pb-3 text-xs">
+        <div className="flex flex-wrap items-center gap-2 border-b border-border pb-3 text-sm">
           <p className="min-w-0 flex-1">
-            {proposal.removed.length} model records with identical values can be merged into{" "}
+            {proposal.removed.length} model values with identical values can be merged into{" "}
             {Object.keys(proposal.added).length} cell values.
           </p>
           <Button
@@ -476,6 +403,36 @@ export function SavedSourcesManager({
           </Button>
         </div>
       ) : null}
+      {wideRows.length > 0 ? (
+        <div className="grid gap-1 rounded-lg border border-border">
+          <p className="px-3 pt-2 text-sm font-medium">Every computer</p>
+          {wideRows.map((row) => (
+            <div
+              key={row.key}
+              className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 text-sm"
+            >
+              <span className="min-w-0 break-words">
+                {row.level === "all" ? "All agents, all hosts" : `All agents on ${row.hostLabel}`}
+              </span>
+              <SourceResolution
+                preferences={preferences}
+                sourceKey={row.key}
+                labels={labelsFor(row.source)}
+                reportedContextWindow={null}
+                reportedAutoCompactTokenLimit={null}
+              />
+              <Button
+                variant="ghost"
+                size="sm"
+                aria-label={`Delete ${row.level === "all" ? "All agents, all hosts" : `All agents on ${row.hostLabel}`}`}
+                onClick={() => setDeleteKeys([row.key])}
+              >
+                Delete
+              </Button>
+            </div>
+          ))}
+        </div>
+      ) : null}
       <div className="grid min-h-0 gap-4 sm:grid-cols-[11rem_minmax(0,1fr)]">
         <nav
           aria-label="Saved source computers"
@@ -483,76 +440,60 @@ export function SavedSourcesManager({
         >
           {hostIds.map((hostId) => (
             <div key={hostId} className="mb-3">
-              <p className="mb-1 break-words text-xs font-medium">
-                {hostId
-                  ? (hosts.find((host) => host.host_id === hostId)?.name ?? hostId)
-                  : "Server"}
+              <p className="mb-1 break-words text-sm font-medium">
+                {describeSource({ ...activeSource, hostId }, hosts, registryItems).hostLabel}
               </p>
-              {sources
-                .filter((source) => source.hostId === hostId)
-                .map((source) => {
-                  const labels = describeSource(source, hosts, registryItems);
-                  return (
-                    <Button
-                      key={usageContextLevelKey(source, "cell")}
-                      variant={
-                        usageContextLevelKey(source, "cell") ===
-                          usageContextLevelKey(activeSource, "cell") && !showColumn
-                          ? "secondary"
-                          : "ghost"
-                      }
-                      size="sm"
-                      className="mb-1 h-auto w-full justify-start whitespace-normal text-left text-xs"
-                      onClick={() => {
-                        setActiveSource(source);
-                        setShowColumn(false);
-                        setEditingKey(null);
-                        setSelectedKeys([]);
-                      }}
-                    >
-                      {labels.agentLabel} · {labels.harnessLabel}
-                    </Button>
-                  );
-                })}
+              {[...(hostAgents.get(hostId)?.values() ?? [])].map((source) => {
+                const labels = describeSource(source, hosts, registryItems);
+                return (
+                  <Button
+                    key={usageContextLevelKey(source, "cell")}
+                    variant={
+                      usageContextLevelKey(source, "cell") ===
+                      usageContextLevelKey(activeSource, "cell")
+                        ? "secondary"
+                        : "ghost"
+                    }
+                    size="sm"
+                    className="mb-1 h-auto w-full justify-start whitespace-normal text-left text-sm"
+                    onClick={() => {
+                      setActiveSource(source);
+                      setSelectedKeys([]);
+                    }}
+                  >
+                    {labels.agentLabel} · {labels.harnessLabel}
+                  </Button>
+                );
+              })}
             </div>
           ))}
         </nav>
         <div className="grid max-h-[55vh] min-w-0 content-start gap-3 overflow-y-auto">
-          <div className="grid gap-1 text-xs">
+          <div className="grid gap-1 text-sm">
             <h4 className="break-words font-medium">
               {activeLabels.hostLabel} × {activeLabels.agentLabel} · {activeLabels.harnessLabel}
             </h4>
             <p className="break-words text-muted-foreground">
-              {activeLabels.agentLabel} · all hosts:{" "}
-              {column?.contextWindowTokens?.toLocaleString() ?? "Auto"} context ·{" "}
-              {column?.compactBufferMode === "percent"
-                ? column.autoCompactBufferPercent == null
-                  ? "Auto"
-                  : `${column.autoCompactBufferPercent}%`
-                : (column?.autoCompactBufferTokens?.toLocaleString() ?? "Auto")}{" "}
-              buffer
+              {columnRows.length === 0
+                ? "No value for every computer."
+                : columnRows
+                    .map(
+                      (row) =>
+                        `${row.override.contextWindowTokens?.toLocaleString() ?? "Auto"} context · ${
+                          row.override.compactBufferMode === "percent"
+                            ? (row.override.autoCompactBufferPercent ?? "Auto")
+                            : (row.override.autoCompactBufferTokens?.toLocaleString() ?? "Auto")
+                        } buffer for every computer`,
+                    )
+                    .join("; ")}
             </p>
-            {!showColumn ? (
-              <Button
-                size="xs"
-                variant="ghost"
-                className="justify-self-start"
-                onClick={() => {
-                  setShowColumn(true);
-                  setSelectedKeys([]);
-                  setEditingKey(null);
-                }}
-              >
-                Edit column values
-              </Button>
-            ) : null}
           </div>
           {selectedKeys.length > 0 ? (
             <div className="flex flex-wrap items-end gap-2 rounded-lg border border-border bg-muted/20 p-3">
-              <span className="pb-1 text-xs font-medium text-foreground">
+              <span className="pb-1 text-sm font-medium text-foreground">
                 {selectedKeys.length} selected
               </span>
-              <div className="grid gap-1 text-xs text-muted-foreground">
+              <div className="grid gap-1 text-sm text-muted-foreground">
                 <span>Context total</span>
                 <div className="flex items-center gap-1">
                   <Input
@@ -580,11 +521,11 @@ export function SavedSourcesManager({
                   </Button>
                 </div>
               </div>
-              <div className="grid gap-1 text-xs text-muted-foreground">
+              <div className="grid gap-1 text-sm text-muted-foreground">
                 <span>Compact buffer</span>
                 <div className="flex gap-1" role="group" aria-label="Selected buffer unit">
                   <Button
-                    size="xs"
+                    size="sm"
                     variant={batchMode === "tokens" ? "secondary" : "outline"}
                     aria-pressed={batchMode === "tokens"}
                     onClick={() => {
@@ -595,7 +536,7 @@ export function SavedSourcesManager({
                     Tokens
                   </Button>
                   <Button
-                    size="xs"
+                    size="sm"
                     variant={batchMode === "percent" ? "secondary" : "outline"}
                     aria-pressed={batchMode === "percent"}
                     onClick={() => {
@@ -649,7 +590,7 @@ export function SavedSourcesManager({
                   disabled={!currentHasOverride}
                   onClick={useCurrentSource}
                 >
-                  Use current source
+                  Use this session's values
                 </Button>
                 <Button
                   size="sm"
@@ -670,7 +611,7 @@ export function SavedSourcesManager({
                 </Button>
               </div>
               {batchInvalid ? (
-                <p role="alert" className="text-xs text-destructive">
+                <p role="alert" className="text-sm text-destructive">
                   Token buffer must be less than every selected context total; enter valid numbers.
                 </p>
               ) : null}
@@ -679,7 +620,7 @@ export function SavedSourcesManager({
 
           <div className="divide-y divide-border overflow-hidden rounded-lg border border-border">
             {modelRows.length > 0 ? (
-              <div className="flex items-center gap-2 bg-muted/20 px-3 py-2 text-xs">
+              <div className="flex items-center gap-2 bg-muted/20 px-3 py-2 text-sm">
                 <Checkbox
                   checked={allShownSelected ? true : someShownSelected ? "indeterminate" : false}
                   onCheckedChange={(checked) => toggleAllShown(checked === true)}
@@ -688,148 +629,49 @@ export function SavedSourcesManager({
                 <span className="text-muted-foreground">Select all shown</span>
               </div>
             ) : null}
+            {visibleRows.length === 0 ? (
+              <p className="px-3 py-3 text-sm text-muted-foreground">Nothing saved here.</p>
+            ) : null}
             {visibleRows.map((row) => {
               const isCurrent = row.key === currentSourceKey;
-              const isEditing = row.key === editingKey;
               return (
-                <div key={row.key} className="grid gap-2 px-3 py-2.5 text-xs">
+                <div key={row.key} className="grid gap-2 px-3 py-2.5 text-sm">
                   <div className="flex min-w-0 flex-wrap items-center gap-2">
-                    {row.level === "model" ? (
-                      <Checkbox
-                        checked={selectedKeySet.has(row.key)}
-                        onCheckedChange={(checked) => toggleRow(row.key, checked === true)}
-                        aria-label={`Select ${row.rowLabel}`}
-                      />
-                    ) : null}
+                    <Checkbox
+                      checked={selectedKeySet.has(row.key)}
+                      onCheckedChange={(checked) => toggleRow(row.key, checked === true)}
+                      aria-label={`Select ${row.rowLabel}`}
+                    />
                     <span className="min-w-0 break-all font-medium text-foreground">
                       {row.modelLabel}
                     </span>
+                    <span className="text-muted-foreground">{row.levelLabel}</span>
                     {isCurrent ? (
                       <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[11px] font-medium text-primary">
                         Current
                       </span>
                     ) : null}
-                    <span className="ml-auto flex shrink-0 items-center gap-1">
-                      <Button
-                        variant="ghost"
-                        size="xs"
-                        aria-label={`Edit ${row.rowLabel}`}
-                        onClick={() => startEdit(row)}
-                      >
-                        Edit
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="xs"
-                        aria-label={`Delete ${row.rowLabel}`}
-                        disabled={!Object.hasOwn(preferences.overrides, row.key)}
-                        onClick={() => setDeleteKeys([row.key])}
-                      >
-                        Delete
-                      </Button>
-                    </span>
-                  </div>
-                  {isEditing ? (
-                    <div
-                      className="grid gap-2 sm:grid-cols-2"
-                      data-usage-context-editor
-                      onKeyDown={(event) => {
-                        if (event.key === "Escape") {
-                          event.stopPropagation();
-                          setEditingKey(null);
-                        }
-                      }}
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="ml-auto"
+                      aria-label={`Delete ${row.rowLabel}`}
+                      onClick={() => setDeleteKeys([row.key])}
                     >
-                      <div className="grid gap-1 text-muted-foreground">
-                        <span>Context total</span>
-                        <Input
-                          type="number"
-                          min={1}
-                          step={1000}
-                          value={editContext}
-                          placeholder="Auto"
-                          onChange={(event) => setEditContext(event.target.value)}
-                          aria-label="Edit context total"
-                        />
-                      </div>
-                      <div className="grid gap-1 text-muted-foreground">
-                        <span>Compact buffer</span>
-                        <div className="flex gap-1" role="group" aria-label="Edit buffer unit">
-                          <Button
-                            size="xs"
-                            variant={editMode === "tokens" ? "secondary" : "outline"}
-                            aria-pressed={editMode === "tokens"}
-                            onClick={() => setEditMode("tokens")}
-                          >
-                            Tokens
-                          </Button>
-                          <Button
-                            size="xs"
-                            variant={editMode === "percent" ? "secondary" : "outline"}
-                            aria-pressed={editMode === "percent"}
-                            onClick={() => setEditMode("percent")}
-                          >
-                            Percent
-                          </Button>
-                        </div>
-                        <Input
-                          type="number"
-                          min={0}
-                          max={editMode === "percent" ? 99.999 : undefined}
-                          step={editMode === "percent" ? "any" : 1}
-                          value={editMode === "percent" ? editPercent : editBuffer}
-                          placeholder="Auto"
-                          onChange={(event) =>
-                            editMode === "percent"
-                              ? setEditPercent(event.target.value)
-                              : setEditBuffer(event.target.value)
-                          }
-                          aria-label={
-                            editMode === "percent"
-                              ? "Edit compact buffer percent"
-                              : "Edit compact buffer"
-                          }
-                        />
-                      </div>
-                      <div className="flex flex-wrap items-center gap-2 sm:col-span-2">
-                        <Button size="xs" disabled={editSaveDisabled} onClick={saveEdit}>
-                          Save
-                        </Button>
-                        <Button variant="ghost" size="xs" onClick={() => setEditingKey(null)}>
-                          Cancel
-                        </Button>
-                        <span className="text-muted-foreground">
-                          Use Delete to remove this source.
-                        </span>
-                      </div>
-                      {editInvalid ? (
-                        <span role="alert" className="text-destructive sm:col-span-2">
-                          Token buffer must be less than the context total; enter valid numbers.
-                        </span>
-                      ) : null}
-                    </div>
-                  ) : (
-                    <div className="grid gap-1 sm:grid-cols-2">
-                      <span className="break-words text-muted-foreground">
-                        {row.level === "model"
-                          ? "Model override"
-                          : row.level === "cell"
-                            ? "Computer × agent"
-                            : "Agent · all hosts"}
-                      </span>
-                      <SourceResolution
-                        preferences={preferences}
-                        sourceKey={row.key}
-                        labels={describeSource(row.source, hosts, registryItems)}
-                        reportedContextWindow={
-                          row.key === currentSourceKey ? reportedContextWindow : null
-                        }
-                        reportedAutoCompactTokenLimit={
-                          row.key === currentSourceKey ? reportedAutoCompactTokenLimit : null
-                        }
-                      />
-                    </div>
-                  )}
+                      Delete
+                    </Button>
+                  </div>
+                  <SourceResolution
+                    preferences={preferences}
+                    sourceKey={row.key}
+                    labels={labelsFor(row.source)}
+                    reportedContextWindow={
+                      row.key === currentSourceKey ? reportedContextWindow : null
+                    }
+                    reportedAutoCompactTokenLimit={
+                      row.key === currentSourceKey ? reportedAutoCompactTokenLimit : null
+                    }
+                  />
                 </div>
               );
             })}
@@ -846,18 +688,18 @@ export function SavedSourcesManager({
           <DialogHeader>
             <DialogTitle>
               {(deleteKeys?.length ?? 0) > 1
-                ? `Delete ${deleteKeys?.length} saved sources?`
-                : "Delete saved source?"}
+                ? `Delete ${deleteKeys?.length} saved values?`
+                : "Delete saved value?"}
             </DialogTitle>
             <DialogDescription>
-              These sources go back to Auto and inherit lower-level values. This syncs to your other
+              These values go back to Auto and inherit the next level. This syncs to your other
               devices.
             </DialogDescription>
           </DialogHeader>
-          <ul className="grid gap-1 text-xs text-muted-foreground">
+          <ul className="grid gap-1 text-sm text-muted-foreground">
             {deleteTargets.map((row) => (
               <li key={row.key} className="break-all">
-                {row.hostLabel} · {row.harnessLabel} · {row.modelLabel}
+                {row.hostLabel} · {row.harnessLabel} · {row.modelLabel} · {row.levelLabel}
                 {row.key === currentSourceKey ? " (Current)" : ""}
               </li>
             ))}

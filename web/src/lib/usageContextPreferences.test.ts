@@ -12,7 +12,9 @@ import {
   providerUsageLimitsForSource,
   resolveUsageContext,
   usageContextLevelKey,
+  usageContextLevelLabel,
   usageContextRecordFromKey,
+  usageContextSettingsHref,
   proposeUsageContextCollapse,
   usageContextSourceFromKey,
   usageContextSourceKey,
@@ -656,6 +658,23 @@ describe("usage/context preferences", () => {
     expect(Object.keys(merged)).toHaveLength(4);
   });
 
+  it("does not collapse exact models across a different every-computer model value", () => {
+    const identity = { hostId: "host-a", agentName: "claude", harness: "claude-native" };
+    const exact = (model: string) => usageContextSourceKey({ ...identity, model });
+    const overrides = {
+      [exact("opus")]: { contextWindowTokens: 200_000, autoCompactBufferTokens: null },
+      [exact("sonnet")]: { contextWindowTokens: 200_000, autoCompactBufferTokens: null },
+      [usageContextLevelKey({ ...identity, model: "opus" }, "agent-model")]: {
+        contextWindowTokens: 300_000,
+        autoCompactBufferTokens: null,
+      },
+    };
+
+    expect(
+      proposeUsageContextCollapse({ ...DEFAULT_USAGE_CONTEXT_PREFERENCES, overrides }),
+    ).toEqual({ removed: [], added: {} });
+  });
+
   it("preserves an unknown level's empty record and future fields while ignoring it", () => {
     const unknown = '["host-a","codex","codex","","future"]';
     const entry = { contextWindowTokens: null, autoCompactBufferTokens: null, futureBuffer: 123 };
@@ -684,5 +703,129 @@ describe("usage/context preferences", () => {
     preferences.overrides[second] = value;
     preferences.overrides[usageContextLevelKey(identity, "cell")] = value;
     expect(proposeUsageContextCollapse(preferences).removed).toEqual([]);
+  });
+});
+
+describe("saved context levels", () => {
+  const source = {
+    hostId: "host-a",
+    agentName: "claude",
+    harness: "claude-native",
+    model: "claude-opus-5-5",
+  };
+  const value = (contextWindowTokens: number) => ({
+    contextWindowTokens,
+    autoCompactBufferTokens: null,
+  });
+  const store = (overrides: Record<string, unknown>) =>
+    ({
+      ...DEFAULT_USAGE_CONTEXT_PREFERENCES,
+      overrides,
+    }) as unknown as UsageContextPreferences;
+
+  it("round trips every level through its own key", () => {
+    const levels = ["model", "agent-model", "cell", "column", "host", "all"] as const;
+    const keys = levels.map((level) => usageContextLevelKey(source, level));
+    expect(new Set(keys).size).toBe(levels.length);
+    for (const [index, key] of keys.entries()) {
+      const record = usageContextRecordFromKey(key);
+      expect(record?.level).toBe(levels[index]);
+      expect(record?.source.model).toBe(
+        levels[index] === "model" || levels[index] === "agent-model" ? source.model : "",
+      );
+    }
+    expect(usageContextRecordFromKey(usageContextLevelKey(source, "host"))?.source).toEqual({
+      hostId: "host-a",
+      agentName: "",
+      harness: "",
+      model: "",
+    });
+    expect(usageContextRecordFromKey(usageContextLevelKey(source, "all"))?.source).toEqual({
+      hostId: "",
+      agentName: "",
+      harness: "",
+      model: "",
+    });
+  });
+
+  it("resolves this model, then the model everywhere, then each level below it", () => {
+    const exact = usageContextSourceKey(source);
+    const order = ["model", "agent-model", "cell", "column", "host", "all"] as const;
+    const expected = [100_000, 200_000, 300_000, 400_000, 500_000, 600_000];
+    const overrides: Record<string, unknown> = {};
+    for (const [index, level] of order.entries())
+      overrides[usageContextLevelKey(source, level)] = value(expected[index]!);
+    for (const [index, level] of order.entries()) {
+      const resolved = resolveUsageContext(store(overrides), exact, {
+        contextWindow: 1_000,
+        autoCompactTokenLimit: null,
+      });
+      expect([level, resolved.contextWindow.value, resolved.contextWindow.level]).toEqual([
+        level,
+        expected[index],
+        level,
+      ]);
+      Reflect.deleteProperty(overrides, usageContextLevelKey(source, level));
+    }
+    expect(
+      resolveUsageContext(store(overrides), exact, {
+        contextWindow: 1_000,
+        autoCompactTokenLimit: null,
+      }).contextWindow,
+    ).toEqual({ value: 1_000, level: "reported" });
+  });
+
+  it("applies the corner to a model that was never saved", () => {
+    const preferences = store({
+      [usageContextLevelKey({ ...source, model: "" }, "all")]: value(550_000),
+    });
+    const unseen = usageContextSourceKey({ ...source, model: "claude-opus-9" });
+    expect(
+      resolveUsageContext(preferences, unseen, {
+        contextWindow: 200_000,
+        autoCompactTokenLimit: null,
+      }).contextWindow,
+    ).toEqual({ value: 550_000, level: "all" });
+  });
+
+  it("keeps a model everywhere above the cell and below this computer's model", () => {
+    const preferences = store({
+      [usageContextLevelKey(source, "agent-model")]: value(200_000),
+      [usageContextLevelKey(source, "cell")]: value(300_000),
+    });
+    expect(
+      resolveUsageContext(preferences, usageContextSourceKey(source), {
+        contextWindow: null,
+        autoCompactTokenLimit: null,
+      }).contextWindow,
+    ).toEqual({ value: 200_000, level: "agent-model" });
+  });
+
+  it("builds the settings entry that carries the whole source", () => {
+    const exact = usageContextSourceKey(source);
+    const href = usageContextSettingsHref(exact);
+    expect(href.startsWith("/settings/general?ctx=")).toBe(true);
+    expect(href.endsWith("#context-usage")).toBe(true);
+    const query = href.slice(href.indexOf("?"), href.indexOf("#"));
+    expect(usageContextSourceFromKey(new URLSearchParams(query).get("ctx") ?? "")).toEqual(source);
+  });
+
+  it("labels each level without a dotted suffix or the word override", () => {
+    const labels = { hostLabel: "Alpha", agentLabel: "Claude Code" };
+    const levels = ["model", "agent-model", "cell", "column", "host", "all", "reported"] as const;
+    const texts = levels.map((level) => usageContextLevelLabel(level, labels));
+    expect(texts).toEqual([
+      "this model",
+      "Claude Code, every host",
+      "Alpha × Claude Code",
+      "Claude Code, all hosts",
+      "all agents on Alpha",
+      "all agents, all hosts",
+      "reported",
+    ]);
+    for (const text of texts) {
+      expect(text).not.toContain("·");
+      expect(text).not.toContain("override");
+    }
   });
 });
