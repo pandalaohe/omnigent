@@ -448,7 +448,7 @@ async def test_claude_usage_frame_at_the_account_cap_keeps_the_tunnel_up(db_uri:
             "text": encode_host_frame(HostClaudeUsageFrame(claude_usage=filler.stored())),
         }
     )
-    await asyncio.sleep(0.2)
+    await asyncio.sleep(0.2)  # custom-lint: disable=sleep-then-assert -- let a rejected frame expose any tunnel disconnect
     assert registry.get(_HOST_ID) is not None
     claude = next(a for a in service.overview(RESERVED_USER_LOCAL).accounts if a.id == "claude")
     assert not claude.windows
