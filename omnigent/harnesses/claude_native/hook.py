@@ -967,8 +967,9 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     """
     _skip_httpx_cli_import()
     from omnigent.native.native_policy_hook import (
+        NATIVE_TOOL_CALL_OUTAGE_WAIT_S,
         evaluation_response_to_hook_output,
-        fail_ask_hook_output,
+        fail_closed_hook_output,
         hook_payload_to_evaluation_request,
         policy_hook_reauth,
         post_evaluate_with_retry,
@@ -1012,7 +1013,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         context["model"] = status_model
 
     def _fail_closed(detail: str | None = None) -> int:
-        out = fail_ask_hook_output(hook_event, detail)
+        out = fail_closed_hook_output(hook_event, detail)
         if out is not None:
             record_policy_eval_fallback(bridge_dir, hook_event, payload, out, marker=marker)
             sys.stdout.write(json.dumps(out))
@@ -1055,6 +1056,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         _EVALUATE_POLICY_TIMEOUT_S,
         "evaluate-policy hook",
         reauth=reauth,
+        tool_call_budget_s=NATIVE_TOOL_CALL_OUTAGE_WAIT_S,
     )
     if resp is None:
         return _fail_closed(api_error or (reauth.failure_reason if reauth else None))

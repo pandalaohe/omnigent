@@ -445,7 +445,7 @@ def test_pre_tool_use_fails_closed_when_verdict_unavailable(
     CLOSED (deny) instead of "no opinion" — the bypass reported in #536.
     """
     write_policy_hook_config(bridge_dir, ap_server_url="http://127.0.0.1:8787", ap_auth_headers={})
-    monkeypatch.setattr(native_policy_hook, "TOOL_CALL_POLICY_RETRY_BUDGET_S", 0.0)
+    monkeypatch.setattr(native_policy_hook, "NATIVE_TOOL_CALL_OUTAGE_WAIT_S", 0.0)
     monkeypatch.setattr(native_policy_hook.httpx, "Client", make_failing_client(mode))
 
     exit_code = _run_hook(
@@ -461,7 +461,7 @@ def test_pre_tool_use_fails_closed_when_verdict_unavailable(
     captured = capsys.readouterr()
     assert exit_code == 0
     result = json.loads(captured.out)
-    assert result["hookSpecificOutput"]["permissionDecision"] == "ask", result
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny", result
     assert result["hookSpecificOutput"]["permissionDecisionReason"]
 
 

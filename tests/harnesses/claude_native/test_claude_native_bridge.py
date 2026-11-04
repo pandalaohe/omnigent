@@ -5171,7 +5171,7 @@ def test_augment_claude_args_pins_policy_hook_timeouts(tmp_path: Path) -> None:
         if "evaluate-policy" in hook["command"]
     ]
     assert len(pre_policy) == 1, f"expected one PreToolUse policy hook, got {pre_policy!r}"
-    assert pre_policy[0]["timeout"] == 600
+    assert pre_policy[0]["timeout"] == 3700
 
     prompt_policy = [
         hook
@@ -16181,9 +16181,9 @@ async def test_hook_evaluate_endpoint_returns_deny_hook_output(
 async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Upstream failure asks for PreToolUse approval and stays open for PostToolUse."""
+    """Upstream failure denies PreToolUse and stays open for PostToolUse."""
     # Zero every wait so the test never sleeps; the tuple length mirrors the
-    # live schedule (PreToolUse's fills the shared TOOL_CALL retry budget).
+    # live schedule (PreToolUse's fills the native outage wait).
     monkeypatch.setattr(
         claude_native_bridge,
         "_PRE_TOOL_USE_POLICY_EVAL_RETRY_DELAYS_S",
@@ -16199,7 +16199,7 @@ async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
             _PRE_TOOL_USE_PAYLOAD,
         )
         output = json.loads(body)
-        assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
+        assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
         marker = claude_native_bridge.policy_fallback_marker(
             bridge_dir, "conv_hook_eval", _PRE_TOOL_USE_PAYLOAD
         )
@@ -16284,14 +16284,14 @@ async def test_hook_evaluate_pre_tool_use_budget_stops_re_attempts(
 
     With no budget left, the pre-re-attempt check must fire before the
     second call, so the single failure falls through to the fail-closed
-    "ask" hook output instead of spending the remaining schedule.
+    "deny" hook output instead of spending the remaining schedule.
     """
     monkeypatch.setattr(
         claude_native_bridge,
         "_PRE_TOOL_USE_POLICY_EVAL_RETRY_DELAYS_S",
         (0.0,) * len(claude_native_bridge._PRE_TOOL_USE_POLICY_EVAL_RETRY_DELAYS_S),
     )
-    monkeypatch.setattr("omnigent.native.native_policy_hook.TOOL_CALL_POLICY_RETRY_BUDGET_S", 0.0)
+    monkeypatch.setattr("omnigent.native.native_policy_hook.NATIVE_TOOL_CALL_OUTAGE_WAIT_S", 0.0)
     client = _ScriptedPolicyClient(None)
     relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
     try:
@@ -16302,7 +16302,7 @@ async def test_hook_evaluate_pre_tool_use_budget_stops_re_attempts(
             _PRE_TOOL_USE_PAYLOAD,
         )
         output = json.loads(body)
-        assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
+        assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
         assert client.calls == 1, f"budget must stop re-attempts, saw {client.calls}"
     finally:
         relay.close()
@@ -16370,13 +16370,13 @@ async def test_hook_evaluate_endpoint_exhausts_connect_retry_budget(
                 4,
             ]
         elif hook_event == "PreToolUse":
-            assert json.loads(body)["hookSpecificOutput"]["permissionDecision"] == "ask"
-            assert client.calls == 20
+            assert json.loads(body)["hookSpecificOutput"]["permissionDecision"] == "deny"
+            assert client.calls == 185
             assert [call.args[0] for call in _policy_retry_clock.sleep.call_args_list] == [
                 0.4,
                 0.4,
                 *[8.0] * 5,
-                *[20.0] * 12,
+                *[20.0] * 177,
             ]
         else:
             assert body == "", "PostToolUse must still fail open"
@@ -16465,7 +16465,7 @@ async def test_curl_evaluate_policy_command_round_trips(
     # or runner gone): stdin replays into the Python hook, which takes
     # its direct-server path against a server answering a final 4xx — not
     # a retryable outage, so the tool-call retry budget is not drained —
-    # and fails closed with its own ask shaping (the pre-curl behavior).
+    # and fails closed (the pre-curl behavior).
     class _BadPolicyHandler(BaseHTTPRequestHandler):
         """HTTP handler answering every policy POST with a final 400."""
 
@@ -16508,7 +16508,7 @@ async def test_curl_evaluate_policy_command_round_trips(
         )
         assert result.returncode == 0, result.stderr
         output = json.loads(result.stdout)
-        assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
+        assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
         assert output["hookSpecificOutput"]["permissionDecisionReason"]
     finally:
         bad_server.shutdown()

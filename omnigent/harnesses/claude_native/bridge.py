@@ -357,12 +357,12 @@ _TOOL_CALL_TIMEOUT_S = 300.0
 _TOOL_RELAY_POST_TIMEOUT_S = _TOOL_CALL_TIMEOUT_S + 30.0
 # Re-attempt delays for the policy-eval relay's PreToolUse retries, indexed
 # by re-attempt (entry 0 spaces attempt 2). PreToolUse's waits are sized to
-# fill the shared ``TOOL_CALL_POLICY_RETRY_BUDGET_S`` (imported from
+# fill ``NATIVE_TOOL_CALL_OUTAGE_WAIT_S`` (imported from
 # ``omnigent.native.native_policy_hook`` where the relay reads it), and
 # that budget — not the tuple — ends the re-attempts, so the last one
-# still starts inside the pinned 600s PreToolUse hook timeout.
-# Long enough to ride out a multi-minute DNS outage instead of forcing an
-# approval card. No other event may share it: UserPromptSubmit's hook
+# still starts inside the pinned 3700s PreToolUse hook timeout.
+# Long enough to ride out a server outage; the call is denied after it.
+# No other event may share it: UserPromptSubmit's hook
 # budget is 30s and a timed-out hook does not block, so those waits there
 # would turn its fail-closed into fail-open. A read that hangs without its
 # own timeout is pre-existing and not bounded here.
@@ -370,7 +370,7 @@ _PRE_TOOL_USE_POLICY_EVAL_RETRY_DELAYS_S: tuple[float, ...] = (
     0.4,
     0.4,
     *(8.0,) * 5,
-    *(20.0,) * 13,
+    *(20.0,) * 178,
 )
 # Backstop per-request threads above any expected client tool-call fan-out.
 _MAX_CONCURRENT_MCP_REQUESTS = 64
@@ -2878,8 +2878,8 @@ def build_hook_settings(
             "&& { printf '%s' \"$out\"; exit 0; }; fi; "
             f"printf '%s' \"$p\" | {evaluate_policy_python}"
         )
-        # PostToolUse keeps the inherited default. PreToolUse pins 600s for
-        # the 300s tool-call budget; UserPromptSubmit pins 30s, which the
+        # PostToolUse keeps the inherited default. PreToolUse pins 3700s for
+        # the 3600s outage wait; UserPromptSubmit pins 30s, which the
         # Python fallback's prompt budget (``_EVALUATE_POLICY_RETRY_BUDGET_S``,
         # 15s) is sized against.
         evaluate_policy_hook: _JsonObject = {
@@ -2891,7 +2891,7 @@ def build_hook_settings(
         evaluate_policy_pre_tool_use_hook: _JsonObject = {
             "type": "command",
             "command": evaluate_policy_command,
-            "timeout": 600,
+            "timeout": 3700,
         }
         evaluate_policy_prompt_hook: _JsonObject = {
             "type": "command",
@@ -8816,9 +8816,9 @@ def _tool_relay_handler_factory(
                 _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S,
                 _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S,
                 _PRE_TOOL_USE,
-                TOOL_CALL_POLICY_RETRY_BUDGET_S,
+                NATIVE_TOOL_CALL_OUTAGE_WAIT_S,
                 evaluation_response_to_hook_output,
-                fail_ask_hook_output,
+                fail_closed_hook_output,
                 hook_payload_to_evaluation_request,
             )
 
@@ -8872,7 +8872,7 @@ def _tool_relay_handler_factory(
                     if pre_tool_use:
                         delay = next(pre_tool_use_delays, None)
                         if delay is None or (
-                            time.monotonic() - started_at + delay > TOOL_CALL_POLICY_RETRY_BUDGET_S
+                            time.monotonic() - started_at + delay > NATIVE_TOOL_CALL_OUTAGE_WAIT_S
                         ):
                             break
                         time.sleep(delay)
@@ -8917,7 +8917,7 @@ def _tool_relay_handler_factory(
                     last_error,
                     extra={"session_id": session_id},
                 )
-                out = fail_ask_hook_output(hook_event, last_error)
+                out = fail_closed_hook_output(hook_event, last_error)
                 if out is not None and bridge_dir is not None and relay_session_active:
                     record_policy_eval_fallback(
                         bridge_dir, hook_event, payload, out, marker=marker
