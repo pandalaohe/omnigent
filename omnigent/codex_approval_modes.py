@@ -26,6 +26,8 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
 from typing import cast
 
+CODEX_CONFIGURED_PERMISSIONS_LABEL_KEY = "omnigent.codex_native.configured_permissions"
+
 
 @dataclass(frozen=True)
 class CodexPermissionPreset:

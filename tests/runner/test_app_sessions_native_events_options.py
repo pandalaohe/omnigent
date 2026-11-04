@@ -20,6 +20,7 @@ from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_bridge_id,
     bridge_dir_for_conversation_id,
 )
+from omnigent.harnesses.codex_native import bridge as codex_native_bridge
 from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
 from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
 from omnigent.harnesses.qwen_native import bridge as qwen_native_bridge
@@ -4558,6 +4559,147 @@ async def test_events_compact_on_claude_sdk_buffered_compact_failed_fallback() -
 
 
 @pytest.mark.parametrize(
+    "mode,screen,status",
+    [
+        ("ask-for-approval", "composer", 200),
+        ("approve-for-me", "escape-armed", 200),
+        ("full-access", "composer", 200),
+        ("ask-for-approval", "statusline", 200),
+        ("approve-for-me", "empty-composer", 200),
+        ("approve-for-me", "draft", 503),
+        ("approve-for-me", "placeholder-draft", 503),
+        ("approve-for-me", "multiline-draft", 503),
+        ("ask-for-approval", "browsing", 503),
+        ("approve-for-me", "search", 503),
+        ("full-access", "missing-popup", 503),
+        ("ask-for-approval", "unconfirmed", 503),
+        ("ask-for-approval", "busy", 409),
+        ("approve-for-me", "busy", 409),
+        ("full-access", "busy", 409),
+    ],
+)
+async def test_codex_permission_switch_preserves_terminal_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    screen: str,
+    status: int,
+) -> None:
+    from tests.runner.helpers import make_test_terminal_instance
+
+    conv_id = "permission-switch"
+    state = codex_native_bridge.CodexNativeBridgeState(
+        session_id=conv_id,
+        socket_path="ws://127.0.0.1:43210",
+        thread_id="thread",
+        codex_home=str(tmp_path / "codex-home"),
+        active_turn_id="running-turn" if screen == "busy" else None,
+    )
+    monkeypatch.setattr(codex_native_bridge, "read_bridge_state", lambda _: state)
+    monkeypatch.setattr(native_controls, "_CODEX_POPUP_RENDER_S", 0)
+    monkeypatch.setattr(native_controls, "_CODEX_PERMISSION_MENU_BUDGET_S", 0)
+    monkeypatch.setattr(native_controls, "_CODEX_PERMISSION_CONFIRM_BUDGET_S", 0)
+    keys: list[str] = []
+    current = screen
+    selected: str | None = None
+    labels = {"1": "Ask for approval", "2": "Approve for me", "3": "Full Access"}
+
+    def tmux(_socket: str, *args: str) -> None:
+        nonlocal current, selected
+        key = args[-1]
+        keys.append(key)
+        if key == "Escape" and current == "escape-armed":
+            current = "browsing"
+        elif key == "/permissions" and current not in {"browsing", "search", "missing-popup"}:
+            current = "popup"
+        elif current == "popup" and key in labels and selected is None:
+            selected = labels[key]
+
+    def capture(*_args: object, preserve_styles: bool = False) -> str:
+        if current in {"draft", "placeholder-draft", "multiline-draft"}:
+            text = {
+                "draft": "Keep this unsent draft",
+                "placeholder-draft": "Ask Codex to do anything",
+                "multiline-draft": "\n  Keep this second line",
+            }[current]
+            return "› " + text + "\n\n  model · branch"
+        if current in {"browsing", "search"}:
+            return "› Ask Codex to do anything\n" + (
+                "Browsing transcript · esc back" if current == "browsing" else "Find: permissions"
+            )
+        if selected is not None:
+            return (
+                "No confirmation"
+                if screen == "unconfirmed"
+                else ("• Permission selection requested: " + selected)
+            )
+        if current == "popup":
+            return "Update Model Permissions\n" + "\n".join(
+                f"{digit}. {label}" for digit, label in labels.items()
+            )
+        if current == "empty-composer":
+            return "› \n\n  model · branch"
+        prompt = (
+            "› \x1b[2mAsk Codex to do anything\x1b[0m"
+            if preserve_styles
+            else "› Ask Codex to do anything"
+        )
+        return (
+            prompt
+            + "\n"
+            + (
+                "esc again to edit previous message"
+                if current == "escape-armed"
+                else "model · branch"
+                if current == "statusline"
+                else "? for shortcuts"
+            )
+        )
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", tmux)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
+    terminals = TerminalRegistry()
+    terminals._by_conversation.setdefault(conv_id, {})[("codex", "main")] = (
+        make_test_terminal_instance("codex", "main", tmp_path)
+    )
+    app, _ = await _build_app_for_spec(_harness_spec("codex-native"), terminal_registry=terminals)
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert created.status_code == 201, created.text
+        response = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "codex_approval_mode_change", "approval_mode": mode},
+        )
+    assert response.status_code == status, response.text
+    if status == 200:
+        assert response.json() == {"approval_mode": mode}
+        assert "Escape" not in keys
+        assert (
+            selected
+            == {
+                "ask-for-approval": "Ask for approval",
+                "approve-for-me": "Approve for me",
+                "full-access": "Full Access",
+            }[mode]
+        )
+    else:
+        assert response.json()["detail"]
+    if screen in {"browsing", "search", "busy", "draft", "placeholder-draft", "multiline-draft"}:
+        assert keys == [], "A refused switch must leave the terminal and running turn alone"
+    if screen in {"draft", "placeholder-draft", "multiline-draft"}:
+        assert "draft" in response.json()["detail"]
+    if screen == "missing-popup":
+        assert selected is None
+        assert not any(key.isdigit() for key in keys), "An unread popup cannot supply a menu digit"
+    if screen == "busy":
+        assert response.json()["error"] == "codex_native_approval_mode_busy"
+        assert "finishes" in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
     "mode,enabled,row,fail,ambiguous",
     [
         ("approve-for-me", True, True, False, False),
@@ -4619,9 +4761,20 @@ async def test_codex_workspace_switch_selects_generated_profile(
         elif key == "Escape":
             actions.append("escape")
 
-    def capture(*_args: object) -> str:
+    def capture(*_args: object, preserve_styles: bool = False) -> str:
         if selected is not None:
-            return f"Permissions updated to {preset.label}"
+            prompt = (
+                "› \x1b[2mAsk Codex to do anything\x1b[0m"
+                if preserve_styles
+                else "› Ask Codex to do anything"
+            )
+            return f"Permissions updated to {preset.label}\n{prompt}\n? for shortcuts"
+        if opens == 0:
+            return (
+                "› \x1b[2mAsk Codex to do anything\x1b[0m\n? for shortcuts"
+                if preserve_styles
+                else "› Ask Codex to do anything\n? for shortcuts"
+            )
         return ("3. omnigent-workspace\n" if ambiguous else "") + "\n".join(
             f"{digit}. {label}" for digit, label in digits.items() if row or digit != "7"
         )
@@ -4718,9 +4871,12 @@ async def test_codex_native_approval_mode_tighten_stops_running_helpers_or_retur
     monkeypatch.setattr(native_controls, "_CODEX_HELPER_STOP_POLL_S", 0.01)
     monkeypatch.setattr(native_controls, "_CODEX_HELPER_PROCESS_GRACE_S", 0.01)
     selected = ""
+    popup_open = False
 
     def _tmux(_socket: str, *args: str) -> None:
-        nonlocal selected
+        nonlocal selected, popup_open
+        if args[-1] == "/permissions":
+            popup_open = True
         if selected == "Full Access" and args[-1] == "1":
             return
         if args[-1] in {"1", "2", "3", "4"} and "-l" in args:
@@ -4731,9 +4887,19 @@ async def test_codex_native_approval_mode_tighten_stops_running_helpers_or_retur
                 "4": "Read Only",
             }[args[-1]]
 
-    def _capture(*_args: object) -> str:
+    def _capture(*_args: object, preserve_styles: bool = False) -> str:
         if selected:
-            return "Permissions updated to " + selected
+            return (
+                "Permissions updated to "
+                + selected
+                + "\n› Ask Codex to do anything\n? for shortcuts"
+            )
+        if not popup_open:
+            return (
+                "› \x1b[2mAsk Codex to do anything\x1b[0m\n? for shortcuts"
+                if preserve_styles
+                else "› Ask Codex to do anything\n? for shortcuts"
+            )
         return "1. Ask for approval\n2. Approve for me\n3. Full Access\n4. Read Only"
 
     monkeypatch.setattr(claude_native_bridge, "_run_tmux", _tmux)
@@ -4844,6 +5010,7 @@ async def test_codex_native_approval_mode_tighten_stops_running_helpers_or_retur
                 status="running",
             )
             selected = ""
+            popup_open = False
         try:
             operation = asyncio.create_task(
                 client.post(

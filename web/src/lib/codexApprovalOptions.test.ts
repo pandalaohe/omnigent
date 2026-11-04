@@ -11,9 +11,10 @@ import {
 } from "@/lib/nativeHarnessModes";
 
 describe("codexCreateApprovalOptions", () => {
-  it("includes all four Codex presets and a separate launch-only bypass", () => {
+  it("offers source configuration alongside four presets and launch-only bypass", () => {
     const values = codexCreateApprovalOptions().map((o) => o.value);
     expect(values).toEqual([
+      "configured",
       "ask-for-approval",
       "approve-for-me",
       "full-access",
@@ -40,6 +41,12 @@ describe("codexApprovalSelectionValue", () => {
 });
 
 describe("applyCodexApprovalSelection", () => {
+  it("clears bypass when source configuration is selected", () => {
+    expect(applyCodexApprovalSelection("configured", "full-access")).toEqual({
+      approvalMode: "configured",
+      bypass: false,
+    });
+  });
   it("arms bypass and keeps the prior preset so unchecking restores it", () => {
     expect(applyCodexApprovalSelection(CODEX_NATIVE_BYPASS_APPROVAL_VALUE, "read-only")).toEqual({
       approvalMode: "read-only",

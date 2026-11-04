@@ -3381,6 +3381,21 @@ describe("Composer native permission readback", () => {
     expect(update).not.toHaveBeenCalled();
     expect(reconnect).not.toHaveBeenCalled();
   });
+  it("offers configured permissions only for a new native Codex session", () => {
+    const setApproval = vi
+      .spyOn(useChatStore.getState(), "setCodexApprovalMode")
+      .mockResolvedValue();
+    renderWithTooltips(
+      <Composer {...composerProps({ permissionLevel: 4, showCodexApprovalMode: true })} />,
+    );
+    fireEvent.keyDown(screen.getByTestId("composer-permission-chip"), { key: "Enter" });
+    const configured = screen.getByTestId("composer-permission-option-configured");
+    expect(configured).toHaveTextContent("Configured permissions");
+    expect(configured).toHaveTextContent("Start a new session");
+    expect(configured).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(configured);
+    expect(setApproval).not.toHaveBeenCalled();
+  });
   it("shows receipt request text with no selected executable preset", () => {
     composerSessionSnapshot.labels = {
       [CODEX_PERMISSION_OBSERVATION_LABEL_KEY]: "c1:1,2,0,0,0,0,0,5,3,-,cnVubmVy",

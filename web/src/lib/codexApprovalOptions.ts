@@ -13,6 +13,7 @@ import {
   CODEX_NATIVE_BYPASS_APPROVAL_VALUE,
   CODEX_NATIVE_DEFAULT_APPROVAL_MODE,
 } from "@/lib/nativeHarnessModes";
+import { CODEX_CONFIGURED_PERMISSION_OPTION } from "@/lib/codexApprovalMode";
 
 /** A `{ value, label }` option, matching the composer permission picker's prop. */
 export interface CodexApprovalOption {
@@ -21,14 +22,15 @@ export interface CodexApprovalOption {
 }
 
 /**
- * The Codex approval options for a CREATE-time picker: four presets plus the
- * bypass entry. `{ value, label }` only — the picker renders them and
- * has no need for the CLI-flag `args`.
+ * Source configuration sends no permission overrides; the presets and bypass
+ * remain explicit launch choices.
  */
 export function codexCreateApprovalOptions(): CodexApprovalOption[] {
-  return [...CODEX_NATIVE_APPROVAL_MODES, CODEX_NATIVE_BYPASS_APPROVAL_OPTION].map(
-    ({ value, label }) => ({ value, label }),
-  );
+  return [
+    CODEX_CONFIGURED_PERMISSION_OPTION,
+    ...CODEX_NATIVE_APPROVAL_MODES,
+    CODEX_NATIVE_BYPASS_APPROVAL_OPTION,
+  ].map(({ value, label }) => ({ value, label }));
 }
 
 /**

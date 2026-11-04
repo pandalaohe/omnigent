@@ -53,6 +53,10 @@ import {
   applyCodexApprovalSelection,
 } from "@/lib/codexApprovalOptions";
 import {
+  CODEX_CONFIGURED_PERMISSION_OPTION,
+  CODEX_CONFIGURED_PERMISSIONS_LABEL_KEY,
+} from "@/lib/codexApprovalMode";
+import {
   ChatComposer,
   COMPOSER_COLUMN_WIDTH,
   COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS,
@@ -4110,8 +4114,9 @@ export function NewChatLandingScreen() {
       const approvalValue =
         isCodex && bypassSandbox
           ? CODEX_NATIVE_BYPASS_APPROVAL_OPTION.label
-          : (CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.label ??
-            approvalMode);
+          : ((isCodex ? codexCreateApprovalOptions() : CODEX_NATIVE_APPROVAL_MODES).find(
+              (m) => m.value === approvalMode,
+            )?.label ?? approvalMode);
       const pickedCodexRow = codexModelOptions.find((m) => m.id === pickedModel);
       const modelRows =
         routingOn || !isCodex
@@ -4966,7 +4971,11 @@ export function NewChatLandingScreen() {
     ? []
     : hasDeclaredPermissionMode
       ? selectedNativeHarness === "codex-native"
-        ? [...declaredPermissionOptions, CODEX_NATIVE_BYPASS_APPROVAL_OPTION]
+        ? [
+            CODEX_CONFIGURED_PERMISSION_OPTION,
+            ...declaredPermissionOptions,
+            CODEX_NATIVE_BYPASS_APPROVAL_OPTION,
+          ]
         : declaredPermissionOptions
       : sdkHarness === "claude-sdk" || sdkHarness === "codex"
         ? (sdkPermissionOptions(sdkHarness) ?? [])
@@ -5158,7 +5167,12 @@ export function NewChatLandingScreen() {
       );
       setApprovalMode(
         seededPermission ??
-          resolve(CODEX_NATIVE_APPROVAL_MODES, CODEX_NATIVE_DEFAULT_APPROVAL_MODE),
+          resolve(
+            selectedNativeHarness === "codex-native"
+              ? codexCreateApprovalOptions()
+              : CODEX_NATIVE_APPROVAL_MODES,
+            CODEX_NATIVE_DEFAULT_APPROVAL_MODE,
+          ),
       );
       if (!projectVisit) {
         // A remembered routing "on" outranks a remembered concrete model, and
@@ -6827,7 +6841,9 @@ export function NewChatLandingScreen() {
       const baseLabels =
         !effectiveAgentId?.startsWith("ca_") && agentSupportsApprovalMode && bypassSandbox
           ? { ...(nativeLabels ?? {}), [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]: "1" }
-          : nativeLabels;
+          : selectedNativeHarness === "codex-native" && approvalMode === "configured"
+            ? { ...(nativeLabels ?? {}), [CODEX_CONFIGURED_PERMISSIONS_LABEL_KEY]: "1" }
+            : nativeLabels;
       // First-class project filing: a project-driven visit whose `?project=`
       // name resolved to a real project id sends `project_id` so the server
       // files the session atomically at create (born filed, no follow-up

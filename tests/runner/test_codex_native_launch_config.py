@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -119,6 +120,52 @@ class _SequenceClient:
 
 async def _run(client: _Client | None, session_id: str = "conv_1") -> Any:
     return await _codex_native_launch_config(session_id=session_id, server_client=client)
+
+
+@pytest.mark.parametrize("reviewer", ["user", "auto_review", None])
+@pytest.mark.parametrize("configured", [False, True])
+async def test_configured_permissions_use_current_source_reviewer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reviewer: str | None, configured: bool
+) -> None:
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8123")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    source = tmp_path / "config.toml"
+    source.write_text(f'approvals_reviewer="{reviewer}"\n' if reviewer else "")
+    client = _Client(
+        _Resp(
+            200,
+            {
+                "workspace": "/opt/work/project",
+                "labels": {"omnigent.codex_native.configured_permissions": "1"}
+                if configured
+                else {},
+            },
+        )
+    )
+    config = await _run(client)
+    assert config.terminal_launch_args == (
+        ["-c", f'approvals_reviewer="{reviewer or "user"}"'] if configured else None
+    )
+    assert source.read_text() == (f'approvals_reviewer="{reviewer}"\n' if reviewer else "")
+
+
+async def test_configured_permissions_keep_explicit_session_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8123")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    args = ["--approve-for-me"]
+    client = _Client(
+        _Resp(
+            200,
+            {
+                "workspace": "/opt/work/project",
+                "labels": {"omnigent.codex_native.configured_permissions": "1"},
+                "terminal_launch_args": args,
+            },
+        )
+    )
+    assert (await _run(client)).terminal_launch_args == args
 
 
 def _init_payload(snapshot: dict[str, Any]) -> dict[str, Any]:
