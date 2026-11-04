@@ -19,6 +19,7 @@ import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { usageBoardAvailable } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { copyText } from "@/lib/clipboard";
 import {
   SESSION_COLLAB_DEFAULTS,
   writeSessionCollabPreferences,
@@ -239,18 +240,19 @@ function ColourLine({
         </span>
         <input
           type="range"
-          min={0}
+          min={10}
           max={100}
           step={5}
           value={tight}
           aria-label={`Amber below a pace of ${tight}`}
-          onChange={(event) =>
+          onChange={(event) => {
+            const value = Number(event.target.value);
             onChange({
-              tight: Number(event.target.value),
-              low: Math.min(low, Number(event.target.value)),
+              tight: value,
+              low: Math.min(low, value - 5),
               floor,
-            })
-          }
+            });
+          }}
           className="h-6 w-full accent-[var(--warning)]"
         />
       </label>
@@ -263,18 +265,19 @@ function ColourLine({
         </span>
         <input
           type="range"
-          min={0}
-          max={100}
+          min={5}
+          max={95}
           step={5}
           value={low}
           aria-label={`Red below a pace of ${low}`}
-          onChange={(event) =>
+          onChange={(event) => {
+            const value = Number(event.target.value);
             onChange({
-              tight: Math.max(tight, Number(event.target.value)),
-              low: Number(event.target.value),
+              tight: Math.max(tight, value + 5),
+              low: value,
               floor,
-            })
-          }
+            });
+          }}
           className="h-6 w-full accent-[var(--destructive)]"
         />
       </label>
@@ -323,7 +326,7 @@ function ConnectDialog() {
 
   async function copy() {
     try {
-      await navigator.clipboard.writeText(command);
+      await copyText(command);
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1500);
     } catch {
