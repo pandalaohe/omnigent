@@ -267,11 +267,12 @@ def test_session_grid_drag_persist_live_updates_and_close(
         other_area = other_cell.evaluate("node => node.style.gridArea")
         first_cell.evaluate("node => node.dataset.instance = 'preserved'")
         assert first_cell.locator("header").bounding_box()["height"] == 32
-        expect(first_cell.locator('header [data-size="icon-xs"]')).to_have_count(4)
+        expect(first_cell.locator('header [data-size="icon-xs"]')).to_have_count(2)
+        expect(first_cell.locator("header").get_by_role("radio")).to_have_count(2)
         # Both cells use real xterm attaches, with independent input and view selection.
         first_cell.get_by_test_id("side-chat-input").fill("Keep this chat draft")
         for cell in (first_cell, other_cell):
-            cell.get_by_role("button", name="Terminal view", exact=True).click()
+            cell.get_by_role("radio", name="Terminal view", exact=True).click()
             expect(cell.get_by_test_id("terminal-view")).to_have_attribute(
                 "data-state", "connected"
             )
@@ -325,11 +326,11 @@ def test_session_grid_drag_persist_live_updates_and_close(
         page.keyboard.press("ControlOrMeta+Alt+Shift+BracketRight")
         expect(other_cell).to_have_attribute("data-active", "true")
         expect(other_cell.get_by_test_id("side-chat-input")).to_be_focused()
-        first_cell.get_by_role("button", name="Chat view", exact=True).click()
+        first_cell.get_by_role("radio", name="Chat view", exact=True).click()
         expect(first_cell.get_by_test_id("side-chat-input")).to_have_value("Keep this chat draft")
-        first_cell.get_by_role("button", name="Terminal view", exact=True).click()
+        first_cell.get_by_role("radio", name="Terminal view", exact=True).click()
         assert terminal_connections == connections
-        first_cell.get_by_role("button", name="Chat view", exact=True).click()
+        first_cell.get_by_role("radio", name="Chat view", exact=True).click()
         first_cell.get_by_test_id("side-chat-input").fill("")
         _move_cell(page, "grid-0", "grid-1")
         assert first_cell.evaluate("node => node.style.gridArea") == other_area

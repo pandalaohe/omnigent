@@ -532,8 +532,7 @@ def test_picker_rows_follow_the_row_grid(
             summaries[1]["x"] + summaries[1]["width"], abs=TOLERANCE
         )
     else:
-        # The session picker has one config row; its submenu holds the model and
-        # effort rows, which share one grid across the section break.
+        # Model choices and the segmented effort row share the menu's inset grid.
         page.get_by_test_id("composer-config-gear").click()
         page.get_by_test_id("composer-agent-edit").click()
         submenu = page.get_by_test_id("composer-agent-config-menu")
@@ -545,16 +544,25 @@ def test_picker_rows_follow_the_row_grid(
         model_rows = submenu.get_by_test_id("composer-agent-models").get_by_role(
             "menuitemcheckbox"
         )
-        effort_rows = submenu.get_by_test_id("composer-agent-efforts").get_by_role(
-            "menuitemcheckbox"
-        )
+        efforts = submenu.get_by_test_id("composer-agent-efforts")
+        effort_row = efforts.get_by_role("menuitem")
+        effort_buttons = efforts.locator("button[data-effort-level]")
         model_boxes = [box(model_rows.nth(index)) for index in range(model_rows.count())]
-        effort_boxes = [box(effort_rows.nth(index)) for index in range(effort_rows.count())]
+        effort_boxes = [box(button) for button in effort_buttons.all()]
         assert len(model_boxes) >= 2 and len(effort_boxes) >= 2
         assert_row_grid(model_boxes)
-        assert_row_grid(effort_boxes)
-        for key in ("x", "width", "height"):
-            assert effort_boxes[0][key] == pytest.approx(model_boxes[0][key], abs=TOLERANCE)
+        effort_bounds = box(effort_row)
+        for key in ("x", "width"):
+            assert effort_bounds[key] == pytest.approx(model_boxes[0][key], abs=TOLERANCE)
+        for segment in effort_boxes:
+            assert segment["width"] > 0
+            assert segment["height"] >= (44 if viewport == PHONE else 28)
+            assert segment["x"] >= effort_bounds["x"]
+            assert segment["x"] + segment["width"] <= effort_bounds["x"] + effort_bounds["width"]
+            assert_same_vertical_center(segment, effort_boxes[0])
+            assert segment["width"] == pytest.approx(effort_boxes[0]["width"], abs=TOLERANCE)
+        for left, right in pairwise(effort_boxes):
+            assert left["x"] + left["width"] <= right["x"]
     if surface == "landing":
         menu = page.locator(".composer-agent-menu").first
         smart_routing = page.get_by_test_id("new-chat-landing-harness-smart-routing")

@@ -524,7 +524,8 @@ def test_side_chat_model_settings_before_and_after_first_message(
     picker.click()
     page.get_by_test_id("side-chat-model-edit").click()
     page.get_by_role("menuitemcheckbox", name="Opus", exact=True).click()
-    page.get_by_role("menuitemcheckbox", name="Low", exact=True).click()
+    page.get_by_test_id("side-chat-effort-low").click()
+    expect(page.get_by_test_id("side-chat-effort-low")).to_have_attribute("aria-pressed", "true")
     page.keyboard.press("Escape")
     # The tray creates a live fork; only an unsent draft displays the requested model.
     expect(picker).to_contain_text("Sonnet" if entrypoint == "tray" else "Opus")
@@ -562,7 +563,7 @@ def test_side_chat_model_settings_before_and_after_first_message(
     expect(page.get_by_role("menuitemcheckbox", name="Opus", exact=True)).to_have_attribute(
         "aria-checked", "true"
     )
-    page.get_by_role("menuitemcheckbox", name="High", exact=True).click()
+    page.get_by_test_id("side-chat-effort-high").click()
     expect(picker).to_contain_text("High")
     assert patches[-1] == {"reasoning_effort": "high"}
     assert chat.session_patches == []

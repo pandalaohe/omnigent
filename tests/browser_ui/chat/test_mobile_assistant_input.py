@@ -95,6 +95,12 @@ def cli_bridge(
     page.get_by_role("menuitem", name="Terminal", exact=True).tap()
     terminal = page.locator('[data-testid="terminal-view"]:visible').first
     expect(terminal).to_have_attribute("data-state", "connected", timeout=20_000)
+    expect(terminal.get_by_role("toolbar", name="Terminal keys")).to_be_visible()
+    expect(page.get_by_role("button", name="Open floating assistant", exact=True)).to_have_count(0)
+    # A short viewport cannot fit the key rows; custom actions use the floating fallback.
+    page.set_viewport_size({"width": 390, "height": 260})
+    expect(terminal.get_by_role("toolbar", name="Terminal keys")).to_have_count(0)
+    expect(page.get_by_role("button", name="Open floating assistant", exact=True)).to_be_visible()
     textarea = terminal.locator("textarea.xterm-helper-textarea")
     textarea.focus()
     return textarea, inputs
