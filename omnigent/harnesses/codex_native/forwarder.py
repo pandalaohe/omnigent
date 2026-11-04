@@ -378,6 +378,7 @@ class _CodexChildStream:
             if turn_id in self.terminal_turn_ids or terminal_error:
                 return False
             self.active_turn_id = turn_id
+            self.state.turn_stopped_by_hook = False
             self.state.reasoning_stream_item_id = None
         elif method in {"turn/completed", "turn/failed"}:
             if turn_id is not None:
@@ -399,6 +400,7 @@ class _CodexChildStream:
             # establish that turn, but cannot revive a completed one.
             if self.active_turn_id is None:
                 self.active_turn_id = turn_id
+                self.state.turn_stopped_by_hook = False
             return self.active_turn_id == turn_id
         return True
 

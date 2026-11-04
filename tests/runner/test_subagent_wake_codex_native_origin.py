@@ -702,8 +702,13 @@ async def test_stranded_wake_rescue_posts_for_a_delegated_native_child(
 @pytest.mark.parametrize(
     "event_name,hook_status", [("userPromptSubmit", "blocked"), ("preToolUse", "stopped")]
 )
+@pytest.mark.parametrize("missed_start", [False, True])
 async def test_native_wait_cannot_consume_a_hook_refusal(
-    tmp_path: Path, _clean_subagent_registry: None, event_name: str, hook_status: str
+    tmp_path: Path,
+    _clean_subagent_registry: None,
+    event_name: str,
+    hook_status: str,
+    missed_start: bool,
 ) -> None:
     """An empty native wait result cannot acknowledge a hook's failure detail."""
     inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -795,8 +800,15 @@ async def test_native_wait_cannot_consume_a_hook_refusal(
             next_wait = {**wait, "item": {**wait["item"], "id": "next-wait"}}
             for frame in (
                 {
-                    "method": "turn/started",
-                    "params": {"threadId": "thread_child", "turn": {"id": "next_turn"}},
+                    "method": "item/agentMessage/delta" if missed_start else "turn/started",
+                    "params": {
+                        "threadId": "thread_child",
+                        "turnId": "next_turn",
+                        "itemId": "next-message",
+                        "delta": "Recovered",
+                    }
+                    if missed_start
+                    else {"threadId": "thread_child", "turn": {"id": "next_turn"}},
                 },
                 {"method": "item/started", "params": next_wait},
                 {
@@ -829,6 +841,7 @@ async def test_native_wait_cannot_consume_a_hook_refusal(
                 )
             assert inbox.empty(), "the next normal native result is consumed without a new wake"
             assert len(server.wakes) == 1
+            assert state.subagent_status_by_thread["thread_child"] == "idle"
         finally:
             await tracker.close()
             await state.close_child_streams()

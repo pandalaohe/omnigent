@@ -28,6 +28,23 @@ from tests.harnesses.codex_native.forwarder._support import (
 )
 
 
+@pytest.mark.parametrize("method", ["turn/started", "item/agentMessage/delta"])
+def test_new_child_turn_clears_the_previous_hook_stop(method: str) -> None:
+    state = fwd._CodexForwarderState(turn_stopped_by_hook=True)
+    stream = fwd._CodexChildStream(
+        state,
+        fwd._OutputTextDeltaCoalescer(_RecordingClient(), "conv_child"),
+        active_turn_id="stopped_turn",
+    )
+    assert stream.accepts_event("item/agentMessage/delta", {"turnId": "stopped_turn"})
+    assert state.turn_stopped_by_hook
+    assert not stream.accepts_event("item/agentMessage/delta", {"turnId": "next_turn"})
+    assert state.turn_stopped_by_hook
+    assert stream.accepts_event("turn/completed", {"turn": {"id": "stopped_turn"}})
+    assert stream.accepts_event(method, {"turnId": "next_turn"})
+    assert not state.turn_stopped_by_hook
+
+
 def _seed_active_turn(bridge_dir: Path, turn_id: str) -> None:
     """
     Seed bridge state so a terminal turn edge clears the active turn.
