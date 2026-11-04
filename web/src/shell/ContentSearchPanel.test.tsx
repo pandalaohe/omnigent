@@ -29,12 +29,15 @@ it("searches only on submission and allows the same query to run again", async (
   const filters = screen.getByRole("button", { name: "Filter files" });
   expect(screen.getByRole("searchbox").nextElementSibling).toBe(filters);
   expect(filters).toHaveAttribute("aria-expanded", "false");
+  expect(filters).toHaveAttribute("data-variant", "outline");
   expect(screen.getByLabelText("Include")).not.toBeVisible();
   fireEvent.click(screen.getByRole("button", { name: "Filter files" }));
   expect(filters).toHaveAttribute("aria-expanded", "true");
   expect(screen.getByLabelText("Include")).toBeVisible();
   fireEvent.change(screen.getByLabelText("Include"), { target: { value: "src/**" } });
   fireEvent.change(screen.getByLabelText("Exclude"), { target: { value: "*.test.ts" } });
+  expect(filters).toHaveAttribute("data-variant", "default");
+  expect(filters).toHaveClass("bg-primary-cta", "text-primary-cta-foreground");
   fireEvent.click(screen.getByRole("button", { name: "Filter files" }));
   expect(filters).toHaveAttribute("aria-expanded", "false");
   expect(screen.getByLabelText("Include")).not.toBeVisible();
@@ -46,6 +49,7 @@ it("searches only on submission and allows the same query to run again", async (
   fireEvent.click(screen.getByRole("button", { name: "Filter files" }));
   fireEvent.change(screen.getByLabelText("Include"), { target: { value: "" } });
   fireEvent.change(screen.getByLabelText("Exclude"), { target: { value: "" } });
+  expect(filters).toHaveAttribute("data-variant", "outline");
   fireEvent.submit(screen.getByRole("searchbox").closest("form")!);
   await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(2));
   const cleared = new URL(String(vi.mocked(authenticatedFetch).mock.calls[1][0]), "http://test");

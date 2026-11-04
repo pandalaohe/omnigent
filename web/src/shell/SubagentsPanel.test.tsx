@@ -64,6 +64,10 @@ vi.mock("@/hooks/useConversations", () => ({
   useStopSession: () => stopSessionState,
 }));
 
+vi.mock("./SubagentsGraphView", () => ({
+  SubagentsGraphView: () => <div data-testid="mock-subagents-graph" />,
+}));
+
 // Stub the brand logos with plain SVGs so jsdom doesn't have to resolve
 // @lobehub/ui's runtime tooltip imports. The assertions prove which icon
 // the row selected, independent of the real glyph internals.
@@ -230,6 +234,23 @@ function CurrentPath() {
 }
 
 describe("SubagentsPanel", () => {
+  it("marks the selected list or graph segment with the neutral primary pair", () => {
+    mockChildTree({ conv_parent: [] });
+    renderPanel();
+    const group = screen.getByRole("radiogroup", { name: "Agents view" });
+    const list = within(group).getByRole("radio", { name: "List view" });
+    const graph = within(group).getByRole("radio", { name: "Graph view" });
+
+    expect(list).toHaveAttribute("aria-checked", "true");
+    expect(list).toHaveClass("bg-primary-cta", "text-primary-cta-foreground");
+    expect(graph).not.toHaveClass("bg-primary-cta");
+    fireEvent.click(graph);
+    expect(graph).toHaveAttribute("aria-checked", "true");
+    expect(graph).toHaveClass("bg-primary-cta", "text-primary-cta-foreground");
+    expect(list).toHaveAttribute("aria-checked", "false");
+    expect(list).not.toHaveClass("bg-primary-cta");
+  });
+
   it("loads each child's own session snapshot only when its actions are requested", () => {
     mockChildTree({ conv_parent: [childInfo({ id: "conv_child", title: "Child" })] });
     const { container } = renderPanel();

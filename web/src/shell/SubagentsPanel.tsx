@@ -43,6 +43,7 @@ import {
 } from "lucide-react";
 import { Link, useLocation } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
+import { Segmented } from "@/components/ui/segmented";
 import {
   Dialog,
   DialogContent,
@@ -731,26 +732,35 @@ function ViewModeToggle({
       <h2 className="pl-1 font-medium text-ui">Agents</h2>
       <div className="ml-auto flex items-center gap-0.5">
         {recheckButton}
-        <Button
-          variant={viewMode === "list" ? "secondary" : "ghost"}
-          size="icon-xs"
-          onClick={() => onViewModeChange("list")}
-          aria-label="List view"
-          title="List view"
-          data-testid="view-mode-list"
-        >
-          <ListIcon className="size-3.5" />
-        </Button>
-        <Button
-          variant={viewMode === "graph" ? "secondary" : "ghost"}
-          size="icon-xs"
-          onClick={() => onViewModeChange("graph")}
-          aria-label="Graph view"
-          title="Graph view"
-          data-testid="view-mode-graph"
-        >
-          <NetworkIcon className="size-3.5" />
-        </Button>
+        <Segmented
+          label="Agents view"
+          options={[
+            {
+              value: "list",
+              label: (
+                <>
+                  <ListIcon className="size-3.5" aria-hidden />
+                  <span className="sr-only">List view</span>
+                </>
+              ),
+              title: "List view",
+              testId: "view-mode-list",
+            },
+            {
+              value: "graph",
+              label: (
+                <>
+                  <NetworkIcon className="size-3.5" aria-hidden />
+                  <span className="sr-only">Graph view</span>
+                </>
+              ),
+              title: "Graph view",
+              testId: "view-mode-graph",
+            },
+          ]}
+          value={viewMode}
+          onChange={onViewModeChange}
+        />
       </div>
     </div>
   );

@@ -208,6 +208,24 @@ describe("ContextUsageSettings", () => {
     );
   });
 
+  it("marks the selected buffer unit with the neutral primary pair", async () => {
+    render(<ContextUsageSettings />);
+    const group = screen.getByRole("radiogroup", { name: "Buffer unit" });
+    const tokens = within(group).getByRole("radio", { name: "Tokens" });
+    const percent = within(group).getByRole("radio", { name: "Percent" });
+
+    expect(tokens).toHaveAttribute("aria-checked", "true");
+    expect(tokens).toHaveClass("bg-primary-cta", "text-primary-cta-foreground");
+    expect(percent).toHaveAttribute("aria-checked", "false");
+    expect(percent).not.toHaveClass("bg-primary-cta");
+
+    fireEvent.click(percent);
+    await waitFor(() => expect(percent).toHaveAttribute("aria-checked", "true"));
+    expect(percent).toHaveClass("bg-primary-cta", "text-primary-cta-foreground");
+    expect(tokens).toHaveAttribute("aria-checked", "false");
+    expect(tokens).not.toHaveClass("bg-primary-cta");
+  });
+
   it("keeps both manual buffer units, accepts zero, and rejects a token buffer at capacity", async () => {
     mocks.contextWindow = 100_000;
     render(<ContextUsageSettings />);
@@ -225,7 +243,7 @@ describe("ContextUsageSettings", () => {
     fireEvent.blur(tokens);
 
     fireEvent.click(
-      within(screen.getByRole("group", { name: "Buffer unit" })).getByRole("button", {
+      within(screen.getByRole("radiogroup", { name: "Buffer unit" })).getByRole("radio", {
         name: "Percent",
       }),
     );
@@ -247,7 +265,7 @@ describe("ContextUsageSettings", () => {
       expect(readUsageContextPreferences().overrides[key]?.autoCompactBufferPercent).toBe(0),
     );
     fireEvent.click(
-      within(screen.getByRole("group", { name: "Buffer unit" })).getByRole("button", {
+      within(screen.getByRole("radiogroup", { name: "Buffer unit" })).getByRole("radio", {
         name: "Tokens",
       }),
     );

@@ -2,13 +2,13 @@ import { useMemo, useState } from "react";
 import { CalendarIcon, Loader2Icon, TriangleAlertIcon } from "lucide-react";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { PageScroll } from "@/components/PageScroll";
+import { Segmented } from "@/components/ui/segmented";
 import { CostTimelineChart } from "@/components/usage/CostTimelineChart";
 import { UsageBreakdownCharts } from "@/components/usage/UsageBreakdownCharts";
 import { UsageSessionTable } from "@/components/usage/UsageSessionTable";
 import { useUsageReport } from "@/hooks/useUsageReport";
 import { formatSessionCostUsd } from "@/lib/formatCost";
 import type { DailyCost, SessionUsage } from "@/lib/usageApi";
-import { cn } from "@/lib/utils";
 
 type RangeKey = "7d" | "30d" | "90d" | "all" | "custom";
 
@@ -104,26 +104,21 @@ export function UsagePage() {
       <div className="mx-auto w-full max-w-4xl px-4 py-8">
         <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
           <h1 className="text-lg font-semibold">Usage</h1>
-          <div className="flex items-center gap-1.5">
-            {RANGE_PRESETS.map(({ key, label }) => (
-              <button
-                type="button"
-                key={key}
-                className={cn(
-                  "rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
-                  rangeKey === key
-                    ? "bg-primary text-primary-foreground"
-                    : "bg-muted text-muted-foreground hover:bg-muted/80",
-                )}
-                onClick={() => {
-                  trackClick(`usage.range_${key}`, "button");
-                  setRangeKey(key);
-                }}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
+          <Segmented
+            label="Usage range"
+            options={RANGE_PRESETS.map(({ key, label }) => ({
+              value: key,
+              label: <span className="whitespace-nowrap">{label}</span>,
+              testId: `usage-range-${key}`,
+            }))}
+            value={rangeKey}
+            onChange={(key) => {
+              trackClick(`usage.range_${key}`, "button");
+              setRangeKey(key);
+            }}
+            stretch
+            className="sm:w-auto"
+          />
         </div>
 
         {rangeKey === "custom" && (

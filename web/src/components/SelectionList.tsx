@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNod
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
+import { Segmented } from "@/components/ui/segmented";
 import { resolveMulti, suggestMode, summarizeMulti, type MultiValue } from "@/lib/multiSelection";
 
 export interface PickerItem {
@@ -161,6 +162,7 @@ export function SelectionList(props: Props) {
     setMenuOpen(false);
   };
   const handleKey = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.defaultPrevented) return;
     if (event.key === "ArrowDown" || event.key === "ArrowUp") {
       if (!rowItems.length) return;
       event.preventDefault();
@@ -276,19 +278,16 @@ export function SelectionList(props: Props) {
     <div className="flex min-h-0 flex-col" onKeyDown={handleKey}>
       {multi && (
         <>
-          <div className="flex gap-1 px-4 pt-3" role="group" aria-label="Selection mode">
-            {(["except", "only"] as const).map((mode) => (
-              <Button
-                key={mode}
-                type="button"
-                size="sm"
-                variant={multi.value.mode === mode ? "secondary" : "ghost"}
-                aria-pressed={multi.value.mode === mode}
-                onClick={() => multi.onChange({ mode, ids: drafts[mode] })}
-              >
-                {mode === "except" ? "All, except these" : "Only these"}
-              </Button>
-            ))}
+          <div className="px-4 pt-3">
+            <Segmented
+              label="Selection mode"
+              options={[
+                { value: "except", label: "All, except these" },
+                { value: "only", label: "Only these" },
+              ]}
+              value={multi.value.mode}
+              onChange={(mode) => multi.onChange({ mode, ids: drafts[mode] })}
+            />
           </div>
           {marked.length > 0 && (
             <div className="flex flex-wrap items-center gap-1 px-4 pt-2 text-xs">

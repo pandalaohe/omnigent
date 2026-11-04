@@ -1,12 +1,13 @@
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { CheckIcon, Loader2Icon, MessagesSquareIcon, TerminalIcon } from "lucide-react";
 import { useShortcutHint } from "@/components/KeyboardShortcut";
-import { Button } from "@/components/ui/button";
+import { Segmented } from "@/components/ui/segmented";
 import { DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useViewModeToggleHotkey } from "@/hooks/useViewModeToggleHotkey";
-import { cn } from "@/lib/utils";
-import { useTerminalFirst } from "./TerminalFirstContext";
+import { useOmnigentAnalytics } from "@/lib/analytics";
+import { useTerminalFirst, type TerminalFirstView } from "./TerminalFirstContext";
 
 const ignoreViewChange = () => {};
 
@@ -32,7 +33,22 @@ const ignoreViewChange = () => {};
 export function ViewModeToggle({ hotkeyEnabled = true, alwaysVisible = false } = {}) {
   const ctx = useTerminalFirst();
   const isMobile = useIsMobileViewport();
+  const segmentedRef = useRef<HTMLDivElement>(null);
+  const { trackClick } = useOmnigentAnalytics();
   const shortcutHint = useShortcutHint("toggleViewMode");
+  const shortcutAria = shortcutHint.aria;
+  const [openView, setOpenView] = useState<TerminalFirstView | null>(null);
+  const toggleVisible = Boolean(
+    ctx?.isTerminalFirst && !ctx.isShellView && (!isMobile || alwaysVisible),
+  );
+  useEffect(() => {
+    if (!toggleVisible) setOpenView(null);
+    const radios = segmentedRef.current?.querySelectorAll<HTMLElement>('[role="radio"]');
+    radios?.forEach((radio) => {
+      if (shortcutAria) radio.setAttribute("aria-keyshortcuts", shortcutAria);
+      else radio.removeAttribute("aria-keyshortcuts");
+    });
+  }, [shortcutAria, toggleVisible]);
   useViewModeToggleHotkey({
     enabled: Boolean(hotkeyEnabled && ctx?.isTerminalFirst && !ctx.isShellView),
     view: ctx?.view ?? "chat",
@@ -47,91 +63,92 @@ export function ViewModeToggle({ hotkeyEnabled = true, alwaysVisible = false } =
 
   return (
     <div
-      role="group"
-      aria-label="Switch between chat and terminal"
+      ref={segmentedRef}
       data-testid="view-mode-toggle"
-      // Two 36×24 segments separated by 2px make a flush 74×24 track.
-      // Desktop-only — mobile folds the switch into the header kebab.
-      className="flex h-6 w-[74px] shrink-0 items-center gap-0.5 rounded-[6px] bg-muted p-0 dark:bg-[var(--segmented-trough-bg)]"
+      className="shrink-0"
+      onFocusCapture={(event) => {
+        const testId = (event.target as HTMLElement).dataset.testid;
+        if (testId === "view-mode-chat") setOpenView("chat");
+        if (testId === "view-mode-terminal") setOpenView("terminal");
+      }}
+      onBlurCapture={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setOpenView(null);
+      }}
     >
-      <ViewModeSegment
-        label="Chat view"
-        active={view === "chat"}
-        onClick={() => setView("chat")}
-        testId="view-mode-chat"
-        componentId="chat.header.view_chat"
-        shortcutHint={shortcutHint}
-      >
-        <MessagesSquareIcon className="size-4" />
-      </ViewModeSegment>
-      <ViewModeSegment
-        label={terminalLabel}
-        active={view === "terminal"}
-        onClick={() => setView("terminal")}
-        testId="view-mode-terminal"
-        componentId="chat.header.view_terminal"
-        shortcutHint={shortcutHint}
-      >
-        {terminalStartingUp ? (
-          <Loader2Icon className="size-4 animate-spin" aria-hidden />
-        ) : (
-          <TerminalIcon className="size-4" />
-        )}
-      </ViewModeSegment>
+      <Segmented
+        label="Switch between chat and terminal"
+        options={[
+          {
+            value: "chat",
+            label: (
+              <ViewModeOptionLabel
+                label="Chat view"
+                shortcutHint={shortcutHint}
+                open={openView === "chat"}
+                onOpenChange={(open) => setOpenView(open ? "chat" : null)}
+              >
+                <MessagesSquareIcon className="size-4" aria-hidden />
+              </ViewModeOptionLabel>
+            ),
+            title: "Chat view",
+            testId: "view-mode-chat",
+          },
+          {
+            value: "terminal",
+            label: (
+              <ViewModeOptionLabel
+                label={terminalLabel}
+                shortcutHint={shortcutHint}
+                open={openView === "terminal"}
+                onOpenChange={(open) => setOpenView(open ? "terminal" : null)}
+              >
+                {terminalStartingUp ? (
+                  <Loader2Icon className="size-4 animate-spin" aria-hidden />
+                ) : (
+                  <TerminalIcon className="size-4" aria-hidden />
+                )}
+              </ViewModeOptionLabel>
+            ),
+            title: terminalLabel,
+            testId: "view-mode-terminal",
+          },
+        ]}
+        value={view}
+        onChange={(next) => {
+          trackClick(
+            next === "chat" ? "chat.header.view_chat" : "chat.header.view_terminal",
+            "button",
+          );
+          setView(next);
+        }}
+      />
     </div>
   );
 }
 
-/**
- * One segment of the switcher: an icon-only button whose name lives in a
- * tooltip. `aria-pressed` (not a radio) so each segment reads as an
- * independent toggle to AT, matching how it behaves — clicking the active
- * segment is a no-op rather than a selection change.
- */
-function ViewModeSegment({
+/** Icon content for one radio; the existing styled hotkey tooltip stays with the segment. */
+function ViewModeOptionLabel({
   label,
-  active,
-  onClick,
-  testId,
-  componentId,
   shortcutHint,
+  open,
+  onOpenChange,
   children,
 }: {
   label: string;
-  active: boolean;
-  onClick: () => void;
-  testId: string;
-  componentId: string;
   shortcutHint: { keys: string[]; aria: string | undefined };
-  children: React.ReactNode;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  children: ReactNode;
 }) {
   return (
-    <Tooltip>
+    <Tooltip open={open} onOpenChange={onOpenChange}>
       <TooltipTrigger asChild>
-        <span className="inline-flex">
-          <Button
-            type="button"
-            variant={active ? "secondary" : "ghost"}
-            size="icon-xs"
-            aria-label={label}
-            aria-pressed={active}
-            aria-keyshortcuts={shortcutHint.aria}
-            onClick={onClick}
-            data-testid={testId}
-            componentId={componentId}
-            className={cn(
-              "h-6 w-9 rounded-[6px] border px-2.5 py-0",
-              active
-                ? "border-border bg-background text-foreground shadow-sm hover:bg-background dark:border-transparent dark:bg-[var(--segmented-active-bg)] dark:hover:bg-[var(--segmented-active-bg)]"
-                : "border-transparent text-muted-foreground hover:bg-transparent hover:text-foreground dark:bg-[var(--segmented-inactive-bg)] dark:hover:bg-[var(--segmented-inactive-bg)]",
-            )}
-          >
-            {children}
-          </Button>
+        <span className="inline-flex items-center justify-center">
+          {children}
+          <span className="sr-only">{label}</span>
         </span>
       </TooltipTrigger>
-      {/* Bottom placement: the header sits at top-0, so a top-side tooltip
-          would render above the viewport edge and get clipped. */}
+      {/* Bottom placement keeps the header tooltip inside the viewport. */}
       <TooltipContent side="bottom" shortcut={shortcutHint.keys}>
         <span>{label}</span>
       </TooltipContent>

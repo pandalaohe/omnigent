@@ -842,7 +842,7 @@ describe("ChatHeader — Chat/Terminal switcher wiring", () => {
   it("mounts the ViewModeToggle for a terminal-first session", () => {
     renderHeaderWithSession(makeTerminalFirstCtx());
     expect(
-      screen.getByRole("group", { name: /switch between chat and terminal/i }),
+      screen.getByRole("radiogroup", { name: /switch between chat and terminal/i }),
     ).toBeInTheDocument();
   });
 
