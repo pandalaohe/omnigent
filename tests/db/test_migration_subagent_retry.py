@@ -43,8 +43,8 @@ def test_upgrade_is_additive_and_matches_registered_metadata(db_uri):
     users = sa.Table("users", sa.MetaData(), autoload_with=engine)
     with engine.begin() as connection:
         connection.execute(users.insert().values(workspace_id=0, id="preserved", is_admin=False))
-    command.upgrade(config, "head")
-    command.upgrade(config, "head")
+    command.upgrade(config, "a51c20261029")
+    command.upgrade(config, "a51c20261029")
     inspector = sa.inspect(engine)
     assert set(inspector.get_table_names()) - before == {model.__tablename__ for model in _MODELS}
     for model in _MODELS:
