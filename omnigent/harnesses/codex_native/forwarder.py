@@ -9286,6 +9286,8 @@ async def _post_status(
         session_id,
         event_type="external_session_status",
         data=data,
+        max_attempts=None,
+        timeout=_DURABLE_ITEM_POST_TIMEOUT_SECONDS,
     )
     _log_failed_session_event_post("external_session_status", response)
     return response is not None and response.status_code < 400
@@ -10520,7 +10522,7 @@ def _log_post_transport_failure(
 def _session_event_is_idempotent(event_type: str, data: _JsonObject) -> bool:
     """Return whether retrying this event cannot append a duplicate item."""
     source_id = data.get("source_id")
-    return (
+    return event_type == "external_session_status" or (
         event_type == "external_conversation_item"
         and isinstance(source_id, str)
         and bool(source_id.strip())

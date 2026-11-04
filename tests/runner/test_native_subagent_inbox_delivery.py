@@ -939,18 +939,16 @@ async def test_runner_restart_recovers_failed_child_error(
 
 
 @pytest.mark.asyncio
-async def test_continued_child_turn_cut_by_502_permission_refusal_reports_failed_with_reason(
+async def test_continued_child_prompt_outage_reports_failed_with_reason(
     _clean_subagent_registry: None,
     tmp_path: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A continued child turn cut at tool_use by HTTP 502 reaches the parent as failed.
+    """A continued child's refused input reaches the parent as failed with its cause.
 
-    Reproduces the three-stage chain where a child continued after a completed
-    turn hits HTTP 502 on PreToolUse policy evaluation and PermissionRequest:
+    Reproduces the chain where a continued child's prompt gate exhausts HTTP 502 retries:
     1. Continuing the child clears stale ``omnigent.subagent.terminal_status``.
-    2. Relay PreToolUse 502 writes the policy-fallback marker with the 502
-       detail, and PermissionRequest 502 records ``StopFailure`` in
+    2. The prompt gate records ``StopFailure`` in
        ``hooks.jsonl`` with ``error="policy_evaluation_failed"`` and the 502
        reason, which the forwarder translates into
        ``external_session_status(status="failed", failure_detail=...)``.
@@ -958,18 +956,12 @@ async def test_continued_child_turn_cut_by_502_permission_refusal_reports_failed
        the 502 reason to the parent inbox, never ``status="completed"`` with
        ``"[System: sub-agent completed with no output]"``.
     """
-    import io
-    import sys
-
     from omnigent.entities import Conversation
     from omnigent.harnesses.claude_native import (
         bridge as claude_native_bridge,
     )
     from omnigent.harnesses.claude_native import (
         forwarder as claude_native_forwarder,
-    )
-    from omnigent.harnesses.claude_native import (
-        hook as claude_native_hook,
     )
     from omnigent.runner.tool_dispatch import _prepare_child_dispatch
     from omnigent.server.routes._sessions.helpers import (
@@ -1037,8 +1029,7 @@ async def test_continued_child_turn_cut_by_502_permission_refusal_reports_failed
     assert post_dispatch_summary.current_task_status == "in_progress"
     assert post_dispatch_summary.last_task_error is None
 
-    # Stage 2: Relay PreToolUse hits HTTP 502 -> fail-closed ask + fallback marker;
-    # PermissionRequest also hits 502 -> records StopFailure in hooks.jsonl.
+    # Stage 2: An exhausted prompt gate records the refusal for the forwarder.
     workspace = tmp_path / "opt" / "work" / "omnigent" / "fork" / "wt"
     workspace.mkdir(parents=True)
     bridge_dir = claude_native_bridge.prepare_bridge_dir(
@@ -1071,36 +1062,16 @@ async def test_continued_child_turn_cut_by_502_permission_refusal_reports_failed
                 f"{info['url'].rstrip('/')}/hook/claude/evaluate-policy",
                 headers={"Authorization": f"Bearer {info['token']}"},
                 json={
-                    "hook_event_name": "PreToolUse",
-                    "tool_name": "Bash",
-                    "tool_input": {"command": "git status"},
+                    "hook_event_name": "UserPromptSubmit",
+                    "prompt": "Continue the review.",
                 },
             )
         assert eval_resp.status_code == 200
         eval_out = eval_resp.json()
-        assert eval_out["hookSpecificOutput"]["permissionDecision"] == "ask"
-        assert (
-            "server returned HTTP 502"
-            in (eval_out["hookSpecificOutput"]["permissionDecisionReason"])
-        )
+        assert eval_out["decision"] == "block"
+        assert "server returned HTTP 502" in eval_out["reason"]
     finally:
         relay.close()
-
-    monkeypatch.setattr(claude_native_hook, "_post_hook_with_reattach", lambda *a, **k: None)
-    monkeypatch.setattr(
-        sys,
-        "stdin",
-        io.StringIO(
-            json.dumps(
-                {
-                    "hook_event_name": "PermissionRequest",
-                    "tool_name": "Bash",
-                    "tool_input": {"command": "git status"},
-                }
-            )
-        ),
-    )
-    assert claude_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)]) == 0
 
     def _status_handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content.decode("utf-8"))

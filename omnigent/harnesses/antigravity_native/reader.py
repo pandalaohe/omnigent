@@ -729,10 +729,12 @@ async def _post_event(
         url=url,
         payload=payload,
         event_type=event.event_type,
-        max_attempts=_POST_MAX_ATTEMPTS,
+        max_attempts=None
+        if event.event_type == "external_session_status" or event.data.get("source_id")
+        else _POST_MAX_ATTEMPTS,
         retry_status_codes=_POST_RETRY_STATUS_CODES,
         sleep=_sleep,
-        retry_delay=lambda attempt: _POST_RETRY_DELAY_SECONDS * attempt,
+        retry_delay=lambda attempt: min(20.0, _POST_RETRY_DELAY_SECONDS * attempt),
         logger_name=__name__,
     )
 

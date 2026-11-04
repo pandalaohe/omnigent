@@ -17,12 +17,49 @@ from omnigent.native._native_post_delivery import (
     append_dead_letter,
     post_external_session_status,
     post_may_have_been_delivered,
+    post_session_event_with_retry,
     replay_dead_letters,
 )
 
 # Status codes a forwarder treats as transient/retryable, used by the replay
 # classifier to tell a recoverable exhausted-503 from a permanent 4xx.
 _RETRYABLE = frozenset({429, 500, 503})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_id", [None, "agy:turn:tool-output"])
+async def test_only_keyed_conversation_items_retry_an_ambiguous_response(source_id) -> None:
+    calls = 0
+
+    async def sleep(_seconds):
+        return
+
+    def post(request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ReadTimeout("acknowledgement lost", request=request)
+        return httpx.Response(200)
+
+    data = {"item_type": "function_call_output"}
+    if source_id is not None:
+        data["source_id"] = source_id
+    async with httpx.AsyncClient(
+        base_url="http://server", transport=httpx.MockTransport(post)
+    ) as client:
+        response = await post_session_event_with_retry(
+            client=client,
+            url="/events",
+            payload={"type": "external_conversation_item", "data": data},
+            event_type="external_conversation_item",
+            max_attempts=None,
+            retry_status_codes=_RETRYABLE,
+            sleep=sleep,
+            retry_delay=lambda _: 0,
+            logger_name=__name__,
+        )
+    assert calls == (1 if source_id is None else 2)
+    assert (response is not None) == (source_id is not None)
 
 
 def _dead_letter_record(

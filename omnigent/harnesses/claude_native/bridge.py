@@ -357,15 +357,13 @@ _TOOL_CALL_TIMEOUT_S = 300.0
 _TOOL_RELAY_POST_TIMEOUT_S = _TOOL_CALL_TIMEOUT_S + 30.0
 # Re-attempt delays for the policy-eval relay's PreToolUse retries, indexed
 # by re-attempt (entry 0 spaces attempt 2). PreToolUse's waits are sized to
-# fill ``NATIVE_TOOL_CALL_OUTAGE_WAIT_S`` (imported from
+# fill ``NATIVE_POLICY_OUTAGE_WAIT_S`` (imported from
 # ``omnigent.native.native_policy_hook`` where the relay reads it), and
 # that budget — not the tuple — ends the re-attempts, so the last one
 # still starts inside the pinned 3700s PreToolUse hook timeout.
 # Long enough to ride out a server outage; the call is denied after it.
-# No other event may share it: UserPromptSubmit's hook
-# budget is 30s and a timed-out hook does not block, so those waits there
-# would turn its fail-closed into fail-open. A read that hangs without its
-# own timeout is pre-existing and not bounded here.
+# UserPromptSubmit shares this wait so the original message survives an outage.
+# Both enforcement hooks have a timeout above the wait limit.
 _PRE_TOOL_USE_POLICY_EVAL_RETRY_DELAYS_S: tuple[float, ...] = (
     0.4,
     0.4,
@@ -1593,6 +1591,7 @@ class ClaudeNativeToolRelay:
         advertised_url: str,
         relay_info: _JsonObject,
         tool_executor: ToolExecutor,
+        policy_stop: threading.Event,
     ) -> None:
         """
         Initialize the relay handle.
@@ -1610,6 +1609,7 @@ class ClaudeNativeToolRelay:
         self._advertised_url = advertised_url
         self._relay_info = relay_info
         self._tool_executor = tool_executor
+        self._policy_stop = policy_stop
 
     def update_tools(self, tools: list[_JsonObject], tool_executor: ToolExecutor) -> None:
         """Refresh tools on the owning event loop without changing cached relay credentials.
@@ -1641,6 +1641,7 @@ class ClaudeNativeToolRelay:
 
         :returns: None.
         """
+        self._policy_stop.set()
         relay_file = self._bridge_dir / _TOOL_RELAY_FILE
         # A newer relay that overwrote the file advertises a different url
         # (this relay's socket is still bound, so its port is unique), so the
@@ -2878,32 +2879,25 @@ def build_hook_settings(
             "&& { printf '%s' \"$out\"; exit 0; }; fi; "
             f"printf '%s' \"$p\" | {evaluate_policy_python}"
         )
-        # PostToolUse keeps the inherited default. PreToolUse pins 3700s for
-        # the 3600s outage wait; UserPromptSubmit pins 30s, which the
-        # Python fallback's prompt budget (``_EVALUATE_POLICY_RETRY_BUDGET_S``,
-        # 15s) is sized against.
+        # Enforcement hooks outlive the bounded outage wait. PostToolUse keeps
+        # the inherited default because its tool has already executed.
         evaluate_policy_hook: _JsonObject = {
             "type": "command",
             "command": policy_allow_cache.guarded_hook_command(
                 bridge_dir, evaluate_policy_command
             ),
         }
-        evaluate_policy_pre_tool_use_hook: _JsonObject = {
+        evaluate_policy_gate_hook: _JsonObject = {
             "type": "command",
             "command": evaluate_policy_command,
             "timeout": 3700,
-        }
-        evaluate_policy_prompt_hook: _JsonObject = {
-            "type": "command",
-            "command": evaluate_policy_command,
-            "timeout": 30,
         }
 
         # AskUserQuestion needs no PreToolUse forwarder: Claude Code raises its
         # permission prompt for the question in every mode, bypass included, so
         # the PermissionRequest hook above carries it. A second forwarder here
         # parked a duplicate elicitation and the web showed two identical cards.
-        hooks["PreToolUse"] = [{"hooks": [evaluate_policy_pre_tool_use_hook]}]
+        hooks["PreToolUse"] = [{"hooks": [evaluate_policy_gate_hook]}]
         # PostToolUse already has TodoWrite and TaskUpdate matchers
         # for the transcript forwarder (the observer ``hook``). Append
         # a catch-all policy evaluation entry so TOOL_RESULT policies
@@ -2917,7 +2911,7 @@ def build_hook_settings(
         # dropping the prompt before the model sees it; ASK is resolved
         # server-side. Covers both web-UI-injected and direct-terminal
         # prompts, since both fire UserPromptSubmit.
-        hooks["UserPromptSubmit"].append({"hooks": [evaluate_policy_prompt_hook]})
+        hooks["UserPromptSubmit"].append({"hooks": [evaluate_policy_gate_hook]})
     if subagent_router_dir is not None:
         # Route natively spawned subagents (the Task/Agent tool) through
         # the runner's route-subagent endpoint. Settings-level hooks also
@@ -8309,6 +8303,7 @@ def start_tool_relay(
     async def _execute_current_tool(name: str, arguments: _JsonObject) -> object:
         return await relay._tool_executor(name, arguments)
 
+    policy_stop = threading.Event()
     handler_cls = _tool_relay_handler_factory(
         token,
         _execute_current_tool,
@@ -8318,6 +8313,7 @@ def start_tool_relay(
         bridge_dir=bridge_dir,
         file_change_observer=file_change_observer,
         permission_tier_control=permission_tier_control,
+        policy_stop=policy_stop,
     )
     httpd, advertised_url = _start_bridge_http_server(handler_cls)
     relay_info: _JsonObject = {
@@ -8345,6 +8341,7 @@ def start_tool_relay(
         advertised_url=advertised_url,
         relay_info=relay_info,
         tool_executor=tool_executor,
+        policy_stop=policy_stop,
     )
     thread = threading.Thread(
         target=httpd.serve_forever,
@@ -8621,6 +8618,7 @@ def _tool_relay_handler_factory(
     bridge_dir: Path | None = None,
     file_change_observer: Callable[[_JsonObject], Awaitable[None]] | None = None,
     permission_tier_control: Callable[[_JsonObject], Awaitable[_JsonObject]] | None = None,
+    policy_stop: threading.Event,
 ) -> type[BaseHTTPRequestHandler]:
     """
     Create an HTTP handler class for active-turn tool calls.
@@ -8796,6 +8794,38 @@ def _tool_relay_handler_factory(
             if raw:
                 self.wfile.write(raw)
 
+        def _wait_for_policy_retry(self, seconds: float) -> None:
+            """End policy work when the hook disconnects or the relay closes."""
+            deadline = time.monotonic() + seconds
+            while True:
+                if policy_stop.is_set():
+                    raise FutureCancelledError
+                try:
+                    readable, _, _ = select.select([self.connection], [], [], 0)
+                except OSError:
+                    raise FutureCancelledError from None
+                if readable:
+                    raise FutureCancelledError
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                time.sleep(min(0.1, remaining))
+
+        def _wait_for_policy_response(self, future: Future[Any], timeout: float) -> Any:
+            deadline = time.monotonic() + timeout
+            try:
+                while True:
+                    self._wait_for_policy_retry(0)
+                    try:
+                        return future.result(
+                            timeout=min(0.1, max(0.001, deadline - time.monotonic()))
+                        )
+                    except TimeoutError:
+                        if future.done() or time.monotonic() >= deadline:
+                            raise
+            finally:
+                future.cancel()
+
         def _handle_hook_evaluate(self, payload: _JsonObject) -> None:
             """Serve one Claude policy hook event end to end.
 
@@ -8816,7 +8846,8 @@ def _tool_relay_handler_factory(
                 _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S,
                 _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S,
                 _PRE_TOOL_USE,
-                NATIVE_TOOL_CALL_OUTAGE_WAIT_S,
+                _USER_PROMPT_SUBMIT,
+                NATIVE_POLICY_OUTAGE_WAIT_S,
                 evaluation_response_to_hook_output,
                 fail_closed_hook_output,
                 hook_payload_to_evaluation_request,
@@ -8860,6 +8891,7 @@ def _tool_relay_handler_factory(
             verdict: object = None
             last_error: str | None = None
             pre_tool_use = hook_event == _PRE_TOOL_USE
+            enforcement_gate = pre_tool_use or hook_event == _USER_PROMPT_SUBMIT
             started_at = time.monotonic()
             pre_tool_use_delays = iter(_PRE_TOOL_USE_POLICY_EVAL_RETRY_DELAYS_S)
             attempts = 0
@@ -8867,27 +8899,54 @@ def _tool_relay_handler_factory(
             deadline = time.monotonic() + _EVALUATE_POLICY_RETRY_BUDGET_S
             backoff_s = _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
             retry_delay = 0.4
-            while pre_tool_use or non_connect_failures < 3:
+            while enforcement_gate or non_connect_failures < 3:
                 if attempts:
-                    if pre_tool_use:
+                    if enforcement_gate:
                         delay = next(pre_tool_use_delays, None)
-                        if delay is None or (
-                            time.monotonic() - started_at + delay > NATIVE_TOOL_CALL_OUTAGE_WAIT_S
-                        ):
+                        remaining = NATIVE_POLICY_OUTAGE_WAIT_S - (time.monotonic() - started_at)
+                        if delay is None or remaining <= 0:
                             break
-                        time.sleep(delay)
+                        try:
+                            self._wait_for_policy_retry(min(delay, remaining))
+                        except FutureCancelledError:
+                            return
+                        if time.monotonic() - started_at >= NATIVE_POLICY_OUTAGE_WAIT_S:
+                            last_error = (
+                                "Policy evaluation wait expired after "
+                                f"{NATIVE_POLICY_OUTAGE_WAIT_S:g}s; "
+                                "request cancelled."
+                            )
+                            break
                     else:
-                        time.sleep(retry_delay)
+                        try:
+                            self._wait_for_policy_retry(retry_delay)
+                        except FutureCancelledError:
+                            return
                 attempts += 1
                 retry_delay = 0.4
                 future = asyncio.run_coroutine_threadsafe(
                     policy_client.post(url, json=request_body), loop
                 )
                 try:
-                    resp = future.result(timeout=86400.0)
+                    timeout = (
+                        max(0.0, NATIVE_POLICY_OUTAGE_WAIT_S - (time.monotonic() - started_at))
+                        if enforcement_gate
+                        else 86400.0
+                    )
+                    resp = self._wait_for_policy_response(future, timeout)
+                except FutureCancelledError:
+                    return
                 except Exception as exc:  # noqa: BLE001 — shaped fail-closed below
                     last_error = str(exc).strip() or type(exc).__name__
-                    if pre_tool_use:
+                    if enforcement_gate and (
+                        time.monotonic() - started_at >= NATIVE_POLICY_OUTAGE_WAIT_S
+                    ):
+                        last_error = (
+                            "Policy evaluation wait expired after "
+                            f"{NATIVE_POLICY_OUTAGE_WAIT_S:g}s; request cancelled."
+                        )
+                        break
+                    if enforcement_gate:
                         continue
                     if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
                         # Resolver failures can outlast three quick attempts.
@@ -8901,6 +8960,8 @@ def _tool_relay_handler_factory(
                 if resp.status_code != HTTPStatus.OK:
                     last_error = f"server returned HTTP {resp.status_code}"
                     non_connect_failures += 1
+                    if 400 <= resp.status_code < 500 and resp.status_code != 429:
+                        break
                     continue
                 try:
                     verdict = json.loads(resp.content)
@@ -9068,7 +9129,9 @@ def _tool_relay_handler_factory(
                                 return
                         except OSError:
                             return
-                resp = future.result(timeout=86400.0)
+                resp = self._wait_for_policy_response(future, 86400.0)
+            except FutureCancelledError:
+                return
             except Exception as exc:  # noqa: BLE001
                 self._send_policy_proxy_error(exc)
                 return

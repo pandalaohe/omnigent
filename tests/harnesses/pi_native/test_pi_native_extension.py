@@ -1319,7 +1319,7 @@ require(extensionPath)(pi);
 const notices = [];
 const ctx = { ui: { setTitle() {}, setStatus() {}, notify(text) { notices.push(text); } } };
 async function settleHistory() {
-  for (let index = 0; index < 20; index++) await new Promise(setImmediate);
+  for (let index = 0; index < 1000; index++) await new Promise(setImmediate);
 }
 async function consumeInput(event, context) {
   await handlers.input(event, context);
@@ -1404,9 +1404,10 @@ def test_assistant_delivery_failure_is_reported_and_400_is_not_retried(
   await settleHistory();
   assert.equal(notices.length, 1);
   assert.match(diagnostics.join("\n"), /HTTP 503/);
-  assert.equal(fetchCalls, 5, JSON.stringify(posted));
-  assert.deepEqual(retryDelays, [1000, 2000, 4000, 8000]);
-  assert.equal(assistantItems().length, 5, JSON.stringify(posted));
+  const transientCalls = fetchCalls;
+  assert.ok(transientCalls > 5);
+  assert.ok(retryDelays.reduce((sum, delay) => sum + delay, 0) <= 3600000);
+  assert.equal(assistantItems().length, transientCalls, JSON.stringify(posted));
   assert.equal(
     new Set(assistantItems().map((item) => item.data.source_id)).size,
     1,
@@ -1420,7 +1421,7 @@ def test_assistant_delivery_failure_is_reported_and_400_is_not_retried(
     return { ok: true, status: 204 };
   };
   await handlers.message_end({ message: transientMessage }, ctx);
-  assert.equal(fetchCalls, 6, JSON.stringify(posted));
+  assert.equal(fetchCalls, transientCalls + 1, JSON.stringify(posted));
 
   global.fetch = async (_url, request) => {
     posted.push(JSON.parse(request.body));
@@ -1437,8 +1438,7 @@ def test_assistant_delivery_failure_is_reported_and_400_is_not_retried(
   await settleHistory();
   assert.equal(notices.length, 2);
   assert.match(diagnostics.join("\n"), /HTTP 400/);
-  assert.equal(fetchCalls, 7, JSON.stringify(posted));
-  assert.deepEqual(retryDelays, [1000, 2000, 4000, 8000]);
+  assert.equal(fetchCalls, transientCalls + 2, JSON.stringify(posted));
 })().catch((error) => {
   console.error(error && error.stack ? error.stack : error);
   process.exit(1);
@@ -1495,12 +1495,15 @@ def test_history_items_retry_without_losing_identity(tmp_path: Path, kind: str) 
   await invoke();
   await settleHistory();
   assert.match(diagnostics.join("\n"), /Failed to persist.*HTTP 503/);
-  assert.deepEqual(retryDelays, [1000, 2000, 4000, 8000]);
+  assert.deepEqual(retryDelays.slice(0, 4), [1000, 2000, 4000, 8000]);
+  assert.ok(retryDelays.length > 4);
+  assert.ok(retryDelays.reduce((sum, delay) => sum + delay, 0) <= 3600000);
   assert.deepEqual(
     notices, kind === "compaction" ? ["Omnigent could not save the compaction checkpoint."] : [],
   );
   let items = posted.filter((body) => body.type === "external_conversation_item");
-  assert.equal(items.length, 5);
+  const failedAttempts = items.length;
+  assert.equal(failedAttempts, retryDelays.length + 1);
   assert.ok(items[0].data.source_id);
   for (const item of items) assert.deepEqual(item, items[0]);
 
@@ -1508,14 +1511,17 @@ def test_history_items_retry_without_losing_identity(tmp_path: Path, kind: str) 
   await invoke();
   await settleHistory();
   items = posted.filter((body) => body.type === "external_conversation_item");
-  assert.equal(items.length, 6);
-  if (kind === "compaction") assert.equal(items[5].data.source_id, items[0].data.source_id);
+  assert.equal(items.length, failedAttempts + 1);
+  if (kind === "compaction") {
+    assert.equal(items[failedAttempts].data.source_id, items[0].data.source_id);
+  }
   if (kind !== "compaction") {
     // A rejected delivery remains eligible; accepted callbacks are suppressed.
-    assert.deepEqual(items[0], items[5]);
+    assert.deepEqual(items[0], items[failedAttempts]);
     await invoke();
-  await settleHistory();
-    assert.equal(posted.filter((body) => body.type === "external_conversation_item").length, 6);
+    await settleHistory();
+    const acceptedItems = posted.filter((body) => body.type === "external_conversation_item");
+    assert.equal(acceptedItems.length, failedAttempts + 1);
   }
   if (kind === "reasoning") {
     const deltas = posted.filter((body) => body.type === "external_output_reasoning_delta");
@@ -1525,8 +1531,9 @@ def test_history_items_retry_without_losing_identity(tmp_path: Path, kind: str) 
     await handlers.message_end({message: {...event.message, timestamp: 43}}, ctx);
     await settleHistory();
     items = posted.filter((body) => body.type === "external_conversation_item");
-    assert.equal(items.length, 7, "a later identical prompt is a separate consumed message");
-    assert.notEqual(items[6].data.source_id, items[0].data.source_id);
+    assert.equal(items.length, failedAttempts + 2,
+      "a later identical prompt is a separate consumed message");
+    assert.notEqual(items[failedAttempts + 1].data.source_id, items[0].data.source_id);
   }
 })().catch((error) => { process.stderr.write(error.stack || String(error)); process.exit(1); });
 """
@@ -1715,6 +1722,45 @@ def test_compaction_snapshot_failures_do_not_block_pi(tmp_path: Path, failure: s
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_outage_recovers_pi_bash_result_and_completion(tmp_path: Path) -> None:
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  let offlineUntil = 0;
+  const accepted = [];
+  global.fetch = async (_url, request) => {
+    const body = JSON.parse(request.body);
+    if (Date.now() < offlineUntil) return {ok: false, status: 503};
+    accepted.push(body);
+    return {ok: true, status: 204};
+  };
+  await handlers.agent_start({}, ctx);
+  const tool = {id: 'bash-outage', name: 'bash', arguments: {command: 'printf RESULT'}};
+  await handlers.message_update({assistantMessageEvent: {
+    type: 'toolcall_end', toolCall: tool}}, ctx);
+  await settleHistory();
+  offlineUntil = Date.now() + 120000;
+  await handlers.tool_result({toolCallId: tool.id, toolName: 'bash',
+    content: [{type: 'text', text: 'RESULT'}]}, ctx);
+  await handlers.message_end({message: {role: 'assistant', timestamp: 40,
+    content: [{type: 'text', text: 'bash returned RESULT'}], stopReason: 'stop'}}, ctx);
+  await handlers.agent_end({}, ctx);
+  await handlers.session_shutdown();
+  assert.ok(accepted.some(e => e.type === 'external_conversation_item' &&
+    e.data.item_type === 'function_call_output' && e.data.item_data.output.includes('RESULT')),
+    'bash output was lost during the outage');
+  const terminal = accepted.filter(e => e.data?.turn_outcome).at(-1)?.data;
+  assert.equal(terminal?.turn_outcome, 'completed', 'the parent never received completion');
+  assert.equal(terminal.status, 'idle');
+  assert.equal(terminal.output, 'bash returned RESULT');
+})().catch(error => { process.stderr.write(error.stack || String(error)); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_history_retry_stops_before_exceeding_elapsed_budget(tmp_path: Path) -> None:
     script = (
         _ASSISTANT_DURABILITY_HARNESS
@@ -1726,14 +1772,14 @@ def test_history_retry_stops_before_exceeding_elapsed_budget(tmp_path: Path) -> 
       return {ok: true, status: 204};
     }
     fetchCalls += 1;
-    now += 5000;
+    now += Math.min(5000, started + 3600000 - Date.now());
     return { ok: false, status: 503 };
   };
   await consumeInput({ text: "keep working", source: "extension" }, ctx);
   await settleHistory();
-  assert.equal(fetchCalls, 4);
-  assert.deepEqual(retryDelays, [1000, 2000, 4000]);
-  assert.equal(Date.now() - started, 27000);
+  assert.ok(fetchCalls > 4);
+  assert.ok(Date.now() - started > 3590000);
+  assert.ok(Date.now() - started <= 3600000);
   assert.match(diagnostics.join("\n"), /Failed to persist message/);
 })().catch(error => { process.stderr.write(error.stack || String(error)); process.exit(1); });
 """
@@ -1802,13 +1848,15 @@ def test_reasoning_identity_survives_lost_ack_across_callbacks(tmp_path: Path) -
     type: "thinking_end", contentIndex: 0, content: "plan",
   } }, ctx);
   await settleHistory();
+  const failedAttempts = posted.filter(item => item.data?.item_type === "reasoning").length;
+  assert.ok(failedAttempts > 5);
   loseAck = false;
   await handlers.message_end({ message: { role: "assistant", content: [
     { type: "thinking", thinking: "plan", thinkingSignature: "different-hint" },
   ] } }, ctx);
   await settleHistory();
   const reasoning = posted.filter(item => item.data?.item_type === "reasoning");
-  assert.equal(reasoning.length, 6);
+  assert.equal(reasoning.length, failedAttempts + 1);
   assert.equal(new Set(reasoning.map(item => item.data.source_id)).size, 1);
   assert.equal(posted.filter(item => item.type === "external_output_reasoning_delta").length, 1);
 })().catch(error => { process.stderr.write(error.stack || String(error)); process.exit(1); });
@@ -1905,7 +1953,7 @@ def test_turn_outcome_waits_for_history_but_idle_does_not(tmp_path: Path, mode: 
   let expireHistory;
   let completionAttempts = 0;
   global.setTimeout = (callback, delay, ...args) => {
-    if (delay !== 30000) return originalSetTimeout(callback, delay, ...args);
+    if (delay !== 3600000) return originalSetTimeout(callback, delay, ...args);
     // Fire the history deadline only after checking the pending barrier.
     expireHistory = () => callback(...args);
     return {};
@@ -2058,7 +2106,8 @@ def test_result_retries_its_failed_call_before_delivery(tmp_path: Path, recover:
   await handlers.message_update({assistantMessageEvent: {type: 'toolcall_end',
     toolCall: tool}}, ctx);
   await settleHistory();
-  assert.deepEqual(retryDelays, [1000, 2000, 4000, 8000]);
+  assert.deepEqual(retryDelays.slice(0, 4), [1000, 2000, 4000, 8000]);
+  assert.ok(retryDelays.length > 4);
   status = process.argv[3] === 'True' ? 204 : 400;
   const result = {toolCallId: 'call-1', content: [{type: 'text', text: 'contents'}]};
   await handlers.tool_result(result, ctx);
@@ -2099,8 +2148,8 @@ def test_history_hung_fetch_is_aborted_and_shutdown_is_bounded(
   const start = performance.now();
   await handlers.session_shutdown();
   const elapsed = performance.now() - start;
-  assert.equal(aborts, process.argv[3] === 'True' ? 1 : 5, JSON.stringify({diagnostics,
-    retryDelays,elapsed}));
+  if (process.argv[3] === 'True') assert.equal(aborts, 1);
+  else assert.ok(aborts >= 5, JSON.stringify({diagnostics, retryDelays, elapsed}));
   assert.ok(elapsed < 6500, String(elapsed));
   if (process.argv[3] === 'True') assert.ok(elapsed >= 4900, String(elapsed));
   assert.match(diagnostics.join('\n'), /Failed to persist/);
@@ -4168,7 +4217,7 @@ def test_policy_transport_error_fails_closed(tmp_path: Path) -> None:
 (async () => {
   // Always throw a transport error; with fake timers collapsing the backoff
   // the transient budget elapses quickly and the loop must fail CLOSED.
-  responders = new Array(64).fill("THROW");
+  responders = new Array(512).fill("THROW");
   const verdict = await runToolCall();
   // Fail closed → a block verdict with the unreachable-server reason.
   assert.equal(verdict && verdict.block, true, JSON.stringify(verdict));
@@ -4192,7 +4241,7 @@ def test_policy_http_error_fails_closed(tmp_path: Path, status: int) -> None:
         + str(status)
         + r""";
 (async () => {
-  responders = new Array(64).fill((_b) => makeJsonResponse({}, status));
+  responders = new Array(512).fill((_b) => makeJsonResponse({}, status));
   const verdict = await runToolCall();
   assert.equal(verdict && verdict.block, true, JSON.stringify(verdict));
   assert.match(verdict.reason, /failing closed/);
@@ -4204,6 +4253,20 @@ def test_policy_http_error_fails_closed(tmp_path: Path, status: int) -> None:
 });
 """
     )
+    _run_policy_node_script(_extension_path(), tmp_path, body)
+
+
+def test_pi_tool_gate_recovers_after_the_old_five_minute_budget(tmp_path: Path) -> None:
+    body = r"""
+(async () => {
+  const started = fakeNow;
+  responders = new Array(32).fill('THROW');
+  responders.push(() => makeJsonResponse({result: 'POLICY_ACTION_ALLOW'}));
+  const verdict = await runToolCall();
+  assert.ok(fakeNow - started > 300000);
+  assert.ok(!verdict || !verdict.block, 'the original Pi call was lost before recovery');
+})().catch(error => { process.stderr.write(error.stack || String(error)); process.exit(1); });
+"""
     _run_policy_node_script(_extension_path(), tmp_path, body)
 
 

@@ -476,7 +476,7 @@ function relayCredentials() {
  * @returns {Promise<{block: boolean, reason: string}>} A verdict; missing
  *   configuration, transport failure and unknown actions block.
  */
-async function evalNativePolicyHttp(config, toolName, args, callId) {
+async function evalNativePolicyHttp(config, toolName, args, callId, signal) {
   if (
     !config ||
     typeof config.serverUrl !== "string" ||
@@ -535,15 +535,14 @@ async function evalNativePolicyHttp(config, toolName, args, callId) {
         ...freshAuthHeaders(config.authHeaders),
       };
 
-  const parkDeadline = Date.now() + _PARK_TOTAL_BUDGET_MS;
-  // Independent transient-error budget so a server that is actually down
-  // resolves quickly (fail CLOSED) instead of riding the long park ceiling.
-  let transientDeadline = Date.now() + _TRANSIENT_RETRY_BUDGET_MS;
+  const parkDeadline = Date.now() + 3_600_000;
+  const transientDeadline = parkDeadline;
   let transientBackoff = _TRANSIENT_RETRY_INITIAL_BACKOFF_MS;
   // Bound on consecutive raw ASK rounds (see _MAX_RAW_ASK_ROUNDS).
   let rawAskRounds = 0;
 
   while (true) {
+    if (signal?.aborted) return {block: true, reason: "Tool call cancelled"};
     const current = readPermissionState(config);
     if (!current || current.status !== "ready" ||
         current.revision !== permissionState.revision ||
@@ -561,8 +560,11 @@ async function evalNativePolicyHttp(config, toolName, args, callId) {
     const controller =
       typeof AbortController === "function" ? new AbortController() : null;
     const timer = controller
-      ? setTimeout(() => controller.abort(), _PARK_ATTEMPT_TIMEOUT_MS)
+      ? setTimeout(() => controller.abort(), Math.min(
+          _PARK_ATTEMPT_TIMEOUT_MS, Math.max(1, parkDeadline - Date.now())))
       : null;
+    const abort = () => controller?.abort();
+    signal?.addEventListener?.("abort", abort, {once: true});
     const attemptStart = Date.now();
     let resp;
     try {
@@ -570,7 +572,7 @@ async function evalNativePolicyHttp(config, toolName, args, callId) {
         method: "POST",
         headers: reqHeaders,
         body,
-        ...(controller ? { signal: controller.signal } : {}),
+        ...(controller || signal ? {signal: controller?.signal || signal} : {}),
       });
     } catch (_err) {
       if (timer) clearTimeout(timer);
@@ -590,12 +592,7 @@ async function evalNativePolicyHttp(config, toolName, args, callId) {
         // Re-park: the server held the connection the whole time, so re-POST
         // the SAME elicitation id immediately (no backoff). This is the human
         // approval window — keep waiting (bounded only by parkDeadline).
-        // A completed long-poll is a healthy round-trip, so refresh the
-        // transient budget the same way the ASK branch does. Without this the
-        // entry budget expires during the first park, and a genuine transport
-        // blip while the human is still deciding would fail closed with zero
-        // retries instead of getting its full transient window.
-        transientDeadline = Date.now() + _TRANSIENT_RETRY_BUDGET_MS;
+        // The same call keeps its fixed deadline across reconnects.
         transientBackoff = _TRANSIENT_RETRY_INITIAL_BACKOFF_MS;
         continue;
       }
@@ -605,7 +602,7 @@ async function evalNativePolicyHttp(config, toolName, args, callId) {
       if (Date.now() + transientBackoff >= transientDeadline) {
         return failClosedVerdict();
       }
-      await sleep(transientBackoff);
+      await sleep(transientBackoff, signal);
       transientBackoff = Math.min(
         transientBackoff * 2,
         _TRANSIENT_RETRY_MAX_BACKOFF_MS,
@@ -613,6 +610,7 @@ async function evalNativePolicyHttp(config, toolName, args, callId) {
       continue;
     } finally {
       if (timer) clearTimeout(timer);
+      signal?.removeEventListener?.("abort", abort);
     }
 
     if (!resp || resp.ok !== true) {
@@ -623,7 +621,7 @@ async function evalNativePolicyHttp(config, toolName, args, callId) {
         if (Date.now() + transientBackoff >= transientDeadline) {
           return failClosedVerdict();
         }
-        await sleep(transientBackoff);
+        await sleep(transientBackoff, signal);
         transientBackoff = Math.min(
           transientBackoff * 2,
           _TRANSIENT_RETRY_MAX_BACKOFF_MS,
@@ -664,12 +662,9 @@ async function evalNativePolicyHttp(config, toolName, args, callId) {
       if (rawAskRounds >= _MAX_RAW_ASK_ROUNDS) {
         return failClosedVerdict();
       }
-      // Reset the transient budget since this is a healthy round-trip, not a
-      // failure, and give it a brief beat so we do not hot-loop a server that
-      // keeps returning ASK.
-      transientDeadline = Date.now() + _TRANSIENT_RETRY_BUDGET_MS;
+      // Keep the deadline and avoid hot-looping a server that returns raw ASK.
       transientBackoff = _TRANSIENT_RETRY_INITIAL_BACKOFF_MS;
-      await sleep(_TRANSIENT_RETRY_INITIAL_BACKOFF_MS);
+      await sleep(_TRANSIENT_RETRY_INITIAL_BACKOFF_MS, signal);
       continue;
     }
     if (
@@ -1406,10 +1401,9 @@ function headers(config) {
   };
 }
 
-const _ASSISTANT_ITEM_MAX_ATTEMPTS = 5;
 const _ASSISTANT_ITEM_INITIAL_BACKOFF_MS = 1_000;
 const _ASSISTANT_ITEM_MAX_BACKOFF_MS = 8_000;
-const _ASSISTANT_ITEM_RETRY_BUDGET_MS = 30_000;
+const _ASSISTANT_ITEM_RETRY_BUDGET_MS = 3_600_000;
 const _ASSISTANT_ITEM_POST_TIMEOUT_MS = 5_000;
 const _PREVIEW_POST_TIMEOUT_MS = 1_000;
 const _PREVIEW_FLUSH_TIMEOUT_MS = 300;
@@ -1417,12 +1411,12 @@ const _PREVIEW_MAX_QUEUED_EVENTS = 32;
 const _PREVIEW_MAX_QUEUED_CHARS = 32_768;
 const _PREVIEW_MAX_DELTA_CHARS = 8_192;
 
-function settledWithinBudget(settled) {
+function settledWithinBudget(settled, budgetMs = _ASSISTANT_ITEM_RETRY_BUDGET_MS) {
   let timeout;
   return Promise.race([
     settled.then(() => true),
     new Promise(resolve => {
-      timeout = setTimeout(() => resolve(false), _ASSISTANT_ITEM_RETRY_BUDGET_MS);
+      timeout = setTimeout(() => resolve(false), budgetMs);
     }),
   ]).finally(() => clearTimeout(timeout));
 }
@@ -1500,7 +1494,7 @@ async function postEventWithRetry(config, body, signal, readReceipt = false) {
   let backoff = _ASSISTANT_ITEM_INITIAL_BACKOFF_MS;
   let lastError;
   const deadline = Date.now() + _ASSISTANT_ITEM_RETRY_BUDGET_MS;
-  for (let attempt = 1; attempt <= _ASSISTANT_ITEM_MAX_ATTEMPTS; attempt += 1) {
+  while (Date.now() < deadline) {
     signal?.throwIfAborted();
     const remaining = deadline - Date.now();
     if (remaining <= 0) break;
@@ -1528,7 +1522,6 @@ async function postEventWithRetry(config, body, signal, readReceipt = false) {
       clearTimeout(timeout);
     }
     if (
-      attempt === _ASSISTANT_ITEM_MAX_ATTEMPTS ||
       !isRetryableAssistantError(lastError) ||
       Date.now() + backoff >= deadline
     )
@@ -2203,7 +2196,7 @@ module.exports = function (pi) {
       { onFailure: notifyFailure },
     );
     // Pi awaits this handler before finishing compaction.
-    if (item) await settledWithinBudget(item.settled);
+    if (item) await settledWithinBudget(item.settled, 30_000);
   });
   let sequence = 0;
   let turnOrdinal = 0;
@@ -3103,6 +3096,7 @@ module.exports = function (pi) {
   }
 
   pi.on("session_shutdown", async () => {
+    turnOutcomeController.abort();
     if (cacheWarmPoller) clearInterval(cacheWarmPoller);
     cacheWarmPoller = null;
     clearTimeout(pi.__omnigentRotationRetry);
@@ -3557,6 +3551,7 @@ module.exports = function (pi) {
       event && event.toolName,
       event && event.input,
       event && event.toolCallId,
+      ctx?.signal || turnOutcomeController.signal,
     );
     if (verdict.block) {
       return {

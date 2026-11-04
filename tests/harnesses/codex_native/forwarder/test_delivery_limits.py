@@ -25,6 +25,38 @@ def _isolated_forward_health(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_outage_does_not_drop_the_terminal_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    attempts = 0
+    accepted = []
+
+    async def sleep(_seconds: float) -> None:
+        return
+
+    def post(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 4:
+            return httpx.Response(503)
+        accepted.append(json.loads(request.content))
+        return httpx.Response(200)
+
+    monkeypatch.setattr(fwd, "_sleep", sleep)
+    async with httpx.AsyncClient(
+        base_url="http://server", transport=httpx.MockTransport(post)
+    ) as client:
+        delivered = await fwd._post_status(
+            client, "conv_outage", "idle", response_id="turn_outage"
+        )
+    assert delivered
+    assert accepted == [
+        {
+            "type": "external_session_status",
+            "data": {"status": "idle", "response_id": "turn_outage"},
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_large_tool_output_is_capped_before_upload() -> None:
     """An early server rejection can arrive as a read error during upload."""
     requests: list[httpx.Request] = []
