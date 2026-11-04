@@ -4649,7 +4649,7 @@ def create_runner_app(
                 bridge_dir = permission_tiers.state_path(
                     session_id, harness_name, permission_snapshot.labels
                 ).parent
-                deadline = asyncio.get_running_loop().time() + 20.0
+                deadline = asyncio.get_running_loop().time() + 60.0
                 while not verify_pi_permission_installation(bridge_dir, startup_tier):
                     if asyncio.get_running_loop().time() >= deadline:
                         raise ValueError("Pi permission extension did not acknowledge startup")

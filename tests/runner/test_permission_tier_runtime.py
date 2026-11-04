@@ -79,6 +79,53 @@ async def test_first_pi_turn_waits_for_permission_bootstrap(monkeypatch, install
         assert "permission tier startup failed" in caplog.text
 
 
+@pytest.mark.asyncio
+async def test_first_pi_native_turn_waits_for_late_permission_ack(monkeypatch, caplog):
+    from tests.runner.conftest import _build_app_for_spec, _runner_client
+    from tests.runner.native_helpers import _harness_spec
+
+    app, pm = await _build_app_for_spec(_harness_spec("pi-native"))
+    harness = pm._client
+    entered = asyncio.Event()
+    async with _runner_client(app, permission_harness="pi-native") as client:
+        loop = asyncio.get_running_loop()
+        acknowledge_at = loop.time() + 40.2
+
+        def acknowledge_late(*_args):
+            entered.set()
+            return loop.time() >= acknowledge_at
+
+        monkeypatch.setattr(
+            "omnigent.harnesses.pi_native.bridge.verify_pi_permission_installation",
+            acknowledge_late,
+        )
+        init = asyncio.create_task(
+            client.post(
+                "/v1/sessions", json={"session_id": "cold-pi-native", "agent_id": "test-agent"}
+            )
+        )
+        await asyncio.wait_for(entered.wait(), 5)
+        response = await client.post(
+            "/v1/sessions/cold-pi-native/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "test-agent",
+                "content": [{"type": "input_text", "text": "hello"}],
+            },
+        )
+        assert response.status_code == 202, response.text
+        turn = app.state.active_turns.get("cold-pi-native")
+        assert turn is not None
+        done, _ = await asyncio.wait([turn], timeout=0.05)
+        assert not done, "first turn failed while the extension acknowledgement was late"
+        initialized = await asyncio.wait_for(init, 60)
+        await asyncio.wait_for(turn, 60)
+    assert initialized.status_code == 201, initialized.text
+    assert "hello" in json.dumps(harness.posted_bodies)
+    assert "turn setup failed" not in caplog.text
+
+
 def _runtime(tmp_path: Path, tier: str) -> PermissionTierRuntime:
     runtime = PermissionTierRuntime()
     workspace = tmp_path / "workspace"
