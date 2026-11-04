@@ -53,7 +53,7 @@ describe("ComposerContextRing", () => {
   it("keeps usage text out of the bar while preserving an accessible percentage", () => {
     renderRing(1000, 123);
     expect(screen.getByTestId("composer-context-ring")).not.toHaveTextContent("12%");
-    expect(screen.getByTestId("composer-context-ring")).toHaveClass("shrink-0", "min-w-11");
+    expect(screen.getByTestId("composer-context-ring")).toHaveClass("shrink-0", "size-6");
     expect(screen.getByTestId("composer-context-ring")).not.toHaveClass("gap-1");
     expect(screen.getByLabelText("12% of context used")).toBeInTheDocument();
   });
@@ -119,7 +119,11 @@ describe("ComposerContextRing", () => {
     fireEvent.click(screen.getByTestId("composer-context-ring"));
     const button = screen.getByRole("button", { name: "Change context values" });
     expect(button).toHaveClass("min-h-11");
-    expect(screen.getByTestId("composer-context-ring")).toHaveClass("min-h-11", "min-w-11");
+    expect(screen.getByTestId("composer-context-ring")).toHaveClass(
+      "size-6",
+      "after:absolute",
+      "after:-inset-2.5",
+    );
 
     fireEvent.click(button);
     expect(mocks.navigate).toHaveBeenCalledWith(usageContextSettingsHref(sourceKey));
