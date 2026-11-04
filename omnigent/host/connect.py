@@ -43,6 +43,7 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus, InvalidURI
 from omnigent._platform import (
     CLI_FALLBACK_DIRS_ENV_VAR,
     IS_POSIX,
+    IS_WINDOWS,
     WINDOWS_ENV_PASSTHROUGH,
     installed_interactive_shells,
     normalize_interactive_shells,
@@ -1134,6 +1135,10 @@ def _build_runner_env(
             "TEMP",
             "PYTHONPATH",
             "VIRTUAL_ENV",
+            # Windows process/profile constants the shell and its children need
+            # (SYSTEMROOT for Winsock, PROGRAMDATA for Win32-OpenSSH, …). Absent
+            # on POSIX, so this is a no-op there; credentials stay dropped.
+            *WINDOWS_ENV_PASSTHROUGH,
         }
         env = {
             key: value
@@ -1385,6 +1390,24 @@ class HostRetryableConnectionError(Exception):
     """Server-reported channel failure that should use reconnect backoff."""
 
 
+def _windows_conpty_available() -> bool:
+    """Return whether this Windows kernel exposes the ConPTY API.
+
+    ConPTY (``kernel32!CreatePseudoConsole``) shipped in Windows 10 1809; older
+    kernels can load kernel32 but not that export. The probe is lazy and
+    Windows-only so importing this module stays dependency-free off Windows.
+    """
+    if not IS_WINDOWS:
+        return False
+    try:
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    except (AttributeError, OSError):
+        return False
+    return hasattr(kernel32, "CreatePseudoConsole")
+
+
 class HostProcess:
     """Manages the host daemon lifecycle.
 
@@ -1436,7 +1459,9 @@ class HostProcess:
             if interactive_shells is not None
             else installed_interactive_shells()
         )
-        if not self._interactive_shells:
+        if not self._interactive_shells and not IS_WINDOWS:
+            # POSIX keeps its historical bash fallback; a Windows host with no
+            # native shell must stay empty rather than advertise a phantom bash.
             self._interactive_shells = ["bash"]
         self._harness_tmp_parent = resolve_harness_tmp_parent()
         self._runners: dict[str, _RunnerHandle] = {}
@@ -1804,6 +1829,9 @@ class HostProcess:
         )
 
     def _host_terminals_supported(self) -> bool:
+        if IS_WINDOWS:
+            # ConPTY plus a real native shell inventory; tmux is POSIX-only.
+            return _windows_conpty_available() and bool(self._interactive_shells)
         return IS_POSIX and shutil.which("tmux") is not None and bool(self._interactive_shells)
 
     def _owner_inventory_snapshot(self) -> HostOwnerInventorySnapshot:

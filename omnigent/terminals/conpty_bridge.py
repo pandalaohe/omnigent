@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING
@@ -22,6 +23,8 @@ from omnigent.terminals.ws_common import (
 if TYPE_CHECKING:
     from omnigent.inner.terminal import TerminalInstance
     from omnigent.terminals.conpty import ConPtyTerminalInstance
+
+_logger = logging.getLogger(__name__)
 
 
 async def bridge_terminal_to_websocket(
@@ -102,7 +105,18 @@ async def bridge_conpty_to_websocket(
                 if on_input is not None:
                     on_input()
                 last_input = time.monotonic()
-                await run_sync_on_thread(instance.write_input, data)
+                try:
+                    await run_sync_on_thread(instance.write_input, data)
+                except OSError as exc:
+                    # Surface the failure; the outer handler still owns the
+                    # close semantics. Log the exception kind and OS text only —
+                    # never the input bytes, which may be a typed secret.
+                    _logger.warning(
+                        "ConPTY input write failed (%s): %s",
+                        type(exc).__name__,
+                        exc.strerror or exc,
+                    )
+                    raise
             elif text:
                 try:
                     frame = json.loads(text)

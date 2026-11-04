@@ -436,7 +436,7 @@ function NewTabMenu({
             disabled={shellDisabled}
             onSelect={() => launchShell(defaultShell, true)}
           >
-            Admin (root)
+            Admin
           </DropdownMenuItem>
         )}
       </DropdownMenuContent>

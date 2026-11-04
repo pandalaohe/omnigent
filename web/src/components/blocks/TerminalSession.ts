@@ -12,7 +12,7 @@
 
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
-import { type FontWeight, type ITheme, Terminal } from "@xterm/xterm";
+import { type FontWeight, type ITheme, type IWindowsPty, Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { withBasePath } from "@/lib/basePath";
 import { type CodeFont, codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences";
@@ -24,6 +24,7 @@ import { splitWorkspaceFileCitation } from "@/components/ai-elements/streamdown-
 import { resolveChatFilePath } from "@/hooks/useWorkspaceChangedFiles";
 import { CodexTerminalPalette, codexTerminalTheme } from "./CodexTerminalPalette";
 import { TerminalLinkProvider } from "./TerminalLinkProvider";
+import { attachImeHeuristic, type Detached } from "./imeAnchor";
 
 const TERMINAL_BOLD_WEIGHT_OFFSET = 300;
 
@@ -433,6 +434,25 @@ export function parseTerminalClipboardMessage(message: string): string | null {
   return decodeTerminalClipboardBase64((value as { data: string }).data);
 }
 
+function parseWindowsPtyMessage(message: string): IWindowsPty | null {
+  let value: { type?: unknown; windows_pty?: { backend?: unknown; build?: unknown } } | null;
+  try {
+    value = JSON.parse(message);
+  } catch {
+    return null;
+  }
+  const pty = value?.type === "pty_info" ? value.windows_pty : null;
+  if (
+    pty?.backend !== "conpty" ||
+    typeof pty.build !== "number" ||
+    !Number.isSafeInteger(pty.build) ||
+    pty.build < 0
+  ) {
+    return null;
+  }
+  return { backend: "conpty", buildNumber: pty.build };
+}
+
 /** Whether a clipboard event is attributable to recent input on this attach. */
 export function hadRecentTerminalInput(lastInputAt: number, now: number): boolean {
   return (
@@ -681,6 +701,7 @@ export class TerminalSession {
   /** Fractional wheel lines carried across events (see {@link wheelReportPayload}). */
   private wheelPartialLines = 0;
   private readonly imeInput: TerminalImeInput;
+  private imeAnchor: Detached | null = null;
   /** Start of the tracked one-finger touch, or ``null`` when none is active. */
   private touchStart: { x: number; y: number } | null = null;
   /** Whether the tracked touch passed the slop gate and owns scrolling. */
@@ -826,8 +847,15 @@ export class TerminalSession {
             onActivity?.();
           }
         } else if (typeof ev.data === "string") {
-          const text = parseTerminalClipboardMessage(ev.data);
-          if (text !== null) this.requestClipboardWrite(text);
+          const windowsPty = parseWindowsPtyMessage(ev.data);
+          if (windowsPty) {
+            // ConPTY's resize/reflow contract differs from a POSIX PTY.
+            this.term.options.windowsPty = windowsPty;
+            this.imeAnchor ??= attachImeHeuristic(this.term);
+          } else {
+            const text = parseTerminalClipboardMessage(ev.data);
+            if (text !== null) this.requestClipboardWrite(text);
+          }
           // Unknown text frames stay ignored for protocol forward compatibility.
         }
       },
@@ -1055,6 +1083,7 @@ export class TerminalSession {
     this.listenerCtl.abort();
     this.resizeObserver.disconnect();
     this.imeInput.dispose();
+    this.imeAnchor?.detach();
     this.dataDispose.dispose();
     this.osc52Dispose.dispose();
     try {

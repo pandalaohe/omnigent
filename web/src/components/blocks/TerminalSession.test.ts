@@ -743,6 +743,86 @@ describe("TerminalSession", () => {
     return { identifier, clientX, clientY } as Touch;
   }
 
+  it.each([0, 19045, 26300])("sets ConPTY build %s before consuming output", (build) => {
+    const onActivity = vi.fn();
+    const { socket, session } = makeSession(onActivity);
+    const term = (session as unknown as { term: Terminal }).term;
+    const observed: unknown[] = [];
+    vi.spyOn(term, "write").mockImplementation(() => observed.push(term.options.windowsPty));
+    socket.emit("message", {
+      data: JSON.stringify({ type: "pty_info", windows_pty: { backend: "conpty", build } }),
+    });
+    expect(onActivity).not.toHaveBeenCalled();
+    socket.emit("message", { data: new ArrayBuffer(1) });
+    expect(observed).toEqual([{ backend: "conpty", buildNumber: build }]);
+    session.dispose();
+  });
+
+  it("keeps xterm defaults for POSIX, unknown and malformed control frames", () => {
+    const { socket, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    const initial = term.options.windowsPty;
+    for (const data of [
+      "not json",
+      "null",
+      "{}",
+      '{"type":"future-frame"}',
+      ...[
+        null,
+        {},
+        { backend: "future", build: 26300 },
+        { backend: "conpty", build: "26300" },
+        { backend: "conpty", build: -1 },
+        { backend: "conpty", build: 1.5 },
+      ].map((windows_pty) => JSON.stringify({ type: "pty_info", windows_pty })),
+    ]) {
+      expect(() => socket.emit("message", { data })).not.toThrow();
+    }
+    expect(term.options.windowsPty).toEqual(initial);
+    session.dispose();
+  });
+
+  it.each([false, true])(
+    "uses the visual IME caret only for ConPTY (metadata: %s)",
+    async (conpty) => {
+      const { socket, session, container } = makeSession();
+      const term = (session as unknown as { term: Terminal }).term;
+      try {
+        if (conpty)
+          socket.emit("message", {
+            data: JSON.stringify({
+              type: "pty_info",
+              windows_pty: { backend: "conpty", build: 26300 },
+            }),
+          });
+        const screen = container.querySelector<HTMLElement>(".xterm-screen")!;
+        vi.spyOn(screen, "getBoundingClientRect").mockReturnValue({
+          width: 800,
+          height: 480,
+        } as DOMRect);
+        await new Promise<void>((resolve) => {
+          term.write("\x1b[2;3H\x1b[7m \x1b[27m\x1b[2;80H", resolve);
+        });
+        const textarea = container.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea")!;
+        const preedit = container.querySelector<HTMLElement>(".composition-view")!;
+        textarea.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+        if (conpty) {
+          expect(textarea.style.left).toBe("20px");
+          expect(textarea.style.top).toBe("20px");
+          expect(preedit.style.left).toBe("20px");
+          expect(textarea.style.getPropertyPriority("left")).toBe("important");
+          textarea.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true }));
+          expect(textarea.style.getPropertyPriority("left")).toBe("");
+        } else {
+          expect(textarea.style.getPropertyPriority("left")).toBe("");
+          expect(preedit.style.getPropertyPriority("left")).toBe("");
+        }
+      } finally {
+        session.dispose();
+      }
+    },
+  );
+
   function testTouchList(touches: Touch[]): TouchList {
     const list = {
       length: touches.length,

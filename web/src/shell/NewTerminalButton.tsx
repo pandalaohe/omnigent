@@ -144,7 +144,7 @@ export function NewTerminalButton({
       ))}
       {canCreateElevated && (
         <DropdownMenuItem className="max-md:min-h-11" onSelect={() => launch(declared[0], true)}>
-          Admin (root)
+          Admin
         </DropdownMenuItem>
       )}
     </DropdownMenuContent>
@@ -216,7 +216,7 @@ export function NewAdminTerminalMenuItem({
           .catch((error: Error) => showToast(`Couldn't open an admin terminal: ${error.message}`));
       }}
     >
-      Admin (root){create.isError && <span role="alert">{create.error.message}</span>}
+      Admin{create.isError && <span role="alert">{create.error.message}</span>}
     </DropdownMenuItem>
   );
 }

@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import queue
 import subprocess
 import sys
@@ -267,6 +268,56 @@ async def test_bridge_metadata_input_resize_and_detach(instance, read_only):
     assert process.writes == ([] if read_only else ["中文".encode()])
     assert ((100, 30) in process.sizes) is not read_only
     assert len(instance._subscribers) == 0 and not process.closed
+
+
+@pytest.mark.asyncio
+async def test_bridge_browser_write_runs_off_the_event_loop_thread(instance):
+    """A browser input write must never block the event-loop thread."""
+    process = _Process()
+    instance._process, instance.running = process, True
+    write_threads = []
+    direct_write = instance.write_input
+
+    def record_write(data):
+        write_threads.append(threading.get_ident())
+        direct_write(data)
+
+    instance.write_input = record_write
+    ws = _WebSocket(
+        [
+            {"type": "websocket.receive", "bytes": b"off-loop"},
+            {"type": "websocket.disconnect"},
+        ]
+    )
+    await asyncio.wait_for(bridge_conpty_to_websocket(ws, instance), 3)
+    assert write_threads and write_threads[0] != threading.get_ident()
+    assert process.writes == [b"off-loop"]
+
+
+@pytest.mark.asyncio
+async def test_bridge_input_write_failure_is_logged_without_input_bytes(
+    instance, monkeypatch, caplog
+):
+    """A ConPTY input write OSError becomes an operator-visible warning, no payload."""
+    process = _Process()
+    instance._process, instance.running = process, True
+    payload = b"secret-input-marker"
+
+    def fail_write(_data):
+        raise OSError(22, "WriteFile failed")
+
+    monkeypatch.setattr(instance, "write_input", fail_write)
+    caplog.set_level(logging.WARNING, logger="omnigent.terminals.conpty_bridge")
+    ws = _WebSocket(
+        [
+            {"type": "websocket.receive", "bytes": payload},
+            {"type": "websocket.disconnect"},
+        ]
+    )
+    await asyncio.wait_for(bridge_conpty_to_websocket(ws, instance), 3)
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("OSError" in message for message in messages), messages
+    assert payload.decode() not in caplog.text
 
 
 @pytest.mark.asyncio
