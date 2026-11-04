@@ -101,6 +101,8 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
     setTheme = vi.fn();
     setClipboardEnabled = vi.fn();
     sendSoftKey = vi.fn();
+    setStickyModifiers = vi.fn();
+    onStickyConsumed = vi.fn(() => vi.fn());
     focus = vi.fn();
     blur = vi.fn();
     isFocused = vi.fn(() => false);
