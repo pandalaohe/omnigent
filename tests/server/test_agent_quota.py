@@ -70,6 +70,44 @@ def service_with_store(db_uri, store=None):
     )
 
 
+def test_pool_readings_use_tile_not_latest_product_projection(db_uri):
+    service = service_with_store(db_uri)
+    service.report_account(OWNER, "a", usage_report(account_product="codex"), now=NOW)
+    service.report_account(
+        OWNER,
+        "b",
+        usage_report(
+            account_product="codex",
+            windows=[
+                {
+                    "id": "weekly",
+                    "kind": "weekly",
+                    "percent_used": 100,
+                    "window_minutes": 10080,
+                    "resets_at": NOW + 86400,
+                }
+            ],
+        ),
+        now=NOW,
+    )
+    readings = service.pool_readings(QuotaContext(OWNER, HOST), now=NOW)
+    assert readings["a"].windows[0].remaining_pct == 60
+    assert readings["b"].windows[0].remaining_pct == 0
+    assert readings["a"].windows[0].resets_at == NOW + 4 * 86400
+    assert (
+        service.pool_readings(QuotaContext("other", HOST), now=NOW).keys().isdisjoint({"a", "b"})
+    )
+    assert service.pool_readings(QuotaContext(OWNER, HOST), now=NOW + 3601)["a"].freshness == "old"
+
+
+def test_pool_readings_with_board_disabled_use_reported_products(service):
+    service.usage_enabled = False
+    service.report(OWNER, None, "claude", snapshot(), now=NOW)
+    readings = service.pool_readings(QuotaContext(OWNER, HOST), now=NOW)
+    assert set(readings) == {"claude"}
+    assert readings["claude"].windows[0].remaining_pct == 15
+
+
 @pytest.fixture
 def service(db_uri):
     return AgentQuotaService(

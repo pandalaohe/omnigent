@@ -11,7 +11,12 @@ from pydantic import BaseModel, ConfigDict, StrictStr, ValidationError
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider, UnifiedAuthProvider
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._content_type import require_json_content_type
-from omnigent.server.session_choice import ChoiceRevisionConflict
+from omnigent.server.session_choice import (
+    ChoiceRevisionConflict,
+    SessionChoice,
+    parse_session_choice,
+    state_for,
+)
 from omnigent.server.user_preferences_store import (
     SqlAlchemyUserPreferencesStore,
     UserPreferencesUserNotFoundError,
@@ -47,13 +52,20 @@ def create_session_choice_router(
             isinstance(auth_provider, UnifiedAuthProvider) and auth_provider._source == "accounts"
         )
         try:
-            return await asyncio.to_thread(
+            result = await asyncio.to_thread(
                 preferences().replace_session_choice,
                 owner,
                 body.settings,
                 body.expected_revision,
                 create_if_missing=not accounts_mode,
             )
+            state_for(request.app).saved(
+                owner,
+                parse_session_choice(result["settings"])
+                if result["settings"]
+                else SessionChoice(),
+            )
+            return result
         except ChoiceRevisionConflict as exc:
             raise HTTPException(409, str(exc)) from exc
         except (ValidationError, UserPreferencesValidationError) as exc:

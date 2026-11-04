@@ -666,6 +666,54 @@ class AgentQuotaService:
             },
         )
 
+    def pool_readings(
+        self, context: QuotaContext, *, now: float | None = None
+    ) -> dict[str, UsageAccountView]:
+        """Read the same tiles as the board, including reset data for selection."""
+        now = time.time() if now is None else now
+        if self.usage_enabled:
+            return {tile.id: tile for tile in self.overview(context.owner_id, now=now).accounts}
+        tiers, quotas = self.quotas(context, now=now)
+        settings = read_collab_settings(self.preferences, context.owner_id)
+        workspace = current_workspace_id()
+        with self._lock:
+            snapshots = {
+                product: max(
+                    (
+                        record
+                        for (ws, owner, host, item), record in self._snapshots.items()
+                        if ws == workspace
+                        and owner == context.owner_id
+                        and host in {None, context.host_id}
+                        and item == product
+                    ),
+                    key=lambda record: record["captured_at"],
+                    default=None,
+                )
+                for product in quotas
+            }
+        result = {}
+        for product, snapshot in snapshots.items():
+            if snapshot is not None:
+                record = {
+                    "read_at": snapshot["captured_at"],
+                    "fresh_until": snapshot.get("fresh_until"),
+                    "last_attempt_status": "available",
+                    "pinned_window": snapshot.get("pinned_period"),
+                }
+                result[product] = self._account_view(
+                    account_id=product,
+                    kind="native",
+                    record=record,
+                    windows=_native_windows(snapshot, product),
+                    tiers=tiers,
+                    settings=settings,
+                    now=now,
+                    product=product,
+                    display_name=product,
+                )
+        return result
+
     def _native_account(
         self,
         product: str,
