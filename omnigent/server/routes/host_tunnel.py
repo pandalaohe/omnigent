@@ -1012,13 +1012,19 @@ async def _receive_loop(
 
         if isinstance(frame, HostClaudeUsageFrame):
             if agent_quota_service is not None:
-                agent_quota_service.report_account(
-                    conn.owner or RESERVED_USER_LOCAL,
-                    "claude",
-                    UsageReport.model_validate(frame.claude_usage).model_copy(
-                        update={"product": "claude", "host_id": host_id}
-                    ),
+                from omnigent.server.agent_quota import UsageAccountLimitError
+
+                # Stamped on receipt: the host clock never decides report order.
+                report = UsageReport.model_validate(frame.claude_usage).model_copy(
+                    update={"product": "claude", "host_id": host_id, "observed_at": time.time()}
                 )
+                try:
+                    agent_quota_service.report_account(
+                        conn.owner or RESERVED_USER_LOCAL, "claude", report
+                    )
+                except UsageAccountLimitError:
+                    # The owner is at the account cap; a full cap must not drop the tunnel.
+                    _logger.warning("Claude usage report dropped: usage account cap reached")
             continue
 
         if isinstance(frame, HostStartupClaimFrame):

@@ -67,7 +67,7 @@ async def test_host_publishes_an_available_reading_and_stays_silent_otherwise(
     monkeypatch: pytest.MonkeyPatch,
 ):
     available = usage_limits.normalize_claude_usage("default", CLAUDE_USAGE, OBSERVED)
-    stale = available.model_copy(update={"status": "stale"})
+    stale = available.model_copy(update={"status": "stale", "windows": available.windows[:1]})
     readings = iter([[stale], [available]])
 
     async def _read(providers: tuple[str, ...]) -> list[AccountUsage]:
@@ -85,7 +85,7 @@ async def test_host_publishes_an_available_reading_and_stays_silent_otherwise(
     assert len(ws.sent) == 1
     frame = decode_host_frame(ws.sent[0])
     assert isinstance(frame, HostClaudeUsageFrame)
-    assert frame.claude_usage["windows"][0]["id"] == "5h"
+    assert [w["id"] for w in frame.claude_usage["windows"]] == ["5h", "w", "Fable"]
     _cleanup_host(host)
 
 

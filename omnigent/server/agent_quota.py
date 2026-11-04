@@ -779,7 +779,8 @@ class AgentQuotaService:
                 )[0],
             )
             for native_host, _, native_record in sorted(
-                native_records, key=lambda entry: entry[0] or ""
+                (entry for entry in native_records if entry[0] != host_id),
+                key=lambda entry: entry[0] or "",
             )
         )
         return view
