@@ -2394,11 +2394,11 @@ describe("NewChatLandingScreen create flow", () => {
     await waitForWorkspaceSeed();
     openAgentModels("ag_agy");
     fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Claude Sonnet" }));
-    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "High" }));
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-high"));
     fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "GPT OSS" }));
-    expect(screen.queryByRole("menuitemcheckbox", { name: "High" })).toBeNull();
-    expect(screen.queryByRole("menuitemcheckbox", { name: "Low" })).toBeNull();
-    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Medium" }));
+    expect(screen.queryByTestId("new-chat-landing-agent-effort-high")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-agent-effort-low")).toBeNull();
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-medium"));
     fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
@@ -2528,7 +2528,7 @@ describe("NewChatLandingScreen create flow", () => {
     // Model and effort selections apply directly from the Edit submenu.
     openAgentModels("ag_native");
     fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Opus" }));
-    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "High" }));
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-high"));
     fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
@@ -2639,7 +2639,7 @@ describe("NewChatLandingScreen create flow", () => {
       "true",
     );
     expect(screen.getByTestId("new-chat-landing-agent-effort-high")).toHaveAttribute(
-      "aria-checked",
+      "aria-pressed",
       "true",
     );
 

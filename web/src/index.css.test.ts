@@ -247,7 +247,17 @@ describe("palette-aware surface composition", () => {
     expect(lightTokens).toContain("--primary-cta-foreground: #fff");
     expect(darkTokens).toContain("--primary-cta: #e8ecf0");
     expect(darkTokens).toContain("--primary-cta-foreground: #11171c");
-    expect(generatedPaletteCssSource).not.toContain("--primary-cta");
+    const paletteCtaColors = [
+      ...generatedPaletteCssSource.matchAll(/--primary-cta: ([^;]+);/g),
+    ].map((match) => match[1]);
+    expect(new Set(paletteCtaColors)).toEqual(
+      new Set([
+        "#11171c",
+        "#e8ecf0",
+        "var(--custom-light-primary-cta)",
+        "var(--custom-dark-primary-cta)",
+      ]),
+    );
   });
 
   it("keeps menu surfaces white in light mode", () => {

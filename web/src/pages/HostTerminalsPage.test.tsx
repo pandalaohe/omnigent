@@ -11,7 +11,7 @@ import { HostTerminalsPage } from "./HostTerminalsPage";
 const mocks = vi.hoisted(() => ({ hosts: [] as Host[], admin: true, mobile: false }));
 vi.mock("@/hooks/useHosts", () => ({ useHosts: () => ({ data: mocks.hosts }) }));
 vi.mock("@/hooks/useIsAdmin", () => ({ useIsAdmin: () => mocks.admin }));
-vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: () => mocks.mobile }));
+vi.mock("@/hooks/useIsPhone", () => ({ useIsPhone: () => mocks.mobile }));
 vi.mock("@/lib/identity", async (original) => ({
   ...(await original<typeof Identity>()),
   authenticatedFetch: vi.fn(),

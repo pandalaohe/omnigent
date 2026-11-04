@@ -182,7 +182,7 @@ it("keeps cell views, input, permissions and shortcut targets independent", asyn
   const second = screen.getByRole("region", { name: "second" });
   expect(screen.getByTestId("workspace-first")).toHaveAttribute("data-terminal", "");
   fireEvent.change(within(first).getByLabelText("Message"), { target: { value: "Keep draft" } });
-  fireEvent.click(within(first).getByRole("button", { name: "Terminal view" }));
+  fireEvent.click(within(first).getByRole("radio", { name: "Terminal view" }));
   const terminal = await within(first).findByLabelText("Terminal input");
   expect(terminal).toHaveAttribute("data-active", "true");
   expect(terminal).not.toHaveAttribute("readonly");
@@ -196,9 +196,9 @@ it("keeps cell views, input, permissions and shortcut targets independent", asyn
   fireEvent.keyDown(window, { code: "Backslash", ctrlKey: true, altKey: true });
   expect(within(second).getByLabelText("Message")).toBeVisible();
   expect(terminal).toBeVisible();
-  fireEvent.click(within(first).getByRole("button", { name: "Chat view" }));
+  fireEvent.click(within(first).getByRole("radio", { name: "Chat view" }));
   expect(within(first).getByLabelText("Message")).toHaveValue("Keep draft");
-  fireEvent.click(within(first).getByRole("button", { name: "Terminal view" }));
+  fireEvent.click(within(first).getByRole("radio", { name: "Terminal view" }));
   expect(within(first).getByLabelText("Terminal input")).toBe(terminal);
   fixture.permissionLevel = 2;
   rendered.rerender(tree(splitGrid("second", "second", "first", "right")!));
@@ -232,7 +232,7 @@ it("cycles keyboard focus through cells and toggles the grid workspace from the 
   );
   const cell = (name: string) => screen.getByRole("region", { name: new RegExp(`^${name}`) });
   // Clicking the switch also selects the third cell, so cycling starts there.
-  fireEvent.click(within(cell("third")).getByRole("button", { name: "Terminal view" }));
+  fireEvent.click(within(cell("third")).getByRole("radio", { name: "Terminal view" }));
   const next = () =>
     fireEvent.keyDown(window, {
       code: "BracketRight",
