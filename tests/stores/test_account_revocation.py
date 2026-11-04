@@ -269,6 +269,7 @@ def test_failed_session_revocation_rolls_back_password_and_work(db_uri: str) -> 
 def test_username_reuse_does_not_inherit_connections_projects_or_spending(db_uri: str) -> None:
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
     from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+    from omnigent.stores.usage_hours_store import UsageHoursStore, hours_of
     from tests.server.test_credential_store import _store
 
     accounts = SqlAlchemyAccountStore(db_uri)
@@ -279,6 +280,10 @@ def test_username_reuse_does_not_inherit_connections_projects_or_spending(db_uri
     costs.add_daily_cost("alice", "2026-09-18", 10.0)
     costs.set_daily_ask_approved("alice", "2026-09-18", 5.0)
     costs.add_daily_cost("other", "2026-09-18", 3.0)
+    hours = UsageHoursStore(db_uri)
+    hour = hours_of(1_800_000_000)
+    hours.add_turn("alice", "native:codex", hour, "m", "h", "metered", True, 10, 0, 0, 1, 11, 0.1)
+    hours.add_turn("other", "native:codex", hour, "m", "h", "metered", True, 10, 0, 0, 1, 11, 0.2)
     project = projects.create(uuid.uuid4().hex, "private", "alice")
     projects.save_order([project.id], user_id="alice")
     credentials.upsert("alice", "github", secret={"access_token": "local-fake-token"}, metadata={})
@@ -289,6 +294,10 @@ def test_username_reuse_does_not_inherit_connections_projects_or_spending(db_uri
         "ask_approved_usd": 0.0,
     }
     assert costs.get_daily_cost("other", "2026-09-18") == 3.0
+    # The hourly usage rows follow the same rule: a re-registered name starts
+    # with no history, and another account's rows stay.
+    assert hours.read("alice", hour, hour + 3600) == []
+    assert len(hours.read("other", hour, hour + 3600)) == 1
     assert projects.list(user_id="alice") == []
     assert projects.get_order(user_id="alice") is None
     assert credentials.get("alice", "github", with_secret=True) is None

@@ -1994,6 +1994,11 @@ def create_app(
     from omnigent.server.agent_quota import AgentQuotaService
     from omnigent.server.routes.agent_quota import create_agent_quota_router
     from omnigent.server.server_config import usage_enabled as usage_module_enabled
+    from omnigent.stores.usage_hours_store import (
+        UsageHoursRecorder,
+        UsageHoursStore,
+        configure_usage_hours,
+    )
     from omnigent.stores.usage_snapshot_store import UsageSnapshotStore
 
     agent_quota_service = AgentQuotaService(
@@ -2004,6 +2009,26 @@ def create_app(
         host_store,
         UsageSnapshotStore(conversation_store.storage_location),
         usage_enabled=usage_module_enabled(resolved_server_config),
+    )
+
+    def _host_login_kind(host_id: str, agent_key: str | None) -> str | None:
+        """The login kind a live host reported for one agent, if any."""
+        if not agent_key:
+            return None
+        conn = host_registry.get(host_id)
+        accounts = conn.hello.harness_accounts if conn is not None else None
+        account = accounts.get(agent_key) if accounts else None
+        if not isinstance(account, dict):
+            return None
+        kind = account.get("kind")
+        return kind if isinstance(kind, str) else None
+
+    configure_usage_hours(
+        UsageHoursRecorder(
+            UsageHoursStore(conversation_store.storage_location),
+            enabled=usage_module_enabled(resolved_server_config),
+            login_kind=_host_login_kind,
+        )
     )
     from omnigent.server.standing_approval import StandingApprovalService
 

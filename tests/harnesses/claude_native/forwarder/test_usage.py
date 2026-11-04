@@ -946,6 +946,128 @@ def test_transcript_cost_size_cached_ignores_partial_appended_line(
     assert completed is not None and completed > stable
 
 
+def test_transcript_tokens_by_model_counts_each_response_once(tmp_path: Path) -> None:
+    """Per-model token totals dedupe repeated records and skip sidechains."""
+    path = tmp_path / "t.jsonl"
+    repeated = _cost_transcript_entry(input_tokens=100, output_tokens=10, request_id="req_A")
+    _append_cost_transcript(
+        path,
+        [
+            repeated,
+            # Claude repeats a response's usage across records; the ledger keys
+            # them by response identity so it is counted once.
+            repeated,
+            _cost_transcript_entry(
+                input_tokens=7, output_tokens=3, request_id="req_B", model="other-model"
+            ),
+            {
+                "isSidechain": True,
+                "message": {
+                    "role": "assistant",
+                    "model": "sub-model",
+                    "usage": {"input_tokens": 999, "output_tokens": 0},
+                },
+                "requestId": "req_side",
+            },
+        ],
+    )
+
+    totals = forwarder._transcript_tokens_by_model_cached(path, include_sidechains=False, cache={})
+    assert totals == {
+        "m": {
+            "input_tokens": 100,
+            "cached_tokens": 0,
+            "cache_write_tokens": 0,
+            "output_tokens": 10,
+            "total_tokens": 110,
+        },
+        "other-model": {
+            "input_tokens": 7,
+            "cached_tokens": 0,
+            "cache_write_tokens": 0,
+            "output_tokens": 3,
+            "total_tokens": 10,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_forward_session_cost_posts_cumulative_tokens_by_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The cost post also carries the parent's and sub-agents' tokens per model."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    parent = tmp_path / "sess.jsonl"
+    _append_cost_transcript(
+        parent,
+        [_cost_transcript_entry(input_tokens=100, output_tokens=10, request_id="req_A")],
+    )
+    # Claude Code keeps sub-agent transcripts beside the parent's stem.
+    subagents_dir = tmp_path / "sess" / "subagents"
+    subagents_dir.mkdir(parents=True)
+    _append_cost_transcript(
+        subagents_dir / "agent-aaa.jsonl",
+        [
+            _cost_transcript_entry(
+                input_tokens=40, output_tokens=4, request_id="req_S", model="sub-model"
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        forwarder,
+        "read_claude_context_state",
+        lambda _bridge: {"total_cost_usd": 0.5, "model": "m"},
+    )
+    monkeypatch.setattr(forwarder, "_session_cost_estimate", lambda **_kwargs: 0.5)
+
+    posted: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body.get("type") == "external_session_usage":
+            posted.append(body["data"])
+        return httpx.Response(200, json={})
+
+    subagent_state = forwarder.SubagentForwardState(
+        subagents={
+            "aaa": forwarder.SubagentEntry(subagent_id="aaa", child_conversation_id="conv_child")
+        }
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        await forwarder._forward_session_cost(
+            client=client,
+            session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            parent_transcript_path=parent,
+            subagent_state=subagent_state,
+            dedupe=forwarder._ForwardDedupeState(),
+            cost_cache={},
+        )
+
+    [data] = posted
+    assert data["cumulative_cost_usd"] == pytest.approx(0.5)
+    assert data["model"] == "m"
+    assert data["cumulative_tokens_by_model"] == {
+        "m": {
+            "input_tokens": 100,
+            "cached_tokens": 0,
+            "cache_write_tokens": 0,
+            "output_tokens": 10,
+            "total_tokens": 110,
+        },
+        "sub-model": {
+            "input_tokens": 40,
+            "cached_tokens": 0,
+            "cache_write_tokens": 0,
+            "output_tokens": 4,
+            "total_tokens": 44,
+        },
+    }
+
+
 def test_transcript_cost_size_cached_reparses_rewritten_prefix(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

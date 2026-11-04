@@ -34,6 +34,7 @@ from omnigent.db.db_models import (
     SqlProject,
     SqlScheduledTask,
     SqlSessionPermission,
+    SqlUsageHour,
     SqlUser,
     SqlUserDailyCost,
     current_workspace_id,
@@ -85,6 +86,14 @@ def _revoke_durable_authority(session: Session, user_id: str, *, now: int) -> No
         delete(SqlUserDailyCost).where(
             SqlUserDailyCost.workspace_id == workspace_id,
             SqlUserDailyCost.user_id == user_id,
+        )
+    )
+    # The hourly usage rows are this user's alone; nothing else reads them and
+    # a re-registered account must not inherit the old one's hours.
+    session.execute(
+        delete(SqlUsageHour).where(
+            SqlUsageHour.workspace_id == workspace_id,
+            SqlUsageHour.owner_id == user_id,
         )
     )
     session.execute(
