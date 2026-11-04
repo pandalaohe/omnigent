@@ -37,6 +37,7 @@ from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.host.frames import (
     CAP_HARNESS_ACCOUNTS,
     IMPORT_SESSION_MAX_CONNECTION_REASSEMBLED_CHARS,
+    HostClaudeUsageFrame,
     HostCodexRateLimitsFrame,
     HostConnectionErrorFrame,
     HostContextInventoryV2ResultFrame,
@@ -104,6 +105,7 @@ from omnigent.server.tunnel_handshake import receive_tunnel_hello
 from omnigent.stores import ConversationStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.session_startup_store import SessionStartupStore
+from omnigent.usage.contract import UsageReport
 
 if TYPE_CHECKING:
     from omnigent.server.agent_quota import AgentQuotaService
@@ -1005,6 +1007,17 @@ async def _receive_loop(
                     host_id,
                     "codex",
                     frame.codex_rate_limits,
+                )
+            continue
+
+        if isinstance(frame, HostClaudeUsageFrame):
+            if agent_quota_service is not None:
+                agent_quota_service.report_account(
+                    conn.owner or RESERVED_USER_LOCAL,
+                    "claude",
+                    UsageReport.model_validate(frame.claude_usage).model_copy(
+                        update={"product": "claude", "host_id": host_id}
+                    ),
                 )
             continue
 

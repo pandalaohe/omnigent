@@ -21,6 +21,7 @@ from omnigent.host.frames import (
     CAP_HARNESS_LOGIN,
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostClaudeUsageFrame,
     HostCodexRateLimitsFrame,
     HostHelloFrame,
     HostLaunchRunnerResultFrame,
@@ -370,6 +371,44 @@ async def test_codex_reading_outlives_disconnect_for_display_only(db_uri: str) -
         item for item in service.overview(RESERVED_USER_LOCAL).accounts if item.id == "codex"
     )
     assert codex.windows[0].percent_used == 25
+
+
+async def test_claude_usage_frame_becomes_a_host_tagged_claude_reading(db_uri: str) -> None:
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+    service = AgentQuotaService(conversation_store, None, None, None, HostStore(db_uri))
+    app, registry, _hs, _cs = _build_host_api_app(db_uri, agent_quota_service=service)
+    comm = await _connect_host(app, registry)
+    report = {
+        "schema_version": 1,
+        "observed_at": time.time(),
+        "status": "available",
+        "windows": [
+            {
+                "id": "w",
+                "kind": "weekly",
+                "label": "Weekly",
+                "percent_used": 53.0,
+                "window_minutes": 10_080,
+                "resets_at": time.time() + 86_400,
+            }
+        ],
+    }
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(HostClaudeUsageFrame(claude_usage=report)),
+        }
+    )
+    for _ in range(50):
+        claude = next(
+            (a for a in service.overview(RESERVED_USER_LOCAL).accounts if a.id == "claude"), None
+        )
+        if claude is not None and claude.windows:
+            break
+        await asyncio.sleep(0.01)
+    assert claude is not None
+    assert claude.windows[0].percent_used == 53.0
+    assert [host.host_id for host in claude.hosts] == [_HOST_ID]
 
 
 async def test_list_hosts_reports_sandbox_provider_for_managed_host(

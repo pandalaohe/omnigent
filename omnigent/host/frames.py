@@ -50,6 +50,7 @@ from omnigent.startup_protocol import (
     UnresolvedContextV2,
     host_context_scope_v2,
 )
+from omnigent.usage.contract import UsageReport
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 
@@ -191,6 +192,7 @@ class HostFrameKind(str, Enum):
     CONNECTION_ERROR = "host.connection_error"
     HARNESS_READINESS = "host.harness_readiness"
     CODEX_RATE_LIMITS = "host.codex_rate_limits"
+    CLAUDE_USAGE = "host.claude_usage"
     LAUNCH_RUNNER = "host.launch_runner"
     LAUNCH_RUNNER_RESULT = "host.launch_runner_result"
     STARTUP_CLAIM = "host.startup_claim"
@@ -401,6 +403,13 @@ class HostCodexRateLimitsFrame:
     """Host's latest sanitized Codex subscription rate-limit snapshot."""
 
     codex_rate_limits: _JsonObject | None
+
+
+@dataclass
+class HostClaudeUsageFrame:
+    """Host's latest Claude plan-usage report, read without a session (opt-in)."""
+
+    claude_usage: _JsonObject
 
 
 @dataclass
@@ -1947,6 +1956,7 @@ HostFrame = (
     | HostConnectionErrorFrame
     | HostHarnessReadinessFrame
     | HostCodexRateLimitsFrame
+    | HostClaudeUsageFrame
     | HostLaunchRunnerFrame
     | HostLaunchRunnerResultFrame
     | HostStartupClaimFrame
@@ -2120,6 +2130,13 @@ def encode_host_frame(frame: HostFrame) -> str:
             {
                 "kind": HostFrameKind.CODEX_RATE_LIMITS.value,
                 "codex_rate_limits": frame.codex_rate_limits,
+            }
+        )
+    if isinstance(frame, HostClaudeUsageFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.CLAUDE_USAGE.value,
+                "claude_usage": frame.claude_usage,
             }
         )
     if isinstance(frame, HostLaunchRunnerFrame):
@@ -3313,6 +3330,11 @@ def _decode_known_host_frame(
             return HostCodexRateLimitsFrame(
                 codex_rate_limits=validate_codex_rate_limits_snapshot(msg.get("codex_rate_limits"))
             )
+        case HostFrameKind.CLAUDE_USAGE:
+            report = msg.get("claude_usage")
+            if not isinstance(report, dict):
+                raise ValueError("claude usage frame requires a report object")
+            return HostClaudeUsageFrame(claude_usage=UsageReport.model_validate(report).stored())
         case HostFrameKind.LAUNCH_RUNNER:
             return _decode_launch_runner(msg)
         case HostFrameKind.LAUNCH_RUNNER_RESULT:
