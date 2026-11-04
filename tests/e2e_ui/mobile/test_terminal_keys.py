@@ -370,7 +370,7 @@ def test_mobile_terminal_keys_byte_delivery_app_cursor_and_gestures(
         before_swipe_lines = len(_lines(normal_log))
         _swipe_pager(pager, 80)
         expect(bar).to_have_attribute("data-page", "0")
-        page.wait_for_timeout(120)
+        page.wait_for_timeout(120)  # custom-lint: disable=sleep-then-assert -- quiet window
         assert len(_lines(normal_log)) == before_swipe_lines, "Pager swipe must not emit key bytes"
 
         # Drag >= 10px on a soft key cancels the press without emitting bytes.
@@ -414,7 +414,7 @@ def test_mobile_terminal_keys_byte_delivery_app_cursor_and_gestures(
                 "bubbles": True,
             },
         )
-        page.wait_for_timeout(150)
+        page.wait_for_timeout(150)  # custom-lint: disable=sleep-then-assert -- quiet window
         assert len(_lines(normal_log)) == before_drag_lines, (
             "Cancelled drag must not emit key bytes"
         )
