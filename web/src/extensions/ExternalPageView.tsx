@@ -1,7 +1,18 @@
+import { useEffect, useRef } from "react";
 import { withBasePath } from "@/lib/basePath";
+import { EXTENSION_RPC_SOURCE } from "./rpc/protocol";
 import type { ExtensionExternalPage } from "./types";
 
-export function ExternalPageView({ page }: { page: ExtensionExternalPage }) {
+type OpenSessionMethod = (params: unknown, signal: AbortSignal) => unknown;
+
+export function ExternalPageView({
+  page,
+  openSession,
+}: {
+  page: ExtensionExternalPage;
+  openSession?: OpenSessionMethod;
+}) {
+  const iframeRef = useRef<HTMLIFrameElement>(null);
   const proxied = page.kind === "proxied";
   const navigationUrl = proxied ? withBasePath(page.url) : page.url;
   const validProxyPath =
@@ -21,6 +32,37 @@ export function ExternalPageView({ page }: { page: ExtensionExternalPage }) {
       : !proxied && url.origin === window.location.origin
         ? "External pages cannot use the application's own origin."
         : null;
+
+  useEffect(() => {
+    if (!proxied || error || !openSession) return;
+    const onMessage = (event: MessageEvent<unknown>) => {
+      const frameWindow = iframeRef.current?.contentWindow;
+      if (
+        !frameWindow ||
+        event.source !== frameWindow ||
+        event.origin !== window.location.origin ||
+        navigator.userActivation?.isActive !== true
+      ) {
+        return;
+      }
+      if (!event.data || typeof event.data !== "object" || Array.isArray(event.data)) return;
+      const request = event.data as Record<string, unknown>;
+      if (
+        request.source !== EXTENSION_RPC_SOURCE ||
+        request.type !== "request" ||
+        request.method !== "navigation.openSession"
+      ) {
+        return;
+      }
+      const params = request.params;
+      if (!params || typeof params !== "object" || Array.isArray(params)) return;
+      const sessionId = (params as Record<string, unknown>).sessionId;
+      if (typeof sessionId !== "string" || !sessionId || sessionId.length > 256) return;
+      openSession(params, new AbortController().signal);
+    };
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, [error, openSession, proxied]);
 
   if (error) {
     return (
@@ -65,6 +107,7 @@ export function ExternalPageView({ page }: { page: ExtensionExternalPage }) {
         </div>
       ) : (
         <iframe
+          ref={iframeRef}
           title={page.title}
           src={navigationUrl}
           // Proxied pages require an explicit operator-trusted server capability.
