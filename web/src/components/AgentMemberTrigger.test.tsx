@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { AgentMemberTrigger } from "./AgentMemberTrigger";
@@ -52,6 +52,30 @@ describe("AgentMemberTrigger", () => {
       expect(mark.compareDocumentPosition(img!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     },
   );
+
+  it("opens a section as a page at phone width instead of a flyout", async () => {
+    const originalMatchMedia = window.matchMedia;
+    window.matchMedia = ((query: string) => ({
+      ...originalMatchMedia(query),
+      matches: query.includes("max-width"),
+    })) as typeof window.matchMedia;
+    try {
+      renderTrigger("claude-native");
+      fireEvent.keyDown(screen.getByTestId("agent-member-trigger"), { key: "ArrowDown" });
+      fireEvent.click(screen.getByTestId("agent-member-effort"));
+
+      const menu = await screen.findByTestId("agent-member-menu");
+      expect(within(menu).getByTestId("agent-member-efforts")).toBeVisible();
+      expect(screen.getAllByRole("menu")).toHaveLength(1);
+      expect(menu).toHaveClass("w-[calc(100vw-1.5rem)]");
+
+      fireEvent.click(screen.getByTestId("agent-member-config-back"));
+      expect(screen.queryByTestId("agent-member-efforts")).toBeNull();
+      expect(screen.getByTestId("agent-member-effort")).toBeVisible();
+    } finally {
+      window.matchMedia = originalMatchMedia;
+    }
+  });
 
   it("leaves a native harness without the SDK mark", () => {
     renderTrigger("claude-native");

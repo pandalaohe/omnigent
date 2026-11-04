@@ -1741,7 +1741,7 @@ describe("model picker hotkey", () => {
     fireEvent.keyDown(input, { code: "KeyE", ctrlKey: true, altKey: true });
     expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveTextContent("Medium");
     expect(await screen.findByTestId("new-chat-landing-agent-effort-medium")).toHaveAttribute(
-      "aria-checked",
+      "aria-pressed",
       "true",
     );
     expect(input).toHaveFocus();
@@ -1917,7 +1917,13 @@ function pickPrimaryOption(section: "model" | "effort", label: string): void {
     section === "effort"
       ? screen.getByTestId("new-chat-landing-agent-efforts")
       : screen.getByTestId("new-chat-landing-agent-models").closest<HTMLElement>('[role="menu"]')!;
-  fireEvent.click(within(scope).getByRole("menuitemcheckbox", { name: label }));
+  fireEvent.click(
+    section === "effort"
+      ? within(scope).getByRole("button", {
+          name: (name) => name.endsWith(`: ${label}`),
+        })
+      : within(scope).getByRole("menuitemcheckbox", { name: label }),
+  );
 }
 function selectedPickerModel(): HTMLElement {
   return screen
@@ -1925,10 +1931,7 @@ function selectedPickerModel(): HTMLElement {
     .find((item) => item.dataset.testid?.startsWith("new-chat-landing-agent-model-"))!;
 }
 function selectedPickerEffort(): HTMLElement {
-  return within(screen.getByTestId("new-chat-landing-agent-efforts")).getByRole(
-    "menuitemcheckbox",
-    { checked: true },
-  );
+  return within(screen.getByTestId("new-chat-landing-agent-efforts")).getByRole("menuitem");
 }
 function closePrimaryPicker(): void {
   fireEvent.keyDown(
@@ -5273,13 +5276,18 @@ describe("NewChatLandingScreen", () => {
     const menus = screen.getAllByRole("menu");
     expect(menus).toHaveLength(2);
     expect(menus[0]).toBe(rootMenu);
-    expect(menus[1]).toHaveClass("w-[13.75rem]", "composer-agent-config-menu");
+    expect(menus[1]).toHaveClass(
+      "w-[13.75rem]",
+      "max-md:w-[calc(100vw-1.5rem)]",
+      "composer-agent-config-menu",
+    );
     expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent("Opus 4.8");
     expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent("Sonnet 4.6");
     expect(screen.getByTestId("new-chat-landing-agent-models").textContent).not.toContain("`");
-    expect(screen.getByTestId("new-chat-landing-agent-efforts")).toHaveTextContent("High");
+    expect(screen.getByTestId("new-chat-landing-agent-effort-high")).toBeVisible();
 
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-high"));
+    expect(screen.getByTestId("new-chat-landing-agent-efforts")).toHaveTextContent("Effort: High");
     expect(screen.getByTestId("new-chat-landing-agent-config-value")).toHaveTextContent(
       "Opus 4.8High",
     );
@@ -5430,10 +5438,13 @@ describe("NewChatLandingScreen", () => {
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-high"));
     expect(screen.getAllByRole("menu")).toHaveLength(2);
     expect(screen.getByTestId("new-chat-landing-agent-effort-high")).toHaveAttribute(
-      "aria-checked",
+      "aria-pressed",
       "true",
     );
     expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveTextContent("High");
+    const glyph = screen.getByRole("img", { name: "Effort: High" });
+    expect(glyph.querySelectorAll(".bg-companion")).toHaveLength(3);
+    expect(screen.getByTestId("new-chat-landing-agent-config-value")).not.toContainElement(glyph);
     const summary = screen.getByTestId("new-chat-landing-agent-summary-a2");
     expect(summary).toHaveTextContent("High");
     expect(summary).toHaveClass("flex-1", "truncate");
@@ -5443,7 +5454,7 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("new-chat-landing-agent-effort-low")).toBeNull();
     expect(screen.getByTestId("new-chat-landing-agent-effort-xhigh")).toBeTruthy();
     expect(screen.getByTestId("new-chat-landing-agent-effort-high")).toHaveAttribute(
-      "aria-checked",
+      "aria-pressed",
       "true",
     );
     closeMenu();
@@ -5464,10 +5475,7 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveTextContent("xHigh");
     expect(screen.getByTestId("new-chat-landing-agent-summary-a2")).toHaveTextContent("xHigh");
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-databricks-gpt-5-5"));
-    expect(screen.getByTestId("new-chat-landing-agent-effort-default")).toHaveAttribute(
-      "aria-checked",
-      "true",
-    );
+    expect(screen.getByTestId("new-chat-landing-agent-efforts")).toHaveTextContent("Default");
     expect(screen.queryByTestId("new-chat-landing-agent-effort-value")).toBeNull();
     closeMenu();
     selectAgent("a1");
@@ -7612,10 +7620,10 @@ describe("NewChatLandingScreen", () => {
     openAgentModels("a2");
     // With no model pinned, the row lists the catalog default's (GPT-5.5)
     // ladder — raw Codex ids, never another model's rungs.
-    expect(screen.getByRole("menuitemcheckbox", { name: "Low" })).toBeTruthy();
-    expect(screen.getByRole("menuitemcheckbox", { name: "Medium" })).toBeTruthy();
-    expect(screen.queryByRole("menuitemcheckbox", { name: "xHigh" })).toBeNull();
-    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "High" }));
+    expect(screen.getByTestId("new-chat-landing-agent-effort-low")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-agent-effort-medium")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-agent-effort-xhigh")).toBeNull();
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-high"));
     expect(selectedPickerEffort().textContent).toContain("High");
     closePrimaryPicker();
 
@@ -7641,8 +7649,8 @@ describe("NewChatLandingScreen", () => {
     // Pin GPT-5.6: the Effort row follows the DRAFTED model, so its ladder
     // swaps in (xhigh appears, low disappears).
     pickPrimaryOption("model", "GPT-5.6");
-    expect(screen.queryByRole("menuitemcheckbox", { name: "Low" })).toBeNull();
-    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "xHigh" }));
+    expect(screen.queryByTestId("new-chat-landing-agent-effort-low")).toBeNull();
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-xhigh"));
     expect(selectedPickerEffort().textContent).toContain("xHigh");
     // Back to GPT-5.5, whose ladder has no xhigh: the stale rung
     // resets so Save can't commit a level the model rejects.
@@ -12103,10 +12111,12 @@ describe("NewChatLandingScreen smart routing", () => {
     expect(selectedPickerEffort()).toHaveTextContent("High");
     pickPrimaryOption("model", "Smart Routing");
     const effortChoices = () =>
-      within(screen.getByTestId("new-chat-landing-agent-efforts")).getAllByRole("menuitemcheckbox");
+      within(screen.getByTestId("new-chat-landing-agent-efforts"))
+        .getAllByRole("button")
+        .filter((option) => option.hasAttribute("data-effort-level"));
     for (const option of effortChoices()) {
-      expect(option).toHaveAttribute("data-disabled");
-      expect(option).toHaveAttribute("aria-checked", "false");
+      expect(option).toBeDisabled();
+      expect(option).toHaveAttribute("aria-pressed", "false");
     }
 
     // Unchecking lands on the harness default with the effort row usable again.
@@ -13423,10 +13433,7 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-codex-default"));
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-ultra"));
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-codex-light"));
-    expect(screen.getByTestId("new-chat-landing-agent-effort-default")).toHaveAttribute(
-      "data-state",
-      "checked",
-    );
+    expect(screen.getByTestId("new-chat-landing-agent-efforts")).toHaveTextContent("Default");
     expect(screen.queryByTestId("new-chat-landing-agent-effort-ultra")).toBeNull();
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-default"));
     expect(screen.getByTestId("new-chat-landing-agent-model-default")).toHaveAttribute(
@@ -13460,18 +13467,15 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
       "data-state",
       "checked",
     );
-    expect(screen.getByTestId("new-chat-landing-agent-effort-default")).toHaveAttribute(
-      "data-state",
-      "checked",
-    );
+    expect(screen.getByTestId("new-chat-landing-agent-efforts")).toHaveTextContent("Default");
     pickSelectOption("new-chat-landing-config-harness", "Claude SDK");
     expect(screen.getByTestId("new-chat-landing-agent-model-opus")).toHaveAttribute(
       "data-state",
       "checked",
     );
     expect(screen.getByTestId("new-chat-landing-agent-effort-max")).toHaveAttribute(
-      "data-state",
-      "checked",
+      "aria-pressed",
+      "true",
     );
     saveConfig();
     const { body } = await submitAndReadBody();

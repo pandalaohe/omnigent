@@ -1,11 +1,16 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 
 import { ComposerAgentIcon } from "@/components/composer/ComposerAgentIcon";
 import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
-import { HarnessPicker, HarnessPickerConfigRow } from "@/components/composer/HarnessPicker";
+import {
+  HarnessPicker,
+  HarnessPickerConfigPage,
+  HarnessPickerConfigRow,
+} from "@/components/composer/HarnessPicker";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { useHostModelOptions, type Host } from "@/hooks/useHosts";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import {
   SECTION_LABELS,
   SECTION_ORDER,
@@ -68,6 +73,7 @@ export function AgentMemberTrigger({
 }) {
   const [open, setOpen] = useState(false);
   const [section, setSection] = useState<Section | null>(null);
+  const isMobile = useIsMobileViewport();
   const [showUndeployed, setShowUndeployed] = useState(false);
   const [modelDraft, setModelDraft] = useState("");
   const [manualModelEntry, setManualModelEntry] = useState(false);
@@ -126,6 +132,19 @@ export function AgentMemberTrigger({
       : (modelOptions.find((option) => option.id === model)?.label ?? model);
   const effortLabel =
     effort !== null && effortLevels !== null ? normalizeEffortLabel(effort) : undefined;
+  const inheritedEffort =
+    (model === null
+      ? rows.find((option) => option.isDefault)
+      : rows.find((option) => option.id === model)
+    )?.defaultReasoningEffort ?? null;
+  const currentEffort = effort ?? inheritedEffort;
+  const effortLevel = effortLevels?.length
+    ? {
+        level: effortLevels.findIndex((level) => level === currentEffort) + 1,
+        total: effortLevels.length,
+        title: `Effort: ${effortLabel ?? "Default"}`,
+      }
+    : undefined;
   const memberHost = hosts?.find((host) => host.host_id === hostId);
   const hostLabel =
     hostId === null
@@ -174,9 +193,215 @@ export function AgentMemberTrigger({
     open: section === name,
     onOpenChange: (next: boolean) =>
       setSection((current) => (next ? name : current === name ? null : current)),
-    isMobile: false,
+    isMobile,
     disabled,
   });
+
+  const hostSectionContent =
+    hosts === undefined ? null : (
+      <ComposerConfigSections
+        extra={[
+          {
+            testId: "agent-member-hosts",
+            header: "Host",
+            choices: [
+              {
+                key: DEFAULT_ROW_KEY,
+                label: "Session host",
+                checked: hostId === null,
+                onSelect: () => selectHost(null),
+                testId: "agent-member-host-session",
+              },
+              ...hosts.map((host) => ({
+                key: host.host_id,
+                label: host.status === "online" ? host.name : `${host.name} · offline`,
+                checked: host.host_id === hostId,
+                onSelect: () => selectHost(host.host_id),
+                testId: `agent-member-host-${host.host_id}`,
+              })),
+            ],
+          },
+        ]}
+      />
+    );
+  const harnessSectionContent = (
+    <>
+      <ComposerConfigSections
+        extra={
+          visibleHarnessOptions.some((option) => "section" in option)
+            ? SECTION_ORDER.filter((group) =>
+                visibleHarnessOptions.some(
+                  (option) => "section" in option && option.section === group,
+                ),
+              ).map((group) => ({
+                testId: `agent-member-harness-options-${group}`,
+                header: SECTION_LABELS[group],
+                choices: visibleHarnessOptions
+                  .filter((option) => "section" in option && option.section === group)
+                  .map((option) => ({
+                    key: option.id,
+                    label: isUndeployed(option) ? `${option.label} · not deployed` : option.label,
+                    checked: option.id === harness,
+                    onSelect: () => selectHarness(option.id),
+                    testId: `agent-member-harness-${option.id}`,
+                  })),
+              }))
+            : [
+                {
+                  testId: "agent-member-harness-options",
+                  header: "Harness",
+                  choices: visibleHarnessOptions.map((option) => ({
+                    key: option.id,
+                    label: isUndeployed(option) ? `${option.label} · not deployed` : option.label,
+                    checked: option.id === harness,
+                    onSelect: () => selectHarness(option.id),
+                    testId: `agent-member-harness-${option.id}`,
+                  })),
+                },
+              ]
+        }
+      />
+      {hiddenUndeployedCount > 0 && (
+        <DropdownMenuItem
+          data-testid="agent-member-show-undeployed"
+          onSelect={(event) => {
+            event.preventDefault();
+            setShowUndeployed((current) => !current);
+          }}
+        >
+          {showUndeployed
+            ? `Hide ${hiddenUndeployedCount} not deployed`
+            : `Show ${hiddenUndeployedCount} not deployed`}
+        </DropdownMenuItem>
+      )}
+    </>
+  );
+  const modelSectionContent = (
+    <>
+      <ComposerConfigSections
+        models={{
+          testId: "agent-member-models",
+          header: "Models",
+          choices: [
+            {
+              key: DEFAULT_ROW_KEY,
+              label: "Default",
+              checked: model === null,
+              onSelect: () => selectModel(null),
+              testId: "agent-member-model-default",
+            },
+            ...modelOptions.map((option) => ({
+              key: option.id,
+              label: option.label,
+              checked: option.id === model,
+              onSelect: () => selectModel(option.id),
+              testId: `agent-member-model-${option.id}`,
+              data: { "data-model-id": option.id },
+            })),
+          ],
+        }}
+      />
+      {/* A harness the host can't probe for models (Cursor) or no reachable
+      host at all leaves only "Default", but Create requires a model id.
+      The manual entry is a menu item: arrow keys skip a bare input. */}
+      {manualModelEntry ? (
+        <Input
+          ref={modelInputRef}
+          aria-label="Model id"
+          placeholder="Model id…"
+          value={modelDraft}
+          onChange={(event) => setModelDraft(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              event.preventDefault();
+              event.stopPropagation();
+              commitModelDraft();
+              return;
+            }
+            // Keeps menu typeahead and arrow navigation off the field.
+            event.stopPropagation();
+          }}
+          data-testid="agent-member-model-input"
+        />
+      ) : (
+        <DropdownMenuItem
+          data-testid="agent-member-model-other"
+          onSelect={(event) => {
+            event.preventDefault();
+            setManualModelEntry(true);
+          }}
+        >
+          Other model…
+        </DropdownMenuItem>
+      )}
+    </>
+  );
+  const effortSectionContent =
+    effortLevels === null ? null : (
+      <ComposerConfigSections
+        efforts={{
+          testId: "agent-member-efforts",
+          header: "Effort",
+          level: {
+            label: "Effort",
+            inherited: inheritedEffort,
+            onUnset: () => selectEffort(null),
+            unsetTestId: "agent-member-effort-default",
+          },
+          choices: [
+            {
+              key: DEFAULT_ROW_KEY,
+              label: "Default",
+              checked: effort === null,
+              onSelect: () => selectEffort(null),
+              testId: "agent-member-effort-default",
+            },
+            ...effortLevels.map((level) => ({
+              key: level,
+              label: normalizeEffortLabel(level),
+              checked: level === effort,
+              onSelect: () => selectEffort(level),
+              testId: `agent-member-effort-${level}`,
+              data: { "data-effort-level": level },
+            })),
+          ],
+        }}
+      />
+    );
+  const speedSectionContent = (
+    <ComposerConfigSections
+      extra={[
+        {
+          testId: "agent-member-speeds",
+          header: "Speed",
+          choices: [
+            {
+              key: DEFAULT_ROW_KEY,
+              label: "Default",
+              checked: speed === null,
+              onSelect: () => selectSpeed(null),
+              testId: "agent-member-speed-default",
+            },
+            ...speedOptions.map((option) => ({
+              key: option.value,
+              label: option.label,
+              checked: option.value === speed,
+              onSelect: () => selectSpeed(option.value),
+              testId: `agent-member-speed-${option.value}`,
+            })),
+          ],
+        },
+      ]}
+    />
+  );
+
+  const sectionContent: Record<Section, ReactNode> = {
+    host: hostSectionContent,
+    harness: harnessSectionContent,
+    model: modelSectionContent,
+    effort: effortSectionContent,
+    speed: speedSectionContent,
+  };
 
   return (
     <HarnessPicker
@@ -194,6 +419,7 @@ export function AgentMemberTrigger({
         label: [harnessLabel, modelLabel, effortLabel, speedLabel].filter(Boolean).join(" · "),
         model: modelLabel,
         effort: [effortLabel, speedLabel].filter(Boolean).join(" · ") || undefined,
+        effortLevel,
         icon: <ComposerAgentIcon agent={{ name: "", harness }} sdkMarkClassName="size-[15px]" />,
         testIdPrefix: "agent-member",
         disabled,
@@ -201,228 +427,71 @@ export function AgentMemberTrigger({
       }}
       contentAlign="start"
       contentSide="bottom"
+      contentClassName={isMobile && section !== null ? "w-[calc(100vw-1.5rem)]" : undefined}
       testId="agent-member-menu"
     >
-      {hosts !== undefined && (
-        <HarnessPickerConfigRow
-          label="Host"
-          value={hostLabel}
-          testId="agent-member-host"
-          configTestId="agent-member-host-menu"
-          {...submenuProps("host")}
+      {isMobile && section !== null ? (
+        <HarnessPickerConfigPage
+          backTestId="agent-member-config-back"
+          testId={`agent-member-${section}-menu`}
+          onBack={() => setSection(null)}
         >
-          <ComposerConfigSections
-            extra={[
-              {
-                testId: "agent-member-hosts",
-                header: "Host",
-                choices: [
-                  {
-                    key: DEFAULT_ROW_KEY,
-                    label: "Session host",
-                    checked: hostId === null,
-                    onSelect: () => selectHost(null),
-                    testId: "agent-member-host-session",
-                  },
-                  ...hosts.map((host) => ({
-                    key: host.host_id,
-                    label: host.status === "online" ? host.name : `${host.name} · offline`,
-                    checked: host.host_id === hostId,
-                    onSelect: () => selectHost(host.host_id),
-                    testId: `agent-member-host-${host.host_id}`,
-                  })),
-                ],
-              },
-            ]}
-          />
-        </HarnessPickerConfigRow>
-      )}
-      <HarnessPickerConfigRow
-        label="Harness"
-        value={harnessLabel}
-        testId="agent-member-harness"
-        configTestId="agent-member-harness-menu"
-        {...submenuProps("harness")}
-      >
-        <ComposerConfigSections
-          extra={
-            visibleHarnessOptions.some((option) => "section" in option)
-              ? SECTION_ORDER.filter((group) =>
-                  visibleHarnessOptions.some(
-                    (option) => "section" in option && option.section === group,
-                  ),
-                ).map((group) => ({
-                  testId: `agent-member-harness-options-${group}`,
-                  header: SECTION_LABELS[group],
-                  choices: visibleHarnessOptions
-                    .filter((option) => "section" in option && option.section === group)
-                    .map((option) => ({
-                      key: option.id,
-                      label: isUndeployed(option) ? `${option.label} · not deployed` : option.label,
-                      checked: option.id === harness,
-                      onSelect: () => selectHarness(option.id),
-                      testId: `agent-member-harness-${option.id}`,
-                    })),
-                }))
-              : [
-                  {
-                    testId: "agent-member-harness-options",
-                    header: "Harness",
-                    choices: visibleHarnessOptions.map((option) => ({
-                      key: option.id,
-                      label: isUndeployed(option) ? `${option.label} · not deployed` : option.label,
-                      checked: option.id === harness,
-                      onSelect: () => selectHarness(option.id),
-                      testId: `agent-member-harness-${option.id}`,
-                    })),
-                  },
-                ]
-          }
-        />
-        {hiddenUndeployedCount > 0 && (
-          <DropdownMenuItem
-            data-testid="agent-member-show-undeployed"
-            onSelect={(event) => {
-              event.preventDefault();
-              setShowUndeployed((current) => !current);
-            }}
+          {sectionContent[section]}
+        </HarnessPickerConfigPage>
+      ) : (
+        <>
+          {hosts !== undefined && (
+            <HarnessPickerConfigRow
+              label="Host"
+              value={hostLabel}
+              testId="agent-member-host"
+              configTestId="agent-member-host-menu"
+              {...submenuProps("host")}
+            >
+              {hostSectionContent}
+            </HarnessPickerConfigRow>
+          )}
+          <HarnessPickerConfigRow
+            label="Harness"
+            value={harnessLabel}
+            testId="agent-member-harness"
+            configTestId="agent-member-harness-menu"
+            {...submenuProps("harness")}
           >
-            {showUndeployed
-              ? `Hide ${hiddenUndeployedCount} not deployed`
-              : `Show ${hiddenUndeployedCount} not deployed`}
-          </DropdownMenuItem>
-        )}
-      </HarnessPickerConfigRow>
-      <HarnessPickerConfigRow
-        label="Model"
-        value={modelLabel}
-        testId="agent-member-model"
-        configTestId="agent-member-model-menu"
-        {...submenuProps("model")}
-      >
-        <ComposerConfigSections
-          models={{
-            testId: "agent-member-models",
-            header: "Models",
-            choices: [
-              {
-                key: DEFAULT_ROW_KEY,
-                label: "Default",
-                checked: model === null,
-                onSelect: () => selectModel(null),
-                testId: "agent-member-model-default",
-              },
-              ...modelOptions.map((option) => ({
-                key: option.id,
-                label: option.label,
-                checked: option.id === model,
-                onSelect: () => selectModel(option.id),
-                testId: `agent-member-model-${option.id}`,
-                data: { "data-model-id": option.id },
-              })),
-            ],
-          }}
-        />
-        {/* A harness the host can't probe for models (Cursor) or no reachable
-            host at all leaves only "Default", but Create requires a model id.
-            The manual entry is a menu item: arrow keys skip a bare input. */}
-        {manualModelEntry ? (
-          <Input
-            ref={modelInputRef}
-            aria-label="Model id"
-            placeholder="Model id…"
-            value={modelDraft}
-            onChange={(event) => setModelDraft(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") {
-                event.preventDefault();
-                event.stopPropagation();
-                commitModelDraft();
-                return;
-              }
-              // Keeps menu typeahead and arrow navigation off the field.
-              event.stopPropagation();
-            }}
-            data-testid="agent-member-model-input"
-          />
-        ) : (
-          <DropdownMenuItem
-            data-testid="agent-member-model-other"
-            onSelect={(event) => {
-              event.preventDefault();
-              setManualModelEntry(true);
-            }}
+            {harnessSectionContent}
+          </HarnessPickerConfigRow>
+          <HarnessPickerConfigRow
+            label="Model"
+            value={modelLabel}
+            testId="agent-member-model"
+            configTestId="agent-member-model-menu"
+            {...submenuProps("model")}
           >
-            Other model…
-          </DropdownMenuItem>
-        )}
-      </HarnessPickerConfigRow>
-      {effortLevels !== null && (
-        <HarnessPickerConfigRow
-          label="Effort"
-          value={effort === null ? "Default" : normalizeEffortLabel(effort)}
-          testId="agent-member-effort"
-          configTestId="agent-member-effort-menu"
-          {...submenuProps("effort")}
-        >
-          <ComposerConfigSections
-            efforts={{
-              testId: "agent-member-efforts",
-              header: "Effort",
-              choices: [
-                {
-                  key: DEFAULT_ROW_KEY,
-                  label: "Default",
-                  checked: effort === null,
-                  onSelect: () => selectEffort(null),
-                  testId: "agent-member-effort-default",
-                },
-                ...effortLevels.map((level) => ({
-                  key: level,
-                  label: normalizeEffortLabel(level),
-                  checked: level === effort,
-                  onSelect: () => selectEffort(level),
-                  testId: `agent-member-effort-${level}`,
-                  data: { "data-effort-level": level },
-                })),
-              ],
-            }}
-          />
-        </HarnessPickerConfigRow>
-      )}
-      {speedOptions.length > 0 && (
-        <HarnessPickerConfigRow
-          label="Speed"
-          value={speed === null ? "Default" : (speedLabel ?? speed)}
-          testId="agent-member-speed"
-          configTestId="agent-member-speed-menu"
-          {...submenuProps("speed")}
-        >
-          <ComposerConfigSections
-            extra={[
-              {
-                testId: "agent-member-speeds",
-                header: "Speed",
-                choices: [
-                  {
-                    key: DEFAULT_ROW_KEY,
-                    label: "Default",
-                    checked: speed === null,
-                    onSelect: () => selectSpeed(null),
-                    testId: "agent-member-speed-default",
-                  },
-                  ...speedOptions.map((option) => ({
-                    key: option.value,
-                    label: option.label,
-                    checked: option.value === speed,
-                    onSelect: () => selectSpeed(option.value),
-                    testId: `agent-member-speed-${option.value}`,
-                  })),
-                ],
-              },
-            ]}
-          />
-        </HarnessPickerConfigRow>
+            {modelSectionContent}
+          </HarnessPickerConfigRow>
+          {effortLevels !== null && (
+            <HarnessPickerConfigRow
+              label="Effort"
+              value={effort === null ? "Default" : normalizeEffortLabel(effort)}
+              testId="agent-member-effort"
+              configTestId="agent-member-effort-menu"
+              {...submenuProps("effort")}
+            >
+              {effortSectionContent}
+            </HarnessPickerConfigRow>
+          )}
+          {speedOptions.length > 0 && (
+            <HarnessPickerConfigRow
+              label="Speed"
+              value={speed === null ? "Default" : (speedLabel ?? speed)}
+              testId="agent-member-speed"
+              configTestId="agent-member-speed-menu"
+              {...submenuProps("speed")}
+            >
+              {speedSectionContent}
+            </HarnessPickerConfigRow>
+          )}
+        </>
       )}
     </HarnessPicker>
   );

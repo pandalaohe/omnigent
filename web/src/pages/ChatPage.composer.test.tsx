@@ -7463,7 +7463,7 @@ describe("Composer config gear", () => {
         cycle("KeyE");
         cycle("KeyE");
         expect(screen.getByTestId("composer-agent-effort-xhigh")).toHaveAttribute(
-          "aria-checked",
+          "aria-pressed",
           "true",
         );
         expect(screen.queryByTestId("composer-agent-effort-low")).toBeNull();
@@ -7681,9 +7681,9 @@ describe("Composer config gear", () => {
       expect(menu.getAllByRole("separator")).toHaveLength(2);
       expect(useChatStore.getState().costControlModeOverride).toBe(costControlModeOverride);
       if (costControlModeOverride === "on") {
-        for (const choice of menu.getAllByRole("menuitemcheckbox")) {
+        for (const choice of menu.getAllByRole("button")) {
           if (choice.getAttribute("data-effort-level")) {
-            expect(choice).toHaveAttribute("data-disabled");
+            expect(choice).toBeDisabled();
           }
         }
       }
@@ -7771,10 +7771,10 @@ describe("Composer config gear", () => {
     fireEvent.keyDown(screen.getByTestId("composer-agent-edit"), { key: "ArrowRight" });
     expect(await screen.findByTestId("composer-agent-models")).toBeVisible();
     expect(await screen.findByTestId("composer-agent-effort-xhigh")).toHaveAttribute(
-      "aria-checked",
+      "aria-pressed",
       "true",
     );
-    expect(screen.getByTestId("composer-agent-effort-xhigh")).toHaveTextContent("xHigh");
+    expect(screen.getByTestId("composer-agent-efforts")).toHaveTextContent("xHigh");
     expect(screen.queryByText("Advanced settings…")).toBeNull();
   });
 
@@ -8221,8 +8221,8 @@ describe("Composer config gear", () => {
     );
     const configRow = screen.getByTestId("composer-agent-edit");
     expect(configRow).toHaveAttribute("data-disabled");
-    for (const choice of screen.queryAllByRole("menuitemcheckbox")) {
-      if (choice.getAttribute("data-effort-level")) expect(choice).toHaveAttribute("data-disabled");
+    for (const choice of screen.queryAllByRole("button")) {
+      if (choice.getAttribute("data-effort-level")) expect(choice).toBeDisabled();
     }
     expect(setModel).toHaveBeenCalledTimes(1);
     expect(setEffort).not.toHaveBeenCalled();
@@ -8403,7 +8403,7 @@ describe("Composer config gear", () => {
     await openSessionEfforts();
     // Sol starts on ultra.
     expect(screen.getByTestId("composer-agent-effort-ultra")).toHaveAttribute(
-      "aria-checked",
+      "aria-pressed",
       "true",
     );
 

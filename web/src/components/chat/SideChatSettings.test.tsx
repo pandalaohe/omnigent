@@ -110,9 +110,9 @@ it("changes only the side session and uses the selected model's effort ladder", 
       reasoningEffort: null,
     }),
   );
-  await waitFor(() => expect(screen.getByRole("menuitemcheckbox", { name: "Max" })).toBeEnabled());
-  expect(screen.queryByRole("menuitemcheckbox", { name: "High" })).not.toBeInTheDocument();
-  await user.click(screen.getByRole("menuitemcheckbox", { name: "Max" }));
+  await waitFor(() => expect(screen.getByTestId("side-chat-effort-max")).toBeEnabled());
+  expect(screen.queryByTestId("side-chat-effort-high")).not.toBeInTheDocument();
+  await user.click(screen.getByTestId("side-chat-effort-max"));
   await waitFor(() =>
     expect(sessionsApi.updateSession).toHaveBeenLastCalledWith("side", { reasoningEffort: "max" }),
   );
@@ -246,7 +246,7 @@ it("offers SDK effort controls without inventing a model catalog", async () => {
   await user.click(screen.getByRole("button", { name: "Side chat model and effort" }));
   await user.click(screen.getByTestId("side-chat-model-edit"));
   expect(screen.queryByTestId("side-chat-models")).not.toBeInTheDocument();
-  await user.click(screen.getByRole("menuitemcheckbox", { name: "Low" }));
+  await user.click(screen.getByTestId("side-chat-effort-low"));
   expect(sessionsApi.updateSession).toHaveBeenCalledWith("side", { reasoningEffort: "low" });
 });
 
@@ -361,7 +361,7 @@ it("does not pin a runner-reported model when changing only draft effort", async
   const user = userEvent.setup();
   await user.click(screen.getByRole("button", { name: "Side chat model and effort" }));
   await user.click(screen.getByTestId("side-chat-model-edit"));
-  await user.click(screen.getByRole("menuitemcheckbox", { name: "Low" }));
+  await user.click(screen.getByTestId("side-chat-effort-low"));
   expect(onChange).toHaveBeenCalledWith({ reasoningEffort: "low" });
   expect(sessionsApi.updateSession).not.toHaveBeenCalled();
 });

@@ -76,16 +76,19 @@ export function LevelMeter<T extends string>({
   return (
     <div
       className={cn(
-        "flex max-w-full flex-wrap items-center gap-x-3 gap-y-1",
+        "flex min-w-0 max-w-full flex-wrap items-center gap-x-3 gap-y-1",
         stretch && "w-full",
         className,
       )}
     >
+      {/* The blocks own one full-width line at every width: seven 44 px phone
+          targets do not fit beside the level name, and a line that sizes itself
+          to its content cannot shrink inside a narrow menu. */}
       <div
         role="radiogroup"
         aria-label={label}
         aria-disabled={disabled}
-        className={cn("flex basis-full gap-0.5 md:basis-auto", stretch && "grow")}
+        className="flex min-w-0 basis-full flex-wrap gap-0.5"
       >
         {options.map((option, index) => (
           <button
@@ -101,7 +104,7 @@ export function LevelMeter<T extends string>({
             data-effort-level={option.value}
             disabled={disabled}
             tabIndex={index === focusIndex ? 0 : -1}
-            className="flex min-h-11 min-w-11 flex-1 items-center rounded-md px-1 outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50 md:min-h-7 md:min-w-7"
+            className="flex min-h-11 min-w-11 flex-1 items-center rounded-md px-1 outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50 md:min-h-7 md:min-w-0"
             onClick={() => onChange(option.value)}
             onKeyDown={(event) => {
               if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
@@ -158,10 +161,7 @@ export function MenuLevelRow<T extends string>({
   return (
     <DropdownMenuItem
       disabled={disabled}
-      className={cn(
-        "flex max-w-[calc(100vw-3rem)] flex-wrap gap-x-3 gap-y-1 whitespace-normal",
-        className,
-      )}
+      className={cn("flex min-w-0 max-w-full flex-wrap gap-x-3 gap-y-1 whitespace-normal", className)}
       onSelect={(event) => event.preventDefault()}
       onKeyDown={(event) => {
         if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
@@ -184,10 +184,10 @@ export function MenuLevelRow<T extends string>({
     >
       <div
         ref={row}
-        className="flex w-full flex-wrap items-center gap-x-3 gap-y-1"
+        className="flex w-full min-w-0 flex-wrap items-center gap-x-3 gap-y-1"
         aria-label={label}
       >
-        <div className="flex basis-full gap-0.5 md:basis-auto">
+        <div className="flex min-w-0 basis-full flex-wrap gap-0.5">
           {options.map((option, index) => (
             <button
               key={option.value}
@@ -198,7 +198,7 @@ export function MenuLevelRow<T extends string>({
               data-testid={option.testId}
               data-effort-level={option.value}
               disabled={disabled}
-              className="flex min-h-11 min-w-11 items-center rounded-md px-1 md:min-h-7 md:min-w-7"
+              className="flex min-h-11 min-w-11 flex-1 items-center rounded-md px-1 md:min-h-7 md:min-w-0"
               onClick={(event) => {
                 event.stopPropagation();
                 onChange(option.value);

@@ -18,6 +18,7 @@ import {
   DropdownMenuRadioItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { LevelGlyph } from "@/components/ui/level-meter";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useMenuGuardedTooltip } from "@/hooks/useMenuGuardedTooltip";
 import { cn } from "@/lib/utils";
@@ -428,6 +429,8 @@ export const ComposerHarnessTrigger = forwardRef<
     /** Yellow dot warning, e.g. a member session with an unavailable member. */
     alert?: boolean;
     effort?: string;
+    /** Current rung and ladder size; stays visible when the text collapses. */
+    effortLevel?: { level: number; total: number; title?: string };
     icon?: ReactNode;
     testIdPrefix?: string;
     labelClassName?: string;
@@ -437,6 +440,7 @@ export const ComposerHarnessTrigger = forwardRef<
     label,
     model,
     effort,
+    effortLevel,
     icon,
     loading = false,
     pending = false,
@@ -506,6 +510,15 @@ export const ComposerHarnessTrigger = forwardRef<
           </span>
         )}
       </span>
+      {effortLevel && effortLevel.total > 0 && (
+        <span className="shrink-0" data-testid={`${testIdPrefix}-agent-effort-glyph`}>
+          <LevelGlyph
+            level={effortLevel.level}
+            total={effortLevel.total}
+            title={effortLevel.title ?? (effort ? `Effort: ${effort}` : "Effort: Default")}
+          />
+        </span>
+      )}
       {alert && (
         <span
           role="status"

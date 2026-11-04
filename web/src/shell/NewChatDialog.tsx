@@ -1498,6 +1498,7 @@ export function AgentHarnessPicker({
   triggerTooltip,
   triggerTooltipRows,
   triggerDetails = EMPTY_HARNESS_TRIGGER_DETAILS,
+  triggerEffortLevel,
   modelCatalogAvailability,
   triggerIcon,
   selectedConfigContent,
@@ -1576,6 +1577,8 @@ export function AgentHarnessPicker({
   triggerTooltipRows?: readonly { label: string; value: string }[];
   /** Model / effort values joined inside the harness trigger. */
   triggerDetails?: readonly { label: string; value: string }[];
+  /** Effort rung shown beside the trigger text, including on narrow screens. */
+  triggerEffortLevel?: { level: number; total: number; title?: string };
   /** Explicit status for the selected model catalog. `unknown` means there is
    * no known catalog because lookup is disabled or still loading; omit it for
    * consumers without catalog state. */
@@ -2158,6 +2161,8 @@ export function AgentHarnessPicker({
           disabledLabel === undefined
             ? (visibleCachedPreview?.effort ?? triggerSecondaryText)
             : undefined,
+        effortLevel:
+          disabledLabel === undefined && !visibleCachedPreview ? triggerEffortLevel : undefined,
         icon:
           disabledLabel !== undefined ? undefined : triggerBadge ? (
             <span className="flex items-center gap-1">
@@ -2181,7 +2186,11 @@ export function AgentHarnessPicker({
       contentAlign={contentAlign}
       contentSide="bottom"
       contentSideOffset={6}
-      contentClassName={cn(showConfig && "composer-agent-config-menu", contentClassName)}
+      contentClassName={cn(
+        showConfig && "composer-agent-config-menu",
+        contentClassName,
+        showConfig && "w-[calc(100vw-1.5rem)]",
+      )}
       configOpen={configAgentId !== null}
       onInitialSelectionFocus={
         focusConfigAgentId === null
@@ -4478,6 +4487,9 @@ export function NewChatLandingScreen() {
       ? codexEffortLevelsForModel(pickerEffortRows, pickerEffortModel)
       : (effortLevelsFor(selectionHarness, pickerEffortRows, pickerEffortModel) ?? [])
   ).map((value) => ({ value, label: normalizeEffortLabel(value) }));
+  const pickerInheritedEffort =
+    pickerEffortRows.find((option) => option.id === pickerEffortModel)?.defaultReasoningEffort ??
+    null;
   const speedHarness = selectionHarness === "codex" || selectionHarness === "codex-native";
   const leadMember = selectedAgent?.members?.find((member) => member.lead);
   const presetSpeedModel =
@@ -4757,14 +4769,19 @@ export function NewChatLandingScreen() {
           ),
         }
       : modelSection;
+  const effortHeader =
+    selectionHarness === "pi-native" || selectionHarness === "pi" ? "Thinking level" : "Effort";
   const effortSection: ComposerConfigSection | undefined =
     pickerEffortOptions.length > 0
       ? {
           testId: "new-chat-landing-agent-efforts",
-          header:
-            selectionHarness === "pi-native" || selectionHarness === "pi"
-              ? "Thinking level"
-              : "Effort",
+          header: effortHeader,
+          level: {
+            label: effortHeader,
+            inherited: pickerInheritedEffort,
+            onUnset: () => selectPickerEffort(EFFORT_SELECT_NONE),
+            unsetTestId: "new-chat-landing-agent-effort-default",
+          },
           choices: [
             {
               key: "__default__",
@@ -4783,6 +4800,22 @@ export function NewChatLandingScreen() {
               testId: `new-chat-landing-agent-effort-${option.value}`,
             })),
           ],
+        }
+      : undefined;
+  const currentPickerEffort = pickedEffort || pickerInheritedEffort;
+  const triggerEffortLevel =
+    effortSection && !routingOn
+      ? {
+          level:
+            pickerEffortOptions.findIndex((option) => option.value === currentPickerEffort) + 1,
+          total: pickerEffortOptions.length,
+          title: `${effortHeader}: ${
+            pickedEffort
+              ? normalizeEffortLabel(pickedEffort)
+              : pickerInheritedEffort
+                ? `Default (${normalizeEffortLabel(pickerInheritedEffort)})`
+                : "Default"
+          }`,
         }
       : undefined;
   const fusionSections =
@@ -8580,6 +8613,7 @@ export function NewChatLandingScreen() {
                             : undefined
                         }
                         triggerDetails={harnessTriggerDetails}
+                        triggerEffortLevel={triggerEffortLevel}
                         modelCatalogAvailability={modelCatalogAvailability}
                         triggerIcon={
                           selectedAgent ? (
