@@ -82,6 +82,7 @@ from omnigent.harness_availability import (
 )
 from omnigent.harness_plugins import native_harnesses
 from omnigent.host import HOST_FATAL_EXIT_CODE
+from omnigent.host.claude_usage import claude_usage_enabled, claude_usage_report
 from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
 from omnigent.host.frames import (
     CAP_HOST_TERMINALS,
@@ -92,6 +93,7 @@ from omnigent.host.frames import (
     WORKSPACE_MISSING_ERROR_CODE,
     HostAgentSettingsFrame,
     HostAgentSettingsResultFrame,
+    HostClaudeUsageFrame,
     HostCodexRateLimitsFrame,
     HostConnectionErrorFrame,
     HostContextInventoryV2Frame,
@@ -202,6 +204,7 @@ from omnigent.host.post_bind_hook import PostBindHookRunner
 from omnigent.host.pre_launch_command import run_pre_launch_command
 from omnigent.host.resource_sampler import ResourceSampler
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
+from omnigent.host.usage_limits import CACHE_SECONDS, read_usage_limits
 from omnigent.inner import _proc
 from omnigent.onboarding.harness_accounts import (
     HARNESS_ACCOUNT_KEYS,
@@ -6193,6 +6196,11 @@ class HostProcess:
         rate_limits_task = asyncio.create_task(
             self._codex_rate_limits_loop(ws), name="host-codex-rate-limits"
         )
+        claude_usage_task = (
+            asyncio.create_task(self._claude_usage_loop(ws), name="host-claude-usage")
+            if claude_usage_enabled()
+            else None
+        )
         runaway_task = asyncio.create_task(
             self._runner_log_runaway_loop(ws), name="host-runner-log-runaway"
         )
@@ -6246,6 +6254,10 @@ class HostProcess:
             rate_limits_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await rate_limits_task
+            if claude_usage_task is not None:
+                claude_usage_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await claude_usage_task
             runaway_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await runaway_task
@@ -6340,6 +6352,27 @@ class HostProcess:
                 # endanger Host liveness or print credential-bearing output.
                 _logger.debug("Codex rate-limit probe unavailable", exc_info=True)
             await asyncio.sleep(CODEX_RATE_LIMITS_REFRESH_INTERVAL_S)
+
+    async def _claude_usage_loop(
+        self,
+        ws: websockets.asyncio.client.ClientConnection,
+    ) -> None:
+        """Publish Claude plan windows read with no session; only started when opted in."""
+        while True:
+            try:
+                usage = (await read_usage_limits(("claude",)))[0]
+                if usage.status == "available":
+                    await ws.send(
+                        encode_host_frame(
+                            HostClaudeUsageFrame(claude_usage=claude_usage_report(usage))
+                        )
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A failed read leaves the last report in place on the server.
+                _logger.debug("Claude usage read unavailable", exc_info=True)
+            await asyncio.sleep(CACHE_SECONDS)
 
     def _codex_rate_limits_enabled(self) -> bool:
         """Return whether this Host has a ready Codex CLI to inspect."""

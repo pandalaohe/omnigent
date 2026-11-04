@@ -21,6 +21,7 @@ from omnigent.host.frames import (
     CAP_HARNESS_LOGIN,
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostClaudeUsageFrame,
     HostCodexRateLimitsFrame,
     HostHelloFrame,
     HostLaunchRunnerResultFrame,
@@ -40,6 +41,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.usage.contract import UsageReport, UsageWindow
 from tests.budgets import budget
 from tests.server.helpers import websocket_scope as _websocket_scope
 
@@ -370,6 +372,86 @@ async def test_codex_reading_outlives_disconnect_for_display_only(db_uri: str) -
         item for item in service.overview(RESERVED_USER_LOCAL).accounts if item.id == "codex"
     )
     assert codex.windows[0].percent_used == 25
+
+
+async def test_claude_usage_frame_becomes_a_host_tagged_claude_reading(db_uri: str) -> None:
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+    service = AgentQuotaService(conversation_store, None, None, None, HostStore(db_uri))
+    app, registry, _hs, _cs = _build_host_api_app(db_uri, agent_quota_service=service)
+    comm = await _connect_host(app, registry)
+    # A statusLine reading already exists for the same host.
+    service.note_reading(
+        RESERVED_USER_LOCAL,
+        _HOST_ID,
+        "claude",
+        {
+            "captured_at": int(time.time()) - 60,
+            "windows": [
+                {
+                    "label": "w",
+                    "aria_label": "weekly",
+                    "used_percent": 10.0,
+                    "duration_mins": 10_080,
+                }
+            ],
+        },
+    )
+    # The host clock is an hour ahead; the server stamps the report on receipt.
+    report = {
+        "schema_version": 1,
+        "observed_at": time.time() + 3600,
+        "status": "available",
+        "windows": [
+            {
+                "id": "w",
+                "kind": "weekly",
+                "label": "Weekly",
+                "percent_used": 53.0,
+                "window_minutes": 10_080,
+                "resets_at": time.time() + 86_400,
+            }
+        ],
+    }
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(HostClaudeUsageFrame(claude_usage=report)),
+        }
+    )
+    for _ in range(50):
+        claude = next(
+            (a for a in service.overview(RESERVED_USER_LOCAL).accounts if a.id == "claude"), None
+        )
+        if claude is not None and claude.windows and claude.windows[0].percent_used == 53.0:
+            break
+        await asyncio.sleep(0.01)
+    assert claude is not None
+    assert claude.windows[0].percent_used == 53.0
+    assert claude.read_at is not None and claude.read_at < time.time() + 60
+    assert [host.host_id for host in claude.hosts] == [_HOST_ID]
+
+
+async def test_claude_usage_frame_at_the_account_cap_keeps_the_tunnel_up(db_uri: str) -> None:
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+    service = AgentQuotaService(conversation_store, None, None, None, HostStore(db_uri))
+    app, registry, _hs, _cs = _build_host_api_app(db_uri, agent_quota_service=service)
+    comm = await _connect_host(app, registry)
+    filler = UsageReport(
+        observed_at=time.time(),
+        windows=[UsageWindow(id="w", kind="weekly", percent_used=1.0)],
+    )
+    for index in range(32):
+        service.report_account(RESERVED_USER_LOCAL, f"acct{index}", filler)
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(HostClaudeUsageFrame(claude_usage=filler.stored())),
+        }
+    )
+    await asyncio.sleep(0.2)
+    assert registry.get(_HOST_ID) is not None
+    claude = next(a for a in service.overview(RESERVED_USER_LOCAL).accounts if a.id == "claude")
+    assert not claude.windows
 
 
 async def test_list_hosts_reports_sandbox_provider_for_managed_host(
