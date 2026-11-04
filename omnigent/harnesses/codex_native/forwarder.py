@@ -96,6 +96,7 @@ from omnigent.native._native_post_delivery import (
 from omnigent.native._native_supersession import post_clear_supersession
 from omnigent.native_subagent_snapshot import NativeSubagentSnapshotPublisher
 from omnigent.runner.launch_failure import is_codex_provider_auth_failure
+from omnigent.runner.turn_routing import read_pending_replay, routed_prompt_block_reason
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -1788,6 +1789,42 @@ def _terminal_error_from_notification(params: _JsonObject) -> _CodexTerminalErro
         return None
     message = _error_payload_message(payload)
     return _CodexTerminalError(message=message, kind=_classify_codex_error(payload, message))
+
+
+def _terminal_error_from_hook_run(
+    params: _JsonObject, *, bridge_dir: Path | None, session_id: str
+) -> _CodexTerminalError | None:
+    """Read a prompt hook's terminal refusal, excluding an owed routing replay."""
+    run = params.get("run")
+    if not isinstance(run, dict) or run.get("eventName") != "userPromptSubmit":
+        return None
+    status = run.get("status")
+    if status not in ("blocked", "stopped"):
+        return None
+    entries = run.get("entries")
+    texts = [
+        entry["text"].strip()
+        for entry in (entries if isinstance(entries, list) else [])
+        if isinstance(entry, dict)
+        and entry.get("kind") != "context"
+        and isinstance(entry.get("text"), str)
+        and entry["text"].strip()
+    ]
+    pending = read_pending_replay(bridge_dir) if bridge_dir is not None else None
+    if (
+        pending is not None
+        and pending.session_id == session_id
+        and pending.blocked_turn_id in (None, _turn_id_from_payload(params))
+        and pending.model
+        and texts == [routed_prompt_block_reason(pending.model)]
+    ):
+        return None
+    label = "Blocked by hook" if status == "blocked" else "Stopped by hook"
+    message = f"{label}: {'\n'.join(texts)}" if texts else label
+    source_path = run.get("sourcePath")
+    if isinstance(source_path, str) and source_path:
+        message = f"{message}\nHook: {source_path}"
+    return _CodexTerminalError(message=message, kind=_CODEX_ERROR_KIND_GENERIC)
 
 
 @dataclass(frozen=True)
@@ -4224,6 +4261,15 @@ async def _handle_event(
         return
     event_state = forwarder_state
     event_bridge_dir = bridge_dir if not is_child else None
+    hook_error = None
+    if method == _CODEX_HOOK_COMPLETED_METHOD:
+        hook_error = _terminal_error_from_hook_run(
+            params, bridge_dir=event_bridge_dir, session_id=route_session_id
+        )
+        if hook_error is not None:
+            # Use the standalone error's turn ownership, dedup and child cleanup.
+            method = "error"
+            terminal_event = True
     child_usage_baseline: _UsageTotals | None = None
     if is_child and forwarder_state is not None:
         child_thread_id = _thread_id_from_params(params)
@@ -4247,9 +4293,10 @@ async def _handle_event(
                 thread_name=params.get("threadName"),
             )
         return
-    if method == _CODEX_HOOK_COMPLETED_METHOD:
+    if event.get("method") == _CODEX_HOOK_COMPLETED_METHOD:
         await _handle_hook_completed(client, route_session_id, params)
-        return
+        if hook_error is None:
+            return
     if is_child and forwarder_state is not None:
         child_thread = _thread_id_from_params(params)
         observed_status = None
@@ -4465,6 +4512,7 @@ async def _handle_event(
         elicitation_tracker=elicitation_tracker,
         codex_client=codex_client,
         forwarder_state=event_state,
+        terminal_error=hook_error,
     ):
         if child_coalescer is not None:
             await child_coalescer.flush()
@@ -5124,6 +5172,7 @@ async def _maybe_handle_turn_event(
     elicitation_tracker: _CodexElicitationTaskTracker,
     codex_client: CodexAppServerClient | None,
     forwarder_state: _CodexForwarderState | None,
+    terminal_error: _CodexTerminalError | None = None,
 ) -> bool:
     """
     Handle turn/thread-level Codex events.
@@ -5161,7 +5210,7 @@ async def _maybe_handle_turn_event(
         async with _conversation_item_delivery_scope(session_id):
             if delta_coalescer is not None:
                 await delta_coalescer.flush()
-            error = _terminal_error_from_notification(params)
+            error = terminal_error or _terminal_error_from_notification(params)
             if error is None:
                 _logger.warning("Codex forwarder ignored malformed error notification")
                 return True

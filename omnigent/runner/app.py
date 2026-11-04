@@ -7297,6 +7297,7 @@ def create_runner_app(
             status=entry.status,
             pending=inbox.qsize(),
             placement_label=entry.placement_label,
+            output=entry.output,
         )
         if is_rewake and notice == _last_rewake_notice.get(entry.parent_session_id):
             return

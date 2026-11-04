@@ -973,6 +973,11 @@ class PendingReplay:
     model: str | None = None
 
 
+def routed_prompt_block_reason(model: str) -> str:
+    """Return the hook's reason for blocking a prompt that routing will replay."""
+    return f"Smart Routing selected {model}; rerunning your message on it."
+
+
 def write_pending_replay(
     bridge_dir: Path,
     *,

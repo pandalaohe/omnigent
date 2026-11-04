@@ -1872,6 +1872,7 @@ def _format_subagent_wake_notice(
     status: str,
     pending: int,
     placement_label: str | None = None,
+    output: str | None = None,
 ) -> str:
     """
     Build the framework notice that wakes a parent after a child finishes.
@@ -1883,6 +1884,7 @@ def _format_subagent_wake_notice(
     :param pending: Number of undrained items in the parent inbox, e.g. ``3``.
     :param placement_label: Where the child ran, e.g. ``"fn · ~/projects/app"``;
         appended in brackets after the identity when known.
+    :param output: Failure detail to include when the child failed.
     :returns: A ``[System: ...]`` notice string, e.g. ``"[System: sub-agent
         researcher/auth finished (completed) — 1 result waiting in inbox. Call
         sys_read_inbox to collect.]"``.
@@ -1891,10 +1893,13 @@ def _format_subagent_wake_notice(
     identity = f"{agent}/{title}"
     if placement_label:
         identity = f"{identity} [{placement_label}]"
-    return (
+    notice = (
         f"[System: sub-agent {identity} finished ({status}) — "
         f"{pending} {noun} waiting in inbox. Call sys_read_inbox to collect.]"
     )
+    if status == "failed" and output:
+        notice = f"{notice}\nFailure: {output}"
+    return notice
 
 
 # Max length of a child message preview mirrored to the parent stream.

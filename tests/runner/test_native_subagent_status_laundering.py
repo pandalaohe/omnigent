@@ -407,6 +407,7 @@ async def test_reaped_dispatch_wakes_parent_not_just_inbox() -> None:
         subagent_work._session_inboxes_ref.pop(parent_id, None)
 
     notice = wake_bodies[0]["data"]["content"][0]["text"]
+    assert payload["output"] in notice
     assert "finished (failed)" in notice, (
         f"the reap's wake notice must tell the parent the dispatch failed, got {notice!r}"
     )
