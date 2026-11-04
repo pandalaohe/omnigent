@@ -161,7 +161,10 @@ export function MenuLevelRow<T extends string>({
   return (
     <DropdownMenuItem
       disabled={disabled}
-      className={cn("flex min-w-0 max-w-full flex-wrap gap-x-3 gap-y-1 whitespace-normal", className)}
+      className={cn(
+        "flex min-w-0 max-w-full flex-wrap gap-x-3 gap-y-1 whitespace-normal",
+        className,
+      )}
       onSelect={(event) => event.preventDefault()}
       onKeyDown={(event) => {
         if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
