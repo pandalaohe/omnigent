@@ -6,7 +6,7 @@ import { useOmnigentPageView } from "@/lib/analytics";
 import { PageLoading } from "@/components/PageLoading";
 import { Spinner } from "@/components/ui/spinner";
 import { ChunkLoadErrorBoundary } from "@/components/ChunkLoadErrorBoundary";
-import { isFeatureEnabled, type FeatureKey } from "@/lib/capabilities";
+import { isFeatureEnabled, usageBoardAvailable, type FeatureKey } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
 import { ExtensionPageRoute } from "@/extensions/ExtensionPageRoute";
@@ -63,6 +63,19 @@ const UsagePage = withPageView(
   "usage",
   lazy(() => import("@/pages/UsagePage").then((m) => ({ default: m.UsagePage }))),
 );
+// The Usage board is its own module, gated by its own switch rather than a
+// release feature: /v1/info's usage_board_enabled plus the user's preference.
+// One lazy chunk serves its three routes; each route keeps its own page-view id.
+const UsageBoardRoute = lazy(() =>
+  import("@/pages/usageBoard").then((m) => ({ default: m.UsageBoardRoute })),
+);
+const UsageBoardPage = withPageView("usage_board", () => <UsageBoardRoute view="board" />);
+const UsageBoardAccountPage = withPageView("usage_board.account", () => (
+  <UsageBoardRoute view="account" />
+));
+const UsageBoardAccountSettingsPage = withPageView("usage_board.account_settings", () => (
+  <UsageBoardRoute view="account_settings" />
+));
 const SystemStatusPage = withPageView(
   "system_status",
   lazy(() => import("@/pages/SystemStatusPage").then((m) => ({ default: m.SystemStatusPage }))),
@@ -228,6 +241,22 @@ function AppRoutes({ basename }: AppProps) {
               </FeatureGatedPage>
             }
           />
+          {/* The board's routes exist only where the deployment allows the
+              module: with usage.enabled false the server serves no usage route,
+              so a registered page would only offer a dead surface. */}
+          {usageBoardAvailable(info) && (
+            <>
+              <Route path={`${prefix}/usage/board`} element={<UsageBoardPage />} />
+              <Route
+                path={`${prefix}/usage/board/:accountId`}
+                element={<UsageBoardAccountPage />}
+              />
+              <Route
+                path={`${prefix}/usage/board/:accountId/settings`}
+                element={<UsageBoardAccountSettingsPage />}
+              />
+            </>
+          )}
           <Route path={`${prefix}/system`} element={<SystemStatusPage />} />
           <Route path={`${prefix}/hosts/:hostId/terminals`} element={<HostTerminalsPage />} />
           {/* Settings renders into the chat outlet so the conversations

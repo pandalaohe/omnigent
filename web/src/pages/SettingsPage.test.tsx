@@ -73,6 +73,8 @@ const mocks = vi.hoisted(() => ({
   // Network for the server-backed worktree location preference; each test
   // overrides the response it needs.
   authenticatedFetch: vi.fn(),
+  // Deployment gate for the Usage board module (server config usage.enabled).
+  usageBoardEnabled: true,
 }));
 
 vi.mock("next-themes", () => ({
@@ -91,6 +93,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     login_url: mocks.loginUrl,
     single_user: mocks.singleUser,
     enabled_connections: mocks.enabledConnections,
+    usage_board_enabled: mocks.usageBoardEnabled,
   }),
 }));
 vi.mock("@/shell/ImportSessionsPanel", () => ({
@@ -2465,5 +2468,20 @@ describe("SettingsPage", () => {
     renderPage("/settings/archived");
 
     expect(screen.queryByTestId("archived-toggle-selection")).toBeNull();
+  });
+});
+
+describe("Usage board group", () => {
+  it("is absent when the deployment turns the module off", () => {
+    mocks.usageBoardEnabled = false;
+    renderPage("/settings/general");
+    expect(screen.queryByTestId("settings-group-usage-board")).toBeNull();
+  });
+
+  it("is present, with its switch, when the deployment allows it", () => {
+    mocks.usageBoardEnabled = true;
+    renderPage("/settings/general");
+    const group = screen.getByTestId("settings-group-usage-board");
+    expect(within(group).getByRole("heading", { name: "Usage board" })).toBeTruthy();
   });
 });

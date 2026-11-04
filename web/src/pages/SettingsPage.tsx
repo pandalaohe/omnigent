@@ -166,7 +166,7 @@ import {
 import { authenticatedFetch, getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { archiveDateRangeBounds } from "@/lib/archiveDateRange";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled } from "@/lib/capabilities";
+import { usageBoardAvailable, isFeatureEnabled } from "@/lib/capabilities";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import {
   type Conversation,
@@ -361,6 +361,10 @@ const InstructionsPage = lazy(() =>
 );
 const SharingPage = lazy(() =>
   import("@/pages/SharingPage").then((m) => ({ default: m.SharingPage })),
+);
+// The Usage board's settings group is part of the board's own chunk.
+const UsageBoardSettingsLazy = lazy(() =>
+  import("@/pages/usageBoard").then((m) => ({ default: m.UsageBoardSettings })),
 );
 
 /**
@@ -2272,7 +2276,8 @@ function TerminalClipboardControl() {
 
 /** App-wide behavior settings. */
 function GeneralSection() {
-  const sessionCollabEnabled = isFeatureEnabled(useServerInfo(), "session_peer_messaging");
+  const info = useServerInfo();
+  const sessionCollabEnabled = isFeatureEnabled(info, "session_peer_messaging");
   return (
     <Section title="General" description="Configure general Omnigent behavior.">
       <div className="flex flex-col gap-6">
@@ -2362,6 +2367,18 @@ function GeneralSection() {
             </div>
           </ExpandableSettings>
         </SettingsGroup>
+        {/* The Usage board module's whole settings surface, present only where
+            the deployment allows the module. Its user switch lives inside, so
+            turning it off here is how a visitor comes back. */}
+        {usageBoardAvailable(info) && (
+          <SettingsGroup title="Usage board" testId="settings-group-usage-board">
+            <ExpandableSettings id="usage-board" title="Usage board">
+              <Suspense fallback={<div className="h-10" />}>
+                <UsageBoardSettingsLazy />
+              </Suspense>
+            </ExpandableSettings>
+          </SettingsGroup>
+        )}
       </div>
     </Section>
   );

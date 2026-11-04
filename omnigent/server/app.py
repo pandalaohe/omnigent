@@ -287,6 +287,9 @@ class ServerInfoResponse(BaseModel):
     dictation_punctuation_available: bool
     # The archive PATCH accepts ``delete_worktree``; older servers reject it.
     archive_worktree_cleanup: bool = True
+    # The Usage board module may run here (server config ``usage.enabled``);
+    # absent on older servers, which clients read as off.
+    usage_board_enabled: bool = False
     worktree_status: bool = True
     # GET /v1/sessions accepts ``search_scope``; older servers ignore it.
     session_search_scope: bool = True
@@ -4073,6 +4076,7 @@ def create_app(
                 "scheduled_task_projects": project_store is not None,
                 "automations_enabled": scheduled_task_store is not None
                 and deployment_gate_enabled(app.state.automations, "automations"),
+                "usage_board_enabled": agent_quota_service.usage_enabled,
                 "branding": branding_snapshot.config(),
                 "attachment_limits": attachment_limits(),
             }
