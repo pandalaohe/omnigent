@@ -411,6 +411,145 @@ describe("shared composer controls", () => {
     );
   });
 
+  it.each([
+    ["manual", "claude-native", "default", "Manual", "lucide-hand"],
+    ["automatic", "claude-native", "auto", "Auto", "lucide-sparkles"],
+    ["edit-automatic", "claude-native", "acceptEdits", "Accept edits", "lucide-file-pen"],
+    ["read-only", "claude-native", "plan", "Plan", "lucide-eye"],
+    ["deny", "claude-native", "dontAsk", "Don't ask", "lucide-ban"],
+    [
+      "full-access",
+      "claude-native",
+      "bypassPermissions",
+      "Bypass permissions",
+      "lucide-shield-off",
+    ],
+  ])(
+    "gives the %s permission concept its own chip and menu icon",
+    (concept, harness, selectedValue, label, iconClass) => {
+      render(
+        <ComposerPermissionPicker
+          label="Permission mode"
+          value={label}
+          harness={harness}
+          selectedValue={selectedValue}
+          options={[{ value: selectedValue, label }]}
+          onSelect={vi.fn()}
+        />,
+      );
+      const chip = screen.getByRole("button", { name: `Permission mode: ${label}` });
+      expect(chip).toHaveAttribute("data-permission-concept", concept);
+      const chipIcons = chip.querySelectorAll("svg");
+      // The mode glyph replaced the old fallback; the chevron stayed put.
+      expect(chipIcons).toHaveLength(2);
+      const chipIcon = chip.querySelector(`svg.${iconClass}`);
+      expect(chipIcon).toBeInTheDocument();
+      expect(chipIcon).toHaveAttribute("aria-hidden", "true");
+      expect(chipIcon).toHaveClass("size-3");
+      expect(chipIcons[1]).toHaveClass("size-4");
+
+      fireEvent.keyDown(chip, { key: "ArrowDown" });
+      const option = screen.getByTestId(`composer-permission-option-${selectedValue}`);
+      expect(option).toHaveAttribute("data-permission-concept", concept);
+      const menuIcon = option.querySelector(`svg.${iconClass}`);
+      expect(menuIcon).toBeInTheDocument();
+      expect(menuIcon).toHaveAttribute("aria-hidden", "true");
+
+      const danger = concept === "full-access";
+      if (danger) {
+        expect(chipIcon).toHaveClass("text-destructive");
+        // The shared menu row paints every svg muted, so full access opts back
+        // in to danger with an important utility.
+        expect(menuIcon).toHaveClass("text-destructive!");
+      } else {
+        expect(chipIcon).toHaveClass("text-muted-foreground");
+        expect(chipIcon?.getAttribute("class") ?? "").not.toContain("text-destructive");
+        expect(menuIcon?.getAttribute("class") ?? "").not.toContain("text-destructive");
+      }
+    },
+  );
+
+  it.each([
+    ["claude-sdk", "acceptEdits", "Accept edits", "edit-automatic", "lucide-file-pen"],
+    ["codex", "read-only", "Read Only", "read-only", "lucide-eye"],
+    ["codex", "full-access", "Full access", "full-access", "lucide-shield-off"],
+  ])(
+    "presents %s permission modes with the icon of their native concept",
+    (harness, selectedValue, label, concept, iconClass) => {
+      render(
+        <ComposerPermissionPicker
+          label="Permission mode"
+          value={label}
+          harness={harness}
+          selectedValue={selectedValue}
+          options={[{ value: selectedValue, label }]}
+          onSelect={vi.fn()}
+        />,
+      );
+      const chip = screen.getByRole("button", { name: `Permission mode: ${label}` });
+      // The shared module has no table for these names, so a fallback would
+      // show the neutral hand instead of the mode glyph.
+      expect(chip).toHaveAttribute("data-permission-concept", concept);
+      expect(chip.querySelector(`svg.${iconClass}`)).toBeInTheDocument();
+      expect(chip.querySelector("svg.lucide-hand")).toBeNull();
+
+      fireEvent.keyDown(chip, { key: "ArrowDown" });
+      const option = screen.getByTestId(`composer-permission-option-${selectedValue}`);
+      expect(option).toHaveAttribute("data-permission-concept", concept);
+      expect(option.querySelector(`svg.${iconClass}`)).toBeInTheDocument();
+    },
+  );
+
+  it.each([
+    ["claude-sdk", "bypassPermissions", "Bypass permissions"],
+    ["claude-native", "plan", "Plan"],
+  ])(
+    "keeps the mode in the icon-only chip's accessible name (%s)",
+    (harness, selectedValue, label) => {
+      render(
+        <ComposerPermissionPicker
+          label="Permission mode"
+          value={label}
+          harness={harness}
+          selectedValue={selectedValue}
+          iconOnly
+          options={[{ value: selectedValue, label }]}
+          onSelect={vi.fn()}
+        />,
+      );
+      const chip = screen.getByRole("button", { name: `Permission mode: ${label}` });
+      expect(chip).toHaveAttribute("aria-label", `Permission mode: ${label}`);
+      // Only the glyph and chevron remain visible, so the name is the only cue.
+      expect(chip.querySelectorAll("svg")).toHaveLength(2);
+      expect(chip).not.toHaveTextContent(label);
+    },
+  );
+
+  it("keeps the neutral hand icon for an unknown permission concept", () => {
+    render(
+      <ComposerPermissionPicker
+        label="Permission mode"
+        value="Mystery"
+        harness="claude-sdk"
+        selectedValue="mystery"
+        options={[{ value: "mystery", label: "Mystery" }]}
+        onSelect={vi.fn()}
+      />,
+    );
+    const chip = screen.getByRole("button", { name: "Permission mode: Mystery" });
+    expect(chip).toHaveAttribute("data-permission-concept", "default");
+    const chipIcon = chip.querySelector("svg.lucide-hand");
+    expect(chipIcon).toHaveClass("text-muted-foreground");
+    expect(chipIcon?.getAttribute("class") ?? "").not.toContain("text-destructive");
+
+    fireEvent.keyDown(chip, { key: "ArrowDown" });
+    const menuIcon = screen
+      .getByTestId("composer-permission-option-mystery")
+      .querySelector("svg.lucide-hand");
+    expect(menuIcon).toBeInTheDocument();
+    expect(menuIcon?.getAttribute("class") ?? "").not.toContain("text-destructive");
+  });
+
   it.each([false, true])(
     "restores permission focus unless another menu has opened (next menu=%s)",
     async (nextMenuOpen) => {

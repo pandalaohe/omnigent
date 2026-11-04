@@ -1,14 +1,20 @@
 import { forwardRef, useRef, type ComponentPropsWithoutRef, type ReactNode } from "react";
 import {
+  BanIcon,
   ChevronDownIcon,
+  EyeIcon,
+  FilePenIcon,
   FolderIcon,
   GitForkIcon,
   HandIcon,
   LaptopIcon,
   Loader2Icon,
   MonitorCloudIcon,
+  ShieldOffIcon,
+  SparklesIcon,
   ZapIcon,
   ZapOffIcon,
+  type LucideIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -21,7 +27,7 @@ import {
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useMenuGuardedTooltip } from "@/hooks/useMenuGuardedTooltip";
 import { cn } from "@/lib/utils";
-import { permissionModeConcept } from "@/lib/nativeHarnessModes";
+import { permissionModeConcept, type PermissionModeConcept } from "@/lib/nativeHarnessModes";
 import type { CodexPermissionReadback } from "@/lib/codexApprovalMode";
 import {
   COMPOSER_COLLAPSED_LABEL_CLASS,
@@ -32,6 +38,34 @@ import {
 } from "./ChatComposer";
 
 const NO_DISABLED_OPTIONS: readonly string[] = [];
+
+// Consumer-facing harness names whose permission vocabulary is identical to a
+// native one. Presentation-only aliases so the shared native table stays native.
+const PERMISSION_HARNESS_ALIASES: Record<string, string> = {
+  "claude-sdk": "claude-native",
+  codex: "codex-native",
+};
+
+/** One glyph per shared permission concept; `default` is the neutral fallback. */
+const PERMISSION_CONCEPT_ICONS: Record<PermissionModeConcept, LucideIcon> = {
+  manual: HandIcon,
+  automatic: SparklesIcon,
+  "edit-automatic": FilePenIcon,
+  "read-only": EyeIcon,
+  deny: BanIcon,
+  "full-access": ShieldOffIcon,
+  default: HandIcon,
+};
+
+function permissionConceptFor(
+  harness: string | null | undefined,
+  value: string | null | undefined,
+): PermissionModeConcept {
+  return permissionModeConcept(
+    harness ? (PERMISSION_HARNESS_ALIASES[harness] ?? harness) : harness,
+    value,
+  );
+}
 
 /**
  * The workspace tray docked above the composer card. A tray nests inside the
@@ -182,6 +216,8 @@ export function ComposerPermissionPicker({
   testIdPrefix?: string;
 }) {
   const writeDisabled = disabled || (loading && !interactiveWhileLoading);
+  const selectedConcept = permissionConceptFor(harness, selectedValue);
+  const SelectedConceptIcon = PERMISSION_CONCEPT_ICONS[selectedConcept];
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild disabled={!readback && writeDisabled}>
@@ -196,9 +232,15 @@ export function ComposerPermissionPicker({
           aria-label={`${label}: ${value}`}
           title={disabled && disabledReason ? disabledReason : `${label}: ${value}`}
           data-testid={`${testIdPrefix}-permission-chip`}
-          data-permission-concept={permissionModeConcept(harness, selectedValue)}
+          data-permission-concept={selectedConcept}
         >
-          <HandIcon className="size-3 shrink-0" />
+          <SelectedConceptIcon
+            aria-hidden="true"
+            className={cn(
+              "size-3 shrink-0",
+              selectedConcept === "full-access" ? "text-destructive" : "text-muted-foreground",
+            )}
+          />
           {!iconOnly && (
             <span
               className={cn(
@@ -254,28 +296,40 @@ export function ComposerPermissionPicker({
             if (!writeDisabled) onSelect(next);
           }}
         >
-          {options.map((option) => (
-            <DropdownMenuRadioItem
-              key={option.value}
-              value={option.value}
-              data-testid={`${testIdPrefix}-permission-option-${option.value}`}
-              data-permission-concept={permissionModeConcept(harness, option.value)}
-              disabled={writeDisabled || disabledOptions.includes(option.value)}
-              title={
-                disabledOptions.includes(option.value)
-                  ? `Start a new ${option.label} session to use this mode`
-                  : undefined
-              }
-              className="whitespace-normal break-words"
-            >
-              {option.label}
-              {disabledOptions.includes(option.value) && (
-                <span className="ml-1 text-xs text-muted-foreground">
-                  {harness === "antigravity-native" ? "Needs a new session" : "Start a new session"}
-                </span>
-              )}
-            </DropdownMenuRadioItem>
-          ))}
+          {options.map((option) => {
+            const concept = permissionConceptFor(harness, option.value);
+            const ConceptIcon = PERMISSION_CONCEPT_ICONS[concept];
+            return (
+              <DropdownMenuRadioItem
+                key={option.value}
+                value={option.value}
+                data-testid={`${testIdPrefix}-permission-option-${option.value}`}
+                data-permission-concept={concept}
+                disabled={writeDisabled || disabledOptions.includes(option.value)}
+                title={
+                  disabledOptions.includes(option.value)
+                    ? `Start a new ${option.label} session to use this mode`
+                    : undefined
+                }
+                className="whitespace-normal break-words"
+              >
+                {/* The shared menu row paints every svg muted; ! keeps the
+                    full-access glyph danger-coloured despite that rule. */}
+                <ConceptIcon
+                  aria-hidden="true"
+                  className={concept === "full-access" ? "text-destructive!" : undefined}
+                />
+                {option.label}
+                {disabledOptions.includes(option.value) && (
+                  <span className="ml-1 text-xs text-muted-foreground">
+                    {harness === "antigravity-native"
+                      ? "Needs a new session"
+                      : "Start a new session"}
+                  </span>
+                )}
+              </DropdownMenuRadioItem>
+            );
+          })}
         </DropdownMenuRadioGroup>
       </DropdownMenuContent>
     </DropdownMenu>
