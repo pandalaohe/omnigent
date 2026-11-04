@@ -2,6 +2,7 @@ import { useState } from "react";
 import { CheckIcon, FolderIcon, PlusIcon, SearchIcon } from "lucide-react";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { useProjects } from "@/hooks/useConversations";
+import { TablerRowIcon, parseProjectIcon } from "@/lib/tablerIcon";
 import { cn } from "@/lib/utils";
 
 /**
@@ -14,20 +15,25 @@ import { cn } from "@/lib/utils";
  * folder's box and centers, so a resized icon column stays aligned.
  */
 export function ProjectRowIcon({ icon, className }: { icon?: string | null; className?: string }) {
-  return icon ? (
-    // Emoji advance-widths vary per glyph; a fixed centered box keeps the
-    // trailing label's left edge aligned with the folder-fallback rows.
-    <span
-      aria-hidden="true"
-      className={cn(
-        "inline-flex size-3.5 shrink-0 items-center justify-center text-[14px] leading-none",
-        className,
-      )}
-      data-testid="project-icon"
-    >
-      {icon}
-    </span>
-  ) : (
+  const parsed = parseProjectIcon(icon);
+  if (parsed.kind === "tabler") return <TablerRowIcon name={parsed.name} className={className} />;
+  if (parsed.kind === "emoji") {
+    return (
+      // Emoji advance-widths vary per glyph; a fixed centered box keeps the
+      // trailing label's left edge aligned with the folder-fallback rows.
+      <span
+        aria-hidden="true"
+        className={cn(
+          "inline-flex size-3.5 shrink-0 items-center justify-center text-[14px] leading-none",
+          className,
+        )}
+        data-testid="project-icon"
+      >
+        {parsed.text}
+      </span>
+    );
+  }
+  return (
     <FolderIcon
       aria-hidden="true"
       className={cn("size-3.5 shrink-0 text-muted-foreground", className)}

@@ -1,9 +1,6 @@
-// Integration test for the project emoji-icon flow (OMNI-3742). Drives the real
-// ProjectLandingIcon + useUpdateProjectConfig + projects API client end to end,
-// mocking only the network (@/lib/projectsApi) and the emoji-mart picker (its
-// ~600KB JSON dataset can't load under vitest). The focus is the data-loss
-// guard: because the config PATCH replaces the whole blob, every set/remove
-// must merge onto a fully-loaded config and must not fire before it loads.
+// Integration test for project icons: the real landing tile, picker tabs,
+// mutation hook and API client, with only the network and heavy picker datasets
+// stubbed. Every write must merge onto the loaded config, never replace it.
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -30,6 +27,13 @@ vi.mock("@emoji-mart/react", () => ({
   ),
 }));
 vi.mock("@emoji-mart/data", () => ({ default: {} }));
+vi.mock("@/components/TablerIconPicker", () => ({
+  TablerIconPicker: ({ onSelect }: { onSelect: (value: string) => void }) => (
+    <button type="button" data-testid="pick-rocket" onClick={() => onSelect("tabler:rocket")}>
+      rocket
+    </button>
+  ),
+}));
 
 const updateMock = vi.mocked(updateProjectConfig);
 const createMock = vi.mocked(createProject);
@@ -76,11 +80,24 @@ describe("ProjectLandingIcon", () => {
     renderIcon({ config });
 
     fireEvent.click(screen.getByTestId("project-icon-tile"));
+    fireEvent.click(screen.getByTestId("project-icon-tab-emoji"));
     fireEvent.click(await screen.findByTestId("pick-fire"));
 
     await waitFor(() => expect(updateMock).toHaveBeenCalledTimes(1));
     // The whole prior config survives; only `icon` is added.
     expect(updateMock).toHaveBeenCalledWith("p_1", { ...config, icon: "🔥" });
+  });
+
+  it("selects a Tabler icon by default and preserves the loaded config", async () => {
+    const config: ProjectConfig = { host_id: "h1", workspace: "/repo" };
+    renderIcon({ config });
+
+    fireEvent.click(screen.getByTestId("project-icon-tile"));
+    expect(screen.getByTestId("project-icon-tab-icons")).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(await screen.findByTestId("pick-rocket"));
+
+    await waitFor(() => expect(updateMock).toHaveBeenCalledTimes(1));
+    expect(updateMock).toHaveBeenCalledWith("p_1", { ...config, icon: "tabler:rocket" });
   });
 
   it("removes the icon while preserving the other defaults", async () => {
@@ -99,7 +116,7 @@ describe("ProjectLandingIcon", () => {
     // config-wiping `{ icon }` PATCH can't be issued against unloaded state.
     expect(screen.getByTestId("project-icon-edit")).toBeDisabled();
     fireEvent.click(screen.getByTestId("project-icon-tile"));
-    expect(screen.queryByTestId("pick-fire")).toBeNull();
+    expect(screen.queryByTestId("project-icon-picker")).toBeNull();
     expect(updateMock).not.toHaveBeenCalled();
   });
 
@@ -107,6 +124,7 @@ describe("ProjectLandingIcon", () => {
     renderIcon({ projectId: null, config: undefined, configReady: true });
 
     fireEvent.click(screen.getByTestId("project-icon-tile"));
+    fireEvent.click(screen.getByTestId("project-icon-tab-emoji"));
     fireEvent.click(await screen.findByTestId("pick-fire"));
 
     await waitFor(() => expect(updateMock).toHaveBeenCalledTimes(1));

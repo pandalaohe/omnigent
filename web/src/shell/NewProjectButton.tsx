@@ -11,12 +11,13 @@ import {
 } from "@/components/ui/dialog";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { EmojiPicker } from "@/components/ProjectIconPicker";
+import { ProjectIconPicker } from "@/components/ProjectIconPicker";
 import { useCreateProject } from "@/hooks/useConversations";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ApiError } from "@/lib/sessionsApi";
 import { listProjects } from "@/lib/projectsApi";
 import { restoreProjectWithNotice } from "@/components/ArchiveProjectDialog";
+import { ProjectIconGlyph } from "@/lib/tablerIcon";
 
 /**
  * "New project" control in the Projects group header. Opens a dialog that
@@ -117,7 +118,9 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
                   className="flex size-[38px] shrink-0 cursor-pointer items-center justify-center bg-primary/10 outline-none transition-colors"
                 >
                   {icon ? (
-                    <span className="text-xl leading-none">{icon}</span>
+                    <span className="text-xl leading-none">
+                      <ProjectIconGlyph icon={icon} />
+                    </span>
                   ) : (
                     <SmilePlusIcon className="size-4 text-primary" />
                   )}
@@ -145,7 +148,7 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
                 onWheel={(e) => e.stopPropagation()}
                 onInteractOutside={() => setEmojiOpen(false)}
               >
-                <EmojiPicker
+                <ProjectIconPicker
                   onSelect={(native) => {
                     setIcon(native);
                     setEmojiOpen(false);
