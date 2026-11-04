@@ -4565,6 +4565,7 @@ async def test_events_compact_on_claude_sdk_buffered_compact_failed_fallback() -
         ("approve-for-me", "escape-armed", 200),
         ("full-access", "composer", 200),
         ("ask-for-approval", "statusline", 200),
+        ("approve-for-me", "empty-composer", 200),
         ("approve-for-me", "draft", 503),
         ("approve-for-me", "placeholder-draft", 503),
         ("approve-for-me", "multiline-draft", 503),
@@ -4636,6 +4637,8 @@ async def test_codex_permission_switch_preserves_terminal_state(
             return "Update Model Permissions\n" + "\n".join(
                 f"{digit}. {label}" for digit, label in labels.items()
             )
+        if current == "empty-composer":
+            return "› \n\n  model · branch"
         prompt = (
             "› \x1b[2mAsk Codex to do anything\x1b[0m"
             if preserve_styles

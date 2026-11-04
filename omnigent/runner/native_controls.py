@@ -2579,11 +2579,19 @@ def build_native_controls(
                 "Return to Codex's message input in the Terminal view, closing any "
                 "open menu or transcript search, then change the permission mode again."
             )
-        # Empty input renders a dim placeholder. Plain capture cannot distinguish
-        # it from an identical draft, and the footer may contain a status line.
-        composer = next(
-            row for row in reversed(styled_pane.split("\n")) if row.plain.lstrip().startswith("›")
+        # Styled capture distinguishes a dim placeholder from an identical draft.
+        # A draft can also start with an empty first line.
+        rows = styled_pane.split("\n")
+        composer_index = next(
+            index
+            for index in range(len(rows) - 1, -1, -1)
+            if rows[index].plain.lstrip().startswith("›")
         )
+        composer = rows[composer_index].copy()
+        for continuation in rows[composer_index + 1 :]:
+            if not continuation.plain.strip() or not continuation.plain.startswith("  "):
+                break
+            composer.append("\n").append(continuation)
         console = Console()
         start = composer.plain.index("›")
         text_offsets = [
@@ -2591,12 +2599,8 @@ def build_native_controls(
             for offset in range(start + 1, len(composer))
             if not composer.plain[offset].isspace()
         ]
-        if (
-            composer.get_style_at_offset(console, start).dim
-            or not text_offsets
-            or not all(
-                composer.get_style_at_offset(console, offset).dim for offset in text_offsets
-            )
+        if composer.get_style_at_offset(console, start).dim or not all(
+            composer.get_style_at_offset(console, offset).dim for offset in text_offsets
         ):
             raise _CodexPermissionSwitchRefused(
                 "Send or clear any unsent draft and close open menus in Codex's Terminal view "
