@@ -1122,7 +1122,7 @@ async def test_claude_stop_on_paneless_subagent_mirror_returns_honest_not_stoppe
     bridge_id: str,
     wrapper_label: str | None,
 ) -> None:
-    """T17 / 26BUG-201: stopping a pane-less sub-agent mirror never lies ``cancelled: true``."""
+    """Stopping a pane-less sub-agent mirror never lies ``cancelled: true``."""
     import omnigent.harnesses.claude_native.bridge as claude_bridge
     from omnigent.runner import subagent_work
     from omnigent.runner.native import interrupt as interrupt_mod

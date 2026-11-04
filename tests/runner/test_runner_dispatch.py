@@ -17137,7 +17137,7 @@ async def test_eager_mcp_cache_keeps_named_child_scope_after_revision_change(mon
 
 @pytest.mark.asyncio
 async def test_sys_cancel_task_on_paneless_subagent_mirror_never_reports_cancelled() -> None:
-    """T17 / 26BUG-201: sys_cancel_task on a pane-less *-subagent mirror returns false."""
+    """sys_cancel_task on a pane-less *-subagent mirror returns false."""
     from omnigent.runner import subagent_work, tool_dispatch
 
     parent_id = "conv_parent_t17"

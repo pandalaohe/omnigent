@@ -469,8 +469,8 @@ def test_pi_native_cold_resume_keeps_result_before_message_sent_during_tool(
         bind_session_runner(client.patch, "", session_id, stack.runner_id)
         send_user_text(client, session_id=session_id, text="Run the slow command.")
         _wait(lambda: any(item["type"] == "function_call" for item in items()))
-        # The fork mirrors a user item only once Pi consumes it (db3234d148,
-        # MOD-session-peer-messaging), so a steer sent mid-tool lands after the
+        # The fork mirrors a user item only once Pi consumes it,
+        # so a steer sent mid-tool lands after the
         # tool result instead of upstream's acceptance-time placement.
         send_user_text(client, session_id=session_id, text=steer)
         release.touch()
