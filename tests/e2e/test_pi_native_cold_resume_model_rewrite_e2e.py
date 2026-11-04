@@ -37,6 +37,13 @@ _CONTEXT_MARKERS = ["PI_GLOBAL_CONTEXT", "PI_ANCESTOR_CONTEXT", "PI_WORKSPACE_CO
 _BASE_MARKER = "PI_DISCOVERED_BASE"
 _APPEND_MARKER = "PI_DISCOVERED_APPEND"
 _GLOBAL_APPEND_MARKER = "PI_GLOBAL_APPEND"
+_NODE_OPTIONS_PRELOAD = """import fs from 'node:fs';
+import path from 'node:path';
+if (process.env.OMNIGENT_PI_NATIVE_BRIDGE_DIR) {
+  fs.appendFileSync(path.join(process.env.OMNIGENT_PI_NATIVE_BRIDGE_DIR, 'node-options.jsonl'),
+    JSON.stringify({pid: process.pid}) + '\\n');
+}
+"""
 
 
 def _pane_command(metadata: dict) -> subprocess.CompletedProcess[str]:
@@ -55,6 +62,86 @@ def _pane_command(metadata: dict) -> subprocess.CompletedProcess[str]:
         text=True,
         timeout=10,
     )
+
+
+def _tmux_type(metadata: dict, text: str) -> None:
+    subprocess.run(
+        [
+            "tmux",
+            "-S",
+            metadata["tmux_socket"],
+            "send-keys",
+            "-t",
+            metadata["tmux_target"],
+            "-l",
+            text,
+        ],
+        check=True,
+        timeout=10,
+    )
+    subprocess.run(
+        [
+            "tmux",
+            "-S",
+            metadata["tmux_socket"],
+            "send-keys",
+            "-t",
+            metadata["tmux_target"],
+            "Enter",
+        ],
+        check=True,
+        timeout=10,
+    )
+
+
+def _scope_snapshots(bridge: Path) -> list[dict]:
+    root = bridge / "pi-scopes"
+    if not root.is_dir():
+        return []
+    snapshots = []
+    for directory in root.iterdir():
+        expected = directory / "permission_expected.json"
+        registry = directory / "permission_tools.json"
+        if expected.is_file() and registry.is_file():
+            snapshots.append(json.loads(expected.read_text()))
+    return snapshots
+
+
+def _await_scope_count(bridge: Path, count: int) -> list[dict]:
+    deadline = time.monotonic() + 30
+    snapshots = []
+    while time.monotonic() < deadline:
+        snapshots = _scope_snapshots(bridge)
+        if len(snapshots) == count:
+            assert all(
+                snapshot.get("harness") == "pi-native"
+                and snapshot.get("origin") == "parent"
+                and snapshot.get("scope_protocol_version") == 2
+                for snapshot in snapshots
+            )
+            return snapshots
+        time.sleep(0.2)
+    raise AssertionError(f"Expected {count} native root scopes, got {snapshots}")
+
+
+def _await_permission_ready(bridge: Path) -> None:
+    deadline = time.monotonic() + 30
+    state = {}
+    while time.monotonic() < deadline:
+        path = bridge / "permission_state.json"
+        if path.is_file():
+            state = json.loads(path.read_text())
+            if state.get("status") == "ready":
+                return
+        time.sleep(0.1)
+    raise AssertionError(f"Initial Pi permission launch did not finish: {state}")
+
+
+def _node_option_pids(bridge: Path) -> list[int]:
+    path = bridge / "node-options.jsonl"
+    if not path.is_file():
+        return []
+    return [json.loads(line)["pid"] for line in path.read_text().splitlines() if line]
 
 
 def _wait_for_catalog(client: httpx.Client, session_id: str, selection: str) -> dict:
@@ -148,6 +235,9 @@ def test_cold_resume_preserves_model_and_prompt_settings(
             }
         }
     }
+    preload = tmp_path / "node options" / "native-carrier-preload.mjs"
+    preload.parent.mkdir()
+    preload.write_text(_NODE_OPTIONS_PRELOAD)
     with isolated_host(
         tmp_path,
         live_server,
@@ -155,7 +245,10 @@ def test_cold_resume_preserves_model_and_prompt_settings(
         env={
             "OMNIGENT_PI_PATH": os.environ.get("OMNIGENT_PI_PATH"),
             "PI_CODING_AGENT_DIR": "../custom-pi-agent" if provider_managed else None,
-            "OMNIGENT_RUNNER_ENV_PASSTHROUGH": "PI_CODING_AGENT_DIR" if provider_managed else None,
+            "OMNIGENT_RUNNER_ENV_PASSTHROUGH": (
+                "PI_CODING_AGENT_DIR,NODE_OPTIONS" if provider_managed else "NODE_OPTIONS"
+            ),
+            "NODE_OPTIONS": f"--import={preload.as_uri()}",
         },
     ) as host:
         host.wait_online(http_client)
@@ -231,7 +324,25 @@ os_env:
             )
             for marker in _CONTEXT_MARKERS:
                 assert (marker in first_prompt["prompt"]) is (context_files is not False)
+            initial_scopes = _await_scope_count(bridge, 1)
+            _await_permission_ready(bridge)
+            assert _node_option_pids(bridge) == [first_prompt["pid"]]
             old_pane = terminal.json()["metadata"]
+            _tmux_type(old_pane, "/reload")
+            poll_until(
+                lambda: len(prompts.read_text().splitlines()) >= 2,
+                timeout_s=30,
+                interval_s=0.2,
+            )
+            reloaded_prompt = json.loads(prompts.read_text().splitlines()[-1])
+            assert reloaded_prompt["pid"] == first_prompt["pid"]
+            # /reload keeps the Node incarnation but revokes and replaces the
+            # scoped client; registry files retain that revoked installation's history.
+            reloaded_scopes = _await_scope_count(bridge, 2)
+            assert len({scope["launch_epoch"] for scope in reloaded_scopes}) == 1
+            assert {scope["scope_id"] for scope in initial_scopes} < {
+                scope["scope_id"] for scope in reloaded_scopes
+            }
             http_client.delete(f"{terminal_url}/terminal_pi_main", timeout=30).raise_for_status()
             deadline = time.monotonic() + 30
             while _pane_command(old_pane).returncode == 0:
@@ -283,10 +394,17 @@ os_env:
                 {selection} if provider_managed else {_SELECTION, "openai-codex/gpt-5.5"}
             )
             poll_until(
-                lambda: len(prompts.read_text().splitlines()) >= 2, timeout_s=30, interval_s=0.2
+                lambda: len(prompts.read_text().splitlines()) >= 3, timeout_s=30, interval_s=0.2
             )
             resumed_prompt = json.loads(prompts.read_text().splitlines()[-1])
             assert resumed_prompt["pid"] != first_prompt["pid"]
+            resumed_scopes = _await_scope_count(bridge, 3)
+            assert len({scope["launch_epoch"] for scope in resumed_scopes}) == 2
+            assert len({scope["scope_id"] for scope in resumed_scopes}) == 3
+            assert {scope["scope_id"] for scope in reloaded_scopes} < {
+                scope["scope_id"] for scope in resumed_scopes
+            }
+            assert _node_option_pids(bridge) == [first_prompt["pid"], resumed_prompt["pid"]]
             if provider_managed:
                 assert resumed_prompt["agentDir"] == first_prompt["agentDir"]
             for snapshot, phase in ((first_prompt, "initial"), (resumed_prompt, "resumed")):

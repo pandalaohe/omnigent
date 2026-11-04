@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     from omnigent.harnesses.opencode_native.forwarder import OpenCodeNativeForwarder
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.inner.terminal import TerminalInstance
+    from omnigent.runner.pi_bootstrap import PiBootstrapBroker
     from omnigent.runner.subagent_routing import SubagentRouter
     from omnigent.runner.turn_routing import TurnRouter
     from omnigent.spec.types import MCPServerConfig
@@ -3218,6 +3219,7 @@ async def _auto_create_pi_terminal(
     peer_messaging_enabled: bool = False,
     session_open_enabled: bool = False,
     global_instructions: str | None = None,
+    pi_bootstrap: Callable[[], Awaitable[PiBootstrapBroker]] | None = None,
 ) -> SessionResourceView:
     """
     Auto-create a Pi terminal for a pi-native session.
@@ -3248,6 +3250,7 @@ async def _auto_create_pi_terminal(
         pi_native_env_unset,
         pi_session_dir,
         prepare_bridge_dir,
+        verify_pi_permission_installation,
         write_agent_instructions,
         write_extension_files,
     )
@@ -3500,60 +3503,130 @@ async def _auto_create_pi_terminal(
     permission_state = read_host_permission_state(bridge_dir / HOST_PERMISSION_STATE_FILE)
     if permission_state.session_id != session_id:
         raise ValueError("Pi launch permission state belongs to another session")
-    if permission_state.tier != "full":
-        pi_command, pi_args = await asyncio.to_thread(
-            ordered_pi_launch,
-            pi_command,
-            pi_args,
-            extension=pi_extension,
-        )
-    # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
-    # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
-    # and ``parent_os_env`` below, launch_required_terminal falls back to
-    # _default_sandbox_for_platform (linux_bwrap), overriding the YAML config.
-    agent_os_env = _agent_os_env_from_spec(agent_spec)
-    terminal_view = await resource_registry.launch_required_terminal(
-        session_id=session_id,
-        terminal_name="pi",
-        session_key="main",
-        resource_role=PI_NATIVE_TERMINAL_ROLE,
-        parent_os_env=agent_os_env,
-        spec=TerminalEnvSpec(
-            os_env=OSEnvSpec(
-                type="caller_process",
-                cwd=workspace,
-                sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
+    scoped_launch: tuple[PiBootstrapBroker, str] | None = None
+    terminal_instance: TerminalInstance | None = None
+    try:
+        if permission_state.tier != "full":
+            if pi_bootstrap is None:
+                raise ValueError("Pi scoped native launcher unavailable")
+            broker = await pi_bootstrap()
+            broker.launcher_descriptor()
+            launch_id = uuid.uuid4().hex
+            reserved = broker.handle_launcher(
+                {"protocol": 1, "op": "reserve", "launch_id": launch_id}
+            )
+            handoff = reserved.get("handoff")
+            if not isinstance(handoff, str):
+                raise ValueError("Pi scoped handoff reservation unavailable")
+            scoped_launch = (broker, launch_id)
+            pi_command, pi_args = await asyncio.to_thread(
+                ordered_pi_launch,
+                pi_command,
+                pi_args,
+                extension=pi_extension,
+                scoped_handoff=Path(handoff),
+            )
+        # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
+        # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
+        # and ``parent_os_env`` below, launch_required_terminal falls back to
+        # _default_sandbox_for_platform (linux_bwrap), overriding the YAML config.
+        agent_os_env = _agent_os_env_from_spec(agent_spec)
+        terminal_view = await resource_registry.launch_required_terminal(
+            session_id=session_id,
+            terminal_name="pi",
+            session_key="main",
+            resource_role=PI_NATIVE_TERMINAL_ROLE,
+            parent_os_env=agent_os_env,
+            spec=TerminalEnvSpec(
+                os_env=OSEnvSpec(
+                    type="caller_process",
+                    cwd=workspace,
+                    sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
+                ),
+                command=pi_command,
+                args=pi_args,
+                env=pi_env,
+                # Credential vars the operator declared off-limits for Pi
+                # (OMNIGENT_PI_ENV_UNSET): Pi activates a built-in provider's
+                # whole catalog on the mere presence of its credential, flooding
+                # the picker with entries that bypass the managed models.json
+                # provider — and Pi needs no credential env (its auth rides the
+                # managed apiKey). Empty list = no scrubbing.
+                env_unset=pi_native_env_unset(os.environ),
+                scrollback=100_000,
+                tmux_allow_passthrough=True,
+                tmux_start_on_attach=False,
+                # Keep the private tmux server alive if the `pi` CLI exits. Without
+                # this, tmux (exit-empty on, remain-on-exit off) reaps the lone-pane
+                # server the instant pi exits, the idle watcher's probes fail with
+                # "tmux unavailable", and the exit is undiagnosable. With it, the
+                # dead pane persists (last output capturable) and the watcher
+                # reports the exit deterministically via `#{pane_dead}` — parity
+                # with the claude terminal.
+                keep_alive_after_exit=True,
             ),
-            command=pi_command,
-            args=pi_args,
-            env=pi_env,
-            # Credential vars the operator declared off-limits for Pi
-            # (OMNIGENT_PI_ENV_UNSET): Pi activates a built-in provider's
-            # whole catalog on the mere presence of its credential, flooding
-            # the picker with entries that bypass the managed models.json
-            # provider — and Pi needs no credential env (its auth rides the
-            # managed apiKey). Empty list = no scrubbing.
-            env_unset=pi_native_env_unset(os.environ),
-            scrollback=100_000,
-            tmux_allow_passthrough=True,
-            tmux_start_on_attach=False,
-            # Keep the private tmux server alive if the `pi` CLI exits. Without
-            # this, tmux (exit-empty on, remain-on-exit off) reaps the lone-pane
-            # server the instant pi exits, the idle watcher's probes fail with
-            # "tmux unavailable", and the exit is undiagnosable. With it, the
-            # dead pane persists (last output capturable) and the watcher
-            # reports the exit deterministically via `#{pane_dead}` — parity
-            # with the claude terminal.
-            keep_alive_after_exit=True,
-        ),
-    )
-    publish_event(
-        session_id,
-        {
-            "type": "session.resource.created",
-            "resource": session_resource_view_to_dict(terminal_view),
-        },
-    )
+        )
+        if scoped_launch is not None:
+            from omnigent.runner.pi_bootstrap import process_identity
+
+            terminal_registry = resource_registry.terminal_registry
+            terminal_instance = (
+                terminal_registry.get(session_id, "pi", "main")
+                if terminal_registry is not None
+                else None
+            )
+            if terminal_instance is None:
+                raise ValueError("Pi scoped terminal incarnation unavailable")
+
+            def _terminal_process_identity() -> tuple[int, float] | None:
+                pid = terminal_instance.pane_pid_sync()
+                return process_identity(pid) if pid is not None else None
+
+            identity = await asyncio.to_thread(_terminal_process_identity)
+            if identity is None:
+                raise ValueError("Pi scoped process identity unavailable")
+            scoped_launch[0].handle_launcher(
+                {
+                    "protocol": 1,
+                    "op": "publish",
+                    "launch_id": scoped_launch[1],
+                    "pid": identity[0],
+                    "started_at": identity[1],
+                }
+            )
+            deadline = asyncio.get_running_loop().time() + 20.0
+            while True:
+                confirmed = scoped_launch[0].handle_launcher(
+                    {"protocol": 1, "op": "confirm", "launch_id": scoped_launch[1]}
+                )
+                if confirmed.get("ready") is True and verify_pi_permission_installation(
+                    bridge_dir, permission_state.tier
+                ):
+                    break
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise ValueError("Pi permission extension did not acknowledge startup")
+                await asyncio.sleep(0.05)
+        publish_event(
+            session_id,
+            {
+                "type": "session.resource.created",
+                "resource": session_resource_view_to_dict(terminal_view),
+            },
+        )
+    except BaseException:
+        if scoped_launch is not None:
+            if terminal_instance is not None:
+                with contextlib.suppress(Exception):
+                    await resource_registry.close_terminal(
+                        session_id,
+                        terminal_resource_id("pi", "main"),
+                        expected_instance=terminal_instance,
+                    )
+            with contextlib.suppress(ValueError):
+                scoped_launch[0].handle_launcher(
+                    {"protocol": 1, "op": "revoke", "launch_id": scoped_launch[1]}
+                )
+        raise
     _logger.info(
         "Auto-created pi terminal for session %s with extension %s",
         session_id,
@@ -11175,6 +11248,7 @@ class NativeLaunchContext:
     server_client: httpx.AsyncClient | None = None
     event_dispatcher: RunnerEventDispatcher | None = None
     ensure_comment_relay: _EnsureCommentRelay | None = None
+    pi_bootstrap: Callable[[], Awaitable[PiBootstrapBroker]] | None = None
     agent_spec: AgentSpec | ResolvedSpec | None = None
     bundle_dir: Path | None = None
     skills_filter: str | list[str] = "all"
@@ -11230,6 +11304,7 @@ async def _launch_pi(ctx: NativeLaunchContext) -> SessionResourceView:
         peer_messaging_enabled=ctx.peer_messaging_enabled,
         session_open_enabled=ctx.session_open_enabled,
         global_instructions=ctx.global_instructions,
+        pi_bootstrap=ctx.pi_bootstrap,
     )
 
 

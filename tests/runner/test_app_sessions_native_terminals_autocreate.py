@@ -151,6 +151,26 @@ async def test_auto_create_agy_terminal_refuses_inline_pre_tool_hook(tmp_path, m
 _PI_SESSION_ID = "47f049b9d13df4db397c7f46859b825f"
 
 
+class _FakePiBootstrap:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+
+    def launcher_descriptor(self) -> dict[str, object]:
+        return {}
+
+    def handle_launcher(self, payload: dict[str, object]) -> dict[str, object]:
+        operation = payload["op"]
+        if operation == "reserve":
+            return {"handoff": str(self.root / "pi-bootstrap" / f"{payload['launch_id']}.json")}
+        if operation == "publish":
+            return {"published": True}
+        if operation == "confirm":
+            return {"ready": True}
+        if operation == "revoke":
+            return {"revoked": True}
+        raise AssertionError(operation)
+
+
 async def _no_op_forwarder(**kwargs: Any) -> None:
     del kwargs
 
@@ -345,10 +365,14 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
 
     captured: dict[str, Any] = {}
 
+    class _FakeTerminalRegistry:
+        def get(self, *_args: Any) -> Any:
+            return SimpleNamespace(pane_pid_sync=lambda: os.getpid())
+
     class _FakeResourceRegistry:
         """Omit launch_terminal so regressions to the optional-terminal API fail."""
 
-        terminal_registry = None
+        terminal_registry = _FakeTerminalRegistry()
 
         async def launch_required_terminal(
             self,
@@ -377,11 +401,21 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
 
     ordered_calls = []
 
-    def ordered(executable, args, *, extension):
-        ordered_calls.append((executable, extension))
+    def ordered(executable, args, *, extension, scoped_handoff=None):
+        ordered_calls.append((executable, extension, scoped_handoff))
         return "/opt/launchers/controlled-pi", args
 
     monkeypatch.setattr("omnigent.inner.pi_settings.ordered_pi_launch", ordered)
+    monkeypatch.setattr(
+        pi_native_bridge,
+        "verify_pi_permission_installation",
+        lambda *_args: True,
+    )
+    bootstrap = _FakePiBootstrap(tmp_path)
+
+    async def provide_bootstrap() -> _FakePiBootstrap:
+        return bootstrap
+
     seed_pi_permission_state(tmp_path, "47f049b9d13df4db397c7f46859b825f", permission_tier)
     instructions = "  Follow the authored role. π\nKeep this whitespace.  "
     agent_spec = None
@@ -407,6 +441,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
         lambda _sid, evt: published.append(evt),
         server_client=NullServerClient(),  # type: ignore[arg-type]
         agent_spec=agent_spec,
+        pi_bootstrap=provide_bootstrap,
     )
 
     # Required lifecycle (parity with claude-native), correct terminal identity.
@@ -416,6 +451,8 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     expected_command = "pi" if permission_tier == "full" else "/opt/launchers/controlled-pi"
     assert captured["spec"].command == expected_command
     assert len(ordered_calls) == (0 if permission_tier == "full" else 1)
+    if permission_tier != "full":
+        assert ordered_calls[0][2] is not None
     # Preserve the exited pane so the idle watcher can report its output.
     assert captured["spec"].keep_alive_after_exit is True
     assert captured["spec"].env_unset == expected_env_unset
@@ -887,12 +924,18 @@ async def test_pi_launcher_requires_sdk_only_for_restricted_tiers(
     session_id = "47f049b9d13df4db397c7f46859b825f"
     seed_pi_permission_state(tmp_path, session_id, permission_tier)
 
+    bootstrap = _FakePiBootstrap(tmp_path)
+
+    async def provide_bootstrap() -> _FakePiBootstrap:
+        return bootstrap
+
     async def launch() -> None:
         await _auto_create_pi_terminal(
             session_id,
             captured["registry"],
             lambda _sid, _event: None,
             server_client=NullServerClient(),  # type: ignore[arg-type]
+            pi_bootstrap=provide_bootstrap,
         )
 
     if permission_tier == "full":

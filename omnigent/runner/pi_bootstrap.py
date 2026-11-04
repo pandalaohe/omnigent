@@ -101,7 +101,7 @@ class PiBootstrapBroker:
         state = self.runtime.state(self.session_id)
         if (
             self.endpoint is None
-            or self.runtime.observation_harness(self.session_id) != "pi"
+            or self.runtime.observation_harness(self.session_id) not in ("pi", "pi-native")
             or state is None
             or state.status not in ("ready", "blocked")
             or state.tier == "full"
@@ -127,7 +127,7 @@ class PiBootstrapBroker:
             or not hmac.compare_digest(
                 authorization.encode(), ("Bearer " + self._launcher_capability).encode()
             )
-            or self.runtime.observation_harness(self.session_id) != "pi"
+            or self.runtime.observation_harness(self.session_id) not in ("pi", "pi-native")
             or state is None
             or state.status not in ("ready", "blocked")
             or state.tier == "full"

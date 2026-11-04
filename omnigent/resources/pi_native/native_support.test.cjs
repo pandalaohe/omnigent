@@ -145,6 +145,21 @@ test("acknowledged async binding wraps root definitions and keeps receipts priva
   await assert.rejects(async()=>f.actual.getToolDefinition("read").execute("late",{}),/sealed/);
   assert.equal(f.backendStarts(),1);
 });
+test("reload seals and closes the previous scoped client before the SDK reloads", async t => {
+  const seen=[];
+  const client={
+    evaluate:async()=>({block:false}),
+    execute:async(_event,_ctx,start)=>start(),
+    finish:async()=>true,
+    seal(){seen.push("seal");},close:async()=>{seen.push("close");},
+    project:value=>value,
+  };
+  const f=await fixture(t,{scopedClient:client,asyncDescriptor:true});
+  assert.equal(await f.final({toolCallId:"bind",toolName:"read",input:{path:"notes"}},f.ctx),undefined);
+  f.loader.loadExtensionPaths=async()=>{seen.push("sdk-reload");};
+  await f.loader.reload();
+  assert.deepEqual(seen,["seal","close","sdk-reload"]);
+});
 test("source proof cannot bypass workflow/machine/cwd/output or extra fields", async t => {
   const additions=[{workflow:"unknown"},{machine:"unknown"},{worktree:true},{cwd:"child"},{options:{output:"other"}}, {options:{sessionDir:"other"}}, {options:{acceptance:{run:"echo changed"}}}, {options:null}];
   for (const extra of additions) await t.test(JSON.stringify(extra), async t => {

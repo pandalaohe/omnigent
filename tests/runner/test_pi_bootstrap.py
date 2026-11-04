@@ -147,6 +147,20 @@ async def test_scoped_registry_accepts_only_the_configured_bridge_file(
         assert not runtime.acknowledge_pi_scope("session-a", admission.credential)
 
 
+@pytest.mark.parametrize(
+    ("path", "accepted"),
+    [("builtin:tool-search", True), ("builtin:other-search", False)],
+)
+def test_scoped_registry_accepts_only_observed_tool_search_alias(tmp_path, path, accepted):
+    runtime, _source, _registry = _extension_runtime(tmp_path, "auto")
+    admission = runtime.begin_pi_scope_launch("session-a", native_guard=True)
+    _write_scope_registry(
+        admission,
+        [{"name": "tool_search", "sourceInfo": {"source": "builtin", "path": path}}],
+    )
+    assert runtime.acknowledge_pi_scope("session-a", admission.credential) is accepted
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "publication", ["pending", "ready", "changed-registry", "revoked", "state-write-retry"]

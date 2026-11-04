@@ -197,7 +197,10 @@ def read_pi_tool_registry(
                 native_tools[name] = "Native helper package source is not verified"
             if isinstance(source, dict):
                 path = source.get("path")
-                if source.get("source") == "builtin" and path == f"builtin:{name}":
+                if source.get("source") == "builtin" and (
+                    path == f"builtin:{name}"
+                    or (name, path) == ("tool_search", "builtin:tool-search")
+                ):
                     continue
                 if path in (str(guard), "<inline:omnigent-permission>"):
                     bridge_tools.add(name)

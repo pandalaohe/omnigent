@@ -3036,6 +3036,10 @@ def create_runner_app(
         # app-server turn; the native-terminal ensure path can recreate it.
         if event.lifecycle != TerminalLifecycle.REQUIRED:
             return
+        if event.terminal_name == "pi" and event.session_key == "main":
+            binding = _session_comment_relays.get(event.session_id)
+            if binding is not None and binding.pi_scope_relay is not None:
+                binding.pi_scope_relay.bootstrap.invalidate()
 
         # Omnigent killed this pane after a delivery timeout. The turn's own
         # error is the failure; a terminal-exit failure would be a second one.
@@ -4111,6 +4115,20 @@ def create_runner_app(
             # claude/codex, a build_context enrichment. All wire the comment
             # relay (pi/opencode route their policy hook through it).
             _launch_locks = _native_terminal_ensure_locks[_native_agent.key]
+
+            async def _pi_native_bootstrap():
+                from omnigent.harnesses.pi_native.bridge import bridge_dir_for_session_id
+
+                await _ensure_comment_relay_started(
+                    session_id,
+                    explicit_bridge_dir=bridge_dir_for_session_id(session_id),
+                    session_labels=init_context.labels,
+                )
+                binding = _session_comment_relays.get(session_id)
+                if binding is None or binding.pi_scope_relay is None:
+                    raise ValueError("Pi scoped permission relay unavailable")
+                return binding.pi_scope_relay.bootstrap
+
             _launch_ctx = NativeLaunchContext(
                 session_id=session_id,
                 resource_registry=resource_registry,
@@ -4118,6 +4136,7 @@ def create_runner_app(
                 server_client=server_client,
                 event_dispatcher=getattr(app.state, "runner_event_dispatcher", None),
                 ensure_comment_relay=_ensure_comment_relay_started,
+                pi_bootstrap=_pi_native_bootstrap,
                 peer_messaging_enabled=_session_peer_messaging_enabled.get(session_id, False),
                 session_open_enabled=_session_open_enabled.get(session_id, False),
                 global_instructions=_session_global_instructions.get(session_id),
