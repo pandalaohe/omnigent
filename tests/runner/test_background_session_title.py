@@ -6,6 +6,7 @@ import asyncio
 import json
 import stat
 import threading
+import tomllib
 import uuid
 from contextlib import asynccontextmanager
 from datetime import date
@@ -735,20 +736,24 @@ async def test_claude_native_title_kills_process_when_cancelled(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("model_override", ["gpt-5.4-mini", "team/gpt-5.4-mini"])
 async def test_background_title_uses_native_codex_without_spawning_headless_harness(
     monkeypatch: pytest.MonkeyPatch,
+    model_override: str,
 ) -> None:
     harness_client = _FakeHarnessClient()
     process_manager = _FakeProcessManager(harness_client)
     resolver_calls: list[tuple[str | None, str | None]] = []
-    cli_calls: list[tuple[str, Any, str | None]] = []
+    cli_calls: list[str | None] = []
 
     async def resolve_harness_config(**kwargs: Any) -> tuple[str, dict[str, str] | None]:
         resolver_calls.append((kwargs["harness_override"], kwargs["model_override"]))
         return "codex-native", None
 
     async def generate_codex_title(context: BackgroundTitleContext) -> str:
-        cli_calls.append((context.prompt, context.model_override))
+        cli_calls.append(context.title_model or context.model_override)
+        if context.title_model:
+            raise RuntimeError("Economy model unavailable")
         return "Debug authentication timeout"
 
     monkeypatch.setattr(
@@ -769,7 +774,7 @@ async def test_background_title_uses_native_codex_without_spawning_headless_harn
             "/v1/sessions/conv_test/background-title",
             json={
                 "prompt": "please investigate the authentication timeout",
-                "model_override": "gpt-5.4-mini",
+                "model_override": model_override,
             },
         )
 
@@ -778,13 +783,12 @@ async def test_background_title_uses_native_codex_without_spawning_headless_harn
         "status": "generated",
         "title": "Debug authentication timeout",
     }
-    assert resolver_calls == [(None, "gpt-5.4-mini")]
-    assert cli_calls == [
-        (
-            "please investigate the authentication timeout",
-            "gpt-5.4-mini",
-        )
-    ]
+    assert resolver_calls == [(None, model_override)]
+    assert cli_calls == (
+        ["team/gpt-5.4-mini"]
+        if model_override == "team/gpt-5.4-mini"
+        else ["gpt-5.6-luna", "gpt-5.4-mini"]
+    )
     assert process_manager.get_client_calls == []
     assert process_manager.released == []
     assert harness_client.requests == []
@@ -982,6 +986,9 @@ async def test_codex_native_title_uses_ephemeral_tool_free_exec(
     assert "[features]" not in config_text
     assert "sk-sentinel-do-not-use" in config_text
     assert "omnigent_provider" in config_text
+    for provider in tomllib.loads(config_text)["model_providers"].values():
+        assert provider["request_max_retries"] == 7
+        assert provider["stream_max_retries"] == 7
     assert captured["codex_home_mode"] == 0o700
     assert captured["config_mode"] == 0o600
     assert captured["agents_exists"] is False
@@ -1220,6 +1227,28 @@ async def test_background_title_dispatch_pins_economy_model_for_mapped_harness(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["codex-native", "codex", "claude-native", "claude-sdk"])
+@pytest.mark.parametrize("result", ["Debug authentication timeout", None])
+async def test_background_title_keeps_explicit_provider_route(
+    monkeypatch: pytest.MonkeyPatch, harness: str, result: str | None
+) -> None:
+    attempted_models: list[str | None] = []
+
+    async def generate_title(context: BackgroundTitleContext) -> str | None:
+        attempted_models.append(context.title_model or context.model_override)
+        return result
+
+    _register_fake_title_generator(monkeypatch, harness, generate_title)
+
+    title = await title_service.generate_background_title(
+        _title_context(harness, model_override="team/session-model")
+    )
+
+    assert title == result
+    assert attempted_models == ["team/session-model"]
+
+
+@pytest.mark.asyncio
 async def test_background_title_dispatch_retries_with_session_model_after_economy_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1298,7 +1327,10 @@ async def test_background_title_dispatch_leaves_unmapped_harness_on_session_mode
 
 
 @pytest.mark.asyncio
-async def test_sdk_title_event_carries_title_model_as_model_override() -> None:
+@pytest.mark.parametrize("title_model", [None, "gpt-5.6-luna"])
+async def test_sdk_title_event_carries_title_model_as_model_override(
+    title_model: str | None,
+) -> None:
     harness_client = _FakeHarnessClient()
     process_manager = _FakeProcessManager(harness_client)
 
@@ -1308,13 +1340,14 @@ async def test_sdk_title_event_carries_title_model_as_model_override() -> None:
             harness="codex",
             spawn_env={},
             process_manager=process_manager,  # type: ignore[arg-type]
-            title_model="gpt-5.6-luna",
+            title_model=title_model,
+            model_override="team/gpt-5.4-mini",
         )
     )
 
     assert title == "Debug authentication timeout"
     [(_url, body)] = harness_client.requests
-    assert body["model_override"] == "gpt-5.6-luna"
+    assert body["model_override"] == (title_model or "team/gpt-5.4-mini")
     assert body["model"] == "session-title"
 
 
