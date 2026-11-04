@@ -81,6 +81,9 @@ function renderInlineSection(
 
 beforeEach(() => {
   useTerminalsMock.mockReset();
+  close.isError = false;
+  close.error = null;
+  close.mutate.mockReset();
 });
 
 afterEach(() => {
@@ -89,6 +92,28 @@ afterEach(() => {
 });
 
 describe("InlineTerminalsSection rows open shells in the main view", () => {
+  it("keeps a failed close visible with its error and allows a retry", () => {
+    const terminal = makeTerminal("terminal_bash_s1", "bash", "s1");
+    const view = renderInlineSection([terminal]);
+    fireEvent.click(screen.getByRole("button", { name: "Close bash · s1" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close shell" }));
+    close.isError = true;
+    close.error = new Error("terminal delete failed: 503 Service Unavailable");
+    view.rerender(
+      <TerminalFirstContextProvider value={TERMINAL_FIRST_SDK_CTX}>
+        <InlineTerminalsSection conversationId="conv_terminal" onExpand={vi.fn()} />
+      </TerminalFirstContextProvider>,
+    );
+    expect(screen.getByRole("dialog", { name: "Close bash · s1?" })).toBeVisible();
+    expect(screen.getByRole("alert")).toHaveTextContent("503 Service Unavailable");
+    expect(
+      screen.getByRole("button", { name: "Open bash · s1", hidden: true }),
+    ).toBeInTheDocument();
+    close.mutate.mockImplementation((_id, options) => options.onSuccess());
+    fireEvent.click(screen.getByRole("button", { name: "Close shell" }));
+    expect(close.mutate).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
   it("labels known origins and closes only after confirmation; cancel leaves the shell intact", () => {
     renderInlineSection([
       { ...makeTerminal("terminal_bash_s1", "bash", "s1"), origin: "user" },

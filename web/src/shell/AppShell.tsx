@@ -2125,17 +2125,20 @@ function AppShellImpl() {
   // drawer even when this harness can't start side chats.
   const [hasSubagentTabs, setHasSubagentTabs] = useState(false);
 
-  function openTerminalsPanel(key: string) {
-    setSelectedFilePath(null); // close file viewer
-    clearFileViewerUrl();
-    setExecutionLogsKey(null); // close execution-logs panel
-    setFilesPanelOpen(false); // close files drawer
-    setArchivePanelOpen(false); // close mobile archive drawer
-    setSubagentsPanelOpen(false); // close mobile agents drawer
-    setShellsPanelOpen(false); // close mobile shells drawer
-    setGithubPanelOpen(false); // close mobile github drawer
-    setPanelInitialKey(key);
-  }
+  const openTerminalsPanel = useCallback(
+    (key: string) => {
+      setSelectedFilePath(null); // close file viewer
+      clearFileViewerUrl();
+      setExecutionLogsKey(null); // close execution-logs panel
+      setFilesPanelOpen(false); // close files drawer
+      setArchivePanelOpen(false); // close mobile archive drawer
+      setSubagentsPanelOpen(false); // close mobile agents drawer
+      setShellsPanelOpen(false); // close mobile shells drawer
+      setGithubPanelOpen(false); // close mobile github drawer
+      setPanelInitialKey(key);
+    },
+    [clearFileViewerUrl, setPanelInitialKey],
+  );
 
   // Open a shell as a tab in the desktop workspace rail (the mobile path
   // still uses ``openTerminalsPanel`` → full-screen drawer). Adds the key to
@@ -2183,7 +2186,11 @@ function AppShellImpl() {
     if (name === null) return;
     markShellCreateStarted();
     createTerminal.mutate(name, {
-      onSuccess: (info) => openTerminalTab(terminalTabKey(info)),
+      onSuccess: (info) => {
+        const key = terminalTabKey(info);
+        if (isMobileViewport()) openTerminalsPanel(key);
+        else openTerminalTab(key);
+      },
       onError: () => clearShellCreatePending(),
     });
   }, [
@@ -2192,6 +2199,7 @@ function AppShellImpl() {
     markShellCreateStarted,
     clearShellCreatePending,
     openTerminalTab,
+    openTerminalsPanel,
   ]);
   useNewShellHotkey(launchDefaultShell, shellLaunchable);
 

@@ -98,6 +98,10 @@ import { useReplyDraft } from "@/hooks/useReplyDraft";
 import { useSessionModelLabel } from "@/hooks/useSessionModelLabel";
 import { useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
 import { useFocusComposerHotkey } from "@/hooks/useFocusComposerHotkey";
+import {
+  MOBILE_ASSISTANT_ACTION_EVENT,
+  type MobileAssistantDirectAction,
+} from "@/lib/mobileAssistantPreferences";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import {
@@ -3389,6 +3393,19 @@ function ComposerImpl(
   useFocusComposerHotkey(() => {
     if (!isMobileRef.current) textareaRef.current?.focus({ preventScroll: true });
   });
+
+  useEffect(() => {
+    const onAction = (event: Event) => {
+      if (
+        (event as CustomEvent<{ actionId: MobileAssistantDirectAction }>).detail.actionId ===
+        "focusComposer"
+      ) {
+        textareaRef.current?.focus({ preventScroll: true });
+      }
+    };
+    window.addEventListener(MOBILE_ASSISTANT_ACTION_EVENT, onAction);
+    return () => window.removeEventListener(MOBILE_ASSISTANT_ACTION_EVENT, onAction);
+  }, []);
 
   // Attachments — same hook as the landing composer; the live composer's
   // own side effects (dirty tracking, desktop refocus) stay in the

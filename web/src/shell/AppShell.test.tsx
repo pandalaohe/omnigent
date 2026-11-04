@@ -796,6 +796,75 @@ describe("Goal session frame", () => {
 });
 
 describe("AppShell header", () => {
+  it.each([false, true])(
+    "opens a newly created phone shell (terminal first=%s)",
+    async (terminalFirst) => {
+      const matchMedia = window.matchMedia;
+      const viewport = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+        ...matchMedia(query),
+        matches: query.includes("max-width"),
+      }));
+      onTestFinished(() => viewport.mockRestore());
+      mockConversations([
+        {
+          id: "conv_phone",
+          permission_level: 4,
+          labels: terminalFirst ? { "omnigent.ui": "terminal" } : {},
+        },
+      ]);
+      useSessionAgentMock.mockReturnValue({
+        data: { id: "ag_x", name: "polly", terminals: ["zsh"] },
+      } as ReturnType<typeof useSessionAgent>);
+      const originalFetch = globalThis.fetch;
+      const fetch = vi.spyOn(globalThis, "fetch").mockImplementation((input, init) =>
+        init?.method === "POST" && String(input).endsWith("/resources/terminals")
+          ? Promise.resolve(
+              new Response(
+                JSON.stringify({
+                  id: "terminal_zsh_new",
+                  object: "session.resource",
+                  name: "zsh:new",
+                  metadata: { terminal_name: "zsh", session_key: "new", running: true },
+                }),
+              ),
+            )
+          : originalFetch(input, init),
+      );
+      onTestFinished(() => fetch.mockRestore());
+      renderShell("/c/conv_phone?view=chat");
+      act(() =>
+        dispatchMobileAssistantButton({
+          id: "shell",
+          label: "New shell",
+          binding: { kind: "shortcut", actionId: "newShell" },
+        }),
+      );
+      await waitFor(() =>
+        expect(fetch).toHaveBeenCalledWith(
+          expect.stringContaining("/v1/sessions/conv_phone/resources/terminals"),
+          expect.objectContaining({
+            method: "POST",
+            body: expect.stringContaining('"terminal":"zsh"'),
+          }),
+        ),
+      );
+      await waitFor(() => {
+        if (terminalFirst) {
+          expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "terminal");
+          expect(screen.getByTestId("view-probe")).toHaveAttribute(
+            "data-terminal-view-key",
+            "terminal:terminal_zsh_new",
+          );
+        } else {
+          expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "open");
+          expect(screen.getByTestId("terminals-panel")).toHaveAttribute(
+            "data-initial-key",
+            "terminal:terminal_zsh_new",
+          );
+        }
+      });
+    },
+  );
   it.each(["/c/conv_abc", "/settings/shortcuts", "/"])(
     "opens the Terminals sheet from mobile controls at %s",
     (path) => {

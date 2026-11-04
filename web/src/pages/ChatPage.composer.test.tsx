@@ -5689,6 +5689,29 @@ describe("Composer reply quotes", () => {
     expect(document.activeElement).not.toBe(ta);
   });
 
+  it("focuses the real phone composer from a tap while its keyboard hotkey stays inert", () => {
+    const matchMedia = window.matchMedia;
+    vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+      ...matchMedia(query),
+      matches: query.includes("max-width"),
+    }));
+    render(<Composer {...composerProps()} />);
+    const input = textarea();
+    fireEvent.change(input, { target: { value: "Keep this draft" } });
+    input.blur();
+    fireEvent.keyDown(window, { key: "L", code: "KeyL", ctrlKey: true, shiftKey: true });
+    expect(input).not.toHaveFocus();
+    act(() =>
+      dispatchMobileAssistantButton({
+        id: "focus",
+        label: "Focus composer",
+        binding: { kind: "shortcut", actionId: "focusComposer" },
+      }),
+    );
+    expect(input).toHaveFocus();
+    expect(input).toHaveValue("Keep this draft");
+  });
+
   it.each([
     { disabled: true },
     { permissionLevel: 1 },

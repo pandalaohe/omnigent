@@ -64,7 +64,7 @@ export const MOBILE_ASSISTANT_DIRECT_ACTIONS = {
   openSideChats: { label: "Side chats" },
 };
 export type MobileAssistantDirectAction =
-  keyof typeof MOBILE_ASSISTANT_DIRECT_ACTIONS | "stopResponse";
+  keyof typeof MOBILE_ASSISTANT_DIRECT_ACTIONS | "stopResponse" | "renameSession" | "focusComposer";
 export type MobileAssistantActionId =
   ShortcutActionId | keyof typeof MOBILE_ASSISTANT_DIRECT_ACTIONS;
 export const MOBILE_ASSISTANT_ACTION_EVENT = "omnigent:mobile-assistant-action";
@@ -1197,7 +1197,9 @@ export function dispatchMobileAssistantButton(
   if (binding.kind === "shortcut") {
     if (
       binding.actionId in MOBILE_ASSISTANT_DIRECT_ACTIONS ||
-      binding.actionId === "stopResponse"
+      binding.actionId === "stopResponse" ||
+      binding.actionId === "renameSession" ||
+      binding.actionId === "focusComposer"
     ) {
       window.dispatchEvent(
         new CustomEvent(MOBILE_ASSISTANT_ACTION_EVENT, { detail: { actionId: binding.actionId } }),
