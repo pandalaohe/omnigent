@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { CircleHelpIcon } from "lucide-react";
 
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { cn } from "@/lib/utils";
 
 /** Grace window for the mouse to cross from the trigger into the popover. */
 const HOVER_CLOSE_DELAY_MS = 150;
@@ -13,7 +14,15 @@ const HOVER_CLOSE_DELAY_MS = 150;
  * on pointer leave keeps it open while the pointer travels from the trigger
  * into the content, and re-entering either side cancels the pending close.
  */
-export function HelpTip({ label, children }: { label: string; children: ReactNode }) {
+export function HelpTip({
+  label,
+  children,
+  className,
+}: {
+  label: string;
+  children: ReactNode;
+  className?: string;
+}) {
   const [open, setOpen] = useState(false);
   const closeTimerRef = useRef<number | null>(null);
   const pointerFocusRef = useRef(false);
@@ -45,7 +54,10 @@ export function HelpTip({ label, children }: { label: string; children: ReactNod
         <button
           type="button"
           aria-label={label}
-          className="inline-flex size-4 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:text-foreground"
+          className={cn(
+            "inline-flex size-4 shrink-0 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:text-foreground",
+            className,
+          )}
           onPointerDown={() => {
             pointerFocusRef.current = true;
           }}

@@ -54,6 +54,8 @@ export interface PaletteSwatch {
   card: string;
   /** Primary action / brand accent for this palette. */
   accent: string;
+  /** Secondary element colour for levels and amounts. */
+  companion: string;
   /** Card border / divider. */
   border: string;
   /** Body text on the card. */
@@ -72,6 +74,8 @@ export interface PaletteTokens {
   primary: string;
   link: string;
   primaryForeground: string;
+  primaryCta: string;
+  primaryCtaForeground: string;
   selectionBackground: string;
   selectionForeground: string;
   secondary: string;
@@ -87,7 +91,11 @@ export interface PaletteTokens {
   input: string;
   ring: string;
   brandAccent: string;
-  /** Clear blue marking a cold keep-warm cache (sidebar indicators). */
+  companion: string;
+  success: string;
+  warning: string;
+  destructive: string;
+  /** Per-palette neutral info and cold keep-warm indicator, untinted by custom accents. */
   keepCold: string;
   sidebar: string;
   sidebarForeground: string;
@@ -115,6 +123,8 @@ export const PALETTE_TOKEN_CSS_NAMES = {
   primary: "primary",
   link: "link",
   primaryForeground: "primary-foreground",
+  primaryCta: "primary-cta",
+  primaryCtaForeground: "primary-cta-foreground",
   selectionBackground: "selection-background",
   selectionForeground: "selection-foreground",
   secondary: "secondary",
@@ -130,6 +140,10 @@ export const PALETTE_TOKEN_CSS_NAMES = {
   input: "input",
   ring: "ring",
   brandAccent: "brand-accent",
+  companion: "companion",
+  success: "success",
+  warning: "warning",
+  destructive: "destructive",
   keepCold: "keep-cold",
   sidebar: "sidebar",
   sidebarForeground: "sidebar-foreground",
@@ -145,7 +159,7 @@ export const PALETTE_TOKEN_CSS_NAMES = {
   shellBackground: "shell-background",
 } as const satisfies Record<keyof PaletteTokens, string>;
 
-type PaletteTokenInput = Pick<
+export type PaletteTokenInput = Pick<
   PaletteTokens,
   | "background"
   | "foreground"
@@ -163,12 +177,26 @@ type PaletteTokenInput = Pick<
   | "border"
   | "borderStrong"
   | "ring"
+  | "companion"
+  | "success"
+  | "warning"
+  | "destructive"
   | "sidebar"
   | "shellBackground"
 > &
   Partial<PaletteTokens>;
 
-function paletteTokens(tokens: PaletteTokenInput): PaletteTokens {
+function isLightBackground(hex: string): boolean {
+  const match = /^#([0-9a-f]{6})$/i.exec(hex);
+  if (!match) return true;
+  const r = Number.parseInt(match[1].slice(0, 2), 16);
+  const g = Number.parseInt(match[1].slice(2, 4), 16);
+  const b = Number.parseInt(match[1].slice(4, 6), 16);
+  return (r * 299 + g * 587 + b * 114) / 255000 >= 0.5;
+}
+
+export function paletteTokens(tokens: PaletteTokenInput): PaletteTokens {
+  const lightBg = isLightBackground(tokens.background);
   return {
     // Selection is a translucent wash of the palette's accent under the page
     // foreground, never an opaque block. Dark alphas are tuned per accent: a
@@ -179,13 +207,16 @@ function paletteTokens(tokens: PaletteTokenInput): PaletteTokens {
     tray: tokens.card,
     popover: tokens.cardSolid,
     popoverForeground: tokens.foreground,
+    primaryCta: lightBg ? "#11171c" : "#e8ecf0",
+    primaryCtaForeground: lightBg ? "#ffffff" : "#11171c",
     secondaryForeground: tokens.foreground,
     buttonBorder: tokens.border,
     input: tokens.border,
     brandAccent: tokens.ring,
-    // A fixed status blue, not the palette accent: cold means "cache likely
-    // lost" on every theme, so it must not shift with the brand color.
-    keepCold: tokens.keepCold ?? "#2f7fd4",
+    // Per-palette info / cold-cache colour so blue-accent palettes (GitHub,
+    // Solarized, Nord) stay distinct from the unread dot, and never tinted by
+    // a custom accent.
+    keepCold: tokens.keepCold ?? (lightBg ? "#2a6cb3" : "#3e91f5"),
     sidebarForeground: tokens.foreground,
     sidebarPrimary: tokens.ring,
     sidebarPrimaryForeground: tokens.primaryForeground,
@@ -227,10 +258,18 @@ export const PALETTES: readonly PaletteMeta[] = [
       bg: "#fdf7fb",
       card: "#ffffff",
       accent: "#df3c85",
+      companion: "#0d9488",
       border: "#e8ecf0",
       text: "#11171c",
     },
-    dark: { bg: "#160e24", card: "#28223a", accent: "#df3c85", border: "#2a2440", text: "#f4f5f7" },
+    dark: {
+      bg: "#160e24",
+      card: "#28223a",
+      accent: "#df3c85",
+      companion: "#2dd4bf",
+      border: "#2a2440",
+      text: "#f4f5f7",
+    },
     tokens: {
       light: paletteTokens({
         background: "#ffffff",
@@ -254,6 +293,11 @@ export const PALETTES: readonly PaletteMeta[] = [
         buttonBorder: "#d6d6d6",
         ring: "#11171c",
         brandAccent: "#df3c85",
+        companion: "#0d9488",
+        success: "#247345",
+        warning: "#826022",
+        destructive: "#c3314a",
+        keepCold: "#2a6cb3",
         sidebar: "#fdfafa",
         sidebarPrimary: "#2272b4",
         sidebarRing: "#2272b4",
@@ -286,6 +330,11 @@ export const PALETTES: readonly PaletteMeta[] = [
         input: "rgb(255 255 255 / 15%)",
         ring: "#e8ecf0",
         brandAccent: "#df3c85",
+        companion: "#2dd4bf",
+        success: "#39ab65",
+        warning: "#d4972a",
+        destructive: "#e7627d",
+        keepCold: "#3e91f5",
         sidebar: "#0e0b19",
         sidebarPrimary: "oklch(0.64 0.22 254)",
         sidebarPrimaryForeground: "oklch(0.12 0.004 240)",
@@ -307,10 +356,18 @@ export const PALETTES: readonly PaletteMeta[] = [
       bg: "#f7f5fd",
       card: "#ffffff",
       accent: "#7c3aed",
+      companion: "#036a96",
       border: "#e6e0f2",
       text: "#1e1a2b",
     },
-    dark: { bg: "#282a36", card: "#343746", accent: "#bd93f9", border: "#44475a", text: "#f8f8f2" },
+    dark: {
+      bg: "#282a36",
+      card: "#343746",
+      accent: "#bd93f9",
+      companion: "#8be9fd",
+      border: "#44475a",
+      text: "#f8f8f2",
+    },
     tokens: {
       light: paletteTokens({
         background: "#f7f5fd",
@@ -330,6 +387,11 @@ export const PALETTES: readonly PaletteMeta[] = [
         borderStrong: "#b6abd6",
         ring: "#7c3aed",
         brandAccent: "#d6409f",
+        companion: "#036a96",
+        success: "#146f0a",
+        warning: "#994914",
+        destructive: "#b73628",
+        keepCold: "#2867aa",
         sidebar: "#f3f0fa",
         shellBackground: "linear-gradient(160deg, #faf8ff 0%, #f5f1fd 50%, #f3eefb 100%)",
       }),
@@ -353,6 +415,11 @@ export const PALETTES: readonly PaletteMeta[] = [
         borderStrong: "#5a5d75",
         ring: "#bd93f9",
         brandAccent: "#ff79c6",
+        companion: "#8be9fd",
+        success: "#50fa7b",
+        warning: "#ffb86c",
+        destructive: "#ff8f8f",
+        keepCold: "#7fb2fe",
         sidebar: "rgba(33, 34, 44, 0.8)",
         shellBackground: "var(--background)",
       }),
@@ -366,10 +433,18 @@ export const PALETTES: readonly PaletteMeta[] = [
       bg: "#f6f8fa",
       card: "#ffffff",
       accent: "#0969da",
+      companion: "#8250df",
       border: "#d1d9e0",
       text: "#1f2328",
     },
-    dark: { bg: "#0d1117", card: "#161b22", accent: "#58a6ff", border: "#30363d", text: "#e6edf3" },
+    dark: {
+      bg: "#0d1117",
+      card: "#161b22",
+      accent: "#58a6ff",
+      companion: "#a371f7",
+      border: "#30363d",
+      text: "#e6edf3",
+    },
     tokens: {
       light: paletteTokens({
         background: "#f6f8fa",
@@ -389,6 +464,11 @@ export const PALETTES: readonly PaletteMeta[] = [
         border: "#d1d9e0",
         borderStrong: "#afb8c1",
         ring: "#0969da",
+        companion: "#8250df",
+        success: "#197333",
+        warning: "#875b03",
+        destructive: "#c8212d",
+        keepCold: "#1a747a",
         sidebar: "#f6f8fa",
         shellBackground: "linear-gradient(180deg, #fbfcfd 0%, #f6f8fa 100%)",
       }),
@@ -410,6 +490,11 @@ export const PALETTES: readonly PaletteMeta[] = [
         border: "#30363d",
         borderStrong: "#444c56",
         ring: "#58a6ff",
+        companion: "#a371f7",
+        success: "#3fb950",
+        warning: "#d29922",
+        destructive: "#f85149",
+        keepCold: "#39c5cf",
         sidebar: "rgba(13, 17, 23, 0.75)",
         sidebarPrimaryForeground: "#0d1117",
         shellBackground: "var(--background)",
@@ -424,10 +509,18 @@ export const PALETTES: readonly PaletteMeta[] = [
       bg: "#eff1f5",
       card: "#ffffff",
       accent: "#8839ef",
+      companion: "#179299",
       border: "#ccd0da",
       text: "#4c4f69",
     },
-    dark: { bg: "#1e1e2e", card: "#313244", accent: "#cba6f7", border: "#45475a", text: "#cdd6f4" },
+    dark: {
+      bg: "#1e1e2e",
+      card: "#313244",
+      accent: "#cba6f7",
+      companion: "#94e2d5",
+      border: "#45475a",
+      text: "#cdd6f4",
+    },
     tokens: {
       light: paletteTokens({
         background: "#eff1f5",
@@ -448,6 +541,11 @@ export const PALETTES: readonly PaletteMeta[] = [
         borderStrong: "#acb0be",
         ring: "#8839ef",
         brandAccent: "#ea76cb",
+        companion: "#179299",
+        success: "#2d6723",
+        warning: "#7c531b",
+        destructive: "#bb0f35",
+        keepCold: "#1c57ce",
         sidebar: "#e6e9ef",
         shellBackground: "linear-gradient(160deg, #f2f3f7 0%, #eff1f5 60%, #e9ecf2 100%)",
       }),
@@ -472,6 +570,11 @@ export const PALETTES: readonly PaletteMeta[] = [
         border: "#45475a",
         borderStrong: "#585b70",
         ring: "#cba6f7",
+        companion: "#94e2d5",
+        success: "#a6e3a1",
+        warning: "#f9e2af",
+        destructive: "#f38ba8",
+        keepCold: "#89b4fa",
         sidebar: "rgba(24, 24, 37, 0.8)",
         shellBackground: "var(--background)",
       }),
@@ -485,10 +588,18 @@ export const PALETTES: readonly PaletteMeta[] = [
       bg: "#fbf1c7",
       card: "#fffdf2",
       accent: "#d65d0e",
+      companion: "#427b58",
       border: "#e6d5a8",
       text: "#3c3836",
     },
-    dark: { bg: "#282828", card: "#3c3836", accent: "#fe8019", border: "#504945", text: "#ebdbb2" },
+    dark: {
+      bg: "#282828",
+      card: "#3c3836",
+      accent: "#fe8019",
+      companion: "#8ec07c",
+      border: "#504945",
+      text: "#ebdbb2",
+    },
     tokens: {
       light: paletteTokens({
         background: "#fbf1c7",
@@ -508,6 +619,11 @@ export const PALETTES: readonly PaletteMeta[] = [
         border: "#e6d5a8",
         borderStrong: "#bdae93",
         ring: "#d65d0e",
+        companion: "#427b58",
+        success: "#615d10",
+        warning: "#7b5315",
+        destructive: "#9d0006",
+        keepCold: "#076678",
         sidebar: "#f4e8bc",
         shellBackground: "linear-gradient(160deg, #fbf3cd 0%, #fbf1c7 55%, #f7ecbb 100%)",
       }),
@@ -529,6 +645,11 @@ export const PALETTES: readonly PaletteMeta[] = [
         border: "#504945",
         borderStrong: "#665c54",
         ring: "#fe8019",
+        companion: "#8ec07c",
+        success: "#b8bb26",
+        warning: "#fabd2f",
+        destructive: "#fc8172",
+        keepCold: "#8eada1",
         sidebar: "rgba(29, 32, 33, 0.8)",
         shellBackground: "var(--background)",
       }),
@@ -542,6 +663,7 @@ export const PALETTES: readonly PaletteMeta[] = [
       bg: "#fdf6e3",
       card: "#eee8d5",
       accent: "#268bd2",
+      companion: "#d33682",
       border: "#c1c5bb",
       text: "#657b83",
     },
@@ -549,6 +671,7 @@ export const PALETTES: readonly PaletteMeta[] = [
       bg: "#002b36",
       card: "#073642",
       accent: "#268bd2",
+      companion: "#d53f88",
       border: "#304f5c",
       text: "#839496",
     },
@@ -575,6 +698,11 @@ export const PALETTES: readonly PaletteMeta[] = [
         borderStrong: "#aeb6af",
         ring: "#268bd2",
         brandAccent: "#6c71c4",
+        companion: "#d33682",
+        success: "#54610a",
+        warning: "#70580a",
+        destructive: "#b12b2a",
+        keepCold: "#206a66",
         sidebar: "#eee8d5",
         shellBackground: "#fdf6e3",
       }),
@@ -601,6 +729,11 @@ export const PALETTES: readonly PaletteMeta[] = [
         borderStrong: "#3f5f69",
         ring: "#268bd2",
         brandAccent: "#6c71c4",
+        companion: "#d53f88",
+        success: "#a8b74a",
+        warning: "#caaa48",
+        destructive: "#eb8786",
+        keepCold: "#59b6af",
         sidebar: "#073642",
         sidebarPrimaryForeground: "#fdf6e3",
         shellBackground: "var(--background)",
@@ -615,10 +748,18 @@ export const PALETTES: readonly PaletteMeta[] = [
       bg: "#eceff4",
       card: "#e5e9f0",
       accent: "#5e81ac",
+      companion: "#9b7b96",
       border: "#d8dee9",
       text: "#2e3440",
     },
-    dark: { bg: "#2e3440", card: "#3b4252", accent: "#88c0d0", border: "#4c566a", text: "#eceff4" },
+    dark: {
+      bg: "#2e3440",
+      card: "#3b4252",
+      accent: "#88c0d0",
+      companion: "#b48ead",
+      border: "#4c566a",
+      text: "#eceff4",
+    },
     tokens: {
       light: paletteTokens({
         background: "#eceff4",
@@ -638,6 +779,11 @@ export const PALETTES: readonly PaletteMeta[] = [
         border: "#d8dee9",
         borderStrong: "#81a1c1",
         ring: "#5e81ac",
+        companion: "#9b7b96",
+        success: "#525f4c",
+        warning: "#795248",
+        destructive: "#904c54",
+        keepCold: "#4e6466",
         sidebar: "#e5e9f0",
         sidebarAccent: "#d8dee9",
         shellBackground: "linear-gradient(160deg, #eceff4 0%, #e5e9f0 55%, #d8dee9 100%)",
@@ -663,6 +809,11 @@ export const PALETTES: readonly PaletteMeta[] = [
         border: "#4c566a",
         borderStrong: "#81a1c1",
         ring: "#88c0d0",
+        companion: "#b48ead",
+        success: "#bfd2af",
+        warning: "#ebcb8b",
+        destructive: "#e1b5b9",
+        keepCold: "#aec2d7",
         sidebar: "rgba(46, 52, 64, 0.8)",
         shellBackground: "var(--background)",
       }),

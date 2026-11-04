@@ -19,8 +19,8 @@ export function SettingsGroup({
   testId,
 }: SettingsGroupProps) {
   return (
-    <section className={cn("flex flex-col gap-3", className)} data-testid={testId}>
-      <h2 className="text-ui font-medium">{title}</h2>
+    <section className={cn("flex max-w-2xl flex-col gap-3", className)} data-testid={testId}>
+      <h2 className="text-ui font-semibold">{title}</h2>
       <div
         data-slot="settings-group-card"
         className={cn("rounded-xl border border-border bg-card p-4", contentClassName)}

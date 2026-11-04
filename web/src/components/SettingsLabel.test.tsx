@@ -6,6 +6,31 @@ import { SettingsLabel } from "./SettingsLabel";
 afterEach(cleanup);
 
 describe("SettingsLabel", () => {
+  it.each(["One short visible line.", null])(
+    "keeps full help behind ? with explicit note %s",
+    async (note) => {
+      render(
+        <SettingsLabel
+          label="Always steer"
+          note={note}
+          description="The original longer explanation."
+        />,
+      );
+      const trigger = screen.getByRole("button", { name: "About Always steer" });
+      expect(trigger).not.toHaveClass("md:hidden");
+      expect(screen.queryByText("One short visible line.") !== null).toBe(note !== null);
+      expect(screen.queryByText("The original longer explanation.")).not.toBeInTheDocument();
+      fireEvent.click(trigger);
+      expect(await screen.findByRole("tooltip")).toHaveTextContent(
+        "The original longer explanation.",
+      );
+    },
+  );
+
+  it("omits the question mark when there is no description", () => {
+    render(<SettingsLabel label="Timeout" note="Approvals wait this long." />);
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+  });
   it("moves mobile help into an inline tooltip while retaining the desktop description", async () => {
     render(
       <SettingsLabel

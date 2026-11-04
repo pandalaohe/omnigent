@@ -144,8 +144,7 @@ function mix(first: string, second: string, secondWeight: number): string {
   });
 }
 
-function luminance(hex: string): number {
-  const color = hexToRgb(hex);
+function rgbLuminance(color: Rgb): number {
   const linear = (channel: number) => {
     const value = channel / 255;
     return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
@@ -153,32 +152,143 @@ function luminance(hex: string): number {
   return linear(color.r) * 0.2126 + linear(color.g) * 0.7152 + linear(color.b) * 0.0722;
 }
 
-function contrastRatio(first: string, second: string): number {
-  const firstLuminance = luminance(first);
-  const secondLuminance = luminance(second);
+function luminance(hex: string): number {
+  return rgbLuminance(hexToRgb(hex));
+}
+
+function rgbContrastRatio(first: Rgb, second: Rgb): number {
+  const firstLuminance = rgbLuminance(first);
+  const secondLuminance = rgbLuminance(second);
   const lighter = Math.max(firstLuminance, secondLuminance);
   const darker = Math.min(firstLuminance, secondLuminance);
   return (lighter + 0.05) / (darker + 0.05);
 }
 
-function ensureContrast(color: string, backgrounds: string[], toward: string): string {
-  const passes = (candidate: string) =>
-    backgrounds.every((background) => contrastRatio(candidate, background) >= 4.5);
+function contrastRatio(first: string, second: string): number {
+  return rgbContrastRatio(hexToRgb(first), hexToRgb(second));
+}
+
+export function ensureContrast(
+  color: string,
+  backgrounds: string[],
+  toward: string,
+  floor = 4.5,
+  ownTintAlpha = 0,
+): string {
+  const bgRgbs = backgrounds.map(hexToRgb);
+  const minRatio = (candidate: string, alpha: number): number => {
+    const candidateRgb = hexToRgb(candidate);
+    let lowest = Number.POSITIVE_INFINITY;
+    for (const bgRgb of bgRgbs) {
+      lowest = Math.min(lowest, rgbContrastRatio(candidateRgb, bgRgb));
+      if (alpha > 0) {
+        const tinted: Rgb = {
+          r: bgRgb.r * (1 - alpha) + candidateRgb.r * alpha,
+          g: bgRgb.g * (1 - alpha) + candidateRgb.g * alpha,
+          b: bgRgb.b * (1 - alpha) + candidateRgb.b * alpha,
+        };
+        lowest = Math.min(lowest, rgbContrastRatio(candidateRgb, tinted));
+      }
+    }
+    return lowest;
+  };
+  const passes = (candidate: string) => minRatio(candidate, ownTintAlpha) >= floor;
   if (passes(color)) return color;
-  let lower = 0;
-  let upper = 1;
-  let result = toward;
-  for (let index = 0; index < 12; index += 1) {
-    const weight = (lower + upper) / 2;
-    const candidate = mix(color, toward, weight);
-    if (passes(candidate)) {
-      result = candidate;
-      upper = weight;
-    } else {
-      lower = weight;
+
+  const search = (target: string, check: (candidate: string) => boolean): string | null => {
+    if (!check(target)) return null;
+    let lower = 0;
+    let upper = 1;
+    let result = target;
+    for (let index = 0; index < 14; index += 1) {
+      const weight = (lower + upper) / 2;
+      const candidate = mix(color, target, weight);
+      if (check(candidate)) {
+        result = candidate;
+        upper = weight;
+      } else {
+        lower = weight;
+      }
+    }
+    return check(result) ? result : target;
+  };
+
+  const primaryPole = luminance(toward) >= 0.5 ? "#ffffff" : "#000000";
+  const oppositePole = primaryPole === "#ffffff" ? "#000000" : "#ffffff";
+
+  for (const target of [toward, primaryPole, oppositePole]) {
+    const hit = search(target, passes);
+    if (hit !== null) return hit;
+  }
+
+  if (ownTintAlpha > 0) {
+    for (const target of [toward, primaryPole, oppositePole]) {
+      const plainHit = search(target, (c) => minRatio(c, 0) >= floor);
+      if (plainHit !== null) return plainHit;
     }
   }
-  return passes(result) ? result : toward;
+
+  const bestPole =
+    minRatio(primaryPole, 0) >= minRatio(oppositePole, 0) ? primaryPole : oppositePole;
+  return minRatio(toward, 0) >= minRatio(bestPole, 0) ? toward : bestPole;
+}
+
+function hexToHsl(hex: string): [number, number, number] {
+  const { r: r255, g: g255, b: b255 } = hexToRgb(hex);
+  const r = r255 / 255;
+  const g = g255 / 255;
+  const b = b255 / 255;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const delta = max - min;
+  const l = (max + min) / 2;
+  let h = 0;
+  if (delta !== 0) {
+    if (max === r) h = ((g - b) / delta + 6) % 6;
+    else if (max === g) h = (b - r) / delta + 2;
+    else h = (r - g) / delta + 4;
+  }
+  const s = delta === 0 ? 0 : delta / (1 - Math.abs(2 * l - 1));
+  return [h * 60, s, l];
+}
+
+function hslToHex(h: number, s: number, l: number): string {
+  const hue = ((h % 360) + 360) % 360;
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs(((hue / 60) % 2) - 1));
+  const m = l - c / 2;
+  const [r1, g1, b1] =
+    hue < 60
+      ? [c, x, 0]
+      : hue < 120
+        ? [x, c, 0]
+        : hue < 180
+          ? [0, c, x]
+          : hue < 240
+            ? [0, x, c]
+            : hue < 300
+              ? [x, 0, c]
+              : [c, 0, x];
+  return rgbToHex({
+    r: (r1 + m) * 255,
+    g: (g1 + m) * 255,
+    b: (b1 + m) * 255,
+  });
+}
+
+/** Base companion, turned 150° when within 35° of the accent's hue, then held to the floor. */
+export function companionFor(
+  baseCompanion: string,
+  accent: string,
+  surfaces: string[],
+  toward: string,
+): string {
+  const [h, s, l] = hexToHsl(baseCompanion);
+  const [accentHue] = hexToHsl(accent);
+  const diff = Math.abs(h - accentHue) % 360;
+  const distance = Math.min(diff, 360 - diff);
+  const candidate = distance < 35 ? hslToHex((h + 150) % 360, s, l) : baseCompanion;
+  return ensureContrast(candidate, surfaces, toward, 3);
 }
 
 function readableForeground(background: string): "#111318" | "#ffffff" {
@@ -267,6 +377,49 @@ function rebaseColor(base: string, reference: string, current: string): string {
 function setAlpha(color: string, alpha: number): string {
   const parsed = parseCssColor(color);
   return parsed ? formatCssColor({ ...parsed, alpha }, "rgba") : color;
+}
+
+function parseSurfaceColor(value: string): CssColor | null {
+  const parsed = parseCssColor(value);
+  if (parsed) return parsed;
+  const spaceRgb = /^rgba?\(\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)(?:\s*\/\s*([\d.]+)(%)?)?\s*\)$/i.exec(
+    value,
+  );
+  if (!spaceRgb) return null;
+  const rawAlpha = spaceRgb[4] ? Number(spaceRgb[4]) : 1;
+  return {
+    r: Number(spaceRgb[1]),
+    g: Number(spaceRgb[2]),
+    b: Number(spaceRgb[3]),
+    alpha: spaceRgb[5] === "%" ? rawAlpha / 100 : rawAlpha,
+  };
+}
+
+function flattenSurface(surface: string, background: string): string {
+  const fg = parseSurfaceColor(surface);
+  const bg = parseSurfaceColor(background);
+  if (!fg) return isHexColor(background) ? background : "#ffffff";
+  if (fg.alpha >= 1 || !bg) return rgbToHex(fg);
+  return rgbToHex({
+    r: fg.r * fg.alpha + bg.r * (1 - fg.alpha),
+    g: fg.g * fg.alpha + bg.g * (1 - fg.alpha),
+    b: fg.b * fg.alpha + bg.b * (1 - fg.alpha),
+  });
+}
+
+const LIGHT_PRIMARY_CTA = { primaryCta: "#11171c", primaryCtaForeground: "#ffffff" } as const;
+const DARK_PRIMARY_CTA = { primaryCta: "#e8ecf0", primaryCtaForeground: "#11171c" } as const;
+
+/** The neutral pair contrasting more with the flattened track; at least 3.9:1 against any opaque colour. */
+export function neutralPairFor(track: string): {
+  primaryCta: string;
+  primaryCtaForeground: string;
+} {
+  const flattened = flattenSurface(track, "#ffffff");
+  return contrastRatio(LIGHT_PRIMARY_CTA.primaryCta, flattened) >=
+    contrastRatio(DARK_PRIMARY_CTA.primaryCta, flattened)
+    ? { ...LIGHT_PRIMARY_CTA }
+    : { ...DARK_PRIMARY_CTA };
 }
 
 function generateCustomTheme(theme: CustomTheme): GeneratedCustomTheme {
@@ -393,6 +546,15 @@ function rebaseVariant(
     current.cardSolid !== reference.cardSolid ||
     current.muted !== reference.muted ||
     current.codeBackground !== reference.codeBackground;
+  const popover = rebaseColor(base.popover, reference.cardSolid, current.cardSolid);
+  const effectiveSidebar = translucentSidebar ? setAlpha(sidebar, 0.72) : sidebar;
+  const elementSurfaces = [background, cardSolid, popover, effectiveSidebar].map((surface) =>
+    flattenSurface(surface, background),
+  );
+  const toward = readableForeground(background);
+  const activePrimary = primaryChanged ? primary : base.primary;
+  const flattenedTrack = flattenSurface(muted, flattenSurface(card, background));
+  const { primaryCta, primaryCtaForeground } = neutralPairFor(flattenedTrack);
 
   return {
     background,
@@ -401,19 +563,17 @@ function rebaseVariant(
     cardSolid,
     cardForeground: rebaseColor(base.cardForeground, reference.foreground, current.foreground),
     tray: rebaseColor(base.tray, reference.card, current.card),
-    popover: rebaseColor(base.popover, reference.cardSolid, current.cardSolid),
+    popover,
     popoverForeground: rebaseColor(
       base.popoverForeground,
       reference.foreground,
       current.foreground,
     ),
-    primary: primaryChanged ? primary : base.primary,
-    link: ensureContrast(
-      primaryChanged ? primary : base.link,
-      linkSurfaces,
-      readableForeground(background),
-    ),
+    primary: activePrimary,
+    link: ensureContrast(primaryChanged ? primary : base.link, linkSurfaces, toward),
     primaryForeground: primaryChanged ? readableForeground(primary) : base.primaryForeground,
+    primaryCta,
+    primaryCtaForeground,
     ...rebaseSelection(base, primaryChanged ? primary : null, foreground),
     secondary: rebaseColor(base.secondary, reference.secondary, current.secondary),
     secondaryForeground: rebaseColor(
@@ -435,9 +595,13 @@ function rebaseVariant(
     input: rebaseColor(base.input, reference.border, current.border),
     ring: primaryChanged ? primary : base.ring,
     brandAccent: primaryChanged ? primary : base.brandAccent,
-    // Status blue, never tinted by the custom accent.
-    keepCold: base.keepCold,
-    sidebar: translucentSidebar ? setAlpha(sidebar, 0.72) : sidebar,
+    companion: companionFor(base.companion, activePrimary, elementSurfaces, toward),
+    success: ensureContrast(base.success, elementSurfaces, toward, 4.5, 0.15),
+    warning: ensureContrast(base.warning, elementSurfaces, toward, 4.5, 0.15),
+    destructive: ensureContrast(base.destructive, elementSurfaces, toward, 4.5, 0.1),
+    // Per-palette info / cold-cache colour: held to contrast on custom surfaces, never tinted by the custom accent.
+    keepCold: ensureContrast(base.keepCold, elementSurfaces, toward, 4.5, 0.1),
+    sidebar: effectiveSidebar,
     sidebarForeground: rebaseColor(
       base.sidebarForeground,
       reference.foreground,
@@ -501,23 +665,26 @@ export function customThemeSwatches(theme: CustomTheme): {
     PALETTES.find((candidate) => candidate.id === normalized.basePalette) ?? PALETTES[0];
   const reference = generateCustomTheme(createCustomThemeFromPalette(palette));
   const current = generateCustomTheme({ ...normalized, translucentSidebar: false });
+  const derived = deriveCustomTheme(normalized);
 
   const swatch = (
     base: PaletteSwatch,
     referenceVariant: GeneratedThemeVariant,
     currentVariant: GeneratedThemeVariant,
+    derivedVariant: DerivedThemeVariant,
   ): PaletteSwatch => ({
     bg: rebaseColor(base.bg, referenceVariant.background, currentVariant.background),
     card: rebaseColor(base.card, referenceVariant.cardSolid, currentVariant.cardSolid),
     accent:
       currentVariant.primary === referenceVariant.primary ? base.accent : currentVariant.primary,
+    companion: derivedVariant.companion,
     border: rebaseColor(base.border, referenceVariant.border, currentVariant.border),
     text: rebaseColor(base.text, referenceVariant.foreground, currentVariant.foreground),
   });
 
   return {
-    light: swatch(palette.light, reference.light, current.light),
-    dark: swatch(palette.dark, reference.dark, current.dark),
+    light: swatch(palette.light, reference.light, current.light, derived.light),
+    dark: swatch(palette.dark, reference.dark, current.dark, derived.dark),
   };
 }
 
