@@ -22,9 +22,27 @@ from omnigent.harnesses.codex_native.bridge import (
     update_active_turn_id,
     write_bridge_state,
 )
+from omnigent.runner.turn_routing import routed_prompt_block_reason, write_pending_replay
 from tests.harnesses.codex_native.forwarder._support import (
     _RecordingClient,
 )
+
+
+@pytest.mark.parametrize("method", ["turn/started", "item/agentMessage/delta"])
+def test_new_child_turn_clears_the_previous_hook_stop(method: str) -> None:
+    state = fwd._CodexForwarderState(turn_stopped_by_hook=True)
+    stream = fwd._CodexChildStream(
+        state,
+        fwd._OutputTextDeltaCoalescer(_RecordingClient(), "conv_child"),
+        active_turn_id="stopped_turn",
+    )
+    assert stream.accepts_event("item/agentMessage/delta", {"turnId": "stopped_turn"})
+    assert state.turn_stopped_by_hook
+    assert not stream.accepts_event("item/agentMessage/delta", {"turnId": "next_turn"})
+    assert state.turn_stopped_by_hook
+    assert stream.accepts_event("turn/completed", {"turn": {"id": "stopped_turn"}})
+    assert stream.accepts_event(method, {"turnId": "next_turn"})
+    assert not state.turn_stopped_by_hook
 
 
 def _seed_active_turn(bridge_dir: Path, turn_id: str) -> None:
@@ -49,6 +67,170 @@ def _seed_active_turn(bridge_dir: Path, turn_id: str) -> None:
             active_turn_id=turn_id,
         ),
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "event_name,hook_status,expected_status",
+    [
+        ("userPromptSubmit", "blocked", "failed"),
+        ("userPromptSubmit", "stopped", "failed"),
+        ("userPromptSubmit", "failed", "idle"),
+        ("userPromptSubmit", "completed", "idle"),
+        ("preToolUse", "blocked", "idle"),
+        ("preToolUse", "stopped", "failed"),
+        (None, "stopped", "failed"),
+        (None, None, "idle"),
+    ],
+)
+async def test_hook_stopped_turn_reports_failure_before_empty_completion(
+    tmp_path: Path, event_name: str | None, hook_status: str | None, expected_status: str
+) -> None:
+    _seed_active_turn(tmp_path, "turn_123")
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+    usage = fwd._SessionUsageCoalescer(client, "conv_x")  # type: ignore[arg-type]
+    tracker = fwd._CodexElicitationTaskTracker()
+    hook_event = {
+        "method": "hook/completed",
+        "params": {
+            "threadId": "thread_123",
+            "turnId": "turn_123",
+            "run": {
+                "id": "hook-1",
+                "eventName": event_name,
+                "status": hook_status,
+                "sourcePath": "/opt/work/hooks.json",
+                "entries": [
+                    {"kind": "context", "text": "MODEL_ONLY_CONTEXT"},
+                    {"kind": "warning", "text": "verification hook stopped this turn"},
+                    {"kind": "feedback", "text": "Resolve the hook refusal before retrying."},
+                ],
+            },
+        },
+    }
+    for event in (
+        hook_event,
+        hook_event,
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread_123",
+                "turn": {"id": "turn_123", "status": "completed", "items": []},
+            },
+        },
+    ):
+        await fwd._handle_event(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            event=event,
+            usage_coalescer=usage,
+            elicitation_tracker=tracker,
+            expected_thread_id="thread_123",
+            forwarder_state=state,
+        )
+
+    statuses = [
+        body["data"] for _, body in client.posts if body["type"] == "external_session_status"
+    ]
+    assert [data["status"] for data in statuses] == [expected_status]
+    if expected_status == "failed":
+        assert "verification hook stopped this turn" in statuses[0]["output"]
+        assert "Resolve the hook refusal before retrying." in statuses[0]["output"]
+        assert "MODEL_ONLY_CONTEXT" not in statuses[0]["output"]
+        assert "/opt/work/hooks.json" not in statuses[0]["output"]
+        assert "reauth_required" not in statuses[0]
+    else:
+        assert "output" not in statuses[0]
+    bridge = read_bridge_state(tmp_path)
+    assert bridge is not None and bridge.active_turn_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("turn_id", [None, "previous_turn"])
+async def test_hook_stop_cannot_fail_another_active_turn(
+    tmp_path: Path, turn_id: str | None
+) -> None:
+    _seed_active_turn(tmp_path, "current_turn")
+    client = _RecordingClient()
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event={
+            "method": "hook/completed",
+            "params": {
+                "threadId": "thread_123",
+                "turnId": turn_id,
+                "run": {"id": "hook-1", "eventName": "userPromptSubmit", "status": "stopped"},
+            },
+        },
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_123",
+        forwarder_state=fwd._CodexForwarderState(),
+    )
+    assert not any(body["type"] == "external_session_status" for _, body in client.posts)
+    bridge = read_bridge_state(tmp_path)
+    assert bridge is not None and bridge.active_turn_id == "current_turn"
+
+
+@pytest.mark.parametrize(
+    "pending",
+    [
+        "none",
+        "owed",
+        "other-session",
+        "other-turn",
+        "extra-refusal",
+        "owed-stopped",
+        "owed-tool-stop",
+    ],
+)
+def test_hook_stop_exempts_only_its_owed_routing_replay(tmp_path: Path, pending: str) -> None:
+    reason = routed_prompt_block_reason("routed-model")
+    if pending != "none":
+        assert write_pending_replay(
+            tmp_path,
+            session_id="other" if pending == "other-session" else "conv_x",
+            prompt="Run the task",
+            blocked_turn_id="other" if pending == "other-turn" else "turn_123",
+            model="routed-model",
+        )
+    entries = [{"kind": "feedback", "text": reason}]
+    if pending == "extra-refusal":
+        entries.append({"kind": "warning", "text": "A different hook refused the prompt"})
+    error = fwd._terminal_error_from_hook_run(
+        {
+            "turnId": "turn_123",
+            "run": {
+                "eventName": "preToolUse" if pending == "owed-tool-stop" else "userPromptSubmit",
+                "status": "stopped"
+                if pending in {"owed-stopped", "owed-tool-stop"}
+                else "blocked",
+                "entries": entries,
+            },
+        },
+        bridge_dir=tmp_path,
+        session_id="conv_x",
+    )
+    if pending == "owed":
+        assert error is None
+    else:
+        assert error is not None
+        assert reason in error.message
+
+
+@pytest.mark.parametrize("entries", [None, [], [{"kind": "context", "text": "MODEL_ONLY"}]])
+def test_hook_stop_without_user_output_reports_the_stop(tmp_path: Path, entries: object) -> None:
+    error = fwd._terminal_error_from_hook_run(
+        {"run": {"eventName": "userPromptSubmit", "status": "stopped", "entries": entries}},
+        bridge_dir=tmp_path,
+        session_id="conv_x",
+    )
+    assert error is not None
+    assert error.message == "Stopped by hook"
 
 
 def test_classify_codex_error_auth_vs_generic() -> None:

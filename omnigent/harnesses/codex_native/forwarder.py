@@ -96,6 +96,7 @@ from omnigent.native._native_post_delivery import (
 from omnigent.native._native_supersession import post_clear_supersession
 from omnigent.native_subagent_snapshot import NativeSubagentSnapshotPublisher
 from omnigent.runner.launch_failure import is_codex_provider_auth_failure
+from omnigent.runner.turn_routing import read_pending_replay, routed_prompt_block_reason
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -377,6 +378,7 @@ class _CodexChildStream:
             if turn_id in self.terminal_turn_ids or terminal_error:
                 return False
             self.active_turn_id = turn_id
+            self.state.turn_stopped_by_hook = False
             self.state.reasoning_stream_item_id = None
         elif method in {"turn/completed", "turn/failed"}:
             if turn_id is not None:
@@ -398,6 +400,7 @@ class _CodexChildStream:
             # establish that turn, but cannot revive a completed one.
             if self.active_turn_id is None:
                 self.active_turn_id = turn_id
+                self.state.turn_stopped_by_hook = False
             return self.active_turn_id == turn_id
         return True
 
@@ -814,6 +817,8 @@ class _CodexForwarderState:
     :param surfaced_terminal_error_turns: Turn ids whose standalone terminal
         ``error`` notification was already surfaced. Used to suppress a later
         terminal boundary for the same turn.
+    :param turn_stopped_by_hook: Whether the current turn has a hook refusal
+        that native collab snapshots cannot acknowledge for the parent.
     :param posted_user_turns: Turn ids whose ``userMessage`` has been
         posted to Omnigent this connection, e.g. ``{"turn_123"}``. Used to
         enforce user-before-assistant ordering: before posting a turn's
@@ -912,6 +917,7 @@ class _CodexForwarderState:
     terminal_delivered_callback: Callable[[], None] | None = None
     synced_item_keys: set[str] = field(default_factory=set)
     surfaced_terminal_error_turns: set[str] = field(default_factory=set)
+    turn_stopped_by_hook: bool = False
     posted_user_turns: set[str] = field(default_factory=set)
     input_ids_by_turn: dict[str, str] = field(default_factory=dict)
     user_message_copy_balance: dict[tuple[str, str, str], int] = field(default_factory=dict)
@@ -1788,6 +1794,43 @@ def _terminal_error_from_notification(params: _JsonObject) -> _CodexTerminalErro
         return None
     message = _error_payload_message(payload)
     return _CodexTerminalError(message=message, kind=_classify_codex_error(payload, message))
+
+
+def _terminal_error_from_hook_run(
+    params: _JsonObject, *, bridge_dir: Path | None, session_id: str
+) -> _CodexTerminalError | None:
+    """Read a terminal hook refusal, excluding an owed prompt-routing replay."""
+    run = params.get("run")
+    if not isinstance(run, dict):
+        return None
+    status = run.get("status")
+    if status != "stopped" and not (
+        status == "blocked" and run.get("eventName") == "userPromptSubmit"
+    ):
+        return None
+    entries = run.get("entries")
+    texts = [
+        entry["text"].strip()
+        for entry in (entries if isinstance(entries, list) else [])
+        if isinstance(entry, dict)
+        and entry.get("kind") != "context"
+        and isinstance(entry.get("text"), str)
+        and entry["text"].strip()
+    ]
+    pending = (
+        read_pending_replay(bridge_dir) if bridge_dir is not None and status == "blocked" else None
+    )
+    if (
+        pending is not None
+        and pending.session_id == session_id
+        and pending.blocked_turn_id in (None, _turn_id_from_payload(params))
+        and pending.model
+        and texts == [routed_prompt_block_reason(pending.model)]
+    ):
+        return None
+    label = "Blocked by hook" if status == "blocked" else "Stopped by hook"
+    message = f"{label}: {'\n'.join(texts)}" if texts else label
+    return _CodexTerminalError(message=message, kind=_CODEX_ERROR_KIND_GENERIC)
 
 
 @dataclass(frozen=True)
@@ -4224,6 +4267,15 @@ async def _handle_event(
         return
     event_state = forwarder_state
     event_bridge_dir = bridge_dir if not is_child else None
+    hook_error = None
+    if method == _CODEX_HOOK_COMPLETED_METHOD:
+        hook_error = _terminal_error_from_hook_run(
+            params, bridge_dir=event_bridge_dir, session_id=route_session_id
+        )
+        if hook_error is not None:
+            # Use the standalone error's turn ownership, dedup and child cleanup.
+            method = "error"
+            terminal_event = True
     child_usage_baseline: _UsageTotals | None = None
     if is_child and forwarder_state is not None:
         child_thread_id = _thread_id_from_params(params)
@@ -4247,9 +4299,10 @@ async def _handle_event(
                 thread_name=params.get("threadName"),
             )
         return
-    if method == _CODEX_HOOK_COMPLETED_METHOD:
+    if event.get("method") == _CODEX_HOOK_COMPLETED_METHOD:
         await _handle_hook_completed(client, route_session_id, params)
-        return
+        if hook_error is None:
+            return
     if is_child and forwarder_state is not None:
         child_thread = _thread_id_from_params(params)
         observed_status = None
@@ -4465,6 +4518,7 @@ async def _handle_event(
         elicitation_tracker=elicitation_tracker,
         codex_client=codex_client,
         forwarder_state=event_state,
+        terminal_error=hook_error,
     ):
         if child_coalescer is not None:
             await child_coalescer.flush()
@@ -5124,6 +5178,7 @@ async def _maybe_handle_turn_event(
     elicitation_tracker: _CodexElicitationTaskTracker,
     codex_client: CodexAppServerClient | None,
     forwarder_state: _CodexForwarderState | None,
+    terminal_error: _CodexTerminalError | None = None,
 ) -> bool:
     """
     Handle turn/thread-level Codex events.
@@ -5161,7 +5216,7 @@ async def _maybe_handle_turn_event(
         async with _conversation_item_delivery_scope(session_id):
             if delta_coalescer is not None:
                 await delta_coalescer.flush()
-            error = _terminal_error_from_notification(params)
+            error = terminal_error or _terminal_error_from_notification(params)
             if error is None:
                 _logger.warning("Codex forwarder ignored malformed error notification")
                 return True
@@ -5195,6 +5250,8 @@ async def _maybe_handle_turn_event(
                     return True
                 if turn_id is not None:
                     forwarder_state.surfaced_terminal_error_turns.add(turn_id)
+                if terminal_error is not None:
+                    forwarder_state.turn_stopped_by_hook = True
             compaction_model: str | None = None
             selected_model = forwarder_state.model if forwarder_state is not None else None
             if (
@@ -5239,6 +5296,8 @@ async def _maybe_handle_turn_event(
             await usage_coalescer.flush()
         return True
     if method == "turn/started":
+        if forwarder_state is not None:
+            forwarder_state.turn_stopped_by_hook = False
         async with _conversation_item_delivery_scope(session_id):
             if delta_coalescer is not None:
                 await delta_coalescer.flush()
@@ -8192,6 +8251,17 @@ async def _post_collab_agent_statuses(
             continue
         ap_status = _omnigent_status_from_collab_state(state)
         if ap_status is not None:
+            child_stream = forwarder_state.child_streams.get(thread_id)
+            if child_stream is not None and child_stream.state.turn_stopped_by_hook:
+                # Native wait can omit the refusal; consuming it would purge the inbox result.
+                forwarder_state.subagent_status_by_thread[thread_id] = "failed"
+                forwarder_state.publish_child_snapshot()
+                deferred = forwarder_state.deferred_child_terminal_edges.pop(thread_id, None)
+                if deferred is not None:
+                    await _post_turn_status_edge(
+                        client, deferred[0], replace(deferred[1], parent_turn_consumed=False)
+                    )
+                continue
             forwarder_state.subagent_status_by_thread[thread_id] = ap_status
             forwarder_state.publish_child_snapshot()
             consumed = False

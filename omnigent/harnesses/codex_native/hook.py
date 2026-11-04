@@ -313,6 +313,7 @@ def _main_route_turn(argv: list[str]) -> int:
         ADVERTISEMENT_FILE,
         HOOK_REQUEST_TIMEOUT_S,
         ROUTE_PATH_TEMPLATE,
+        routed_prompt_block_reason,
         trace_turn_routing,
         turn_routing_marker_present,
     )
@@ -419,7 +420,7 @@ def _main_route_turn(argv: list[str]) -> int:
         json.dumps(
             {
                 "decision": "block",
-                "reason": f"Smart Routing selected {model}; rerunning your message on it.",
+                "reason": routed_prompt_block_reason(model),
             }
         )
     )

@@ -437,6 +437,7 @@ class SubagentRetryRuntime:
             status=status,
             pending=1,
             placement_label=entry.placement_label,
+            output=output,
         )
         raw = await self._control(
             chain,
