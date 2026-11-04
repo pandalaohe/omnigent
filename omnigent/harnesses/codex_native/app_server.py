@@ -101,6 +101,7 @@ from omnigent.inner.codex_executor import (
     _CODEX_ROUTER_HOOK_MODULE,
     CODEX_AGENT_PID_CONFIG_KEY,
     CODEX_PRIMARY_SESSION_ID_CONFIG_KEY,
+    _apply_codex_current_route,
     _clean_codex_env,
     _codex_cli_version,
     _codex_home_config_source_from_env,
@@ -1929,17 +1930,28 @@ async def _wait_for_discovery_listener(
     raise TimeoutError("Timed out waiting for Codex model discovery app-server")
 
 
+def _codex_current_route_identity() -> str | None:
+    """Separate account catalogs when the host's route content changes."""
+    try:
+        content = (Path.home() / ".codex-route" / "current.toml").read_bytes()
+    except OSError:
+        return None
+    return hashlib.sha256(content).hexdigest()
+
+
 def _codex_config_identity(source_home: Path) -> tuple[object, ...]:
     """Invalidate cached CLI answers when configuration or its catalog changes."""
     from omnigent.models.model_catalog_store import binary_identity
 
     picker_config = _codex_picker_config(source_home)
-    return (
+    identity = (
         str(source_home.resolve()),
         binary_identity(str(source_home / "config.toml")),
         binary_identity(picker_config.get("model_catalog_json")),
         binary_identity(str(source_home / "auth.json")),
     )
+    route_identity = _codex_current_route_identity()
+    return (*identity, route_identity) if route_identity is not None else identity
 
 
 def _codex_picker_config(source_home: Path) -> dict[str, str]:
@@ -1990,9 +2002,11 @@ def _probe_codex_home(config_overrides: Sequence[str]) -> Path:
     # ``CODEX_HOME``) never reuses another source's bridged ``auth.json``
     # symlink or account-specific cached state under identical overrides.
     source_home = _codex_home_config_source_from_env()
-    key = hashlib.sha256(
-        "\n".join((str(source_home.resolve()), *config_overrides)).encode("utf-8")
-    ).hexdigest()[:12]
+    route_identity = _codex_current_route_identity()
+    key_parts = (str(source_home.resolve()), *config_overrides)
+    if route_identity is not None:
+        key_parts = (*key_parts, route_identity)
+    key = hashlib.sha256("\n".join(key_parts).encode("utf-8")).hexdigest()[:12]
     home = Path.home() / ".omnigent" / "cache" / "codex-model-probe" / key
     home.mkdir(mode=0o700, parents=True, exist_ok=True)
     # The bridge skips files that already exist, and config.toml is copied
@@ -2016,6 +2030,10 @@ def _probe_codex_home(config_overrides: Sequence[str]) -> Path:
         )
         document.update(picker_config)
         config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
+    config_path = home / "config.toml"
+    if route_identity is not None and not config_path.exists():
+        config_path.write_text("", encoding="utf-8")
+    _apply_codex_current_route(config_path, picker_only=True, source_home=source_home)
     return home
 
 

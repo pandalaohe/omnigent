@@ -1700,12 +1700,27 @@ async def test_codex_native_model_options_query_model_list(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("case", ["default", "other", "missing-spec", "invalid-config"])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "default",
+        "other",
+        "missing-spec",
+        "invalid-config",
+        "route-changed",
+        "route-removed",
+        "route-added",
+        "route-same",
+        "legacy-home",
+        "legacy-home-routed",
+    ],
+)
 async def test_codex_model_catalog_writeback_uses_session_provider(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: str
 ) -> None:
     """Session rows stay in their provider's shared cache, including across sessions."""
     from omnigent.harnesses.codex_native import app_server as codex
+    from omnigent.inner.codex_executor import _populate_codex_home_config
     from omnigent.models import model_catalog_store
     from omnigent.runner.session_init_protocol import (
         RunnerSessionInitEnvelope,
@@ -1713,6 +1728,14 @@ async def test_codex_model_catalog_writeback_uses_session_provider(
     )
     from omnigent.spec.types import DatabricksAuth
 
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    route_file = tmp_path / ".codex-route" / "current.toml"
+    route_file.parent.mkdir()
+    if case in {"route-changed", "route-removed", "route-same", "legacy-home-routed"}:
+        route_file.write_text(
+            'model_provider = "custom"\n[model_providers.custom]\n'
+            'name = "Gateway"\nbase_url = "https://route-a.example/v1"\n'
+        )
     cfg = tmp_path / "databrickscfg"
     cfg.write_text("[default]\nhost = https://a.example\n[other]\nhost = https://b.example\n")
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
@@ -1763,7 +1786,23 @@ async def test_codex_model_catalog_writeback_uses_session_provider(
     live_rows = [dict(row, displayName="Live model") for row in catalogs[profile]]
     codex_home = tmp_path / "codex-home"
     codex_home.mkdir()
-    (codex_home / "config.toml").write_text('model = "second-picker"\n')
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.toml").write_text('model = "second-picker"\n')
+    if case in {"legacy-home", "legacy-home-routed"}:
+        (codex_home / "config.toml").write_text('model = "second-picker"\n')
+    _populate_codex_home_config(codex_home, source, minimal_config=False)
+    if case in {"route-changed", "route-added"}:
+        route_file.write_text(
+            'model_provider = "custom"\n[model_providers.custom]\n'
+            'name = "Gateway"\nbase_url = "https://route-b.example/v1"\n'
+        )
+    elif case == "route-removed":
+        route_file.unlink()
+    _populate_codex_home_config(codex_home, source, minimal_config=False)
+    current_fingerprint = codex.codex_catalog_fingerprint(
+        codex.NativeCodexLaunch([], None, profile)
+    )
     fake_client = _RecordingCodexAppServerClient("ws://codex.test", "test")
     monkeypatch.setattr(codex, "client_for_transport", lambda *args, **kwargs: fake_client)
 
@@ -1832,7 +1871,8 @@ async def test_codex_model_catalog_writeback_uses_session_provider(
             for provider in ("default", "other"):
                 expected = (
                     live_rows
-                    if provider == profile and case in {"default", "other"}
+                    if provider == profile
+                    and case in {"default", "other", "route-same", "legacy-home"}
                     else catalogs[provider]
                 )
                 assert (
@@ -1843,16 +1883,22 @@ async def test_codex_model_catalog_writeback_uses_session_provider(
                 "codex-native", fingerprints[profile]
             ).parent
             assert len(list(catalog_dir.glob("*.json"))) == 2
-            for provider, host in (
-                ("default", "https://a.example"),
-                ("other", "https://b.example"),
-            ):
+            if case in {"route-changed", "route-removed", "route-added"}:
                 assert (
-                    codex._resolve_databricks_codex_model(
-                        host, provider, "shared-picker", codex_path=sys.executable
-                    )
-                    == f"{provider}.schema.model"
+                    model_catalog_store.read_catalog("codex-native", current_fingerprint) is None
                 )
+            else:
+                # Alias reuse requires a catalog for the unchanged route.
+                for provider, host in (
+                    ("default", "https://a.example"),
+                    ("other", "https://b.example"),
+                ):
+                    assert (
+                        codex._resolve_databricks_codex_model(
+                            host, provider, "shared-picker", codex_path=sys.executable
+                        )
+                        == f"{provider}.schema.model"
+                    )
             credentials.assert_not_called()
     if case == "missing-spec":
         launch_resolver.assert_not_called()

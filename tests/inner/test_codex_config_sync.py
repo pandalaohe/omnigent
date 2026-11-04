@@ -62,8 +62,14 @@ def test_populate_syncs_approved_value_and_restart_is_noop(
 
 @pytest.mark.parametrize("profile", [False, True], ids=["base", "inline-profile"])
 @pytest.mark.parametrize("relative", [False, True], ids=["absolute", "relative"])
+@pytest.mark.parametrize("route", [False, True], ids=["source-setting", "route-setting"])
 def test_initial_copy_keeps_source_catalog_paths(
-    homes: tuple[Path, Path], profile: bool, relative: bool
+    homes: tuple[Path, Path],
+    profile: bool,
+    relative: bool,
+    route: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source, target = homes
     catalog = source / "models.json"
@@ -71,21 +77,30 @@ def test_initial_copy_keeps_source_catalog_paths(
     setting = json.dumps(catalog.name if relative else str(catalog))
     layer = "[profiles.work]\n" if profile else ""
     original = f"{layer}model_catalog_json = {setting} # user catalog\n"
-    (source / "config.toml").write_text(original)
+    source_original = "" if route else original
+    (source / "config.toml").write_text(source_original)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    if route:
+        route_file = tmp_path / ".codex-route" / "current.toml"
+        route_file.parent.mkdir()
+        route_file.write_text(original)
     path = target / "config.toml"
-    assert (
-        codex_config_sync.sync_codex_config(
-            source / "config.toml", path, minimal_config=False, include_credentials=True
+    if route:
+        _populate_codex_home_config(target, source, minimal_config=False)
+    else:
+        assert (
+            codex_config_sync.sync_codex_config(
+                source / "config.toml", path, minimal_config=False, include_credentials=True
+            )
+            == "created"
         )
-        == "created"
-    )
     copied = path.read_text()
     data = tomllib.loads(copied)
     selected = data["profiles"]["work"] if profile else data
     assert selected["model_catalog_json"] == str(catalog)
     assert Path(selected["model_catalog_json"]).read_text() == '{"models": []}'
     assert "# user catalog" in copied
-    assert (source / "config.toml").read_text() == original
+    assert (source / "config.toml").read_text() == source_original
     path.write_text('model_catalog_json = "session.json"\n')
     codex_config_sync.sync_codex_config(
         source / "config.toml", path, minimal_config=False, include_credentials=True
@@ -556,3 +571,168 @@ def test_fresh_conflict_retains_base_copy_behavior(
     _populate_codex_home_config(target, source)
     assert (target / "config.toml").read_text() == content
     assert "SOURCE_POLICY_MISMATCH" in caplog.text
+
+
+@pytest.fixture
+def route_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    route_dir = tmp_path / ".codex-route"
+    route_dir.mkdir()
+    return route_dir / "current.toml"
+
+
+@pytest.mark.parametrize("content", [None, 'model = ["DO_NOT_LOG",\n'])
+def test_current_route_missing_or_invalid_keeps_source_copy(
+    homes: tuple[Path, Path],
+    route_file: Path,
+    content: str | None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    source, target = homes
+    if content is not None:
+        route_file.write_text(content)
+    _populate_codex_home_config(target, source)
+    assert (target / "config.toml").read_text() == _SOURCE
+    assert (source / "config.toml").read_text() == _SOURCE
+    route_logs = [r for r in caplog.records if "Codex current route" in r.message]
+    if content is None:
+        assert not route_logs
+    else:
+        assert len(route_logs) == 1
+        assert route_logs[0].args == ("UnexpectedCharError",)
+        assert route_logs[0].exc_info is None
+        assert "DO_NOT_LOG" not in caplog.text
+
+
+def test_fresh_home_applies_current_route_after_config_sync(
+    homes: tuple[Path, Path],
+    route_file: Path,
+) -> None:
+    source, target = homes
+    original = (
+        '# user comment\nmodel = "host" # model comment\n'
+        'approval_policy = "on-request"\napprovals_reviewer = "auto_review"\n'
+        'sandbox_mode = "workspace-write"\n'
+        '[model_providers.old]\nbase_url = "https://old.example.test/v1"\n'
+        'env_key = "OLD_KEY"\n'
+    )
+    (source / "config.toml").write_text(original)
+    route_file.write_text(
+        'route = "work"\nremove = ["model_providers.old.env_key", "missing.leaf"]\n'
+        'model = "route-model"\nmodel_provider = "old"\n'
+        "[features]\nroute_feature = true\n"
+    )
+    _populate_codex_home_config(target, source)
+    copied = (target / "config.toml").read_text()
+    data = tomllib.loads(copied)
+    assert data == {
+        "model": "route-model",
+        "model_provider": "old",
+        "approval_policy": "on-request",
+        "approvals_reviewer": "auto_review",
+        "sandbox_mode": "workspace-write",
+        "features": {"route_feature": True},
+        "model_providers": {
+            "old": {"base_url": "https://old.example.test/v1"},
+        },
+    }
+    assert "# user comment" in copied
+    assert "# model comment" in copied
+    assert (source / "config.toml").read_text() == original
+    route_file.write_text('model = "later-route"\n')
+    _populate_codex_home_config(target, source)
+    assert (target / "config.toml").read_text() == copied
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"minimal_config": True},
+        {"include_credentials": False},
+        {"minimal_config": True, "include_credentials": False},
+    ],
+)
+def test_special_homes_skip_current_route(
+    homes: tuple[Path, Path],
+    route_file: Path,
+    options: dict[str, bool],
+) -> None:
+    source, target = homes
+    route_file.write_text('model = "route-model"\nroute_only = true\n')
+    _populate_codex_home_config(target, source, **options)
+    path = target / "config.toml"
+    data = tomllib.loads(path.read_text()) if path.exists() else {}
+    assert "route_only" not in data
+    assert data.get("model") != "route-model"
+    assert (source / "config.toml").read_text() == _SOURCE
+
+
+def test_existing_home_does_not_apply_current_route(
+    homes: tuple[Path, Path],
+    route_file: Path,
+) -> None:
+    source, target = homes
+    route_file.write_text('model = "route-model"\n')
+    path = target / "config.toml"
+    path.write_text(_PRIVATE)
+    _populate_codex_home_config(target, source)
+    assert tomllib.loads(path.read_text())["model"] == "session"
+
+
+def test_current_route_failed_rewrite_keeps_private_config(
+    tmp_path: Path,
+    route_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.inner import codex_executor
+
+    path = tmp_path / "config.toml"
+    original = '# private comment\nmodel = "original"\n'
+    path.write_text(original)
+    route_file.write_text('model = "route-model"\n')
+
+    def fail_replace(source: object, target: object) -> None:
+        raise OSError("replacement failed")
+
+    monkeypatch.setattr(codex_executor.os, "replace", fail_replace)
+    codex_executor._apply_codex_current_route(path)
+    assert path.read_text() == original
+    assert not list(tmp_path.glob("config.toml.*"))
+
+
+async def test_native_startup_keeps_current_route_and_source_stance(
+    homes: tuple[Path, Path],
+    route_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from omnigent.harnesses.codex_native import app_server
+    from tests.harnesses.codex_native.app_server._support import (
+        _disable_codex_startup_rpc,
+        _test_app_server,
+    )
+
+    source, target = homes
+    original = (
+        'model = "host"\napproval_policy = "on-request"\n'
+        'approvals_reviewer = "auto_review"\nsandbox_mode = "workspace-write"\n'
+    )
+    (source / "config.toml").write_text(original)
+    route_file.write_text('model_provider = "route-provider"\n')
+    monkeypatch.setenv("CODEX_HOME", str(source))
+    monkeypatch.setattr(app_server, "_codex_cli_version", AsyncMock(return_value=(0, 147, 0)))
+    monkeypatch.setattr(app_server.CodexNativeAppServer, "_populate_context_catalog", AsyncMock())
+    _disable_codex_startup_rpc(monkeypatch)
+    server = _test_app_server(tmp_path, target, tmp_path / "bridge", tmp_path)
+    try:
+        await server.start()
+        data = tomllib.loads((target / "config.toml").read_text())
+        assert data["model_provider"] == "route-provider"
+        assert data["approval_policy"] == "on-request"
+        assert data["approvals_reviewer"] == "auto_review"
+        assert data["sandbox_mode"] == "workspace-write"
+        assert (source / "config.toml").read_text() == original
+    finally:
+        await server.close()
