@@ -21,7 +21,7 @@ from omnigent.entities.host_terminal import (
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.native.native_coding_agents import native_shell_terminal_specs
 from omnigent.terminals import TerminalRegistry
-from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
+from omnigent.terminals.conpty_bridge import bridge_terminal_to_websocket
 
 _REGISTRY_KEY = "host-terminals"
 _logger = logging.getLogger(__name__)
@@ -136,10 +136,9 @@ def create_host_terminal_app(
         if instance is None or terminal_id not in created or not await instance.is_alive():
             await websocket.close(code=4404, reason="terminal not found")
             return
-        await bridge_tmux_control_to_websocket(
+        await bridge_terminal_to_websocket(
             websocket,
-            socket_path=str(instance.socket_path),
-            tmux_target=instance.tmux_target,
+            instance,
             read_only=False,
             on_input=instance.note_input,
         )

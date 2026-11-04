@@ -85,7 +85,7 @@ def _patch_control_attach(
         raise RuntimeError("bridge stopped")
 
     monkeypatch.setattr(
-        "omnigent.runner.resource_routes.bridge_tmux_control_to_websocket",
+        "omnigent.terminals.conpty_bridge.bridge_tmux_control_to_websocket",
         fake_control,
     )
 

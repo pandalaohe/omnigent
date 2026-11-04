@@ -153,9 +153,11 @@ def _format_launch_envelope(
             "terminal": validated.terminal_name,
             "session": validated.session_key,
             **(
-                {}
-                if instance.elevated or instance.origin == "user"
-                else {"tmux_socket": str(instance.socket_path)}
+                {"tmux_socket": str(instance.socket_path)}
+                if not instance.elevated
+                and instance.origin != "user"
+                and instance.backend == "tmux"
+                else {}
             ),
             "instance_id": instance.instance_id,
             "origin": instance.origin,
@@ -1251,6 +1253,6 @@ def _describe_entry(
         "elevated": instance.elevated,
         "agent_access": instance.agent_access if instance.elevated else True,
     }
-    if not instance.elevated and instance.origin != "user":
+    if not instance.elevated and instance.origin != "user" and instance.backend == "tmux":
         result["tmux_socket"] = str(instance.socket_path)
     return result

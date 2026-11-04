@@ -172,7 +172,7 @@ def test_admin_local_attach_is_interactive_only(
         await websocket.close()
 
     monkeypatch.setattr(
-        "omnigent.server.routes.terminal_attach.bridge_tmux_control_to_websocket", bridge
+        "omnigent.terminals.conpty_bridge.bridge_tmux_control_to_websocket", bridge
     )
     path = "/v1/sessions/admin_session/resources/terminals/terminal_bash_admin/attach"
     with TestClient(app).websocket_connect(path + f"?read_only={str(read_only).lower()}") as ws:
@@ -749,12 +749,13 @@ async def test_attach_terminal_local_fallback_uses_control_mode(
         tmux_target: str,
         read_only: bool,
         on_input: object = None,
+        on_client_interaction: object = None,
     ) -> None:
         del websocket, on_input
         calls.append((socket_path, tmux_target, read_only))
 
     monkeypatch.setattr(
-        "omnigent.server.routes.terminal_attach.bridge_tmux_control_to_websocket",
+        "omnigent.terminals.conpty_bridge.bridge_tmux_control_to_websocket",
         fake_control,
     )
 
