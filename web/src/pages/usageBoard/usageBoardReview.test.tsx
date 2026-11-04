@@ -9,6 +9,7 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ServerInfo } from "@/lib/capabilities";
+import { readSessionCollabPreferences } from "@/lib/sessionCollabPreferences";
 import { DEFAULT_USAGE_CONTEXT_PREFERENCES } from "@/lib/usageContextPreferences";
 import type * as PrefsModule from "@/lib/usageContextPreferences";
 import type * as UsageBoardDataModule from "@/pages/usageBoard/usageBoardData";
@@ -68,6 +69,8 @@ vi.mock("@/hooks/useSessionCollabPreferences", () => ({
 
 const SERVER_INFO = { usage_board_enabled: true } as unknown as ServerInfo;
 const LOADED = { isPending: false, error: null, refetch: vi.fn(), data: { accounts: [] } };
+const clipboardDescriptor = Object.getOwnPropertyDescriptor(Navigator.prototype, "clipboard");
+const execCommandDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, "execCommand");
 
 function renderBoard(path = "/usage/board") {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -107,7 +110,19 @@ beforeEach(() => {
   };
 });
 
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  if (clipboardDescriptor) {
+    Object.defineProperty(Navigator.prototype, "clipboard", clipboardDescriptor);
+  } else {
+    delete (Navigator.prototype as { clipboard?: unknown }).clipboard;
+  }
+  if (execCommandDescriptor) {
+    Object.defineProperty(Document.prototype, "execCommand", execCommandDescriptor);
+  } else {
+    delete (Document.prototype as { execCommand?: unknown }).execCommand;
+  }
+});
 
 describe("Connect command", () => {
   // The route's own contract: `observed_at` is a strict number, `resets_at`
@@ -149,6 +164,46 @@ describe("Connect command", () => {
     fireEvent.click(await screen.findByRole("button", { name: /connect/i }));
     const shown = await screen.findByText(/\/v1\/me\/usage\/accounts\/my-gateway/);
     expect(shown.textContent).toBe(buildConnectCommand(window.location.origin));
+  });
+
+  it("copies through the fallback and confirms without the Clipboard API", async () => {
+    const copiedText = vi.fn();
+    Object.defineProperty(Navigator.prototype, "clipboard", {
+      configurable: true,
+      value: undefined,
+    });
+    Object.defineProperty(Document.prototype, "execCommand", {
+      configurable: true,
+      value: vi.fn((command: string) => {
+        if (command !== "copy") return false;
+        const event = new Event("copy", { bubbles: true, cancelable: true }) as ClipboardEvent;
+        Object.defineProperty(event, "clipboardData", {
+          value: { setData: copiedText },
+        });
+        document.dispatchEvent(event);
+        return event.defaultPrevented;
+      }),
+    });
+    render(
+      <QueryClientProvider
+        client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
+      >
+        <MemoryRouter>
+          <UsageBoardSettings />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: /connect/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+
+    await waitFor(() => {
+      expect(copiedText).toHaveBeenCalledWith(
+        "text/plain",
+        buildConnectCommand(window.location.origin),
+      );
+    });
+    expect(document.execCommand).toHaveBeenCalledWith("copy");
+    expect(await screen.findByRole("button", { name: "Copied" })).toBeTruthy();
   });
 });
 
@@ -257,6 +312,35 @@ describe("colour line", () => {
     expect(readCollab().quotaFloorPct).toBe(10);
     within(amber.closest("div") as HTMLElement).getByText(/Amber/);
   });
+
+  it.each([
+    { handle: "amber", value: "15", tight: 15, low: 10 },
+    { handle: "red", value: "60", tight: 65, low: 60 },
+  ])(
+    "keeps a valid pair when the $handle handle crosses the other",
+    async ({ handle, value, tight, low }) => {
+      render(
+        <QueryClientProvider
+          client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
+        >
+          <MemoryRouter>
+            <UsageBoardSettings />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+      const amber = await screen.findByLabelText(/Amber below/);
+      const red = screen.getByLabelText(/Red below a pace/);
+      fireEvent.change(handle === "amber" ? amber : red, { target: { value } });
+
+      const preferences = readSessionCollabPreferences();
+      expect(preferences).toMatchObject({
+        quotaTightBelowPct: tight,
+        quotaLowBelowPct: low,
+      });
+      expect(preferences.quotaLowBelowPct).toBeGreaterThan(0);
+      expect(preferences.quotaLowBelowPct).toBeLessThan(preferences.quotaTightBelowPct);
+    },
+  );
 });
 
 function readCollab() {
