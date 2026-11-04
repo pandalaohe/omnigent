@@ -252,6 +252,7 @@ function mobileSyncValue(value: unknown): unknown | null {
     terminalButtons?: unknown;
     terminalKeysEnabled?: unknown;
     terminalSecondRow?: unknown;
+    chatActionsRevision?: unknown;
   };
   if (raw.version !== 2 || typeof raw.enabled !== "boolean" || !Array.isArray(raw.buttons)) {
     return null;
@@ -267,6 +268,7 @@ function mobileSyncValue(value: unknown): unknown | null {
     ...(typeof raw.terminalSecondRow === "boolean"
       ? { terminalSecondRow: raw.terminalSecondRow }
       : {}),
+    ...(raw.chatActionsRevision === 1 ? { chatActionsRevision: 1 } : {}),
   };
 }
 

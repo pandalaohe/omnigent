@@ -19,6 +19,7 @@ export interface TerminalInfo {
   instanceId?: string;
   elevated?: boolean;
   agentAccess?: boolean;
+  origin?: "user" | "agent" | "harness";
 }
 
 /**
@@ -249,6 +250,9 @@ export function terminalInfoFromResource(resource: Record<string, unknown>): Ter
           : "",
     session: typeof sessionKey === "string" ? sessionKey : "",
     running: typeof running === "boolean" ? running : false,
+    ...(["user", "agent", "harness"].includes(metadata.origin as string)
+      ? { origin: metadata.origin as TerminalInfo["origin"] }
+      : {}),
     directAttachUrl:
       metadata.elevated === true ? undefined : parseDirectAttachUrl(metadata.direct_attach_url),
     ...(typeof metadata.instance_id === "string" && metadata.instance_id

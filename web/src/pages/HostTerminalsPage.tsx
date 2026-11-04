@@ -21,7 +21,7 @@ import { useHostTerminals, type HostTerminal } from "@/hooks/useHostTerminals";
 import { useHosts } from "@/hooks/useHosts";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
 import { useIsPhone } from "@/hooks/useIsPhone";
-import { Link, useParams } from "@/lib/routing";
+import { useLocation, useNavigate, useParams } from "@/lib/routing";
 import { ApiError } from "@/lib/sessionsApi";
 import { cn } from "@/lib/utils";
 
@@ -31,6 +31,9 @@ export function HostTerminalsPage() {
 }
 
 function HostTerminals({ hostId }: { hostId: string }) {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const returnTo = (location.state as { returnTo?: string } | null)?.returnTo;
   const hosts = useHosts();
   const host = hosts.data?.find((item) => item.host_id === hostId);
   const available =
@@ -76,10 +79,17 @@ function HostTerminals({ hostId }: { hostId: string }) {
       }}
     >
       <header className="flex shrink-0 items-center gap-3 border-b px-3 py-2">
-        <Button asChild variant="ghost" size="icon">
-          <Link to="/" aria-label="Back to sessions">
-            <ArrowLeftIcon aria-hidden="true" />
-          </Link>
+        <Button
+          variant="ghost"
+          size="icon"
+          aria-label="Back"
+          onClick={() => {
+            if (returnTo) navigate(returnTo);
+            else if (location.key !== "default") navigate(-1);
+            else navigate("/");
+          }}
+        >
+          <ArrowLeftIcon aria-hidden="true" />
         </Button>
         <h1 className="min-w-0 flex-1 truncate text-ui font-semibold">
           {host?.name || hostId} · Terminals

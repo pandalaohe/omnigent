@@ -29,13 +29,11 @@ import {
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
-import {
-  DEFAULT_SHORTCUT_DEFINITIONS,
-  type ShortcutActionId,
-  type ShortcutChord,
-} from "@/lib/keyboardShortcutPreferences";
+import type { ShortcutChord } from "@/lib/keyboardShortcutPreferences";
 import {
   MOBILE_ASSISTANT_ACTIONS,
+  MOBILE_ASSISTANT_ACTION_DEFINITIONS,
+  type MobileAssistantActionId,
   MOBILE_ASSISTANT_CHAT_ACTION_IDS,
   defaultTerminalButtons,
   type TerminalKeyRowItem,
@@ -61,7 +59,7 @@ interface ButtonDraft {
   id: string;
   label: string;
   kind: BindingKind;
-  actionId: ShortcutActionId;
+  actionId: MobileAssistantActionId;
   chord: ShortcutChord;
   text: string;
   submit: boolean;
@@ -106,7 +104,7 @@ function bindingDescription(binding: MobileAssistantButtonBinding): string | und
   if (binding.kind !== "shortcut") return undefined;
   return (
     MOBILE_ASSISTANT_ACTIONS.find((action) => action.id === binding.actionId)?.description ??
-    DEFAULT_SHORTCUT_DEFINITIONS[binding.actionId]?.note
+    MOBILE_ASSISTANT_ACTION_DEFINITIONS[binding.actionId]?.note
   );
 }
 
@@ -884,7 +882,10 @@ export function MobileAssistantSettings() {
                           onChange={(event) =>
                             setDraft((current) =>
                               current
-                                ? { ...current, actionId: event.target.value as ShortcutActionId }
+                                ? {
+                                    ...current,
+                                    actionId: event.target.value as MobileAssistantActionId,
+                                  }
                                 : current,
                             )
                           }
@@ -892,7 +893,7 @@ export function MobileAssistantSettings() {
                         >
                           {MOBILE_ASSISTANT_CHAT_ACTION_IDS.map((actionId) => (
                             <option key={actionId} value={actionId}>
-                              {DEFAULT_SHORTCUT_DEFINITIONS[actionId].label}
+                              {MOBILE_ASSISTANT_ACTION_DEFINITIONS[actionId].label}
                             </option>
                           ))}
                         </select>

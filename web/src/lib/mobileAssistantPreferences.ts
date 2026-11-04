@@ -56,8 +56,25 @@ export const MOBILE_ASSISTANT_ACTIONS: MobileAssistantActionDefinition[] = [
   { id: "archiveSession", label: "Archive session", shortLabel: "Archive" },
 ];
 
+export const MOBILE_ASSISTANT_DIRECT_ACTIONS = {
+  openTerminals: { label: "Terminals" },
+  openFiles: { label: "Files" },
+  openChanges: { label: "Changes" },
+  openAgents: { label: "Agents" },
+  openSideChats: { label: "Side chats" },
+};
+export type MobileAssistantDirectAction =
+  keyof typeof MOBILE_ASSISTANT_DIRECT_ACTIONS | "stopResponse";
+export type MobileAssistantActionId =
+  ShortcutActionId | keyof typeof MOBILE_ASSISTANT_DIRECT_ACTIONS;
+export const MOBILE_ASSISTANT_ACTION_EVENT = "omnigent:mobile-assistant-action";
+export const MOBILE_ASSISTANT_ACTION_DEFINITIONS: Record<
+  MobileAssistantActionId,
+  { label: string; note?: string }
+> = { ...DEFAULT_SHORTCUT_DEFINITIONS, ...MOBILE_ASSISTANT_DIRECT_ACTIONS };
+
 export type MobileAssistantButtonBinding =
-  | { kind: "shortcut"; actionId: ShortcutActionId }
+  | { kind: "shortcut"; actionId: MobileAssistantActionId }
   | { kind: "key"; chord: ShortcutChord }
   | { kind: "text"; text: string; submit?: boolean };
 
@@ -176,6 +193,7 @@ export interface MobileAssistantPreferences {
   terminalButtons?: TerminalKeyRowItem[];
   terminalKeysEnabled?: boolean;
   terminalSecondRow?: boolean;
+  chatActionsRevision?: 1;
   position?: { x: number; y: number };
   dock?: MobileAssistantDock;
 }
@@ -192,7 +210,13 @@ export interface TerminalStickyModifiers {
   alt: TerminalStickyState;
 }
 
-export const MOBILE_ASSISTANT_CHAT_ACTION_IDS: readonly ShortcutActionId[] = [
+export const MOBILE_ASSISTANT_CHAT_ACTION_IDS: readonly MobileAssistantActionId[] = [
+  "openTerminals",
+  "stopResponse",
+  "openFiles",
+  "openChanges",
+  "openAgents",
+  "openSideChats",
   "approvePrompt",
   "pollSessions",
   "previousSession",
@@ -372,7 +396,7 @@ const LEGACY_DEFAULT_BUTTONS: MobileAssistantButton[] = [
   },
 ];
 
-export function defaultMobileAssistantButtons(): MobileAssistantButton[] {
+function previousChatDefaults(): MobileAssistantButton[] {
   return [
     {
       id: "default-approve",
@@ -402,6 +426,47 @@ export function defaultMobileAssistantButtons(): MobileAssistantButton[] {
   ];
 }
 
+export function defaultMobileAssistantButtons(): MobileAssistantButton[] {
+  return [
+    {
+      id: "default-terminals",
+      label: "Terminals",
+      icon: "terminal",
+      display: "icon",
+      binding: { kind: "shortcut", actionId: "openTerminals" },
+    },
+    {
+      id: "default-stop",
+      label: "Stop",
+      icon: "escape",
+      display: "icon",
+      binding: { kind: "shortcut", actionId: "stopResponse" },
+    },
+    ...previousChatDefaults(),
+  ];
+}
+
+function upgradeChatActions(
+  sets: Pick<ResolvedMobileAssistantPreferences, "buttons" | "terminalButtons">,
+  revision?: number,
+) {
+  if (
+    revision === 1 ||
+    sets.buttons.some(
+      (button) => button.binding.kind === "shortcut" && button.binding.actionId === "openTerminals",
+    )
+  )
+    return sets;
+  const stock =
+    JSON.stringify(sets.buttons) === JSON.stringify(previousChatDefaults().map(normalizeButton));
+  return {
+    ...sets,
+    buttons: stock
+      ? defaultMobileAssistantButtons()
+      : [defaultMobileAssistantButtons()[0], ...sets.buttons],
+  };
+}
+
 function defaults(): ResolvedMobileAssistantPreferences {
   return {
     version: 2,
@@ -410,6 +475,7 @@ function defaults(): ResolvedMobileAssistantPreferences {
     terminalButtons: defaultTerminalButtons(),
     terminalKeysEnabled: true,
     terminalSecondRow: true,
+    chatActionsRevision: 1,
   };
 }
 
@@ -417,8 +483,8 @@ function isAction(value: unknown): value is MobileAssistantAction {
   return MOBILE_ASSISTANT_ACTIONS.some((action) => action.id === value);
 }
 
-function isShortcutAction(value: unknown): value is ShortcutActionId {
-  return typeof value === "string" && value in DEFAULT_SHORTCUT_DEFINITIONS;
+function isShortcutAction(value: unknown): value is MobileAssistantActionId {
+  return typeof value === "string" && value in MOBILE_ASSISTANT_ACTION_DEFINITIONS;
 }
 
 function isIcon(value: unknown): value is MobileAssistantIcon {
@@ -643,21 +709,23 @@ export function readMobileAssistantPreferences(): ResolvedMobileAssistantPrefere
         ...defaults(),
         version: 2,
         enabled: parsed.enabled,
-        ...splitLegacyButtons(
-          actions.map(legacyActionToButton),
-          JSON.stringify(actions) ===
-            JSON.stringify(MOBILE_ASSISTANT_ACTIONS.map((action) => action.id)) ||
+        ...upgradeChatActions(
+          splitLegacyButtons(
+            actions.map(legacyActionToButton),
             JSON.stringify(actions) ===
-              JSON.stringify([
-                "escape",
-                "tab",
-                "arrowUp",
-                "arrowDown",
-                "enter",
-                "pollSessions",
-                "archiveSession",
-              ]),
-          true,
+              JSON.stringify(MOBILE_ASSISTANT_ACTIONS.map((action) => action.id)) ||
+              JSON.stringify(actions) ===
+                JSON.stringify([
+                  "escape",
+                  "tab",
+                  "arrowUp",
+                  "arrowDown",
+                  "enter",
+                  "pollSessions",
+                  "archiveSession",
+                ]),
+            true,
+          ),
         ),
         ...((devicePosition ?? normalizePosition(parsed.position))
           ? { position: devicePosition ?? normalizePosition(parsed.position) }
@@ -677,18 +745,21 @@ export function readMobileAssistantPreferences(): ResolvedMobileAssistantPrefere
         if (!button || ids.has(button.id)) return false;
         ids.add(button.id);
         return true;
-      })
-      .slice(0, MOBILE_ASSISTANT_MAX_BUTTONS);
+      });
     return {
       ...defaults(),
       version: 2,
       enabled: parsed.enabled,
-      ...(Array.isArray(parsed.terminalButtons)
-        ? { buttons, terminalButtons: normalizeTerminalButtons(parsed.terminalButtons) }
-        : splitLegacyButtons(
-            buttons,
-            JSON.stringify(buttons) === JSON.stringify(LEGACY_DEFAULT_BUTTONS.map(normalizeButton)),
-          )),
+      ...upgradeChatActions(
+        Array.isArray(parsed.terminalButtons)
+          ? { buttons, terminalButtons: normalizeTerminalButtons(parsed.terminalButtons) }
+          : splitLegacyButtons(
+              buttons,
+              JSON.stringify(buttons) ===
+                JSON.stringify(LEGACY_DEFAULT_BUTTONS.map(normalizeButton)),
+            ),
+        parsed.chatActionsRevision,
+      ),
       terminalKeysEnabled: parsed.terminalKeysEnabled !== false,
       terminalSecondRow: parsed.terminalSecondRow !== false,
       ...((devicePosition ?? normalizePosition(parsed.position))
@@ -716,6 +787,7 @@ export function writeMobileAssistantPreferences(preferences: MobileAssistantPref
       terminalButtons: preferences.terminalButtons ?? defaultTerminalButtons(),
       terminalKeysEnabled: preferences.terminalKeysEnabled !== false,
       terminalSecondRow: preferences.terminalSecondRow !== false,
+      chatActionsRevision: 1,
       ...(preferences.position ? { position: preferences.position } : {}),
       ...(preferences.dock ? { dock: preferences.dock } : {}),
     };
@@ -1100,7 +1172,8 @@ function insertText(text: string, target: HTMLElement): boolean {
 }
 
 export function mobileAssistantBindingLabel(binding: MobileAssistantButtonBinding): string {
-  if (binding.kind === "shortcut") return DEFAULT_SHORTCUT_DEFINITIONS[binding.actionId].label;
+  if (binding.kind === "shortcut")
+    return MOBILE_ASSISTANT_ACTION_DEFINITIONS[binding.actionId].label;
   if (binding.kind === "text") return binding.submit ? `${binding.text} + send` : binding.text;
   const parts = binding.chord.modifiers.map((modifier) =>
     modifier === "primary" ? "Primary" : modifier[0].toUpperCase() + modifier.slice(1),
@@ -1122,6 +1195,15 @@ export function dispatchMobileAssistantButton(
 ): void {
   const binding = button.binding;
   if (binding.kind === "shortcut") {
+    if (
+      binding.actionId in MOBILE_ASSISTANT_DIRECT_ACTIONS ||
+      binding.actionId === "stopResponse"
+    ) {
+      window.dispatchEvent(
+        new CustomEvent(MOBILE_ASSISTANT_ACTION_EVENT, { detail: { actionId: binding.actionId } }),
+      );
+      return;
+    }
     if (binding.actionId === "pollSessions") {
       dispatchPollSessions();
       return;
@@ -1133,14 +1215,15 @@ export function dispatchMobileAssistantButton(
     // The switcher needs a held modifier to cycle and release to commit, which
     // a tap can't express.
     if (binding.actionId === "recentSessions") return;
-    const tabNumber = WORKSPACE_TAB_SHORTCUTS[binding.actionId];
+    const actionId = binding.actionId as ShortcutActionId;
+    const tabNumber = WORKSPACE_TAB_SHORTCUTS[actionId];
     if (tabNumber !== undefined) {
       dispatchSelectWorkspaceTab(tabNumber);
       return;
     }
-    const chord = resolveShortcutBindings(binding.actionId)[0];
+    const chord = resolveShortcutBindings(actionId)[0];
     if (!chord) return;
-    if (DEFAULT_SHORTCUT_DEFINITIONS[binding.actionId].scope === "global") {
+    if (DEFAULT_SHORTCUT_DEFINITIONS[actionId].scope === "global") {
       dispatchGlobalShortcutChord(chord, preferredDomTarget);
       return;
     }

@@ -26,6 +26,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { setSessionHost } from "@/lib/sessionHost";
 import { SideChatPane } from "@/components/chat/SideChatPane";
 import { toast } from "sonner";
+import { dispatchMobileAssistantButton } from "@/lib/mobileAssistantPreferences";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { handleSessionEvent, useChatStore, type ChatState } from "@/store/chatStore";
 import {
@@ -3714,6 +3715,26 @@ describe("Composer permission-mode shortcut", () => {
 
     expect(setMode.mock.calls.map(([mode]) => mode)).toEqual(["auto", "acceptEdits"]);
     expect(input).toHaveFocus();
+    expect(input).toHaveValue("half-written prompt");
+  });
+
+  it("cycles permission mode from a mobile action while keeping the composer draft", async () => {
+    const setMode = spyClaudeSetter();
+    const input = renderClaudeSession("mobile-cycle");
+    input.focus();
+    fireEvent.change(input, { target: { value: "half-written prompt" } });
+    act(() =>
+      dispatchMobileAssistantButton(
+        {
+          id: "permission",
+          label: "Permission",
+          binding: { kind: "shortcut", actionId: "cyclePermissionMode" },
+        },
+        input,
+      ),
+    );
+    await waitFor(() => expect(chip()).toHaveTextContent("Auto"));
+    expect(setMode).toHaveBeenCalledWith("auto");
     expect(input).toHaveValue("half-written prompt");
   });
 

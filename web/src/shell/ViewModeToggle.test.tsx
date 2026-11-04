@@ -356,9 +356,13 @@ describe("ViewModeMenuItems", () => {
     expect(screen.queryByTestId("view-mode-menu-chat")).toBeNull();
   });
 
-  it("renders nothing while a shell owns the main view", () => {
-    renderMenuItems(makeCtx({ isShellView: true, view: "terminal" }));
-    expect(screen.queryByTestId("view-mode-menu-chat")).toBeNull();
+  it("keeps Chat and the agent Terminal reachable while a shell owns the main view", () => {
+    const setView = vi.fn();
+    renderMenuItems(makeCtx({ isShellView: true, view: "terminal", setView }));
+    fireEvent.click(screen.getByTestId("view-mode-menu-chat"));
+    expect(setView).toHaveBeenLastCalledWith("chat");
+    fireEvent.click(screen.getByTestId("view-mode-menu-terminal"));
+    expect(setView).toHaveBeenLastCalledWith("terminal");
   });
 
   it("switches to the terminal view when its entry is chosen", () => {

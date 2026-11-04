@@ -49,6 +49,7 @@ import {
   writeSessionNavigationPreferences,
 } from "@/lib/sessionNavigationPreferences";
 import { writePinnedWorkspaceTabs } from "@/lib/workspaceTabPreferences";
+import { dispatchMobileAssistantButton } from "@/lib/mobileAssistantPreferences";
 
 const runnerHealthState = vi.hoisted(() => ({
   runnerOnline: undefined as boolean | undefined,
@@ -795,6 +796,109 @@ describe("Goal session frame", () => {
 });
 
 describe("AppShell header", () => {
+  it.each(["/c/conv_abc", "/settings/shortcuts", "/"])(
+    "opens the Terminals sheet from mobile controls at %s",
+    (path) => {
+      mockConversations([{ id: "conv_abc", permission_level: 4 }]);
+      useHostsMock.mockReturnValue({
+        data: [
+          {
+            host_id: "host-a",
+            name: "Online host",
+            owner: "a",
+            status: "online",
+            capabilities: ["host_terminals_v1"],
+          },
+          {
+            host_id: "host-b",
+            name: "Offline host",
+            owner: "a",
+            status: "offline",
+            capabilities: ["host_terminals_v1"],
+          },
+        ],
+      } as ReturnType<typeof useHosts>);
+      renderShell(path);
+      act(() =>
+        dispatchMobileAssistantButton({
+          id: "terminals",
+          label: "Terminals",
+          binding: { kind: "shortcut", actionId: "openTerminals" },
+        }),
+      );
+      expect(screen.getByRole("dialog", { name: "Terminals" })).toBeVisible();
+      expect(screen.getByRole("button", { name: "Online host" })).toBeEnabled();
+      expect(screen.getByRole("button", { name: /Offline host/ })).toBeDisabled();
+      expect(screen.queryByRole("region", { name: "This session" }) !== null).toBe(
+        path.startsWith("/c/"),
+      );
+    },
+  );
+
+  it.each([
+    ["openFiles", "files-panel-drawer", "false"],
+    ["openChanges", "files-panel-drawer", "true"],
+    ["openAgents", "subagents-panel-drawer", null],
+  ] as const)("mobile %s opens its real drawer", (actionId, testId, flat) => {
+    const baseMatchMedia = window.matchMedia;
+    const viewport = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+      ...baseMatchMedia(query),
+      matches: query === "(min-width: 768px)" ? false : query === "(max-width: 767.98px)",
+    }));
+    onTestFinished(() => viewport.mockRestore());
+    mockConversations([{ id: "conv_abc", permission_level: 4 }]);
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as ReturnType<typeof useWorkspaceEnvironment>);
+    renderShell("/c/conv_abc");
+    act(() =>
+      dispatchMobileAssistantButton({
+        id: actionId,
+        label: actionId,
+        binding: { kind: "shortcut", actionId },
+      }),
+    );
+    const drawer = screen.getByTestId(testId);
+    expect(drawer).toHaveAttribute("data-state", "open");
+    if (flat !== null) expect(drawer).toHaveAttribute("data-flat-view", flat);
+  });
+
+  it.each([4, 2, 1])(
+    "mobile Stop calls the session consumer without composer focus at level %i",
+    (permission) => {
+      mockConversations([{ id: "conv_abc", permission_level: permission }]);
+      const previous = useChatStore.getState();
+      const stop = vi.fn().mockResolvedValue(undefined);
+      renderShell("/c/conv_abc");
+      act(() =>
+        useChatStore.setState({
+          conversationId: "conv_abc",
+          sessionStatus: "running",
+          status: "streaming",
+          stop,
+          activeResponse: { state: "streaming" } as never,
+        }),
+      );
+      document.body.focus();
+      act(() =>
+        dispatchMobileAssistantButton({
+          id: "stop",
+          label: "Stop",
+          binding: { kind: "shortcut", actionId: "stopResponse" },
+        }),
+      );
+      expect(stop).toHaveBeenCalledTimes(permission >= 2 ? 1 : 0);
+      act(() =>
+        useChatStore.setState({
+          stop: previous.stop,
+          conversationId: previous.conversationId,
+          status: previous.status,
+          sessionStatus: previous.sessionStatus,
+        }),
+      );
+    },
+  );
   it("renders the sidebar toggle on all pages", () => {
     mockConversations([]);
     renderShell("/");
@@ -5884,6 +5988,40 @@ describe("Terminal-first shells — opening a shell from the mobile drawer", () 
     const probe = screen.getByTestId("view-probe");
     expect(probe).toHaveAttribute("data-view", "terminal");
     expect(probe).toHaveAttribute("data-terminal-view-key", "terminal:terminal_main");
+  });
+
+  it("keeps the selected shell when the Shells drawer is cancelled", () => {
+    mockConversations([
+      { id: "conv_native", permission_level: null, labels: { "omnigent.ui": "terminal" } },
+    ]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [
+        { id: "terminal_tui_main", name: "tui", session: "main", running: true },
+        { id: "terminal_main", name: "zsh", session: "shell", running: true },
+      ],
+      isLoading: false,
+      error: null,
+    });
+    useSessionAgentMock.mockReturnValue({
+      data: { id: "ag_x", name: "polly", terminals: ["zsh"] },
+    } as ReturnType<typeof useSessionAgent>);
+    renderShell("/c/conv_native");
+    openSessionMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: /^Shells/i }));
+    const drawer = screen.getByTestId("shells-panel-drawer");
+    fireEvent.click(within(drawer).getByRole("button", { name: /rail: open terminal/i }));
+    expect(screen.getByTestId("view-probe")).toHaveAttribute(
+      "data-terminal-view-key",
+      "terminal:terminal_main",
+    );
+    openSessionMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: /^Shells/i }));
+    fireEvent.click(within(drawer).getByRole("button", { name: "Close" }));
+    expect(screen.getByTestId("view-probe")).toHaveAttribute(
+      "data-terminal-view-key",
+      "terminal:terminal_main",
+    );
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "terminal");
   });
 
   it("still opens the agent pane for a bare ?view=terminal deep link", () => {

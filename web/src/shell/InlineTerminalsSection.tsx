@@ -5,9 +5,25 @@
 // here. On mobile (no tab strip) the drawer passes ``showNewShell`` to
 // surface a leading "+ New shell" row as the create entry point.
 
-import { TerminalIcon } from "lucide-react";
-import { useMemo } from "react";
-import { inventoryTerminals, terminalTabKey, useTerminals } from "@/hooks/useTerminals";
+import { TerminalIcon, XIcon } from "lucide-react";
+import { useMemo, useState } from "react";
+import {
+  inventoryTerminals,
+  terminalTabKey,
+  terminalDisplayLabel,
+  useTerminals,
+  useDeleteTerminal,
+  type TerminalInfo,
+} from "@/hooks/useTerminals";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+} from "@/components/ui/dialog";
 import { NewTerminalButton } from "./NewTerminalButton";
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { TerminalStatusBadge } from "./terminalStatus";
@@ -21,14 +37,18 @@ interface InlineTerminalsSectionProps {
    *  rail creates shells from the tab strip's "+" menu. Set on mobile, where
    *  there's no tab strip, so the drawer stays a usable create entry point. */
   showNewShell?: boolean;
+  canClose?: boolean;
 }
 
 export function InlineTerminalsSection({
   conversationId,
   onExpand,
   showNewShell = false,
+  canClose = true,
 }: InlineTerminalsSectionProps) {
   const { terminals: allTerminals } = useTerminals(conversationId);
+  const close = useDeleteTerminal(conversationId);
+  const [closing, setClosing] = useState<TerminalInfo | null>(null);
   // Inventory view: the agent's own terminal (SDK REPL / native vendor
   // pane) backs the pill's Terminal view and must not appear as a
   // shell row here.
@@ -50,22 +70,75 @@ export function InlineTerminalsSection({
           <NewTerminalButton conversationId={conversationId} onCreated={onExpand} variant="row" />
         )}
         {terminals.map((t) => (
-          <button
-            key={terminalTabKey(t)}
-            type="button"
-            className="flex w-full items-center gap-2 px-2 py-1.5 text-left hover:bg-accent/60"
-            onClick={() => onExpand(terminalTabKey(t))}
-          >
-            <TerminalIcon className="size-3.5 shrink-0 text-muted-foreground" />
-            {t.session && <span className="shrink-0 text-sm font-medium">{t.session}</span>}
-            <span className="truncate text-sm text-muted-foreground/70">
-              {t.elevated ? "root" : t.name}
-            </span>
-            <span className="flex-1" />
-            <TerminalStatusBadge status={getStatus(t)} />
-          </button>
+          <div key={terminalTabKey(t)} className="flex items-center gap-1">
+            <button
+              type="button"
+              aria-label={`Open ${terminalDisplayLabel(t)}`}
+              className="flex min-h-11 min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left hover:bg-accent/60"
+              onClick={() => onExpand(terminalTabKey(t))}
+            >
+              <TerminalIcon className="size-3.5 shrink-0 text-muted-foreground" />
+              <span className="min-w-0 flex-1">
+                <span className="block truncate text-ui">{terminalDisplayLabel(t)}</span>
+                {(t.origin === "user" || t.origin === "agent") && (
+                  <span className="block truncate text-sm text-muted-foreground">
+                    {t.origin === "user" ? "Opened by you" : "Opened by the agent"}
+                  </span>
+                )}
+              </span>
+              <TerminalStatusBadge status={getStatus(t)} />
+            </button>
+            {canClose && (
+              <Button
+                variant="ghost"
+                size="icon"
+                className="min-h-11 min-w-11"
+                aria-label={`Close ${terminalDisplayLabel(t)}`}
+                onClick={() => {
+                  close.reset();
+                  setClosing(t);
+                }}
+              >
+                <XIcon className="size-4" />
+              </Button>
+            )}
+          </div>
         ))}
       </div>
+      <Dialog
+        open={closing !== null}
+        onOpenChange={(open) => {
+          if (!open && !close.isPending) setClosing(null);
+        }}
+      >
+        <DialogContent showCloseButton={!close.isPending}>
+          <DialogHeader>
+            <DialogTitle>Close {closing ? terminalDisplayLabel(closing) : "shell"}?</DialogTitle>
+            <DialogDescription>
+              This ends the shell and any commands running in it.
+            </DialogDescription>
+          </DialogHeader>
+          {close.isError && (
+            <p role="alert" className="text-sm text-destructive">
+              {close.error?.message}
+            </p>
+          )}
+          <DialogFooter>
+            <Button variant="outline" disabled={close.isPending} onClick={() => setClosing(null)}>
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              disabled={close.isPending || !canClose}
+              onClick={() => {
+                if (closing) close.mutate(closing.id, { onSuccess: () => setClosing(null) });
+              }}
+            >
+              Close shell
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

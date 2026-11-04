@@ -160,14 +160,14 @@ function ViewModeOptionLabel({
  * Chat/Terminal switch as dropdown-menu items — the mobile counterpart of the
  * {@link ViewModeToggle} segmented track, folded into the header kebab so the
  * narrow header pill carries one trigger instead of a switch beside the "…"
- * menu. Self-gates to null on the same conditions as the toggle (non
- * terminal-first sessions, and a shell owning the main view). The active view
+ * menu. A shell keeps both destinations reachable; only non-terminal-first
+ * sessions hide these entries. The active view
  * carries a trailing check; a trailing separator sets the switch off from the
  * menu items that follow.
  */
 export function ViewModeMenuItems() {
   const ctx = useTerminalFirst();
-  if (!ctx || !ctx.isTerminalFirst || ctx.isShellView) return null;
+  if (!ctx || !ctx.isTerminalFirst) return null;
 
   const { view, setView, terminalStartingUp } = ctx;
   const terminalLabel = terminalStartingUp ? "Terminal (starting up…)" : "Terminal";
@@ -194,7 +194,7 @@ export function ViewModeMenuItems() {
           <TerminalIcon className="size-4" />
         )}
         {terminalLabel}
-        {view === "terminal" && <CheckIcon className="ml-auto size-4" />}
+        {view === "terminal" && !ctx.isShellView && <CheckIcon className="ml-auto size-4" />}
       </DropdownMenuItem>
       <DropdownMenuSeparator />
     </>
