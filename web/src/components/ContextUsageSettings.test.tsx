@@ -1,4 +1,5 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -386,6 +387,29 @@ describe("ContextUsageSettings", () => {
     expect(screen.getByLabelText("Context total for Claude Code on Alpha")).toHaveValue(null);
   });
 
+  it("focuses Context total when stepping into a level from the keyboard", async () => {
+    const user = userEvent.setup();
+    renderSettings();
+    fireEvent.click(screen.getByTestId("layered-row-claude-claude-native"));
+    screen.getByRole("button", { name: "Only on Alpha" }).focus();
+
+    await user.keyboard("{Enter}");
+
+    expect(screen.getByLabelText("Context total for Claude Code on Alpha")).toHaveFocus();
+  });
+
+  it("returns focus to the originating level entry when going back", async () => {
+    const user = userEvent.setup();
+    renderSettings();
+    fireEvent.click(screen.getByTestId("layered-row-claude-claude-native"));
+    fireEvent.click(screen.getByRole("button", { name: "All agents on Alpha" }));
+    screen.getByRole("button", { name: "Claude Code, all hosts" }).focus();
+
+    await user.keyboard("{Enter}");
+
+    expect(screen.getByRole("button", { name: "All agents on Alpha" })).toHaveFocus();
+  });
+
   it("lists a model value in the agent row with its scope and removes it", async () => {
     const modelKey = usageContextLevelKey({ ...source, model: "claude-opus-5-5" }, "agent-model");
     store({ [modelKey]: value(200_000) });
@@ -422,6 +446,30 @@ describe("ContextUsageSettings", () => {
     expect(
       readUsageContextPreferences().overrides[usageContextLevelKey(source, "cell")],
     ).toMatchObject({ contextWindowTokens: 100_000 });
+  });
+
+  it("keeps bulk Undo after Enter is pressed twice", () => {
+    const cellKey = usageContextLevelKey(source, "cell");
+    store({ [cellKey]: value(100_000) });
+    renderSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Select cells" }));
+    fireEvent.click(cell("claude-claude-native", "host-a"));
+    fireEvent.click(screen.getByRole("button", { name: "Set values" }));
+    const input = screen.getByLabelText("Context total for the selection");
+    fireEvent.change(input, { target: { value: "600000" } });
+
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(readUsageContextPreferences().overrides[cellKey]).toMatchObject({
+      contextWindowTokens: 600_000,
+    });
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+
+    expect(readUsageContextPreferences().overrides[cellKey]).toMatchObject({
+      contextWindowTokens: 100_000,
+    });
   });
 
   it("keeps the usage limits row and shows no provider reading without a harness session", () => {

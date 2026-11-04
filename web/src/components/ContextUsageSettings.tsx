@@ -7,6 +7,7 @@ import {
   type KeyboardEvent,
   type ReactElement,
   type ReactNode,
+  type Ref,
 } from "react";
 
 import { AgentNameTag } from "@/components/AgentNameTag";
@@ -395,6 +396,7 @@ type DraftField = "context" | "buffer";
 /** Context total and Compact buffer, each with its unit and one line about its value. */
 function DraftFields({
   draft,
+  contextInputRef,
   onChange,
   onSubmit,
   labelFor,
@@ -403,6 +405,7 @@ function DraftFields({
   error,
 }: {
   draft: Draft;
+  contextInputRef?: Ref<HTMLInputElement>;
   onChange: (next: Draft) => void;
   onSubmit: () => void;
   labelFor: (field: DraftField | "unit") => string;
@@ -421,6 +424,7 @@ function DraftFields({
         <span className="text-sm font-medium">Context total</span>
         <span className={VALUE_ROW}>
           <Input
+            ref={contextInputRef}
             type="number"
             min={1}
             step={1000}
@@ -487,6 +491,7 @@ function DraftFields({
 /** The two fields for one stored level; an empty one shows what it would inherit. */
 function LevelFields({
   preferences,
+  contextInputRef,
   source,
   level,
   label,
@@ -497,6 +502,7 @@ function LevelFields({
   error,
 }: {
   preferences: UsageContextPreferences;
+  contextInputRef?: Ref<HTMLInputElement>;
   source: UsageContextSource;
   level: UsageContextLevel;
   label: string;
@@ -524,6 +530,7 @@ function LevelFields({
   return (
     <DraftFields
       draft={draft}
+      contextInputRef={contextInputRef}
       onChange={onChange}
       onSubmit={onSubmit}
       error={error}
@@ -1266,6 +1273,7 @@ function SelectionActions({
     return key ? [key] : [];
   });
   const apply = () => {
+    if (keys.length === 0) return;
     const outcome = recordFromDraft(draft, null);
     if ("error" in outcome) {
       setError(outcome.error);
@@ -1427,12 +1435,24 @@ function AgentRowEditor({
   const [stepped, setStepped] = useState<(RowEditorTarget & { title: string }) | null>(null);
   const [typed, setTyped] = useState<Record<string, Draft>>({});
   const [error, setError] = useState("");
+  const contextInputRef = useRef<HTMLInputElement>(null);
+  const cellEntryRef = useRef<HTMLButtonElement>(null);
+  const hostEntryRef = useRef<HTMLButtonElement>(null);
+  const returnEntryRef = useRef<"cell" | "host" | null>(null);
   useEffect(() => {
     setModelTab("model");
     setStepped(null);
     setTyped({});
     setError("");
   }, [open]);
+  useEffect(() => {
+    if (stepped) contextInputRef.current?.focus();
+    else if (returnEntryRef.current) {
+      const entry = returnEntryRef.current === "host" ? hostEntryRef : cellEntryRef;
+      entry.current?.focus();
+      returnEntryRef.current = null;
+    }
+  }, [stepped]);
 
   const target = stepped ?? (oneModel && modelTab === "model" ? oneModel : allModels);
   const onFocusedModel = !stepped && target === oneModel;
@@ -1443,6 +1463,7 @@ function AgentRowEditor({
       JSON.stringify(draft) !== JSON.stringify(draftOf(preferences.overrides[target.key]));
     if (changed) setTyped({ ...typed, [next.key]: draft });
     setError("");
+    returnEntryRef.current = next.level === "host" ? "host" : "cell";
     setStepped(next);
   };
   const save = () => {
@@ -1539,6 +1560,7 @@ function AgentRowEditor({
       ) : null}
       <LevelFields
         preferences={preferences}
+        contextInputRef={contextInputRef}
         source={target.source}
         level={target.level}
         label={target.label}
@@ -1556,6 +1578,7 @@ function AgentRowEditor({
       {!stepped && hostColumn ? (
         <nav aria-label="Other levels" className="grid border-t border-border pt-1.5">
           <StepButton
+            buttonRef={cellEntryRef}
             onClick={() => {
               const source: UsageContextSource = {
                 ...agentSource,
@@ -1575,6 +1598,7 @@ function AgentRowEditor({
             Only on {hostColumn.label}
           </StepButton>
           <StepButton
+            buttonRef={hostEntryRef}
             onClick={() => {
               const source: UsageContextSource = {
                 hostId: hostColumn.hostId,
@@ -1620,9 +1644,18 @@ function AgentRowEditor({
   );
 }
 
-function StepButton({ children, onClick }: { children: ReactNode; onClick: () => void }) {
+function StepButton({
+  children,
+  onClick,
+  buttonRef,
+}: {
+  children: ReactNode;
+  onClick: () => void;
+  buttonRef?: Ref<HTMLButtonElement>;
+}) {
   return (
     <button
+      ref={buttonRef}
       type="button"
       className="-mx-1 flex min-h-11 items-center justify-between gap-2 rounded-md px-1 text-left text-sm text-muted-foreground hover:bg-foreground/5 hover:text-foreground md:min-h-8"
       onClick={onClick}
