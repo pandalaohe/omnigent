@@ -6311,6 +6311,7 @@ async def _execute_session_create_impl(
             "status": data.get("status") or "created",
             "agent_id": data.get("agent_id") or agent_id,
             "title": data.get("title") or args.get("title"),
+            **({"session_choice": data["session_choice"]} if data.get("session_choice") else {}),
         }
         initial_message = data.get("initial_message")
         if placement_mode == "same_host" and args.get("message"):

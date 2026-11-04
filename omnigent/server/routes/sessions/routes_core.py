@@ -2350,6 +2350,10 @@ def register_core_routes(
                 and (
                     payload.get("project_id") is not None
                     or (
+                        request.headers.get("x-omnigent-session-choice") == "1"
+                        and ORCHESTRATION_SOURCE_HEADER in request.headers
+                    )
+                    or (
                         payload.get("parent_session_id") is not None
                         and payload.get("agent_id") is None
                     )

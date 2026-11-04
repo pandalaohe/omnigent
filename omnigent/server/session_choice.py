@@ -417,11 +417,16 @@ def _filter_link(
             if not window.past_reset
             and window.percent_used is not None
             and window.percent_used >= 100
-            and window.resets_at is not None
-            and window.resets_at > now
         ]
         if exhausted:
-            return Skipped(link, "exhausted", max(window.resets_at or now for window in exhausted))
+            return Skipped(
+                link,
+                "exhausted",
+                max(
+                    (window.resets_at for window in exhausted if window.resets_at is not None),
+                    default=None,
+                ),
+            )
         released = pool in floor_off and floor_off_active(floor_off[pool], reading, now)
         reserve = limits.reserve
         if reserve and work_type.id not in limits.reserve_exempt and not released:

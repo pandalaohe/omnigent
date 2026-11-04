@@ -374,6 +374,15 @@ def pick(
     )
 
 
+def test_exhausted_without_reset_is_skipped_without_an_invented_until():
+    exhausted = reading(used=100)
+    exhausted.windows[0].resets_at = None
+    result = pick(table(), readings={"pool-0": exhausted})
+    assert result.pool == "pool-1"
+    assert result.skipped[0].why == "exhausted"
+    assert result.skipped[0].until is None
+
+
 @pytest.mark.parametrize("strategy", ["drain", "balance"])
 def test_weighted_picks_and_preview(strategy):
     settings = table(strategy=strategy)

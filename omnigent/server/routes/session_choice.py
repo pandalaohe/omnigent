@@ -18,6 +18,7 @@ from omnigent.server.session_choice import (
     active_on,
     floor_off_active,
     parse_session_choice,
+    reserve_now,
     state_for,
 )
 from omnigent.server.user_preferences_store import (
@@ -241,20 +242,69 @@ def create_session_choice_router(
         pool = await asyncio.to_thread(
             pool_of_session, session, settings, products=context.products
         )
-        readings, _, floors = await asyncio.to_thread(
-            inputs, request.app, settings, context, time.time()
-        )
+        now = time.time()
+        readings, _, floors = await asyncio.to_thread(inputs, request.app, settings, context, now)
         reading = readings.get(pool)
-        if reading is None or reading.freshness != "fresh" or reading.state == "ok":
+        if reading is None or reading.freshness != "fresh":
+            return {"notice": None}
+        limits = settings.limits.get(pool) if pool is not None else None
+        reserve = limits.reserve if limits else None
+        window = next(
+            (
+                w
+                for w in reading.windows
+                if w.id == (reserve.window if reserve else reading.deciding_window)
+            ),
+            None,
+        )
+        if reserve:
+            if (
+                window is None
+                or window.past_reset
+                or window.remaining_pct is None
+                or (
+                    reserve.mode == "daily"
+                    and (
+                        window.resets_at is None
+                        or window.resets_at <= now
+                        or (window.window_minutes or 0) < 1440
+                    )
+                )
+                or window.remaining_pct
+                > reserve_now(reserve.mode, reserve.pct, window.resets_at or now, now)
+            ):
+                return {"notice": None}
+        elif reading.state != "low":
+            return {"notice": None}
+        elif window is None:
+            window = next(
+                (w for w in reading.windows if not w.past_reset and w.remaining_pct is not None),
+                None,
+            )
+        if window is None or window.past_reset or window.remaining_pct is None:
             return {"notice": None}
         mode = (
             " Use up."
             if pool in floors and floors[pool].until == "manual"
             else " Floor off until reset."
-            if pool in floors and floor_off_active(floors[pool], reading, time.time())
+            if pool in floors and floor_off_active(floors[pool], reading, now)
             else ""
         )
-        return {"notice": f"{pool}: {reading.state}.{mode}", "pool": pool}
+        reset = (
+            f", resets in {round(max(0, window.resets_at - now) / 86400, 1):g}d"
+            if window.resets_at is not None
+            else ""
+        )
+        return {
+            "notice": (
+                f"{reading.display_name} {window.label or window.id}: "
+                f"{window.remaining_pct:g}% left{reset}.{mode}"
+            ),
+            "pool": pool,
+            "remaining_pct": window.remaining_pct,
+            "resets_at": window.resets_at,
+            "window": window.id,
+        }
 
     @router.get("/me/session-choice")
     async def read(request: Request) -> dict[str, Any]:

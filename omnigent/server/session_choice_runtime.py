@@ -292,10 +292,10 @@ class CreateChoice:
             )
         await self.stack.aclose()
 
-    def labels(self, now: float) -> dict[str, str]:
+    def labels(self, now: float, *, host_load_held: bool = False) -> dict[str, str]:
         marker = (
             f"queued@{self.host}@{self.choice.pool}"
-            if self.choice.outcome == "hold"
+            if self.choice.outcome == "hold" or host_load_held
             else f"admitted@{self.host}@{self.choice.pool}@{now}"
         )
         return {**choice_labels(self.choice), SLOT_LABEL: marker}
@@ -384,6 +384,11 @@ async def admit_create(
                 flags=(*flags, "choice_failed"),
             )
         if named:
+            from omnigent.server.routes._sessions.helpers import (
+                _resolve_harness_impl,
+                _resolve_llm_model,
+            )
+
             link = Link.model_validate(
                 {
                     "agent": body.agent_id,
@@ -398,8 +403,22 @@ async def admit_create(
                 root_conversation_id="",
                 agent_id=body.agent_id,
                 model_override=body.model_override,
+                harness_override=body.harness_override,
             )
-            pool = pool_of_session(probe, settings, products=request.products)
+            product = agent_key_for_harness(
+                _resolve_harness_impl(
+                    probe, agent_store=app.state.agent_store, agent_cache=app.state.agent_cache
+                )
+            )
+            model = body.model_override or await asyncio.to_thread(
+                _resolve_llm_model,
+                probe,
+                agent_store=app.state.agent_store,
+                agent_cache=app.state.agent_cache,
+            )
+            pool = pool_of_session(
+                probe, settings, product=product, model=model, products=request.products
+            )
             if pool is not None and any(item.meter == pool for item in ordered_links(settings)):
                 link = link.model_copy(update={"meter": pool})
             reading = readings.get(pool) if pool else None

@@ -140,8 +140,18 @@ async def test_create_skips_an_unbindable_agent_before_choosing_next(choice_env,
 
 
 @pytest.mark.asyncio
-async def test_named_reason_checks_cap_but_user_can_override(choice_env):
+@pytest.mark.parametrize("default_model", [False, True])
+async def test_named_reason_checks_cap_but_user_can_override(choice_env, default_model):
     env = choice_env
+    if default_model:
+        model = env.agents[0]["name"]
+        env.settings["presets"][0]["links"][0]["model"] = model
+        env.settings["hosts"][HOST]["work"][0][0]["links"][0]["model"] = model
+        env.prefs.replace_session_choice(
+            RESERVED_USER_LOCAL,
+            env.settings,
+            env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"],
+        )
     first = await create(env)
     assert first.status_code == 201, first.text
     named = {
@@ -149,11 +159,120 @@ async def test_named_reason_checks_cap_but_user_can_override(choice_env):
         "model_override": "test-model",
         "choice_reason": "specific need",
     }
+    if default_model:
+        named.pop("model_override")
     refused = await create(env, **named)
     assert refused.status_code == 409, refused.text
     assert refused.json()["detail"]["code"] == "agent_busy"
     allowed = await create(env, **{**named, "user_named": True})
     assert allowed.status_code == 201, allowed.text
+
+
+@pytest.mark.asyncio
+async def test_host_hold_rechecks_pool_after_admission_timeout(choice_env, monkeypatch):
+    env = choice_env
+    now = time.time()
+    clock = [now]
+    monkeypatch.setattr("omnigent.server.session_choice_runtime.time.time", lambda: clock[0])
+    env.app.state.system_status = SimpleNamespace(
+        queue_enabled=lambda workspace: True,
+        host_load=lambda *args: {
+            "level": "new_session_hold",
+            "load_per_core": 6,
+            "lines": {"heavy": 4, "new_session": 5},
+        },
+    )
+    held_response = await create(env)
+    assert held_response.status_code == 201, held_response.text
+    held_id = held_response.json()["id"]
+    held = env.store.get_conversation(held_id)
+    assert held.labels[SLOT_LABEL].startswith("queued@")
+    assert not holds_slot(held, now)
+    clock[0] += 121
+    env.app.state.system_status = None
+    other_response = await create(env)
+    assert other_response.status_code == 201, other_response.text
+    other = other_response.json()
+    assert other["session_choice"]["pool"] == "pool-0"
+    env.store.set_host_id(other["id"], "2" * 32, workspace="/opt/work/project")
+    queue = HostLoadQueue(env.store)
+    monkeypatch.setattr(queue, "_start", AsyncMock())
+    monkeypatch.setattr(env.app.state.host_load_inputs, "deliver_session", AsyncMock())
+    assert not await queue.release(env.app, held_id, HOST)
+    queue._start.assert_not_awaited()
+    env.store.set_session_live_status(other["id"], "idle")
+    assert await queue.release(env.app, held_id, HOST)
+    queue._start.assert_awaited_once()
+    assert holds_slot(env.store.get_conversation(held_id), clock[0])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reserve", "state", "expected"),
+    [
+        ({"mode": "total", "window": "7d", "pct": 50}, "ok", True),
+        ({"mode": "total", "window": "7d", "pct": 30}, "low", False),
+        ({"mode": "daily", "window": "7d", "pct": 11}, "ok", True),
+        (None, "tight", False),
+        (None, "low", True),
+    ],
+)
+async def test_notice_uses_reserve_else_low_pace(
+    choice_env, monkeypatch, reserve, state, expected
+):
+    import httpx
+    from fastapi import FastAPI
+
+    from omnigent.server.routes.session_choice import create_session_choice_router
+    from omnigent.usage.contract import UsageAccountView, UsageWindowView
+
+    env = choice_env
+    env.settings["limits"]["pool-0"]["reserve"] = reserve
+    env.prefs.replace_session_choice(
+        RESERVED_USER_LOCAL,
+        env.settings,
+        env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"],
+    )
+    reset = time.time() + 4 * 86400
+    reading = UsageAccountView(
+        id="pool-0",
+        kind="account",
+        display_name="Example",
+        state=state,
+        freshness="fresh",
+        deciding_window="7d",
+        windows=[
+            UsageWindowView(
+                id="7d",
+                kind="weekly",
+                label="7d",
+                percent_used=60,
+                remaining_pct=40,
+                window_minutes=10080,
+                resets_at=reset,
+                state=state,
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        env.app.state.agent_quota_service, "pool_readings", lambda *a, **k: {"pool-0": reading}
+    )
+    app = FastAPI()
+    app.state = env.app.state
+    app.include_router(create_session_choice_router(env.prefs, None), prefix="/v1")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get(
+            "/v1/me/session-choice/notice",
+            params={"host_id": HOST, "agent_id": env.agents[0]["id"], "model": "test-model"},
+        )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert bool(payload["notice"]) is expected, payload
+    if expected:
+        assert payload["remaining_pct"] == 40
+        assert payload["resets_at"] == reset
 
 
 @pytest.mark.asyncio

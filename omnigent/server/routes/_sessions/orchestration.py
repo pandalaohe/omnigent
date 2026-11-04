@@ -15484,7 +15484,9 @@ async def _create_session_from_existing_agent_impl(
     native_agent = native_coding_agent_for_agent_name(agent.name)
     initial_labels = dict(body.labels) if body.labels else {}
     if choice_admission is not None:
-        initial_labels.update(choice_admission.labels(time.time()))
+        initial_labels.update(
+            choice_admission.labels(time.time(), host_load_held=host_load_hold is not None)
+        )
     if host_load_hold:
         initial_labels["omnigent.startup.host_load"] = f"queued@{host_load_hold.host_id}"
     client_surface = resolve_client_surface(
