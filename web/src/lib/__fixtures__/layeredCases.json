@@ -1,0 +1,160 @@
+{
+  "cases": [
+    {
+      "scenario": 1,
+      "name": "Host column flows down",
+      "store": {
+        "corner": { "state": "On" },
+        "rows": { "codex": {} },
+        "cols": { "desktop": { "state": "Off" } },
+        "cells": { "desktop": { "codex": {} } }
+      },
+      "row": "codex",
+      "col": "desktop",
+      "field": "state",
+      "expected": {
+        "value": "Off",
+        "stored": "Off",
+        "source": { "level": "col", "col": "desktop" }
+      },
+      "clashes": []
+    },
+    {
+      "scenario": 2,
+      "name": "Cell beats header",
+      "store": {
+        "corner": { "state": "On" },
+        "rows": { "codex": {} },
+        "cols": { "desktop": { "state": "Off" } },
+        "cells": { "desktop": { "codex": { "state": "On" } } }
+      },
+      "row": "codex",
+      "col": "desktop",
+      "field": "state",
+      "expected": {
+        "value": "On",
+        "stored": "On",
+        "source": { "level": "cell", "row": "codex", "col": "desktop" }
+      },
+      "clashes": []
+    },
+    {
+      "scenario": 3,
+      "name": "Agent beats unmarked host",
+      "store": {
+        "corner": {},
+        "rows": { "codex": { "maxSeconds": 28800 } },
+        "cols": { "desktop": { "maxSeconds": 7200 } },
+        "cells": { "desktop": { "codex": {} } }
+      },
+      "row": "codex",
+      "col": "desktop",
+      "field": "maxSeconds",
+      "expected": { "value": 28800, "stored": 28800, "source": { "level": "row", "row": "codex" } },
+      "clashes": [{ "field": "maxSeconds", "winner": "row" }]
+    },
+    {
+      "scenario": 4,
+      "name": "Marked host beats agent",
+      "store": {
+        "corner": {},
+        "rows": { "codex": { "maxSeconds": 28800 } },
+        "cols": { "desktop": { "maxSeconds": 7200 } },
+        "cells": { "desktop": { "codex": {} } },
+        "hostWins": { "desktop": true }
+      },
+      "row": "codex",
+      "col": "desktop",
+      "field": "maxSeconds",
+      "expected": { "value": 7200, "stored": 7200, "source": { "level": "col", "col": "desktop" } },
+      "clashes": [{ "field": "maxSeconds", "winner": "col" }]
+    },
+    {
+      "scenario": 5,
+      "name": "Marked host with the field unset",
+      "store": {
+        "corner": {},
+        "rows": { "codex": { "maxSeconds": 28800 } },
+        "cols": { "desktop": {} },
+        "cells": { "desktop": { "codex": {} } },
+        "hostWins": { "desktop": true }
+      },
+      "row": "codex",
+      "col": "desktop",
+      "field": "maxSeconds",
+      "expected": { "value": 28800, "stored": 28800, "source": { "level": "row", "row": "codex" } },
+      "clashes": []
+    },
+    {
+      "scenario": 8,
+      "name": "Two marked hosts stay independent",
+      "store": {
+        "corner": {},
+        "rows": { "codex": { "maxSeconds": 28800 } },
+        "cols": {
+          "desktop": { "maxSeconds": 7200 },
+          "server": { "maxSeconds": 3600 }
+        },
+        "cells": { "desktop": { "codex": {} }, "server": { "codex": {} } },
+        "hostWins": { "desktop": true, "server": true }
+      },
+      "row": "codex",
+      "col": "server",
+      "field": "maxSeconds",
+      "expected": { "value": 3600, "stored": 3600, "source": { "level": "col", "col": "server" } },
+      "clashes": [{ "field": "maxSeconds", "winner": "col" }]
+    },
+    {
+      "scenario": 9,
+      "name": "Header equal to corner stays stored and wins",
+      "store": {
+        "corner": { "state": "On" },
+        "rows": { "codex": { "state": "On" } },
+        "cols": { "desktop": { "state": "Off" } },
+        "cells": { "desktop": { "codex": {} } }
+      },
+      "row": "codex",
+      "col": "desktop",
+      "field": "state",
+      "expected": { "value": "On", "stored": "On", "source": { "level": "row", "row": "codex" } },
+      "inherited": { "value": "On", "source": { "level": "corner" } },
+      "clashes": [{ "field": "state", "winner": "row" }]
+    },
+    {
+      "scenario": 37,
+      "name": "Runtime clamp is the displayed value",
+      "store": {
+        "corner": {},
+        "rows": { "codex": {} },
+        "cols": { "desktop": {} },
+        "cells": { "desktop": { "codex": { "intervalSeconds": 60 } } }
+      },
+      "row": "codex",
+      "col": "desktop",
+      "field": "intervalSeconds",
+      "normalize": "clamp-interval",
+      "expected": {
+        "value": 300,
+        "stored": 60,
+        "source": { "level": "cell", "row": "codex", "col": "desktop" }
+      },
+      "clashes": []
+    },
+    {
+      "scenario": 38,
+      "name": "Invalid cell value falls through and leaves the clash",
+      "store": {
+        "corner": {},
+        "rows": { "codex": { "maxSeconds": 28800 } },
+        "cols": { "desktop": { "maxSeconds": 7200 } },
+        "cells": { "desktop": { "codex": { "maxSeconds": "invalid" } } }
+      },
+      "row": "codex",
+      "col": "desktop",
+      "field": "maxSeconds",
+      "canHold": "numbers-only",
+      "expected": { "value": 28800, "stored": 28800, "source": { "level": "row", "row": "codex" } },
+      "clashes": [{ "field": "maxSeconds", "winner": "row" }]
+    }
+  ]
+}
