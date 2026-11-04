@@ -1,3 +1,4 @@
+import { useSyncExternalStore } from "react";
 import { dispatchArchiveSession, dispatchPollSessions } from "@/hooks/useSessionPollingHotkeys";
 import { dispatchSelectWorkspaceTab } from "@/hooks/useWorkspaceTabHotkeys";
 import {
@@ -10,7 +11,15 @@ import {
 import { queueUserPreferencePatch } from "@/lib/userPreferencesSync";
 
 export type MobileAssistantSoftKey =
-  "escape" | "tab" | "arrowUp" | "arrowDown" | "arrowLeft" | "arrowRight" | "enter";
+  | "escape"
+  | "tab"
+  | "arrowUp"
+  | "arrowDown"
+  | "arrowLeft"
+  | "arrowRight"
+  | "enter"
+  | "home"
+  | "end";
 
 /** Legacy fixed action ids retained for a lossless version-1 migration. */
 export type MobileAssistantAction = MobileAssistantSoftKey | "pollSessions" | "archiveSession";
@@ -123,7 +132,68 @@ const SOFT_KEY_DEFAULTS: Record<MobileAssistantSoftKey, ShortcutChord> = {
   arrowLeft: { code: "ArrowLeft", modifiers: [] },
   arrowRight: { code: "ArrowRight", modifiers: [] },
   enter: { code: "Enter", modifiers: [] },
+  home: { code: "Home", modifiers: [] },
+  end: { code: "End", modifiers: [] },
 };
+
+export interface TypableTerminalsSnapshot {
+  count: number;
+  withBar: number;
+}
+
+let nextTypableTerminalId = 1;
+const typableTerminals = new Map<number, boolean>();
+const typableTerminalListeners = new Set<() => void>();
+let typableTerminalsSnapshot: TypableTerminalsSnapshot = { count: 0, withBar: 0 };
+
+function updateTypableTerminalsSnapshot(): void {
+  let withBar = 0;
+  for (const hasBar of typableTerminals.values()) {
+    if (hasBar) withBar += 1;
+  }
+  const count = typableTerminals.size;
+  if (typableTerminalsSnapshot.count === count && typableTerminalsSnapshot.withBar === withBar) {
+    return;
+  }
+  typableTerminalsSnapshot = { count, withBar };
+  for (const listener of typableTerminalListeners) {
+    listener();
+  }
+}
+
+export function registerTypableTerminal(hasBar: boolean): () => void {
+  const id = nextTypableTerminalId++;
+  typableTerminals.set(id, hasBar);
+  updateTypableTerminalsSnapshot();
+  return () => {
+    if (!typableTerminals.delete(id)) return;
+    updateTypableTerminalsSnapshot();
+  };
+}
+
+function subscribeTypableTerminals(listener: () => void): () => void {
+  typableTerminalListeners.add(listener);
+  return () => {
+    typableTerminalListeners.delete(listener);
+  };
+}
+
+function getTypableTerminalsSnapshot(): TypableTerminalsSnapshot {
+  return typableTerminalsSnapshot;
+}
+
+const SERVER_TYPABLE_TERMINALS_SNAPSHOT: TypableTerminalsSnapshot = {
+  count: 0,
+  withBar: 0,
+};
+
+export function useTypableTerminals(): TypableTerminalsSnapshot {
+  return useSyncExternalStore(
+    subscribeTypableTerminals,
+    getTypableTerminalsSnapshot,
+    () => SERVER_TYPABLE_TERMINALS_SNAPSHOT,
+  );
+}
 
 const DEFAULT_BUTTONS: MobileAssistantButton[] = [
   {
@@ -488,7 +558,7 @@ function keyboardEventInit(chord: ShortcutChord): KeyboardEventInit {
   };
 }
 
-function softKeyForChord(chord: ShortcutChord): MobileAssistantSoftKey | null {
+export function softKeyForChord(chord: ShortcutChord): MobileAssistantSoftKey | null {
   if (chord.modifiers.length > 0) return null;
   return (Object.entries(SOFT_KEY_DEFAULTS).find(
     ([, candidate]) => candidate.code === chord.code,

@@ -77,6 +77,7 @@ const terminalSessionMock = vi.hoisted(() => ({
     url: string;
     container: HTMLDivElement;
     clipboardEnabled: boolean;
+    focusOnConnect: boolean;
     adaptCodexPalette: boolean;
     onClipboardRequest?: (text: string, copyEvent?: ClipboardEvent) => void;
     onFileLink?: (uri: string) => boolean;
@@ -86,6 +87,8 @@ const terminalSessionMock = vi.hoisted(() => ({
     setClipboardEnabled: ReturnType<typeof vi.fn>;
     sendSoftKey: ReturnType<typeof vi.fn>;
     focus: ReturnType<typeof vi.fn>;
+    blur: ReturnType<typeof vi.fn>;
+    isFocused: ReturnType<typeof vi.fn>;
   }[],
 }));
 
@@ -99,6 +102,8 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
     setClipboardEnabled = vi.fn();
     sendSoftKey = vi.fn();
     focus = vi.fn();
+    blur = vi.fn();
+    isFocused = vi.fn(() => false);
 
     constructor(
       container: HTMLDivElement,
@@ -109,7 +114,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
       _onInput?: () => void,
       clipboardEnabled = true,
       onClipboardRequest?: (text: string, copyEvent?: ClipboardEvent) => void,
-      _focusOnConnect = true,
+      focusOnConnect = true,
       adaptCodexPalette = false,
       onFileLink?: (uri: string) => boolean,
     ) {
@@ -117,6 +122,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
         url,
         container,
         clipboardEnabled,
+        focusOnConnect,
         adaptCodexPalette,
         onClipboardRequest,
         onFileLink,
@@ -126,6 +132,8 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
         setClipboardEnabled: this.setClipboardEnabled,
         sendSoftKey: this.sendSoftKey,
         focus: this.focus,
+        blur: this.blur,
+        isFocused: this.isFocused,
       });
     }
   },
@@ -1785,5 +1793,159 @@ describe("automatic reconnect", () => {
     await act(async () => {});
     expect(terminalSessionMock.instances).toHaveLength(1);
     expect(screen.getByText("Bridge closed: code 4405")).toBeInTheDocument();
+  });
+});
+
+describe("TerminalView phone key rows", () => {
+  function stubPhoneViewport(width: number, height: number, coarse = true) {
+    vi.stubGlobal("innerWidth", width);
+    vi.stubGlobal("innerHeight", height);
+    vi.stubGlobal("screen", { width, height });
+    vi.stubGlobal(
+      "matchMedia",
+      vi.fn((query: string) => ({
+        matches:
+          query === "(max-width: 767.98px)"
+            ? width < 768
+            : query === "(pointer: coarse)"
+              ? coarse
+              : false,
+        media: query,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      })),
+    );
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((cb: FrameRequestCallback) => {
+      cb(0);
+      return 1;
+    });
+  }
+
+  function stubRootRect(width: number, height: number) {
+    return vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
+      () =>
+        ({
+          top: 0,
+          bottom: height,
+          left: 0,
+          right: width,
+          width,
+          height,
+          x: 0,
+          y: 0,
+          toJSON: () => ({}),
+        }) as DOMRect,
+    );
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("renders key rows on a writable phone terminal, suppresses auto-focus on connect and reveal, and disables keys while reconnecting", async () => {
+    stubPhoneViewport(390, 844);
+    stubRootRect(390, 788);
+
+    const { rerender } = render(
+      <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active={false} />,
+    );
+    await act(async () => {});
+    expect(terminalSessionMock.instances).toHaveLength(1);
+    expect(terminalSessionMock.instances[0].focusOnConnect).toBe(false);
+    expect(screen.queryByTestId("terminal-key-row")).toBeNull();
+
+    // Reveal on phone: key row mounts, session.focus() is not called automatically
+    rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active />);
+    await act(async () => {});
+    expect(terminalSessionMock.instances[0].focus).not.toHaveBeenCalled();
+    const keyRow = screen.getByTestId("terminal-key-row");
+    expect(keyRow).toHaveAttribute("aria-disabled", "true");
+
+    act(() => {
+      terminalSessionMock.instances[0].onState({ kind: "connected" });
+    });
+    expect(keyRow).toHaveAttribute("aria-disabled", "false");
+
+    // Swipe pager to page 1 and verify transient error + transport close (1006)
+    // keep the exact same DOM node disabled in place without resetting page.
+    const pager = screen.getByTestId("terminal-key-row-pager");
+    fireEvent.pointerDown(pager, { button: 0, pointerId: 1, clientX: 200, clientY: 70 });
+    fireEvent.pointerMove(pager, { pointerId: 1, clientX: 120, clientY: 70 });
+    fireEvent.pointerUp(pager, { pointerId: 1, clientX: 120, clientY: 70 });
+    expect(keyRow).toHaveAttribute("data-page", "1");
+
+    act(() => {
+      terminalSessionMock.instances[0].onState({ kind: "error" });
+    });
+    expect(screen.getByTestId("terminal-key-row")).toBe(keyRow);
+    expect(keyRow).toHaveAttribute("aria-disabled", "true");
+    expect(keyRow).toHaveAttribute("data-page", "1");
+
+    act(() => {
+      terminalSessionMock.instances[0].onState({ kind: "closed", code: 1006, reason: "transport" });
+    });
+    expect(screen.getByTestId("terminal-key-row")).toBe(keyRow);
+    expect(keyRow).toHaveAttribute("aria-disabled", "true");
+    expect(keyRow).toHaveAttribute("data-page", "1");
+
+    // Deliberate close (1000) hides the key row
+    act(() => {
+      terminalSessionMock.instances[0].onState({ kind: "closed", code: 1000, reason: "" });
+    });
+    expect(screen.queryByTestId("terminal-key-row")).toBeNull();
+  });
+
+  it("hides key rows on readOnly, showKeyRows={false}, desktop viewports, or below the vertical room floor", async () => {
+    stubPhoneViewport(390, 844);
+    const rectSpy = stubRootRect(390, 788);
+
+    const { rerender } = render(
+      <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" readOnly />,
+    );
+    await act(async () => {});
+    expect(screen.queryByTestId("terminal-key-row")).toBeNull();
+
+    rerender(
+      <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" showKeyRows={false} />,
+    );
+    await act(async () => {});
+    expect(screen.queryByTestId("terminal-key-row")).toBeNull();
+
+    // Portrait room floor: height 180 < 99 + 108 (207) -> hidden
+    rectSpy.mockRestore();
+    const tightSpy = stubRootRect(390, 180);
+    rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await act(async () => {});
+    act(() => {
+      window.dispatchEvent(new Event("resize"));
+    });
+    expect(screen.queryByTestId("terminal-key-row")).toBeNull();
+
+    // Landscape 1-row bar: width 667 >= 560, height 170 >= 55 + 108 (163) -> visible
+    tightSpy.mockRestore();
+    stubPhoneViewport(667, 375);
+    stubRootRect(667, 170);
+    act(() => {
+      window.dispatchEvent(new Event("resize"));
+    });
+    expect(screen.getByTestId("terminal-key-row")).toBeInTheDocument();
+  });
+
+  it("uses width after side safe areas for the one-row room floor", async () => {
+    stubPhoneViewport(844, 390);
+    stubRootRect(590.8, 180);
+
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await act(async () => {});
+
+    const view = screen.getByTestId("terminal-view");
+    view.style.setProperty("--omnigent-safe-left", "47px");
+    view.style.setProperty("--omnigent-safe-right", "47px");
+    act(() => {
+      window.dispatchEvent(new Event("resize"));
+    });
+
+    // 590.8 - 47 - 47 = 496.8px: two rows need 99 + 108px, not 55 + 108px.
+    expect(screen.queryByTestId("terminal-key-row")).toBeNull();
   });
 });

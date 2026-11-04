@@ -425,6 +425,7 @@ export function MainTerminalView({
                             terminalId={terminal.id}
                             readOnly={readOnly}
                             active={visible && active && focused}
+                            showKeyRows={!split || focused}
                             directAttachUrl={terminal.directAttachUrl}
                             onResume={runnerOffline && onResume ? handleResume : undefined}
                             resumeTarget={resumeTarget}

@@ -697,6 +697,7 @@ function RailTerminalView({
           sessionId={conversationId}
           terminalId={terminal.id}
           readOnly={readOnly}
+          showKeyRows={false}
           focusOnConnect={autoFocus}
           directAttachUrl={terminal.directAttachUrl}
           onStateChange={(state) => setTerminalConnectionState(terminal.id, state)}

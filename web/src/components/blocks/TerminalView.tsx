@@ -33,9 +33,12 @@ import { useFileViewer, useWorkspacePaths } from "@/shell/FileViewerContext";
 import { resolveInitialAttachUrl, watchDirectUpgrade, withAttachParams } from "@/lib/terminals";
 import { getSessionHost, markHostKeyless, isHostKeyless } from "@/lib/sessionHost";
 import { hostTerminalsPath } from "@/hooks/useHostTerminals";
+import { useIsPhone } from "@/hooks/useIsPhone";
+import { useTerminalKeyboardRoom } from "@/hooks/useTerminalKeyboardRoom";
 import {
   TERMINAL_SOFT_KEY_EVENT,
   isDomTargetVisible,
+  registerTypableTerminal,
   type TerminalSoftKeyEventDetail,
 } from "@/lib/mobileAssistantPreferences";
 import {
@@ -43,6 +46,7 @@ import {
   type TerminalClipboardDecision,
   type TerminalClipboardPromptReason,
 } from "./TerminalClipboardPrompt";
+import { TerminalKeyRow } from "./TerminalKeyRow";
 import {
   type ConnectionState,
   type TerminalActivityListener,
@@ -154,6 +158,17 @@ type TerminalViewProps = (
    * way. It still grabs focus on the reveal edge and on an explicit open.
    */
   focusOnConnect?: boolean;
+  /**
+   * Whether this surface owns bottom safe-area reservation when the software
+   * keyboard is down. False on HostTerminalsPage where the page root already
+   * reserves `--omnigent-safe-bottom`. Default true.
+   */
+  reservesBottomSafeArea?: boolean;
+  /**
+   * Whether phone key rows may render inside this TerminalView. False on
+   * unfocused split panes and the desktop workspace rail. Default true.
+   */
+  showKeyRows?: boolean;
 };
 
 export function TerminalView({
@@ -169,6 +184,8 @@ export function TerminalView({
   resumePending = false,
   active = true,
   focusOnConnect = active,
+  reservesBottomSafeArea = true,
+  showKeyRows = true,
   directAttachUrl,
 }: TerminalViewProps) {
   const openFile = useFileViewer();
@@ -284,6 +301,40 @@ export function TerminalView({
   isDarkRef.current = isDark;
   const sessionRef = useRef<TerminalSession | null>(null);
   const terminalNodeRef = useRef<HTMLDivElement | null>(null);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const isPhone = useIsPhone();
+  const isPhoneRef = useRef(isPhone);
+  isPhoneRef.current = isPhone;
+  // Track whether this terminal has already tried a keyless re-dial after a
+  // 4400 wrong-replica close. If keyless still fails with 4400, the host is
+  // genuinely unreachable — stop retrying.
+  const keylessRef = useRef(false);
+  // The reconnect effect below owns the decision; replicating it here keeps the
+  // bar mounted (keys disabled in place) across a transport drop instead of
+  // unmounting for the frame before `reconnectPending` is set, which would
+  // reset the key-row page and blink the terminal height.
+  const willAutoReconnect =
+    state.kind === "closed" &&
+    ((state.code === WS_CLOSE_WRONG_REPLICA && isDatabricksWorkspace() && !keylessRef.current) ||
+      (isReconnectableTerminalClose(state.code) &&
+        (reconnectAttemptsRef.current < RECONNECT_BACKOFF_MS.length ||
+          (connectedAtRef.current !== null &&
+            Date.now() - connectedAtRef.current >= RECONNECT_STABLE_MS))));
+  const terminalEnded = state.kind === "closed" && !reconnectPending && !willAutoReconnect;
+  const canShowKeyRows = isPhone && !readOnly && showKeyRows && active && !terminalEnded;
+  const { overlap, keyboardUp, roomPx, keyRowWidth, paddingBottomPx } = useTerminalKeyboardRoom(
+    rootRef,
+    canShowKeyRows,
+    reservesBottomSafeArea,
+  );
+  const barHeight = keyRowWidth >= 560 ? 55 : 99;
+  const hasBar = canShowKeyRows && roomPx >= barHeight + 108;
+
+  useEffect(() => {
+    if (!active || readOnly || terminalEnded) return;
+    return registerTypableTerminal(hasBar);
+  }, [active, readOnly, terminalEnded, hasBar]);
+
   // Stable refs so callback prop changes never recreate the WS session.
   const onStateChangeRef = useRef(onStateChange);
   onStateChangeRef.current = onStateChange;
@@ -317,10 +368,6 @@ export function TerminalView({
     window.addEventListener(TERMINAL_SOFT_KEY_EVENT, handleSoftKey);
     return () => window.removeEventListener(TERMINAL_SOFT_KEY_EVENT, handleSoftKey);
   }, [readOnly]);
-  // Track whether this terminal has already tried a keyless re-dial after a
-  // 4400 wrong-replica close. If keyless still fails with 4400, the host is
-  // genuinely unreachable — stop retrying.
-  const keylessRef = useRef(false);
   // Bumped by every attach so an in-flight attach can tell it has been
   // superseded — a ref callback can re-run for the *same* node, which
   // leaves no other way to retire the previous attempt's async work.
@@ -622,7 +669,7 @@ export function TerminalView({
           notifyInput,
           !readOnly && activeRef.current,
           notifyClipboardRequest,
-          focusOnConnectRef.current,
+          focusOnConnectRef.current && !isPhoneRef.current,
           terminalId === "terminal_codex_main",
           notifyFileLink,
         );
@@ -686,7 +733,7 @@ export function TerminalView({
   const wasActiveRef = useRef(active);
   useEffect(() => {
     if (active && !wasActiveRef.current) {
-      sessionRef.current?.focus();
+      if (!isPhoneRef.current) sessionRef.current?.focus();
       const current = stateRef.current;
       if (current.kind === "closed" && isReconnectableTerminalClose(current.code)) {
         reconnectAttemptsRef.current = 0;
@@ -790,11 +837,15 @@ export function TerminalView({
   // can't paint over body-portaled UI such as the header's session menu.
   return (
     <div
+      ref={rootRef}
       data-testid="terminal-view"
       data-state={state.kind}
       data-terminal-id={terminalId}
       data-terminal-theme={isDark ? "dark" : "light"}
-      className="relative isolate flex min-h-0 flex-1 flex-col"
+      data-keyboard-overlap={canShowKeyRows ? String(overlap) : undefined}
+      data-keyboard-up={canShowKeyRows ? String(keyboardUp) : undefined}
+      className="relative isolate flex min-h-0 flex-1 flex-col @container [:is([data-ios-native],[data-android-native])_[data-testid=terminals-panel]_&]:[--term-safe-b:0px] [:is([data-ios-native],[data-android-native])_[data-testid=terminals-panel]_&]:[--key-row-safe-l:0px] [:is([data-ios-native],[data-android-native])_[data-testid=terminals-panel]_&]:[--key-row-safe-r:0px]"
+      style={canShowKeyRows ? { paddingBottom: `${paddingBottomPx}px` } : undefined}
     >
       {visibleClipboardPrompt !== null && (
         <TerminalClipboardPrompt
@@ -822,6 +873,13 @@ export function TerminalView({
           />
         )}
       </div>
+      {hasBar && (
+        <TerminalKeyRow
+          sessionRef={sessionRef}
+          keyboardUp={keyboardUp}
+          disabled={state.kind !== "connected"}
+        />
+      )}
     </div>
   );
 }
