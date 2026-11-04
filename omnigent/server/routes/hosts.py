@@ -43,11 +43,14 @@ from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness, harness_account_key
 from omnigent.host.frames import (
+    CAP_AGENT_SETTINGS,
     CAP_HARNESS_ACCOUNTS,
     CAP_HARNESS_LOGIN,
     CAP_REFRESH_HARNESSES,
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostAgentSettingsFrame,
+    HostAgentSettingsResultFrame,
     HostCreateDirFrame,
     HostDetectCredentialsFrame,
     HostHarnessLoginCancelFrame,
@@ -110,6 +113,7 @@ from omnigent.server.routes._workspace_validation import (
 )
 from omnigent.server.schemas import SessionGitOptions
 from omnigent.stores import AgentStore, ConversationStore
+from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
 from omnigent.stores.host_store import (
     Host,
     HostCliRetentionRevisionConflictError,
@@ -175,6 +179,21 @@ _HARNESS_ACCOUNTS_CACHE_S = 60.0
 _HARNESS_LOGIN_START_TIMEOUT_S = 30.0
 _HARNESS_LOGIN_CANCEL_TIMEOUT_S = 10.0
 _HARNESS_LOGOUT_TIMEOUT_S = 30.0
+_AGENT_SETTINGS_TIMEOUT_S = 30.0
+
+
+class AgentSettingWriteRequest(BaseModel):
+    key: str
+    value: Any = None
+    revision: str | None = None
+
+
+class AgentSettingUndoRequest(BaseModel):
+    key: str
+
+
+class AgentSettingRootRequest(BaseModel):
+    root: str | None = None
 
 
 # ``/v1/hosts/{id}/*`` routes share the wrong-replica-vs-offline classification
@@ -288,6 +307,55 @@ async def _proxy_model_options(
                 f"{_MODEL_OPTIONS_TIMEOUT_S:.0f}s"
             ),
         ) from exc
+
+
+async def _proxy_agent_settings(
+    *,
+    host_registry: HostRegistry,
+    host_conn: HostConnection,
+    op: str,
+    family: str,
+    key: str | None = None,
+    value: Any = None,
+    revision: str | None = None,
+    root: str | None = None,
+) -> dict[str, Any]:
+    """Run one filtered settings operation on the owning host."""
+    request_id = secrets.token_hex(8)
+    future: asyncio.Future[HostAgentSettingsResultFrame] = (
+        asyncio.get_running_loop().create_future()
+    )
+    host_conn.pending_agent_settings[request_id] = future
+    try:
+        try:
+            host_registry.send_text(
+                host_conn,
+                encode_host_frame(
+                    HostAgentSettingsFrame(
+                        request_id=request_id,
+                        op=op,
+                        family=family,
+                        key=key,
+                        value=value,
+                        revision=revision,
+                        root=root,
+                    )
+                ),
+            )
+        except ConnectionError as exc:
+            raise HTTPException(502, f"host '{host_conn.host_id}' connection lost") from exc
+        try:
+            result = await asyncio.wait_for(future, timeout=_AGENT_SETTINGS_TIMEOUT_S)
+        except TimeoutError as exc:
+            raise HTTPException(504, "host agent settings request timed out") from exc
+        except ConnectionError as exc:
+            raise HTTPException(502, str(exc)) from exc
+        return {"status": result.status, "view": result.view, "error": result.error}
+    finally:
+        host_conn.pending_agent_settings.pop(request_id, None)
+        if future.done() and not future.cancelled():
+            # Consume a late failure so a timed-out request leaves no unretrieved future.
+            future.exception()
 
 
 async def _proxy_list_dir(
@@ -970,6 +1038,7 @@ def create_hosts_router(
     register_startup_prepare: Callable[[Callable[[Any, StartupSnapshot], Awaitable[None]]], None]
     | None = None,
     harness_install: HarnessInstallGate | None = None,
+    catalog_store: HostModelCatalogCacheStore | None = None,
 ) -> APIRouter:
     """Build the router for host REST endpoints.
 
@@ -994,6 +1063,7 @@ def create_hosts_router(
         When omitted, resolves ``OMNIGENT_FEATURES`` at router construction.
     :param harness_install: Optional static or per-request harness-install gate.
         When omitted, the feature snapshot decides.
+    :param catalog_store: Host model catalog cache refreshed after a settings-root change.
     :returns: A FastAPI router with host endpoints.
     """
     flags = feature_flags or resolve_feature_flags()
@@ -2549,6 +2619,134 @@ def create_hosts_router(
                 detail=result.get("error") or "host account probe failed",
             )
         return {"harness_accounts": conn.hello.harness_accounts}
+
+    def _agent_settings_response(result: dict[str, Any]) -> dict[str, Any] | JSONResponse:
+        view = result.get("view")
+        if result.get("status") == "ok" and isinstance(view, dict):
+            return view
+        error = result.get("error")
+        detail = error if isinstance(error, str) and error else "Agent settings operation failed."
+        status_code = 409 if detail.startswith("Changed since") else 400
+        if detail == "Agent settings operation failed.":
+            status_code = 502
+        return JSONResponse(status_code=status_code, content={"error": detail, "view": view})
+
+    async def _request_agent_settings(
+        request: Request,
+        host_id: str,
+        family: str,
+        op: str,
+        **kwargs: Any,
+    ) -> dict[str, Any] | JSONResponse:
+        _host, conn = await _connected_owned_host(
+            request=request,
+            host_id=host_id,
+            auth_provider=auth_provider,
+            host_registry=host_registry,
+            host_store=host_store,
+        )
+        if CAP_AGENT_SETTINGS not in conn.hello.capabilities:
+            raise HTTPException(501, "Update this host to see its settings.")
+        result = await _proxy_agent_settings(
+            host_registry=host_registry,
+            host_conn=conn,
+            op=op,
+            family=family,
+            **kwargs,
+        )
+        return _agent_settings_response(result)
+
+    @router.get("/hosts/{host_id}/agent-settings/{family}")
+    async def read_host_agent_settings(request: Request, host_id: str, family: str) -> Any:
+        """Read one family's allow-listed settings from its selected root."""
+        return await _request_agent_settings(request, host_id, family, "agent_settings_read")
+
+    @router.put("/hosts/{host_id}/agent-settings/{family}")
+    async def write_host_agent_setting(
+        request: Request, host_id: str, family: str, body: AgentSettingWriteRequest
+    ) -> Any:
+        """Compare-and-swap one allow-listed setting, preserving unknown fields."""
+        return await _request_agent_settings(
+            request,
+            host_id,
+            family,
+            "agent_settings_write",
+            key=body.key,
+            value=body.value,
+            revision=body.revision,
+        )
+
+    @router.post("/hosts/{host_id}/agent-settings/{family}/undo")
+    async def undo_host_agent_setting(
+        request: Request, host_id: str, family: str, body: AgentSettingUndoRequest
+    ) -> Any:
+        """Restore one setting's last preimage unless it changed since the write."""
+        return await _request_agent_settings(
+            request, host_id, family, "agent_settings_undo", key=body.key
+        )
+
+    @router.put("/hosts/{host_id}/agent-settings/{family}/root")
+    async def set_host_agent_settings_root(
+        request: Request, host_id: str, family: str, body: AgentSettingRootRequest
+    ) -> Any:
+        """Anchor a family at an existing directory, then refresh its catalogs."""
+        host, conn = await _connected_owned_host(
+            request=request,
+            host_id=host_id,
+            auth_provider=auth_provider,
+            host_registry=host_registry,
+            host_store=host_store,
+        )
+        if CAP_AGENT_SETTINGS not in conn.hello.capabilities:
+            raise HTTPException(501, "Update this host to see its settings.")
+        result = await _proxy_agent_settings(
+            host_registry=host_registry,
+            host_conn=conn,
+            op="agent_settings_set_root",
+            family=family,
+            root=body.root,
+        )
+        response = _agent_settings_response(result)
+        if isinstance(response, JSONResponse) or catalog_store is None:
+            return response
+        from omnigent.host.agent_settings import AgentSettingsError, descriptor_for
+        from omnigent.server.routes.calling_defaults import _harness_configured, _sync_pair
+
+        try:
+            canonical_family = descriptor_for(family).family
+        except AgentSettingsError:
+            canonical_family = family
+        harnesses = {
+            "claude": ("claude-native", "claude-sdk"),
+            "codex": ("codex-native", "codex"),
+            "pi": ("pi-native", "pi"),
+            "agy": ("antigravity-native",),
+        }.get(canonical_family, ())
+        semaphore = asyncio.Semaphore(2)
+        await asyncio.gather(
+            *(
+                _sync_pair(
+                    host_registry=host_registry,
+                    host_conn=conn,
+                    catalog_store=catalog_store,
+                    semaphore=semaphore,
+                    host_id=host.host_id,
+                    harness=harness,
+                    refresh="force",
+                )
+                for harness in harnesses
+                if _harness_configured(host, harness)
+            )
+        )
+        try:
+            accounts = await host_registry.request_harness_accounts(
+                conn, refresh_codex=False, timeout_s=_HARNESS_ACCOUNTS_REFRESH_TIMEOUT_S
+            )
+            if isinstance(accounts.get("harness_accounts"), dict):
+                update_harness_accounts(conn, accounts["harness_accounts"])
+        except (ConnectionError, TimeoutError):
+            _logger.info("Account refresh after settings-root change did not complete")
+        return response
 
     @router.post("/hosts/{host_id}/harnesses/{harness}/login")
     async def start_host_harness_login(

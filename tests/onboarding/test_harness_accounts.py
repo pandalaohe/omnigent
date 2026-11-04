@@ -7,6 +7,7 @@ import stat
 import sys
 import threading
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -193,8 +194,9 @@ def test_pi_probe_shares_one_deadline_and_keeps_partial_results(
         *,
         deadline: float,
         cancel_event: threading.Event | None,
+        env: Mapping[str, str] | None = None,
     ) -> tuple[int, dict[str, object] | None]:
-        del cancel_event
+        del cancel_event, env
         deadlines.append(deadline)
         provider = argv[argv.index("--provider") + 1]
         if provider == "anthropic":

@@ -89,6 +89,8 @@ from omnigent.host.frames import (
     LAUNCH_HANDLER_FAILED_ERROR_CODE,
     RUNNER_LOG_TAIL_HEADING,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostAgentSettingsFrame,
+    HostAgentSettingsResultFrame,
     HostCodexRateLimitsFrame,
     HostConnectionErrorFrame,
     HostContextInventoryV2Frame,
@@ -1110,6 +1112,10 @@ def _build_runner_env(
         or key.startswith(_RUNNER_ENV_ALLOWLIST_PREFIXES)
         or key in forwarded
     }
+    from omnigent.host.agent_settings import agent_settings_launch_env
+
+    for family in ("claude", "codex", "pi"):
+        env.update(agent_settings_launch_env(family))
     if purpose == "host_terminals":
         from omnigent.runner.identity import RUNNER_PURPOSE_ENV_VAR
 
@@ -4244,6 +4250,55 @@ class HostProcess:
             _logger.exception("Harness launch settings failed")
             return HostHarnessStartupResultFrame(frame.request_id)
 
+    def _handle_agent_settings(
+        self, frame: HostAgentSettingsFrame
+    ) -> HostAgentSettingsResultFrame:
+        """Keep raw agent files on this host and return only their filtered view."""
+        from omnigent.host.agent_settings import (
+            AgentSettingsError,
+            agent_settings_set_root,
+            read_agent_settings,
+            undo_agent_setting,
+            write_agent_setting,
+        )
+
+        try:
+            if frame.op == "agent_settings_read":
+                view = read_agent_settings(frame.family, None)
+            elif frame.op == "agent_settings_write":
+                if frame.key is None:
+                    raise AgentSettingsError("A setting key is required.")
+                view = write_agent_setting(
+                    frame.family, None, frame.key, frame.value, frame.revision
+                )
+            elif frame.op == "agent_settings_undo":
+                if frame.key is None:
+                    raise AgentSettingsError("A setting key is required.")
+                view = undo_agent_setting(frame.family, None, frame.key)
+            elif frame.op == "agent_settings_set_root":
+                view = agent_settings_set_root(frame.family, frame.root)
+            else:
+                raise AgentSettingsError("Unknown agent settings operation.")
+            return HostAgentSettingsResultFrame(frame.request_id, "ok", dict(view))
+        except AgentSettingsError as exc:
+            fresh = None
+            if frame.op != "agent_settings_set_root":
+                try:
+                    fresh = read_agent_settings(frame.family, None)
+                except Exception:  # noqa: BLE001 — a fresh view is best-effort after refusal
+                    fresh = None
+            return HostAgentSettingsResultFrame(
+                frame.request_id,
+                "failed",
+                dict(fresh) if fresh is not None else None,
+                str(exc),
+            )
+        except Exception as exc:  # noqa: BLE001 — no parser or I/O text crosses the tunnel
+            _logger.warning("Agent settings operation failed: %s", type(exc).__name__)
+            return HostAgentSettingsResultFrame(
+                frame.request_id, "failed", None, "Agent settings operation failed."
+            )
+
     def _handle_mcp_servers(self, frame: HostMcpServersFrame) -> HostMcpServersResultFrame:
         """List user-level MCP servers in a worker thread."""
         try:
@@ -6907,6 +6962,9 @@ class HostProcess:
         elif isinstance(frame, HostMcpServersFrame):
             mcp_result = await asyncio.to_thread(self._handle_mcp_servers, frame)
             await self._send_text(ws, encode_host_frame(mcp_result))
+        elif isinstance(frame, HostAgentSettingsFrame):
+            settings_result = await asyncio.to_thread(self._handle_agent_settings, frame)
+            await self._send_text(ws, encode_host_frame(settings_result))
         elif isinstance(frame, HostModelOptionsFrame):
             # Every dispatched frame already runs on its own task (see
             # _start_frame_task), so a cold harness probe here cannot stall

@@ -1214,9 +1214,23 @@ def _codex_home_config_source_from_env() -> Path:
     can inherit a parent private home, so this resolver maps that specific
     inherited session-state home back to the user's default ``~/.codex``.
 
+    A configured ``harness.codex.config_root`` record wins over this process
+    environment. This function has no environment parameter, so it cannot
+    tell an operator's own ``CODEX_HOME`` from ambient inheritance: stated
+    limit, once a record is set, Omnigent's probes and launches use the
+    record and ignore that ``CODEX_HOME``.
+
     :returns: Host Codex home to read ``auth.json`` and ``config.toml`` from,
         e.g. ``Path.home() / ".codex"`` or an explicit user ``CODEX_HOME``.
     """
+    from omnigent.host.agent_settings import resolved_root
+
+    selected = resolved_root("codex")
+    if selected:
+        # One configured root wins over an inherited ``CODEX_HOME`` so the
+        # pre-launch probe reads the same login/config the editor and a newly
+        # launched runner use.
+        return Path(selected)
     home_codex_home = Path.home() / ".codex"
     return _resolve_codex_home_config_source(
         Path(os.environ.get("CODEX_HOME") or str(home_codex_home)),

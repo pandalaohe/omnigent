@@ -83,6 +83,7 @@ RUNNER_LOG_TAIL_HEADING = "--- runner log tail ---"
 CAP_CODEX_SIDE_CHAT = "codex_side_chat"
 # The host answers ``host.mcp_servers`` with its user-level MCP inventory:
 CAP_MCP_INVENTORY = "mcp_inventory"
+CAP_AGENT_SETTINGS = "agent_settings"
 CAP_HARNESS_STARTUP = "harness_startup"
 CAP_PLUGINS = "plugins"
 CAP_SKILL_CONTENT = "skill_content"
@@ -127,6 +128,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_MCP_TOOLS,
     CAP_MCP_REGISTRY,
     CAP_MCP_INVENTORY,
+    CAP_AGENT_SETTINGS,
     CAP_RESOURCE_SNAPSHOT,
     CAP_LOAD_LEVEL_V1,
     CAP_HARNESS_STARTUP,
@@ -249,6 +251,8 @@ class HostFrameKind(str, Enum):
     HARNESS_STARTUP_RESULT = "host.harness_startup_result"
     MCP_SERVERS = "host.mcp_servers"
     MCP_SERVERS_RESULT = "host.mcp_servers_result"
+    AGENT_SETTINGS = "host.agent_settings"
+    AGENT_SETTINGS_RESULT = "host.agent_settings_result"
     OWNER_INVENTORY = "host.owner_inventory"
     OWNER_INVENTORY_RESULT = "host.owner_inventory_result"
     CONTEXT_INVENTORY_V2 = "host.context_inventory_v2"
@@ -1698,6 +1702,29 @@ class HostMcpServersResultFrame:
 
 
 @dataclass
+class HostAgentSettingsFrame:
+    """Server → host: read or change one family's allow-listed settings."""
+
+    request_id: str
+    op: str
+    family: str
+    key: str | None = None
+    value: object = None
+    revision: str | None = None
+    root: str | None = None
+
+
+@dataclass
+class HostAgentSettingsResultFrame:
+    """Host → server: a filtered settings view and a fixed, safe error."""
+
+    request_id: str
+    status: str
+    view: dict[str, Any] | None = None
+    error: str | None = None
+
+
+@dataclass
 class HostPluginsFrame:
     """Server → host: list installed Claude plugins."""
 
@@ -2005,6 +2032,8 @@ HostFrame = (
     | HostHarnessStartupResultFrame
     | HostMcpServersFrame
     | HostMcpServersResultFrame
+    | HostAgentSettingsFrame
+    | HostAgentSettingsResultFrame
     | HostOwnerInventoryFrame
     | HostOwnerInventoryResultFrame
     | HostContextInventoryV2Frame
@@ -2741,6 +2770,29 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "request_id": frame.request_id,
                 "status": frame.status,
                 "mcp_servers": frame.mcp_servers,
+                "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostAgentSettingsFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.AGENT_SETTINGS.value,
+                "request_id": frame.request_id,
+                "op": frame.op,
+                "family": frame.family,
+                "key": frame.key,
+                "value": frame.value,
+                "revision": frame.revision,
+                "root": frame.root,
+            }
+        )
+    if isinstance(frame, HostAgentSettingsResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.AGENT_SETTINGS_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "view": _agent_settings_view_payload(frame.view),
                 "error": frame.error,
             }
         )
@@ -3502,6 +3554,18 @@ def _decode_known_host_frame(
             return HostMcpServersFrame(request_id=_required_str(msg, "request_id"))
         case HostFrameKind.MCP_SERVERS_RESULT:
             return _decode_mcp_servers_result(msg)
+        case HostFrameKind.AGENT_SETTINGS:
+            return HostAgentSettingsFrame(
+                request_id=_required_str(msg, "request_id"),
+                op=_required_str(msg, "op"),
+                family=_required_str(msg, "family"),
+                key=_optional_nullable_str(msg, "key"),
+                value=msg.get("value"),
+                revision=_optional_nullable_str(msg, "revision"),
+                root=_optional_nullable_str(msg, "root"),
+            )
+        case HostFrameKind.AGENT_SETTINGS_RESULT:
+            return _decode_agent_settings_result(msg)
         case HostFrameKind.OWNER_INVENTORY:
             return HostOwnerInventoryFrame(
                 request_id=_required_str(msg, "request_id"),
@@ -4469,6 +4533,60 @@ def host_context_inventory_evidence_v2(
                 work_bindings=None,
             ),
         ),
+    )
+
+
+def _agent_settings_view_payload(raw_view: object) -> dict[str, Any] | None:
+    """Keep only the settings view's allow-listed shape on both wire directions."""
+    if raw_view is None:
+        return None
+    if not isinstance(raw_view, dict):
+        raise ValueError("frame field must be an object or null: 'view'")
+    raw_fields = raw_view.get("fields", [])
+    if not isinstance(raw_fields, list):
+        raise ValueError("agent settings fields must be a list")
+    fields: list[dict[str, Any]] = []
+    for item in raw_fields:
+        if not isinstance(item, dict):
+            raise ValueError("agent settings fields must be objects")
+        value = item.get("value")
+        if value is not None and not isinstance(value, (str, int, float, bool)):
+            value = None
+        fields.append(
+            {
+                "key": _required_str(item, "key"),
+                "present": _required_bool(item, "present"),
+                "value": value,
+                "writable": _required_bool(item, "writable"),
+                "undo_available": _required_bool(item, "undo_available"),
+            }
+        )
+    raw_account = raw_view.get("account")
+    account = None
+    if isinstance(raw_account, dict):
+        account = {
+            "kind": _required_str(raw_account, "kind"),
+            "label": _required_str(raw_account, "label"),
+        }
+    return {
+        "family": _required_str(raw_view, "family"),
+        "root": _required_str(raw_view, "root"),
+        "choosable": _required_bool(raw_view, "choosable"),
+        "exists": _required_bool(raw_view, "exists"),
+        "read_only_reason": _optional_nullable_str(raw_view, "read_only_reason"),
+        "revision": _optional_nullable_str(raw_view, "revision"),
+        "fields": fields,
+        "account": account,
+    }
+
+
+def _decode_agent_settings_result(msg: _JsonObject) -> HostAgentSettingsResultFrame:
+    """Drop everything outside the settings view's allow-listed wire shape."""
+    return HostAgentSettingsResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        view=_agent_settings_view_payload(msg.get("view")),
+        error=_optional_nullable_str(msg, "error"),
     )
 
 
