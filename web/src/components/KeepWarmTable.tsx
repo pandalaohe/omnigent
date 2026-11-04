@@ -459,13 +459,23 @@ function KeepWarmLevelEditor({
     <LayeredEditor
       trigger={trigger}
       title={title}
+      note={order}
       open={open}
       onOpenChange={onOpenChange}
       onClear={at.level !== "corner" && recordHasValues(own) ? onClear : undefined}
       clearBelowCount={belowCount}
       onClearBelow={onClearBelow}
+      footer={
+        <>
+          <Button variant="outline" size="sm" disabled={busy} onClick={() => onOpenChange(false)}>
+            Cancel
+          </Button>
+          <Button size="sm" disabled={busy} onClick={() => void commit()}>
+            {busy ? "Saving…" : "Save"}
+          </Button>
+        </>
+      }
     >
-      <p className="text-xs text-muted-foreground">{order}</p>
       {at.level === "col" && (
         <label className="flex items-start justify-between gap-2 rounded-md border border-border px-2 py-1.5">
           <span className="min-w-0 text-sm">
@@ -665,14 +675,6 @@ function KeepWarmLevelEditor({
           {error}
         </p>
       )}
-      <div className="flex justify-end gap-2 border-t border-border pt-2.5">
-        <Button variant="outline" size="sm" disabled={busy} onClick={() => onOpenChange(false)}>
-          Cancel
-        </Button>
-        <Button size="sm" disabled={busy} onClick={() => void commit()}>
-          {busy ? "Saving…" : "Save"}
-        </Button>
-      </div>
     </LayeredEditor>
   );
 }
@@ -712,10 +714,27 @@ function BulkEditor({
         </Button>
       }
       title={`${selected.length} selected ${selected.length === 1 ? "cell" : "cells"}`}
+      note="A blank field stays as each cell has it."
       open={open}
       onOpenChange={setOpen}
+      footer={
+        <>
+          <Button variant="outline" size="sm" disabled={busy} onClick={() => setOpen(false)}>
+            Cancel
+          </Button>
+          <Button
+            size="sm"
+            disabled={busy}
+            onClick={() => {
+              onApply(selected, draft);
+              setOpen(false);
+            }}
+          >
+            Save to {selected.length} {selected.length === 1 ? "cell" : "cells"}
+          </Button>
+        </>
+      }
     >
-      <p className="text-xs text-muted-foreground">A blank field stays as each cell has it.</p>
       {fields.includes("main") && (
         <SettingRow label="Main sessions">
           <Segmented
@@ -793,21 +812,6 @@ function BulkEditor({
           <span className="text-sm text-muted-foreground">min</span>
         </SettingRow>
       )}
-      <div className="flex justify-end gap-2 border-t border-border pt-2.5">
-        <Button variant="outline" size="sm" disabled={busy} onClick={() => setOpen(false)}>
-          Cancel
-        </Button>
-        <Button
-          size="sm"
-          disabled={busy}
-          onClick={() => {
-            onApply(selected, draft);
-            setOpen(false);
-          }}
-        >
-          Save to {selected.length} {selected.length === 1 ? "cell" : "cells"}
-        </Button>
-      </div>
     </LayeredEditor>
   );
 }

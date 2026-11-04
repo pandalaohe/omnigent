@@ -8,6 +8,8 @@ export interface SegmentedProps<T extends string> {
   value: T;
   onChange: (value: T) => void;
   stretch?: boolean;
+  /** For a control that qualifies a value beside it, not the value itself. */
+  quiet?: boolean;
   className?: string;
 }
 
@@ -18,6 +20,7 @@ export function Segmented<T extends string>({
   value,
   onChange,
   stretch,
+  quiet,
   className,
 }: SegmentedProps<T>) {
   const buttons = useRef<(HTMLButtonElement | null)[]>([]);
@@ -27,6 +30,7 @@ export function Segmented<T extends string>({
       aria-label={label}
       className={cn(
         "inline-flex max-w-full rounded-lg bg-muted p-1",
+        quiet && "p-0.5",
         stretch && "flex w-full",
         className,
       )}
@@ -51,8 +55,12 @@ export function Segmented<T extends string>({
             "min-h-11 min-w-11 rounded-md px-2 text-ui whitespace-normal wrap-anywhere outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring md:min-h-8 md:px-3",
             stretch && "flex-1",
             value === option.value
-              ? "bg-primary-cta font-medium text-primary-cta-foreground"
-              : "text-foreground/90 hover:bg-foreground/10",
+              ? quiet
+                ? "bg-background font-medium text-foreground shadow-xs dark:bg-foreground/15"
+                : "bg-primary-cta font-medium text-primary-cta-foreground"
+              : quiet
+                ? "text-muted-foreground hover:text-foreground"
+                : "text-foreground/90 hover:bg-foreground/10",
           )}
           onClick={() => onChange(option.value)}
           onKeyDown={(event) => {

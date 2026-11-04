@@ -180,25 +180,32 @@ describe("ContextUsageSettings", () => {
     store({ [usageContextLevelKey(source, "column")]: value(400_000) });
     renderSettings();
 
-    fireEvent.click(cell("claude-claude-native", "host-a"));
-    const input = screen.getByLabelText("Context total for Alpha × Claude Code");
-    expect(screen.getByText("Context total: From Claude Code, all hosts")).toBeInTheDocument();
+    const saveCell = (typedValue: string) => {
+      fireEvent.click(cell("claude-claude-native", "host-a"));
+      fireEvent.change(screen.getByLabelText("Context total for Alpha × Claude Code"), {
+        target: { value: typedValue },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    };
 
-    fireEvent.change(input, { target: { value: "400000" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    fireEvent.click(cell("claude-claude-native", "host-a"));
+    const empty = screen.getByLabelText("Context total for Alpha × Claude Code");
+    expect(empty).toHaveAttribute("placeholder", "400000");
+    expect(screen.getByText("From Claude Code, all hosts")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    saveCell("400000");
     expect(
       readUsageContextPreferences().overrides[usageContextLevelKey(source, "cell")],
     ).toBeUndefined();
 
-    fireEvent.change(input, { target: { value: "300000" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    saveCell("300000");
     expect(
       readUsageContextPreferences().overrides[usageContextLevelKey(source, "cell")],
     ).toMatchObject({ contextWindowTokens: 300_000 });
     expect(cell("claude-claude-native", "host-a")).toHaveTextContent("300k–");
 
-    fireEvent.change(input, { target: { value: "123456" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    saveCell("123456");
     expect(cell("claude-claude-native", "host-a")).toHaveTextContent("123456–");
     expect(cell("claude-claude-native", "host-a")).not.toHaveTextContent("123.5k");
     expect(cell("claude-claude-native", "host-a")).toHaveAccessibleName(
@@ -209,11 +216,44 @@ describe("ContextUsageSettings", () => {
   it("orders the cell after its own value, then the agent, then the computer, then all", () => {
     renderSettings();
     fireEvent.click(cell("claude-claude-native", "host-a"));
+    fireEvent.click(screen.getByRole("button", { name: /^About .*Alpha/ }));
     expect(
       screen.getByText(
         "This cell, then Claude Code, all hosts, then all agents on Alpha, then all agents, all hosts.",
       ),
     ).toBeInTheDocument();
+  });
+
+  it("saves on Enter and closes, and shows an error without closing", () => {
+    renderSettings();
+    fireEvent.click(cell("claude-claude-native", "host-a"));
+    const input = screen.getByLabelText("Context total for Alpha × Claude Code");
+
+    fireEvent.change(input, { target: { value: "-5" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(screen.getByRole("alert")).toHaveTextContent("Enter a positive context total.");
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+
+    fireEvent.change(input, { target: { value: "300000" } });
+    expect(screen.getByText("Not saved yet")).toBeInTheDocument();
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(
+      readUsageContextPreferences().overrides[usageContextLevelKey(source, "cell")],
+    ).toMatchObject({ contextWindowTokens: 300_000 });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("drops an agent row's typed value on Cancel", () => {
+    renderSettings();
+    fireEvent.click(screen.getByTestId("layered-row-claude-claude-native"));
+    fireEvent.change(screen.getByLabelText("Context total for all models of Claude Code"), {
+      target: { value: "250000" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    fireEvent.click(screen.getByTestId("layered-row-claude-claude-native"));
+    expect(screen.getByLabelText("Context total for all models of Claude Code")).toHaveValue(null);
+    expect(readUsageContextPreferences().overrides).toEqual({});
   });
 
   it("counts the model values saved for one cell in a small frame", () => {
@@ -274,7 +314,7 @@ describe("ContextUsageSettings", () => {
 
     const input = await screen.findByLabelText("Context total for claude-opus-5-5");
     expect(input).toHaveFocus();
-    expect(screen.getByText(/this session's model/)).toBeInTheDocument();
+    expect(screen.getByText("This session's model")).toBeInTheDocument();
     expect(screen.getByRole("dialog")).toHaveTextContent("Claude Code, all hosts");
     await waitFor(() =>
       expect(screen.getByTestId("location")).toHaveTextContent("/settings/general#context-usage"),
@@ -317,15 +357,33 @@ describe("ContextUsageSettings", () => {
     const cellInput = await screen.findByLabelText("Context total for Claude Code on Alpha");
     expect(cellInput).toHaveValue(250_000);
     expect(readUsageContextPreferences().overrides).toEqual({});
-    // The row's own value is still unsaved, and the panel stays open.
+    // One level is in view; going back finds the row's own value still unsaved.
+    expect(screen.queryByLabelText("Context total for all models of Claude Code")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Claude Code, all hosts" }));
     expect(screen.getByLabelText("Context total for all models of Claude Code")).toHaveValue(
       250_000,
     );
+    fireEvent.click(screen.getByRole("button", { name: "Only on Alpha" }));
+    expect(readUsageContextPreferences().overrides).toEqual({});
 
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     expect(
       readUsageContextPreferences().overrides[usageContextLevelKey(source, "cell")],
     ).toMatchObject({ contextWindowTokens: 250_000 });
+  });
+
+  it("keeps a level's stored value when stepping to it with nothing typed", async () => {
+    const cellKey = usageContextLevelKey(source, "cell");
+    store({ [cellKey]: value(100_000) });
+    renderSettings();
+
+    fireEvent.click(screen.getByTestId("layered-row-claude-claude-native"));
+    fireEvent.click(screen.getByRole("button", { name: "Only on Alpha" }));
+    expect(screen.getByLabelText("Context total for Claude Code on Alpha")).toHaveValue(100_000);
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear this level" }));
+    await waitFor(() => expect(readUsageContextPreferences().overrides[cellKey]).toBeUndefined());
+    expect(screen.getByLabelText("Context total for Claude Code on Alpha")).toHaveValue(null);
   });
 
   it("lists a model value in the agent row with its scope and removes it", async () => {
@@ -386,11 +444,12 @@ describe("ContextUsageSettings", () => {
     fireEvent.change(screen.getByLabelText("Context total for all models of Claude Code"), {
       target: { value: "250000" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Save all models" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
     expect(readUsageContextPreferences().overrides[columnKey]).toMatchObject({
       contextWindowTokens: 250_000,
     });
 
+    fireEvent.click(screen.getByTestId("layered-row-claude-claude-native"));
     fireEvent.click(screen.getByRole("button", { name: "Undo" }));
     await waitFor(() =>
       expect(readUsageContextPreferences().overrides[cellKey]).toMatchObject({

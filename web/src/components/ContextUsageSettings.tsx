@@ -1,9 +1,20 @@
-import { useEffect, useMemo, useRef, useState, type ReactElement } from "react";
+import { ChevronRightIcon } from "lucide-react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type ReactElement,
+  type ReactNode,
+} from "react";
 
 import { AgentNameTag } from "@/components/AgentNameTag";
-import { LayeredEditor } from "@/components/LayeredEditor";
+import { HelpTip } from "@/components/HelpTip";
+import { LayeredEditor, LayeredEditorAction } from "@/components/LayeredEditor";
 import {
   LayeredChip,
+  LayeredMark,
   LayeredOwn,
   LayeredTable,
   type LayeredCellLevel,
@@ -375,53 +386,72 @@ function LevelState({
   );
 }
 
-/** Context total and Compact buffer, with the buffer's unit beside the buffer. */
+const VALUE_ROW = "grid grid-cols-[minmax(0,1fr)_7.5rem] items-center gap-2";
+const VALUE_INPUT =
+  "h-11 [appearance:textfield] text-base font-medium tabular-nums md:h-9 md:text-base [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none";
+
+type DraftField = "context" | "buffer";
+
+/** Context total and Compact buffer, each with its unit and one line about its value. */
 function DraftFields({
   draft,
   onChange,
+  onSubmit,
   labelFor,
+  placeholder,
+  note,
   error,
 }: {
   draft: Draft;
   onChange: (next: Draft) => void;
-  labelFor: (field: "context" | "buffer" | "unit") => string;
+  onSubmit: () => void;
+  labelFor: (field: DraftField | "unit") => string;
+  placeholder: (field: DraftField) => string;
+  note?: (field: DraftField) => ReactNode;
   error: string;
 }) {
+  const submitOnEnter = (event: KeyboardEvent<HTMLInputElement>) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    onSubmit();
+  };
   return (
-    <div className="grid gap-3">
-      <label className="grid gap-1 text-sm">
-        Context total
-        <Input
-          type="number"
-          min={1}
-          step={1000}
-          value={draft.context}
-          placeholder="Auto"
-          aria-label={labelFor("context")}
-          onChange={(event) => onChange({ ...draft, context: event.target.value })}
-        />
-      </label>
-      <div className="grid gap-1 text-sm">
-        <span>Compact buffer</span>
-        <div className="flex flex-wrap items-center gap-1">
-          <Segmented
-            label={labelFor("unit")}
-            value={draft.mode}
-            options={[
-              { value: "tokens", label: "Tokens" },
-              { value: "percent", label: "Percent" },
-            ]}
-            onChange={(mode) => onChange({ ...draft, mode })}
+    <div className="grid gap-3.5">
+      <label className="grid gap-1.5">
+        <span className="text-sm font-medium">Context total</span>
+        <span className={VALUE_ROW}>
+          <Input
+            type="number"
+            min={1}
+            step={1000}
+            value={draft.context}
+            placeholder={placeholder("context")}
+            aria-label={labelFor("context")}
+            className={VALUE_INPUT}
+            onChange={(event) => onChange({ ...draft, context: event.target.value })}
+            onKeyDown={submitOnEnter}
           />
+          <span className="px-1 text-sm text-muted-foreground">tokens</span>
+        </span>
+        {note ? <span className="text-xs text-muted-foreground">{note("context")}</span> : null}
+      </label>
+      <div className="grid gap-1.5">
+        <span className="flex items-center gap-1.5 text-sm font-medium">
+          Compact buffer
+          <HelpTip label="About Compact buffer" className="-my-3 size-11 md:my-0 md:size-4">
+            Compact point = context total minus this buffer.
+          </HelpTip>
+        </span>
+        <div className={VALUE_ROW}>
           <Input
             type="number"
             min={0}
             max={draft.mode === "percent" ? 99.999 : undefined}
             step={draft.mode === "percent" ? "any" : 1}
             value={draft.mode === "percent" ? draft.percent : draft.buffer}
-            placeholder="Auto"
+            placeholder={placeholder("buffer")}
             aria-label={labelFor("buffer")}
-            className="min-w-24 flex-1"
+            className={VALUE_INPUT}
             onChange={(event) =>
               onChange(
                 draft.mode === "percent"
@@ -429,11 +459,21 @@ function DraftFields({
                   : { ...draft, buffer: event.target.value },
               )
             }
+            onKeyDown={submitOnEnter}
+          />
+          <Segmented
+            quiet
+            className="justify-self-start"
+            label={labelFor("unit")}
+            value={draft.mode}
+            options={[
+              { value: "tokens", label: "Tokens" },
+              { value: "percent", label: "%", title: "Percent of the context total" },
+            ]}
+            onChange={(mode) => onChange({ ...draft, mode })}
           />
         </div>
-        <span className="text-sm text-muted-foreground">
-          Compact point = context total minus this buffer.
-        </span>
+        {note ? <span className="text-xs text-muted-foreground">{note("buffer")}</span> : null}
       </div>
       {error ? (
         <p role="alert" className="text-sm text-destructive">
@@ -444,82 +484,182 @@ function DraftFields({
   );
 }
 
-/** One value pair at one level, written whole on Save. */
-function ValueFields({
+/** The two fields for one stored level; an empty one shows what it would inherit. */
+function LevelFields({
   preferences,
   source,
   level,
   label,
-  caption,
-  orderLine,
-  initialDraft,
-  onSave,
+  levelText,
+  draft,
+  onChange,
+  onSubmit,
+  error,
 }: {
   preferences: UsageContextPreferences;
   source: UsageContextSource;
   level: UsageContextLevel;
   label: string;
-  caption: (field: "contextWindowTokens" | "buffer") => string;
-  orderLine?: string;
-  initialDraft: Draft | null;
-  onSave: (record: UsageContextOverride | null) => void;
+  levelText: (level: UsageContextLevel) => string;
+  draft: Draft;
+  onChange: (next: Draft) => void;
+  onSubmit: () => void;
+  error: string;
+}) {
+  const stored = draftOf(preferences.overrides[usageContextLevelKey(source, level)]);
+  const inherited = inheritedUsageContext(preferences, source, level);
+  const inheritedBuffer = inherited.buffer.value;
+  const fromText = (winner: UsageContextLevel | "reported") =>
+    winner === "reported" ? "The agent reports its own" : `From ${levelText(winner)}`;
+  const valueNote = (typed: string, saved: string, winner: UsageContextLevel | "reported") => {
+    if (typed.trim() === "") return fromText(winner);
+    if (typed !== saved) return "Not saved yet";
+    return (
+      <span className="inline-flex items-center gap-1.5">
+        <LayeredMark />
+        Saved here
+      </span>
+    );
+  };
+  return (
+    <DraftFields
+      draft={draft}
+      onChange={onChange}
+      onSubmit={onSubmit}
+      error={error}
+      labelFor={(field) =>
+        field === "unit"
+          ? `Buffer unit for ${label}`
+          : `${field === "context" ? "Context total" : "Compact buffer"} for ${label}`
+      }
+      placeholder={(field) =>
+        field === "context"
+          ? (inherited.contextWindow.value?.toString() ?? "Auto")
+          : inheritedBuffer === null
+            ? "Auto"
+            : `${inheritedBuffer}${inherited.buffer.mode === "percent" ? "%" : ""}`
+      }
+      note={(field) =>
+        field === "context"
+          ? valueNote(draft.context, stored.context, inherited.contextWindow.level)
+          : draft.mode === "percent"
+            ? valueNote(draft.percent, stored.percent, inherited.buffer.level)
+            : valueNote(draft.buffer, stored.buffer, inherited.buffer.level)
+      }
+    />
+  );
+}
+
+/** Validate a draft and turn it into the record its level stores. */
+function recordForLevel(
+  preferences: UsageContextPreferences,
+  source: UsageContextSource,
+  level: UsageContextLevel,
+  draft: Draft,
+): { record: UsageContextOverride | null } | { error: string } {
+  const inheritedContext = inheritedUsageContext(preferences, source, level).contextWindow.value;
+  const outcome = recordFromDraft(draft, inheritedContext);
+  if ("error" in outcome || level !== "cell" || !outcome.record) return outcome;
+  return { record: dropRepeatedCellFields(preferences, source, outcome.record) };
+}
+
+function EditorButtons({ onCancel, onSave }: { onCancel: () => void; onSave: () => void }) {
+  return (
+    <>
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        className="min-h-11 md:min-h-7"
+        onClick={onCancel}
+      >
+        Cancel
+      </Button>
+      <Button type="button" size="sm" className="min-h-11 md:min-h-7" onClick={onSave}>
+        Save
+      </Button>
+    </>
+  );
+}
+
+/** The editor of a corner, host column or cell: one level, written whole on Save. */
+function ValueEditor({
+  trigger,
+  title,
+  help,
+  open,
+  onOpenChange,
+  preferences,
+  source,
+  level,
+  label,
+  levelText,
+  clearBelowCount,
+  onClearBelow,
+  undo,
+  onUndo,
+}: {
+  trigger: ReactElement;
+  title: string;
+  help?: string;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  preferences: UsageContextPreferences;
+  source: UsageContextSource;
+  level: UsageContextLevel;
+  label: string;
+  levelText: (level: UsageContextLevel) => string;
+  clearBelowCount: number;
+  onClearBelow: () => void;
+  undo: UndoState | null;
+  onUndo: () => void;
 }) {
   const key = usageContextLevelKey(source, level);
-  const [draft, setDraft] = useState<Draft>(
-    () => initialDraft ?? draftOf(preferences.overrides[key]),
-  );
+  const own = preferences.overrides[key];
+  const [draft, setDraft] = useState<Draft>(() => draftOf(own));
   const [error, setError] = useState("");
-  const carried = useRef(initialDraft !== null);
-  const storedSignature = JSON.stringify(preferences.overrides[key] ?? null);
-  const inheritedContext = inheritedUsageContext(preferences, source, level).contextWindow.value;
+  const storedSignature = JSON.stringify(own ?? null);
   useEffect(() => {
-    if (carried.current) {
-      carried.current = false;
-      return;
-    }
-    setDraft(draftOf(preferences.overrides[key]));
+    setDraft(draftOf(own));
     setError("");
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [storedSignature]);
+  }, [open, storedSignature]);
   const save = () => {
-    const outcome = recordFromDraft(draft, inheritedContext);
+    const outcome = recordForLevel(preferences, source, level, draft);
     if ("error" in outcome) {
       setError(outcome.error);
       return;
     }
-    setError("");
-    onSave(
-      level === "cell" && outcome.record
-        ? dropRepeatedCellFields(preferences, source, outcome.record)
-        : outcome.record,
-    );
+    setUsageContextLevel(preferences, key, outcome.record);
+    onOpenChange(false);
   };
   return (
-    <div className="grid gap-3">
-      {orderLine ? <p className="text-sm text-muted-foreground">{orderLine}</p> : null}
-      <DraftFields
+    <LayeredEditor
+      trigger={trigger}
+      title={title}
+      help={help}
+      open={open}
+      onOpenChange={onOpenChange}
+      onClear={
+        usageContextHasValue(own) ? () => setUsageContextLevel(preferences, key, null) : undefined
+      }
+      clearBelowCount={clearBelowCount}
+      onClearBelow={clearBelowCount > 0 ? onClearBelow : undefined}
+      actions={undo ? <LayeredEditorAction onClick={onUndo}>Undo</LayeredEditorAction> : null}
+      footer={<EditorButtons onCancel={() => onOpenChange(false)} onSave={save} />}
+    >
+      <LevelFields
+        preferences={preferences}
+        source={source}
+        level={level}
+        label={label}
+        levelText={levelText}
         draft={draft}
         onChange={setDraft}
+        onSubmit={save}
         error={error}
-        labelFor={(field) =>
-          field === "unit"
-            ? `Buffer unit for ${label}`
-            : `${field === "context" ? "Context total" : "Compact buffer"} for ${label}`
-        }
       />
-      <div className="grid gap-0.5 text-sm text-muted-foreground">
-        <span>Context total: {caption("contextWindowTokens")}</span>
-        <span>Compact buffer: {caption("buffer")}</span>
-      </div>
-      <div className="flex flex-wrap items-center gap-2">
-        <Button type="button" size="sm" className="min-h-11 md:min-h-7" onClick={save}>
-          Save
-        </Button>
-        <span className="text-sm text-muted-foreground">
-          Empty fields inherit from the level below.
-        </span>
-      </div>
-    </div>
+    </LayeredEditor>
   );
 }
 
@@ -871,60 +1011,32 @@ export function ContextUsageSettings() {
   );
 
   const renderValueEditor = (at: LayeredLevel, trigger: ReactElement) => {
-    const key = keyAt(at);
-    if (!key) return trigger;
+    if (!keyAt(at)) return trigger;
     const source = sourceAt(at);
     const level = levelAt(at);
-    const own = preferences.overrides[key];
-    const resolved = resolveAt(at);
-    const caption = (field: "contextWindowTokens" | "buffer") => {
-      const winner =
-        field === "contextWindowTokens" ? resolved.contextWindow.level : resolved.buffer.level;
-      if (winner === level) return "Saved here";
-      if (winner === "reported") return "The agent reports its own";
-      return `From ${levelLabel(winner as UsageContextLevel, source)}`;
-    };
     const belowCount = keysBelow(at).length;
     const props = editorProps(at);
     return (
-      <LayeredEditor
+      <ValueEditor
         trigger={trigger}
         title={titleAt(at)}
+        help={
+          at.level === "cell"
+            ? `This cell, then ${levelLabel("column", source)}, then ${levelLabel("host", source)}, then ${levelLabel("all", source)}.`
+            : undefined
+        }
         open={props.open}
         onOpenChange={props.onOpenChange}
-        actions={
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            className="min-h-11 md:min-h-7"
-            disabled={!undo}
-            onClick={restoreUndo}
-          >
-            Undo
-          </Button>
-        }
-        onClear={
-          usageContextHasValue(own) ? () => setUsageContextLevel(preferences, key, null) : undefined
-        }
+        preferences={preferences}
+        source={source}
+        level={level}
+        label={levelLabel(level, source)}
+        levelText={(winner) => levelLabel(winner, source)}
         clearBelowCount={belowCount}
-        onClearBelow={belowCount > 0 ? () => clearBelow(at) : undefined}
-      >
-        <ValueFields
-          preferences={preferences}
-          source={source}
-          level={level}
-          label={levelLabel(level, source)}
-          caption={caption}
-          initialDraft={null}
-          orderLine={
-            at.level === "cell"
-              ? `This cell, then ${levelLabel("column", source)}, then ${levelLabel("host", source)}, then ${levelLabel("all", source)}.`
-              : undefined
-          }
-          onSave={(record) => setUsageContextLevel(preferences, key, record)}
-        />
-      </LayeredEditor>
+        onClearBelow={() => clearBelow(at)}
+        undo={undo}
+        onUndo={restoreUndo}
+      />
     );
   };
 
@@ -1074,11 +1186,6 @@ export function ContextUsageSettings() {
               focusModel={focusModel}
               hostColumn={liveHostColumn}
               hostLabel={hostLabelOf}
-              onClear={
-                rowKeys.get(row.id)
-                  ? () => setUsageContextLevel(preferences, rowKeys.get(row.id)!, null)
-                  : undefined
-              }
               clearBelowCount={keysBelow(at).length}
               onClearBelow={() => clearBelow(at)}
               undo={undo}
@@ -1146,6 +1253,7 @@ function SelectionActions({
   onUndo: () => void;
   clear: () => void;
 }) {
+  const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState<Draft>({
     context: "",
     buffer: "",
@@ -1196,30 +1304,44 @@ function SelectionActions({
           </Button>
         }
         title={`${selected.length} selected ${selected.length === 1 ? "cell" : "cells"}`}
-        contentClassName="w-[min(20rem,calc(100vw-1rem))]"
+        note="Empty fields inherit."
+        open={open}
+        onOpenChange={setOpen}
+        footer={
+          <>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="min-h-11 md:min-h-7"
+              onClick={() => setOpen(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              className="min-h-11 md:min-h-7"
+              disabled={keys.length === 0}
+              onClick={apply}
+            >
+              Apply to {keys.length} selected
+            </Button>
+          </>
+        }
       >
         <DraftFields
           draft={draft}
           onChange={setDraft}
+          onSubmit={apply}
           error={error}
+          placeholder={() => "Inherit"}
           labelFor={(field) =>
             field === "unit"
               ? "Buffer unit for the selection"
               : `${field === "context" ? "Context total" : "Compact buffer"} for the selection`
           }
         />
-        <div className="flex flex-wrap items-center gap-2">
-          <Button
-            type="button"
-            size="sm"
-            className="min-h-11 md:min-h-7"
-            disabled={keys.length === 0}
-            onClick={apply}
-          >
-            Apply to {keys.length} selected
-          </Button>
-          <span className="text-sm text-muted-foreground">Empty fields inherit.</span>
-        </div>
       </LayeredEditor>
       <Button
         type="button"
@@ -1240,7 +1362,16 @@ function SelectionActions({
   );
 }
 
-/** The agent row: this session's model, every model, saved model values, and one step away. */
+/** One stored level the agent row's editor can show. */
+interface RowEditorTarget {
+  key: string;
+  level: UsageContextLevel;
+  source: UsageContextSource;
+  /** Names the fields for assistive tech. */
+  label: string;
+}
+
+/** The agent row: one level in view at a time, the others a step away. */
 function AgentRowEditor({
   preferences,
   registryItems,
@@ -1251,7 +1382,6 @@ function AgentRowEditor({
   focusModel,
   hostColumn,
   hostLabel,
-  onClear,
   clearBelowCount,
   onClearBelow,
   undo,
@@ -1266,60 +1396,83 @@ function AgentRowEditor({
   focusModel: string | null;
   hostColumn: HostColumn | null;
   hostLabel: (hostId: string) => string;
-  onClear?: () => void;
   clearBelowCount: number;
   onClearBelow: () => void;
   undo: UndoState | null;
   onUndo: () => void;
 }) {
   const labels = registrySourceLabels(registryItems, row.name, row.harness);
-  const columnSource: UsageContextSource = {
+  const agentSource: UsageContextSource = {
     hostId: "",
     agentName: row.name,
     harness: row.harness,
     model: "",
   };
-  const columnKey = usageContextLevelKey(columnSource, "column");
-  const modelSource: UsageContextSource = { ...columnSource, model: focusModel ?? "" };
-  const modelKey = focusModel ? usageContextLevelKey(modelSource, "agent-model") : null;
-  const [columnDraft, setColumnDraft] = useState<Draft>(() =>
-    draftOf(preferences.overrides[columnKey]),
-  );
-  const [modelDraft, setModelDraft] = useState<Draft>(() =>
-    draftOf(modelKey ? preferences.overrides[modelKey] : undefined),
-  );
-  const [columnError, setColumnError] = useState("");
-  const [modelError, setModelError] = useState("");
-  const [drill, setDrill] = useState<{
-    level: "model" | "cell" | "host";
-    key: string;
-    label: string;
-    source: UsageContextSource;
-    draft: Draft;
-  } | null>(null);
-  const columnSignature = JSON.stringify(preferences.overrides[columnKey] ?? null);
-  const modelSignature = JSON.stringify(
-    modelKey ? (preferences.overrides[modelKey] ?? null) : null,
-  );
+  const allModels: RowEditorTarget = {
+    key: usageContextLevelKey(agentSource, "column"),
+    level: "column",
+    source: agentSource,
+    label: `all models of ${labels.agentLabel}`,
+  };
+  const modelSource: UsageContextSource = { ...agentSource, model: focusModel ?? "" };
+  const oneModel: RowEditorTarget | null = focusModel
+    ? {
+        key: usageContextLevelKey(modelSource, "agent-model"),
+        level: "agent-model",
+        source: modelSource,
+        label: focusModel,
+      }
+    : null;
+  const [modelTab, setModelTab] = useState<"model" | "all">("model");
+  const [stepped, setStepped] = useState<(RowEditorTarget & { title: string }) | null>(null);
+  const [typed, setTyped] = useState<Record<string, Draft>>({});
+  const [error, setError] = useState("");
   useEffect(() => {
-    setColumnDraft(draftOf(preferences.overrides[columnKey]));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [columnSignature]);
-  useEffect(() => {
-    setModelDraft(draftOf(modelKey ? preferences.overrides[modelKey] : undefined));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [modelSignature]);
+    setModelTab("model");
+    setStepped(null);
+    setTyped({});
+    setError("");
+  }, [open]);
+
+  const target = stepped ?? (oneModel && modelTab === "model" ? oneModel : allModels);
+  const onFocusedModel = !stepped && target === oneModel;
+  const draftFor = (key: string) => typed[key] ?? draftOf(preferences.overrides[key]);
+  const draft = draftFor(target.key);
+  const stepTo = (next: RowEditorTarget & { title: string }) => {
+    const changed =
+      JSON.stringify(draft) !== JSON.stringify(draftOf(preferences.overrides[target.key]));
+    if (changed) setTyped({ ...typed, [next.key]: draft });
+    setError("");
+    setStepped(next);
+  };
+  const save = () => {
+    const outcome = recordForLevel(preferences, target.source, target.level, draft);
+    if ("error" in outcome) {
+      setError(outcome.error);
+      return;
+    }
+    setUsageContextLevel(preferences, target.key, outcome.record);
+    onOpenChange(false);
+  };
+  const clear = () => {
+    const rest = { ...typed };
+    Reflect.deleteProperty(rest, target.key);
+    setTyped(rest);
+    setUsageContextLevel(preferences, target.key, null);
+  };
 
   const savedModels = Object.keys(preferences.overrides).flatMap((key) => {
     const record = usageContextRecordFromKey(key);
     if (!record || record.source.agentName !== row.name || record.source.harness !== row.harness)
       return [];
     if (record.level !== "model" && record.level !== "agent-model") return [];
-    if (!usageContextHasValue(preferences.overrides[key])) return [];
+    const override = preferences.overrides[key];
+    if (!override || !usageContextHasValue(override)) return [];
     return [
       {
         key,
         model: record.source.model,
+        override,
         scope:
           record.level === "agent-model" || !record.source.hostId
             ? "Every computer"
@@ -1327,232 +1480,164 @@ function AgentRowEditor({
       },
     ];
   });
-  const save = (
-    key: string,
-    draft: Draft,
-    level: UsageContextLevel,
-    source: UsageContextSource,
-    onError: (message: string) => void,
-  ) => {
-    const inheritedContext = inheritedUsageContext(preferences, source, level).contextWindow.value;
-    const outcome = recordFromDraft(draft, inheritedContext);
-    if ("error" in outcome) {
-      onError(outcome.error);
-      return;
-    }
-    onError("");
-    setUsageContextLevel(preferences, key, outcome.record);
-  };
+  const hostText = hostColumn?.label ?? "";
 
   return (
     <LayeredEditor
       trigger={trigger}
-      title={`${labels.agentLabel}, all hosts`}
+      title={stepped ? stepped.title : `${labels.agentLabel}, all hosts`}
+      note={
+        stepped
+          ? stepped.level === "model"
+            ? focusModel
+            : undefined
+          : oneModel
+            ? modelTab === "model"
+              ? "This session's model"
+              : "Any model with no value of its own"
+            : "All models"
+      }
+      help={
+        stepped?.level === "cell" || stepped?.level === "model"
+          ? `This cell, then ${labels.agentLabel}, all hosts, then all agents on ${hostText}, then all agents, all hosts.`
+          : undefined
+      }
+      back={
+        stepped
+          ? {
+              label: `${labels.agentLabel}, all hosts`,
+              onBack: () => {
+                setError("");
+                setStepped(null);
+              },
+            }
+          : undefined
+      }
       open={open}
       onOpenChange={onOpenChange}
-      contentClassName="w-[min(24rem,calc(100vw-1rem))]"
-      onClear={onClear}
-      clearBelowCount={clearBelowCount}
+      onClear={usageContextHasValue(preferences.overrides[target.key]) ? clear : undefined}
+      clearBelowCount={stepped ? 0 : clearBelowCount}
       onClearBelow={clearBelowCount > 0 ? onClearBelow : undefined}
-      actions={
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          className="min-h-11 md:min-h-7"
-          disabled={!undo}
-          onClick={onUndo}
-        >
-          Undo
-        </Button>
-      }
+      actions={undo ? <LayeredEditorAction onClick={onUndo}>Undo</LayeredEditorAction> : null}
+      footer={<EditorButtons onCancel={() => onOpenChange(false)} onSave={save} />}
     >
-      {focusModel && modelKey ? (
-        <section className="grid gap-2 rounded-lg border border-border p-2.5">
-          <p className="text-sm font-medium">
-            {focusModel}{" "}
-            <span className="font-normal text-muted-foreground">· this session's model</span>
-          </p>
-          <DraftFields
-            draft={modelDraft}
-            onChange={setModelDraft}
-            error={modelError}
-            labelFor={(field) =>
-              field === "unit"
-                ? `Buffer unit for ${focusModel}`
-                : `${field === "context" ? "Context total" : "Compact buffer"} for ${focusModel}`
-            }
-          />
-          <div className="flex flex-wrap items-center gap-2">
-            <Button
-              type="button"
-              size="sm"
-              className="min-h-11 md:min-h-7"
-              onClick={() => save(modelKey, modelDraft, "agent-model", modelSource, setModelError)}
-            >
-              Save this model
-            </Button>
-            <span className="text-sm text-muted-foreground">Applies to every host.</span>
-          </div>
-        </section>
-      ) : null}
-      <section className="grid gap-2">
-        <div className="flex items-baseline justify-between gap-2">
-          <p className="text-sm font-medium">All models</p>
-          <span className="text-sm text-muted-foreground">
-            {usageContextHasValue(preferences.overrides[columnKey])
-              ? "Saved here"
-              : "Any model with no value of its own"}
-          </span>
-        </div>
-        <DraftFields
-          draft={columnDraft}
-          onChange={setColumnDraft}
-          error={columnError}
-          labelFor={(field) =>
-            field === "unit"
-              ? `Buffer unit for all models of ${labels.agentLabel}`
-              : `${field === "context" ? "Context total" : "Compact buffer"} for all models of ${labels.agentLabel}`
-          }
+      {oneModel && !stepped ? (
+        <Segmented
+          quiet
+          stretch
+          label="Which models"
+          value={modelTab}
+          options={[
+            { value: "model", label: oneModel.label },
+            { value: "all", label: "All models" },
+          ]}
+          onChange={(next) => {
+            setError("");
+            setModelTab(next);
+          }}
         />
-        <div className="flex flex-wrap items-center gap-2">
-          <Button
-            type="button"
-            size="sm"
-            className="min-h-11 md:min-h-7"
-            onClick={() => save(columnKey, columnDraft, "column", columnSource, setColumnError)}
+      ) : null}
+      <LevelFields
+        preferences={preferences}
+        source={target.source}
+        level={target.level}
+        label={target.label}
+        levelText={(winner) =>
+          usageContextLevelLabel(winner, {
+            hostLabel: hostText || "No host",
+            agentLabel: labels.agentLabel,
+          })
+        }
+        draft={draft}
+        onChange={(next) => setTyped({ ...typed, [target.key]: next })}
+        onSubmit={save}
+        error={error}
+      />
+      {!stepped && hostColumn ? (
+        <nav aria-label="Other levels" className="grid border-t border-border pt-1.5">
+          <StepButton
+            onClick={() => {
+              const source: UsageContextSource = {
+                ...agentSource,
+                hostId: hostColumn.hostId,
+                model: onFocusedModel ? (focusModel ?? "") : "",
+              };
+              const level = onFocusedModel ? "model" : "cell";
+              stepTo({
+                key: usageContextLevelKey(source, level),
+                level,
+                source,
+                label: `${labels.agentLabel} on ${hostColumn.label}`,
+                title: `${labels.agentLabel} on ${hostColumn.label}`,
+              });
+            }}
           >
-            Save all models
-          </Button>
-        </div>
-      </section>
-      <section className="grid gap-1.5">
-        <p className="text-sm font-medium">Saved for one model</p>
-        {savedModels.length === 0 ? (
-          <p className="text-sm text-muted-foreground">
-            No model has its own value. A session's ring sets one.
-          </p>
-        ) : (
-          savedModels.map((item) => (
-            <div
-              key={item.key}
-              className="flex flex-wrap items-center justify-between gap-2 text-sm"
-            >
-              <span className="min-w-0 break-all">{item.model}</span>
-              <span className="text-muted-foreground">{item.scope}</span>
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                className="min-h-11 md:min-h-7"
+            Only on {hostColumn.label}
+          </StepButton>
+          <StepButton
+            onClick={() => {
+              const source: UsageContextSource = {
+                hostId: hostColumn.hostId,
+                agentName: "",
+                harness: "",
+                model: "",
+              };
+              stepTo({
+                key: usageContextLevelKey(source, "host"),
+                level: "host",
+                source,
+                label: `all agents on ${hostColumn.label}`,
+                title: `All agents on ${hostColumn.label}`,
+              });
+            }}
+          >
+            All agents on {hostColumn.label}
+          </StepButton>
+        </nav>
+      ) : null}
+      {!stepped && savedModels.length > 0 ? (
+        <section className="grid gap-1 border-t border-border pt-3">
+          <p className="text-xs font-medium text-muted-foreground">Saved for one model</p>
+          {savedModels.map((item) => (
+            <div key={item.key} className="flex items-center gap-2 text-sm">
+              <span className="min-w-0 flex-1">
+                <span className="block break-all">{item.model}</span>
+                <span className="block text-xs text-muted-foreground">
+                  {item.scope} · {savedValueText(item.override)}
+                </span>
+              </span>
+              <LayeredEditorAction
                 aria-label={`Remove the value for ${item.model} on ${item.scope}`}
                 onClick={() => setUsageContextLevel(preferences, item.key, null)}
               >
                 Remove
-              </Button>
+              </LayeredEditorAction>
             </div>
-          ))
-        )}
-      </section>
-      {hostColumn ? (
-        <section className="grid gap-2 border-t border-border pt-2.5">
-          <p className="text-sm font-medium">One step away</p>
-          <div className="flex flex-wrap gap-2">
-            <Button
-              type="button"
-              variant={
-                drill?.level === "cell" || drill?.level === "model" ? "secondary" : "outline"
-              }
-              size="sm"
-              className="min-h-11 md:min-h-7"
-              aria-pressed={drill?.level === "cell" || drill?.level === "model"}
-              onClick={() => {
-                const drillSource: UsageContextSource = {
-                  hostId: hostColumn.hostId,
-                  agentName: row.name,
-                  harness: row.harness,
-                  model: focusModel ?? "",
-                };
-                setDrill({
-                  level: focusModel ? "model" : "cell",
-                  key: usageContextLevelKey(drillSource, focusModel ? "model" : "cell"),
-                  label: `${labels.agentLabel} on ${hostColumn.label}`,
-                  source: drillSource,
-                  draft: focusModel ? modelDraft : columnDraft,
-                });
-              }}
-            >
-              Only on {hostColumn.label}
-            </Button>
-            <Button
-              type="button"
-              variant={drill?.level === "host" ? "secondary" : "outline"}
-              size="sm"
-              className="min-h-11 md:min-h-7"
-              aria-pressed={drill?.level === "host"}
-              onClick={() =>
-                setDrill({
-                  level: "host",
-                  key: usageContextLevelKey(
-                    { hostId: hostColumn.hostId, agentName: "", harness: "", model: "" },
-                    "host",
-                  ),
-                  label: `all agents on ${hostColumn.label}`,
-                  source: { hostId: hostColumn.hostId, agentName: "", harness: "", model: "" },
-                  draft: columnDraft,
-                })
-              }
-            >
-              All agents on {hostColumn.label}
-            </Button>
-          </div>
-        </section>
-      ) : null}
-      {drill ? (
-        <section
-          className="grid gap-2 rounded-lg border border-border bg-muted/20 p-2.5"
-          data-testid="drilled-level"
-        >
-          <div className="flex items-baseline justify-between gap-2">
-            <p className="text-sm font-medium">{drill.label}</p>
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              className="min-h-11 md:min-h-7"
-              onClick={() => setDrill(null)}
-            >
-              Close this level
-            </Button>
-          </div>
-          <ValueFields
-            preferences={preferences}
-            source={drill.source}
-            level={drill.level}
-            label={drill.label}
-            caption={(field) => {
-              const resolved = resolveUsageContextLevel(preferences, drill.source, drill.level);
-              const winner =
-                field === "contextWindowTokens"
-                  ? resolved.contextWindow.level
-                  : resolved.buffer.level;
-              if (winner === drill.level) return "Saved here";
-              if (winner === "reported") return "The agent reports its own";
-              return `From ${usageContextLevelLabel(winner as UsageContextLevel, {
-                hostLabel: drill.source.hostId || "No host",
-                agentLabel: labels.agentLabel,
-              })}`;
-            }}
-            orderLine={
-              drill.level === "cell"
-                ? `This cell, then ${labels.agentLabel}, all hosts, then all agents on ${hostColumn?.label ?? ""}, then all agents, all hosts.`
-                : undefined
-            }
-            initialDraft={drill.draft}
-            onSave={(record) => setUsageContextLevel(preferences, drill.key, record)}
-          />
+          ))}
         </section>
       ) : null}
     </LayeredEditor>
   );
+}
+
+function StepButton({ children, onClick }: { children: ReactNode; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      className="-mx-1 flex min-h-11 items-center justify-between gap-2 rounded-md px-1 text-left text-sm text-muted-foreground hover:bg-foreground/5 hover:text-foreground md:min-h-8"
+      onClick={onClick}
+    >
+      <span className="min-w-0 wrap-anywhere">{children}</span>
+      <ChevronRightIcon className="size-4 shrink-0" />
+    </button>
+  );
+}
+
+function savedValueText(override: UsageContextOverride): string {
+  const context = override.contextWindowTokens;
+  const percent = override.compactBufferMode === "percent";
+  const buffer = percent ? override.autoCompactBufferPercent : override.autoCompactBufferTokens;
+  const contextText = context == null ? "Auto" : contextTokenText(context);
+  if (buffer == null) return contextText;
+  return `${contextText} / ${percent ? `${buffer}%` : contextTokenText(buffer)}`;
 }
