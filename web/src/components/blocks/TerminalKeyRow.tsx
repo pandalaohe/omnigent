@@ -8,34 +8,22 @@ import {
   type PointerEvent as ReactPointerEvent,
   type RefObject,
 } from "react";
-import type { ShortcutChord } from "@/lib/keyboardShortcutPreferences";
-import { softKeyForChord, terminalDataForChord } from "@/lib/mobileAssistantPreferences";
+import {
+  DEFAULT_TERMINAL_KEY_ITEMS,
+  softKeyForChord,
+  terminalDataForChord,
+  type TerminalKeyRowItem,
+} from "@/lib/mobileAssistantPreferences";
 import { cn } from "@/lib/utils";
+import { getIOSKeyboardViewportHeight } from "@/lib/nativeBridge";
 import type { StickyModifiers, TerminalSession } from "./TerminalSession";
 
-type PressableItem = Extract<TerminalKeyRowItem, { kind: "key" | "modifier" }>;
+export {
+  DEFAULT_TERMINAL_KEY_ITEMS,
+  type TerminalKeyRowItem,
+} from "@/lib/mobileAssistantPreferences";
 
-export type TerminalKeyRowItem =
-  | {
-      id: string;
-      label: string;
-      kind: "modifier";
-      modifier: keyof StickyModifiers;
-      repeat?: false;
-    }
-  | {
-      id: string;
-      label: string;
-      kind: "key";
-      chord: ShortcutChord;
-      repeat?: boolean;
-    }
-  | {
-      id: string;
-      label: string;
-      kind: "action";
-      action: "keyboard";
-    };
+type PressableItem = Extract<TerminalKeyRowItem, { kind: "key" | "modifier" }>;
 
 export const TERMINAL_KEY_ROW_COLS = 6;
 export const TERMINAL_REPEAT_DELAY_MS = 400;
@@ -43,60 +31,12 @@ export const TERMINAL_REPEAT_INTERVAL_MS = 80;
 export const TERMINAL_DRAG_SLOP_PX = 10;
 export const TERMINAL_SWIPE_THRESHOLD_PX = 36;
 
-/** First 6 keys populate Row 1; remaining keys fill 6-slot pages in Row 2. */
-export const DEFAULT_TERMINAL_KEY_ITEMS: readonly TerminalKeyRowItem[] = [
-  // Row 1 (fixed)
-  { id: "esc", label: "Esc", kind: "key", chord: { code: "Escape", modifiers: [] } },
-  {
-    id: "up",
-    label: "↑",
-    kind: "key",
-    chord: { code: "ArrowUp", modifiers: [] },
-    repeat: true,
-  },
-  {
-    id: "down",
-    label: "↓",
-    kind: "key",
-    chord: { code: "ArrowDown", modifiers: [] },
-    repeat: true,
-  },
-  { id: "enter", label: "↵", kind: "key", chord: { code: "Enter", modifiers: [] } },
-  { id: "ctrl-c", label: "^C", kind: "key", chord: { code: "KeyC", modifiers: ["control"] } },
-  { id: "keyboard", label: "Keyboard", kind: "action", action: "keyboard" },
-  // Row 2, Page 1
-  { id: "tab", label: "Tab", kind: "key", chord: { code: "Tab", modifiers: [] } },
-  { id: "shift-tab", label: "⇧Tab", kind: "key", chord: { code: "Tab", modifiers: ["shift"] } },
-  {
-    id: "left",
-    label: "←",
-    kind: "key",
-    chord: { code: "ArrowLeft", modifiers: [] },
-    repeat: true,
-  },
-  {
-    id: "right",
-    label: "→",
-    kind: "key",
-    chord: { code: "ArrowRight", modifiers: [] },
-    repeat: true,
-  },
-  { id: "slash", label: "/", kind: "key", chord: { code: "Slash", modifiers: [] } },
-  { id: "ctrl", label: "Ctrl", kind: "modifier", modifier: "ctrl" },
-  // Row 2, Page 2
-  { id: "pgup", label: "PgUp", kind: "key", chord: { code: "PageUp", modifiers: [] } },
-  { id: "pgdn", label: "PgDn", kind: "key", chord: { code: "PageDown", modifiers: [] } },
-  { id: "home", label: "Home", kind: "key", chord: { code: "Home", modifiers: [] } },
-  { id: "end", label: "End", kind: "key", chord: { code: "End", modifiers: [] } },
-  { id: "alt", label: "Alt", kind: "modifier", modifier: "alt" },
-  { id: "ctrl-d", label: "^D", kind: "key", chord: { code: "KeyD", modifiers: ["control"] } },
-];
-
 export interface TerminalKeyRowProps {
   sessionRef: RefObject<TerminalSession | null>;
   keyboardUp: boolean;
   disabled?: boolean;
   items?: readonly TerminalKeyRowItem[];
+  secondRow?: boolean;
 }
 
 interface ActiveKeyPress {
@@ -114,6 +54,24 @@ interface PagerSwipeStart {
   pointerId: number;
   startX: number;
   startY: number;
+}
+
+export function toggleTerminalKeyboard(
+  session: TerminalSession | null,
+  keyboardUp?: boolean,
+): void {
+  if (!session) return;
+  const nativeHeight = getIOSKeyboardViewportHeight();
+  const visibleBottom =
+    nativeHeight ??
+    (window.visualViewport
+      ? window.visualViewport.offsetTop + window.visualViewport.height
+      : window.innerHeight);
+  const isKeyboardUp =
+    keyboardUp ?? window.innerHeight - visibleBottom > (nativeHeight === null ? 80 : 0);
+  const focused = session.isFocused?.() ?? Boolean(document.activeElement?.closest(".xterm"));
+  if (focused) session.blur?.();
+  if (!focused || !isKeyboardUp) session.focus();
 }
 
 export function sendTerminalKeyRowItem(
@@ -142,6 +100,7 @@ export function TerminalKeyRow({
   keyboardUp,
   disabled = false,
   items = DEFAULT_TERMINAL_KEY_ITEMS,
+  secondRow = true,
 }: TerminalKeyRowProps) {
   const pageCount = Math.max(
     1,
@@ -384,17 +343,7 @@ export function TerminalKeyRow({
         keyboardDraggedRef.current = false;
         return;
       }
-      const session = sessionRef.current;
-      if (!session) return;
-      const focused = session.isFocused?.() ?? Boolean(document.activeElement?.closest(".xterm"));
-      if (focused && keyboardUp) {
-        session.blur?.();
-      } else {
-        if (focused) {
-          session.blur?.();
-        }
-        session.focus();
-      }
+      toggleTerminalKeyboard(sessionRef.current, keyboardUp);
       return;
     }
 
@@ -477,39 +426,43 @@ export function TerminalKeyRow({
       className="shrink-0 border-t border-border bg-card pt-[2px] pb-0 select-none touch-none"
     >
       <div className="@container">
-        <div className="grid grid-cols-1 gap-[2px] @min-[35rem]:grid-cols-12">
+        <div className={cn("grid grid-cols-1 gap-[2px]", secondRow && "@min-[35rem]:grid-cols-12")}>
           <div
             data-testid="terminal-key-row-primary"
-            className="grid grid-cols-6 gap-[2px] @min-[35rem]:col-span-6"
+            className={cn("grid grid-cols-6 gap-[2px]", secondRow && "@min-[35rem]:col-span-6")}
           >
             {renderCells(firstRow, "row1")}
           </div>
+          {secondRow && (
+            <div
+              data-testid="terminal-key-row-pager"
+              data-pager
+              role="group"
+              aria-label={`More keys, page ${clampedPage + 1} of ${pageCount}. Swipe left or right.`}
+              className="grid grid-cols-6 gap-[2px] touch-none @min-[35rem]:col-span-6"
+            >
+              {renderCells(secondRowPage, `page-${clampedPage}`)}
+            </div>
+          )}
+        </div>
+        {secondRow && (
           <div
-            data-testid="terminal-key-row-pager"
-            data-pager
-            role="group"
-            aria-label={`More keys, page ${clampedPage + 1} of ${pageCount}. Swipe left or right.`}
-            className="grid grid-cols-6 gap-[2px] touch-none @min-[35rem]:col-span-6"
+            data-testid="terminal-key-row-dots"
+            aria-hidden="true"
+            className="flex h-[6px] items-center justify-center gap-1 @min-[35rem]:h-[8px]"
           >
-            {renderCells(secondRowPage, `page-${clampedPage}`)}
+            {Array.from({ length: pageCount }, (_, index) => (
+              <i
+                key={index}
+                data-page-dot={String(index)}
+                className={cn(
+                  "block h-[3px] rounded-full transition-all",
+                  index === clampedPage ? "w-[10px] bg-muted-foreground" : "w-[3px] bg-border",
+                )}
+              />
+            ))}
           </div>
-        </div>
-        <div
-          data-testid="terminal-key-row-dots"
-          aria-hidden="true"
-          className="flex h-[6px] items-center justify-center gap-1 @min-[35rem]:h-[8px]"
-        >
-          {Array.from({ length: pageCount }, (_, index) => (
-            <i
-              key={index}
-              data-page-dot={String(index)}
-              className={cn(
-                "block h-[3px] rounded-full transition-all",
-                index === clampedPage ? "w-[10px] bg-muted-foreground" : "w-[3px] bg-border",
-              )}
-            />
-          ))}
-        </div>
+        )}
       </div>
     </div>
   );

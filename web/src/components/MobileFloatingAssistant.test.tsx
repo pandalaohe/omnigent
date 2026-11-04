@@ -1,8 +1,17 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { POLL_SESSIONS_ACTION_EVENT } from "@/hooks/useSessionPollingHotkeys";
+import {
+  POLL_SESSIONS_ACTION_EVENT,
+  useSessionPollingHotkeys,
+} from "@/hooks/useSessionPollingHotkeys";
+import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
+import { useApproveHotkey } from "@/hooks/useApproveHotkey";
+import { currentShortcutPlatform } from "@/lib/keyboardShortcutPreferences";
+import { useChatStore } from "@/store/chatStore";
+import type { ElicitationBlock } from "@/lib/blocks";
+import type { Conversation } from "@/hooks/useConversations";
 import {
   MOBILE_ASSISTANT_DEVICE_STORAGE_KEY,
   TERMINAL_SOFT_KEY_EVENT,
@@ -20,6 +29,8 @@ import {
 vi.mock("@/hooks/useIsPhone", () => ({
   useIsPhone: () => true,
 }));
+const navigate = vi.hoisted(() => vi.fn());
+vi.mock("@/lib/routing", () => ({ useNavigate: () => navigate }));
 
 describe("MobileFloatingAssistant", () => {
   beforeEach(() => {
@@ -38,7 +49,7 @@ describe("MobileFloatingAssistant", () => {
     fireEvent.click(screen.getByRole("button", { name: "Open floating assistant" }));
     fireEvent.click(screen.getByRole("button", { name: "Poll" }));
 
-    expect(screen.getByRole("button", { name: "Esc" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Approve" })).toBeTruthy();
     expect(listener).toHaveBeenCalledOnce();
     window.removeEventListener(POLL_SESSIONS_ACTION_EVENT, listener);
   });
@@ -382,6 +393,17 @@ describe("MobileFloatingAssistant", () => {
   });
 
   it("keeps the last terminal as the key target after chrome focus with two terminals", () => {
+    writeMobileAssistantPreferences({
+      version: 2,
+      enabled: true,
+      buttons: [
+        {
+          id: "up",
+          label: "↑",
+          binding: { kind: "key", chord: { code: "ArrowUp", modifiers: [] } },
+        },
+      ],
+    });
     const first = vi.fn();
     const second = vi.fn();
     const textarea = document.createElement("textarea");
@@ -554,9 +576,78 @@ describe("MobileFloatingAssistant", () => {
       releaseNoBar = registerTypableTerminal(false);
     });
     expect(screen.getByTestId("mobile-floating-assistant")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Open floating assistant" }));
+    expect(screen.getByRole("button", { name: "Esc" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
 
     act(() => {
       releaseNoBar();
     });
+    expect(screen.getByRole("button", { name: "Approve" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Esc" })).toBeNull();
+  });
+
+  it("gives every chat default a real effect through its existing consumer", async () => {
+    const before = useChatStore.getState();
+    const submitApproval = vi.fn().mockResolvedValue(undefined);
+    const onArchive = vi.fn().mockResolvedValue(undefined);
+    const rows = ["a", "b", "c"].map(
+      (id) =>
+        ({
+          id,
+          object: "conversation",
+          title: id,
+          created_at: 1,
+          updated_at: Date.now() / 1000,
+          labels: {},
+          archived: false,
+          pending_elicitations_count: id === "c" ? 1 : 0,
+        }) as Conversation,
+    );
+    useChatStore.setState({
+      blocks: [
+        { type: "elicitation", status: "pending", elicitationId: "approval" } as ElicitationBlock,
+      ],
+      submitApproval,
+    });
+    const isMac = currentShortcutPlatform() === "macos";
+    function Consumers() {
+      useApproveHotkey(isMac);
+      useSessionSwitchHotkey(["a", "b", "c"], "b", isMac);
+      useSessionPollingHotkeys({
+        activeId: "b",
+        getConversations: async () => rows,
+        isUnread: () => false,
+        onArchive,
+      });
+      return <MobileFloatingAssistant />;
+    }
+    try {
+      render(<Consumers />);
+      fireEvent.click(screen.getByRole("button", { name: "Open floating assistant" }));
+      expect(readMobileAssistantPreferences().buttons.map((button) => button.label)).toEqual([
+        "Approve",
+        "Poll",
+        "Previous",
+        "Next",
+        "Archive",
+      ]);
+      fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+      expect(submitApproval).toHaveBeenCalledExactlyOnceWith("approval", "accept");
+      fireEvent.click(screen.getByRole("button", { name: "Previous" }));
+      expect(navigate).toHaveBeenLastCalledWith("/c/a");
+      fireEvent.click(screen.getByRole("button", { name: "Next" }));
+      expect(navigate).toHaveBeenLastCalledWith("/c/c");
+      navigate.mockClear();
+      fireEvent.click(screen.getByRole("button", { name: "Poll" }));
+      await waitFor(() => expect(navigate).toHaveBeenLastCalledWith("/c/c"));
+      fireEvent.click(screen.getByRole("button", { name: "Archive" }));
+      await waitFor(() =>
+        expect(onArchive).toHaveBeenCalledWith(expect.objectContaining({ id: "b" })),
+      );
+      expect(navigate).toHaveBeenLastCalledWith("/c/c", { replace: true });
+    } finally {
+      useChatStore.setState({ blocks: before.blocks, submitApproval: before.submitApproval });
+    }
   });
 });

@@ -18,6 +18,10 @@ import { toast } from "sonner";
 import {
   dispatchMobileAssistantAction,
   dispatchMobileAssistantButton,
+  dispatchTerminalAssistantItem,
+  readMobileAssistantPreferences,
+  writeMobileAssistantPreferences,
+  type TerminalStickyModifiers,
 } from "@/lib/mobileAssistantPreferences";
 import * as host from "@/lib/host";
 import { isHostKeyless, setSessionHost } from "@/lib/sessionHost";
@@ -86,6 +90,7 @@ const terminalSessionMock = vi.hoisted(() => ({
     setTheme: ReturnType<typeof vi.fn>;
     setClipboardEnabled: ReturnType<typeof vi.fn>;
     sendSoftKey: ReturnType<typeof vi.fn>;
+    getStickyModifiers: () => TerminalStickyModifiers;
     focus: ReturnType<typeof vi.fn>;
     blur: ReturnType<typeof vi.fn>;
     isFocused: ReturnType<typeof vi.fn>;
@@ -101,7 +106,11 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
     setTheme = vi.fn();
     setClipboardEnabled = vi.fn();
     sendSoftKey = vi.fn();
-    setStickyModifiers = vi.fn();
+    stickyModifiers: TerminalStickyModifiers = { ctrl: "off", alt: "off" };
+    setStickyModifiers = vi.fn((next: TerminalStickyModifiers) => {
+      this.stickyModifiers = next;
+    });
+    getStickyModifiers = () => this.stickyModifiers;
     onStickyConsumed = vi.fn(() => vi.fn());
     focus = vi.fn();
     blur = vi.fn();
@@ -133,6 +142,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
         setTheme: this.setTheme,
         setClipboardEnabled: this.setClipboardEnabled,
         sendSoftKey: this.sendSoftKey,
+        getStickyModifiers: this.getStickyModifiers,
         focus: this.focus,
         blur: this.blur,
         isFocused: this.isFocused,
@@ -1949,5 +1959,86 @@ describe("TerminalView phone key rows", () => {
 
     // 590.8 - 47 - 47 = 496.8px: two rows need 99 + 108px, not 55 + 108px.
     expect(screen.queryByTestId("terminal-key-row")).toBeNull();
+  });
+
+  it("consumes custom order and live switches, and sends fallback wheel keys to the registered session", async () => {
+    stubPhoneViewport(390, 844);
+    stubRootRect(390, 788);
+    const initial = readMobileAssistantPreferences();
+    const customKey = {
+      id: "refresh",
+      label: "Refresh",
+      kind: "key" as const,
+      chord: { code: "KeyR", modifiers: [] },
+    };
+    writeMobileAssistantPreferences({
+      ...initial,
+      terminalButtons: [customKey, ...initial.terminalButtons],
+    });
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await act(async () => {});
+    act(() => terminalSessionMock.instances[0].onState({ kind: "connected" }));
+    expect(
+      within(screen.getByTestId("terminal-key-row-primary")).getAllByRole("button")[0],
+    ).toHaveAccessibleName("Refresh");
+    act(() =>
+      writeMobileAssistantPreferences({
+        ...readMobileAssistantPreferences(),
+        terminalSecondRow: false,
+      }),
+    );
+    expect(screen.queryByTestId("terminal-key-row-pager")).toBeNull();
+    act(() =>
+      writeMobileAssistantPreferences({
+        ...readMobileAssistantPreferences(),
+        terminalKeysEnabled: false,
+      }),
+    );
+    expect(screen.queryByTestId("terminal-key-row")).toBeNull();
+    const session = terminalSessionMock.instances[0];
+    act(() => {
+      dispatchTerminalAssistantItem({
+        id: "ctrl",
+        label: "Ctrl",
+        kind: "modifier",
+        modifier: "ctrl",
+      });
+      dispatchTerminalAssistantItem(customKey);
+    });
+    expect(session.getStickyModifiers()).toEqual({ ctrl: "once", alt: "off" });
+    expect(session.sendSoftKey).toHaveBeenLastCalledWith("enter", "r", {
+      focus: false,
+      chord: customKey.chord,
+    });
+    session.isFocused.mockReturnValue(true);
+    const keyboard = {
+      id: "keyboard",
+      label: "Keyboard",
+      kind: "action" as const,
+      action: "keyboard" as const,
+    };
+    // A stale focused textarea must be blurred and refocused within the tap gesture.
+    act(() => dispatchTerminalAssistantItem(keyboard));
+    expect(session.blur).toHaveBeenCalledOnce();
+    expect(session.focus).toHaveBeenCalledOnce();
+    session.blur.mockClear();
+    session.focus.mockClear();
+    vi.stubGlobal("visualViewport", {
+      height: 500,
+      offsetTop: 0,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    });
+    act(() => dispatchTerminalAssistantItem(keyboard));
+    expect(session.blur).toHaveBeenCalledOnce();
+    expect(session.focus).not.toHaveBeenCalled();
+    act(() =>
+      writeMobileAssistantPreferences({
+        ...readMobileAssistantPreferences(),
+        terminalKeysEnabled: true,
+      }),
+    );
+    expect(screen.getByTestId("terminal-key-row")).toBeInTheDocument();
+    expect(screen.queryByTestId("terminal-key-row-pager")).toBeNull();
   });
 });

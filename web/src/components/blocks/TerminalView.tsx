@@ -39,6 +39,7 @@ import {
   TERMINAL_SOFT_KEY_EVENT,
   isDomTargetVisible,
   registerTypableTerminal,
+  useMobileAssistantPreferences,
   type TerminalSoftKeyEventDetail,
 } from "@/lib/mobileAssistantPreferences";
 import {
@@ -46,7 +47,7 @@ import {
   type TerminalClipboardDecision,
   type TerminalClipboardPromptReason,
 } from "./TerminalClipboardPrompt";
-import { TerminalKeyRow } from "./TerminalKeyRow";
+import { TerminalKeyRow, sendTerminalKeyRowItem, toggleTerminalKeyboard } from "./TerminalKeyRow";
 import {
   type ConnectionState,
   type TerminalActivityListener,
@@ -321,13 +322,21 @@ export function TerminalView({
           (connectedAtRef.current !== null &&
             Date.now() - connectedAtRef.current >= RECONNECT_STABLE_MS))));
   const terminalEnded = state.kind === "closed" && !reconnectPending && !willAutoReconnect;
-  const canShowKeyRows = isPhone && !readOnly && showKeyRows && active && !terminalEnded;
+  const keyPreferences = useMobileAssistantPreferences();
+  const canShowKeyRows =
+    isPhone &&
+    !readOnly &&
+    showKeyRows &&
+    active &&
+    !terminalEnded &&
+    keyPreferences.terminalKeysEnabled &&
+    keyPreferences.terminalButtons.length > 0;
   const { overlap, keyboardUp, roomPx, keyRowWidth, paddingBottomPx } = useTerminalKeyboardRoom(
     rootRef,
     canShowKeyRows,
     reservesBottomSafeArea,
   );
-  const barHeight = keyRowWidth >= 560 ? 55 : 99;
+  const barHeight = !keyPreferences.terminalSecondRow ? 47 : keyRowWidth >= 560 ? 55 : 99;
   const hasBar = canShowKeyRows && roomPx >= barHeight + 108;
 
   useEffect(() => {
@@ -359,10 +368,26 @@ export function TerminalView({
         ownsPreferredTarget: Boolean(
           detail.preferredTarget && node?.contains(detail.preferredTarget),
         ),
-        send: () =>
-          detail.data !== undefined
-            ? session.sendSoftKey(detail.action, detail.data)
-            : session.sendSoftKey(detail.action),
+        send: () => {
+          if (detail.onStickyChanged) {
+            detail.onStickySubscribed?.(session.onStickyConsumed(detail.onStickyChanged));
+          }
+          const item = detail.terminalItem;
+          if (item?.kind === "modifier") {
+            const next = { ...session.getStickyModifiers() };
+            const current = next[item.modifier];
+            next[item.modifier] =
+              current === "off" ? "once" : current === "once" ? "locked" : "off";
+            session.setStickyModifiers(next);
+          } else if (item?.kind === "action") {
+            toggleTerminalKeyboard(session);
+          } else if (item?.kind === "key") {
+            sendTerminalKeyRowItem(session, item, session.getStickyModifiers());
+          } else if (detail.data !== undefined) {
+            session.sendSoftKey(detail.action, detail.data);
+          } else session.sendSoftKey(detail.action);
+          detail.onStickyChanged?.(session.getStickyModifiers());
+        },
       });
     };
     window.addEventListener(TERMINAL_SOFT_KEY_EVENT, handleSoftKey);
@@ -878,6 +903,8 @@ export function TerminalView({
           sessionRef={sessionRef}
           keyboardUp={keyboardUp}
           disabled={state.kind !== "connected"}
+          items={keyPreferences.terminalButtons}
+          secondRow={keyPreferences.terminalSecondRow}
         />
       )}
     </div>

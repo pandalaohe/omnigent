@@ -245,11 +245,29 @@ function safeParse(raw: string | null): unknown | null {
 
 function mobileSyncValue(value: unknown): unknown | null {
   if (!value || typeof value !== "object") return null;
-  const raw = value as { version?: unknown; enabled?: unknown; buttons?: unknown };
+  const raw = value as {
+    version?: unknown;
+    enabled?: unknown;
+    buttons?: unknown;
+    terminalButtons?: unknown;
+    terminalKeysEnabled?: unknown;
+    terminalSecondRow?: unknown;
+  };
   if (raw.version !== 2 || typeof raw.enabled !== "boolean" || !Array.isArray(raw.buttons)) {
     return null;
   }
-  return { version: 2, enabled: raw.enabled, buttons: raw.buttons };
+  return {
+    version: 2,
+    enabled: raw.enabled,
+    buttons: raw.buttons,
+    ...(Array.isArray(raw.terminalButtons) ? { terminalButtons: raw.terminalButtons } : {}),
+    ...(typeof raw.terminalKeysEnabled === "boolean"
+      ? { terminalKeysEnabled: raw.terminalKeysEnabled }
+      : {}),
+    ...(typeof raw.terminalSecondRow === "boolean"
+      ? { terminalSecondRow: raw.terminalSecondRow }
+      : {}),
+  };
 }
 
 function sessionCollabSyncValue(value: unknown): unknown {

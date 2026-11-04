@@ -9,6 +9,7 @@ import {
   CornerDownLeftIcon,
   GripVerticalIcon,
   KeyboardIcon,
+  LockKeyholeIcon,
   RefreshCwIcon,
   SquareTerminalIcon,
   XIcon,
@@ -18,15 +19,20 @@ import {
 import { useIsPhone } from "@/hooks/useIsPhone";
 import {
   MOBILE_ASSISTANT_CHANGED_EVENT,
+  MOBILE_ASSISTANT_MAX_BUTTONS,
   dispatchMobileAssistantButton,
+  dispatchTerminalAssistantItem,
   mobileAssistantBindingSupportsRepeat,
   readMobileAssistantPreferences,
   useTypableTerminals,
+  visibleChatButtons,
   writeMobileAssistantDeviceState,
   type MobileAssistantButton,
   type MobileAssistantDock,
   type MobileAssistantDockEdge,
   type MobileAssistantIcon,
+  type TerminalKeyRowItem,
+  type TerminalStickyModifiers,
 } from "@/lib/mobileAssistantPreferences";
 import { cn } from "@/lib/utils";
 
@@ -40,6 +46,15 @@ const DOCK_THRESHOLD = 38;
 // On portrait phones this clears the composer band (input, action row, queued
 // messages), keyboard-shortened viewport included; a stored or docked spot wins.
 const FIRST_USE_POINT = { x: 0.86, y: 0.2 };
+type WheelItem = MobileAssistantButton | TerminalKeyRowItem;
+
+function repeats(item: WheelItem): boolean {
+  if (!("repeat" in item) || item.repeat !== true) return false;
+  return "binding" in item
+    ? mobileAssistantBindingSupportsRepeat(item.binding)
+    : item.kind === "key" &&
+        mobileAssistantBindingSupportsRepeat({ kind: "key", chord: item.chord });
+}
 
 interface ViewportSize {
   width: number;
@@ -251,7 +266,7 @@ export function MobileAssistantButtonContent({
   button,
   className = "h-4 w-4",
 }: {
-  button: MobileAssistantButton;
+  button: Pick<MobileAssistantButton, "label" | "icon" | "display">;
   className?: string;
 }) {
   const Icon = button.icon ? MOBILE_ASSISTANT_ICON_COMPONENTS[button.icon] : undefined;
@@ -261,9 +276,12 @@ export function MobileAssistantButtonContent({
 
 export function MobileFloatingAssistant() {
   const isPhone = useIsPhone();
-  const { withBar } = useTypableTerminals();
+  const terminals = useTypableTerminals();
+  const { count, withBar } = terminals;
   const [preferences, setPreferences] = useState(readMobileAssistantPreferences);
   const [open, setOpen] = useState(false);
+  const [sticky, setSticky] = useState<TerminalStickyModifiers>({ ctrl: "off", alt: "off" });
+  const stickySubscription = useRef<(() => void) | null>(null);
   const [viewport, setViewport] = useState<ViewportSize>(() => viewportSize());
   const [dragPreview, setDragPreview] = useState<Point | null>(null);
   const dragRef = useRef<{
@@ -297,6 +315,14 @@ export function MobileFloatingAssistant() {
       window.removeEventListener("storage", refresh);
     };
   }, []);
+
+  useEffect(() => {
+    setSticky({ ctrl: "off", alt: "off" });
+    return () => {
+      stickySubscription.current?.();
+      stickySubscription.current = null;
+    };
+  }, [terminals]);
 
   const stopRepeating = () => {
     if (repeatTimeoutRef.current !== null) window.clearTimeout(repeatTimeoutRef.current);
@@ -347,24 +373,31 @@ export function MobileFloatingAssistant() {
     x: clamp(point.x * viewport.width, MAIN_SIZE / 2, viewport.width - MAIN_SIZE / 2),
     y: clamp(point.y * viewport.height, MAIN_SIZE / 2, viewport.height - MAIN_SIZE / 2),
   };
-  const circle = layoutMobileAssistantCircle(preferences.buttons.length, center, viewport);
+  const buttons: WheelItem[] =
+    count > 0
+      ? preferences.terminalButtons.slice(0, MOBILE_ASSISTANT_MAX_BUTTONS)
+      : visibleChatButtons(preferences);
+  const circle = layoutMobileAssistantCircle(buttons.length, center, viewport);
   const displayCenter = open ? circle.center : center;
   const actionPositions = circle.actions;
 
-  const fireButton = (button: MobileAssistantButton) =>
-    dispatchMobileAssistantButton(button, lastInputFocusRef.current);
+  const fireButton = (button: WheelItem) => {
+    if ("binding" in button) dispatchMobileAssistantButton(button, lastInputFocusRef.current);
+    else {
+      stickySubscription.current?.();
+      stickySubscription.current = null;
+      dispatchTerminalAssistantItem(button, lastInputFocusRef.current, {
+        onStickyChanged: setSticky,
+        onStickySubscribed: (unsubscribe) => {
+          stickySubscription.current = unsubscribe;
+        },
+      });
+    }
+  };
 
-  const onActionPointerDown = (
-    button: MobileAssistantButton,
-    event: PointerEvent<HTMLButtonElement>,
-  ) => {
+  const onActionPointerDown = (button: WheelItem, event: PointerEvent<HTMLButtonElement>) => {
     if (event.button === 0) event.preventDefault();
-    if (
-      event.button !== 0 ||
-      button.repeat !== true ||
-      !mobileAssistantBindingSupportsRepeat(button.binding)
-    )
-      return;
+    if (event.button !== 0 || !repeats(button)) return;
     stopRepeating();
     suppressActionClickRef.current = button.id;
     repeatingPointerRef.current = { buttonId: button.id, pointerId: event.pointerId };
@@ -376,7 +409,7 @@ export function MobileFloatingAssistant() {
     }, 400);
   };
 
-  const onActionPointerEnd = (button: MobileAssistantButton, pointerId: number) => {
+  const onActionPointerEnd = (button: WheelItem, pointerId: number) => {
     const repeating = repeatingPointerRef.current;
     if (!repeating || repeating.buttonId !== button.id || repeating.pointerId !== pointerId) return;
     stopRepeating();
@@ -442,7 +475,7 @@ export function MobileFloatingAssistant() {
     writeMobileAssistantDeviceState(next);
   };
 
-  if (!isPhone || !preferences.enabled || preferences.buttons.length === 0 || withBar > 0) {
+  if (!isPhone || !preferences.enabled || buttons.length === 0 || withBar > 0) {
     return null;
   }
 
@@ -499,7 +532,7 @@ export function MobileFloatingAssistant() {
       ) : (
         <>
           {open
-            ? preferences.buttons.map((button, index) => {
+            ? buttons.map((button, index) => {
                 const position = actionPositions[index] ?? center;
                 return (
                   <button
@@ -507,8 +540,22 @@ export function MobileFloatingAssistant() {
                     type="button"
                     aria-label={button.label}
                     title={button.label}
-                    data-display={button.display === "icon" && button.icon ? "icon" : "text"}
-                    data-repeat={button.repeat === true ? "true" : undefined}
+                    data-display={
+                      "display" in button && button.display === "icon" && button.icon
+                        ? "icon"
+                        : "text"
+                    }
+                    aria-pressed={
+                      "kind" in button && button.kind === "modifier"
+                        ? sticky[button.modifier] !== "off"
+                        : undefined
+                    }
+                    data-sticky-state={
+                      "kind" in button && button.kind === "modifier"
+                        ? sticky[button.modifier]
+                        : undefined
+                    }
+                    data-repeat={"repeat" in button && button.repeat === true ? "true" : undefined}
                     onPointerDown={(event) => onActionPointerDown(button, event)}
                     onPointerUp={(event) => onActionPointerEnd(button, event.pointerId)}
                     onPointerCancel={(event) => onActionPointerEnd(button, event.pointerId)}
@@ -523,6 +570,10 @@ export function MobileFloatingAssistant() {
                     className={cn(
                       "pointer-events-auto fixed flex items-center justify-center rounded-full border border-border bg-popover px-1 text-xs font-semibold text-popover-foreground shadow-lg",
                       "touch-manipulation select-none active:scale-95",
+                      "kind" in button &&
+                        button.kind === "modifier" &&
+                        sticky[button.modifier] !== "off" &&
+                        "border-primary-cta bg-primary-cta text-primary-cta-foreground",
                     )}
                     style={{
                       left: position.x,
@@ -533,6 +584,11 @@ export function MobileFloatingAssistant() {
                     }}
                   >
                     <MobileAssistantButtonContent button={button} />
+                    {"kind" in button &&
+                      button.kind === "modifier" &&
+                      sticky[button.modifier] === "locked" && (
+                        <LockKeyholeIcon className="ml-0.5 size-3" aria-hidden />
+                      )}
                   </button>
                 );
               })

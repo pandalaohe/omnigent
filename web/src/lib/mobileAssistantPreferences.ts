@@ -94,12 +94,134 @@ export interface MobileAssistantDock {
   offset: number;
 }
 
+export type TerminalKeyRowItem =
+  | {
+      id: string;
+      label: string;
+      kind: "modifier";
+      modifier: "ctrl" | "alt";
+      repeat?: false;
+    }
+  | {
+      id: string;
+      label: string;
+      kind: "key";
+      chord: ShortcutChord;
+      repeat?: boolean;
+    }
+  | {
+      id: string;
+      label: string;
+      kind: "action";
+      action: "keyboard";
+    };
+
+/** First 6 keys populate Row 1; remaining keys fill 6-slot pages in Row 2. */
+export const DEFAULT_TERMINAL_KEY_ITEMS: readonly TerminalKeyRowItem[] = [
+  // Row 1 (fixed)
+  { id: "esc", label: "Esc", kind: "key", chord: { code: "Escape", modifiers: [] } },
+  {
+    id: "up",
+    label: "↑",
+    kind: "key",
+    chord: { code: "ArrowUp", modifiers: [] },
+    repeat: true,
+  },
+  {
+    id: "down",
+    label: "↓",
+    kind: "key",
+    chord: { code: "ArrowDown", modifiers: [] },
+    repeat: true,
+  },
+  { id: "enter", label: "↵", kind: "key", chord: { code: "Enter", modifiers: [] } },
+  { id: "ctrl-c", label: "^C", kind: "key", chord: { code: "KeyC", modifiers: ["control"] } },
+  { id: "keyboard", label: "Keyboard", kind: "action", action: "keyboard" },
+  // Row 2, Page 1
+  { id: "tab", label: "Tab", kind: "key", chord: { code: "Tab", modifiers: [] } },
+  { id: "shift-tab", label: "⇧Tab", kind: "key", chord: { code: "Tab", modifiers: ["shift"] } },
+  {
+    id: "left",
+    label: "←",
+    kind: "key",
+    chord: { code: "ArrowLeft", modifiers: [] },
+    repeat: true,
+  },
+  {
+    id: "right",
+    label: "→",
+    kind: "key",
+    chord: { code: "ArrowRight", modifiers: [] },
+    repeat: true,
+  },
+  { id: "slash", label: "/", kind: "key", chord: { code: "Slash", modifiers: [] } },
+  { id: "ctrl", label: "Ctrl", kind: "modifier", modifier: "ctrl" },
+  // Row 2, Page 2
+  { id: "pgup", label: "PgUp", kind: "key", chord: { code: "PageUp", modifiers: [] } },
+  { id: "pgdn", label: "PgDn", kind: "key", chord: { code: "PageDown", modifiers: [] } },
+  { id: "home", label: "Home", kind: "key", chord: { code: "Home", modifiers: [] } },
+  { id: "end", label: "End", kind: "key", chord: { code: "End", modifiers: [] } },
+  { id: "alt", label: "Alt", kind: "modifier", modifier: "alt" },
+  { id: "ctrl-d", label: "^D", kind: "key", chord: { code: "KeyD", modifiers: ["control"] } },
+];
+
+export function defaultTerminalButtons(): TerminalKeyRowItem[] {
+  return structuredClone([...DEFAULT_TERMINAL_KEY_ITEMS]);
+}
+
 export interface MobileAssistantPreferences {
   version: 2;
   enabled: boolean;
   buttons: MobileAssistantButton[];
+  terminalButtons?: TerminalKeyRowItem[];
+  terminalKeysEnabled?: boolean;
+  terminalSecondRow?: boolean;
   position?: { x: number; y: number };
   dock?: MobileAssistantDock;
+}
+
+export type ResolvedMobileAssistantPreferences = MobileAssistantPreferences & {
+  terminalButtons: TerminalKeyRowItem[];
+  terminalKeysEnabled: boolean;
+  terminalSecondRow: boolean;
+};
+
+export type TerminalStickyState = "off" | "once" | "locked";
+export interface TerminalStickyModifiers {
+  ctrl: TerminalStickyState;
+  alt: TerminalStickyState;
+}
+
+export const MOBILE_ASSISTANT_CHAT_ACTION_IDS: readonly ShortcutActionId[] = [
+  "approvePrompt",
+  "pollSessions",
+  "previousSession",
+  "nextSession",
+  "archiveSession",
+  "newSession",
+  "findSession",
+  "commandPalette",
+  "openSettings",
+  "renameSession",
+  "openModelPicker",
+  "cycleModel",
+  "cycleEffort",
+  "cyclePermissionMode",
+  "focusComposer",
+  "voiceDictation",
+  "toggleViewMode",
+  "toggleConversationsSidebar",
+  "newShell",
+];
+
+export function visibleChatButtons(
+  preferences: MobileAssistantPreferences,
+): MobileAssistantButton[] {
+  return preferences.buttons.filter(
+    (button) =>
+      button.binding.kind !== "shortcut" ||
+      MOBILE_ASSISTANT_CHAT_ACTION_IDS.includes(button.binding.actionId),
+  );
 }
 
 interface LegacyMobileAssistantPreferences {
@@ -121,6 +243,9 @@ export interface TerminalSoftKeyEventDetail {
   data?: string;
   handled: boolean;
   preferredTarget?: HTMLElement | null;
+  terminalItem?: TerminalKeyRowItem;
+  onStickyChanged?: (next: TerminalStickyModifiers) => void;
+  onStickySubscribed?: (unsubscribe: () => void) => void;
   candidates?: { focused: boolean; ownsPreferredTarget: boolean; send: () => void }[];
 }
 
@@ -195,7 +320,7 @@ export function useTypableTerminals(): TypableTerminalsSnapshot {
   );
 }
 
-const DEFAULT_BUTTONS: MobileAssistantButton[] = [
+const LEGACY_DEFAULT_BUTTONS: MobileAssistantButton[] = [
   {
     id: "default-escape",
     label: "Esc",
@@ -248,14 +373,43 @@ const DEFAULT_BUTTONS: MobileAssistantButton[] = [
 ];
 
 export function defaultMobileAssistantButtons(): MobileAssistantButton[] {
-  return structuredClone(DEFAULT_BUTTONS);
+  return [
+    {
+      id: "default-approve",
+      label: "Approve",
+      binding: { kind: "shortcut", actionId: "approvePrompt" },
+    },
+    {
+      id: "default-poll",
+      label: "Poll",
+      display: "icon",
+      icon: "refresh",
+      binding: { kind: "shortcut", actionId: "pollSessions" },
+    },
+    {
+      id: "default-previous",
+      label: "Previous",
+      binding: { kind: "shortcut", actionId: "previousSession" },
+    },
+    { id: "default-next", label: "Next", binding: { kind: "shortcut", actionId: "nextSession" } },
+    {
+      id: "default-archive",
+      label: "Archive",
+      display: "icon",
+      icon: "archive",
+      binding: { kind: "shortcut", actionId: "archiveSession" },
+    },
+  ];
 }
 
-function defaults(): MobileAssistantPreferences {
+function defaults(): ResolvedMobileAssistantPreferences {
   return {
     version: 2,
     enabled: true,
     buttons: defaultMobileAssistantButtons(),
+    terminalButtons: defaultTerminalButtons(),
+    terminalKeysEnabled: true,
+    terminalSecondRow: true,
   };
 }
 
@@ -264,10 +418,7 @@ function isAction(value: unknown): value is MobileAssistantAction {
 }
 
 function isShortcutAction(value: unknown): value is ShortcutActionId {
-  if (typeof value !== "string" || !(value in DEFAULT_SHORTCUT_DEFINITIONS)) return false;
-  // Card actions only mean anything while a card has focus, which a wheel tap
-  // cannot give them; stored ones are treated as unknown ids.
-  return DEFAULT_SHORTCUT_DEFINITIONS[value as ShortcutActionId].group !== "questionCard";
+  return typeof value === "string" && value in DEFAULT_SHORTCUT_DEFINITIONS;
 }
 
 function isIcon(value: unknown): value is MobileAssistantIcon {
@@ -395,7 +546,72 @@ function legacyActionToButton(action: MobileAssistantAction, index: number): Mob
   };
 }
 
-export function readMobileAssistantPreferences(): MobileAssistantPreferences {
+function normalizeTerminalButtons(value: unknown): TerminalKeyRowItem[] {
+  if (!Array.isArray(value)) return defaultTerminalButtons();
+  const ids = new Set<string>();
+  return value.flatMap((candidate): TerminalKeyRowItem[] => {
+    if (!candidate || typeof candidate !== "object") return [];
+    const item = candidate as Partial<TerminalKeyRowItem>;
+    if (
+      typeof item.id !== "string" ||
+      !item.id ||
+      ids.has(item.id) ||
+      typeof item.label !== "string" ||
+      !item.label.trim()
+    )
+      return [];
+    let normalized: TerminalKeyRowItem;
+    if (item.kind === "modifier" && (item.modifier === "ctrl" || item.modifier === "alt")) {
+      normalized = { id: item.id, label: item.label, kind: "modifier", modifier: item.modifier };
+    } else if (item.kind === "action" && item.action === "keyboard") {
+      normalized = { id: item.id, label: item.label, kind: "action", action: "keyboard" };
+    } else if (item.kind === "key") {
+      const chord = normalizeChord(item.chord);
+      if (!chord) return [];
+      normalized = {
+        id: item.id,
+        label: item.label,
+        kind: "key",
+        chord,
+        ...(item.repeat && mobileAssistantBindingSupportsRepeat({ kind: "key", chord })
+          ? { repeat: true }
+          : {}),
+      };
+    } else return [];
+    ids.add(item.id);
+    return [normalized];
+  });
+}
+
+function splitLegacyButtons(
+  buttons: MobileAssistantButton[],
+  stock: boolean,
+  fromVersionOne = false,
+): Pick<ResolvedMobileAssistantPreferences, "buttons" | "terminalButtons"> {
+  if (stock)
+    return { buttons: defaultMobileAssistantButtons(), terminalButtons: defaultTerminalButtons() };
+  const terminalButtons = defaultTerminalButtons();
+  for (const button of buttons) {
+    if (button.binding.kind !== "key") continue;
+    const stockKey = LEGACY_DEFAULT_BUTTONS.find(
+      (candidate) =>
+        candidate.binding.kind === "key" &&
+        (JSON.stringify(normalizeButton(candidate, 0)) === JSON.stringify(button) ||
+          (fromVersionOne && JSON.stringify(candidate.binding) === JSON.stringify(button.binding))),
+    );
+    if (stockKey) continue;
+    terminalButtons.push({
+      id: `moved-${button.id}`,
+      label: button.label,
+      kind: "key",
+      chord: button.binding.chord,
+      ...(button.repeat ? { repeat: true } : {}),
+    });
+  }
+  return { buttons: buttons.filter((button) => button.binding.kind !== "key"), terminalButtons };
+}
+
+export function readMobileAssistantPreferences(): ResolvedMobileAssistantPreferences {
   if (typeof window === "undefined") return defaults();
   try {
     const raw = window.localStorage.getItem(MOBILE_ASSISTANT_STORAGE_KEY);
@@ -424,9 +640,25 @@ export function readMobileAssistantPreferences(): MobileAssistantPreferences {
         MOBILE_ASSISTANT_MAX_BUTTONS,
       );
       return {
+        ...defaults(),
         version: 2,
         enabled: parsed.enabled,
-        buttons: actions.map(legacyActionToButton),
+        ...splitLegacyButtons(
+          actions.map(legacyActionToButton),
+          JSON.stringify(actions) ===
+            JSON.stringify(MOBILE_ASSISTANT_ACTIONS.map((action) => action.id)) ||
+            JSON.stringify(actions) ===
+              JSON.stringify([
+                "escape",
+                "tab",
+                "arrowUp",
+                "arrowDown",
+                "enter",
+                "pollSessions",
+                "archiveSession",
+              ]),
+          true,
+        ),
         ...((devicePosition ?? normalizePosition(parsed.position))
           ? { position: devicePosition ?? normalizePosition(parsed.position) }
           : {}),
@@ -448,9 +680,17 @@ export function readMobileAssistantPreferences(): MobileAssistantPreferences {
       })
       .slice(0, MOBILE_ASSISTANT_MAX_BUTTONS);
     return {
+      ...defaults(),
       version: 2,
       enabled: parsed.enabled,
-      buttons,
+      ...(Array.isArray(parsed.terminalButtons)
+        ? { buttons, terminalButtons: normalizeTerminalButtons(parsed.terminalButtons) }
+        : splitLegacyButtons(
+            buttons,
+            JSON.stringify(buttons) === JSON.stringify(LEGACY_DEFAULT_BUTTONS.map(normalizeButton)),
+          )),
+      terminalKeysEnabled: parsed.terminalKeysEnabled !== false,
+      terminalSecondRow: parsed.terminalSecondRow !== false,
       ...((devicePosition ?? normalizePosition(parsed.position))
         ? { position: devicePosition ?? normalizePosition(parsed.position) }
         : {}),
@@ -473,6 +713,9 @@ export function writeMobileAssistantPreferences(preferences: MobileAssistantPref
       version: 2,
       enabled: preferences.enabled,
       buttons: preferences.buttons,
+      terminalButtons: preferences.terminalButtons ?? defaultTerminalButtons(),
+      terminalKeysEnabled: preferences.terminalKeysEnabled !== false,
+      terminalSecondRow: preferences.terminalSecondRow !== false,
       ...(preferences.position ? { position: preferences.position } : {}),
       ...(preferences.dock ? { dock: preferences.dock } : {}),
     };
@@ -491,6 +734,30 @@ export function writeMobileAssistantPreferences(preferences: MobileAssistantPref
   } catch {
     // Mobile controls retain their safe defaults when storage is unavailable.
   }
+}
+
+function subscribeMobileAssistantPreferences(listener: () => void): () => void {
+  window.addEventListener(MOBILE_ASSISTANT_CHANGED_EVENT, listener);
+  window.addEventListener("storage", listener);
+  return () => {
+    window.removeEventListener(MOBILE_ASSISTANT_CHANGED_EVENT, listener);
+    window.removeEventListener("storage", listener);
+  };
+}
+
+export function useMobileAssistantPreferences(): ResolvedMobileAssistantPreferences {
+  useSyncExternalStore(
+    subscribeMobileAssistantPreferences,
+    () => {
+      try {
+        return window.localStorage.getItem(MOBILE_ASSISTANT_STORAGE_KEY);
+      } catch {
+        return null;
+      }
+    },
+    () => null,
+  );
+  return readMobileAssistantPreferences();
 }
 
 /** Persist only this device's on-screen placement without syncing button data. */
@@ -678,7 +945,7 @@ export function terminalDataForChord(chord: ShortcutChord): string | null {
     };
     if (chord.code in navigationPayloads) return navigationPayloads[chord.code];
   }
-  if (hasCtrlOrPrimary && !modifiers.has("meta") && !hasShift) {
+  if (hasCtrlOrPrimary && !modifiers.has("meta")) {
     if (/^Key[A-Z]$/.test(chord.code)) {
       const ctrlChar = String.fromCharCode(chord.code.charCodeAt(3) - 64);
       return hasAlt ? `\x1b${ctrlChar}` : ctrlChar;
@@ -691,7 +958,7 @@ export function terminalDataForChord(chord: ShortcutChord): string | null {
       Minus: "\x1f",
       Slash: "\x1f",
     };
-    if (chord.code in controlPunctuation) {
+    if (!hasShift && chord.code in controlPunctuation) {
       const ctrlChar = controlPunctuation[chord.code];
       return hasAlt ? `\x1b${ctrlChar}` : ctrlChar;
     }
@@ -739,12 +1006,14 @@ export function terminalDataForChord(chord: ShortcutChord): string | null {
 }
 
 function dispatchToTerminal(
-  payload: { action: MobileAssistantSoftKey; data?: string },
+  payload: Pick<
+    TerminalSoftKeyEventDetail,
+    "action" | "data" | "terminalItem" | "onStickyChanged" | "onStickySubscribed"
+  >,
   target: HTMLElement,
 ): boolean {
   const detail: TerminalSoftKeyEventDetail = {
-    action: payload.action,
-    ...(payload.data !== undefined ? { data: payload.data } : {}),
+    ...payload,
     handled: false,
     preferredTarget: target,
     candidates: [],
@@ -774,6 +1043,17 @@ function dispatchToTerminal(
     }
   }
   return false;
+}
+
+export function dispatchTerminalAssistantItem(
+  item: TerminalKeyRowItem,
+  preferredDomTarget?: HTMLElement | null,
+  callbacks?: Pick<TerminalSoftKeyEventDetail, "onStickyChanged" | "onStickySubscribed">,
+): void {
+  dispatchToTerminal(
+    { action: "enter", terminalItem: item, ...callbacks },
+    preferredTarget(preferredDomTarget),
+  );
 }
 
 function dispatchGlobalShortcutChord(
