@@ -2030,7 +2030,10 @@ def _probe_codex_home(config_overrides: Sequence[str]) -> Path:
         )
         document.update(picker_config)
         config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
-    _apply_codex_current_route(home / "config.toml", picker_only=True)
+    config_path = home / "config.toml"
+    if route_identity is not None and not config_path.exists():
+        config_path.write_text("", encoding="utf-8")
+    _apply_codex_current_route(config_path, picker_only=True, source_home=source_home)
     return home
 
 

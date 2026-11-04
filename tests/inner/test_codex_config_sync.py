@@ -62,8 +62,14 @@ def test_populate_syncs_approved_value_and_restart_is_noop(
 
 @pytest.mark.parametrize("profile", [False, True], ids=["base", "inline-profile"])
 @pytest.mark.parametrize("relative", [False, True], ids=["absolute", "relative"])
+@pytest.mark.parametrize("route", [False, True], ids=["source-setting", "route-setting"])
 def test_initial_copy_keeps_source_catalog_paths(
-    homes: tuple[Path, Path], profile: bool, relative: bool
+    homes: tuple[Path, Path],
+    profile: bool,
+    relative: bool,
+    route: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source, target = homes
     catalog = source / "models.json"
@@ -71,21 +77,30 @@ def test_initial_copy_keeps_source_catalog_paths(
     setting = json.dumps(catalog.name if relative else str(catalog))
     layer = "[profiles.work]\n" if profile else ""
     original = f"{layer}model_catalog_json = {setting} # user catalog\n"
-    (source / "config.toml").write_text(original)
+    source_original = "" if route else original
+    (source / "config.toml").write_text(source_original)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    if route:
+        route_file = tmp_path / ".codex-route" / "current.toml"
+        route_file.parent.mkdir()
+        route_file.write_text(original)
     path = target / "config.toml"
-    assert (
-        codex_config_sync.sync_codex_config(
-            source / "config.toml", path, minimal_config=False, include_credentials=True
+    if route:
+        _populate_codex_home_config(target, source, minimal_config=False)
+    else:
+        assert (
+            codex_config_sync.sync_codex_config(
+                source / "config.toml", path, minimal_config=False, include_credentials=True
+            )
+            == "created"
         )
-        == "created"
-    )
     copied = path.read_text()
     data = tomllib.loads(copied)
     selected = data["profiles"]["work"] if profile else data
     assert selected["model_catalog_json"] == str(catalog)
     assert Path(selected["model_catalog_json"]).read_text() == '{"models": []}'
     assert "# user catalog" in copied
-    assert (source / "config.toml").read_text() == original
+    assert (source / "config.toml").read_text() == source_original
     path.write_text('model_catalog_json = "session.json"\n')
     codex_config_sync.sync_codex_config(
         source / "config.toml", path, minimal_config=False, include_credentials=True

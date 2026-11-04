@@ -1243,17 +1243,21 @@ def build_native_controls(
         # session — keeping the SHAPE's stored default (a session's own pin
         # must not become the host-wide default).
         asyncio.get_running_loop().create_task(
-            _write_back_codex_catalog(conv_id, [dict(row) for row in rows])
+            _write_back_codex_catalog(conv_id, [dict(row) for row in rows], Path(state.codex_home))
         )
         return marked
 
-    async def _write_back_codex_catalog(session_id: str, rows: list[_JsonObject]) -> None:
+    async def _write_back_codex_catalog(
+        session_id: str, rows: list[_JsonObject], codex_home: Path
+    ) -> None:
         try:
             from omnigent.harnesses.codex_native.app_server import (
+                _codex_current_route_identity,
                 codex_catalog_fingerprint,
                 mark_launch_default,
                 resolve_native_codex_launch,
             )
+            from omnigent.inner.codex_executor import _CODEX_HOME_ROUTE_RECORD
             from omnigent.models import model_catalog_store
 
             spec = await _resolve_session_agent_spec(session_id)
@@ -1261,6 +1265,11 @@ def build_native_controls(
                 return
             launch = await asyncio.to_thread(resolve_native_codex_launch, model=None, spec=spec)
             fingerprint = codex_catalog_fingerprint(launch)
+            # Older private homes have no route record; their live rows cannot
+            # safely identify the host's current shared catalog.
+            route_identity = (codex_home / _CODEX_HOME_ROUTE_RECORD).read_text(encoding="utf-8")
+            if route_identity != (_codex_current_route_identity() or "none"):
+                return
             stored = model_catalog_store.read_catalog("codex-native", fingerprint)
             stored_default = next(
                 (row.get("id") for row in stored or [] if row.get("isDefault") is True),

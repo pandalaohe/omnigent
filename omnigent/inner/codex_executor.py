@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -251,6 +252,7 @@ _CODEX_HOME_HARDLINK_FILES = frozenset({".credentials.json"})
 # Unlike a symlink, a hard link records no path back to its source home, so the
 # private home records it here for nested launches to resolve.
 _CODEX_HOME_SOURCE_RECORD = ".omnigent-codex-source"
+_CODEX_HOME_ROUTE_RECORD = ".omnigent-codex-route"
 _CODEX_HOME_GLOBAL_INSTRUCTION_FILES = ("AGENTS.md", "AGENTS.override.md", "hooks.json")
 # Name of the hooks file inside a CODEX_HOME. Symlinked from the user's home
 # by default; generated as a merged regular file when subagent routing is on.
@@ -1364,19 +1366,22 @@ def _sync_codex_windows_sandbox(source_config: Path, dest_config: Path) -> None:
                 logger.warning("could not remove temporary Codex config %s (%s)", tmp_name, exc)
 
 
-def _apply_codex_current_route(config_path: Path, *, picker_only: bool = False) -> None:
-    """Apply the host's current route to a newly copied session config."""
+def _apply_codex_current_route(
+    config_path: Path, *, picker_only: bool = False, source_home: Path | None = None
+) -> str | None:
+    """Apply the route and return its content digest after successful publication."""
     import tomlkit
     import tomlkit.exceptions
 
     route_path = Path.home() / ".codex-route" / "current.toml"
     try:
-        route = tomlkit.parse(route_path.read_text(encoding="utf-8"))
+        route_content = route_path.read_bytes()
+        route = tomlkit.parse(route_content.decode("utf-8"))
     except FileNotFoundError:
-        return
+        return None
     except (OSError, UnicodeError, ValueError, tomlkit.exceptions.TOMLKitError) as exc:
         logger.warning("Codex current route skipped: %s", type(exc).__name__)
-        return
+        return None
     try:
         document = tomlkit.parse(config_path.read_text(encoding="utf-8"))
         picker_keys = {
@@ -1401,9 +1406,13 @@ def _apply_codex_current_route(config_path: Path, *, picker_only: bool = False) 
                     break
             else:
                 parent.pop(parts[-1], None)
-        _write_codex_config(config_path, tomlkit.dumps(document))
+        if source_home is not None:
+            normalize_codex_catalog_paths(document, source_home)
+        if _write_codex_config(config_path, tomlkit.dumps(document)):
+            return hashlib.sha256(route_content).hexdigest()
     except (OSError, UnicodeError, ValueError, tomlkit.exceptions.TOMLKitError) as exc:
         logger.warning("Codex current route skipped: %s", type(exc).__name__)
+    return None
 
 
 def _populate_codex_home_config(
@@ -1679,7 +1688,10 @@ def _populate_codex_home_config(
                 if catalog_path is not None:
                     set_codex_model_catalog_path(dest_path, catalog_path)
             if not config_existed and include_credentials and not minimal_config:
-                _apply_codex_current_route(dest_path)
+                route_identity = _apply_codex_current_route(dest_path, source_home=source_dir)
+                _write_codex_config(
+                    target_dir / _CODEX_HOME_ROUTE_RECORD, route_identity or "none"
+                )
 
 
 def materialize_codex_provider_config(

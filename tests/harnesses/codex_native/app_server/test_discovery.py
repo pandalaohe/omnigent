@@ -817,16 +817,23 @@ def test_codex_catalog_fingerprint_tracks_configured_catalog(
 
 
 @pytest.mark.parametrize("refresh", [None, "force"], ids=["fresh-session", "forced-probe"])
+@pytest.mark.parametrize("source_config", [True, False], ids=["source-config", "no-source-config"])
+@pytest.mark.parametrize("relative", [False, True], ids=["absolute", "relative"])
 async def test_codex_catalog_follows_current_route(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refresh: str | None
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    refresh: str | None,
+    source_config: bool,
+    relative: bool,
 ) -> None:
     from omnigent.harnesses.codex_native import app_server
 
     source = tmp_path / "source"
     source.mkdir()
-    (source / "config.toml").write_text(
-        'model = "source-model"\nprofile = "old"\n[profiles.old]\nmodel = "source-model"\n'
-    )
+    if source_config:
+        (source / "config.toml").write_text(
+            'model = "source-model"\nprofile = "old"\n[profiles.old]\nmodel = "source-model"\n'
+        )
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setattr(app_server, "_codex_home_config_source_from_env", lambda: source)
@@ -839,8 +846,9 @@ async def test_codex_catalog_follows_current_route(
         catalogs.append(catalog)
 
     def write_route(index: int) -> None:
+        catalog_setting = catalogs[index].name if relative else str(catalogs[index])
         route.write_text(
-            f'model = "route-model"\nmodel_catalog_json = {json.dumps(str(catalogs[index]))}\n'
+            f'model = "route-model"\nmodel_catalog_json = {json.dumps(catalog_setting)}\n'
             'model_provider = "gateway"\nremove = ["profile", "profiles.old"]\n'
             '[model_providers.gateway]\nbase_url = "https://route.example/v1"\n'
             '[mcp_servers.unrelated]\ncommand = "must-not-start"\n'
@@ -864,9 +872,10 @@ async def test_codex_catalog_follows_current_route(
             return {"result": {"config": {"model": config.get("model")}}}
         assert method == "model/list"
         catalog_path = config.get("model_catalog_json")
-        rows = (
-            json.loads(Path(str(catalog_path)).read_text()) if catalog_path else [{"id": "source"}]
-        )
+        catalog = Path(str(catalog_path)) if catalog_path else None
+        if catalog is not None and not catalog.is_absolute():
+            catalog = homes[-1] / catalog
+        rows = json.loads(catalog.read_text()) if catalog else [{"id": "source"}]
         return {"result": {"data": rows}}
 
     client = AsyncMock(spec=CodexAppServerClient)
@@ -898,8 +907,9 @@ async def test_codex_catalog_follows_current_route(
         assert "mcp_servers" not in config
 
 
+@pytest.mark.parametrize("source_config", [True, False], ids=["source-config", "no-source-config"])
 def test_codex_without_current_route_keeps_catalog_identity(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source_config: bool
 ) -> None:
     import hashlib
 
@@ -908,7 +918,8 @@ def test_codex_without_current_route_keeps_catalog_identity(
 
     source = tmp_path / ".codex"
     source.mkdir()
-    (source / "config.toml").write_text('model = "source-model"\n')
+    if source_config:
+        (source / "config.toml").write_text('model = "source-model"\n')
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr(app_server, "_codex_home_config_source_from_env", lambda: source)
     legacy_identity = (
@@ -930,7 +941,10 @@ def test_codex_without_current_route_keeps_catalog_identity(
     )
     home = app_server._probe_codex_home([])
     assert home.name == hashlib.sha256(str(source.resolve()).encode()).hexdigest()[:12]
-    assert tomllib.loads((home / "config.toml").read_text()) == {"model": "source-model"}
+    if source_config:
+        assert tomllib.loads((home / "config.toml").read_text()) == {"model": "source-model"}
+    else:
+        assert not (home / "config.toml").exists()
 
 
 @pytest.mark.parametrize("code", [-32600, -32602])
