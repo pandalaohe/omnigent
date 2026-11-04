@@ -5771,11 +5771,13 @@ async def _complete_created_session(
                 startup = _string_object_dict(data.get("startup"))
                 held = (
                     startup is not None
-                    and startup.get("reason") == "host_load"
+                    and startup.get("reason") in {"host_load", "pool_full"}
                     and startup.get("status") == "queued"
                 )
                 initial_message = (
-                    {"status": "queued", "reason": "host_load"} if held else {"status": "sent"}
+                    {"status": "queued", "reason": (startup or {}).get("reason")}
+                    if held
+                    else {"status": "sent"}
                 )
                 if remote and not held:
                     _subagent_work.mark_subagent_work_started(child_id)
@@ -5815,6 +5817,7 @@ async def _complete_created_session(
             **({"initial_message": initial_message} if initial_message is not None else {}),
             **({"host_load": data["host_load"]} if "host_load" in data else {}),
             **({"startup": data["startup"]} if "startup" in data else {}),
+            **({"session_choice": data["session_choice"]} if data.get("session_choice") else {}),
         }
     )
 
@@ -5833,6 +5836,11 @@ _SESSION_OPEN_ALLOWED_ARGS = frozenset(
         "branch",
         "wait_for_host",
         "title",
+        "work_type",
+        "user_named",
+        "choice_reason",
+        "exclude",
+        "differ_from",
     }
 )
 
@@ -5868,7 +5876,7 @@ async def _execute_session_open_tool(
     extra = set(args) - _SESSION_OPEN_ALLOWED_ARGS
     if extra:
         return invalid(f"unexpected argument: {sorted(extra)[0]}")
-    for key in ("project", "host", "agent"):
+    for key in ("project", "host"):
         value = args.get(key)
         if not isinstance(value, str) or not value:
             return invalid(f"'{key}' must be a non-empty string")
@@ -5879,6 +5887,7 @@ async def _execute_session_open_tool(
         response = await server_client.post(
             f"/v1/sessions/{conversation_id}/open",
             json=dict(args),
+            headers={"x-omnigent-session-choice": "1"},
             timeout=180.0,
         )
     except Exception as exc:  # noqa: BLE001
@@ -6082,7 +6091,7 @@ async def _execute_session_create_impl(
     placement_mode = args.get("placement", "child")
     if placement_mode not in ("child", "same_host", "managed"):
         return json.dumps({"error": "placement must be child, same_host or managed"})
-    if placement_mode != "child" and (has_config_path or not has_agent_id):
+    if placement_mode != "child" and has_config_path:
         return json.dumps({"error": "Independent sessions require agent_id"})
     message = args.get("message")
     if placement_mode != "child" and message is not None:
@@ -6169,6 +6178,10 @@ async def _execute_session_create_impl(
         speed=args.get("speed"),
     )
     headers: dict[str, str] = dict(_AGENT_CREATE_HEADERS)
+    headers["x-omnigent-session-choice"] = "1"
+    for key in ("work_type", "user_named", "choice_reason", "exclude", "differ_from"):
+        if key in args:
+            body[key] = args[key]
     if placement_mode != "child":
         from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 
@@ -6238,7 +6251,13 @@ async def _execute_session_create_impl(
         from omnigent.runner.session_requests import is_wrong_replica
 
         # Host loss can be reported before persistence or during the later launch.
-        if is_wrong_replica(resp) or resp.status_code == 409:
+        if is_wrong_replica(resp) or (
+            resp.status_code == 409
+            and not any(
+                code in resp.text
+                for code in ("session_choice_ask", "agent_busy", "agent_exhausted")
+            )
+        ):
             return json.dumps(unconfirmed_creation)
     if placement_mode != "child" and resp.status_code in (404, 405):
         return json.dumps(
@@ -6255,6 +6274,14 @@ async def _execute_session_create_impl(
         return _open_rate_error(resp)
     if resp.status_code == 409 and (cap_error := _child_cap_error(resp)) is not None:
         return cap_error
+    if resp.status_code == 409:
+        detail = resp.json().get("detail")
+        if isinstance(detail, dict) and detail.get("code") in {
+            "session_choice_ask",
+            "agent_busy",
+            "agent_exhausted",
+        }:
+            return json.dumps({"error": detail["code"], **detail})
     if resp.status_code >= 400:
         return json.dumps(
             {"error": f"sys_session_create returned {resp.status_code}", "detail": resp.text}

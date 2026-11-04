@@ -217,6 +217,40 @@ async def _post(
     return response.json()
 
 
+@pytest.mark.asyncio
+async def test_session_choice_open_accepts_work_type_and_preserves_choice_fields(
+    open_env, monkeypatch
+):
+    env = open_env
+    env["app"].state.user_preferences_store = _FakePreferences(
+        {
+            "sessionChoice": {
+                "enabled": True,
+                "workTypes": [{"id": "review", "label": "Review"}],
+                "hosts": {HOST_ID: {"review": [[{"links": [{"agent": env["agent_id"]}]}]]}},
+            }
+        }
+    )
+    captured = _patch_create(env, monkeypatch)
+    async with await _client(env) as client:
+        response = await client.post(
+            f"/v1/sessions/{env['sender'].id}/open",
+            headers={**_headers(env["sender_token"]), "x-omnigent-session-choice": "1"},
+            json={
+                "project": "Target",
+                "host": HOST_NAME,
+                "work_type": "review",
+                "exclude": ["account-a"],
+            },
+        )
+    assert response.status_code == 200, response.text
+    assert response.json()["state"] == "opened", response.text
+    assert captured["body"].work_type == "review"
+    assert captured["body"].agent_id is None
+    assert captured["body"].exclude == ["account-a"]
+    assert captured["kwargs"]["created_by_session_id"] == env["sender"].id
+
+
 def _patch_create(
     env: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,

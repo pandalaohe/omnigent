@@ -2669,6 +2669,9 @@ def create_app(
 
     app.state.host_load_inputs = ManagedStartupInputs(conversation_store, host_registry)
     app.state.host_load_queue = HostLoadQueue(conversation_store)
+    from omnigent.server.child_cap import ChildCapLocks
+
+    app.state.child_cap_locks = ChildCapLocks()
 
     def _register_startup_dispatch(handler: StartupDispatch) -> None:
         app.state.host_load_inputs.dispatch = handler
@@ -2773,6 +2776,8 @@ def create_app(
 
     host_registry.launch_authorizer = _admit_host_launch
     app.state.agent_store = agent_store
+    app.state.conversation_store = conversation_store
+    app.state.permission_store = permission_store
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
     app.state.feature_flags = resolved_feature_flags

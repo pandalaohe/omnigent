@@ -3043,6 +3043,8 @@ def _build_session_response(
             permission_tiers_capability = (
                 conv.labels.get(PERMISSION_CAPABILITY_LABEL_KEY) == PERMISSION_CAPABILITY_VALUE
             )
+    from omnigent.server.session_choice_runtime import choice_record
+
     return SessionResponse(
         id=conv.id,
         agent_id=conv.agent_id,
@@ -3062,6 +3064,7 @@ def _build_session_response(
         archived_at=conv.archived_at,
         title=title_without_closed_marker(conv.title),
         labels=labels,
+        session_choice=choice_record(conv),
         runner_id=conv.runner_id,
         host_id=conv.host_id,
         runner_online=runner_online,
@@ -14339,6 +14342,38 @@ async def _create_session_from_existing_agent(
     runner_router: RunnerRouter | None,
     body: SessionCreateInput,
     request: Request,
+    **kwargs: Any,
+) -> tuple[SessionResponse, Conversation]:
+    from omnigent.server.session_choice_runtime import CHOICE_PROTOCOL_HEADER, admit_create
+
+    if request.headers.get(CHOICE_PROTOCOL_HEADER) != "1":
+        return await _create_session_from_existing_agent_impl(
+            conversation_store, agent_store, runner_router, body, request, **kwargs
+        )
+    caller_id = body.parent_session_id or kwargs.get("created_by_session_id")
+    caller = (
+        await asyncio.to_thread(conversation_store.get_conversation, caller_id)
+        if caller_id
+        else None
+    )
+    async with admit_create(request.app, body, caller, kwargs.get("user_id")) as selection:
+        return await _create_session_from_existing_agent_impl(
+            conversation_store,
+            agent_store,
+            runner_router,
+            selection.body if selection else body,
+            request,
+            choice_admission=selection,
+            **kwargs,
+        )
+
+
+async def _create_session_from_existing_agent_impl(
+    conversation_store: ConversationStore,
+    agent_store: AgentStore,
+    runner_router: RunnerRouter | None,
+    body: SessionCreateInput,
+    request: Request,
     agent_cache: AgentCache | None = None,
     user_id: str | None = None,
     permission_store: PermissionStore | None = None,
@@ -14351,6 +14386,7 @@ async def _create_session_from_existing_agent(
     calling_path_label: str = "POST /v1/sessions",
     host_load_hold: Any = None,
     created_by_session_id: str | None = None,
+    choice_admission: Any = None,
 ) -> tuple[SessionResponse, Conversation]:
     """
     Create a session bound to an already-registered agent.
@@ -15447,6 +15483,8 @@ async def _create_session_from_existing_agent(
 
     native_agent = native_coding_agent_for_agent_name(agent.name)
     initial_labels = dict(body.labels) if body.labels else {}
+    if choice_admission is not None:
+        initial_labels.update(choice_admission.labels(time.time()))
     if host_load_hold:
         initial_labels["omnigent.startup.host_load"] = f"queued@{host_load_hold.host_id}"
     client_surface = resolve_client_surface(
@@ -15670,6 +15708,9 @@ async def _create_session_from_existing_agent(
     # The create request has no conv id in its URL, so the path-based
     # FastAPI hook can't tag it — stamp the minted id so the create span
     # joins the session's session.id group.
+    if choice_admission is not None:
+        await choice_admission.persisted(request.app, conv)
+
     from omnigent.runtime import telemetry
 
     session_created(
@@ -15799,12 +15840,13 @@ async def _create_session_from_existing_agent(
                     request.app.state.standing_approval_service.first_message, conv, item
                 )
                 break
-    if host_load_hold and body.initial_items:
+    choice_held = choice_admission is not None and choice_admission.choice.outcome == "hold"
+    if (host_load_hold or choice_held) and body.initial_items:
         for index, item in enumerate(body.initial_items):
             await request.app.state.host_load_inputs.enqueue(
                 conv.id, item, user_id=user_id, headers=request.headers, first=index == 0
             )
-    if body.initial_items and not defer_initial_items and not host_load_hold:
+    if body.initial_items and not defer_initial_items and not host_load_hold and not choice_held:
         runner_client = await _get_runner_client(
             conv.id,
             runner_router,

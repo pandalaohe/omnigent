@@ -8067,6 +8067,19 @@ class SqlAlchemyConversationStore(ConversationStore):
         encoded_status = encode_session_live_status(status)
 
         def write(session: Session) -> None:
+            from omnigent.server.session_choice import SLOT_LABEL
+
+            session.execute(
+                delete(SqlConversationLabel).where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.conversation_id == conversation_id,
+                    SqlConversationLabel.key == SLOT_LABEL,
+                    or_(
+                        SqlConversationLabel.value.startswith("admitted@"),
+                        SqlConversationLabel.value.startswith("releasing@"),
+                    ),
+                )
+            )
             session.execute(
                 update(SqlConversationMetadata)
                 .where(

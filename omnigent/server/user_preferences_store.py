@@ -2110,6 +2110,68 @@ class SqlAlchemyUserPreferencesStore:
         value = collab.get("sessionChoice") if isinstance(collab, dict) else None
         return {"settings": value, "revision": choice_revision(value)}
 
+    def choice_floor_off(self, user_id: str) -> dict[str, Any]:
+        from omnigent.server.session_choice import FloorOff
+
+        with self._session("read_session_choice_floor_off") as session:
+            raw = session.scalar(
+                select(type_coerce(SqlPreference.value, LargeBinary)).where(
+                    SqlPreference.workspace_id == current_workspace_id(),
+                    SqlPreference.user_id == user_id,
+                    SqlPreference.key == "session_choice.floor_off",
+                )
+            )
+        if raw is None:
+            return {}
+        document = json.loads(decode(raw, max_decoded_bytes=USER_PREFERENCES_MAX_BYTES) or "{}")
+        return {
+            pool: FloorOff(until=value["until"], windows=value.get("windows", {}))
+            for pool, value in document.items()
+        }
+
+    def set_choice_floor_off(
+        self,
+        user_id: str,
+        pool: str,
+        entry: Any | None,
+        *,
+        create_if_missing: bool = True,
+    ) -> None:
+        from dataclasses import asdict
+
+        def write(session: Session) -> None:
+            _require_user_row(session, user_id, create_if_missing)
+            self._upsert_row(
+                session,
+                user_id=user_id,
+                key=_ENVELOPE_VERSION_KEY,
+                value=_encode_value(USER_PREFERENCE_VERSION),
+            )
+            raw = session.scalar(
+                select(type_coerce(SqlPreference.value, LargeBinary)).where(
+                    SqlPreference.workspace_id == current_workspace_id(),
+                    SqlPreference.user_id == user_id,
+                    SqlPreference.key == "session_choice.floor_off",
+                )
+            )
+            document = (
+                json.loads(decode(raw, max_decoded_bytes=USER_PREFERENCES_MAX_BYTES) or "{}")
+                if raw
+                else {}
+            )
+            if entry is None:
+                document.pop(pool, None)
+            else:
+                document[pool] = asdict(entry)
+            self._upsert_row(
+                session,
+                user_id=user_id,
+                key="session_choice.floor_off",
+                value=_encode_value(document),
+            )
+
+        run_write_transaction(self._write_session, "change_session_choice_floor_off", write)
+
     def replace_session_choice(
         self,
         user_id: str,

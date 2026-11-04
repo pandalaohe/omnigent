@@ -90,7 +90,12 @@ class SessionOpenRequest(BaseModel):
 
     project: str = Field(min_length=1)
     host: str = Field(min_length=1)
-    agent: str = Field(min_length=1)
+    agent: str | None = Field(default=None, min_length=1)
+    work_type: str | None = None
+    user_named: bool = False
+    choice_reason: str | None = None
+    exclude: list[str] = Field(default_factory=list)
+    differ_from: str | None = None
     model: str | None = None
     reasoning_effort: str | None = None
     speed: Literal["standard", "fast"] | None = None
@@ -163,6 +168,7 @@ class _PendingOpen:
     body: SessionOpenRequest
     created_at: int
     expiry_handle: asyncio.TimerHandle | None = field(default=None)
+    choice_protocol: bool = False
 
 
 class PendingOpens:
@@ -360,13 +366,19 @@ def register_open_routes(
                 return rows
             after = page.last_id
 
-    def _synthetic_request(session_id: str) -> Request:
+    def _synthetic_request(session_id: str, choice_protocol: bool = False) -> Request:
         """Build the standalone request the pending fire path needs."""
         from omnigent.server.peer_sweeper import PeerSweeper
 
         sweeper = getattr(app_state, "peer_sweeper", None)
         app = getattr(sweeper, "_app", None) or SimpleNamespace(state=app_state)
-        return PeerSweeper._synthetic_request(session_id, app)
+        request = PeerSweeper._synthetic_request(session_id, app)
+        if choice_protocol:
+            request.scope["headers"] = [
+                *request.scope.get("headers", []),
+                (b"x-omnigent-session-choice", b"1"),
+            ]
+        return request
 
     def _placement_problem(
         body: SessionOpenRequest,
@@ -511,8 +523,13 @@ def register_open_routes(
                 "project_id": project.id,
                 "host_id": host_id,
                 "workspace": workspace,
-                "agent_id": agent.id,
+                "agent_id": agent.id if body.agent is not None else None,
                 "title": body.title,
+                "work_type": body.work_type,
+                "user_named": body.user_named,
+                "choice_reason": body.choice_reason,
+                "exclude": body.exclude,
+                "differ_from": body.differ_from,
             }
             # Omitted fields fall through to create defaults: a plain open
             # leaves git for the project hint, an explicit workspace pins it.
@@ -543,8 +560,23 @@ def register_open_routes(
                 project_store=project_store,
                 conversation_id=sid,
                 calling_path_label="sys_session_open",
+                created_by_session_id=sender.id,
             )
+            from omnigent.server.session_choice_runtime import choice_record
+
+            selected = choice_record(conv)
+            if selected is not None:
+                actual = await asyncio.to_thread(agent_store.get, conv.agent_id)
+                if actual is not None:
+                    agent_name = public_agent_name(actual.name) or actual.name
         except Exception as exc:
+            if (
+                isinstance(exc, HTTPException)
+                and isinstance(exc.detail, dict)
+                and exc.detail.get("code")
+                in {"session_choice_ask", "agent_busy", "agent_exhausted"}
+            ):
+                return {"error": exc.detail["code"], **exc.detail}
             detail = str(exc)
             reason = (
                 "branch_exists"
@@ -605,6 +637,7 @@ def register_open_routes(
             "git_branch": conv.git_branch,
             "first_message": first_message,
             "shared_with": [],
+            **({"session_choice": selected} if selected is not None else {}),
         }
         if git is not None and not git.existing_worktree:
             # The open cut a fresh branch worktree; nothing shares it yet.
@@ -730,7 +763,7 @@ def register_open_routes(
             agent=agent,
             agent_name=public_agent_name(agent.name) or agent.name,
             body=entry.body,
-            request=_synthetic_request(entry.sid),
+            request=_synthetic_request(entry.sid, entry.choice_protocol),
         )
 
     async def _collab_enabled(owner: str) -> bool:
@@ -869,20 +902,45 @@ def register_open_routes(
         )
         if placement is not None:
             return placement
+        from omnigent.server.session_choice import active_on, resolve_work_type
+        from omnigent.server.session_choice_runtime import CHOICE_PROTOCOL_HEADER
+
+        agent_hint = body.agent
+        if request.headers.get(CHOICE_PROTOCOL_HEADER) == "1" and not (
+            body.agent and (body.user_named or body.choice_reason)
+        ):
+            settings = (
+                await asyncio.to_thread(
+                    read_collab_settings, getattr(app_state, "user_preferences_store", None), owner
+                )
+            ).session_choice
+            if active_on(settings, host_id):
+                work, _ = resolve_work_type(settings, body.work_type)
+                tiers = settings.hosts[host_id].get(work.id, ())
+                if not tiers or not tiers[0]:
+                    return {"error": "session_choice_ask", "work_type": work.id, "skipped": []}
+                # The shared create boundary does the actual selection under the owner lock.
+                agent_hint = tiers[0][0].links[0].agent_id
+        if agent_hint is None:
+            return _problem(
+                "needs_input",
+                "agent_not_found",
+                "Choose an agent or configure session choice on this host.",
+            )
         agent = (
-            await asyncio.to_thread(agent_store.get, body.agent)
-            if agent_store and _store_id(body.agent)
+            await asyncio.to_thread(agent_store.get, agent_hint)
+            if agent_store and _store_id(agent_hint)
             else None
         )
         if agent is None and agent_store:
-            agent = await asyncio.to_thread(agent_store.get_by_name, body.agent)
+            agent = await asyncio.to_thread(agent_store.get_by_name, agent_hint)
         if agent is None and agent_store:
             matches = []
             after = None
             while True:
                 page = await asyncio.to_thread(agent_store.list, limit=200, after=after)
                 for item in page.data:
-                    if (public_agent_name(item.name) or "").casefold() != body.agent.casefold():
+                    if (public_agent_name(item.name) or "").casefold() != agent_hint.casefold():
                         continue
                     try:
                         visible = await validate_session_agent(
@@ -968,6 +1026,7 @@ def register_open_routes(
                     agent_id=agent.id,
                     body=body,
                     created_at=int(time.time()),
+                    choice_protocol=request.headers.get("x-omnigent-session-choice") == "1",
                 ),
                 settings.undelivered_ttl_s,
             )
