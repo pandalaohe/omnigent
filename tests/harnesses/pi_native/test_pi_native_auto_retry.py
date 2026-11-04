@@ -136,3 +136,65 @@ const read = () => JSON.parse(fs.readFileSync(path.join(bridgeDir, 'auto-retry.j
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert read_receipt(tmp_path, guard.input_id).reason == "superseded_by_human_input"
+
+
+def test_pi_turn_edges_survive_a_workspace_with_its_own_omnigent_package(tmp_path):
+    """A Pi child working inside an omnigent checkout still reports its turn end."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node required for resident Pi extension")
+    workspace = tmp_path / "workspace"
+    shadow = workspace / "omnigent" / "native"
+    shadow.mkdir(parents=True)
+    (workspace / "omnigent" / "__init__.py").write_text("")
+    (shadow / "__init__.py").write_text("")
+    (shadow / "auto_retry.py").write_text("raise SystemExit('shadowed')\n")
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    (bridge / "config.json").write_text(
+        json.dumps(
+            {
+                "sessionId": "child",
+                "bridgeDir": str(bridge),
+                "autoRetryPython": sys.executable,
+                "serverUrl": "http://omnigent.test",
+            }
+        )
+    )
+    script = r"""
+const assert = require("assert").strict;
+const path = require("path");
+const [extensionPath, bridgeDir] = process.argv.slice(1);
+process.env.OMNIGENT_PI_NATIVE_CONFIG = path.join(bridgeDir, "config.json");
+const posted = [];
+global.fetch = async (_url, request) => {
+  posted.push(JSON.parse(request.body));
+  return {ok: true, status: 204};
+};
+global.setInterval = () => ({fakeInterval: true});
+const handlers = {};
+require(extensionPath)({registerCommand() {}, on(name, handler) {handlers[name] = handler;}});
+const ctx = {ui: {setTitle() {}, setStatus() {}, notify() {}}};
+(async () => {
+  await handlers.agent_start({}, ctx);
+  await handlers.message_end({message: {role: "assistant", timestamp: 2, stopReason: "stop",
+    content: [{type: "text", text: "done"}]}}, ctx);
+  await handlers.agent_end({}, ctx);
+  const terminal = posted.filter(e => e.type === "external_session_status").at(-1).data;
+  assert.equal(terminal.status, "idle");
+  assert.equal(terminal.turn_outcome, "completed");
+  await handlers.session_shutdown();
+})().catch(error => { console.error(error); process.exit(1); });
+"""
+    extension = (
+        Path(__file__).resolve().parents[3]
+        / "omnigent/resources/pi_native/omnigent_pi_native_extension.js"
+    )
+    result = subprocess.run(
+        [node, "-e", script, str(extension), str(bridge)],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
