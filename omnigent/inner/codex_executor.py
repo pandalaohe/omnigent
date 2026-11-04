@@ -1364,7 +1364,7 @@ def _sync_codex_windows_sandbox(source_config: Path, dest_config: Path) -> None:
                 logger.warning("could not remove temporary Codex config %s (%s)", tmp_name, exc)
 
 
-def _apply_codex_current_route(config_path: Path) -> None:
+def _apply_codex_current_route(config_path: Path, *, picker_only: bool = False) -> None:
     """Apply the host's current route to a newly copied session config."""
     import tomlkit
     import tomlkit.exceptions
@@ -1379,11 +1379,21 @@ def _apply_codex_current_route(config_path: Path) -> None:
         return
     try:
         document = tomlkit.parse(config_path.read_text(encoding="utf-8"))
+        picker_keys = {
+            "model",
+            "model_catalog_json",
+            "profile",
+            "profiles",
+            "model_provider",
+            "model_providers",
+        }
         for key, value in route.items():
-            if key not in {"route", "remove"}:
+            if key not in {"route", "remove"} and (not picker_only or key in picker_keys):
                 document[key] = value
         for dotted_key in route.get("remove", []):
             parts = dotted_key.split(".")
+            if picker_only and parts[0] not in picker_keys:
+                continue
             parent = document
             for part in parts[:-1]:
                 parent = parent.get(part)

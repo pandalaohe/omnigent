@@ -768,7 +768,15 @@ def test_codex_probe_home_is_keyed_by_the_source_home(
 
 @pytest.mark.parametrize(
     "change",
-    ["catalog-content", "catalog-path", "default-model", "profile", "auth", "source-home"],
+    [
+        "catalog-content",
+        "catalog-path",
+        "default-model",
+        "profile",
+        "auth",
+        "source-home",
+        "current-route",
+    ],
 )
 def test_codex_catalog_fingerprint_tracks_configured_catalog(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
@@ -779,6 +787,7 @@ def test_codex_catalog_fingerprint_tracks_configured_catalog(
     catalog.write_text('{"models": []}')
     config = tmp_path / "config.toml"
     config.write_text('model = "first"\nmodel_catalog_json = "models.json"\n')
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr(app_server, "_codex_home_config_source_from_env", lambda: tmp_path)
     launch = NativeCodexLaunch([], None, None)
     before = app_server.codex_catalog_fingerprint(launch, codex_path=sys.executable)
@@ -795,12 +804,133 @@ def test_codex_catalog_fingerprint_tracks_configured_catalog(
         )
     elif change == "auth":
         (tmp_path / "auth.json").write_text("{}")
+    elif change == "current-route":
+        route = tmp_path / ".codex-route" / "current.toml"
+        route.parent.mkdir()
+        route.write_text('model = "second"\n')
     else:
         monkeypatch.setattr(
             app_server, "_codex_home_config_source_from_env", lambda: tmp_path / "other"
         )
 
     assert app_server.codex_catalog_fingerprint(launch, codex_path=sys.executable) != before
+
+
+@pytest.mark.parametrize("refresh", [None, "force"], ids=["fresh-session", "forced-probe"])
+async def test_codex_catalog_follows_current_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refresh: str | None
+) -> None:
+    from omnigent.harnesses.codex_native import app_server
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.toml").write_text(
+        'model = "source-model"\nprofile = "old"\n[profiles.old]\nmodel = "source-model"\n'
+    )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr(app_server, "_codex_home_config_source_from_env", lambda: source)
+    route = tmp_path / ".codex-route" / "current.toml"
+    route.parent.mkdir()
+    catalogs = []
+    for name in ("first", "other"):
+        catalog = source / f"{name}.json"
+        catalog.write_text(json.dumps([{"id": name, "isDefault": True}]))
+        catalogs.append(catalog)
+
+    def write_route(index: int) -> None:
+        route.write_text(
+            f'model = "route-model"\nmodel_catalog_json = {json.dumps(str(catalogs[index]))}\n'
+            'model_provider = "gateway"\nremove = ["profile", "profiles.old"]\n'
+            '[model_providers.gateway]\nbase_url = "https://route.example/v1"\n'
+            '[mcp_servers.unrelated]\ncommand = "must-not-start"\n'
+        )
+
+    configs: list[dict[str, object]] = []
+    homes: list[Path] = []
+
+    async def start(**kwargs: object) -> object:
+        env = kwargs["env"]
+        assert isinstance(env, dict)
+        home = Path(env["CODEX_HOME"])
+        homes.append(home)
+        configs.append(tomllib.loads((home / "config.toml").read_text()))
+        return object()
+
+    async def request(method: str, params: dict[str, object]) -> dict[str, object]:
+        del params
+        config = configs[-1]
+        if method == "config/read":
+            return {"result": {"config": {"model": config.get("model")}}}
+        assert method == "model/list"
+        catalog_path = config.get("model_catalog_json")
+        rows = (
+            json.loads(Path(str(catalog_path)).read_text()) if catalog_path else [{"id": "source"}]
+        )
+        return {"result": {"data": rows}}
+
+    client = AsyncMock(spec=CodexAppServerClient)
+    client.request.side_effect = request
+    monkeypatch.setattr(app_server, "CodexAppServerClient", lambda **_kwargs: client)
+    monkeypatch.setattr(app_server, "_start_codex_model_discovery_process", start)
+    monkeypatch.setattr(app_server, "_wait_for_discovery_listener", AsyncMock())
+    monkeypatch.setattr(app_server, "_stop_codex_model_discovery_process", AsyncMock())
+    launch = NativeCodexLaunch([], None, None)
+    write_route(0)
+    first_stat = route.stat()
+    before = app_server.codex_catalog_fingerprint(launch, codex_path=sys.executable)
+    first = await app_server.codex_launch_catalog(codex_path=sys.executable, launch=launch)
+    write_route(1)
+    os.utime(route, ns=(first_stat.st_atime_ns, first_stat.st_mtime_ns))
+    assert route.stat().st_size == first_stat.st_size
+    after = app_server.codex_catalog_fingerprint(launch, codex_path=sys.executable)
+    other = await app_server.codex_launch_catalog(
+        codex_path=sys.executable, launch=launch, refresh=refresh
+    )
+    assert (first, other) == ([{"id": "first"}], [{"id": "other"}])
+    assert before != after
+    assert homes[0] != homes[1]
+    for config in configs:
+        assert config["model_provider"] == "gateway"
+        assert config["model_providers"] == {"gateway": {"base_url": "https://route.example/v1"}}
+        assert "profile" not in config
+        assert "old" not in config.get("profiles", {})
+        assert "mcp_servers" not in config
+
+
+def test_codex_without_current_route_keeps_catalog_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hashlib
+
+    from omnigent.harnesses.codex_native import app_server
+    from omnigent.models.model_catalog_store import binary_identity, fingerprint_of
+
+    source = tmp_path / ".codex"
+    source.mkdir()
+    (source / "config.toml").write_text('model = "source-model"\n')
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(app_server, "_codex_home_config_source_from_env", lambda: source)
+    legacy_identity = (
+        str(source.resolve()),
+        binary_identity(str(source / "config.toml")),
+        binary_identity(None),
+        binary_identity(str(source / "auth.json")),
+    )
+    assert app_server.codex_catalog_fingerprint(
+        NativeCodexLaunch([], None, None), codex_path=sys.executable
+    ) == fingerprint_of(
+        "codex-native",
+        "isolated-picker-v4",
+        legacy_identity,
+        None,
+        None,
+        (),
+        binary_identity(sys.executable),
+    )
+    home = app_server._probe_codex_home([])
+    assert home.name == hashlib.sha256(str(source.resolve()).encode()).hexdigest()[:12]
+    assert tomllib.loads((home / "config.toml").read_text()) == {"model": "source-model"}
 
 
 @pytest.mark.parametrize("code", [-32600, -32602])
