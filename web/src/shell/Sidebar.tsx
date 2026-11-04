@@ -1577,7 +1577,7 @@ function SidebarImpl({
                     SIDEBAR_HOVER_HIGHLIGHT,
                     isUsageBoardPage && SIDEBAR_ACTIVE_HIGHLIGHT,
                   )}
-                  data-testid="usage-board-nav"
+                  data-testid="usage-settings-nav"
                 >
                   <Link to="/usage/board" onClick={onNavClick} componentId="sidebar.usage_board">
                     <GaugeIcon

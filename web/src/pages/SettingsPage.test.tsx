@@ -2475,13 +2475,13 @@ describe("Usage board group", () => {
   it("is absent when the deployment turns the module off", () => {
     mocks.usageBoardEnabled = false;
     renderPage("/settings/general");
-    expect(screen.queryByTestId("settings-group-usage-board")).toBeNull();
+    expect(screen.queryByTestId("settings-group-usage-settings")).toBeNull();
   });
 
   it("is present, with its switch, when the deployment allows it", () => {
     mocks.usageBoardEnabled = true;
     renderPage("/settings/general");
-    const group = screen.getByTestId("settings-group-usage-board");
+    const group = screen.getByTestId("settings-group-usage-settings");
     expect(within(group).getByRole("heading", { name: "Usage board" })).toBeTruthy();
   });
 });

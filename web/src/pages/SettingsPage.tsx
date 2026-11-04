@@ -2371,8 +2371,8 @@ function GeneralSection() {
             the deployment allows the module. Its user switch lives inside, so
             turning it off here is how a visitor comes back. */}
         {usageBoardAvailable(info) && (
-          <SettingsGroup title="Usage board" testId="settings-group-usage-board">
-            <ExpandableSettings id="usage-board" title="Usage board">
+          <SettingsGroup title="Usage board" testId="settings-group-usage-settings">
+            <ExpandableSettings id="usage-settings" title="Usage board">
               <Suspense fallback={<div className="h-10" />}>
                 <UsageBoardSettingsLazy />
               </Suspense>

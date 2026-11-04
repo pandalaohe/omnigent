@@ -97,7 +97,7 @@ async function readOverview(): Promise<UsageOverview> {
 
 export function useUsageOverview(enabled: boolean) {
   return useQuery({
-    queryKey: ["usage-board", "overview"],
+    queryKey: ["usageBoard", "overview"],
     queryFn: readOverview,
     enabled,
     // Poll while the tab is visible; a hidden tab keeps the last reading and

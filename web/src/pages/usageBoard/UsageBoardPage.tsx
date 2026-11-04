@@ -146,7 +146,7 @@ export function UsageBoardPage() {
               )}
             </Button>
             <Button variant="ghost" size="icon" asChild aria-label="Usage board settings">
-              <Link to="/settings/general#usage-board">
+              <Link to="/settings/general#usage-settings">
                 <SettingsIcon className="size-4" aria-hidden="true" />
               </Link>
             </Button>
@@ -273,7 +273,7 @@ function EmptyBoard() {
         a host has read them.
       </p>
       <Button variant="outline" size="sm" asChild className="mt-1">
-        <Link to="/settings/general#usage-board">Open settings</Link>
+        <Link to="/settings/general#usage-settings">Open settings</Link>
       </Button>
     </div>
   );

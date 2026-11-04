@@ -13,7 +13,7 @@ import { UsageAccountPage } from "./UsageAccountPage";
 import { UsageAccountSettingsPage } from "./UsageAccountSettingsPage";
 import { UsageBoardPage } from "./UsageBoardPage";
 
-export const USAGE_BOARD_SETTINGS_PATH = "/settings/general#usage-board";
+export const USAGE_BOARD_SETTINGS_PATH = "/settings/general#usage-settings";
 
 export function UsageBoardRoute({
   view = "board",
