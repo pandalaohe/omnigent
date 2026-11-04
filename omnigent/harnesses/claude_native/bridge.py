@@ -8909,7 +8909,8 @@ def _tool_relay_handler_factory(
                         try:
                             self._wait_for_policy_retry(min(delay, remaining))
                         except FutureCancelledError:
-                            return
+                            last_error = "Policy evaluation cancelled."
+                            break
                         if time.monotonic() - started_at >= NATIVE_POLICY_OUTAGE_WAIT_S:
                             last_error = (
                                 "Policy evaluation wait expired after "
@@ -8921,7 +8922,8 @@ def _tool_relay_handler_factory(
                         try:
                             self._wait_for_policy_retry(retry_delay)
                         except FutureCancelledError:
-                            return
+                            last_error = "Policy evaluation cancelled."
+                            break
                 attempts += 1
                 retry_delay = 0.4
                 future = asyncio.run_coroutine_threadsafe(
@@ -8935,7 +8937,8 @@ def _tool_relay_handler_factory(
                     )
                     resp = self._wait_for_policy_response(future, timeout)
                 except FutureCancelledError:
-                    return
+                    last_error = "Policy evaluation cancelled."
+                    break
                 except Exception as exc:  # noqa: BLE001 — shaped fail-closed below
                     last_error = str(exc).strip() or type(exc).__name__
                     if enforcement_gate and (
@@ -8969,6 +8972,11 @@ def _tool_relay_handler_factory(
                     last_error = "malformed EvaluationResponse body"
                 break
             if not isinstance(verdict, dict) or not verdict.get("result"):
+                try:
+                    if select.select([self.connection], [], [], 0)[0]:
+                        return
+                except OSError:
+                    return
                 _logger.warning(
                     "policy_eval_relay_failure: session=%s hook_event=%s "
                     "attempts=%d last_error=%r; falling back to fail-closed",

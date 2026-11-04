@@ -16322,6 +16322,58 @@ async def test_hook_evaluate_stops_with_its_caller(
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX /bin/sh")
+@pytest.mark.parametrize("payload", [_PRE_TOOL_USE_PAYLOAD, _USER_PROMPT_SUBMIT_PAYLOAD])
+async def test_policy_hook_command_does_not_replay_after_relay_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload: dict[str, object]
+) -> None:
+    """Closing a relay returns a refusal without starting the Python fallback."""
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    release = asyncio.Event()
+
+    async def post(request: httpx.Request) -> httpx.Response:
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return httpx.Response(200, json={"result": "POLICY_ACTION_ALLOW"})
+
+    async with httpx.AsyncClient(
+        base_url="https://server.example", transport=httpx.MockTransport(post)
+    ) as client:
+        relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+        settings = claude_native_bridge.build_hook_settings(
+            bridge_dir,
+            # Any fallback invocation fails visibly instead of opening another wait.
+            python_executable=str(tmp_path / "fallback-must-not-run"),
+            ap_server_url="https://server.example",
+        )
+        command = next(
+            hook["command"]
+            for entry in settings["hooks"][payload["hook_event_name"]]
+            for hook in entry["hooks"]
+            if "evaluate-policy" in hook["command"]
+        )
+        pending = asyncio.create_task(_run_shell_hook(command, payload))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=5.0)
+            await asyncio.to_thread(relay.close)
+            await asyncio.wait_for(cancelled.wait(), timeout=1.0)
+            output = json.loads(await pending)
+            if payload["hook_event_name"] == "PreToolUse":
+                assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+            else:
+                assert output["decision"] == "block"
+            assert "cancelled" in output["systemMessage"].lower()
+        finally:
+            release.set()
+            await asyncio.to_thread(relay.close)
+
+
+@pytest.mark.asyncio
 async def test_hook_evaluate_first_prompt_survives_a_server_outage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _policy_retry_clock: Mock
 ) -> None:
