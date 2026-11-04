@@ -334,6 +334,20 @@ def attachment_upload_request_limit() -> int | None:
 ATTACHMENT_ARCHIVE_CLEANUP_MIN_BYTES_DEFAULT = 10 * 1024**2
 
 
+def session_retention_days() -> int:
+    """Idle/archive age before whole session trees expire; zero disables it."""
+    return _config_limit("session_retention_days", 0) or 0
+
+
+def session_retention_dry_run() -> bool:
+    """Log candidates only; malformed values keep deletion disabled."""
+    config = load_server_config()
+    if "session_retention_dry_run" not in config:
+        return False
+    raw = config["session_retention_dry_run"]
+    return raw if isinstance(raw, bool) else True
+
+
 def attachment_archive_cleanup_days() -> int:
     """Days an archived session must stay archived before big originals go.
 
