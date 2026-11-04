@@ -5171,7 +5171,7 @@ def test_augment_claude_args_pins_policy_hook_timeouts(tmp_path: Path) -> None:
         if "evaluate-policy" in hook["command"]
     ]
     assert len(pre_policy) == 1, f"expected one PreToolUse policy hook, got {pre_policy!r}"
-    assert pre_policy[0]["timeout"] == 600
+    assert pre_policy[0]["timeout"] == 3700
 
     prompt_policy = [
         hook
@@ -5180,7 +5180,7 @@ def test_augment_claude_args_pins_policy_hook_timeouts(tmp_path: Path) -> None:
         if "evaluate-policy" in hook["command"]
     ]
     assert len(prompt_policy) == 1, f"expected one prompt policy hook, got {prompt_policy!r}"
-    assert prompt_policy[0]["timeout"] == 30
+    assert prompt_policy[0]["timeout"] == 3700
 
     post_policy = [
         hook
@@ -16181,9 +16181,9 @@ async def test_hook_evaluate_endpoint_returns_deny_hook_output(
 async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Upstream failure asks for PreToolUse approval and stays open for PostToolUse."""
+    """Upstream failure denies PreToolUse and stays open for PostToolUse."""
     # Zero every wait so the test never sleeps; the tuple length mirrors the
-    # live schedule (PreToolUse's fills the shared TOOL_CALL retry budget).
+    # live schedule (PreToolUse's fills the native outage wait).
     monkeypatch.setattr(
         claude_native_bridge,
         "_PRE_TOOL_USE_POLICY_EVAL_RETRY_DELAYS_S",
@@ -16199,7 +16199,7 @@ async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
             _PRE_TOOL_USE_PAYLOAD,
         )
         output = json.loads(body)
-        assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
+        assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
         marker = claude_native_bridge.policy_fallback_marker(
             bridge_dir, "conv_hook_eval", _PRE_TOOL_USE_PAYLOAD
         )
@@ -16225,14 +16225,7 @@ async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
 async def test_hook_evaluate_pre_tool_use_rides_out_an_outage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _policy_retry_clock: Mock
 ) -> None:
-    """PreToolUse retries past the short schedule; UserPromptSubmit does not.
-
-    Seven straight failures are ridden out by PreToolUse's re-attempts
-    (zeroed here so the test is instant), so the eighth PreToolUse call's
-    ALLOW must still be the answer. The same outage on UserPromptSubmit —
-    whose 30s hook budget cannot fit the long PreToolUse waits — falls back
-    to the fail-closed block after three calls.
-    """
+    """Tool calls and prompts both retain the original operation through an outage."""
     monkeypatch.setattr(
         claude_native_bridge,
         "_PRE_TOOL_USE_POLICY_EVAL_RETRY_DELAYS_S",
@@ -16250,8 +16243,7 @@ async def test_hook_evaluate_pre_tool_use_rides_out_an_outage(
         assert body == "", f"a late ALLOW must come back empty, got {body!r}"
         assert client.calls == 8, f"PreToolUse must spend all 8 attempts, saw {client.calls}"
 
-        # Replay the same outage for UserPromptSubmit, whose schedule is
-        # the short one: the third failed call is its last.
+        # Replay the same outage for the original input gate.
         client.calls = 0
         _policy_retry_clock.sleep.reset_mock()
         prompt_body = await asyncio.to_thread(
@@ -16260,18 +16252,142 @@ async def test_hook_evaluate_pre_tool_use_rides_out_an_outage(
             "/hook/claude/evaluate-policy",
             {**_PRE_TOOL_USE_PAYLOAD, "hook_event_name": "UserPromptSubmit", "prompt": "hi"},
         )
-        output = json.loads(prompt_body)
-        assert output["decision"] == "block", f"UserPromptSubmit must fail closed, got {output!r}"
-        assert client.calls == 3, f"UserPromptSubmit keeps the short schedule, saw {client.calls}"
-        assert [call.args[0] for call in _policy_retry_clock.sleep.call_args_list] == [0.4, 0.4]
-        hooks = [
-            json.loads(line)["payload"]
-            for line in (bridge_dir / "hooks.jsonl").read_text(encoding="utf-8").splitlines()
-        ]
-        assert len(hooks) == 1
-        assert hooks[0]["hook_event_name"] == "StopFailure"
-        assert hooks[0]["error"] == "policy_evaluation_failed"
-        assert hooks[0]["error_details"] == output["reason"]
+        assert prompt_body == ""
+        assert client.calls == 8
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("end", ["disconnect", "close"])
+@pytest.mark.parametrize("phase", ["retry", "parked"])
+async def test_hook_evaluate_stops_with_its_caller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, end: str, phase: str
+) -> None:
+    """Stopping the hook or its relay ends retries and cancels a parked request."""
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def post(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        started.set()
+        if phase == "retry":
+            raise httpx.ConnectError("server offline", request=request)
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return httpx.Response(200, json={"result": "POLICY_ACTION_ALLOW"})
+
+    monkeypatch.setattr(claude_native_bridge, "_PRE_TOOL_USE_POLICY_EVAL_RETRY_DELAYS_S", (0.3,))
+    async with httpx.AsyncClient(
+        base_url="https://server.example", transport=httpx.MockTransport(post)
+    ) as client:
+        relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+        info = json.loads((bridge_dir / claude_native_bridge._TOOL_RELAY_FILE).read_text())
+        url = httpx.URL(info["url"])
+        _reader, writer = await asyncio.open_connection(url.host, url.port)
+        body = json.dumps(_PRE_TOOL_USE_PAYLOAD).encode()
+        writer.write(
+            (
+                "POST /hook/claude/evaluate-policy HTTP/1.1\r\n"
+                f"Host: {url.host}\r\nAuthorization: Bearer {info['token']}\r\n"
+                f"Content-Length: {len(body)}\r\n\r\n"
+            ).encode()
+            + body
+        )
+        await writer.drain()
+        try:
+            await asyncio.wait_for(started.wait(), timeout=2.0)
+            if end == "disconnect":
+                writer.close()
+                await writer.wait_closed()
+            else:
+                await asyncio.to_thread(relay.close)
+            if phase == "parked":
+                await asyncio.wait_for(cancelled.wait(), timeout=1.0)
+            else:
+                # Observe beyond the 0.3s retry delay to detect a forbidden later POST.
+                await asyncio.sleep(0.5)  # custom-lint: disable=sleep-then-assert -- retry window
+                assert calls == 1, "a stopped call must not be retried after recovery"
+        finally:
+            release.set()
+            writer.close()
+            await writer.wait_closed()
+            await asyncio.to_thread(relay.close)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX /bin/sh")
+@pytest.mark.parametrize("payload", [_PRE_TOOL_USE_PAYLOAD, _USER_PROMPT_SUBMIT_PAYLOAD])
+async def test_policy_hook_command_does_not_replay_after_relay_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload: dict[str, object]
+) -> None:
+    """Closing a relay returns a refusal without starting the Python fallback."""
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    release = asyncio.Event()
+
+    async def post(request: httpx.Request) -> httpx.Response:
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return httpx.Response(200, json={"result": "POLICY_ACTION_ALLOW"})
+
+    async with httpx.AsyncClient(
+        base_url="https://server.example", transport=httpx.MockTransport(post)
+    ) as client:
+        relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+        settings = claude_native_bridge.build_hook_settings(
+            bridge_dir,
+            # Any fallback invocation fails visibly instead of opening another wait.
+            python_executable=str(tmp_path / "fallback-must-not-run"),
+            ap_server_url="https://server.example",
+        )
+        command = next(
+            hook["command"]
+            for entry in settings["hooks"][payload["hook_event_name"]]
+            for hook in entry["hooks"]
+            if "evaluate-policy" in hook["command"]
+        )
+        pending = asyncio.create_task(_run_shell_hook(command, payload))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=5.0)
+            await asyncio.to_thread(relay.close)
+            await asyncio.wait_for(cancelled.wait(), timeout=1.0)
+            output = json.loads(await pending)
+            if payload["hook_event_name"] == "PreToolUse":
+                assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+            else:
+                assert output["decision"] == "block"
+            assert "cancelled" in output["systemMessage"].lower()
+        finally:
+            release.set()
+            await asyncio.to_thread(relay.close)
+
+
+@pytest.mark.asyncio
+async def test_hook_evaluate_first_prompt_survives_a_server_outage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _policy_retry_clock: Mock
+) -> None:
+    client = _ScriptedPolicyClient(*([503] * 7), {"result": "POLICY_ACTION_ALLOW"})
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            _USER_PROMPT_SUBMIT_PAYLOAD,
+        )
+        assert body == "", "the original prompt must proceed when policy evaluation recovers"
+        assert client.calls == 8
     finally:
         relay.close()
 
@@ -16284,14 +16400,14 @@ async def test_hook_evaluate_pre_tool_use_budget_stops_re_attempts(
 
     With no budget left, the pre-re-attempt check must fire before the
     second call, so the single failure falls through to the fail-closed
-    "ask" hook output instead of spending the remaining schedule.
+    "deny" hook output instead of spending the remaining schedule.
     """
     monkeypatch.setattr(
         claude_native_bridge,
         "_PRE_TOOL_USE_POLICY_EVAL_RETRY_DELAYS_S",
         (0.0,) * len(claude_native_bridge._PRE_TOOL_USE_POLICY_EVAL_RETRY_DELAYS_S),
     )
-    monkeypatch.setattr("omnigent.native.native_policy_hook.TOOL_CALL_POLICY_RETRY_BUDGET_S", 0.0)
+    monkeypatch.setattr("omnigent.native.native_policy_hook.NATIVE_POLICY_OUTAGE_WAIT_S", 0.0)
     client = _ScriptedPolicyClient(None)
     relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
     try:
@@ -16302,7 +16418,7 @@ async def test_hook_evaluate_pre_tool_use_budget_stops_re_attempts(
             _PRE_TOOL_USE_PAYLOAD,
         )
         output = json.loads(body)
-        assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
+        assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
         assert client.calls == 1, f"budget must stop re-attempts, saw {client.calls}"
     finally:
         relay.close()
@@ -16331,7 +16447,7 @@ async def test_hook_evaluate_endpoint_retries_connect_failures_within_budget(
         )
         assert body == "", f"recovered lookup must let the prompt through, got {body!r}"
         assert client.calls == 4
-        assert [call.args[0] for call in _policy_retry_clock.sleep.call_args_list] == [1, 2, 4]
+        assert _policy_retry_clock.monotonic() == pytest.approx(8.8)
         assert len({body["_omnigent_elicitation_id"] for body in client.bodies if body}) == 1
     finally:
         relay.close()
@@ -16363,29 +16479,16 @@ async def test_hook_evaluate_endpoint_exhausts_connect_retry_budget(
             output = json.loads(body)
             assert output["decision"] == "block"
             assert "failing closed for this request" in output["reason"]
-            assert client.calls == 4
-            assert [call.args[0] for call in _policy_retry_clock.sleep.call_args_list] == [
-                1,
-                2,
-                4,
-            ]
+            assert client.calls == 185
+            assert _policy_retry_clock.monotonic() == pytest.approx(3600.0)
         elif hook_event == "PreToolUse":
-            assert json.loads(body)["hookSpecificOutput"]["permissionDecision"] == "ask"
-            assert client.calls == 20
-            assert [call.args[0] for call in _policy_retry_clock.sleep.call_args_list] == [
-                0.4,
-                0.4,
-                *[8.0] * 5,
-                *[20.0] * 12,
-            ]
+            assert json.loads(body)["hookSpecificOutput"]["permissionDecision"] == "deny"
+            assert client.calls == 185
+            assert _policy_retry_clock.monotonic() == pytest.approx(3600.0)
         else:
             assert body == "", "PostToolUse must still fail open"
             assert client.calls == 4
-            assert [call.args[0] for call in _policy_retry_clock.sleep.call_args_list] == [
-                1,
-                2,
-                4,
-            ]
+            assert _policy_retry_clock.monotonic() == pytest.approx(7.0)
     finally:
         relay.close()
 
@@ -16401,7 +16504,7 @@ async def test_hook_evaluate_endpoint_preserves_non_connect_retries(
     _policy_retry_clock: Mock,
     failure: int | Exception,
 ) -> None:
-    """HTTP, auth, and held-poll failures keep a prompt's three quick attempts."""
+    """An auth rejection is final; transport and gateway failures get the outage wait."""
     client = _ScriptedPolicyClient(failure)
     relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
     try:
@@ -16413,8 +16516,8 @@ async def test_hook_evaluate_endpoint_preserves_non_connect_retries(
         )
         output = json.loads(body)
         assert output["decision"] == "block"
-        assert client.calls == 3
-        assert [call.args[0] for call in _policy_retry_clock.sleep.call_args_list] == [0.4, 0.4]
+        assert client.calls == (1 if failure == 401 else 185)
+        assert _policy_retry_clock.monotonic() == pytest.approx(0 if failure == 401 else 3600.0)
     finally:
         relay.close()
 
@@ -16465,7 +16568,7 @@ async def test_curl_evaluate_policy_command_round_trips(
     # or runner gone): stdin replays into the Python hook, which takes
     # its direct-server path against a server answering a final 4xx — not
     # a retryable outage, so the tool-call retry budget is not drained —
-    # and fails closed with its own ask shaping (the pre-curl behavior).
+    # and fails closed (the pre-curl behavior).
     class _BadPolicyHandler(BaseHTTPRequestHandler):
         """HTTP handler answering every policy POST with a final 400."""
 
@@ -16508,7 +16611,7 @@ async def test_curl_evaluate_policy_command_round_trips(
         )
         assert result.returncode == 0, result.stderr
         output = json.loads(result.stdout)
-        assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
+        assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
         assert output["hookSpecificOutput"]["permissionDecisionReason"]
     finally:
         bad_server.shutdown()

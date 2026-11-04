@@ -104,8 +104,9 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         read_policy_hook_config,
     )
     from omnigent.native.native_policy_hook import (
+        NATIVE_POLICY_OUTAGE_WAIT_S,
         evaluation_response_to_hook_output,
-        fail_ask_hook_output,
+        fail_closed_hook_output,
         hook_payload_to_evaluation_request,
         policy_hook_reauth,
         post_evaluate_with_retry,
@@ -184,7 +185,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         context["model"] = model
 
     def _fail_closed(detail: str | None = None) -> int:
-        out = fail_ask_hook_output(hook_event, detail)
+        out = fail_closed_hook_output(hook_event, detail)
         if out is not None:
             sys.stdout.write(json.dumps(out))
         return 0
@@ -223,6 +224,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         _EVALUATE_POLICY_TIMEOUT_S,
         "codex evaluate-policy hook",
         reauth=reauth,
+        outage_wait_s=NATIVE_POLICY_OUTAGE_WAIT_S if hook_event != "PostToolUse" else None,
     )
     if resp is None:
         return _fail_closed(api_error or (reauth.failure_reason if reauth else None))

@@ -1479,7 +1479,7 @@ def test_evaluate_policy_pre_tool_use_fails_closed_when_verdict_unavailable(
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setattr(native_policy_hook.httpx, "Client", make_failing_client(mode))
-    monkeypatch.setattr(native_policy_hook, "TOOL_CALL_POLICY_RETRY_BUDGET_S", 0.0)
+    monkeypatch.setattr(native_policy_hook, "NATIVE_POLICY_OUTAGE_WAIT_S", 0.0)
     bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
     write_active_session_id(bridge_dir, "conv_active")
     build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
@@ -1495,7 +1495,7 @@ def test_evaluate_policy_pre_tool_use_fails_closed_when_verdict_unavailable(
     captured = capsys.readouterr()
     assert exit_code == 0
     result = json.loads(captured.out)
-    assert result["hookSpecificOutput"]["permissionDecision"] == "ask", result
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny", result
     assert result["hookSpecificOutput"]["permissionDecisionReason"]
 
     posted: list[dict[str, object]] = []
@@ -1550,7 +1550,7 @@ def test_evaluate_policy_user_prompt_submit_fails_closed_on_error(
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setattr(native_policy_hook.httpx, "Client", make_failing_client("connect_error"))
-    monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 0.0)
+    monkeypatch.setattr(native_policy_hook, "NATIVE_POLICY_OUTAGE_WAIT_S", 0.0)
     bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
     write_active_session_id(bridge_dir, "conv_active")
     build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
@@ -1932,9 +1932,9 @@ def test_evaluate_policy_fails_closed_when_reauth_unavailable(
     captured = capsys.readouterr()
     assert exit_code == 0
     result = json.loads(captured.out)
-    assert result["hookSpecificOutput"]["permissionDecision"] == "ask"
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert result["hookSpecificOutput"]["permissionDecisionReason"].startswith(
-        native_policy_hook._EVAL_UNAVAILABLE_ASK_REASON
+        native_policy_hook._EVAL_UNAVAILABLE_REASON
     )
 
 

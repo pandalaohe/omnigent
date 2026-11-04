@@ -350,21 +350,18 @@ async def post_session_event_with_retry(
     url: str,
     payload: dict[str, object],
     event_type: str,
-    max_attempts: int,
+    max_attempts: int | None,
     retry_status_codes: frozenset[int],
     sleep: Callable[[float], Coroutine[None, None, None]],
     retry_delay: Callable[[int], float],
     logger_name: str,
 ) -> httpx.Response | None:
     """
-    POST a session event payload with bounded transient retries.
+    POST a session event payload with transient retries.
 
     Shared retry loop used by the antigravity (and optionally other)
-    native forwarders. Conversation items persist with a random primary
-    key and no server-side dedup, so an ambiguous transport failure
-    (request sent, response lost) is NOT retried — a re-post would
-    duplicate the item. Other event types are idempotent/transient and
-    are retried.
+    native forwarders. Legacy conversation items without a stable source ID
+    cannot retry an ambiguous failure; the server deduplicates keyed items.
 
     :param client: HTTP client for Omnigent event posts.
     :param url: Full request URL, e.g. ``"/v1/sessions/conv_x/events"``.
@@ -372,7 +369,7 @@ async def post_session_event_with_retry(
     :param event_type: Session event type, e.g.
         ``"external_conversation_item"``. Used in log messages and to decide
         whether an ambiguous failure is safe to retry.
-    :param max_attempts: Maximum POST attempts, e.g. ``3``.
+    :param max_attempts: Maximum attempts, or ``None`` to wait for recovery.
     :param retry_status_codes: HTTP status codes to retry, e.g.
         ``frozenset({429, 500, 503})``.
     :param sleep: Async sleep coroutine (stubbable in tests).
@@ -384,7 +381,12 @@ async def post_session_event_with_retry(
         transport errors (or after an ambiguous conversation-item failure).
     """
     log = logging.getLogger(logger_name)
-    for attempt in range(1, max_attempts + 1):
+    data = payload.get("data")
+    source_id = data.get("source_id") if isinstance(data, dict) else None
+    keyed_item = isinstance(source_id, str) and bool(source_id.strip())
+    attempt = 0
+    while max_attempts is None or attempt < max_attempts:
+        attempt += 1
         try:
             response = await client.post(url, json=payload)
         except httpx.HTTPError as exc:
@@ -394,7 +396,11 @@ async def post_session_event_with_retry(
             # be retried: a re-post would duplicate the item.
             # Other event types are idempotent / transient, so retrying
             # them on the same errors is safe and preserves delivery.
-            if event_type == "external_conversation_item" and post_may_have_been_delivered(exc):
+            if (
+                event_type == "external_conversation_item"
+                and not keyed_item
+                and post_may_have_been_delivered(exc)
+            ):
                 log.warning(
                     "skipping session event after an ambiguous transport "
                     "failure (may already be committed); not retrying to avoid "
@@ -403,7 +409,7 @@ async def post_session_event_with_retry(
                     exc,
                 )
                 return None
-            if attempt >= max_attempts:
+            if max_attempts is not None and attempt >= max_attempts:
                 log.warning(
                     "failed to post session event after retries: type=%s attempts=%s error=%r",
                     event_type,
@@ -427,7 +433,7 @@ async def post_session_event_with_retry(
             return response
         if response.status_code not in retry_status_codes:
             return response
-        if attempt >= max_attempts:
+        if max_attempts is not None and attempt >= max_attempts:
             return response
         await sleep(retry_delay(attempt))
     return None

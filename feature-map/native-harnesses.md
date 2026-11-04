@@ -837,6 +837,18 @@ Cross-harness journeys:
   afterwards never appears, and a follow-up in the same session completes. The
   harness bench does not register opencode-native, so its interrupt probe does
   not apply.
+- **`disconnect`, policy-server outage (component tests):**
+  `tests/test_native_policy_hook.py` and the Claude/Codex hook modules under
+  `tests/harnesses/` cover retaining native prompts and tool calls until recovery,
+  a bounded one-hour wait, and a user-visible refusal reason. Claude relay
+  cancellation and session-close coverage lives in
+  `tests/harnesses/claude_native/test_claude_native_bridge.py::test_hook_evaluate_stops_with_its_caller`.
+  Pi output/completion recovery is covered by
+  `tests/harnesses/pi_native/test_pi_native_extension.py::test_outage_recovers_pi_bash_result_and_completion`;
+  Codex and Antigravity terminal-status retries are covered by their forwarder
+  and reader tests. These component checks do not establish browser rendering
+  or live outage recovery on every harness. Kimi, Cursor and Hermes keep their
+  existing five-minute tool-policy retry budget.
 - **`disconnect`, Claude startup (plain `uv run pytest`, no vendor CLI):**
   `tests/harnesses/claude_native/test_claude_native_readiness_exit.py` delivers
   a web message through the public bridge into a real retained dead tmux pane.

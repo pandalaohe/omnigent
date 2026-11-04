@@ -12,7 +12,6 @@ from omnigent.native import native_policy_hook
 from omnigent.native.native_policy_hook import (
     _is_login_redirect_or_unauthorized,
     evaluation_response_to_hook_output,
-    fail_ask_hook_output,
     fail_closed_hook_output,
     hook_payload_to_evaluation_request,
     post_evaluate_with_retry,
@@ -339,6 +338,7 @@ def test_fail_closed_pre_tool_use_denies() -> None:
     # A deny is inert without a reason on the consuming harnesses, so one
     # must always be present.
     assert hook_specific["permissionDecisionReason"]
+    assert output["systemMessage"] == hook_specific["permissionDecisionReason"]
 
 
 def test_fail_closed_user_prompt_submit_fails_closed() -> None:
@@ -355,6 +355,7 @@ def test_fail_closed_user_prompt_submit_fails_closed() -> None:
     assert output is not None
     assert output["decision"] == "block"
     assert output["reason"]
+    assert output["systemMessage"] == output["reason"]
 
 
 def test_fail_closed_post_tool_use_fails_open() -> None:
@@ -379,49 +380,130 @@ def test_fail_closed_unknown_event_fails_open() -> None:
     assert fail_closed_hook_output("SomeNewEvent") is None
 
 
-def test_fail_ask_pre_tool_use_returns_ask() -> None:
-    """
-    ``fail_ask_hook_output`` returns ``permissionDecision: "ask"`` for ``PreToolUse``.
+def test_tool_call_budget_override_extends_the_outage_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tool-call gate keeps retrying to the caller's budget, and stops at it."""
+    clock = {"t": 0.0}
+    monkeypatch.setattr(native_policy_hook.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(
+        native_policy_hook.time, "sleep", lambda seconds: clock.update(t=clock["t"] + seconds)
+    )
+    attempt_times: list[float] = []
 
-    Using ``"ask"`` explicitly prompts the user regardless of permission mode
-    (unlike ``None``, which fails open in ``bypassPermissions``/``acceptEdits``).
-    """
-    output = fail_ask_hook_output("PreToolUse")
-    assert output is not None
-    hook = output["hookSpecificOutput"]
-    assert hook["hookEventName"] == "PreToolUse"
-    assert hook["permissionDecision"] == "ask"
-    assert hook["permissionDecisionReason"]
+    class _Client:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            attempt_times.append(clock["t"])
+            raise httpx.ConnectError("refused", request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _Client)
+
+    resp, error = post_evaluate_with_retry(
+        "https://ap/x",
+        {},
+        {"event": {"type": "PHASE_TOOL_CALL"}},
+        86400.0,
+        "evaluate-policy hook",
+        outage_wait_s=native_policy_hook.NATIVE_POLICY_OUTAGE_WAIT_S,
+    )
+
+    assert resp is None and error is not None
+    assert max(attempt_times) > native_policy_hook.TOOL_CALL_POLICY_RETRY_BUDGET_S
+    assert max(attempt_times) <= native_policy_hook.NATIVE_POLICY_OUTAGE_WAIT_S
 
 
-def test_fail_ask_pre_tool_use_with_detail_includes_detail() -> None:
-    """Detail string is appended to the ask reason."""
-    output = fail_ask_hook_output("PreToolUse", "server connection refused")
-    assert output is not None
-    assert "server connection refused" in output["hookSpecificOutput"]["permissionDecisionReason"]
+@pytest.mark.parametrize("fault", ["504", "read"])
+@pytest.mark.parametrize("phase", ["PHASE_TOOL_CALL", "PHASE_REQUEST"])
+def test_native_outage_wait_bounds_slow_failures(
+    monkeypatch: pytest.MonkeyPatch, fault: str, phase: str
+) -> None:
+    """Slow gateway failures and an unanswered POST still end at the wait limit."""
+    now = 0.0
+    attempts = 0
+
+    def sleep(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+
+    def post(request: httpx.Request) -> httpx.Response:
+        nonlocal now, attempts
+        attempts += 1
+        read_budget = request.extensions["timeout"]["read"]
+        duration = 60.0 if fault == "read" else 11.0
+        now += min(duration, read_budget)
+        if duration >= read_budget:
+            raise httpx.ReadTimeout("no verdict", request=request)
+        # Bound the broken implementation's repeated held-poll resets too.
+        return httpx.Response(200 if attempts == 4 else 504, request=request)
+
+    client = httpx.Client
+    monkeypatch.setattr(native_policy_hook.time, "monotonic", lambda: now)
+    monkeypatch.setattr(native_policy_hook.time, "sleep", sleep)
+    monkeypatch.setattr(
+        native_policy_hook.httpx,
+        "Client",
+        lambda **kwargs: client(transport=httpx.MockTransport(post), **kwargs),
+    )
+    response, error = post_evaluate_with_retry(
+        "https://server.example/policies/evaluate",
+        {},
+        {"event": {"type": phase}},
+        86400.0,
+        "native policy hook",
+        outage_wait_s=30.0,
+    )
+    assert response is None
+    assert error is not None
+    assert now <= 30.0
 
 
-def test_fail_ask_user_prompt_submit_still_fails_closed() -> None:
-    """
-    ``fail_ask_hook_output`` still blocks ``UserPromptSubmit``.
+def test_native_prompt_waits_for_recovery_before_returning_a_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 0.0
+    calls = 0
 
-    The request gate is the sole pre-turn enforcement point; a server
-    hiccup must not silently allow an over-budget or blocked request.
-    """
-    output = fail_ask_hook_output("UserPromptSubmit")
-    assert output is not None
-    assert output["decision"] == "block"
-    assert output["reason"]
+    def sleep(seconds: float) -> None:
+        nonlocal now
+        now += seconds
 
+    def post(request: httpx.Request) -> httpx.Response:
+        nonlocal calls, now
+        calls += 1
+        if calls == 1:
+            now += 20.0
+            raise httpx.ConnectError("server offline", request=request)
+        return httpx.Response(200, json={"result": "POLICY_ACTION_ALLOW"})
 
-def test_fail_ask_post_tool_use_fails_open() -> None:
-    """``PostToolUse`` fails open under fail-ask, same as fail-closed."""
-    assert fail_ask_hook_output("PostToolUse") is None
-
-
-def test_fail_ask_unknown_event_fails_open() -> None:
-    """Unknown events fail open under fail-ask."""
-    assert fail_ask_hook_output("SomeNewEvent") is None
+    client = httpx.Client
+    monkeypatch.setattr(native_policy_hook.time, "monotonic", lambda: now)
+    monkeypatch.setattr(native_policy_hook.time, "sleep", sleep)
+    monkeypatch.setattr(
+        native_policy_hook.httpx,
+        "Client",
+        lambda **kwargs: client(transport=httpx.MockTransport(post), **kwargs),
+    )
+    response, error = post_evaluate_with_retry(
+        "https://server.example/policies/evaluate",
+        {},
+        {"event": {"type": "PHASE_REQUEST"}},
+        86400.0,
+        "native prompt hook",
+        outage_wait_s=30.0,
+    )
+    assert response is not None and response.json()["result"] == "POLICY_ACTION_ALLOW"
+    assert error is None
+    assert calls == 2
 
 
 def _resp(status: int, location: str | None = None) -> httpx.Response:

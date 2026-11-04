@@ -60,6 +60,9 @@ _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S = 10.0
 # buys nothing. Public because the claude-native relay, which owns its own
 # retry loop, shares the budget.
 TOOL_CALL_POLICY_RETRY_BUDGET_S = 300.0
+# Claude/Codex enforcement hooks retain the original operation through an outage.
+# Their hook timeouts exceed this bounded wait.
+NATIVE_POLICY_OUTAGE_WAIT_S = 3600.0
 _TOOL_CALL_POLICY_RETRY_MAX_BACKOFF_S = 20.0
 _EVALUATE_POLICY_MAX_RETRY_AFTER_S = 10.0
 # Fast connect budget so an unreachable server fails into the retry
@@ -546,6 +549,7 @@ def fail_closed_hook_output(
     )
     if hook_event == _PRE_TOOL_USE:
         return {
+            "systemMessage": tool_reason,
             "hookSpecificOutput": {
                 "hookEventName": _PRE_TOOL_USE,
                 "permissionDecision": "deny",
@@ -554,64 +558,16 @@ def fail_closed_hook_output(
         }
     if hook_event == _USER_PROMPT_SUBMIT:
         return {
+            "systemMessage": request_reason,
             "decision": "block",
             "reason": request_reason,
         }
     return None
 
 
-_EVAL_UNAVAILABLE_ASK_REASON = (
-    "Omnigent policy evaluation unavailable (could not reach or authenticate to the "
-    "Omnigent server); please approve or deny this tool call manually."
-)
-
-
-def fail_ask_hook_output(hook_event: str, detail: str | None = None) -> dict[str, object] | None:
-    """
-    Build the fail-ask hook output for an unobtainable policy verdict.
-
-    Like :func:`fail_closed_hook_output` but for ``PreToolUse``: instead of
-    auto-denying the tool call, returns ``permissionDecision: "ask"`` so the
-    harness explicitly prompts the user for approval. This preserves human
-    oversight when the policy server is transiently unreachable — the user
-    still decides — rather than blocking all tool calls until the server
-    recovers. Unlike returning ``None`` (which fails open in
-    ``bypassPermissions`` / ``acceptEdits`` modes), ``"ask"`` forces the
-    approval dialog regardless of the current permission mode.
-
-    ``UserPromptSubmit`` still blocks (fail-closed) because it is the sole
-    pre-turn enforcement gate for native sessions; a server hiccup must not
-    let an over-budget or otherwise-blocked request proceed silently.
-
-    Use this for harnesses whose native TUI has an interactive approval UI
-    (claude-native, codex-native). For headless harnesses where no approval
-    UI is available, prefer :func:`fail_closed_hook_output`.
-
-    :param hook_event: Hook event name, e.g. ``"PreToolUse"``.
-    :param detail: Optional diagnostic string appended to the ask reason
-        shown in the UI. Forwarded to :func:`fail_closed_hook_output` for
-        non-PreToolUse events.
-    :returns: ``permissionDecision: "ask"`` hook output for ``PreToolUse``;
-        delegates to :func:`fail_closed_hook_output` for all other events.
-    """
-    if hook_event == _PRE_TOOL_USE:
-        ask_reason = (
-            f"{_EVAL_UNAVAILABLE_ASK_REASON} Detail: {detail}"
-            if detail
-            else _EVAL_UNAVAILABLE_ASK_REASON
-        )
-        return {
-            "hookSpecificOutput": {
-                "hookEventName": _PRE_TOOL_USE,
-                "permissionDecision": "ask",
-                "permissionDecisionReason": ask_reason,
-            },
-        }
-    return fail_closed_hook_output(hook_event, detail)
-
-
 def _retry_budget_for_request(
     eval_request: Mapping[str, object],
+    outage_wait_s: float | None = None,
 ) -> tuple[float, float]:
     """Return the ``(budget_s, max_backoff_s)`` a request's phase retries within.
 
@@ -622,8 +578,11 @@ def _retry_budget_for_request(
     fail-closed block before a prompt hook's kill.
 
     :param eval_request: ``EvaluationRequest`` JSON body about to be POSTed.
+    :param outage_wait_s: Optional wait limit for a native enforcement gate.
     :returns: ``(retry_budget_s, max_backoff_s)`` for its event phase.
     """
+    if outage_wait_s is not None:
+        return outage_wait_s, _TOOL_CALL_POLICY_RETRY_MAX_BACKOFF_S
     event = eval_request.get("event")
     if isinstance(event, Mapping) and event.get("type") == _PHASE_TOOL_CALL:
         return TOOL_CALL_POLICY_RETRY_BUDGET_S, _TOOL_CALL_POLICY_RETRY_MAX_BACKOFF_S
@@ -637,6 +596,7 @@ def post_evaluate_with_retry(
     read_timeout: float,
     hook_label: str,
     reauth: Callable[[], dict[str, str] | None] | None = None,
+    outage_wait_s: float | None = None,
 ) -> tuple[httpx.Response, None] | tuple[None, str]:
     """
     POST to the Omnigent policy evaluate endpoint, retrying on transient errors.
@@ -694,6 +654,8 @@ def post_evaluate_with_retry(
         normal failure handling (the caller fails closed). A poll the server
         held past the floor re-arms the one-shot, so a wait longer than the
         token lifetime survives every lapse.
+    :param outage_wait_s: Bounds retries and response waits for this gate;
+        ``None`` keeps phase defaults and held-ASK reattachment behavior.
     :returns: ``(response, error)`` — on success, ``(response, None)``; on
         failure, ``(None, short_error_string)`` describing the last error so
         callers can surface it in the deny/block reason shown to the user.
@@ -704,7 +666,8 @@ def post_evaluate_with_retry(
     # server-side by ``_EVALUATE_HOOK_ELICITATION_ID_RE``.
     elicitation_id = f"elicit_evaluate_{secrets.token_hex(16)}"
     request_body = {**eval_request, "_omnigent_elicitation_id": elicitation_id}
-    retry_budget_s, max_backoff_s = _retry_budget_for_request(eval_request)
+    retry_budget_s, max_backoff_s = _retry_budget_for_request(eval_request, outage_wait_s)
+    bounded_wait = outage_wait_s is not None
     deadline = time.monotonic() + retry_budget_s
     backoff_s = _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
     timeout = httpx.Timeout(read_timeout, connect=_EVALUATE_POLICY_CONNECT_TIMEOUT_S)
@@ -714,6 +677,12 @@ def post_evaluate_with_retry(
         retry_delay_s = backoff_s
         attempt_started = time.monotonic()
         held_poll_severed = False
+        if bounded_wait:
+            remaining = max(0.001, deadline - attempt_started)
+            timeout = httpx.Timeout(
+                min(read_timeout, remaining),
+                connect=min(_EVALUATE_POLICY_CONNECT_TIMEOUT_S, remaining),
+            )
         try:
             with httpx.Client(headers=headers, timeout=timeout) as client:
                 resp = client.post(url, json=request_body)
@@ -822,8 +791,12 @@ def post_evaluate_with_retry(
                 f"omnigent {hook_label}: Omnigent request failed: {exc}",
                 file=sys.stderr,
             )
+            if bounded_wait and time.monotonic() >= deadline:
+                return None, (
+                    f"Policy evaluation wait expired after {retry_budget_s:g}s; request cancelled."
+                )
             return None, last_error
-        if held_poll_severed:
+        if held_poll_severed and not bounded_wait:
             # The re-park mechanism working as intended, not a transient fault:
             # the budget and backoff are for fast failures, and the accepted
             # poll re-arms the one-shot re-mint for the next token lapse.
@@ -841,6 +814,11 @@ def post_evaluate_with_retry(
                 f"omnigent {hook_label}: retry budget exhausted",
                 file=sys.stderr,
             )
+            if bounded_wait:
+                return None, (
+                    f"Policy evaluation wait expired after {retry_budget_s:g}s; "
+                    f"request cancelled (last error: {last_error})."
+                )
             return None, f"retry budget exhausted (last error: {last_error})"
         # Two-step backoff; not worth a retry library in this dependency-light hook.
         time.sleep(retry_delay_s)

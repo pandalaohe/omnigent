@@ -73,6 +73,47 @@ from omnigent.native.native_bridge_common import wrap_agent_instructions
 _WRAPPED_PLAN_TURN = wrap_agent_instructions("be terse", "Call the tool.")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["message", "status"])
+async def test_outage_retains_agy_messages_and_terminal_status(
+    monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    attempts = 0
+    accepted = []
+
+    async def sleep(_seconds: float) -> None:
+        return
+
+    def post(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 4:
+            return httpx.Response(503)
+        accepted.append(json.loads(request.content))
+        return httpx.Response(200)
+
+    event = reader._status_event("idle")
+    if kind == "message":
+        event = reader.OutboundEvent(
+            event_type="external_conversation_item",
+            step_index=1,
+            data={
+                "item_type": "message",
+                "source_id": "agy:original-user-input",
+                "item_data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                },
+            },
+        )
+    monkeypatch.setattr(reader, "_sleep", sleep)
+    async with httpx.AsyncClient(
+        base_url="http://server", transport=httpx.MockTransport(post)
+    ) as client:
+        await reader._post_event(client, "conv_outage", event)
+    assert accepted == [{"type": event.event_type, "data": event.data}]
+
+
 @pytest.mark.parametrize(
     ("tier", "delivered", "agy_echo", "expected"),
     [
