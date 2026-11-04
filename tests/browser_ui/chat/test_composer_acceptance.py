@@ -195,22 +195,46 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
     )
     control_bounds = {}
     icon_bounds = {}
+    center_hits = {}
     for test_id in ("composer-workspace-dir", "composer-git-branch", *status_ids):
         control = bar.get_by_test_id(test_id)
         rect = control.bounding_box()
         assert rect is not None
         control_bounds[test_id] = rect
+        center_hits[test_id] = control.evaluate(
+            """element => {
+                const rect = element.getBoundingClientRect();
+                const hit = document.elementFromPoint(
+                    rect.x + rect.width / 2, rect.y + rect.height / 2
+                );
+                return {ownsCenter: element.contains(hit),
+                    target: hit?.closest('[data-testid]')?.getAttribute('data-testid')};
+            }"""
+        )
         icon_bounds[test_id] = []
         for icon in control.locator("svg").all():
             icon_rect = icon.bounding_box()
             assert icon_rect is not None
             icon_bounds[test_id].append(icon_rect)
     measured_font = context.evaluate("el => parseFloat(getComputedStyle(el).fontSize)")
+    touch_target = context.evaluate(
+        """element => {
+            const rect = element.getBoundingClientRect();
+            const after = getComputedStyle(element, '::after');
+            return {coarse: matchMedia('(pointer: coarse)').matches,
+                width: rect.width - parseFloat(after.left) - parseFloat(after.right),
+                height: rect.height - parseFloat(after.top) - parseFloat(after.bottom)};
+        }"""
+    )
     print(
         f"Status bar ({viewport_width}px, {font_size}px preference, {theme}): "
         f"bar={bounds}, controls={control_bounds}, icons={icon_bounds}, "
-        f"font={measured_font}, family={font_family or 'system'}"
+        f"font={measured_font}, family={font_family or 'system'}, "
+        f"center_hits={center_hits}, ring_target={touch_target}"
     )
+    assert all(hit["ownsCenter"] for hit in center_hits.values()), center_hits
+    if touch_target["coarse"]:
+        assert touch_target["width"] >= 44 and touch_target["height"] >= 44, touch_target
     bar.screenshot(path=tmp_path / f"status-bar-{theme}.png", animations="disabled")
     page.screenshot(path=tmp_path / f"status-page-{theme}.png", animations="disabled")
     directory_icon = icon_bounds["composer-workspace-dir"][0]
