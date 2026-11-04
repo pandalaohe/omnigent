@@ -1148,7 +1148,9 @@ class GitFilesystemRegistry(FilesystemRegistry):
         # below anyway.  With ``-uall`` git otherwise stat's every file in them,
         # which dominates the runtime on big repos.  These mirror the
         # ``_SKIP_DIRS`` root-level prune (kept below as a safety net).
-        argv = ["git", "status", "--porcelain", "--untracked-files=all"]
+        # A scan killed at its timeout must not strand ``.git/index.lock``
+        # against the user's own commits in this repository.
+        argv = ["git", "--no-optional-locks", "status", "--porcelain", "--untracked-files=all"]
         argv.extend(self._skip_dir_pathspecs())
         started = time.monotonic()
         try:
@@ -1247,7 +1249,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
         # spawn error / non-zero exit) raises so the diff endpoint surfaces it,
         # instead of being swallowed to ``None`` — which the endpoint turns
         # into a 404 indistinguishable from "this path has no changes".
-        argv = ["git", "status", "--porcelain", "--", git_path]
+        argv = ["git", "--no-optional-locks", "status", "--porcelain", "--", git_path]
         started = time.monotonic()
         try:
             result = run_git(
@@ -1420,7 +1422,17 @@ class GitFilesystemRegistry(FilesystemRegistry):
 
         :returns: Map of cwd-relative path → ``(lines_added, lines_removed)``.
         """
-        argv = ["git", "diff", "--numstat", "--no-renames", "HEAD"]
+        # Display-only counts: skip ``git diff``'s index refresh, which takes the
+        # lock a scan killed at its timeout could strand.
+        argv = [
+            "git",
+            "-c",
+            "diff.autoRefreshIndex=false",
+            "diff",
+            "--numstat",
+            "--no-renames",
+            "HEAD",
+        ]
         try:
             result = run_git(
                 argv,

@@ -176,11 +176,21 @@ def _exec_git(
 
 @overload
 def _run_git(
-    args: list[str], *, cwd: str, timeout: float | None = ..., text: Literal[True] = ...
+    args: list[str],
+    *,
+    cwd: str,
+    timeout: float | None = ...,
+    text: Literal[True] = ...,
+    optional_locks: bool = ...,
 ) -> subprocess.CompletedProcess[str]: ...
 @overload
 def _run_git(
-    args: list[str], *, cwd: str, timeout: float | None = ..., text: Literal[False]
+    args: list[str],
+    *,
+    cwd: str,
+    timeout: float | None = ...,
+    text: Literal[False],
+    optional_locks: bool = ...,
 ) -> subprocess.CompletedProcess[bytes]: ...
 def _run_git(
     args: list[str],
@@ -188,6 +198,7 @@ def _run_git(
     cwd: str,
     timeout: float | None = None,
     text: bool = True,
+    optional_locks: bool = True,
 ) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
     """Run a git command, returning the completed process.
 
@@ -205,6 +216,10 @@ def _run_git(
     :param text: When ``True`` (default) stdout/stderr are decoded text;
         pass ``False`` for raw bytes (e.g. hashing a blob byte-for-byte,
         where decoding would normalise newlines).
+    :param optional_locks: ``False`` for a background read: git may not
+        refresh the index, which would take ``.git/index.lock`` and, if this
+        command is killed at ``timeout``, strand it against every later
+        writer in that tree. Commands that need the lock still take it.
     :returns: The completed process with captured stdout/stderr.
     :raises WorktreeError: If git is not installed, or the command
         exceeds ``timeout`` or the create deadline.
@@ -216,11 +231,12 @@ def _run_git(
         remaining = _time_left(*create_deadline)
         if remaining < bound:
             bound, cut_by_deadline = remaining, True
+    argv = args if optional_locks else ["--no-optional-locks", *args]
     try:
         return (
-            _exec_git(args, cwd=cwd, timeout=bound)
+            _exec_git(argv, cwd=cwd, timeout=bound)
             if text
-            else _exec_git(args, cwd=cwd, timeout=bound, text=False)
+            else _exec_git(argv, cwd=cwd, timeout=bound, text=False)
         )
     except OSError as exc:
         if isinstance(exc, FileNotFoundError):
@@ -550,6 +566,7 @@ def read_worktree_status(
         ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching"],
         cwd=path,
         timeout=_FOLDER_FACTS_GIT_TIMEOUT_S,
+        optional_locks=False,
     )
     if status.returncode != 0:
         raise _git_error("git status failed", status)
@@ -703,6 +720,7 @@ def read_folder_facts(path: str) -> FolderFacts:
             ["status", "--porcelain", "--untracked-files=normal"],
             cwd=path,
             timeout=_FOLDER_FACTS_GIT_TIMEOUT_S,
+            optional_locks=False,
         )
     except WorktreeError as exc:
         facts.error = facts.error or exc.message

@@ -1420,6 +1420,65 @@ def test_failed_pinned_checkout_rolls_back_without_hiding_original_error(
     assert len(list_worktrees(repo_path=str(git_repo))) == (2 if rollback_fails else 1)
 
 
+def _index_signature(tree: Path) -> tuple[int, int]:
+    """Return the tree's index inode and mtime, which a rewrite replaces.
+
+    :param tree: A work tree directory, main or linked.
+    :returns: ``(st_ino, st_mtime_ns)`` of that tree's own index file.
+    """
+    import os
+
+    git_path = subprocess.run(
+        ["git", "rev-parse", "--git-path", "index"],
+        cwd=tree,
+        env={**os.environ, **_GIT_ENV},
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    index = Path(git_path)
+    if not index.is_absolute():
+        index = (tree / index).resolve()
+    stat = index.stat()
+    return (stat.st_ino, stat.st_mtime_ns)
+
+
+def _age_tracked_file(path: Path) -> None:
+    """Give a tracked file a new, older mtime and leave its bytes alone.
+
+    Content must stay unchanged: git keeps a dirty entry's cached stat, so a
+    scan never refreshes it and the index stays untouched even without the fix.
+    An unchanged file whose stat is stale is what forces the refresh.
+
+    :param path: Tracked file whose cached stat is to go stale.
+    """
+    import os
+    import time
+
+    past = time.time() - 10
+    os.utime(path, (past, past))
+
+
+def test_worktree_status_read_takes_no_optional_index_lock(git_repo: Path) -> None:
+    """A background status read must not refresh the index it shares with writers."""
+    created = create_worktree(repo_path=str(git_repo), branch_name="feature/status-read")
+    tree = Path(created.worktree_path)
+    _age_tracked_file(tree / "README.md")
+    before = _index_signature(tree)
+    status = read_worktree_status(str(tree))
+    assert status["files"] == []
+    assert _index_signature(tree) == before
+
+
+def test_read_folder_facts_takes_no_optional_index_lock(git_repo: Path) -> None:
+    """The folder-facts status read is background work too, so it stays index-read-only."""
+    _age_tracked_file(git_repo / "README.md")
+    before = _index_signature(git_repo)
+    facts = read_folder_facts(str(git_repo))
+    assert facts.dirty is False
+    assert _index_signature(git_repo) == before
+
+
 def test_read_folder_facts_clean_repo(git_repo: Path) -> None:
     """A clean checkout reports git's own branch, HEAD and work-tree root."""
     facts = read_folder_facts(str(git_repo))
@@ -1539,11 +1598,11 @@ def test_read_folder_facts_status_timeout_leaves_dirty_unknown(
     real_run = git_worktree_module._run_git
 
     def timeout_status(
-        args: list[str], *, cwd: str, timeout: float = 10.0
+        args: list[str], *, cwd: str, timeout: float = 10.0, **kwargs: Any
     ) -> subprocess.CompletedProcess[str]:
         if args[0] == "status":
             raise WorktreeError("git command timed out after 10s")
-        return real_run(args, cwd=cwd, timeout=timeout)
+        return real_run(args, cwd=cwd, timeout=timeout, **kwargs)
 
     monkeypatch.setattr(git_worktree_module, "_run_git", timeout_status)
     facts = read_folder_facts(str(git_repo))

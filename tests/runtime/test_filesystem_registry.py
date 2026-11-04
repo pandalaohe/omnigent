@@ -15,6 +15,7 @@ import logging
 import os
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -480,6 +481,43 @@ def test_git_list_changed_files_excludes_terminals_dir(tmp_path: Path) -> None:
         f"Expected no terminals/ paths but got {terminal_paths}. "
         "Terminal output files are leaking into the Files panel."
     )
+
+
+def _index_signature(repo: Path) -> tuple[int, int]:
+    """Return the repository's index inode and mtime, which a rewrite replaces.
+
+    :param repo: A git repository root.
+    :returns: ``(st_ino, st_mtime_ns)`` of ``.git/index``.
+    """
+    stat = (repo / ".git" / "index").stat()
+    return (stat.st_ino, stat.st_mtime_ns)
+
+
+def test_git_list_changed_files_takes_no_optional_index_lock(tmp_path: Path) -> None:
+    """The Files panel's Git reads must not refresh the index they share with writers.
+
+    Covers both background reads behind ``list_changed_files``: the ``git
+    status`` scan and ``git diff --numstat``.
+    """
+    env = _git_env()
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
+    tracked = tmp_path / "committed.py"
+    tracked.write_text("committed content")
+    subprocess.run(
+        ["git", "add", "committed.py"], cwd=tmp_path, check=True, capture_output=True, env=env
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True, env=env
+    )
+    # Bytes unchanged, stat stale: a dirty entry keeps its cached stat, so only
+    # this shape guarantees the refresh the fix suppresses.
+    past = time.time() - 10
+    os.utime(tracked, (past, past))
+
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    before = _index_signature(tmp_path)
+    assert reg.list_changed_files("any-conv", limit=100) == []
+    assert _index_signature(tmp_path) == before
 
 
 def test_git_changed_files_suppress_ephemeral_files(tmp_path: Path) -> None:
