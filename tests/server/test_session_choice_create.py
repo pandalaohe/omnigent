@@ -276,6 +276,60 @@ async def test_notice_uses_reserve_else_low_pace(
 
 
 @pytest.mark.asyncio
+async def test_user_named_host_hold_keeps_priority_at_release(choice_env, monkeypatch):
+    from omnigent.server.session_choice import state_for
+    from omnigent.usage.contract import UsageAccountView, UsageWindowView
+
+    env = choice_env
+    first = await create(env)
+    assert first.status_code == 201, first.text
+    env.app.state.system_status = SimpleNamespace(
+        queue_enabled=lambda workspace: True,
+        host_load=lambda *args: {
+            "level": "new_session_hold",
+            "load_per_core": 6,
+            "lines": {"heavy": 4, "new_session": 5},
+        },
+    )
+    response = await create(
+        env, agent_id=env.agents[0]["id"], user_named=True, model_override="test-model"
+    )
+    assert response.status_code == 201, response.text
+    held_id = response.json()["id"]
+    assert choice_record(env.store.get_conversation(held_id))["flags"] == ["user_named"]
+    reset = time.time() + 86400
+    exhausted = UsageAccountView(
+        id="pool-0",
+        kind="account",
+        display_name="Pool",
+        state="low",
+        freshness="fresh",
+        windows=[
+            UsageWindowView(
+                id="7d",
+                kind="weekly",
+                percent_used=100,
+                remaining_pct=0,
+                resets_at=reset,
+                state="low",
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        env.app.state.agent_quota_service, "pool_readings", lambda *a, **k: {"pool-0": exhausted}
+    )
+    state_for(env.app).cooldowns[(RESERVED_USER_LOCAL, "pool-0")] = reset
+    env.app.state.system_status = None
+    queue = HostLoadQueue(env.store)
+    monkeypatch.setattr(queue, "_start", AsyncMock())
+    monkeypatch.setattr(env.app.state.host_load_inputs, "deliver_session", AsyncMock())
+    assert await queue.release(env.app, held_id, HOST)
+    queue._start.assert_awaited_once()
+    assert holds_slot(env.store.get_conversation(first.json()["id"]), time.time())
+    assert holds_slot(env.store.get_conversation(held_id), time.time())
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["quota", "running", "choose"])
 async def test_failed_reads_and_selector_keep_projectless_create_usable(
     choice_env, monkeypatch, failure

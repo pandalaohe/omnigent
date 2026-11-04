@@ -534,11 +534,12 @@ async def release_choice(app: Any, session: Conversation, host: str) -> bool:
             for (user, pool), until in state_for(app).cooldowns.items()
             if user == owner
         }
-        failure = _filter_link(
-            settings, work, link, request, readings, running, floors, cooldowns, now
-        )
-        if failure is not None:
-            return False
+        if "user_named" not in record.get("flags", ()):
+            failure = _filter_link(
+                settings, work, link, request, readings, running, floors, cooldowns, now
+            )
+            if failure is not None:
+                return False
         return await asyncio.to_thread(
             app.state.conversation_store.compare_and_set_label,
             session.id,
