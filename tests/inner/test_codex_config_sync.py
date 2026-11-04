@@ -664,6 +664,27 @@ def test_existing_home_does_not_apply_current_route(
     assert tomllib.loads(path.read_text())["model"] == "session"
 
 
+def test_current_route_failed_rewrite_keeps_private_config(
+    tmp_path: Path,
+    route_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.inner import codex_executor
+
+    path = tmp_path / "config.toml"
+    original = '# private comment\nmodel = "original"\n'
+    path.write_text(original)
+    route_file.write_text('model = "route-model"\n')
+
+    def fail_replace(source: object, target: object) -> None:
+        raise OSError("replacement failed")
+
+    monkeypatch.setattr(codex_executor.os, "replace", fail_replace)
+    codex_executor._apply_codex_current_route(path)
+    assert path.read_text() == original
+    assert not list(tmp_path.glob("config.toml.*"))
+
+
 async def test_native_startup_keeps_current_route_and_source_stance(
     homes: tuple[Path, Path],
     route_file: Path,

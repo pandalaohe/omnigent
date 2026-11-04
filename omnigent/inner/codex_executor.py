@@ -1391,7 +1391,7 @@ def _apply_codex_current_route(config_path: Path) -> None:
                     break
             else:
                 parent.pop(parts[-1], None)
-        config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
+        _write_codex_config(config_path, tomlkit.dumps(document))
     except (OSError, UnicodeError, ValueError, tomlkit.exceptions.TOMLKitError) as exc:
         logger.warning("Codex current route skipped: %s", type(exc).__name__)
 
