@@ -3329,3 +3329,36 @@ async def test_on_runner_connect_reassign_http_status_levels(
     assert row.levelno == level
     assert row.exc_info is None
     assert f"HTTP {status}: runner said no" in row.getMessage()
+
+
+def test_usage_snapshot_store_uses_primary_database(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.runtime.agent_cache import AgentCache
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    captured = []
+
+    class CaptureStore:
+        def __init__(self, location):
+            captured.append(location)
+
+    monkeypatch.setattr("omnigent.stores.usage_snapshot_store.UsageSnapshotStore", CaptureStore)
+    artifact_store = LocalArtifactStore(str(tmp_path / "split-artifacts"))
+    conversation_store = SqlAlchemyConversationStore(
+        db_uri, f"sqlite:///{tmp_path / 'split-conversations.db'}"
+    )
+    server_app.create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=conversation_store,
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(
+            artifact_store=artifact_store,
+            cache_dir=tmp_path / "split-cache",
+        ),
+    )
+    assert captured == [db_uri]

@@ -11,6 +11,13 @@ _MAX_WINDOWS = 8
 _MAX_TEXT = 64
 
 
+def _finite(value: int | float) -> bool:
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
 def pi_provider_usage_limits_from_headers(
     headers: object, *, captured_at: int
 ) -> dict[str, Any] | None:
@@ -89,6 +96,19 @@ def validate_provider_usage_limits_snapshot(snapshot: object) -> dict[str, Any] 
         label = candidate.get("label")
         aria_label = candidate.get("aria_label")
         used_percent = candidate.get("used_percent")
+        used_value = candidate.get("used_value")
+        has_percent = (
+            not isinstance(used_percent, bool)
+            and isinstance(used_percent, (int, float))
+            and _finite(used_percent)
+            and 0 <= used_percent <= 100
+        )
+        has_value = (
+            not isinstance(used_value, bool)
+            and isinstance(used_value, (int, float))
+            and _finite(used_value)
+            and used_value >= 0
+        )
         if (
             not isinstance(label, str)
             or not label.strip()
@@ -96,18 +116,35 @@ def validate_provider_usage_limits_snapshot(snapshot: object) -> dict[str, Any] 
             or not isinstance(aria_label, str)
             or not aria_label.strip()
             or len(aria_label) > _MAX_TEXT
-            or isinstance(used_percent, bool)
-            or not isinstance(used_percent, (int, float))
-            or used_percent < 0
-            or used_percent > 100
-            or not math.isfinite(used_percent)
+            or (used_percent is not None and not has_percent)
+            or (used_value is not None and not has_value)
+            or (not has_percent and not has_value)
         ):
             raise ValueError("invalid provider usage-limit window values")
         normalized: dict[str, Any] = {
             "label": label.strip(),
             "aria_label": aria_label.strip(),
-            "used_percent": float(used_percent),
         }
+        if used_percent is not None and has_percent:
+            normalized["used_percent"] = float(used_percent)
+        if used_value is not None and has_value:
+            normalized["used_value"] = float(used_value)
+        limit_value = candidate.get("limit_value")
+        if limit_value is not None:
+            if (
+                not has_value
+                or isinstance(limit_value, bool)
+                or not isinstance(limit_value, (int, float))
+                or not _finite(limit_value)
+                or limit_value < 0
+            ):
+                raise ValueError("invalid provider usage-limit value limit")
+            normalized["limit_value"] = float(limit_value)
+        unit = candidate.get("unit")
+        if unit is not None:
+            if not has_value or not isinstance(unit, str) or not unit.strip() or len(unit) > 8:
+                raise ValueError("invalid provider usage-limit value unit")
+            normalized["unit"] = unit.strip()
         duration_mins = candidate.get("duration_mins")
         if duration_mins is not None:
             if (

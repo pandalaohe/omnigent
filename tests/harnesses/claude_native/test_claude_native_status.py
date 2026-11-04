@@ -144,6 +144,43 @@ def test_status_wrapper_captures_sanitized_claude_plan_windows(
     assert "account" not in persisted
 
 
+def test_status_wrapper_passes_spend_limit_without_inventing_missing_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spend values and independently absent plan windows keep their real shape."""
+    monkeypatch.setattr(claude_native_status.time, "time", lambda: 1_900_000_000)
+    stdin = json.dumps(
+        {
+            "context_window": {"context_window_size": 200_000},
+            "rate_limits": {
+                "spend_limit": {
+                    "used_percentage": 62.8,
+                    "resets_at": 2_000_000_000,
+                    "used_usd": 314.12,
+                    "limit_usd": 500,
+                    "period": "monthly",
+                }
+            },
+        }
+    )
+
+    assert _run(stdin_payload=stdin, bridge_dir=tmp_path, monkeypatch=monkeypatch) == 0
+    persisted = json.loads((tmp_path / "context.json").read_text(encoding="utf-8"))
+    windows = persisted["provider_usage_limits"]["windows"]
+    assert windows == [
+        {
+            "label": "spend",
+            "aria_label": "spend",
+            "used_percent": 62.8,
+            "duration_mins": 43_200,
+            "resets_at": 2_000_000_000,
+            "used_value": 314.12,
+            "unit": "USD",
+            "limit_value": 500,
+        }
+    ]
+
+
 def test_status_wrapper_drops_payload_without_context_window(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

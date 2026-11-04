@@ -1993,9 +1993,17 @@ def create_app(
     archive_close_coordinator.set_archive_preferences(user_preferences_store, permission_store)
     from omnigent.server.agent_quota import AgentQuotaService
     from omnigent.server.routes.agent_quota import create_agent_quota_router
+    from omnigent.server.server_config import usage_enabled as usage_module_enabled
+    from omnigent.stores.usage_snapshot_store import UsageSnapshotStore
 
     agent_quota_service = AgentQuotaService(
-        conversation_store, permission_store, user_preferences_store, host_registry, host_store
+        conversation_store,
+        permission_store,
+        user_preferences_store,
+        host_registry,
+        host_store,
+        UsageSnapshotStore(conversation_store.storage_location),
+        usage_enabled=usage_module_enabled(resolved_server_config),
     )
     from omnigent.server.standing_approval import StandingApprovalService
 
@@ -2234,6 +2242,18 @@ def create_app(
             )
         )
 
+        usage_flush_task: asyncio.Task[None] | None = None
+        if agent_quota_service.usage_enabled:
+
+            async def _usage_flush_loop() -> None:
+                while True:
+                    await asyncio.sleep(60.0)
+                    await asyncio.to_thread(agent_quota_service.flush)
+
+            usage_flush_task = asyncio.create_task(
+                _usage_flush_loop(), name="usage-snapshot-flush"
+            )
+
         # System status: one tick loop rolls up host points, trims history and
         # evaluates findings; a second loop renews the fast-sampling lease for
         # hosts someone is watching. Both are no-ops without a host store.
@@ -2470,6 +2490,11 @@ def create_app(
             with monitor_event_loop():
                 yield
         finally:
+            if usage_flush_task is not None:
+                usage_flush_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await usage_flush_task
+                await asyncio.to_thread(agent_quota_service.flush, force=True)
             if child_idle is not None:
                 await child_idle.shutdown()
             # Keep-warm stops first: its notices post through the peer
@@ -5968,6 +5993,7 @@ def create_app(
                 on_host_update=_on_hosts_changed,
                 conversation_store=conversation_store,
                 startup_store=app.state.startup_store,
+                agent_quota_service=agent_quota_service,
                 harness_install=app.state.harness_install,
             ),
             prefix="/v1",
