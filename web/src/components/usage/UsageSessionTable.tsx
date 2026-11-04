@@ -119,7 +119,7 @@ export function UsageSessionTable({ sessions, now }: Props) {
                     {primaryModel(s.models)}
                     {Object.keys(s.models).length > 1 && (
                       <span
-                        className="ml-1.5 inline-flex items-center rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+                        className="ml-1.5 inline-flex items-center rounded-full bg-muted px-1.5 py-0.5 text-sm font-medium text-muted-foreground"
                         title={Object.entries(s.models)
                           .sort(([, a], [, b]) => b - a)
                           .slice(1)
@@ -136,7 +136,7 @@ export function UsageSessionTable({ sessions, now }: Props) {
                 {s.harness ?? "—"}
                 {s.otherHarnesses && s.otherHarnesses.length > 0 && (
                   <span
-                    className="ml-1.5 inline-flex items-center rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+                    className="ml-1.5 inline-flex items-center rounded-full bg-muted px-1.5 py-0.5 text-sm font-medium text-muted-foreground"
                     title={s.otherHarnesses.join(", ")}
                   >
                     +{s.otherHarnesses.length}

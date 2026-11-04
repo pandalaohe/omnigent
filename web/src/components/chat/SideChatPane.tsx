@@ -360,7 +360,7 @@ export function SideChatPane({
                 className="mt-1"
                 onClick={() => void ensureConversationStreamed(childId)}
               >
-                Retry
+                Retry loading this chat
               </Button>
             </div>
           ) : fullSession && loadingConversation && bubbles.length === 0 ? (

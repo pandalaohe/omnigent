@@ -11,7 +11,7 @@ describe("SetupTerminalStep", () => {
 
     expect(onRun).toHaveBeenCalledOnce();
     expect(await screen.findByText("Server ready")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Retry setup" })).toBeNull();
   });
 
   it("shows the error and a Retry that runs the action again on failure", async () => {
@@ -23,7 +23,7 @@ describe("SetupTerminalStep", () => {
 
     expect(await screen.findByText("omnigent CLI not found")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry setup" }));
     expect(onRun).toHaveBeenCalledTimes(2);
     expect(await screen.findByText("Server ready")).toBeInTheDocument();
   });

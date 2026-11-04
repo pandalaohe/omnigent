@@ -774,7 +774,7 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
                       onClick={() => removeBinding(hostId, binding.name)}
                       disabled={pending}
                     >
-                      Remove
+                      Remove this folder
                     </Button>
                   )}
                 </div>
@@ -805,7 +805,7 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
                     onClick={() => saveTypedBinding(hostId, repository, bindingName)}
                     disabled={pending}
                   >
-                    Save
+                    Save this folder path
                   </Button>
                 </div>
               )}
@@ -862,7 +862,7 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
                     onClick={() => removeBinding(hostId, orphan.name)}
                     disabled={pending}
                   >
-                    Remove
+                    Remove this folder
                   </Button>
                 )}
               </div>
@@ -968,7 +968,7 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
                 onClick={() => removeRepository(repository)}
                 disabled={pending}
               >
-                Remove
+                Remove this repository
               </Button>
             </div>
             <div className="flex min-w-0 flex-wrap gap-4">
@@ -1234,7 +1234,7 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
                       onClick={() => setAddMode("address")}
                       disabled={pending}
                     >
-                      Add by address
+                      Add repository by address
                     </Button>
                     <HelpTip label="About adding a repository by address">
                       Records a URL only. It does not clone the repository, set a push target or
@@ -1360,7 +1360,7 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
               void queryClient.invalidateQueries({ queryKey: ["project-code-folder-facts"] });
             }}
           >
-            Refresh
+            Refresh host folders
           </Button>
         </div>
         {cardHostIds.map(renderHostCard)}

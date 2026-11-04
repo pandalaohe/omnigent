@@ -251,7 +251,7 @@ function AddDefaultPolicyDialog({
                     {prop?.description ? (
                       <SettingsLabel
                         label={fieldLabel}
-                        labelClassName="text-sm text-foreground"
+                        note={null}
                         description={prop.description}
                         descriptionClassName="break-words"
                       />

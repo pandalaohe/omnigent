@@ -387,7 +387,7 @@ export function ArchiveDateRangePicker({
             )}
           </div>
           {invalid && (
-            <p className="mt-1 text-[11px] text-destructive" role="alert">
+            <p className="mt-1 text-sm text-destructive" role="alert">
               Use YYYYMMDD or YYYYMMDD-YYYYMMDD.
             </p>
           )}
@@ -409,7 +409,7 @@ export function ArchiveDateRangePicker({
         <div className="min-w-0 flex-1">
           {input}
           {invalid && (
-            <p className="mt-1 text-[11px] text-destructive" role="alert">
+            <p className="mt-1 text-sm text-destructive" role="alert">
               Use YYYYMMDD or YYYYMMDD-YYYYMMDD.
             </p>
           )}

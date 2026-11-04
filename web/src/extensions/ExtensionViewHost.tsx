@@ -288,7 +288,7 @@ export function ExtensionViewHost({
               setRetryKey((value) => value + 1);
             }}
           >
-            Retry
+            Retry starting this page
           </button>
         </div>
       </div>

@@ -642,7 +642,7 @@ export function HeaderConversationMenu({
         onSelect={() => setDeleteOpen(true)}
       >
         <Trash2Icon className="size-3.5" />
-        Delete
+        Delete this session
       </DropdownMenuItem>
     </>
   );

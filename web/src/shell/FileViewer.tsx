@@ -1769,7 +1769,7 @@ function FileViewerBody({
               >
                 <ChevronLeftIcon className="size-4" />
               </Button>
-              <span className="text-[10px] text-muted-foreground tabular-nums">
+              <span className="text-sm text-muted-foreground tabular-nums">
                 {currentNavIdx + 1}/{navigableFiles.length}
               </span>
               <Button

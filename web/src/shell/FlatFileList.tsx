@@ -117,7 +117,7 @@ function FileListItem({
         <span className={cn("flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}>
           {((file.lines_added ?? 0) !== 0 || (file.lines_removed ?? 0) !== 0) && (
             <span
-              className="font-mono text-[10px]"
+              className="font-mono text-sm"
               aria-label={[
                 file.lines_added !== null && `${file.lines_added} lines added`,
                 file.lines_removed !== null && `${file.lines_removed} removed`,

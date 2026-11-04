@@ -160,8 +160,9 @@ export function ImportSessionsPanel() {
           <SettingsLabel
             label={`How many recent sessions${source === "all" ? " (across all harnesses)" : ""}`}
             className="flex-1"
+            note={null}
             description="The most recent sessions you opened in the harness. Sub-agent and automation runs are skipped, and sessions you've already imported are counted separately, not re-imported."
-            descriptionTestId="import-limit-help"
+            testId="import-limit-help"
           />
           <Select
             value={String(limit)}
@@ -269,7 +270,7 @@ export function ImportSessionsPanel() {
                   loading={importing}
                   onClick={handleRetry}
                 >
-                  Retry failed
+                  Retry failed imports
                 </Button>
                 <p className="mt-1 text-xs text-muted-foreground">
                   Retrying re-runs the import; sessions already imported are skipped.

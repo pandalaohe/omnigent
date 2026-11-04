@@ -1109,7 +1109,7 @@ export function RoutingDecisionCard({
           // The spawn named its own model and the router picked another — the
           // substitution is the whole point of the row, so it shows at a glance.
           <span
-            className="ml-auto shrink-0 whitespace-nowrap font-mono text-[10px] text-muted-foreground line-through"
+            className="ml-auto shrink-0 whitespace-nowrap font-mono text-sm text-muted-foreground line-through"
             data-testid="routing-decision-attempted-override"
             title="The spawn asked for this model; Smart Routing picked the one on the right."
           >
@@ -1121,7 +1121,7 @@ export function RoutingDecisionCard({
           // show what the router said next to what actually ran.
           <span
             className={cn(
-              "shrink-0 whitespace-nowrap font-mono text-[10px] text-muted-foreground",
+              "shrink-0 whitespace-nowrap font-mono text-sm text-muted-foreground",
               !attemptedShort && "ml-auto",
             )}
             data-testid="routing-decision-raw-model"
@@ -1131,7 +1131,7 @@ export function RoutingDecisionCard({
         ) : null}
         <span
           className={cn(
-            "shrink-0 inline-flex items-center whitespace-nowrap rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] font-medium leading-none text-foreground",
+            "shrink-0 inline-flex items-center whitespace-nowrap rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono text-sm font-medium leading-none text-foreground",
             !rawShort && !attemptedShort && "ml-auto",
           )}
         >

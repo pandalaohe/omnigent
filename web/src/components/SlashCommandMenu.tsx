@@ -568,7 +568,7 @@ export function SlashCommandMenu({
                 onMouseDown={(e) => e.preventDefault()}
                 onClick={onRetrySkills}
               >
-                Retry
+                Retry loading skills
               </button>
             )}
           </div>

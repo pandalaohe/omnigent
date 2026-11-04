@@ -548,7 +548,7 @@ describe("PullRequestPanel", () => {
     const heading = screen.getByRole("heading", { name: "Pull Requests" });
     const header = heading.closest("header")!;
     expect(screen.getAllByRole("heading", { name: "Pull Requests" })).toHaveLength(1);
-    await user.click(within(header).getByRole("button", { name: "Refresh" }));
+    await user.click(within(header).getByRole("button", { name: "Refresh pull requests" }));
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session-pull-requests", "conv_1"] });
     await user.click(within(header).getByRole("button", { name: "Link a PR" }));
     expect(screen.getByRole("textbox", { name: "Pull request URL" })).toBeVisible();
@@ -2119,7 +2119,7 @@ describe("PullRequestPanel", () => {
     const invalidate = vi.spyOn(QueryClient.prototype, "invalidateQueries").mockResolvedValue();
     onTestFinished(() => invalidate.mockRestore());
     renderPanel();
-    await userEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    await userEvent.click(screen.getByRole("button", { name: "Refresh pull requests" }));
     expect(invalidate.mock.calls.map(([filters]) => filters?.queryKey?.[0])).toEqual([
       "github-info",
       "github-changed-files",

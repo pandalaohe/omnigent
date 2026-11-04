@@ -240,6 +240,38 @@ describe("PoliciesPage actions", () => {
     });
   });
 
+  it("keeps schema descriptions behind help and uses the row-title size", async () => {
+    const description = "Choose how the policy runs.";
+    vi.mocked(policies.usePolicyRegistry).mockReturnValue({
+      data: [
+        {
+          handler: "omnigent.policies.budget",
+          kind: "factory",
+          name: "Budget Guard",
+          description: "blocks expensive models",
+          params_schema: {
+            properties: {
+              mode: { type: "string", description, enum: ["safe", "fast"] },
+            },
+            required: [],
+          },
+        },
+      ],
+    } as never);
+    renderPage();
+    await screen.findByText(/No global policies configured/);
+
+    fireEvent.click(screen.getByRole("button", { name: /Add policy/ }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByText("Budget Guard"));
+
+    expect(within(dialog).getByText("mode (string)")).toHaveClass("text-ui");
+    expect(within(dialog).getByText("mode (string)")).not.toHaveClass("text-sm");
+    expect(within(dialog).queryByText(description)).not.toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole("button", { name: "About mode (string)" }));
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(description);
+  });
+
   it("adds a global policy from the registry via the Add dialog", async () => {
     vi.mocked(policies.usePolicyRegistry).mockReturnValue({
       data: [

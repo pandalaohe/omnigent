@@ -77,10 +77,10 @@ function AgentNodeComponent({ data }: NodeProps<Node<AgentNodeData>>) {
           <NodeStatusDot activity={activity} />
         </div>
         {preview && (
-          <p className="mt-1 truncate text-[10px] leading-tight text-muted-foreground">{preview}</p>
+          <p className="mt-1 truncate text-sm leading-tight text-muted-foreground">{preview}</p>
         )}
         {!["idle", "done"].includes(activity) && (
-          <p className="mt-0.5 text-[10px] text-muted-foreground">{statusLabel}</p>
+          <p className="mt-0.5 text-sm text-muted-foreground">{statusLabel}</p>
         )}
       </div>
       <Handle

@@ -184,7 +184,7 @@ describe("CommandPalette — sessions", () => {
     expect(fetchNextPage).not.toHaveBeenCalled();
     expect(screen.getByRole("status").textContent).toContain("Couldn't load");
     expect(screen.queryByText("No results found")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading sessions" }));
     expect(fetchNextPage).toHaveBeenCalledOnce();
   });
 
@@ -196,7 +196,7 @@ describe("CommandPalette — sessions", () => {
       renderPalette({ sessionsOnly });
       expect(screen.getByRole("status").textContent).toContain("Couldn't load sessions.");
       expect(screen.queryByText("No results found")).toBeNull();
-      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      fireEvent.click(screen.getByRole("button", { name: "Retry loading sessions" }));
       expect(refetch).toHaveBeenCalledOnce();
     },
   );
@@ -809,7 +809,7 @@ describe("CommandPalette — title and content groups", () => {
 
     expect(screen.getByRole("status").textContent).toContain("Couldn't load more sessions.");
     // A slow content request doesn't block retrying the failed title page.
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading sessions" }));
     expect(fetchTitlePage).toHaveBeenCalledOnce();
     expect(fetchContentPage).not.toHaveBeenCalled();
   });
@@ -825,7 +825,7 @@ describe("CommandPalette — title and content groups", () => {
     search("deploy");
 
     expect(screen.getByRole("status").textContent).toContain("Couldn't load sessions.");
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading sessions" }));
     expect(refetchContent).toHaveBeenCalledOnce();
     expect(refetchTitle).not.toHaveBeenCalled();
   });

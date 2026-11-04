@@ -378,7 +378,7 @@ export function ArchiveTranscriptViewer({
           <h2 className="truncate text-sm font-semibold" title={title}>
             {title}
           </h2>
-          <p className="truncate font-mono text-[11px] text-muted-foreground">
+          <p className="truncate font-mono text-sm text-muted-foreground">
             {conversation.agent_name ?? "Agent not recorded"} · {conversation.id}
           </p>
         </div>
@@ -541,7 +541,7 @@ export function ArchiveTranscriptViewer({
             >
               <ArrowUpIcon />
             </Button>
-            <span className="min-w-10 text-center text-[11px] tabular-nums text-muted-foreground">
+            <span className="min-w-10 text-center text-sm tabular-nums text-muted-foreground">
               {activeTurnIndex + 1}/{turnBubbleIndexes.length}
             </span>
             <Button

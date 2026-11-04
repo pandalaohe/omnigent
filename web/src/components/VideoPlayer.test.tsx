@@ -97,7 +97,7 @@ describe("VideoPlayer", () => {
     );
 
     fireEvent.error(video);
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading this video" }));
     expect(container.querySelector("video")).toBeNull();
     expect(revokeUrl).toHaveBeenCalledWith("blob:recording");
     expect(screen.getByRole("button", { name: /Beyond the recording/ })).toBeEnabled();
@@ -263,7 +263,7 @@ describe("VideoPlayer", () => {
     vi.mocked(downloadWorkspaceFile).mockResolvedValueOnce();
     fireEvent.click(screen.getByRole("button", { name: "Download video: Feature demo" }));
     expect(downloadWorkspaceFile).toHaveBeenCalledWith("sess_1", "demo.webm");
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading this video" }));
     fireEvent.click(screen.getByRole("button", { name: "Play video: Feature demo" }));
     await waitFor(() => expect(fetchBlob).toHaveBeenCalledTimes(2));
   });
@@ -346,7 +346,7 @@ describe("VideoPlayer", () => {
       src,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading this video" }));
     expect(screen.queryByRole("status")).toBeNull();
     expect(container.querySelector("video")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Play video: Demo" }));

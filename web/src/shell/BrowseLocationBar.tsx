@@ -169,7 +169,7 @@ export function BrowseLocationBar({
         )}
       </span>
       {shownError && (
-        <span className="truncate text-[10px] text-destructive" data-testid="browse-location-error">
+        <span className="truncate text-sm text-destructive" data-testid="browse-location-error">
           {shownError}
         </span>
       )}

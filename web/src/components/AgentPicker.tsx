@@ -100,7 +100,7 @@ export function AgentPicker({
             <div className="flex items-center justify-between gap-3 px-3 py-3 text-sm">
               <span>Couldn't load agents</span>
               <Button type="button" variant="outline" size="sm" onClick={onRetry}>
-                Retry
+                Retry loading agents
               </Button>
             </div>
           )

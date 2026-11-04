@@ -430,7 +430,7 @@ describe("HeaderConversationMenu", () => {
       "Mark as unread",
       "Add to project",
       "Archive",
-      "Delete",
+      "Delete this session",
     ]);
     expect(screen.getByTestId("header-move-to-project")).toBeInTheDocument();
     expect(screen.getByTestId("header-rename-conversation")).toBeInTheDocument();
@@ -592,7 +592,7 @@ describe("HeaderConversationMenu", () => {
     view.unmount();
     renderMenu();
     openMenu();
-    fireEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete this session" }));
     fireEvent.click(screen.getByTestId("header-delete-branch-checkbox"));
     fireEvent.click(screen.getByRole("button", { name: "Delete" }));
     expect(mocks.deleteConversation).toHaveBeenCalledWith({
@@ -611,7 +611,7 @@ describe("HeaderConversationMenu", () => {
     renderMenu();
 
     openMenu();
-    fireEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete this session" }));
 
     const dialog = await screen.findByRole("dialog");
     expect(
@@ -624,7 +624,7 @@ describe("HeaderConversationMenu", () => {
     renderMenu();
 
     openMenu();
-    fireEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete this session" }));
 
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).queryByText(/unhandled comments/)).toBeNull();
@@ -810,7 +810,7 @@ describe("HeaderConversationMenu", () => {
   it("closes Delete and clears branch selection when the conversation id changes", async () => {
     const view = renderMenu();
     openMenu();
-    fireEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete this session" }));
     fireEvent.click(screen.getByTestId("header-delete-branch-checkbox"));
 
     view.rerender(menuTree({ conversation: SECOND_CONVERSATION }));
@@ -821,7 +821,7 @@ describe("HeaderConversationMenu", () => {
     expect(mocks.deleteConversation).not.toHaveBeenCalled();
 
     openMenu();
-    fireEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete this session" }));
     expect(screen.getByTestId("header-delete-branch-checkbox")).not.toBeChecked();
     fireEvent.click(screen.getByRole("button", { name: "Delete" }));
     expect(mocks.deleteConversation).toHaveBeenCalledWith({
@@ -885,7 +885,7 @@ describe("HeaderConversationMenu", () => {
       "Mark as unread",
       "Add to project",
       "Archive",
-      "Delete",
+      "Delete this session",
     ]);
   });
 
@@ -910,7 +910,7 @@ describe("HeaderConversationMenu", () => {
       "Add to project",
       "Files",
       "Archive",
-      "Delete",
+      "Delete this session",
     ]);
   });
 

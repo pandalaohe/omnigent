@@ -552,7 +552,7 @@ function CanvasSurface({ selectedSessionId }: { selectedSessionId?: string | nul
             <strong className="font-medium">Canvas could not load</strong>
             <span className="text-ui text-muted-foreground">{error}</span>
             <Button variant="outline" size="sm" className="mt-2" onClick={() => void refresh()}>
-              Retry
+              Retry loading Canvas
             </Button>
           </div>
         ) : (

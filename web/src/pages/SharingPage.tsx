@@ -60,17 +60,20 @@ const TIERS: { id: SharingMode; label: string; description: string }[] = [
 const DEFAULT_PUBLIC_OPTIONS: {
   id: Exclude<DefaultPublicSessions, "off">;
   label: string;
+  note: string;
   description: string;
 }[] = [
   {
     id: "sandbox",
     label: "Managed hosts only",
+    note: "Managed-host sessions start shared; local ones stay private.",
     description:
       "Share sessions on server-managed sandboxes. Sessions on local hosts start private.",
   },
   {
     id: "all",
     label: "All sessions",
+    note: "Managed and local sessions start with public read access.",
     description: "Share sessions on both managed and local hosts.",
   },
 ];
@@ -265,6 +268,7 @@ export function SharingPage() {
                     <SettingsLabel
                       label="Public access"
                       className="flex-1"
+                      note="Public links give signed-in people session access."
                       description={
                         <>
                           Allow sharing a session with anyone who has the link and can sign in. When
@@ -292,6 +296,7 @@ export function SharingPage() {
                   <SettingsLabel
                     label="Maximum public permission"
                     className="min-w-0 flex-1"
+                    note="Public links can grant at most this access level."
                     description={
                       <>
                         The maximum access a public link can grant. Lowering this to Read also
@@ -339,6 +344,7 @@ export function SharingPage() {
                         descriptionId="default-public-description"
                         descriptionClassName="max-md:block"
                         className="flex-1"
+                        note="New sessions start with public read access."
                         description={
                           <>
                             New sessions start with public read access for anyone with the link who
@@ -392,6 +398,7 @@ export function SharingPage() {
                               <SettingsLabel
                                 label={option.label}
                                 labelId={`default-public-${option.id}-label`}
+                                note={option.note}
                                 description={option.description}
                                 descriptionId={`default-public-${option.id}-description`}
                                 descriptionClassName="max-md:block"

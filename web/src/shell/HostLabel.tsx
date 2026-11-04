@@ -26,7 +26,7 @@ export function HostLabel({ host }: { host: Host }) {
       )}
       <span className="text-ui">{host.name}</span>
       <span
-        className={`inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider ${
+        className={`inline-flex items-center gap-1 text-sm font-semibold uppercase tracking-wider ${
           isOnline ? "text-green-600" : "text-muted-foreground"
         }`}
       >
