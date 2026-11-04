@@ -12,6 +12,7 @@ import time
 import weakref
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import httpx
@@ -394,6 +395,7 @@ from omnigent.stores.conversation_store import (
     ConversationArchiveClosingError,
     runner_seen_is_fresh,
 )
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import host_is_live
 from omnigent.stores.peer_message_store import PeerMessageStore
@@ -6284,6 +6286,23 @@ def register_events_routes(
                         "Conversation not found",
                         code=ErrorCode.NOT_FOUND,
                     )
+        return await _delete_session_authorized(
+            session_id,
+            state=request.app.state,
+            delete_branch=delete_branch,
+            capture_logs=capture_logs,
+            user_id=user_id,
+        )
+
+    async def _delete_session_authorized(
+        session_id: str,
+        *,
+        state: Any,
+        delete_branch: bool = False,
+        capture_logs: bool = False,
+        user_id: str | None = None,
+    ) -> ConversationDeleted:
+        """Delete after caller authorization; also used by the retention job."""
         claim_token = secrets.token_hex(16)
         delete_lease = _DeletionClaimLease(conversation_store, session_id, claim_token)
         current_task = asyncio.current_task()
@@ -6317,6 +6336,16 @@ def register_events_routes(
         if conv is None:
             await delete_lease.release()
             raise _session_not_found()
+        if isinstance(
+            conversation_store, SqlAlchemyConversationStore
+        ) and await delete_lease.to_thread(
+            conversation_store.has_unresolved_worktree_hold, session_id
+        ):
+            await delete_lease.release()
+            raise OmnigentError(
+                "Worktree removal is unresolved; retry deletion after host confirmation",
+                code=ErrorCode.CONFLICT,
+            )
         descendant_ids = await delete_lease.run(
             _best_effort_stop(session_id, conversation_store, runner_router)
         )
@@ -6362,7 +6391,7 @@ def register_events_routes(
         # retained, so nothing irrecoverable may be destroyed first.
         # Git errors on a reachable host stay best-effort.
         if delete_branch:
-            binding_store = getattr(request.app.state, "project_host_binding_store", None)
+            binding_store = getattr(state, "project_host_binding_store", None)
 
             def is_entry(host_id: str, path: str) -> bool:
                 """Whether an entry sits at or under ``(host_id, path)``."""
@@ -6383,7 +6412,7 @@ def register_events_routes(
                         worktree_path=worktree_target,
                         branch=cast(str, conv.git_branch),
                         delete_branch=True,
-                        host_registry=getattr(request.app.state, "host_registry", None),
+                        host_registry=getattr(state, "host_registry", None),
                         reason="session-delete",
                         expected_root_fingerprint=conv.labels.get(WORKTREE_ROOT_LABEL_KEY),
                         conversation_store=conversation_store,
@@ -6459,7 +6488,7 @@ def register_events_routes(
         # still-in-flight entry, releasing any parked message POST into
         # its session re-read (which now correctly 404s); the background
         # task's later ``fail`` on the popped entry is a no-op.
-        managed_launches_for_delete = getattr(request.app.state, "managed_launches", None)
+        managed_launches_for_delete = getattr(state, "managed_launches", None)
         if managed_launches_for_delete is not None:
             managed_launches_for_delete.finish(session_id)
         # Managed-host cleanup: when the session's host is backed by a
@@ -6468,7 +6497,7 @@ def register_events_routes(
         # launch token. Best-effort by design — the provider's lifetime
         # cap reaps stragglers. External (laptop) hosts have no
         # sandbox_id and are never touched.
-        host_store_for_managed = getattr(request.app.state, "host_store", None)
+        host_store_for_managed = getattr(state, "host_store", None)
         if conv.host_id is not None and host_store_for_managed is not None:
             bound_host = await delete_lease.to_thread(
                 host_store_for_managed.get_host, conv.host_id
@@ -6483,7 +6512,7 @@ def register_events_routes(
                         # Supplies the launcher for the provider-side
                         # terminate; None (config removed since launch)
                         # still deletes the row and revokes the token.
-                        getattr(request.app.state, "sandbox_config", None),
+                        getattr(state, "sandbox_config", None),
                         capture_logs=capture_logs,
                     )
                 )
@@ -6511,6 +6540,19 @@ def register_events_routes(
             pass
         await delete_lease.release()
         return ConversationDeleted(id=session_id)
+
+    async def session_tree_idle(session_ids: list[str]) -> bool:
+        """Use the route's status and background-shell readings before retention."""
+        conversations = await asyncio.to_thread(conversation_store.get_conversations, session_ids)
+        return len(conversations) == len(session_ids) and all(
+            _session_status_from_cache(session_id, conv.live_status) == "idle"
+            and _session_background_task_count_cache.get(session_id, 0) == 0
+            for session_id, conv in conversations.items()
+        )
+
+    if app_state is not None:
+        app_state.delete_session_authorized = partial(_delete_session_authorized, state=app_state)
+        app_state.session_tree_idle = session_tree_idle
 
     router.include_router(event_router)
     return peer

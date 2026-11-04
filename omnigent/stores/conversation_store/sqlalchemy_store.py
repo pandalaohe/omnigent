@@ -2709,6 +2709,126 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             )
 
+    def _expired_session_trees_query(self, cutoff: int) -> Select:
+        """Select old archived roots with no fresh, locked or held member."""
+        member = aliased(SqlConversation)
+        removed = aliased(SqlConversationLabel)
+        held_member = (
+            select(SqlConversationLabel.conversation_id)
+            .where(
+                SqlConversationLabel.workspace_id == current_workspace_id(),
+                SqlConversationLabel.conversation_id == member.id,
+                SqlConversationLabel.key == ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY,
+                ~select(removed.conversation_id)
+                .where(
+                    removed.workspace_id == current_workspace_id(),
+                    removed.conversation_id == member.id,
+                    removed.key == ARCHIVE_REMOVED_WORKTREE_LABEL_KEY,
+                )
+                .correlate(member)
+                .exists(),
+            )
+            .correlate(member)
+            .exists()
+        )
+        ineligible_member = (
+            select(member.id)
+            .where(
+                member.workspace_id == current_workspace_id(),
+                member.root_conversation_id == SqlConversation.id,
+                or_(
+                    member.updated_at >= cutoff,
+                    member.archived_at >= cutoff,
+                    member.archive_locked.is_(True),
+                    held_member,
+                ),
+            )
+            .correlate(SqlConversation)
+            .exists()
+        )
+        return select(SqlConversation.id, SqlConversation.archived_at).where(
+            SqlConversation.workspace_id == current_workspace_id(),
+            SqlConversation.id == SqlConversation.root_conversation_id,
+            SqlConversation.archived.is_(True),
+            SqlConversation.archived_at < cutoff,
+            ~ineligible_member,
+        )
+
+    def list_expired_session_trees(
+        self, cutoff: int, limit: int, *, after: tuple[int, str] | None = None
+    ) -> list[tuple[str, int]]:
+        """Page expired roots oldest first in the current workspace."""
+        query = self._expired_session_trees_query(cutoff)
+        if after is not None:
+            query = query.where(tuple_(SqlConversation.archived_at, SqlConversation.id) > after)
+        query = query.order_by(SqlConversation.archived_at, SqlConversation.id).limit(limit)
+        with self._conv_session("list_expired_session_trees") as session:
+            return [(row[0], row[1]) for row in session.execute(query)]
+
+    def session_tree_still_expired(self, root_id: str, root_archived_at: int, cutoff: int) -> bool:
+        """Recheck the whole tree and the archive date selected by the sweep."""
+        query = self._expired_session_trees_query(cutoff).where(
+            SqlConversation.id == root_id, SqlConversation.archived_at == root_archived_at
+        )
+        with self._conv_session("session_tree_still_expired") as session:
+            return session.execute(query).first() is not None
+
+    def list_session_tree_bottom_up(self, root_id: str) -> list[str]:
+        """List tree members with every child before its parent, root last."""
+        with self._conv_session("list_session_tree_bottom_up") as session:
+            rows = session.execute(
+                select(SqlConversation.id, SqlConversation.parent_conversation_id).where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.root_conversation_id == root_id,
+                )
+            ).all()
+        children: dict[str, list[str]] = {}
+        for session_id, parent_id in rows:
+            if parent_id is not None:
+                children.setdefault(parent_id, []).append(session_id)
+        ordered: list[str] = []
+        stack = [(root_id, False)]
+        while stack:
+            session_id, visited = stack.pop()
+            if visited:
+                ordered.append(session_id)
+            else:
+                stack.append((session_id, True))
+                stack.extend((child, False) for child in sorted(children.get(session_id, [])))
+        return ordered
+
+    def has_unresolved_worktree_hold(self, session_id: str) -> bool:
+        """Read the subtree hold gate before a route removes files or blobs."""
+        subtree = (
+            select(SqlConversation.id)
+            .where(
+                SqlConversation.workspace_id == current_workspace_id(),
+                SqlConversation.id == session_id,
+            )
+            .cte(recursive=True)
+        )
+        subtree = subtree.union_all(
+            select(SqlConversation.id).where(
+                SqlConversation.workspace_id == current_workspace_id(),
+                SqlConversation.parent_conversation_id == subtree.c.id,
+            )
+        )
+        removed = aliased(SqlConversationLabel)
+        query = select(SqlConversationLabel.conversation_id).where(
+            SqlConversationLabel.workspace_id == current_workspace_id(),
+            SqlConversationLabel.conversation_id.in_(select(subtree.c.id)),
+            SqlConversationLabel.key == ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY,
+            ~select(removed.conversation_id)
+            .where(
+                removed.workspace_id == current_workspace_id(),
+                removed.conversation_id == SqlConversationLabel.conversation_id,
+                removed.key == ARCHIVE_REMOVED_WORKTREE_LABEL_KEY,
+            )
+            .exists(),
+        )
+        with self._conv_session("has_unresolved_worktree_hold") as session:
+            return session.execute(query.limit(1)).first() is not None
+
     def claim_archive_close(
         self,
         conversation_id: str,

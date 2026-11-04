@@ -184,6 +184,7 @@ from omnigent.server.seeded_agents import (
     seeded_agent_allowlist,
 )
 from omnigent.server.session_collab import session_peer_enabled
+from omnigent.server.session_retention import SessionRetention
 from omnigent.server.user_preferences_store import (
     USER_PREFERENCE_NAMESPACES,
     USER_PREFERENCES_MAX_BYTES,
@@ -2501,6 +2502,19 @@ def create_app(
         app_inst.state.attachment_archive_cleanup = attachment_archive_cleanup
         await attachment_archive_cleanup.start()
 
+        session_retention = None
+        if isinstance(conversation_store, SqlAlchemyConversationStore):
+            from omnigent.server.admin_list import resolve_data_dir
+
+            session_retention = SessionRetention(
+                conversation_store,
+                app_inst.state.delete_session_authorized,
+                session_tree_idle=app_inst.state.session_tree_idle,
+                data_dir=resolve_data_dir(),
+            )
+            app_inst.state.session_retention = session_retention
+            await session_retention.start()
+
         peer_sweeper = getattr(app_inst.state, "peer_sweeper", None)
         if peer_sweeper is not None:
             await peer_sweeper.start(app_inst)
@@ -2545,6 +2559,8 @@ def create_app(
             if managed_sandbox_reaper is not None:
                 await managed_sandbox_reaper.shutdown()
             await attachment_archive_cleanup.shutdown()
+            if session_retention is not None:
+                await session_retention.shutdown()
             metrics_publish_task.cancel()
             with suppress(asyncio.CancelledError):
                 await metrics_publish_task
