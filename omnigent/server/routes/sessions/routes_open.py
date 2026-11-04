@@ -164,7 +164,7 @@ class _PendingOpen:
     host_name: str
     project_id: str
     root_workspace: str
-    agent_id: str
+    agent_id: str | None
     body: SessionOpenRequest
     created_at: int
     expiry_handle: asyncio.TimerHandle | None = field(default=None)
@@ -523,7 +523,7 @@ def register_open_routes(
                 "project_id": project.id,
                 "host_id": host_id,
                 "workspace": workspace,
-                "agent_id": agent.id if body.agent is not None else None,
+                "agent_id": agent.id if agent is not None else None,
                 "title": body.title,
                 "work_type": body.work_type,
                 "user_named": body.user_named,
@@ -565,7 +565,7 @@ def register_open_routes(
             from omnigent.server.session_choice_runtime import choice_record
 
             selected = choice_record(conv)
-            if selected is not None:
+            if conv.agent_id is not None:
                 actual = await asyncio.to_thread(agent_store.get, conv.agent_id)
                 if actual is not None:
                     agent_name = public_agent_name(actual.name) or actual.name
@@ -723,34 +723,36 @@ def register_open_routes(
         )
         if placement is not None:
             return placement
-        agent = (
-            await asyncio.to_thread(agent_store.get, entry.agent_id)
-            if agent_store is not None
-            else None
-        )
-        if agent is None:
-            return _problem("failed", "agent_not_found", "The agent is no longer available.")
-        try:
-            agent = await validate_session_agent(
-                user_id=entry.owner,
-                agent_id=agent.id,
-                agent_store=agent_store,
-                permission_store=permission_store,
-                conversation_store=conversation_store,
+        agent = None
+        if entry.agent_id is not None:
+            agent = (
+                await asyncio.to_thread(agent_store.get, entry.agent_id)
+                if agent_store is not None
+                else None
             )
-        except OmnigentError:
-            return _problem("failed", "agent_not_found", "The agent is no longer available.")
-        if (
-            agent.session_id is not None
-            and permission_store is not None
-            and await asyncio.to_thread(get_session_owner_id, agent.session_id, permission_store)
-            != entry.owner
-        ):
-            return _problem(
-                "failed",
-                "agent_not_found",
-                "The agent belongs to another user's session.",
-            )
+            if agent is None:
+                return _problem("failed", "agent_not_found", "The agent is no longer available.")
+            try:
+                agent = await validate_session_agent(
+                    user_id=entry.owner,
+                    agent_id=agent.id,
+                    agent_store=agent_store,
+                    permission_store=permission_store,
+                    conversation_store=conversation_store,
+                )
+            except OmnigentError:
+                return _problem("failed", "agent_not_found", "The agent is no longer available.")
+            if (
+                agent.session_id is not None
+                and permission_store is not None
+                and await asyncio.to_thread(
+                    get_session_owner_id, agent.session_id, permission_store
+                )
+                != entry.owner
+            ):
+                return _problem(
+                    "failed", "agent_not_found", "The agent belongs to another user's session."
+                )
         return await _open_now(
             sid=entry.sid,
             owner=entry.owner,
@@ -761,7 +763,9 @@ def register_open_routes(
             host_id=entry.host_id,
             root=root,
             agent=agent,
-            agent_name=public_agent_name(agent.name) or agent.name,
+            agent_name=(public_agent_name(agent.name) or agent.name)
+            if agent
+            else "Session choice",
             body=entry.body,
             request=_synthetic_request(entry.sid, entry.choice_protocol),
         )
@@ -902,10 +906,11 @@ def register_open_routes(
         )
         if placement is not None:
             return placement
-        from omnigent.server.session_choice import active_on, resolve_work_type
+        from omnigent.server.session_choice import active_on
         from omnigent.server.session_choice_runtime import CHOICE_PROTOCOL_HEADER
 
         agent_hint = body.agent
+        use_choice = False
         if request.headers.get(CHOICE_PROTOCOL_HEADER) == "1" and not (
             body.agent and (body.user_named or body.choice_reason)
         ):
@@ -914,87 +919,89 @@ def register_open_routes(
                     read_collab_settings, getattr(app_state, "user_preferences_store", None), owner
                 )
             ).session_choice
-            if active_on(settings, host_id):
-                work, _ = resolve_work_type(settings, body.work_type)
-                tiers = settings.hosts[host_id].get(work.id, ())
-                if not tiers or not tiers[0]:
-                    return {"error": "session_choice_ask", "work_type": work.id, "skipped": []}
-                # The shared create boundary does the actual selection under the owner lock.
-                agent_hint = tiers[0][0].links[0].agent_id
-        if agent_hint is None:
+            use_choice = active_on(settings, host_id)
+        if agent_hint is None and not use_choice:
             return _problem(
                 "needs_input",
                 "agent_not_found",
                 "Choose an agent or configure session choice on this host.",
             )
-        agent = (
-            await asyncio.to_thread(agent_store.get, agent_hint)
-            if agent_store and _store_id(agent_hint)
-            else None
-        )
-        if agent is None and agent_store:
-            agent = await asyncio.to_thread(agent_store.get_by_name, agent_hint)
-        if agent is None and agent_store:
-            matches = []
-            after = None
-            while True:
-                page = await asyncio.to_thread(agent_store.list, limit=200, after=after)
-                for item in page.data:
-                    if (public_agent_name(item.name) or "").casefold() != agent_hint.casefold():
-                        continue
-                    try:
-                        visible = await validate_session_agent(
-                            user_id=owner,
-                            agent_id=item.id,
-                            agent_store=agent_store,
-                            permission_store=permission_store,
-                            conversation_store=conversation_store,
-                        )
-                    except OmnigentError:
-                        continue
-                    matches.append(visible)
-                if not page.has_more or page.last_id is None:
-                    break
-                after = page.last_id
-            if len(matches) != 1:
+        agent = None
+        agent_name = "Session choice"
+        if not use_choice:
+            assert agent_hint is not None
+            agent = (
+                await asyncio.to_thread(agent_store.get, agent_hint)
+                if agent_store and _store_id(agent_hint)
+                else None
+            )
+            if agent is None and agent_store:
+                agent = await asyncio.to_thread(agent_store.get_by_name, agent_hint)
+            if agent is None and agent_store:
+                matches = []
+                after = None
+                while True:
+                    page = await asyncio.to_thread(agent_store.list, limit=200, after=after)
+                    for item in page.data:
+                        if (
+                            public_agent_name(item.name) or ""
+                        ).casefold() != agent_hint.casefold():
+                            continue
+                        try:
+                            visible = await validate_session_agent(
+                                user_id=owner,
+                                agent_id=item.id,
+                                agent_store=agent_store,
+                                permission_store=permission_store,
+                                conversation_store=conversation_store,
+                            )
+                        except OmnigentError:
+                            continue
+                        matches.append(visible)
+                    if not page.has_more or page.last_id is None:
+                        break
+                    after = page.last_id
+                if len(matches) != 1:
+                    return _problem(
+                        "needs_input",
+                        "agent_not_found",
+                        f"Agent {body.agent!r} was not found.",
+                        [
+                            {"id": item.id, "name": public_agent_name(item.name) or item.name}
+                            for item in matches
+                        ],
+                    )
+                agent = matches[0]
+            if agent is None:
+                return _problem(
+                    "needs_input", "agent_not_found", f"Agent {body.agent!r} was not found."
+                )
+            try:
+                agent = await validate_session_agent(
+                    user_id=owner,
+                    agent_id=agent.id,
+                    agent_store=agent_store,
+                    permission_store=permission_store,
+                    conversation_store=conversation_store,
+                )
+            except OmnigentError:
+                return _problem(
+                    "needs_input", "agent_not_found", f"Agent {body.agent!r} was not found."
+                )
+            if (
+                agent.session_id is not None
+                and permission_store is not None
+                and await asyncio.to_thread(
+                    get_session_owner_id, agent.session_id, permission_store
+                )
+                != owner
+            ):
                 return _problem(
                     "needs_input",
                     "agent_not_found",
-                    f"Agent {body.agent!r} was not found.",
-                    [
-                        {"id": item.id, "name": public_agent_name(item.name) or item.name}
-                        for item in matches
-                    ],
+                    f"Agent {body.agent!r} belongs to another user's session.",
                 )
-            agent = matches[0]
-        if agent is None:
-            return _problem(
-                "needs_input", "agent_not_found", f"Agent {body.agent!r} was not found."
-            )
-        try:
-            agent = await validate_session_agent(
-                user_id=owner,
-                agent_id=agent.id,
-                agent_store=agent_store,
-                permission_store=permission_store,
-                conversation_store=conversation_store,
-            )
-        except OmnigentError:
-            return _problem(
-                "needs_input", "agent_not_found", f"Agent {body.agent!r} was not found."
-            )
-        if (
-            agent.session_id is not None
-            and permission_store is not None
-            and await asyncio.to_thread(get_session_owner_id, agent.session_id, permission_store)
-            != owner
-        ):
-            return _problem(
-                "needs_input",
-                "agent_not_found",
-                f"Agent {body.agent!r} belongs to another user's session.",
-            )
-        agent_name = public_agent_name(agent.name) or agent.name
+            agent_name = public_agent_name(agent.name) or agent.name
         refusal_text = await asyncio.to_thread(admit_open, app_state, owner)
         if refusal_text is not None:
             return _problem("refused", "open_rate", refusal_text)
@@ -1023,7 +1030,7 @@ def register_open_routes(
                     host_name=host.name,
                     project_id=project.id,
                     root_workspace=root.workspace,
-                    agent_id=agent.id,
+                    agent_id=agent.id if agent is not None else None,
                     body=body,
                     created_at=int(time.time()),
                     choice_protocol=request.headers.get("x-omnigent-session-choice") == "1",

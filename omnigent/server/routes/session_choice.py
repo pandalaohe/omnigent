@@ -151,7 +151,11 @@ def create_session_choice_router(
 
     @router.post("/me/session-choice/preview")
     async def preview(request: Request, body: ChoicePreview) -> dict[str, Any]:
-        from omnigent.server.session_choice_runtime import context_request, inputs
+        from omnigent.server.session_choice_runtime import (
+            authorize_agents,
+            context_request,
+            inputs,
+        )
         from omnigent.server.session_collab import collab_owner_for
         from omnigent.server.user_preferences_store import read_collab_settings
 
@@ -192,6 +196,7 @@ def create_session_choice_router(
             differ_from=body.differ_from,
         )
         now = time.time()
+        choice_request = await authorize_agents(request.app, choice_request)
         readings, running, floors = await asyncio.to_thread(
             inputs, request.app, settings, choice_request, now
         )
@@ -200,6 +205,12 @@ def create_session_choice_router(
             .select(settings, body.work_type, choice_request, readings, running, floors, now=now)
             .payload()
         )
+
+    @router.get("/me/session-choice/preview")
+    async def preview_query(
+        request: Request, host_id: str, work_type: str | None = None
+    ) -> dict[str, Any]:
+        return await preview(request, ChoicePreview(host_id=host_id, work_type=work_type))
 
     @router.get("/me/session-choice/notice")
     async def notice(

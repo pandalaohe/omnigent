@@ -193,7 +193,12 @@ def create_agent_quota_router(
         conversation = await asyncio.to_thread(service.conversations.get_conversation, session_id)
         if conversation is None:
             raise HTTPException(404, "Session not found")
-        payload = await asyncio.to_thread(service.payload, conversation)
+        payload = await asyncio.to_thread(
+            service.payload,
+            conversation,
+            agent_store=getattr(request.app.state, "agent_store", None),
+            agent_cache=getattr(request.app.state, "agent_cache", None),
+        )
         return JSONResponse(payload, headers={"Cache-Control": "private, no-store"})
 
     return router

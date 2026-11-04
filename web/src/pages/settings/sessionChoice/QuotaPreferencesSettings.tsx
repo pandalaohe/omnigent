@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ExceptionList } from "@/components/ExceptionList";
 import { HelpTip } from "@/components/HelpTip";
 import { Button } from "@/components/ui/button";
@@ -51,6 +51,7 @@ export function QuotaPreferencesSettings() {
     EMPTY_CAPABILITIES,
   );
   const [draft, setDraft] = useState(() => draftFromPreferences(preferences));
+  const storedDraft = useRef(JSON.stringify(draftFromPreferences(preferences)));
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
   const productKeys = new Set<string>();
@@ -66,7 +67,14 @@ export function QuotaPreferencesSettings() {
     return { ...item, key: product };
   });
 
-  useEffect(() => setDraft(draftFromPreferences(preferences)), [preferences]);
+  useEffect(() => {
+    const incoming = draftFromPreferences(preferences);
+    const key = JSON.stringify(incoming);
+    if (storedDraft.current !== key) {
+      storedDraft.current = key;
+      setDraft(incoming);
+    }
+  }, [preferences]);
   useEffect(() => {
     const rejected = (event: Event) => {
       const namespace = (event as CustomEvent<{ namespace: string }>).detail?.namespace;

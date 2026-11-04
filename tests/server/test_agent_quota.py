@@ -100,12 +100,49 @@ def test_pool_readings_use_tile_not_latest_product_projection(db_uri):
     assert service.pool_readings(QuotaContext(OWNER, HOST), now=NOW + 3601)["a"].freshness == "old"
 
 
-def test_pool_readings_with_board_disabled_use_reported_products(service):
+@pytest.mark.parametrize("report_host", [None, HOST])
+@pytest.mark.parametrize("read_host", [None, HOST])
+def test_pool_readings_with_board_disabled_use_reported_products(service, report_host, read_host):
     service.usage_enabled = False
-    service.report(OWNER, None, "claude", snapshot(), now=NOW)
-    readings = service.pool_readings(QuotaContext(OWNER, HOST), now=NOW)
+    service.report(OWNER, report_host, "claude", snapshot(), now=NOW)
+    readings = service.pool_readings(QuotaContext(OWNER, read_host), now=NOW)
     assert set(readings) == {"claude"}
     assert readings["claude"].windows[0].remaining_pct == 15
+    assert service.pool_readings(QuotaContext("other", read_host), now=NOW) == {}
+
+
+def test_discovery_lists_pools_for_exclusion_without_duplicate_or_extra_prompt(service):
+    conv = service.conversations.create_conversation(host_id=HOST, workspace="/opt/work/project")
+    owner = service.context(conv).owner_id
+    settings = {
+        "enabled": True,
+        "workTypes": [{"id": "work", "label": "Work"}],
+        "presets": [
+            {"id": "code", "name": "Code", "links": [{"agent": "codex-native", "meter": "plan"}]}
+        ],
+        "hosts": {
+            HOST: {
+                "work": [
+                    [
+                        {
+                            "links": [
+                                {"agent": "codex-native", "meter": "plan"},
+                                {"agent": "pi", "model": "kimi"},
+                            ]
+                        }
+                    ]
+                ]
+            }
+        },
+    }
+    service.preferences.replace_session_choice(
+        owner, settings, service.preferences.session_choice(owner)["revision"]
+    )
+    assert service.payload(conv)["session_choice"] == {
+        "enabled": True,
+        "work_types": ["work"],
+        "pools": ["plan", "pi:kimi"],
+    }
 
 
 @pytest.fixture

@@ -233,6 +233,9 @@ async def test_floor_controls_and_preview_use_owner_tiles_without_changing_docum
         revision = saved.json()["revision"]
         preview = await client.post(url + "/preview", json={"host_id": host})
         assert preview.status_code == 200 and preview.json()["outcome"] == "hold", preview.text
+        query_preview = await client.get(url + "/preview", params={"host_id": host})
+        assert query_preview.status_code == 200, query_preview.text
+        assert query_preview.json() == preview.json()
         floor = await client.post(url + "/floor", json={"tile": "account-a", "off": True})
         assert floor.status_code == 200, floor.text
         assert floor.json()["account-a"]["until"] == "reset"
@@ -258,6 +261,43 @@ async def test_floor_controls_and_preview_use_owner_tiles_without_changing_docum
         ).json() == {}
         result = await client.put(url, json={"settings": settings, "expected_revision": revision})
         assert result.status_code == 200, result.text
+
+
+@pytest.mark.asyncio
+async def test_floor_until_reset_with_board_disabled_reads_host_scoped_report(db_uri, tmp_path):
+    import time
+
+    app = _preferences_app(db_uri, tmp_path)
+    service = app.state.agent_quota_service
+    service.usage_enabled = False
+    now = time.time()
+    service.report(
+        OWNER,
+        "host-a",
+        "claude",
+        {
+            "captured_at": now,
+            "windows": [
+                {
+                    "label": "7d",
+                    "used_percent": 90,
+                    "duration_mins": 10080,
+                    "resets_at": now + 86400,
+                },
+            ],
+        },
+        now=now,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+        headers={"X-Test-User": OWNER},
+    ) as client:
+        floor = await client.post(
+            "/v1/me/session-choice/floor", json={"tile": "claude", "off": True}
+        )
+    assert floor.status_code == 200, floor.text
+    assert floor.json()["claude"]["windows"]["7d"] == [now + 86400, 90]
 
 
 NOW = 2_000_000

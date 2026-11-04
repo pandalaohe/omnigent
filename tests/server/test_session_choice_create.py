@@ -119,6 +119,27 @@ async def test_named_precedence_and_old_runner(choice_env, mode):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", ["missing", "foreign"])
+async def test_create_skips_an_unbindable_agent_before_choosing_next(choice_env, invalid):
+    env = choice_env
+    bad_id = "f" * 32
+    if invalid == "foreign":
+        env.app.state.agent_store.create_user_agent(
+            bad_id, "foreign", "test:///bundle", "other@example.test"
+        )
+    env.settings["hosts"][HOST]["work"][0][0]["links"].insert(0, {"agent": bad_id})
+    env.prefs.replace_session_choice(
+        RESERVED_USER_LOCAL,
+        env.settings,
+        env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"],
+    )
+    response = await create(env)
+    assert response.status_code == 201, response.text
+    assert response.json()["agent_id"] == env.agents[0]["id"]
+    assert response.json()["session_choice"]["skipped"][0]["why"] == "unavailable"
+
+
+@pytest.mark.asyncio
 async def test_named_reason_checks_cap_but_user_can_override(choice_env):
     env = choice_env
     first = await create(env)

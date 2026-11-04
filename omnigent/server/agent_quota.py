@@ -25,12 +25,14 @@ from omnigent.quota_pace import (
     quota_line,
     rate_limit_quota,
 )
+from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.user_preferences_store import (
     SqlAlchemyUserPreferencesStore,
     read_collab_settings,
 )
+from omnigent.stores.agent_store import AgentStore
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
@@ -603,7 +605,13 @@ class AgentQuotaService:
             result[product] = quota
         return tiers, result
 
-    def payload(self, conversation: Conversation) -> dict[str, Any]:
+    def payload(
+        self,
+        conversation: Conversation,
+        *,
+        agent_store: AgentStore | None = None,
+        agent_cache: AgentCache | None = None,
+    ) -> dict[str, Any]:
         from omnigent.harness_plugins import native_agents
 
         context = self.context(conversation)
@@ -611,9 +619,20 @@ class AgentQuotaService:
         # Missing reports are explicit at the API boundary; instruction lines
         # still enumerate only products with an actual source in this scope.
         missing = AgentQuota("unknown", None, None, (), reason="no_report")
-        from omnigent.server.session_choice import active_on, generated_line
+        from omnigent.runtime.instruction_layers import agent_key_for_harness
+        from omnigent.server.routes._sessions.helpers import _resolve_harness_impl
+        from omnigent.server.session_choice import active_on, ordered_links, pool_of
 
         choice = read_collab_settings(self.preferences, context.owner_id).session_choice
+        pools = []
+        for link in ordered_links(choice):
+            probe = Conversation(
+                id="", created_at=0, updated_at=0, root_conversation_id="", agent_id=link.agent_id
+            )
+            product = agent_key_for_harness(
+                _resolve_harness_impl(probe, agent_store=agent_store, agent_cache=agent_cache)
+            )
+            pools.append(pool_of(link, product))
         return {
             "tiers": asdict(tiers),
             "agents": {
@@ -622,9 +641,7 @@ class AgentQuotaService:
             "session_choice": {
                 "enabled": active_on(choice, context.host_id or ""),
                 "work_types": [work.id for work in choice.work_types],
-                "instruction": generated_line(choice)
-                if active_on(choice, context.host_id or "")
-                else None,
+                "pools": list(dict.fromkeys(pools)),
             },
         }
 
@@ -684,7 +701,7 @@ class AgentQuotaService:
         now = time.time() if now is None else now
         if self.usage_enabled:
             return {tile.id: tile for tile in self.overview(context.owner_id, now=now).accounts}
-        tiers, quotas = self.quotas(context, now=now)
+        tiers, quotas = self._quotas(context, now=now, all_hosts=context.host_id is None)
         settings = read_collab_settings(self.preferences, context.owner_id)
         workspace = current_workspace_id()
         with self._lock:
@@ -695,7 +712,7 @@ class AgentQuotaService:
                         for (ws, owner, host, item), record in self._snapshots.items()
                         if ws == workspace
                         and owner == context.owner_id
-                        and host in {None, context.host_id}
+                        and (context.host_id is None or host in {None, context.host_id})
                         and item == product
                     ),
                     key=lambda record: record["captured_at"],

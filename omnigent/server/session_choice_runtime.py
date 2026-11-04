@@ -8,7 +8,7 @@ import logging
 import time
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from fastapi import HTTPException
@@ -183,6 +183,29 @@ def context_request(
     )
 
 
+async def authorize_agents(app: Any, request: ChoiceRequest) -> ChoiceRequest:
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.server.routes._session_create_validation import validate_session_agent
+
+    unavailable = set(request.unavailable)
+    for agent_id in request.products:
+        if agent_id in unavailable:
+            continue
+        try:
+            await validate_session_agent(
+                user_id=request.owner,
+                agent_id=agent_id,
+                agent_store=app.state.agent_store,
+                permission_store=app.state.permission_store,
+                conversation_store=app.state.conversation_store,
+            )
+        except OmnigentError as exc:
+            if exc.code not in {ErrorCode.NOT_FOUND, ErrorCode.FORBIDDEN}:
+                raise
+            unavailable.add(agent_id)
+    return replace(request, unavailable=frozenset(unavailable))
+
+
 def running_pools(app: Any, owner: str, settings: SessionChoice, products: Any, now: float):
     from omnigent.server.routes._sessions.helpers import _resolve_harness_impl, _resolve_llm_model
 
@@ -332,7 +355,7 @@ async def admit_create(
             independent=body.parent_session_id is None,
         )
         readings, running, floors = await asyncio.to_thread(inputs, app, settings, request, now)
-        from dataclasses import replace
+        request = await authorize_agents(app, request)
 
         named = bool(body.agent_id and (body.user_named or body.choice_reason))
         if named:
@@ -482,6 +505,7 @@ async def release_choice(app: Any, session: Conversation, host: str) -> bool:
             settings = parse_session_choice({"workTypes": [{"id": "work", "label": "Work"}]})
             work = settings.work_types[0]
         request = await asyncio.to_thread(context_request, app, owner, host, settings, None)
+        request = await authorize_agents(app, request)
         readings, running, floors = await asyncio.to_thread(inputs, app, settings, request, now)
         running = {
             pool: tuple(sid for sid in ids if sid != session.id) for pool, ids in running.items()

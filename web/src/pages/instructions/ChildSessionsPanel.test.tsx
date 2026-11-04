@@ -88,6 +88,14 @@ import {
   writeSessionCollabPreferences,
 } from "@/lib/sessionCollabPreferences";
 
+it("preserves an unsaved quota draft across unrelated storage notifications", () => {
+  render(<QuotaPreferencesSettings />);
+  const tight = screen.getByRole("textbox", { name: /Tight below/ });
+  fireEvent.change(tight, { target: { value: "60" } });
+  fireEvent(window, new StorageEvent("storage", { key: "theme" }));
+  expect(tight).toHaveValue("60");
+});
+
 beforeEach(() => {
   fetchMock.mockResolvedValue({
     ok: true,

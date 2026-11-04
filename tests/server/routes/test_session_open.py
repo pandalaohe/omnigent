@@ -218,8 +218,10 @@ async def _post(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stale_first", [False, True])
+@pytest.mark.parametrize("waiting", [False, True])
 async def test_session_choice_open_accepts_work_type_and_preserves_choice_fields(
-    open_env, monkeypatch
+    open_env, monkeypatch, stale_first, waiting
 ):
     env = open_env
     env["app"].state.user_preferences_store = _FakePreferences(
@@ -227,11 +229,25 @@ async def test_session_choice_open_accepts_work_type_and_preserves_choice_fields
             "sessionChoice": {
                 "enabled": True,
                 "workTypes": [{"id": "review", "label": "Review"}],
-                "hosts": {HOST_ID: {"review": [[{"links": [{"agent": env["agent_id"]}]}]]}},
+                "hosts": {
+                    HOST_ID: {
+                        "review": [
+                            [
+                                {
+                                    "links": [
+                                        *([{"agent": "f" * 32}] if stale_first else []),
+                                        {"agent": env["agent_id"]},
+                                    ]
+                                }
+                            ]
+                        ]
+                    }
+                },
             }
         }
     )
     captured = _patch_create(env, monkeypatch)
+    env["online"]["on"] = not waiting
     async with await _client(env) as client:
         response = await client.post(
             f"/v1/sessions/{env['sender'].id}/open",
@@ -241,10 +257,15 @@ async def test_session_choice_open_accepts_work_type_and_preserves_choice_fields
                 "host": HOST_NAME,
                 "work_type": "review",
                 "exclude": ["account-a"],
+                "wait_for_host": waiting,
             },
         )
     assert response.status_code == 200, response.text
-    assert response.json()["state"] == "opened", response.text
+    assert response.json()["state"] == ("waiting_for_host" if waiting else "opened"), response.text
+    if waiting:
+        env["online"]["on"] = True
+        env["app"].state.pending_session_opens.trigger(HOST_ID)
+        assert await _wait_for(lambda: "body" in captured)
     assert captured["body"].work_type == "review"
     assert captured["body"].agent_id is None
     assert captured["body"].exclude == ["account-a"]
