@@ -25,7 +25,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { assignLabels, bindDraft } from "@/lib/composerTokens";
 import { composerPartsFromProjection } from "@/lib/composerContent";
 import { serializeReplyDraft, type ReplyDraft } from "@/lib/replyDraft";
-import { Composer } from "./ChatPage";
+import { RoutedComposer as Composer } from "@/test/composerTestHelpers";
 
 vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
   ...(await importOriginal<typeof UseWorkspaceChangedFilesModule>()),

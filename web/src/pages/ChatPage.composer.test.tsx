@@ -224,7 +224,8 @@ vi.mock("@/lib/goalApi", async (importOriginal) => ({
 import type { ElicitationBlock, UserMessageBlock } from "@/lib/blocks";
 import { getGoal } from "@/lib/goalApi";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { ChatPage, Composer, CodexPermissionReadbackChip, computeIsWorking } from "./ChatPage";
+import { RoutedComposer as Composer } from "@/test/composerTestHelpers";
+import { ChatPage, CodexPermissionReadbackChip, computeIsWorking } from "./ChatPage";
 import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import { writeShortcutPreference } from "@/lib/keyboardShortcutPreferences";

@@ -110,7 +110,8 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
   }),
 }));
 
-import { Composer, detectMentionAt, mentionMarkerFor } from "./ChatPage";
+import { RoutedComposer as Composer } from "@/test/composerTestHelpers";
+import { detectMentionAt, mentionMarkerFor } from "./ChatPage";
 
 function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) {
   return {
