@@ -5271,10 +5271,8 @@ def register_events_routes(
             if _prompt_for_display:
                 schedule_background_child_task_summary(
                     coordinator=background_title_coordinator,
-                    session_id=session_id,
+                    conversation=conv,
                     prompt=_prompt_for_display,
-                    agent_id=conv.agent_id,
-                    sub_agent_name=conv.sub_agent_name,
                 )
         if body.type == _SLASH_COMMAND_TYPE:
             if _agent is None:
