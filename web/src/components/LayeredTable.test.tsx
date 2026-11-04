@@ -287,9 +287,12 @@ describe("LayeredTable and LayeredEditor", () => {
     const row = screen.getByTestId("layered-row-codex");
     expect(row.querySelector(".bg-pink-500")).toBeNull();
     expect(screen.getByTestId("layered-cell-codex-desktop")).toHaveTextContent("On");
-    expect(
-      screen.getByLabelText("Warning: state: Codex and Desktop differ; Codex wins"),
-    ).toHaveTextContent("?");
+    const warning = screen.getByLabelText("Warning: state: Codex and Desktop differ; Codex wins");
+    await user.hover(warning);
+    expect(await screen.findByText("Click this cell to set it here.")).toBeVisible();
+    expect(screen.queryByText("Saved here")).toBeNull();
+    await user.unhover(warning);
+    await user.keyboard("{Escape}");
     await user.click(row);
     expect(screen.getByText("Saved here")).toBeVisible();
   });
@@ -307,7 +310,7 @@ describe("LayeredTable and LayeredEditor", () => {
         }}
       />,
     );
-    expect(screen.getByText("Host wins")).toBeVisible();
+    expect(screen.getByTitle("Host wins")).toBeVisible();
     expect(
       screen.getByLabelText("Warning: state: Codex and Desktop differ; Desktop wins"),
     ).toBeVisible();
@@ -366,10 +369,10 @@ describe("LayeredTable and LayeredEditor", () => {
     );
     await user.click(screen.getByTestId("layered-corner"));
     await user.click(screen.getByRole("button", { name: "Clear 3 values" }));
-    expect(screen.queryByText("Host wins")).toBeNull();
+    expect(screen.queryByTitle("Host wins")).toBeNull();
     expect(screen.getByTestId("layered-cell-codex-desktop")).toHaveTextContent("On");
     await user.click(screen.getByRole("button", { name: "Undo" }));
-    expect(screen.getByText("Host wins")).toBeVisible();
+    expect(screen.getByTitle("Host wins")).toBeVisible();
     expect(screen.getByTestId("layered-cell-codex-desktop")).toHaveTextContent("On");
     expect(
       screen.getByTestId("layered-cell-codex-desktop").querySelector(".bg-pink-500"),

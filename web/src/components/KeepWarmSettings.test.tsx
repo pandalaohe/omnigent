@@ -9,7 +9,7 @@ import { KeepWarmSettings } from "./KeepWarmSettings";
 import {
   KEEP_WARM_STORAGE_KEY,
   readKeepWarmPreferences,
-  type KeepWarmCells,
+  type KeepWarmLayers,
 } from "@/lib/keepWarmPreferences";
 import {
   initializeUserPreferencesSync,
@@ -17,15 +17,13 @@ import {
 } from "@/lib/userPreferencesSync";
 
 interface Preview {
-  cells: KeepWarmCells;
-  columns: string[];
+  layers: KeepWarmLayers;
   already: boolean;
-  migratedToCellsAt?: number;
+  migratedToLayersAt?: number;
 }
 const state = vi.hoisted(() => ({
   fetch: vi.fn(),
   preview: {} as Preview,
-  actual: null as Preview | null,
   conversionStatus: 200,
   patchStatus: 200,
   patchGate: null as Promise<Response> | null,
@@ -50,7 +48,12 @@ vi.mock("@/hooks/useHosts", async (original) => ({
         name: "Hawk",
         owner: "alice",
         status: "online",
-        configured_harnesses: { "claude-native": true, "codex-native": false, pi: true },
+        configured_harnesses: {
+          "claude-native": true,
+          "codex-native": false,
+          pi: true,
+          "pi-native": true,
+        },
       },
       {
         host_id: "h2",
@@ -138,13 +141,14 @@ vi.mock("@/hooks/useAgentRegistry", async (original) => ({
 
 let client: QueryClient;
 let server: Record<string, unknown>;
-const columns = ["harness:claude-native", "ca_codex", "harness:pi"];
+function layersWith(layers: Partial<KeepWarmLayers> = {}): KeepWarmLayers {
+  return { corner: {}, hosts: {}, agents: {}, cells: {}, hostWins: {}, ...layers };
+}
 beforeEach(() => {
   localStorage.clear();
   resetUserPreferencesSyncForTests();
   state.fetch.mockReset();
-  state.preview = { cells: {}, columns: [...columns], already: false, migratedToCellsAt: 123 };
-  state.actual = null;
+  state.preview = { layers: layersWith(), already: false, migratedToLayersAt: 123 };
   state.conversionStatus = 200;
   state.patchStatus = 200;
   state.patchGate = null;
@@ -159,10 +163,7 @@ beforeEach(() => {
           { detail: "Conversion needs 80 hosts and exceeds 64 KiB" },
           { status: state.conversionStatus },
         );
-      const dry = JSON.parse(String(init?.body)).dry_run;
-      const result = dry ? state.preview : (state.actual ?? state.preview);
-      if (!dry) server = { ...server, cells: result.cells, migratedToCellsAt: 123 };
-      return Response.json(result);
+      return Response.json(state.preview);
     }
     if (url.endsWith("/preferences/keep_warm")) {
       const response = state.patchGate
@@ -205,287 +206,313 @@ function patches() {
     .filter(([url]) => String(url).endsWith("/preferences/keep_warm"))
     .map(([, init]) => JSON.parse(String(init.body)).value as Record<string, unknown>);
 }
-function latestCells() {
-  return patches().at(-1)?.cells as KeepWarmCells;
+function latestLayers() {
+  return patches().at(-1)?.layers as KeepWarmLayers;
 }
-async function saveCell() {
-  fireEvent.click(screen.getByRole("button", { name: "Save cell" }));
-  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+function convertCalls() {
+  return state.fetch.mock.calls.filter(([url]) => String(url).endsWith("/keep_warm/convert"));
+}
+function editName(name: string) {
+  return new RegExp(`^${name}(:|$)`);
+}
+function editButton(name: string): HTMLElement {
+  return screen.getByRole("button", { name: editName(name) });
+}
+function openEditor(name: string): HTMLElement {
+  fireEvent.click(editButton(name));
+  return document.querySelector('[data-slot="popover-content"][data-state="open"]') as HTMLElement;
+}
+function choose(editor: HTMLElement, group: string, option: string) {
+  fireEvent.click(
+    within(within(editor).getByRole("radiogroup", { name: group })).getByRole("radio", {
+      name: option,
+    }),
+  );
+}
+function clickSave(editor: HTMLElement) {
+  fireEvent.click(within(editor).getByRole("button", { name: "Save" }));
+}
+async function saveAndClose(editor: HTMLElement) {
+  clickSave(editor);
+  await waitFor(() =>
+    expect(document.querySelector('[data-slot="popover-content"][data-state="open"]')).toBeNull(),
+  );
 }
 
 describe("KeepWarmSettings table", () => {
-  it("keeps the sticky corner above scrolling headers in one table layer", async () => {
+  it("keeps the sticky corner above the sticky first column on one surface", async () => {
     await mount();
-    const table = screen.getByRole("table", { name: "Keep-warm settings by host and agent" });
-    const corner = within(table).getByRole("columnheader", { name: "Agent / Host" });
-    const headers = within(table)
+    const corner = screen.getByTestId("layered-corner").closest("th") as HTMLElement;
+    const rows = within(screen.getByRole("table", { name: "Keep-warm by agent and host" }))
+      .getAllByRole("rowheader")
+      .map((row) => row as HTMLElement);
+    const headers = screen
       .getAllByRole("columnheader")
-      .filter((header) => header !== corner);
-    const rows = within(table).getAllByRole("rowheader");
+      .filter((header) => header !== corner) as HTMLElement[];
     // jsdom cannot paint; verify sticky ownership, opaque surfaces and relative layers.
-    expect(corner.closest("thead")).not.toHaveClass("sticky");
-    expect(corner).toHaveClass("sticky", "top-0", "left-0", "bg-card-solid");
+    expect(corner).toHaveClass("sticky", "left-0", "bg-background");
     const layer = (element: HTMLElement) => Number(element.className.match(/\bz-(\d+)\b/)?.[1]);
-    expect(headers.length).toBeGreaterThan(0);
-    for (const header of headers) {
-      expect(header).toHaveClass("sticky", "top-0", "bg-card-solid");
-      expect(layer(corner)).toBeGreaterThan(layer(header));
-      for (const row of rows) expect(layer(header)).toBeGreaterThan(layer(row));
+    expect(rows.length).toBeGreaterThan(0);
+    for (const row of rows) {
+      expect(row).toHaveClass("sticky", "left-0", "bg-background");
+      expect(layer(corner)).toBeGreaterThan(layer(row));
     }
+    expect(headers.length).toBeGreaterThan(0);
+    for (const header of headers) expect(header).toHaveClass("bg-background");
   });
 
   it("distinguishes same-name harness rows and keeps editor targets consistent", async () => {
-    state.preview.columns = ["harness:pi", "harness:pi-native"];
-    state.preview.cells = {
-      h1: { "harness:pi": { child: true }, "harness:pi-native": { main: false, child: false } },
-    };
+    state.preview.layers = layersWith({
+      cells: {
+        h1: { "harness:pi": { child: true }, "harness:pi-native": { main: false, child: false } },
+      },
+    });
     await mount();
-    const table = screen.getByRole("table", { name: "Keep-warm settings by host and agent" });
-    const sdkHeader = within(table).getByRole("rowheader", { name: /^Pi · pi(?: |$)/ });
-    const nativeHeader = within(table).getByRole("rowheader", {
-      name: /^Pi · pi-native(?: |$)/,
-    });
-    expect(within(sdkHeader).getByText("Pi · pi", { exact: true })).toBeVisible();
-    expect(within(nativeHeader).getByText("Pi · pi-native", { exact: true })).toBeVisible();
-    expect(screen.getByRole("button", { name: "Remove Pi · pi row" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Remove Pi · pi-native row" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Edit Hawk / Pi · pi-native" }));
-    expect(screen.getByRole("dialog", { name: "Hawk / Pi · pi-native" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("switch", { name: "Keep main sessions warm" }));
-    await saveCell();
-    expect(latestCells()).toEqual({
-      h1: { "harness:pi": { child: true }, "harness:pi-native": { main: true } },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Edit Hawk / Pi · pi" }));
-    expect(screen.getByRole("dialog", { name: "Hawk / Pi · pi" })).toBeInTheDocument();
-    expect(screen.getByRole("switch", { name: "Keep children warm" })).toBeChecked();
-    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-    fireEvent.click(screen.getByRole("button", { name: "Remove Pi · pi-native row" }));
-    expect(screen.getByRole("dialog", { name: "Remove Pi · pi-native row?" })).toBeInTheDocument();
+    expect(screen.getByTestId("layered-row-harness:pi")).toHaveTextContent("Pi · …pi");
+    expect(screen.getByTestId("layered-row-harness:pi-native")).toHaveTextContent(
+      "Pi · …pi-native",
+    );
+    const native = openEditor("Edit Pi · …pi-native on Hawk");
+    expect(within(native).getByText("Pi · …pi-native on Hawk")).toBeInTheDocument();
+    choose(native, "Main sessions", "On");
+    await saveAndClose(native);
+    expect(latestLayers().cells.h1["harness:pi-native"].main).toBe(true);
+    expect(latestLayers().cells.h1["harness:pi"]).toEqual({ child: true });
+    const sdk = openEditor("Edit Pi · …pi on Hawk");
+    expect(within(sdk).getByText("Pi · …pi on Hawk")).toBeInTheDocument();
+    expect(
+      within(within(sdk).getByRole("radiogroup", { name: "Children" })).getByRole("radio", {
+        name: "On",
+      }),
+    ).toHaveAttribute("aria-checked", "true");
   });
 
-  it("previews the authoritative payload without writing, retaining off columns and unknown hosts", async () => {
-    state.preview.cells = {
-      h1: { "harness:claude-native": { main: true } },
-      removed: { orphan: { coldAfterSeconds: 0 } },
-    };
-    state.preview.columns.push("harness:claude-sdk");
+  it("previews the authoritative payload without writing, retaining unknown hosts", async () => {
+    state.preview.layers = layersWith({
+      cells: {
+        h1: { "harness:claude-native": { main: true } },
+        removed: { orphan: { coldAfterSeconds: 0 } },
+      },
+    });
     await mount();
-    const table = screen.getByRole("table", { name: "Keep-warm settings by host and agent" });
-    expect(
-      within(table)
-        .getAllByRole("columnheader")
-        .map((header) => header.textContent),
-    ).toEqual(["Agent / Host", "Server", "Hawkonline", "Owloffline", "removedUnavailable host"]);
-    expect(within(table).getByRole("rowheader", { name: "Claude Code Remove" })).toBeVisible();
+    expect(screen.getAllByRole("columnheader").map((header) => header.textContent)).toEqual([
+      "AllMC–4h",
+      "No hostMC–4h",
+      "HawkMC–4h",
+      "OwlMC–4h",
+      "removed (unavailable)MC–4h",
+    ]);
+    expect(within(screen.getByTestId("layered-col-h1")).getByTitle("Online")).toBeInTheDocument();
+    expect(within(screen.getByTestId("layered-col-h2")).getByTitle("Offline")).toBeInTheDocument();
     expect(
       screen.getByText("Converted from your previous settings · saved when you first edit"),
     ).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Edit Hawk / Claude Code" })).toHaveTextContent(
-      "Main on",
+    expect(editButton("Edit Claude Code on Hawk")).toHaveAccessibleName(
+      /main on( \(set here\))?, children off/,
     );
+    const claudeRow = screen.getByTestId("layered-row-harness:claude-native").closest("tr");
+    expect(claudeRow).toHaveTextContent("Not installed here");
+    expect(screen.queryByRole("button", { name: editName("Edit Claude Code on Owl") })).toBeNull();
     expect(
-      screen.getByRole("button", { name: "Edit Server / harness:claude-sdk" }),
-    ).toHaveTextContent("Main off");
-    expect(screen.getByRole("button", { name: "Edit removed / orphan" })).toHaveTextContent(
-      "not deployed",
-    );
-    expect(screen.getByRole("button", { name: "Edit Owl / Claude Code" })).toHaveTextContent(
-      "not deployed",
-    );
-    expect(screen.getByRole("button", { name: "Edit Hawk / Claude Code" })).not.toHaveTextContent(
-      "not deployed",
-    );
+      screen.queryByRole("button", { name: editName("Edit Claude Code on removed") }),
+    ).toBeNull();
     expect(patches()).toEqual([]);
-    expect(readKeepWarmPreferences().cells).toBeUndefined();
+    expect(readKeepWarmPreferences().layers).toBeUndefined();
   });
 
-  it("converts once, applies an edit to the actual response, and waits for PATCH acknowledgement", async () => {
-    state.actual = {
-      cells: { h2: { ca_codex: { child: true } } },
-      columns: [...columns, "race-agent"],
-      already: true,
-      migratedToCellsAt: 456,
-    };
+  it("saves the conversion with the first edit in one PATCH and waits for its acknowledgement", async () => {
+    state.preview.layers = layersWith({ cells: { h2: { ca_codex: { child: true } } } });
+    state.preview.migratedToLayersAt = 456;
     let finish!: (response: Response) => void;
     state.patchGate = new Promise((resolve) => {
       finish = resolve;
     });
     await mount();
-    fireEvent.click(screen.getByRole("button", { name: "Edit Hawk / Claude Code" }));
-    fireEvent.click(screen.getByRole("switch", { name: "Keep main sessions warm" }));
-    fireEvent.click(screen.getByRole("button", { name: "Save cell" }));
-    await waitFor(() => expect(screen.getByRole("button", { name: "Saving…" })).toBeDisabled());
+    const editor = openEditor("Edit Claude Code on Hawk");
+    choose(editor, "Main sessions", "On");
+    clickSave(editor);
+    await waitFor(() =>
+      expect(within(editor).getByRole("button", { name: "Saving…" })).toBeDisabled(),
+    );
     await waitFor(() => expect(patches()).toHaveLength(1));
-    expect(latestCells()).toEqual({
+    expect(latestLayers().cells).toEqual({
       h1: { "harness:claude-native": { main: true } },
       h2: { ca_codex: { child: true } },
     });
-    expect(patches()[0].columns).toContain("race-agent");
-    expect(patches()[0].migratedToCellsAt).toBe(456);
-    expect(patches()[0]).not.toHaveProperty("default");
-    expect(patches()[0]).not.toHaveProperty("agents");
-    const calls = state.fetch.mock.calls.filter(([url]) => String(url).includes("keep_warm"));
-    expect(calls.slice(0, 3).map(([url, init]) => [url, JSON.parse(String(init.body))])).toEqual([
-      ["/v1/me/preferences/keep_warm/convert", { dry_run: true }],
-      ["/v1/me/preferences/keep_warm/convert", { dry_run: false }],
-      ["/v1/me/preferences/keep_warm", { value: patches()[0] }],
+    expect(patches()[0].migratedToLayersAt).toBe(456);
+    expect(convertCalls().map(([, init]) => JSON.parse(String(init.body)))).toEqual([
+      { dry_run: true, target: "layers" },
     ]);
+    expect(editor).toBeInTheDocument();
     finish(Response.json({}));
-    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    await waitFor(() =>
+      expect(document.querySelector('[data-slot="popover-content"][data-state="open"]')).toBeNull(),
+    );
+    expect(editButton("Edit Claude Code on Hawk")).toHaveAccessibleName(
+      /main on( \(set here\))?, children off/,
+    );
   });
 
   it("shows a rejected patch and retains the edited draft instead of silently reverting", async () => {
     state.patchStatus = 422;
     await mount();
-    fireEvent.click(screen.getByRole("button", { name: "Edit Hawk / Claude Code" }));
-    fireEvent.click(screen.getByRole("switch", { name: "Keep main sessions warm" }));
-    fireEvent.click(screen.getByRole("button", { name: "Save cell" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent(
+    const editor = openEditor("Edit Claude Code on Hawk");
+    choose(editor, "Main sessions", "On");
+    clickSave(editor);
+    expect(await within(editor).findByRole("alert")).toHaveTextContent(
       "64 KiB limit: 20 hosts, 30 columns",
     );
-    expect(screen.getByRole("switch", { name: "Keep main sessions warm" })).toBeChecked();
-    state.patchStatus = 200;
-    await saveCell();
-    expect(latestCells().h1["harness:claude-native"]).toEqual({ main: true });
     expect(
-      state.fetch.mock.calls.filter(
-        ([, init]) => JSON.parse(String(init?.body ?? "{}")).dry_run === false,
-      ),
-    ).toHaveLength(1);
+      within(within(editor).getByRole("radiogroup", { name: "Main sessions" })).getByRole("radio", {
+        name: "On",
+      }),
+    ).toHaveAttribute("aria-checked", "true");
+    state.patchStatus = 200;
+    await saveAndClose(editor);
+    expect(latestLayers().cells.h1["harness:claude-native"]).toEqual({ main: true });
+    expect(convertCalls()).toHaveLength(1);
   });
 
-  it("keeps legacy settings when conversion is refused, and makes a 404 read-only", async () => {
+  it("shows the previous settings read-only when the server cannot convert", async () => {
     state.conversionStatus = 404;
     await mount({ default: { main: true }, agents: { direct: { child: true } } });
     expect(screen.getByRole("alert")).toHaveTextContent("Server update needed");
+    expect(screen.getByText("Previous settings")).toBeInTheDocument();
     expect(screen.getByText("Default: main on · children off")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Add agent" })).toBeDisabled();
+    expect(screen.getByText("Direct Claude: main off · children on")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Select cells" })).toBeNull();
     expect(screen.getByRole("spinbutton", { name: /Archive children/ })).toBeDisabled();
     expect(patches()).toEqual([]);
   });
 
-  it("discards a rejected draft only when the user cancels it", async () => {
+  it("discards a rejected draft only when the user asks to", async () => {
     state.patchStatus = 422;
     await mount();
-    fireEvent.click(screen.getByRole("button", { name: "Edit Hawk / Claude Code" }));
-    fireEvent.click(screen.getByRole("switch", { name: "Keep main sessions warm" }));
-    fireEvent.click(screen.getByRole("button", { name: "Save cell" }));
-    await screen.findByRole("alert");
-    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-    expect(screen.getByRole("button", { name: "Edit Hawk / Claude Code" })).toHaveTextContent(
-      "Main off",
+    const editor = openEditor("Edit Claude Code on Hawk");
+    choose(editor, "Main sessions", "On");
+    clickSave(editor);
+    await within(editor).findByRole("alert");
+    expect(editButton("Edit Claude Code on Hawk")).toHaveAccessibleName(
+      /main on( \(set here\))?, children off/,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Discard unsaved changes" }));
+    await waitFor(() =>
+      expect(editButton("Edit Claude Code on Hawk")).toHaveAccessibleName(
+        /main off( \(set here\))?, children off/,
+      ),
     );
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
-  it("preserves uneditable values on a saved non-participant while clearing cold-after", async () => {
-    state.preview.columns = ["other"];
-    state.preview.cells = {
-      h1: { other: { intervalSeconds: 600, maxSeconds: 7200, coldAfterSeconds: 0 } },
-    };
-    await mount();
-    fireEvent.click(screen.getByRole("button", { name: "Edit Hawk / Other" }));
-    expect(screen.getByRole("switch", { name: "Keep main sessions warm" })).toBeDisabled();
-    fireEvent.change(screen.getByRole("spinbutton", { name: "Cold after in minutes" }), {
-      target: { value: "" },
+  it("preserves saved values of an agent with no row when another cell is edited", async () => {
+    state.preview.layers = layersWith({
+      cells: { h1: { other: { intervalSeconds: 600, maxSeconds: 7200, coldAfterSeconds: 0 } } },
     });
-    await saveCell();
-    expect(latestCells()).toEqual({ h1: { other: { intervalSeconds: 600, maxSeconds: 7200 } } });
+    await mount();
+    expect(screen.queryByTestId("layered-row-other")).toBeNull();
+    const editor = openEditor("Edit Claude Code on Hawk");
+    choose(editor, "Main sessions", "On");
+    await saveAndClose(editor);
+    expect(latestLayers().cells.h1.other).toEqual({
+      intervalSeconds: 600,
+      maxSeconds: 7200,
+      coldAfterSeconds: 0,
+    });
   });
 
-  it("shows a conversion 422 without queuing a preference edit", async () => {
-    const view = await mount();
+  it("shows a conversion 422 with a retry and no table to edit", async () => {
     state.conversionStatus = 422;
-    fireEvent.click(screen.getByRole("button", { name: "Edit Hawk / Claude Code" }));
-    fireEvent.click(screen.getByRole("switch", { name: "Keep main sessions warm" }));
-    fireEvent.click(screen.getByRole("button", { name: "Save cell" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("80 hosts");
+    await mount();
+    expect(screen.getByRole("alert")).toHaveTextContent("80 hosts");
+    expect(screen.queryByRole("table")).toBeNull();
     expect(patches()).toEqual([]);
-    expect(readKeepWarmPreferences().cells).toBeUndefined();
-    view.unmount();
+    expect(readKeepWarmPreferences().layers).toBeUndefined();
+    state.conversionStatus = 200;
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(
+      await screen.findByRole("table", { name: "Keep-warm by agent and host" }),
+    ).toBeInTheDocument();
   });
 
-  it("fills only one host column and clamps each destination family's interval", async () => {
-    state.preview.cells = { h2: { ca_codex: { child: true, coldAfterSeconds: 0 } } };
-    await mount();
-    fireEvent.click(screen.getByRole("button", { name: "Edit Hawk / Claude Code" }));
-    fireEvent.click(screen.getByRole("switch", { name: "Keep main sessions warm" }));
-    fireEvent.click(screen.getByRole("button", { name: "Fill host column" }));
-    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
-    expect(latestCells()).toEqual({
-      h2: { ca_codex: { child: true, coldAfterSeconds: 0 } },
-      h1: {
-        "harness:claude-native": { main: true },
-        ca_codex: { main: true, intervalSeconds: 1740 },
-        "harness:pi": { main: true },
-      },
+  it("writes a host header to its one column and keeps Ping every per agent", async () => {
+    state.preview.layers = layersWith({
+      cells: { h2: { ca_codex: { child: true, coldAfterSeconds: 0 } } },
     });
+    await mount();
+    const column = openEditor("Edit Hawk");
+    expect(within(column).queryByRole("spinbutton", { name: "Ping every in minutes" })).toBeNull();
+    expect(
+      within(column).getByText("Ping every is set per agent: its range depends on the agent."),
+    ).toBeInTheDocument();
+    choose(column, "Main sessions", "On");
+    await saveAndClose(column);
+    expect(latestLayers().hosts).toEqual({ h1: { main: true } });
+    expect(latestLayers().cells).toEqual({
+      h2: { ca_codex: { child: true, coldAfterSeconds: 0 } },
+    });
+    expect(editButton("Edit Claude Code on Hawk")).toHaveAccessibleName(
+      /main on( \(set here\))?, children off/,
+    );
+    const codex = openEditor("Edit My Codex");
+    expect(
+      within(codex).getByRole("spinbutton", { name: "Ping every in minutes" }),
+    ).toHaveAttribute("max", "29");
+    fireEvent.click(within(codex).getByRole("button", { name: "Cancel" }));
+    const claude = openEditor("Edit Claude Code");
+    expect(
+      within(claude).getByRole("spinbutton", { name: "Ping every in minutes" }),
+    ).toHaveAttribute("max", "59");
   });
 
-  it("fills only one agent row and clears Cold after Auto cleanly", async () => {
-    state.preview.cells = {
-      h1: { "harness:claude-native": { coldAfterSeconds: 0 }, ca_codex: { child: true } },
-    };
+  it("writes an agent header to its one row and clears Cold after to the platform rule", async () => {
+    state.preview.layers = layersWith({
+      agents: { "harness:claude-native": { coldAfterSeconds: 0 } },
+      cells: { h1: { ca_codex: { child: true } } },
+    });
     await mount();
-    fireEvent.click(screen.getByRole("button", { name: "Edit Hawk / Claude Code" }));
-    fireEvent.click(screen.getByRole("switch", { name: "Keep main sessions warm" }));
-    fireEvent.change(screen.getByRole("spinbutton", { name: "Cold after in minutes" }), {
+    const editor = openEditor("Edit Claude Code");
+    choose(editor, "Main sessions", "On");
+    fireEvent.change(within(editor).getByRole("spinbutton", { name: "Cold after in minutes" }), {
       target: { value: "" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Fill agent row" }));
-    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
-    expect(latestCells()).toEqual({
-      "": { "harness:claude-native": { main: true } },
-      h1: { "harness:claude-native": { main: true }, ca_codex: { child: true } },
-      h2: { "harness:claude-native": { main: true } },
+    await saveAndClose(editor);
+    expect(latestLayers().agents).toEqual({
+      "harness:claude-native": { main: true, coldAfterSeconds: null },
     });
+    expect(latestLayers().cells).toEqual({ h1: { ca_codex: { child: true } } });
   });
 
-  it("turns a cell off with a mask, while column removal confirms harness fallback", async () => {
-    state.preview.columns = ["harness:claude-native", "direct"];
-    state.preview.cells = {
-      h1: { "harness:claude-native": { main: true }, direct: { child: true } },
-    };
+  it("turns one cell off under a warm corner without touching its neighbours", async () => {
+    state.preview.layers = layersWith({ corner: { main: true, child: true } });
     await mount();
-    fireEvent.click(screen.getByRole("button", { name: "Edit Hawk / Direct Claude" }));
-    fireEvent.click(screen.getByRole("button", { name: "Turn off" }));
-    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
-    expect(latestCells().h1.direct).toEqual({ main: false, child: false });
-    expect(screen.getByRole("button", { name: "Edit Hawk / Direct Claude" })).toHaveTextContent(
-      "Main off",
+    const editor = openEditor("Edit Direct Claude on Hawk");
+    choose(editor, "Main sessions", "Off");
+    choose(editor, "Children", "Off");
+    await saveAndClose(editor);
+    expect(latestLayers().cells).toEqual({ h1: { direct: { main: false, child: false } } });
+    expect(editButton("Edit Direct Claude on Hawk")).toHaveAccessibleName(
+      /main off( \(set here\))?, children off/,
     );
-    fireEvent.click(screen.getByRole("button", { name: "Remove Direct Claude row" }));
-    expect(screen.getByRole("dialog")).toHaveTextContent(
-      "Sessions may then follow matching harness cells",
+    expect(editButton("Edit Claude Code on Hawk")).toHaveAccessibleName(
+      /main on( \(set here\))?, children on/,
     );
-    fireEvent.click(screen.getByRole("button", { name: /^Remove row$/ }));
-    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
-    expect(latestCells().h1).toEqual({ "harness:claude-native": { main: true } });
-    expect(
-      screen.queryByRole("button", { name: "Edit Hawk / Direct Claude" }),
-    ).not.toBeInTheDocument();
   });
 
-  it("retains first-convert off columns and added axes across a normal remount", async () => {
-    state.preview.columns = ["harness:claude-native"];
+  it("retains a first edit across a normal remount", async () => {
     const first = await mount();
-    fireEvent.click(screen.getByRole("button", { name: "Add agent" }));
-    fireEvent.click(screen.getByRole("button", { name: /My Codex.*Your agents/ }));
-    await waitFor(() => expect(patches()).toHaveLength(1));
-    await waitFor(() =>
-      expect(screen.getByRole("button", { name: "Edit Hawk / My Codex" })).toBeEnabled(),
-    );
-    expect(patches()[0]).toMatchObject({
-      cells: {},
-      columns: ["harness:claude-native", "ca_codex"],
-    });
+    const editor = openEditor("Edit Claude Code on Hawk");
+    choose(editor, "Main sessions", "On");
+    await saveAndClose(editor);
     first.unmount();
     client.clear();
-    state.preview = { cells: {}, columns: [], already: true };
+    state.preview = { layers: server.layers as KeepWarmLayers, already: true };
     await mount(server);
-    expect(screen.getByRole("button", { name: "Edit Server / Claude Code" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Edit Server / My Codex" })).toBeInTheDocument();
+    expect(editButton("Edit Claude Code on Hawk")).toHaveAccessibleName(
+      /main on( \(set here\))?, children off/,
+    );
+    expect(
+      screen.queryByText("Converted from your previous settings · saved when you first edit"),
+    ).toBeNull();
     expect(localStorage.getItem(KEEP_WARM_STORAGE_KEY)).not.toBeNull();
   });
 
@@ -497,44 +524,30 @@ describe("KeepWarmSettings table", () => {
     });
     expect(await screen.findByRole("alert")).toHaveTextContent("64 KiB limit");
     expect(patches()[0].hostOfflineArchiveSeconds).toBe(0);
-    expect(
-      state.fetch.mock.calls.filter(
-        ([, init]) => JSON.parse(String(init?.body ?? "{}")).dry_run === false,
-      ),
-    ).toHaveLength(1);
+    expect(patches()[0].layers).toEqual(layersWith());
+    expect(convertCalls()).toHaveLength(1);
   });
 
-  it("hides Every for Pi, exposes its actual cap and filters unsupported picker choices", async () => {
+  it("hides Ping every for Pi, exposes its actual cap and lists agents with no channel", async () => {
     await mount();
-    fireEvent.click(screen.getByRole("button", { name: "Edit Hawk / Pi" }));
-    expect(screen.queryByRole("spinbutton", { name: /interval/ })).not.toBeInTheDocument();
-    expect(screen.getByText("30 min (Pi limit)")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-    fireEvent.click(screen.getByRole("button", { name: "Add agent" }));
-    fireEvent.click(screen.getByRole("button", { name: /Not supported here/ }));
-    expect(
-      within(screen.getByRole("dialog", { name: "Add agent" })).getByRole("button", {
-        name: /Other.*no declared keep-warm channel/,
-      }),
-    ).toBeDisabled();
+    const editor = openEditor("Edit Pi · …pi");
+    expect(within(editor).queryByRole("spinbutton", { name: /Ping every/ })).toBeNull();
+    expect(within(editor).getByText("30 min (Pi limit)")).toBeInTheDocument();
+    fireEvent.click(within(editor).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("button", { name: editName("Edit Other") })).toBeNull();
+    expect(screen.getByText("No keep-warm:").closest("p")).toHaveTextContent("Other");
   });
 
-  it("drops an in-flight edit on disposal before it can patch another owner", async () => {
-    const view = await mount();
-    let converted!: (response: Response) => void;
-    state.fetch.mockImplementationOnce(
-      () =>
-        new Promise<Response>((resolve) => {
-          converted = resolve;
-        }),
-    );
-    fireEvent.click(screen.getByRole("button", { name: "Edit Hawk / Claude Code" }));
-    fireEvent.click(screen.getByRole("switch", { name: "Keep main sessions warm" }));
-    fireEvent.click(screen.getByRole("button", { name: "Save cell" }));
-    view.unmount();
+  it("refuses an edit made after the signed-in owner changed", async () => {
+    await mount();
+    const editor = openEditor("Edit Claude Code on Hawk");
+    choose(editor, "Main sessions", "On");
     state.user = "bob";
-    converted(Response.json(state.preview));
-    await Promise.resolve();
+    clickSave(editor);
+    // Past the 250 ms patch debounce, so a queued write would have been sent.
+    await new Promise((resolve) => {
+      setTimeout(resolve, 400);
+    });
     expect(patches()).toEqual([]);
   });
 });

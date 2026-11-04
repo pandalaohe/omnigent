@@ -3,6 +3,8 @@ import { useQuery } from "@tanstack/react-query";
 
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { customAgentsSettingsEnabled } from "@/lib/capabilities";
+import { authenticatedFetch } from "@/lib/identity";
+import { apiErrorFromResponse } from "@/lib/sessionsApi";
 import {
   AGENT_CATALOG_QUERY_KEY,
   AVAILABLE_AGENTS_STALE_MS,
@@ -344,4 +346,51 @@ export function useAgentRegistry() {
       void Promise.all([catalog.refetch(), harnesses.refetch(), user.refetch(), library.refetch()]);
     },
   };
+}
+
+export const AGENTS_WITH_SESSIONS_QUERY_KEY = ["agents-with-sessions"] as const;
+
+/** Agent ids and template labels on at least one session, or an error. */
+export function useAgentsWithSessions() {
+  return useQuery({
+    queryKey: AGENTS_WITH_SESSIONS_QUERY_KEY,
+    queryFn: async ({ signal }) => {
+      const response = await authenticatedFetch("/v1/agents/with-sessions", { signal });
+      if (!response.ok) throw await apiErrorFromResponse(response);
+      const body = (await response.json()) as {
+        agent_ids?: unknown;
+        template_by_agent_id?: Record<string, string>;
+      };
+      if (
+        !Array.isArray(body.agent_ids) ||
+        body.agent_ids.some((value) => typeof value !== "string")
+      ) {
+        throw new Error("The server returned an invalid session list.");
+      }
+      return Object.assign(new Set(body.agent_ids as string[]), {
+        templateByAgentId: body.template_by_agent_id ?? {},
+      });
+    },
+    staleTime: 30_000,
+    retry: false,
+  });
+}
+
+/** Map session agent ids (and template labels) to the registry rows they name. */
+export function rowsForAgentIds(
+  items: readonly RegistryItem[],
+  legacyProducts: Record<string, RegistryItem>,
+  agentIds: ReadonlySet<string>,
+): Set<RegistryKey> {
+  const byKey = new Map(items.map((item) => [item.key, item]));
+  const keys = new Set<RegistryKey>();
+  for (const agentId of agentIds) {
+    const legacy = legacyProducts[agentId];
+    const item =
+      byKey.get(agentId) ??
+      (legacy?.harness ? byKey.get(`harness:${legacy.harness}`) : undefined) ??
+      legacy;
+    if (item) keys.add(item.key);
+  }
+  return keys;
 }

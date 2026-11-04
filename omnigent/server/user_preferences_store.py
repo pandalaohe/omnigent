@@ -16,9 +16,10 @@ import logging
 import math
 import re
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any, Literal, TypeAlias
 
 import zstandard
@@ -736,6 +737,31 @@ def _default_keep_warm_row() -> AgentKeepWarm:
     return AgentKeepWarm(False, False, None, KEEP_WARM_DEFAULT_MAX_S)
 
 
+_LAYER_FIELDS = ("main", "child", "intervalSeconds", "maxSeconds", "coldAfterSeconds")
+_LAYER_COLUMN_FIELDS = frozenset({"main", "child", "maxSeconds", "coldAfterSeconds"})
+_MISSING = object()
+
+
+@dataclass(frozen=True)
+class KeepWarmLayers:
+    """
+    Layered keep-warm records; each mapping holds only fields set at that level.
+
+    :param corner: Fields set for every agent on every host.
+    :param hosts: Host id to the fields set in that host's column; never holds
+        ``intervalSeconds`` because the range depends on the agent.
+    :param agents: Row key (template, agent or ``harness:x``) to its fields.
+    :param cells: Host id, then row key, to the fields set in that cell.
+    :param host_wins: Hosts whose column beats agent rows.
+    """
+
+    corner: Mapping[str, Any]
+    hosts: Mapping[str, Mapping[str, Any]]
+    agents: Mapping[str, Mapping[str, Any]]
+    cells: Mapping[str, Mapping[str, Mapping[str, Any]]]
+    host_wins: frozenset[str]
+
+
 @dataclass(frozen=True)
 class KeepWarmSettings:
     """
@@ -752,6 +778,8 @@ class KeepWarmSettings:
     :param cells: Host-keyed whitelist, or ``None`` to use legacy rows.
         An empty dictionary disables warming everywhere.
     :param migrated_to_cells_at: Unix time when the whitelist was persisted.
+    :param layers: Layered records, or ``None`` for the legacy/cells shapes.
+    :param migrated_to_layers_at: Unix time when layered records were persisted.
     """
 
     agents: dict[str, AgentKeepWarm]
@@ -761,6 +789,8 @@ class KeepWarmSettings:
     default: AgentKeepWarm = field(default_factory=_default_keep_warm_row)
     cells: dict[str, dict[str, AgentKeepWarm]] | None = None
     migrated_to_cells_at: int | None = None
+    layers: KeepWarmLayers | None = None
+    migrated_to_layers_at: int | None = None
 
 
 @dataclass(frozen=True)
@@ -869,6 +899,69 @@ def read_keep_warm_settings(
     return _parse_keep_warm_settings(value)
 
 
+def _parse_keep_warm_layer_record(value: Any, *, allow_interval: bool) -> dict[str, Any]:
+    """Keep only the fields a level sets, with the stored types the reader uses."""
+    if not isinstance(value, dict):
+        return {}
+    record: dict[str, Any] = {}
+    if isinstance(value.get("main"), bool):
+        record["main"] = value["main"]
+    if isinstance(value.get("child"), bool):
+        record["child"] = value["child"]
+    if allow_interval:
+        interval = _parse_collab_value("positive_int", value.get("intervalSeconds"))
+        if interval is not None:
+            record["intervalSeconds"] = interval
+    max_s = _parse_collab_value("positive_int", value.get("maxSeconds"))
+    if max_s is not None:
+        record["maxSeconds"] = max_s
+    if "coldAfterSeconds" in value:
+        raw_cold = value["coldAfterSeconds"]
+        if raw_cold is None:
+            record["coldAfterSeconds"] = None
+        elif isinstance(raw_cold, int) and not isinstance(raw_cold, bool) and raw_cold >= 0:
+            low, high = KEEP_WARM_COLD_AFTER_BOUNDS_S
+            record["coldAfterSeconds"] = 0 if raw_cold == 0 else min(max(raw_cold, low), high)
+    return record
+
+
+def _parse_keep_warm_layers(value: Any) -> KeepWarmLayers | None:
+    """Parse layered records; ``None`` marks an unusable value for the fail-safe."""
+    if not isinstance(value, dict):
+        return None
+    corner = _parse_keep_warm_layer_record(value.get("corner"), allow_interval=False)
+    hosts: dict[str, dict[str, Any]] = {}
+    raw_hosts = value.get("hosts")
+    if isinstance(raw_hosts, dict):
+        for host_id, record in raw_hosts.items():
+            hosts[host_id] = _parse_keep_warm_layer_record(record, allow_interval=False)
+    agents: dict[str, dict[str, Any]] = {}
+    raw_agents = value.get("agents")
+    if isinstance(raw_agents, dict):
+        for key, record in raw_agents.items():
+            agents[key] = _parse_keep_warm_layer_record(record, allow_interval=True)
+    cells: dict[str, dict[str, dict[str, Any]]] = {}
+    raw_cells = value.get("cells")
+    if isinstance(raw_cells, dict):
+        for host_id, rows in raw_cells.items():
+            if not isinstance(rows, dict):
+                continue
+            cells[host_id] = {
+                key: _parse_keep_warm_layer_record(record, allow_interval=True)
+                for key, record in rows.items()
+            }
+    raw_wins = value.get("hostWins")
+    if isinstance(raw_wins, dict):
+        host_wins = frozenset(host for host, marked in raw_wins.items() if marked)
+    elif isinstance(raw_wins, list):
+        host_wins = frozenset(host for host in raw_wins if isinstance(host, str))
+    else:
+        host_wins = frozenset()
+    return KeepWarmLayers(
+        corner=corner, hosts=hosts, agents=agents, cells=cells, host_wins=host_wins
+    )
+
+
 def _parse_keep_warm_settings(value: Any) -> KeepWarmSettings:
     """Parse one namespace, including an explicitly empty whitelist."""
     if not isinstance(value, dict):
@@ -910,6 +1003,14 @@ def _parse_keep_warm_settings(value: Any) -> KeepWarmSettings:
             if isinstance(rows, dict)
         }
     raw_cells_at = value.get("migratedToCellsAt")
+    layers = None
+    if "layers" in value and value["layers"] is not None:
+        layers = _parse_keep_warm_layers(value["layers"])
+        if layers is None:
+            logger.warning(
+                "Ignoring an unparsable keep-warm layers value; using the earlier shape"
+            )
+    raw_layers_at = value.get("migratedToLayersAt")
     return KeepWarmSettings(
         agents=agents,
         host_offline_archive_s=host_offline_archive_s,
@@ -918,6 +1019,115 @@ def _parse_keep_warm_settings(value: Any) -> KeepWarmSettings:
         default=default,
         cells=cells,
         migrated_to_cells_at=raw_cells_at if type(raw_cells_at) is int else None,
+        layers=layers,
+        migrated_to_layers_at=raw_layers_at if type(raw_layers_at) is int else None,
+    )
+
+
+@lru_cache(maxsize=64)
+def _keep_warm_family(harness: str | None) -> str | None:
+    """Read one harness's keep-warm family; ``None`` when it has no channel."""
+    if harness is None:
+        return None
+    from omnigent.harness_plugins import capability_for_harness
+
+    capability = capability_for_harness(harness)
+    family = capability.keep_warm_family if capability is not None else None
+    return family if family in ("claude", "codex", "pi") else None
+
+
+def _keep_warm_layer_row(
+    layers: KeepWarmLayers,
+    *,
+    template_id: str | None,
+    agent_id: str | None,
+    harness: str | None,
+) -> Mapping[str, Any] | None:
+    """First agent-level key the stored rows hold, as ``resolve_override`` picks."""
+    for key in (template_id, agent_id, f"harness:{harness}" if harness else None):
+        if key is not None and key in layers.agents:
+            return layers.agents[key]
+    return None
+
+
+def resolve_keep_warm_layers(
+    layers: KeepWarmLayers,
+    *,
+    host_id: str | None = None,
+    template_id: str | None = None,
+    agent_id: str | None = None,
+    harness: str | None = None,
+) -> AgentKeepWarm:
+    """
+    Apply the layered order per field: cell, marked column, row, column, corner.
+
+    A column or the corner never holds ``intervalSeconds``. A field the
+    harness cannot use is skipped at every level, the cell included: Pi keeps
+    its fixed 30-minute run and ignores cold-after, and a harness with no
+    keep-warm family uses nothing. Absent fields keep the built-in defaults
+    the runtime applied before layered records existed.
+
+    :param layers: Parsed layered records.
+    :param host_id: Session host, or ``None`` for the no-host column.
+    :param template_id: Agent template id, when the session carries one.
+    :param agent_id: Bound agent id, when the session has one.
+    :param harness: Effective harness id.
+    :returns: The selected row, clamped later by the runtime functions.
+    """
+    column_id = host_id or ""
+    row = _keep_warm_layer_row(layers, template_id=template_id, agent_id=agent_id, harness=harness)
+    cell = None
+    cell_rows = layers.cells.get(column_id, {})
+    for key in (template_id, agent_id, f"harness:{harness}" if harness else None):
+        if key is not None and key in cell_rows:
+            cell = cell_rows[key]
+            break
+    column = layers.hosts.get(column_id)
+    marked = column_id in layers.host_wins
+    family = _keep_warm_family(harness)
+
+    def usable(field: str) -> bool:
+        if family is None:
+            return False
+        return family != "pi" or field not in ("intervalSeconds", "coldAfterSeconds")
+
+    def pick(field: str) -> Any:
+        if not usable(field):
+            return _MISSING
+        column_ok = field in _LAYER_COLUMN_FIELDS
+        candidates = [cell]
+        if marked:
+            candidates.append(column if column_ok else None)
+        candidates.append(row)
+        if not marked:
+            candidates.append(column if column_ok else None)
+        candidates.append(layers.corner if column_ok else None)
+        for record in candidates:
+            if record is not None and field in record:
+                return record[field]
+        return _MISSING
+
+    main = pick("main")
+    child = pick("child")
+    interval = pick("intervalSeconds")
+    max_s = pick("maxSeconds")
+    cold = pick("coldAfterSeconds")
+    return AgentKeepWarm(
+        main=main if isinstance(main, bool) else False,
+        child=child if isinstance(child, bool) else False,
+        interval_s=(
+            interval
+            if isinstance(interval, int) and not isinstance(interval, bool) and interval > 0
+            else None
+        ),
+        max_s=(
+            max_s
+            if isinstance(max_s, int) and not isinstance(max_s, bool) and max_s > 0
+            else KEEP_WARM_DEFAULT_MAX_S
+        ),
+        cold_after_s=(
+            cold if isinstance(cold, int) and not isinstance(cold, bool) and cold >= 0 else None
+        ),
     )
 
 
@@ -929,9 +1139,17 @@ def keep_warm_row(
     agent_id: str | None = None,
     harness: str | None = None,
 ) -> AgentKeepWarm:
-    """Select the host's whitelist cell, or retain the legacy override order."""
+    """Select the layered cell, the host's whitelist cell, or the legacy override."""
     from omnigent.server.session_overrides import resolve_override
 
+    if settings.layers is not None:
+        return resolve_keep_warm_layers(
+            settings.layers,
+            host_id=host_id,
+            template_id=template_id,
+            agent_id=agent_id,
+            harness=harness,
+        )
     rows = settings.agents if settings.cells is None else settings.cells.get(host_id or "", {})
     default = settings.default if settings.cells is None else _default_keep_warm_row()
     return resolve_override(
@@ -1115,6 +1333,171 @@ def _encode_keep_warm_cell(row: AgentKeepWarm, family: str | None) -> dict[str, 
     if row.cold_after_s is not None:
         value["coldAfterSeconds"] = row.cold_after_s
     return value
+
+
+def _materialize_keep_warm_layer(
+    row: AgentKeepWarm, *, allow_interval: bool = True
+) -> dict[str, Any]:
+    """Write every field the stored row applies, so no level starts inheriting."""
+    value: dict[str, Any] = {
+        "main": row.main,
+        "child": row.child,
+        "maxSeconds": row.max_s,
+        "coldAfterSeconds": row.cold_after_s,
+    }
+    if allow_interval and row.interval_s is not None:
+        value["intervalSeconds"] = row.interval_s
+    return value
+
+
+def _keep_warm_layers_to_dict(layers: KeepWarmLayers) -> dict[str, Any]:
+    """Serialize parsed layered records back to the namespace shape."""
+    return {
+        "corner": dict(layers.corner),
+        "hosts": {host: dict(record) for host, record in layers.hosts.items()},
+        "agents": {key: dict(record) for key, record in layers.agents.items()},
+        "cells": {
+            host: {key: dict(record) for key, record in rows.items()}
+            for host, rows in layers.cells.items()
+        },
+        "hostWins": dict.fromkeys(sorted(layers.host_wins), True),
+    }
+
+
+def _convert_keep_warm_layers(
+    settings: KeepWarmSettings, identities: Iterable[KeepWarmIdentity], hosts: Iterable[str]
+) -> dict[str, Any]:
+    """
+    Materialize the legacy or cells shape into layered records without losing a route.
+
+    Every stored row is written whole because a stored row applies whole. On
+    the legacy shape a product row folds to its ``harness:x`` row under
+    ``_convert_keep_warm_cells``'s rule; any snapshot identity whose result the
+    fold would change keeps a row of its own, and an identity with no key to
+    hold one keeps that harness from folding.
+    """
+    if settings.layers is not None:
+        return _keep_warm_layers_to_dict(settings.layers)
+    if settings.cells is not None:
+        return {
+            "corner": {
+                "main": False,
+                "child": False,
+                "maxSeconds": KEEP_WARM_DEFAULT_MAX_S,
+                "coldAfterSeconds": None,
+            },
+            "hosts": {},
+            "agents": {},
+            "cells": {
+                host: {key: _materialize_keep_warm_layer(row) for key, row in rows.items()}
+                for host, rows in settings.cells.items()
+            },
+            "hostWins": {},
+        }
+
+    from omnigent.db.utils import builtin_agent_id
+    from omnigent.harness_plugins import harness_capabilities, product_agent_harnesses
+
+    families = {
+        harness: caps.keep_warm_family
+        for harness, caps in harness_capabilities().items()
+        if caps.keep_warm_family in ("claude", "codex", "pi")
+    }
+    products = {
+        harness: builtin_agent_id(name) for name, harness in product_agent_harnesses().items()
+    }
+    corner = _materialize_keep_warm_layer(settings.default, allow_interval=False)
+    rows = {key: _materialize_keep_warm_layer(row) for key, row in settings.agents.items()}
+    identities = sorted(
+        set(identities),
+        key=lambda item: (
+            bool(item.template_id),
+            item.template_id or "",
+            item.agent_id or "",
+            item.harness or "",
+        ),
+    )
+    host_ids = sorted(set(hosts) | {""})
+
+    def changed_routes(row_map: dict[str, dict[str, Any]]) -> list[KeepWarmIdentity]:
+        layers = KeepWarmLayers(
+            corner=corner, hosts={}, agents=row_map, cells={}, host_wins=frozenset()
+        )
+        changed: list[KeepWarmIdentity] = []
+        for identity in identities:
+            family = families.get(identity.harness or "")
+            if family is None:
+                continue
+            for host in host_ids:
+                before = keep_warm_row(
+                    settings,
+                    host_id=host,
+                    template_id=identity.template_id,
+                    agent_id=identity.agent_id,
+                    harness=identity.harness,
+                )
+                after = resolve_keep_warm_layers(
+                    layers,
+                    host_id=host,
+                    template_id=identity.template_id,
+                    agent_id=identity.agent_id,
+                    harness=identity.harness,
+                )
+                if _effective_keep_warm(before, family) != _effective_keep_warm(after, family):
+                    changed.append(identity)
+                    break
+        return changed
+
+    folded = dict(rows)
+    fold_map: dict[str, str] = {}
+    for harness, product in products.items():
+        if harness not in families or product not in rows:
+            continue
+        harness_key = f"harness:{harness}"
+        if harness_key in rows:
+            continue
+        folded.pop(product)
+        folded[harness_key] = rows[product]
+        fold_map[harness] = product
+
+    for identity in changed_routes(folded):
+        key = (
+            identity.template_id
+            if identity.template_id in settings.agents
+            else (identity.agent_id or identity.template_id)
+        )
+        if key is None and identity.harness in fold_map:
+            product = fold_map.pop(identity.harness)
+            folded.pop(f"harness:{identity.harness}", None)
+            folded[product] = rows[product]
+
+    for identity in changed_routes(folded):
+        key = (
+            identity.template_id
+            if identity.template_id in settings.agents
+            else (identity.agent_id or identity.template_id)
+        )
+        if key is None:
+            continue
+        before = keep_warm_row(
+            settings,
+            template_id=identity.template_id,
+            agent_id=identity.agent_id,
+            harness=identity.harness,
+        )
+        folded[key] = _materialize_keep_warm_layer(before)
+
+    # A correction can mask a route under any harness, not only a folded one.
+    if changed_routes(folded):
+        folded = rows
+
+    return {
+        "corner": corner,
+        "hosts": {},
+        "agents": folded,
+        "cells": {},
+        "hostWins": {},
+    }
 
 
 def _convert_keep_warm_cells(
@@ -1625,8 +2008,24 @@ class SqlAlchemyUserPreferencesStore:
                 value=_encode_value(USER_PREFERENCE_VERSION),
             )
             settings, _initialized = _read_settings(session, user_id)
+            existing = settings.get(namespace)
+            if (
+                namespace == KEEP_WARM_NAMESPACE
+                and isinstance(existing, dict)
+                and "layers" in existing
+                and (
+                    value is None
+                    or not isinstance(value, dict)
+                    or (
+                        "layers" not in value
+                        and any(key in value for key in ("agents", "default", "cells"))
+                    )
+                )
+            ):
+                raise UserPreferencesValidationError(
+                    "This page is out of date. Reload it to change keep-warm settings."
+                )
             if value is None:
-                existing = settings.get(namespace)
                 if (
                     namespace == KEEP_WARM_NAMESPACE
                     and isinstance(existing, dict)
@@ -1640,7 +2039,6 @@ class SqlAlchemyUserPreferencesStore:
                 else:
                     settings.pop(namespace, None)
             else:
-                existing = settings.get(namespace)
                 if (
                     namespace != WORKTREE_ARCHIVE_NAMESPACE
                     and isinstance(existing, dict)
@@ -1687,10 +2085,13 @@ class SqlAlchemyUserPreferencesStore:
         dry_run: bool,
         create_if_missing: bool = True,
         legacy_native_agents: Iterable[tuple[str, str]] = (),
+        target: Literal["cells", "layers"] = "cells",
     ) -> dict[str, Any]:
         """Convert one snapshot under the preference lock without losing legacy values."""
         if type(dry_run) is not bool:
             raise UserPreferencesValidationError("dry_run must be a boolean")
+        if target not in ("cells", "layers"):
+            raise UserPreferencesValidationError("target must be 'cells' or 'layers'")
         identities = tuple(identities)
         hosts = tuple(hosts)
         legacy_native_agents = tuple(legacy_native_agents)
@@ -1716,6 +2117,43 @@ class SqlAlchemyUserPreferencesStore:
                         collab, legacy_native_agents, int(time.time())
                     )
             settings = _parse_keep_warm_settings(namespace)
+            if target == "layers":
+                if settings.layers is not None:
+                    already = True
+                    layers = _keep_warm_layers_to_dict(settings.layers)
+                else:
+                    already = False
+                    layers = _convert_keep_warm_layers(settings, identities, hosts)
+                    namespace = {
+                        **namespace,
+                        "layers": layers,
+                        "migratedToLayersAt": int(time.time()),
+                    }
+                namespaces[KEEP_WARM_NAMESPACE] = namespace
+                try:
+                    _assemble_envelope(namespaces)
+                except UserPreferencesValidationError as exc:
+                    raise UserPreferencesValidationError(
+                        f"Keep-warm conversion exceeds the 64 KiB envelope: "
+                        f"{len(set(hosts) | {''})} hosts, "
+                        f"{sum(len(rows) for rows in layers['cells'].values())} cells; {exc}"
+                    ) from exc
+                if not dry_run and not already:
+                    self._upsert_row(
+                        session,
+                        user_id=user_id,
+                        key=_settings_key(KEEP_WARM_NAMESPACE),
+                        value=_encode_value(namespace),
+                    )
+                return {
+                    "layers": layers,
+                    "already": already,
+                    "banner": (
+                        "Converted from your previous settings · saved when you first edit."
+                    ),
+                    "bytes": len(_encode_value(namespace).encode("utf-8")),
+                    "migratedToLayersAt": namespace.get("migratedToLayersAt"),
+                }
             already = settings.cells is not None
             if already:
                 cells = namespace["cells"]

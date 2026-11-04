@@ -18,10 +18,12 @@ export function HelpTip({
   label,
   children,
   className,
+  icon,
 }: {
   label: string;
   children: ReactNode;
   className?: string;
+  icon?: ReactNode;
 }) {
   const [open, setOpen] = useState(false);
   const closeTimerRef = useRef<number | null>(null);
@@ -83,7 +85,7 @@ export function HelpTip({
             scheduleClose();
           }}
         >
-          <CircleHelpIcon className="size-3.5" />
+          {icon ?? <CircleHelpIcon className="size-3.5" />}
         </button>
       </PopoverTrigger>
       <PopoverContent

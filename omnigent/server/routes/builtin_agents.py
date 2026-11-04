@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import re
 from collections.abc import Callable, Coroutine
 from typing import Any
 
@@ -69,6 +70,11 @@ _MULTIPART_OVERHEAD_BYTES = 64 * 1024
 _USER_AGENTS_PAGE_LIMIT = 50
 # How many sessions using an agent we count before reporting "N+".
 _IN_USE_COUNT_CAP = 100
+
+
+# A bound agent id is a bare 32-char hex uuid; library template ids (``ca_…``)
+# are already template ids and cannot be looked up in the agents table.
+_AGENT_ID_PATTERN = re.compile(r"[0-9a-fA-F]{32}")
 
 
 def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
@@ -527,6 +533,43 @@ def create_builtin_agents_router(
         return AgentList(
             data=data, first_id=page.first_id, last_id=page.last_id, has_more=page.has_more
         )
+
+    @router.get("/agents/with-sessions")
+    async def list_agents_with_sessions(request: Request) -> dict[str, list[str] | dict[str, str]]:
+        """List agent ids that at least one session uses, for settings tables.
+
+        Reads distinct ``agent_id`` values from the conversation index and the
+        distinct agent-template labels that library starts carry, then maps
+        copies back to their template id. Archived sessions count. No new
+        column and no per-agent query.
+
+        :param request: The incoming request (for auth).
+        :returns: Sorted, de-duplicated ``agent_ids`` and the bound-agent to
+            template mapping already computed for the visible rows.
+        """
+        _require_user(request, auth_provider)
+        if conversation_store is None:
+            raise HTTPException(status_code=404, detail="sessions are not supported")
+        from omnigent.server.session_overrides import AGENT_TEMPLATE_ID_LABEL
+
+        agent_ids = await asyncio.to_thread(
+            conversation_store.agent_ids_with_sessions, AGENT_TEMPLATE_ID_LABEL
+        )
+        label_templates = await asyncio.to_thread(
+            conversation_store.agent_template_labels_with_sessions, AGENT_TEMPLATE_ID_LABEL
+        )
+        mappable = [agent_id for agent_id in agent_ids if _AGENT_ID_PATTERN.fullmatch(agent_id)]
+        server_templates: dict[str, str] = {}
+        if mappable:
+            server_templates = await asyncio.to_thread(
+                agent_store.get_template_ids, sorted(mappable)
+            )
+            agent_ids = {server_templates.get(agent_id, agent_id) for agent_id in agent_ids}
+        templates = {**label_templates, **server_templates}
+        return {
+            "agent_ids": sorted(agent_ids),
+            "template_by_agent_id": dict(sorted(templates.items())),
+        }
 
     @router.get("/agents/{agent_id}")
     async def get_agent(request: Request, agent_id: str) -> AgentDetailObject:
