@@ -2602,12 +2602,17 @@ function WorktreeLocationControl() {
           </div>
         </div>
       )}
-      <p className="text-sm text-muted-foreground">
-        Example:{" "}
-        <span data-testid="settings-worktree-location-example" className="font-mono wrap-anywhere">
-          {example || "Enter a custom path."}
-        </span>
-      </p>
+      {error === null && (
+        <p className="text-sm text-muted-foreground">
+          Template with sample values (not validated):{" "}
+          <span
+            data-testid="settings-worktree-location-example"
+            className="font-mono wrap-anywhere"
+          >
+            {example || "Enter a custom path."}
+          </span>
+        </p>
+      )}
       <div className="flex flex-wrap gap-2">
         <Button
           size="sm"

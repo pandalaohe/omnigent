@@ -1861,6 +1861,54 @@ describe("SettingsPage", () => {
     expect(worktreeLocationPatch()).toBeUndefined();
   });
 
+  it("labels custom substitutions as unvalidated sample values without validating locally", async () => {
+    mocks.authenticatedFetch.mockResolvedValue(meResponse(null));
+    renderPage("/settings/git");
+    await waitFor(() => expect(screen.getByRole("radio", { name: "Custom" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("radio", { name: "Custom" }));
+    fireEvent.change(screen.getByTestId("settings-worktree-location-input"), {
+      target: { value: "~/.worktrees/{branch}" },
+    });
+
+    const sample = screen.getByTestId("settings-worktree-location-example");
+    expect(sample).toHaveTextContent("~/.worktrees/feature-login");
+    expect(sample.parentElement).toHaveTextContent("Template with sample values (not validated):");
+    expect(screen.getByTestId("settings-worktree-location-save")).toBeEnabled();
+    expect(worktreeLocationPatch()).toBeUndefined();
+  });
+
+  it("hides sample values while the server rejects the current worktree template", async () => {
+    mocks.authenticatedFetch.mockImplementation(async (_url, init) => {
+      if ((init as RequestInit | undefined)?.method === "PATCH") {
+        return new Response(
+          JSON.stringify({ detail: "worktree location template must contain {repo}" }),
+          { status: 422, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return meResponse(null);
+    });
+    renderPage("/settings/git");
+    await waitFor(() => expect(screen.getByRole("radio", { name: "Custom" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("radio", { name: "Custom" }));
+    const input = screen.getByTestId("settings-worktree-location-input");
+    fireEvent.change(input, { target: { value: "{entry}/.worktrees/{branch}" } });
+    expect(screen.getByTestId("settings-worktree-location-example")).toBeVisible();
+    fireEvent.click(screen.getByTestId("settings-worktree-location-save"));
+
+    expect(await screen.findByTestId("settings-worktree-location-error")).toHaveTextContent(
+      "worktree location template must contain {repo}",
+    );
+    expect(input).toHaveValue("{entry}/.worktrees/{branch}");
+    expect(screen.queryByTestId("settings-worktree-location-example")).toBeNull();
+    expect(screen.queryByText(/Template with sample values/)).toBeNull();
+
+    fireEvent.change(input, { target: { value: "{entry}/.worktrees/{repo}/{branch}" } });
+    expect(screen.queryByTestId("settings-worktree-location-error")).toBeNull();
+    expect(screen.getByTestId("settings-worktree-location-example")).toHaveTextContent(
+      "/opt/work/project/.worktrees/repo/feature-login",
+    );
+  });
+
   it("keeps Open at latest in General Sessions and polling options beneath their shortcut", () => {
     const general = renderPage("/settings/general");
     expect(
