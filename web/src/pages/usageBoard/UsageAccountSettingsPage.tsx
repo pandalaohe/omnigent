@@ -3,7 +3,7 @@
 // once — no save button — and the tile beside the rows is the preview.
 
 import { useState } from "react";
-import { useNavigate, useParams } from "@/lib/routing";
+import { Link, useNavigate, useParams } from "@/lib/routing";
 
 import { HelpTip } from "@/components/HelpTip";
 import { Button } from "@/components/ui/button";
@@ -72,6 +72,12 @@ export function UsageAccountSettingsPage() {
             />
           </div>
           <div className="rounded-[11px] border border-border bg-card px-3.5 py-1">
+            <Link
+              to={`/usage/board/${encodeURIComponent(account.id)}/models`}
+              className="flex min-h-12 items-center justify-between border-b border-border py-2 text-sm"
+            >
+              Models <span aria-hidden="true">›</span>
+            </Link>
             <label className="flex min-h-12 flex-wrap items-center gap-2 py-2 text-sm">
               Shown model
               <Input

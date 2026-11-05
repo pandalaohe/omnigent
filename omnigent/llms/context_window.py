@@ -204,7 +204,7 @@ class ModelPricing:
     cache_write_per_token: float | None = None
 
 
-def fetch_model_pricing(model: str) -> ModelPricing | None:
+def fetch_model_pricing(model: str, *, cached_only: bool = False) -> ModelPricing | None:
     """
     Look up per-token pricing for *model* from the MLflow catalog.
 
@@ -215,6 +215,7 @@ def fetch_model_pricing(model: str) -> ModelPricing | None:
 
     :param model: Model identifier, e.g. ``"anthropic/claude-sonnet-4-6"``
         or ``"databricks-gpt-5-5"``.
+    :param cached_only: Read cached catalog metadata without network discovery.
     :returns: A :class:`ModelPricing`, or ``None`` when pricing is
         unavailable (network error, model not in catalog, or catalog
         entry lacks input/output pricing data).
@@ -239,7 +240,9 @@ def fetch_model_pricing(model: str) -> ModelPricing | None:
             ),
         )
 
-    matches = find_catalog_models(model)
+    matches = (
+        find_catalog_models(model, cached_only=True) if cached_only else find_catalog_models(model)
+    )
     prices = {price for info in matches if (price := _extract(info)) is not None}
     if len(prices) == 1:
         return next(iter(prices))
@@ -312,14 +315,17 @@ def fetch_model_pricing_with_provider(
     model: str,
     provider_config: dict[str, Any] | None = None,
     harness: str | None = None,
+    *,
+    cached_only: bool = False,
 ) -> ModelPricing | None:
     """
     Fetch model pricing, checking provider config first then catalog.
 
     Resolution order:
     1. Provider config custom pricing (for self-hosted/gateway models with configured rates)
-    2. MLflow catalog via :func:`fetch_model_pricing` (for known vendor models)
-    3. ``None`` (unpriced)
+    2. The server's selected public price map, when installed
+    3. MLflow catalog via :func:`fetch_model_pricing` (for known vendor models)
+    4. ``None`` (unpriced)
 
     This enables cost tracking for self-hosted models (Ollama, vLLM, custom
     gateways) and gateway endpoints that expose catalog-known model IDs but
@@ -349,6 +355,7 @@ def fetch_model_pricing_with_provider(
         lookup and falls through to catalog. SDK executors may pass
         executor-style spellings (``claude_sdk``, ``agents_sdk``) which are
         normalized internally.
+    :param cached_only: Keep the catalog fallback local to its memory/disk cache.
     :returns: A :class:`ModelPricing` (per-token rates), or ``None`` when
         pricing is unavailable.
 
@@ -404,8 +411,15 @@ def fetch_model_pricing_with_provider(
             # fall through to catalog rather than breaking cost tracking entirely.
             pass
 
-    # Step 2: Fall back to catalog pricing when provider pricing is not configured
-    catalog_pricing = fetch_model_pricing(model)
+    from omnigent.llms.price_source import selected_price
+
+    if (selected := selected_price(model)) is not None:
+        return selected
+
+    # Fall back to the catalog when the server's selected map has no match.
+    catalog_pricing = (
+        fetch_model_pricing(model, cached_only=True) if cached_only else fetch_model_pricing(model)
+    )
     if catalog_pricing is not None:
         return catalog_pricing
 

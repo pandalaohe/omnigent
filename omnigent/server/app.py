@@ -1995,9 +1995,11 @@ def create_app(
         archive_close_coordinator.set_host_lock_provider(cli_retention_coordinator.lease_for_host)
     archive_close_coordinator.set_project_host_binding_store(project_host_binding_store)
     archive_close_coordinator.set_archive_preferences(user_preferences_store, permission_store)
+    from omnigent.server.admin_list import resolve_data_dir
     from omnigent.server.agent_quota import AgentQuotaService
     from omnigent.server.routes.agent_quota import create_agent_quota_router
     from omnigent.server.server_config import usage_enabled as usage_module_enabled
+    from omnigent.server.usage_price_source import UsagePriceSource
     from omnigent.stores.usage_hours_store import (
         UsageHoursRecorder,
         UsageHoursStore,
@@ -2014,6 +2016,11 @@ def create_app(
         _logger.warning("Invalid usage.mark configuration; using defaults")
         usage_mark = MarkSettings()
     usage_hours_store = UsageHoursStore(conversation_store.storage_location)
+    usage_price_source = UsagePriceSource(
+        UsageSnapshotStore(conversation_store.storage_location),
+        usage_hours_store,
+        resolve_data_dir(),
+    )
     agent_quota_service = AgentQuotaService(
         conversation_store,
         permission_store,
@@ -2286,7 +2293,12 @@ def create_app(
         )
 
         usage_flush_task: asyncio.Task[None] | None = None
+        usage_price_task: asyncio.Task[None] | None = None
         if agent_quota_service.usage_enabled:
+            await asyncio.to_thread(usage_price_source.load)
+            usage_price_task = asyncio.create_task(
+                usage_price_source.run(), name="usage-price-source"
+            )
 
             async def _usage_flush_loop() -> None:
                 while True:
@@ -2546,6 +2558,10 @@ def create_app(
             with monitor_event_loop():
                 yield
         finally:
+            if usage_price_task is not None:
+                usage_price_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await usage_price_task
             if usage_flush_task is not None:
                 usage_flush_task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -2744,7 +2760,11 @@ def create_app(
     app.state.agent_quota_service = agent_quota_service
     app.include_router(
         create_agent_quota_router(
-            agent_quota_service, auth_provider=auth_provider, host_store=host_store
+            agent_quota_service,
+            auth_provider=auth_provider,
+            host_store=host_store,
+            price_source=usage_price_source,
+            model_catalogs=host_model_catalog_cache_store,
         ),
         prefix="/v1",
     )

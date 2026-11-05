@@ -61,6 +61,12 @@ export interface UsageBoardBand {
 }
 
 export interface UsageBoardPreferences {
+  range?: {
+    key: "today" | "h24" | "d7" | "period" | "d30" | "d90" | "custom";
+    from?: string;
+    to?: string;
+  };
+  unit?: "money" | "tokens";
   /** The user's switch. The deployment gate sits on top of it. */
   enabled: boolean;
   density: "std" | "mini";
@@ -254,6 +260,8 @@ export function normalizeUsageBoardPreferences(value: unknown): UsageBoardPrefer
     windows?: unknown;
     renewals?: unknown;
     hidden?: unknown;
+    range?: UsageBoardPreferences["range"];
+    unit?: unknown;
   };
   const bands: UsageBoardBand[] = [];
   const seenBands = new Set<string>();
@@ -288,6 +296,17 @@ export function normalizeUsageBoardPreferences(value: unknown): UsageBoardPrefer
     hidden: Array.isArray(raw.hidden)
       ? raw.hidden.filter((item): item is string => typeof item === "string").slice(0, 64)
       : [],
+    ...(raw.range &&
+    ["today", "h24", "d7", "period", "d30", "d90", "custom"].includes(raw.range.key)
+      ? {
+          range: {
+            key: raw.range.key,
+            ...(typeof raw.range.from === "string" ? { from: raw.range.from.slice(0, 10) } : {}),
+            ...(typeof raw.range.to === "string" ? { to: raw.range.to.slice(0, 10) } : {}),
+          },
+        }
+      : {}),
+    ...(raw.unit === "tokens" || raw.unit === "money" ? { unit: raw.unit } : {}),
   };
 }
 
@@ -298,7 +317,9 @@ export function isDefaultUsageBoardPreferences(board: UsageBoardPreferences): bo
     board.bands.length === 0 &&
     Object.keys(board.windows).length === 0 &&
     Object.keys(board.renewals).length === 0 &&
-    board.hidden.length === 0
+    board.hidden.length === 0 &&
+    (!board.range || board.range.key === "d7") &&
+    board.unit !== "tokens"
   );
 }
 

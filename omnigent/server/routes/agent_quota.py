@@ -8,20 +8,22 @@ import time
 from copy import deepcopy
 from datetime import date
 from typing import Annotated, Any, Literal
-from zoneinfo import ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, ValidationError
-from sqlalchemy.exc import StatementError
+from sqlalchemy.exc import SQLAlchemyError, StatementError
 
 from omnigent.harness_plugins import native_agents
 from omnigent.quota_pace import accept_snapshot
 from omnigent.server.agent_quota import AgentQuotaService, UsageAccountLimitError
 from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes._auth_helpers import require_access, require_user
+from omnigent.server.usage_price_source import PriceSourceSelection, UsagePriceSource
+from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
 from omnigent.stores.host_store import HostStore
 from omnigent.usage.contract import UsageOverview, UsageReport
-from omnigent.usage.ranges import RangeKey
+from omnigent.usage.ranges import RangeKey, range_spans
 
 _Number = Annotated[StrictFloat | StrictInt, Field(allow_inf_nan=False)]
 _Period = Annotated[
@@ -71,6 +73,8 @@ def create_agent_quota_router(
     *,
     auth_provider: AuthProvider | None,
     host_store: HostStore | None,
+    price_source: UsagePriceSource | None = None,
+    model_catalogs: HostModelCatalogCacheStore | None = None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -216,7 +220,80 @@ def create_agent_quota_router(
                 payload = await asyncio.to_thread(service.activity, owner, **options)
         except (ValueError, ZoneInfoNotFoundError):
             raise HTTPException(422, "Invalid usage range or timezone") from None
+        if issues and price_source is not None and price_source.failures:
+            span, _ = range_spans(
+                range_key, time.time(), ZoneInfo(tz), from_date=from_date, to_date=to_date
+            )
+            selected_failures = [
+                entry
+                for entry in price_source.failures
+                if span.counted_from <= entry["at"] < span.until
+            ]
+            if selected_failures:
+                payload["price_source"] = selected_failures
         return JSONResponse(payload, headers={"Cache-Control": "private, no-store"})
+
+    @router.get("/me/usage/price-source")
+    async def read_price_source(request: Request) -> dict[str, Any]:
+        require_usage()
+        owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
+        if price_source is None:
+            raise HTTPException(503, "Price source is unavailable")
+        can_edit = (
+            auth_provider is None
+            or service.permissions is None
+            or await asyncio.to_thread(service.permissions.is_admin, owner)
+        )
+        return {**price_source.status(), "can_edit": can_edit}
+
+    @router.put("/me/usage/price-source")
+    async def write_price_source(request: Request, body: PriceSourceSelection) -> dict[str, Any]:
+        require_usage()
+        from omnigent.server.routes.default_policies import _require_admin
+
+        await _require_admin(
+            request, auth_provider, service.permissions if auth_provider is not None else None
+        )
+        if price_source is None:
+            raise HTTPException(503, "Price source is unavailable")
+        try:
+            return {**await price_source.select(body), "can_edit": True}
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+        except (OSError, SQLAlchemyError):
+            raise HTTPException(503, "Price source could not be saved") from None
+
+    @router.get("/me/usage/models")
+    async def read_models(
+        request: Request,
+        account: str,
+        range_key: Annotated[RangeKey, Query(alias="range")] = "d7",
+        from_date: Annotated[date | None, Query(alias="from")] = None,
+        to_date: Annotated[date | None, Query(alias="to")] = None,
+        tz: str = "UTC",
+        host_id: str | None = None,
+    ) -> dict[str, Any]:
+        require_usage()
+        owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
+        from omnigent.server.usage_models import usage_models
+
+        try:
+            return await asyncio.to_thread(
+                usage_models,
+                service,
+                model_catalogs,
+                owner,
+                account,
+                host_id=host_id,
+                range_key=range_key,
+                from_date=from_date,
+                to_date=to_date,
+                tz=tz,
+            )
+        except (ValueError, ZoneInfoNotFoundError):
+            raise HTTPException(422, "Invalid usage range or timezone") from None
+        except LookupError:
+            raise HTTPException(404, "Usage account not found") from None
 
     @router.get("/sessions/{session_id}/agent-quota", include_in_schema=False)
     async def session_quota(request: Request, session_id: str) -> Response:

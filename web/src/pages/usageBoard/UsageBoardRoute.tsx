@@ -12,13 +12,14 @@ import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import { UsageAccountPage } from "./UsageAccountPage";
 import { UsageAccountSettingsPage } from "./UsageAccountSettingsPage";
 import { UsageBoardPage } from "./UsageBoardPage";
+import { UsageModelsPage } from "./UsageModelsPage";
 
 export const USAGE_BOARD_SETTINGS_PATH = "/settings/general#usage-settings";
 
 export function UsageBoardRoute({
   view = "board",
 }: {
-  view?: "board" | "account" | "account_settings";
+  view?: "board" | "account" | "account_settings" | "models";
 }) {
   const info = useServerInfo();
   const board = useUsageContextPreferences().board;
@@ -58,5 +59,6 @@ export function UsageBoardRoute({
   }
   if (view === "account") return <UsageAccountPage />;
   if (view === "account_settings") return <UsageAccountSettingsPage />;
+  if (view === "models") return <UsageModelsPage />;
   return <UsageBoardPage />;
 }

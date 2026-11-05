@@ -32,6 +32,7 @@ import { cn } from "@/lib/utils";
 
 import { buildConnectCommand } from "./usageBoardConnect";
 import { UsageRing } from "./UsageRing";
+import { UsagePriceSourceSettings } from "./UsagePriceSourceSettings";
 import { useUsageOverview, type UsageWindowView } from "./usageBoardData";
 
 /** A synthetic reading, so the colour line shows what each tier looks like. */
@@ -126,6 +127,7 @@ export function UsageBoardSettings() {
 
       {available && board.enabled ? (
         <>
+          <UsagePriceSourceSettings />
           <div className="flex flex-col gap-2 border-t border-border py-2.5">
             <div className="flex items-start justify-between gap-2">
               <span className="flex flex-wrap items-center gap-1.5 text-sm">
