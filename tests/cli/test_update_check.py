@@ -680,6 +680,34 @@ def test_read_wheel_info_uv_git_install(tmp_path: Path, monkeypatch: pytest.Monk
     assert abs(info.install_time_epoch - install_time) < 1.0
 
 
+@pytest.mark.parametrize("revision", ["release/stable", "v0.21.0", "b" * 40, None])
+def test_read_wheel_info_preserves_requested_revision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, revision: str | None
+) -> None:
+    """A uv PEP 610 record keeps its requested ref and SSH alias on reinstall."""
+    source = "ssh://build-host/srv/git/omnigent.git"
+    vcs_info = {"vcs": "git", "commit_id": _FAKE_COMMIT}
+    if revision is not None:
+        vcs_info["requested_revision"] = revision
+    dist = _write_fake_dist_info(
+        tmp_path, installer="uv", direct_url={"url": source, "vcs_info": vcs_info}
+    )
+    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+
+    info = _read_installed_wheel_info()
+
+    assert info is not None
+    expected = f"git+{source}" + (f"@{revision}" if revision else "")
+    assert info.vcs_url == expected
+    assert info.commit_sha == _FAKE_COMMIT
+    assert _build_upgrade_suggestion(info).command == (
+        f"uv tool install --reinstall{_UV_PY} {expected}"
+    )
+    from omnigent.update_check import _split_vcs_url
+
+    assert _split_vcs_url(info.vcs_url) == (source, revision)
+
+
 @pytest.mark.parametrize(
     "stored,expected",
     [

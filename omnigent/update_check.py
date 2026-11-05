@@ -1110,6 +1110,9 @@ def _read_installed_wheel_info() -> _InstalledWheelInfo | None:
                     # the reinstall command ssh's in as user ``****``
                     # and fails.
                     vcs_url = _unredact_ssh_userinfo(vcs_url)
+                    revision = vcs_info.get("requested_revision")
+                    if isinstance(revision, str) and revision:
+                        vcs_url = f"{vcs_url}@{revision}"
                 if isinstance(cid, str):
                     commit_sha = cid
 
