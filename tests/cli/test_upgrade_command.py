@@ -162,6 +162,59 @@ def test_upgrade_preview_does_not_inspect_services(
     assert "Running:" not in result.output
 
 
+@pytest.mark.parametrize("outcome", ["success", "locked", "stop-failed", "start-failed"])
+def test_windows_upgrade_uses_wrapper_and_external_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _wheel_install: None, outcome: str
+) -> None:
+    import subprocess
+    from dataclasses import replace
+
+    wrapper = tmp_path / "omni-host-service.cmd"
+    wrapper.write_text("@echo off\n")
+    source = "git+ssh://build-host/srv/git/omnigent.git@release/stable"
+    info = replace(_git_install_info(), vcs_url=source, extras=("all",))
+    monkeypatch.setattr("omnigent.cli.IS_WINDOWS", True)
+    monkeypatch.setattr("omnigent.update_check.IS_WINDOWS", True, raising=False)
+    monkeypatch.setattr("omnigent.host.service.platform.system", lambda: "Windows")
+    monkeypatch.setattr("omnigent.update_check._read_installed_wheel_info", lambda: info)
+    monkeypatch.setattr("omnigent.update_check._remote_git_head", lambda _: "b" * 40)
+    monkeypatch.setattr(
+        "omnigent.cli.shutil.which",
+        lambda name: "/opt/bin/pwsh" if name == "pwsh" else str(wrapper),
+    )
+    events: list[str] = []
+
+    def _run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        environment = kwargs["env"]
+        action = environment["OMNIGENT_HOST_SERVICE_ACTION"]
+        assert environment["OMNIGENT_HOST_SERVICE_WRAPPER"] == str(wrapper)
+        assert args[:2] == ["/opt/bin/pwsh", "-NoProfile"]
+        events.append(action)
+        return subprocess.CompletedProcess(args, int(outcome == action + "-failed"), "", "")
+
+    def _install(command: str, _console: object) -> int:
+        assert command == f"uv tool install --reinstall{_UV_PY} {source}#egg=omnigent[all]"
+        events.append("install")
+        return 2 if outcome == "locked" else 0
+
+    monkeypatch.setattr("omnigent.cli.subprocess.run", _run)
+    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", _install)
+    monkeypatch.setattr(
+        "omnigent.update_check._probe_installed_distribution", lambda: ("0.2.0", "b" * 40)
+    )
+
+    result = CliRunner().invoke(cli, ["up"])
+
+    assert result.exit_code == (0 if outcome == "success" else 1), result.output
+    assert events == (
+        ["stop", "start"] if outcome == "stop-failed" else ["stop", "install", "start"]
+    )
+    if outcome == "locked":
+        assert f"uv tool install --reinstall{_UV_PY} {source}#egg=omnigent[all]" in result.output
+        assert "Close this CLI" in result.output
+        assert "curl" not in result.output
+
+
 def test_upgrade_up_to_date(monkeypatch: pytest.MonkeyPatch, _wheel_install: None) -> None:
     """Latest == installed → reports up to date, exit 0, nothing stopped/run."""
     monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda *_a, **_k: "0.1.0")

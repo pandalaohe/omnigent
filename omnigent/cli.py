@@ -5899,9 +5899,64 @@ def _drain_and_stop_local_server(*, force: bool) -> None:
         click.echo("Stopped the background server before upgrading.")
 
 
+def _windows_host_service_wrapper() -> Path | None:
+    """Locate the installed Windows Host supervisor, if present."""
+    command = shutil.which("omni-host-service.cmd") or shutil.which("omni-host-service")
+    wrapper = Path(command) if command else Path.home() / ".local/bin/omni-host-service.cmd"
+    return wrapper if wrapper.is_file() else None
+
+
+def _run_windows_host_service(wrapper: Path, action: Literal["start", "stop"]) -> None:
+    """Control the existing supervisor through PowerShell without a shell string path."""
+    pwsh = shutil.which("pwsh")
+    if pwsh is None:
+        raise click.ClickException("PowerShell 7 is required to control the Windows Host service.")
+    try:
+        result = subprocess.run(
+            [
+                pwsh,
+                "-NoProfile",
+                "-Command",
+                "& $env:OMNIGENT_HOST_SERVICE_WRAPPER "
+                "$env:OMNIGENT_HOST_SERVICE_ACTION; exit $LASTEXITCODE",
+            ],
+            check=False,
+            timeout=60,
+            env={
+                **os.environ,
+                "OMNIGENT_HOST_SERVICE_WRAPPER": str(wrapper),
+                "OMNIGENT_HOST_SERVICE_ACTION": action,
+            },
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise click.ClickException(f"Windows Host supervisor could not {action}: {exc}") from exc
+    if result.returncode:
+        raise click.ClickException(
+            f"Windows Host supervisor failed to {action} (status {result.returncode}): {wrapper}"
+        )
+
+
 @contextlib.contextmanager
 def _upgrade_host_service(*, force: bool) -> Iterator[None]:
     """Keep an enabled service stopped until the install and version check finish."""
+    if IS_WINDOWS:
+        wrapper = _windows_host_service_wrapper()
+        _drain_and_stop_local_server(force=force)
+        try:
+            if wrapper is not None:
+                _run_windows_host_service(wrapper, "stop")
+            yield
+        finally:
+            if wrapper is not None:
+                failed = sys.exc_info()[0] is not None
+                try:
+                    _run_windows_host_service(wrapper, "start")
+                except click.ClickException as exc:
+                    if not failed:
+                        raise
+                    click.echo(f"Additionally failed to restart the Windows Host: {exc}", err=True)
+        return
+
     from omnigent.host.service import (
         HostServiceError,
         enable_user_host_service,
@@ -6058,7 +6113,11 @@ def _upgrade_vcs_install(
         code = _run_upgrade_command(suggestion.command, console)
         if code != 0:
             raise click.ClickException(
-                _upgrade_failure_message(code, set(info.extras) | set(extra_overrides))
+                _upgrade_failure_message(
+                    code,
+                    set(info.extras) | set(extra_overrides),
+                    recovery_command=suggestion.command,
+                )
             )
 
         # Verify by commit, not exit code: a re-pull of a ref that hasn't moved (or
@@ -6201,7 +6260,11 @@ def _upgrade_to_nightly(
         code = _run_upgrade_command(suggestion.command, console)
         if code != 0:
             raise click.ClickException(
-                _upgrade_failure_message(code, set(info.extras) | set(extra_overrides))
+                _upgrade_failure_message(
+                    code,
+                    set(info.extras) | set(extra_overrides),
+                    recovery_command=suggestion.command,
+                )
             )
 
         # Same trust-the-disk verification as the release path: re-read the
@@ -6466,7 +6529,11 @@ def upgrade(
         code = _run_upgrade_command(suggestion.command, console)
         if code != 0:
             raise click.ClickException(
-                _upgrade_failure_message(code, set(info.extras) | set(extra_overrides))
+                _upgrade_failure_message(
+                    code,
+                    set(info.extras) | set(extra_overrides),
+                    recovery_command=suggestion.command,
+                )
             )
 
         # Trust the installed version, not the installer's exit code. The running

@@ -49,6 +49,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.git_commands import run_git
 
 if TYPE_CHECKING:
@@ -1822,7 +1823,9 @@ def _probe_installed_distribution() -> tuple[str | None, str | None]:
     return version, commit
 
 
-def _upgrade_failure_message(code: int, extras: Collection[str] = ()) -> str:
+def _upgrade_failure_message(
+    code: int, extras: Collection[str] = (), *, recovery_command: str | None = None
+) -> str:
     """Describe a failed upgrade, after checking whether the install survived.
 
     uv and pipx replace the tool environment before the replacement is built,
@@ -1834,8 +1837,16 @@ def _upgrade_failure_message(code: int, extras: Collection[str] = ()) -> str:
     :param code: The installer's exit status.
     :param extras: Extras this install had, so the recovery line reinstalls
         the same shape.
+    :param recovery_command: Exact installer command, preserving the source and extras.
     :returns: The message body for the raised ``ClickException``.
     """
+    if IS_WINDOWS and recovery_command is not None:
+        return (
+            f"Upgrade command exited with status {code}. Windows may keep this CLI's files "
+            "in use. Close this CLI and stop the Host supervisor before retrying from an "
+            f"external terminal:\n\n    {recovery_command}\n\n"
+            "Then start the existing Host supervisor again."
+        )
     version, _ = _probe_installed_distribution()
     if version is not None:
         return f"Upgrade command exited with status {code}; your previous install is intact."
