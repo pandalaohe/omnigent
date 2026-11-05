@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { Host } from "@/hooks/useHosts";
+import type { CallingDefaultsCatalogRow } from "@/lib/callingDefaultsApi";
 import {
   callingDefaultsPatch,
   patchCallingDefaults,
@@ -31,13 +32,16 @@ const hosts: Host[] = [
     configured_harnesses: { "codex-native": true, "claude-native": true },
   },
 ];
+const EMPTY_CATALOGS: CallingDefaultsCatalogRow[] = [];
 
 function Table({
   field = "permission",
   hostList = hosts,
+  catalogs = EMPTY_CATALOGS,
 }: {
   field?: AgentField;
   hostList?: Host[];
+  catalogs?: CallingDefaultsCatalogRow[];
 }) {
   const master = useCallingDefaults();
   return (
@@ -45,7 +49,7 @@ function Table({
       hosts={hostList}
       master={master}
       field={field}
-      catalogs={[]}
+      catalogs={catalogs}
       onChange={(next) => patchCallingDefaults(callingDefaultsPatch(master, next))}
     />
   );
@@ -67,6 +71,57 @@ afterEach(() => {
 });
 
 describe("agent layered defaults", () => {
+  it("offers SDK thinking choices for the model inherited from Native", async () => {
+    seed({ desktop: { "codex-native": { model: "model-b" }, codex: { effort: "high" } } });
+    render(
+      <Table
+        field="effort"
+        hostList={[
+          {
+            ...hosts[0],
+            configured_harnesses: { "codex-native": true, codex: true },
+          },
+        ]}
+        catalogs={[
+          {
+            host_id: "desktop",
+            harness: "codex",
+            fetched_at: 1,
+            stale: false,
+            error: null,
+            models: [
+              {
+                id: "model-a",
+                isDefault: true,
+                supportedReasoningEfforts: [{ reasoningEffort: "low" }],
+              },
+              {
+                id: "model-b",
+                supportedReasoningEfforts: [
+                  { reasoningEffort: "medium" },
+                  { reasoningEffort: "high" },
+                ],
+              },
+            ],
+          },
+        ]}
+      />,
+    );
+    const cell = screen.getByTestId("layered-cell-codex-desktop");
+    expect(cell).toHaveTextContent("High");
+    fireEvent.click(cell);
+    fireEvent.click(screen.getByRole("combobox", { name: "Thinking" }));
+    expect(await screen.findByRole("option", { name: "High" })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "Low" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("option", { name: "Medium" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(readCallingDefaults().desktop).toEqual({
+      "codex-native": { model: "model-b" },
+      codex: { effort: "medium" },
+    });
+    expect(cell).toHaveTextContent("Medium");
+  });
+
   it("shows skipped agents at a marked host and never offers Full access on totals", async () => {
     seed({
       "*": { "codex-native": { permission: "approve-for-me" } },

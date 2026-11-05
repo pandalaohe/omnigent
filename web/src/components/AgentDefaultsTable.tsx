@@ -39,7 +39,6 @@ import {
   inheritedAt,
   levelsBelow,
   missingCellText,
-  resolveField,
   type LayeredLevel,
 } from "@/lib/layeredValues";
 import { effortLevelsFor, reconcileEffortOnModelChange } from "@/lib/modelEffortOptions";
@@ -291,7 +290,7 @@ export function AgentDefaultsTable({
     ...new Set(
       (col ? [col] : hostList.map((host) => host.host_id)).flatMap((host) => {
         const rows = models(row, host);
-        const model = resolveField(layers, row, host, "model", { colFields: [] }).value;
+        const model = resolveAgentMasterField(master, host, row, "model", capabilities).value;
         return effortLevelsFor(row, rows, typeof model === "string" ? model : null) ?? [];
       }),
     ),
