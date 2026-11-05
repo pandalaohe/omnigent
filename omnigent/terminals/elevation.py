@@ -10,9 +10,6 @@ from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpe
 ELEVATED_TERMINALS_ENV = "OMNIGENT_ELEVATED_TERMINALS"
 ELEVATED_INPUT_IDLE_S = 15 * 60
 AGENT_ACCESS_REQUIRED = "agent access not granted; ask with sys_terminal_request_access"
-USER_SHELL_READ_ONLY = (
-    "this shell belongs to the user: you can list and read it, not type into it or close it"
-)
 
 
 def elevated_terminal_spec(spec: TerminalEnvSpec, *, method: str | None) -> TerminalEnvSpec:

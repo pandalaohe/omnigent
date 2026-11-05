@@ -25,6 +25,8 @@ import pytest
 
 from omnigent.entities.conversation import MessageData
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
+from omnigent.runner.identity import RUNNER_INTERACTIVE_SHELLS_ENV_VAR
+from omnigent.runner.tool_dispatch import _execute_terminal_tool
 from omnigent.runtime import _globals
 from omnigent.spec.types import AgentSpec
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -143,33 +145,68 @@ async def _invoke(tool: Tool, payload: dict[str, object], ctx: ToolContext) -> d
 # ── sys_terminal_launch ──────────────────────────────────────
 
 
-async def test_user_shell_is_read_only_for_agent(
-    registry: TerminalRegistry, ctx: ToolContext, cleanup_registry: None
+@pytest.mark.parametrize("agent_name", ["codex-sdk", "pi-rpc"])
+async def test_sdk_agent_can_use_plain_host_shells(
+    registry: TerminalRegistry,
+    ctx: ToolContext,
+    cleanup_registry: None,
+    monkeypatch: pytest.MonkeyPatch,
+    agent_name: str,
 ) -> None:
-    spec = _make_spec(terminals={"bash": TerminalEnvSpec(command="bash")})
+    from omnigent.tools.manager import ToolManager
+
+    monkeypatch.setenv(RUNNER_INTERACTIVE_SHELLS_ENV_VAR, '["bash"]')
+    spec = AgentSpec(
+        spec_version=1,
+        name=agent_name,
+        skills_filter="none",
+        os_env=OSEnvSpec(cwd="/opt/sandbox/work", sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+    )
+    manager = ToolManager(spec, os_env_schema_only=True)
+    assert "sys_terminal_launch" in manager.get_tool_names()
+
+    async def invoke(name: str, payload: dict[str, object]):
+        return json.loads(
+            await _execute_terminal_tool(
+                f"sys_terminal_{name}",
+                payload,
+                terminal_registry=registry,
+                agent_spec=spec,
+                conversation_id=ctx.conversation_id,
+                task_id=ctx.task_id,
+                agent_id=ctx.agent_id,
+                runner_workspace=ctx.workspace,
+            )
+        )
+
     target = {"terminal": "bash", "session": "user-shell"}
-    launched = await _invoke(SysTerminalLaunchTool(spec, registry), target, ctx)
+    launched = await invoke("launch", target)
     assert launched["status"] == "launched"
     instance = registry.get(ctx.conversation_id, "bash", "user-shell")
     assert instance is not None
+    assert instance.os_env is not None and instance.os_env.cwd == ctx.workspace
+    assert instance.os_env.spec.sandbox.type == "none"
+    assert not instance.agent_access
     instance.origin = "user"
-    refusal = {
-        "error": "this shell belongs to the user: you can list and read it, "
-        "not type into it or close it"
+    assert await invoke("send", {**target, "text": "printf 'sdk-%s\\n' marker"}) == {
+        "status": "sent"
     }
-    assert (
-        await _invoke(SysTerminalSendTool(registry), {**target, "text": "echo marker"}, ctx)
-        == refusal
-    )
-    assert await _invoke(SysTerminalCloseTool(registry), target, ctx) == refusal
-    assert "error" not in await _invoke(SysTerminalReadTool(registry), target, ctx)
-    listed = json.loads(await asyncio.to_thread(SysTerminalListTool(registry).invoke, "{}", ctx))
+    for _ in range(20):
+        screen = await invoke("read", target)
+        if "sdk-marker" in screen.get("screen", ""):
+            break
+        await asyncio.sleep(0.1)
+    assert "sdk-marker" in screen.get("screen", ""), screen
+    listed = await invoke("list", {})
     assert listed[0]["origin"] == "user"
     assert "tmux_socket" not in listed[0]
-    again = await _invoke(SysTerminalLaunchTool(spec, registry), target, ctx)
+    again = await invoke("launch", target)
     assert again["status"] == "already_running"
     assert again["origin"] == "user"
     assert "tmux_socket" not in again
+    assert (await invoke("close", target))["status"] == "closed"
+    assert await invoke("list", {}) == []
+    assert spec.terminals is None
 
 
 def test_launch_unknown_terminal_returns_error(
@@ -195,6 +232,24 @@ def test_launch_unknown_terminal_returns_error(
     # And lists the declared terminals so the LLM can see the
     # valid options.
     assert "bash" in result["error"]
+
+
+def test_launch_keeps_declared_terminal_restrictions_with_host_inventory(
+    registry: TerminalRegistry, ctx: ToolContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(RUNNER_INTERACTIVE_SHELLS_ENV_VAR, '["bash"]')
+    terminal = TerminalEnvSpec(command="python3", args=["-q"], env={"DECLARED": "yes"})
+    spec = _make_spec(terminals={"restricted": terminal})
+    tool = SysTerminalLaunchTool(spec, registry)
+    for payload, expected_error in [
+        ({"terminal": "bash"}, "unknown terminal"),
+        ({"terminal": "restricted", "cwd": "/opt/work"}, "cwd override is not allowed"),
+        ({"terminal": "restricted", "sandbox": "none"}, "sandbox override is not allowed"),
+    ]:
+        result = json.loads(tool.invoke(json.dumps({"session": "s1", **payload}), ctx))
+        assert expected_error in result["error"]
+    assert registry.list_for_conversation(ctx.conversation_id) == []
+    assert spec.terminals == {"restricted": terminal}
 
 
 def test_launch_requires_conversation_id(registry: TerminalRegistry, tmp_path: Path) -> None:

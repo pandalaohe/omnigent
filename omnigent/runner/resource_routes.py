@@ -764,8 +764,8 @@ def register_resource_routes(
         from omnigent.runner._entry import _host_interactive_shells_from_env
 
         # The declared ``terminals:``, plus this host's shells for a user shell
-        # it can actually run. The spec's own block is untouched, so the agent
-        # gains no ``sys_terminal_*`` tool from the host inventory.
+        # it can actually run. Agent tools resolve the same host shells when
+        # no terminals are declared, without changing the spec's own block.
         terminals_map = user_shell_terminals(
             agent_spec, host_shells=_host_interactive_shells_from_env()
         )

@@ -13,6 +13,9 @@ from unittest.mock import patch
 import pytest
 
 from omnigent.errors import OmnigentError
+from omnigent.inner.datamodel import TerminalEnvSpec
+from omnigent.runner.identity import RUNNER_INTERACTIVE_SHELLS_ENV_VAR
+from omnigent.runtime import _globals
 from omnigent.spec.types import (
     AgentSpec,
     BuiltinToolConfig,
@@ -25,6 +28,7 @@ from omnigent.spec.types import (
     ToolRuntime,
     ToolsConfig,
 )
+from omnigent.terminals import TerminalRegistry
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.client_specified import ClientSideTool, ClientSideToolSpec
@@ -32,6 +36,54 @@ from omnigent.tools.manager import _UCFunctionSchemaTool
 from omnigent.tools.mcp import clear_discovery_cache
 
 _TEST_CTX = ToolContext(task_id="task_test", agent_id="agent_test")
+
+
+@pytest.mark.parametrize(
+    "inventory", [None, "[]", "invalid", '["pwsh", "powershell", "cmd"]', '["zsh", "bash"]']
+)
+@pytest.mark.parametrize("declared", [False, True])
+@pytest.mark.parametrize("access_requests", [False, True])
+def test_terminal_tools_follow_declared_terminals_or_host_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+    inventory: str | None,
+    declared: bool,
+    access_requests: bool,
+) -> None:
+    monkeypatch.setattr(_globals, "_terminal_registry", TerminalRegistry())
+    if inventory is None:
+        monkeypatch.delenv(RUNNER_INTERACTIVE_SHELLS_ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(RUNNER_INTERACTIVE_SHELLS_ENV_VAR, inventory)
+    spec = AgentSpec(
+        spec_version=1,
+        name="codex-sdk",
+        skills_filter="none",
+        terminals={"restricted": TerminalEnvSpec(command="python3")} if declared else None,
+    )
+    manager = ToolManager(spec, terminal_access_requests_enabled=access_requests)
+    functions = {
+        schema["function"]["name"]: schema["function"]
+        for schema in manager.get_tool_schemas()
+        if schema["function"]["name"].startswith("sys_terminal_")
+    }
+    shells = json.loads(inventory) if inventory not in (None, "invalid") else []
+    expected = ["restricted"] if declared else shells
+    if not expected:
+        assert functions == {}
+        return
+    assert set(functions) == {
+        "sys_terminal_launch",
+        "sys_terminal_send",
+        "sys_terminal_read",
+        "sys_terminal_list",
+        "sys_terminal_close",
+    } | ({"sys_terminal_request_access"} if access_requests else set())
+    assert (
+        functions["sys_terminal_launch"]["parameters"]["properties"]["terminal"]["enum"]
+        == expected
+    )
+    assert bool(spec.terminals) is declared
+
 
 # Tools that ToolManager registers unconditionally on every
 # spec these tests construct: the lifecycle ``sys_cancel_task``

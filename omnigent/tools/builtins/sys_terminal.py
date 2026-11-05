@@ -1,7 +1,7 @@
 """
 ``sys_terminal_*`` tool builtins for the AP-side ToolManager.
 
-Five tools backing the spec's ``terminals:`` block:
+Five tools backing declared terminals or the runner's host shells:
 
 - ``sys_terminal_launch`` — start a configured tmux session.
 - ``sys_terminal_send`` — type text + key chords.
@@ -39,10 +39,22 @@ from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.spec.types import AgentSpec
 from omnigent.terminals import TerminalRegistry
+from omnigent.terminals.user_shells import user_shell_terminals
 from omnigent.tools.base import Tool, ToolContext
 
 _logger = logging.getLogger(__name__)
 _PLACEHOLDER_CWDS = (None, "", ".", "./")
+
+
+def _agent_terminal_specs(spec: AgentSpec) -> dict[str, TerminalEnvSpec]:
+    """Keep declared terminals, or use only shells reported by this runner's host."""
+    if spec.terminals:
+        return spec.terminals
+    from omnigent.runner._entry import _host_interactive_shells_from_env
+
+    shells = _host_interactive_shells_from_env()
+    # A hostless agent must not gain the human-only default bash offer.
+    return user_shell_terminals(spec, host_shells=shells) if shells else {}
 
 
 def _has_meaningful_cwd(cwd: str | None) -> bool:
@@ -282,7 +294,7 @@ _LAUNCH_SCHEMA: dict[str, Any] = {
     "properties": {
         "terminal": {
             "type": "string",
-            "description": "Terminal name from spec.terminals (e.g. 'bash').",
+            "description": "Declared terminal or available host shell name (e.g. 'bash').",
         },
         "session": {
             "type": "string",
@@ -493,10 +505,6 @@ def _resolve_running_instance(
         from omnigent.terminals.elevation import AGENT_ACCESS_REQUIRED
 
         return json.dumps({"error": AGENT_ACCESS_REQUIRED})
-    if tool_name == "sys_terminal_send" and instance.origin == "user" and not instance.elevated:
-        from omnigent.terminals.elevation import USER_SHELL_READ_ONLY
-
-        return json.dumps({"error": USER_SHELL_READ_ONLY})
     return _ResolvedInstance(instance=instance, parsed=parsed, lock=lock)
 
 
@@ -553,6 +561,7 @@ class SysTerminalLaunchTool(Tool):
         """
         self._spec = spec
         self._registry = registry
+        self._terminals = _agent_terminal_specs(spec)
 
     @classmethod
     def name(cls) -> str:
@@ -563,12 +572,11 @@ class SysTerminalLaunchTool(Tool):
     def description(cls) -> str:
         """:returns: LLM-facing description."""
         return (
-            "Launch a named terminal (tmux session). The terminal must be "
-            "declared in the agent spec's `terminals:` block. After launch, "
+            "Launch a declared terminal or an available host shell. After launch, "
             "use sys_terminal_send to type into it and sys_terminal_read to "
-            "capture output. Call sys_terminal_close when done. You MUST "
-            "call sys_terminal_launch before sys_terminal_send / "
-            "sys_terminal_read for a given (terminal, session) pair."
+            "capture output. Host shells run outside the agent sandbox. "
+            "Call sys_terminal_list to find existing terminals; "
+            "admin terminals require access approval. Call sys_terminal_close when done."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -578,7 +586,16 @@ class SysTerminalLaunchTool(Tool):
             "function": {
                 "name": self.name(),
                 "description": self.description(),
-                "parameters": _LAUNCH_SCHEMA,
+                "parameters": {
+                    **_LAUNCH_SCHEMA,
+                    "properties": {
+                        **_LAUNCH_SCHEMA["properties"],
+                        "terminal": {
+                            **_LAUNCH_SCHEMA["properties"]["terminal"],
+                            "enum": list(self._terminals),
+                        },
+                    },
+                },
             },
         }
 
@@ -759,16 +776,15 @@ class SysTerminalLaunchTool(Tool):
         cwd_override = parsed.get("cwd")
         sandbox_override = parsed.get("sandbox")
 
-        if self._spec.terminals is None or terminal_name not in self._spec.terminals:
+        if terminal_name not in self._terminals:
             return json.dumps(
                 {
                     "error": (
-                        f"unknown terminal {terminal_name!r}; "
-                        f"declared: {sorted(self._spec.terminals or [])}"
+                        f"unknown terminal {terminal_name!r}; available: {sorted(self._terminals)}"
                     )
                 }
             )
-        terminal_spec = self._spec.terminals[terminal_name]
+        terminal_spec = self._terminals[terminal_name]
 
         override_error = _check_overrides(
             terminal_name, terminal_spec, cwd_override, sandbox_override
@@ -821,7 +837,8 @@ class SysTerminalLaunchTool(Tool):
             terminal_cwd = getattr(terminal_os_env, "cwd", None)
             if _has_meaningful_cwd(terminal_cwd):
                 return terminal_cwd
-        if self._spec.os_env is not None:
+        # Host shells start in the session workspace, outside the SDK sandbox.
+        if self._spec.terminals and self._spec.os_env is not None:
             spec_cwd = self._spec.os_env.cwd
             if _has_meaningful_cwd(spec_cwd):
                 return spec_cwd
@@ -1019,8 +1036,8 @@ class SysTerminalListTool(Tool):
         """:returns: LLM-facing description."""
         return (
             "List the conversation's active terminal sessions, with their "
-            "running state and available tmux socket paths; includes shells the user opened; "
-            "those can be read, not typed into or closed. Admin shells require access approval."
+            "running state; includes shells the user opened. "
+            "Admin shells require access approval."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -1114,11 +1131,6 @@ class SysTerminalCloseTool(Tool):
         terminal_name = parsed["terminal"]
         session_key = parsed["session"]
         instance = self._registry.get(conversation_id, terminal_name, session_key)
-
-        if instance is not None and instance.origin == "user" and not instance.elevated:
-            from omnigent.terminals.elevation import USER_SHELL_READ_ONLY
-
-            return json.dumps({"error": USER_SHELL_READ_ONLY})
 
         # Acquire the per-instance lock BEFORE asking the registry
         # to close. This serializes against any in-flight send/read
