@@ -2,7 +2,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { focusManager, QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { authenticatedFetch } from "@/lib/identity";
-import type { AgentFolderSettings } from "@/lib/agentFolderSettings";
+import { agentFolderQueryKey, type AgentFolderSettings } from "@/lib/agentFolderSettings";
 import type { Host } from "@/hooks/useHosts";
 import { AgentSettingsFolder } from "./AgentSettingsFolder";
 
@@ -49,9 +49,9 @@ function mount(target = host, harness = "codex-native") {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  const tree = (next: Host) => (
+  const tree = (next: Host, nextHarness = harness) => (
     <QueryClientProvider client={client}>
-      <AgentSettingsFolder host={next} harness={harness} />
+      <AgentSettingsFolder host={next} harness={nextHarness} />
     </QueryClientProvider>
   );
   return { ...render(tree(target)), client, tree };
@@ -102,6 +102,70 @@ afterEach(() => {
 });
 
 describe("Settings folder", () => {
+  it.each([
+    ["claude-native", "claude", "claude-model"],
+    ["codex", "codex", "model-two"],
+  ])(
+    "preserves a %s read when a pending Codex save completes",
+    async (nextHarness, family, expectedModel) => {
+      const fetch = vi.mocked(authenticatedFetch).getMockImplementation()!;
+      let finishSave: ((response: Response) => void) | undefined;
+      let finishRead: ((response: Response) => void) | undefined;
+      let pendingRead: Promise<Response> | undefined;
+      vi.mocked(authenticatedFetch).mockImplementation((input, init) => {
+        if (String(input).endsWith("/agent-settings/codex-native") && init?.method === "PUT")
+          return new Promise((resolve) => {
+            finishSave = resolve;
+          });
+        if (String(input).endsWith(`/agent-settings/${nextHarness}`)) {
+          pendingRead = new Promise((resolve) => {
+            finishRead = resolve;
+          });
+          return pendingRead;
+        }
+        return fetch(input, init);
+      });
+      const mounted = mount();
+      if (family === "codex")
+        mounted.client.setQueryData(agentFolderQueryKey(host.host_id, nextHarness), initial);
+      await screen.findByText("model-one");
+      fireEvent.click(screen.getByRole("button", { name: "Change Model" }));
+      fireEvent.change(screen.getByLabelText("New Model"), { target: { value: "model-two" } });
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      await waitFor(() => expect(finishSave).toBeDefined());
+      mounted.rerender(mounted.tree(host, nextHarness));
+      await waitFor(() => expect(finishRead).toBeDefined());
+      const saved = {
+        ...initial,
+        revision: "r2",
+        fields: [{ ...initial.fields[0], value: "model-two", undo_available: true }],
+      };
+      act(() => finishSave!(Response.json(saved)));
+      await waitFor(() =>
+        expect(
+          mounted.client.getQueryData(agentFolderQueryKey(host.host_id, "codex-native")),
+        ).toEqual(saved),
+      );
+      const read = Response.json({
+        ...initial,
+        family,
+        fields: [
+          { ...initial.fields[0], value: family === "codex" ? "model-one" : "claude-model" },
+        ],
+      });
+      const parsedRead = vi.spyOn(read, "json");
+      await act(async () => {
+        finishRead!(read);
+        await pendingRead;
+      });
+      await waitFor(() => expect(parsedRead).toHaveBeenCalled());
+      await screen.findByText(expectedModel);
+      expect(screen.queryByText("Loading settings…")).toBeNull();
+      if (family === "codex")
+        expect(screen.getByRole("button", { name: "Undo Model" })).toBeTruthy();
+    },
+  );
+
   it("keeps the saved value and Undo when a focus read returns an older view after Save", async () => {
     const fetch = vi.mocked(authenticatedFetch).getMockImplementation()!;
     let finishSave: ((response: Response) => void) | undefined;

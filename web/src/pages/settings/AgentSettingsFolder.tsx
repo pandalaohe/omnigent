@@ -1,5 +1,5 @@
 import { useId, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient, type Query } from "@tanstack/react-query";
 import { FolderIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -68,22 +68,22 @@ function FolderCard({ host, harness }: { host: Host; harness: string }) {
     poll: false,
   });
   const listId = useId();
+  const familyQueries = (family: string | undefined) => ({
+    queryKey: ["agent-folder-settings", host.host_id],
+    predicate: (cachedQuery: Query) =>
+      cachedQuery.queryKey[2] === harness ||
+      (family !== undefined &&
+        (cachedQuery.state.data as { family?: string } | undefined)?.family === family),
+  });
   const operation = useMutation({
-    onMutate: () => client.cancelQueries({ queryKey: ["agent-folder-settings", host.host_id] }),
+    onMutate: () => client.cancelQueries(familyQueries(view?.family)),
     mutationFn: (change: AgentFolderChange) =>
       requestAgentFolderSettings(host.host_id, harness, change),
     onSuccess: async (next, change) => {
       // A refocus can start another read while the write is pending.
-      await client.cancelQueries({ queryKey: ["agent-folder-settings", host.host_id] });
+      await client.cancelQueries(familyQueries(next.family));
       client.setQueryData(queryKey, next);
-      client.setQueriesData(
-        {
-          queryKey: ["agent-folder-settings", host.host_id],
-          predicate: (cachedQuery) =>
-            (cachedQuery.state.data as { family?: string } | undefined)?.family === next.family,
-        },
-        next,
-      );
+      client.setQueriesData(familyQueries(next.family), next);
       setEditing(null);
       if (
         change.action === "write" &&
