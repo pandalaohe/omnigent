@@ -10360,27 +10360,6 @@ def _windows_custom_host_cli_path(cli_executable: str | None = None) -> Path:
     return Path.home() / ".local" / "bin" / "omni.exe"
 
 
-def _windows_custom_host_recovery_steps(
-    *,
-    wrapper: Path | str,
-    tool_venv_path: Path | str,
-    cli_bin_path: Path | str,
-    recovery_command: str,
-) -> str:
-    """Return the exact manual recovery steps when a Windows update fails."""
-    venv_prefix = str(tool_venv_path).rstrip("\\/") + "\\"
-    cli_text = str(cli_bin_path)
-    return (
-        f'(1) & "{wrapper}" stop; '
-        "(2) Get-Process | Where-Object { $_.Path -and ("
-        f'$_.Path.StartsWith("{venv_prefix}", [System.StringComparison]::OrdinalIgnoreCase) -or '
-        f'$_.Path.Equals("{cli_text}", [System.StringComparison]::OrdinalIgnoreCase)'
-        ") } | Stop-Process -Force; "
-        f"(3) {recovery_command}; "
-        f'(4) & "{wrapper}" start'
-    )
-
-
 def _normalize_windows_fs_path(raw: Path | str) -> str:
     """Normalize a Windows path for case-insensitive prefix comparisons."""
     return str(raw).strip().strip('"').replace("/", "\\").rstrip("\\").casefold()
@@ -10806,7 +10785,6 @@ def _validate_windows_custom_host_recovery_paths(wrapper: Path) -> None:
 def _launch_windows_custom_host_update(
     *,
     install_command: str,
-    recovery_command: str,
     old_commit: str,
     target_commit: str,
     host_id: str,
@@ -10859,12 +10837,6 @@ def _launch_windows_custom_host_update(
         )
         tool_venv_path = _custom_host_tool_venv_path()
         cli_bin_path = _windows_custom_host_cli_path(cli_executable)
-        recovery_steps = _windows_custom_host_recovery_steps(
-            wrapper=wrapper,
-            tool_venv_path=tool_venv_path,
-            cli_bin_path=cli_bin_path,
-            recovery_command=recovery_command,
-        )
         instruction: dict[str, object] = {
             "schema_version": 1,
             "parent_pid": os.getpid(),
@@ -10872,8 +10844,6 @@ def _launch_windows_custom_host_update(
             "helper_path": str(paths["helper"]),
             "disabled_marker": str(Path.home() / ".omnigent" / "autostart" / "disabled"),
             "constraints_dir": str(constraints_dir) if constraints_dir is not None else "",
-            "recovery_command": recovery_command,
-            "recovery_steps": recovery_steps,
             "tool_venv_path": str(tool_venv_path),
             "cli_bin_path": str(cli_bin_path),
             "old_commit": old_commit,
@@ -11113,8 +11083,16 @@ def _pause_custom_host_supervisor() -> object:
                 "No managed Windows Host supervisor was found. Install our "
                 "omni-host-service wrapper before using custom self-update."
             )
-        _run_windows_host_service(wrapper, "stop")
-        return ("windows", wrapper)
+        token = ("windows", wrapper)
+        try:
+            _run_windows_host_service(wrapper, "stop")
+        except Exception:
+            try:
+                _resume_custom_host_supervisor(token)
+            except (click.ClickException, OSError, subprocess.SubprocessError) as resume_error:
+                click.echo(f"Additionally failed to restart the Host: {resume_error}", err=True)
+            raise
+        return token
 
     from omnigent.host.service import HostServiceError, pause_user_host_service
 
@@ -11510,7 +11488,6 @@ def _host_update_custom_impl(
             _wait_for_windows_host_tree_exit(process_identities)
             helper_pid, result_path, log_path = _launch_windows_custom_host_update(
                 install_command=suggestion.command,
-                recovery_command=suggestion.command,
                 old_commit=current_sha,
                 target_commit=target_sha,
                 host_id=host_id,
@@ -11522,7 +11499,12 @@ def _host_update_custom_impl(
             )
         except Exception:
             if paused is not None:
-                _resume_custom_host_supervisor(paused)
+                try:
+                    _resume_custom_host_supervisor(paused)
+                except (click.ClickException, OSError, subprocess.SubprocessError) as resume_error:
+                    click.echo(
+                        f"Additionally failed to restart the Host: {resume_error}", err=True
+                    )
             raise
         click.echo(
             f"Scheduled custom Host update in detached helper pid {helper_pid}. "

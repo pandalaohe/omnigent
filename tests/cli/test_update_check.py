@@ -2394,7 +2394,6 @@ def test_windows_locked_install_constraints_lifetime(
     (tmp_path / "service.cmd").write_text("@echo off\nexit /b 0\n")
     kwargs = {
         "install_command": f"uv tool install --force --reinstall git+{repo.as_uri()}@{sha}",
-        "recovery_command": "fixture recovery",
         "old_commit": "a" * 40,
         "target_commit": sha,
         "host_id": "fixture-host",

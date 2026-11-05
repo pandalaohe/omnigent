@@ -1148,6 +1148,70 @@ def test_windows_custom_update_schedules_detached_helper(
     assert "detached helper pid 321" in result.output
 
 
+@pytest.mark.parametrize("stop_failure", ["nonzero", "timeout"])
+@pytest.mark.parametrize("resume_fails", [False, True])
+def test_windows_custom_update_resumes_after_partial_stop_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stop_failure: str,
+    resume_fails: bool,
+) -> None:
+    import omnigent.cli as cli_module
+
+    wrapper = tmp_path / "omni-host-service.cmd"
+    wrapper.write_text("@echo off\n")
+    disabled = tmp_path / "disabled"
+    actions: list[str] = []
+    primary = (
+        click.ClickException("supervisor stop returned status 1")
+        if stop_failure == "nonzero"
+        else subprocess.TimeoutExpired("supervisor stop", 30)
+    )
+
+    def run_service(path: Path, action: str) -> None:
+        assert path == wrapper
+        actions.append(action)
+        if action == "stop":
+            disabled.touch()
+            raise primary
+        if resume_fails:
+            raise click.ClickException("supervisor restart failed")
+        disabled.unlink()
+
+    monkeypatch.setattr(cli_module, "IS_WINDOWS", True)
+    monkeypatch.setattr(cli_module, "_find_repo_root", lambda: None)
+    monkeypatch.setattr(cli_module, "_read_installed_wheel_info", lambda: _uv_info())
+    monkeypatch.setattr(
+        cli_module,
+        "_resolve_custom_host_channel_head",
+        lambda: ("git+https://example.invalid/repo", "b" * 40),
+    )
+    monkeypatch.setattr(cli_module, "_load_existing_host_id", lambda: "host-1")
+    monkeypatch.setattr(cli_module, "_drain_custom_host_sessions", lambda *_a, **_k: None)
+    monkeypatch.setattr(cli_module, "_custom_host_records", lambda _host_id: [])
+    monkeypatch.setattr(cli_module, "_windows_host_service_wrapper", lambda: wrapper)
+    monkeypatch.setattr(cli_module, "_run_windows_host_service", run_service)
+    monkeypatch.setattr(
+        cli_module,
+        "_launch_windows_custom_host_update",
+        lambda **_kwargs: pytest.fail("stop failed"),
+    )
+
+    result = CliRunner().invoke(cli, ["host", "update", "custom"])
+
+    assert result.exit_code != 0
+    assert actions == ["stop", "start"]
+    assert disabled.exists() == resume_fails
+    if stop_failure == "nonzero":
+        assert "supervisor stop returned status 1" in result.output
+    else:
+        assert result.exception is primary
+    if resume_fails:
+        assert (
+            "Additionally failed to restart the Host: supervisor restart failed" in result.output
+        )
+
+
 def test_windows_custom_helper_launch_preserves_helper_readiness_receipt(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1209,7 +1273,6 @@ def test_windows_custom_helper_launch_preserves_helper_readiness_receipt(
 
     helper_pid, result_path, _log_path = cli_module._launch_windows_custom_host_update(
         install_command="uv fake",
-        recovery_command="uv fake",
         old_commit=old,
         target_commit=new,
         host_id="host-1",
@@ -1648,87 +1711,6 @@ def test_windows_custom_update_hands_off_after_its_host_tree_exits(
     assert len(listings) == 1
 
 
-def test_windows_custom_helper_instruction_and_recovery_steps_include_stopping_leftover_processes(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The helper instruction carries venv/CLI paths and full recovery steps if uv fails."""
-    import omnigent.cli as cli_module
-
-    old = "a" * 40
-    new = "b" * 40
-    wrapper = tmp_path / "omni-host-service.cmd"
-    wrapper.write_text("@echo off\nexit /b 0\n")
-    tool_venv = Path(r"C:\Users\<user>\AppData\Roaming\uv\tools\omnigent")
-    cli_bin = Path(r"C:\Users\<user>\.local\bin\omni.exe")
-    recovery_cmd = (
-        "uv tool install --force --reinstall --python 3.12 "
-        f"git+https://github.com/pandalaohe/omnigent.git@{new}#egg=omnigent[all]"
-    )
-    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
-    monkeypatch.setattr(cli_module.shutil, "which", lambda name: f"{name}.exe")
-    monkeypatch.setattr(
-        cli_module,
-        "_custom_host_tool_venv_path",
-        lambda: tool_venv,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        cli_module,
-        "_windows_custom_host_cli_path",
-        lambda *_a, **_k: cli_bin,
-        raising=False,
-    )
-
-    class _ReadyProcess:
-        pid = 321
-
-        def poll(self) -> None:
-            return None
-
-    def _popen(_argv: list[str], **_kwargs: object) -> _ReadyProcess:
-        paths = cli_module._custom_host_update_paths()
-        paths["result"].write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "status": "running",
-                    "old_commit": old,
-                    "target_commit": new,
-                    "helper_pid": 321,
-                    "error": None,
-                }
-            )
-        )
-        return _ReadyProcess()
-
-    monkeypatch.setattr(cli_module.subprocess, "Popen", _popen)
-
-    cli_module._launch_windows_custom_host_update(
-        install_command="uv fake",
-        recovery_command=recovery_cmd,
-        old_commit=old,
-        target_commit=new,
-        host_id="host-1",
-        previous_records=[],
-        wrapper=wrapper,
-    )
-
-    paths = cli_module._custom_host_update_paths()
-    instruction = json.loads(paths["instruction"].read_text())
-    assert instruction["tool_venv_path"] == str(tool_venv)
-    assert instruction["cli_bin_path"] == str(cli_bin)
-    recovery_steps = instruction["recovery_steps"]
-    assert f'"{wrapper}" stop' in recovery_steps
-    assert f'StartsWith("{tool_venv}\\' in recovery_steps
-    assert str(cli_bin) in recovery_steps
-    assert "Stop-Process -Force" in recovery_steps
-    assert recovery_cmd in recovery_steps
-    assert f'"{wrapper}" start' in recovery_steps
-    helper_text = paths["helper"].read_text(encoding="utf-8")
-    assert "Wait-HostTreeExit" in helper_text
-    assert "Format-RecoverySteps" in helper_text
-
-
 def test_windows_custom_update_reconciles_stale_failed_result_after_manual_recovery(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1957,7 +1939,6 @@ def test_windows_custom_helper_survives_launcher_exit_and_completes(
                 "parent_pid": 0,
                 "install_argv": [sys.executable, str(installer), str(installed)],
                 "skip_web_ui": skip_web_ui,
-                "recovery_command": "synthetic recovery",
                 "old_commit": old,
                 "target_commit": new,
                 "host_id": host_id,

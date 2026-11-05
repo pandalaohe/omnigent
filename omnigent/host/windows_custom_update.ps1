@@ -109,44 +109,6 @@ function ConvertTo-NormalizedWindowsPath {
     return $RawPath.Trim().Trim('"').Replace('/', '\').TrimEnd('\').ToLowerInvariant()
 }
 
-function Get-ToolVenvPath {
-    param([object]$Instruction)
-    if ($null -ne $Instruction -and $Instruction.PSObject.Properties['tool_venv_path'] -and $Instruction.tool_venv_path) {
-        return [string]$Instruction.tool_venv_path
-    }
-    return ''
-}
-
-function Get-CliBinPath {
-    param([object]$Instruction)
-    if ($null -ne $Instruction -and $Instruction.PSObject.Properties['cli_bin_path'] -and $Instruction.cli_bin_path) {
-        return [string]$Instruction.cli_bin_path
-    }
-    return ''
-}
-
-function Format-RecoverySteps {
-    param([object]$Instruction, [string]$WrapperPath)
-    if ($null -ne $Instruction -and $Instruction.PSObject.Properties['recovery_steps'] -and $Instruction.recovery_steps) {
-        return [string]$Instruction.recovery_steps
-    }
-    $toolVenv = Get-ToolVenvPath $Instruction
-    if (-not $toolVenv) {
-        $toolVenv = Join-Path $env:APPDATA 'uv\tools\omnigent'
-    }
-    $toolVenvPrefix = $toolVenv.TrimEnd('\', '/') + '\'
-    $cliBin = Get-CliBinPath $Instruction
-    if (-not $cliBin) {
-        $cliBin = Join-Path $HOME '.local\bin\omni.exe'
-    }
-    $recoveryCmd = if ($null -ne $Instruction -and $Instruction.PSObject.Properties['recovery_command']) {
-        [string]$Instruction.recovery_command
-    } else {
-        'uv tool install --force --reinstall omnigent'
-    }
-    return "(1) & `"$WrapperPath`" stop; (2) Get-Process | Where-Object { `$_.Path -and (`$_.Path.StartsWith(`"$toolVenvPrefix`", [System.StringComparison]::OrdinalIgnoreCase) -or `$_.Path.Equals(`"$cliBin`", [System.StringComparison]::OrdinalIgnoreCase)) } | Stop-Process -Force; (3) $recoveryCmd; (4) & `"$WrapperPath`" start"
-}
-
 function Test-ToolProcess {
     param(
         [object]$ProcessRow,
