@@ -6830,7 +6830,10 @@ describe("NewChatLandingScreen", () => {
     ]);
     renderLanding();
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    const sdk = screen.getByText("SDK", { exact: true });
+    const sdk = screen.getByText("SDK", {
+      exact: true,
+      selector: "[data-harness-menu-section-label]",
+    });
     const agents = screen.getByText("Agents", { exact: true });
     const codex = screen.getByTestId("new-chat-landing-agent-a_codex_sdk");
     const claude = screen.getByTestId("new-chat-landing-agent-a_claude_sdk");
@@ -7038,7 +7041,7 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
-  it("draws the SDK mark before the vendor logo, yielding to a user badge", () => {
+  it("labels picker names with one integration mark, yielding to a user badge", () => {
     mockAllFourHarnessesReady();
     mockCodexCollisionAgents();
     renderLanding();
@@ -7046,20 +7049,9 @@ describe("NewChatLandingScreen", () => {
     const codex = screen.getByTestId("new-chat-landing-agent-a_codex_sdk");
     const claude = screen.getByTestId("new-chat-landing-agent-a_claude_sdk");
 
-    expect(within(codex).getByTestId("sdk-mark")).toHaveClass(
-      "size-[17px]",
-      "text-muted-foreground",
-    );
-    expect(within(claude).getByTestId("sdk-mark")).toBeInTheDocument();
-    // The grey catalog glyph is replaced by the vendor product logo.
-    expect(decodeURIComponent(codex.querySelector("img")?.getAttribute("src") ?? "")).toContain(
-      "#B1A7FF",
-    );
-    expect(decodeURIComponent(claude.querySelector("img")?.getAttribute("src") ?? "")).toContain(
-      "M20.998 10.949H24v3.102",
-    );
+    expect(within(codex).getByTestId("agent-name-mark")).toHaveTextContent("SDK");
+    expect(within(claude).getByTestId("agent-name-mark")).toHaveTextContent("SDK");
 
-    // A user badge owns the slot: no mark, badge + vendor logo only.
     closeMenu();
     writeAgentBadgePreferences({
       version: 1,
@@ -7070,9 +7062,8 @@ describe("NewChatLandingScreen", () => {
     });
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     const badged = screen.getByTestId("new-chat-landing-agent-a_codex_sdk");
-    expect(within(badged).queryByTestId("sdk-mark")).toBeNull();
-    expect(within(badged).getByTestId("agent-badge")).toHaveTextContent("研");
-    expect(badged.querySelector("img")).toBeTruthy();
+    expect(within(badged).queryByTestId("agent-name-mark")).toBeNull();
+    expect(within(badged).getByTestId("agent-name-badge")).toHaveTextContent("研");
   });
 
   it("disables native rows on Windows while leaving the SDK row selectable", async () => {

@@ -262,7 +262,7 @@ describe("worktree archive choice", () => {
     expect(screen.getByTestId("archive-location")).toHaveTextContent("/c/conv_1");
     act(() => window.dispatchEvent(new Event(ARCHIVE_SESSION_ACTION_EVENT)));
     await screen.findByTestId("archive-worktree-dialog");
-    fireEvent.click(screen.getByRole("radio", { name: /Delete green and yellow worktrees/ }));
+    fireEvent.click(screen.getByRole("radio", { name: /Remove clean and ignored/ }));
     fireEvent.click(screen.getByTestId("archive-worktree-confirm"));
     await waitFor(() =>
       expect(mocks.archive.mutateAsync).toHaveBeenCalledWith({
@@ -286,7 +286,7 @@ describe("worktree archive choice", () => {
     renderSidebar(CLEANUP_SERVER);
     clickArchive();
     await screen.findByTestId("archive-worktree-dialog");
-    expect(screen.getByRole("radio", { name: /Never delete worktrees/ })).toBeChecked();
+    expect(screen.getByRole("radio", { name: /Keep all/ })).toBeChecked();
     expect(mocks.archive.mutate).not.toHaveBeenCalled();
     fireEvent.click(screen.getByTestId("archive-worktree-confirm"));
     await waitFor(() =>
@@ -304,7 +304,7 @@ describe("worktree archive choice", () => {
     renderSidebar(CLEANUP_SERVER);
     clickArchive();
     await screen.findByTestId("archive-worktree-dialog");
-    fireEvent.click(screen.getByRole("radio", { name: /Delete green and yellow worktrees/ }));
+    fireEvent.click(screen.getByRole("radio", { name: /Remove clean and ignored/ }));
     fireEvent.click(screen.getByTestId("archive-worktree-remember"));
     fireEvent.click(screen.getByTestId("archive-worktree-confirm"));
     await waitFor(() =>

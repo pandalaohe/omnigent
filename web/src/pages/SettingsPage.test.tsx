@@ -552,9 +552,11 @@ describe("SettingsPage", () => {
     const toggle = await screen.findByRole("switch", { name: "Keep in-app browser login" });
     await waitFor(() => expect(toggle).not.toBeDisabled());
     expect(toggle).not.toBeChecked();
-    expect(
-      screen.getByText(/Each connected server has separate browser storage/),
-    ).toBeInTheDocument();
+    expect(screen.getByText("Reuse this server's saved browser login.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "About Keep in-app browser login" }));
+    expect(screen.getByRole("tooltip")).toHaveTextContent(
+      /Each connected server has separate browser storage/,
+    );
     fireEvent.click(toggle);
     await waitFor(() => expect(setBrowserLoginSetting).toHaveBeenCalledWith(true));
     await waitFor(() => expect(toggle).toBeChecked());
@@ -601,10 +603,10 @@ describe("SettingsPage", () => {
     localStorage.removeItem(OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY);
   });
 
-  it("groups General settings into titled outlined cards and hides its description on mobile", () => {
+  it("groups General settings into titled outlined cards without a restating subtitle", () => {
     renderPage("/settings/general");
 
-    expect(screen.getByText("Configure general Omnigent behavior.")).toHaveClass("max-md:hidden");
+    expect(screen.queryByText("Configure general Omnigent behavior.")).toBeNull();
 
     for (const testId of [
       "settings-group-composer",
@@ -746,12 +748,15 @@ describe("SettingsPage", () => {
     const select = screen.getByTestId("terminal-clipboard-preference-select");
     expect(select).toHaveValue("ask");
     expect(screen.getByText("Copying from terminals")).toBeInTheDocument();
-    expect(screen.getByText(/Controls copying text from all sessions/)).toBeInTheDocument();
     expect(
-      screen.getByText(/Allowing copying also lets terminal programs silently replace/),
+      screen.getByText("Choose when terminals can copy to your clipboard."),
     ).toBeInTheDocument();
-    expect(screen.getByText(/all sessions and terminals on this server/)).toBeInTheDocument();
-    expect(screen.getByText(/this browser or app/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "About Copying from terminals" }));
+    const help = screen.getByRole("tooltip");
+    expect(help).toHaveTextContent(/Controls copying text from all sessions/);
+    expect(help).toHaveTextContent(/Allowing copying also lets terminal programs silently replace/);
+    expect(help).toHaveTextContent(/all sessions and terminals on this server/);
+    expect(help).toHaveTextContent(/this browser or app/);
     expect(within(select).getByRole("option", { name: "Allow copying" })).toBeInTheDocument();
     expect(within(select).getByRole("option", { name: "Block copying" })).toBeInTheDocument();
   });
@@ -798,10 +803,12 @@ describe("SettingsPage", () => {
 
     expect(screen.getByTestId("terminal-clipboard-preference-select")).toBeDisabled();
     expect(
-      screen.getByText(
-        "This connection can’t remember clipboard permissions. You can still allow or block copying for each open terminal.",
-      ),
+      screen.getByText("This connection asks separately for each terminal."),
     ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "About Copying from terminals" }));
+    expect(screen.getByRole("tooltip")).toHaveTextContent(
+      "This connection can’t remember clipboard permissions. You can still allow or block copying for each open terminal.",
+    );
   });
 
   it("does not claim terminal clipboard permission was saved when storage fails", () => {
@@ -823,30 +830,19 @@ describe("SettingsPage", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
-  it("renders composer shortcut guidance as two accessible lines", () => {
+  it("keeps current composer guidance visible and detailed help beside the control", () => {
     renderPage("/settings/general");
     const toggle = screen.getByTestId("composer-submit-with-mod-enter-toggle");
     const descriptionId = toggle.getAttribute("aria-describedby");
     const description = descriptionId ? document.getElementById(descriptionId) : null;
-
-    expect(description).toBeTruthy();
-    if (description === null) throw new Error("Missing composer shortcut description");
-    expect(Array.from(description.children).map((line) => line.tagName)).toEqual(["P", "P"]);
-    expect(
-      within(description).getByText(
-        /Off: Enter submits and Shift\+Enter or (?:⌥|Alt)\+Enter inserts a newline\./,
-      ),
-    ).toBeInTheDocument();
-    expect(
-      within(description).getByText(/On: Enter inserts a newline and (?:⌘|Ctrl)\+Enter submits\./),
-    ).toBeInTheDocument();
-    expect(description).toHaveClass("max-md:hidden");
-    expect(
-      screen.getByRole("button", {
-        name: /About Submit with (?:⌘|Ctrl) \+ Enter on desktop/,
-      }),
-    ).toHaveClass("md:hidden");
-    expect(toggle).toHaveAttribute("aria-labelledby");
+    expect(description).toHaveTextContent("Enter sends; Shift+Enter adds a line.");
+    expect(description).not.toHaveClass("max-md:hidden");
+    const help = screen.getByRole("button", {
+      name: /About Submit with (?:⌘|Ctrl) \+ Enter on desktop/,
+    });
+    expect(help).not.toHaveClass("md:hidden");
+    fireEvent.click(help);
+    expect(screen.getByRole("tooltip")).toHaveTextContent(/On: Enter inserts a newline/);
     expect(toggle).toHaveAccessibleName(/Submit with (?:⌘|Ctrl) \+ Enter on desktop/);
   });
 
@@ -856,15 +852,14 @@ describe("SettingsPage", () => {
     expect(heading).toHaveClass("settings-page-title", "font-medium");
     expect(heading).not.toHaveClass("font-semibold");
     expect(heading.closest("section")?.parentElement).toHaveClass("max-w-4xl", "px-4", "md:px-8");
-    expect(screen.getByRole("button", { name: "About Interface font size" })).toHaveClass(
+    expect(screen.getByRole("button", { name: "About Interface font size" })).not.toHaveClass(
       "md:hidden",
     );
-    expect(
-      screen.getByText("Set text across the interface. Icons and spacing stay fixed."),
-    ).toHaveClass("max-md:hidden");
-    expect(screen.getByText("Choose how Omnigent looks on this device.")).toHaveClass(
-      "max-md:hidden",
+    fireEvent.click(screen.getByRole("button", { name: "About Interface font size" }));
+    expect(screen.getByRole("tooltip")).toHaveTextContent(
+      "Set text across the interface. Icons and spacing stay fixed.",
     );
+    expect(screen.getByText("Saved on this device.")).toBeInTheDocument();
     for (const testId of [
       "settings-group-theme",
       "settings-group-chat",
@@ -943,10 +938,7 @@ describe("SettingsPage", () => {
     renderPage("/settings/appearance");
 
     expect(screen.queryByTestId("theme-system")).not.toBeInTheDocument();
-    for (const name of [
-      "Click to open Databricks user preferences page.",
-      "Open Databricks preferences",
-    ]) {
+    for (const name of ["Open Databricks preferences"]) {
       const link = screen.getByRole("link", { name });
       expect(link).toHaveAttribute("href", url);
       expect(link).toHaveAttribute("target", "_blank");
@@ -1839,11 +1831,57 @@ describe("SettingsPage", () => {
   }
 
   it("loads and shows the stored worktree location template", async () => {
-    mocks.authenticatedFetch.mockResolvedValue(meResponse("{entry}/.worktrees/{repo}/{branch}"));
+    mocks.authenticatedFetch.mockResolvedValue(meResponse("~/worktrees/{repo}/{branch}"));
     renderPage("/settings/git");
 
+    const input = (await screen.findByTestId(
+      "settings-worktree-location-input",
+    )) as HTMLInputElement;
+    await waitFor(() => expect(input.value).toBe("~/worktrees/{repo}/{branch}"));
+  });
+
+  it("previews presets and inserts custom variables without saving until requested", async () => {
+    mocks.authenticatedFetch.mockResolvedValue(meResponse(null));
+    renderPage("/settings/git");
+    await waitFor(() =>
+      expect(screen.getByRole("radio", { name: "Inside project" })).toBeEnabled(),
+    );
+    fireEvent.click(screen.getByRole("radio", { name: "Inside project" }));
+    expect(screen.getByTestId("settings-worktree-location-example")).toHaveTextContent(
+      "/opt/work/project/.worktrees/repo/feature-login",
+    );
+    expect(worktreeLocationPatch()).toBeUndefined();
+    expect(screen.queryByTestId("settings-worktree-location-input")).toBeNull();
+    fireEvent.click(screen.getByRole("radio", { name: "Custom" }));
     const input = screen.getByTestId("settings-worktree-location-input") as HTMLInputElement;
-    await waitFor(() => expect(input.value).toBe("{entry}/.worktrees/{repo}/{branch}"));
+    fireEvent.change(input, { target: { value: "{entry}/.worktrees/{repo}/" } });
+    input.setSelectionRange(input.value.length, input.value.length);
+    fireEvent.click(screen.getByRole("button", { name: "Insert branch name" }));
+    expect(input).toHaveValue("{entry}/.worktrees/{repo}/{branch}");
+    expect(worktreeLocationPatch()).toBeUndefined();
+  });
+
+  it("keeps Open at latest in General Sessions and polling options beneath their shortcut", () => {
+    const general = renderPage("/settings/general");
+    expect(
+      within(screen.getByTestId("settings-group-sessions")).getByRole("switch", {
+        name: "Scroll to the bottom when opening a session",
+      }),
+    ).toBeVisible();
+    expect(screen.queryByLabelText("Polling window")).toBeNull();
+    general.unmount();
+    renderPage("/settings/shortcuts");
+    fireEvent.change(screen.getByRole("textbox", { name: "Search shortcuts" }), {
+      target: { value: "Poll sessions" },
+    });
+    expect(
+      within(screen.getByTestId("shortcut-editor-row-pollSessions")).getByLabelText(
+        "Polling window",
+      ),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("switch", { name: "Scroll to the bottom when opening a session" }),
+    ).toBeNull();
   });
 
   it("saves the worktree location template and keeps the saved value", async () => {
@@ -1855,8 +1893,9 @@ describe("SettingsPage", () => {
     });
     renderPage("/settings/git");
 
+    await waitFor(() => expect(screen.getByRole("radio", { name: "Custom" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("radio", { name: "Custom" }));
     const input = screen.getByTestId("settings-worktree-location-input") as HTMLInputElement;
-    await waitFor(() => expect(input).not.toBeDisabled());
     fireEvent.change(input, { target: { value: "{entry}/.worktrees/{repo}/{branch}" } });
     fireEvent.click(screen.getByTestId("settings-worktree-location-save"));
 
@@ -1882,8 +1921,9 @@ describe("SettingsPage", () => {
     });
     renderPage("/settings/git");
 
+    await waitFor(() => expect(screen.getByRole("radio", { name: "Custom" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("radio", { name: "Custom" }));
     const input = screen.getByTestId("settings-worktree-location-input") as HTMLInputElement;
-    await waitFor(() => expect(input).not.toBeDisabled());
     fireEvent.change(input, { target: { value: "wt/{repo}" } });
     fireEvent.click(screen.getByTestId("settings-worktree-location-save"));
 
@@ -1892,6 +1932,11 @@ describe("SettingsPage", () => {
     );
     // The draft stays so the user can fix the refused template in place.
     expect(input).toHaveValue("wt/{repo}");
+    fireEvent.change(input, { target: { value: "{entry}/.worktrees/{repo}/{branch}" } });
+    expect(screen.queryByTestId("settings-worktree-location-error")).toBeNull();
+    fireEvent.click(screen.getByRole("radio", { name: "Next to repository" }));
+    expect(screen.getByTestId("settings-worktree-location-save")).toBeDisabled();
+    expect(screen.queryByTestId("settings-worktree-location-error")).toBeNull();
   });
 
   it("clears the worktree location with a null value", async () => {
@@ -1903,8 +1948,9 @@ describe("SettingsPage", () => {
     });
     renderPage("/settings/git");
 
-    const input = screen.getByTestId("settings-worktree-location-input") as HTMLInputElement;
-    await waitFor(() => expect(input).toHaveValue("{entry}/.worktrees/{repo}/{branch}"));
+    await waitFor(() =>
+      expect(screen.getByRole("radio", { name: "Inside project" })).toBeChecked(),
+    );
     fireEvent.click(screen.getByTestId("settings-worktree-location-reset"));
 
     await waitFor(() =>
@@ -1913,7 +1959,10 @@ describe("SettingsPage", () => {
         body: { value: null },
       }),
     );
-    await waitFor(() => expect(input).toHaveValue(""));
+    await waitFor(() =>
+      expect(screen.getByRole("radio", { name: "Next to repository" })).toBeChecked(),
+    );
+    expect(screen.queryByTestId("settings-worktree-location-input")).toBeNull();
   });
 
   it("reenables the archive prompt and saves the rebuildable list only on request", async () => {
@@ -1958,6 +2007,7 @@ describe("SettingsPage", () => {
       ),
     );
 
+    fireEvent.click(screen.getByText("Rebuildable ignored directories", { selector: "summary" }));
     const list = screen.getByTestId("settings-archive-worktree-paths");
     const patchCount = mocks.authenticatedFetch.mock.calls.filter(
       ([, init]) => (init as RequestInit | undefined)?.method === "PATCH",
@@ -1984,7 +2034,7 @@ describe("SettingsPage", () => {
         }),
       ),
     );
-    fireEvent.click(screen.getByRole("radio", { name: /Delete green and yellow worktrees/ }));
+    fireEvent.click(screen.getByRole("radio", { name: /Remove clean and ignored/ }));
     await waitFor(() =>
       expect(mocks.authenticatedFetch).toHaveBeenCalledWith(
         "/v1/me/preferences/worktree_archive",

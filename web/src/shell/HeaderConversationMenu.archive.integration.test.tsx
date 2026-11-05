@@ -243,7 +243,7 @@ describe("HeaderConversationMenu archive integration", () => {
 
     clickArchive();
     await screen.findByTestId("archive-worktree-dialog");
-    fireEvent.click(screen.getByRole("radio", { name: /Delete green and yellow worktrees/ }));
+    fireEvent.click(screen.getByRole("radio", { name: /Remove clean and ignored/ }));
     expect(screen.getByTestId("archive-worktree-remember")).not.toBeChecked();
     fireEvent.click(screen.getByTestId("archive-worktree-confirm"));
 

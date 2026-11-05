@@ -115,15 +115,13 @@ describe("SharingPage", () => {
     ).toBeDisabled();
   });
 
-  it("uses titled outlined groups and mobile description tooltips", async () => {
+  it("uses titled outlined groups with detailed help on every viewport", async () => {
     setSharingState(state());
 
     renderPage();
     await waitFor(() => expect(screen.getByText("On")).toBeInTheDocument());
 
-    expect(screen.getByText(/Control whether users on this server can share sessions/)).toHaveClass(
-      "max-md:hidden",
-    );
+    expect(screen.getByText("Applies to everyone on this server.")).toBeInTheDocument();
     for (const testId of ["settings-group-sharing-mode", "settings-group-public-sharing"]) {
       expect(screen.getByTestId(testId).lastElementChild).toHaveClass(
         "rounded-xl",
@@ -133,11 +131,8 @@ describe("SharingPage", () => {
       );
     }
 
-    expect(screen.getByText(/Allow sharing a session with anyone who has the link/)).toHaveClass(
-      "max-md:hidden",
-    );
     const help = screen.getByRole("button", { name: "About Public access" });
-    expect(help).toHaveClass("md:hidden");
+    expect(help).not.toHaveClass("md:hidden");
     fireEvent.click(help);
     expect(await screen.findByRole("tooltip")).toHaveTextContent(
       /Allow sharing a session with anyone who has the link/,
@@ -252,9 +247,7 @@ describe("SharingPage", () => {
 
     renderPage();
     await waitFor(() =>
-      expect(
-        screen.getByText(/managed by this deployment and can't be changed here/i),
-      ).toBeInTheDocument(),
+      expect(screen.getByText(/Sharing mode is managed by this deployment/i)).toBeInTheDocument(),
     );
 
     const trigger = screen.getByRole("combobox", { name: "Session sharing mode" });
@@ -329,7 +322,7 @@ describe("SharingPage", () => {
       expect(radios.map((r) => r.value)).toEqual(["sandbox", "all"]);
       expect(radios.find((r) => r.value === "sandbox")!.checked).toBe(true);
       expect(screen.getByRole("radio", { name: "Managed hosts only" })).toBeChecked();
-      expect(screen.getByText(/Sessions on local hosts start private/)).toBeInTheDocument();
+      expect(screen.getByText("Local sessions start private.")).toBeInTheDocument();
     });
 
     it("hides scope while off and enables managed hosts only by default", async () => {

@@ -18,6 +18,8 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
+import { Segmented } from "@/components/ui/segmented";
+import { SettingRow } from "@/components/SettingsFields";
 import { Textarea } from "@/components/ui/textarea";
 import {
   DEFAULT_SHORTCUT_DEFINITIONS,
@@ -294,16 +296,11 @@ export function MobileAssistantSettings() {
 
   return (
     <section>
-      <div className="flex items-start justify-between gap-4">
-        <div>
-          <h3 className="text-sm font-medium text-foreground">Mobile floating assistant</h3>
-          <p
-            className="mt-1 text-sm text-muted-foreground"
-            title="Move a button freely, then release anywhere inside the circle to insert it. Releasing outside cancels."
-          >
-            Drag to reorder. Edge-drag to collapse.
-          </p>
-        </div>
+      <SettingRow
+        label="Mobile floating assistant"
+        note="Drag to reorder. Edge-drag to collapse."
+        hint="Move a button freely, then release anywhere inside the circle to insert it. Releasing outside cancels."
+      >
         <Switch
           checked={preferences.enabled}
           onCheckedChange={(enabled) =>
@@ -311,7 +308,7 @@ export function MobileAssistantSettings() {
           }
           aria-label="Enable mobile floating assistant"
         />
-      </div>
+      </SettingRow>
 
       <div className="mt-4 grid gap-4 rounded-xl border border-border p-3 sm:grid-cols-[240px_1fr]">
         <div
@@ -496,6 +493,7 @@ export function MobileAssistantSettings() {
                 Button label
                 <Input
                   value={draft.label}
+                  placeholder="Up to 24 characters"
                   maxLength={24}
                   onChange={(event) =>
                     setDraft((current) =>
@@ -504,24 +502,20 @@ export function MobileAssistantSettings() {
                   }
                 />
               </label>
-              <label className="grid gap-1.5 text-sm">
-                Button display
-                <select
-                  aria-label="Button display"
+              <div className="grid gap-1.5 text-ui">
+                <span>Button display</span>
+                <Segmented<"text" | "icon">
+                  label="Button display"
                   value={draft.display}
-                  onChange={(event) =>
-                    setDraft((current) =>
-                      current
-                        ? { ...current, display: event.target.value as "text" | "icon" }
-                        : current,
-                    )
+                  onChange={(display) =>
+                    setDraft((current) => (current ? { ...current, display } : current))
                   }
-                  className="h-8 rounded-lg border border-input bg-background px-2.5 text-sm"
-                >
-                  <option value="text">Text label</option>
-                  <option value="icon">Icon</option>
-                </select>
-              </label>
+                  options={[
+                    { value: "text", label: "Text label" },
+                    { value: "icon", label: "Icon" },
+                  ]}
+                />
+              </div>
               {draft.display === "icon" ? (
                 <label className="grid gap-1.5 text-sm">
                   Button icon
@@ -545,22 +539,21 @@ export function MobileAssistantSettings() {
                   </select>
                 </label>
               ) : null}
-              <label className="grid gap-1.5 text-sm">
-                Binding type
-                <select
+              <div className="grid gap-1.5 text-ui">
+                <span>Binding type</span>
+                <Segmented<BindingKind>
+                  label="Binding type"
                   value={draft.kind}
-                  onChange={(event) =>
-                    setDraft((current) =>
-                      current ? { ...current, kind: event.target.value as BindingKind } : current,
-                    )
+                  onChange={(kind) =>
+                    setDraft((current) => (current ? { ...current, kind } : current))
                   }
-                  className="h-8 rounded-lg border border-input bg-background px-2.5 text-sm"
-                >
-                  <option value="shortcut">OmniGent action</option>
-                  <option value="key">Custom key combination</option>
-                  <option value="text">Text or phrase</option>
-                </select>
-              </label>
+                  options={[
+                    { value: "shortcut", label: "App action" },
+                    { value: "key", label: "Key combination" },
+                    { value: "text", label: "Text or phrase" },
+                  ]}
+                />
+              </div>
 
               {draft.kind === "shortcut" ? (
                 <div className="grid gap-1.5 text-sm">

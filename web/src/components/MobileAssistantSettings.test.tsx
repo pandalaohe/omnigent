@@ -34,7 +34,7 @@ describe("MobileAssistantSettings", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Add button" }));
     fireEvent.change(screen.getByLabelText("Button label"), { target: { value: "Compact" } });
-    fireEvent.change(screen.getByLabelText("Binding type"), { target: { value: "text" } });
+    fireEvent.click(screen.getByRole("radio", { name: "Text or phrase" }));
     fireEvent.change(screen.getByLabelText("Text or phrase"), {
       target: { value: "/compact" },
     });
@@ -143,7 +143,7 @@ describe("MobileAssistantSettings", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Add button" }));
     fireEvent.change(screen.getByLabelText("Button label"), { target: { value: "Open" } });
-    fireEvent.change(screen.getByLabelText("Binding type"), { target: { value: "key" } });
+    fireEvent.click(screen.getByRole("radio", { name: "Key combination" }));
     fireEvent.click(screen.getByRole("button", { name: "Record custom key combination" }));
     fireEvent.keyDown(window, { key: "t", code: "KeyT", ctrlKey: true });
     fireEvent.click(screen.getByRole("button", { name: "Save button" }));
@@ -185,7 +185,7 @@ describe("MobileAssistantSettings", () => {
 
     expect(screen.getByTestId("mobile-assistant-circle-preview")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Edit ↑" }));
-    fireEvent.change(screen.getByLabelText("Button display"), { target: { value: "icon" } });
+    fireEvent.click(screen.getByRole("radio", { name: "Icon" }));
     fireEvent.change(screen.getByLabelText("Button icon"), { target: { value: "arrow-up" } });
     expect(screen.getByLabelText("Repeat while held")).toHaveAttribute("aria-checked", "true");
     fireEvent.click(screen.getByRole("button", { name: "Save button" }));

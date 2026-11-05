@@ -91,7 +91,7 @@ describe("archive policy prompt", () => {
     render(<Harness />);
     fireEvent.click(screen.getByText("Start archive"));
     await screen.findByRole("dialog");
-    fireEvent.click(screen.getByRole("radio", { name: /Delete green worktrees/ }));
+    fireEvent.click(screen.getByRole("radio", { name: "Remove clean" }));
     expect(
       screen.getByText("Keep unless a fresh safety check permits removal: host offline"),
     ).toBeInTheDocument();
@@ -104,7 +104,7 @@ describe("archive policy prompt", () => {
     fireEvent.click(screen.getByText("Start archive"));
     await screen.findByRole("dialog");
     expect(screen.getByText(/descendant directories kept/)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("radio", { name: /Delete green worktrees/ }));
+    fireEvent.click(screen.getByRole("radio", { name: "Remove clean" }));
     fireEvent.click(screen.getByRole("button", { name: "Archive" }));
     expect(proceed).toHaveBeenCalledWith(new Set(["one"]), "green_only");
   });
@@ -155,11 +155,11 @@ describe("archive policy prompt", () => {
     expect(screen.getByText(/Clean child/)).toBeInTheDocument();
     expect(screen.getByText(/Local child/)).toBeInTheDocument();
     expect(screen.getByText(/Dirty child/)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("radio", { name: /Delete green worktrees/ }));
+    fireEvent.click(screen.getByRole("radio", { name: "Remove clean" }));
     expect(screen.getAllByText("Remove after safety checks")).toHaveLength(1);
     expect(screen.getByText("Keep: selected tier keeps local files")).toBeInTheDocument();
     expect(screen.getByText("Keep: uncommitted source files")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("radio", { name: /Delete green and yellow worktrees/ }));
+    fireEvent.click(screen.getByRole("radio", { name: /Remove clean and ignored/ }));
     expect(screen.getAllByText("Remove after safety checks")).toHaveLength(2);
     fireEvent.click(screen.getByRole("button", { name: "Archive" }));
     expect(proceed).toHaveBeenCalledWith(new Set(), "yellow_too");
@@ -167,7 +167,7 @@ describe("archive policy prompt", () => {
   it("keeps the first-archive prompt with default never and cancels without archiving", async () => {
     render(<Harness />);
     fireEvent.click(screen.getByText("Start archive"));
-    expect(await screen.findByRole("radio", { name: /Never delete worktrees/ })).toBeChecked();
+    expect(await screen.findByRole("radio", { name: /Keep all/ })).toBeChecked();
     expect(screen.getByRole("checkbox", { name: "Don't ask again" })).not.toBeChecked();
     fireEvent.click(screen.getByText("Cancel"));
     expect(proceed).not.toHaveBeenCalled();
@@ -191,7 +191,7 @@ describe("archive policy prompt", () => {
     render(<Harness />);
     fireEvent.click(screen.getByText("Start archive"));
     await screen.findByRole("dialog");
-    fireEvent.click(screen.getByRole("radio", { name: /Delete green and yellow worktrees/ }));
+    fireEvent.click(screen.getByRole("radio", { name: /Remove clean and ignored/ }));
     fireEvent.click(screen.getByRole("checkbox", { name: "Don't ask again" }));
     fireEvent.click(screen.getByTestId("archive-worktree-confirm"));
     await waitFor(() => expect(proceed).toHaveBeenCalledWith(new Set(), "yellow_too"));

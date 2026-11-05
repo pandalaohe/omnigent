@@ -12,7 +12,8 @@
  * open-conversation link) — never an invented summary line.
  */
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { AgentNameTag } from "@/components/AgentNameTag";
 import {
   CalendarOffIcon,
   ChevronLeftIcon,
@@ -386,7 +387,17 @@ function TaskDetail({ taskId }: { taskId: string }) {
       {/* Configuration: agent + host columns. */}
       <Section title="Configuration">
         <dl className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-          <ConfigField label="Agent" value={agentLabel} testId="task-detail-agent" />
+          <ConfigField
+            label="Agent"
+            value={
+              <AgentNameTag
+                agentId={task.agentId}
+                name={agentLabel}
+                harness={agents?.find((agent) => agent.id === task.agentId)?.harness ?? null}
+              />
+            }
+            testId="task-detail-agent"
+          />
           <ConfigField label="Host" value={hostLabel} testId="task-detail-host" />
         </dl>
       </Section>
@@ -444,7 +455,15 @@ function Section({ title, children }: { title: string; children: React.ReactNode
   );
 }
 
-function ConfigField({ label, value, testId }: { label: string; value: string; testId: string }) {
+function ConfigField({
+  label,
+  value,
+  testId,
+}: {
+  label: string;
+  value: ReactNode;
+  testId: string;
+}) {
   return (
     <div className="flex flex-col gap-0.5">
       <dt className="text-xs text-muted-foreground uppercase tracking-wide">{label}</dt>

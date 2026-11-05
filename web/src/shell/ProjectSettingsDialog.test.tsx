@@ -2111,7 +2111,7 @@ describe("ProjectSettingsDialog", () => {
     expect(screen.getByRole("dialog", { name: "Apply to which projects" })).toHaveTextContent(
       "Other",
     );
-    fireEvent.click(screen.getByRole("button", { name: "Done" }));
+    fireEvent.click(screen.getByRole("button", { name: "Use selected projects" }));
     expect(screen.getByTestId("project-settings-copy-field-agent")).not.toBeChecked();
     fireEvent.click(screen.getByRole("button", { name: "Apply selected fields" }));
     await waitFor(() => expect(patchDefaultsMock).toHaveBeenCalledTimes(1));
@@ -2436,7 +2436,7 @@ describe("ProjectSettingsDialog", () => {
   }
 
   function closeCopyPreview() {
-    fireEvent.click(screen.getByRole("button", { name: "Done" }));
+    fireEvent.click(screen.getByRole("button", { name: "Use selected projects" }));
   }
 
   it("previews unavailable fields and reports a target revision conflict", async () => {

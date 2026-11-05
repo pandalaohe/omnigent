@@ -31,6 +31,7 @@ export function HarnessMenuNavigationLabel({ children }: { children: ReactNode }
 export function HarnessMenuRowContent({
   icon,
   label,
+  labelContent,
   summary,
   description,
   active,
@@ -45,6 +46,7 @@ export function HarnessMenuRowContent({
 }: {
   icon: ReactNode;
   label: string;
+  labelContent?: ReactNode;
   summary: string;
   description?: string;
   active: boolean;
@@ -72,7 +74,7 @@ export function HarnessMenuRowContent({
         {icon}
         <span className={cn("flex min-w-0 items-center gap-1 text-left", active && "font-medium")}>
           <span data-harness-menu-choice-label="" className="truncate">
-            {label}
+            {labelContent ?? label}
           </span>
           {warning}
         </span>

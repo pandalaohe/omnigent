@@ -7,6 +7,7 @@ import {
   readKeyboardShortcutPreferences,
   readMacWindowsKeyPositions,
   resolveShortcutBindings,
+  writeShortcutPreference,
 } from "@/lib/keyboardShortcutPreferences";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 
@@ -14,6 +15,12 @@ function actionRow(label: string): HTMLElement {
   const row = screen.getByText(label).closest('[data-testid^="shortcut-editor-row-"]');
   expect(row).toBeTruthy();
   return row as HTMLElement;
+}
+
+function renderExpandedEditor() {
+  const view = render(<KeyboardShortcutEditor />);
+  view.container.querySelectorAll("summary").forEach((summary) => fireEvent.click(summary));
+  return view;
 }
 
 describe("KeyboardShortcutEditor", () => {
@@ -27,8 +34,68 @@ describe("KeyboardShortcutEditor", () => {
     vi.restoreAllMocks();
   });
 
-  it("lists the question-card group and records its actions", () => {
+  it("starts with six folded groups and opens search matches", () => {
+    const { container } = render(<KeyboardShortcutEditor />);
+    expect(container.querySelectorAll("details")).toHaveLength(6);
+    expect(container.querySelectorAll("details[open]")).toHaveLength(0);
+    fireEvent.change(screen.getByRole("textbox", { name: "Search shortcuts" }), {
+      target: { value: "poll sessions" },
+    });
+    expect(
+      screen.getByRole("button", { name: "Record common shortcut for Poll sessions" }),
+    ).toBeVisible();
+    expect(
+      screen
+        .getByLabelText("Polling window")
+        .closest('[data-testid="shortcut-editor-row-pollSessions"]'),
+    ).not.toBeNull();
+    expect(screen.queryByTestId("shortcut-editor-row-newSession")).toBeNull();
+    expect(
+      screen.queryByRole("switch", { name: "Scroll to the bottom when opening a session" }),
+    ).toBeNull();
+  });
+
+  it("finds a platform key, filters changed rows and resets the entire row", () => {
+    writeShortcutPreference("newSession", {
+      common: [{ code: "F9", modifiers: [] }],
+      enabled: false,
+      platformOverrides: { macos: [{ code: "F10", modifiers: [] }] },
+    });
+    writeShortcutPreference("commandPalette", { common: [{ code: "F11", modifiers: [] }] });
     render(<KeyboardShortcutEditor />);
+    const search = screen.getByRole("textbox", { name: "Search shortcuts" });
+    fireEvent.change(search, { target: { value: "F10" } });
+    expect(screen.getByTestId("shortcut-editor-row-newSession")).toBeVisible();
+    expect(screen.queryByTestId("shortcut-editor-row-commandPalette")).toBeNull();
+    fireEvent.change(search, { target: { value: "" } });
+    fireEvent.click(screen.getByRole("switch", { name: "Changed only" }));
+    expect(screen.getByTestId("shortcut-editor-row-commandPalette")).toBeVisible();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Restore default shortcut for Start a new session" }),
+    );
+    expect(readKeyboardShortcutPreferences().actions.newSession).toBeUndefined();
+    expect(screen.queryByTestId("shortcut-editor-row-newSession")).toBeNull();
+    expect(readKeyboardShortcutPreferences().actions.commandPalette?.common).toEqual([
+      { code: "F11", modifiers: [] },
+    ]);
+  });
+
+  it("cancels recording when its action is filtered away", () => {
+    renderExpandedEditor();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Record common shortcut for Start a new session" }),
+    );
+    expect(isShortcutRecordingActive()).toBe(true);
+    fireEvent.change(screen.getByRole("textbox", { name: "Search shortcuts" }), {
+      target: { value: "poll" },
+    });
+    fireEvent.keyDown(window, { key: "F9", code: "F9" });
+    expect(isShortcutRecordingActive()).toBe(false);
+    expect(readKeyboardShortcutPreferences().actions.newSession).toBeUndefined();
+  });
+
+  it("lists the question-card group and records its actions", () => {
+    renderExpandedEditor();
 
     expect(actionRow("Focus question card")).toBeTruthy();
     expect(within(actionRow("Previous option")).getByText("↑")).toBeTruthy();
@@ -45,7 +112,7 @@ describe("KeyboardShortcutEditor", () => {
   });
 
   it("rejects a card chord already used by another card action", () => {
-    render(<KeyboardShortcutEditor />);
+    renderExpandedEditor();
 
     fireEvent.click(screen.getByRole("button", { name: "Record common shortcut for Next option" }));
     fireEvent.keyDown(window, { key: "ArrowUp", code: "ArrowUp" });
@@ -54,7 +121,7 @@ describe("KeyboardShortcutEditor", () => {
   });
 
   it("shows the effective default in the common row", () => {
-    render(<KeyboardShortcutEditor />);
+    renderExpandedEditor();
 
     const row = actionRow("Start a new session");
     expect(within(row).getByText("Ctrl")).toBeTruthy();
@@ -63,7 +130,7 @@ describe("KeyboardShortcutEditor", () => {
   });
 
   it("records and persists a common shortcut inline", () => {
-    render(<KeyboardShortcutEditor />);
+    renderExpandedEditor();
 
     fireEvent.click(
       screen.getByRole("button", { name: "Record common shortcut for Start a new session" }),
@@ -77,7 +144,7 @@ describe("KeyboardShortcutEditor", () => {
   });
 
   it("adds, records, and deletes a platform-specific override", () => {
-    render(<KeyboardShortcutEditor />);
+    renderExpandedEditor();
 
     fireEvent.pointerDown(
       screen.getByRole("button", { name: "Add system override for Start a new session" }),
@@ -112,7 +179,7 @@ describe("KeyboardShortcutEditor", () => {
   });
 
   it("rejects a shortcut already used by another action on the target platform", () => {
-    render(<KeyboardShortcutEditor />);
+    renderExpandedEditor();
 
     fireEvent.click(
       screen.getByRole("button", { name: "Record common shortcut for Open command palette" }),
@@ -127,7 +194,7 @@ describe("KeyboardShortcutEditor", () => {
 
   it("shows the legacy composer preference as the effective reset target", () => {
     localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
-    render(<KeyboardShortcutEditor />);
+    renderExpandedEditor();
 
     const row = actionRow("Send message");
     expect(within(row).getByText("Ctrl")).toBeTruthy();
@@ -135,7 +202,7 @@ describe("KeyboardShortcutEditor", () => {
   });
 
   it("rejects global chords that would collide with composer actions", () => {
-    render(<KeyboardShortcutEditor />);
+    renderExpandedEditor();
 
     fireEvent.click(
       screen.getByRole("button", { name: "Record common shortcut for Archive current session" }),
@@ -146,7 +213,7 @@ describe("KeyboardShortcutEditor", () => {
   });
 
   it("rejects a non-number pinned-session recording and clears recording mode", () => {
-    render(<KeyboardShortcutEditor />);
+    renderExpandedEditor();
 
     fireEvent.click(
       screen.getByRole("button", {
@@ -161,7 +228,7 @@ describe("KeyboardShortcutEditor", () => {
   });
 
   it("renders Not set and the note for an action with no default binding", () => {
-    render(<KeyboardShortcutEditor />);
+    renderExpandedEditor();
 
     const row = actionRow("Select workspace tab 1");
     expect(within(row).getByText("Not set")).toBeTruthy();
@@ -169,7 +236,7 @@ describe("KeyboardShortcutEditor", () => {
   });
 
   it("renders the secondary description on the Poll sessions row", () => {
-    render(<KeyboardShortcutEditor />);
+    renderExpandedEditor();
 
     const row = actionRow("Poll sessions");
     expect(
@@ -178,7 +245,7 @@ describe("KeyboardShortcutEditor", () => {
   });
 
   it("refuses a Shift chord for the recent-sessions switcher", () => {
-    render(<KeyboardShortcutEditor />);
+    renderExpandedEditor();
 
     fireEvent.click(
       screen.getByRole("button", { name: "Record common shortcut for Switch recent sessions" }),
@@ -193,7 +260,7 @@ describe("KeyboardShortcutEditor", () => {
   });
 
   it("refuses a modifier-less chord for the recent-sessions switcher", () => {
-    render(<KeyboardShortcutEditor />);
+    renderExpandedEditor();
 
     fireEvent.click(
       screen.getByRole("button", { name: "Record common shortcut for Switch recent sessions" }),
@@ -207,7 +274,7 @@ describe("KeyboardShortcutEditor", () => {
 
   it("offers Windows key positions on macOS and previews the mapped defaults", () => {
     vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
-    render(<KeyboardShortcutEditor />);
+    renderExpandedEditor();
 
     const toggle = screen.getByRole("switch", { name: "Use Windows key positions" });
     fireEvent.click(toggle);
@@ -221,7 +288,7 @@ describe("KeyboardShortcutEditor", () => {
   });
 
   it("does not offer Windows key positions off macOS", () => {
-    render(<KeyboardShortcutEditor />);
+    renderExpandedEditor();
 
     expect(screen.queryByRole("switch", { name: "Use Windows key positions" })).toBeNull();
   });

@@ -188,11 +188,7 @@ export function SharingPage() {
       <div>
         <div className="mb-6">
           <h1 className="settings-page-title text-2xl font-medium">Session sharing</h1>
-          <p className="mt-1 text-ui text-muted-foreground max-md:hidden">
-            Control whether users on this server can share sessions with others. Applies server-wide
-            and takes effect immediately. Sharing mode and visibility defaults affect new shares.
-            The public permission ceiling also applies to existing public grants.
-          </p>
+          <p className="mt-1 text-sm text-muted-foreground">Applies to everyone on this server.</p>
         </div>
 
         {isLoading || current === undefined ? (
@@ -201,7 +197,7 @@ export function SharingPage() {
           <>
             {!editable && (
               <p className="mb-4 rounded-md border border-border bg-muted/40 px-3 py-2 text-ui text-muted-foreground">
-                The sharing mode is managed by this deployment and can't be changed here.
+                Sharing mode is managed by this deployment.
               </p>
             )}
             <div className="flex flex-col gap-6">
@@ -264,6 +260,7 @@ export function SharingPage() {
                   <div className="flex items-center justify-between gap-4">
                     <SettingsLabel
                       label="Public access"
+                      note={!publicEditable ? "Managed by this deployment." : null}
                       className="flex-1"
                       description={
                         <>
@@ -291,6 +288,7 @@ export function SharingPage() {
                 <div className="mt-4 flex items-center justify-between gap-4 border-t border-border pt-4">
                   <SettingsLabel
                     label="Maximum public permission"
+                    note={!publicMaxEditable ? "Managed by this deployment." : null}
                     className="min-w-0 flex-1"
                     description={
                       <>
@@ -335,6 +333,11 @@ export function SharingPage() {
                     <div className="flex items-center justify-between gap-4">
                       <SettingsLabel
                         label="Share new sessions by default"
+                        note={
+                          !defaultPublicEditable
+                            ? "Managed by this deployment."
+                            : "New sessions can start with public read access."
+                        }
                         labelId="default-public-label"
                         descriptionId="default-public-description"
                         descriptionClassName="max-md:block"
@@ -374,7 +377,10 @@ export function SharingPage() {
                             <label
                               key={option.id}
                               className={cn(
-                                "flex cursor-pointer items-start gap-3",
+                                "flex cursor-pointer items-start gap-3 rounded-lg border p-3",
+                                option.id === defaultPublic
+                                  ? "border-primary bg-primary/5"
+                                  : "border-border",
                                 defaultPublicDisabled && "cursor-not-allowed opacity-70",
                               )}
                             >
@@ -391,6 +397,11 @@ export function SharingPage() {
                               />
                               <SettingsLabel
                                 label={option.label}
+                                note={
+                                  option.id === "sandbox"
+                                    ? "Local sessions start private."
+                                    : "Includes managed and local hosts."
+                                }
                                 labelId={`default-public-${option.id}-label`}
                                 description={option.description}
                                 descriptionId={`default-public-${option.id}-description`}

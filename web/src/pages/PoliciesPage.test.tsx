@@ -123,7 +123,7 @@ describe("PoliciesPage gating", () => {
     vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(false);
     renderPage();
     expect(
-      await screen.findByText("You don't have permission to manage global policies."),
+      await screen.findByText("An administrator can manage global policies."),
     ).toBeInTheDocument();
   });
 
@@ -141,9 +141,7 @@ describe("PoliciesPage list", () => {
   it("shows the empty state when no global policies are configured", async () => {
     renderPage();
     expect(await screen.findByText(/No global policies configured/)).toBeInTheDocument();
-    expect(screen.getByText("Global policies applied to all sessions.")).toHaveClass(
-      "max-md:hidden",
-    );
+    expect(screen.queryByText("Global policies applied to all sessions.")).toBeNull();
   });
 
   it("renders each policy with its handler, a Disabled badge, and parameters", async () => {
@@ -186,9 +184,41 @@ describe("PoliciesPage actions", () => {
 
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getByText("Remove block_canada?")).toBeInTheDocument();
-    fireEvent.click(within(dialog).getByRole("button", { name: /^Remove$/ }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Remove policy" }));
 
     expect(deleteMutate).toHaveBeenCalledWith("p1", expect.anything());
+  });
+
+  it("saves a boolean parameter from its On and Off segments as a boolean", async () => {
+    vi.mocked(policies.usePolicyRegistry).mockReturnValue({
+      data: [
+        {
+          handler: "example.safe_actions",
+          kind: "factory",
+          name: "Safe actions",
+          description: "Example",
+          params_schema: {
+            properties: {
+              require_approval: {
+                type: "boolean",
+                default: true,
+                description: "Ask before acting.",
+              },
+            },
+          },
+        },
+      ],
+    } as never);
+    renderPage();
+    await screen.findByText(/No global policies configured/);
+    fireEvent.click(screen.getByRole("button", { name: /Add policy/ }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByText("Safe actions"));
+    const options = within(dialog).getByRole("radiogroup", { name: /require_approval/ });
+    expect(within(options).getByRole("radio", { name: "On" })).toBeChecked();
+    fireEvent.click(within(options).getByRole("radio", { name: "Off" }));
+    fireEvent.click(within(dialog).getByRole("button", { name: /^Add$/ }));
+    expect(addMutate.mock.calls[0][0].factory_params).toEqual({ require_approval: false });
   });
 
   it("adds array (multi-select) values via the model combobox as a coerced list", async () => {
@@ -340,7 +370,7 @@ describe("PoliciesPage single-user mode", () => {
     expect(await screen.findByText(/No global policies configured/)).toBeInTheDocument();
     expect(screen.queryByText("Loading...")).not.toBeInTheDocument();
     expect(
-      screen.queryByText("You don't have permission to manage global policies."),
+      screen.queryByText("An administrator can manage global policies."),
     ).not.toBeInTheDocument();
   });
 
@@ -368,7 +398,7 @@ describe("PoliciesPage on a multi-user header-auth deploy", () => {
     vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(false);
     renderPage();
     expect(
-      await screen.findByText("You don't have permission to manage global policies."),
+      await screen.findByText("An administrator can manage global policies."),
     ).toBeInTheDocument();
     expect(identity.resolveIdentity).toHaveBeenCalled();
   });

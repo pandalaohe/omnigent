@@ -12,6 +12,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { SettingRow } from "@/components/SettingsFields";
 import { useSoundAlertPreferences } from "@/hooks/useSoundAlertPreferences";
 import { isNativeShell, listNativeSystemSounds } from "@/lib/nativeBridge";
 import { getSoundDeviceId, soundDeviceLabel } from "@/lib/soundDevice";
@@ -115,130 +116,125 @@ export function SoundAlertSettings() {
 
   return (
     <div className="flex flex-col gap-3" data-testid="sound-alert-settings">
-      <div className="flex items-center justify-between gap-6">
-        <span className="text-sm font-medium text-foreground">Play sounds on this device</span>
+      <SettingRow label="Play sounds on this device">
         <Switch
           aria-label="Play sounds on this device"
           checked={device.enabled}
           onCheckedChange={(enabled) => updateDevice({ enabled })}
         />
-      </div>
+      </SettingRow>
 
-      <div className="flex items-center justify-between gap-6">
-        <span className="text-sm text-muted-foreground">Volume</span>
-        <div className="flex shrink-0 items-center gap-2">
-          <input
-            type="range"
-            min={0}
-            max={100}
-            step={1}
-            aria-label="Sound volume"
-            value={Math.round(device.volume * 100)}
-            onChange={(event) => updateDevice({ volume: Number(event.target.value) / 100 })}
-            className="h-2 w-40 cursor-pointer accent-primary"
-          />
-          <span className="w-10 text-right text-sm tabular-nums text-muted-foreground">
-            {Math.round(device.volume * 100)}%
-          </span>
-        </div>
-      </div>
+      <SettingRow label="Volume" indent={1}>
+        <input
+          type="range"
+          min={0}
+          max={100}
+          step={1}
+          aria-label="Sound volume"
+          value={Math.round(device.volume * 100)}
+          onChange={(event) => updateDevice({ volume: Number(event.target.value) / 100 })}
+          className="h-2 w-40 cursor-pointer accent-primary"
+        />
+        <span className="w-10 text-right text-sm tabular-nums text-muted-foreground">
+          {Math.round(device.volume * 100)}%
+        </span>
+      </SettingRow>
 
-      <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border pt-3">
-        <div className="flex flex-col gap-0.5">
-          <span className="text-sm text-foreground">Primary device</span>
-          <span className="text-sm text-muted-foreground">
-            Plays when none of your devices was used in the last 5 minutes.
-          </span>
-        </div>
-        {isPrimaryDevice ? (
-          <span className="text-sm text-muted-foreground" data-testid="sound-alert-primary-device">
-            This device ({deviceLabel}) is the primary device
-          </span>
-        ) : (
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            data-testid="sound-alert-make-primary"
-            onClick={() => writeSoundAlertPreferences({ ...account, primaryDeviceId: deviceId })}
-          >
-            Make this the primary device
-          </Button>
-        )}
+      <div className="border-t border-border pt-3">
+        <SettingRow
+          label="Primary device"
+          hint="Plays when none of your devices was used in the last 5 minutes."
+        >
+          {isPrimaryDevice ? (
+            <span
+              className="text-sm text-muted-foreground"
+              data-testid="sound-alert-primary-device"
+            >
+              This device ({deviceLabel}) is the primary device
+            </span>
+          ) : (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              data-testid="sound-alert-make-primary"
+              onClick={() => writeSoundAlertPreferences({ ...account, primaryDeviceId: deviceId })}
+            >
+              Make this the primary device
+            </Button>
+          )}
+        </SettingRow>
       </div>
 
       {SOUND_LEVELS.map((level) => (
-        <div
-          key={level}
-          className="flex flex-wrap items-center justify-between gap-3 border-t border-border pt-3"
-        >
-          <label className="flex items-center gap-2 text-sm text-foreground">
+        <div key={level} className="border-t border-border pt-3">
+          <SettingRow label={LEVEL_LABELS[level]}>
             <Switch
               aria-label={`Play sound for ${LEVEL_LABELS[level]}`}
               data-testid={`sound-alert-level-${level}`}
               checked={isSoundLevelEnabled(account, level)}
               onCheckedChange={(enabled) => updateLevel(level, { enabled })}
             />
-            {LEVEL_LABELS[level]}
-          </label>
-          <div className="flex items-center gap-2">
-            <Select value={soundValue(level)} onValueChange={(value) => chooseSound(level, value)}>
-              <SelectTrigger
-                aria-label={`${LEVEL_LABELS[level]} sound`}
-                data-testid={`sound-alert-sound-${level}`}
-                className="w-32"
+            <div className="flex items-center gap-2">
+              <Select
+                value={soundValue(level)}
+                onValueChange={(value) => chooseSound(level, value)}
               >
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {BUILTIN_SOUNDS.map((sound) => (
-                  <SelectItem key={sound.id} value={sound.id}>
-                    {sound.label}
-                  </SelectItem>
-                ))}
-                {systemSounds.length > 0 && (
-                  <SelectGroup>
-                    <SelectLabel>System sounds</SelectLabel>
-                    {systemSounds.map((name) => (
-                      <SelectItem key={`system:${name}`} value={`${SYSTEM_SOUND_PREFIX}${name}`}>
-                        {name}
-                      </SelectItem>
-                    ))}
-                  </SelectGroup>
-                )}
-              </SelectContent>
-            </Select>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={() =>
-                // The click is a user gesture: unlock before playing so the
-                // first preview in a fresh tab is audible.
-                void playLevel(level, account, device, { resume: true })
-              }
-            >
-              Play
-            </Button>
-          </div>
+                <SelectTrigger
+                  aria-label={`${LEVEL_LABELS[level]} sound`}
+                  data-testid={`sound-alert-sound-${level}`}
+                  className="w-32"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {BUILTIN_SOUNDS.map((sound) => (
+                    <SelectItem key={sound.id} value={sound.id}>
+                      {sound.label}
+                    </SelectItem>
+                  ))}
+                  {systemSounds.length > 0 && (
+                    <SelectGroup>
+                      <SelectLabel>System sounds</SelectLabel>
+                      {systemSounds.map((name) => (
+                        <SelectItem key={`system:${name}`} value={`${SYSTEM_SOUND_PREFIX}${name}`}>
+                          {name}
+                        </SelectItem>
+                      ))}
+                    </SelectGroup>
+                  )}
+                </SelectContent>
+              </Select>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() =>
+                  // The click is a user gesture: unlock before playing so the
+                  // first preview in a fresh tab is audible.
+                  void playLevel(level, account, device, { resume: true })
+                }
+              >
+                Preview sound
+              </Button>
+            </div>
+          </SettingRow>
         </div>
       ))}
 
-      <div className="flex items-center justify-between gap-6 border-t border-border pt-3">
-        <div className="flex flex-col gap-0.5">
-          <span className="text-sm text-foreground">Sound the dot while B shows</span>
-          <span id="sound-dot-background-description" className="text-sm text-muted-foreground">
-            Play the done sound for an unread dot while background work is still active.
-          </span>
-        </div>
-        <Switch
-          aria-label="Sound the dot while B shows"
-          aria-describedby="sound-dot-background-description"
-          checked={account.soundDotWhileBackground}
-          onCheckedChange={(soundDotWhileBackground) =>
-            writeSoundAlertPreferences({ ...account, soundDotWhileBackground })
-          }
-        />
+      <div className="border-t border-border pt-3">
+        <SettingRow
+          label="Done sound during background work"
+          hint="Play the done sound for an unread message while background work is still active."
+        >
+          <Switch
+            aria-label="Done sound during background work"
+            checked={account.soundDotWhileBackground}
+            onCheckedChange={(soundDotWhileBackground) =>
+              writeSoundAlertPreferences({ ...account, soundDotWhileBackground })
+            }
+          />
+        </SettingRow>
       </div>
 
       {systemSounds.length > 0 && (
@@ -247,36 +243,35 @@ export function SoundAlertSettings() {
         </p>
       )}
 
-      <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border pt-3">
-        <label className="flex items-center gap-2 text-sm text-foreground">
+      <div className="border-t border-border pt-3">
+        <SettingRow label="Quiet hours">
           <Switch
             aria-label="Quiet hours"
             checked={account.quietHours.enabled}
             onCheckedChange={(enabled) => updateQuietHours({ enabled })}
           />
-          Quiet hours
-        </label>
-        <div className="flex items-center gap-2">
-          <Input
-            type="time"
-            aria-label="Quiet hours start"
-            className="w-28"
-            value={account.quietHours.start}
-            onChange={(event) =>
-              updateQuietHours({ start: event.target.value || account.quietHours.start })
-            }
-          />
-          <span className="text-sm text-muted-foreground">to</span>
-          <Input
-            type="time"
-            aria-label="Quiet hours end"
-            className="w-28"
-            value={account.quietHours.end}
-            onChange={(event) =>
-              updateQuietHours({ end: event.target.value || account.quietHours.end })
-            }
-          />
-        </div>
+          <div className="flex items-center gap-2">
+            <Input
+              type="time"
+              aria-label="Quiet hours start"
+              className="w-28"
+              value={account.quietHours.start}
+              onChange={(event) =>
+                updateQuietHours({ start: event.target.value || account.quietHours.start })
+              }
+            />
+            <span className="text-sm text-muted-foreground">to</span>
+            <Input
+              type="time"
+              aria-label="Quiet hours end"
+              className="w-28"
+              value={account.quietHours.end}
+              onChange={(event) =>
+                updateQuietHours({ end: event.target.value || account.quietHours.end })
+              }
+            />
+          </div>
+        </SettingRow>
       </div>
 
       {account.mutedSessionIds.length > 0 && (
