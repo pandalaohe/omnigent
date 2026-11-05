@@ -105,6 +105,7 @@ describe("Settings folder", () => {
   it.each([
     ["claude-native", "claude", "claude-model"],
     ["codex", "codex", "model-two"],
+    ["codex-sdk", "codex", "model-two"],
   ])(
     "preserves a %s read when a pending Codex save completes",
     async (nextHarness, family, expectedModel) => {
@@ -112,12 +113,33 @@ describe("Settings folder", () => {
       let finishSave: ((response: Response) => void) | undefined;
       let finishRead: ((response: Response) => void) | undefined;
       let pendingRead: Promise<Response> | undefined;
+      let confirmed = false;
+      const saved = {
+        ...initial,
+        revision: "r2",
+        fields: [{ ...initial.fields[0], value: "model-two", undo_available: true }],
+      };
       vi.mocked(authenticatedFetch).mockImplementation((input, init) => {
         if (String(input).endsWith("/agent-settings/codex-native") && init?.method === "PUT")
           return new Promise((resolve) => {
-            finishSave = resolve;
+            finishSave = (response) => {
+              confirmed = true;
+              resolve(response);
+            };
           });
         if (String(input).endsWith(`/agent-settings/${nextHarness}`)) {
+          if (confirmed)
+            return Promise.resolve(
+              Response.json(
+                family === "codex"
+                  ? saved
+                  : {
+                      ...initial,
+                      family,
+                      fields: [{ ...initial.fields[0], value: "claude-model" }],
+                    },
+              ),
+            );
           pendingRead = new Promise((resolve) => {
             finishRead = resolve;
           });
@@ -126,7 +148,7 @@ describe("Settings folder", () => {
         return fetch(input, init);
       });
       const mounted = mount();
-      if (family === "codex")
+      if (nextHarness === "codex")
         mounted.client.setQueryData(agentFolderQueryKey(host.host_id, nextHarness), initial);
       await screen.findByText("model-one");
       fireEvent.click(screen.getByRole("button", { name: "Change Model" }));
@@ -135,11 +157,6 @@ describe("Settings folder", () => {
       await waitFor(() => expect(finishSave).toBeDefined());
       mounted.rerender(mounted.tree(host, nextHarness));
       await waitFor(() => expect(finishRead).toBeDefined());
-      const saved = {
-        ...initial,
-        revision: "r2",
-        fields: [{ ...initial.fields[0], value: "model-two", undo_available: true }],
-      };
       act(() => finishSave!(Response.json(saved)));
       await waitFor(() =>
         expect(
