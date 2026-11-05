@@ -62,7 +62,7 @@ it("saves a selected map and leaves the prior selection after a rejected URL", a
   fireEvent.change(screen.getByLabelText("Price map HTTPS URL"), {
     target: { value: "https://prices.example.test/empty.json" },
   });
-  fireEvent.click(screen.getByRole("button", { name: "Add source", exact: true }));
+  fireEvent.click(screen.getByRole("button", { name: "Add source" }));
   await screen.findByText("No valid prices");
   expect((select as HTMLSelectElement).value).toBe("litellm");
   expect(screen.getByRole("dialog")).toBeTruthy();
@@ -116,7 +116,7 @@ it("reads models for the selected account and remembered range, with a tokens sw
       ([path]) => path.includes("account=gateway") && path.includes("range=d30"),
     ),
   ).toBe(true);
-  fireEvent.click(screen.getByRole("button", { name: "Tokens", exact: true }));
+  fireEvent.click(screen.getByRole("button", { name: "Tokens" }));
   await screen.findByText("1.5M");
   fireEvent.change(screen.getByLabelText("Usage range"), { target: { value: "d7" } });
   await waitFor(() =>

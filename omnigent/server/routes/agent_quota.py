@@ -290,10 +290,10 @@ def create_agent_quota_router(
                 to_date=to_date,
                 tz=tz,
             )
-        except LookupError:
-            raise HTTPException(404, "Usage account not found") from None
         except (ValueError, ZoneInfoNotFoundError):
             raise HTTPException(422, "Invalid usage range or timezone") from None
+        except LookupError:
+            raise HTTPException(404, "Usage account not found") from None
 
     @router.get("/sessions/{session_id}/agent-quota", include_in_schema=False)
     async def session_quota(request: Request, session_id: str) -> Response:

@@ -11,6 +11,8 @@ import { formatMoney, formatShortDate } from "./usageBoardFormat";
 interface ModelSource {
   kind: "host" | "report";
   label: string;
+  host_id?: string;
+  harness?: string;
   stale?: boolean;
   configuration?: { label?: string; name?: string; host?: string } | null;
 }
@@ -103,9 +105,9 @@ export function UsageModelsPage() {
                   <th scope="row" className="max-w-[360px] p-3 font-normal">
                     <span className="break-all font-medium">{model.id}</span>
                     <div className="mt-1 flex flex-wrap gap-1">
-                      {model.sources.map((source, index) => (
+                      {model.sources.map((source) => (
                         <span
-                          key={index}
+                          key={`${source.kind}:${source.host_id ?? source.label}:${source.harness ?? ""}`}
                           className="rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground"
                         >
                           {source.label}

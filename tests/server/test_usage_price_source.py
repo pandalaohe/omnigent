@@ -12,6 +12,7 @@ from omnigent.server.usage_models import usage_models
 from omnigent.server.usage_price_source import PriceSourceSelection, UsagePriceSource, fetch_prices
 from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
 from omnigent.stores.host_store import HostStore
+from tests.server.integration.test_global_instructions_routes import auth_app as auth_app
 from tests.server.test_usage_activity import (
     HOUR,
     NOW,
@@ -20,6 +21,7 @@ from tests.server.test_usage_activity import (
     _make_user,
     report,
 )
+from tests.server.test_usage_activity import service as service
 
 URL = "https://prices.example.test/map.json"
 PAYLOAD = {"vendor/model": {"input_cost_per_token": 2e-6, "output_cost_per_token": 6e-6}}

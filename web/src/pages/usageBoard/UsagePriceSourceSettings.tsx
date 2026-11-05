@@ -57,8 +57,8 @@ export function UsagePriceSourceSettings() {
   return (
     <div className="border-t border-border py-2.5">
       <div className="flex min-h-9 flex-wrap items-center justify-between gap-2">
-        <label htmlFor="usage-price-source" className="flex items-center gap-1.5 text-sm">
-          Price source
+        <div className="flex items-center gap-1.5 text-sm">
+          <label htmlFor="usage-price-source">Price source</label>
           <HelpTip label="How price changes apply">
             <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-2 text-xs">
               <dt>New usage</dt>
@@ -69,7 +69,7 @@ export function UsagePriceSourceSettings() {
               <dd>Filled once a price is available, then frozen.</dd>
             </dl>
           </HelpTip>
-        </label>
+        </div>
         {current?.can_edit ? (
           <div className="flex items-center gap-1.5">
             <select

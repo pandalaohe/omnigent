@@ -97,6 +97,7 @@ def test_selected_slot_precedes_catalog_but_provider_config_wins(monkeypatch):
                 "default": True,
                 "openai": {
                     "base_url": "http://localhost:11434/v1",
+                    "api_key": "test",
                     "pricing": {"input_per_million": 0, "output_per_million": 0},
                 },
             }
