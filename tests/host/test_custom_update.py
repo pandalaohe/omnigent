@@ -1534,11 +1534,11 @@ def test_windows_custom_update_stops_host_tree_and_waits_for_cli_parent(
     )
 
 
-@pytest.mark.parametrize("launcher_provenance", ["exe", "argv"])
+@pytest.mark.parametrize("launcher_binary", ["python.exe", "pythonw.exe"])
 @pytest.mark.parametrize("other_holder", [None, "sibling", "above-wrapper", "above-shell"])
 def test_windows_custom_update_allows_own_launcher_chain_only(
     monkeypatch: pytest.MonkeyPatch,
-    launcher_provenance: str,
+    launcher_binary: str,
     other_holder: str | None,
 ) -> None:
     import omnigent.cli as cli_module
@@ -1546,6 +1546,7 @@ def test_windows_custom_update_allows_own_launcher_chain_only(
     tool_venv = r"C:\Users\<user>\AppData\Roaming\uv\tools\omnigent"
     cli_bin = r"C:\Users\<user>\.local\bin\omni.exe"
     venv_python = tool_venv + r"\Scripts\python.exe"
+    launcher_exe = tool_venv + "\\Scripts\\" + launcher_binary
     base_python = r"C:\Python\python.exe"
     row = cli_module._WindowsProcessInfo
     processes = [
@@ -1553,9 +1554,9 @@ def test_windows_custom_update_allows_own_launcher_chain_only(
         row(
             590,
             580,
-            "python.exe",
-            venv_python if launcher_provenance == "exe" else base_python,
-            "python" if launcher_provenance == "exe" else f'"{venv_python}" -m omnigent.cli up',
+            launcher_binary,
+            launcher_exe,
+            f'"{launcher_exe}" -m omnigent.cli up',
         ),
         row(
             580,
@@ -1598,6 +1599,46 @@ def test_windows_custom_update_allows_own_launcher_chain_only(
             check_release()
         assert f"pid {888 if other_holder == 'sibling' else 30}" in str(error.value)
         assert "pid 590" not in str(error.value)
+
+
+@pytest.mark.parametrize("host_provenance", ["argv", "loaded-files"])
+def test_windows_custom_update_keeps_direct_host_parent_as_holder(
+    monkeypatch: pytest.MonkeyPatch, host_provenance: str
+) -> None:
+    import omnigent.cli as cli_module
+
+    tool_venv = r"C:\Users\<user>\AppData\Roaming\uv\tools\omnigent"
+    venv_python = tool_venv + r"\Scripts\python.exe"
+    base_python = r"C:\Python\python.exe"
+    row = cli_module._WindowsProcessInfo
+    processes = [
+        row(600, 590, "python.exe", base_python, "python -m omnigent.cli up"),
+        row(590, 30, "python.exe", venv_python, f'"{venv_python}" -m omnigent.cli up'),
+        row(
+            30,
+            1,
+            "python.exe",
+            base_python,
+            f'"{venv_python}" -m omnigent.host._daemon_entry'
+            if host_provenance == "argv"
+            else "python -m omnigent.host._daemon_entry",
+            (tool_venv + r"\Lib\worker.pyd",) if host_provenance == "loaded-files" else (),
+        ),
+    ]
+    monkeypatch.setattr(cli_module, "_list_windows_processes", lambda: processes)
+
+    with pytest.raises(click.ClickException) as error:
+        cli_module._wait_for_windows_custom_host_venv_release(
+            tool_venv_path=tool_venv,
+            cli_bin_path=r"C:\Users\<user>\.local\bin\omni.exe",
+            stopped_host_pids=[],
+            helper_pid=600,
+            allow_ancestor_cli=True,
+            timeout_s=0,
+            grace_s=0,
+        )
+    assert "pid 30" in str(error.value)
+    assert "pid 590" not in str(error.value)
 
 
 def test_windows_custom_update_aborts_before_uv_and_restarts_supervisor_when_venv_locked(

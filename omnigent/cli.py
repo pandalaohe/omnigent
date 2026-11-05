@@ -10650,6 +10650,9 @@ def _windows_process_ancestor_pids(
 ) -> set[int]:
     """Return ancestor PIDs of ``start_pid`` that belong to the current CLI wrapper chain."""
     by_pid = {proc.pid: proc for proc in processes}
+    venv = _normalize_windows_fs_path(tool_venv_path)
+    cli = _normalize_windows_fs_path(cli_bin_path)
+    launchers = {cli, venv + r"\scripts\python.exe", venv + r"\scripts\pythonw.exe"}
     ancestors: set[int] = set()
     current = by_pid.get(start_pid)
     visited: set[int] = set()
@@ -10659,12 +10662,11 @@ def _windows_process_ancestor_pids(
         if parent is None:
             break
         # Windows venv Python can be a launcher between omni.exe and the CLI.
-        if not _windows_path_holds_tool_venv(
-            parent, tool_venv_path=tool_venv_path, cli_bin_path=cli_bin_path
-        ):
+        exe = _normalize_windows_fs_path(parent.exe)
+        if exe not in launchers:
             break
         ancestors.add(parent.pid)
-        if _normalize_windows_fs_path(parent.exe) == _normalize_windows_fs_path(cli_bin_path):
+        if exe == cli:
             break
         current = parent
     return ancestors
