@@ -511,8 +511,9 @@ async def test_scoped_prepare_waits_for_startup_lock_before_spawning(
     spawn.assert_awaited_once()
 
 
-async def test_full_tier_replaces_scoped_rpc_without_reacquiring_startup_lock(
-    context_v2_pi, tmp_path, monkeypatch
+@pytest.mark.parametrize("concurrent_close", [False, True], ids=["replace", "close-during-switch"])
+async def test_full_tier_rpc_switch_respects_close_requests(
+    context_v2_pi, tmp_path, monkeypatch, concurrent_close
 ):
     from omnigent.inner import pi_executor as module
 
@@ -526,12 +527,42 @@ async def test_full_tier_replaces_scoped_rpc_without_reacquiring_startup_lock(
     )
     monkeypatch.setattr(module, "bridge_dir_for_session_id", lambda _: tmp_path)
     monkeypatch.setattr(executor, "_await_permission_installation", AsyncMock())
-    current = await asyncio.wait_for(executor._ensure_rpc("switch-full", "system", None, []), 2)
-    assert current is not old
-    assert old.process is None
-    assert executor._session_states["switch-full"].rpc is current
-    assert "switch-full" not in executor._scoped_handoffs
-    assert spawn.await_count == 2
+    entered, release = asyncio.Event(), asyncio.Event()
+    close = old._close_unobserved
+
+    async def pending_close():
+        entered.set()
+        await release.wait()
+        await close()
+
+    monkeypatch.setattr(old, "_close_unobserved", pending_close)
+    switching = asyncio.create_task(executor._ensure_rpc("switch-full", "system", None, []))
+    closing = None
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        if concurrent_close:
+            closing = asyncio.create_task(executor.close_session("switch-full"))
+            await asyncio.sleep(0)
+            assert executor._session_states["switch-full"].closing
+        release.set()
+        if concurrent_close:
+            with pytest.raises(RuntimeError, match=r"owner.*closing|owner changed"):
+                await asyncio.wait_for(switching, 2)
+            await asyncio.wait_for(closing, 2)
+            assert "switch-full" not in executor._session_states
+            assert spawn.await_count == 1
+        else:
+            current = await asyncio.wait_for(switching, 2)
+            assert current is not old
+            assert executor._session_states["switch-full"].rpc is current
+            assert spawn.await_count == 2
+        assert old.process is None
+        assert "switch-full" not in executor._scoped_handoffs
+    finally:
+        release.set()
+        await asyncio.gather(
+            *(task for task in (switching, closing) if task is not None), return_exceptions=True
+        )
 
 
 async def test_concurrent_permission_bootstrap_reuses_one_proven_process(

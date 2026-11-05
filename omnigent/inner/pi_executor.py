@@ -4579,6 +4579,8 @@ class PiExecutor(Executor):
                             self._peer_initial[session_key] = initial_peer
                     self._scoped_launchers.pop(session_key, None)
                     self._scoped_handoffs.pop(session_key, None)
+                    if state.closing:
+                        raise RuntimeError("Pi RPC owner is closing")
                     state = self._session_states.setdefault(session_key, _PiSessionState())
 
         effective_model = model
