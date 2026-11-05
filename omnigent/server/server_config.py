@@ -303,6 +303,24 @@ def filesystem_attachment_upload_limit() -> int | None:
     return _config_limit("filesystem_attachment_max_bytes", None)
 
 
+def artifact_max_bytes() -> int:
+    """Per-file artifact cap: 64 MiB by default, at most 72 MiB over the host tunnel.
+
+    ``artifact_max_bytes`` uses the shared limit parser; zero (unlimited)
+    and values above the transport ceiling are clamped with a warning.
+    """
+    from omnigent.util.tunnel_limits import HOST_FILESYSTEM_MAX_READ_BYTES
+
+    limit = _config_limit("artifact_max_bytes", 64 * 1024 * 1024)
+    if limit is None or limit > HOST_FILESYSTEM_MAX_READ_BYTES:
+        logger.warning(
+            "artifact_max_bytes is limited to %d bytes by the host tunnel's base64 frame budget",
+            HOST_FILESYSTEM_MAX_READ_BYTES,
+        )
+        return HOST_FILESYSTEM_MAX_READ_BYTES
+    return limit
+
+
 def filesystem_attachment_file_limit() -> int | None:
     """Max number of filesystem attachments one session may hold.
 

@@ -58,6 +58,7 @@ from omnigent.runtime.filesystem_registry import (
     GitStatusUnavailable,
     create_filesystem_registry,
 )
+from omnigent.util.tunnel_limits import HOST_FILESYSTEM_MAX_READ_BYTES
 
 # Match the runner's caps so a host-served read is truncated identically.
 _MAX_READ_BYTES = 10 * 1024 * 1024  # 10 MiB
@@ -135,6 +136,7 @@ class WorkspaceReader:
         before: str | None = None,
         order: str = "desc",
         raw: bool = False,
+        max_bytes: int | None = None,
         within: str | None = None,
     ) -> _WorkspacePayload:
         """List a directory or read a file, mirroring ``_fs_list_or_read``.
@@ -145,7 +147,10 @@ class WorkspaceReader:
         :param before: Backward-pagination cursor entry id.
         :param order: Sort order, ``"asc"`` or ``"desc"``.
         :param raw: Accepted from older callers; files are always returned
-            whole up to the byte cap, so it changes nothing.
+            whole up to the byte cap. With ``max_bytes``, returns base64
+            to bound JSON expansion regardless of the file's contents.
+        :param max_bytes: Artifact byte cap for raw reads; at most 72 MiB.
+            Other reads retain their default 10 MiB cap.
         :param within: Bundle root (relative to the workspace, ``""`` for the
             workspace root) the file must resolve strictly inside, passing
             the bundle name rules; anything else is a 404. A directory
@@ -153,7 +158,11 @@ class WorkspaceReader:
         :returns: A directory-listing dict or a file-content dict.
         :raises WorkspaceReaderError: On invalid path or missing file.
         """
-        del raw
+        byte_cap = _MAX_READ_BYTES
+        if raw and max_bytes is not None:
+            if type(max_bytes) is not int or max_bytes <= 0:
+                raise WorkspaceReaderError(400, "invalid_input", "max_bytes must be positive")
+            byte_cap = min(max_bytes, HOST_FILESYSTEM_MAX_READ_BYTES)
         resolved = self._resolve(path)
         if resolved.is_dir():
             if within is not None:
@@ -165,7 +174,9 @@ class WorkspaceReader:
             root = self._resolve(within)
             if not resolved_within(resolved, root):
                 raise WorkspaceReaderError(404, "not_found", f"Path {path!r} not found")
-        payload = self._read_file(path, resolved)
+        payload = self._read_file(
+            path, resolved, byte_cap, force_base64=raw and max_bytes is not None
+        )
         if within is not None:
             payload["within_enforced"] = True
         return payload
@@ -244,39 +255,56 @@ class WorkspaceReader:
         self,
         rel: str,
         resolved: Path,
+        max_bytes: int,
+        *,
+        force_base64: bool = False,
     ) -> _WorkspacePayload:
         """Build the file-content payload for a resolved file.
 
         Text files are UTF-8 decoded; binary files are base64-encoded.
-        Both are byte-capped at :data:`_MAX_READ_BYTES`.
+        Both are byte-capped at ``max_bytes``.
         Shape matches the runner's file-content
         response, including the mimetype guess.
 
-        Reads at most ``_MAX_READ_BYTES + 1`` from disk, bounding memory
+        Reads at most ``max_bytes + 1`` from disk, bounding memory
         use before decoding oversized files.
         """
         try:
             with resolved.open("rb") as fh:
                 # One extra byte lets us detect (and flag) truncation
                 # without loading the rest of a large file into memory.
-                capped = fh.read(_MAX_READ_BYTES + 1)
+                capped = fh.read(max_bytes + 1)
         except OSError as exc:
             raise WorkspaceReaderError(404, "not_found", f"Path {rel!r} not found") from exc
 
-        return self._file_content_payload(rel, capped)
+        return self._file_content_payload(rel, capped, max_bytes, force_base64=force_base64)
 
     def _file_content_payload(
         self,
         rel: str,
         raw: bytes,
+        max_bytes: int,
+        *,
+        force_base64: bool = False,
     ) -> _WorkspacePayload:
         """Assemble the file-content dict from raw bytes."""
         content_type_guess, _ = mimetypes.guess_type(rel)
         truncated = False
         capped = raw
-        if len(capped) > _MAX_READ_BYTES:
-            capped = capped[:_MAX_READ_BYTES]
+        if len(capped) > max_bytes:
+            capped = capped[:max_bytes]
             truncated = True
+
+        if force_base64:
+            return {
+                "object": "session.environment.filesystem.file_content",
+                "path": rel,
+                "content_type": content_type_guess,
+                "bytes": len(capped),
+                "truncated": truncated,
+                "encoding": "base64",
+                "content": base64.b64encode(capped).decode("ascii"),
+            }
 
         text: str | None = None
         try:

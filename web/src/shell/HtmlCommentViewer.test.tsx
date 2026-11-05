@@ -635,11 +635,17 @@ describe("HtmlCommentViewer standalone (artifact URL)", () => {
 
   it.each([
     [404, "File not found"],
-    [413, "File too large to preview (10 MiB limit)"],
+    [413, "File too large to preview (16777216 bytes limit)"],
     [502, "The session's host or runner needs an update"],
     [503, "Host offline"],
   ])("shows the %s status as an inline error with no iframe", async (status, message) => {
-    fetchMock.mockImplementation(async () => new Response("<html>err</html>", { status }));
+    fetchMock.mockImplementation(
+      async () =>
+        new Response("<html>err</html>", {
+          status,
+          headers: status === 413 ? { "X-Omnigent-Artifact-Max-Bytes": "16777216" } : {},
+        }),
+    );
     renderViewer();
 
     expect(await screen.findByText(message)).toBeTruthy();

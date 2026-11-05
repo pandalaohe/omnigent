@@ -4704,6 +4704,7 @@ class HostProcess:
                 before=cast("str | None", params.get("before")),
                 order=str(params.get("order", "desc")),
                 raw=bool(params.get("raw", False)),
+                max_bytes=cast("int | None", params.get("max_bytes")),
                 within=within if isinstance(within, str) else None,
             )
         if op == "changes":

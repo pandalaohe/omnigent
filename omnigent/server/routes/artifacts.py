@@ -59,7 +59,7 @@ from omnigent.entities.element_annotation import (
     parse_element_anchor,
 )
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.host.frames import CAP_FS_READ_RAW
+from omnigent.host.frames import CAP_FS_READ_RAW, CAP_FS_READ_RAW_LIMIT
 from omnigent.server.artifact_links import (
     ArtifactTokenClaims,
     bridge_nonce,
@@ -105,6 +105,7 @@ from omnigent.server.routes._oauth import RATE_LIMITER_MAX_KEYS, SlidingWindowRa
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.routes.sessions.routes_resources import _RunnerStreamResponse
 from omnigent.server.schemas import ArtifactOpenRequestEvent
+from omnigent.server.server_config import artifact_max_bytes
 from omnigent.server.visitor_screenshots import (
     VISITOR_SCREENSHOT_BYTES,
     VISITOR_SCREENSHOT_LIMIT,
@@ -124,10 +125,6 @@ logger = logging.getLogger(__name__)
 
 # The web UI's environment resource id (see the file-panel routes).
 _ENVIRONMENT_ID = "default"
-
-# Per-file ceiling for a served artifact. The runner announces the size in
-# Content-Length; a body without one is read into a buffer no larger than this.
-_MAX_ARTIFACT_BYTES = 10 * 1024 * 1024
 
 # Panel tokens live long enough to keep an open panel working without a
 # redirect; the viewer re-mints before they expire.
@@ -222,7 +219,6 @@ _ERROR_PAGE_TEMPLATE = (
 
 _NOT_FOUND_SENTENCE = "Not found."
 _REVOKED_SENTENCE = "This link is no longer available."
-_TOO_LARGE_SENTENCE = "This file is too large to serve as an artifact."
 _HOST_OFFLINE_SENTENCE = "The session host is offline."
 _HOST_NEEDS_UPDATE_SENTENCE = "The session host needs an update to serve bundle files."
 _RUNNER_NEEDS_UPDATE_SENTENCE = "The session runner needs an update to serve bundle files."
@@ -325,7 +321,7 @@ def _sentence_for(status: int) -> str:
     if status == 410:
         return _REVOKED_SENTENCE
     if status == 413:
-        return _TOO_LARGE_SENTENCE
+        return _too_large_sentence(artifact_max_bytes())
     if status == 503:
         return _HOST_OFFLINE_SENTENCE
     return _LOAD_FAILED_SENTENCE
@@ -334,6 +330,16 @@ def _sentence_for(status: int) -> str:
 def _page_status(status: int) -> int:
     """Clamp an error status to one the artifact route serves as a page."""
     return status if status in _PAGE_STATUSES else 502
+
+
+def _too_large_sentence(max_bytes: int) -> str:
+    return f"This file is too large to preview ({max_bytes} bytes limit)."
+
+
+def _too_large_page(max_bytes: int) -> HTMLResponse:
+    response = _error_page(413, _too_large_sentence(max_bytes))
+    response.headers["X-Omnigent-Artifact-Max-Bytes"] = str(max_bytes)
+    return response
 
 
 def _error_page(status: int, sentence: str) -> HTMLResponse:
@@ -421,18 +427,18 @@ def _content_length(value: str | None) -> int | None:
         return None
 
 
-async def _read_stream_bounded(upstream: httpx.Response) -> bytes | None:
+async def _read_stream_bounded(upstream: httpx.Response, max_bytes: int) -> bytes | None:
     """Read a runner body up to the artifact cap.
 
     :param upstream: The runner's streamed response.
-    :returns: The decoded body, or ``None`` when it exceeds
-        :data:`_MAX_ARTIFACT_BYTES`.
+    :param max_bytes: Per-file cap captured for this read.
+    :returns: The decoded body, or ``None`` when it exceeds the cap.
     """
     chunks: list[bytes] = []
     total = 0
     async for chunk in upstream.aiter_bytes():
         total += len(chunk)
-        if total > _MAX_ARTIFACT_BYTES:
+        if total > max_bytes:
             return None
         chunks.append(chunk)
     return b"".join(chunks)
@@ -1049,12 +1055,13 @@ def register_artifact_routes(
             return _error_page(502, _RUNNER_NEEDS_UPDATE_SENTENCE)
         content_type = upstream.headers.get("content-type") or _guess_media_type(relpath)
         content_length = _content_length(upstream.headers.get("content-length"))
-        if content_length is not None and content_length > _MAX_ARTIFACT_BYTES:
+        max_bytes = artifact_max_bytes()
+        if content_length is not None and content_length > max_bytes:
             await upstream.aclose()
-            return _error_page(413, _TOO_LARGE_SENTENCE)
+            return _too_large_page(max_bytes)
         if content_length is None or (claims.view in ("p", "h") and _is_html(content_type)):
             try:
-                body = await _read_stream_bounded(upstream)
+                body = await _read_stream_bounded(upstream, max_bytes)
             except httpx.HTTPError:
                 # A runner body that dies mid-read cannot become a streamed
                 # response, so answer the page the route promises.
@@ -1065,7 +1072,7 @@ def register_artifact_routes(
                 # including when the read itself fails.
                 await upstream.aclose()
             if body is None:
-                return _error_page(413, _TOO_LARGE_SENTENCE)
+                return _too_large_page(max_bytes)
             return _render_buffered(request, claims, nonce, content_type, body)
         _apply_stream_headers(request, runner_response, content_type)
         return runner_response
@@ -1086,7 +1093,7 @@ def register_artifact_routes(
         host_conn = host_registry.get(conv.host_id)
         if host_conn is None:
             return _error_page(503, _HOST_OFFLINE_SENTENCE)
-        if CAP_FS_READ_RAW not in host_conn.hello.capabilities:
+        if not {CAP_FS_READ_RAW, CAP_FS_READ_RAW_LIMIT}.issubset(host_conn.hello.capabilities):
             return _error_page(502, _HOST_NEEDS_UPDATE_SENTENCE)
         workspace_override: str | None = None
         if claims.absolute:
@@ -1098,9 +1105,11 @@ def register_artifact_routes(
                 if exc.status_code >= 500:
                     return _error_page(502, _LOAD_FAILED_SENTENCE)
                 return _error_page(404, _NOT_FOUND_SENTENCE)
+        max_bytes = artifact_max_bytes()
         params: dict[str, Any] = {
             "path": relpath if claims.absolute else _posix_join(claims.root, relpath),
             "raw": True,
+            "max_bytes": max_bytes,
         }
         if sub_resource:
             params["within"] = "" if claims.absolute else claims.root
@@ -1129,10 +1138,12 @@ def register_artifact_routes(
             # An older host ignores ``within`` and would serve unconfined.
             return _error_page(502, _HOST_NEEDS_UPDATE_SENTENCE)
         if payload.get("truncated"):
-            return _error_page(413, _TOO_LARGE_SENTENCE)
+            return _too_large_page(max_bytes)
         body = _decode_host_content(payload)
         if body is None:
             return _error_page(502, _LOAD_FAILED_SENTENCE)
+        if len(body) > max_bytes:
+            return _too_large_page(max_bytes)
         content_type = payload.get("content_type") or _guess_media_type(relpath)
         return _render_buffered(request, claims, nonce, content_type, body)
 

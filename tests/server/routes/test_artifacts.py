@@ -36,11 +36,15 @@ from omnigent.db.utils import generate_file_id, get_or_create_engine, now_epoch
 from omnigent.entities import Conversation, ResolvedAccess, SessionPermission
 from omnigent.entities.element_annotation import ELEMENT_ANCHOR_PREFIX, parse_element_anchor
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.host.connect import HostProcess
 from omnigent.host.frames import (
     CAP_FS_READ_RAW,
+    CAP_FS_READ_RAW_LIMIT,
     HostFsRequestFrame,
+    HostFsResultFrame,
     HostHelloFrame,
     decode_host_frame,
+    encode_host_frame,
 )
 from omnigent.runtime import (
     _globals,
@@ -78,6 +82,7 @@ from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
 from omnigent.stores.conversation_store import ARTIFACT_LINK_KEY_LABEL
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.workspace_fs import WorkspaceReader
 
 pytestmark = pytest.mark.asyncio
 
@@ -500,9 +505,10 @@ class _FakeWebSocket:
 async def _online_host(
     registry: HostRegistry,
     *,
-    capabilities: tuple[str, ...] = (CAP_FS_READ_RAW,),
+    capabilities: tuple[str, ...] = (CAP_FS_READ_RAW, CAP_FS_READ_RAW_LIMIT),
     reply: dict[str, Any] | None = None,
     frames: list[Any] | None = None,
+    workspace: Path | None = None,
 ) -> AsyncIterator[None]:
     """Register a host connection that auto-replies to ``host.fs_request``."""
     conn = registry.register(
@@ -525,6 +531,22 @@ async def _online_host(
             frame = decode_host_frame(text.data)
             if frames is not None:
                 frames.append(frame)
+            if isinstance(frame, HostFsRequestFrame) and workspace is not None:
+                payload = HostProcess._dispatch_fs_op(
+                    WorkspaceReader(workspace), frame.op, frame.session_id, frame.params
+                )
+                result = decode_host_frame(
+                    encode_host_frame(
+                        HostFsResultFrame(
+                            request_id=frame.request_id, status="ok", payload=payload
+                        )
+                    )
+                )
+                assert isinstance(result, HostFsResultFrame)
+                future = conn.pending_fs_requests.pop(frame.request_id, None)
+                if future is not None and not future.done():
+                    future.set_result({"status": result.status, "payload": result.payload})
+                continue
             if isinstance(frame, HostFsRequestFrame) and reply is not None:
                 future = conn.pending_fs_requests.pop(frame.request_id, None)
                 if future is not None and not future.done():
@@ -1281,8 +1303,10 @@ async def test_no_runner_and_no_host_is_unavailable(
 
 async def test_runner_content_length_over_cap_is_payload_too_large(
     client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A declared size over the cap is a 413 before any streaming starts."""
+    monkeypatch.setattr(artifacts_module, "artifact_max_bytes", lambda: 10 * _MIB)
     runner = _stub_runner_app(
         b"tiny",
         content_type="text/plain",
@@ -1294,12 +1318,16 @@ async def test_runner_content_length_over_cap_is_payload_too_large(
         resp = await client.get(minted["url"])
 
     assert resp.status_code == 413
+    assert "10485760 bytes limit" in resp.text
+    assert resp.headers["X-Omnigent-Artifact-Max-Bytes"] == "10485760"
 
 
 async def test_runner_body_over_cap_without_content_length_is_payload_too_large(
     client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A body without Content-Length is buffered bounded and refused past cap."""
+    monkeypatch.setattr(artifacts_module, "artifact_max_bytes", lambda: 10 * _MIB)
     runner = _stub_runner_app(
         b"x" * (11 * _MIB),
         content_type="application/octet-stream",
@@ -1311,6 +1339,64 @@ async def test_runner_body_over_cap_without_content_length_is_payload_too_large(
         resp = await client.get(minted["url"])
 
     assert resp.status_code == 413
+    assert "10485760 bytes limit" in resp.text
+
+
+@pytest.mark.parametrize("reader", ["runner", "host"])
+async def test_large_html_preview_uses_configured_cap(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reader: str,
+) -> None:
+    """17 MiB survives either reader; lowering the setting refuses the same file."""
+    body = b"<html><body><!--" + b"x" * (17 * _MIB) + b"--><p>complete</p></body></html>"
+    minted = await _mint(client)
+    if reader == "runner":
+        async with _use_runner(_stub_runner_app(body)):
+            response = await client.get(minted["url"])
+            monkeypatch.setattr(artifacts_module, "artifact_max_bytes", lambda: 16 * _MIB)
+            refused = await client.get(minted["url"])
+    else:
+        set_runner_router(_OfflineRunnerRouter())  # type: ignore[arg-type]
+        _bind_host(app)
+        (tmp_path / "reports").mkdir()
+        (tmp_path / _ENTRY).write_bytes(body)
+        async with _online_host(app.state.test_host_registry, workspace=tmp_path):
+            response = await client.get(minted["url"])
+            monkeypatch.setattr(artifacts_module, "artifact_max_bytes", lambda: 16 * _MIB)
+            refused = await client.get(minted["url"])
+    assert response.status_code == 200
+    assert b"<p>complete</p>" in response.content
+    assert response.content.count(b"x") >= 17 * _MIB
+    assert refused.status_code == 413
+    assert "16777216 bytes limit" in refused.text
+
+
+async def test_legacy_host_needs_update_for_configurable_artifacts(
+    client: httpx.AsyncClient, app: FastAPI
+) -> None:
+    set_runner_router(_OfflineRunnerRouter())  # type: ignore[arg-type]
+    _bind_host(app)
+    minted = await _mint(client)
+    async with _online_host(app.state.test_host_registry, capabilities=(CAP_FS_READ_RAW,)):
+        response = await client.get(minted["url"])
+    assert response.status_code == 502
+    assert "host needs an update" in response.text
+
+
+async def test_host_untruncated_oversize_payload_is_refused(
+    client: httpx.AsyncClient, app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(artifacts_module, "artifact_max_bytes", lambda: 8)
+    set_runner_router(_OfflineRunnerRouter())  # type: ignore[arg-type]
+    _bind_host(app)
+    minted = await _mint(client)
+    async with _online_host(app.state.test_host_registry, reply=_host_file_payload("x" * 9)):
+        response = await client.get(minted["url"])
+    assert response.status_code == 413
+    assert "8 bytes limit" in response.text
 
 
 async def test_runner_read_error_while_buffering_is_bad_gateway_page(
