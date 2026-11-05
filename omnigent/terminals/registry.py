@@ -290,6 +290,7 @@ class TerminalRegistry:
         program_status_app: str | None = None,
         elevated: bool = False,
         agent_invocation: bool = False,
+        host_shell: bool = False,
         origin: Literal["user", "agent", "harness"] = "harness",
     ) -> TerminalInstance:
         """Launch a terminal session, or return the existing one.
@@ -384,6 +385,7 @@ class TerminalRegistry:
         try:
             created.instance.elevated = elevated
             created.instance.origin = "agent" if agent_invocation else origin
+            created.instance.host_shell = host_shell
             created.instance.program_status_app = program_status_app
             created.instance.lifecycle_trace.transfer_session(conversation_id)
             await created.instance.launch(cwd=created.cwd)

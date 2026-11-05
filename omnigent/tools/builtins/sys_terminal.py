@@ -130,7 +130,11 @@ class _ResolvedInstance:
 def _terminal_tool_result(result: dict[str, Any], instance: TerminalInstance | None) -> str:
     """Keep user-owned sockets out of tool errors while retaining pane contents."""
     error = result.get("error")
-    if instance is not None and instance.origin == "user" and isinstance(error, str):
+    if (
+        instance is not None
+        and (instance.origin == "user" or instance.host_shell)
+        and isinstance(error, str)
+    ):
         socket = str(instance.socket_path)
         # Command diagnostics JSON-encode paths; start failures use raw paths.
         for spelling in (json.dumps(socket)[1:-1], socket):
@@ -168,6 +172,7 @@ def _format_launch_envelope(
                 {"tmux_socket": str(instance.socket_path)}
                 if not instance.elevated
                 and instance.origin != "user"
+                and not instance.host_shell
                 and instance.backend == "tmux"
                 else {}
             ),
@@ -746,6 +751,7 @@ class SysTerminalLaunchTool(Tool):
                     cwd_override=validated.cwd_override,
                     sandbox_override=validated.sandbox_override,
                     agent_invocation=True,
+                    host_shell=not self._spec.terminals,
                 )
             )
         except (RuntimeError, OSError, ValueError) as exc:
@@ -1265,6 +1271,11 @@ def _describe_entry(
         "elevated": instance.elevated,
         "agent_access": instance.agent_access if instance.elevated else True,
     }
-    if not instance.elevated and instance.origin != "user" and instance.backend == "tmux":
+    if (
+        not instance.elevated
+        and instance.origin != "user"
+        and not instance.host_shell
+        and instance.backend == "tmux"
+    ):
         result["tmux_socket"] = str(instance.socket_path)
     return result

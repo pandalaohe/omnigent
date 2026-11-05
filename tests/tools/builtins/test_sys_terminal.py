@@ -182,12 +182,13 @@ async def test_sdk_agent_can_use_plain_host_shells(
     target = {"terminal": "bash", "session": "user-shell"}
     launched = await invoke("launch", target)
     assert launched["status"] == "launched"
+    assert launched["origin"] == "agent"
+    assert "tmux_socket" not in launched
     instance = registry.get(ctx.conversation_id, "bash", "user-shell")
     assert instance is not None
     assert instance.os_env is not None and instance.os_env.cwd == ctx.workspace
     assert instance.os_env.spec.sandbox.type == "none"
     assert not instance.agent_access
-    instance.origin = "user"
     assert await invoke("send", {**target, "text": "printf 'sdk-%s\\n' marker"}) == {
         "status": "sent"
     }
@@ -198,11 +199,11 @@ async def test_sdk_agent_can_use_plain_host_shells(
         await asyncio.sleep(0.1)
     assert "sdk-marker" in screen.get("screen", ""), screen
     listed = await invoke("list", {})
-    assert listed[0]["origin"] == "user"
+    assert listed[0]["origin"] == "agent"
     assert "tmux_socket" not in listed[0]
     again = await invoke("launch", target)
     assert again["status"] == "already_running"
-    assert again["origin"] == "user"
+    assert again["origin"] == "agent"
     assert "tmux_socket" not in again
     assert (await invoke("close", target))["status"] == "closed"
     assert await invoke("list", {}) == []
@@ -511,7 +512,7 @@ async def test_multiple_sessions_per_terminal_are_independent(
 # ── sys_terminal_send / read ──────────────────────────────────
 
 
-@pytest.mark.parametrize("origin", ["user", "agent"])
+@pytest.mark.parametrize("origin", ["user", "agent", "sdk"])
 @pytest.mark.parametrize("failure", ["bool_true", "bool_false", "command", "start", "raised"])
 async def test_read_errors_do_not_disclose_user_shell_socket(
     registry: TerminalRegistry,
@@ -523,14 +524,18 @@ async def test_read_errors_do_not_disclose_user_shell_socket(
 ) -> None:
     from omnigent.inner.terminal import _tmux_process_start_error, _TmuxCommandFailedError
 
-    spec = _make_spec(terminals={"bash": TerminalEnvSpec(command="bash")})
+    monkeypatch.setenv(RUNNER_INTERACTIVE_SHELLS_ENV_VAR, '["bash"]')
+    spec = _make_spec(
+        terminals=None if origin == "sdk" else {"bash": TerminalEnvSpec(command="bash")}
+    )
     target = {"terminal": "bash", "session": "read-error"}
     assert (await _invoke(SysTerminalLaunchTool(spec, registry), target, ctx))[
         "status"
     ] == "launched"
     instance = registry.get(ctx.conversation_id, "bash", "read-error")
     assert instance is not None
-    instance.origin = origin
+    if origin != "sdk":
+        instance.origin = origin
     socket = str(instance.socket_path)
     if failure in {"command", "start"}:
         command = ["tmux", "-S", socket, "capture-pane", "-t", "main", "-p"]
@@ -551,7 +556,7 @@ async def test_read_errors_do_not_disclose_user_shell_socket(
     result = await _invoke(
         SysTerminalReadTool(registry), {**target, "scrollback": scrollback}, ctx
     )
-    if origin == "user":
+    if origin in {"user", "sdk"}:
         assert socket not in json.dumps(result), result
     if failure.startswith("bool_"):
         assert result == {"error": "'scrollback' must be a non-negative integer"}

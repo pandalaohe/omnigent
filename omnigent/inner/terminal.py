@@ -1125,6 +1125,8 @@ class TerminalInstance:
     keep_alive_after_exit: bool = False
     running: bool = False
     origin: Literal["user", "agent", "harness"] = "harness"
+    # Host-inventory shells keep their socket private even when agent-launched.
+    host_shell: bool = False
     elevated: bool = False
     agent_access: bool = False
     last_input_at: float = field(default_factory=time.monotonic, repr=False)
