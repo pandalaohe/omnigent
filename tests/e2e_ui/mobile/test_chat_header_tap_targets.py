@@ -161,6 +161,7 @@ def test_settings_phone_hit_areas_activate_without_stealing_neighbours(
     try:
         page.set_viewport_size({"width": width, "height": height})
         page.goto(f"{live_server}/settings/shortcuts")
+        page.get_by_role("textbox", name="Search shortcuts").fill("Start a new session")
         shortcut = page.get_by_test_id("shortcut-editor-row-newSession")
         expect(shortcut).to_be_visible(timeout=30_000)
         shortcut_toggle = shortcut.get_by_role("switch")
