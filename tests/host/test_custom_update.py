@@ -1585,6 +1585,7 @@ def test_windows_process_inspection_selects_candidates_and_keeps_loaded_holder(
         row(70, 1, "worker.exe", r"C:\Other\worker.exe", created_at=7.0),
     ]
     inspected: list[int] = []
+    request_paths: list[Path] = []
 
     class Process:
         def __init__(self, pid: int) -> None:
@@ -1603,7 +1604,7 @@ def test_windows_process_inspection_selects_candidates_and_keeps_loaded_holder(
             pytest.fail("open_files is not a reliable Windows lock check")
 
     def scan(command: list[str], **kwargs: object) -> SimpleNamespace:
-        assert command == [
+        assert command[:4] == [
             r"C:\Python\python.exe",
             "-I",
             "-m",
@@ -1612,7 +1613,11 @@ def test_windows_process_inspection_selects_candidates_and_keeps_loaded_holder(
         scan_env = kwargs["env"]
         assert isinstance(scan_env, dict)
         assert scan_env["__PYVENV_LAUNCHER__"] == tool + r"\Scripts\python.exe"
-        request = json.loads(str(kwargs["input"]))
+        assert "input" not in kwargs
+        assert kwargs["stdin"] == subprocess.DEVNULL
+        request_path = Path(command[4])
+        request_paths.append(request_path)
+        request = json.loads(request_path.read_text(encoding="utf-8"))
         return SimpleNamespace(
             stdout=json.dumps(windows_process_scan.inspect_loaded_paths(request))
         )
@@ -1637,6 +1642,8 @@ def test_windows_process_inspection_selects_candidates_and_keeps_loaded_holder(
         timeout_s=1.0,
     )
     assert inspected == [20, 30, 40, 50, 60]
+    assert len(request_paths) == 1
+    assert not request_paths[0].exists()
     holders = cli_module._windows_venv_locking_processes(
         inspected_rows, tool_venv_path=tool, cli_bin_path=wrapper, excluded_pids=set()
     )
@@ -1648,12 +1655,22 @@ def test_windows_custom_update_bounds_hung_mapping_scan(
 ) -> None:
     import omnigent.cli as cli_module
 
-    processes = [cli_module._WindowsProcessInfo(20, 1, "python.exe", created_at=2.0)]
+    # Exceed the Windows stdin pipe capacity; the child never reads its input.
+    processes = [
+        cli_module._WindowsProcessInfo(pid, 1, "python.exe", created_at=2.0)
+        for pid in range(20, 4116)
+    ]
+    request_paths: list[Path] = []
     monkeypatch.setattr(cli_module, "_list_windows_processes", lambda: processes)
     monkeypatch.setattr(cli_module, "os", SimpleNamespace(name="nt", environ=os.environ))
     run = subprocess.run
 
     def hang(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert "input" not in kwargs
+        assert kwargs["stdin"] == subprocess.DEVNULL
+        request_path = Path(command[-1])
+        assert request_path.stat().st_size > 64 * 1024
+        request_paths.append(request_path)
         return run([command[0], "-c", "import time; time.sleep(60)"], **kwargs)
 
     monkeypatch.setattr(cli_module.subprocess, "run", hang)
@@ -1667,6 +1684,8 @@ def test_windows_custom_update_bounds_hung_mapping_scan(
             grace_s=0,
         )
     assert time.monotonic() - started < 1.5
+    assert len(request_paths) == 1
+    assert not request_paths[0].exists()
 
 
 def test_windows_custom_update_uses_one_deadline_for_grace_and_scans(
@@ -1800,6 +1819,10 @@ def test_windows_custom_update_allows_own_launcher_chain_only(
     if other_holder == "sibling":
         processes.append(row(888, 580, "python.exe", venv_python, "python worker.py"))
     monkeypatch.setattr(cli_module, "_list_windows_processes", lambda: processes)
+    monkeypatch.setattr(cli_module, "os", SimpleNamespace(name="nt", environ=os.environ))
+    monkeypatch.setattr(
+        cli_module, "_inspect_windows_processes", lambda rows, **_kwargs: list(rows)
+    )
 
     def check_release() -> None:
         cli_module._wait_for_windows_custom_host_venv_release(
@@ -1846,6 +1869,10 @@ def test_windows_custom_update_keeps_direct_host_parent_as_holder(
         ),
     ]
     monkeypatch.setattr(cli_module, "_list_windows_processes", lambda: processes)
+    monkeypatch.setattr(cli_module, "os", SimpleNamespace(name="nt", environ=os.environ))
+    monkeypatch.setattr(
+        cli_module, "_inspect_windows_processes", lambda rows, **_kwargs: list(rows)
+    )
 
     with pytest.raises(click.ClickException) as error:
         cli_module._wait_for_windows_custom_host_venv_release(

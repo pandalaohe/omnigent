@@ -10471,6 +10471,7 @@ def _inspect_windows_processes(
     """Inspect candidate mappings outside the CLI so native queries have a deadline."""
     if os.name != "nt":
         return list(processes)
+    started = time.monotonic()
     captured = {proc.pid: proc.created_at for proc in process_identities if proc.created_at > 0}
     candidates = [
         {"pid": proc.pid, "created_at": proc.created_at}
@@ -10505,21 +10506,30 @@ def _inspect_windows_processes(
     try:
         if timeout_s <= 0:
             raise subprocess.TimeoutExpired("process mapping scan", timeout_s)
-        result = subprocess.run(
-            [
-                scan_python,
-                "-I",
-                "-m",
-                "omnigent.host.windows_process_scan",
-            ],
-            input=json.dumps(candidates),
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=timeout_s,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            env=scan_env,
-        )
+        # Windows communicate() can block writing stdin before its timed wait.
+        # A file also lets us kill a scanner stuck importing before it reads.
+        with tempfile.TemporaryDirectory(prefix="omnigent-process-scan-") as request_dir:
+            request_path = Path(request_dir) / "candidates.json"
+            request_path.write_text(json.dumps(candidates), encoding="utf-8")
+            remaining = timeout_s - (time.monotonic() - started)
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired("process mapping scan", timeout_s)
+            result = subprocess.run(
+                [
+                    scan_python,
+                    "-I",
+                    "-m",
+                    "omnigent.host.windows_process_scan",
+                    str(request_path),
+                ],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=remaining,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                env=scan_env,
+            )
         paths = json.loads(result.stdout)
         if not isinstance(paths, dict) or any(
             not isinstance(items, list) or not all(isinstance(path, str) for path in items)

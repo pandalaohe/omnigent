@@ -6,6 +6,7 @@ import contextlib
 import json
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 
 import psutil
 
@@ -26,4 +27,5 @@ def inspect_loaded_paths(identities: Sequence[dict[str, int | float]]) -> dict[s
 
 
 if __name__ == "__main__":
-    json.dump(inspect_loaded_paths(json.load(sys.stdin)), sys.stdout)
+    identities = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    json.dump(inspect_loaded_paths(identities), sys.stdout)
