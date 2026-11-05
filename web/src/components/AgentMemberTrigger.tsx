@@ -1,6 +1,7 @@
 import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 
 import { ComposerAgentIcon } from "@/components/composer/ComposerAgentIcon";
+import { AgentNameTag } from "@/components/AgentNameTag";
 import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
 import {
   HarnessPicker,
@@ -240,7 +241,18 @@ export function AgentMemberTrigger({
                   .filter((option) => "section" in option && option.section === group)
                   .map((option) => ({
                     key: option.id,
-                    label: isUndeployed(option) ? `${option.label} · not deployed` : option.label,
+                    label: (
+                      <>
+                        <AgentNameTag
+                          agentId={`harness:${option.id}`}
+                          name={option.label}
+                          harness={option.id}
+                        />
+                        {isUndeployed(option) && (
+                          <span className="ml-1 text-muted-foreground">Not installed here</span>
+                        )}
+                      </>
+                    ),
                     checked: option.id === harness,
                     onSelect: () => selectHarness(option.id),
                     testId: `agent-member-harness-${option.id}`,
@@ -252,7 +264,18 @@ export function AgentMemberTrigger({
                   header: "Harness",
                   choices: visibleHarnessOptions.map((option) => ({
                     key: option.id,
-                    label: isUndeployed(option) ? `${option.label} · not deployed` : option.label,
+                    label: (
+                      <>
+                        <AgentNameTag
+                          agentId={`harness:${option.id}`}
+                          name={option.label}
+                          harness={option.id}
+                        />
+                        {isUndeployed(option) && (
+                          <span className="ml-1 text-muted-foreground">Not installed here</span>
+                        )}
+                      </>
+                    ),
                     checked: option.id === harness,
                     onSelect: () => selectHarness(option.id),
                     testId: `agent-member-harness-${option.id}`,
@@ -270,8 +293,8 @@ export function AgentMemberTrigger({
           }}
         >
           {showUndeployed
-            ? `Hide ${hiddenUndeployedCount} not deployed`
-            : `Show ${hiddenUndeployedCount} not deployed`}
+            ? `Hide ${hiddenUndeployedCount} not installed here`
+            : `Show ${hiddenUndeployedCount} not installed here`}
         </DropdownMenuItem>
       )}
     </>

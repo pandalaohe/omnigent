@@ -33,12 +33,24 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("ArtifactSharingSettings", () => {
+  it("locks the share code and explains how to enable it when external access is off", async () => {
+    fetchMock.mockResolvedValueOnce(sharingResponse({ external: false, share_code_set: true }));
+    render(<ArtifactSharingSettings />);
+    const input = await screen.findByLabelText("Share code");
+    expect(input).toBeDisabled();
+    expect(input).toHaveAttribute("placeholder", "4 to 64 characters");
+    expect(input).toHaveAccessibleDescription("Turn on External access to change the share code.");
+    expect(screen.getByRole("button", { name: "Save code" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Clear code" })).toBeDisabled();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it("loads the current settings", async () => {
     fetchMock.mockResolvedValueOnce(sharingResponse({ external: true, share_code_set: true }));
     render(<ArtifactSharingSettings />);
 
     expect(await screen.findByRole("switch", { name: "External access" })).toBeChecked();
-    expect(screen.getByRole("button", { name: "Clear" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Clear code" })).toBeInTheDocument();
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/artifact-sharing");
   });
 
@@ -67,7 +79,7 @@ describe("ArtifactSharingSettings", () => {
 
     const input = await screen.findByLabelText("Share code");
     fireEvent.change(input, { target: { value: "  secret-code  " } });
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save code" }));
 
     await waitFor(() => expect(input).toHaveValue(""));
     expect(fetchMock).toHaveBeenLastCalledWith("/v1/artifact-sharing", {
@@ -75,7 +87,7 @@ describe("ArtifactSharingSettings", () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ share_code: "secret-code" }),
     });
-    expect(await screen.findByRole("button", { name: "Clear" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Clear code" })).toBeInTheDocument();
   });
 
   it("only enables Save for a 4–64 character code", async () => {
@@ -83,7 +95,7 @@ describe("ArtifactSharingSettings", () => {
     render(<ArtifactSharingSettings />);
 
     const input = await screen.findByLabelText("Share code");
-    const save = screen.getByRole("button", { name: "Save" });
+    const save = screen.getByRole("button", { name: "Save code" });
     expect(save).toBeDisabled();
 
     fireEvent.change(input, { target: { value: "abc" } });
@@ -101,14 +113,14 @@ describe("ArtifactSharingSettings", () => {
     render(<ArtifactSharingSettings />);
 
     await screen.findByRole("switch", { name: "External access" });
-    expect(screen.queryByRole("button", { name: "Clear" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Clear code" })).toBeNull();
 
     const input = screen.getByLabelText("Share code");
     fireEvent.change(input, { target: { value: "abcd" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
-    fireEvent.click(await screen.findByRole("button", { name: "Clear" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save code" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Clear code" }));
 
-    await waitFor(() => expect(screen.queryByRole("button", { name: "Clear" })).toBeNull());
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Clear code" })).toBeNull());
     expect(fetchMock).toHaveBeenLastCalledWith("/v1/artifact-sharing", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
@@ -164,7 +176,7 @@ describe("ArtifactSharingSettings", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Retry" }));
     expect(await screen.findByRole("switch", { name: "External access" })).toBeChecked();
-    expect(screen.getByRole("button", { name: "Clear" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Clear code" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });

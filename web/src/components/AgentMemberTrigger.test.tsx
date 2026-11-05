@@ -139,17 +139,17 @@ describe("AgentMemberTrigger", () => {
     });
     openTrigger();
     fireEvent.click(screen.getByTestId("agent-member-harness"));
-    expect(screen.getByTestId("agent-member-harness-saved-sdk")).toHaveTextContent(
-      "Saved SDK · not deployed",
-    );
+    const saved = screen.getByTestId("agent-member-harness-saved-sdk");
+    expect(within(saved).getByText("Saved SDK", { exact: true })).toBeInTheDocument();
+    expect(within(saved).getByText("Not installed here")).toBeInTheDocument();
     expect(screen.queryByTestId("agent-member-harness-other-sdk")).toBeNull();
     expect(screen.getByTestId("agent-member-show-undeployed")).toHaveTextContent(
-      "Show 1 not deployed",
+      "Show 1 not installed here",
     );
     fireEvent.click(screen.getByTestId("agent-member-show-undeployed"));
-    expect(screen.getByTestId("agent-member-harness-other-sdk")).toHaveTextContent(
-      "Other SDK · not deployed",
-    );
+    const other = screen.getByTestId("agent-member-harness-other-sdk");
+    expect(within(other).getByText("Other SDK", { exact: true })).toBeInTheDocument();
+    expect(within(other).getByText("Not installed here")).toBeInTheDocument();
     fireEvent.click(screen.getByTestId("agent-member-harness-other-sdk"));
     expect(onChange).toHaveBeenCalledWith({
       harness: "other-sdk",

@@ -22,7 +22,7 @@ function currentScope(): string {
 }
 
 function dateLabel(epoch: number | null): string {
-  return epoch === null ? "—" : new Date(epoch * 1000).toLocaleDateString();
+  return epoch === null ? "Not recorded" : new Date(epoch * 1000).toLocaleDateString();
 }
 
 function receiptMessage(receipt: OldAnnotationReceipt): { title: string; detail: string } {

@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { readSessionNavigationPreferences } from "@/lib/sessionNavigationPreferences";
 import {
   GoalMarkersSetting,
+  OpenAtLatestSetting,
   MobileSessionTitleSetting,
   SessionNavigationSettings,
 } from "./SessionNavigationSettings";
@@ -54,7 +55,7 @@ describe("SessionNavigationSettings", () => {
   });
 
   it("opens sessions at the newest content by default and lets the user disable it", async () => {
-    render(<SessionNavigationSettings />);
+    render(<OpenAtLatestSetting />);
     const toggle = screen.getByRole("switch", {
       name: "Scroll to the bottom when opening a session",
     });

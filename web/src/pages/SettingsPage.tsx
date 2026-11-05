@@ -33,7 +33,6 @@
 import { AgentBadgeDisplaySetting } from "@/components/AgentsSettings";
 import { ChatReserveWidthSetting } from "@/components/ChatReserveWidthSetting";
 import { writePanelSizePreference } from "@/lib/panelSizePreferences";
-import { HelpTip } from "@/components/HelpTip";
 import { toast } from "sonner";
 import {
   type ComponentType,
@@ -108,6 +107,7 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Switch } from "@/components/ui/switch";
+import { Segmented } from "@/components/ui/segmented";
 import {
   Select,
   SelectContent,
@@ -140,7 +140,7 @@ import { SoundAlertSettings } from "@/components/SoundAlertSettings";
 import {
   MobileSessionTitleSetting,
   GoalMarkersSetting,
-  SessionNavigationSettings,
+  OpenAtLatestSetting,
 } from "@/components/SessionNavigationSettings";
 import { useContextIndicatorMode } from "@/hooks/useContextIndicatorMode";
 import {
@@ -612,7 +612,7 @@ function ThemeSubsection({
 }) {
   return (
     <div className="flex flex-col gap-3">
-      <SettingsLabel label={title} labelId={labelId} description={helper} />
+      <SettingsLabel label={title} labelId={labelId} note={null} description={helper} />
       {children}
     </div>
   );
@@ -627,6 +627,7 @@ function ModeControl() {
     <div className="flex items-center justify-between gap-4">
       <SettingsLabel
         label="Mode"
+        note={null}
         labelId={labelId}
         description="Follow your system, or force light or dark."
         className="flex-1"
@@ -659,6 +660,7 @@ function TerminalThemeControl() {
     <div className="flex items-center justify-between gap-4">
       <SettingsLabel
         label="Terminal theme"
+        note={null}
         labelId={labelId}
         description="Use a light or dark terminal, or match the app."
         className="flex-1"
@@ -866,10 +868,10 @@ function WorkspaceTabsControl() {
 function InheritLastRightRailTabSetting() {
   const [inheritLastTab, setInheritLastTab] = useState(readInheritLastRightRailTab);
   return (
-    <div className="flex items-center gap-3 text-ui">
-      <span className="min-w-0 flex-1">
-        New sessions use the last right rail tab you explicitly selected
-      </span>
+    <SettingRow
+      label="Remember Workspace tab"
+      hint="New sessions open the last Workspace tab you selected."
+    >
       <Switch
         checked={inheritLastTab}
         aria-label="Use last explicitly selected right rail tab for new sessions"
@@ -878,7 +880,7 @@ function InheritLastRightRailTabSetting() {
           writeInheritLastRightRailTab(checked);
         }}
       />
-    </div>
+    </SettingRow>
   );
 }
 
@@ -894,6 +896,7 @@ function WidenWorkspaceForContentControl() {
     <div className="flex items-start justify-between gap-6">
       <SettingsLabel
         label="Widen Workspace for browser and files"
+        note={null}
         labelId={labelId}
         description="While Workspace shows a browser tab or an open file, it uses its own width, taken from the chat column. Drag it once to set that width; other tabs keep your usual width."
       />
@@ -985,6 +988,7 @@ function ColorThemeControl() {
             </div>
             <SettingsLabel
               label="Theme palette"
+              note={null}
               description={paletteDescription}
               descriptionClassName="truncate"
             />
@@ -1039,9 +1043,13 @@ function ColorThemeControl() {
             testId="custom-theme-tint"
             onChange={(tint) => updateCustomTheme(isDark ? { darkTint: tint } : { tint })}
           />
-          <div className="flex items-center justify-between gap-4 border-b border-border/70 py-4">
-            <SettingsLabel label="Contrast" description="Separates text, borders, and surfaces." />
-            <div className="flex w-52 items-center gap-3">
+          <div className="flex flex-wrap items-center justify-between gap-4 border-b border-border/70 py-4">
+            <SettingsLabel
+              label="Contrast"
+              note={null}
+              description="Separates text, borders, and surfaces."
+            />
+            <div className="flex w-52 max-w-full shrink-0 items-center gap-3">
               <input
                 id="custom-theme-contrast"
                 type="range"
@@ -1057,15 +1065,16 @@ function ColorThemeControl() {
               <output
                 htmlFor="custom-theme-contrast"
                 data-testid="custom-theme-contrast-value"
-                className="w-7 text-right text-sm font-medium tabular-nums"
+                className="w-12 text-right text-sm font-medium tabular-nums"
               >
-                {editableTheme.contrast}
+                {editableTheme.contrast}%
               </output>
             </div>
           </div>
           <div className="flex items-center justify-between gap-4 py-4">
             <SettingsLabel
               label="Translucent sidebars"
+              note={null}
               description="Lets the canvas show through the conversation and workspace rails."
             />
             <Switch
@@ -1121,6 +1130,7 @@ function FoldAssistantNarrationControl() {
     <div className="flex items-start justify-between gap-6">
       <SettingsLabel
         label="Show only the final answer"
+        note={null}
         labelId={labelId}
         description="Once a turn finishes, fold its progress messages into the Worked row. Codex's marked answers stay visible; for other agents, the last message does."
       />
@@ -1256,11 +1266,7 @@ function AppearanceSection() {
   };
 
   return (
-    <Section
-      title="Appearance"
-      description="Choose how Omnigent looks on this device."
-      descriptionClassName="text-sm"
-    >
+    <Section title="Appearance" description="Saved on this device." descriptionClassName="text-sm">
       <div className="flex flex-col gap-6">
         <div key={resetKey} className="flex flex-col gap-6">
           <SettingsGroup title="Theme" testId="settings-group-theme">
@@ -1268,33 +1274,15 @@ function AppearanceSection() {
               <div className="flex flex-col gap-3">
                 <SettingsLabel
                   label="Theme"
-                  tooltipDescription="Light and dark mode are configured in Databricks preferences."
-                  description={
-                    <>
-                      Light and dark mode are configured in Databricks preferences.
-                      {themeSettingsUrl ? (
-                        <>
-                          {" "}
-                          <a
-                            href={themeSettingsUrl}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="font-medium text-primary underline underline-offset-2 hover:text-primary/80"
-                          >
-                            Click to open Databricks user preferences page.
-                          </a>
-                          .
-                        </>
-                      ) : null}
-                    </>
-                  }
+                  note="Managed in Databricks preferences."
+                  description="Light and dark mode are configured in Databricks preferences."
                 />
                 {themeSettingsUrl && (
                   <a
                     href={themeSettingsUrl}
                     target="_blank"
                     rel="noreferrer"
-                    className="text-sm font-medium text-primary underline underline-offset-2 md:hidden"
+                    className="text-sm font-medium text-primary underline underline-offset-2"
                   >
                     Open Databricks preferences
                   </a>
@@ -1377,7 +1365,7 @@ function AppearanceSection() {
               onClick={exportSettings}
             >
               <DownloadIcon className="size-4" />
-              Export
+              Export settings
             </Button>
             <Button
               variant="outline"
@@ -1389,7 +1377,7 @@ function AppearanceSection() {
               }}
             >
               <UploadIcon className="size-4" />
-              Import
+              Import settings
             </Button>
             <Dialog open={isResetDialogOpen} onOpenChange={setIsResetDialogOpen}>
               <DialogTrigger asChild>
@@ -1419,7 +1407,7 @@ function AppearanceSection() {
                     data-testid="reset-appearance-confirm"
                     componentId="settings.appearance.reset"
                   >
-                    Reset
+                    Reset settings
                   </Button>
                 </DialogFooter>
               </DialogContent>
@@ -1480,7 +1468,7 @@ function GitSection() {
   const info = useServerInfo();
   const archiveWorktreeCleanup = info !== "loading" && info.worktree_status === true;
   return (
-    <Section title="Git" description="Configure how Omnigent works with Git.">
+    <Section title="Git">
       <SettingsGroup title="Worktrees" testId="settings-group-worktrees">
         <AlwaysUseWorktreeControl />
         <div className="mt-4 border-t border-border pt-4">
@@ -1620,7 +1608,7 @@ function GithubIntegrationControl() {
       <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
         <SettingsLabel
           label="GitHub"
-          labelClassName="text-sm"
+          note={status.connected && status.login ? `Connected as ${status.login}.` : null}
           className="flex-1"
           description={
             status.connected && status.login
@@ -1638,7 +1626,7 @@ function GithubIntegrationControl() {
               data-testid="github-disconnect"
               onClick={() => void onDisconnect()}
             >
-              Disconnect
+              Disconnect GitHub
             </Button>
           ) : (
             <Button
@@ -1681,32 +1669,30 @@ function GithubIntegrationControl() {
  */
 function AlwaysUseWorktreeControl() {
   const value = useAlwaysUseWorktree();
-  const labelId = useId();
   const toggle = useCallback((next: boolean) => {
     writeAlwaysUseWorktree(next);
   }, []);
   return (
-    <div className="flex items-start justify-between gap-6">
-      <div className="flex flex-1 items-center gap-2">
-        <span id={labelId} className="text-ui font-medium">
-          Always use a random worktree
-        </span>
-        <HelpTip label="About the default random worktree">
+    <SettingRow
+      label="Always use a random worktree"
+      hint={
+        <>
           Sessions opened from New Chat start in a separate Git checkout with a random branch name.
           A project can override this default. Sessions opened by agents or tools keep following
           their parent&apos;s folder unless a folder or worktree is specified. This preference is
           saved for your account across devices.
-        </HelpTip>
-      </div>
+        </>
+      }
+    >
       <Switch
-        aria-labelledby={labelId}
+        aria-label="Always use a random worktree"
         checked={value}
         onCheckedChange={toggle}
         data-testid="settings-always-use-worktree-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.git.always_use_worktree"
       />
-    </div>
+    </SettingRow>
   );
 }
 
@@ -1735,10 +1721,9 @@ function DeleteWorktreesOnArchiveControl() {
       aria-describedby={`${labelId}-help`}
       className="min-w-0 space-y-4"
     >
-      <legend className="text-ui font-medium">Worktrees on archive</legend>
-      <p id={`${labelId}-help`} className="text-ui text-muted-foreground">
-        Choose which worktrees Omnigent may remove when their sessions are archived. Source changes
-        are always kept, and Git branches are never deleted.
+      <legend className="text-ui font-normal md:font-medium">Worktrees on archive</legend>
+      <p id={`${labelId}-help`} className="text-sm text-muted-foreground">
+        Source changes and Git branches are kept.
       </p>
       <ArchiveWorktreeTierChoices
         name={labelId}
@@ -1754,7 +1739,7 @@ function DeleteWorktreesOnArchiveControl() {
         </p>
       )}
       <div className="flex items-start justify-between gap-4">
-        <label htmlFor={`${labelId}-ask`} className="text-ui font-medium">
+        <label htmlFor={`${labelId}-ask`} className="text-ui font-normal md:font-medium">
           Ask before archiving
         </label>
         <Switch
@@ -1768,48 +1753,53 @@ function DeleteWorktreesOnArchiveControl() {
           componentId="settings.git.archive_worktree_ask"
         />
       </div>
-      <div className="space-y-2">
-        <label htmlFor={`${labelId}-paths`} className="text-ui font-medium">
-          Rebuildable ignored directories
-        </label>
-        <p className="text-sm text-muted-foreground">
-          One entry per line. Plain names match ignored directories at any depth; paths with slashes
-          are relative to the worktree root. Untracked source files never qualify.
-        </p>
-        <Textarea
-          id={`${labelId}-paths`}
-          className="min-h-32 w-full min-w-0 font-mono text-sm"
-          value={pathsDraft}
-          onChange={(event) => setPathsDraft(event.target.value)}
-          disabled={disabled}
-          spellCheck={false}
-          data-testid="settings-archive-worktree-paths"
-        />
-        <div className="flex flex-wrap gap-2">
-          <Button
-            type="button"
-            size="sm"
-            disabled={disabled || !pathsChanged}
-            onClick={() => {
-              if (current) save.mutate({ ...current, rebuildable_paths: parsedPaths });
-            }}
-            data-testid="settings-archive-worktree-paths-save"
-          >
-            Save list
-          </Button>
-          <Button
-            type="button"
-            size="sm"
-            variant="outline"
+      {current?.mode !== "never" && (
+        <details className="space-y-2">
+          <summary className="cursor-pointer text-ui font-normal md:font-medium">
+            Rebuildable ignored directories
+          </summary>
+          <label htmlFor={`${labelId}-paths`} className="sr-only">
+            Rebuildable ignored directories
+          </label>
+          <p className="text-sm text-muted-foreground">
+            One entry per line. Plain names match ignored directories at any depth; paths with
+            slashes are relative to the worktree root. Untracked source files never qualify.
+          </p>
+          <Textarea
+            id={`${labelId}-paths`}
+            className="min-h-32 w-full min-w-0 font-mono text-sm"
+            value={pathsDraft}
+            onChange={(event) => setPathsDraft(event.target.value)}
             disabled={disabled}
-            onClick={() => {
-              setPathsDraft(DEFAULT_REBUILDABLE_PATHS.join("\n"));
-            }}
-          >
-            Restore defaults
-          </Button>
-        </div>
-      </div>
+            spellCheck={false}
+            data-testid="settings-archive-worktree-paths"
+          />
+          <div className="flex flex-wrap gap-2">
+            <Button
+              type="button"
+              size="sm"
+              disabled={disabled || !pathsChanged}
+              onClick={() => {
+                if (current) save.mutate({ ...current, rebuildable_paths: parsedPaths });
+              }}
+              data-testid="settings-archive-worktree-paths-save"
+            >
+              Save directories
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={disabled}
+              onClick={() => {
+                setPathsDraft(DEFAULT_REBUILDABLE_PATHS.join("\n"));
+              }}
+            >
+              Restore defaults
+            </Button>
+          </div>
+        </details>
+      )}
       {(preference.error || save.error) && (
         <p role="alert" className="text-sm text-destructive">
           {(preference.error || save.error)?.message}
@@ -1898,12 +1888,16 @@ function DatabricksIntegrationControl() {
       <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
         <SettingsLabel
           label="Databricks"
-          labelClassName="text-sm"
+          note={
+            status.connected && status.workspace_host
+              ? `Connected to ${status.workspace_host}.`
+              : null
+          }
           className="flex-1"
           description={
             status.connected && status.workspace_host
-              ? `Connected to ${status.workspace_host}${status.databricks_user ? ` as ${status.databricks_user}` : ""}. New sandboxes reach the Databricks Unity Gateway (MCP + model serving) as you.`
-              : "Connect your Databricks workspace so new sandboxes reach its Unity Gateway (MCP + model serving) as you."
+              ? `Connected to ${status.workspace_host}${status.databricks_user ? ` as ${status.databricks_user}` : ""}. New sandboxes use your Databricks tools and models.`
+              : "Connect your Databricks workspace to use its tools and models in new sandboxes."
           }
         />
         <div className="flex shrink-0 items-center gap-2">
@@ -1916,7 +1910,7 @@ function DatabricksIntegrationControl() {
               data-testid="databricks-disconnect"
               onClick={() => void onDisconnect()}
             >
-              Disconnect
+              Disconnect Databricks
             </Button>
           ) : (
             <>
@@ -1960,10 +1954,10 @@ function AlwaysSteerControl() {
     <div className="flex items-start justify-between gap-6">
       <SettingsLabel
         label="Always steer"
+        note={null}
         labelId={labelId}
         className="flex-1"
         description="Send follow-ups straight into the running turn instead of queuing them. The agent folds each one into its current work where the harness supports it, otherwise at the next turn."
-        descriptionClassName="text-ui"
       />
       <Switch
         aria-labelledby={labelId}
@@ -1990,6 +1984,11 @@ function ComposerSendShortcutControl() {
     <div className="flex items-start justify-between gap-6">
       <SettingsLabel
         label={`Submit with ${MOD_KEY} + Enter on desktop`}
+        note={
+          enabled
+            ? `${MOD_KEY}+Enter sends; Enter adds a line.`
+            : "Enter sends; Shift+Enter adds a line."
+        }
         labelId={labelId}
         descriptionId={descriptionId}
         className="flex-1"
@@ -1999,7 +1998,6 @@ function ComposerSendShortcutControl() {
             <p>On: Enter inserts a newline and {MOD_KEY}+Enter submits.</p>
           </>
         }
-        descriptionClassName="text-ui"
       />
       <Switch
         aria-labelledby={labelId}
@@ -2033,11 +2031,11 @@ function OpenLinksInAppControl() {
     <div className="flex items-start justify-between gap-6">
       <SettingsLabel
         label="Open links in the in-app browser"
+        note="Keep web links beside the chat."
         labelId={labelId}
         descriptionId={descriptionId}
         className="flex-1"
         description={`Open web links from chat in in-app browser tabs, reusing a tab already showing the same URL. ${MOD_KEY}+click also opens in-app; Shift+click opens your default browser.`}
-        descriptionClassName="text-ui"
       />
       <Switch
         aria-labelledby={labelId}
@@ -2116,6 +2114,7 @@ function BrowserLoginControl() {
       <div className="flex items-start justify-between gap-6">
         <SettingsLabel
           label="Keep in-app browser login"
+          note="Reuse this server's saved browser login."
           labelId={labelId}
           descriptionId={descriptionId}
           className="flex-1"
@@ -2169,11 +2168,11 @@ function BackgroundSessionTitlesControl() {
     <div className="flex items-start justify-between gap-6">
       <SettingsLabel
         label="Automatically name new sessions"
+        note="Name sessions after the first message."
         labelId={labelId}
         descriptionId={descriptionId}
         className="flex-1"
         description="Generate a concise title in the background after the first message. Turn this off to keep the default session name."
-        descriptionClassName="text-ui"
       />
       <Switch
         aria-labelledby={labelId}
@@ -2245,6 +2244,11 @@ function TerminalClipboardControl() {
       <div className="min-w-0 flex-1">
         <SettingsLabel
           label="Copying from terminals"
+          note={
+            canRemember
+              ? "Choose when terminals can copy to your clipboard."
+              : "This connection asks separately for each terminal."
+          }
           labelId={labelId}
           descriptionId={descriptionId}
           description={
@@ -2290,7 +2294,7 @@ function GeneralSection() {
   const info = useServerInfo();
   const sessionCollabEnabled = isFeatureEnabled(info, "session_peer_messaging");
   return (
-    <Section title="General" description="Configure general Omnigent behavior.">
+    <Section title="General">
       <div className="flex flex-col gap-6">
         <nav
           aria-label="General settings sections"
@@ -2344,6 +2348,9 @@ function GeneralSection() {
         )}
         <SettingsGroup title="Sessions" testId="settings-group-sessions" className="max-w-none">
           <BackgroundSessionTitlesControl />
+          <div className="mt-4 border-t border-border pt-4">
+            <OpenAtLatestSetting />
+          </div>
           <ExpandableSettings
             id="session-choice"
             title="Session choice"
@@ -2423,9 +2430,9 @@ function DefaultBaseBranchControl() {
     <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
       <SettingsLabel
         label="Default base branch"
+        note={null}
         className="min-w-min flex-1"
-        description="Auto-filled as the base when you name a new worktree branch. Leave blank to not auto-fill."
-        descriptionClassName="text-ui"
+        description="Starting branch for a new worktree. Leave blank to choose when creating one."
       />
       <Input
         type="text"
@@ -2444,9 +2451,14 @@ function DefaultBaseBranchControl() {
   );
 }
 
-const WORKTREE_LOCATION_TOKEN_HELP =
-  "Tokens: {entry} (project folder on the host, else the repository), {repo_parent}, " +
-  "{repo}, {branch}; start with {entry}, {repo_parent}, ~ or an absolute path.";
+const PROJECT_WORKTREE_TEMPLATE = "{entry}/.worktrees/{repo}/{branch}";
+type WorktreeLocationPreset = "sibling" | "project" | "custom";
+const WORKTREE_EXAMPLE_VALUES: Record<string, string> = {
+  entry: "/opt/work/project",
+  repo_parent: "/opt/work",
+  repo: "repo",
+  branch: "feature-login",
+};
 
 /**
  * Worktree location template for new sessions on every host. Kept on the
@@ -2460,6 +2472,8 @@ function WorktreeLocationControl() {
   const [loadFailed, setLoadFailed] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [preset, setPreset] = useState<WorktreeLocationPreset>("sibling");
+  const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     let alive = true;
@@ -2468,6 +2482,13 @@ function WorktreeLocationControl() {
         if (!alive) return;
         setStored(template);
         setDraft(template ?? "");
+        setPreset(
+          template === null
+            ? "sibling"
+            : template === PROJECT_WORKTREE_TEMPLATE
+              ? "project"
+              : "custom",
+        );
       })
       .catch(() => {
         if (alive) setLoadFailed(true);
@@ -2496,23 +2517,43 @@ function WorktreeLocationControl() {
   }, []);
 
   const trimmed = draft.trim();
+  const nextTemplate =
+    preset === "sibling" ? null : preset === "project" ? PROJECT_WORKTREE_TEMPLATE : trimmed;
+  const example =
+    nextTemplate === null
+      ? "/opt/work/repo-worktrees/feature-login"
+      : nextTemplate.replace(
+          /\{(entry|repo_parent|repo|branch)\}/g,
+          (_, name: string) => WORKTREE_EXAMPLE_VALUES[name],
+        );
   const controlsDisabled = loading || loadFailed || saving;
-  const canSave = !controlsDisabled && trimmed !== "" && trimmed !== (stored ?? "");
+  const canSave = !controlsDisabled && nextTemplate !== "" && nextTemplate !== stored;
   const error = loadFailed ? "Could not load the worktree location." : saveError;
 
   return (
-    <div className="flex flex-col gap-2">
-      <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
-        <div className="flex min-w-0 flex-1 flex-col">
-          <span className="text-ui font-medium">Worktree location</span>
-          <span className="text-ui text-muted-foreground">
-            Where Omnigent creates new worktrees, on every host. Leave unset for the default next to
-            the repository.
-          </span>
-          <span className="text-ui text-muted-foreground">{WORKTREE_LOCATION_TOKEN_HELP}</span>
-        </div>
-        <div className="flex shrink-0 items-center gap-2">
+    <fieldset disabled={controlsDisabled} className="min-w-0 space-y-3">
+      <SettingsLabel
+        label="Worktree location"
+        note={null}
+        description="Where new worktrees are created on every host. Custom paths must include the repository and branch variables and start with {entry}, {repo_parent}, ~ or an absolute path. The server checks the path before saving."
+      />
+      <Segmented<WorktreeLocationPreset>
+        label="Worktree location"
+        value={preset}
+        onChange={(value) => {
+          setPreset(value);
+          setSaveError(null);
+        }}
+        options={[
+          { value: "sibling", label: "Next to repository" },
+          { value: "project", label: "Inside project" },
+          { value: "custom", label: "Custom" },
+        ]}
+      />
+      {preset === "custom" && (
+        <div className="space-y-2">
           <Input
+            ref={inputRef}
             type="text"
             aria-label="Worktree location template"
             data-testid="settings-worktree-location-input"
@@ -2520,35 +2561,84 @@ function WorktreeLocationControl() {
             spellCheck={false}
             autoCapitalize="off"
             autoCorrect="off"
-            className="h-9 w-80 shrink-0"
+            className="h-9 w-full min-w-0"
             value={draft}
-            onChange={(e) => setDraft(e.target.value)}
+            onChange={(e) => {
+              setDraft(e.target.value);
+              setSaveError(null);
+            }}
             disabled={controlsDisabled}
             componentId="settings.git.worktree_location"
           />
-          <Button
-            size="sm"
-            className="h-9"
-            disabled={!canSave}
-            loading={saving}
-            data-testid="settings-worktree-location-save"
-            onClick={() => void save(trimmed)}
-            componentId="settings.git.worktree_location_save"
-          >
-            Save
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            className="h-9"
-            disabled={controlsDisabled || stored === null}
-            data-testid="settings-worktree-location-reset"
-            onClick={() => void save(null)}
-            componentId="settings.git.worktree_location_reset"
-          >
-            Use default
-          </Button>
+          <div className="flex flex-wrap gap-2" aria-label="Path variables">
+            {[
+              ["entry", "Project folder"],
+              ["repo_parent", "Repository parent"],
+              ["repo", "Repository name"],
+              ["branch", "Branch name"],
+            ].map(([variable, label]) => (
+              <Button
+                key={variable}
+                type="button"
+                variant="outline"
+                size="sm"
+                aria-label={`Insert ${label.toLowerCase()}`}
+                onClick={() => {
+                  const input = inputRef.current;
+                  const start = input?.selectionStart ?? draft.length;
+                  const end = input?.selectionEnd ?? start;
+                  const token = `{${variable}}`;
+                  setDraft(draft.slice(0, start) + token + draft.slice(end));
+                  setSaveError(null);
+                  requestAnimationFrame(() => {
+                    input?.focus();
+                    input?.setSelectionRange(start + token.length, start + token.length);
+                  });
+                }}
+              >
+                {label}
+              </Button>
+            ))}
+          </div>
         </div>
+      )}
+      {error === null && (
+        <p className="text-sm text-muted-foreground">
+          Template with sample values (not validated):{" "}
+          <span
+            data-testid="settings-worktree-location-example"
+            className="font-mono wrap-anywhere"
+          >
+            {example || "Enter a custom path."}
+          </span>
+        </p>
+      )}
+      <div className="flex flex-wrap gap-2">
+        <Button
+          size="sm"
+          className="h-9"
+          disabled={!canSave}
+          loading={saving}
+          data-testid="settings-worktree-location-save"
+          onClick={() => void save(nextTemplate)}
+          componentId="settings.git.worktree_location_save"
+        >
+          Save location
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-9"
+          disabled={controlsDisabled || stored === null}
+          data-testid="settings-worktree-location-reset"
+          onClick={() => {
+            setPreset("sibling");
+            void save(null);
+          }}
+          componentId="settings.git.worktree_location_reset"
+        >
+          Use default location
+        </Button>
       </div>
       {error !== null && (
         <p
@@ -2559,7 +2649,7 @@ function WorktreeLocationControl() {
           {error}
         </p>
       )}
-    </div>
+    </fieldset>
   );
 }
 
@@ -2627,6 +2717,7 @@ function UiFontSizeControl() {
     <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
       <SettingsLabel
         label="Interface font size"
+        note={null}
         description="Set text across the interface. Icons and spacing stay fixed."
       />
       {/* One cohesive pill: [ −  | value px |  + ]. Segments share the pill
@@ -2665,6 +2756,7 @@ function UiFontSizeControl() {
               if (e.key === "Enter") e.currentTarget.blur();
             }}
           />
+          <span className="ml-1 text-sm text-muted-foreground">px</span>
         </div>
         <StepperButton
           label="Increase interface font size"
@@ -2706,6 +2798,7 @@ function UiFontFamilyControl() {
           row — matches the font-size row's alignment. */}
       <SettingsLabel
         label="Font family"
+        note={null}
         className="flex-1"
         description="Use any font installed on this device. Leave blank for the system default."
       />
@@ -2723,7 +2816,7 @@ function UiFontFamilyControl() {
           onClick={() => update(UI_FONT_FAMILY_DEFAULT)}
           componentId="settings.appearance.ui_font_family_reset"
         >
-          Reset
+          Reset font
         </Button>
         <Input
           type="text"
@@ -2791,6 +2884,7 @@ function UiCodeFontSizeControl() {
     <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
       <SettingsLabel
         label="Code font size"
+        note={null}
         description="Size of code in the editor and terminal."
       />
       {/* One cohesive pill: [ −  | value px |  + ] — same shell as the UI
@@ -2829,6 +2923,7 @@ function UiCodeFontSizeControl() {
               if (e.key === "Enter") e.currentTarget.blur();
             }}
           />
+          <span className="ml-1 text-sm text-muted-foreground">px</span>
         </div>
         <StepperButton
           label="Increase code font size"
@@ -2864,6 +2959,7 @@ function UiCodeFontFamilyControl() {
     <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
       <SettingsLabel
         label="Code font family"
+        note={null}
         className="flex-1"
         description="Font for the code editor and terminal. Leave blank for the default."
       />
@@ -2881,7 +2977,7 @@ function UiCodeFontFamilyControl() {
           onClick={() => update(CODE_FONT_FAMILY_DEFAULT)}
           componentId="settings.appearance.code_font_family_reset"
         >
-          Reset
+          Reset font
         </Button>
         <Input
           type="text"
@@ -2913,6 +3009,7 @@ function UiCodeFontWeightControl() {
     <div className="flex items-center justify-between gap-6" data-testid="code-font-weight-control">
       <SettingsLabel
         label="Heavier code font"
+        note={null}
         className="flex-1"
         description="Use a slightly heavier font weight in the code editor and terminal."
       />
@@ -2968,12 +3065,9 @@ function StepperButton({
 
 function ShortcutsSection() {
   return (
-    <Section title="Keyboard shortcuts" description="Record and override shortcuts.">
+    <Section title="Keyboard shortcuts">
       <div className="flex flex-col gap-8">
         <KeyboardShortcutEditor />
-        <div className="[&>section]:mt-0">
-          <SessionNavigationSettings />
-        </div>
         <div className="border-t border-border pt-6">
           <h2 className="text-ui font-medium">Mobile controls</h2>
           <p className="mt-1 text-sm text-muted-foreground">Customize the mobile assistant.</p>
@@ -3019,10 +3113,7 @@ function LocalCliSection() {
   }
 
   return (
-    <Section
-      title="Local CLI"
-      description="The Omnigent command-line tool this app uses to run a local server and connect this machine as a runner."
-    >
+    <Section title="Local CLI" description="Runs a local server and connects this machine.">
       <SettingsGroup title="CLI status">
         {status === null ? (
           <p className="text-ui text-muted-foreground">CLI status is unavailable.</p>
@@ -3185,10 +3276,7 @@ function UpdatesSection() {
   }
 
   return (
-    <Section
-      title="Updates"
-      description="Desktop app update preferences for this installed Omnigent shell."
-    >
+    <Section title="Updates">
       {config === null ? (
         <SettingsGroup title="Preferences">
           <p className="text-ui text-muted-foreground">Update settings are unavailable.</p>
@@ -3234,6 +3322,7 @@ function UpdatesSection() {
             <div className="mt-4 flex items-center justify-between gap-4 border-t border-border pt-4">
               <SettingsLabel
                 label="Install downloaded updates on next quit"
+                note={null}
                 description="Applies only after you choose to download an update."
               />
               <Switch
@@ -3575,7 +3664,7 @@ function ImportSection() {
   return (
     <Section
       title="Import sessions"
-      description="Pull local chats from a machine you're running into Omnigent. Sessions already imported are skipped."
+      description="Import local chats; previously imported sessions are skipped."
     >
       <div className="flex flex-col gap-3">
         <h2 className="text-ui font-medium">Import from a machine</h2>
@@ -4038,7 +4127,7 @@ function ArchivedListPane({
                 data-testid="archived-exit-selection"
                 onClick={exitSelectionMode}
               >
-                Done
+                Exit selection
               </Button>
             </>
           ) : (

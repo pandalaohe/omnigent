@@ -9,6 +9,7 @@ import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { showToast } from "@/components/ui/toast";
 import { authenticatedFetch } from "@/lib/identity";
+import { SettingRow } from "@/components/SettingsFields";
 
 /** Response shape of `GET`/`PUT /v1/artifact-sharing`. */
 interface SharingState {
@@ -97,8 +98,10 @@ export function ArtifactSharingSettings() {
 
   return (
     <div className="flex flex-col">
-      <div className="flex items-start justify-between gap-6">
-        <span className="text-sm font-medium text-foreground">External access</span>
+      <SettingRow
+        label="External access"
+        hint="Let visitors open shared file links outside the app."
+      >
         <Switch
           aria-label="External access"
           checked={state.external}
@@ -106,55 +109,66 @@ export function ArtifactSharingSettings() {
           onCheckedChange={(external) => void save({ external })}
           className="shrink-0"
         />
-      </div>
+      </SettingRow>
       <div className="mt-5 flex flex-wrap items-center justify-between gap-x-6 gap-y-3 border-t border-border pt-5">
-        <label htmlFor="artifact-share-code" className="text-sm font-medium text-foreground">
+        <label
+          htmlFor="artifact-share-code"
+          className="text-ui font-normal text-foreground md:font-medium"
+        >
           Share code
         </label>
-        <div className="flex shrink-0 items-center gap-2">
+        <div className="flex max-w-full flex-wrap items-center gap-2">
           <Input
             id="artifact-share-code"
             type="password"
             autoComplete="off"
             value={codeDraft}
-            disabled={saving}
+            disabled={saving || !state.external}
+            placeholder="4 to 64 characters"
+            aria-describedby={!state.external ? "artifact-share-code-disabled" : undefined}
             onChange={(event) => setCodeDraft(event.target.value)}
-            className="h-8 w-56 font-mono text-sm"
+            className="h-9 w-48 max-w-full font-mono text-sm"
           />
           <Button
             type="button"
             size="sm"
-            disabled={!canSaveCode || saving}
+            disabled={!canSaveCode || saving || !state.external}
             onClick={() => {
               void save({ share_code: trimmedCode }).then((saved) => {
                 if (saved) setCodeDraft("");
               });
             }}
           >
-            Save
+            Save code
           </Button>
           {state.share_code_set && (
             <Button
               type="button"
               size="sm"
               variant="outline"
-              disabled={saving}
+              disabled={saving || !state.external}
               onClick={() => void save({ share_code: null })}
             >
-              Clear
+              Clear code
             </Button>
           )}
         </div>
       </div>
-      <div className="mt-5 flex items-start justify-between gap-6 border-t border-border pt-5">
-        <span className="text-sm font-medium text-foreground">Visitor comments</span>
-        <Switch
-          aria-label="Visitor comments"
-          checked={state.allow_comments ?? true}
-          disabled={saving}
-          onCheckedChange={(allow_comments) => void save({ allow_comments })}
-          className="shrink-0"
-        />
+      {!state.external && (
+        <p id="artifact-share-code-disabled" className="mt-2 text-sm text-muted-foreground">
+          Turn on External access to change the share code.
+        </p>
+      )}
+      <div className="mt-5 border-t border-border pt-5">
+        <SettingRow label="Visitor comments" hint="Let visitors comment on shared files.">
+          <Switch
+            aria-label="Visitor comments"
+            checked={state.allow_comments ?? true}
+            disabled={saving}
+            onCheckedChange={(allow_comments) => void save({ allow_comments })}
+            className="shrink-0"
+          />
+        </SettingRow>
       </div>
     </div>
   );

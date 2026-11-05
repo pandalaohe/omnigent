@@ -60,6 +60,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { ApprovalCard, type SubmitApprovalFn } from "@/components/blocks/ApprovalCard";
+import { AgentNameTag } from "@/components/AgentNameTag";
 import { FilePathAwareMessageResponse } from "@/components/blocks/ChatMarkdown";
 import { ElicitationMessage } from "@/components/blocks/ElicitationMessage";
 import { PageScroll } from "@/components/PageScroll";
@@ -485,7 +486,18 @@ export function InboxPage() {
           expanded={expanded}
           onToggle={onToggle}
         >
-          <SessionLine title={title} detail={agentLabel !== title ? agentLabel : undefined} />
+          <SessionLine
+            title={title}
+            detail={
+              agentLabel !== title ? (
+                <AgentNameTag
+                  agentId={item.row.agent_template_id ?? item.row.agent_id ?? null}
+                  name={agentLabel}
+                  harness={item.row.harness ?? null}
+                />
+              ) : undefined
+            }
+          />
           <ApprovalCard
             triage={item.elicitation.triage}
             elicitationId={elicitationId}
@@ -1011,7 +1023,7 @@ function KindTile({ icon: Icon, tone }: { icon: LucideIcon; tone: keyof typeof T
 }
 
 /** The expanded card's "which session" line. */
-function SessionLine({ title, detail }: { title: string; detail?: string }) {
+function SessionLine({ title, detail }: { title: string; detail?: ReactNode }) {
   return (
     <p className="flex items-center gap-1.5 text-sm text-muted-foreground">
       <SquarePenIcon aria-hidden className="size-3 shrink-0" />

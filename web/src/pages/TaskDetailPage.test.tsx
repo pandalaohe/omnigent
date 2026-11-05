@@ -242,7 +242,9 @@ describe("header, prompt, configuration", () => {
     }));
     setTask(task({ agentId: "ag_1" }));
     renderPage();
-    expect(screen.getByTestId("task-detail-agent")).toHaveTextContent(/^Polly$/);
+    expect(
+      within(screen.getByTestId("task-detail-agent")).getByText("Polly", { exact: true }),
+    ).toBeInTheDocument();
   });
 
   it("names the sandbox for a task that runs in a new sandbox each time", () => {

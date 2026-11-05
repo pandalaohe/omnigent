@@ -102,14 +102,14 @@ afterEach(() => cleanup());
 describe("SoundAlertSettings", () => {
   it("defaults the background-dot switch off and saves it with the account", () => {
     const first = render(<SoundAlertSettings />);
-    const toggle = screen.getByRole("switch", { name: "Sound the dot while B shows" });
+    const toggle = screen.getByRole("switch", { name: "Done sound during background work" });
     expect(toggle).toHaveAttribute("aria-checked", "false");
     fireEvent.click(toggle);
     expect(stored()?.soundDotWhileBackground).toBe(true);
     expect(localStorage.getItem(SOUND_ALERTS_DEVICE_STORAGE_KEY)).toBeNull();
     first.unmount();
     render(<SoundAlertSettings />);
-    const saved = screen.getByRole("switch", { name: "Sound the dot while B shows" });
+    const saved = screen.getByRole("switch", { name: "Done sound during background work" });
     expect(saved).toHaveAttribute("aria-checked", "true");
     fireEvent.click(saved);
     expect(stored()?.soundDotWhileBackground ?? false).toBe(false);
@@ -138,7 +138,7 @@ describe("SoundAlertSettings", () => {
   it("resumes audio for the preview", () => {
     render(<SoundAlertSettings />);
 
-    fireEvent.click(screen.getAllByRole("button", { name: "Play" })[0]);
+    fireEvent.click(screen.getAllByRole("button", { name: "Preview sound" })[0]);
 
     expect(playLevelMock).toHaveBeenCalledWith("done", expect.anything(), expect.anything(), {
       resume: true,

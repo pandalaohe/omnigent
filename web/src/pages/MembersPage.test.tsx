@@ -99,9 +99,7 @@ describe("MembersPage gating", () => {
     vi.mocked(identity.resolveIdentity).mockResolvedValue("alice");
     vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(false);
     renderPage();
-    expect(
-      await screen.findByText("You don't have permission to manage members."),
-    ).toBeInTheDocument();
+    expect(await screen.findByText("An administrator can manage members.")).toBeInTheDocument();
     expect(accountsApi.listUsers).not.toHaveBeenCalled();
   });
 
@@ -176,7 +174,7 @@ describe("MembersPage actions", () => {
 
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getByText("Remove bob?")).toBeInTheDocument();
-    fireEvent.click(within(dialog).getByRole("button", { name: /^Remove$/ }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Remove member" }));
 
     await waitFor(() => expect(accountsApi.deleteUser).toHaveBeenCalledWith("bob"));
     expect(await screen.findByText("No members yet.")).toBeInTheDocument();
@@ -209,9 +207,7 @@ describe("MembersPage in plain header/single-user mode", () => {
 
   it("shows a not-available message and never calls listUsers", async () => {
     renderPage();
-    expect(
-      await screen.findByText("Member management is not available in single-user mode."),
-    ).toBeInTheDocument();
+    expect(await screen.findByText("Members are managed in multi-user mode.")).toBeInTheDocument();
     expect(accountsApi.listUsers).not.toHaveBeenCalled();
   });
 });

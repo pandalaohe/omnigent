@@ -22,6 +22,7 @@ import {
   type HarnessCapabilityMap,
 } from "@/lib/sessionDefaultModes";
 import { useHarnessCapabilities } from "@/lib/agentLabels";
+import { AgentNameTag } from "@/components/AgentNameTag";
 import { normalizeAgyPermissionTier } from "@/lib/nativeHarnessModes";
 import { reconcileSpeed } from "@/lib/speedTiers";
 import { Button } from "@/components/ui/button";
@@ -1714,7 +1715,7 @@ export function ProjectSettingsDialog({
     const renderItem = (agent: AvailableAgent) => (
       <SelectItem key={agent.id} value={agent.id}>
         <span className="block min-w-0 truncate" title={agent.display_name}>
-          {agent.display_name}
+          <AgentNameTag agentId={agent.id} name={agent.display_name} harness={agent.harness} />
         </span>
       </SelectItem>
     );
@@ -1775,7 +1776,7 @@ export function ProjectSettingsDialog({
         data-testid={`project-settings-host-reset-${field}-${row.hostId}`}
         aria-label={`Reset ${field} to defaults`}
       >
-        Reset
+        Reset {field}
       </Button>
     );
     return (
@@ -1919,15 +1920,15 @@ export function ProjectSettingsDialog({
           <div className="flex flex-wrap gap-3">
             {CALLING_FIELDS.map((field) => (
               <label key={field} className="flex items-center gap-1 text-ui">
-                <input
-                  type="checkbox"
+                <Switch
+                  aria-label={`Copy ${field}`}
                   checked={copySelection.fields[field]}
-                  onChange={(event) =>
+                  onCheckedChange={(checked) =>
                     setCopySelection((current) =>
                       current
                         ? {
                             ...current,
-                            fields: { ...current.fields, [field]: event.target.checked },
+                            fields: { ...current.fields, [field]: checked },
                           }
                         : null,
                     )
@@ -1938,13 +1939,11 @@ export function ProjectSettingsDialog({
               </label>
             ))}
             <label className="flex items-center gap-1 text-ui">
-              <input
-                type="checkbox"
+              <Switch
+                aria-label="Copy project default agent"
                 checked={copySelection.agent}
-                onChange={(event) =>
-                  setCopySelection((current) =>
-                    current ? { ...current, agent: event.target.checked } : null,
-                  )
+                onCheckedChange={(checked) =>
+                  setCopySelection((current) => (current ? { ...current, agent: checked } : null))
                 }
                 data-testid="project-settings-copy-field-agent"
               />
@@ -2007,7 +2006,7 @@ export function ProjectSettingsDialog({
                       setCopyPickerOpen(false);
                     }}
                   >
-                    Done
+                    Use selected projects
                   </Button>
                 </>
               }
@@ -2467,7 +2466,7 @@ export function ProjectSettingsDialog({
                 setModel(NONE);
               }}
             >
-              Clear
+              Clear agent and model
             </Button>
           )}
         </div>
@@ -2806,7 +2805,7 @@ export function ProjectSettingsDialog({
               loading={updateConfig.isPending || saving}
               disabled={isLoading || entriesLoading || loadFailed || entriesLoadFailed}
             >
-              Save
+              Save project
             </Button>
           </>
         </DialogFooter>

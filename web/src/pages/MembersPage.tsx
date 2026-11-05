@@ -26,6 +26,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { CopyIcon, KeyRoundIcon, RefreshCwIcon, Trash2Icon, UserPlusIcon } from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
+import { Switch } from "@/components/ui/switch";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -116,9 +117,7 @@ export function MembersPage() {
         extraBottom="2.5rem"
       >
         <h1 className="settings-page-title mb-2 text-2xl font-medium">Members</h1>
-        <p className="text-ui text-muted-foreground">
-          Member management is not available in single-user mode.
-        </p>
+        <p className="text-ui text-muted-foreground">Members are managed in multi-user mode.</p>
       </PageScroll>
     );
   }
@@ -145,9 +144,7 @@ export function MembersPage() {
         extraBottom="2.5rem"
       >
         <h1 className="settings-page-title mb-2 text-2xl font-medium">Members</h1>
-        <p className="text-ui text-muted-foreground">
-          You don't have permission to manage members.
-        </p>
+        <p className="text-ui text-muted-foreground">An administrator can manage members.</p>
       </PageScroll>
     );
   }
@@ -314,10 +311,10 @@ export function MembersPage() {
             </DialogDescription>
           </DialogHeader>
           <label className="flex items-center gap-2 text-ui">
-            <input
-              type="checkbox"
+            <Switch
+              aria-label="Grant admin privileges"
               checked={inviteAsAdmin}
-              onChange={(e) => setInviteAsAdmin(e.target.checked)}
+              onCheckedChange={setInviteAsAdmin}
               disabled={pendingAction}
             />
             Grant admin privileges
@@ -430,7 +427,7 @@ export function MembersPage() {
               onClick={() => void onConfirmDelete()}
               loading={pendingAction}
             >
-              Remove
+              Remove member
             </Button>
           </DialogFooter>
         </DialogContent>

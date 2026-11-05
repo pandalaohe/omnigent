@@ -10,6 +10,9 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Switch } from "@/components/ui/switch";
+import { Input } from "@/components/ui/input";
+import { SettingRow } from "@/components/SettingsFields";
+import { SessionNavigationSettings } from "@/components/SessionNavigationSettings";
 import {
   DEFAULT_SHORTCUT_DEFINITIONS,
   SHORTCUT_ACTION_IDS,
@@ -21,6 +24,9 @@ import {
   macWindowsKeyPositionNotes,
   readKeyboardShortcutPreferences,
   readMacWindowsKeyPositions,
+  resolveShortcutBindings,
+  resetShortcutPreference,
+  shortcutAriaKeys,
   shortcutBindingLabels,
   shortcutChordFromEvent,
   setShortcutRecordingActive,
@@ -115,6 +121,8 @@ export function KeyboardShortcutEditor() {
   useKeyboardShortcutsVersion();
   const [recording, setRecording] = useState<RecordingTarget | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [search, setSearch] = useState("");
+  const [changedOnly, setChangedOnly] = useState(false);
   const preferences = readKeyboardShortcutPreferences();
   const defaultContext = useMemo(
     () => ({
@@ -127,6 +135,45 @@ export function KeyboardShortcutEditor() {
     actionId: ShortcutActionId,
     platform: ShortcutPlatform = currentShortcutPlatform(),
   ) => defaultShortcutBindings(actionId, defaultContext, platform);
+
+  const stopRecording = () => {
+    setShortcutRecordingActive(false);
+    setRecording(null);
+  };
+  const normalizeSearch = (value: string) =>
+    value
+      .toLowerCase()
+      .replace(/⌘|command|meta/g, "cmd")
+      .replace(/⌃|control/g, "ctrl")
+      .replace(/⇧/g, "shift")
+      .replace(/⌥|option/g, "alt")
+      .replace(/[\s+]+/g, "");
+  const query = normalizeSearch(search.trim());
+  const isChanged = (actionId: ShortcutActionId) => {
+    const preference = preferences.actions[actionId];
+    return (
+      preference?.enabled === false ||
+      preference?.common !== undefined ||
+      Object.keys(preference?.platformOverrides ?? {}).length > 0
+    );
+  };
+  const matches = (actionId: ShortcutActionId) => {
+    if (changedOnly && !isChanged(actionId)) return false;
+    const definition = DEFAULT_SHORTCUT_DEFINITIONS[actionId];
+    return (
+      !query ||
+      [
+        definition.label,
+        definition.note ?? "",
+        ...PLATFORMS.flatMap(({ id }) =>
+          resolveShortcutBindings(actionId, id, defaultContext).flatMap((binding) => [
+            shortcutBindingLabels(binding, id).join(" "),
+            shortcutAriaKeys(binding, id),
+          ]),
+        ),
+      ].some((value) => normalizeSearch(value).includes(query))
+    );
+  };
 
   const startRecording = (target: RecordingTarget) => {
     setError(null);
@@ -246,13 +293,6 @@ export function KeyboardShortcutEditor() {
     setError(null);
   };
 
-  const resetCommon = (actionId: ShortcutActionId) => {
-    const current = readKeyboardShortcutPreferences().actions[actionId] ?? {};
-    const { common: _removed, ...rest } = current;
-    writeShortcutPreference(actionId, rest);
-    setError(null);
-  };
-
   const resetPlatform = (actionId: ShortcutActionId, platform: ShortcutPlatform) => {
     const current = readKeyboardShortcutPreferences().actions[actionId] ?? {};
     writeShortcutPreference(actionId, {
@@ -273,6 +313,31 @@ export function KeyboardShortcutEditor() {
 
   return (
     <div>
+      <div className="mb-3 flex flex-wrap items-center gap-3">
+        <Input
+          aria-label="Search shortcuts"
+          onFocus={stopRecording}
+          placeholder="Search actions or keys"
+          value={search}
+          className="h-9 min-w-0 flex-1"
+          onChange={(event) => {
+            stopRecording();
+            setSearch(event.target.value);
+          }}
+        />
+        <label className="flex items-center gap-2 text-ui">
+          <Switch
+            aria-label="Changed only"
+            checked={changedOnly}
+            onCheckedChange={(value) => {
+              stopRecording();
+              setChangedOnly(value);
+            }}
+          />
+          Changed only
+        </label>
+      </div>
+      <p className="mb-4 text-sm text-muted-foreground">Click a shortcut to record.</p>
       {error ? (
         <p
           role="alert"
@@ -282,116 +347,139 @@ export function KeyboardShortcutEditor() {
         </p>
       ) : null}
       {currentShortcutPlatform() === "macos" ? (
-        <div className="mb-4 flex items-center gap-3 rounded-xl border border-border bg-card px-3 py-2">
-          <span className="min-w-0 flex-1">
-            <span className="block text-ui text-foreground">Use Windows key positions</span>
-            <span className="block text-xs text-muted-foreground">
-              Default shortcuts use ⌘ where Windows uses Alt, and ⌃ where Windows uses Ctrl.
-              Shortcuts you record yourself stay as recorded.
-            </span>
-          </span>
-          <Switch
-            checked={readMacWindowsKeyPositions()}
-            onCheckedChange={(checked) => writeMacWindowsKeyPositions(checked)}
-            aria-label="Use Windows key positions"
-          />
+        <div className="mb-4 rounded-xl border border-border bg-card px-3 py-2">
+          <SettingRow
+            label="Use Windows key positions"
+            hint="Default shortcuts use ⌘ where Windows uses Alt, and ⌃ where Windows uses Ctrl. Shortcuts you record yourself stay as recorded."
+          >
+            <Switch
+              checked={readMacWindowsKeyPositions()}
+              onCheckedChange={(checked) => writeMacWindowsKeyPositions(checked)}
+              aria-label="Use Windows key positions"
+            />
+          </SettingRow>
         </div>
       ) : null}
-      {GROUPS.map((group) => (
-        <section key={group.id} className="mb-5 last:mb-0">
-          <h3 className="mb-1 text-sm font-medium text-muted-foreground">
+      {GROUPS.filter((group) =>
+        (definitionsByGroup.get(group.id) ?? []).some((definition) => matches(definition.id)),
+      ).map((group) => (
+        <details
+          key={group.id}
+          open={query || changedOnly ? true : undefined}
+          className="mb-3 rounded-xl border border-border bg-card p-3 last:mb-0"
+          onToggle={(event) => {
+            if (
+              !event.currentTarget.open &&
+              recording &&
+              DEFAULT_SHORTCUT_DEFINITIONS[recording.actionId].group === group.id
+            )
+              stopRecording();
+          }}
+        >
+          <summary className="min-h-8 cursor-pointer text-ui font-medium">
             {group.label}
             {group.note ? (
               <span className="ml-1.5 font-normal text-muted-foreground/70">· {group.note}</span>
             ) : null}
-          </h3>
+          </summary>
           <ul>
-            {(definitionsByGroup.get(group.id) ?? []).map((definition) => {
-              const actionPreference = preferences.actions[definition.id];
-              const platformOverrides = actionPreference?.platformOverrides ?? {};
-              const missingPlatforms = PLATFORMS.filter(
-                (platform) => platformOverrides[platform.id] === undefined,
-              );
-              const enabled = isShortcutActionEnabled(definition.id);
-              return (
-                <li
-                  key={definition.id}
-                  data-testid={`shortcut-editor-row-${definition.id}`}
-                  className="border-b border-border/60 py-2 last:border-b-0"
-                >
-                  <div className="flex min-h-9 items-center gap-2 phone:min-h-11 phone:gap-5">
-                    <span className="min-w-0 flex-1">
-                      <span className="block text-ui text-foreground">{definition.label}</span>
-                      {definition.note ? (
-                        <span className="block text-xs text-muted-foreground">
-                          {definition.note}
-                        </span>
-                      ) : null}
-                      {!actionPreference?.common && !platformOverrides.macos
-                        ? macWindowsKeyPositionNotes(definition.id, defaultContext).map((note) => (
-                            <span key={note} className="block text-xs text-muted-foreground">
-                              {note}
-                            </span>
-                          ))
-                        : null}
-                    </span>
-                    <Switch
-                      checked={enabled}
-                      onCheckedChange={(checked) => setEnabled(definition.id, checked)}
-                      aria-label={`${enabled ? "Disable" : "Enable"} ${definition.label} shortcut`}
-                      className="scale-90 phone:after:min-h-[calc(44px/0.9)] phone:after:min-w-[calc(44px/0.9)]"
-                    />
-                    <ShortcutBindingButton
-                      actionId={definition.id}
-                      platform={null}
-                      bindings={actionPreference?.common ?? defaultsFor(definition.id)}
-                      recording={
-                        recording?.actionId === definition.id && recording.platform === null
-                      }
-                      onRecord={() => startRecording({ actionId: definition.id, platform: null })}
-                    />
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-xs"
-                      aria-label={`Restore default shortcut for ${definition.label}`}
-                      onClick={() => resetCommon(definition.id)}
-                    >
-                      <RotateCcwIcon />
-                    </Button>
-                    <DropdownMenu>
-                      <DropdownMenuTrigger asChild>
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="icon-xs"
-                          disabled={missingPlatforms.length === 0}
-                          aria-label={`Add system override for ${definition.label}`}
-                        >
-                          <PlusIcon />
-                        </Button>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent align="end">
-                        {missingPlatforms.map((platform) => (
-                          <DropdownMenuItem
-                            key={platform.id}
-                            onSelect={(event) => {
-                              event.preventDefault();
-                              addPlatformOverride(definition.id, platform.id);
-                            }}
+            {(definitionsByGroup.get(group.id) ?? [])
+              .filter((definition) => matches(definition.id))
+              .map((definition) => {
+                const actionPreference = preferences.actions[definition.id];
+                const platformOverrides = actionPreference?.platformOverrides ?? {};
+                const missingPlatforms = PLATFORMS.filter(
+                  (platform) => platformOverrides[platform.id] === undefined,
+                );
+                const enabled = isShortcutActionEnabled(definition.id);
+                return (
+                  <li
+                    key={definition.id}
+                    data-testid={`shortcut-editor-row-${definition.id}`}
+                    className="border-b border-border/60 py-2 last:border-b-0"
+                  >
+                    <div className="flex min-h-9 flex-wrap items-center gap-2 phone:min-h-11 phone:gap-5">
+                      <span className="min-w-32 flex-1">
+                        <span className="block text-ui text-foreground">{definition.label}</span>
+                        {definition.note ? (
+                          <span className="block text-xs text-muted-foreground">
+                            {definition.note}
+                          </span>
+                        ) : null}
+                        {!actionPreference?.common && !platformOverrides.macos
+                          ? macWindowsKeyPositionNotes(definition.id, defaultContext).map(
+                              (note) => (
+                                <span key={note} className="block text-xs text-muted-foreground">
+                                  {note}
+                                </span>
+                              ),
+                            )
+                          : null}
+                      </span>
+                      <Switch
+                        checked={enabled}
+                        onCheckedChange={(checked) => setEnabled(definition.id, checked)}
+                        aria-label={`${enabled ? "Disable" : "Enable"} ${definition.label} shortcut`}
+                        className="scale-90 phone:after:min-h-[calc(44px/0.9)] phone:after:min-w-[calc(44px/0.9)]"
+                      />
+                      <ShortcutBindingButton
+                        actionId={definition.id}
+                        platform={null}
+                        bindings={actionPreference?.common ?? defaultsFor(definition.id)}
+                        recording={
+                          recording?.actionId === definition.id && recording.platform === null
+                        }
+                        onRecord={() => startRecording({ actionId: definition.id, platform: null })}
+                      />
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        aria-label={`Restore default shortcut for ${definition.label}`}
+                        disabled={!isChanged(definition.id)}
+                        onClick={() => {
+                          stopRecording();
+                          resetShortcutPreference(definition.id);
+                          setError(null);
+                        }}
+                      >
+                        <RotateCcwIcon />
+                        Reset
+                      </Button>
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon-xs"
+                            disabled={missingPlatforms.length === 0}
+                            aria-label={`Add system override for ${definition.label}`}
                           >
-                            {platform.label}
-                          </DropdownMenuItem>
-                        ))}
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-                  </div>
-                  {PLATFORMS.filter((platform) => platformOverrides[platform.id] !== undefined).map(
-                    (platform) => (
+                            <PlusIcon />
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
+                          {missingPlatforms.map((platform) => (
+                            <DropdownMenuItem
+                              key={platform.id}
+                              onSelect={(event) => {
+                                event.preventDefault();
+                                addPlatformOverride(definition.id, platform.id);
+                              }}
+                            >
+                              {platform.label}
+                            </DropdownMenuItem>
+                          ))}
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    </div>
+                    {PLATFORMS.filter(
+                      (platform) => platformOverrides[platform.id] !== undefined,
+                    ).map((platform) => (
                       <div
                         key={platform.id}
                         data-testid={`shortcut-platform-${definition.id}-${platform.id}`}
-                        className="ml-5 flex min-h-9 items-center gap-2 border-l border-border/60 pl-3 phone:mt-3 phone:min-h-11 phone:gap-5"
+                        className="ml-4 flex min-h-9 flex-wrap items-center gap-2 border-l border-border/60 pl-3 phone:mt-3 phone:min-h-11 phone:gap-5"
                       >
                         <span className="min-w-20 flex-1 text-sm text-muted-foreground">
                           {platform.label}
@@ -430,20 +518,19 @@ export function KeyboardShortcutEditor() {
                           <Trash2Icon />
                         </Button>
                       </div>
-                    ),
-                  )}
-                </li>
-              );
-            })}
+                    ))}
+                    {definition.id === "pollSessions" && <SessionNavigationSettings />}
+                  </li>
+                );
+              })}
           </ul>
-        </section>
+        </details>
       ))}
-      <p
-        className="mt-3 text-xs text-muted-foreground"
-        title="Ctrl on Windows/Linux and Cmd on macOS are stored as the cross-platform primary modifier. System rows override the common shortcut; deleting one restores inheritance."
-      >
-        Click a shortcut to record.
-      </p>
+      {!SHORTCUT_ACTION_IDS.some(matches) && (
+        <p role="status" className="py-3 text-sm text-muted-foreground">
+          No matching shortcuts.
+        </p>
+      )}
       <span className="sr-only">
         Current platform: {platformLabel(currentShortcutPlatform())}. Effective shortcuts update
         immediately.

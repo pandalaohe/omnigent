@@ -418,6 +418,7 @@ import {
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { CreateAgentDialog } from "./CreateAgentDialog";
 import { AgentBadge } from "@/components/AgentBadge";
+import { AgentNameTag } from "@/components/AgentNameTag";
 import { useAgentBadgePreferences } from "@/hooks/useAgentBadgePreferences";
 import { agentBadgeFor } from "@/lib/agentBadgePreferences";
 import { AgentEditor, BuiltinAgentView } from "@/components/AgentEditor";
@@ -1890,13 +1891,11 @@ export function AgentHarnessPicker({
           setFocusConfigAgentId((current) => (current === agent.id ? null : current));
         }}
         testId={`new-chat-landing-agent-${agent.id}`}
-        icon={
-          <span className="flex items-center gap-1">
-            <AgentBadge agentId={agent.id} />
-            <ComposerAgentIcon agent={agent} />
-          </span>
-        }
+        icon={<ComposerAgentIcon agent={agent} sdkMarkClassName="hidden" />}
         label={agent.display_name}
+        labelContent={
+          <AgentNameTag agentId={agent.id} name={agent.display_name} harness={agent.harness} />
+        }
         summary={summary}
         description={blurb}
         active={active}

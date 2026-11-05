@@ -26,6 +26,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Switch } from "@/components/ui/switch";
+import { Segmented } from "@/components/ui/segmented";
 import {
   useDefaultPolicies,
   useAddDefaultPolicy,
@@ -251,7 +252,8 @@ function AddDefaultPolicyDialog({
                     {prop?.description ? (
                       <SettingsLabel
                         label={fieldLabel}
-                        labelClassName="text-sm text-foreground"
+                        note={null}
+                        labelClassName="text-foreground"
                         description={prop.description}
                         descriptionClassName="break-words"
                       />
@@ -261,22 +263,24 @@ function AddDefaultPolicyDialog({
                       </label>
                     )}
                     {prop?.type === "boolean" ? (
-                      <select
+                      <Segmented
+                        label={fieldLabel}
                         value={
                           factoryParams[key] ??
                           (prop?.default !== undefined ? String(prop.default) : "")
                         }
-                        onChange={(e) =>
+                        onChange={(value) =>
                           setFactoryParams((prev) => ({
                             ...prev,
-                            [key]: e.target.value,
+                            [key]: value,
                           }))
                         }
-                        className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-ui"
-                      >
-                        <option value="true">true</option>
-                        <option value="false">false</option>
-                      </select>
+                        options={[
+                          { value: "true", label: "On" },
+                          { value: "false", label: "Off" },
+                        ]}
+                        className="mt-1"
+                      />
                     ) : prop?.type === "string" && prop.enum ? (
                       <select
                         value={
@@ -474,7 +478,7 @@ export function PoliciesPage() {
       >
         <h1 className="settings-page-title mb-2 text-2xl font-medium">Global Policies</h1>
         <p className="text-ui text-muted-foreground">
-          You don't have permission to manage global policies.
+          An administrator can manage global policies.
         </p>
       </PageScroll>
     );
@@ -501,9 +505,6 @@ export function PoliciesPage() {
       <div className="mb-6 flex items-center justify-between">
         <div>
           <h1 className="settings-page-title text-2xl font-medium">Global Policies</h1>
-          <p className="mt-1 text-ui text-muted-foreground max-md:hidden">
-            Global policies applied to all sessions.
-          </p>
         </div>
         <Button onClick={() => setAddOpen(true)}>
           <PlusIcon /> Add policy
@@ -653,7 +654,7 @@ export function PoliciesPage() {
               onClick={() => void onConfirmDelete()}
               loading={pendingAction}
             >
-              Remove
+              Remove policy
             </Button>
           </DialogFooter>
         </DialogContent>

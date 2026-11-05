@@ -159,6 +159,7 @@ export function ImportSessionsPanel() {
         <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3 border-b border-border py-4">
           <SettingsLabel
             label={`How many recent sessions${source === "all" ? " (across all harnesses)" : ""}`}
+            note="Recent sessions you opened, excluding automation."
             className="flex-1"
             description="The most recent sessions you opened in the harness. Sub-agent and automation runs are skipped, and sessions you've already imported are counted separately, not re-imported."
             descriptionTestId="import-limit-help"
@@ -209,7 +210,7 @@ export function ImportSessionsPanel() {
           disabled={hostId === null || (mode === "session" && sessionId.trim().length === 0)}
           onClick={() => void handleImport()}
         >
-          Import
+          Import sessions
         </Button>
       </div>
 
