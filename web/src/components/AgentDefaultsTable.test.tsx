@@ -71,6 +71,32 @@ afterEach(() => {
 });
 
 describe("agent layered defaults", () => {
+  it("discards the previous field's editor before opening a Permission editor", () => {
+    seed({ desktop: { "codex-native": { model: "code", effort: "medium" } } });
+    const catalogs: CallingDefaultsCatalogRow[] = [
+      {
+        host_id: "desktop",
+        harness: "codex-native",
+        fetched_at: 1,
+        stale: false,
+        error: null,
+        models: [{ id: "code", supportedReasoningEfforts: [{ reasoningEffort: "medium" }] }],
+      },
+    ];
+    const { rerender } = render(<Table field="effort" catalogs={catalogs} />);
+    fireEvent.click(screen.getByTestId("layered-cell-codex-native-desktop"));
+    expect(screen.getByRole("combobox", { name: "Thinking" })).toHaveTextContent("Medium");
+    rerender(<Table field="permission" catalogs={catalogs} />);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("layered-col-desktop"));
+    expect(screen.getAllByRole("combobox", { name: "Permission" })).toHaveLength(1);
+    expect(screen.queryByText("Unavailable (medium)")).not.toBeInTheDocument();
+    expect(readCallingDefaults().desktop["codex-native"]).toEqual({
+      model: "code",
+      effort: "medium",
+    });
+  });
+
   it("offers SDK thinking choices for the model inherited from Native", async () => {
     seed({ desktop: { "codex-native": { model: "model-b" }, codex: { effort: "high" } } });
     render(

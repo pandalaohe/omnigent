@@ -421,6 +421,7 @@ export function AgentDefaultsTable({
             : `${label(row)} on ${hostLabel(col)}`;
     return (
       <AgentLayerEditor
+        key={field}
         trigger={trigger}
         title={title}
         field={field}
