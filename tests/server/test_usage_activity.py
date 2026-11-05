@@ -294,6 +294,22 @@ def test_silent_source_follows_the_requested_custom_range(service):
     ]
 
 
+@pytest.mark.parametrize("range_key", ["d7", "custom"])
+def test_current_silence_older_than_the_range_remains_visible(service, range_key):
+    read_at = datetime(2026, 10, 28, 12, 40, tzinfo=UTC).timestamp()
+    report(service, observed_at=read_at)
+    options = (
+        {"from_date": date(2026, 11, 5), "to_date": date(2026, 11, 5)}
+        if range_key == "custom"
+        else {}
+    )
+    current = service.issues(OWNER, now=NOW, range_key=range_key, **options)
+    assert current["source_reports"] == [{"account": "gateway", "kind": "silent", "at": read_at}]
+    assert service.usage_issues(OWNER, now=NOW) == [
+        {"account": "gateway", "level": "notice", "what": "silent", "last_at": read_at}
+    ]
+
+
 def test_store_failure_keeps_readings_and_advisory_payload_available(service, monkeypatch):
     report(service, product="codex")
     conversation = service.conversations.create_conversation()

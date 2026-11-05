@@ -922,7 +922,7 @@ class AgentQuotaService:
             if (
                 read_at is not None
                 and now - read_at > 3600
-                and span["counted_from"] <= read_at < span["until"]
+                and (span["until"] >= now or span["counted_from"] <= read_at < span["until"])
             ):
                 sources.append({"account": account, "kind": "silent", "at": read_at})
         return {"failures": failures, "unpriced_models": unpriced, "source_reports": sources}
