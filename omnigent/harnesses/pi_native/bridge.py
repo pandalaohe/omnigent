@@ -728,9 +728,19 @@ def _extension_source() -> str:
     reviewable without embedding JS syntax in a Python raw string.
     """
     resource = files(_EXTENSION_PACKAGE).joinpath(_EXTENSION_FILE)
-    return resource.read_text(encoding="utf-8").replace(
-        'require("./permission_tool_registry.cjs")', permission_tool_registry_source()
+    return (
+        resource.read_text(encoding="utf-8")
+        .replace('require("./permission_tool_registry.cjs")', permission_tool_registry_source())
+        .replace('require("./native_support.cjs")', native_support_source())
     )
+
+
+def native_support_source() -> str:
+    """Keep generated native hooks on the same source and semantic classifier."""
+    source = files(_EXTENSION_PACKAGE).joinpath("native_support.cjs").read_text()
+    policy = files("omnigent.permission_tiers").joinpath("native_support_rules.json").read_text()
+    source = source.replace('require("../../permission_tiers/native_support_rules.json")', policy)
+    return "(() => { const module = { exports: {} };\n" + source + "\nreturn module.exports; })()"
 
 
 def permission_tool_registry_source() -> str:

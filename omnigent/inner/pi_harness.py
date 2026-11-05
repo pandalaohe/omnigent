@@ -93,6 +93,7 @@ from omnigent.inner.pi_executor import (
     PiExecutor,
     PiPermissionBootstrapError,
     _pi_thinking_from_config,
+    _PiScopedLauncher,
 )
 from omnigent.inner.pi_settings import PiSdkLoaderUnavailableError
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
@@ -360,6 +361,8 @@ def create_app() -> FastAPI:
         FastAPI app-boot crash).
     """
 
+    scoped_launcher: _PiScopedLauncher | None = None
+
     def build_executor() -> Executor:
         # A restarted harness has not seen bootstrap; its runner binding is stable.
         session_id = getattr(app.state, "conversation_id", None)
@@ -378,6 +381,8 @@ def create_app() -> FastAPI:
 
         if isinstance(executor, PiExecutor):
             executor._pi_session_event = report_pi_session_event
+            if scoped_launcher is not None:
+                executor._scoped_launchers[session_id] = scoped_launcher
         return executor
 
     adapter = ExecutorAdapter(executor_factory=build_executor)
@@ -417,6 +422,7 @@ def create_app() -> FastAPI:
             return JSONResponse({"applied": True})
 
     async def bootstrap_permission_tier(request: Request) -> Response:
+        nonlocal scoped_launcher
         denied = adapter._check_auth(request)
         if denied is not None:
             return denied
@@ -431,9 +437,29 @@ def create_app() -> FastAPI:
         adapter._session_key = session_id
         try:
             executor = adapter._ensure_executor()
+            if payload.get("phase") == "configure":
+                descriptor = payload.get("launcher")
+                if (
+                    adapter._in_flight
+                    or not isinstance(executor, PiExecutor)
+                    or not isinstance(descriptor, dict)
+                ):
+                    return JSONResponse({"installed": False}, status_code=400)
+                await executor.configure_scoped_bootstrap(session_id, descriptor)
+            if payload.get("phase") == "prepare":
+                locator = payload.get("handoff")
+                if not isinstance(executor, PiExecutor) or not isinstance(locator, str):
+                    return JSONResponse({"installed": False}, status_code=400)
+                return JSONResponse(
+                    await executor.prepare_scoped_bootstrap(session_id, Path(locator))
+                )
+            if payload.get("phase") not in (None, "confirm", "configure"):
+                return JSONResponse({"installed": False}, status_code=400)
             installed = isinstance(
                 executor, PiExecutor
             ) and await executor.bootstrap_permission_tier(session_id)
+            if installed and isinstance(executor, PiExecutor):
+                scoped_launcher = executor._scoped_launchers.get(session_id)
         except PiPermissionBootstrapError as exc:
             _logger.warning("Pi permission bootstrap failed: %s", exc)
             return JSONResponse(

@@ -11,6 +11,7 @@ import binascii
 import hashlib
 import io
 import json
+import math
 import ntpath
 import os
 import re
@@ -37,6 +38,7 @@ class ToolKind(StrEnum):
     EDIT = "edit"
     DELETE = "delete"
     EXEC = "exec"
+    DELEGATE = "delegate"
     OTHER = "other"
     UNKNOWN = "unknown"
 
@@ -52,6 +54,40 @@ class TierDecision:
     action: Verdict
     reason: str = ""
     rule_id: str | None = None
+
+
+class NativeSupportStatus(StrEnum):
+    ATTESTED = "attested_native"
+    FAILED = "failed_native"
+    OUTSIDE = "outside_native_support"
+
+
+@dataclass(frozen=True)
+class NativeCallBinding:
+    scope_id: str
+    installation_id: str
+    registry_generation: str
+    name: str
+    arguments_digest: str
+    tier_revision: int
+
+
+@dataclass(frozen=True)
+class NativeInputSnapshot:
+    path: str
+    resolved_path: str | None
+    sha256: str | None
+
+
+@dataclass(frozen=True)
+class NativeSupport:
+    binding: NativeCallBinding
+    status: NativeSupportStatus
+    action: Literal["ordinary", "read", "control", "delegate"] = "ordinary"
+    reason: str = ""
+    outside_kind: str | None = None
+    inputs: tuple[NativeInputSnapshot, ...] = ()
+    semantics_digest: str = ""
 
 
 @dataclass(frozen=True)
@@ -79,6 +115,10 @@ class TrustedHostContext:
     drive_cwds: Mapping[str, str] = field(default_factory=dict)
     environment: Mapping[str, str] = field(default_factory=dict)
     extension_tools: Mapping[str, str] = field(default_factory=dict)
+    native_tools: Mapping[str, str] = field(default_factory=dict)
+    native_binding: NativeCallBinding | None = None
+    native_support: NativeSupport | None = None
+    local_execution: bool = True
 
 
 @dataclass(frozen=True)
@@ -103,6 +143,7 @@ class ToolIntent:
     recursive_read_paths: tuple[str, ...] = ()
     command_read_only: bool = False
     unbound_write: bool = False
+    native_status: NativeSupportStatus | None = None
 
 
 @dataclass(frozen=True)
@@ -476,6 +517,49 @@ def load_rules() -> RelaxedRules:
     return RelaxedRules(rules, signatures)
 
 
+def _canonical_json(value: object) -> str:
+    """Code-point keys, scalar UTF-8 strings and exact finite binary64 decimals.
+
+    Keep this native proof format paired with native_support.cjs. Authorization
+    leases retain BoundToolCall's separate serialization.
+    """
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        value.encode("utf-8", errors="strict")
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, (int, float)):
+        try:
+            number = float(value)
+        except OverflowError as exc:
+            raise ValueError("Native number is not finite binary64") from exc
+        if not math.isfinite(number) or (isinstance(value, int) and int(number) != value):
+            raise ValueError("Native number is not exact binary64")
+        numerator, denominator = number.as_integer_ratio()
+        if denominator == 1:
+            return str(numerator)
+        places = denominator.bit_length() - 1
+        digits = str(abs(numerator) * 5**places).zfill(places + 1)
+        return ("-" if numerator < 0 else "") + digits[:-places] + "." + digits[-places:]
+    if isinstance(value, (list, tuple)):
+        return "[" + ",".join(_canonical_json(item) for item in value) + "]"
+    if isinstance(value, Mapping) and all(isinstance(key, str) for key in value):
+        return (
+            "{"
+            + ",".join(
+                _canonical_json(key) + ":" + _canonical_json(value[key]) for key in sorted(value)
+            )
+            + "}"
+        )
+    raise ValueError("Native proof requires JSON values")
+
+
+def _native_digest(arguments: Mapping[str, object]) -> str:
+    return hashlib.sha256(_canonical_json(arguments).encode("utf-8")).hexdigest()
+
+
 def _digest(arguments: Mapping[str, object]) -> str:
     return hashlib.sha256(
         json.dumps(
@@ -640,6 +724,38 @@ def _adapt_unbound_call(
         )
     try:
         digest = _digest(arguments)
+        native = None
+        try:
+            if (
+                context.native_binding is not None
+                or context.native_support is not None
+                or name in context.native_tools
+            ):
+                from omnigent.permission_tiers.native_support import adapt_native_call
+
+                native = adapt_native_call(name, arguments, digest, context)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            native = ToolIntent(
+                ToolKind.UNKNOWN,
+                name,
+                digest,
+                context,
+                detail="Native support proof could not be checked",
+                native_status=NativeSupportStatus.FAILED,
+            )
+        if native is not None and (
+            context.local_execution or native.native_status == NativeSupportStatus.FAILED
+        ):
+            return native
+        if not context.local_execution:
+            return ToolIntent(
+                ToolKind.UNKNOWN,
+                name,
+                digest,
+                context,
+                status="unknown",
+                native_status=native.native_status if native is not None else None,
+            )
         if name in context.extension_tools:
             reason = context.extension_tools[name]
             return ToolIntent(
@@ -2473,9 +2589,15 @@ def decide_tier(tier: PermissionTier, intent: ToolIntent, rules: RelaxedRules) -
             )
         if tier == "full":
             return TierDecision(Verdict.ALLOW)
-        if intent.name == "subagent":
+        if intent.native_status == NativeSupportStatus.FAILED or (
+            intent.name == "subagent" and intent.native_status is None
+        ):
             return TierDecision(
-                Verdict.DENY, "Pi subagents are not yet governed by Omnigent permissions"
+                Verdict.DENY,
+                "Native support proof is missing"
+                if intent.native_status is None
+                else intent.detail or "Native support proof failed",
+                "native-proof",
             )
         active, _, _, control_reason, protected_reason, credential_reason = _validated_rules(rules)
         context = intent.context
@@ -2544,7 +2666,7 @@ def decide_tier(tier: PermissionTier, intent: ToolIntent, rules: RelaxedRules) -
                 if pattern.search(intent.command):
                     explanation = _explanation(intent.command, context.platform, rules.signatures)
                     return TierDecision(Verdict.DENY, f"{name}: {explanation or reason}", rule_id)
-        if intent.kind == ToolKind.READ or intent.detail in (
+        if intent.kind in (ToolKind.READ, ToolKind.DELEGATE) or intent.detail in (
             "framework-question",
             "framework-control",
         ):
@@ -2584,6 +2706,10 @@ __all__ = [
     "PERMISSION_TIERS",
     "PERMISSION_TIERS_CAPABILITY",
     "PI_PERMISSION_TIER_LABEL_KEY",
+    "NativeCallBinding",
+    "NativeInputSnapshot",
+    "NativeSupport",
+    "NativeSupportStatus",
     "PermissionTier",
     "RelaxedRules",
     "ResolvedPath",

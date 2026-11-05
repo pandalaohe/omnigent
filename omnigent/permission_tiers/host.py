@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Literal
 
 from omnigent.permission_tiers import (
+    NativeCallBinding,
+    NativeSupport,
     PermissionTier,
     TierDecision,
     TrustedHostContext,
@@ -137,6 +139,10 @@ def evaluate_host_tool(
     *,
     control_paths: tuple[str, ...],
     extension_tools: Mapping[str, str] | None = None,
+    native_tools: Mapping[str, str] | None = None,
+    native_binding: NativeCallBinding | None = None,
+    native_support: NativeSupport | None = None,
+    local_execution: bool = True,
 ) -> TierDecision:
     """Adapt with local filesystem facts immediately before requesting approval."""
     try:
@@ -147,6 +153,13 @@ def evaluate_host_tool(
         context = local_host_context(state, control_paths=control_paths)
         if extension_tools is not None:
             context = replace(context, extension_tools=extension_tools)
+        context = replace(
+            context,
+            native_tools=native_tools or {},
+            native_binding=native_binding,
+            native_support=native_support,
+            local_execution=local_execution,
+        )
         intent = adapt_tool_call(name, arguments, context)
         return decide_tier(state.tier, intent, load_rules())
     except Exception as exc:  # noqa: BLE001 - failures never become execution permission

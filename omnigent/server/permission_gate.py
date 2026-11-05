@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from omnigent.db.workspace_cache import WorkspaceScopedSet
@@ -29,15 +29,19 @@ if TYPE_CHECKING:
 class InspectedPermissionCall:
     binding: BoundToolCall | None
     decision: TierDecision
+    origin_receipt: str | None = field(default=None, repr=False)
 
     def execution_binding(self) -> dict[str, object] | None:
         if self.binding is None:
             return None
-        return {
+        result: dict[str, object] = {
             "call_id": self.binding.call_id,
             "revision": self.binding.tier_revision,
             "arguments_digest": self.binding.arguments_digest,
         }
+        if self.origin_receipt is not None:
+            result["pi_origin_receipt"] = self.origin_receipt
+        return result
 
 
 def _denied(reason: str) -> InspectedPermissionCall:
@@ -53,6 +57,8 @@ async def inspect_permission_call(
     call_id: object,
     runner_router: RunnerRouter | None,
     local_execution: bool = True,
+    origin_receipt: object = None,
+    execution_operation_id: object = None,
 ) -> InspectedPermissionCall:
     """Only the authenticated executing runner may supply filesystem facts."""
     if harness is None and any(
@@ -72,6 +78,8 @@ async def inspect_permission_call(
             return InspectedPermissionCall(None, TierDecision(Verdict.ALLOW))
         if not isinstance(arguments, dict) or not isinstance(call_id, str):
             return _denied("Permission check requires object arguments and a stable call id")
+        if origin_receipt is not None and not isinstance(origin_receipt, str):
+            return _denied("Malformed Pi transport receipt")
         binding = BoundToolCall.bind(
             session_id=conversation.id,
             host_id=permission_execution_host_id(
@@ -98,6 +106,12 @@ async def inspect_permission_call(
                 "arguments": arguments,
                 "expected_revision": state.revision,
                 "local_execution": local_execution,
+                **({"pi_origin_receipt": origin_receipt} if origin_receipt is not None else {}),
+                **(
+                    {"execution_operation_id": execution_operation_id}
+                    if execution_operation_id is not None
+                    else {}
+                ),
             },
             timeout=10.0,
         )
@@ -122,7 +136,9 @@ async def inspect_permission_call(
         reason, rule_id = raw.get("reason", ""), raw.get("rule_id")
         if not isinstance(reason, str) or (rule_id is not None and not isinstance(rule_id, str)):
             return _denied("Malformed execution-host permission verdict")
-        return InspectedPermissionCall(binding, TierDecision(verdict, reason, rule_id))
+        return InspectedPermissionCall(
+            binding, TierDecision(verdict, reason, rule_id), origin_receipt
+        )
     except Exception as exc:  # noqa: BLE001 - unavailable facts cannot become permission
         return _denied(f"Permission check unavailable: {type(exc).__name__}")
 
@@ -137,6 +153,7 @@ async def finish_permission_call(
     call_id: object,
     revision: object,
     runner_router: RunnerRouter | None,
+    origin_receipt: object = None,
 ) -> bool:
     """Release only the executing host's matching completed-call lease."""
     if not isinstance(call_id, str) or not call_id or type(revision) is not int:
@@ -155,6 +172,7 @@ async def finish_permission_call(
                 "type": "permission_tier_finish",
                 "call_id": call_id,
                 "expected_revision": revision,
+                **({"pi_origin_receipt": origin_receipt} if origin_receipt is not None else {}),
             },
             timeout=10.0,
         )
@@ -256,6 +274,11 @@ async def authorize_permission_call(
                 "name": binding.name,
                 "arguments_digest": binding.arguments_digest,
                 "expected_revision": binding.tier_revision,
+                **(
+                    {"pi_origin_receipt": inspection.origin_receipt}
+                    if inspection.origin_receipt is not None
+                    else {}
+                ),
             },
             timeout=10.0,
         )
