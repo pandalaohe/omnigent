@@ -44,7 +44,7 @@ def test_permission_installation_failure_identifies_field(tmp_path, changed, fie
         "tools_verified": True,
         "active_tools": ["read"],
     }
-    receipt = tmp_path / "permission_installation.json"
+    receipt = Path(f"{extension}.permission_installation.json")
     receipt.write_text(json.dumps(installed))
     assert pi_native_bridge.pi_permission_installation_failure(tmp_path, "auto") is None
     receipt.write_text(json.dumps({**installed, **changed}))

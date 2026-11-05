@@ -802,20 +802,27 @@ async def test_context_v2_pi_late_start_preserves_replacement_identity_and_usage
     spawn.side_effect = pending
     read = await executor.prepare_context_inventory_v2("outer", "read")
     old = asyncio.create_task(executor._ensure_rpc("same-key", "system", None, []))
+    replacement_task = None
     try:
         await asyncio.wait_for(entered.wait(), 2)
         old_key = read().sources[0].contexts[0].key
         await executor.close_session("same-key")
         assert read().sources[0].contexts[0].lifecycle == "unknown"
-        replacement = await executor._ensure_rpc("same-key", "system", None, [])
+        replacement_task = asyncio.create_task(
+            executor._ensure_rpc("same-key", "system", None, [])
+        )
+        await asyncio.sleep(0)
+        assert calls == 1, "replacement startup overlapped the retired owner's startup"
+        assert not replacement_task.done()
+        release.set()
+        with pytest.raises(RuntimeError, match="owner changed"):
+            await old
+        replacement = await replacement_task
         token = executor._tool_server._pi_usage_tokens["same-key"]
         source = read().sources[0]
         assert source.contexts[0].key == old_key and source.contexts[0].lifecycle == "unknown"
         assert source.contexts[1].key != old_key
         assert "pi_rpc_owner_unregistered" in {u.reason for u in source.unresolved}
-        release.set()
-        with pytest.raises(RuntimeError, match="owner changed"):
-            await old
         assert executor._session_states["same-key"].rpc is replacement
         assert executor._tool_server._pi_usage_token_ok("same-key", token)
         assert read().sources[0].contexts[0].lifecycle == "unknown"
@@ -823,6 +830,9 @@ async def test_context_v2_pi_late_start_preserves_replacement_identity_and_usage
         release.set()
         old.cancel()
         await asyncio.gather(old, return_exceptions=True)
+        if replacement_task is not None:
+            replacement_task.cancel()
+            await asyncio.gather(replacement_task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -1984,7 +1994,7 @@ assert.deepEqual(active, process.argv[2] === "safe" && tier === "plan"
     )
     assert result.returncode == 0, result.stderr
     assert verify_pi_permission_installation(bridge_dir, tier)
-    installed = json.loads((bridge_dir / "permission_installation.json").read_text())
+    installed = json.loads(Path(f"{extension}.permission_installation.json").read_text())
     assert installed["active_tools"] == (
         ["read", "sys_os_read"] if tier == "plan" else ["read", "sys_os_read", "sys_os_shell"]
     )
@@ -1997,7 +2007,7 @@ assert.deepEqual(active, process.argv[2] === "safe" && tier === "plan"
         [node, "-e", script, str(extension), "safe", tier], capture_output=True, text=True
     )
     assert result.returncode == 0, result.stderr
-    assert not (bridge_dir / "permission_installation.json").exists(), (
+    assert not Path(f"{replacement}.permission_installation.json").exists(), (
         "a superseded process must not overwrite this launch's acknowledgement"
     )
 
@@ -3271,6 +3281,75 @@ async def test_generated_pi_full_tier_gates_without_finish_lease(tmp_path: Path)
         await server.wait_closed()
 
 
+@pytest.mark.parametrize("ordering", ["before-check", "after-check"])
+def test_old_rpc_ack_cannot_overwrite_replacement_proof(tmp_path: Path, ordering) -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for generated Pi extension test")
+    bridge = tmp_path / "bridge"
+    (bridge / "inbox").mkdir(parents=True)
+    write_host_permission_state(
+        bridge / "permission_state.json",
+        HostPermissionState("session", "host", str(tmp_path), "auto", 1, "blocked"),
+    )
+    old, new = tmp_path / "old.js", tmp_path / "new.js"
+    for index, extension in enumerate((old, new)):
+        extension.write_text(
+            _generate_extension_js(
+                12345 + index, [], "test-token", permission_bridge_dir=bridge, session_id="session"
+            )
+        )
+    prepare_permission_installation(bridge, session_id="session", harness="pi", extension=old)
+    script = r"""
+const fs = require('fs');
+const cp = require('child_process');
+const path = require('path');
+const crypto = require('crypto');
+const [old, replacement, bridge, ordering] = process.argv.slice(1);
+const proof = `
+const handlers = {};
+global.setInterval = () => 0;
+process.env.OMNIGENT_PI_PERMISSION_INLINE = process.argv[1];
+require(process.argv[1])({ on: (name, fn) => handlers[name] = fn, registerTool() {},
+  getActiveTools: () => ['read'], setActiveTools() {}, getAllTools: () => [] });
+handlers.session_start({}, { isIdle: () => true });
+`;
+function replaceLaunch() {
+  const expectedFile = path.join(bridge, 'permission_expected.json');
+  const expected = JSON.parse(fs.readFileSync(expectedFile, 'utf8'));
+  expected.installation_id = 'replacement-launch';
+  expected.extension_path = replacement;
+  expected.extension_sha256 = crypto.createHash('sha256')
+    .update(fs.readFileSync(replacement)).digest('hex');
+  fs.writeFileSync(expectedFile, JSON.stringify(expected));
+  cp.execFileSync(process.execPath, ['-e', proof, replacement]);
+}
+if (ordering === 'before-check') replaceLaunch();
+const rename = fs.renameSync;
+let paused = false;
+fs.renameSync = (source, target) => {
+  if (ordering === 'after-check' && !paused && target.endsWith('permission_installation.json')) {
+    paused = true;
+    replaceLaunch();
+  }
+  return rename(source, target);
+};
+process.argv = [process.argv[0], old];
+eval(proof);
+if (ordering === 'after-check' && !paused) throw new Error('old proof never reached rename');
+"""
+    result = subprocess.run(
+        [node, "-e", script, str(old), str(new), str(bridge), ordering],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert verify_pi_permission_installation(bridge, "auto"), (
+        "the old extension replaced the current launch's valid acknowledgement"
+    )
+
+
 def test_generated_pi_rpc_extension_switches_into_and_out_of_full(tmp_path: Path) -> None:
     node = shutil.which("node")
     if node is None:
@@ -3334,12 +3413,12 @@ function switchTier(target, revision) {
     target_tier: target, expected_revision: revision,
   }));
   pollInbox();
-  const ack = JSON.parse(fs.readFileSync(path.join(bridgeDir, "permission_ack.json"), "utf8"));
+  const ack = JSON.parse(fs.readFileSync(`${extensionPath}.permission_ack.json`, "utf8"));
   assert.equal(ack.id, `switch-${revision}`);
   assert.equal(ack.ok, true, JSON.stringify(ack));
   assert.deepEqual(ack.active_tools, ["read", "bash"]);
   const installed = JSON.parse(fs.readFileSync(
-    path.join(bridgeDir, "permission_installation.json"), "utf8"));
+    `${extensionPath}.permission_installation.json`, "utf8"));
   assert.equal(installed.tier, target);
   assert.equal(installed.revision, revision + 1);
   state.tier = target;

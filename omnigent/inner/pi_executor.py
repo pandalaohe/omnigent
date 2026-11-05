@@ -100,6 +100,7 @@ from omnigent.models.pi_model_compatibility import (
 from omnigent.onboarding.provider_config import CHAT_WIRE_API, RESPONSES_WIRE_API
 from omnigent.permission_tiers import plan_visible_tool_names
 from omnigent.permission_tiers.host import HOST_PERMISSION_STATE_FILE, read_host_permission_state
+from omnigent.permission_tiers.pi_tools import pi_permission_control_path
 from omnigent.pi_prompt import pi_prompt_args
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.sdk_peer_delivery import ReportPeerOutcome, SDKPeerInput, SDKPeerOutcome
@@ -888,7 +889,7 @@ function permissionRevision() {
   return state && state.status === "ready" ? state.revision : null;
 }
 function writePermissionJson(name, payload) {
-  const target = permissionPath(name);
+  const target = `${__filename}.${name}`;
   const temporary = `${target}.${process.pid}.${crypto.randomBytes(8).toString("hex")}.tmp`;
   fs.writeFileSync(temporary, JSON.stringify(payload), { mode: 0o600 });
   fs.renameSync(temporary, target);
@@ -2398,7 +2399,6 @@ class _PiPeerPending:
 
 @dataclass
 class _PiSessionState:
-    startup_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     rpc: _PiRpcSession | None = None
     system_prompt: str | None = None
     model: str | None = None
@@ -3342,6 +3342,8 @@ class PiExecutor(Executor):
         self._sandboxed = sandboxed.sandboxed
 
         self._session_states: dict[str, _PiSessionState] = {}
+        # A retired state can still have a pending spawn; successors share its lock.
+        self._session_startup_locks: dict[str, asyncio.Lock] = {}
         self._peer_initial: dict[str, _PiPeerPending] = {}
         self._context_incarnation = uuid4().hex
         self._context_records: dict[str, ContextRecordV2] = {}
@@ -4305,10 +4307,9 @@ class PiExecutor(Executor):
             :meth:`_apply_thinking_level` — so it is not part of the reuse
             signature. A model change respawns, which re-asserts the level.
         """
-        state = self._session_states.setdefault(session_key, _PiSessionState())
-        async with state.startup_lock:
-            if self._session_states.get(session_key) is not state:
-                raise RuntimeError("Pi RPC owner changed during startup")
+        lock = self._session_startup_locks.setdefault(session_key, asyncio.Lock())
+        async with lock:
+            state = self._session_states.setdefault(session_key, _PiSessionState())
             return await self._ensure_rpc_locked(
                 state,
                 session_key,
@@ -4498,7 +4499,13 @@ class PiExecutor(Executor):
                 return
             await asyncio.sleep(0.05)
         else:
-            if (bridge_dir / PERMISSION_INSTALLATION_FILE).exists():
+            try:
+                installed_path = pi_permission_control_path(
+                    bridge_dir, PERMISSION_INSTALLATION_FILE
+                )
+            except (OSError, ValueError, TypeError):
+                installed_path = bridge_dir / PERMISSION_INSTALLATION_FILE
+            if installed_path.exists():
                 failure = pi_permission_installation_failure(bridge_dir, state.tier)
                 if failure is None:
                     return

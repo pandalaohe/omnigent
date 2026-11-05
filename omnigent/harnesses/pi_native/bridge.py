@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 from omnigent.native import native_bridge_common
 from omnigent.permission_tiers import PermissionTier, plan_visible_tool_names
 from omnigent.permission_tiers.host import HOST_PERMISSION_STATE_FILE, read_host_permission_state
+from omnigent.permission_tiers.pi_tools import pi_permission_control_path
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -519,7 +520,11 @@ def _pi_permission_installation_failure(
     receipts: list[dict[str, object]] = []
     for name in (PERMISSION_EXPECTED_FILE, PERMISSION_INSTALLATION_FILE):
         try:
-            path = bridge_dir / name
+            path = (
+                pi_permission_control_path(bridge_dir, name, receipts[0])
+                if receipts
+                else bridge_dir / name
+            )
             if path.is_symlink():
                 return name
             receipt = json.loads(path.read_text(encoding="utf-8"))
@@ -607,7 +612,7 @@ async def apply_pi_permission_tier(
         )
         deadline = asyncio.get_running_loop().time() + 8.0
         while asyncio.get_running_loop().time() < deadline:
-            ack_path = bridge_dir / PERMISSION_ACK_FILE
+            ack_path = pi_permission_control_path(bridge_dir, PERMISSION_ACK_FILE)
             if ack_path.is_symlink():
                 return False
             try:
