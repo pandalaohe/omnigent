@@ -1,7 +1,5 @@
 """Source selection, restart, failures and the owner-scoped Models join."""
 
-import logging
-
 import httpx
 import pytest
 from fastapi import FastAPI
@@ -55,41 +53,44 @@ def test_custom_requires_https_without_credentials(url):
 
 
 @pytest.mark.parametrize(
-    "name",
+    "query",
     [
-        "api_key",
-        "API-KEY",
-        "access_token",
-        "password",
-        "X-Amz-Credential",
-        "X-Amz-Signature",
-        "%61pi_key",
+        "api_key=made-up",
+        "API-KEY=made-up",
+        "access_token=made-up",
+        "password=made-up",
+        "X-Amz-Credential=made-up",
+        "X-Amz-Signature=made-up",
+        "%61pi_key=made-up",
+        "jwt=made-up",
+        "bearer=made-up",
+        "sort_key=name",
+        "edition=public",
+        "",
     ],
 )
-def test_custom_rejects_credential_query_names(name):
-    with pytest.raises(ValidationError):
-        PriceSourceSelection(source="custom", format="litellm", url=f"{URL}?{name}=made-up")
+def test_custom_rejects_any_query_string(query):
+    with pytest.raises(ValidationError, match="cannot contain a query string"):
+        PriceSourceSelection(source="custom", format="litellm", url=f"{URL}?{query}")
 
 
 @pytest.mark.asyncio
-async def test_query_is_sent_but_never_exposed_in_status_or_http_logs(
-    price_source, respx_mock, caplog
-):
-    url = f"{URL}?edition=private-query-marker"
-    selection = PriceSourceSelection(source="custom", format="litellm", url=url)
-    route = respx_mock.get(url).respond(200, json=PAYLOAD)
-    with caplog.at_level(logging.INFO, logger="httpx"):
-        status = await price_source.select(selection)
+async def test_plain_public_url_is_accepted(price_source, respx_mock):
+    route = respx_mock.get(URL).respond(200, json=PAYLOAD)
+    status = await price_source.select(CUSTOM)
     assert route.call_count == 1
-    assert "private-query-marker" not in caplog.text
-    assert "?edition=" not in caplog.text
     assert status["url"] == URL
-    caplog.clear()
-    route.respond(500)
-    with caplog.at_level(logging.INFO, logger="httpx"), pytest.raises(ValueError):
-        await price_source.select(selection)
-    assert "private-query-marker" not in caplog.text
-    assert "?edition=" not in str(price_source.status())
+    assert status["model_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_does_not_follow_a_redirect_adding_a_query(respx_mock):
+    target = respx_mock.get(f"{URL}?edition=made-up").respond(200, json=PAYLOAD)
+    source = respx_mock.get(URL).respond(302, headers={"location": f"{URL}?edition=made-up"})
+    with pytest.raises(ValueError, match="HTTP 302"):
+        await fetch_prices(CUSTOM)
+    assert source.call_count == 1
+    assert target.call_count == 0
 
 
 @pytest.mark.asyncio
