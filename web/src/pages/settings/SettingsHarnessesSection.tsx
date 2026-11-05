@@ -57,6 +57,7 @@ import {
 import { harnessAccountKey } from "@/lib/nativeHarnessModes";
 import { BackButton, HarnessCatalog } from "./HarnessCatalog";
 import { HarnessFixDialog } from "./HarnessFixDialog";
+import { AgentSettingsFolder } from "./AgentSettingsFolder";
 import {
   applyHarnessFixResult,
   harnessFixMode,
@@ -880,6 +881,7 @@ function HarnessDetail({
           />
         )}
         {credentialCard}
+        <AgentSettingsFolder host={host} harness={entry.harness} />
         {agentPresentOnHost(entry.harness, host) && (
           <AgentPromptCard harness={entry.harness} host={host} capabilities={capabilities} />
         )}
