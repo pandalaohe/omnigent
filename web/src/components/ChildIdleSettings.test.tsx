@@ -203,6 +203,11 @@ describe("child check-ins", () => {
       screen.getByRole("spinbutton", { name: "Minimum check-in gap in minutes" }),
     ).toBeEnabled();
     expect(screen.getByRole("spinbutton", { name: "Repeat interval in minutes" })).toBeEnabled();
+    const done = screen.getByRole("button", { name: "Done editing Agent A" });
+    expect(done).toHaveTextContent("Done");
+    fireEvent.click(done);
+    expect(screen.getByRole("button", { name: "Edit Agent A" })).toHaveTextContent("Edit");
+    expect(screen.queryByRole("switch", { name: "Monitor Agent A children" })).toBeNull();
   });
 
   it("keeps a legacy raw-id row while saving a new harness exception", () => {

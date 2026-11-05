@@ -89,7 +89,7 @@ export function ExceptionList<T>({
                   type="button"
                   size="sm"
                   variant="ghost"
-                  aria-label={`Edit ${label}`}
+                  aria-label={openKey === key ? `Done editing ${label}` : `Edit ${label}`}
                   onClick={() => setOpenKey(openKey === key ? null : key)}
                 >
                   {openKey === key ? "Done" : "Edit"}
