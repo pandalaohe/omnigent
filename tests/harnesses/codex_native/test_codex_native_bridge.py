@@ -1740,6 +1740,43 @@ def test_unmarked_cache_trim_preserves_retention_clock(
     assert codex_native_bridge._codex_orphan_retention_expired(bridge_dir)
 
 
+def test_unmarked_cache_trim_preserves_retention_clock_without_follow_symlinks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A platform without ``utime`` follow_symlinks still trims and keeps the clock."""
+    now = codex_native_bridge.time.time()
+    bridge_dir, _rollout = _make_unmarked_bridge(tmp_path, inactive_since=now - 8 * 86400)
+    home = bridge_dir / "codex-home"
+    (home / "models_cache.json").write_text("cache")
+    aged_ns = int((now - 8 * 86400) * 1_000_000_000)
+    os.utime(home, ns=(aged_ns, aged_ns))
+    monkeypatch.setattr(codex_native_bridge.time, "time", lambda: now)
+
+    real_utime = os.utime
+    follow_symlinks_used: list[bool] = []
+
+    def no_follow_symlinks_utime(
+        path: Any,
+        times: Any = None,
+        *,
+        ns: Any = None,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> None:
+        # Windows rejects the keyword before it touches the filesystem.
+        follow_symlinks_used.append(follow_symlinks)
+        if not follow_symlinks:
+            raise NotImplementedError("utime: follow_symlinks unavailable on this platform")
+        real_utime(path, times, ns=ns, dir_fd=dir_fd)
+
+    monkeypatch.setattr(codex_native_bridge.os, "utime", no_follow_symlinks_utime)
+    before = codex_native_bridge._codex_newest_activity_time(bridge_dir)
+    assert not codex_native_bridge._codex_orphan_retention_expired(bridge_dir)
+    assert not (home / "models_cache.json").exists()
+    assert follow_symlinks_used == [False, True]
+    assert codex_native_bridge._codex_newest_activity_time(bridge_dir) == before
+
+
 def test_prune_orphaned_bridge_dirs_keeps_unmarked_bridge_with_recent_writes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

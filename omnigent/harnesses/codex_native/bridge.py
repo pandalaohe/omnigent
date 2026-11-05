@@ -401,11 +401,13 @@ def _trim_codex_orphan_caches(bridge_dir: Path) -> None:
         # activity evidence. Maintenance must not extend their retention.
         current = codex_home.lstat()
         if (current.st_dev, current.st_ino) == (home_stat.st_dev, home_stat.st_ino):
-            os.utime(
-                codex_home,
-                ns=(home_stat.st_atime_ns, home_stat.st_mtime_ns),
-                follow_symlinks=False,
-            )
+            restored = (home_stat.st_atime_ns, home_stat.st_mtime_ns)
+            try:
+                os.utime(codex_home, ns=restored, follow_symlinks=False)
+            except NotImplementedError:
+                # Windows has no utime follow_symlinks; the inode check above
+                # proved the path is this directory rather than a symlink.
+                os.utime(codex_home, ns=restored)
     except OSError:
         _logger.warning("Could not preserve Codex orphan cache activity time")
 
