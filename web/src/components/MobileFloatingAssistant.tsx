@@ -120,7 +120,7 @@ export function layoutMobileAssistantCircle(
   const cornerPressure = Math.min(horizontalPressure, verticalPressure);
   const compression = clamp(edgePressure + cornerPressure * 0.55, 0, 1);
   const twoRings = edgePressure > 0 && count > 0;
-  const actionSize = ACTION_SIZE - compression * 3;
+  const actionSize = Math.max(44, ACTION_SIZE - compression * 3);
   const gap = ACTION_GAP - compression * 4;
   const chord = actionSize + gap;
   const innerCount = twoRings ? Math.ceil(count / 2) : count;
@@ -495,6 +495,7 @@ export function MobileFloatingAssistant() {
         <button
           type="button"
           aria-label="Expand floating assistant"
+          data-dock-edge={preferences.dock.edge}
           title="Drag away from the edge to restore"
           {...commonPointerProps}
           onClick={() => {
@@ -505,7 +506,7 @@ export function MobileFloatingAssistant() {
             undock();
           }}
           className={cn(
-            "pointer-events-auto fixed flex touch-none select-none items-center justify-center border border-primary/30 bg-primary text-primary-foreground shadow-lg",
+            "phone-hit-area pointer-events-auto fixed flex touch-none select-none items-center justify-center border border-primary/30 bg-primary text-primary-foreground shadow-lg",
             "focus-visible:ring-2 focus-visible:ring-ring active:brightness-110",
             preferences.dock.edge === "left" || preferences.dock.edge === "right"
               ? "h-12 w-[18px]"
@@ -568,7 +569,7 @@ export function MobileFloatingAssistant() {
                       fireButton(button);
                     }}
                     className={cn(
-                      "pointer-events-auto fixed flex items-center justify-center rounded-full border border-border bg-popover px-1 text-xs font-semibold text-popover-foreground shadow-lg",
+                      "pointer-events-auto fixed flex items-center justify-center rounded-full border border-border bg-popover px-1 text-sm font-semibold text-popover-foreground shadow-lg",
                       "touch-manipulation select-none active:scale-95",
                       "kind" in button &&
                         button.kind === "modifier" &&

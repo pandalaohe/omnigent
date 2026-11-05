@@ -114,6 +114,7 @@ describe("MobileFloatingAssistant", () => {
 
       for (const center of centers) {
         const layout = layoutMobileAssistantCircle(count, center, viewport);
+        expect(layout.actionSize).toBeGreaterThanOrEqual(44);
         const inset = layout.actionSize / 2;
         layout.actions.forEach((point, index) => {
           expect(point.x).toBeGreaterThanOrEqual(inset);
@@ -148,6 +149,7 @@ describe("MobileFloatingAssistant", () => {
 
       for (const center of centers) {
         const layout = layoutMobileAssistantCircle(count, center, viewport);
+        expect(layout.actionSize).toBeGreaterThanOrEqual(44);
         const inset = layout.actionSize / 2;
         layout.actions.forEach((point, index) => {
           expect(point.x).toBeGreaterThanOrEqual(inset);
