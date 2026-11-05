@@ -135,6 +135,14 @@ class TerminalRegistrationSnapshot:
 _MAX_UNCERTAIN_TERMINAL_OWNERS = 1000
 
 
+class HostShellLaunchError(RuntimeError):
+    """Carry the failed host-shell instance after launch cleanup removes it."""
+
+    def __init__(self, instance: TerminalInstance, cause: Exception) -> None:
+        super().__init__(str(cause))
+        self.instance = instance
+
+
 class TerminalExitedDuringLaunch(RuntimeError):
     """Retain a dead launch's captured evidence after its private server is closed."""
 
@@ -290,6 +298,7 @@ class TerminalRegistry:
         program_status_app: str | None = None,
         elevated: bool = False,
         agent_invocation: bool = False,
+        host_shell: bool = False,
         origin: Literal["user", "agent", "harness"] = "harness",
     ) -> TerminalInstance:
         """Launch a terminal session, or return the existing one.
@@ -384,6 +393,7 @@ class TerminalRegistry:
         try:
             created.instance.elevated = elevated
             created.instance.origin = "agent" if agent_invocation else origin
+            created.instance.host_shell = host_shell
             created.instance.program_status_app = program_status_app
             created.instance.lifecycle_trace.transfer_session(conversation_id)
             await created.instance.launch(cwd=created.cwd)
@@ -448,6 +458,8 @@ class TerminalRegistry:
             if cleanup.caller_cancelled and not cancelled:
                 # The caller cancelled us while cleanup ran; cancellation wins.
                 raise asyncio.CancelledError() from exc
+            if host_shell and isinstance(exc, (RuntimeError, OSError, ValueError)):
+                raise HostShellLaunchError(created.instance, exc) from exc
             raise
 
         with self._lock:

@@ -13,6 +13,9 @@ reattach when the session moves to another host.
   and returns to chat with the terminal's content kept. States: starting up
   (no Resume action), stopped (Resume offered), connected.
 - `user-shell`: open a shell, type into it, and close it.
+- `sdk-terminal-tools`: an SDK agent without declared terminals can launch the
+  host's reported shells and use existing plain session shells without an access
+  grant. Declared terminals keep their configuration and override restrictions.
 - `admin-terminal`: on an opted-in host, the host owner who is also an app
   admin opens a root terminal. The human uses its relay connection; the session
   agent needs explicit consent for that terminal instance.
@@ -115,6 +118,18 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   `tests/e2e_ui/shells/test_new_shell.py::test_new_shell_accepts_typed_command`.
   Closing a shell has no e2e coverage: close its tab, confirm, and expect the
   tab to disappear.
+- **`sdk-terminal-tools`:** component coverage is in
+  `tests/tools/test_manager.py`, `tests/tools/builtins/test_sys_terminal.py`
+  and `tests/runner/test_elevated_terminals.py`. On a host-bound Codex SDK or Pi
+  RPC session without declared terminals, ask the agent to launch an available
+  shell, print a marker, read it back, list it and close it. Expect the host's
+  shell names, the session workspace and no plain-terminal approval card.
+  Repeat send/read/close with a plain shell opened from the rail; its tool
+  results omit the socket path. Host shells run outside the SDK sandbox.
+  With an admin terminal, read/send must fail before approval, succeed after
+  approval and fail again after turning access off. Closing and reopening it
+  starts a new denied instance. Record the tool name, arguments and result on
+  failure; never record terminal passwords.
 - **`admin-terminal`:** backend coverage is in
   `tests/host/test_elevated_terminals.py`,
   `tests/runner/test_elevated_terminals.py`,

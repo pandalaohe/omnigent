@@ -801,24 +801,22 @@ class ToolManager:
 
     def _register_terminal_tools(self) -> None:
         """
-        Register ``sys_terminal_*`` tools when the spec declares ``terminals``.
+        Register ``sys_terminal_*`` for declared terminals or reported host shells.
 
         Per ``designs/OMNIGENT_TERMINAL_BRIDGE.md`` §4.3, the five
         ``sys_terminal_launch`` / ``send`` / ``read`` / ``list`` /
         ``close`` tools register together when the spec carries a
-        non-empty ``terminals`` block. They share the AP-process
-        :class:`TerminalRegistry` (looked up via
+        non-empty ``terminals`` block or the runner has host shells.
+        They share the AP-process :class:`TerminalRegistry` (looked up via
         :func:`omnigent.runtime.get_terminal_registry`) so state
         survives across turns within a conversation.
 
-        When the spec declares no terminals, this is a no-op.
+        Without either source this is a no-op.
 
         :raises ValueError: If a ``sys_terminal_*`` name collides
             with an already-registered tool — defensive; none of
             AP's other builtins use that prefix today.
         """
-        if not self._spec.terminals:
-            return
         from omnigent.runtime import get_terminal_registry
         from omnigent.tools.builtins.sys_terminal import (
             SysTerminalCloseTool,
@@ -827,8 +825,11 @@ class ToolManager:
             SysTerminalReadTool,
             SysTerminalRequestAccessTool,
             SysTerminalSendTool,
+            _agent_terminal_specs,
         )
 
+        if not _agent_terminal_specs(self._spec):
+            return
         registry = get_terminal_registry()
         for tool in (
             SysTerminalLaunchTool(spec=self._spec, registry=registry),

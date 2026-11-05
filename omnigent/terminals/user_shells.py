@@ -53,9 +53,9 @@ def user_shell_terminals(
     inventory is known does an agent that declares none get the default
     ``bash``, which inherits the agent's ``os_env``.
 
-    Besides the offer, only the spec's own ``terminals:`` decide the agent's
-    ``sys_terminal_*`` tools, so none of this reaches the agent. Callers that
-    only need names (listing and the create gate) read the keys; the runner
+    Agent tools preserve declared terminals, or reuse this host-shell mapping
+    when none are declared and the runner reports shells. The hostless default
+    remains human-only. Callers that only need names read the keys; the runner
     launches the same mapping, so offer and validation cannot drift.
 
     :param spec: The session agent's spec, or ``None`` when none resolves.

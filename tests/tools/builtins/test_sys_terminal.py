@@ -25,6 +25,9 @@ import pytest
 
 from omnigent.entities.conversation import MessageData
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
+from omnigent.inner.terminal import TerminalInstance
+from omnigent.runner.identity import RUNNER_INTERACTIVE_SHELLS_ENV_VAR
+from omnigent.runner.tool_dispatch import _execute_terminal_tool
 from omnigent.runtime import _globals
 from omnigent.spec.types import AgentSpec
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -143,33 +146,107 @@ async def _invoke(tool: Tool, payload: dict[str, object], ctx: ToolContext) -> d
 # ── sys_terminal_launch ──────────────────────────────────────
 
 
-async def test_user_shell_is_read_only_for_agent(
-    registry: TerminalRegistry, ctx: ToolContext, cleanup_registry: None
+@pytest.mark.parametrize("agent_name", ["codex-sdk", "pi-rpc"])
+async def test_sdk_agent_can_use_plain_host_shells(
+    registry: TerminalRegistry,
+    ctx: ToolContext,
+    cleanup_registry: None,
+    monkeypatch: pytest.MonkeyPatch,
+    agent_name: str,
 ) -> None:
-    spec = _make_spec(terminals={"bash": TerminalEnvSpec(command="bash")})
+    from omnigent.tools.manager import ToolManager
+
+    monkeypatch.setenv(RUNNER_INTERACTIVE_SHELLS_ENV_VAR, '["bash"]')
+    spec = AgentSpec(
+        spec_version=1,
+        name=agent_name,
+        skills_filter="none",
+        os_env=OSEnvSpec(cwd="/opt/sandbox/work", sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+    )
+    manager = ToolManager(spec, os_env_schema_only=True)
+    assert "sys_terminal_launch" in manager.get_tool_names()
+
+    async def invoke(name: str, payload: dict[str, object]):
+        return json.loads(
+            await _execute_terminal_tool(
+                f"sys_terminal_{name}",
+                payload,
+                terminal_registry=registry,
+                agent_spec=spec,
+                conversation_id=ctx.conversation_id,
+                task_id=ctx.task_id,
+                agent_id=ctx.agent_id,
+                runner_workspace=ctx.workspace,
+            )
+        )
+
     target = {"terminal": "bash", "session": "user-shell"}
-    launched = await _invoke(SysTerminalLaunchTool(spec, registry), target, ctx)
+    launched = await invoke("launch", target)
     assert launched["status"] == "launched"
+    assert launched["origin"] == "agent"
+    assert "tmux_socket" not in launched
     instance = registry.get(ctx.conversation_id, "bash", "user-shell")
     assert instance is not None
-    instance.origin = "user"
-    refusal = {
-        "error": "this shell belongs to the user: you can list and read it, "
-        "not type into it or close it"
+    assert instance.os_env is not None and instance.os_env.cwd == ctx.workspace
+    assert instance.os_env.spec.sandbox.type == "none"
+    assert not instance.agent_access
+    assert await invoke("send", {**target, "text": "printf 'sdk-%s\\n' marker"}) == {
+        "status": "sent"
     }
-    assert (
-        await _invoke(SysTerminalSendTool(registry), {**target, "text": "echo marker"}, ctx)
-        == refusal
-    )
-    assert await _invoke(SysTerminalCloseTool(registry), target, ctx) == refusal
-    assert "error" not in await _invoke(SysTerminalReadTool(registry), target, ctx)
-    listed = json.loads(await asyncio.to_thread(SysTerminalListTool(registry).invoke, "{}", ctx))
-    assert listed[0]["origin"] == "user"
+    for _ in range(20):
+        screen = await invoke("read", target)
+        if "sdk-marker" in screen.get("screen", ""):
+            break
+        await asyncio.sleep(0.1)
+    assert "sdk-marker" in screen.get("screen", ""), screen
+    listed = await invoke("list", {})
+    assert listed[0]["origin"] == "agent"
     assert "tmux_socket" not in listed[0]
-    again = await _invoke(SysTerminalLaunchTool(spec, registry), target, ctx)
+    again = await invoke("launch", target)
     assert again["status"] == "already_running"
-    assert again["origin"] == "user"
+    assert again["origin"] == "agent"
     assert "tmux_socket" not in again
+    assert (await invoke("close", target))["status"] == "closed"
+    assert await invoke("list", {}) == []
+    assert spec.terminals is None
+
+
+@pytest.mark.parametrize("rebuild", [False, True])
+@pytest.mark.parametrize("host_shell", [False, True])
+async def test_launch_failure_hides_the_new_host_shell_socket(
+    registry: TerminalRegistry,
+    ctx: ToolContext,
+    cleanup_registry: None,
+    monkeypatch: pytest.MonkeyPatch,
+    rebuild: bool,
+    host_shell: bool,
+) -> None:
+    monkeypatch.setenv(RUNNER_INTERACTIVE_SHELLS_ENV_VAR, '["bash"]')
+    spec = _make_spec(terminals=None if host_shell else {"bash": TerminalEnvSpec(command="bash")})
+    tool = SysTerminalLaunchTool(spec, registry)
+    target = {"terminal": "bash", "session": "start-error"}
+    old_socket = None
+    if rebuild:
+        assert (await _invoke(tool, target, ctx))["status"] == "launched"
+        old = registry.get(ctx.conversation_id, "bash", "start-error")
+        assert old is not None
+        old_socket = old.socket_path
+        await old.close()
+
+    attempted_sockets: list[Path] = []
+
+    async def fail_launch(instance: TerminalInstance, *, cwd: Path | None = None) -> None:
+        attempted_sockets.append(instance.socket_path)
+        raise RuntimeError(f"error creating {instance.socket_path} (Permission denied)")
+
+    monkeypatch.setattr(TerminalInstance, "launch", fail_launch)
+    result = await _invoke(tool, target, ctx)
+    assert len(attempted_sockets) == 1
+    new_socket = attempted_sockets[0]
+    assert new_socket != old_socket
+    assert "Permission denied" in result["error"]
+    assert (str(new_socket) in result["error"]) is not host_shell
+    assert registry.get(ctx.conversation_id, "bash", "start-error") is None
 
 
 def test_launch_unknown_terminal_returns_error(
@@ -195,6 +272,24 @@ def test_launch_unknown_terminal_returns_error(
     # And lists the declared terminals so the LLM can see the
     # valid options.
     assert "bash" in result["error"]
+
+
+def test_launch_keeps_declared_terminal_restrictions_with_host_inventory(
+    registry: TerminalRegistry, ctx: ToolContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(RUNNER_INTERACTIVE_SHELLS_ENV_VAR, '["bash"]')
+    terminal = TerminalEnvSpec(command="python3", args=["-q"], env={"DECLARED": "yes"})
+    spec = _make_spec(terminals={"restricted": terminal})
+    tool = SysTerminalLaunchTool(spec, registry)
+    for payload, expected_error in [
+        ({"terminal": "bash"}, "unknown terminal"),
+        ({"terminal": "restricted", "cwd": "/opt/work"}, "cwd override is not allowed"),
+        ({"terminal": "restricted", "sandbox": "none"}, "sandbox override is not allowed"),
+    ]:
+        result = json.loads(tool.invoke(json.dumps({"session": "s1", **payload}), ctx))
+        assert expected_error in result["error"]
+    assert registry.list_for_conversation(ctx.conversation_id) == []
+    assert spec.terminals == {"restricted": terminal}
 
 
 def test_launch_requires_conversation_id(registry: TerminalRegistry, tmp_path: Path) -> None:
@@ -456,7 +551,7 @@ async def test_multiple_sessions_per_terminal_are_independent(
 # ── sys_terminal_send / read ──────────────────────────────────
 
 
-@pytest.mark.parametrize("origin", ["user", "agent"])
+@pytest.mark.parametrize("origin", ["user", "agent", "sdk"])
 @pytest.mark.parametrize("failure", ["bool_true", "bool_false", "command", "start", "raised"])
 async def test_read_errors_do_not_disclose_user_shell_socket(
     registry: TerminalRegistry,
@@ -468,14 +563,18 @@ async def test_read_errors_do_not_disclose_user_shell_socket(
 ) -> None:
     from omnigent.inner.terminal import _tmux_process_start_error, _TmuxCommandFailedError
 
-    spec = _make_spec(terminals={"bash": TerminalEnvSpec(command="bash")})
+    monkeypatch.setenv(RUNNER_INTERACTIVE_SHELLS_ENV_VAR, '["bash"]')
+    spec = _make_spec(
+        terminals=None if origin == "sdk" else {"bash": TerminalEnvSpec(command="bash")}
+    )
     target = {"terminal": "bash", "session": "read-error"}
     assert (await _invoke(SysTerminalLaunchTool(spec, registry), target, ctx))[
         "status"
     ] == "launched"
     instance = registry.get(ctx.conversation_id, "bash", "read-error")
     assert instance is not None
-    instance.origin = origin
+    if origin != "sdk":
+        instance.origin = origin
     socket = str(instance.socket_path)
     if failure in {"command", "start"}:
         command = ["tmux", "-S", socket, "capture-pane", "-t", "main", "-p"]
@@ -496,7 +595,7 @@ async def test_read_errors_do_not_disclose_user_shell_socket(
     result = await _invoke(
         SysTerminalReadTool(registry), {**target, "scrollback": scrollback}, ctx
     )
-    if origin == "user":
+    if origin in {"user", "sdk"}:
         assert socket not in json.dumps(result), result
     if failure.startswith("bool_"):
         assert result == {"error": "'scrollback' must be a non-negative integer"}

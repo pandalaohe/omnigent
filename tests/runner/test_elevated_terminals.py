@@ -18,6 +18,7 @@ from starlette.websockets import WebSocketDisconnect
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.runner import create_runner_app
 from omnigent.runner.direct_attach import create_direct_attach_app
+from omnigent.runner.identity import RUNNER_INTERACTIVE_SHELLS_ENV_VAR
 from omnigent.runner.native.orchestration import (
     _codex_pane_screen,
     _publish_tmux_target_for_bridge,
@@ -53,10 +54,14 @@ def admin(tmp_path: Path):
     return registry, instance
 
 
-def test_terminal_access_request_is_discovered_only_with_approval_transport(admin, monkeypatch):
+@pytest.mark.parametrize("declared", [False, True])
+def test_terminal_access_request_is_discovered_only_with_approval_transport(
+    admin, monkeypatch, declared: bool
+):
     registry, instance = admin
     monkeypatch.setattr("omnigent.runtime.get_terminal_registry", lambda: registry)
-    spec = AgentSpec(spec_version=1, terminals={"bash": TerminalEnvSpec()})
+    monkeypatch.setenv(RUNNER_INTERACTIVE_SHELLS_ENV_VAR, '["bash"]')
+    spec = AgentSpec(spec_version=1, terminals={"bash": TerminalEnvSpec()} if declared else None)
     name = "sys_terminal_request_access"
     for available in (False, True):
         schemas = ToolManager(spec, terminal_access_requests_enabled=available).get_tool_schemas()
@@ -100,11 +105,17 @@ def test_terminal_access_request_is_discovered_only_with_approval_transport(admi
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("tool", ["launch", "send", "read", "close", "list"])
-async def test_agent_terminal_tools_require_instance_consent(admin, tool: str) -> None:
+@pytest.mark.parametrize("declared", [False, True])
+async def test_agent_terminal_tools_require_instance_consent(
+    admin, tool: str, declared: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
     registry, instance = admin
     instance.send = AsyncMock(return_value={"status": "sent"})
     instance.read = AsyncMock(return_value={"screen": "private admin output"})
-    spec = AgentSpec(spec_version=1, name="test", terminals={"bash": TerminalEnvSpec()})
+    monkeypatch.setenv(RUNNER_INTERACTIVE_SHELLS_ENV_VAR, '["bash"]')
+    spec = AgentSpec(
+        spec_version=1, name="test", terminals={"bash": TerminalEnvSpec()} if declared else None
+    )
 
     async def invoke():
         return json.loads(
