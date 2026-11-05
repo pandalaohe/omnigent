@@ -667,6 +667,7 @@ class AgentQuotaService:
         self,
         conversation: Conversation,
         *,
+        requester_id: str | None = None,
         agent_store: AgentStore | None = None,
         agent_cache: AgentCache | None = None,
     ) -> dict[str, Any]:
@@ -702,7 +703,7 @@ class AgentQuotaService:
                 "pools": list(dict.fromkeys(pools)),
             },
         }
-        if self.usage_enabled:
+        if self.usage_enabled and requester_id == context.owner_id:
             try:
                 issues = self.usage_issues(context.owner_id)
                 if issues:
@@ -918,7 +919,11 @@ class AgentQuotaService:
                 if span["counted_from"] <= entry["at"] < span["until"]:
                     sources.append({"account": account, **entry})
             read_at = record.get("read_at")
-            if read_at is not None and now - read_at > 3600:
+            if (
+                read_at is not None
+                and now - read_at > 3600
+                and span["counted_from"] <= read_at < span["until"]
+            ):
                 sources.append({"account": account, "kind": "silent", "at": read_at})
         return {"failures": failures, "unpriced_models": unpriced, "source_reports": sources}
 

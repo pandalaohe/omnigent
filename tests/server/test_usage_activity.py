@@ -271,6 +271,29 @@ def test_unavailable_and_rejected_source_log_is_bounded_and_resolved(service):
     assert service.usage_issues(OWNER, now=NOW + 401) == []
 
 
+def test_silent_source_follows_the_requested_custom_range(service):
+    read_at = NOW - 86400
+    report(service, observed_at=read_at)
+    past = service.issues(
+        OWNER,
+        now=NOW,
+        range_key="custom",
+        from_date=date(2026, 10, 29),
+        to_date=date(2026, 10, 29),
+    )
+    assert past["source_reports"] == []
+    reported_day = service.issues(
+        OWNER,
+        now=NOW,
+        range_key="custom",
+        from_date=date(2026, 11, 4),
+        to_date=date(2026, 11, 4),
+    )
+    assert reported_day["source_reports"] == [
+        {"account": "gateway", "kind": "silent", "at": read_at}
+    ]
+
+
 def test_store_failure_keeps_readings_and_advisory_payload_available(service, monkeypatch):
     report(service, product="codex")
     conversation = service.conversations.create_conversation()
@@ -280,7 +303,7 @@ def test_store_failure_keeps_readings_and_advisory_payload_available(service, mo
 
     monkeypatch.setattr(service.hours_store, "read", failed)
     assert service.overview(OWNER, now=NOW).accounts
-    assert "usage_issues" not in service.payload(conversation)
+    assert "usage_issues" not in service.payload(conversation, requester_id="local")
 
 
 def test_future_old_rows_are_dropped_and_hours_are_normalized(service):
@@ -339,8 +362,14 @@ async def test_authenticated_routes_isolate_amounts_and_open_issues(request, db_
         assert other_issues.json() == {"failures": [], "unpriced_models": [], "source_reports": []}
         root = service.conversations.create_conversation()
         service.permissions.grant(OWNER, root.id, 4)
+        service.permissions.grant("other@example.test", root.id, 1)
         quota = await client.get(f"/v1/sessions/{root.id}/agent-quota", headers=_headers(OWNER))
         assert quota.json()["usage_issues"][0]["what"] == "unpriced"
+        shared_quota = await client.get(
+            f"/v1/sessions/{root.id}/agent-quota", headers=_headers("other@example.test")
+        )
+        assert shared_quota.status_code == 200
+        assert "usage_issues" not in shared_quota.json()
         service.usage_enabled = False
         quota = await client.get(f"/v1/sessions/{root.id}/agent-quota", headers=_headers(OWNER))
         assert "usage_issues" not in quota.json()

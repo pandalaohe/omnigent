@@ -232,6 +232,7 @@ def create_agent_quota_router(
         payload = await asyncio.to_thread(
             service.payload,
             conversation,
+            requester_id=user or RESERVED_USER_LOCAL,
             agent_store=getattr(request.app.state, "agent_store", None),
             agent_cache=getattr(request.app.state, "agent_cache", None),
         )
