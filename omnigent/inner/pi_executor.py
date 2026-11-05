@@ -58,6 +58,7 @@ from importlib.resources import files
 from typing import Any, Literal, NotRequired, Protocol, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse as _urlparse
 from uuid import uuid4
+from weakref import WeakValueDictionary
 
 from omnigent._platform import IS_WINDOWS, default_shell_argv, resolve_cli_binary
 from omnigent.databricks_ai_gateway import PI_AGENT, gateway_attribution_headers, is_ug_route
@@ -2400,6 +2401,7 @@ class _PiPeerPending:
 @dataclass
 class _PiSessionState:
     rpc: _PiRpcSession | None = None
+    closing: bool = False
     system_prompt: str | None = None
     model: str | None = None
     model_selection: str | None = None
@@ -3343,7 +3345,7 @@ class PiExecutor(Executor):
 
         self._session_states: dict[str, _PiSessionState] = {}
         # A retired state can still have a pending spawn; successors share its lock.
-        self._session_startup_locks: dict[str, asyncio.Lock] = {}
+        self._session_startup_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
         self._peer_initial: dict[str, _PiPeerPending] = {}
         self._context_incarnation = uuid4().hex
         self._context_records: dict[str, ContextRecordV2] = {}
@@ -3395,6 +3397,14 @@ class PiExecutor(Executor):
             return False
 
     async def close_session(self, session_key: str) -> None:
+        lock = self._session_startup_locks.setdefault(session_key, asyncio.Lock())
+        state = self._session_states.get(session_key)
+        if state is not None:
+            state.closing = True
+        async with lock:
+            await self._close_session_locked(session_key)
+
+    async def _close_session_locked(self, session_key: str) -> None:
         await self.finish_peer_messages(session_key)
         state = self._session_states.get(session_key)
         rpc = state.rpc if state is not None else None
@@ -4310,6 +4320,8 @@ class PiExecutor(Executor):
         lock = self._session_startup_locks.setdefault(session_key, asyncio.Lock())
         async with lock:
             state = self._session_states.setdefault(session_key, _PiSessionState())
+            if state.closing:
+                raise RuntimeError("Pi RPC owner is closing")
             return await self._ensure_rpc_locked(
                 state,
                 session_key,
@@ -4456,7 +4468,11 @@ class PiExecutor(Executor):
             )
             if self._permission_controlled:
                 await self._await_permission_installation(session_key, rpc)
-            if self._session_states.get(session_key) is not state or state.rpc is not previous_rpc:
+            if (
+                self._session_states.get(session_key) is not state
+                or state.rpc is not previous_rpc
+                or state.closing
+            ):
                 raise RuntimeError("Pi RPC owner changed during startup")
         except BaseException as exc:
             cancelled = isinstance(exc, asyncio.CancelledError)

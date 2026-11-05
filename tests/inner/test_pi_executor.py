@@ -700,13 +700,15 @@ async def test_context_v2_pi_start_is_visible_before_await_and_cannot_rebind(
     spawn.side_effect = pending
     read = await executor.prepare_context_inventory_v2("outer", "read")
     task = asyncio.create_task(executor._ensure_rpc("sdk-key", "system", None, []))
+    closing = None
     try:
         await asyncio.wait_for(entered.wait(), 2)
         (before,) = read().sources[0].contexts
         assert before.lifecycle == "starting" and before.vendor_id is None
         if outcome == "owner-removed":
-            await executor.close_session("sdk-key")
-            assert read().sources[0].contexts[0].lifecycle == "unknown"
+            closing = asyncio.create_task(executor.close_session("sdk-key"))
+            await asyncio.sleep(0)
+            assert not closing.done()
         if outcome == "cancel":
             task.cancel()
         release.set()
@@ -723,10 +725,14 @@ async def test_context_v2_pi_start_is_visible_before_await_and_cannot_rebind(
                 await task
             assert read().sources[0].contexts[0].lifecycle == "unknown"
         assert read().sources[0].contexts[0].key == before.key
+        if closing is not None:
+            await asyncio.wait_for(closing, 2)
     finally:
         release.set()
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+        if closing is not None:
+            await asyncio.gather(closing, return_exceptions=True)
 
 
 @pytest.mark.parametrize("evict", [False, True])
@@ -782,6 +788,52 @@ async def test_context_v2_pi_eof_detach_and_history_budget_are_unknown(context_v
     assert source.unresolved[0].reason == "context_history_budget"
 
 
+async def test_ensure_rpc_waits_until_existing_rpc_finishes_closing(context_v2_pi, monkeypatch):
+    executor, spawn, _, _ = context_v2_pi
+    old = await executor._ensure_rpc("closing", "system", None, [])
+    entered, release = asyncio.Event(), asyncio.Event()
+    close = old._close_unobserved
+
+    async def slow_close():
+        entered.set()
+        await release.wait()
+        await close()
+
+    monkeypatch.setattr(old, "_close_unobserved", slow_close)
+    closing = asyncio.create_task(executor.close_session("closing"))
+    replacement = None
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        replacement = asyncio.create_task(executor._ensure_rpc("closing", "system", None, []))
+        await asyncio.sleep(0)
+        assert not replacement.done(), "a closing RPC was reused before its process exited"
+        assert spawn.await_count == 1
+        release.set()
+        await asyncio.wait_for(closing, 2)
+        current = await asyncio.wait_for(replacement, 2)
+        assert current is not old and old.process is None
+        assert executor._session_states["closing"].rpc is current
+        assert spawn.await_count == 2
+    finally:
+        release.set()
+        await asyncio.gather(closing, return_exceptions=True)
+        if replacement is not None:
+            await asyncio.gather(replacement, return_exceptions=True)
+
+
+async def test_finished_pi_sessions_release_startup_locks(context_v2_pi):
+    import gc
+
+    executor, _, _, _ = context_v2_pi
+    for index in range(2000):
+        key = f"finished-{index}"
+        await executor._ensure_rpc(key, "system", None, [])
+        await executor.close_session(key)
+    gc.collect()
+    assert executor._session_states == {}
+    assert len(executor._session_startup_locks) == 0
+
+
 async def test_context_v2_pi_late_start_preserves_replacement_identity_and_usage_token(
     context_v2_pi, monkeypatch
 ):
@@ -802,12 +854,14 @@ async def test_context_v2_pi_late_start_preserves_replacement_identity_and_usage
     spawn.side_effect = pending
     read = await executor.prepare_context_inventory_v2("outer", "read")
     old = asyncio.create_task(executor._ensure_rpc("same-key", "system", None, []))
+    closing = None
     replacement_task = None
     try:
         await asyncio.wait_for(entered.wait(), 2)
         old_key = read().sources[0].contexts[0].key
-        await executor.close_session("same-key")
-        assert read().sources[0].contexts[0].lifecycle == "unknown"
+        closing = asyncio.create_task(executor.close_session("same-key"))
+        await asyncio.sleep(0)
+        assert not closing.done(), "close must settle the pending startup before returning"
         replacement_task = asyncio.create_task(
             executor._ensure_rpc("same-key", "system", None, [])
         )
@@ -816,8 +870,9 @@ async def test_context_v2_pi_late_start_preserves_replacement_identity_and_usage
         assert not replacement_task.done()
         release.set()
         with pytest.raises(RuntimeError, match="owner changed"):
-            await old
-        replacement = await replacement_task
+            await asyncio.wait_for(old, 2)
+        await asyncio.wait_for(closing, 2)
+        replacement = await asyncio.wait_for(replacement_task, 2)
         token = executor._tool_server._pi_usage_tokens["same-key"]
         source = read().sources[0]
         assert source.contexts[0].key == old_key and source.contexts[0].lifecycle == "unknown"
@@ -830,6 +885,8 @@ async def test_context_v2_pi_late_start_preserves_replacement_identity_and_usage
         release.set()
         old.cancel()
         await asyncio.gather(old, return_exceptions=True)
+        if closing is not None:
+            await asyncio.gather(closing, return_exceptions=True)
         if replacement_task is not None:
             replacement_task.cancel()
             await asyncio.gather(replacement_task, return_exceptions=True)
