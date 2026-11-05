@@ -6,6 +6,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { KeepWarmSettings } from "./KeepWarmSettings";
+import { OfflineHostArchiveSettings } from "./OfflineHostArchiveSettings";
 import {
   KEEP_WARM_STORAGE_KEY,
   readKeepWarmPreferences,
@@ -381,7 +382,7 @@ describe("KeepWarmSettings table", () => {
     expect(screen.getByText("Default: main on · children off")).toBeInTheDocument();
     expect(screen.getByText("Direct Claude: main off · children on")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Select cells" })).toBeNull();
-    expect(screen.getByRole("spinbutton", { name: /Archive children/ })).toBeDisabled();
+    expect(screen.queryByRole("spinbutton", { name: /Archive children/ })).toBeNull();
     expect(patches()).toEqual([]);
   });
 
@@ -516,16 +517,47 @@ describe("KeepWarmSettings table", () => {
     expect(localStorage.getItem(KEEP_WARM_STORAGE_KEY)).not.toBeNull();
   });
 
-  it("uses the same conversion and acknowledged error path for the archive control", async () => {
+  it("edits the moved archive delay without converting or changing keep-warm records", async () => {
+    const heldLayers = layersWith({ corner: { main: true }, hosts: { h1: { child: false } } });
+    await initializeUserPreferencesSync(
+      {
+        version: 1,
+        settings: { keep_warm: { layers: heldLayers, hostOfflineArchiveSeconds: 21600 } },
+      },
+      state.fetch,
+      "alice",
+    );
+    const { unmount } = render(<OfflineHostArchiveSettings />);
+    expect(screen.getByRole("spinbutton", { name: /Archive children/ })).toHaveValue(6);
+    fireEvent.change(screen.getByRole("spinbutton", { name: /Archive children/ }), {
+      target: { value: "0" },
+    });
+    expect(await screen.findByRole("status")).toHaveTextContent("Saving");
+    await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Saved."));
+    expect(patches()).toEqual([{ hostOfflineArchiveSeconds: 0, layers: heldLayers }]);
+    expect(readKeepWarmPreferences().layers).toEqual(heldLayers);
+    expect(convertCalls()).toHaveLength(0);
+    unmount();
+    render(<OfflineHostArchiveSettings />);
+    expect(screen.getByRole("spinbutton", { name: /Archive children/ })).toHaveValue(0);
+  });
+
+  it("reports a rejected archive edit and restores its last saved value", async () => {
     state.patchStatus = 422;
-    await mount();
+    await initializeUserPreferencesSync(
+      { version: 1, settings: { keep_warm: { hostOfflineArchiveSeconds: 21600 } } },
+      state.fetch,
+      "alice",
+    );
+    render(<OfflineHostArchiveSettings />);
     fireEvent.change(screen.getByRole("spinbutton", { name: /Archive children/ }), {
       target: { value: "0" },
     });
     expect(await screen.findByRole("alert")).toHaveTextContent("64 KiB limit");
     expect(patches()[0].hostOfflineArchiveSeconds).toBe(0);
-    expect(patches()[0].layers).toEqual(layersWith());
-    expect(convertCalls()).toHaveLength(1);
+    expect(patches()[0].hostOfflineArchiveSeconds).toBe(0);
+    expect(screen.getByRole("spinbutton", { name: /Archive children/ })).toHaveValue(6);
+    expect(convertCalls()).toHaveLength(0);
   });
 
   it("hides Ping every for Pi, exposes its actual cap and lists agents with no channel", async () => {

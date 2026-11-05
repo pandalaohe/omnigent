@@ -29,7 +29,6 @@ import {
 import { HostPicker } from "./instructions/HostPicker";
 import { RemoveAxisDialog } from "./instructions/RemoveAxisDialog";
 import { LayerEditor } from "./instructions/LayerEditor";
-import { ChildSessionsPanel } from "./instructions/ChildSessionsPanel";
 import { LayerGrid } from "./instructions/LayerGrid";
 import { RoutePicker } from "./instructions/RoutePicker";
 import { RouteView } from "./instructions/RouteView";
@@ -221,11 +220,7 @@ export function InstructionsPage() {
     <PageScroll contentClassName="px-4 sm:px-8" extraBottom="2.5rem">
       <div className="mx-auto w-full max-w-5xl space-y-6">
         <header>
-          <h1 className="text-2xl font-semibold">Instructions</h1>
-          <p className="mt-2 max-w-prose text-sm leading-6 text-muted-foreground">
-            See what a new session receives on a host and agent route. Manage shared instructions,
-            add specific guidance, or make one route independent.
-          </p>
+          <h1 className="text-2xl font-semibold">Startup prompts</h1>
         </header>
         {data.isError && (
           <p role="alert" className="text-sm text-destructive">
@@ -428,7 +423,6 @@ export function InstructionsPage() {
           they next reconnect to the server.
           {!canEdit ? " Only administrators can edit these layers." : ""}
         </p>
-        <ChildSessionsPanel />
         {removal && (
           <RemoveAxisDialog
             name={removal.name}

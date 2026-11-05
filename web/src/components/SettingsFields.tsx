@@ -2,6 +2,7 @@ import { useEffect, useState, type ReactNode } from "react";
 
 import { HelpTip } from "@/components/HelpTip";
 import { Input } from "@/components/ui/input";
+import { cn } from "@/lib/utils";
 
 interface NumericFieldProps {
   value: number | null;
@@ -71,17 +72,23 @@ export function SettingRow({
   label,
   hint,
   note,
+  indent,
   children,
 }: {
   label: string;
   hint?: ReactNode;
   note?: ReactNode;
+  indent?: 1 | 2;
   children: ReactNode;
 }) {
   return (
     <div
       data-slot="setting-row"
-      className="flex max-w-2xl flex-wrap items-center justify-between gap-x-6 gap-y-2"
+      className={cn(
+        "flex max-w-2xl flex-wrap items-center justify-between gap-x-6 gap-y-2",
+        indent === 1 && "pl-4 md:pl-6",
+        indent === 2 && "pl-8 md:pl-12",
+      )}
     >
       <div className="min-w-0">
         <div className="flex items-center gap-1.5">

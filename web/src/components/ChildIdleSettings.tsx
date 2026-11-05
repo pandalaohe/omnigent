@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useId, useState } from "react";
 
 import { NumericField, SettingRow } from "@/components/SettingsFields";
+import { AgentNameTag } from "@/components/AgentNameTag";
 import { ExceptionList } from "@/components/ExceptionList";
 import { HelpTip } from "@/components/HelpTip";
 import { Switch } from "@/components/ui/switch";
@@ -23,37 +24,37 @@ function FreezeControls({
 }) {
   return (
     <div className="space-y-3">
-      <SettingRow label="Monitor children" hint="Detect children that stop making progress.">
+      <SettingRow label="Is stuck, offline or hit an error" indent={1}>
         <Switch
           aria-label={`Monitor ${label} children`}
           checked={value.enabled}
           onCheckedChange={(enabled) => onPatch({ enabled })}
         />
+        <NumericField
+          ariaLabel={`${label} quiet or offline for in minutes`}
+          value={value.freezeThresholdSeconds / 60}
+          min={1}
+          max={10080}
+          disabled={!value.enabled}
+          onCommit={(minutes) => onPatch({ freezeThresholdSeconds: minutes * 60 })}
+        />
+        <span className="text-sm text-muted-foreground">min</span>
       </SettingRow>
-      {(
-        [
-          ["checkIntervalSeconds", "Check every"],
-          ["freezeThresholdSeconds", "Quiet or offline for"],
-        ] as const
-      ).map(([key, text]) => (
-        <label key={key} className="flex flex-wrap items-center justify-between gap-2 text-sm">
-          <span>{text}</span>
-          <span className="flex items-center gap-2 text-muted-foreground">
-            <NumericField
-              ariaLabel={`${label} ${text.toLowerCase()} in minutes`}
-              value={value[key] / 60}
-              min={1}
-              max={10080}
-              disabled={!value.enabled}
-              onCommit={(minutes) => onPatch({ [key]: minutes * 60 })}
-            />{" "}
-            min
-          </span>
-        </label>
-      ))}
+      <SettingRow label="Check every" indent={2}>
+        <NumericField
+          ariaLabel={`${label} check every in minutes`}
+          value={value.checkIntervalSeconds / 60}
+          min={1}
+          max={10080}
+          disabled={!value.enabled}
+          onCommit={(minutes) => onPatch({ checkIntervalSeconds: minutes * 60 })}
+        />
+        <span className="text-sm text-muted-foreground">min</span>
+      </SettingRow>
       <SettingRow
         label="Resume once after a temporary error"
         hint="Sends at most one automatic continuation per child session."
+        indent={2}
       >
         <Switch
           aria-label={`Resume ${label} once`}
@@ -104,47 +105,129 @@ export function ChildIdleSettings() {
 
   return (
     <div className="flex flex-col gap-4" data-testid="child-idle-settings">
-      <p className="text-sm text-muted-foreground">
-        Fallback check-ins tell a parent when a child stays idle, stops after a temporary service
-        error, loses its runner, or stops making progress. Each check-in can start a parent turn.
-        Completion and approval notices are unaffected. Works independently of keep-warm.
-      </p>
-      <SettingRow
-        label="Remind parent sessions"
-        hint="Applies to your child sessions on every agent."
-      >
+      <div className="flex items-center gap-1.5 text-ui font-medium">
+        Tell the parent session when a child…
+        <HelpTip label="About child check-ins" className="size-11 md:size-4">
+          Each check-in can start a parent turn. Completion and approval notices are unaffected.
+          Works independently of keep-warm. Checks can delay detection by one interval. Pending
+          questions, archived sessions and running tools are skipped.
+        </HelpTip>
+      </div>
+      <SettingRow label="Is idle" indent={1}>
         <Switch
           aria-label="Remind parent sessions about idle children"
           checked={preferences.enabled}
           onCheckedChange={(enabled) => writeChildIdlePreferences({ ...preferences, enabled })}
         />
+        <NumericField
+          ariaLabel="Idle threshold in minutes"
+          value={preferences.idleThresholdSeconds / 60}
+          min={1}
+          max={10080}
+          disabled={!preferences.enabled}
+          onCommit={(minutes) =>
+            writeChildIdlePreferences({ ...preferences, idleThresholdSeconds: minutes * 60 })
+          }
+        />
+        <span className="text-sm text-muted-foreground">min</span>
       </SettingRow>
-      {(
-        [
-          ["idleThresholdSeconds", "Idle for", "Idle threshold in minutes", 1, 10080],
-          ["mergeWindowSeconds", "Combine reminders for", "Merge window in minutes", 0, 1440],
-        ] as const
-      ).map(([key, label, ariaLabel, min, max]) => (
-        <label key={key} className="flex flex-wrap items-center justify-between gap-2 text-sm">
-          <span className="font-medium text-foreground">{label}</span>
-          <span className="flex items-center gap-2 text-muted-foreground">
-            <NumericField
-              ariaLabel={ariaLabel}
-              value={preferences[key] / 60}
-              min={min}
-              max={max}
-              disabled={key === "idleThresholdSeconds" ? !preferences.enabled : !anyEnabled}
-              onCommit={(minutes) =>
-                writeChildIdlePreferences({ ...preferences, [key]: minutes * 60 })
-              }
-            />
-            min
-          </span>
-        </label>
-      ))}
+      <FreezeControls
+        label="all agents"
+        value={preferences.freezeDefault}
+        onPatch={(next) =>
+          writeChildIdlePreferences({
+            ...preferences,
+            freezeDefault: { ...preferences.freezeDefault, ...next },
+          })
+        }
+      />
+      <div className="pl-8 md:pl-12">
+        <ExceptionList
+          rows={preferences.agents}
+          items={registry.items}
+          legacyLabels={registry.legacyLabels}
+          savedItems={registry.legacyProducts}
+          renderLabel={(key, name) => {
+            const item =
+              registry.items.find((candidate) => candidate.key === key) ??
+              registry.legacyProducts?.[key];
+            return (
+              <AgentNameTag
+                agentId={
+                  key.startsWith("harness:")
+                    ? (Object.values(registry.legacyProducts ?? {}).find(
+                        (product) => product.harness === item?.harness,
+                      )?.key ?? null)
+                    : key
+                }
+                name={name}
+                harness={item?.harness ?? null}
+              />
+            );
+          }}
+          summary={(row) =>
+            row.enabled
+              ? `Monitor · every ${row.checkIntervalSeconds / 60} min · quiet ${row.freezeThresholdSeconds / 60} min${row.resumeOnce ? " · resume once" : ""}`
+              : "Monitoring off"
+          }
+          editor={renderEditor}
+          onAdd={(key) =>
+            writeChildIdlePreferences({
+              ...preferences,
+              agents: { ...preferences.agents, [key]: { ...preferences.freezeDefault } },
+            })
+          }
+          onPatch={(key, next) =>
+            writeChildIdlePreferences({
+              ...preferences,
+              agents: { ...preferences.agents, [key]: { ...preferences.agents[key], ...next } },
+            })
+          }
+          onRemove={(key) =>
+            writeChildIdlePreferences({
+              ...preferences,
+              agents: Object.fromEntries(
+                Object.entries(preferences.agents).filter(([id]) => id !== key),
+              ),
+            })
+          }
+          isLoading={registry.isLoading}
+          isError={registry.isError}
+          onRetry={registry.retry}
+        />
+      </div>
+      <SettingRow label="Combine reminders for">
+        <NumericField
+          ariaLabel="Merge window in minutes"
+          value={preferences.mergeWindowSeconds / 60}
+          min={0}
+          max={1440}
+          disabled={!anyEnabled}
+          onCommit={(minutes) =>
+            writeChildIdlePreferences({ ...preferences, mergeWindowSeconds: minutes * 60 })
+          }
+        />
+        <span className="text-sm text-muted-foreground">min</span>
+      </SettingRow>
       <SettingRow
-        label="At most one check-in per parent every"
-        hint="0 uses per-child reminders without a shared parent interval."
+        label="Remind again every"
+        hint="Repeat a check-in when a child's state has not changed. 0 sends no repeat reminders."
+      >
+        <NumericField
+          ariaLabel="Repeat interval in minutes"
+          value={preferences.repeatSeconds / 60}
+          min={0}
+          max={10080}
+          disabled={!anyEnabled}
+          onCommit={(minutes) =>
+            writeChildIdlePreferences({ ...preferences, repeatSeconds: minutes * 60 })
+          }
+        />
+        <span className="text-sm text-muted-foreground">min</span>
+      </SettingRow>
+      <SettingRow
+        label="At most one notice per parent every"
+        hint="0 uses per-child reminders without a shared parent interval. A parent still waiting for this interval may hear about a child later."
       >
         <NumericField
           ariaLabel="Minimum check-in gap in minutes"
@@ -179,91 +262,6 @@ export function ChildIdleSettings() {
           </label>
         ))}
       </fieldset>
-      <SettingRow
-        label="Remind again"
-        hint="Repeat a check-in when a child's state has not changed. Off sends no repeat reminders."
-      >
-        <span className="text-sm text-muted-foreground">
-          {preferences.repeatSeconds === 0 ? "Off" : "On"}
-        </span>
-        <Switch
-          aria-label="Remind again"
-          checked={preferences.repeatSeconds > 0}
-          disabled={!anyEnabled}
-          onCheckedChange={(enabled) =>
-            writeChildIdlePreferences({ ...preferences, repeatSeconds: enabled ? 14400 : 0 })
-          }
-        />
-      </SettingRow>
-      {preferences.repeatSeconds > 0 && (
-        <SettingRow label="Remind again after" hint="Time before repeating an unchanged check-in.">
-          <NumericField
-            ariaLabel="Repeat interval in minutes"
-            value={preferences.repeatSeconds / 60}
-            min={1}
-            max={10080}
-            disabled={!anyEnabled}
-            onCommit={(minutes) =>
-              writeChildIdlePreferences({ ...preferences, repeatSeconds: minutes * 60 })
-            }
-          />
-          <span className="text-sm text-muted-foreground">min</span>
-        </SettingRow>
-      )}
-      <div className="flex flex-col gap-4">
-        <div className="flex items-center gap-1.5 text-sm font-medium">
-          Child freeze monitoring{" "}
-          <HelpTip label="About child freeze monitoring">
-            Checks can delay detection by one interval. Pending questions, archived sessions and
-            running tools are skipped. Automatic continuation makes one attempt per child.
-          </HelpTip>
-        </div>
-        <fieldset className="space-y-3 border-t border-border pt-3">
-          <legend className="text-sm font-medium">All agents</legend>
-          <FreezeControls
-            label="all agents"
-            value={preferences.freezeDefault}
-            onPatch={(next) =>
-              writeChildIdlePreferences({
-                ...preferences,
-                freezeDefault: { ...preferences.freezeDefault, ...next },
-              })
-            }
-          />
-        </fieldset>
-        <ExceptionList
-          rows={preferences.agents}
-          items={registry.items}
-          legacyLabels={registry.legacyLabels}
-          summary={(row) =>
-            row.enabled
-              ? `Monitor · every ${row.checkIntervalSeconds / 60} min · quiet ${row.freezeThresholdSeconds / 60} min${row.resumeOnce ? " · resume once" : ""}`
-              : "Monitoring off"
-          }
-          editor={renderEditor}
-          onAdd={(key) =>
-            writeChildIdlePreferences({
-              ...preferences,
-              agents: { ...preferences.agents, [key]: { ...preferences.freezeDefault } },
-            })
-          }
-          onPatch={(key, next) =>
-            writeChildIdlePreferences({
-              ...preferences,
-              agents: { ...preferences.agents, [key]: { ...preferences.agents[key], ...next } },
-            })
-          }
-          onRemove={(key) => {
-            const agents = Object.fromEntries(
-              Object.entries(preferences.agents).filter(([id]) => id !== key),
-            );
-            writeChildIdlePreferences({ ...preferences, agents });
-          }}
-          isLoading={registry.isLoading}
-          isError={registry.isError}
-          onRetry={registry.retry}
-        />
-      </div>
     </div>
   );
 }

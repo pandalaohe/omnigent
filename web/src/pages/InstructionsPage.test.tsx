@@ -179,10 +179,10 @@ describe("InstructionsPage", () => {
     const table = screen.getByRole("table", { name: "Instruction layers by host and agent" });
     expect(within(table).getByRole("columnheader", { name: /^Laptop/ })).toBeVisible();
     expect(within(table).getByRole("rowheader", { name: /^Codex/ })).toBeVisible();
-    expect(
-      table.compareDocumentPosition(screen.getByRole("heading", { name: "Child sessions" })) &
-        Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "Startup prompts" })).toBeVisible();
+    expect(screen.queryByRole("textbox", { name: "Open children per parent" })).toBeNull();
+    expect(screen.queryByTestId("child-idle-settings")).toBeNull();
+    expect(screen.queryByRole("spinbutton", { name: /Archive children/ })).toBeNull();
     await userEvent.click(screen.getByRole("tab", { name: "Parent" }));
     expect(screen.getByTestId("location")).toHaveTextContent("role=parent");
     fireEvent.click(within(screen.getByRole("table")).getByRole("button", { name: "Edit Codex" }));

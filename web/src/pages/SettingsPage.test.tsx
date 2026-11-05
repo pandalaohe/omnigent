@@ -75,6 +75,7 @@ const mocks = vi.hoisted(() => ({
   authenticatedFetch: vi.fn(),
   // Deployment gate for the Usage board module (server config usage.enabled).
   usageBoardEnabled: true,
+  sessionCollabEnabled: false,
 }));
 
 vi.mock("next-themes", () => ({
@@ -94,6 +95,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     single_user: mocks.singleUser,
     enabled_connections: mocks.enabledConnections,
     usage_board_enabled: mocks.usageBoardEnabled,
+    features: { session_peer_messaging: mocks.sessionCollabEnabled },
   }),
 }));
 vi.mock("@/shell/ImportSessionsPanel", () => ({
@@ -363,6 +365,7 @@ beforeEach(() => {
   mocks.importSessionsPanel.mockClear();
   mocks.enabledConnections = [];
   mocks.realContextUsage = false;
+  mocks.sessionCollabEnabled = false;
   mocks.loginUrl = "/login";
   mocks.me = { id: "alice", is_admin: false };
   mocks.conversations = [];
@@ -406,6 +409,31 @@ describe("Import sessions", () => {
     expect(screen.queryByRole("heading", { name: "Harness imports" })).toBeNull();
   });
 });
+
+it.each(["#child-sessions", "#child-idle"])(
+  "opens the child settings fold from %s",
+  async (hash) => {
+    mocks.sessionCollabEnabled = true;
+    renderPage(`/settings/general${hash}`);
+    const group = screen.getByTestId("settings-group-sessions");
+    expect(
+      within(group)
+        .getAllByText(/^(Session choice|Session collaboration|Child sessions|Keep-warm)$/, {
+          selector: "summary",
+        })
+        .map((node) => node.textContent),
+    ).toEqual(["Session choice", "Session collaboration", "Child sessions", "Keep-warm"]);
+    const opening = within(group).getByRole("region", { name: "Opening" });
+    const checkins = within(group).getByRole("region", { name: "Check-ins" });
+    const offline = within(group).getByRole("region", { name: "Offline hosts" });
+    expect(
+      within(opening).getByRole("textbox", { name: "Open children per parent" }),
+    ).toBeVisible();
+    expect(within(checkins).getByTestId("child-idle-settings")).toBeVisible();
+    expect(within(offline).getByRole("spinbutton", { name: /Archive children/ })).toHaveValue(4);
+    expect(screen.getAllByRole("spinbutton", { name: /Archive children/ })).toHaveLength(1);
+  },
+);
 
 describe("MCP settings", () => {
   it("renders configured MCP accounts at their own URL", () => {
@@ -626,7 +654,7 @@ describe("SettingsPage", () => {
   });
 
   it("opens sub-agents full screen by default and persists the panel setting", async () => {
-    renderPage("/settings/general");
+    renderPage("/settings/general#child-sessions");
     const toggle = await screen.findByTestId("open-subagents-in-panel-toggle");
     expect(screen.getByTestId("settings-group-sessions")).toContainElement(toggle);
     expect(toggle).toHaveAccessibleName("Open sub-agents in the Workspace panel");
