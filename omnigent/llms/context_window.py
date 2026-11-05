@@ -404,7 +404,12 @@ def fetch_model_pricing_with_provider(
             # fall through to catalog rather than breaking cost tracking entirely.
             pass
 
-    # Step 2: Fall back to catalog pricing when provider pricing is not configured
+    from omnigent.llms.price_source import selected_price
+
+    if (selected := selected_price(model)) is not None:
+        return selected
+
+    # Fall back to the catalog when the server's selected map has no match.
     catalog_pricing = fetch_model_pricing(model)
     if catalog_pricing is not None:
         return catalog_pricing
