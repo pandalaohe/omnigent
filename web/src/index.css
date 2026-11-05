@@ -16,6 +16,48 @@
 @source "../node_modules/streamdown/dist/*.js";
 
 @custom-variant dark (&:is(.dark *));
+@custom-variant phone {
+  @media (max-width: 767.98px), (pointer: coarse) and (max-height: 500px) {
+    @slot;
+  }
+}
+
+/* Enlarge the hit box without changing a control's visible size or layout. */
+.phone-hit-area {
+  @variant phone {
+    &::after {
+      content: "";
+      position: absolute;
+      inset: auto;
+      left: 50%;
+      top: 50%;
+      width: max(100%, 44px);
+      height: max(100%, 44px);
+      transform: translate(-50%, -50%);
+      pointer-events: inherit;
+    }
+
+    /* Edge handles keep the entire target inside the viewport. */
+    &[data-dock-edge="left"]::after {
+      left: 0;
+      transform: translateY(-50%);
+    }
+    &[data-dock-edge="right"]::after {
+      left: auto;
+      right: 0;
+      transform: translateY(-50%);
+    }
+    &[data-dock-edge="top"]::after {
+      top: 0;
+      transform: translateX(-50%);
+    }
+    &[data-dock-edge="bottom"]::after {
+      top: auto;
+      bottom: 0;
+      transform: translateX(-50%);
+    }
+  }
+}
 
 /* Native popup menus use the browser's color scheme, including on Windows. */
 select {

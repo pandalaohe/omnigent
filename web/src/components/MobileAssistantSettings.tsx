@@ -220,7 +220,11 @@ function KeyChordPicker({
           ))}
         </select>
       </label>
-      <div className="flex flex-wrap gap-1" role="group" aria-label="Key modifiers">
+      <div
+        className="flex flex-wrap gap-1 phone:gap-x-3 phone:gap-y-4"
+        role="group"
+        aria-label="Key modifiers"
+      >
         {(
           [
             ["control", "Ctrl"],
@@ -275,7 +279,7 @@ function TerminalKeySettings({ preferences }: { preferences: ResolvedMobileAssis
     persist(next);
   };
   return (
-    <div className="mt-4 space-y-5">
+    <div className="mt-4 space-y-5 phone:[&_[data-slot=setting-row]]:min-h-11">
       <SettingRow
         label="Terminal key rows"
         hint="Show keys above the phone keyboard. When the rows are off or cannot fit, the floating assistant uses the first ten terminal keys instead."
@@ -315,8 +319,8 @@ function TerminalKeySettings({ preferences }: { preferences: ResolvedMobileAssis
                     {index === 0 ? "First row" : `Page ${index / 6}`}
                   </h4>
                 )}
-                <div className="flex min-h-11 items-center gap-1 border-b border-border px-2 py-1">
-                  <span className="w-5 shrink-0 text-xs text-muted-foreground">{index + 1}</span>
+                <div className="flex min-h-11 items-center gap-1 border-b border-border px-2 py-1 phone:gap-3">
+                  <span className="w-5 shrink-0 text-sm text-muted-foreground">{index + 1}</span>
                   <span className="min-w-0 flex-1 truncate text-ui">{button.label}</span>
                   <Button
                     type="button"
@@ -362,7 +366,7 @@ function TerminalKeySettings({ preferences }: { preferences: ResolvedMobileAssis
           })}
         </ul>
       )}
-      <div className="flex flex-wrap gap-2">
+      <div className="flex flex-wrap gap-2 phone:gap-y-4">
         <Button
           type="button"
           variant="outline"
@@ -600,7 +604,7 @@ export function MobileAssistantSettings() {
 
   return (
     <section>
-      <div className="mb-4 flex items-center justify-between gap-3">
+      <div className="mb-4 flex min-h-11 items-center justify-between gap-3">
         <SettingsLabel label="Mobile controls" note={null} />
         <Switch
           checked={preferences.enabled}
@@ -660,7 +664,7 @@ export function MobileAssistantSettings() {
                         (index + offset + preferences.buttons.length) % preferences.buttons.length;
                       persistButtonSlot(button.id, target);
                     }}
-                    className="absolute flex h-9 w-9 touch-none cursor-grab items-center justify-center rounded-full border border-border bg-popover px-1 text-[10px] font-semibold text-popover-foreground shadow-sm transition-[left,top,transform,opacity] focus-visible:ring-2 focus-visible:ring-ring active:cursor-grabbing data-[dragging=true]:opacity-25 data-[drop-target=true]:border-primary data-[drop-target=true]:ring-2 data-[drop-target=true]:ring-primary/45"
+                    className="phone-hit-area absolute flex h-9 w-9 touch-none cursor-grab items-center justify-center rounded-full border border-border bg-popover px-1 text-sm font-semibold text-popover-foreground shadow-sm transition-[left,top,transform,opacity] focus-visible:ring-2 focus-visible:ring-ring active:cursor-grabbing data-[dragging=true]:opacity-25 data-[drop-target=true]:border-primary data-[drop-target=true]:ring-2 data-[drop-target=true]:ring-primary/45"
                     style={{
                       left: position.x,
                       top: position.y,
@@ -669,7 +673,7 @@ export function MobileAssistantSettings() {
                     title={`${index + 1}. ${button.label}`}
                   >
                     <MobileAssistantButtonContent button={button} className="h-3.5 w-3.5" />
-                    <span className="absolute -right-1 -top-1 flex size-4 items-center justify-center rounded-full bg-primary text-[9px] text-primary-foreground">
+                    <span className="absolute -right-1 -top-1 flex size-4 items-center justify-center rounded-full bg-primary text-sm text-primary-foreground">
                       {index + 1}
                     </span>
                   </button>
@@ -680,9 +684,9 @@ export function MobileAssistantSettings() {
               </div>
             </div>
             <div className="grid content-center gap-3">
-              <p className="text-sm font-medium text-foreground">Drag to arrange</p>
+              <p className="text-ui font-medium text-foreground">Drag to arrange</p>
               <p
-                className="text-xs text-muted-foreground"
+                className="text-sm text-muted-foreground"
                 title="The button follows your pointer. Release outside the circle to keep the current order."
               >
                 Release inside to place · outside to cancel
@@ -695,7 +699,7 @@ export function MobileAssistantSettings() {
                 <div
                   aria-hidden
                   data-testid="mobile-assistant-drag-preview"
-                  className="pointer-events-none fixed z-[100] flex h-9 w-9 items-center justify-center rounded-full border border-primary bg-popover px-1 text-[10px] font-semibold text-popover-foreground shadow-lg ring-2 ring-primary/35"
+                  className="pointer-events-none fixed z-[100] flex h-9 w-9 items-center justify-center rounded-full border border-primary bg-popover px-1 text-sm font-semibold text-popover-foreground shadow-lg ring-2 ring-primary/35"
                   style={{
                     left: previewDrag.clientX,
                     top: previewDrag.clientY,
@@ -716,20 +720,20 @@ export function MobileAssistantSettings() {
                 {preferences.buttons.map((button, index) => (
                   <li
                     key={button.id}
-                    className="flex min-h-12 items-center gap-1.5 border-b border-border/60 px-2 py-1.5 last:border-b-0"
+                    className="flex min-h-12 items-center gap-1.5 border-b border-border/60 px-2 py-1.5 last:border-b-0 phone:px-3"
                   >
-                    <span className="flex size-5 shrink-0 items-center justify-center rounded-full bg-muted text-[10px] text-muted-foreground">
+                    <span className="flex size-5 shrink-0 items-center justify-center rounded-full bg-muted text-sm text-muted-foreground">
                       {index + 1}
                     </span>
-                    <span className="w-16 shrink-0 truncate text-sm font-medium text-foreground">
+                    <span className="w-16 shrink-0 truncate text-ui font-medium text-foreground">
                       {button.label}
                     </span>
                     <div className="min-w-0 flex-1">
-                      <span className="block truncate text-xs text-muted-foreground">
+                      <span className="block truncate text-sm text-muted-foreground">
                         {bindingSummary(button)}
                       </span>
                       {bindingDescription(button.binding) ? (
-                        <span className="block truncate text-xs text-muted-foreground">
+                        <span className="block truncate text-sm text-muted-foreground">
                           {bindingDescription(button.binding)}
                         </span>
                       ) : null}
@@ -748,6 +752,7 @@ export function MobileAssistantSettings() {
                       variant="ghost"
                       size="icon-xs"
                       aria-label={`Delete ${button.label}`}
+                      className="phone:ml-3.5"
                       onClick={() => removeButton(button.id)}
                     >
                       <Trash2Icon />
@@ -758,7 +763,7 @@ export function MobileAssistantSettings() {
             )}
           </div>
 
-          <div className="mt-3 flex flex-wrap gap-2">
+          <div className="mt-3 flex flex-wrap gap-2 phone:gap-y-4">
             <Button
               type="button"
               variant="outline"
@@ -781,7 +786,7 @@ export function MobileAssistantSettings() {
             >
               <RotateCcwIcon /> Restore default buttons
             </Button>
-            <span className="self-center text-xs text-muted-foreground">
+            <span className="self-center text-sm text-muted-foreground">
               {preferences.buttons.length}/{MOBILE_ASSISTANT_MAX_BUTTONS}
             </span>
           </div>
@@ -801,7 +806,7 @@ export function MobileAssistantSettings() {
               </DialogHeader>
               {draft ? (
                 <div className="grid gap-4">
-                  <label className="grid gap-1.5 text-sm">
+                  <label className="grid gap-1.5 text-ui">
                     Button label
                     <Input
                       value={draft.label}
@@ -813,7 +818,7 @@ export function MobileAssistantSettings() {
                       }
                     />
                   </label>
-                  <label className="grid gap-1.5 text-sm">
+                  <label className="grid gap-1.5 text-ui">
                     Button display
                     <select
                       aria-label="Button display"
@@ -825,14 +830,14 @@ export function MobileAssistantSettings() {
                             : current,
                         )
                       }
-                      className="h-8 rounded-lg border border-input bg-background px-2.5 text-sm"
+                      className="h-8 rounded-lg border border-input bg-background px-2.5 text-ui phone:min-h-11"
                     >
                       <option value="text">Text label</option>
                       <option value="icon">Icon</option>
                     </select>
                   </label>
                   {draft.display === "icon" ? (
-                    <label className="grid gap-1.5 text-sm">
+                    <label className="grid gap-1.5 text-ui">
                       Button icon
                       <select
                         aria-label="Button icon"
@@ -844,7 +849,7 @@ export function MobileAssistantSettings() {
                               : current,
                           )
                         }
-                        className="h-8 rounded-lg border border-input bg-background px-2.5 text-sm"
+                        className="h-8 rounded-lg border border-input bg-background px-2.5 text-ui phone:min-h-11"
                       >
                         {MOBILE_ASSISTANT_ICONS.map((icon) => (
                           <option key={icon.id} value={icon.id}>
@@ -854,7 +859,7 @@ export function MobileAssistantSettings() {
                       </select>
                     </label>
                   ) : null}
-                  <label className="grid gap-1.5 text-sm">
+                  <label className="grid gap-1.5 text-ui">
                     Binding type
                     <select
                       value={draft.kind}
@@ -865,7 +870,7 @@ export function MobileAssistantSettings() {
                             : current,
                         )
                       }
-                      className="h-8 rounded-lg border border-input bg-background px-2.5 text-sm"
+                      className="h-8 rounded-lg border border-input bg-background px-2.5 text-ui phone:min-h-11"
                     >
                       <option value="shortcut">OmniGent action</option>
                       <option value="key">Custom key combination</option>
@@ -874,8 +879,8 @@ export function MobileAssistantSettings() {
                   </label>
 
                   {draft.kind === "shortcut" ? (
-                    <div className="grid gap-1.5 text-sm">
-                      <label className="grid gap-1.5 text-sm">
+                    <div className="grid gap-1.5 text-ui">
+                      <label className="grid gap-1.5 text-ui">
                         Action from keyboard shortcuts
                         <select
                           value={draft.actionId}
@@ -889,7 +894,7 @@ export function MobileAssistantSettings() {
                                 : current,
                             )
                           }
-                          className="h-8 rounded-lg border border-input bg-background px-2.5 text-sm"
+                          className="h-8 rounded-lg border border-input bg-background px-2.5 text-ui phone:min-h-11"
                         >
                           {MOBILE_ASSISTANT_CHAT_ACTION_IDS.map((actionId) => (
                             <option key={actionId} value={actionId}>
@@ -899,18 +904,18 @@ export function MobileAssistantSettings() {
                         </select>
                       </label>
                       {bindingDescription({ kind: "shortcut", actionId: draft.actionId }) ? (
-                        <span className="text-xs text-muted-foreground">
+                        <span className="text-sm text-muted-foreground">
                           {bindingDescription({ kind: "shortcut", actionId: draft.actionId })}
                         </span>
                       ) : null}
-                      <span className="text-xs text-muted-foreground">
+                      <span className="text-sm text-muted-foreground">
                         Switch recent sessions is keyboard-only: it needs a held key.
                       </span>
                     </div>
                   ) : null}
 
                   {draft.kind === "key" ? (
-                    <div className="grid gap-1.5 text-sm">
+                    <div className="grid gap-1.5 text-ui">
                       <span>Key combination</span>
                       <KeyChordPicker
                         chord={draft.chord}
@@ -919,7 +924,7 @@ export function MobileAssistantSettings() {
                         }
                       />
                       <p
-                        className="text-xs text-muted-foreground"
+                        className="text-sm text-muted-foreground"
                         title="Browsers do not allow a web page to invoke protected browser or operating-system shortcuts such as opening a new tab."
                       >
                         In-app keys only.
@@ -929,7 +934,7 @@ export function MobileAssistantSettings() {
 
                   {draft.kind === "text" ? (
                     <>
-                      <label className="grid gap-1.5 text-sm">
+                      <label className="grid gap-1.5 text-ui">
                         Text or phrase
                         <Textarea
                           value={draft.text}
@@ -943,7 +948,7 @@ export function MobileAssistantSettings() {
                           }
                         />
                       </label>
-                      <label className="flex items-center justify-between gap-3 text-sm">
+                      <label className="flex min-h-11 items-center justify-between gap-3 text-ui">
                         Send after insert
                         <Switch
                           checked={draft.submit}
@@ -957,7 +962,7 @@ export function MobileAssistantSettings() {
                   ) : null}
 
                   {mobileAssistantBindingSupportsRepeat(bindingFromDraft(draft)) ? (
-                    <label className="flex items-center justify-between gap-3 text-sm">
+                    <label className="flex min-h-11 items-center justify-between gap-3 text-ui">
                       Repeat while held
                       <Switch
                         checked={draft.repeat}

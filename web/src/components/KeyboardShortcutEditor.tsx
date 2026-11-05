@@ -90,7 +90,7 @@ function ShortcutBindingButton({
       onClick={onRecord}
       aria-label={`Record ${targetLabel} for ${definition.label}`}
       aria-pressed={recording}
-      className="flex min-h-8 items-center justify-end gap-1 rounded-md px-1.5 outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
+      className="phone-hit-area relative flex min-h-8 items-center justify-end gap-1 rounded-md px-1.5 outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring phone:min-h-11 phone:min-w-11"
     >
       {recording ? (
         <span className="animate-pulse text-sm text-primary">Press shortcut…</span>
@@ -319,7 +319,7 @@ export function KeyboardShortcutEditor() {
                   data-testid={`shortcut-editor-row-${definition.id}`}
                   className="border-b border-border/60 py-2 last:border-b-0"
                 >
-                  <div className="flex min-h-9 items-center gap-2">
+                  <div className="flex min-h-9 items-center gap-2 phone:min-h-11 phone:gap-5">
                     <span className="min-w-0 flex-1">
                       <span className="block text-ui text-foreground">{definition.label}</span>
                       {definition.note ? (
@@ -339,7 +339,7 @@ export function KeyboardShortcutEditor() {
                       checked={enabled}
                       onCheckedChange={(checked) => setEnabled(definition.id, checked)}
                       aria-label={`${enabled ? "Disable" : "Enable"} ${definition.label} shortcut`}
-                      className="scale-90"
+                      className="scale-90 phone:after:min-h-[calc(44px/0.9)] phone:after:min-w-[calc(44px/0.9)]"
                     />
                     <ShortcutBindingButton
                       actionId={definition.id}
@@ -391,7 +391,7 @@ export function KeyboardShortcutEditor() {
                       <div
                         key={platform.id}
                         data-testid={`shortcut-platform-${definition.id}-${platform.id}`}
-                        className="ml-5 flex min-h-9 items-center gap-2 border-l border-border/60 pl-3"
+                        className="ml-5 flex min-h-9 items-center gap-2 border-l border-border/60 pl-3 phone:mt-3 phone:min-h-11 phone:gap-5"
                       >
                         <span className="min-w-20 flex-1 text-sm text-muted-foreground">
                           {platform.label}

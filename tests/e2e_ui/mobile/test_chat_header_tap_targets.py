@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 
+import pytest
 from playwright.sync_api import Browser, BrowserContext, Page, expect
 
 # iPhone-12/13-class portrait viewport -- comfortably below the Tailwind
@@ -147,6 +148,128 @@ def test_sidebar_opens_from_header_toggle_on_mobile(
         expect(drawer).to_have_attribute("aria-hidden", "false", timeout=5_000)
         expect(page.get_by_test_id("sidebar-conversation-list")).to_be_visible()
         _beat(page)
+    finally:
+        context.close()
+
+
+@pytest.mark.parametrize("width,height", [(320, 844), (390, 844), (844, 390)])
+def test_settings_phone_hit_areas_activate_without_stealing_neighbours(
+    browser: Browser, live_server: str, width: int, height: int
+) -> None:
+    """Small controls keep their visuals while precise outer-ring presses work."""
+    context, page = _new_mobile_page(browser)
+    try:
+        page.set_viewport_size({"width": width, "height": height})
+        page.goto(f"{live_server}/settings/shortcuts")
+        shortcut = page.get_by_test_id("shortcut-editor-row-newSession")
+        expect(shortcut).to_be_visible(timeout=30_000)
+        shortcut_toggle = shortcut.get_by_role("switch")
+        shortcut_toggle.scroll_into_view_if_needed()
+        box = shortcut_toggle.bounding_box()
+        assert box is not None
+        page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2 + 20.5)
+        expect(shortcut_toggle).to_have_attribute("aria-checked", "false")
+        shortcut_toggle.click()
+        shortcut.get_by_role(
+            "button", name="Record common shortcut for Start a new session"
+        ).click()
+        page.keyboard.press("Alt+Shift+F12")
+        expect(shortcut.get_by_text("F12", exact=True)).to_be_visible()
+        restore = shortcut.get_by_role(
+            "button", name="Restore default shortcut for Start a new session"
+        )
+        restore.scroll_into_view_if_needed()
+        box = restore.bounding_box()
+        assert box is not None
+        page.mouse.click(box["x"] + box["width"] / 2 + 20, box["y"] + box["height"] / 2)
+        expect(shortcut.get_by_text("F12", exact=True)).to_have_count(0)
+        expect(page.get_by_role("menu")).not_to_be_visible()
+        shortcut.get_by_role("button", name="Add system override for Start a new session").click()
+        page.get_by_role("menuitem", name="macOS", exact=True).click()
+        page.keyboard.press("Escape")
+        platform = page.get_by_test_id("shortcut-platform-newSession-macos")
+        restore = platform.get_by_role(
+            "button", name="Restore macOS shortcut for Start a new session"
+        )
+        remove = platform.get_by_role(
+            "button", name="Delete macOS override for Start a new session"
+        )
+        restore.scroll_into_view_if_needed()
+        restore_box, remove_box = restore.bounding_box(), remove.bounding_box()
+        assert restore_box is not None and remove_box is not None
+        assert remove_box["x"] - restore_box["x"] >= 44 - _EPSILON
+        page.mouse.click(
+            restore_box["x"] + restore_box["width"] / 2 + 20,
+            restore_box["y"] + restore_box["height"] / 2,
+        )
+        expect(platform).to_be_visible()
+        remove.click()
+        expect(platform).to_have_count(0)
+
+        toggle = page.get_by_role("switch", name="Enable mobile floating assistant")
+        expect(toggle).to_be_visible(timeout=30_000)
+        toggle.scroll_into_view_if_needed()
+        box = toggle.bounding_box()
+        assert box is not None
+        cx, cy = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+        initial = toggle.get_attribute("aria-checked")
+        page.mouse.click(cx, cy)
+        expect(toggle).to_have_attribute("aria-checked", "false" if initial == "true" else "true")
+        page.mouse.click(cx, cy + 20)
+        expect(toggle).to_have_attribute("aria-checked", initial or "false")
+        # The assistant is draggable app chrome; keep it out of the settings
+        # probes, whose targets are the underlying shared controls.
+        if toggle.get_attribute("aria-checked") == "true":
+            toggle.click()
+        expect(page.get_by_test_id("mobile-floating-assistant")).to_have_count(0)
+        # All viewport cases share the test server's user preferences.
+        page.get_by_role("button", name="Restore default buttons", exact=True).click()
+
+        # Chat rows deliberately retain 24px icons: their 44px targets must
+        # survive the rounded list's overflow clipping and remain independent.
+        edit = page.get_by_role("button", name="Edit Approve", exact=True)
+        delete = page.get_by_role("button", name="Delete Approve", exact=True)
+        edit.scroll_into_view_if_needed()
+        edit_box, delete_box = edit.bounding_box(), delete.bounding_box()
+        assert edit_box is not None and delete_box is not None
+        assert delete_box["x"] - edit_box["x"] >= 44 - _EPSILON
+        ex = edit_box["x"] + edit_box["width"] / 2
+        ey = edit_box["y"] + edit_box["height"] / 2
+        for offset in (0, -20):
+            page.mouse.click(ex + offset, ey)
+            dialog = page.get_by_role("dialog")
+            expect(dialog).to_be_visible()
+            dialog.get_by_role("button", name="Cancel", exact=True).click()
+            expect(dialog).not_to_be_visible()
+        page.mouse.click(
+            delete_box["x"] + delete_box["width"] / 2,
+            delete_box["y"] + delete_box["height"] / 2,
+        )
+        expect(page.get_by_role("dialog")).not_to_be_visible()
+        expect(edit).to_have_count(0)
+
+        page.get_by_role("radio", name="Terminal", exact=True).click()
+        assert page.evaluate("matchMedia('(pointer: coarse)').matches")
+        terminal_toggle = page.get_by_role("switch", name="Enable terminal key rows")
+        terminal_toggle.evaluate("el => el.scrollIntoView({block: 'center'})")
+        box = terminal_toggle.bounding_box()
+        assert box is not None
+        initial = terminal_toggle.get_attribute("aria-checked")
+        assert 22 <= box["y"] + box["height"] / 2 <= height - 22
+        probe = [box["x"] + box["width"] / 2, box["y"] + box["height"] / 2 + 20]
+        assert terminal_toggle.evaluate(
+            "(el, [x, y]) => el.contains(document.elementFromPoint(x, y))", probe
+        ), "terminal key-row switch's outer target is clipped or covered"
+        page.mouse.click(*probe)
+        expect(terminal_toggle).to_have_attribute(
+            "aria-checked", "false" if initial == "true" else "true"
+        )
+        # The next switch's centre must still address only that switch.
+        second = page.get_by_role("switch", name="Show second terminal key row")
+        second.click()
+        expect(terminal_toggle).to_have_attribute(
+            "aria-checked", "false" if initial == "true" else "true"
+        )
     finally:
         context.close()
 
