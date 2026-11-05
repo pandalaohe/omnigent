@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import filecmp
 import json
 import logging
 import os
@@ -1992,7 +1993,8 @@ async def _ensure_local_codex_resume_rollout(
     same snapshot. If server history is temporarily unavailable, a valid local
     rollout remains a best-effort fallback. A successful server fetch wins even
     when its committed history is empty or shorter than the local file;
-    local-only records are intentionally discarded.
+    local-only records are omitted from the rebuilt rollout, with the previous
+    file kept in a timestamped backup when its contents differ.
 
     :param client: HTTP client pointed at the Omnigent server.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
@@ -2083,6 +2085,17 @@ async def _ensure_local_codex_resume_rollout(
             for record in records:
                 handle.write(json.dumps(record, separators=(",", ":")) + "\n")
         assert tmp is not None
+        if target.exists() and not filecmp.cmp(target, tmp, shallow=False):
+            while True:
+                stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+                backup = target.with_name(f"{target.name}.omnigent-backup-{stamp}")
+                try:
+                    backup_handle = backup.open("xb")
+                except FileExistsError:
+                    continue
+                with backup_handle, target.open("rb") as previous:
+                    shutil.copyfileobj(previous, backup_handle)
+                break
         os.replace(tmp, target)
     except OSError as exc:
         raise click.ClickException(

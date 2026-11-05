@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 
 import click
 import httpx
@@ -773,8 +776,11 @@ def test_rollout_records_keep_function_call_namespace() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("backup_fails", [False, True])
 async def test_ensure_local_codex_resume_rollout_refreshes_existing_from_server(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backup_fails: bool,
 ) -> None:
     """
     Codex cold resume refreshes an existing rollout from server history.
@@ -827,7 +833,27 @@ async def test_ensure_local_codex_resume_rollout_refreshes_existing_from_server(
         )
 
     transport = httpx.MockTransport(handler)
+    if backup_fails:
+
+        def fail_copy(*args: object) -> None:
+            raise OSError("backup unavailable")
+
+        monkeypatch.setattr(codex_native.shutil, "copyfileobj", fail_copy)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        if backup_fails:
+            with pytest.raises(click.ClickException, match="backup unavailable"):
+                await codex_native._ensure_local_codex_resume_rollout(
+                    client,
+                    session_id="conv_codex",
+                    external_session_id=thread_id,
+                    codex_home=codex_home,
+                    workspace=workspace,
+                    model_provider="omnigent_databricks",
+                    codex_path=None,
+                )
+            assert existing.read_bytes() == before
+            assert list(existing.parent.glob("*.tmp")) == []
+            return
         rollout = await codex_native._ensure_local_codex_resume_rollout(
             client,
             session_id="conv_codex",
@@ -841,10 +867,67 @@ async def test_ensure_local_codex_resume_rollout_refreshes_existing_from_server(
     assert requested
     assert rollout == existing
     assert existing.read_bytes() != before
+    backups = list(existing.parent.glob(f"{existing.name}.omnigent-backup-*"))
+    assert len(backups) == 1
+    assert re.fullmatch(r"(.+\.jsonl)\.omnigent-backup-\d{8}T\d{12}Z", backups[0].name)
+    assert backups[0].read_bytes() == before
     records = [json.loads(line) for line in existing.read_text().splitlines()]
     assert records[0]["payload"]["cwd"] == str(workspace)
     assert "authoritative server history" in json.dumps(records)
     assert "/stale/cwd" not in json.dumps(records)
+
+
+@pytest.mark.asyncio
+async def test_ensure_local_codex_resume_rollout_skips_unchanged_and_preserves_backups(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Back up only changed rollouts, retaining older copies on timestamp collisions."""
+    thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    codex_home = tmp_path / "codex-home"
+    stamp = datetime(2026, 11, 5, 13, 25, 1, 123456, tzinfo=UTC)
+    monkeypatch.setattr(codex_native, "_codex_rollout_timestamp", lambda: stamp.isoformat())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": [], "has_more": False})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+
+        async def rebuild() -> Path:
+            return await codex_native._ensure_local_codex_resume_rollout(
+                client,
+                session_id="conv_codex",
+                external_session_id=thread_id,
+                codex_home=codex_home,
+                workspace=tmp_path,
+                model_provider="test",
+                codex_path=None,
+            )
+
+        rollout = await rebuild()
+        rebuilt = rollout.read_bytes()
+        assert list(rollout.parent.glob("*.omnigent-backup-*")) == []
+        assert await rebuild() == rollout
+        assert rollout.read_bytes() == rebuilt
+        assert list(rollout.parent.glob("*.omnigent-backup-*")) == []
+
+        # Two replacements choose the same first timestamp; the second must retry.
+        clock = Mock()
+        clock.now.side_effect = [stamp, stamp, stamp + timedelta(microseconds=1)]
+        monkeypatch.setattr(codex_native, "datetime", clock)
+        previous_versions = [rebuilt + b"local usage one\n", rebuilt + b"local usage two\n"]
+        for previous in previous_versions:
+            rollout.write_bytes(previous)
+            assert await rebuild() == rollout
+            assert rollout.read_bytes() == rebuilt
+
+    backups = sorted(rollout.parent.glob(f"{rollout.name}.omnigent-backup-*"))
+    assert [path.name for path in backups] == [
+        f"{rollout.name}.omnigent-backup-20261105T132501123456Z",
+        f"{rollout.name}.omnigent-backup-20261105T132501123457Z",
+    ]
+    assert [path.read_bytes() for path in backups] == previous_versions
 
 
 @pytest.mark.asyncio
