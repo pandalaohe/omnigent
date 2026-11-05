@@ -14,6 +14,7 @@ export interface LayeredTableRow {
   mark?: boolean;
   /** Spoken and hover text for a level whose values show only as marks. */
   summary?: string;
+  action?: ReactNode;
 }
 
 export interface LayeredTableColumn {
@@ -57,6 +58,7 @@ export interface LayeredTableProps {
   selectionActions?: (selected: readonly LayeredCellLevel[], clear: () => void) => ReactNode;
   className?: string;
   testId?: string;
+  readOnly?: boolean;
 }
 
 function selectionKey(row: string, col: string): string {
@@ -181,7 +183,9 @@ export function LayeredTable({
   selectionActions,
   className,
   testId,
+  readOnly = false,
 }: LayeredTableProps) {
+  const firstColumn = cn(FIRST_COLUMN, rows.some((row) => row.action) && "min-w-50 max-w-50");
   const [selecting, setSelecting] = useState(false);
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
   const availableLevels: LayeredCellLevel[] = rows.flatMap((row) =>
@@ -268,16 +272,18 @@ export function LayeredTable({
         </div>
         <div className="flex flex-wrap items-center gap-2">
           {tools}
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            className="min-h-11 md:min-h-7"
-            aria-label={selecting ? "Done selecting" : "Select cells"}
-            onClick={() => (selecting ? stopSelecting() : setSelecting(true))}
-          >
-            {selecting ? "Done" : "Select"}
-          </Button>
+          {!readOnly && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="min-h-11 md:min-h-7"
+              aria-label={selecting ? "Done selecting" : "Select cells"}
+              onClick={() => (selecting ? stopSelecting() : setSelecting(true))}
+            >
+              {selecting ? "Done" : "Select"}
+            </Button>
+          )}
         </div>
       </div>
       {selecting && (
@@ -298,7 +304,7 @@ export function LayeredTable({
         >
           <thead>
             <tr>
-              <th className={cn("lt-c z-20", LEVEL_CELL, FIRST_COLUMN)}>
+              <th className={cn("lt-c z-20", LEVEL_CELL, firstColumn)}>
                 {editorButton(
                   { level: "corner" },
                   <>
@@ -344,23 +350,28 @@ export function LayeredTable({
           <tbody>
             {rows.map((row) => (
               <tr key={row.id} className="[&:last-child>*]:border-b-0">
-                <th scope="row" className={cn("lt-c z-10", LEVEL_CELL, FIRST_COLUMN)}>
-                  {editorButton(
-                    { level: "row", row: row.id },
-                    <>
-                      <span className={LEVEL_NAME}>{row.content ?? row.label}</span>
-                      {row.detail && <LevelState mark={row.mark}>{row.detail}</LevelState>}
-                    </>,
-                    selecting ? `Select ${row.label} cells` : `Edit ${row.label}`,
-                    undefined,
-                    columns.flatMap((col) =>
-                      renderCell(row.id, col.id).unavailable
-                        ? []
-                        : [{ level: "cell" as const, row: row.id, col: col.id }],
-                    ),
-                    `layered-row-${row.id}`,
-                    row.summary,
-                  )}
+                <th scope="row" className={cn("lt-c z-10", LEVEL_CELL, firstColumn)}>
+                  <div className="flex size-full min-w-0 items-stretch">
+                    <div className="min-w-0 flex-1">
+                      {editorButton(
+                        { level: "row", row: row.id },
+                        <>
+                          <span className={LEVEL_NAME}>{row.content ?? row.label}</span>
+                          {row.detail && <LevelState mark={row.mark}>{row.detail}</LevelState>}
+                        </>,
+                        selecting ? `Select ${row.label} cells` : `Edit ${row.label}`,
+                        undefined,
+                        columns.flatMap((col) =>
+                          renderCell(row.id, col.id).unavailable
+                            ? []
+                            : [{ level: "cell" as const, row: row.id, col: col.id }],
+                        ),
+                        `layered-row-${row.id}`,
+                        row.summary,
+                      )}
+                    </div>
+                    {row.action}
+                  </div>
                 </th>
                 {columns.map((col) => {
                   const cell = renderCell(row.id, col.id);
@@ -408,13 +419,15 @@ export function LayeredTable({
           </tbody>
         </table>
       </div>
-      <p className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-muted-foreground">
-        <span className="inline-flex items-center gap-1.5">
-          <LayeredMark />
-          Differs from above
-        </span>
-        {legend}
-      </p>
+      {!readOnly && (
+        <p className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-muted-foreground">
+          <span className="inline-flex items-center gap-1.5">
+            <LayeredMark />
+            Differs from above
+          </span>
+          {legend}
+        </p>
+      )}
     </div>
   );
 }

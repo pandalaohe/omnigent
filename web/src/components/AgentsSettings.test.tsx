@@ -280,7 +280,7 @@ describe("AgentsSettings", () => {
   it("adds and removes an optional badge on a built-in Agent", async () => {
     renderSettings();
 
-    fireEvent.click(screen.getByRole("button", { name: "Edit badge for Codex SDK" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit badge for Polly" }));
     fireEvent.click(await screen.findByRole("switch", { name: "Show badge" }));
     fireEvent.change(screen.getByRole("textbox", { name: "Badge text" }), {
       target: { value: "C" },
@@ -288,19 +288,21 @@ describe("AgentsSettings", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
-    expect(readAgentBadgePreferences().entries[builtin.id]).toEqual({
+    expect(readAgentBadgePreferences().entries[builtinPolly.id]).toEqual({
       label: "C",
       borderColor: "#8b5cf6",
       textColor: "theme",
     });
-    expect(screen.getByTestId("agent-badge")).toHaveTextContent("C");
+    expect(screen.getByTestId("agent-name-badge")).toHaveTextContent("C");
 
-    fireEvent.click(screen.getByRole("button", { name: "Edit badge for Codex SDK" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit badge for Polly" }));
     fireEvent.click(await screen.findByRole("switch", { name: "Show badge" }));
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
-    await waitFor(() => expect(readAgentBadgePreferences().entries[builtin.id]).toBeUndefined());
-    expect(screen.queryByTestId("agent-badge")).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(readAgentBadgePreferences().entries[builtinPolly.id]).toBeUndefined(),
+    );
+    expect(screen.queryByTestId("agent-name-badge")).not.toBeInTheDocument();
   });
 
   it("shows custom Agent edit and delete controls and awaits both mutations", async () => {
@@ -331,8 +333,9 @@ describe("AgentsSettings", () => {
   });
 
   it("hides every badge globally without discarding saved entries", async () => {
+    mocks.available = [builtinPolly];
     const entries = {
-      [builtin.id]: { label: "C", borderColor: "#112233", textColor: "#ddeeff" },
+      [builtinPolly.id]: { label: "P", borderColor: "#112233", textColor: "#ddeeff" },
       [custom.id]: { label: "R", borderColor: "#445566", textColor: "#ffffff" },
     };
     writeAgentBadgePreferences({
@@ -341,11 +344,11 @@ describe("AgentsSettings", () => {
       entries,
     });
     renderSettings(true);
-    expect(screen.getAllByTestId("agent-badge")).toHaveLength(2);
+    expect(screen.getAllByTestId("agent-name-badge")).toHaveLength(2);
 
     fireEvent.click(screen.getByRole("switch", { name: "Show Agent badges" }));
 
-    await waitFor(() => expect(screen.queryByTestId("agent-badge")).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.queryByTestId("agent-name-badge")).not.toBeInTheDocument());
     const saved = JSON.parse(localStorage.getItem(AGENT_BADGE_STORAGE_KEY) ?? "null") as {
       enabled: boolean;
       entries: Record<string, unknown>;
@@ -360,7 +363,7 @@ describe("AgentsSettings", () => {
       .mockResolvedValueOnce(customDetail);
     renderSettings();
 
-    fireEvent.click(screen.getByRole("button", { name: "New" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add agent" }));
     const dialog = await screen.findByTestId("create-agent-dialog");
     fireEvent.change(within(dialog).getByTestId("create-agent-name"), {
       target: { value: "Reviewer" },
@@ -396,97 +399,37 @@ describe("AgentsSettings", () => {
     expect(screen.getByRole("button", { name: "Duplicate Debby" })).toBeEnabled();
   });
 
-  it("keeps harness built-ins in the Built-in list with only their badge surface", () => {
-    mocks.available = [builtinPolly, builtinClaudeNative, builtinAcp];
+  it("keeps product rows out of Team agents while retaining team controls", () => {
+    mocks.available = [builtinPolly, builtinClaudeNative, builtinAcp, builtin];
     renderSettings();
-
-    const builtins = screen.getByRole("heading", { name: "Built-in" }).parentElement;
-    expect(builtins).not.toBeNull();
-    expect(within(builtins!).getByText("Polly")).toBeInTheDocument();
-    for (const name of ["Claude Code", "Grok"]) {
-      expect(within(builtins!).getByText(name)).toBeInTheDocument();
-      expect(
-        within(builtins!).getByRole("button", { name: `Edit badge for ${name}` }),
-      ).toBeInTheDocument();
-      expect(within(builtins!).queryByRole("button", { name: `View ${name}` })).toBeNull();
-      expect(within(builtins!).queryByRole("button", { name: `Duplicate ${name}` })).toBeNull();
-      expect(within(builtins!).queryByRole("button", { name: `Pin ${name}` })).toBeNull();
-      expect(within(builtins!).queryByRole("button", { name: `Unpin ${name}` })).toBeNull();
-    }
+    const teams = screen.getByRole("heading", { name: "Team agents" }).parentElement!;
+    expect(within(teams).getByText("Polly")).toBeInTheDocument();
+    expect(within(teams).getByRole("button", { name: "Edit badge for Polly" })).toBeInTheDocument();
+    expect(within(teams).getByRole("button", { name: "View Polly" })).toBeInTheDocument();
+    for (const name of ["Claude Code", "Grok", "Codex SDK"])
+      expect(within(teams).queryByText(name)).toBeNull();
   });
 
-  it("groups declared products by registry section and searches without changing saved pins", () => {
-    const plugin = {
-      ...builtin,
-      id: "ag_plugin_sdk",
-      name: "plugin-sdk-product",
-      display_name: "Plugin SDK",
-      harness: "plugin-sdk",
-      product_of: "plugin-sdk",
-      integration_mode: "sdk-in-process",
-    };
-    mocks.available = [builtinPolly, plugin, builtinClaudeNative];
-    mocks.registryItems = [
-      {
-        key: "harness:plugin-sdk",
-        name: plugin.name,
-        label: plugin.display_name,
-        section: "sdk",
-        harness: "plugin-sdk",
-        description: null,
-        deployed: true,
-        source: "builtin",
-      },
-      {
-        key: "harness:claude-native",
-        name: builtinClaudeNative.name,
-        label: builtinClaudeNative.display_name,
-        section: "native",
-        harness: "claude-native",
-        description: null,
-        deployed: true,
-        source: "builtin",
-      },
-    ];
+  it("searches teams without changing saved pins", () => {
     renderSettings();
-    expect(screen.getByRole("heading", { name: "SDK" })).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "Native CLI" })).toBeInTheDocument();
+    const before = localStorage.getItem("omnigent:agent-pins");
     fireEvent.change(screen.getByRole("textbox", { name: "Search agents" }), {
-      target: { value: "plugin" },
+      target: { value: "Polly" },
     });
-    expect(screen.getByText("Plugin SDK")).toBeInTheDocument();
-    expect(screen.queryByText("Claude Code")).toBeNull();
-    expect(screen.queryByText("Polly")).toBeNull();
+    expect(screen.getByText("Polly")).toBeInTheDocument();
+    expect(screen.queryByText("Debby")).toBeNull();
+    expect(localStorage.getItem("omnigent:agent-pins")).toBe(before);
   });
 
-  it("keeps a built-in SDK row in SDK when a library agent has the same name and harness", () => {
-    mocks.available = [{ ...builtin, product_of: "codex", integration_mode: "cli-subprocess" }];
-    mocks.registryItems = [
-      {
-        key: "ca_copy",
-        name: "codex-sdk",
-        label: "Codex SDK · library",
-        section: "yours",
-        harness: "codex",
-        description: null,
-        deployed: true,
-        source: "library",
-      },
-      {
-        key: "harness:codex",
-        name: "codex-sdk",
-        label: "Codex SDK",
-        section: "sdk",
-        harness: "codex",
-        description: null,
-        deployed: true,
-        source: "builtin",
-      },
+  it("places saved multi-member agents under Team agents", () => {
+    mocks.catalog = [
+      { ...custom, members: [leadMember, { ...leadMember, name: "reviewer", lead: false }] },
     ];
     renderSettings();
-    expect(
-      within(screen.getByRole("heading", { name: "SDK" }).parentElement!).getByText("Codex SDK"),
-    ).toBeInTheDocument();
+    const teams = screen.getByRole("heading", { name: "Team agents" }).parentElement!;
+    expect(within(teams).getByRole("button", { name: "Edit Reviewer" })).toBeInTheDocument();
+    const customs = screen.getByRole("region", { name: "Custom agents" });
+    expect(within(customs).queryByRole("button", { name: "Edit Reviewer" })).toBeNull();
   });
 
   it("shows a built-in's roster, lead first, in a read-only dialog", async () => {
@@ -605,7 +548,7 @@ describe("AgentsSettings", () => {
     mocks.available = [...mocks.available!, installedNative, installedAcp];
     renderSettings();
 
-    const installed = screen.getByRole("heading", { name: "Installed agents" }).parentElement!;
+    const installed = screen.getByRole("heading", { name: "Saved configurations" }).parentElement!;
     expect(within(installed).getByText("Prepares releases")).toBeInTheDocument();
     expect(within(installed).getByText("Checks deployments")).toBeInTheDocument();
     expect(within(installed).queryByRole("button", { name: "View Orion" })).toBeNull();

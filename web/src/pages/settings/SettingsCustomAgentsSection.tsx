@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { BotIcon, PlusIcon, SearchIcon, TrashIcon } from "lucide-react";
 import { Link, useNavigate } from "@/lib/routing";
@@ -8,8 +8,8 @@ import { useAcpHarnessIds, useHarnessLabels } from "@/lib/agentLabels";
 import { nativeCodingAgentForAgentName } from "@/lib/nativeCodingAgents";
 import { isAcpHarnessAgent } from "@/lib/agentGrouping";
 import { Button } from "@/components/ui/button";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { AgentsSettings } from "@/components/AgentsSettings";
+import { AgentNameTag } from "@/components/AgentNameTag";
 import {
   Dialog,
   DialogContent,
@@ -31,8 +31,8 @@ import { CustomAgentConfigForm } from "./CustomAgentConfigForm";
 import { BackButton } from "./HarnessCatalog";
 import { ApiError } from "@/lib/sessionsApi";
 
-const BASE = "/settings/custom-agents";
-const agentPath = (id: string) => `${BASE}/${encodeURIComponent(id)}`;
+const BASE = "/settings/agents#custom-agents";
+const agentPath = (id: string) => `/settings/agents/custom/${encodeURIComponent(id)}`;
 const date = (value: number | null) =>
   value === null
     ? "—"
@@ -45,32 +45,25 @@ const date = (value: number | null) =>
 export function SettingsCustomAgentsSection() {
   const info = useServerInfo();
   const { agentId } = useSettingsRoute();
-  const navigate = useNavigate();
-  const [selectedView, setSelectedView] = useState("installed");
-  if (!customAgentsSettingsEnabled(info)) return <AgentsSettings />;
+  if (agentId) return <InstalledAgentsSettingsSection />;
   return (
-    <Tabs
-      value={agentId ? "installed" : selectedView}
-      onValueChange={(value) => {
-        setSelectedView(value);
-        if (agentId) navigate(BASE);
-      }}
-    >
-      <TabsList className="mb-6">
-        <TabsTrigger value="installed">Installed agents</TabsTrigger>
-        <TabsTrigger value="library">Agent library</TabsTrigger>
-      </TabsList>
-      <TabsContent value="installed">
-        <InstalledAgentsSettingsSection />
-      </TabsContent>
-      <TabsContent value="library">
-        <AgentsSettings />
-      </TabsContent>
-    </Tabs>
+    <AgentsSettings
+      renderInstalled={
+        customAgentsSettingsEnabled(info)
+          ? (pin) => <InstalledAgentsSettingsSection embedded renderPin={pin} />
+          : undefined
+      }
+    />
   );
 }
 
-function InstalledAgentsSettingsSection() {
+function InstalledAgentsSettingsSection({
+  embedded = false,
+  renderPin,
+}: {
+  embedded?: boolean;
+  renderPin?: (id: string, name: string) => ReactNode;
+}) {
   const info = useServerInfo();
   const enabled = customAgentsSettingsEnabled(info);
   const supported = enabled && info !== "loading" && info.agent_detail === true;
@@ -107,11 +100,13 @@ function InstalledAgentsSettingsSection() {
                 harness: a.harness,
                 acpHarness: acpHarnesses.has(a.harness ?? "") || undefined,
               }))
-          ) && matches(a),
+          ) &&
+          (!embedded || !a.builtin) &&
+          matches(a),
       ),
       filtered: userAgents.filter(matches),
     };
-  }, [serverAgents, userAgents, acpHarnesses, searchTerm]);
+  }, [serverAgents, userAgents, acpHarnesses, searchTerm, embedded]);
 
   if (!enabled) return null;
   if (!supported) return <UnsupportedServer />;
@@ -182,21 +177,23 @@ function InstalledAgentsSettingsSection() {
   }
   return (
     <div className="@container">
-      <h1 className="pb-6 text-2xl font-semibold">Custom agents</h1>
+      {!embedded && (
+        <h1 className="settings-page-title pb-6 text-2xl font-medium">Custom agents</h1>
+      )}
       <div className="mb-6 flex items-center gap-2">
         <div className="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-lg border border-border px-2.5">
           <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
           <input
             type="search"
-            aria-label="Search agents"
-            placeholder="Search agents…"
+            aria-label="Search configurations"
+            placeholder="Search configurations…"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             className="min-w-0 flex-1 bg-transparent text-ui outline-none placeholder:text-muted-foreground/50"
           />
         </div>
         <Button asChild size="sm">
-          <Link to={`${BASE}/new`} componentId="settings.custom_agents.create">
+          <Link to={agentPath("new")} componentId="settings.custom_agents.create">
             <PlusIcon />
             Create
           </Link>
@@ -208,9 +205,11 @@ function InstalledAgentsSettingsSection() {
         </p>
       )}
       <section className="mb-8" aria-label="Your agents">
-        <h2 className="mb-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">
-          Yours
-        </h2>
+        {!embedded && (
+          <h2 className="mb-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+            Yours
+          </h2>
+        )}
         {filtered.length > 0 && (
           <div className="overflow-x-auto">
             <table className="w-full min-w-[36rem] text-left text-ui">
@@ -228,6 +227,11 @@ function InstalledAgentsSettingsSection() {
                   <th scope="col" className="h-10 w-[120px] whitespace-nowrap px-2 font-medium">
                     Last edited
                   </th>
+                  {renderPin && (
+                    <th scope="col" className="h-10 px-2 font-medium">
+                      Pin
+                    </th>
+                  )}
                 </tr>
               </thead>
               <tbody>
@@ -247,7 +251,13 @@ function InstalledAgentsSettingsSection() {
                           <BotIcon className="size-[15px]" aria-hidden />
                         </span>
                         <span className="min-w-0">
-                          <span className="block truncate font-medium">{agent.name}</span>
+                          <span className="block truncate font-medium">
+                            <AgentNameTag
+                              agentId={agent.id}
+                              name={agent.name}
+                              harness={agent.harness}
+                            />
+                          </span>
                           <span className="block truncate text-xs text-muted-foreground">
                             {agent.description}
                           </span>
@@ -259,6 +269,9 @@ function InstalledAgentsSettingsSection() {
                     </td>
                     <td className="whitespace-nowrap p-2">{date(agent.created_at)}</td>
                     <td className="whitespace-nowrap p-2">{date(agent.updated_at)}</td>
+                    {renderPin && (
+                      <td className="relative z-10 p-2">{renderPin(agent.id, agent.name)}</td>
+                    )}
                   </tr>
                 ))}
               </tbody>
@@ -276,35 +289,37 @@ function InstalledAgentsSettingsSection() {
           }
         />
       </section>
-      <section aria-label="Built-in agents">
-        <h2 className="mb-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">
-          Built-in &amp; server agents
-        </h2>
-        <div className="grid gap-3 @lg:grid-cols-2">
-          {builtins.map((agent) => (
-            <Link
-              key={agent.id}
-              to={agentPath(agent.id)}
-              componentId="settings.custom_agents.review_server"
-              className="flex flex-col gap-3 rounded-xl border border-border p-4 hover:bg-muted/40"
-            >
-              <span className="flex items-center gap-3 font-medium">
-                <BotIcon className="size-5 shrink-0" aria-hidden />
-                {agent.name}
-              </span>
-              <span className="text-ui text-muted-foreground">
-                {agent.description || "Server-provided agent"}
-              </span>
-            </Link>
-          ))}
-        </div>
-        <ListStatus
-          query={servers}
-          scope="server"
-          empty={builtins.length === 0}
-          emptyText={search ? "No matching server agents." : "No server agents."}
-        />
-      </section>
+      {(!embedded || builtins.length > 0) && (
+        <section aria-label="Server agents">
+          <h2 className="mb-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+            Built-in &amp; server agents
+          </h2>
+          <div className="grid gap-3 @lg:grid-cols-2">
+            {builtins.map((agent) => (
+              <Link
+                key={agent.id}
+                to={agentPath(agent.id)}
+                componentId="settings.custom_agents.review_server"
+                className="flex flex-col gap-3 rounded-xl border border-border p-4 hover:bg-muted/40"
+              >
+                <span className="flex items-center gap-3 font-medium">
+                  <BotIcon className="size-5 shrink-0" aria-hidden />
+                  <AgentNameTag agentId={agent.id} name={agent.name} harness={agent.harness} />
+                </span>
+                <span className="text-ui text-muted-foreground">
+                  {agent.description || "Server-provided agent"}
+                </span>
+              </Link>
+            ))}
+          </div>
+          <ListStatus
+            query={servers}
+            scope="server"
+            empty={builtins.length === 0}
+            emptyText={search ? "No matching server agents." : "No server agents."}
+          />
+        </section>
+      )}
     </div>
   );
 }

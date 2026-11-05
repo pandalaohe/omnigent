@@ -20,6 +20,16 @@ vi.mock("@/components/CallingDefaultsSection", () => ({
   CallingDefaultsSection: () => <div data-testid="calling-defaults-section">Master defaults</div>,
 }));
 
+vi.mock("@/hooks/useAgentRegistry", async (original) => ({
+  ...(await original<Record<string, unknown>>()),
+  useAgentRegistry: () => ({ items: [], legacyProducts: {}, isLoading: false, isError: false }),
+}));
+vi.mock("@/lib/agentLabels", async (original) => ({
+  ...(await original<Record<string, unknown>>()),
+  useHarnessCapabilities: () => ({}),
+}));
+vi.mock("@/components/AgentContextTable", () => ({ AgentPromptCard: () => null }));
+
 let pluginMetadataRequested = false;
 const CONTENT: SkillContent = {
   name: "review",
@@ -269,186 +279,64 @@ afterEach(() => {
   startupError = null;
 });
 
-describe("Harnesses grid", () => {
-  it("opens the master defaults without depending on catalog host readiness", async () => {
-    hosts = [{ ...ONLINE, status: "offline" }];
+describe("Agent setup list", () => {
+  it("folds only products present on no host into Not set up", () => {
+    hosts = [ONLINE, { ...ONLINE, host_id: "other", configured_harnesses: { "pi-native": true } }];
     renderHarnesses();
-    expect(screen.queryByTestId("calling-defaults-section")).toBeNull();
-    fireEvent.click(screen.getByText("New session defaults"));
-    expect(await screen.findByTestId("calling-defaults-section")).toBeInTheDocument();
-    expect(screen.getByTestId("harness-no-host")).toBeInTheDocument();
+    expect(screen.getByText(/^Not set up/).closest("details")).not.toHaveAttribute("open");
+    expect(screen.queryByTestId("harness-card-claude-native")).toBeNull();
+    expect(screen.queryByTestId("harness-card-codex-native")).toBeNull();
+    expect(screen.queryByTestId("harness-card-pi-native")).toBeNull();
+    expect(card("qwen-native")).toBeInTheDocument();
   });
-
-  it("requests accounts only for a selected capable host while setup is enabled", () => {
+  it("requests accounts only on a capable online host with setup enabled", () => {
     hosts = [{ ...ONLINE, harness_accounts_supported: true }];
     renderHarnesses();
     expect(accountRefreshCalls).toHaveBeenLastCalledWith("h1", true);
-
     cleanup();
-    accountRefreshCalls.mockClear();
     harnessInstall = false;
     renderHarnesses();
     expect(accountRefreshCalls).toHaveBeenLastCalledWith("h1", false);
   });
-
-  it("preselects the linked online host and keeps it after returning to the grid", () => {
-    hosts = [ONLINE, { ...ONLINE, host_id: "host & two", name: "session-host" }];
-    renderHarnesses("claude-native", "?host=host%20%26%20two&tab=settings");
-    expect(startupCalls).toHaveBeenCalledWith("host & two", "claude-native");
-    fireEvent.click(screen.getByRole("link", { name: /Harnesses/ }));
-    expect(screen.getByRole("button", { name: "session-host" })).toBeInTheDocument();
-  });
-
-  it.each([
-    ["offline", [ONLINE, { ...ONLINE, host_id: "linked", status: "offline" as const }]],
-    ["no longer listed", [ONLINE]],
-  ])("falls back to an online host if the linked host is %s", (_, linkedHosts) => {
-    hosts = linkedHosts;
-    renderHarnesses("claude-native", "?host=linked&tab=settings");
-    expect(startupCalls).toHaveBeenCalledWith("h1", "claude-native");
-    expect(startupCalls).not.toHaveBeenCalledWith("linked", "claude-native");
-  });
-
-  it("shows the configured credential and a reconfiguration warning with its reason", async () => {
-    hosts = [ONLINE];
-    renderHarnesses();
-
-    expect(within(card("claude-native")).getByText("Configured")).toBeTruthy();
-    expect(within(card("claude-native")).getByText("· Signed in")).toBeTruthy();
-    expect(screen.queryByTestId("harness-action-claude-native")).toBeNull();
-
-    const warning = within(card("codex-native")).getByLabelText(
-      "Needs reconfiguration: Missing credentials",
-    );
-    expect(warning.textContent).toContain("Needs reconfiguration");
-    expect(screen.getByTestId("harness-settings-codex-native")).toBeTruthy();
-    fireEvent.focus(warning);
-    expect(await screen.findByRole("tooltip")).toHaveTextContent("Missing credentials");
-  });
-
-  it("opens install for a not-installed harness on the selected host", () => {
+  it("opens install for a missing product on the selected host", () => {
     hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": "binary-missing" } }];
     renderHarnesses();
-
+    screen.getByText(/^Not set up/).closest("details")!.open = true;
     fireEvent.click(screen.getByTestId("harness-action-codex-native"));
-
-    const dialog = screen.getByTestId("fix-dialog");
-    expect(dialog.getAttribute("data-harness")).toBe("codex-native");
-    expect(dialog.getAttribute("data-host")).toBe("h1");
-    expect(dialog.getAttribute("data-mode")).toBe("install");
-    expect(within(card("codex-native")).queryByText("Needs reconfiguration")).toBeNull();
-    expect(within(card("codex-native")).getByText("Not installed")).toBeTruthy();
+    expect(screen.getByTestId("fix-dialog")).toHaveAttribute("data-host", "h1");
+    expect(screen.getByTestId("fix-dialog")).toHaveAttribute("data-mode", "install");
   });
-
-  it("does not offer one-click install for a not-installed Cursor harness", () => {
+  it("keeps recovery on the detail page when one-click installation is unsupported", () => {
     hosts = [{ ...ONLINE, configured_harnesses: { "cursor-native": "binary-missing" } }];
     renderHarnesses();
-
+    screen.getByText(/^Not set up/).closest("details")!.open = true;
     expect(screen.queryByTestId("harness-action-cursor-native")).toBeNull();
-    expect(screen.getByTestId("harness-settings-cursor-native")).toBeTruthy();
+    fireEvent.click(screen.getByTestId("harness-settings-cursor-native"));
+    expect(screen.getByRole("heading", { name: "Cursor" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Set up" })).toBeInTheDocument();
   });
-
-  it("uses the existing inventory label instead of guessing a personal subscription", () => {
-    hosts = [{ ...ONLINE, gateway_inference: { "claude-native": false } }];
-    renderHarnesses();
-
-    expect(within(card("claude-native")).getByText("· Signed in")).toBeTruthy();
-    expect(within(card("claude-native")).queryByText(/Personal subscription/)).toBeNull();
-  });
-
-  it("treats unknown readiness (host reports nothing) as neutral, not needs-setup", () => {
-    // Older host: configured_harnesses null → every harness is readiness-unknown.
+  it("keeps unknown inventory out of the missing-products list", () => {
     hosts = [{ ...ONLINE, configured_harnesses: null }];
     renderHarnesses();
-
-    // No false "needs setup": no badge, no Set-up button, no bogus "Installed".
-    expect(screen.queryByTestId("harness-action-codex-native")).toBeNull();
+    expect(screen.queryByText(/^Not set up/)).toBeNull();
     expect(screen.queryByTestId("harness-action-claude-native")).toBeNull();
-    expect(within(card("claude-native")).queryByText("Installed")).toBeNull();
-    expect(screen.queryByText("Needs reconfiguration")).toBeNull();
   });
-
-  it("hides Set-up (keeps the badge) when harness_install is disabled", () => {
-    // Flag off + binary-missing: the setup dialog would be a dead end (no
-    // runnable install step), so we show status only — matching New Chat.
-    harnessInstall = false;
-    hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": "binary-missing" } }];
-    renderHarnesses();
-
-    expect(within(card("codex-native")).getByText("Binary missing")).toBeTruthy();
-    expect(within(card("codex-native")).queryByText("Not installed")).toBeNull();
-    expect(within(card("codex-native")).queryByLabelText(/Needs reconfiguration/)).toBeNull();
-    expect(screen.queryByTestId("harness-action-codex-native")).toBeNull();
-    expect(screen.queryByTestId("harness-settings-codex-native")).toBeNull();
-  });
-
-  it("shows the no-host notice and no Set-up buttons when no host is online", () => {
+  it("keeps setup disabled on an offline host", () => {
     hosts = [{ ...ONLINE, status: "offline" }];
     renderHarnesses();
-
-    expect(screen.getByTestId("harness-no-host")).toBeTruthy();
-    // No host → no readiness, so no Set-up affordance on any card.
     expect(screen.queryByTestId("harness-action-codex-native")).toBeNull();
   });
-
-  it("filters harnesses by the search query", () => {
-    hosts = [ONLINE];
-    renderHarnesses();
-
-    fireEvent.change(screen.getByTestId("harness-search"), { target: { value: "codex" } });
-
-    expect(screen.getByText("Codex")).toBeTruthy();
-    expect(screen.queryByText("Claude Code")).toBeNull();
-  });
-
-  it("shows only ready harnesses under the Installed filter", () => {
-    hosts = [ONLINE];
-    renderHarnesses();
-
-    selectTab("Configured");
-
-    expect(card("claude-native")).toBeTruthy();
-    expect(screen.queryByTestId("harness-card-codex-native")).toBeNull();
-  });
-
-  it("links ready and broken harness cards to details while the feature is enabled", () => {
-    hosts = [ONLINE];
-    renderHarnesses();
-
-    expect(card("claude-native").getAttribute("href")).toBe("/settings/harnesses/claude-native");
-    expect(card("codex-native").getAttribute("href")).toBe(
-      "/settings/harnesses/codex-native?tab=settings",
+  it("preselects an encoded host link and retains its cached offline metadata", () => {
+    hosts = [ONLINE, { ...ONLINE, host_id: "host & two", name: "Server", status: "offline" }];
+    renderHarnesses("claude-native", "?host=host%20%26%20two");
+    expect(screen.getByRole("radio", { name: "Server (offline)" })).toHaveAttribute(
+      "aria-checked",
+      "true",
     );
-  });
-});
-
-describe("Harness card navigation", () => {
-  const selected = (name: string) =>
-    screen.getByRole("tab", { name }).getAttribute("aria-selected");
-
-  it("opens the details on MCP servers from the card", () => {
-    hosts = [ONLINE];
-    renderHarnesses();
-
-    fireEvent.click(card("claude-native"));
-    expect(selected("MCP servers · 2")).toBe("true");
-  });
-
-  it("opens the details on Settings from the card's gear", () => {
-    hosts = [ONLINE];
-    renderHarnesses();
-
-    fireEvent.click(screen.getByTestId("harness-settings-claude-native"));
-    expect(selected("Settings")).toBe("true");
-  });
-
-  it("opens a broken harness on Settings from its gear", () => {
-    hosts = [ONLINE];
-    renderHarnesses();
-
-    fireEvent.click(screen.getByTestId("harness-settings-codex-native"));
-    expect(selected("Settings")).toBe("true");
-    expect(screen.getByText(/No ChatGPT account or API key on my-laptop/)).toBeTruthy();
+    expect(startupCalls).not.toHaveBeenCalledWith("host & two", "claude-native");
+    expect(screen.getByText("Connect Server to view startup settings.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("radio", { name: "my-laptop" }));
+    expect(startupCalls).toHaveBeenCalledWith("h1", "claude-native");
   });
 });
 
@@ -467,8 +355,7 @@ describe("Harness details", () => {
     expect(within(screen.getByTestId("catalog-row-linear")).getByText("Linear")).toBeTruthy();
     expect(screen.queryByTestId("catalog-row-docs")).toBeNull();
 
-    // The credential lives under the Settings tab.
-    selectTab("Settings");
+    // Sign-in and startup stay visible around the Connections tabs.
     expect(screen.getByText("Isaac")).toBeTruthy();
     expect(screen.getByText("Databricks-managed credential via the Unity Gateway")).toBeTruthy();
     expect(screen.getByText("/opt/bin/claude")).toBeTruthy();
@@ -477,15 +364,14 @@ describe("Harness details", () => {
     expect(screen.getByText(/harness.claude-native in ~\/.omnigent\/config.yaml/)).toBeTruthy();
   });
 
-  it("keeps the Isaac label when databricks_features is false", () => {
+  it("keeps the gateway label when databricks_features is false", () => {
     databricksFeatures = false;
     hosts = [{ ...ONLINE, gateway_inference: { "claude-native": true } }];
-    renderHarnesses();
-
-    expect(within(card("claude-native")).getByText("· Isaac")).toBeTruthy();
-    fireEvent.click(screen.getByTestId("harness-settings-claude-native"));
-    expect(screen.getByText("Isaac")).toBeTruthy();
-    expect(screen.getByText("Databricks-managed credential via the Unity Gateway")).toBeTruthy();
+    renderHarnesses("claude-native");
+    expect(screen.getByText("Isaac")).toBeInTheDocument();
+    expect(
+      screen.getByText("Databricks-managed credential via the Unity Gateway"),
+    ).toBeInTheDocument();
   });
 
   it("keeps tool discovery lazy and shows host-reported details", () => {
@@ -614,14 +500,7 @@ describe("Harness details", () => {
         },
       },
     ];
-    renderHarnesses();
-
-    expect(within(card("claude-native")).getByText("· person@example.com · Max")).toBeTruthy();
-    expect(within(card("codex-native")).getByText("· codex@example.com · Plus")).toBeTruthy();
-    expect(within(card("pi-native")).getByText("· Anthropic")).toBeTruthy();
-    expect(within(card("opencode-native")).getByText("· Anthropic, OpenRouter")).toBeTruthy();
-
-    fireEvent.click(screen.getByTestId("harness-settings-opencode-native"));
+    renderHarnesses("opencode-native");
     expect(screen.getByText("Providers")).toBeTruthy();
     expect(screen.getByText("Anthropic (API key) · OpenRouter (API key)")).toBeTruthy();
   });
@@ -657,7 +536,6 @@ describe("Harness details", () => {
       },
     ];
     renderHarnesses("codex-native");
-    selectTab("Settings");
 
     expect(screen.getAllByText("Isaac").length).toBeGreaterThan(0);
     expect(screen.queryByText("Not signed in")).toBeNull();
@@ -700,7 +578,6 @@ describe("Harness details", () => {
       },
     ];
     renderHarnesses("claude-native");
-    selectTab("Settings");
 
     fireEvent.click(screen.getByRole("button", { name: "Switch account" }));
     expect(screen.getByTestId("fix-dialog")).toHaveAttribute("data-mode", "switch");
@@ -716,7 +593,6 @@ describe("Harness details", () => {
       },
     ];
     renderHarnesses("claude-native");
-    selectTab("Settings");
 
     expect(screen.queryByRole("button", { name: "Switch account" })).toBeNull();
     expect(screen.getAllByText("Configured").length).toBeGreaterThan(0);
@@ -879,7 +755,6 @@ describe("Harness details", () => {
     hosts = [{ ...ONLINE, gateway_inference: { "claude-native": true } }];
     renderHarnesses("claude-native");
 
-    selectTab("Settings");
     expect(screen.getByText("Unity Gateway")).toBeTruthy();
     expect(screen.queryByText("Isaac")).toBeNull();
     expect(screen.queryByText("Machine")).toBeNull();
@@ -908,11 +783,11 @@ describe("Harness details", () => {
     expect(screen.queryByRole("button", { name: "Sign in again" })).toBeNull();
   });
 
-  it("falls back to the grid for an unknown harness slug", () => {
+  it("reports an unknown agent slug", () => {
     hosts = [ONLINE];
     renderHarnesses("not-a-harness");
 
-    expect(screen.getByRole("heading", { name: "Harnesses" })).toBeTruthy();
+    expect(screen.getByText("Agent not found.")).toBeInTheDocument();
   });
 });
 
@@ -945,7 +820,6 @@ describe("Launch settings compatibility", () => {
         },
       };
       renderHarnesses(harness);
-      selectTab("Settings");
       const startupSection = screen
         .getByRole("heading", { name: "Startup configuration" })
         .closest("section")!;
@@ -994,7 +868,6 @@ describe("Launch settings compatibility", () => {
       environment: null,
     };
     renderHarnesses("claude-native");
-    selectTab("Settings");
     expect(screen.getByText(/Cannot separate environment values/)).toBeTruthy();
     expect(screen.getByText("/usr/bin/env")).toBeTruthy();
     expect(screen.getAllByRole("listitem").map((item) => item.textContent)).toEqual([
@@ -1009,7 +882,6 @@ describe("Launch settings compatibility", () => {
     hosts = [ONLINE];
     startupData = { ...STARTUP, configured_args: undefined, environment: undefined };
     renderHarnesses("claude-native");
-    selectTab("Settings");
     expect(screen.getByText("Update my-laptop to see environment settings.")).toBeTruthy();
     expect(screen.queryByText("Configured invocation")).toBeNull();
   });
@@ -1018,7 +890,6 @@ describe("Launch settings compatibility", () => {
     hosts = [ONLINE];
     startupData = { ...STARTUP, args: null, configured_args: null, environment: null };
     renderHarnesses("claude-native");
-    selectTab("Settings");
     expect(
       screen.getByText("4 configured arguments. Update my-laptop to view values."),
     ).toBeTruthy();
@@ -1028,7 +899,6 @@ describe("Launch settings compatibility", () => {
     hosts = [ONLINE];
     startupError = new ApiError("unavailable", status, null);
     renderHarnesses("claude-native");
-    selectTab("Settings");
     expect(screen.getByText("Signed in")).toBeTruthy();
     expect(screen.queryByText("Startup configuration")).toBeNull();
     if (status === 501)
@@ -1038,15 +908,10 @@ describe("Launch settings compatibility", () => {
     if (status === 404) expect(screen.queryByText(/launch settings/)).toBeNull();
   });
 
-  it("uses the host selected on the grid", () => {
+  it("switches the detail host through the host segment", () => {
     hosts = [ONLINE, { ...ONLINE, host_id: "h2", name: "second-host" }];
-    renderHarnesses();
-    fireEvent.pointerDown(screen.getByRole("button", { name: "my-laptop" }), {
-      button: 0,
-      ctrlKey: false,
-    });
-    fireEvent.click(screen.getByRole("menuitem", { name: "second-host" }));
-    fireEvent.click(screen.getByTestId("harness-settings-claude-native"));
+    renderHarnesses("claude-native");
+    fireEvent.click(screen.getByRole("radio", { name: "second-host" }));
     expect(startupCalls).toHaveBeenLastCalledWith("h2", "claude-native");
   });
 });

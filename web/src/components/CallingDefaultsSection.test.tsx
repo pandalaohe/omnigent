@@ -1,4 +1,12 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import type { ReactElement } from "react";
+import { MemoryRouter } from "react-router-dom";
+import {
+  cleanup,
+  fireEvent,
+  render as renderComponent,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CustomAgent } from "@/lib/customAgentsApi";
 import type { HarnessCapability } from "@/lib/agentLabels";
@@ -47,7 +55,18 @@ vi.mock("@/lib/agentLabels", async (original) => ({
   ...(await original<typeof AgentLabels>()),
   useHarnessCapabilities: () => mocks.capabilities,
 }));
+vi.mock("@/hooks/useAgentRegistry", async (original) => ({
+  ...(await original<Record<string, unknown>>()),
+  useAgentRegistry: () => ({ items: [], legacyProducts: {}, isError: false }),
+}));
 import { CallingDefaultsSection } from "./CallingDefaultsSection";
+
+function render(ui: ReactElement) {
+  const result = renderComponent(<MemoryRouter>{ui}</MemoryRouter>);
+  const options = screen.queryByText("New session options")?.closest("details");
+  if (options) options.open = true;
+  return result;
+}
 
 const DEFAULTS_KEY = "omnigent:calling-defaults";
 const LAST_KEY = "omnigent:calling-last";
@@ -247,6 +266,7 @@ describe("CallingDefaultsSection", () => {
     );
     render(<CallingDefaultsSection />);
     await waitFor(() => expect(mocks.listCatalogs).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("radio", { name: "Permission" }));
     expect(screen.getByTestId("layered-cell-pi-native-host-a")).toHaveTextContent("Full access");
     fireEvent.click(screen.getByTestId("layered-cell-codex-host-a"));
     fireEvent.click(screen.getByRole("button", { name: "Use inherited" }));
@@ -254,30 +274,25 @@ describe("CallingDefaultsSection", () => {
     expect(readMaster()["host-a"].codex).toEqual({});
   });
   it.each(["claude-native", "claude-sdk"])(
-    "reads and saves %s speed with focused help",
+    "edits %s speed through the same layered table",
     async (harness) => {
       localStorage.setItem(
         DEFAULTS_KEY,
         JSON.stringify({ "host-a": { [harness]: { speed: "fast" } } }),
       );
       render(<CallingDefaultsSection />);
-      expect(screen.getByTestId(`calling-defaults-speed-${harness}`)).toHaveTextContent("Fast");
-      expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
-      fireEvent.focus(
-        screen.getAllByRole("button", { name: "About Claude fast mode" })[
-          harness === "claude-native" ? 0 : 1
-        ],
-      );
+      fireEvent.click(screen.getByRole("radio", { name: "Speed" }));
+      expect(screen.getByTestId(`layered-cell-${harness}-host-a`)).toHaveTextContent("Fast");
+      fireEvent.click(screen.getByTestId(`layered-cell-${harness}-host-a`));
+      fireEvent.focus(screen.getByRole("button", { name: "About Claude fast mode" }));
       expect(await screen.findByRole("tooltip")).toHaveTextContent("usage credits");
-      fireEvent.blur(
-        screen.getAllByRole("button", { name: "About Claude fast mode" })[
-          harness === "claude-native" ? 0 : 1
-        ],
-      );
-      await pickOption(`calling-defaults-speed-${harness}`, "Standard");
+      fireEvent.blur(screen.getByRole("button", { name: "About Claude fast mode" }));
+      fireEvent.click(screen.getByRole("combobox", { name: "Speed" }));
+      fireEvent.click(await screen.findByRole("option", { name: "Standard" }));
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
       expect(readMaster()["host-a"][harness]).toEqual({ speed: "standard" });
-      await pickOption(`calling-defaults-speed-${harness}`, "Default");
-      expect(readMaster()["host-a"][harness]).toEqual({});
+      fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+      expect(readMaster()["host-a"][harness]).toEqual({ speed: "fast" });
     },
   );
 
@@ -316,6 +331,7 @@ it("adds a plugin declared setting and saves its mode", async () => {
     },
   };
   render(<CallingDefaultsSection />);
+  fireEvent.click(screen.getByRole("radio", { name: "Permission" }));
   fireEvent.click(screen.getByTestId("layered-cell-custom-host-a"));
   fireEvent.click(screen.getByRole("combobox", { name: "Permission" }));
   fireEvent.click(await screen.findByRole("option", { name: "Review" }));

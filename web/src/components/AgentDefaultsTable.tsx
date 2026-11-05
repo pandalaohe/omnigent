@@ -1,6 +1,10 @@
 import { useState, type ReactElement, type ReactNode } from "react";
 
 import { HelpTip } from "@/components/HelpTip";
+import { AgentNameTag } from "@/components/AgentNameTag";
+import { ClaudeFastModeHelp } from "@/components/SessionDefaultModeSelect";
+import { ArrowRightIcon } from "lucide-react";
+import { Link } from "@/lib/routing";
 import { LayeredEditor, LayeredEditorAction } from "@/components/LayeredEditor";
 import { LayeredOwn, LayeredTable } from "@/components/LayeredTable";
 import { Button } from "@/components/ui/button";
@@ -33,7 +37,12 @@ import {
 } from "@/lib/callingDefaults";
 import type { CallingDefaultsCatalogRow } from "@/lib/callingDefaultsApi";
 import { nativeModelLabel, normalizeEffortLabel } from "@/lib/composerModelLabel";
-import { harnessUnavailableReasonOnHost } from "@/lib/harnessSetup";
+import {
+  agentPresentOnHost,
+  agentProductHarness,
+  agentSettingsPath,
+  groupAgentHarnesses,
+} from "@/lib/agentSettings";
 import {
   crossingClashes,
   inheritedAt,
@@ -43,14 +52,15 @@ import {
 } from "@/lib/layeredValues";
 import { effortLevelsFor, reconcileEffortOnModelChange } from "@/lib/modelEffortOptions";
 import { reconcileSpeed } from "@/lib/speedTiers";
-import { sessionModeHandler } from "@/lib/sessionDefaultModes";
+import { sessionModeHandler, sessionDefaultModeOptions } from "@/lib/sessionDefaultModes";
 import type { HarnessCapabilityMap } from "@/lib/sessionDefaultModes";
 
-export type AgentField = "permission" | "model" | "effort";
+export type AgentField = "permission" | "model" | "effort" | "speed";
 const FIELDS = [
   { value: "permission", label: "Permission" },
   { value: "model", label: "Model" },
   { value: "effort", label: "Thinking" },
+  { value: "speed", label: "Speed" },
 ] as const;
 const CONCEPT_LABELS: Record<string, string> = {
   manual: "Ask every time",
@@ -59,18 +69,17 @@ const CONCEPT_LABELS: Record<string, string> = {
   "read-only": "Read only",
 };
 
-function agentPresentOnHost(harness: string, host: Host | undefined): boolean {
-  if (!host) return false;
-  const reason = harnessUnavailableReasonOnHost(harness, host);
-  return !["platform-unsupported", "binary-missing", "unconfigured"].includes(reason ?? "");
-}
-
 export interface AgentDefaultsTableProps {
   hosts: readonly Host[];
   master: CallingDefaultsTable;
   catalogs: readonly CallingDefaultsCatalogRow[];
   capabilities?: HarnessCapabilityMap;
   field?: AgentField;
+  harnesses?: readonly string[];
+  names?: Readonly<Record<string, string>>;
+  agentIds?: Readonly<Record<string, string>>;
+  linkToDetails?: boolean;
+  visibleHostId?: string;
   onChange: (table: CallingDefaultsTable) => void;
   onLoadCatalog?: (host: string, harness: string) => void;
 }
@@ -79,6 +88,7 @@ function AgentLayerEditor({
   trigger,
   title,
   field,
+  harness,
   initial,
   inherited,
   from,
@@ -97,6 +107,7 @@ function AgentLayerEditor({
   trigger: ReactElement;
   title: string;
   field: AgentField;
+  harness: string;
   initial?: string;
   inherited?: string;
   from: string;
@@ -181,9 +192,12 @@ function AgentLayerEditor({
         </>
       }
     >
-      <label className="flex min-w-0 flex-col gap-1.5">
-        <span className="text-sm font-medium">
+      <div className="flex min-w-0 flex-col gap-1.5">
+        <span className="inline-flex items-center gap-1.5 text-sm font-medium">
           {FIELDS.find((item) => item.value === field)?.label}
+          {field === "speed" && ["claude-native", "claude-sdk"].includes(harness) && (
+            <ClaudeFastModeHelp />
+          )}
         </span>
         {field === "model" && (custom || options.length === 0) ? (
           <Input
@@ -223,7 +237,7 @@ function AgentLayerEditor({
             </SelectContent>
           </Select>
         )}
-      </label>
+      </div>
       {field === "model" && options.length > 0 && (
         <LayeredEditorAction onClick={() => setCustom(!custom)}>
           {custom ? "Choose a model" : "Enter another model"}
@@ -254,6 +268,11 @@ export function AgentDefaultsTable({
   catalogs,
   capabilities,
   field: fixedField,
+  harnesses: suppliedHarnesses,
+  names,
+  agentIds,
+  linkToDetails = false,
+  visibleHostId,
   onChange,
   onLoadCatalog,
 }: AgentDefaultsTableProps) {
@@ -265,15 +284,18 @@ export function AgentDefaultsTable({
   const [status, setStatus] = useState("");
   const field = fixedField ?? selectedField;
   const hostList = hosts.filter((host) => host.host_id !== "*");
-  const harnesses = [
-    ...new Set([
-      ...callingDefaultHarnesses(capabilities),
-      ...hostList.flatMap((host) =>
-        Object.keys(host.configured_harnesses ?? {}).filter((row) => row.startsWith("acp:")),
-      ),
-      ...Object.values(master).flatMap((entries) => Object.keys(entries)),
-    ]),
-  ].filter((row) => row !== "*");
+  const harnesses = groupAgentHarnesses(
+    suppliedHarnesses ?? [
+      ...new Set([
+        ...callingDefaultHarnesses(capabilities),
+        ...hostList.flatMap((host) =>
+          Object.keys(host.configured_harnesses ?? {}).filter((row) => row.startsWith("acp:")),
+        ),
+        ...Object.values(master).flatMap((entries) => Object.keys(entries)),
+      ]),
+    ],
+    capabilities,
+  );
   const layers = callingDefaultsLayers(master);
   const catalog = (row: string, col?: string) =>
     catalogs.filter((item) => item.harness === row && (!col || item.host_id === col));
@@ -295,20 +317,47 @@ export function AgentDefaultsTable({
       }),
     ),
   ];
+  const speeds = (row: string, col?: string) => [
+    ...new Map(
+      (col ? [col] : hostList.map((host) => host.host_id))
+        .flatMap((host) => {
+          const model = resolveAgentMasterField(master, host, row, "model", capabilities).value;
+          return sessionDefaultModeOptions(
+            row,
+            "speed",
+            models(row, host),
+            typeof model === "string" ? model : null,
+            "default",
+            capabilities,
+          );
+        })
+        .map((option) => [option.value, option]),
+    ).values(),
+  ];
   const optionsFor = (row: string, col?: string) =>
     field === "permission"
       ? permissions(row, col)
       : field === "model"
         ? models(row, col).map((item) => ({ value: item.id, label: nativeModelLabel(item) }))
-        : efforts(row, col).map((value) => ({ value, label: normalizeEffortLabel(value) }));
+        : field === "speed"
+          ? speeds(row, col)
+          : efforts(row, col).map((value) => ({ value, label: normalizeEffortLabel(value) }));
   const layerOptions = (col?: string) =>
     callingLayerOptions(
       (row) => permissions(row, col),
-      (row, key, value) => key !== "effort" || efforts(row, col).includes(value),
+      (row, key, value) =>
+        key === "effort"
+          ? efforts(row, col).includes(value)
+          : key === "speed"
+            ? optionsFor(row, col).some((option) => option.value === value)
+            : true,
     );
   const resolve = (row: string, col: string) =>
     resolveAgentMasterField(master, col, row, field, capabilities, layerOptions(col));
-  const label = (row: string) => callingHarnessLabel(row, capabilities);
+  const label = (row: string) => names?.[row] ?? callingHarnessLabel(row, capabilities);
+  const dependent = (row: string) =>
+    agentProductHarness(row, capabilities) !== row &&
+    harnesses.includes(agentProductHarness(row, capabilities));
   const hostLabel = (col: string) =>
     hostList.find((candidate) => candidate.host_id === col)?.name || col;
   const sourceLabel = (source: LayeredLevel | null) =>
@@ -390,7 +439,7 @@ export function AgentDefaultsTable({
         <div className="px-2.5 py-1.75">
           {at.level === "row" && (trigger.props as { children: ReactNode }).children}
           <span className="block text-sm text-muted-foreground">
-            No advertised {field === "effort" ? "thinking" : "permission"} options
+            No advertised {field === "effort" ? "thinking" : field} options
           </span>
         </div>
       );
@@ -425,6 +474,7 @@ export function AgentDefaultsTable({
         trigger={trigger}
         title={title}
         field={field}
+        harness={row}
         initial={current}
         inherited={typeof inheritedValue === "string" ? inheritedValue : undefined}
         from={
@@ -515,14 +565,6 @@ export function AgentDefaultsTable({
           A cell beats its headers. The agent row beats an unmarked host; Host wins reverses those
           headers. A project can override these in its settings.
         </HelpTip>
-        <span role="status" className="text-sm text-muted-foreground">
-          {status}
-        </span>
-        {undo && (
-          <Button variant="ghost" size="sm" onClick={undoSave}>
-            Undo
-          </Button>
-        )}
       </div>
       <LayeredTable
         label={`${FIELDS.find((item) => item.value === field)?.label} defaults`}
@@ -537,6 +579,28 @@ export function AgentDefaultsTable({
         rows={harnesses.map((row) => ({
           id: row,
           label: label(row),
+          content: (
+            <span className={dependent(row) ? "pl-4" : undefined}>
+              <AgentNameTag
+                agentId={agentIds?.[row] ?? null}
+                name={label(row)}
+                harness={row}
+                markOnly={dependent(row)}
+              />
+              {dependent(row) && <span className="sr-only">{label(row)}</span>}
+            </span>
+          ),
+          action:
+            linkToDetails && !dependent(row) ? (
+              <Link
+                to={agentSettingsPath(row, visibleHostId)}
+                aria-label={`${label(row)} details`}
+                className="flex min-h-11 w-11 shrink-0 items-center justify-center rounded-sm text-muted-foreground hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
+                componentId="settings.agents.detail"
+              >
+                <ArrowRightIcon className="size-4" aria-hidden />
+              </Link>
+            ) : undefined,
           detail: master["*"]?.[row]?.[field]
             ? valueLabel(master["*"][row][field], row)
             : undefined,
@@ -546,28 +610,30 @@ export function AgentDefaultsTable({
             layerOptions().normalize(row, field, master["*"][row][field]) !==
               inheritedAt(layers, { level: "row", row }, field, layerOptions()).value,
         }))}
-        columns={hostList.map((host) => ({
-          id: host.host_id,
-          label: host.name || host.host_id,
-          content: (
-            <span className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
-              {host.name || host.host_id}
-              {field === "permission" && layers.hostWins?.[host.host_id] && (
-                <LayeredOwn>Host wins</LayeredOwn>
-              )}
-            </span>
-          ),
-          detail:
-            field === "permission" && master[host.host_id]?.["*"]?.permission
-              ? valueLabel(master[host.host_id]["*"].permission)
-              : undefined,
-          mark:
-            field === "permission" &&
-            COLUMN_CONCEPTS.some(
-              (concept) => concept === master[host.host_id]?.["*"]?.permission,
-            ) &&
-            master[host.host_id]?.["*"]?.permission !== master["*"]?.["*"]?.permission,
-        }))}
+        columns={hostList
+          .filter((host) => !visibleHostId || host.host_id === visibleHostId)
+          .map((host) => ({
+            id: host.host_id,
+            label: host.name || host.host_id,
+            content: (
+              <span className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                {host.name || host.host_id}
+                {field === "permission" && layers.hostWins?.[host.host_id] && (
+                  <LayeredOwn>Host wins</LayeredOwn>
+                )}
+              </span>
+            ),
+            detail:
+              field === "permission" && master[host.host_id]?.["*"]?.permission
+                ? valueLabel(master[host.host_id]["*"].permission)
+                : undefined,
+            mark:
+              field === "permission" &&
+              COLUMN_CONCEPTS.some(
+                (concept) => concept === master[host.host_id]?.["*"]?.permission,
+              ) &&
+              master[host.host_id]?.["*"]?.permission !== master["*"]?.["*"]?.permission,
+          }))}
         renderEditor={renderEditor}
         renderCell={(row, col) => {
           const host = hostList.find((candidate) => candidate.host_id === col);
@@ -622,6 +688,16 @@ export function AgentDefaultsTable({
           </Button>
         )}
       />
+      <div className="flex min-h-8 items-center gap-2" aria-live="polite">
+        <span role="status" className="text-sm text-muted-foreground">
+          {status}
+        </span>
+        {undo && (
+          <Button variant="ghost" size="sm" onClick={undoSave}>
+            Undo
+          </Button>
+        )}
+      </div>
     </div>
   );
 }
