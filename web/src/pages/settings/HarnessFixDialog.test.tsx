@@ -1426,7 +1426,7 @@ describe("HarnessFixDialog", () => {
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: "Use an API key or gateway URL instead" }));
     await user.type(screen.getByPlaceholderText("Paste an API key"), "secret");
-    await user.click(screen.getAllByRole("button", { name: "Save" })[0]);
+    await user.click(screen.getByTestId("harness-credential-save"));
 
     await waitFor(() =>
       expect(props.onFixed).toHaveBeenCalledWith({

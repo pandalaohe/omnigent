@@ -144,10 +144,10 @@ def test_usage_clears_mobile_sidebar_control(
         ("/settings/general", "General"),
         ("/settings/appearance", "Appearance"),
         ("/settings/git", "Git"),
-        ("/settings/harnesses", "Harnesses"),
-        ("/settings/custom-agents", "Custom agents"),
+        ("/settings/harnesses", "Agents"),
+        ("/settings/custom-agents", "Agents"),
         ("/settings/import", "Import sessions"),
-        ("/settings/instructions", "Instructions"),
+        ("/settings/instructions", "Startup prompts"),
         ("/settings/policies", "Global Policies"),
         ("/settings/system-status", "System status"),
     ],
@@ -454,7 +454,7 @@ _PAGE_SCROLL_CALLERS = [
     ("/system", "System status", "SystemStatusPage.tsx"),
     ("/settings/general", "General", "SettingsPage.tsx"),
     ("/settings/system-status", "System status", "SettingsPage.tsx"),
-    ("/settings/instructions", "Instructions", "InstructionsPage.tsx"),
+    ("/settings/instructions", "Startup prompts", "InstructionsPage.tsx"),
     ("/settings/policies", "Global Policies", "PoliciesPage.tsx"),
     ("/settings/members", "Members", "MembersPage.tsx"),
     ("/settings/sharing", "Session sharing", "SharingPage.tsx"),
@@ -626,7 +626,7 @@ def test_sidebar_surfaces_with_their_own_headers(
         first_row = page.get_by_role("navigation", name="Conversation", exact=True)
     expect(first_row).to_be_visible()
     menu = (
-        page.get_by_role("link", name="Back to sessions")
+        page.get_by_role("button", name="Back", exact=True)
         if surface == "host-terminals"
         else page.get_by_role(
             "button",
@@ -708,7 +708,7 @@ def test_touch_landscape_chat_and_host_terminals_clear_header_and_controls(
         )
         page.goto(f"{contract.base_url}/hosts/{chat.host_id}/terminals")
         first_row = page.get_by_role("heading", name="Example host · Terminals")
-        menu = page.get_by_role("link", name="Back to sessions")
+        menu = page.get_by_role("button", name="Back", exact=True)
         expect(first_row).to_be_visible()
         expect(menu).to_be_visible()
         key_row = page.get_by_test_id("terminal-key-row")

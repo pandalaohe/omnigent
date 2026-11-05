@@ -88,4 +88,9 @@ def register_collab_settings_routes(
             permission_store=permission_store,
         )
         settings = await asyncio.to_thread(read_collab_settings, user_preferences_store, owner)
-        return JSONResponse(dataclasses.asdict(settings))
+        return JSONResponse(
+            {
+                **dataclasses.asdict(settings),
+                "session_choice": settings.session_choice.model_dump(mode="json", by_alias=True),
+            }
+        )

@@ -283,7 +283,7 @@ def test_build_engine_includes_session_policies(db_uri: str) -> None:
 
     assert isinstance(engine.policies[0], FunctionPolicy)
     assert engine.policies[0].spec.name == "test_policy"
-    assert [p.spec.name for p in engine.policies[-7:]] == [
+    assert [p.spec.name for p in engine.policies[-8:]] == [
         "__ask_on_add_policy",
         "__ask_on_scheduled_task_change",
         "__ask_on_terminal_agent_access",
@@ -291,6 +291,7 @@ def test_build_engine_includes_session_policies(db_uri: str) -> None:
         "__ask_on_standing_approval_grant",
         "__ask_on_instruction_layer_update",
         "__ask_on_project_settings_update",
+        "__ask_on_session_choice_update",
     ]
 
 
@@ -317,6 +318,7 @@ def test_build_engine_no_store_returns_noop(db_uri: str) -> None:
         "__ask_on_standing_approval_grant",
         "__ask_on_instruction_layer_update",
         "__ask_on_project_settings_update",
+        "__ask_on_session_choice_update",
     ]
 
 
@@ -381,6 +383,7 @@ def test_build_engine_ordering_session_agent_admin(db_uri: str) -> None:
         "__ask_on_standing_approval_grant",
         "__ask_on_instruction_layer_update",
         "__ask_on_project_settings_update",
+        "__ask_on_session_choice_update",
     ]
 
 
@@ -855,6 +858,7 @@ def test_build_engine_ordering_session_agent_db_default_admin(db_uri: str) -> No
         "__ask_on_standing_approval_grant",
         "__ask_on_instruction_layer_update",
         "__ask_on_project_settings_update",
+        "__ask_on_session_choice_update",
     ]
 
 

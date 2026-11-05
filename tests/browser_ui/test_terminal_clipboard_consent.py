@@ -130,7 +130,7 @@ class _ClipboardBrowser:
             self.page.get_by_role("button", name="Conversation actions").click()
             self.page.get_by_role("menuitem", name=re.compile(r"^Shells\b")).click()
             drawer = self.page.get_by_test_id("shells-panel-drawer")
-            drawer.get_by_role("button", name=re.compile("clipboard-e2e")).click()
+            drawer.get_by_role("button", name=f"Open {_TERMINAL_LABEL}", exact=True).click()
         else:
             _open_right_rail(self.page)
             rail = self.page.get_by_role("complementary", name="Workspace")

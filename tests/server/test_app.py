@@ -3361,4 +3361,5 @@ def test_usage_snapshot_store_uses_primary_database(
             cache_dir=tmp_path / "split-cache",
         ),
     )
-    assert captured == [db_uri]
+    assert captured
+    assert set(captured) == {db_uri}

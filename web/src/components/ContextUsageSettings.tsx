@@ -33,6 +33,7 @@ import {
 } from "@/hooks/useAgentRegistry";
 import { useCodexRateLimits, useHosts, type Host } from "@/hooks/useHosts";
 import { useSession } from "@/hooks/useSession";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useStableProviderUsageLimits } from "@/hooks/useStableProviderUsageLimits";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import { formatTokenCountShort } from "@/lib/formatCost";
@@ -671,6 +672,7 @@ function ValueEditor({
 }
 
 export function ContextUsageSettings() {
+  const mobile = useIsMobileViewport();
   const preferences = useUsageContextPreferences();
   const registry = useAgentRegistry();
   const { data: hosts = [] } = useHosts();
@@ -965,7 +967,7 @@ export function ContextUsageSettings() {
         document.querySelector<HTMLInputElement>('[data-pop][data-state="open"] input')?.focus();
     }, 0);
     return () => window.clearTimeout(timer);
-  }, [openEditor]);
+  }, [openEditor, mobile]);
 
   const codexSession = liveHarness === "codex" || liveHarness === "codex-native";
   const { data: codexRateLimits, isLoading: rateLimitsLoading } = useCodexRateLimits(

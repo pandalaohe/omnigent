@@ -115,7 +115,9 @@ def test_child_freeze_default_and_exception_stay_compact(
     page.set_viewport_size({"width": width, "height": 900})
     page.goto(f"{appearance_url}/settings/general#child-idle")
     section = page.get_by_test_id("child-idle-settings")
-    expect(section.get_by_text("All agents", exact=True)).to_be_visible()
+    expect(
+        section.get_by_text("Tell the parent session when a child…", exact=True)
+    ).to_be_visible()
     expect(section.get_by_role("switch", name="Monitor all agents children")).to_have_count(1)
     expect(section.get_by_role("switch", name=re.compile(r"Monitor .* children"))).to_have_count(1)
     expect(section.get_by_role("button", name="Add exception")).to_have_count(1)
@@ -248,8 +250,9 @@ def test_quota_default_and_registry_product_exception_persist(
         f"localStorage.setItem('omnigent:session-collab', {json.dumps(json.dumps(saved))})"
     )
     page.set_viewport_size({"width": width, "height": 900})
-    page.goto(f"{appearance_url}/settings/instructions")
-    section = page.locator('section[aria-labelledby="child-sessions-heading"]')
+    page.goto(f"{appearance_url}/settings/general#session-choice")
+    page.locator("#session-choice").get_by_text("Quota display", exact=True).first.click()
+    section = page.locator('section[aria-labelledby="quota-display-heading"]')
     section.locator("summary").click()
     expect(section.get_by_role("textbox", name="All products")).to_have_value("")
     expect(section.get_by_role("button", name="Edit Codex")).to_be_visible()
@@ -268,10 +271,11 @@ def test_quota_default_and_registry_product_exception_persist(
             and response.url.endswith("/v1/me/preferences/session_collab")
         )
     ):
-        section.get_by_role("button", name="Save child settings").click()
+        section.get_by_role("button", name="Save quota display").click()
     assert saved["quotaPeriodDefault"] == "5h"
     assert saved["quotaPeriods"] == {"codex": "7d", "kite": "month"}
     page.reload()
+    page.locator("#session-choice").get_by_text("Quota display", exact=True).first.click()
     section.locator("summary").click()
     expect(section.get_by_role("textbox", name="All products")).to_have_value("5h")
     expect(section.get_by_role("button", name="Edit Kite")).to_be_visible()
@@ -315,8 +319,8 @@ def test_reserve_width_persists_and_settings_fit(
         ("keep-warm", "/settings/general#keep-warm"),
         ("context-usage", "/settings/general#context-usage"),
         ("runtime-resources", "/system"),
-        ("calling-defaults", "/settings/harnesses#calling-defaults"),
-        ("agents", "/settings/custom-agents"),
+        ("calling-defaults", "/settings/agents#calling-defaults"),
+        ("agents", "/settings/agents"),
     ],
 )
 def test_legacy_links_open_the_new_group(
@@ -796,7 +800,7 @@ def test_project_inheritance_cancel_and_copy_preview_fit(
     unavailable = picker.get_by_role("checkbox", name=re.compile(r"^Without folder"))
     expect(unavailable).to_be_disabled()
     expect(unavailable).not_to_be_checked()
-    picker.get_by_role("button", name="Done", exact=True).click()
+    picker.get_by_role("button", name="Use selected projects", exact=True).click()
     expect(picker).not_to_be_visible()
     dialog = page.get_by_role("dialog", name="Project settings", exact=True)
     assert dialog.evaluate("element => element.scrollWidth <= element.clientWidth")

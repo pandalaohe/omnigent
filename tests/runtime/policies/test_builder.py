@@ -118,6 +118,7 @@ name: no-guardrails
         "__ask_on_standing_approval_grant",
         "__ask_on_instruction_layer_update",
         "__ask_on_project_settings_update",
+        "__ask_on_session_choice_update",
     ]
     assert engine.label_defs == {}
     assert engine.labels == {}
@@ -155,6 +156,7 @@ guardrails: {}
         "__ask_on_standing_approval_grant",
         "__ask_on_instruction_layer_update",
         "__ask_on_project_settings_update",
+        "__ask_on_session_choice_update",
     ]
     assert engine.label_defs == {}
     assert engine.labels == {}
@@ -215,6 +217,7 @@ guardrails:
         "__ask_on_standing_approval_grant",
         "__ask_on_instruction_layer_update",
         "__ask_on_project_settings_update",
+        "__ask_on_session_choice_update",
     ]
 
 
@@ -623,7 +626,7 @@ def test_build_from_programmatic_spec(
     )
     assert engine.ask_timeout == 45
     assert engine.policies[0].spec.name == "taint_web"
-    assert [p.spec.name for p in engine.policies[-7:]] == [
+    assert [p.spec.name for p in engine.policies[-8:]] == [
         "__ask_on_add_policy",
         "__ask_on_scheduled_task_change",
         "__ask_on_terminal_agent_access",
@@ -631,6 +634,7 @@ def test_build_from_programmatic_spec(
         "__ask_on_standing_approval_grant",
         "__ask_on_instruction_layer_update",
         "__ask_on_project_settings_update",
+        "__ask_on_session_choice_update",
     ]
     assert engine.labels == {"integrity": "1"}
 
@@ -678,6 +682,7 @@ def test_default_policies_appended_after_agent_policies(
         "__ask_on_standing_approval_grant",
         "__ask_on_instruction_layer_update",
         "__ask_on_project_settings_update",
+        "__ask_on_session_choice_update",
     ]
 
 
@@ -703,7 +708,7 @@ def test_default_policies_alone_builds_live_engine(
         default_policies=[admin_policy],
     )
     assert engine.policies[0].spec.name == "admin_audit"
-    assert [p.spec.name for p in engine.policies[-7:]] == [
+    assert [p.spec.name for p in engine.policies[-8:]] == [
         "__ask_on_add_policy",
         "__ask_on_scheduled_task_change",
         "__ask_on_terminal_agent_access",
@@ -711,6 +716,7 @@ def test_default_policies_alone_builds_live_engine(
         "__ask_on_standing_approval_grant",
         "__ask_on_instruction_layer_update",
         "__ask_on_project_settings_update",
+        "__ask_on_session_choice_update",
     ]
 
 
@@ -744,6 +750,7 @@ def test_empty_default_policies_preserves_existing_behaviour(
         "__ask_on_standing_approval_grant",
         "__ask_on_instruction_layer_update",
         "__ask_on_project_settings_update",
+        "__ask_on_session_choice_update",
     ]
     assert [p.spec.name for p in engine_none.policies] == guards
     assert [p.spec.name for p in engine_empty.policies] == guards

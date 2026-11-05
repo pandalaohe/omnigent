@@ -356,6 +356,7 @@ guardrails:
         "__ask_on_standing_approval_grant",
         "__ask_on_instruction_layer_update",
         "__ask_on_project_settings_update",
+        "__ask_on_session_choice_update",
     ]
 
     from omnigent.spec.types import FunctionPolicySpec

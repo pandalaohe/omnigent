@@ -71,9 +71,8 @@ async def test_pi_rpc_relay_is_ready_before_permission_bootstrap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from omnigent.harnesses.pi_native import bridge as pi_bridge
-    from omnigent.server.permission_tiers import PERMISSION_STATE_LABEL_KEY
+    from omnigent.server.permission_tiers import tier_label_key
 
-    _stub_permission_start_for_routing_test(monkeypatch)
     monkeypatch.setattr(pi_bridge, "_BRIDGE_ROOT", tmp_path / "pi-native")
     spec = AgentSpec(
         spec_version=1,
@@ -99,19 +98,12 @@ async def test_pi_rpc_relay_is_ready_before_permission_bootstrap(
     payload = {
         "session_id": session_id,
         "agent_id": "9d3e2b1c7a504f6e8c2d1b0a3f5e7c9d",
-        "session_init": {
-            "protocol_version": 2,
-            "server_version": "test",
-            "session_id": session_id,
-            "agent_id": "9d3e2b1c7a504f6e8c2d1b0a3f5e7c9d",
-            "snapshot": {
-                "created_at": 1,
-                "updated_at": 1,
-                "labels": {PERMISSION_STATE_LABEL_KEY: "full"},
-            },
-        },
     }
-    async with _runner_client(app) as client:
+    async with _runner_client(
+        app,
+        permission_harness="pi",
+        permission_snapshot={"workspace": str(tmp_path), "labels": {tier_label_key("pi"): "full"}},
+    ) as client:
         response = await client.post("/v1/sessions", json=payload)
         assert response.status_code == 201, response.text
         assert observed == ["relay-before-bootstrap"]
@@ -643,6 +635,7 @@ def _launch_ctx(**overrides: Any) -> NativeLaunchContext:
                 "peer_messaging_enabled",
                 "session_open_enabled",
                 "global_instructions",
+                "pi_bootstrap",
             },
         ),
         (

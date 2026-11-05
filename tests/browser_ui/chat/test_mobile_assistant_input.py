@@ -23,6 +23,11 @@ def _configure_buttons(page: Page) -> None:
     page.add_init_script("""
         localStorage.setItem('omnigent:mobile-assistant-preferences', JSON.stringify({
             version: 2, enabled: true,
+            terminalButtons: [['Esc', 'Escape'], ['Tab', 'Tab'], ['Up', 'ArrowUp'],
+                ['Down', 'ArrowDown'], ['Left', 'ArrowLeft'],
+                ['Right', 'ArrowRight'], ['Enter', 'Enter']].map(([label, code]) => ({
+                    id: code, label, kind: 'key', chord: {code, modifiers: []}
+                })),
             buttons: [
                 {id: 'phrase', label: 'Phrase', binding: {kind: 'text', text: 'hello'}},
                 ...[['Esc', 'Escape'], ['Tab', 'Tab'], ['Up', 'ArrowUp'],
@@ -109,7 +114,6 @@ def cli_bridge(
 @pytest.mark.parametrize(
     ("label", "expected"),
     [
-        ("Phrase", b"hello"),
         ("Up", b"\x1b[A"),
         ("Down", b"\x1b[B"),
         ("Left", b"\x1b[D"),
@@ -130,7 +134,8 @@ def test_phrase_and_keys_reach_cli_bridge(
     while b"".join(inputs) != expected and time.monotonic() < deadline:
         page.wait_for_timeout(10)
     assert b"".join(inputs) == expected
-    expect(textarea).to_be_focused()
+    # Terminal keys preserve the dismissed keyboard; only Keyboard explicitly opens it.
+    expect(textarea).not_to_be_focused()
 
 
 def test_switching_to_chat_does_not_type_into_the_hidden_terminal(

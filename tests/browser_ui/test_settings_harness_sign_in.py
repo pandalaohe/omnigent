@@ -56,6 +56,21 @@ def test_expired_codex_account_recovers_on_selected_machine(
         contract.json(re.compile(r"/v1/skills(?:\?.*)?$"), {"skills": []})
         contract.json(prefix + "/credentials/detected", {"credentials": []})
         contract.json(
+            prefix + "/agent-settings/codex-native",
+            {"detail": "Settings folder not known"},
+            status=404,
+        )
+        contract.json(
+            "/v1/instruction-layers",
+            {
+                "data": [],
+                "agents": [],
+                "order": [],
+                "route_sizes": [],
+                "size_reminder_chars": 20000,
+            },
+        )
+        contract.json(
             prefix + "/harnesses/codex-native/startup",
             {
                 "command": "codex",

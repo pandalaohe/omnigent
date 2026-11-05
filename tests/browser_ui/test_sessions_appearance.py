@@ -8,6 +8,7 @@ from collections.abc import Iterator
 import pytest
 from playwright.sync_api import Page, expect
 
+from omnigent.server.child_idle import DEFAULT_CHECKIN_INSTRUCTIONS
 from tests.browser_ui.conftest import BrowserContract
 
 _COMPOSER = "Send a message…"
@@ -53,6 +54,19 @@ def appearance_url(browser_contract: BrowserContract) -> Iterator[str]:
         },
     )
     browser_contract.json("/v1/me", {"user_id": "local", "is_admin": True})
+    browser_contract.json("/v1/calling-defaults/catalogs", {"rows": []})
+    browser_contract.json("/v1/me/session-choice", {"settings": None, "revision": "empty"})
+    browser_contract.json("/v1/me/session-choice/notice", {"notice": None})
+    browser_contract.json(
+        "/v1/me/session-choice/meters", {"meters": [], "running": {}, "floors": {}}
+    )
+    browser_contract.json(
+        "/v1/child-checkin/defaults", {"instructions": DEFAULT_CHECKIN_INSTRUCTIONS}
+    )
+    browser_contract.json(
+        "/v1/instruction-layers",
+        {"data": [], "agents": [], "order": [], "route_sizes": [], "size_reminder_chars": 20000},
+    )
     browser_contract.json("/v1/agents", empty_list)
     browser_contract.json("/v1/hosts", empty_list)
     browser_contract.json("/v1/projects", empty_list)

@@ -60,12 +60,29 @@ async def test_local_mode_reads_the_local_user_row_and_defaults(
         assert default.status_code == 200
         assert default.json()["flow_timer_enabled"] is True
         assert default.json()["enabled"] is True
+        assert default.json()["session_choice"]["workTypes"] == []
 
-        SqlAlchemyUserPreferencesStore(db_uri).patch_namespace(
+        preferences = SqlAlchemyUserPreferencesStore(db_uri)
+        preferences.patch_namespace(
             RESERVED_USER_LOCAL, "session_collab", {"flowTimerEnabled": False}
+        )
+        preferences.replace_session_choice(
+            RESERVED_USER_LOCAL,
+            {
+                "enabled": True,
+                "defaultWorkType": "implementation",
+                "workTypes": [{"id": "implementation", "label": "Implementation"}],
+                "hosts": {
+                    "host-a": {"implementation": [[{"links": [{"agent": "codex-native"}]}]]}
+                },
+            },
+            preferences.session_choice(RESERVED_USER_LOCAL)["revision"],
         )
         off = await client.get(f"/v1/sessions/{session_id}/collab-settings")
     assert off.json()["flow_timer_enabled"] is False
+    choice = off.json()["session_choice"]
+    assert choice["defaultWorkType"] == "implementation"
+    assert choice["hosts"]["host-a"]["implementation"][0][0]["links"][0]["agent"] == "codex-native"
 
 
 async def test_auth_mode_reads_the_top_level_owner_and_checks_access(

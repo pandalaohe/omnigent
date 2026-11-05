@@ -491,9 +491,9 @@ describe("ServerSelectorV2", () => {
     expect(await screen.findByText("Arca failed")).toBeInTheDocument();
     expect(onConnect).not.toHaveBeenCalled();
     const skip = screen.getByRole("button", { name: "Continue anyway" });
-    expect(skip.nextElementSibling).toBe(screen.getByRole("button", { name: "Retry" }));
+    expect(skip.nextElementSibling).toBe(screen.getByRole("button", { name: "Retry setup" }));
 
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry setup" }));
     expect(await screen.findByText("Arca failed")).toBeInTheDocument();
     expect(onConnectRunner).toHaveBeenCalledTimes(2);
     fireEvent.click(screen.getByRole("button", { name: "Continue anyway" }));
@@ -501,13 +501,13 @@ describe("ServerSelectorV2", () => {
       expect(onConnect).toHaveBeenCalledWith("https://team.example.com/", expect.any(Function)),
     );
     expect(screen.queryByRole("button", { name: "Continue anyway" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Retry setup" })).not.toBeInTheDocument();
     expect(screen.queryByText("Arca failed")).not.toBeInTheDocument();
 
     act(() => finishConnect({ error: "Server unavailable" }));
     expect(await screen.findByText("Server unavailable")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Continue anyway" })).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry setup" }));
     expect(await screen.findByText("Server ready")).toBeInTheDocument();
     expect(onConnect).toHaveBeenCalledTimes(2);
     expect(onConnectRunner).toHaveBeenCalledTimes(2);
@@ -897,7 +897,7 @@ describe("onboarding parity", () => {
     await screen.findByText("Connection cancelled.");
     expect(setup.onConnectRunner).not.toHaveBeenCalled();
     expect(setup.onConnect).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry setup" }));
     await waitFor(() => expect(setup.onConnect).toHaveBeenCalledOnce());
     expect(setup.onConnectRunner).toHaveBeenCalledOnce();
     expect(confirm).toHaveBeenCalledTimes(2);
