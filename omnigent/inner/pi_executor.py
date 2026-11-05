@@ -58,6 +58,7 @@ from importlib.resources import files
 from typing import Any, Literal, NotRequired, Protocol, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse as _urlparse
 from uuid import uuid4
+from weakref import WeakValueDictionary
 
 from omnigent._platform import IS_WINDOWS, default_shell_argv, resolve_cli_binary
 from omnigent.databricks_ai_gateway import PI_AGENT, gateway_attribution_headers, is_ug_route
@@ -65,9 +66,11 @@ from omnigent.debug_logging import debug_event
 from omnigent.harnesses.pi_cli import pi_cli_argv
 from omnigent.harnesses.pi_native.bridge import (
     PERMISSION_INSTALLATION_FILE,
+    PI_PERMISSION_INSTALLATION_FIELDS,
     bridge_dir_for_session_id,
     clear_inbox,
     permission_tool_registry_source,
+    pi_permission_installation_failure,
     prepare_bridge_dir,
     prepare_permission_installation,
     verify_pi_permission_installation,
@@ -98,6 +101,7 @@ from omnigent.models.pi_model_compatibility import (
 from omnigent.onboarding.provider_config import CHAT_WIRE_API, RESPONSES_WIRE_API
 from omnigent.permission_tiers import plan_visible_tool_names
 from omnigent.permission_tiers.host import HOST_PERMISSION_STATE_FILE, read_host_permission_state
+from omnigent.permission_tiers.pi_tools import pi_permission_control_path
 from omnigent.pi_prompt import pi_prompt_args
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.sdk_peer_delivery import ReportPeerOutcome, SDKPeerInput, SDKPeerOutcome
@@ -161,6 +165,17 @@ _TOOL_REQUEST_DRAIN_TIMEOUT_S = 2
 
 class PiPermissionBootstrapError(RuntimeError):
     """Fixed startup diagnostic without subprocess output or receipt contents."""
+
+    code = "pi_permission_bootstrap_failed"
+
+    def __init__(self, reason: str) -> None:
+        safe = reason in {"timeout", "missing_ack", "ack_mismatch", "unknown"} or reason in {
+            f"ack_mismatch (field={name})" for name in PI_PERMISSION_INSTALLATION_FIELDS
+        }
+        if not safe and re.fullmatch(r"process_exit \(status=(?:-?[0-9]{1,10}|None)\)", reason):
+            safe = True
+        self.reason = reason if safe else "unknown"
+        super().__init__(f"Pi permission bootstrap failed: {self.reason}")
 
 
 def _permission_stderr_tail(lines: list[str]) -> str:
@@ -875,7 +890,7 @@ function permissionRevision() {
   return state && state.status === "ready" ? state.revision : null;
 }
 function writePermissionJson(name, payload) {
-  const target = permissionPath(name);
+  const target = `${__filename}.${name}`;
   const temporary = `${target}.${process.pid}.${crypto.randomBytes(8).toString("hex")}.tmp`;
   fs.writeFileSync(temporary, JSON.stringify(payload), { mode: 0o600 });
   fs.renameSync(temporary, target);
@@ -909,6 +924,10 @@ function writePermissionInstallation(pi, confirmedState, confirmedTools) {
   }
   if (!active) return false;
   try {
+    const extensionSha256 = crypto.createHash("sha256")
+      .update(fs.readFileSync(__filename)).digest("hex");
+    if (extensionSha256 !== expected.extension_sha256 ||
+        fs.realpathSync(expected.extension_path) !== fs.realpathSync(__filename)) return false;
     if (state.tier !== "full") {
       permissionToolRegistry = permissionToolSources.capture(pi, {
         version: 1, installation_id: expected.installation_id,
@@ -920,8 +939,7 @@ function writePermissionInstallation(pi, confirmedState, confirmedTools) {
     writePermissionJson("permission_installation.json", {
       version: 1, installation_id: expected.installation_id,
       session_id: PERMISSION_SESSION_ID, harness: "pi",
-      extension_sha256: crypto.createHash("sha256")
-        .update(fs.readFileSync(__filename)).digest("hex"),
+      extension_sha256: extensionSha256,
       tier: state.tier, revision: state.revision,
       tools_verified: true, active_tools: active,
     });
@@ -2383,6 +2401,7 @@ class _PiPeerPending:
 @dataclass
 class _PiSessionState:
     rpc: _PiRpcSession | None = None
+    closing: bool = False
     system_prompt: str | None = None
     model: str | None = None
     model_selection: str | None = None
@@ -3325,6 +3344,8 @@ class PiExecutor(Executor):
         self._sandboxed = sandboxed.sandboxed
 
         self._session_states: dict[str, _PiSessionState] = {}
+        # A retired state can still have a pending spawn; successors share its lock.
+        self._session_startup_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
         self._peer_initial: dict[str, _PiPeerPending] = {}
         self._context_incarnation = uuid4().hex
         self._context_records: dict[str, ContextRecordV2] = {}
@@ -3376,6 +3397,14 @@ class PiExecutor(Executor):
             return False
 
     async def close_session(self, session_key: str) -> None:
+        lock = self._session_startup_locks.setdefault(session_key, asyncio.Lock())
+        state = self._session_states.get(session_key)
+        if state is not None:
+            state.closing = True
+        async with lock:
+            await self._close_session_locked(session_key)
+
+    async def _close_session_locked(self, session_key: str) -> None:
         await self.finish_peer_messages(session_key)
         state = self._session_states.get(session_key)
         rpc = state.rpc if state is not None else None
@@ -4288,7 +4317,33 @@ class PiExecutor(Executor):
             :meth:`_apply_thinking_level` — so it is not part of the reuse
             signature. A model change respawns, which re-asserts the level.
         """
-        state = self._session_states.setdefault(session_key, _PiSessionState())
+        lock = self._session_startup_locks.setdefault(session_key, asyncio.Lock())
+        async with lock:
+            state = self._session_states.setdefault(session_key, _PiSessionState())
+            if state.closing:
+                raise RuntimeError("Pi RPC owner is closing")
+            return await self._ensure_rpc_locked(
+                state,
+                session_key,
+                system_prompt,
+                model,
+                tools,
+                thinking,
+                permission_bootstrap=permission_bootstrap,
+            )
+
+    async def _ensure_rpc_locked(
+        self,
+        state: _PiSessionState,
+        session_key: str,
+        system_prompt: str,
+        model: str | None,
+        tools: list[ToolSpec],
+        thinking: str | None,
+        *,
+        permission_bootstrap: bool,
+    ) -> _PiRpcSession:
+        """Keep launch files and their acknowledgement under one session owner."""
         if self._permission_controlled:
             if not session_key or session_key == "__default__":
                 raise ValueError("Pi permission session is not bound")
@@ -4307,9 +4362,16 @@ class PiExecutor(Executor):
             and state.model == effective_model
             and state.tool_names == effective_tool_names
         ):
+            rpc = state.rpc
             if self._permission_controlled:
-                await self._await_permission_installation(session_key, state.rpc)
-            return state.rpc
+                await self._await_permission_installation(session_key, rpc)
+            if (
+                self._session_states.get(session_key) is not state
+                or state.rpc is not rpc
+                or state.closing
+            ):
+                raise RuntimeError("Pi RPC owner changed during startup")
+            return rpc
 
         previous_rpc = state.rpc
         wire_catalog = await self._load_gateway_model_wire_apis()
@@ -4384,6 +4446,20 @@ class PiExecutor(Executor):
         else:
             pi_model = effective_model
 
+        def log_bootstrap(status: str, reason: str = "none") -> None:
+            if self._permission_controlled:
+                logger.info(
+                    "Pi permission bootstrap %s: bootstrap_id=%s session_id=%s "
+                    "generated_dir=%s status=%s reason=%s",
+                    "started" if status == "starting" else "ended",
+                    rpc.context_incarnation,
+                    session_key,
+                    pathlib.Path(tmp_dir).name if tmp_dir else "unavailable",
+                    status,
+                    reason,
+                )
+
+        log_bootstrap("starting")
         try:
             await rpc.start(
                 subprocess_config.executable or self._pi_launch_path,
@@ -4399,13 +4475,27 @@ class PiExecutor(Executor):
             )
             if self._permission_controlled:
                 await self._await_permission_installation(session_key, rpc)
-            if self._session_states.get(session_key) is not state or state.rpc is not previous_rpc:
+            if (
+                self._session_states.get(session_key) is not state
+                or state.rpc is not previous_rpc
+                or state.closing
+            ):
                 raise RuntimeError("Pi RPC owner changed during startup")
-        except BaseException:
+        except BaseException as exc:
+            cancelled = isinstance(exc, asyncio.CancelledError)
+            log_bootstrap(
+                "cancelled" if cancelled else "failed",
+                exc.reason
+                if isinstance(exc, PiPermissionBootstrapError)
+                else "cancelled"
+                if cancelled
+                else "startup_error",
+            )
             if tool_server is not None and usage_token is not None:
                 tool_server.revoke_pi_usage_token(session_key, expected_token=usage_token)
             await rpc.close()
             raise
+        log_bootstrap("installed")
         state.rpc = rpc
         state.system_prompt = system_prompt
         state.model = effective_model
@@ -4432,17 +4522,25 @@ class PiExecutor(Executor):
                 return
             await asyncio.sleep(0.05)
         else:
-            reason = (
-                "ack_mismatch"
-                if (bridge_dir / PERMISSION_INSTALLATION_FILE).exists()
-                else "missing_ack"
-            )
+            try:
+                installed_path = pi_permission_control_path(
+                    bridge_dir, PERMISSION_INSTALLATION_FILE
+                )
+            except (OSError, ValueError, TypeError):
+                installed_path = bridge_dir / PERMISSION_INSTALLATION_FILE
+            if installed_path.exists():
+                failure = pi_permission_installation_failure(bridge_dir, state.tier)
+                if failure is None:
+                    return
+                reason = f"ack_mismatch (field={failure})"
+            else:
+                reason = "missing_ack"
         logger.warning(
             "Pi permission bootstrap failed: reason=%s; filtered stderr tail=%s",
             reason,
             _permission_stderr_tail(rpc._stderr_lines),
         )
-        raise PiPermissionBootstrapError(f"Pi permission bootstrap failed: {reason}")
+        raise PiPermissionBootstrapError(reason)
 
     async def bootstrap_permission_tier(self, session_id: str) -> bool:
         """Spawn Pi without a user prompt and prove the installed extension."""

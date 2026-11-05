@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -27,11 +28,25 @@ def _object(path: Path) -> dict:
     return value
 
 
+def pi_permission_control_path(
+    bridge: Path, name: str, expected: Mapping[str, object] | None = None
+) -> Path:
+    """Keep RPC receipts beside their unique, process-owned extension file."""
+    if expected is None:
+        expected = _object(bridge / "permission_expected.json")
+    if expected.get("harness") == "pi":
+        extension = expected.get("extension_path")
+        if not isinstance(extension, str) or not extension:
+            raise ValueError("missing RPC extension path")
+        return Path(f"{extension}.{name}")
+    return bridge / name
+
+
 def read_pi_tool_registry(bridge: Path, state: HostPermissionState) -> PiToolRegistry:
     """Never consume provenance sent in tool arguments or policy event data."""
     try:
         expected = _object(bridge / "permission_expected.json")
-        registry = _object(bridge / "permission_tools.json")
+        registry = _object(pi_permission_control_path(bridge, "permission_tools.json", expected))
         for key in ("version", "installation_id", "session_id", "harness", "extension_sha256"):
             if registry.get(key) != expected.get(key):
                 raise ValueError("stale registry")

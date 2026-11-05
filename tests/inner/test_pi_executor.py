@@ -357,7 +357,7 @@ class _FakeProcess:
         (True, 12.0, None),
         (False, None, "missing_ack"),
         (True, None, "missing_ack"),
-        (False, None, "ack_mismatch"),
+        (False, None, "ack_mismatch (field=permission_expected.json)"),
         (False, None, "process_exit (status=7)"),
     ],
 )
@@ -385,7 +385,7 @@ async def test_permission_bootstrap_waits_for_live_process_and_reports_safe_reas
             status="blocked",
         ),
     )
-    if expected == "ack_mismatch":
+    if expected and expected.startswith("ack_mismatch"):
         (bridge / "permission_installation.json").write_text("{}")
     rpc = _PiRpcSession()
     rpc.process = _FakeProcess()
@@ -475,6 +475,135 @@ async def context_v2_pi(monkeypatch):
         yield executor, spawn, create, processes
     finally:
         await executor.close()
+
+
+async def test_concurrent_permission_bootstrap_reuses_one_proven_process(
+    context_v2_pi, tmp_path, monkeypatch, caplog
+):
+    from omnigent.inner import pi_executor as module
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the controlled Pi extension test")
+    executor, spawn, create, _ = context_v2_pi
+    executor._permission_controlled = True
+    caplog.set_level(logging.INFO, logger=module.__name__)
+    bridge = tmp_path / "bridge"
+    (bridge / "inbox").mkdir(parents=True)
+    write_host_permission_state(
+        bridge / "permission_state.json",
+        HostPermissionState("same-key", "host", str(tmp_path), "auto", 1, "blocked"),
+    )
+    monkeypatch.setattr(module, "bridge_dir_for_session_id", lambda _: bridge)
+    launches = []
+
+    def config(*args, **kwargs):
+        directory = tmp_path / f"launch-{len(launches)}"
+        directory.mkdir()
+        extension = directory / "tools.js"
+        extension.write_text(
+            _generate_extension_js(
+                12345 + len(launches),
+                [],
+                "test-token",
+                permission_bridge_dir=bridge,
+                session_id="same-key",
+            )
+        )
+        prepare_permission_installation(
+            bridge, session_id="same-key", harness="pi", extension=extension
+        )
+        launches.append(extension)
+        return PiSubprocessConfig({}, str(directory), ["--extension", str(extension)])
+
+    monkeypatch.setattr(executor, "_build_env_and_dir", config)
+
+    async def start(*args, **kwargs):
+        extension = Path(args[args.index("--extension") + 1])
+        process = await create(*args, **kwargs)
+        await asyncio.sleep(0)
+        if extension == launches[0]:
+            await asyncio.sleep(0)
+        subprocess.run(
+            [
+                node,
+                "-e",
+                "const handlers = {}; global.setInterval = () => 0;"
+                "process.env.OMNIGENT_PI_PERMISSION_INLINE = "
+                "require('fs').realpathSync(process.argv[1]);"
+                "require(process.argv[1])({ on: (n, h) => handlers[n] = h,"
+                "registerTool() {}, getAllTools: () => [],"
+                "getActiveTools: () => ['read'], setActiveTools() {} });"
+                "handlers.session_start({}, { isIdle: () => true });",
+                str(extension),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        await asyncio.sleep(0)
+        return process
+
+    spawn.side_effect = start
+    results = await asyncio.gather(
+        executor.bootstrap_permission_tier("same-key"),
+        executor.bootstrap_permission_tier("same-key"),
+        return_exceptions=True,
+    )
+    assert results == [True, True]
+    assert verify_pi_permission_installation(bridge, "auto")
+    assert len(launches) == 1
+    lifecycle = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("Pi permission bootstrap ")
+    ]
+    assert len(lifecycle) == 2
+    assert "bootstrap started:" in lifecycle[0]
+    assert "bootstrap ended:" in lifecycle[1] and "status=installed" in lifecycle[1]
+    rpc = executor._session_states["same-key"].rpc
+    assert rpc is not None
+    for message in lifecycle:
+        assert "generated_dir=launch-0" in message
+        assert f"bootstrap_id={rpc.context_incarnation}" in message
+        assert str(tmp_path) not in message and "test-token" not in message
+
+
+@pytest.mark.parametrize("failure", ["proof", "startup", "cancelled"])
+async def test_permission_bootstrap_logs_end_before_failed_launch_cleanup(
+    context_v2_pi, monkeypatch, caplog, failure
+):
+    from omnigent.inner import pi_executor as module
+
+    executor, _, _, _ = context_v2_pi
+    executor._permission_controlled = True
+    error = (
+        module.PiPermissionBootstrapError("ack_mismatch (field=extension_sha256)")
+        if failure == "proof"
+        else asyncio.CancelledError()
+        if failure == "cancelled"
+        else OSError("private path and credential")
+    )
+    monkeypatch.setattr(executor, "_await_permission_installation", AsyncMock(side_effect=error))
+    caplog.set_level(logging.INFO, logger=module.__name__)
+    with pytest.raises(type(error)):
+        await executor.bootstrap_permission_tier("failed-log")
+    lifecycle = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("Pi permission bootstrap ")
+    ]
+    assert len(lifecycle) == 2
+    assert "bootstrap started:" in lifecycle[0] and "bootstrap ended:" in lifecycle[1]
+    expected = "cancelled" if failure == "cancelled" else "failed"
+    assert f"status={expected}" in lifecycle[1]
+    assert (
+        "reason=ack_mismatch (field=extension_sha256)"
+        if failure == "proof"
+        else "reason=cancelled"
+        if failure == "cancelled"
+        else "reason=startup_error"
+    ) in lifecycle[1]
+    assert "private" not in " ".join(lifecycle)
 
 
 async def test_context_v2_pi_primary_reuse_replacement_and_close(context_v2_pi):
@@ -571,13 +700,15 @@ async def test_context_v2_pi_start_is_visible_before_await_and_cannot_rebind(
     spawn.side_effect = pending
     read = await executor.prepare_context_inventory_v2("outer", "read")
     task = asyncio.create_task(executor._ensure_rpc("sdk-key", "system", None, []))
+    closing = None
     try:
         await asyncio.wait_for(entered.wait(), 2)
         (before,) = read().sources[0].contexts
         assert before.lifecycle == "starting" and before.vendor_id is None
         if outcome == "owner-removed":
-            await executor.close_session("sdk-key")
-            assert read().sources[0].contexts[0].lifecycle == "unknown"
+            closing = asyncio.create_task(executor.close_session("sdk-key"))
+            await asyncio.sleep(0)
+            assert not closing.done()
         if outcome == "cancel":
             task.cancel()
         release.set()
@@ -594,10 +725,14 @@ async def test_context_v2_pi_start_is_visible_before_await_and_cannot_rebind(
                 await task
             assert read().sources[0].contexts[0].lifecycle == "unknown"
         assert read().sources[0].contexts[0].key == before.key
+        if closing is not None:
+            await asyncio.wait_for(closing, 2)
     finally:
         release.set()
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+        if closing is not None:
+            await asyncio.gather(closing, return_exceptions=True)
 
 
 @pytest.mark.parametrize("evict", [False, True])
@@ -653,6 +788,102 @@ async def test_context_v2_pi_eof_detach_and_history_budget_are_unknown(context_v
     assert source.unresolved[0].reason == "context_history_budget"
 
 
+async def test_ensure_rpc_waits_until_existing_rpc_finishes_closing(context_v2_pi, monkeypatch):
+    executor, spawn, _, _ = context_v2_pi
+    old = await executor._ensure_rpc("closing", "system", None, [])
+    entered, release = asyncio.Event(), asyncio.Event()
+    close = old._close_unobserved
+
+    async def slow_close():
+        entered.set()
+        await release.wait()
+        await close()
+
+    monkeypatch.setattr(old, "_close_unobserved", slow_close)
+    closing = asyncio.create_task(executor.close_session("closing"))
+    replacement = None
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        replacement = asyncio.create_task(executor._ensure_rpc("closing", "system", None, []))
+        await asyncio.sleep(0)
+        assert not replacement.done(), "a closing RPC was reused before its process exited"
+        assert spawn.await_count == 1
+        release.set()
+        await asyncio.wait_for(closing, 2)
+        current = await asyncio.wait_for(replacement, 2)
+        assert current is not old and old.process is None
+        assert executor._session_states["closing"].rpc is current
+        assert spawn.await_count == 2
+    finally:
+        release.set()
+        await asyncio.gather(closing, return_exceptions=True)
+        if replacement is not None:
+            await asyncio.gather(replacement, return_exceptions=True)
+
+
+async def test_finished_pi_sessions_release_startup_locks(context_v2_pi):
+    import gc
+
+    executor, _, _, _ = context_v2_pi
+    for index in range(2000):
+        key = f"finished-{index}"
+        await executor._ensure_rpc(key, "system", None, [])
+        await executor.close_session(key)
+    gc.collect()
+    assert executor._session_states == {}
+    assert len(executor._session_startup_locks) == 0
+
+
+async def test_reused_rpc_proof_cannot_return_owner_marked_closing(context_v2_pi, monkeypatch):
+    executor, spawn, _, _ = context_v2_pi
+    old = await executor._ensure_rpc("closing-proof", "system", None, [])
+    executor._permission_controlled = True
+    proof_entered, proof_release = asyncio.Event(), asyncio.Event()
+    close_entered, close_release = asyncio.Event(), asyncio.Event()
+    close = old._close_unobserved
+
+    async def pending_proof(session_key, rpc):
+        if rpc is old:
+            proof_entered.set()
+            await proof_release.wait()
+
+    async def pending_close():
+        close_entered.set()
+        await close_release.wait()
+        await close()
+
+    monkeypatch.setattr(executor, "_await_permission_installation", pending_proof)
+    monkeypatch.setattr(old, "_close_unobserved", pending_close)
+    reuse = asyncio.create_task(executor._ensure_rpc("closing-proof", "system", None, []))
+    closing = replacement = None
+    try:
+        await asyncio.wait_for(proof_entered.wait(), 2)
+        closing = asyncio.create_task(executor.close_session("closing-proof"))
+        await asyncio.sleep(0)
+        assert executor._session_states["closing-proof"].closing
+        replacement = asyncio.create_task(
+            executor._ensure_rpc("closing-proof", "system", None, [])
+        )
+        proof_release.set()
+        with pytest.raises(RuntimeError, match="owner changed"):
+            await asyncio.wait_for(reuse, 2)
+        await asyncio.wait_for(close_entered.wait(), 2)
+        assert not replacement.done() and spawn.await_count == 1
+        close_release.set()
+        await asyncio.wait_for(closing, 2)
+        current = await asyncio.wait_for(replacement, 2)
+        assert current is not old and old.process is None
+        assert executor._session_states["closing-proof"].rpc is current
+        assert spawn.await_count == 2
+    finally:
+        proof_release.set()
+        close_release.set()
+        await asyncio.gather(
+            *(task for task in (reuse, closing, replacement) if task is not None),
+            return_exceptions=True,
+        )
+
+
 async def test_context_v2_pi_late_start_preserves_replacement_identity_and_usage_token(
     context_v2_pi, monkeypatch
 ):
@@ -673,20 +904,30 @@ async def test_context_v2_pi_late_start_preserves_replacement_identity_and_usage
     spawn.side_effect = pending
     read = await executor.prepare_context_inventory_v2("outer", "read")
     old = asyncio.create_task(executor._ensure_rpc("same-key", "system", None, []))
+    closing = None
+    replacement_task = None
     try:
         await asyncio.wait_for(entered.wait(), 2)
         old_key = read().sources[0].contexts[0].key
-        await executor.close_session("same-key")
-        assert read().sources[0].contexts[0].lifecycle == "unknown"
-        replacement = await executor._ensure_rpc("same-key", "system", None, [])
+        closing = asyncio.create_task(executor.close_session("same-key"))
+        await asyncio.sleep(0)
+        assert not closing.done(), "close must settle the pending startup before returning"
+        replacement_task = asyncio.create_task(
+            executor._ensure_rpc("same-key", "system", None, [])
+        )
+        await asyncio.sleep(0)
+        assert calls == 1, "replacement startup overlapped the retired owner's startup"
+        assert not replacement_task.done()
+        release.set()
+        with pytest.raises(RuntimeError, match="owner changed"):
+            await asyncio.wait_for(old, 2)
+        await asyncio.wait_for(closing, 2)
+        replacement = await asyncio.wait_for(replacement_task, 2)
         token = executor._tool_server._pi_usage_tokens["same-key"]
         source = read().sources[0]
         assert source.contexts[0].key == old_key and source.contexts[0].lifecycle == "unknown"
         assert source.contexts[1].key != old_key
         assert "pi_rpc_owner_unregistered" in {u.reason for u in source.unresolved}
-        release.set()
-        with pytest.raises(RuntimeError, match="owner changed"):
-            await old
         assert executor._session_states["same-key"].rpc is replacement
         assert executor._tool_server._pi_usage_token_ok("same-key", token)
         assert read().sources[0].contexts[0].lifecycle == "unknown"
@@ -694,6 +935,11 @@ async def test_context_v2_pi_late_start_preserves_replacement_identity_and_usage
         release.set()
         old.cancel()
         await asyncio.gather(old, return_exceptions=True)
+        if closing is not None:
+            await asyncio.gather(closing, return_exceptions=True)
+        if replacement_task is not None:
+            replacement_task.cancel()
+            await asyncio.gather(replacement_task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -1782,7 +2028,10 @@ class TestGenerateExtensionJs(unittest.TestCase):
 
 
 @pytest.mark.parametrize("tier", ["plan", "full"])
-def test_controlled_rpc_extension_proves_plan_tools_before_prompt(tmp_path: Path, tier) -> None:
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_controlled_rpc_extension_proves_plan_tools_before_prompt(
+    tmp_path: Path, tier, newline
+) -> None:
     """The real generated JS must install itself and hide executable tools in plan."""
     node = shutil.which("node")
     if node is None:
@@ -1811,7 +2060,9 @@ def test_controlled_rpc_extension_proves_plan_tools_before_prompt(tmp_path: Path
             "test-token",
             permission_bridge_dir=bridge_dir,
             session_id="test-session",
-        )
+        ),
+        encoding="utf-8",
+        newline=newline,
     )
     prepare_permission_installation(
         bridge_dir, session_id="test-session", harness="pi", extension=extension
@@ -1850,9 +2101,21 @@ assert.deepEqual(active, process.argv[2] === "safe" && tier === "plan"
     )
     assert result.returncode == 0, result.stderr
     assert verify_pi_permission_installation(bridge_dir, tier)
-    installed = json.loads((bridge_dir / "permission_installation.json").read_text())
+    installed = json.loads(Path(f"{extension}.permission_installation.json").read_text())
     assert installed["active_tools"] == (
         ["read", "sys_os_read"] if tier == "plan" else ["read", "sys_os_read", "sys_os_shell"]
+    )
+    replacement = tmp_path / "replacement.js"
+    replacement.write_bytes(extension.read_bytes() + b"\n// replacement\n")
+    prepare_permission_installation(
+        bridge_dir, session_id="test-session", harness="pi", extension=replacement
+    )
+    result = subprocess.run(
+        [node, "-e", script, str(extension), "safe", tier], capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
+    assert not Path(f"{replacement}.permission_installation.json").exists(), (
+        "a superseded process must not overwrite this launch's acknowledgement"
     )
 
 
@@ -3125,6 +3388,75 @@ async def test_generated_pi_full_tier_gates_without_finish_lease(tmp_path: Path)
         await server.wait_closed()
 
 
+@pytest.mark.parametrize("ordering", ["before-check", "after-check"])
+def test_old_rpc_ack_cannot_overwrite_replacement_proof(tmp_path: Path, ordering) -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for generated Pi extension test")
+    bridge = tmp_path / "bridge"
+    (bridge / "inbox").mkdir(parents=True)
+    write_host_permission_state(
+        bridge / "permission_state.json",
+        HostPermissionState("session", "host", str(tmp_path), "auto", 1, "blocked"),
+    )
+    old, new = tmp_path / "old.js", tmp_path / "new.js"
+    for index, extension in enumerate((old, new)):
+        extension.write_text(
+            _generate_extension_js(
+                12345 + index, [], "test-token", permission_bridge_dir=bridge, session_id="session"
+            )
+        )
+    prepare_permission_installation(bridge, session_id="session", harness="pi", extension=old)
+    script = r"""
+const fs = require('fs');
+const cp = require('child_process');
+const path = require('path');
+const crypto = require('crypto');
+const [old, replacement, bridge, ordering] = process.argv.slice(1);
+const proof = `
+const handlers = {};
+global.setInterval = () => 0;
+process.env.OMNIGENT_PI_PERMISSION_INLINE = process.argv[1];
+require(process.argv[1])({ on: (name, fn) => handlers[name] = fn, registerTool() {},
+  getActiveTools: () => ['read'], setActiveTools() {}, getAllTools: () => [] });
+handlers.session_start({}, { isIdle: () => true });
+`;
+function replaceLaunch() {
+  const expectedFile = path.join(bridge, 'permission_expected.json');
+  const expected = JSON.parse(fs.readFileSync(expectedFile, 'utf8'));
+  expected.installation_id = 'replacement-launch';
+  expected.extension_path = replacement;
+  expected.extension_sha256 = crypto.createHash('sha256')
+    .update(fs.readFileSync(replacement)).digest('hex');
+  fs.writeFileSync(expectedFile, JSON.stringify(expected));
+  cp.execFileSync(process.execPath, ['-e', proof, replacement]);
+}
+if (ordering === 'before-check') replaceLaunch();
+const rename = fs.renameSync;
+let paused = false;
+fs.renameSync = (source, target) => {
+  if (ordering === 'after-check' && !paused && target.endsWith('permission_installation.json')) {
+    paused = true;
+    replaceLaunch();
+  }
+  return rename(source, target);
+};
+process.argv = [process.argv[0], old];
+eval(proof);
+if (ordering === 'after-check' && !paused) throw new Error('old proof never reached rename');
+"""
+    result = subprocess.run(
+        [node, "-e", script, str(old), str(new), str(bridge), ordering],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert verify_pi_permission_installation(bridge, "auto"), (
+        "the old extension replaced the current launch's valid acknowledgement"
+    )
+
+
 def test_generated_pi_rpc_extension_switches_into_and_out_of_full(tmp_path: Path) -> None:
     node = shutil.which("node")
     if node is None:
@@ -3188,12 +3520,12 @@ function switchTier(target, revision) {
     target_tier: target, expected_revision: revision,
   }));
   pollInbox();
-  const ack = JSON.parse(fs.readFileSync(path.join(bridgeDir, "permission_ack.json"), "utf8"));
+  const ack = JSON.parse(fs.readFileSync(`${extensionPath}.permission_ack.json`, "utf8"));
   assert.equal(ack.id, `switch-${revision}`);
   assert.equal(ack.ok, true, JSON.stringify(ack));
   assert.deepEqual(ack.active_tools, ["read", "bash"]);
   const installed = JSON.parse(fs.readFileSync(
-    path.join(bridgeDir, "permission_installation.json"), "utf8"));
+    `${extensionPath}.permission_installation.json`, "utf8"));
   assert.equal(installed.tier, target);
   assert.equal(installed.revision, revision + 1);
   state.tier = target;
