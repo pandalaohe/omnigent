@@ -834,6 +834,56 @@ async def test_finished_pi_sessions_release_startup_locks(context_v2_pi):
     assert len(executor._session_startup_locks) == 0
 
 
+async def test_reused_rpc_proof_cannot_return_owner_marked_closing(context_v2_pi, monkeypatch):
+    executor, spawn, _, _ = context_v2_pi
+    old = await executor._ensure_rpc("closing-proof", "system", None, [])
+    executor._permission_controlled = True
+    proof_entered, proof_release = asyncio.Event(), asyncio.Event()
+    close_entered, close_release = asyncio.Event(), asyncio.Event()
+    close = old._close_unobserved
+
+    async def pending_proof(session_key, rpc):
+        if rpc is old:
+            proof_entered.set()
+            await proof_release.wait()
+
+    async def pending_close():
+        close_entered.set()
+        await close_release.wait()
+        await close()
+
+    monkeypatch.setattr(executor, "_await_permission_installation", pending_proof)
+    monkeypatch.setattr(old, "_close_unobserved", pending_close)
+    reuse = asyncio.create_task(executor._ensure_rpc("closing-proof", "system", None, []))
+    closing = replacement = None
+    try:
+        await asyncio.wait_for(proof_entered.wait(), 2)
+        closing = asyncio.create_task(executor.close_session("closing-proof"))
+        await asyncio.sleep(0)
+        assert executor._session_states["closing-proof"].closing
+        replacement = asyncio.create_task(
+            executor._ensure_rpc("closing-proof", "system", None, [])
+        )
+        proof_release.set()
+        with pytest.raises(RuntimeError, match="owner changed"):
+            await asyncio.wait_for(reuse, 2)
+        await asyncio.wait_for(close_entered.wait(), 2)
+        assert not replacement.done() and spawn.await_count == 1
+        close_release.set()
+        await asyncio.wait_for(closing, 2)
+        current = await asyncio.wait_for(replacement, 2)
+        assert current is not old and old.process is None
+        assert executor._session_states["closing-proof"].rpc is current
+        assert spawn.await_count == 2
+    finally:
+        proof_release.set()
+        close_release.set()
+        await asyncio.gather(
+            *(task for task in (reuse, closing, replacement) if task is not None),
+            return_exceptions=True,
+        )
+
+
 async def test_context_v2_pi_late_start_preserves_replacement_identity_and_usage_token(
     context_v2_pi, monkeypatch
 ):

@@ -4362,9 +4362,16 @@ class PiExecutor(Executor):
             and state.model == effective_model
             and state.tool_names == effective_tool_names
         ):
+            rpc = state.rpc
             if self._permission_controlled:
-                await self._await_permission_installation(session_key, state.rpc)
-            return state.rpc
+                await self._await_permission_installation(session_key, rpc)
+            if (
+                self._session_states.get(session_key) is not state
+                or state.rpc is not rpc
+                or state.closing
+            ):
+                raise RuntimeError("Pi RPC owner changed during startup")
+            return rpc
 
         previous_rpc = state.rpc
         wire_catalog = await self._load_gateway_model_wire_apis()
