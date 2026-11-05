@@ -7,7 +7,7 @@ import os
 import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 from unittest.mock import Mock
 
 import click
@@ -780,6 +780,7 @@ def test_rollout_records_keep_function_call_namespace() -> None:
 async def test_ensure_local_codex_resume_rollout_refreshes_existing_from_server(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
     backup_fails: bool,
 ) -> None:
     """
@@ -835,25 +836,12 @@ async def test_ensure_local_codex_resume_rollout_refreshes_existing_from_server(
     transport = httpx.MockTransport(handler)
     if backup_fails:
 
-        def fail_copy(*args: object) -> None:
+        def fail_copy(source: BinaryIO, destination: BinaryIO) -> None:
+            destination.write(source.read(10))
             raise OSError("backup unavailable")
 
         monkeypatch.setattr(codex_native.shutil, "copyfileobj", fail_copy)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        if backup_fails:
-            with pytest.raises(click.ClickException, match="backup unavailable"):
-                await codex_native._ensure_local_codex_resume_rollout(
-                    client,
-                    session_id="conv_codex",
-                    external_session_id=thread_id,
-                    codex_home=codex_home,
-                    workspace=workspace,
-                    model_provider="omnigent_databricks",
-                    codex_path=None,
-                )
-            assert existing.read_bytes() == before
-            assert list(existing.parent.glob("*.tmp")) == []
-            return
         rollout = await codex_native._ensure_local_codex_resume_rollout(
             client,
             session_id="conv_codex",
@@ -868,9 +856,17 @@ async def test_ensure_local_codex_resume_rollout_refreshes_existing_from_server(
     assert rollout == existing
     assert existing.read_bytes() != before
     backups = list(existing.parent.glob(f"{existing.name}.omnigent-backup-*"))
-    assert len(backups) == 1
-    assert re.fullmatch(r"(.+\.jsonl)\.omnigent-backup-\d{8}T\d{12}Z", backups[0].name)
-    assert backups[0].read_bytes() == before
+    if backup_fails:
+        assert backups == []
+        warnings = [record for record in caplog.records if record.levelname == "WARNING"]
+        assert len(warnings) == 1
+        assert str(existing) in warnings[0].getMessage()
+        assert "backup unavailable" in warnings[0].getMessage()
+    else:
+        assert len(backups) == 1
+        assert re.fullmatch(r"(.+\.jsonl)\.omnigent-backup-\d{8}T\d{12}Z", backups[0].name)
+        assert backups[0].read_bytes() == before
+    assert list(existing.parent.glob("*.tmp")) == []
     records = [json.loads(line) for line in existing.read_text().splitlines()]
     assert records[0]["payload"]["cwd"] == str(workspace)
     assert "authoritative server history" in json.dumps(records)

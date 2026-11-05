@@ -1994,7 +1994,7 @@ async def _ensure_local_codex_resume_rollout(
     rollout remains a best-effort fallback. A successful server fetch wins even
     when its committed history is empty or shorter than the local file;
     local-only records are omitted from the rebuilt rollout, with the previous
-    file kept in a timestamped backup when its contents differ.
+    file best-effort copied to a timestamped backup when its contents differ.
 
     :param client: HTTP client pointed at the Omnigent server.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
@@ -2085,17 +2085,25 @@ async def _ensure_local_codex_resume_rollout(
             for record in records:
                 handle.write(json.dumps(record, separators=(",", ":")) + "\n")
         assert tmp is not None
-        if target.exists() and not filecmp.cmp(target, tmp, shallow=False):
-            while True:
-                stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
-                backup = target.with_name(f"{target.name}.omnigent-backup-{stamp}")
-                try:
-                    backup_handle = backup.open("xb")
-                except FileExistsError:
-                    continue
-                with backup_handle, target.open("rb") as previous:
-                    shutil.copyfileobj(previous, backup_handle)
-                break
+        backup: Path | None = None
+        try:
+            if target.exists() and not filecmp.cmp(target, tmp, shallow=False):
+                while True:
+                    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+                    candidate = target.with_name(f"{target.name}.omnigent-backup-{stamp}")
+                    try:
+                        backup_handle = candidate.open("xb")
+                    except FileExistsError:
+                        continue
+                    backup = candidate
+                    with backup_handle, target.open("rb") as previous:
+                        shutil.copyfileobj(previous, backup_handle)
+                    break
+        except OSError as exc:
+            if backup is not None:
+                with contextlib.suppress(OSError):
+                    backup.unlink()
+            _logger.warning("Failed to back up Codex resume rollout %s: %s", target, exc)
         os.replace(tmp, target)
     except OSError as exc:
         raise click.ClickException(
