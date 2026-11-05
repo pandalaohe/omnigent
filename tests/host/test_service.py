@@ -258,10 +258,10 @@ def test_pause_resume_launchd_user_service_preserves_definition(
     path.write_text("preserve-me")
     calls = _capture_runs(monkeypatch)
 
-    paused = service.pause_user_host_service()
-    assert paused is not None
+    paused = service._service_for_current_platform()
+    service.stop_user_host_service(paused)
     assert path.read_text() == "preserve-me"
-    service.resume_user_host_service(paused)
+    service.start_user_host_service(paused)
 
     assert path.read_text() == "preserve-me"
     assert calls == [
@@ -292,7 +292,8 @@ def test_pause_launchd_user_service_waits_for_async_bootout(
     monkeypatch.setattr(service.subprocess, "run", _run)
     monkeypatch.setattr(service.time, "sleep", sleeps.append)
 
-    paused = service.pause_user_host_service()
+    paused = service._service_for_current_platform()
+    service.stop_user_host_service(paused)
 
     assert paused is not None
     assert path.read_text() == "preserve-me"
@@ -316,10 +317,10 @@ def test_pause_resume_systemd_user_service_preserves_definition(
     path.write_text("preserve-me")
     calls = _capture_runs(monkeypatch)
 
-    paused = service.pause_user_host_service()
-    assert paused is not None
+    paused = service._service_for_current_platform()
+    service.stop_user_host_service(paused)
     assert path.read_text() == "preserve-me"
-    service.resume_user_host_service(paused)
+    service.start_user_host_service(paused)
 
     assert path.read_text() == "preserve-me"
     assert calls == [
@@ -327,6 +328,42 @@ def test_pause_resume_systemd_user_service_preserves_definition(
         ["systemctl", "--user", "daemon-reload"],
         ["systemctl", "--user", "start", "omnigent-host.service"],
     ]
+
+
+@pytest.mark.parametrize("system", ["Darwin", "Linux"])
+@pytest.mark.parametrize("target", [None, "https://remote.example/space%2Fname?q=$value"])
+def test_installed_service_round_trip_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, system: str, target: str | None
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setattr(service.platform, "system", lambda: system)
+    monkeypatch.setattr(service.os, "getuid", lambda: 503, raising=False)
+    _capture_runs(monkeypatch)
+    installed = service.enable_user_host_service(target, environment={"PATH": "/old/bin"})
+
+    assert service.installed_user_host_service() == (installed, target)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b"invalid plist",
+        plistlib.dumps({"ProgramArguments": ["python"]}),
+        plistlib.dumps({"ProgramArguments": "wrong"}),
+    ],
+)
+def test_installed_service_rejects_unreadable_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: bytes
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(service.platform, "system", lambda: "Darwin")
+    path = tmp_path / "Library/LaunchAgents/ai.omnigent.host.plist"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(content)
+
+    with pytest.raises(service.HostServiceError, match="installed host service"):
+        service.installed_user_host_service()
 
 
 def test_host_service_rejects_unsupported_platform(monkeypatch: pytest.MonkeyPatch) -> None:
