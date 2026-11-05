@@ -1925,9 +1925,17 @@ def _remote_git_head(vcs_url: str) -> str | None:
     except (subprocess.SubprocessError, OSError):
         return None
     lines = result.stdout.splitlines()
+    remote_refs: dict[str, str] = {}
     for line in lines:
-        if line.rstrip().endswith("^{}"):
-            return line.split("\t", 1)[0].strip() or None
+        sha, _, name = line.strip().partition("\t")
+        remote_refs[name] = sha
+    for name in (
+        f"refs/heads/{revision}",
+        f"refs/tags/{revision}^{{}}",
+        f"refs/tags/{revision}",
+    ):
+        if name in remote_refs:
+            return remote_refs[name] or None
     first = lines[0].strip() if lines else ""
     sha = first.split("\t", 1)[0].strip() if first else ""
     return sha or None
