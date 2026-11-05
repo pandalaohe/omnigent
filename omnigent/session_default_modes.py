@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from omnigent.codex_approval_modes import CODEX_NATIVE_PERMISSION_PRESETS
@@ -107,16 +107,17 @@ CLAUDE_PERMISSION_OPTIONS = _options(
         ("dontAsk", "Don't ask", "deny"),
         ("bypassPermissions", "Bypass permissions", "full-access"),
     ),
-    create_only=frozenset({"default"}),
 )
 CODEX_PERMISSION_OPTIONS = _options(
     tuple(
         (
             preset.value,
             preset.label,
-            {"full-access": "full-access", "read-only": "read-only"}.get(
-                preset.value, "automatic"
-            ),
+            {
+                "full-access": "full-access",
+                "read-only": "read-only",
+                "ask-for-approval": "manual",
+            }.get(preset.value, "automatic"),
         )
         for preset in CODEX_NATIVE_PERMISSION_PRESETS
     )
@@ -189,6 +190,27 @@ def mode_values(harness: str | None, field: str, context: ModeContext) -> frozen
     if declared is None or declared.options == "per-model":
         return frozenset()
     return frozenset(option.value for option in declared.options if context in option.contexts)
+
+
+def mode_for_concept(
+    harness: str,
+    concept: str,
+    acp_options: Sequence[Mapping[str, str]] | None = None,
+) -> str | None:
+    """Find the first declared permission mode with this meaning."""
+    if acp_options is not None and (harness == "acp" or harness.startswith("acp:")):
+        return next(
+            (
+                row["value"]
+                for row in acp_options
+                if row.get("concept") == concept and row.get("value")
+            ),
+            None,
+        )
+    declared = mode_set(harness, "permission")
+    if declared is None or declared.options == "per-model":
+        return None
+    return next((row.value for row in declared.options if row.concept == concept), None)
 
 
 def valid_mode(value: object, harness: str | None, field: str, context: ModeContext) -> bool:

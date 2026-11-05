@@ -5,7 +5,41 @@ from __future__ import annotations
 import pytest
 
 from omnigent.harness_capabilities import ModeOption
-from omnigent.session_default_modes import apply_mode, mode_values, valid_mode
+from omnigent.session_default_modes import apply_mode, mode_for_concept, mode_values, valid_mode
+
+
+@pytest.mark.parametrize(
+    "harness,expected",
+    [
+        ("claude-native", ("default", "acceptEdits", "auto", "plan")),
+        ("claude-sdk", ("default", "acceptEdits", "auto", "plan")),
+        ("codex-native", ("ask-for-approval", None, "approve-for-me", "read-only")),
+        ("codex", ("ask-for-approval", None, "approve-for-me", "read-only")),
+        ("pi", ("ask", "accept-edits", "auto", "plan")),
+        ("pi-native", ("ask", "accept-edits", "auto", "plan")),
+        ("antigravity-native", ("ask", "accept-edits", "auto", "plan")),
+    ],
+)
+def test_permission_concepts(harness: str, expected: tuple) -> None:
+    assert (
+        tuple(
+            mode_for_concept(harness, concept)
+            for concept in ("manual", "edit-automatic", "automatic", "read-only")
+        )
+        == expected
+    )
+
+
+def test_acp_concepts_only_use_declared_meanings_and_option_order() -> None:
+    options = [
+        {"value": "default", "concept": "manual"},
+        {"value": "other", "concept": "manual"},
+        {"value": "auto"},
+    ]
+    assert mode_for_concept("acp:example", "manual", options) == "default"
+    assert mode_for_concept("acp:example", "automatic", options) is None
+    assert mode_for_concept("acp:example", "read-only", options) is None
+    assert mode_for_concept("codex", "manual", []) == "ask-for-approval"
 
 
 def test_builtin_permission_contexts_and_application() -> None:
@@ -27,7 +61,7 @@ def test_builtin_permission_contexts_and_application() -> None:
         assert valid_mode("full", harness, "permission", "default")
         assert apply_mode(harness, "permission", "full", context="default").tier == "full"
     for harness in ("claude-native", "claude-sdk"):
-        assert "default" not in mode_values(harness, "permission", "default")
+        assert "default" in mode_values(harness, "permission", "default")
         assert "default" in mode_values(harness, "permission", "create")
     for harness in ("codex", "codex-native"):
         assert mode_values(harness, "permission", "default") == {

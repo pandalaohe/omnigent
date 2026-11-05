@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -15,6 +17,63 @@ from omnigent.calling_defaults import (
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
+
+_LAYERED_CASES = json.loads(
+    (Path(__file__).parents[1] / "web/src/lib/__fixtures__/layeredCases.json").read_text()
+)["permissionCases"]
+
+
+@pytest.mark.parametrize("case", _LAYERED_CASES, ids=lambda case: case["name"])
+def test_shared_permission_layers(case: dict) -> None:
+    result = resolve_calling(
+        explicit={"harness_override": case["harness"]},
+        explicit_fields={"harness_override"},
+        project_config=None,
+        master=case["master"],
+        host_id=case["host"],
+        agent_harness=lambda _: None,
+        permission_options=(lambda _host, _harness: case["permission_options"])
+        if "permission_options" in case
+        else None,
+    )
+    assert {
+        "value": result.permission,
+        "source": result.sources["permission"],
+        "level": result.level.get("permission"),
+    } == case["expected"]
+
+
+def test_model_and_thinking_rows_ignore_cross_agent_totals() -> None:
+    result = _resolve(
+        explicit={"agent_id": "codex-sdk"},
+        explicit_fields={"agent_id"},
+        master={
+            "*": {
+                "*": {"model": "invalid-total", "effort": "max"},
+                "codex": {"model": "row-model", "effort": "high"},
+            },
+            "workstation": {"*": {"model": "invalid-host", "host_wins": True}},
+        },
+    )
+    assert (result.model, result.effort) == ("row-model", "high")
+    assert result.level == {"model": "row", "effort": "row"}
+
+
+def test_invalid_thinking_cell_falls_through_to_the_agent_row() -> None:
+    result = _resolve(
+        explicit={"agent_id": "codex-sdk"},
+        explicit_fields={"agent_id"},
+        master={
+            "*": {"codex": {"effort": "high"}},
+            "workstation": {"codex": {"effort": "obsolete"}},
+        },
+    )
+    assert (result.effort, result.level["effort"]) == ("high", "row")
+
+
+def test_legacy_model_does_not_require_a_known_harness() -> None:
+    result = _resolve(project_config={"agent_id": "unregistered", "model": "legacy-model"})
+    assert (result.model, result.sources["model"]) == ("legacy-model", "project_legacy")
 
 
 def _agent_harness(agent_id: str) -> str | None:
