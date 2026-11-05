@@ -33,12 +33,18 @@ import {
 } from "./usageBoardFormat";
 import { groupWindows, isStale, neverRead, pickWindow } from "./usageBoardSelect";
 import { readingTip, windowTip } from "./usageBoardTips";
+import { useUsageActivity } from "./usageActivityData";
+import { UsageByModel, UsageCostCard } from "./UsageAmounts";
 
 export function UsageAccountPage() {
   const { accountId = "" } = useParams();
   const info = useServerInfo();
   const board = useUsageContextPreferences().board;
   const overview = useUsageOverview(info !== "loading" && info.usage_board_enabled === true);
+  const activity = useUsageActivity(
+    accountId,
+    info !== "loading" && info.usage_board_enabled === true,
+  );
   const navigate = useNavigate();
   const account = overview.data?.accounts.find((item) => item.id === accountId);
 
@@ -67,7 +73,7 @@ export function UsageAccountPage() {
       title={account?.display_name ?? "…"}
       back={{ to: "/usage/board", label: "Usage board" }}
       loading={overview.isPending}
-      error={overview.error}
+      error={overview.error ?? activity.error}
       actions={
         <Button variant="ghost" size="icon" asChild aria-label="Account settings">
           <Link to={`/usage/board/${encodeURIComponent(accountId)}/settings`}>
@@ -224,6 +230,24 @@ export function UsageAccountPage() {
                       className="flex min-h-9 items-center justify-between gap-2 border-t border-border/60 py-1.5 first:border-t-0 text-xs"
                     >
                       <span className="min-w-0 truncate font-medium">{host.name}</span>
+                      {(() => {
+                        const own = activity.data?.accounts[0];
+                        const part = own?.hosts?.find((item) => item.host_id === host.host_id);
+                        const all = own?.totals.tokens ?? own?.totals.cost_usd;
+                        const value = own?.totals.tokens != null ? part?.tokens : part?.cost_usd;
+                        const percent = all && value != null ? (value / all) * 100 : null;
+                        return percent === null ? null : (
+                          <span className="ml-auto flex w-28 items-center gap-2 text-xs text-muted-foreground">
+                            <span className="h-1 flex-1 overflow-hidden rounded bg-muted">
+                              <span
+                                className="block h-full bg-info/60"
+                                style={{ width: `${Math.min(100, percent)}%` }}
+                              />
+                            </span>
+                            {Math.round(percent)}%
+                          </span>
+                        );
+                      })()}
                       <span className="shrink-0 text-muted-foreground">
                         {host.read_at === null
                           ? "No reading"
@@ -237,6 +261,15 @@ export function UsageAccountPage() {
               )}
             </section>
           </div>
+          <div className="mt-3">
+            <UsageCostCard
+              accounts={activity.data?.accounts ?? []}
+              account={account}
+              now={activity.data?.generated_at ?? Date.now() / 1000}
+              fee={board.fees?.[account.id]}
+            />
+          </div>
+          <UsageByModel accounts={activity.data?.accounts ?? []} />
           <div className="mt-3">
             <Button
               variant="ghost"

@@ -70,6 +70,10 @@ const UsageBoardRoute = lazy(() =>
   import("@/pages/usageBoard").then((m) => ({ default: m.UsageBoardRoute })),
 );
 const UsageBoardPage = withPageView("usage_board", () => <UsageBoardRoute view="board" />);
+const UsageBoardCostPage = withPageView("usage_board.cost", () => <UsageBoardRoute view="cost" />);
+const UsageBoardIssuesPage = withPageView("usage_board.issues", () => (
+  <UsageBoardRoute view="issues" />
+));
 const UsageBoardModelsPage = withPageView("usage_board.models", () => (
   <UsageBoardRoute view="models" />
 ));
@@ -250,6 +254,12 @@ function AppRoutes({ basename }: AppProps) {
           {usageBoardAvailable(info) && (
             <>
               <Route path={`${prefix}/usage/board`} element={<UsageBoardPage />} />
+              <Route path={`${prefix}/usage/board/cost`} element={<UsageBoardCostPage />} />
+              <Route path={`${prefix}/usage/board/issues`} element={<UsageBoardIssuesPage />} />
+              <Route
+                path={`${prefix}/usage/board/:accountId/issues`}
+                element={<UsageBoardIssuesPage />}
+              />
               <Route
                 path={`${prefix}/usage/board/:accountId/models`}
                 element={<UsageBoardModelsPage />}

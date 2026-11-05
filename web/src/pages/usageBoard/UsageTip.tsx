@@ -150,6 +150,7 @@ export function UsageTip({ model, children, className, tapOpens = false }: Usage
       <PopoverTrigger asChild>
         <span
           className={className}
+          tabIndex={tapOpens ? undefined : 0}
           onPointerEnter={(event) => {
             if (event.pointerType !== "mouse") return;
             cancelClose();
@@ -159,7 +160,10 @@ export function UsageTip({ model, children, className, tapOpens = false }: Usage
             if (event.pointerType !== "mouse") return;
             scheduleClose();
           }}
-          onFocus={cancelClose}
+          onFocus={(event) => {
+            cancelClose();
+            if ((event.target as HTMLElement).matches(":focus-visible")) setOpen(true);
+          }}
           onBlur={scheduleClose}
         >
           {children}

@@ -66,6 +66,13 @@ def attributed_rows(
 
 
 def totals(rows: Sequence[HourRow]) -> dict[str, Any]:
+    return {
+        **_totals(rows),
+        "metered": _totals([row for row in rows if row.basis in COUNTED_BASES]),
+    }
+
+
+def _totals(rows: Sequence[HourRow]) -> dict[str, Any]:
     cost = sum(row.cost_usd for row in rows)
     counted = [row for row in rows if row.basis in COUNTED_BASES]
     covered = [row for row in rows if row.priced and row.total_tokens > 0]
@@ -84,6 +91,8 @@ def totals(rows: Sequence[HourRow]) -> dict[str, Any]:
         "tokens": sum(row.total_tokens for row in rows) or None,
         "unpriced": sum(not row.priced for row in rows),
         "per_million": covered_cost / covered_tokens * 1e6 if covered_tokens else None,
+        "covered_cost_usd": covered_cost,
+        "covered_tokens": covered_tokens,
         "cost_coverage_pct": covered_cost / cost * 100 if cost > 0 else None,
         "tokens_complete": bool(rows) and all(row.total_tokens > 0 for row in rows if row.priced),
         "requests": requests if failures else None,

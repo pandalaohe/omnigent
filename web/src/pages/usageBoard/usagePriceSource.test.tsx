@@ -85,7 +85,8 @@ it("applies Custom dates live, moves the end with the start and rejects future d
   };
   patchUsageBoardPreferences({ range: { key: "d7" } });
   mount("range");
-  fireEvent.change(screen.getByLabelText("Usage range"), { target: { value: "custom" } });
+  fireEvent.click(screen.getByRole("button", { name: "Usage range" }));
+  fireEvent.click(screen.getByRole("button", { name: /^Custom/ }));
   expect(screen.queryByRole("button", { name: "Apply" })).toBeNull();
   expect(readUsageContextPreferences().board.range?.key).toBe("custom");
   const start = screen.getByLabelText("Usage from date");
@@ -164,7 +165,8 @@ it("reads models for the selected account and remembered range, with a tokens sw
   ).toBe(true);
   fireEvent.click(screen.getByRole("button", { name: "Tokens" }));
   await screen.findByText("1.5M");
-  fireEvent.change(screen.getByLabelText("Usage range"), { target: { value: "d7" } });
+  fireEvent.click(screen.getByRole("button", { name: "Usage range" }));
+  fireEvent.click(screen.getByRole("button", { name: /^7 days/ }));
   await waitFor(() =>
     expect(fetchMock.mock.calls.some(([path]) => path.includes("range=d7"))).toBe(true),
   );

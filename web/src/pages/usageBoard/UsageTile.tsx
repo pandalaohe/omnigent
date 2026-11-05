@@ -27,6 +27,8 @@ import { formatAge, formatTimeLeft, windowName } from "./usageBoardFormat";
 import { UsageRing } from "./UsageRing";
 import { UsageTip, UsageTipButton } from "./UsageTip";
 import { readingTip, renewalTip, windowTip } from "./usageBoardTips";
+import type { UsageAmount } from "./usageActivityData";
+import { UsageAmountFigure, UsageErrorMark } from "./UsageAmounts";
 
 const TONE_TILE: Record<string, string> = {
   warn: "border-warning/60 bg-warning/13",
@@ -45,6 +47,8 @@ interface UsageTileProps {
   onMove?: (direction: -1 | 1) => void;
   shownModel?: string;
   floorControl?: ReactNode;
+  amount?: UsageAmount;
+  tokens?: boolean;
 }
 
 export function UsageTile({
@@ -57,6 +61,8 @@ export function UsageTile({
   onMove,
   shownModel,
   floorControl,
+  amount,
+  tokens = false,
 }: UsageTileProps) {
   const stale = isStale(account);
   const empty = neverRead(account);
@@ -112,7 +118,16 @@ export function UsageTile({
           )}
         </div>
         {floorControl}
+        <UsageErrorMark account={account} />
         <div className="flex shrink-0 flex-col items-end leading-tight">
+          {amount &&
+          (tokens
+            ? amount.totals.tokens !== null
+            : amount.totals.cost_usd !== null || amount.totals.unpriced > 0) ? (
+            <span className="text-xs">
+              <UsageAmountFigure amount={amount} tokens={tokens} />
+            </span>
+          ) : null}
           {first?.window && first.window.percent_used !== null ? (
             <span
               className={cn(
@@ -165,6 +180,7 @@ export function UsageTile({
           )}
         </div>
         <ReadingButton account={account} />
+        <UsageErrorMark account={account} />
       </div>
 
       {floorControl && (
@@ -267,6 +283,12 @@ export function UsageTile({
           ) : (
             <span />
           )}
+          {amount &&
+          (tokens
+            ? amount.totals.tokens !== null
+            : amount.totals.cost_usd !== null || amount.totals.unpriced > 0) ? (
+            <UsageAmountFigure amount={amount} tokens={tokens} />
+          ) : null}
         </div>
       )}
     </div>

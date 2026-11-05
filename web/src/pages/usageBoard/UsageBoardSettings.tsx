@@ -127,6 +127,15 @@ export function UsageBoardSettings() {
 
       {available && board.enabled ? (
         <>
+          <Link
+            to="/usage/board/issues"
+            className="inline-flex min-h-11 items-center border-t border-border py-2 text-sm"
+          >
+            Issues{" "}
+            <span className="ml-auto" aria-hidden="true">
+              ›
+            </span>
+          </Link>
           <UsagePriceSourceSettings />
           <div className="flex flex-col gap-2 border-t border-border py-2.5">
             <div className="flex items-start justify-between gap-2">

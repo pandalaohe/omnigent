@@ -67,6 +67,8 @@ export interface UsageBoardPreferences {
     to?: string;
   };
   unit?: "money" | "tokens";
+  /** Monthly subscription fees, used only to compare against usage. */
+  fees?: Record<string, number>;
   /** The user's switch. The deployment gate sits on top of it. */
   enabled: boolean;
   density: "std" | "mini";
@@ -262,6 +264,7 @@ export function normalizeUsageBoardPreferences(value: unknown): UsageBoardPrefer
     hidden?: unknown;
     range?: UsageBoardPreferences["range"];
     unit?: unknown;
+    fees?: unknown;
   };
   const bands: UsageBoardBand[] = [];
   const seenBands = new Set<string>();
@@ -307,6 +310,23 @@ export function normalizeUsageBoardPreferences(value: unknown): UsageBoardPrefer
         }
       : {}),
     ...(raw.unit === "tokens" || raw.unit === "money" ? { unit: raw.unit } : {}),
+    ...(raw.fees && typeof raw.fees === "object"
+      ? {
+          fees: Object.fromEntries(
+            Object.entries(raw.fees)
+              .slice(0, 64)
+              .filter(
+                ([key, fee]) =>
+                  key.length > 0 &&
+                  key.length <= 64 &&
+                  typeof fee === "number" &&
+                  Number.isFinite(fee) &&
+                  fee >= 0 &&
+                  fee <= 1e9,
+              ),
+          ) as Record<string, number>,
+        }
+      : {}),
   };
 }
 
@@ -319,7 +339,8 @@ export function isDefaultUsageBoardPreferences(board: UsageBoardPreferences): bo
     Object.keys(board.renewals).length === 0 &&
     board.hidden.length === 0 &&
     (!board.range || board.range.key === "d7") &&
-    board.unit !== "tokens"
+    board.unit !== "tokens" &&
+    Object.keys(board.fees ?? {}).length === 0
   );
 }
 
