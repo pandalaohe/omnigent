@@ -155,7 +155,7 @@ def test_child_freeze_default_and_exception_stay_compact(
             "JSON.parse(localStorage.getItem('omnigent:child-idle'))"
         )
         assert "harness:claude-native" in local_preferences["agents"]
-    expect(section.get_by_role("button", name="Edit Claude Code")).to_be_visible()
+    expect(section.get_by_role("button", name="Done editing Claude Code")).to_be_visible()
     assert saved["freezeDefault"]["enabled"] is True
     assert "harness:claude-native" in saved["agents"]
     page.reload()
