@@ -64,10 +64,10 @@ _PAGE_0_KEYS: list[tuple[str, str, str, str]] = [
     ("←", "ArrowLeft", "1b5b44", "1b4f44"),
     ("→", "ArrowRight", "1b5b43", "1b4f43"),
     ("/", "/", "2f", "2f"),
-    ("PgUp", "PageUp", "1b5b357e", "1b5b357e"),
 ]
 
 _PAGE_1_KEYS: list[tuple[str, str, str, str]] = [
+    ("PgUp", "PageUp", "1b5b357e", "1b5b357e"),
     ("PgDn", "PageDown", "1b5b367e", "1b5b367e"),
     ("Home", "Home", "1b5b48", "1b4f48"),
     ("End", "End", "1b5b46", "1b4f46"),
@@ -373,6 +373,62 @@ def test_mobile_terminal_keys_byte_delivery_app_cursor_and_gestures(
         page.wait_for_timeout(120)  # custom-lint: disable=sleep-then-assert -- quiet window
         assert len(_lines(normal_log)) == before_swipe_lines, "Pager swipe must not emit key bytes"
 
+        # Sticky modifiers act on actual keyboard input and notify the rendered row.
+        ctrl = bar.get_by_role("button", name="Ctrl", exact=True)
+        _tap_soft_key(ctrl)
+        expect(ctrl).to_have_attribute("data-sticky-state", "once")
+        textarea.focus()
+        count = len(_lines(normal_log))
+        page.keyboard.type("r")
+        assert _read_back(page, normal_log, count) == "12"
+        expect(ctrl).to_have_attribute("data-sticky-state", "off")
+
+        _tap_soft_key(ctrl)
+        _tap_soft_key(ctrl)
+        expect(ctrl).to_have_attribute("data-sticky-state", "locked")
+        for letter, expected_hex in [("c", "03"), ("d", "04")]:
+            count = len(_lines(normal_log))
+            page.keyboard.type(letter)
+            assert _read_back(page, normal_log, count) == expected_hex
+        expect(ctrl).to_have_attribute("data-sticky-state", "locked")
+        _tap_soft_key(ctrl)
+        expect(ctrl).to_have_attribute("data-sticky-state", "off")
+
+        # DEL and ESC-containing keyboard sequences preserve a one-shot; Chinese commits clear it.
+        _tap_soft_key(ctrl)
+        count = len(_lines(normal_log))
+        page.keyboard.press("Backspace")
+        assert _read_back(page, normal_log, count) == "7f"
+        expect(ctrl).to_have_attribute("data-sticky-state", "once")
+        count = len(_lines(normal_log))
+        page.keyboard.insert_text("中文")
+        assert _read_back(page, normal_log, count) == "e4b8ade69687"
+        expect(ctrl).to_have_attribute("data-sticky-state", "off")
+
+        _tap_soft_key(ctrl)
+        count = len(_lines(normal_log))
+        _tap_soft_key(bar.get_by_role("button", name="←", exact=True))
+        assert _read_back(page, normal_log, count) == "1b5b313b3544"
+        expect(ctrl).to_have_attribute("data-sticky-state", "off")
+
+        _swipe_pager(pager, -80)
+        alt = bar.get_by_role("button", name="Alt", exact=True)
+        _tap_soft_key(alt)
+        count = len(_lines(normal_log))
+        page.keyboard.type("p")
+        assert _read_back(page, normal_log, count) == "1b70"
+        expect(alt).to_have_attribute("data-sticky-state", "off")
+        _tap_soft_key(alt)
+        _tap_soft_key(alt)
+        for letter, expected_hex in [("x", "1b78"), ("y", "1b79")]:
+            count = len(_lines(normal_log))
+            page.keyboard.type(letter)
+            assert _read_back(page, normal_log, count) == expected_hex
+        expect(alt).to_have_attribute("data-sticky-state", "locked")
+        _tap_soft_key(alt)
+        expect(alt).to_have_attribute("data-sticky-state", "off")
+        _swipe_pager(pager, 80)
+
         # Drag >= 10px on a soft key cancels the press without emitting bytes.
         slash_btn = bar.get_by_role("button", name="/", exact=True)
         sbox = slash_btn.bounding_box()
@@ -537,13 +593,13 @@ def test_mobile_terminal_keys_byte_delivery_app_cursor_and_gestures(
             page.wait_for_timeout(50)
         assert "LINE_040" in capture_pty(), "PgDn did not advance less page"
 
-        _swipe_pager(pager, 80)
-        expect(bar).to_have_attribute("data-page", "0")
         _tap_soft_key(bar.get_by_role("button", name="PgUp", exact=True))
         deadline = time.monotonic() + 8.0
         while "LINE_001" not in capture_pty() and time.monotonic() < deadline:
             page.wait_for_timeout(50)
         assert "LINE_001" in capture_pty(), "PgUp did not return less to top"
+        _swipe_pager(pager, 80)
+        expect(bar).to_have_attribute("data-page", "0")
         textarea.focus()
         page.keyboard.type("q")
         page.wait_for_timeout(200)

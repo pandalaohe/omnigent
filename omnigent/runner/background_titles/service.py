@@ -50,8 +50,8 @@ BACKGROUND_TITLE_INSTRUCTIONS = (
 
 #: Economy-tier title model per canonical harness, armed from the owned
 #: fallback records (see ``omnigent.models.model_fallbacks``). Title calls are tiny
-#: (<=64 output tokens, no tools, low effort), so they always run on the
-#: family's cheapest arm regardless of the session's model.
+#: (<=64 output tokens, no tools, low effort), so they use the family's
+#: cheapest arm unless the session pins a provider-qualified model.
 _BACKGROUND_TITLE_MODELS: dict[str, str] = {
     "claude-sdk": BACKGROUND_TITLE_CLAUDE_ECONOMY_MODEL,
     "claude-native": BACKGROUND_TITLE_CLAUDE_ECONOMY_MODEL,
@@ -272,9 +272,9 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
     """Load and invoke the generator registered for ``context.harness``.
 
     The harness's economy-tier model (see :func:`background_title_model`)
-    is attempted first; a provider that cannot serve it falls back to the
-    session's own model resolution, so title generation is never worse
-    than before on exotic providers.
+    is attempted first unless the session pins a provider-qualified model.
+    A provider that cannot serve the economy model falls back to the
+    session's own model resolution.
     """
     spec = generator_spec_for_harness(context.harness)
     if spec is None:
@@ -290,6 +290,8 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
         else BACKGROUND_TITLE_MAX_CHARS
     )
     title_model = background_title_model(context.harness)
+    if context.model_override and "/" in context.model_override:
+        title_model = None
     if title_model is not None and context.title_model is None:
         try:
             title = await typed_generator(replace(context, title_model=title_model))

@@ -17,6 +17,7 @@ from omnigent.server.background_session_titles import (
     background_session_titles_enabled,
     normalize_background_title,
     prepare_background_session_title,
+    schedule_background_child_task_summary,
 )
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -49,6 +50,35 @@ async def test_prepare_background_title_for_eligible_session(db_uri: str) -> Non
     )
 
     assert pending is not None
+
+
+async def test_child_task_summary_keeps_session_route(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation(kind="default")
+    child = store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id, title="worker:auth"
+    )
+    child.harness_override = "codex-native"
+    child.model_override = "team/gpt-5.4-mini"
+    requests: list[BackgroundTitleRequest] = []
+
+    async def generator(request: BackgroundTitleRequest) -> str:
+        requests.append(request)
+        return "Debug authentication timeout"
+
+    coordinator = BackgroundSessionTitleCoordinator(store, generator)
+    schedule_background_child_task_summary(
+        coordinator=coordinator,
+        conversation=child,
+        prompt="Investigate authentication timeout",
+    )
+    await coordinator.wait_for_idle()
+
+    [request] = requests
+    assert request.session_id == child.id
+    assert request.harness_override == "codex-native"
+    assert request.model_override == "team/gpt-5.4-mini"
+    assert store.get_conversation(child.id).task_summary == "Debug authentication timeout"
 
 
 async def test_prepare_background_title_skips_when_user_setting_is_disabled(db_uri: str) -> None:

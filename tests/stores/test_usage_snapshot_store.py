@@ -14,8 +14,13 @@ def test_snapshot_round_trip_is_owner_scoped_and_delete_is_exact(db_uri):
     store.write("owner@example.test", "usage.account.gw", first)
     store.write("owner@example.test", "usage.account.other", {"schema_version": 1})
     store.write("other@example.test", "usage.account.gw", {"schema_version": 1})
+    store.write("owner@example.test", "usage;account.gw", {"schema_version": 1})
+    store.write("owner@example.test", "usageXaccount.gw", {"schema_version": 1})
 
-    assert store.read("owner@example.test")["usage.account.gw"] == first
+    assert store.read("owner@example.test") == {
+        "usage.account.gw": first,
+        "usage.account.other": {"schema_version": 1},
+    }
     store.delete("owner@example.test", "usage.account.gw")
     assert "usage.account.gw" not in store.read("owner@example.test")
     assert "usage.account.other" in store.read("owner@example.test")

@@ -1394,7 +1394,8 @@ _AGY_PASTE_PLACEHOLDER_RE = re.compile(r"\[Pasted text #\d+[^\]]*\]")
 _AGY_COLLAPSED_LINES_RE = re.compile(r"↑ \d+ more lines?")
 # A background command row in agy's ruled task panel below the composer
 # (``● [12:45:28] sleep 600… running``; footer ``… · 1 task(s) · /tasks``).
-_AGY_TASK_ROW_RE = re.compile(r"[^\s>] \[\d{1,2}:\d{2}:\d{2}\] .+")
+# A task row, or the "↓ N more" row agy adds when more tasks than fit are running.
+_AGY_TASK_ROW_RE = re.compile(r"(?:[^\s>] \[\d{1,2}:\d{2}:\d{2}\] .+|↓ \d+ more)")
 # agy's notice when a turn is submitted before its startup account-eligibility
 # check settles. The composer footer mounts ~3s after launch but eligibility is
 # not settled for ~7-9s, and a turn landing in that window is CONSUMED (the draft

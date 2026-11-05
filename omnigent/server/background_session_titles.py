@@ -439,19 +439,19 @@ def prepare_background_session_title(
 def schedule_background_child_task_summary(
     *,
     coordinator: BackgroundSessionTitleCoordinator | None,
-    session_id: str,
+    conversation: Conversation,
     prompt: str,
-    agent_id: str | None = None,
-    sub_agent_name: str | None = None,
 ) -> None:
     """Schedule a background task-summary attempt for a child session."""
     if coordinator is None or not prompt:
         return
     coordinator.schedule_task_summary(
-        session_id=session_id,
+        session_id=conversation.id,
         prompt=prompt,
-        agent_id=agent_id,
-        sub_agent_name=sub_agent_name,
+        agent_id=conversation.agent_id,
+        harness_override=conversation.harness_override,
+        model_override=conversation.model_override,
+        sub_agent_name=conversation.sub_agent_name,
     )
 
 

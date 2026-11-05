@@ -59,8 +59,7 @@ class UsageSnapshotStore:
                 ).where(
                     SqlPreference.workspace_id == current_workspace_id(),
                     SqlPreference.user_id == owner,
-                    SqlPreference.key >= _PREFIX,
-                    SqlPreference.key < "usage;",
+                    SqlPreference.key.startswith(_PREFIX, autoescape=True),
                 )
             ).all()
         result: dict[str, dict[str, Any]] = {}
