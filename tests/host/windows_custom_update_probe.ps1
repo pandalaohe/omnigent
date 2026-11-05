@@ -29,32 +29,22 @@ function Check {
         Write-Output "FAIL ${Name}: $($_.Exception.Message)"
     }
 }
-Check 'base interpreter with a mapped native tool module blocks update' {
-    $row = [pscustomobject]@{
-        ProcessId = 123; ParentProcessId = 1; Name = 'python.exe'; CreatedAt = 1.0
-        ExecutablePath = 'C:\Python\python.exe'
-        CommandLine = 'python -m omnigent.runner._entry'
-        LoadedPaths = @('C:\Tools\omnigent\Lib\site-packages\worker.pyd')
-    }
-    $locking = @(Get-VenvLockingProcesses -Processes @($row) -ToolVenvPath 'C:\Tools\omnigent' -CliBinPath 'C:\Bin\omni.exe' -ExcludedPids @())
-    if ($locking.Count -ne 1) { throw 'Loaded module was invisible to lock detection.' }
-}
 Check 'daemon entry is stopped even when its exe is outside the venv' {
     $row = [pscustomobject]@{
         ProcessId = 123; ParentProcessId = 1; Name = 'python.exe'; CreatedAt = 1.0
         ExecutablePath = 'C:\Python\python.exe'
         CommandLine = 'python -m omnigent.host._daemon_entry --non-interactive'
     }
-    $tree = @(Get-StoppedHostTreePids -Processes @($row) -StoppedHostPids @(123) -ToolVenvPath 'C:\Tools\omnigent' -CliBinPath 'C:\Bin\omni.exe' -ExcludedPids @())
+    $tree = @(Get-StoppedHostTreePids -Processes @($row) -StoppedHostPids @(123) -CliBinPath 'C:\Bin\omni.exe' -ExcludedPids @())
     if ($tree -notcontains 123) { throw 'Captured daemon PID was missed.' }
 }
 Check 'a holder controller and its unrelated worker are not kill roots' {
     $rows = @(
-        [pscustomobject]@{ ProcessId = 10; ParentProcessId = 1; Name = 'python.exe'; CreatedAt = 1.0; ExecutablePath = 'C:\Python\python.exe'; CommandLine = 'controller.py'; LoadedPaths = @('C:\Tools\omnigent\Lib\worker.pyd') },
+        [pscustomobject]@{ ProcessId = 10; ParentProcessId = 1; Name = 'python.exe'; CreatedAt = 1.0; ExecutablePath = 'C:\Python\python.exe'; CommandLine = 'controller.py' },
         [pscustomobject]@{ ProcessId = 11; ParentProcessId = 10; Name = 'python.exe'; CreatedAt = 2.0; ExecutablePath = 'C:\Python\python.exe'; CommandLine = 'python -m omnigent.host._daemon_entry' },
         [pscustomobject]@{ ProcessId = 12; ParentProcessId = 10; Name = 'python.exe'; CreatedAt = 3.0; ExecutablePath = 'C:\Python\python.exe'; CommandLine = 'unrelated.py' }
     )
-    $tree = @(Get-StoppedHostTreePids $rows @(11) 'C:\Tools\omnigent' 'C:\Bin\omni.exe' @())
+    $tree = @(Get-StoppedHostTreePids $rows @(11) 'C:\Bin\omni.exe' @())
     if ($tree.Count -ne 1 -or $tree[0] -ne 11) { throw "Controller incorrectly authorized: $tree" }
 }
 Check 'script mentions do not authorize Host or installer termination' {
@@ -197,7 +187,7 @@ $child.WaitForExit()
     $child = Get-Process -Id ([int](Get-Content $childFile)) -ErrorAction SilentlyContinue
     if ($child -and -not $child.HasExited) { throw 'Timed-out command child survived.' }
 }
-Check 'an unrelated native holder blocks without being killed and PID reuse is refused' {
+Check 'unrelated file holders survive and PID reuse is refused' {
     $venv = Join-Path $FixtureRoot 'unrelated-holder'
     New-Item -ItemType Directory -Path $venv -Force | Out-Null
     $file = Join-Path $venv 'held.txt'
@@ -222,11 +212,9 @@ Start-Sleep -Seconds 120
         $created = $process.StartTime.ToFileTimeUtc() / 10000000.0 - 11644473600.0
         Stop-ProcessIdentity ([pscustomobject]@{ pid = $process.Id; created_at = $created - 100 })
         if ($process.HasExited) { throw 'Wrong creation identity authorized a kill.' }
-        $instruction = [pscustomobject]@{ tool_venv_path = $venv; cli_bin_path = (Join-Path $FixtureRoot 'omni.exe'); previous_records = @() }
-        $blocked = $false
-        try { Wait-CustomHostVenvReleased $instruction (Join-Path $FixtureRoot 'holder.log') $PID -TimeoutSeconds 0 }
-        catch { $blocked = $true }
-        if (-not $blocked -or $process.HasExited) { throw 'Unrelated holder did not safely block installation.' }
+        $instruction = [pscustomobject]@{ tool_venv_path = $venv; cli_bin_path = (Join-Path $FixtureRoot 'omni.exe'); previous_records = @(); previous_processes = @() }
+        Wait-HostTreeExit $instruction $PID -TimeoutSeconds 0
+        if ($process.HasExited) { throw 'Unrelated file holder was terminated.' }
     } finally {
         if (-not $process.HasExited) { $process.Kill($true); [void]$process.WaitForExit(5000) }
         $process.Dispose()
@@ -260,36 +248,7 @@ Check 'retention keeps one successful backup and all incomplete transactions' {
         throw 'Successful constraints were not retained with the single previous transaction.'
     }
 }
-Check 'an open file fails the final release gate' {
-    $venv = Join-Path $FixtureRoot 'held'
-    New-Item -ItemType Directory -Path $venv -Force | Out-Null
-    $file = Join-Path $venv 'held.pyd'
-    [IO.File]::WriteAllText($file, 'old')
-    $handle = [IO.File]::Open($file, 'Open', 'Read', 'Read')
-    try {
-        $blocked = $false
-        try { Assert-ToolFilesReleased $venv } catch { $blocked = $true }
-        if (-not $blocked) { throw 'A held file passed the release gate.' }
-    } finally { $handle.Dispose() }
-    Assert-ToolFilesReleased $venv
-}
-Check 'a real loaded DLL outside exe and argv blocks update' {
-    $venv = Join-Path $FixtureRoot 'mapped'
-    New-Item -ItemType Directory -Path $venv -Force | Out-Null
-    $library = Join-Path $venv 'fixture-version.dll'
-    Copy-Item -LiteralPath "$env:SystemRoot\System32\version.dll" -Destination $library
-    $module = [Runtime.InteropServices.NativeLibrary]::Load($library)
-    try {
-        $row = @(Get-ProcessTable | Where-Object { $_.ProcessId -eq $PID })
-        $locking = @(Get-VenvLockingProcesses -Processes $row -ToolVenvPath $venv -CliBinPath (Join-Path $FixtureRoot 'omni.exe') -ExcludedPids @())
-        if ($locking.Count -ne 1) { throw 'Real loaded DLL was missed.' }
-        $blocked = $false
-        try { Assert-ToolFilesReleased $venv } catch { $blocked = $true }
-        if (-not $blocked) { throw 'Mapped image passed exclusive-access check.' }
-    } finally { [Runtime.InteropServices.NativeLibrary]::Free($module) }
-    Assert-ToolFilesReleased $venv
-}
-foreach ($mode in @('installer-fails', 'probe-fails', 'version-fails', 'version-mismatch', 'success')) {
+foreach ($mode in @('installer-fails', 'file-locked', 'probe-fails', 'version-fails', 'version-mismatch', 'success')) {
     Check "transaction $mode" {
         $scenario = Join-Path $FixtureRoot $mode
         $venv = Join-Path $scenario 'omnigent'
@@ -314,6 +273,14 @@ foreach ($mode in @('installer-fails', 'probe-fails', 'version-fails', 'version-
             if ($Arguments[0] -eq 'fixture-installer') {
                 New-Item -ItemType Directory -Path $venv -Force | Out-Null
                 [IO.File]::WriteAllText((Join-Path $venv 'partial.txt'), 'new')
+                if ($mode -eq 'file-locked') {
+                    $locked = Join-Path $scenario 'installer-target.txt'
+                    [IO.File]::WriteAllText($locked, 'held')
+                    $handle = [IO.File]::Open($locked, 'Open', 'Read', 'Read')
+                    try { [IO.File]::WriteAllText($locked, 'new') }
+                    finally { $handle.Dispose() }
+                    throw 'Expected the operating system to refuse the locked write.'
+                }
                 [IO.File]::WriteAllText($cli, 'new-wrapper')
                 return @{ ExitCode = $(if ($mode -eq 'installer-fails') { 2 } else { 0 }); Stdout = ''; Stderr = '' }
             }
@@ -329,7 +296,12 @@ foreach ($mode in @('installer-fails', 'probe-fails', 'version-fails', 'version-
         $failed = $false
         try {
             Invoke-TransactionalInstall -Instruction $instruction -TargetCommit ('b' * 40) -LogPath (Join-Path $scenario 'update.log') -Result $receipt
-        } catch { $failed = $true }
+        } catch {
+            $failed = $true
+            if ($mode -eq 'file-locked' -and $_.Exception.Message -notlike '*installer-target.txt*') {
+                throw "Installer lock error was lost: $($_.Exception.Message)"
+            }
+        }
         if ($mode -eq 'success') {
             if ($failed -or -not (Test-Path (Join-Path $venv 'partial.txt'))) { throw 'New installation not committed.' }
         } else {

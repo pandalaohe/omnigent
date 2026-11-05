@@ -10329,19 +10329,17 @@ def _read_custom_host_update_result() -> dict[str, object] | None:
 
 @dataclass(frozen=True)
 class _WindowsProcessInfo:
-    """Snapshot of one Windows process used while releasing the tool venv."""
+    """Snapshot of one Windows process used to capture the managed Host tree."""
 
     pid: int
     ppid: int
     name: str
     exe: str = ""
     cmdline: str = ""
-    loaded_paths: tuple[str, ...] = ()
     created_at: float = 0.0
 
 
-_CUSTOM_HOST_PARENT_EXIT_TIMEOUT_S = 120.0
-_CUSTOM_HOST_VENV_RELEASE_TIMEOUT_S = 15.0
+_CUSTOM_HOST_TREE_EXIT_TIMEOUT_S = 15.0
 _CUSTOM_HOST_TREE_GRACE_S = 2.0
 
 
@@ -10388,45 +10386,6 @@ def _normalize_windows_fs_path(raw: Path | str) -> str:
     return str(raw).strip().strip('"').replace("/", "\\").rstrip("\\").casefold()
 
 
-def _windows_path_holds_tool_venv(
-    proc: _WindowsProcessInfo,
-    *,
-    tool_venv_path: Path | str,
-    cli_bin_path: Path | str,
-) -> bool:
-    """Detect executable/argv provenance and observable native-module mappings."""
-    venv_norm = _normalize_windows_fs_path(tool_venv_path)
-    cli_norm = _normalize_windows_fs_path(cli_bin_path)
-    exe_norm = _normalize_windows_fs_path(proc.exe) if proc.exe else ""
-    cmd_norm = proc.cmdline.replace("/", "\\").casefold() if proc.cmdline else ""
-    if exe_norm:
-        if venv_norm and (exe_norm == venv_norm or exe_norm.startswith(venv_norm + "\\")):
-            return True
-        if cli_norm and exe_norm == cli_norm:
-            return True
-    if venv_norm and venv_norm + "\\" in cmd_norm:
-        return True
-    if cli_norm and cli_norm in cmd_norm:
-        return True
-    if any(
-        _normalize_windows_fs_path(path).startswith(venv_norm + "\\")
-        for path in proc.loaded_paths
-        if venv_norm
-    ):
-        return True
-    return (
-        not exe_norm
-        and not cmd_norm
-        and proc.name.casefold()
-        in {
-            "omni.exe",
-            "omnigent.exe",
-            "omni",
-            "omnigent",
-        }
-    )
-
-
 def _list_windows_processes() -> list[_WindowsProcessInfo]:
     """List Windows processes with parent PID, executable path, and command line."""
     if os.name != "nt":
@@ -10458,107 +10417,6 @@ def _list_windows_processes() -> list[_WindowsProcessInfo]:
         except (psutil.Error, OSError, ValueError):
             continue
     return rows
-
-
-def _inspect_windows_processes(
-    processes: Sequence[_WindowsProcessInfo],
-    *,
-    tool_venv_path: Path | str,
-    cli_bin_path: Path | str,
-    process_identities: Sequence[_WindowsProcessInfo],
-    timeout_s: float,
-) -> list[_WindowsProcessInfo]:
-    """Inspect candidate mappings outside the CLI so native queries have a deadline."""
-    if os.name != "nt":
-        return list(processes)
-    started = time.monotonic()
-    captured = {proc.pid: proc.created_at for proc in process_identities if proc.created_at > 0}
-    candidates = [
-        {"pid": proc.pid, "created_at": proc.created_at}
-        for proc in processes
-        if (
-            _windows_path_holds_tool_venv(
-                proc, tool_venv_path=tool_venv_path, cli_bin_path=cli_bin_path
-            )
-            or any(
-                image.startswith("python")
-                or image in {"omni.exe", "omnigent.exe", "omni", "omnigent"}
-                for image in (
-                    proc.name.casefold(),
-                    _normalize_windows_fs_path(proc.exe).rsplit("\\", 1)[-1],
-                )
-            )
-            or (proc.pid in captured and proc.created_at == captured[proc.pid])
-        )
-    ]
-    if not candidates:
-        return list(processes)
-    # Bypass Windows' venv trampoline: killing it on timeout could leave the
-    # actual scanning interpreter alive. Preserve the tool's import environment.
-    scan_env = os.environ.copy()
-    scan_env["__PYVENV_LAUNCHER__"] = sys.executable
-    scan_python = (
-        getattr(sys, "_base_executable", sys.executable)
-        if sys.platform == "win32"
-        else sys.executable
-    )
-    paths: dict[str, list[str]] = {}
-    try:
-        if timeout_s <= 0:
-            raise subprocess.TimeoutExpired("process mapping scan", timeout_s)
-        # Windows communicate() can block writing stdin before its timed wait.
-        # A file also lets us kill a scanner stuck importing before it reads.
-        with tempfile.TemporaryDirectory(prefix="omnigent-process-scan-") as request_dir:
-            request_path = Path(request_dir) / "candidates.json"
-            request_path.write_text(json.dumps(candidates), encoding="utf-8")
-            remaining = timeout_s - (time.monotonic() - started)
-            if remaining <= 0:
-                raise subprocess.TimeoutExpired("process mapping scan", timeout_s)
-            result = subprocess.run(
-                [
-                    scan_python,
-                    "-I",
-                    "-m",
-                    "omnigent.host.windows_process_scan",
-                    str(request_path),
-                ],
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                check=True,
-                timeout=remaining,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                env=scan_env,
-            )
-        paths = json.loads(result.stdout)
-        if not isinstance(paths, dict) or any(
-            not isinstance(items, list) or not all(isinstance(path, str) for path in items)
-            for items in paths.values()
-        ):
-            raise ValueError("Invalid process mapping snapshot")
-    except subprocess.TimeoutExpired as exc:
-        raise click.ClickException(
-            "Timed out inspecting Windows process mappings. "
-            "Aborted before modifying the installation."
-        ) from exc
-    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
-        raise click.ClickException(
-            "Cannot inspect Windows process mappings. Aborted before modifying the installation."
-        ) from exc
-    return [
-        replace(proc, loaded_paths=proc.loaded_paths + tuple(paths.get(str(proc.pid), ())))
-        for proc in processes
-    ]
-
-
-def _terminate_windows_process(pid: int, created_at: float) -> None:
-    """Stop a captured process only while its creation identity still matches."""
-    with contextlib.suppress(psutil.Error, OSError):
-        proc = psutil.Process(pid)
-        if created_at > 0 and proc.create_time() == created_at:
-            proc.kill()
-            # The next process-table pass observes exit; per-PID waits would
-            # multiply the overall deadline by the size of the captured tree.
 
 
 def _windows_process_arguments(proc: _WindowsProcessInfo) -> list[str]:
@@ -10625,23 +10483,14 @@ def _windows_is_host_launcher(proc: _WindowsProcessInfo, cli_bin_path: Path | st
     return False
 
 
-def _wait_for_windows_pid_exit(pid: int, timeout_s: float) -> None:
-    """Wait up to ``timeout_s`` seconds for ``pid`` to exit."""
-    with contextlib.suppress(psutil.Error, OSError):
-        psutil.Process(pid).wait(timeout=timeout_s)
-
-
 def _windows_stopped_host_tree_pids(
     processes: Sequence[_WindowsProcessInfo],
     *,
     stopped_host_pids: Sequence[int],
-    tool_venv_path: Path | str,
     cli_bin_path: Path | str,
     excluded_pids: set[int],
 ) -> list[int]:
     """Identify the stopped Host supervisor loop, ``omni.exe host``, and runner descendants."""
-    if not _normalize_windows_fs_path(tool_venv_path):
-        return []
     by_pid = {proc.pid: proc for proc in processes}
     children_by_ppid: dict[int, list[int]] = {}
     for proc in processes:
@@ -10666,24 +10515,14 @@ def _windows_stopped_host_tree_pids(
                 parent = by_pid.get(current.ppid)
                 if parent is None or parent.pid in excluded_pids:
                     break
-                if 0 < parent.created_at <= current.created_at and _windows_is_host_launcher(
-                    parent, cli_bin_path
+                if 0 < parent.created_at <= current.created_at and (
+                    _windows_is_host_launcher(parent, cli_bin_path)
+                    or _windows_is_host_daemon(parent)
                 ):
                     roots.add(parent.pid)
                     current = parent
                     continue
                 break
-
-    for proc in processes:
-        if proc.pid in excluded_pids:
-            continue
-        is_supervisor_script = (
-            _windows_is_host_launcher(proc, cli_bin_path)
-            and _normalize_windows_fs_path(proc.exe) != _normalize_windows_fs_path(cli_bin_path)
-            and proc.created_at > 0
-        )
-        if is_supervisor_script:
-            roots.add(proc.pid)
 
     tree: set[int] = set()
     queue = list(roots)
@@ -10702,139 +10541,42 @@ def _windows_stopped_host_tree_pids(
     return sorted(pid for pid in tree if pid in by_pid)
 
 
-def _windows_venv_locking_processes(
-    processes: Sequence[_WindowsProcessInfo],
+def _wait_for_windows_host_tree_exit(
+    process_identities: Sequence[_WindowsProcessInfo],
     *,
-    tool_venv_path: Path | str,
-    cli_bin_path: Path | str,
-    excluded_pids: set[int],
-) -> list[_WindowsProcessInfo]:
-    """Return processes still running from the tool venv or ``~\\.local\\bin\\omni.exe``."""
-    return [
-        proc
-        for proc in processes
-        if proc.pid not in excluded_pids
-        and _windows_path_holds_tool_venv(
-            proc,
-            tool_venv_path=tool_venv_path,
-            cli_bin_path=cli_bin_path,
-        )
-    ]
-
-
-def _windows_process_ancestor_pids(
-    processes: Sequence[_WindowsProcessInfo],
-    start_pid: int,
-    *,
-    tool_venv_path: Path | str,
-    cli_bin_path: Path | str,
-) -> set[int]:
-    """Return ancestor PIDs of ``start_pid`` that belong to the current CLI wrapper chain."""
-    by_pid = {proc.pid: proc for proc in processes}
-    venv = _normalize_windows_fs_path(tool_venv_path)
-    cli = _normalize_windows_fs_path(cli_bin_path)
-    launchers = {cli, venv + r"\scripts\python.exe", venv + r"\scripts\pythonw.exe"}
-    ancestors: set[int] = set()
-    current = by_pid.get(start_pid)
-    visited: set[int] = set()
-    while current is not None and current.ppid > 0 and current.ppid not in visited:
-        visited.add(current.ppid)
-        parent = by_pid.get(current.ppid)
-        if parent is None:
-            break
-        # Windows venv Python can be a launcher between omni.exe and the CLI.
-        exe = _normalize_windows_fs_path(parent.exe)
-        if exe not in launchers:
-            break
-        ancestors.add(parent.pid)
-        if exe == cli:
-            break
-        current = parent
-    return ancestors
-
-
-def _wait_for_windows_custom_host_venv_release(
-    *,
-    tool_venv_path: Path | str,
-    cli_bin_path: Path | str,
-    stopped_host_pids: Sequence[int],
-    process_identities: Sequence[_WindowsProcessInfo] = (),
-    parent_pid: int | None = None,
-    helper_pid: int | None = None,
-    allow_ancestor_cli: bool = False,
-    timeout_s: float = _CUSTOM_HOST_VENV_RELEASE_TIMEOUT_S,
+    timeout_s: float = _CUSTOM_HOST_TREE_EXIT_TIMEOUT_S,
     grace_s: float = _CUSTOM_HOST_TREE_GRACE_S,
-    parent_timeout_s: float = _CUSTOM_HOST_PARENT_EXIT_TIMEOUT_S,
 ) -> None:
-    """Wait on ``parent_pid``, stop the paused Host tree, and verify the tool venv is unlocked."""
-    if parent_pid is not None and parent_pid > 0:
-        _wait_for_windows_pid_exit(parent_pid, parent_timeout_s)
-
-    base_excluded: set[int] = set()
-    if helper_pid is not None and helper_pid > 0:
-        base_excluded.add(helper_pid)
-    tree_excluded = set(base_excluded)
-    if parent_pid is not None and parent_pid > 0:
-        tree_excluded.add(parent_pid)
-    started = time.monotonic()
-    deadline = started + max(timeout_s, 0.0)
-    grace_deadline = min(deadline, started + max(grace_s, 0.0))
-    captured = list(process_identities)
-    captured_initially = bool(captured)
-    while True:
-        processes = _list_windows_processes()
-        ancestors = (
-            _windows_process_ancestor_pids(
-                processes,
-                helper_pid,
-                tool_venv_path=tool_venv_path,
-                cli_bin_path=cli_bin_path,
-            )
-            if allow_ancestor_cli and helper_pid is not None
-            else set()
-        )
-        host_tree = _windows_stopped_host_tree_pids(
-            processes,
-            stopped_host_pids=stopped_host_pids,
-            tool_venv_path=tool_venv_path,
-            cli_bin_path=cli_bin_path,
-            excluded_pids=tree_excluded | ancestors,
-        )
-        if not captured_initially:
-            captured = [proc for proc in processes if proc.pid in host_tree]
-            captured_initially = True
-        captured_times = {proc.pid: proc.created_at for proc in captured if proc.created_at > 0}
-        if time.monotonic() < grace_deadline and (
-            host_tree or any(proc.pid in captured_times for proc in processes)
-        ):
-            time.sleep(min(0.05, max(0.0, grace_deadline - time.monotonic())))
+    """Allow the captured Host tree to exit, then end only its remaining processes."""
+    deadline = time.monotonic() + max(timeout_s, 0.0)
+    processes: list[psutil.Process] = []
+    for identity in process_identities:
+        try:
+            process = psutil.Process(identity.pid)
+            if identity.created_at > 0 and process.create_time() == identity.created_at:
+                processes.append(process)
+        except psutil.NoSuchProcess:
             continue
-        for pid, expected in captured_times.items():
-            if pid not in tree_excluded | ancestors:
-                _terminate_windows_process(pid, expected)
-        processes = _inspect_windows_processes(
-            [proc for proc in processes if proc.pid not in base_excluded | ancestors],
-            tool_venv_path=tool_venv_path,
-            cli_bin_path=cli_bin_path,
-            process_identities=captured,
-            timeout_s=deadline - time.monotonic(),
-        )
-        locking = _windows_venv_locking_processes(
-            processes,
-            tool_venv_path=tool_venv_path,
-            cli_bin_path=cli_bin_path,
-            excluded_pids=base_excluded | ancestors,
-        )
-        if not locking:
-            return
-        if time.monotonic() >= deadline:
-            summary = ", ".join(f"{proc.name or 'process'} (pid {proc.pid})" for proc in locking)
+        except (psutil.Error, OSError) as exc:
             raise click.ClickException(
-                f"Cannot update custom Host while tool files are still in use by: {summary}. "
-                "Stop the remaining process(es) and retry. "
-                "Aborted before modifying the installation."
-            )
-        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+                f"Cannot inspect stopped Host process {identity.pid}: {exc}"
+            ) from exc
+    _gone, alive = psutil.wait_procs(
+        processes, timeout=min(max(grace_s, 0.0), max(0.0, deadline - time.monotonic()))
+    )
+    for process in alive:
+        try:
+            process.kill()
+        except psutil.NoSuchProcess:
+            continue
+        except (psutil.Error, OSError) as exc:
+            raise click.ClickException(f"Cannot stop Host process {process.pid}: {exc}") from exc
+    _gone, alive = psutil.wait_procs(alive, timeout=max(0.0, deadline - time.monotonic()))
+    if alive:
+        summary = ", ".join(str(process.pid) for process in alive)
+        raise click.ClickException(
+            f"Stopped Host processes did not exit: {summary}. Retry the update."
+        )
 
 
 def _reconcile_custom_host_update_result(
@@ -11753,7 +11495,6 @@ def _host_update_custom_impl(
             old_tree = _windows_stopped_host_tree_pids(
                 processes,
                 stopped_host_pids=[record.pid for record in previous_records],
-                tool_venv_path=_custom_host_tool_venv_path(),
                 cli_bin_path=_windows_custom_host_cli_path(shutil.which("omni")),
                 excluded_pids={os.getpid()},
             )
@@ -11766,16 +11507,7 @@ def _host_update_custom_impl(
                 and isinstance(paused[1], Path)
             ):
                 raise click.ClickException("Invalid Windows Host supervisor state.")
-            _wait_for_windows_custom_host_venv_release(
-                tool_venv_path=_custom_host_tool_venv_path(),
-                cli_bin_path=_windows_custom_host_cli_path(
-                    shutil.which("omni") or shutil.which("omnigent")
-                ),
-                stopped_host_pids=[record.pid for record in previous_records],
-                process_identities=process_identities,
-                helper_pid=os.getpid(),
-                allow_ancestor_cli=True,
-            )
+            _wait_for_windows_host_tree_exit(process_identities)
             helper_pid, result_path, log_path = _launch_windows_custom_host_update(
                 install_command=suggestion.command,
                 recovery_command=suggestion.command,

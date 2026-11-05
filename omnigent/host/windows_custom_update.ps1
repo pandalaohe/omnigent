@@ -147,7 +147,7 @@ function Format-RecoverySteps {
     return "(1) & `"$WrapperPath`" stop; (2) Get-Process | Where-Object { `$_.Path -and (`$_.Path.StartsWith(`"$toolVenvPrefix`", [System.StringComparison]::OrdinalIgnoreCase) -or `$_.Path.Equals(`"$cliBin`", [System.StringComparison]::OrdinalIgnoreCase)) } | Stop-Process -Force; (3) $recoveryCmd; (4) & `"$WrapperPath`" start"
 }
 
-function Test-PathHoldsToolVenv {
+function Test-ToolProcess {
     param(
         [object]$ProcessRow,
         [string]$ToolVenvPath,
@@ -175,64 +175,22 @@ function Test-PathHoldsToolVenv {
     if ($cliNorm -and $cmdNorm.Contains($cliNorm)) {
         return $true
     }
-    foreach ($loadedPath in $ProcessRow.LoadedPaths) {
-        $loadedNorm = ConvertTo-NormalizedWindowsPath ([string]$loadedPath)
-        if ($venvNorm -and $loadedNorm.StartsWith("$venvNorm\")) {
-            return $true
-        }
-    }
-    $nameNorm = if ($ProcessRow.Name) { ([string]$ProcessRow.Name).ToLowerInvariant() } else { '' }
-    if (-not $exeNorm -and -not $cmdNorm -and $nameNorm -in @('omni.exe', 'omnigent.exe', 'omni', 'omnigent')) {
-        return $true
-    }
     return $false
 }
 
 function Get-ProcessTable {
-    $rows = @()
-    $loadedByPid = @{}
-    $createdByPid = @{}
-    foreach ($process in Get-Process -ErrorAction SilentlyContinue) {
-        try {
-            $createdByPid[[int]$process.Id] = $process.StartTime.ToFileTimeUtc() / 10000000.0 - 11644473600.0
-            $loadedByPid[[int]$process.Id] = @($process.Modules | ForEach-Object { $_.FileName })
-        } catch {
-            # Protected/exited processes may be uninspectable. Exclusive file
-            # access below is the final gate, including non-module file handles.
+    return @(Get-CimInstance Win32_Process -OperationTimeoutSec 5 -ErrorAction Stop | ForEach-Object {
+        [pscustomobject]@{
+            ProcessId = [int]$_.ProcessId
+            ParentProcessId = [int]$_.ParentProcessId
+            Name = [string]$_.Name
+            ExecutablePath = [string]$_.ExecutablePath
+            CommandLine = [string]$_.CommandLine
+            CreatedAt = if ($_.CreationDate) {
+                $_.CreationDate.ToUniversalTime().ToFileTimeUtc() / 10000000.0 - 11644473600.0
+            } else { 0.0 }
         }
-    }
-    try {
-        $rows = @(Get-CimInstance Win32_Process -OperationTimeoutSec 5 -ErrorAction Stop | ForEach-Object {
-            [pscustomobject]@{
-                ProcessId = [int]$_.ProcessId
-                ParentProcessId = [int]$_.ParentProcessId
-                Name = [string]$_.Name
-                ExecutablePath = [string]$_.ExecutablePath
-                CommandLine = [string]$_.CommandLine
-                LoadedPaths = @($loadedByPid[[int]$_.ProcessId])
-                CreatedAt = [double]$createdByPid[[int]$_.ProcessId]
-            }
-        })
-    }
-    catch {
-        $rows = @(Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
-            $exePath = ''
-            try { $exePath = [string]$_.Path } catch {}
-            [pscustomobject]@{
-                ProcessId = [int]$_.Id
-                ParentProcessId = 0
-                Name = [string]$_.ProcessName
-                ExecutablePath = $exePath
-                CommandLine = ''
-                LoadedPaths = @($loadedByPid[[int]$_.Id])
-                CreatedAt = [double]$createdByPid[[int]$_.Id]
-            }
-        })
-    }
-    if ($rows.Count -eq 0) {
-        throw "Could not enumerate running Windows processes to verify that the tool environment is unlocked."
-    }
-    return $rows
+    })
 }
 
 function Get-WindowsProcessArguments {
@@ -296,7 +254,7 @@ function Test-HostDaemon {
 }
 
 function Get-StoppedHostTreePids {
-    param([object[]]$Processes, [int[]]$StoppedHostPids, [string]$ToolVenvPath,
+    param([object[]]$Processes, [int[]]$StoppedHostPids,
           [string]$CliBinPath, [int[]]$ExcludedPids)
     $byPid = @{}
     foreach ($row in $Processes) { $byPid[[int]$row.ProcessId] = $row }
@@ -310,7 +268,7 @@ function Get-StoppedHostTreePids {
         while ($row -and $visited.Add([int]$row.ParentProcessId)) {
             $parent = $byPid[[int]$row.ParentProcessId]
             if (-not $parent -or $parent.CreatedAt -le 0 -or $parent.CreatedAt -gt $row.CreatedAt -or $parent.ProcessId -in $ExcludedPids -or
-                -not (Test-HostLauncher $parent $CliBinPath)) { break }
+                -not ((Test-HostLauncher $parent $CliBinPath) -or (Test-HostDaemon $parent))) { break }
             [void]$selected.Add([int]$parent.ProcessId)
             $row = $parent
         }
@@ -350,13 +308,13 @@ function Get-ManagedHostSnapshot {
     param([object]$Instruction)
     $processes = @(Get-ProcessTable)
     $seeds = @($processes | Where-Object {
-        ((Test-HostDaemon $_) -and (Test-PathHoldsToolVenv $_ $Instruction.tool_venv_path $Instruction.cli_bin_path)) -or
+        ((Test-HostDaemon $_) -and (Test-ToolProcess $_ $Instruction.tool_venv_path $Instruction.cli_bin_path)) -or
         (Test-HostLauncher $_ $Instruction.cli_bin_path)
     } | ForEach-Object { [int]$_.ProcessId })
     # Startup invokes recovery before launching the Host. Its caller must
     # survive recovery even though its exact script is a managed launcher.
     $protected = @(Get-UpdaterAncestorPids $processes $PID)
-    $ids = @(Get-StoppedHostTreePids $processes $seeds $Instruction.tool_venv_path $Instruction.cli_bin_path $protected)
+    $ids = @(Get-StoppedHostTreePids $processes $seeds $Instruction.cli_bin_path $protected)
     return @($processes | Where-Object { $_.ProcessId -in $ids -and $_.CreatedAt -gt 0 } |
         ForEach-Object { [pscustomobject]@{ pid = [int]$_.ProcessId; created_at = [double]$_.CreatedAt } })
 }
@@ -390,81 +348,47 @@ function Stop-ProcessIdentity {
     } finally { $process.Dispose() }
 }
 
-function Get-VenvLockingProcesses {
-    param(
-        [object[]]$Processes,
-        [string]$ToolVenvPath,
-        [string]$CliBinPath,
-        [int[]]$ExcludedPids
-    )
-    $excluded = [System.Collections.Generic.HashSet[int]]::new()
-    foreach ($id in $ExcludedPids) {
-        if ($id -gt 0) { [void]$excluded.Add([int]$id) }
-    }
-    return @($Processes | Where-Object {
-        -not $excluded.Contains([int]$_.ProcessId) -and
-        (Test-PathHoldsToolVenv -ProcessRow $_ -ToolVenvPath $ToolVenvPath -CliBinPath $CliBinPath)
-    })
-}
-
-function Wait-CustomHostVenvReleased {
-    param([object]$Instruction, [string]$LogPath, [int]$HelperPid,
+function Wait-HostTreeExit {
+    param([object]$Instruction, [int]$HelperPid,
           [int]$GraceSeconds = 2, [int]$TimeoutSeconds = 15, [object[]]$Identities = @())
-    $toolVenvPath = Get-ToolVenvPath $Instruction
-    $cliBinPath = Get-CliBinPath $Instruction
-    $protected = @(Get-UpdaterAncestorPids @(Get-ProcessTable) $HelperPid)
     if (-not $Identities.Count) {
         $Identities = @($Instruction.previous_processes | Where-Object { $null -ne $_ })
     }
-    if (-not $Identities.Count -and @($Instruction.previous_records | Where-Object { $null -ne $_ }).Count -gt 0) {
-        $processes = @(Get-ProcessTable)
-        $seeds = @($Instruction.previous_records | ForEach-Object { [int]$_.pid })
-        $ids = @(Get-StoppedHostTreePids $processes $seeds $toolVenvPath $cliBinPath @($HelperPid))
-        $Identities = @($processes | Where-Object { $_.ProcessId -in $ids } | ForEach-Object {
-            [pscustomobject]@{ pid = [int]$_.ProcessId; created_at = [double]$_.CreatedAt }
-        })
-    }
-    $deadline = [DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
-    do {
-        foreach ($identity in $Identities) {
-            if ($identity.pid -notin $protected) { Stop-ProcessIdentity $identity }
-        }
-        $locking = @(Get-VenvLockingProcesses @(Get-ProcessTable) $toolVenvPath $cliBinPath @($HelperPid))
-        $exclusiveError = ''
-        if (-not $locking.Count) {
+    if (-not $Identities.Count) { return }
+    $rows = @(Get-ProcessTable)
+    $protected = @(Get-UpdaterAncestorPids $rows $HelperPid)
+    $processes = @($Identities | Where-Object { $_.pid -notin $protected } | ForEach-Object {
+        $identity = $_
+        $process = Get-Process -Id ([int]$identity.pid) -ErrorAction SilentlyContinue
+        if ($process) {
             try {
-                if (Test-Path -LiteralPath $toolVenvPath) { Assert-ToolFilesReleased $toolVenvPath }
-                foreach ($launcher in Get-ToolLaunchers $cliBinPath) {
-                    if (Test-Path -LiteralPath $launcher) {
-                        $handle = [IO.File]::Open($launcher, 'Open', 'ReadWrite', 'None')
-                        $handle.Dispose()
-                    }
+                $created = $process.StartTime.ToFileTimeUtc() / 10000000.0 - 11644473600.0
+                if ($identity.created_at -gt 0 -and [Math]::Abs($created - [double]$identity.created_at) -lt 0.00001) {
+                    $process
+                } else { $process.Dispose() }
+            } catch [InvalidOperationException] { $process.Dispose() }
+        }
+    })
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $terminated = $false
+    try {
+        do {
+            $alive = @($processes | Where-Object { -not $_.HasExited })
+            if (-not $alive.Count) { return }
+            if (-not $terminated -and $clock.Elapsed.TotalSeconds -ge $GraceSeconds) {
+                foreach ($process in $alive) {
+                    try { if (-not $process.HasExited) { $process.Kill() } }
+                    catch [InvalidOperationException] {}
                 }
-                return
-            } catch { $exclusiveError = $_.Exception.Message }
-        }
-        if ([DateTimeOffset]::UtcNow -ge $deadline) {
-            $summary = ($locking | ForEach-Object { "$($_.Name) (pid $($_.ProcessId))" }) -join ', '
-            throw "Installation files held by: $summary $exclusiveError. Unrelated holders were not terminated."
-        }
-        Start-Sleep -Milliseconds 100
-    } while ($true)
-}
-
-function Assert-ToolFilesReleased {
-    param([string]$ToolVenvPath)
-    if (-not $ToolVenvPath -or -not (Test-Path -LiteralPath $ToolVenvPath -PathType Container)) {
-        throw 'Cannot verify the existing tool environment; installation was not modified.'
-    }
-    # ReadWrite + FileShare.None also refuses mapped images whose loader has
-    # already closed its original file handle. Do not write through the handle.
-    foreach ($file in Get-ChildItem -LiteralPath $ToolVenvPath -File -Recurse -Force -ErrorAction Stop) {
-        try {
-            $handle = [IO.File]::Open($file.FullName, 'Open', 'ReadWrite', 'None')
-            $handle.Dispose()
-        } catch {
-            throw "Cannot release tool file '$($file.FullName)': $($_.Exception.Message). Installation was not modified."
-        }
+                $terminated = $true
+            }
+            if ($clock.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
+                throw "Stopped Host processes did not exit: $($alive.Id -join ', ')."
+            }
+            Start-Sleep -Milliseconds 50
+        } while ($true)
+    } finally {
+        foreach ($process in $processes) { $process.Dispose() }
     }
 }
 
@@ -604,7 +528,7 @@ function Recover-InterruptedTransaction {
     Stop-InstallerGuard $transaction $Instruction
     Save-ReplacementHostSnapshot $Instruction $Result
     $identities = @($Result.recovery_processes | Where-Object { $null -ne $_ })
-    Wait-CustomHostVenvReleased $Instruction $Instruction.log_path $PID -Identities $identities
+    Wait-HostTreeExit $Instruction $PID -Identities $identities
     Restore-ToolInstallation $Instruction $Result
     $Result.status = 'failed'
     $Result.interrupted_phase = $interruptedPhase
@@ -643,7 +567,6 @@ function Complete-Transaction {
         if (@(Get-ChildItem -LiteralPath $absolute -Recurse -Force -Attributes ReparsePoint).Count) {
             throw "Refusing retention cleanup through a reparse point: $absolute"
         }
-        Assert-ToolFilesReleased $absolute
         # The resolved GUID directory is a verified successful transaction in
         # the same tool directory. Incomplete journals never enter this set.
         Remove-Item -LiteralPath $absolute -Recurse -Force -ErrorAction Stop
@@ -694,7 +617,6 @@ function Invoke-TransactionalInstall {
         [System.Collections.IDictionary]$Result
     )
     $venv = [IO.Path]::GetFullPath([string]$Instruction.tool_venv_path)
-    Assert-ToolFilesReleased $venv
     $transaction = "$venv.update-$([guid]::NewGuid().ToString('N'))"
     New-Item -ItemType Directory -Path $transaction -ErrorAction Stop | Out-Null
     $Result.backup_path = Join-Path $transaction 'previous'
@@ -739,7 +661,7 @@ function Invoke-TransactionalInstall {
         try {
             if (Test-Path -LiteralPath (Join-Path $transaction 'installer-request.json')) {
                 Stop-InstallerGuard $transaction $Instruction
-                Wait-CustomHostVenvReleased $Instruction $LogPath $PID
+                Wait-HostTreeExit $Instruction $PID
             }
             Restore-ToolInstallation -Instruction $Instruction -Result $Result
         }
@@ -911,10 +833,14 @@ try {
     Write-JsonAtomic $ResultPath $result
     Add-UpdateLog $LogPath "Waiting for CLI process $($instruction.parent_pid) to exit."
     if ([int]$instruction.parent_pid -gt 0) {
-        Wait-Process -Id ([int]$instruction.parent_pid) -Timeout 120 -ErrorAction SilentlyContinue
+        $parent = Get-Process -Id ([int]$instruction.parent_pid) -ErrorAction SilentlyContinue
+        if ($parent) {
+            try {
+                if (-not $parent.WaitForExit(120000)) { throw 'The update CLI did not exit within 120 seconds.' }
+            } finally { $parent.Dispose() }
+        }
     }
     Start-Sleep -Milliseconds 500
-    Wait-CustomHostVenvReleased -Instruction $instruction -LogPath $LogPath -HelperPid $PID
 
     Write-JsonAtomic ([string]$instruction.rollback_path) ([ordered]@{
         schema_version = 2
@@ -961,7 +887,7 @@ catch {
                     $stop = Invoke-CapturedProcess @([string]$instruction.cli_bin_path, 'host', 'stop', '--all', '--daemon-only', '--force')
                     if ($stop.ExitCode -ne 0) { Add-UpdateLog $LogPath "Host stop diagnostic: exit $($stop.ExitCode)." }
                 } catch { Add-UpdateLog $LogPath "Host stop diagnostic: $($_.Exception.Message)" }
-                Wait-CustomHostVenvReleased -Instruction $instruction -LogPath $LogPath -HelperPid $PID -Identities $identities
+                Wait-HostTreeExit -Instruction $instruction -HelperPid $PID -Identities $identities
             }
             Restore-ToolInstallation -Instruction $instruction -Result $result
         } catch {
