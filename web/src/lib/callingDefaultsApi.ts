@@ -12,6 +12,7 @@ export interface CallingDefaultsCatalogRow {
   host_id: string;
   harness: string;
   models: NativeModelOption[];
+  permission_options?: { value: string; label: string; concept?: string }[];
   /** Unix epoch seconds of the last successful sync; `null` when none. */
   fetched_at: number | null;
   /** The last sync failed, or the host is offline on this replica. */
@@ -37,6 +38,7 @@ export interface CallingDefaultsResolution {
   permission?: string | null;
   /** Source tokens keyed by field: `agent`, `model`, `effort`. */
   sources: Record<string, string>;
+  level?: Record<string, "cell" | "host" | "row" | "corner">;
   problems: CallingDefaultsProblem[];
 }
 

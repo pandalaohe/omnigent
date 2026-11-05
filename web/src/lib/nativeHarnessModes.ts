@@ -31,7 +31,7 @@ const PERMISSION_MODE_CONCEPTS: Record<string, Record<string, PermissionModeConc
   },
   "codex-native": {
     default: "automatic",
-    "ask-for-approval": "automatic",
+    "ask-for-approval": "manual",
     "approve-for-me": "automatic",
     "full-access": "full-access",
     "read-only": "read-only",

@@ -305,7 +305,45 @@ async def test_resolve_reads_the_master_table_through_the_agents_harness(
         "speed": "master",
         "permission": "master",
     }
+    assert body["level"] == dict.fromkeys(("model", "effort", "speed", "permission"), "cell")
     assert body["problems"] == []
+
+
+async def test_resolve_reports_host_level_and_unsupported_host_falls_back(
+    client: httpx.AsyncClient,
+    stores: _Stores,
+) -> None:
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    _seed_agent(stores, AGENT_ID, harness="codex")
+    stores.prefs.patch_namespace(
+        "local",
+        "calling_defaults",
+        {
+            "*": {"codex": {"permission": "approve-for-me"}},
+            HOST_A: {"*": {"permission": "read-only", "host_wins": True}},
+        },
+    )
+    params = {"host_id": HOST_A, "agent_id": AGENT_ID}
+    result = await client.get("/v1/calling-defaults/resolve", params=params)
+    assert result.status_code == 200
+    assert (
+        result.json()["permission"],
+        result.json()["sources"]["permission"],
+        result.json()["level"]["permission"],
+    ) == ("read-only", "master", "host")
+    stores.prefs.patch_namespace(
+        "local",
+        "calling_defaults",
+        {
+            HOST_A: {"*": {"permission": "edit-automatic", "host_wins": True}},
+        },
+    )
+    result = await client.get("/v1/calling-defaults/resolve", params=params)
+    assert result.status_code == 200
+    assert (result.json()["permission"], result.json()["level"]["permission"]) == (
+        "approve-for-me",
+        "row",
+    )
 
 
 async def test_resolve_a_named_member_with_an_explicit_harness(

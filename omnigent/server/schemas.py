@@ -448,6 +448,7 @@ class CallingDefaultsResolveResponse(BaseModel):
     :param permission: Harness-specific permission preset, or ``None``.
     :param sources: Per-field source tokens (``agent``, ``model``,
         ``effort``, ``speed``, ``permission``).
+    :param level: Winning master level for each default-sourced field.
     :param problems: Default values the cached catalog does not offer;
         empty when the catalog is missing, empty, or stale.
     """
@@ -459,6 +460,7 @@ class CallingDefaultsResolveResponse(BaseModel):
     speed: str | None = None
     permission: str | None = None
     sources: dict[str, str]
+    level: dict[str, str] = Field(default_factory=dict)
     problems: list[CallingDefaultsProblem] = Field(default_factory=list)
 
 

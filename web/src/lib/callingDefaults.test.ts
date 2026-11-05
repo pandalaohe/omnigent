@@ -4,6 +4,12 @@ const { queuePatchMock } = vi.hoisted(() => ({ queuePatchMock: vi.fn() }));
 vi.mock("./userPreferencesSync", () => ({ queueUserPreferencePatch: queuePatchMock }));
 
 import {
+  callingLayerOptions,
+  callingPermissionOptions,
+  resolveAgentMasterField,
+  patchCallingDefaults,
+  promoteCallingValueOnAllHosts,
+  type CallingDefaultsTable,
   addCallingDefaultEntry,
   readCallingDefaults,
   readCallingLast,
@@ -14,9 +20,67 @@ import {
   setCallingDefaultField,
   writeCallingLastEnabled,
 } from "./callingDefaults";
+import layeredCasesJson from "./__fixtures__/layeredCases.json?raw";
+
+const layeredCases: {
+  permissionCases: {
+    name: string;
+    master: CallingDefaultsTable;
+    host: string;
+    harness: string;
+    permission_options?: { value: string; label: string; concept: string }[];
+    expected: { value: string | null; source: string; level: string | null };
+  }[];
+} = JSON.parse(layeredCasesJson);
 
 const DEFAULTS_KEY = "omnigent:calling-defaults";
 const LAST_KEY = "omnigent:calling-last";
+
+describe("shared permission layers", () => {
+  it.each(layeredCases.permissionCases)("$name", (testCase) => {
+    const options = callingLayerOptions((row) =>
+      callingPermissionOptions(row, undefined, testCase.permission_options),
+    );
+    const resolved = resolveAgentMasterField(
+      testCase.master,
+      testCase.host,
+      testCase.harness,
+      "permission",
+      undefined,
+      options,
+    );
+    const source = !resolved.source ? "none" : resolved.parent ? "master_native" : "master";
+    expect({
+      value: resolved.value ?? null,
+      source,
+      level: resolved.source?.level === "col" ? "host" : (resolved.source?.level ?? null),
+    }).toEqual(testCase.expected);
+  });
+  it("preserves the reserved keys and an explicit Manual permission", () => {
+    const table = {
+      "*": { "*": { permission: "manual" }, "claude-native": { permission: "default" } },
+      desktop: { "*": { permission: "read-only", host_wins: true } },
+    };
+    localStorage.setItem(DEFAULTS_KEY, JSON.stringify(table));
+    expect(readCallingDefaults()).toEqual(table);
+  });
+  it("promotes one field atomically and restores every affected host with one Undo patch", () => {
+    const before: CallingDefaultsTable = {
+      desktop: { codex: { model: "first", effort: "high" } },
+      server: { codex: { model: "second", permission: "read-only" } },
+    };
+    const after = promoteCallingValueOnAllHosts(before, "codex", "model", "first");
+    patchCallingDefaults(after);
+    expect(queuePatchMock).toHaveBeenCalledTimes(1);
+    expect(readCallingDefaults()).toEqual({
+      "*": { codex: { model: "first" } },
+      desktop: { codex: { effort: "high" } },
+      server: { codex: { permission: "read-only" } },
+    });
+    patchCallingDefaults({ ...before, "*": {} });
+    expect(readCallingDefaults()).toEqual({ ...before, "*": {} });
+  });
+});
 
 afterEach(() => {
   localStorage.clear();
