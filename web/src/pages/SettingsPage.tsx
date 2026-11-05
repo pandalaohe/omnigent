@@ -342,9 +342,8 @@ import {
   readBackgroundSessionTitlesEnabled,
   writeBackgroundSessionTitlesEnabled,
 } from "@/lib/backgroundSessionTitlesPreferences";
-import { SettingsHarnessesSection } from "./settings/SettingsHarnessesSection";
+import { SettingsAgentsSection } from "./settings/SettingsAgentsSection";
 import { ConnectedAppsSettings } from "@/components/ConnectedAppsSettings";
-import { SettingsCustomAgentsSection } from "./settings/SettingsCustomAgentsSection";
 
 // Admin-only management surfaces, rendered as the Members / Policies / Global
 // instructions / Sharing settings sub-categories. Visible to admins in all
@@ -389,8 +388,19 @@ export function SettingsPage() {
       location.pathname,
       isFeatureEnabled(info, "session_peer_messaging"),
     );
-    if (destination) navigate(destination, { replace: true });
-  }, [info, location.pathname, navigate]);
+    if (destination) {
+      const [path, anchor] = destination.split("#");
+      const [pathname, destinationSearch] = path.split("?");
+      const search = new URLSearchParams(location.search);
+      for (const [key, value] of new URLSearchParams(destinationSearch)) search.set(key, value);
+      navigate(
+        `${pathname}${search.size ? `?${search}` : ""}${anchor ? `#${anchor}` : location.hash}`,
+        {
+          replace: true,
+        },
+      );
+    }
+  }, [info, location.pathname, location.search, location.hash, navigate]);
   useEffect(() => {
     const id = location.hash.slice(1);
     if (!id) return;
@@ -445,8 +455,7 @@ export function SettingsPage() {
     >
       {section === "appearance" && <AppearanceSection />}
       {section === "general" && <GeneralSection />}
-      {section === "harnesses" && <SettingsHarnessesSection />}
-      {section === "custom-agents" && <SettingsCustomAgentsSection />}
+      {section === "agents" && <SettingsAgentsSection />}
       {section === "git" && <GitSection />}
       {section === "integrations" && <IntegrationsSection />}
       {section === "mcp" && (

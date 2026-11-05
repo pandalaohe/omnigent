@@ -93,26 +93,27 @@ export function SessionDefaultModeSelect({
   return (
     <div className="flex min-w-0 items-center gap-1">
       {select}
-      <TooltipProvider>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-xs"
-              aria-label="About Claude fast mode"
-            >
-              <CircleHelpIcon className="size-3.5" />
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent>
-            Fast mode supports Opus 5.5, 5 and 4.8, subject to account availability. Other models
-            start at standard speed. On subscription plans it uses usage credits instead of included
-            plan usage. First enable charges the conversation context at the uncached fast rate;
-            starting fast minimizes that charge.
-          </TooltipContent>
-        </Tooltip>
-      </TooltipProvider>
+      <ClaudeFastModeHelp />
     </div>
+  );
+}
+
+export function ClaudeFastModeHelp() {
+  return (
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button type="button" variant="ghost" size="icon-xs" aria-label="About Claude fast mode">
+            <CircleHelpIcon className="size-3.5" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>
+          Fast mode supports Opus 5.5, 5 and 4.8, subject to account availability. Other models
+          start at standard speed. On subscription plans it uses usage credits instead of included
+          plan usage. First enable charges the conversation context at the uncached fast rate;
+          starting fast minimizes that charge.
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
   );
 }

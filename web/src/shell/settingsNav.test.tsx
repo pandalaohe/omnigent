@@ -96,7 +96,7 @@ describe("settingsNavGroups", () => {
       settingsNavGroups(false, false, false, false, false, true)
         .find((group) => group.title === "Customize")
         ?.items.map((item) => item.id),
-    ).toEqual(["harnesses", "custom-agents", "instructions"]);
+    ).toEqual(["agents", "instructions"]);
   });
 
   it("keeps Keyboard shortcuts reachable on mobile for floating-assistant setup", () => {
@@ -105,9 +105,7 @@ describe("settingsNavGroups", () => {
     );
     const shortcuts = items.find((i) => i.id === "shortcuts");
     expect(shortcuts?.hideOnMobile).toBeFalsy();
-    expect(items.map((item) => item.id)).toEqual(
-      expect.arrayContaining(["shortcuts", "custom-agents"]),
-    );
+    expect(items.map((item) => item.id)).toEqual(expect.arrayContaining(["shortcuts", "agents"]));
     for (const item of items) expect(item.hideOnMobile).toBeFalsy();
   });
 
@@ -193,13 +191,12 @@ describe("settingsNavGroups", () => {
     expect(item(true)).toMatchObject({ id: "integrations", label: "Sandbox Integrations" });
   });
 
-  it("keeps 16 navigation destinations with collaboration on", () => {
+  it("keeps 15 navigation destinations with collaboration on", () => {
     const ids = settingsNavGroups(true, true, true, false, true, true).flatMap((group) =>
       group.items.map((item) => item.id),
     );
-    // 17 before the System status settings section moved onto the page itself.
-    expect(ids).toHaveLength(16);
-    expect(new Set(ids).size).toBe(16);
+    expect(ids).toHaveLength(15);
+    expect(new Set(ids).size).toBe(15);
     expect(ids).not.toEqual(
       expect.arrayContaining([
         "keep-warm",
@@ -411,10 +408,7 @@ describe("SettingsSidebarBody", () => {
     mocks.agentInstall = true;
     renderBody();
     expect(screen.queryByTestId("settings-nav-session-collab")).toBeNull();
-    expect(screen.getByTestId("settings-nav-custom-agents")).toHaveAttribute(
-      "href",
-      "/settings/custom-agents",
-    );
+    expect(screen.getByTestId("settings-nav-agents")).toHaveAttribute("href", "/settings/agents");
 
     cleanup();
     mocks.sessionCollabEnabled = true;
@@ -515,11 +509,16 @@ describe("useSettingsRoute", () => {
     expect(routeHook("/inbox").inSettings).toBe(false);
   });
 
-  it("parses the harness details segment of the harnesses section", () => {
-    expect(routeHook("/settings/harnesses")).toEqual({ inSettings: true, section: "harnesses" });
+  it("parses canonical and legacy agent detail routes", () => {
+    expect(routeHook("/settings/harnesses")).toEqual({ inSettings: true, section: "agents" });
+    expect(routeHook("/settings/agents/claude-native")).toEqual({
+      inSettings: true,
+      section: "agents",
+      harness: "claude-native",
+    });
     expect(routeHook("/settings/harnesses/claude-native")).toEqual({
       inSettings: true,
-      section: "harnesses",
+      section: "agents",
       harness: "claude-native",
     });
   });
@@ -528,14 +527,14 @@ describe("useSettingsRoute", () => {
     expect(routeHook("/settings/keep-warm")).toEqual({ inSettings: true, section: "general" });
     expect(routeHook("/settings/calling-defaults")).toEqual({
       inSettings: true,
-      section: "harnesses",
+      section: "agents",
     });
-    expect(routeHook("/settings/agents")).toEqual({ inSettings: true, section: "custom-agents" });
+    expect(routeHook("/settings/agents")).toEqual({ inSettings: true, section: "agents" });
     expect(settingsLegacyDestination("/settings/keep-warm", false)).toBe(
       "/settings/general#keep-warm",
     );
     expect(settingsLegacyDestination("/ml/omnigent-embed/settings/calling-defaults", false)).toBe(
-      "/ml/omnigent-embed/settings/harnesses#calling-defaults",
+      "/ml/omnigent-embed/settings/agents#calling-defaults",
     );
     // Idle CLI lives on each Host's card on /system now.
     expect(settingsLegacyDestination("/settings/runtime-resources", false)).toBe("/system");
@@ -546,6 +545,24 @@ describe("useSettingsRoute", () => {
     expect(settingsLegacyDestination("/settings/global-instructions", false)).toBe(
       "/settings/instructions",
     );
+  });
+
+  it("redirects old lists and encoded details under an embed basename", () => {
+    expect(settingsLegacyDestination("/settings/harnesses/claude-native", false)).toBe(
+      "/settings/agents/claude-native",
+    );
+    expect(settingsLegacyDestination("/settings/custom-agents", false)).toBe(
+      "/settings/agents#custom-agents",
+    );
+    expect(
+      settingsLegacyDestination("/ml/omnigent-embed/settings/custom-agents/agent%2Fone", false),
+    ).toBe("/ml/omnigent-embed/settings/agents/custom/agent%2Fone");
+    expect(routeHook("/settings/agents/custom/agent%2Fone")).toEqual({
+      inSettings: true,
+      section: "agents",
+      agentId: "agent/one",
+    });
+    expect(settingsLegacyDestination("/settings/agents", false)).toBeNull();
   });
 
   it("gates the session-collab deep link on the peer-messaging feature", () => {
@@ -598,7 +615,7 @@ describe("custom agent settings availability", () => {
         routeHook(`/ml/omnigent-embed/settings/custom-agents/${encodeURIComponent(agentId)}`),
       ).toEqual({
         inSettings: true,
-        section: "custom-agents",
+        section: "agents",
         agentId,
       });
     },
@@ -609,7 +626,7 @@ describe("custom agent settings availability", () => {
     mocks.agentInstall = true;
     expect(routeHook("/settings/custom-agents/%E0%A4%A")).toEqual({
       inSettings: true,
-      section: "custom-agents",
+      section: "agents",
     });
   });
 
@@ -623,19 +640,12 @@ describe("custom agent settings availability", () => {
     mocks.customAgentsEnabled = flag;
     mocks.agentInstall = api;
     renderBody();
-    const enabled = flag === true && api;
-    expect(screen.getByTestId("settings-nav-custom-agents")).toHaveTextContent(
-      enabled ? "Custom agents" : "Agent library",
-    );
+    expect(screen.getByTestId("settings-nav-agents")).toHaveTextContent("Agents");
     const group = screen.getByRole("heading", { name: "Customize" });
-    expect(group.parentElement).toContainElement(screen.getByTestId("settings-nav-harnesses"));
-    if (enabled) {
-      expect(group.parentElement).toContainElement(
-        screen.getByTestId("settings-nav-custom-agents"),
-      );
-    }
+    expect(group.parentElement).toContainElement(screen.getByTestId("settings-nav-agents"));
+    expect(screen.queryByTestId("settings-nav-custom-agents")).toBeNull();
     for (const suffix of ["", "/new", "/agent-1"]) {
-      expect(routeHook(`/settings/custom-agents${suffix}`).section).toBe("custom-agents");
+      expect(routeHook(`/settings/custom-agents${suffix}`).section).toBe("agents");
     }
   });
 
@@ -651,13 +661,13 @@ describe("custom agent settings availability", () => {
     ]);
     expect(
       groups.find((group) => group.title === "Customize")?.items.map((item) => item.id),
-    ).toEqual(["harnesses", "custom-agents", "instructions"]);
+    ).toEqual(["agents", "instructions"]);
     expect(
-      groups.flatMap((group) => group.items).filter((item) => item.id === "harnesses"),
+      groups.flatMap((group) => group.items).filter((item) => item.id === "agents"),
     ).toHaveLength(1);
     expect(routeHook("/ml/omnigent-embed/settings/custom-agents/agent-1")).toEqual({
       inSettings: true,
-      section: "custom-agents",
+      section: "agents",
       agentId: "agent-1",
     });
   });

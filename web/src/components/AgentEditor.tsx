@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { PlusIcon, TrashIcon } from "lucide-react";
 
 import { AgentMemberTrigger } from "@/components/AgentMemberTrigger";
+import { AgentNameTag } from "@/components/AgentNameTag";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -363,7 +364,10 @@ export function AgentEditor({
     >
       <DialogContent data-testid="agent-editor" className="flex max-h-[85vh] flex-col sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>Edit Agent</DialogTitle>
+          <DialogTitle>
+            Edit{" "}
+            <AgentNameTag agentId={agent.id} name={agent.name} harness={agent.harness ?? null} />
+          </DialogTitle>
           <DialogDescription>
             Changes apply when this saved Agent is selected for a new session.
           </DialogDescription>
@@ -414,7 +418,13 @@ export function AgentEditor({
                 >
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2">
-                      <span className="truncate text-sm font-medium">{name.trim()}</span>
+                      <span className="truncate text-sm font-medium">
+                        <AgentNameTag
+                          agentId={agent.id}
+                          name={name.trim()}
+                          harness={member.harness}
+                        />
+                      </span>
                       <span className="shrink-0 rounded-full border border-border px-1.5 text-xs text-muted-foreground">
                         Lead
                       </span>
@@ -449,7 +459,7 @@ export function AgentEditor({
                         className="min-w-0 flex-1 truncate text-sm leading-8"
                         title={member.name}
                       >
-                        {member.name}
+                        <AgentNameTag agentId={null} name={member.name} harness={member.harness} />
                       </span>
                     ) : (
                       <Input
@@ -626,7 +636,13 @@ export function BuiltinAgentView({
     >
       <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>{agent.display_name}</DialogTitle>
+          <DialogTitle>
+            <AgentNameTag
+              agentId={agent.id}
+              name={agent.display_name}
+              harness={agent.harness ?? null}
+            />
+          </DialogTitle>
           <DialogDescription>Built-in · read-only</DialogDescription>
         </DialogHeader>
         {agent.members == null ? (
@@ -639,7 +655,9 @@ export function BuiltinAgentView({
                 data-testid="builtin-member-row"
                 className="flex items-center gap-2 rounded-md border border-border p-2"
               >
-                <span className="min-w-0 flex-1 truncate text-sm">{member.name}</span>
+                <span className="min-w-0 flex-1 truncate text-sm">
+                  <AgentNameTag agentId={null} name={member.name} harness={member.harness} />
+                </span>
                 {member.lead && (
                   <span className="shrink-0 rounded-full border border-border px-1.5 text-xs text-muted-foreground">
                     Lead

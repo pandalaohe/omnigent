@@ -290,8 +290,8 @@ vi.mock("@/pages/PoliciesPage", () => ({
 vi.mock("@/components/McpRegistry", () => ({
   McpRegistryConnections: () => <div>mcp-accounts-stub</div>,
 }));
-vi.mock("@/pages/settings/SettingsCustomAgentsSection", () => ({
-  SettingsCustomAgentsSection: () => <div data-testid="custom-agent-settings">Agent settings</div>,
+vi.mock("@/pages/settings/SettingsAgentsSection", () => ({
+  SettingsAgentsSection: () => <div data-testid="custom-agent-settings">Agent settings</div>,
 }));
 
 import { SettingsPage } from "./SettingsPage";
@@ -312,6 +312,17 @@ function conv(id: string, partial: Partial<Conversation> = {}): Conversation {
 /** Exposes the router location so navigation assertions read the real URL. */
 function LocationProbe() {
   return <span data-testid="location">{useLocation().pathname}</span>;
+}
+
+function FullLocationProbe() {
+  const location = useLocation();
+  return (
+    <span data-testid="full-location">
+      {location.pathname}
+      {location.search}
+      {location.hash}
+    </span>
+  );
 }
 
 function renderPage(path = "/settings", navigation?: ReactNode) {
@@ -569,6 +580,21 @@ describe("SettingsPage", () => {
   it("mounts one custom-agent section even without the installed-agent flags", () => {
     renderPage("/settings/custom-agents");
     expect(screen.getAllByTestId("custom-agent-settings")).toHaveLength(1);
+  });
+  it.each([
+    [
+      "/settings/harnesses/claude-native?host=host%20%26%20two&tab=settings#startup",
+      "/settings/agents/claude-native?host=host+%26+two&tab=settings#startup",
+    ],
+    ["/settings/custom-agents?host=server", "/settings/agents?host=server#custom-agents"],
+    [
+      "/settings/custom-agents/agent%2Fone?host=server",
+      "/settings/agents/custom/agent%2Fone?host=server",
+    ],
+    ["/settings/system-status?host=server", "/system?host=server&monitor=1"],
+  ])("redirects %s while preserving its selected context", async (path, destination) => {
+    renderPage(path, <FullLocationProbe />);
+    await waitFor(() => expect(screen.getByTestId("full-location").textContent).toBe(destination));
   });
   beforeEach(() => {
     localStorage.removeItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY);

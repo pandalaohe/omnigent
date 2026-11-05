@@ -13,8 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
@@ -23,12 +23,17 @@ from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_availability import is_harness_availability
 from omnigent.permission_tiers import normalize_permission_tier
 from omnigent.session_default_modes import (
+    mode_for_concept,
     mode_values,
     valid_speed_tier,
 )
 from omnigent.util.reasoning_effort import EFFORT_VALUES, efforts_for_harness, validate_effort
 
 _logger = logging.getLogger(__name__)
+
+RESERVED_KEY = "*"
+COLUMN_CONCEPTS = frozenset({"manual", "edit-automatic", "automatic", "read-only"})
+COLUMN_FIELDS = frozenset({"permission"})
 
 
 def sdk_native_parent(harness: str | None) -> str | None:
@@ -77,6 +82,7 @@ class CallingResolution:
     sources: dict[str, str]
     speed: str | None = None
     permission: str | None = None
+    level: dict[str, str] = field(default_factory=dict)
 
 
 def _setting(value: object) -> str | None:
@@ -191,6 +197,7 @@ def resolve_calling(
     master: dict,
     host_id: str | None,
     agent_harness: Callable[[str], str | None],
+    permission_options: Callable[[str | None, str], Sequence[Mapping[str, str]]] | None = None,
 ) -> CallingResolution:
     """Resolve agent / harness / model / effort for one create.
 
@@ -234,7 +241,9 @@ def resolve_calling(
         # canonical override, or the agent's own harness when the override is
         # explicitly null / blank.
         if harness is not None:
-            mode_harness = canonicalize_harness(harness) or harness
+            mode_harness = (
+                harness if harness.startswith("acp:") else canonicalize_harness(harness) or harness
+            )
         else:
             mode_harness = agent_harness(agent_id) if agent_id is not None else None
     elif agent_id is not None:
@@ -244,35 +253,55 @@ def resolve_calling(
         harness = None
         mode_harness = None
 
-    model, model_source = _resolve_model(
-        explicit,
-        explicit_fields,
-        project_config,
-        master,
-        host_id,
-        harness,
-        agent_id,
-    )
-    effort, effort_source = _resolve_effort(
-        explicit, explicit_fields, project_config, master, host_id, harness
-    )
-    if "speed" in explicit_fields:
-        speed = _explicit(explicit.get("speed"))
-        if speed is not None and not valid_speed_tier(speed, mode_harness):
-            raise OmnigentError("invalid explicit speed for harness", code=ErrorCode.INVALID_INPUT)
-        speed_source = "explicit"
-    else:
-        speed, speed_source = _resolve_harness_setting(
-            "speed", project_config, master, host_id, mode_harness
-        )
-    permission, permission_source = _resolve_harness_setting(
-        "permission",
-        project_config,
-        master,
-        host_id,
-        mode_harness,
-        mode_values(mode_harness, "permission", "default"),
-    )
+    levels: dict[str, str] = {}
+
+    def resolve(field: str, request_key: str, target: str | None) -> tuple[str | None, str]:
+        if request_key in explicit_fields:
+            return _explicit(explicit.get(request_key)), "explicit"
+        normalize = _field_normalizer(field, target, host_id, permission_options)
+        native = sdk_native_parent(target)
+        for candidate_harness, suffix in ((target, ""), (native, "_native")):
+            entry = _project_harness_entry(project_config, host_id, candidate_harness)
+            value = normalize(_setting(entry.get(field)) if entry else None)
+            if value is not None:
+                return value, "project_host" + suffix
+            if (
+                field == "model"
+                and not suffix
+                and agent_id is not None
+                and agent_id == _project_legacy(project_config, "agent_id")
+            ):
+                value = _project_legacy(project_config, "model")
+                if value is not None:
+                    return value, "project_legacy"
+            value, level = _master_value(
+                master,
+                host_id,
+                candidate_harness,
+                field,
+                lambda value: normalize(value) is not None,
+                lambda concept: mode_for_concept(
+                    target or "",
+                    concept,
+                    permission_options(host_id, target) if permission_options and target else None,
+                ),
+            )
+            if value is not None:
+                if level is not None:
+                    levels[field] = level
+                return normalize(value), "master" + suffix
+        return None, "none"
+
+    model, model_source = resolve("model", "model_override", harness)
+    effort, effort_source = resolve("effort", "reasoning_effort", harness)
+    speed, speed_source = resolve("speed", "speed", mode_harness)
+    if (
+        speed_source == "explicit"
+        and speed is not None
+        and not valid_speed_tier(speed, mode_harness)
+    ):
+        raise OmnigentError("invalid explicit speed for harness", code=ErrorCode.INVALID_INPUT)
+    permission, permission_source = resolve("permission", "permission", mode_harness)
     return CallingResolution(
         agent_id=agent_id,
         harness=harness,
@@ -287,102 +316,78 @@ def resolve_calling(
             "speed": speed_source,
             "permission": permission_source,
         },
+        level=levels,
     )
 
 
-def _resolve_model(
-    explicit: dict[str, Any],
-    explicit_fields: set[str],
-    project_config: dict | None,
-    master: dict,
-    host_id: str | None,
-    harness: str | None,
-    agent_id: str | None,
-) -> tuple[str | None, str]:
-    """Walk the model chain, returning the value and its source token."""
-    if "model_override" in explicit_fields:
-        return _explicit(explicit.get("model_override")), "explicit"
-    entry = _project_harness_entry(project_config, host_id, harness)
-    value = _setting(entry.get("model")) if entry is not None else None
-    if value is not None:
-        return value, "project_host"
-    legacy_agent = _project_legacy(project_config, "agent_id")
-    # A legacy model belongs to the legacy agent only, and only when that
-    # agent actually resolved — absent / blank ids never match each other.
-    if agent_id is not None and agent_id == legacy_agent:
-        value = _project_legacy(project_config, "model")
-        if value is not None:
-            return value, "project_legacy"
-    entry = _master_entry(master, host_id, harness)
-    value = _setting(entry.get("model")) if entry is not None else None
-    if value is not None:
-        return value, "master"
-    native = sdk_native_parent(harness)
-    if native is not None:
-        entry = _project_harness_entry(project_config, host_id, native)
-        value = _setting(entry.get("model")) if entry is not None else None
-        if value is not None:
-            return value, "project_host_native"
-        entry = _master_entry(master, host_id, native)
-        value = _setting(entry.get("model")) if entry is not None else None
-        if value is not None:
-            return value, "master_native"
-    return None, "none"
-
-
-def _resolve_effort(
-    explicit: dict[str, Any],
-    explicit_fields: set[str],
-    project_config: dict | None,
-    master: dict,
-    host_id: str | None,
-    harness: str | None,
-) -> tuple[str | None, str]:
-    """Walk the effort chain, returning the value and its source token."""
-    if "reasoning_effort" in explicit_fields:
-        return _explicit(explicit.get("reasoning_effort")), "explicit"
-    return _resolve_harness_setting("effort", project_config, master, host_id, harness)
-
-
-def _resolve_harness_setting(
+def _field_normalizer(
     field: str,
-    project_config: dict | None,
-    master: dict,
+    harness: str | None,
+    host_id: str | None,
+    permission_options: Callable[[str | None, str], Sequence[Mapping[str, str]]] | None,
+) -> Callable[[str | None], str | None]:
+    def normalize(value: str | None) -> str | None:
+        if value is None:
+            return None
+        if field == "permission":
+            if harness in {"pi", "pi-native", "antigravity-native"}:
+                try:
+                    return normalize_permission_tier(value, harness=harness, legacy=True)
+                except ValueError:
+                    return None
+            values = (
+                frozenset(
+                    row["value"]
+                    for row in permission_options(host_id, harness)
+                    if row.get("value")
+                )
+                if permission_options
+                and harness
+                and (harness == "acp" or harness.startswith("acp:"))
+                else mode_values(harness, field, "default")
+            )
+            return value if value in values else None
+        if field == "speed":
+            return value if valid_speed_tier(value, harness) else None
+        if field == "effort":
+            supported = efforts_for_harness(harness)
+            return value if supported is None or value in supported else None
+        return value
+
+    return normalize
+
+
+def _master_value(
+    master: Mapping[str, Any],
     host_id: str | None,
     harness: str | None,
-    values: frozenset[str] | None = None,
-) -> tuple[str | None, str]:
-    """Walk one per-harness setting's chain, ignoring unsupported stored values."""
-    native = sdk_native_parent(harness)
-    entries = [
-        (_project_harness_entry(project_config, host_id, harness), "project_host"),
-        (_master_entry(master, host_id, harness), "master"),
+    field: str,
+    can_hold: Callable[[str], bool],
+    to_mode: Callable[[str], str | None],
+) -> tuple[str | None, str | None]:
+    """Walk cell, marked host, row, unmarked host, corner without moving values."""
+    if harness is None or harness == RESERVED_KEY or host_id == RESERVED_KEY:
+        return None, None
+    column = _master_entry(master, host_id, RESERVED_KEY) or {}
+    marked = column.get("host_wins") is True
+    candidates = [
+        (_master_entry(master, host_id, harness), "cell"),
+        (column if marked else None, "host"),
+        (_master_entry(master, RESERVED_KEY, harness), "row"),
+        (column if not marked else None, "host"),
+        (_master_entry(master, RESERVED_KEY, RESERVED_KEY), "corner"),
     ]
-    if native is not None:
-        entries.extend(
-            [
-                (_project_harness_entry(project_config, host_id, native), "project_host_native"),
-                (_master_entry(master, host_id, native), "master_native"),
-            ]
-        )
-    for entry, source in entries:
-        value = _setting(entry.get(field)) if entry is not None else None
-        if (
-            field == "permission"
-            and value is not None
-            and harness in {"pi", "pi-native", "antigravity-native"}
-        ):
-            try:
-                tier = normalize_permission_tier(value, harness=harness, legacy=True)
-            except ValueError:
+    for entry, level in candidates:
+        value = _setting(entry.get(field)) if entry else None
+        if value is None:
+            continue
+        if level in {"host", "corner"}:
+            if field not in COLUMN_FIELDS or value not in COLUMN_CONCEPTS:
                 continue
-            return tier, source
-        if value is not None and (
-            (field == "speed" and valid_speed_tier(value, harness))
-            or (field != "speed" and (values is None or value in values))
-        ):
-            return value, source
-    return None, "none"
+            value = to_mode(value)
+        if value is not None and can_hold(value):
+            return value, level
+    return None, None
 
 
 def _catalog_model_ids(rows: list[Mapping[str, Any]]) -> set[str]:

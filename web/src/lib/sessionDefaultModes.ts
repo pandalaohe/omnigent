@@ -15,9 +15,7 @@ export const SPEED_TIER_OPTIONS = [
   { value: "standard", label: "Standard" },
   { value: "fast", label: "Fast" },
 ];
-const CLAUDE_PERMISSION_OPTIONS = CLAUDE_NATIVE_PERMISSION_MODES.filter(
-  (option) => option.value !== "default",
-);
+const CLAUDE_PERMISSION_OPTIONS = CLAUDE_NATIVE_PERMISSION_MODES;
 export const PERMISSION_DEFAULT_OPTIONS: Record<
   string,
   readonly { value: string; label: string }[]

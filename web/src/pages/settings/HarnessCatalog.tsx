@@ -77,21 +77,22 @@ export function BackButton({
  */
 export function HarnessCatalog({
   header,
-  settings,
+  footer,
   host,
   family,
   defaultTab = "mcps",
 }: {
   header: ReactNode;
-  settings: ReactNode;
+  footer?: ReactNode;
   host: Host;
   family: BrandHarness;
-  defaultTab?: CatalogKind | "settings";
+  defaultTab?: CatalogKind;
 }) {
   // `?tab=settings` (the grid card's gear) opens on Settings; otherwise MCP servers.
   const [searchParams] = useSearchParams();
-  const [tab, setTab] = useState<CatalogKind | "settings">(
-    searchParams.get("tab") === "settings" ? "settings" : defaultTab,
+  const requestedTab = searchParams.get("tab");
+  const [tab, setTab] = useState<CatalogKind>(
+    KINDS.some((kind) => kind.id === requestedTab) ? (requestedTab as CatalogKind) : defaultTab,
   );
   const [open, setOpen] = useState<OpenPlugin | null>(null);
   const [selectedSkill, setSelectedSkill] = useState<{ name: string; sourceId?: string } | null>(
@@ -181,11 +182,12 @@ export function HarnessCatalog({
   return (
     <>
       {header}
+      <h2 className="mt-6 text-ui font-medium">Connections</h2>
       <Tabs
         value={tab}
-        onValueChange={(v) => setTab(v as CatalogKind | "settings")}
+        onValueChange={(v) => setTab(v as CatalogKind)}
         componentId="settings.harnesses.tab"
-        className="mt-8 gap-4"
+        className="mt-3 gap-4"
       >
         <TabsList variant="line" className="w-full justify-start border-b border-border px-0">
           {KINDS.map((k) => (
@@ -198,11 +200,7 @@ export function HarnessCatalog({
               {loading ? k.label : `${k.label} · ${own[k.id].length}`}
             </TabsTrigger>
           ))}
-          <TabsTrigger value="settings" className="flex-none" data-testid="harness-tab-settings">
-            Settings
-          </TabsTrigger>
         </TabsList>
-        <TabsContent value="settings">{settings}</TabsContent>
         <TabsContent value="mcps">
           {ownList("mcps", own.mcps.length, <McpList host={host} servers={own.mcps} />)}
         </TabsContent>
@@ -248,6 +246,7 @@ export function HarnessCatalog({
           )}
         </TabsContent>
       </Tabs>
+      {footer}
     </>
   );
 }

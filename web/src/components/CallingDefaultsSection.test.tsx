@@ -1,9 +1,16 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import type { ReactElement } from "react";
+import { MemoryRouter } from "react-router-dom";
+import {
+  cleanup,
+  fireEvent,
+  render as renderComponent,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CustomAgent } from "@/lib/customAgentsApi";
 import type { HarnessCapability } from "@/lib/agentLabels";
 import type * as AgentLabels from "@/lib/agentLabels";
-import type * as AgentRegistry from "@/hooks/useAgentRegistry";
 import type * as CustomAgentsApi from "@/lib/customAgentsApi";
 
 const mocks = vi.hoisted(() => ({
@@ -49,29 +56,17 @@ vi.mock("@/lib/agentLabels", async (original) => ({
   useHarnessCapabilities: () => mocks.capabilities,
 }));
 vi.mock("@/hooks/useAgentRegistry", async (original) => ({
-  ...(await original<typeof AgentRegistry>()),
-  useAgentRegistry: () => ({
-    items: Object.keys(mocks.hosts[0]?.configured_harnesses ?? {}).map((harness) => ({
-      key: `harness:${harness}`,
-      harness,
-      label:
-        harness === "codex-native"
-          ? "Codex"
-          : harness.startsWith("acp:")
-            ? `ACP · ${harness.slice(4)}`
-            : harness,
-      section: harness.startsWith("acp:") ? "acp" : "native",
-      source: "builtin",
-      deployed: true,
-      description: null,
-    })),
-    isLoading: false,
-    isError: false,
-    retry: vi.fn(),
-  }),
+  ...(await original<Record<string, unknown>>()),
+  useAgentRegistry: () => ({ items: [], legacyProducts: {}, isError: false }),
 }));
-
 import { CallingDefaultsSection } from "./CallingDefaultsSection";
+
+function render(ui: ReactElement) {
+  const result = renderComponent(<MemoryRouter>{ui}</MemoryRouter>);
+  const options = screen.queryByText("New session options")?.closest("details");
+  if (options) options.open = true;
+  return result;
+}
 
 const DEFAULTS_KEY = "omnigent:calling-defaults";
 const LAST_KEY = "omnigent:calling-last";
@@ -137,7 +132,7 @@ afterEach(() => {
 });
 
 describe("CallingDefaultsSection", () => {
-  it("adds a configured ACP row using only its advertised effort choices", async () => {
+  it("shows every configured ACP row and saves advertised thinking choices", async () => {
     mocks.hosts = [{ ...HOST, configured_harnesses: { "acp:neutral": true } }];
     mocks.listCatalogs.mockResolvedValue([
       {
@@ -150,17 +145,17 @@ describe("CallingDefaultsSection", () => {
       },
     ]);
     render(<CallingDefaultsSection />);
-    fireEvent.click(screen.getByTestId("calling-defaults-add-row"));
-    fireEvent.click(await screen.findByRole("button", { name: /ACP · neutral.*ACP/ }));
-    expect(await screen.findByTestId("calling-defaults-row-acp:neutral")).toBeInTheDocument();
-    fireEvent.click(await screen.findByTestId("calling-defaults-effort-acp:neutral"));
-    expect(screen.getByRole("option", { name: /deliberate/i })).toBeInTheDocument();
+    await waitFor(() => expect(mocks.listCatalogs).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("radio", { name: "Thinking" }));
+    fireEvent.click(screen.getByTestId("layered-cell-acp:neutral-host-a"));
+    fireEvent.click(screen.getByRole("combobox", { name: "Thinking" }));
+    expect(await screen.findByRole("option", { name: /deliberate/i })).toBeInTheDocument();
     expect(screen.queryByRole("option", { name: "High" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("option", { name: /deliberate/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
     expect(readMaster()["host-a"]["acp:neutral"]).toEqual({ effort: "deliberate" });
   });
-
-  it("hides the ACP effort control when the selected model advertises none", async () => {
+  it("hides a thinking editor when the selected ACP model has no choices", async () => {
     localStorage.setItem(
       DEFAULTS_KEY,
       JSON.stringify({ "host-a": { "acp:neutral": { model: "model-b", effort: "high" } } }),
@@ -176,10 +171,10 @@ describe("CallingDefaultsSection", () => {
       },
     ]);
     render(<CallingDefaultsSection />);
-    expect(
-      await screen.findByTestId("calling-defaults-effort-unavailable-acp:neutral"),
-    ).toBeInTheDocument();
-    expect(screen.queryByTestId("calling-defaults-effort-acp:neutral")).not.toBeInTheDocument();
+    await waitFor(() => expect(mocks.listCatalogs).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("radio", { name: "Thinking" }));
+    expect(screen.queryByTestId("layered-cell-acp:neutral-host-a")).not.toBeInTheDocument();
+    expect(screen.queryByRole("combobox", { name: "Thinking" })).not.toBeInTheDocument();
   });
   it("offers library agents only when all member targets are ready", async () => {
     const member = {
@@ -241,121 +236,63 @@ describe("CallingDefaultsSection", () => {
     await pickOption("new-project-agent", "No template");
     expect(mocks.queuePatch).toHaveBeenLastCalledWith("project_host_agents", { "host-b": null });
   });
-  it("keeps a saved offline host editable", async () => {
+  it("keeps a saved offline host editable without adding a harness row", async () => {
     mocks.hosts = [{ ...HOST, status: "offline" }];
     localStorage.setItem(DEFAULTS_KEY, JSON.stringify({ "host-a": { "codex-native": {} } }));
     render(<CallingDefaultsSection />);
-
+    await waitFor(() => expect(mocks.listCatalogs).toHaveBeenCalled());
     expect(screen.getByTestId("calling-defaults-host-host-a")).toHaveTextContent("offline");
-    expect(screen.getByTestId("calling-defaults-row-codex-native")).toBeInTheDocument();
-    await pickOption("calling-defaults-model-codex-native", "GPT-6-Astra");
-    await waitFor(() =>
-      expect(readMaster()["host-a"]["codex-native"]).toEqual({ model: "gpt-6-astra" }),
-    );
+    fireEvent.click(screen.getByRole("radio", { name: "Model" }));
+    fireEvent.click(screen.getByTestId("layered-cell-codex-native-host-a"));
+    fireEvent.click(screen.getByRole("combobox", { name: "Model" }));
+    fireEvent.click(await screen.findByRole("option", { name: "GPT-6-Astra" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(readMaster()["host-a"]["codex-native"]).toEqual({ model: "gpt-6-astra" });
+    expect(screen.queryByTestId("calling-defaults-add-row")).not.toBeInTheDocument();
   });
-
-  it("adds, edits, and deletes a harness row", async () => {
-    render(<CallingDefaultsSection />);
-
-    expect(await screen.findByTestId("calling-defaults-follows-codex")).toBeInTheDocument();
-    expect(screen.getByTestId("calling-defaults-follows-claude-sdk")).toBeInTheDocument();
-
-    fireEvent.click(screen.getByTestId("calling-defaults-add-row"));
-    fireEvent.click(await screen.findByRole("button", { name: /Codex.*Native CLI/ }));
-    await waitFor(() => expect(readMaster()).toEqual({ "host-a": { "codex-native": {} } }));
-
-    await pickOption("calling-defaults-model-codex-native", "GPT-6-Astra");
-    await waitFor(() =>
-      expect(readMaster()).toEqual({
-        "host-a": { "codex-native": { model: "gpt-6-astra" } },
-      }),
-    );
-
-    await pickOption("calling-defaults-effort-codex-native", "Medium");
-    await waitFor(() =>
-      expect(readMaster()).toEqual({
-        "host-a": { "codex-native": { model: "gpt-6-astra", effort: "medium" } },
-      }),
-    );
-
-    fireEvent.click(screen.getByTestId("calling-defaults-delete-codex-native"));
-    await waitFor(() => expect(readMaster()).toEqual({ "host-a": {} }));
-    expect(screen.queryByTestId("calling-defaults-row-codex-native")).not.toBeInTheDocument();
-    expect(screen.getByTestId("calling-defaults-follows-codex")).toBeInTheDocument();
-  });
-
-  it("edits and clears supported session modes while hiding unsupported controls", async () => {
+  it("keeps saved full access on the agent and lets a cleared SDK cell follow Native", async () => {
+    mocks.hosts = [
+      { ...HOST, configured_harnesses: { ...HOST.configured_harnesses, "pi-native": true } },
+    ];
     localStorage.setItem(
       DEFAULTS_KEY,
-      JSON.stringify({ "host-a": { "codex-native": {}, "claude-native": {}, "pi-native": {} } }),
+      JSON.stringify({
+        "host-a": {
+          codex: { permission: "approve-for-me" },
+          "codex-native": { permission: "read-only" },
+          "pi-native": { permission: "full" },
+        },
+      }),
     );
     render(<CallingDefaultsSection />);
-    await pickOption("calling-defaults-speed-codex-native", "Fast");
-    await pickOption("calling-defaults-permission-codex-native", "Approve for me");
-    expect(readMaster()["host-a"]["codex-native"]).toEqual({
-      speed: "fast",
-      permission: "approve-for-me",
-    });
-    await pickOption("calling-defaults-speed-codex-native", "Default");
-    await pickOption("calling-defaults-permission-codex-native", "Default");
-    expect(readMaster()["host-a"]["codex-native"]).toEqual({});
-    expect(screen.getByTestId("calling-defaults-speed-claude-native")).toHaveTextContent("Default");
-    await pickOption("calling-defaults-permission-claude-native", "Accept edits");
-    expect(readMaster()["host-a"]["claude-native"]).toEqual({ permission: "acceptEdits" });
-    await pickOption("calling-defaults-permission-pi-native", "Auto");
-    expect(readMaster()["host-a"]["pi-native"]).toEqual({ permission: "auto" });
-    await pickOption("calling-defaults-permission-pi-native", "Full access");
-    expect(readMaster()["host-a"]["pi-native"]).toEqual({ permission: "full" });
+    await waitFor(() => expect(mocks.listCatalogs).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("radio", { name: "Permission" }));
+    expect(screen.getByTestId("layered-cell-pi-native-host-a")).toHaveTextContent("Full access");
+    fireEvent.click(screen.getByTestId("layered-cell-codex-host-a"));
+    fireEvent.click(screen.getByRole("button", { name: "Use inherited" }));
+    expect(screen.getByTestId("layered-cell-codex-host-a")).toHaveTextContent("Follows Codex");
+    expect(readMaster()["host-a"].codex).toEqual({});
   });
-
-  it("shows a saved full tier default", () => {
-    localStorage.setItem(
-      DEFAULTS_KEY,
-      JSON.stringify({ "host-a": { "pi-native": { permission: "full" } } }),
-    );
-    render(<CallingDefaultsSection />);
-    expect(screen.getByTestId("calling-defaults-permission-pi-native")).toHaveTextContent(
-      "Full access",
-    );
-  });
-
-  it("returns an SDK row to Follows after deleting its own entry", async () => {
-    render(<CallingDefaultsSection />);
-
-    expect(await screen.findByTestId("calling-defaults-follows-codex")).toHaveTextContent(
-      "Follows Codex",
-    );
-
-    fireEvent.click(screen.getByTestId("calling-defaults-set-separately-codex"));
-    await waitFor(() => expect(readMaster()).toEqual({ "host-a": { codex: {} } }));
-    expect(screen.queryByTestId("calling-defaults-follows-codex")).not.toBeInTheDocument();
-    expect(screen.getByTestId("calling-defaults-row-codex")).toBeInTheDocument();
-
-    fireEvent.click(screen.getByTestId("calling-defaults-delete-codex"));
-    await waitFor(() =>
-      expect(screen.queryByTestId("calling-defaults-row-codex")).not.toBeInTheDocument(),
-    );
-    expect(screen.getByTestId("calling-defaults-follows-codex")).toBeInTheDocument();
-    expect(readMaster()).toEqual({ "host-a": {} });
-  });
-
   it.each(["claude-native", "claude-sdk"])(
-    "reads and saves %s speed with focused help",
+    "edits %s speed through the same layered table",
     async (harness) => {
       localStorage.setItem(
         DEFAULTS_KEY,
         JSON.stringify({ "host-a": { [harness]: { speed: "fast" } } }),
       );
       render(<CallingDefaultsSection />);
-      expect(screen.getByTestId(`calling-defaults-speed-${harness}`)).toHaveTextContent("Fast");
-      expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("radio", { name: "Speed" }));
+      expect(screen.getByTestId(`layered-cell-${harness}-host-a`)).toHaveTextContent("Fast");
+      fireEvent.click(screen.getByTestId(`layered-cell-${harness}-host-a`));
       fireEvent.focus(screen.getByRole("button", { name: "About Claude fast mode" }));
       expect(await screen.findByRole("tooltip")).toHaveTextContent("usage credits");
       fireEvent.blur(screen.getByRole("button", { name: "About Claude fast mode" }));
-      await pickOption(`calling-defaults-speed-${harness}`, "Standard");
+      fireEvent.click(screen.getByRole("combobox", { name: "Speed" }));
+      fireEvent.click(await screen.findByRole("option", { name: "Standard" }));
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
       expect(readMaster()["host-a"][harness]).toEqual({ speed: "standard" });
-      await pickOption(`calling-defaults-speed-${harness}`, "Default");
-      expect(readMaster()["host-a"][harness]).toEqual({});
+      fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+      expect(readMaster()["host-a"][harness]).toEqual({ speed: "fast" });
     },
   );
 
@@ -394,9 +331,12 @@ it("adds a plugin declared setting and saves its mode", async () => {
     },
   };
   render(<CallingDefaultsSection />);
-  fireEvent.click(screen.getByTestId("calling-defaults-add-row"));
-  fireEvent.click(await screen.findByRole("button", { name: /custom.*Native CLI/ }));
-  await pickOption("calling-defaults-permission-custom", "Review");
+  fireEvent.click(screen.getByRole("radio", { name: "Permission" }));
+  fireEvent.click(screen.getByTestId("layered-cell-custom-host-a"));
+  fireEvent.click(screen.getByRole("combobox", { name: "Permission" }));
+  fireEvent.click(await screen.findByRole("option", { name: "Review" }));
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
   expect(readMaster()["host-a"].custom).toEqual({ permission: "review" });
-  expect(screen.queryByTestId("calling-defaults-model-custom")).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("radio", { name: "Model" }));
+  expect(screen.queryByTestId("layered-cell-custom-host-a")).not.toBeInTheDocument();
 });

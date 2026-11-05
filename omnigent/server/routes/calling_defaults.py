@@ -356,6 +356,7 @@ def create_calling_defaults_router(
             speed=resolution.speed,
             permission=resolution.permission,
             sources=resolution.sources,
+            level=resolution.level,
             problems=problems,
         )
 

@@ -13,7 +13,13 @@
 
 import { useEffect, useState } from "react";
 import type { ProjectConfig } from "./projectsApi";
-import { normalizeAgyPermissionTier } from "./nativeHarnessModes";
+import { normalizeAgyPermissionTier, permissionModeConcept } from "./nativeHarnessModes";
+import {
+  resolveField,
+  type LayeredStore,
+  type LayeredLevel,
+  type LayeredOptions,
+} from "./layeredValues";
 import {
   sessionDefaultModeOptions,
   sessionModeHandler,
@@ -145,11 +151,207 @@ export interface CallingDefaultEntry {
   effort?: string;
   speed?: string;
   permission?: string;
+  host_wins?: boolean;
 }
 
 export type CallingDefaultsTable = Record<string, Record<string, CallingDefaultEntry>>;
 
-export type CallingDefaultField = keyof CallingDefaultEntry;
+export type CallingDefaultField = "model" | "effort" | "speed" | "permission";
+
+export const COLUMN_CONCEPTS = ["manual", "edit-automatic", "automatic", "read-only"] as const;
+
+export interface PermissionOption {
+  value: string;
+  label: string;
+  concept?: string;
+}
+
+export function callingPermissionOptions(
+  harness: string,
+  capabilities?: HarnessCapabilityMap,
+  acpOptions?: readonly PermissionOption[],
+): PermissionOption[] {
+  if (harness === "acp" || harness.startsWith("acp:")) return [...(acpOptions ?? [])];
+  const declared = capabilities?.[harness]?.session_modes?.permission?.options;
+  if (declared && declared !== "per-model")
+    return declared.filter((row) => row.contexts.includes("default"));
+  return sessionDefaultModeOptions(harness, "permission", [], null, "default", capabilities).map(
+    (row) => ({
+      ...row,
+      concept: permissionModeConcept(
+        harness === "codex" ? "codex-native" : harness === "claude-sdk" ? "claude-native" : harness,
+        row.value,
+      ),
+    }),
+  );
+}
+
+export function modeForConcept(
+  options: readonly PermissionOption[],
+  concept: string,
+): string | undefined {
+  return options.find((row) => row.concept === concept)?.value;
+}
+
+/** Columns carry tagged concepts so an own mode with the same spelling stays distinct. */
+export function callingDefaultsLayers(
+  table: CallingDefaultsTable,
+): LayeredStore<CallingDefaultField> {
+  const conceptEntry = (entry: CallingDefaultEntry | undefined) =>
+    entry?.permission ? { permission: { concept: entry.permission } } : {};
+  const layers: LayeredStore<CallingDefaultField> = {
+    corner: conceptEntry(table["*"]?.["*"]),
+    rows: {},
+    cols: {},
+    cells: {},
+    hostWins: {},
+  };
+  for (const [host, entries] of Object.entries(table)) {
+    for (const [harness, entry] of Object.entries(entries)) {
+      if (host === "*") {
+        if (harness !== "*") layers.rows[harness] = entry;
+      } else if (harness === "*") {
+        layers.cols[host] = conceptEntry(entry);
+        if (entry.host_wins) layers.hostWins![host] = true;
+      } else {
+        (layers.cells[host] ??= {})[harness] = entry;
+      }
+    }
+  }
+  return layers;
+}
+
+export function callingLayerOptions(
+  optionsFor: (harness: string) => readonly PermissionOption[],
+  canHoldOwn: (harness: string, field: CallingDefaultField, value: string) => boolean = () => true,
+) {
+  const normalize = (row: string, field: CallingDefaultField, value: unknown): unknown => {
+    if (field === "permission" && isRecord(value) && typeof value.concept === "string") {
+      return COLUMN_CONCEPTS.some((concept) => concept === value.concept)
+        ? modeForConcept(optionsFor(row), value.concept)
+        : undefined;
+    }
+    if (
+      field === "permission" &&
+      ["pi", "pi-native", "antigravity-native"].includes(row) &&
+      typeof value === "string"
+    )
+      return normalizeAgyPermissionTier(value);
+    return value;
+  };
+  return {
+    colFields: ["permission"] as const,
+    normalize,
+    canHold: (row: string, field: CallingDefaultField, value: unknown) => {
+      const normalized = normalize(row, field, value);
+      return (
+        typeof normalized === "string" &&
+        (field === "permission"
+          ? optionsFor(row).some((option) => option.value === normalized)
+          : canHoldOwn(row, field, normalized))
+      );
+    },
+  };
+}
+
+export function resolveCallingMasterField(
+  table: CallingDefaultsTable,
+  host: string,
+  harness: string,
+  field: CallingDefaultField,
+  capabilities?: HarnessCapabilityMap,
+  options: LayeredOptions<CallingDefaultField> = callingLayerOptions((row) =>
+    callingPermissionOptions(row, capabilities),
+  ),
+) {
+  return resolveField(callingDefaultsLayers(table), harness, host, field, options);
+}
+
+export function resolveAgentMasterField(
+  table: CallingDefaultsTable,
+  host: string,
+  harness: string,
+  field: CallingDefaultField,
+  capabilities?: HarnessCapabilityMap,
+  options?: LayeredOptions<CallingDefaultField>,
+) {
+  const own = resolveCallingMasterField(table, host, harness, field, capabilities, options);
+  const parent = callingDefaultParent(harness, capabilities);
+  if (own.value !== undefined || !parent) return { ...own, parent: null };
+  return {
+    ...resolveCallingMasterField(table, host, parent, field, capabilities, options),
+    parent,
+  };
+}
+
+/** Replace only the touched host keys in one atomic namespace PATCH. */
+export function patchCallingDefaults(patch: CallingDefaultsTable): void {
+  storeObject(CALLING_DEFAULTS_STORAGE_KEY, CALLING_DEFAULTS_CHANGED_EVENT, {
+    ...readCallingDefaults(),
+    ...patch,
+  });
+  queueUserPreferencePatch("calling_defaults", patch);
+}
+
+export function sameCallingHost(
+  left: Record<string, CallingDefaultEntry> | undefined,
+  right: Record<string, CallingDefaultEntry> | undefined,
+): boolean {
+  return [...new Set([...Object.keys(left ?? {}), ...Object.keys(right ?? {})])].every((row) =>
+    (["model", "effort", "speed", "permission", "host_wins"] as const).every(
+      (key) => left?.[row]?.[key] === right?.[row]?.[key],
+    ),
+  );
+}
+
+export function callingDefaultsPatch(
+  before: CallingDefaultsTable,
+  after: CallingDefaultsTable,
+): CallingDefaultsTable {
+  return Object.fromEntries(
+    Object.entries(after).filter(([host, value]) => !sameCallingHost(before[host], value)),
+  );
+}
+
+export function callingLevelKeys(at: LayeredLevel): [string, string] {
+  return [
+    at.level === "cell" || at.level === "col" ? at.col : "*",
+    at.level === "cell" || at.level === "row" ? at.row : "*",
+  ];
+}
+
+export function setCallingLayer(
+  table: CallingDefaultsTable,
+  at: LayeredLevel,
+  field: CallingDefaultField,
+  value: string | null,
+  hostWins?: boolean,
+): CallingDefaultsTable {
+  const [host, row] = callingLevelKeys(at);
+  const entry = { ...table[host]?.[row] };
+  if (value === null) Reflect.deleteProperty(entry, field);
+  else entry[field] = value;
+  if (at.level === "col" && hostWins !== undefined) {
+    if (hostWins) entry.host_wins = true;
+    else delete entry.host_wins;
+  }
+  return { ...table, [host]: { ...table[host], [row]: entry } };
+}
+
+/** Promote one field; unrelated fields and unknown hosts survive the operation. */
+export function promoteCallingValueOnAllHosts(
+  table: CallingDefaultsTable,
+  harness: string,
+  field: CallingDefaultField,
+  value: string,
+): CallingDefaultsTable {
+  let next = setCallingLayer(table, { level: "row", row: harness }, field, value);
+  for (const host of Object.keys(table)) {
+    if (host !== "*" && table[host]?.[harness]?.[field] !== undefined)
+      next = setCallingLayer(next, { level: "cell", row: harness, col: host }, field, null);
+  }
+  return next;
+}
 export type ProjectDefaultSource =
   "project_legacy" | "master" | "project_host_native" | "master_native" | "none";
 
@@ -164,16 +366,23 @@ export function resolveProjectInheritedField(
   capabilities?: HarnessCapabilityMap,
 ): { value: string | null; source: ProjectDefaultSource } {
   const projectHost = config.calling_defaults?.[hostId]?.harnesses;
-  const masterHost = master[hostId];
   const parent = callingDefaultParent(harness, capabilities);
   const candidates: [string | undefined, ProjectDefaultSource][] = [];
   if (field === "model" && agentId && agentId === config.agent_id) {
     candidates.push([config.model, "project_legacy"]);
   }
-  candidates.push([masterHost?.[harness]?.[field], "master"]);
+  candidates.push([
+    resolveCallingMasterField(master, hostId, harness, field, capabilities).value as
+      string | undefined,
+    "master",
+  ]);
   if (parent) {
     candidates.push([projectHost?.[parent]?.[field], "project_host_native"]);
-    candidates.push([masterHost?.[parent]?.[field], "master_native"]);
+    candidates.push([
+      resolveCallingMasterField(master, hostId, parent, field, capabilities).value as
+        string | undefined,
+      "master_native",
+    ]);
   }
   for (const [candidate, source] of candidates) {
     const value =
@@ -217,8 +426,14 @@ function sanitizeEntry(value: unknown, harness: string): CallingDefaultEntry | n
       harness === "antigravity-native" && field === "permission"
         ? normalizeAgyPermissionTier(typeof value[field] === "string" ? value[field] : null)
         : value[field];
-    if (typeof setting === "string" && setting && !isClearValue(setting)) entry[field] = setting;
+    if (
+      typeof setting === "string" &&
+      setting &&
+      (field === "permission" || !isClearValue(setting))
+    )
+      entry[field] = setting;
   }
+  if (harness === "*" && value.host_wins === true) entry.host_wins = true;
   return entry;
 }
 
@@ -281,7 +496,9 @@ export function setCallingDefaultField(
   if (
     value === null ||
     value === "" ||
-    (field === "effort" ? isClearEffort(value, harness) : isClearValue(value))
+    (field === "effort"
+      ? isClearEffort(value, harness)
+      : field !== "permission" && isClearValue(value))
   ) {
     Reflect.deleteProperty(entry, field);
   } else {

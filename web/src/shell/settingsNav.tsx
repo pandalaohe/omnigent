@@ -9,7 +9,6 @@
 import { useEffect } from "react";
 import {
   ArchiveIcon,
-  BotIcon,
   ArrowLeftIcon,
   BlocksIcon,
   DownloadIcon,
@@ -29,11 +28,7 @@ import {
 import { Link, useLocation } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import {
-  customAgentsSettingsEnabled,
-  isFeatureEnabled,
-  isSingleUserMode,
-} from "@/lib/capabilities";
+import { isFeatureEnabled, isSingleUserMode } from "@/lib/capabilities";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
@@ -41,8 +36,7 @@ import { SIDEBAR_ROW } from "./sidebarStyles";
 
 export type SettingsSectionId =
   | "appearance"
-  | "harnesses"
-  | "custom-agents"
+  | "agents"
   | "general"
   | "git"
   | "integrations"
@@ -60,8 +54,7 @@ export type SettingsSectionId =
 
 const SECTION_IDS: readonly SettingsSectionId[] = [
   "appearance",
-  "harnesses",
-  "custom-agents",
+  "agents",
   "general",
   "git",
   "integrations",
@@ -106,12 +99,12 @@ export function settingsNavGroups(
   isAdmin = false,
   isSingleUser = false,
   integrationsEnabled = false,
-  customAgentsEnabled = false,
+  _customAgentsEnabled = false,
   mcpEnabled = false,
 ): SettingsNavGroup[] {
   const harnesses: SettingsNavItem = {
-    id: "harnesses",
-    label: "Harnesses",
+    id: "agents",
+    label: "Agents",
     icon: VectorSquareIcon,
   };
   const instructions: SettingsNavItem = {
@@ -145,15 +138,7 @@ export function settingsNavGroups(
   const groups: SettingsNavGroup[] = [{ title: "General", items: general }];
   groups.push({
     title: "Customize",
-    items: [
-      harnesses,
-      {
-        id: "custom-agents",
-        label: customAgentsEnabled ? "Custom agents" : "Agent library",
-        icon: BotIcon,
-      },
-      ...(!isAdmin ? [instructions] : []),
-    ],
+    items: [harnesses, ...(!isAdmin ? [instructions] : [])],
   });
   // Keep shell-specific settings directly after the cross-platform preferences.
   if (isDesktop) {
@@ -212,6 +197,24 @@ export function useSettingsRoute(): {
   const idx = segments.lastIndexOf("settings");
   if (idx === -1) return { inSettings: false, section: defaultSection };
   const next = segments[idx + 1];
+  if (next === "harnesses") {
+    return { inSettings: true, section: "agents", harness: segments[idx + 2] };
+  }
+  if (
+    next === "custom-agents" ||
+    (next === "agents" && segments[idx + 2] === "custom" && segments[idx + 3])
+  ) {
+    const encodedId = segments[idx + (next === "custom-agents" ? 2 : 3)];
+    try {
+      return {
+        inSettings: true,
+        section: "agents",
+        agentId: encodedId ? decodeURIComponent(encodedId) : undefined,
+      };
+    } catch {
+      return { inSettings: true, section: "agents" };
+    }
+  }
   const legacySection = LEGACY_SETTINGS_SECTIONS[next];
   if (
     legacySection &&
@@ -234,23 +237,20 @@ export function useSettingsRoute(): {
     (SECTION_IDS as readonly string[]).includes(next) &&
     !(singleUser && (next === "members" || next === "sharing"));
   const section = isValidSection ? (next as SettingsSectionId) : defaultSection;
-  const harness = section === "harnesses" ? segments[idx + 2] : undefined;
-  if (section === "custom-agents" && segments[idx + 2]) {
-    try {
-      return { inSettings: true, section, agentId: decodeURIComponent(segments[idx + 2]) };
-    } catch {
-      // Malformed escapes in a bookmarked URL should not crash Settings.
-      return { inSettings: true, section };
-    }
+  let harness: string | undefined;
+  try {
+    harness =
+      section === "agents" && segments[idx + 2] ? decodeURIComponent(segments[idx + 2]) : undefined;
+  } catch {
+    /* A malformed bookmarked slug falls back to the list. */
   }
   return harness ? { inSettings: true, section, harness } : { inSettings: true, section };
 }
 
 const LEGACY_SETTINGS_SECTIONS: Record<string, { section: SettingsSectionId; anchor?: string }> = {
   "global-instructions": { section: "instructions" },
-  agents: { section: "custom-agents" },
   "keep-warm": { section: "general", anchor: "keep-warm" },
-  "calling-defaults": { section: "harnesses", anchor: "calling-defaults" },
+  "calling-defaults": { section: "agents", anchor: "calling-defaults" },
   "session-collab": { section: "general", anchor: "session-collab" },
   "context-usage": { section: "general", anchor: "context-usage" },
 };
@@ -261,6 +261,13 @@ export function settingsLegacyDestination(
 ): string | null {
   const segments = pathname.split("/");
   const index = segments.lastIndexOf("settings");
+  if (index >= 0 && segments[index + 1] === "harnesses") {
+    return `${segments.slice(0, index + 1).join("/")}/agents${segments[index + 2] ? `/${segments.slice(index + 2).join("/")}` : ""}`;
+  }
+  if (index >= 0 && segments[index + 1] === "custom-agents") {
+    const id = segments[index + 2];
+    return `${segments.slice(0, index + 1).join("/")}/agents${id ? `/custom/${id}` : "#custom-agents"}`;
+  }
   // The System status settings form is gone: its values are edited on the
   // page that shows them, so its links land there with the panel open.
   if (index >= 0 && segments[index + 1] === "system-status") {
@@ -323,7 +330,7 @@ export function SettingsSidebarBody({
     isAdmin,
     isSingleUserMode(info),
     integrationsEnabled,
-    customAgentsSettingsEnabled(info),
+    false,
     mcpEnabled,
   );
 

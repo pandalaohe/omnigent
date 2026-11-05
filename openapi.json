@@ -1393,6 +1393,14 @@
             "description": "Effective harness, or `None`.",
             "title": "Harness"
           },
+          "level": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Winning master level for each default-sourced field.",
+            "title": "Level",
+            "type": "object"
+          },
           "model": {
             "anyOf": [
               {

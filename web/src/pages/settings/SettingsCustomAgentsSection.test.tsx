@@ -39,7 +39,17 @@ vi.mock("@/lib/agentLabels", () => ({
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
 vi.mock("@/lib/agentBundle", () => ({ buildAgentBundle: vi.fn() }));
 vi.mock("@/components/AgentsSettings", () => ({
-  AgentsSettings: () => <div data-testid="agent-library">Agent library controls</div>,
+  AgentsSettings: ({
+    renderInstalled,
+  }: {
+    renderInstalled?: (pin: () => null) => React.ReactNode;
+  }) => (
+    <>
+      <h2>Custom agents</h2>
+      {renderInstalled?.(() => null)}
+      <div data-testid="agent-library">Team agent controls</div>
+    </>
+  ),
 }));
 
 const agent = (id: string, name = id): ManagedAgent => ({
@@ -147,11 +157,53 @@ afterEach(() => {
 });
 
 describe("Custom agents settings", () => {
+  it("loads later server agents when the first page contains only hidden built-ins", async () => {
+    const builtins = Array.from({ length: 50 }, (_, index) => ({
+      ...polly,
+      id: `builtin-${index}`,
+    }));
+    vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
+      const url = new URL(String(input), "http://localhost");
+      if (url.searchParams.get("scope") === "user") return response(page([]));
+      return response(
+        url.searchParams.has("after")
+          ? page([agent("later-server", "Later server agent")])
+          : page(builtins, true, "builtin-49"),
+      );
+    });
+    mount();
+    fireEvent.click(await screen.findByRole("button", { name: "Load more server agents" }));
+    expect(await screen.findByRole("link", { name: /Later server agent/ })).toBeVisible();
+    expect(authenticatedFetch).toHaveBeenCalledWith(
+      expect.stringContaining("after=builtin-49"),
+      expect.anything(),
+    );
+  });
+
+  it("keeps server loading and failure visible before any row can be shown", async () => {
+    let finish!: (value: Response) => void;
+    vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
+      const url = new URL(String(input), "http://localhost");
+      return url.searchParams.get("scope") === "user"
+        ? response(page([]))
+        : new Promise<Response>((resolve) => {
+            finish = resolve;
+          });
+    });
+    mount();
+    const server = screen.getByRole("region", { name: "Server agents" });
+    expect(within(server).getByText("Loading agents…")).toBeVisible();
+    finish(response({ error: { message: "Unavailable" } }, 500));
+    expect(await within(server).findByRole("alert")).toHaveTextContent("Could not load agents");
+    expect(within(server).getByRole("button", { name: "Retry" })).toBeVisible();
+  });
+
   it("keeps duplicate names by ID and reviews server agents without mutation actions", async () => {
     mount();
     expect(await screen.findAllByRole("link", { name: "research" })).toHaveLength(2);
     expect(screen.queryByRole("link", { name: /jcode/ })).toBeNull();
-    fireEvent.click(screen.getByRole("link", { name: /Polly description/ }));
+    cleanup();
+    mount("/settings/agents/custom/builtin-polly");
     expect(await screen.findByRole("heading", { name: "Polly" })).toBeVisible();
     expect(screen.getByText("Review code")).toBeVisible();
     expect(screen.queryByRole("button", { name: "Delete agent" })).toBeNull();
@@ -250,9 +302,10 @@ describe("Custom agents settings", () => {
   });
 
   it("updates search results when the term or loaded pages change", async () => {
+    const shared = agent("server-reviewer", "Shared reviewer");
     vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
       const url = new URL(String(input), "http://localhost");
-      if (url.searchParams.get("scope") !== "user") return response(page([polly]));
+      if (url.searchParams.get("scope") !== "user") return response(page([shared]));
       return response(
         url.searchParams.has("after")
           ? page([agent("later", "research-later")])
@@ -261,13 +314,17 @@ describe("Custom agents settings", () => {
     });
     mount();
     expect(await screen.findAllByRole("link", { name: "research" })).toHaveLength(2);
-    fireEvent.change(screen.getByRole("searchbox"), { target: { value: " RESEARCH " } });
-    expect(screen.queryByRole("link", { name: /Polly description/ })).toBeNull();
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search configurations" }), {
+      target: { value: " RESEARCH " },
+    });
+    expect(screen.queryByRole("link", { name: /Shared reviewer description/ })).toBeNull();
     expect(screen.getAllByRole("link", { name: "research" })).toHaveLength(2);
     fireEvent.click(screen.getByRole("button", { name: "Load more agents" }));
     expect(await screen.findByRole("link", { name: "research-later" })).toBeVisible();
-    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "polly" } });
-    expect(screen.getByRole("link", { name: /Polly description/ })).toBeVisible();
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search configurations" }), {
+      target: { value: "shared" },
+    });
+    expect(screen.getByRole("link", { name: /Shared reviewer description/ })).toBeVisible();
     expect(screen.queryByRole("link", { name: "research-later" })).toBeNull();
   });
 
@@ -355,21 +412,11 @@ describe("Custom agents settings", () => {
     expect(authenticatedFetch).not.toHaveBeenCalled();
   });
 
-  it("shows one agent surface at a time and keeps the library available", () => {
+  it("shows custom and team sections together without library tabs", async () => {
     mount();
-    expect(screen.queryByTestId("agent-library")).toBeNull();
-    fireEvent.mouseDown(screen.getByRole("tab", { name: "Agent library" }), {
-      button: 0,
-      ctrlKey: false,
-    });
+    expect(await screen.findAllByRole("link", { name: "research" })).toHaveLength(2);
     expect(screen.getByTestId("agent-library")).toBeInTheDocument();
-    expect(screen.queryByRole("searchbox")).toBeNull();
-    fireEvent.mouseDown(screen.getByRole("tab", { name: "Installed agents" }), {
-      button: 0,
-      ctrlKey: false,
-    });
-    expect(screen.queryByTestId("agent-library")).toBeNull();
-    expect(screen.getByRole("searchbox")).toBeInTheDocument();
+    expect(screen.queryByRole("tab")).toBeNull();
   });
 });
 
