@@ -19,6 +19,8 @@ import { type CodeFont, codeFontFamilyForEditor, readCodeFont } from "@/lib/code
 import {
   terminalDataForChord,
   type TerminalSoftKeyEventDetail,
+  type TerminalStickyState,
+  type TerminalStickyModifiers,
 } from "@/lib/mobileAssistantPreferences";
 import type { ShortcutChord } from "@/lib/keyboardShortcutPreferences";
 import { TerminalImeInput } from "./TerminalImeInput";
@@ -32,11 +34,8 @@ import { attachImeHeuristic, type Detached } from "./imeAnchor";
 
 const TERMINAL_BOLD_WEIGHT_OFFSET = 300;
 
-export type StickyState = "off" | "once" | "locked";
-export interface StickyModifiers {
-  ctrl: StickyState;
-  alt: StickyState;
-}
+export type StickyState = TerminalStickyState;
+export type StickyModifiers = TerminalStickyModifiers;
 
 export function terminalSoftKeyPayload(
   action: TerminalSoftKeyEventDetail["action"],
@@ -1078,6 +1077,11 @@ export class TerminalSession {
 
   setStickyModifiers(next: StickyModifiers): void {
     this.stickyModifiers = next;
+    for (const listener of this.stickyListeners) listener(next);
+  }
+
+  getStickyModifiers(): StickyModifiers {
+    return this.stickyModifiers;
   }
 
   onStickyConsumed(listener: (next: StickyModifiers) => void): () => void {
@@ -1088,11 +1092,10 @@ export class TerminalSession {
   private consumeStickyModifiers(): void {
     const { ctrl, alt } = this.stickyModifiers;
     if (ctrl !== "once" && alt !== "once") return;
-    this.stickyModifiers = {
+    this.setStickyModifiers({
       ctrl: ctrl === "once" ? "off" : ctrl,
       alt: alt === "once" ? "off" : alt,
-    };
-    for (const listener of this.stickyListeners) listener(this.stickyModifiers);
+    });
   }
 
   private applyStickyModifiers(data: string): string {

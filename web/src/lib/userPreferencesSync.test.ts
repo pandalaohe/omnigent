@@ -601,6 +601,30 @@ describe("user preference synchronization", () => {
     });
   });
 
+  it("syncs both mobile key sets and row switches while keeping placement local", async () => {
+    const value = {
+      version: 2,
+      enabled: true,
+      buttons: [],
+      terminalButtons: [{ id: "ctrl", label: "Ctrl", kind: "modifier", modifier: "ctrl" }],
+      terminalKeysEnabled: false,
+      terminalSecondRow: false,
+    };
+    localStorage.setItem(
+      "omnigent:mobile-assistant-preferences",
+      JSON.stringify({ ...value, position: { x: 0.2, y: 0.8 } }),
+    );
+    expect(collectLocalUserPreferences().settings.mobile_assistant).toEqual(value);
+    await initializeUserPreferencesSync(
+      { version: 1, settings: { mobile_assistant: value } },
+      vi.fn(),
+    );
+    expect(JSON.parse(localStorage.getItem("omnigent:mobile-assistant-preferences")!)).toEqual({
+      ...value,
+      position: { x: 0.2, y: 0.8 },
+    });
+  });
+
   it("retains device-only assistant placement when the user has no assistant namespace", async () => {
     localStorage.setItem(
       "omnigent:mobile-assistant-preferences",

@@ -1,13 +1,64 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { readMobileAssistantPreferences } from "@/lib/mobileAssistantPreferences";
+import {
+  defaultTerminalButtons,
+  readMobileAssistantPreferences,
+  writeMobileAssistantPreferences,
+} from "@/lib/mobileAssistantPreferences";
 import { MobileAssistantSettings } from "./MobileAssistantSettings";
 
 describe("MobileAssistantSettings", () => {
   beforeEach(() => {
     localStorage.clear();
     vi.restoreAllMocks();
+    // Exercise the existing wheel editor with an explicitly customized current-schema set.
+    writeMobileAssistantPreferences({
+      version: 2,
+      enabled: true,
+      terminalButtons: defaultTerminalButtons(),
+      buttons: [
+        {
+          id: "default-escape",
+          label: "Esc",
+          icon: "escape",
+          binding: { kind: "key", chord: { code: "Escape", modifiers: [] } },
+        },
+        {
+          id: "default-tab",
+          label: "Tab",
+          icon: "tab",
+          binding: { kind: "key", chord: { code: "Tab", modifiers: [] } },
+        },
+        {
+          id: "default-up",
+          label: "↑",
+          repeat: true,
+          binding: { kind: "key", chord: { code: "ArrowUp", modifiers: [] } },
+        },
+        {
+          id: "default-down",
+          label: "↓",
+          repeat: true,
+          binding: { kind: "key", chord: { code: "ArrowDown", modifiers: [] } },
+        },
+        {
+          id: "default-enter",
+          label: "↵",
+          binding: { kind: "key", chord: { code: "Enter", modifiers: [] } },
+        },
+        {
+          id: "default-poll",
+          label: "Poll",
+          binding: { kind: "shortcut", actionId: "pollSessions" },
+        },
+        {
+          id: "default-archive",
+          label: "Archive",
+          binding: { kind: "shortcut", actionId: "archiveSession" },
+        },
+      ],
+    });
   });
 
   function mockCircleRect() {
@@ -138,19 +189,19 @@ describe("MobileAssistantSettings", () => {
     expect(escape).toHaveFocus();
   });
 
-  it("records a custom in-app key combination", () => {
+  it("chooses a custom in-app key combination by tapping instead of recording", () => {
     render(<MobileAssistantSettings />);
 
     fireEvent.click(screen.getByRole("button", { name: "Add button" }));
     fireEvent.change(screen.getByLabelText("Button label"), { target: { value: "Open" } });
     fireEvent.change(screen.getByLabelText("Binding type"), { target: { value: "key" } });
-    fireEvent.click(screen.getByRole("button", { name: "Record custom key combination" }));
-    fireEvent.keyDown(window, { key: "t", code: "KeyT", ctrlKey: true });
+    fireEvent.change(screen.getByLabelText("Key"), { target: { value: "KeyT" } });
+    fireEvent.click(screen.getByRole("button", { name: "Ctrl" }));
     fireEvent.click(screen.getByRole("button", { name: "Save button" }));
 
     expect(readMobileAssistantPreferences().buttons.at(-1)).toMatchObject({
       label: "Open",
-      binding: { kind: "key", chord: { code: "KeyT", modifiers: ["primary"] } },
+      binding: { kind: "key", chord: { code: "KeyT", modifiers: ["control"] } },
     });
   });
 
@@ -207,5 +258,79 @@ describe("MobileAssistantSettings", () => {
     expect(
       screen.getAllByText("Jumps to the next session waiting for your answer.").length,
     ).toBeGreaterThanOrEqual(2);
+  });
+
+  it("edits the terminal set separately, adds a chord by tap, moves it, and persists both switches", () => {
+    localStorage.clear();
+    render(<MobileAssistantSettings />);
+    const chat = readMobileAssistantPreferences().buttons;
+    fireEvent.click(screen.getByRole("radio", { name: "Terminal" }));
+    expect(screen.getByText("First row")).toBeTruthy();
+    expect(screen.getByText("Page 1")).toBeTruthy();
+    expect(screen.getByText("Page 2")).toBeTruthy();
+    fireEvent.click(screen.getByRole("switch", { name: "Enable terminal key rows" }));
+    fireEvent.click(screen.getByRole("switch", { name: "Show second terminal key row" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add a key" }));
+    fireEvent.change(screen.getByLabelText("Key"), { target: { value: "KeyR" } });
+    fireEvent.click(screen.getByRole("button", { name: "Ctrl" }));
+    fireEvent.click(screen.getByRole("button", { name: "Shift" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save key" }));
+    const added = readMobileAssistantPreferences().terminalButtons.at(-1)!;
+    expect(added).toMatchObject({
+      kind: "key",
+      chord: { code: "KeyR", modifiers: ["control", "shift"] },
+    });
+    fireEvent.click(screen.getByRole("button", { name: `Move ${added.label} up` }));
+    expect(readMobileAssistantPreferences().terminalButtons[17].id).toBe(added.id);
+    expect(readMobileAssistantPreferences()).toMatchObject({
+      buttons: chat,
+      terminalKeysEnabled: false,
+      terminalSecondRow: false,
+    });
+    fireEvent.click(screen.getByRole("radio", { name: "Chat" }));
+    expect(readMobileAssistantPreferences().buttons).toEqual(chat);
+    fireEvent.click(screen.getByRole("radio", { name: "Terminal" }));
+    fireEvent.click(screen.getByRole("button", { name: `Delete ${added.label}` }));
+    expect(readMobileAssistantPreferences().terminalButtons).toHaveLength(18);
+  });
+
+  it("keeps the same focused move control when a key crosses a page boundary", () => {
+    localStorage.clear();
+    render(<MobileAssistantSettings />);
+    fireEvent.click(screen.getByRole("radio", { name: "Terminal" }));
+    const move = screen.getByRole("button", { name: "Move Tab up" });
+    move.focus();
+    fireEvent.click(move);
+    expect(readMobileAssistantPreferences().terminalButtons[5].id).toBe("tab");
+    expect(screen.getByRole("button", { name: "Move Tab up" })).toBe(move);
+    expect(move).toHaveFocus();
+  });
+
+  it("explains an unsupported terminal chord and prevents saving an inert key", () => {
+    render(<MobileAssistantSettings />);
+    fireEvent.click(screen.getByRole("radio", { name: "Terminal" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add a key" }));
+    fireEvent.change(screen.getByLabelText("Key"), { target: { value: "ArrowUp" } });
+    fireEvent.click(screen.getByRole("button", { name: "Ctrl" }));
+    expect(screen.getByRole("button", { name: "Save key" })).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent("not supported in terminals");
+    fireEvent.change(screen.getByLabelText("Key"), { target: { value: "KeyR" } });
+    fireEvent.click(screen.getByRole("button", { name: "Shift" }));
+    expect(screen.getByRole("button", { name: "Save key" })).toBeEnabled();
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("uses the shared help control for terminal rows and closes it on a second tap", () => {
+    render(<MobileAssistantSettings />);
+    fireEvent.click(screen.getByRole("radio", { name: "Terminal" }));
+    const help = screen.getByRole("button", { name: "About Terminal key rows" });
+    fireEvent.click(help);
+    expect(
+      screen.getByText(/the floating assistant uses the first ten terminal keys/),
+    ).toBeVisible();
+    fireEvent.click(help);
+    expect(
+      screen.queryByText(/the floating assistant uses the first ten terminal keys/),
+    ).not.toBeInTheDocument();
   });
 });

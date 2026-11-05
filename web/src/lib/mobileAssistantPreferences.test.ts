@@ -9,6 +9,9 @@ import {
   TERMINAL_SOFT_KEY_EVENT,
   dispatchMobileAssistantAction,
   dispatchMobileAssistantButton,
+  defaultTerminalButtons,
+  defaultMobileAssistantButtons,
+  visibleChatButtons,
   readMobileAssistantPreferences,
   registerTypableTerminal,
   softKeyForChord,
@@ -28,16 +31,9 @@ describe("mobileAssistantPreferences", () => {
     vi.mocked(queueUserPreferencePatch).mockClear();
   });
 
-  it("uses repeatable arrow defaults and persists version-2 customization", () => {
-    expect(readMobileAssistantPreferences().buttons).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          binding: { kind: "shortcut", actionId: "pollSessions" },
-        }),
-        expect.objectContaining({ id: "default-up", repeat: true }),
-        expect.objectContaining({ id: "default-down", repeat: true }),
-      ]),
-    );
+  it("uses separate chat and terminal defaults and persists version-2 customization", () => {
+    expect(readMobileAssistantPreferences().buttons).toEqual(defaultMobileAssistantButtons());
+    expect(readMobileAssistantPreferences().terminalButtons).toEqual(defaultTerminalButtons());
 
     writeMobileAssistantPreferences({
       version: 2,
@@ -53,7 +49,7 @@ describe("mobileAssistantPreferences", () => {
       ],
     });
 
-    expect(readMobileAssistantPreferences()).toEqual({
+    expect(readMobileAssistantPreferences()).toMatchObject({
       version: 2,
       enabled: false,
       buttons: [
@@ -128,7 +124,10 @@ describe("mobileAssistantPreferences", () => {
     const preferences = readMobileAssistantPreferences();
     expect(preferences.version).toBe(2);
     expect(preferences.position).toEqual({ x: 0.2, y: 0.3 });
-    expect(preferences.buttons.map((button) => button.label)).toEqual(["Tab", "Poll"]);
+    expect(preferences.buttons.map((button) => button.label)).toEqual(["Poll"]);
+    expect(preferences.terminalButtons.find((item) => item.id === "tab")).toMatchObject({
+      label: "Tab",
+    });
   });
 
   it("falls back safely when stored data is malformed", () => {
@@ -136,7 +135,7 @@ describe("mobileAssistantPreferences", () => {
     expect(readMobileAssistantPreferences().enabled).toBe(true);
   });
 
-  it("drops question-card actions stored on wheel buttons", () => {
+  it("keeps unavailable actions stored while hiding them from the chat wheel", () => {
     // Card actions need a focused card, which a wheel tap cannot give them.
     localStorage.setItem(
       MOBILE_ASSISTANT_STORAGE_KEY,
@@ -158,7 +157,130 @@ describe("mobileAssistantPreferences", () => {
       }),
     );
 
-    expect(readMobileAssistantPreferences().buttons.map((button) => button.id)).toEqual(["poll"]);
+    const preferences = readMobileAssistantPreferences();
+    expect(preferences.buttons.map((button) => button.id)).toEqual(["card", "poll"]);
+    expect(visibleChatButtons(preferences).map((button) => button.id)).toEqual(["poll"]);
+  });
+
+  it("derives custom old keys into the terminal tail without writing or losing chat phrases and actions", () => {
+    const raw = JSON.stringify({
+      version: 2,
+      enabled: true,
+      buttons: [
+        {
+          id: "default-escape",
+          label: "Esc",
+          icon: "escape",
+          binding: { kind: "key", chord: { code: "Escape", modifiers: [] } },
+        },
+        {
+          id: "custom-save",
+          label: "Save",
+          binding: { kind: "key", chord: { code: "KeyS", modifiers: ["control"] } },
+        },
+        { id: "phrase", label: "Phrase", binding: { kind: "text", text: "/compact" } },
+        { id: "poll", label: "Poll", binding: { kind: "shortcut", actionId: "pollSessions" } },
+      ],
+      position: { x: 0.2, y: 0.3 },
+    });
+    localStorage.setItem(MOBILE_ASSISTANT_STORAGE_KEY, raw);
+    const preferences = readMobileAssistantPreferences();
+    expect(preferences.buttons.map((button) => button.id)).toEqual(["phrase", "poll"]);
+    expect(preferences.terminalButtons).toHaveLength(19);
+    expect(preferences.terminalButtons.at(-1)).toMatchObject({
+      label: "Save",
+      kind: "key",
+      chord: { code: "KeyS", modifiers: ["control"] },
+    });
+    expect(localStorage.getItem(MOBILE_ASSISTANT_STORAGE_KEY)).toBe(raw);
+    expect(preferences.position).toEqual({ x: 0.2, y: 0.3 });
+    writeMobileAssistantPreferences(preferences);
+    expect(readMobileAssistantPreferences()).toEqual(preferences);
+  });
+
+  it("uses current defaults for the complete old v1 stock list and preserves explicit empty new sets", () => {
+    localStorage.setItem(
+      MOBILE_ASSISTANT_STORAGE_KEY,
+      JSON.stringify({
+        version: 1,
+        enabled: true,
+        actions: MOBILE_ASSISTANT_ACTIONS.map((action) => action.id),
+      }),
+    );
+    expect(readMobileAssistantPreferences().buttons).toEqual(defaultMobileAssistantButtons());
+    writeMobileAssistantPreferences({
+      version: 2,
+      enabled: true,
+      buttons: [],
+      terminalButtons: [],
+      terminalKeysEnabled: false,
+      terminalSecondRow: false,
+    });
+    expect(readMobileAssistantPreferences()).toMatchObject({
+      buttons: [],
+      terminalButtons: [],
+      terminalKeysEnabled: false,
+      terminalSecondRow: false,
+    });
+  });
+
+  it("derives current defaults from a complete unmodified version-2 stock list without rewriting storage", () => {
+    const buttons = [
+      {
+        id: "default-escape",
+        label: "Esc",
+        icon: "escape",
+        binding: { kind: "key", chord: { code: "Escape", modifiers: [] } },
+      },
+      {
+        id: "default-tab",
+        label: "Tab",
+        icon: "tab",
+        binding: { kind: "key", chord: { code: "Tab", modifiers: [] } },
+      },
+      {
+        id: "default-up",
+        label: "↑",
+        display: "icon",
+        icon: "arrow-up",
+        repeat: true,
+        binding: { kind: "key", chord: { code: "ArrowUp", modifiers: [] } },
+      },
+      {
+        id: "default-down",
+        label: "↓",
+        display: "icon",
+        icon: "arrow-down",
+        repeat: true,
+        binding: { kind: "key", chord: { code: "ArrowDown", modifiers: [] } },
+      },
+      {
+        id: "default-enter",
+        label: "↵",
+        display: "icon",
+        icon: "enter",
+        binding: { kind: "key", chord: { code: "Enter", modifiers: [] } },
+      },
+      {
+        id: "default-poll",
+        label: "Poll",
+        display: "icon",
+        icon: "refresh",
+        binding: { kind: "shortcut", actionId: "pollSessions" },
+      },
+      {
+        id: "default-archive",
+        label: "Archive",
+        display: "icon",
+        icon: "archive",
+        binding: { kind: "shortcut", actionId: "archiveSession" },
+      },
+    ];
+    const raw = JSON.stringify({ version: 2, enabled: true, buttons });
+    localStorage.setItem(MOBILE_ASSISTANT_STORAGE_KEY, raw);
+    expect(readMobileAssistantPreferences().buttons).toEqual(defaultMobileAssistantButtons());
+    expect(readMobileAssistantPreferences().terminalButtons).toEqual(defaultTerminalButtons());
+    expect(localStorage.getItem(MOBILE_ASSISTANT_STORAGE_KEY)).toBe(raw);
   });
 
   it("keeps repeat only for repeatable terminal keys", () => {
@@ -442,6 +564,8 @@ describe("mobileAssistantPreferences", () => {
     [{ code: "ArrowRight", modifiers: ["control"] as const }, "\x1b[1;5C"],
     [{ code: "ArrowLeft", modifiers: ["meta"] as const }, "\x01"],
     [{ code: "ArrowRight", modifiers: ["meta"] as const }, "\x05"],
+    [{ code: "KeyR", modifiers: ["control", "shift"] as const }, "\x12"],
+    [{ code: "KeyR", modifiers: ["control", "alt", "shift"] as const }, "\x1b\x12"],
   ])("translates recordable terminal chord %o to %j", (chord, expected) => {
     expect(terminalDataForChord({ code: chord.code, modifiers: [...chord.modifiers] })).toBe(
       expected,

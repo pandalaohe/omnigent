@@ -941,6 +941,7 @@ describe("TerminalSession", () => {
     const consumed = vi.fn();
     session.onStickyConsumed(consumed);
     session.setStickyModifiers({ ctrl: "once", alt: "off" });
+    consumed.mockClear();
     term.input("\x7f", true);
     term.input("\x1b[A", true);
     expect(consumed).not.toHaveBeenCalled();
