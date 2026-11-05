@@ -2320,6 +2320,45 @@ def test_format_version_omits_sha_when_build_info_has_empty_sha(
 # --- VCS (git) install handling: passive notice + URL parsing -----------------
 
 
+@pytest.mark.parametrize("annotated", [False, True])
+def test_remote_git_head_resolves_tag_commit(tmp_path: Path, annotated: bool) -> None:
+    from omnigent.update_check import _remote_git_head
+
+    def git(*args: str) -> str:
+        return subprocess.check_output(["git", "-C", str(tmp_path), *args], text=True).strip()
+
+    git("init", "--quiet")
+    git(
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--allow-empty",
+        "--quiet",
+        "-m",
+        "Initial",
+    )
+    if annotated:
+        git(
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "tag",
+            "-a",
+            "v1",
+            "-m",
+            "Release",
+        )
+    else:
+        git("tag", "v1")
+
+    assert _remote_git_head(f"git+{tmp_path}@v1") == git("rev-parse", "HEAD")
+
+
 def test_split_vcs_url_strips_prefix_and_separates_revision() -> None:
     """``git+<url>@<rev>`` splits into the bare repo URL and the revision."""
     from omnigent.update_check import _split_vcs_url

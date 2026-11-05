@@ -1911,9 +1911,10 @@ def _remote_git_head(vcs_url: str) -> str | None:
     url, ref = _split_vcs_url(vcs_url)
     if not url:
         return None
+    revision = ref or "HEAD"
     try:
         result = run_git(
-            ["git", "ls-remote", url, ref or "HEAD"],
+            ["git", "ls-remote", url, revision, f"{revision}^{{}}"],
             capture_output=True,
             text=True,
             timeout=_GIT_TIMEOUT_SECONDS,
@@ -1921,6 +1922,10 @@ def _remote_git_head(vcs_url: str) -> str | None:
         )
     except (subprocess.SubprocessError, OSError):
         return None
-    first = result.stdout.split("\n", 1)[0].strip()
+    lines = result.stdout.splitlines()
+    for line in lines:
+        if line.rstrip().endswith("^{}"):
+            return line.split("\t", 1)[0].strip() or None
+    first = lines[0].strip() if lines else ""
     sha = first.split("\t", 1)[0].strip() if first else ""
     return sha or None
