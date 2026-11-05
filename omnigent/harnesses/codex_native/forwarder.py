@@ -73,6 +73,7 @@ from omnigent.harnesses.codex_native.bridge import (
     update_thread_id,
     write_bridge_state,
 )
+from omnigent.harnesses.codex_native.context_recovery import ChildContextRecovery
 from omnigent.harnesses.codex_native.elicitation import (
     codex_elicitation_id,
 )
@@ -895,6 +896,7 @@ class _CodexForwarderState:
     helper_tightening_pending: str | None = None
     parent_session_id: str | None = None
     codex_client: CodexAppServerClient | None = None
+    context_recovery: ChildContextRecovery = field(default_factory=ChildContextRecovery)
     async_question_tracker: _CodexAsyncQuestionTracker = field(
         default_factory=_CodexAsyncQuestionTracker
     )
@@ -1215,6 +1217,7 @@ class _CodexForwarderState:
         self.posted_permission_observation = None
         self.posted_permission_session_id = None
         self.active_parent_turn_id = None
+        self.context_recovery = ChildContextRecovery()
         self.completed_parent_turn_ids.clear()
         self.consumed_child_threads.clear()
         self.in_flight_collab_calls_by_thread.clear()
@@ -4265,6 +4268,47 @@ async def _handle_event(
     )
     if route_session_id is None:
         return
+    if not is_child and not is_replay and forwarder_state is not None and codex_client is not None:
+        item = params.get("item")
+        compacted = method == _CODEX_THREAD_COMPACTED_METHOD or (
+            method == "item/completed"
+            and isinstance(item, dict)
+            and item.get("type") == _CODEX_COMPACTION_ITEM_TYPE
+        )
+        recovery = forwarder_state.context_recovery
+        if method == "item/started" and recovery.pending_window is None:
+            native = read_bridge_state(bridge_dir)
+            if native is not None and native.session_id == route_session_id:
+                recovery.restore_pending(bridge_dir, route_session_id, native.thread_id)
+        resumed = (
+            recovery.pending_window is not None
+            and method == "item/started"
+            and isinstance(item, dict)
+            and item.get("type") in {"reasoning", "agentMessage"}
+        )
+        if compacted or resumed:
+            native = read_bridge_state(bridge_dir)
+            rollout = _latest_thread_rollout(native) if native is not None else None
+            turn_id = _turn_id_from_payload(params) or forwarder_state.active_parent_turn_id
+            if (
+                native is not None
+                and native.session_id == route_session_id
+                and rollout is not None
+                and turn_id
+            ):
+                await recovery.restore(
+                    client=client,
+                    codex_client=codex_client,
+                    session_id=route_session_id,
+                    bridge_dir=bridge_dir,
+                    rollout=rollout,
+                    thread_id=native.thread_id,
+                    turn_id=turn_id,
+                    model_resumed=resumed,
+                )
+        elif terminal_event and not recovery.refused:
+            recovery.pending_window = None
+            recovery.refused = False
     event_state = forwarder_state
     event_bridge_dir = bridge_dir if not is_child else None
     hook_error = None
