@@ -75,6 +75,7 @@ import { shouldHideNativeServerSwitcher } from "@/lib/sessionNavigationPreferenc
 import { isIOSShell, onNativeSidebarDrag, setNativeServerSwitcherHidden } from "@/lib/nativeBridge";
 import { useSessionNavigationPreferences } from "@/hooks/useSessionNavigationPreferences";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
+import { useRecordReportedContext } from "@/hooks/useRecordReportedContext";
 import { useStableProviderUsageLimits } from "@/hooks/useStableProviderUsageLimits";
 import { usageContextSourceKey } from "@/lib/usageContextPreferences";
 import { type Agent, useSessionAgent, useAgents } from "@/hooks/useAgents";
@@ -2506,6 +2507,7 @@ function ComposerStatusLine({
     agentName: boundAgentName,
     harness: sessionHarness,
   });
+  useRecordReportedContext(usageContextPreferences, usageSourceKey);
   const formattedRateLimits = formatProviderUsageLimits(stableProviderUsageLimits);
   // The context ring, PR link and goal indicator live in the workspace bar.
   const showPlanMode = !!conversationId && codexPlanMode;
