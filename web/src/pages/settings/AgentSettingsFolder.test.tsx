@@ -1,5 +1,5 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { focusManager, QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { authenticatedFetch } from "@/lib/identity";
 import type { AgentFolderSettings } from "@/lib/agentFolderSettings";
@@ -45,13 +45,13 @@ let refusal: { status: number; error: string } | null;
 let readError: number | null;
 let ignoreWrite: boolean;
 
-function mount(target = host) {
+function mount(target = host, harness = "codex-native") {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
   const tree = (next: Host) => (
     <QueryClientProvider client={client}>
-      <AgentSettingsFolder host={next} harness="codex-native" />
+      <AgentSettingsFolder host={next} harness={harness} />
     </QueryClientProvider>
   );
   return { ...render(tree(target)), client, tree };
@@ -97,10 +97,74 @@ beforeEach(() => {
 });
 afterEach(() => {
   cleanup();
+  focusManager.setFocused(undefined);
   vi.clearAllMocks();
 });
 
 describe("Settings folder", () => {
+  it("keeps the saved value and Undo when a focus read returns an older view after Save", async () => {
+    const fetch = vi.mocked(authenticatedFetch).getMockImplementation()!;
+    let finishSave: ((response: Response) => void) | undefined;
+    let finishRead: ((response: Response) => void) | undefined;
+    let lateRead: Promise<Response> | undefined;
+    vi.mocked(authenticatedFetch).mockImplementation((input, init) => {
+      if (String(input).includes("agent-settings")) {
+        if (init?.method === "PUT")
+          return new Promise((resolve) => {
+            finishSave = resolve;
+          });
+        if (finishSave) {
+          lateRead = new Promise((resolve) => {
+            finishRead = resolve;
+          });
+          return lateRead;
+        }
+      }
+      return fetch(input, init);
+    });
+    mount();
+    await screen.findByText("model-one");
+    fireEvent.click(screen.getByRole("button", { name: "Change Model" }));
+    fireEvent.change(screen.getByLabelText("New Model"), { target: { value: "model-two" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(finishSave).toBeDefined());
+    act(() => {
+      focusManager.setFocused(false);
+      focusManager.setFocused(true);
+    });
+    await waitFor(() => expect(finishRead).toBeDefined());
+    const saved = {
+      ...initial,
+      revision: "r2",
+      fields: [{ ...initial.fields[0], value: "model-two", undo_available: true }],
+    };
+    act(() => finishSave!(Response.json(saved)));
+    await screen.findByText("Model saved.");
+    const staleResponse = Response.json(initial);
+    const parsedRead = vi.spyOn(staleResponse, "json");
+    await act(async () => {
+      finishRead!(staleResponse);
+      await lateRead;
+    });
+    await waitFor(() => expect(parsedRead).toHaveBeenCalled());
+    expect(screen.getByText("model-two")).toBeTruthy();
+    expect(screen.queryByText("model-one")).toBeNull();
+    expect(screen.getByRole("button", { name: "Undo Model" })).toBeTruthy();
+    expect(screen.getByText("Model saved.")).toBeTruthy();
+  });
+
+  it.each(["opencode-native", "acp:research"])(
+    "shows no Retry for an unknown settings folder (%s)",
+    async (harness) => {
+      vi.mocked(authenticatedFetch).mockResolvedValue(
+        Response.json({ error: "Settings folder not known" }, { status: 400 }),
+      );
+      mount(host, harness);
+      await screen.findByText("Settings folder not known");
+      expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    },
+  );
+
   it("reads without writing, then saves one key with its revision and restores its preimage", async () => {
     mount();
     await screen.findByText("model-one");

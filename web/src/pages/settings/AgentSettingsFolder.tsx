@@ -69,9 +69,12 @@ function FolderCard({ host, harness }: { host: Host; harness: string }) {
   });
   const listId = useId();
   const operation = useMutation({
+    onMutate: () => client.cancelQueries({ queryKey: ["agent-folder-settings", host.host_id] }),
     mutationFn: (change: AgentFolderChange) =>
       requestAgentFolderSettings(host.host_id, harness, change),
-    onSuccess: (next, change) => {
+    onSuccess: async (next, change) => {
+      // A refocus can start another read while the write is pending.
+      await client.cancelQueries({ queryKey: ["agent-folder-settings", host.host_id] });
       client.setQueryData(queryKey, next);
       client.setQueriesData(
         {
@@ -118,6 +121,10 @@ function FolderCard({ host, harness }: { host: Host; harness: string }) {
   });
   const busy = operation.isPending;
   const locked = !online || busy || query.isFetching;
+  const unknownFolder =
+    query.error instanceof ApiError &&
+    query.error.status === 400 &&
+    query.error.message === "Settings folder not known";
 
   async function openPath() {
     if (!view) return;
@@ -177,14 +184,16 @@ function FolderCard({ host, harness }: { host: Host; harness: string }) {
       {query.isError && (
         <div className="mt-2 flex flex-wrap items-center gap-2 text-sm">
           <p role="alert">{failure(query.error)}</p>
-          <Button
-            size="sm"
-            variant="outline"
-            disabled={!online || busy || query.isFetching}
-            onClick={() => void query.refetch()}
-          >
-            Retry
-          </Button>
+          {!unknownFolder && (
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={!online || busy || query.isFetching}
+              onClick={() => void query.refetch()}
+            >
+              Retry
+            </Button>
+          )}
         </div>
       )}
       {view?.account && (
