@@ -6053,45 +6053,45 @@ def _upgrade_vcs_install(
         _echo_upgrade_plan(info, suggestion, extra_overrides)
         return
 
-    _drain_and_stop_local_server(force=force)
+    with _upgrade_host_service(force=force):
+        console = Console()
+        code = _run_upgrade_command(suggestion.command, console)
+        if code != 0:
+            raise click.ClickException(
+                _upgrade_failure_message(code, set(info.extras) | set(extra_overrides))
+            )
 
-    console = Console()
-    code = _run_upgrade_command(suggestion.command, console)
-    if code != 0:
-        raise click.ClickException(
-            _upgrade_failure_message(code, set(info.extras) | set(extra_overrides))
-        )
-
-    # Verify by commit, not exit code: a re-pull of a ref that hasn't moved (or
-    # a pinned ref, or a cached reinstall) exits 0 without changing anything.
-    _, new_sha = _probe_installed_distribution()
-    if new_sha and current_sha and new_sha != current_sha:
+        # Verify by commit, not exit code: a re-pull of a ref that hasn't moved (or
+        # a pinned ref, or a cached reinstall) exits 0 without changing anything.
+        _, new_sha = _probe_installed_distribution()
+        if new_sha and current_sha and new_sha != current_sha:
+            click.echo(
+                f"✓ Updated to git {new_sha[:9]}. Re-run your command — the local "
+                "server will start on the new version."
+            )
+            return
+        if known_behind and new_sha and new_sha == current_sha:
+            # We positively confirmed the ref had advanced, yet the re-pull left the
+            # install on the same commit — a silent no-op that would otherwise
+            # recreate the "still behind" loop. Fail loudly, mirroring the PyPI guard.
+            raise click.ClickException(
+                f"The re-pull ran but the install is still at {cur_short} (the ref is at "
+                f"{remote_short}). The ref may be pinned or the reinstall reused a cached "
+                f"commit; try `uv tool install --reinstall {info.vcs_url}`."
+            )
+        if new_sha and current_sha and new_sha == current_sha:
+            # Remote was indeterminate, so we never claimed it was behind — a
+            # no-change re-pull is fine here.
+            click.echo(
+                f"Already on the latest commit of the tracked ref ({cur_short}); nothing changed."
+            )
+            return
+        # Couldn't read the new commit — the re-pull ran, but don't assert a
+        # result we can't confirm.
         click.echo(
-            f"✓ Updated to git {new_sha[:9]}. Re-run your command — the local "
-            "server will start on the new version."
+            f"Re-pulled the git ref. Run "
+            f"`{cli_invocation(name='omni')} upgrade --check` to confirm."
         )
-        return
-    if known_behind and new_sha and new_sha == current_sha:
-        # We positively confirmed the ref had advanced, yet the re-pull left the
-        # install on the same commit — a silent no-op that would otherwise
-        # recreate the "still behind" loop. Fail loudly, mirroring the PyPI guard.
-        raise click.ClickException(
-            f"The re-pull ran but the install is still at {cur_short} (the ref is at "
-            f"{remote_short}). The ref may be pinned or the reinstall reused a cached "
-            f"commit; try `uv tool install --reinstall {info.vcs_url}`."
-        )
-    if new_sha and current_sha and new_sha == current_sha:
-        # Remote was indeterminate, so we never claimed it was behind — a
-        # no-change re-pull is fine here.
-        click.echo(
-            f"Already on the latest commit of the tracked ref ({cur_short}); nothing changed."
-        )
-        return
-    # Couldn't read the new commit — the re-pull ran, but don't assert a
-    # result we can't confirm.
-    click.echo(
-        f"Re-pulled the git ref. Run `{cli_invocation(name='omni')} upgrade --check` to confirm."
-    )
 
 
 def _upgrade_to_nightly(
@@ -6196,34 +6196,33 @@ def _upgrade_to_nightly(
         _echo_upgrade_plan(info, suggestion, extra_overrides)
         return
 
-    _drain_and_stop_local_server(force=force)
+    with _upgrade_host_service(force=force):
+        console = Console()
+        code = _run_upgrade_command(suggestion.command, console)
+        if code != 0:
+            raise click.ClickException(
+                _upgrade_failure_message(code, set(info.extras) | set(extra_overrides))
+            )
 
-    console = Console()
-    code = _run_upgrade_command(suggestion.command, console)
-    if code != 0:
+        # Same trust-the-disk verification as the release path: re-read the
+        # version in a fresh subprocess instead of believing the exit code.
+        new_version, _ = _probe_installed_distribution()
+        if new_version == target:
+            click.echo(
+                f"✓ Upgraded to nightly v{target}. Re-run your command; the local "
+                "server will start on the new version."
+            )
+            return
+        if new_version is None:
+            click.echo(
+                "Ran the upgrade command, but couldn't confirm the installed version. "
+                f"Run `{cli_invocation(name='omni')} upgrade --nightly --check` to verify."
+            )
+            return
         raise click.ClickException(
-            _upgrade_failure_message(code, set(info.extras) | set(extra_overrides))
+            f"The upgrade command ran but omnigent is still v{new_version} (expected "
+            f"v{target}). Try the command directly: {suggestion.command}"
         )
-
-    # Same trust-the-disk verification as the release path: re-read the
-    # version in a fresh subprocess instead of believing the exit code.
-    new_version, _ = _probe_installed_distribution()
-    if new_version == target:
-        click.echo(
-            f"✓ Upgraded to nightly v{target}. Re-run your command; the local "
-            "server will start on the new version."
-        )
-        return
-    if new_version is None:
-        click.echo(
-            "Ran the upgrade command, but couldn't confirm the installed version. "
-            f"Run `{cli_invocation(name='omni')} upgrade --nightly --check` to verify."
-        )
-        return
-    raise click.ClickException(
-        f"The upgrade command ran but omnigent is still v{new_version} (expected "
-        f"v{target}). Try the command directly: {suggestion.command}"
-    )
 
 
 @cli.command("upgrade")

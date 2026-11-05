@@ -75,8 +75,13 @@ def _wheel_install(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.parametrize("outcome", ["success", "install-failure", "no-op", "refresh-failure"])
+@pytest.mark.parametrize("origin", ["registry", "git", "nightly"])
 def test_upgrade_preserves_enabled_service(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _wheel_install: None, outcome: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _wheel_install: None,
+    outcome: str,
+    origin: str,
 ) -> None:
     from omnigent.host import service
 
@@ -108,11 +113,19 @@ def test_upgrade_preserves_enabled_service(
 
     monkeypatch.setattr("omnigent.update_check._run_upgrade_command", _install)
     version = "0.1.0" if outcome in {"install-failure", "no-op"} else "0.2.0"
+    commit = "a" * 40 if outcome in {"install-failure", "no-op"} else "b" * 40
     monkeypatch.setattr(
-        "omnigent.update_check._probe_installed_distribution", lambda: (version, None)
+        "omnigent.update_check._probe_installed_distribution", lambda: (version, commit)
     )
+    args = ["upgrade"]
+    if origin == "git":
+        monkeypatch.setattr("omnigent.update_check._read_installed_wheel_info", _git_install_info)
+        monkeypatch.setattr("omnigent.update_check._remote_git_head", lambda _: "b" * 40)
+    elif origin == "nightly":
+        args.append("--nightly")
+        monkeypatch.setattr("omnigent.update_check._latest_nightly_version", lambda: "0.2.0")
 
-    result = CliRunner().invoke(cli, ["upgrade"])
+    result = CliRunner().invoke(cli, args)
 
     assert result.exit_code == (0 if outcome == "success" else 1), result.output
     assert events.index("stop") < events.index("install")
@@ -123,6 +136,30 @@ def test_upgrade_preserves_enabled_service(
     else:
         assert events.index("install") < events.index("start")
         assert installed.path.read_bytes() == original
+
+
+@pytest.mark.parametrize("origin", ["registry", "git", "nightly"])
+@pytest.mark.parametrize("flag", ["--check", "--dry-run"])
+def test_upgrade_preview_does_not_inspect_services(
+    monkeypatch: pytest.MonkeyPatch, _wheel_install: None, origin: str, flag: str
+) -> None:
+    def _unexpected() -> None:
+        pytest.fail("preview must not inspect or stop a service")
+
+    monkeypatch.setattr("omnigent.host.service.installed_user_host_service", _unexpected)
+    monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda **_: "0.2.0")
+    args = ["upgrade", flag]
+    if origin == "git":
+        monkeypatch.setattr("omnigent.update_check._read_installed_wheel_info", _git_install_info)
+        monkeypatch.setattr("omnigent.update_check._remote_git_head", lambda _: "b" * 40)
+    elif origin == "nightly":
+        args.append("--nightly")
+        monkeypatch.setattr("omnigent.update_check._latest_nightly_version", lambda: "0.2.0")
+
+    result = CliRunner().invoke(cli, args)
+
+    assert result.exit_code == (1 if flag == "--check" else 0), result.output
+    assert "Running:" not in result.output
 
 
 def test_upgrade_up_to_date(monkeypatch: pytest.MonkeyPatch, _wheel_install: None) -> None:
