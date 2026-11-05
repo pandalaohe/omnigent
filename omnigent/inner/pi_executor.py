@@ -4426,6 +4426,20 @@ class PiExecutor(Executor):
         else:
             pi_model = effective_model
 
+        def log_bootstrap(status: str, reason: str = "none") -> None:
+            if self._permission_controlled:
+                logger.info(
+                    "Pi permission bootstrap %s: bootstrap_id=%s session_id=%s "
+                    "generated_dir=%s status=%s reason=%s",
+                    "started" if status == "starting" else "ended",
+                    rpc.context_incarnation,
+                    session_key,
+                    pathlib.Path(tmp_dir).name if tmp_dir else "unavailable",
+                    status,
+                    reason,
+                )
+
+        log_bootstrap("starting")
         try:
             await rpc.start(
                 subprocess_config.executable or self._pi_launch_path,
@@ -4443,11 +4457,21 @@ class PiExecutor(Executor):
                 await self._await_permission_installation(session_key, rpc)
             if self._session_states.get(session_key) is not state or state.rpc is not previous_rpc:
                 raise RuntimeError("Pi RPC owner changed during startup")
-        except BaseException:
+        except BaseException as exc:
+            cancelled = isinstance(exc, asyncio.CancelledError)
+            log_bootstrap(
+                "cancelled" if cancelled else "failed",
+                exc.reason
+                if isinstance(exc, PiPermissionBootstrapError)
+                else "cancelled"
+                if cancelled
+                else "startup_error",
+            )
             if tool_server is not None and usage_token is not None:
                 tool_server.revoke_pi_usage_token(session_key, expected_token=usage_token)
             await rpc.close()
             raise
+        log_bootstrap("installed")
         state.rpc = rpc
         state.system_prompt = system_prompt
         state.model = effective_model

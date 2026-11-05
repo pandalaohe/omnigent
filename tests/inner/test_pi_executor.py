@@ -478,7 +478,7 @@ async def context_v2_pi(monkeypatch):
 
 
 async def test_concurrent_permission_bootstrap_reuses_one_proven_process(
-    context_v2_pi, tmp_path, monkeypatch
+    context_v2_pi, tmp_path, monkeypatch, caplog
 ):
     from omnigent.inner import pi_executor as module
 
@@ -487,6 +487,7 @@ async def test_concurrent_permission_bootstrap_reuses_one_proven_process(
         pytest.skip("node is required for the controlled Pi extension test")
     executor, spawn, create, _ = context_v2_pi
     executor._permission_controlled = True
+    caplog.set_level(logging.INFO, logger=module.__name__)
     bridge = tmp_path / "bridge"
     (bridge / "inbox").mkdir(parents=True)
     write_host_permission_state(
@@ -551,6 +552,58 @@ async def test_concurrent_permission_bootstrap_reuses_one_proven_process(
     assert results == [True, True]
     assert verify_pi_permission_installation(bridge, "auto")
     assert len(launches) == 1
+    lifecycle = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("Pi permission bootstrap ")
+    ]
+    assert len(lifecycle) == 2
+    assert "bootstrap started:" in lifecycle[0]
+    assert "bootstrap ended:" in lifecycle[1] and "status=installed" in lifecycle[1]
+    rpc = executor._session_states["same-key"].rpc
+    assert rpc is not None
+    for message in lifecycle:
+        assert "generated_dir=launch-0" in message
+        assert f"bootstrap_id={rpc.context_incarnation}" in message
+        assert str(tmp_path) not in message and "test-token" not in message
+
+
+@pytest.mark.parametrize("failure", ["proof", "startup", "cancelled"])
+async def test_permission_bootstrap_logs_end_before_failed_launch_cleanup(
+    context_v2_pi, monkeypatch, caplog, failure
+):
+    from omnigent.inner import pi_executor as module
+
+    executor, _, _, _ = context_v2_pi
+    executor._permission_controlled = True
+    error = (
+        module.PiPermissionBootstrapError("ack_mismatch (field=extension_sha256)")
+        if failure == "proof"
+        else asyncio.CancelledError()
+        if failure == "cancelled"
+        else OSError("private path and credential")
+    )
+    monkeypatch.setattr(executor, "_await_permission_installation", AsyncMock(side_effect=error))
+    caplog.set_level(logging.INFO, logger=module.__name__)
+    with pytest.raises(type(error)):
+        await executor.bootstrap_permission_tier("failed-log")
+    lifecycle = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("Pi permission bootstrap ")
+    ]
+    assert len(lifecycle) == 2
+    assert "bootstrap started:" in lifecycle[0] and "bootstrap ended:" in lifecycle[1]
+    expected = "cancelled" if failure == "cancelled" else "failed"
+    assert f"status={expected}" in lifecycle[1]
+    assert (
+        "reason=ack_mismatch (field=extension_sha256)"
+        if failure == "proof"
+        else "reason=cancelled"
+        if failure == "cancelled"
+        else "reason=startup_error"
+    ) in lifecycle[1]
+    assert "private" not in " ".join(lifecycle)
 
 
 async def test_context_v2_pi_primary_reuse_replacement_and_close(context_v2_pi):
