@@ -177,6 +177,14 @@ async def test_discovery_quota_failure_is_advisory(quota_status):
                 quota_status,
                 json={
                     "session_choice": {"enabled": True, "work_types": ["work"]},
+                    "usage_issues": [
+                        {
+                            "account": "gateway",
+                            "level": "notice",
+                            "what": "unpriced",
+                            "last_at": 100,
+                        }
+                    ],
                     "agents": {
                         "codex": {
                             "state": "low",
@@ -204,6 +212,11 @@ async def test_discovery_quota_failure_is_advisory(quota_status):
     assert (quota["state"] if quota else None) == ("low" if quota_status == 200 else None)
     if quota_status == 200:
         assert result["session_choice"] == {"enabled": True, "work_types": ["work"]}
+        assert result["usage_issues"] == [
+            {"account": "gateway", "level": "notice", "what": "unpriced", "last_at": 100}
+        ]
+    else:
+        assert "usage_issues" not in result
 
 
 @pytest.mark.asyncio
