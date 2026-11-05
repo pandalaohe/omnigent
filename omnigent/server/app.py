@@ -2004,7 +2004,16 @@ def create_app(
         configure_usage_hours,
     )
     from omnigent.stores.usage_snapshot_store import UsageSnapshotStore
+    from omnigent.usage.activity import MarkSettings
 
+    usage_config = resolved_server_config.get("usage") or {}
+    raw_mark = usage_config.get("mark") if isinstance(usage_config, dict) else None
+    try:
+        usage_mark = MarkSettings.model_validate(raw_mark or {})
+    except ValidationError:
+        _logger.warning("Invalid usage.mark configuration; using defaults")
+        usage_mark = MarkSettings()
+    usage_hours_store = UsageHoursStore(conversation_store.storage_location)
     agent_quota_service = AgentQuotaService(
         conversation_store,
         permission_store,
@@ -2013,6 +2022,10 @@ def create_app(
         host_store,
         UsageSnapshotStore(conversation_store.storage_location),
         usage_enabled=usage_module_enabled(resolved_server_config),
+        hours_store=usage_hours_store,
+        mark_settings=usage_mark,
+        agent_store=agent_store,
+        agent_cache=agent_cache,
     )
 
     def _host_login_kind(host_id: str, agent_key: str | None) -> str | None:
@@ -2029,7 +2042,7 @@ def create_app(
 
     configure_usage_hours(
         UsageHoursRecorder(
-            UsageHoursStore(conversation_store.storage_location),
+            usage_hours_store,
             enabled=usage_module_enabled(resolved_server_config),
             login_kind=_host_login_kind,
         )

@@ -6,9 +6,11 @@ import asyncio
 import re
 import time
 from copy import deepcopy
-from typing import Annotated, Any
+from datetime import date
+from typing import Annotated, Any, Literal
+from zoneinfo import ZoneInfoNotFoundError
 
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, ValidationError
 from sqlalchemy.exc import StatementError
 
@@ -19,6 +21,7 @@ from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.stores.host_store import HostStore
 from omnigent.usage.contract import UsageOverview, UsageReport
+from omnigent.usage.ranges import RangeKey
 
 _Number = Annotated[StrictFloat | StrictInt, Field(allow_inf_nan=False)]
 _Period = Annotated[
@@ -182,6 +185,39 @@ def create_agent_quota_router(
             raise HTTPException(404, "Usage account not found")
         return Response(status_code=204)
 
+    @router.get("/me/usage/activity")
+    @router.get("/me/usage/issues")
+    async def read_activity(
+        request: Request,
+        range_key: Annotated[RangeKey, Query(alias="range")] = "d7",
+        from_date: Annotated[date | None, Query(alias="from")] = None,
+        to_date: Annotated[date | None, Query(alias="to")] = None,
+        tz: str = "UTC",
+        account: str | None = None,
+        include: Literal["models"] | None = None,
+    ) -> Response:
+        require_usage()
+        from fastapi.responses import JSONResponse
+
+        owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
+        issues = request.url.path.endswith("/issues")
+        options: dict[str, Any] = {
+            "range_key": range_key,
+            "from_date": from_date,
+            "to_date": to_date,
+            "tz": tz,
+            "account": account,
+            "include_models": issues or include == "models",
+        }
+        try:
+            if issues:
+                payload = await asyncio.to_thread(service.issues, owner, **options)
+            else:
+                payload = await asyncio.to_thread(service.activity, owner, **options)
+        except (ValueError, ZoneInfoNotFoundError):
+            raise HTTPException(422, "Invalid usage range or timezone") from None
+        return JSONResponse(payload, headers={"Cache-Control": "private, no-store"})
+
     @router.get("/sessions/{session_id}/agent-quota", include_in_schema=False)
     async def session_quota(request: Request, session_id: str) -> Response:
         from fastapi.responses import JSONResponse
@@ -196,6 +232,7 @@ def create_agent_quota_router(
         payload = await asyncio.to_thread(
             service.payload,
             conversation,
+            requester_id=user or RESERVED_USER_LOCAL,
             agent_store=getattr(request.app.state, "agent_store", None),
             agent_cache=getattr(request.app.state, "agent_cache", None),
         )

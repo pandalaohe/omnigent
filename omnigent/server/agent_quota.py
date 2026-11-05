@@ -7,9 +7,12 @@ import logging
 import re
 import threading
 import time
+from collections import defaultdict
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
+from datetime import date
 from typing import Any, Literal, cast
+from zoneinfo import ZoneInfo
 
 from omnigent.codex_rate_limits import fresh_codex_rate_limits
 from omnigent.db.db_models import current_workspace_id, workspace_scope
@@ -36,7 +39,9 @@ from omnigent.stores.agent_store import AgentStore
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.usage_hours_store import UsageHoursStore
 from omnigent.stores.usage_snapshot_store import UsageSnapshotStore
+from omnigent.usage.activity import MarkSettings, attributed_rows, error_mark, summarize, totals
 from omnigent.usage.contract import (
     UsageAccountView,
     UsageHostView,
@@ -49,6 +54,7 @@ from omnigent.usage.contract import (
     period_of,
     window_start,
 )
+from omnigent.usage.ranges import RangeKey, range_spans
 
 _logger = logging.getLogger(__name__)
 _DELETE = object()
@@ -163,6 +169,10 @@ class AgentQuotaService:
         snapshot_store: UsageSnapshotStore | None = None,
         *,
         usage_enabled: bool = True,
+        hours_store: UsageHoursStore | None = None,
+        mark_settings: MarkSettings | None = None,
+        agent_store: AgentStore | None = None,
+        agent_cache: AgentCache | None = None,
     ) -> None:
         self.conversations = conversation_store
         self.permissions = permission_store
@@ -171,6 +181,10 @@ class AgentQuotaService:
         self.host_store = host_store
         self.snapshot_store = snapshot_store
         self.usage_enabled = usage_enabled
+        self.hours_store = hours_store
+        self.mark_settings = mark_settings or MarkSettings()
+        self.agent_store = agent_store
+        self.agent_cache = agent_cache
         self._snapshots: dict[tuple[int, str, str | None, str], dict[str, Any]] = {}
         self._accounts: dict[tuple[int, str, str], dict[str, Any]] = {}
         self._display: dict[tuple[int, str, str | None, str], dict[str, Any]] = {}
@@ -179,6 +193,7 @@ class AgentQuotaService:
         self._last_written: dict[tuple[int, str, str], float] = {}
         self._persisted_windows: dict[tuple[int, str, str], str] = {}
         self._lock = threading.Lock()
+        self._account_write_lock = threading.Lock()
 
     def context(self, conversation: Conversation, owner_hint: str | None = None) -> QuotaContext:
         from omnigent.server.routes.sessions.routes_peer import effective_owner_id
@@ -358,6 +373,19 @@ class AgentQuotaService:
         *,
         now: float | None = None,
     ) -> None:
+        # Serialize source replacements without holding the native reading
+        # cache's lock during database I/O.
+        with self._account_write_lock:
+            self._report_account(owner, account_id, report, now=now)
+
+    def _report_account(
+        self,
+        owner: str,
+        account_id: str,
+        report: UsageReport,
+        *,
+        now: float | None = None,
+    ) -> None:
         if not self.usage_enabled:
             return
         now = time.time() if now is None else now
@@ -367,6 +395,21 @@ class AgentQuotaService:
         key = (current_workspace_id(), owner, account_id)
         observed = float(report.observed_at)
         snapshot: dict[str, Any] | None = None
+        with self._lock:
+            previous = self._accounts.get(key)
+            if previous is not None and observed < float(previous.get("last_attempt_at") or 0):
+                return
+            if (
+                previous is None
+                and sum(1 for ws, user, _ in self._accounts if (ws, user) == key[:2]) >= 32
+            ):
+                raise UsageAccountLimitError("at most 32 usage accounts per owner")
+        if (
+            report.status == "available"
+            and report.activity is not None
+            and self.hours_store is not None
+        ):
+            self.hours_store.replace_activity(owner, account_id, report.activity)
         with self._lock:
             previous = self._accounts.get(key)
             if previous is not None and observed < float(previous.get("last_attempt_at") or 0):
@@ -401,6 +444,8 @@ class AgentQuotaService:
             record["last_attempt_at"] = observed
             record["last_attempt_status"] = report.status
             if report.status == "available":
+                if report.activity is not None and self.hours_store is not None:
+                    record["has_activity"] = True
                 if report.pinned_window is not None:
                     record["pinned_window"] = report.pinned_window
                 record["report"] = report.stored()
@@ -447,6 +492,12 @@ class AgentQuotaService:
     @staticmethod
     def _append_log(record: dict[str, Any], kind: str, at: float) -> None:
         entries = list(record.get("report_log") or [])
+        if (
+            not entries
+            or entries[-1]["kind"] != kind
+            or entries[-1]["at"] <= (record.get("read_at") or 0)
+        ):
+            _logger.warning("Usage source report: %s", kind)
         entries.append({"kind": kind, "at": at})
         record["report_log"] = entries[-200:]
 
@@ -480,14 +531,21 @@ class AgentQuotaService:
             self._dirty[(key[0], owner, self._account_key(account_id))] = record
 
     def delete_account(self, owner: str, account_id: str) -> bool:
+        with self._account_write_lock:
+            return self._delete_account(owner, account_id)
+
+    def _delete_account(self, owner: str, account_id: str) -> bool:
         if not self.usage_enabled:
             return False
         self._hydrate(owner)
         key = (current_workspace_id(), owner, account_id)
+        if self.hours_store is not None:
+            self.hours_store.delete_account(owner, account_id)
         with self._lock:
-            record = self._accounts.pop(key, None)
+            record = self._accounts.get(key)
             if record is None:
                 return False
+            self._accounts.pop(key)
             self._dirty[(key[0], owner, self._account_key(account_id))] = _DELETE
             product = record.get("product")
             if isinstance(product, str):
@@ -609,6 +667,7 @@ class AgentQuotaService:
         self,
         conversation: Conversation,
         *,
+        requester_id: str | None = None,
         agent_store: AgentStore | None = None,
         agent_cache: AgentCache | None = None,
     ) -> dict[str, Any]:
@@ -633,7 +692,7 @@ class AgentQuotaService:
                 _resolve_harness_impl(probe, agent_store=agent_store, agent_cache=agent_cache)
             )
             pools.append(pool_of(link, product))
-        return {
+        payload: dict[str, Any] = {
             "tiers": asdict(tiers),
             "agents": {
                 agent.key: asdict(quotas.get(agent.key, missing)) for agent in native_agents()
@@ -644,8 +703,18 @@ class AgentQuotaService:
                 "pools": list(dict.fromkeys(pools)),
             },
         }
+        if self.usage_enabled and requester_id == context.owner_id:
+            try:
+                issues = self.usage_issues(context.owner_id)
+                if issues:
+                    payload["usage_issues"] = issues
+            except Exception:
+                _logger.warning("Could not read usage issues", exc_info=True)
+        return payload
 
-    def overview(self, owner: str, *, now: float | None = None) -> UsageOverview:
+    def overview(
+        self, owner: str, *, now: float | None = None, include_marks: bool = True
+    ) -> UsageOverview:
         now = time.time() if now is None else now
         tiers, quotas = self._quotas(QuotaContext(owner, None), now=now, all_hosts=True)
         settings = read_collab_settings(self.preferences, owner)
@@ -685,6 +754,14 @@ class AgentQuotaService:
         from omnigent.harness_plugins import native_agents
 
         missing = AgentQuota("unknown", None, None, (), reason="no_report")
+        if include_marks and self.usage_enabled and self.hours_store is not None:
+            try:
+                projected = self.activity(owner, range_key="h24", now=now)
+                marks = {item["account"]: item["error_mark"] for item in projected["accounts"]}
+                for account in accounts:
+                    account.mark = marks.get(account.id)
+            except Exception:
+                _logger.warning("Could not read usage error marks", exc_info=True)
         return UsageOverview(
             generated_at=now,
             tiers=asdict(tiers),
@@ -693,6 +770,212 @@ class AgentQuotaService:
                 agent.key: asdict(quotas.get(agent.key, missing)) for agent in native_agents()
             },
         )
+
+    def _activity_meters(self, owner: str) -> dict[tuple[str, str], set[str | None]]:
+        from omnigent.runtime.instruction_layers import agent_key_for_harness
+        from omnigent.server.routes._sessions.helpers import (
+            _resolve_harness_impl,
+            _resolve_llm_model,
+        )
+        from omnigent.server.session_choice import ordered_links
+
+        settings = read_collab_settings(self.preferences, owner).session_choice
+        meters: dict[tuple[str, str], set[str | None]] = defaultdict(set)
+        for link in ordered_links(settings):
+            probe = Conversation(
+                id="", created_at=0, updated_at=0, root_conversation_id="", agent_id=link.agent_id
+            )
+            product = agent_key_for_harness(
+                _resolve_harness_impl(
+                    probe, agent_store=self.agent_store, agent_cache=self.agent_cache
+                )
+            )
+            model = link.model or _resolve_llm_model(
+                probe, agent_store=self.agent_store, agent_cache=self.agent_cache
+            )
+            if product is not None:
+                meters[(product, model or "")].add(link.meter)
+        return dict(meters)
+
+    def activity(
+        self,
+        owner: str,
+        *,
+        range_key: RangeKey = "d7",
+        tz: str = "UTC",
+        from_date: date | None = None,
+        to_date: date | None = None,
+        account: str | None = None,
+        include_models: bool = False,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        now = time.time() if now is None else now
+        zone = ZoneInfo(tz)
+        overview = self.overview(owner, now=now, include_marks=False)
+        views = {item.id: item for item in overview.accounts}
+        workspace = current_workspace_id()
+        with self._lock:
+            records = {
+                key[2]: deepcopy(record)
+                for key, record in self._accounts.items()
+                if key[:2] == (workspace, owner)
+            }
+            display_records = [
+                (key[2], key[3], deepcopy(record))
+                for key, record in self._display.items()
+                if key[:2] == (workspace, owner)
+            ]
+        # Native tiles may be hidden by a linked reading while still owning
+        # unclaimed model rows. Keep that remainder available to the board.
+        from omnigent.harness_plugins import native_agents
+
+        settings = read_collab_settings(self.preferences, owner)
+        tiers = QuotaTiers(
+            tight_below_pct=cast(float, overview.tiers["tight_below_pct"]),
+            low_below_pct=cast(float, overview.tiers["low_below_pct"]),
+            floor_pct=overview.tiers.get("floor_pct"),
+        )
+        for native in native_agents():
+            if native.key not in views:
+                views[native.key] = self._native_account(
+                    native.key,
+                    [item for item in display_records if item[1] == native.key],
+                    tiers,
+                    settings,
+                    now,
+                )
+        spans = {
+            key: range_spans(
+                range_key, now, zone, from_date=from_date, to_date=to_date, period=view.period
+            )
+            for key, view in views.items()
+        }
+        since = min(
+            [int((now - 86400) // 3600) * 3600, *(prev.counted_from for _, prev in spans.values())]
+        )
+        rows = self.hours_store.read(owner, since, int(now) + 1) if self.hours_store else []
+        projected = attributed_rows(rows, records, self._activity_meters(owner), list(views))
+        result = []
+        for key, view in views.items():
+            if account is not None and key != account:
+                continue
+            if key not in {item.id for item in overview.accounts} and key not in projected:
+                continue
+            current, previous = spans[key]
+            own_rows = projected.get(key, [])
+            amount = summarize(own_rows, current, zone)
+            before = summarize(own_rows, previous, zone)
+            selected = [
+                row for row in own_rows if current.counted_from <= row.hour_utc < current.until
+            ]
+            mark = error_mark(own_rows, now, view.freshness == "fresh", self.mark_settings)
+            item = {
+                "account": key,
+                **amount,
+                "error_mark": mark,
+                "previous": before if before["series"] else None,
+            }
+            if account is not None or include_models:
+                item["models"] = [
+                    {"model": model, **totals([row for row in selected if row.model == model])}
+                    for model in sorted({row.model for row in selected})
+                ]
+                item["hosts"] = [
+                    {"host_id": host, **totals([row for row in selected if row.host_id == host])}
+                    for host in sorted({row.host_id for row in selected})
+                ]
+            result.append(item)
+        return {"generated_at": now, "range": range_key, "tz": tz, "accounts": result}
+
+    def issues(
+        self, owner: str, *, now: float | None = None, **range_options: Any
+    ) -> dict[str, Any]:
+        now = time.time() if now is None else now
+        activity = self.activity(owner, now=now, **range_options)
+        failures = []
+        unpriced = []
+        sources = []
+        workspace = current_workspace_id()
+        with self._lock:
+            records = [
+                (key[2], deepcopy(record))
+                for key, record in self._accounts.items()
+                if key[:2] == (workspace, owner)
+            ]
+        amounts = {item["account"]: item for item in activity["accounts"]}
+        for account, item in amounts.items():
+            value = item["totals"]
+            if value["failed"]:
+                failures.append({"account": account, **value})
+            for model in item.get("models", []):
+                if model["unpriced"]:
+                    unpriced.append({"account": account, **model})
+        for account, record in records:
+            item = amounts.get(account)
+            if item is None:
+                continue
+            span = item["span"]
+            for entry in record.get("report_log") or []:
+                if span["counted_from"] <= entry["at"] < span["until"]:
+                    sources.append({"account": account, **entry})
+            read_at = record.get("read_at")
+            if (
+                read_at is not None
+                and now - read_at > 3600
+                and (span["until"] >= now or span["counted_from"] <= read_at < span["until"])
+            ):
+                sources.append({"account": account, "kind": "silent", "at": read_at})
+        return {"failures": failures, "unpriced_models": unpriced, "source_reports": sources}
+
+    def usage_issues(self, owner: str, *, now: float | None = None) -> list[dict[str, Any]]:
+        now = time.time() if now is None else now
+        recent = self.activity(owner, range_key="h24", now=now)
+        issues = []
+        for item in recent["accounts"]:
+            mark = item["error_mark"]
+            if mark is not None:
+                issues.append(
+                    {
+                        "account": item["account"],
+                        "level": mark["level"],
+                        "what": "failures",
+                        "last_at": item["totals"]["last_at"],
+                    }
+                )
+            if item["totals"]["unpriced"]:
+                issues.append(
+                    {
+                        "account": item["account"],
+                        "level": "notice",
+                        "what": "unpriced",
+                        "last_at": item["totals"]["last_at"],
+                    }
+                )
+        with self._lock:
+            for (workspace, user, account), record in self._accounts.items():
+                if (workspace, user) != (current_workspace_id(), owner):
+                    continue
+                last_at = record.get("read_at")
+                latest = (record.get("report_log") or [None])[-1]
+                if latest and latest["at"] > (last_at or 0):
+                    issues.append(
+                        {
+                            "account": account,
+                            "level": "notice",
+                            "what": latest["kind"],
+                            "last_at": latest["at"],
+                        }
+                    )
+                if last_at is not None and now - last_at > 3600:
+                    issues.append(
+                        {
+                            "account": account,
+                            "level": "notice",
+                            "what": "silent",
+                            "last_at": last_at,
+                        }
+                    )
+        return issues
 
     def pool_readings(
         self, context: QuotaContext, *, now: float | None = None
@@ -1040,6 +1323,7 @@ class AgentQuotaService:
                 "product",
                 "host_id",
                 "report_log",
+                "has_activity",
             ):
                 if field in stored:
                     merged[field] = deepcopy(stored[field])

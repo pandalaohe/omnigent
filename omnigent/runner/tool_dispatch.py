@@ -9717,8 +9717,14 @@ async def _agent_list_via_rest(
         },
     )
     choice = _string_object_dict(quotas.get("session_choice"))
+    issues = quotas.get("usage_issues")
+    extras: _JsonObject = {}
     if choice is not None:
-        return json.dumps({**json.loads(result), "session_choice": choice})
+        extras["session_choice"] = choice
+    if isinstance(issues, list) and issues:
+        extras["usage_issues"] = issues
+    if extras:
+        return json.dumps({**json.loads(result), **extras})
     return result
 
 

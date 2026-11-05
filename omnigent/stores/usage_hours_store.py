@@ -53,7 +53,6 @@ COUNTED_BASES = frozenset({"metered"})
 #: Bound for a pushed ``activity`` hour: a source clock can be wrong, and a
 #: future row would land in every "now" range.
 _ACTIVITY_MAX_AGE_S = 400 * 86_400
-_ACTIVITY_FUTURE_SKEW_S = 300
 
 
 @dataclass(frozen=True)
@@ -243,9 +242,7 @@ class UsageHoursStore:
         """
         now = now_epoch()
         bounded = [
-            row
-            for row in rows
-            if row.hour <= now + _ACTIVITY_FUTURE_SKEW_S and row.hour >= now - _ACTIVITY_MAX_AGE_S
+            row for row in rows if row.hour <= now and row.hour >= now - _ACTIVITY_MAX_AGE_S
         ]
         if not bounded:
             return
@@ -259,7 +256,7 @@ class UsageHoursStore:
                         SqlUsageHour.workspace_id == current_workspace_id(),
                         SqlUsageHour.owner_id == owner,
                         SqlUsageHour.account_id == account_id,
-                        SqlUsageHour.hour_utc == int(row.hour),
+                        SqlUsageHour.hour_utc == hours_of(row.hour),
                         SqlUsageHour.model == model,
                     )
                 )
@@ -269,7 +266,7 @@ class UsageHoursStore:
                     session,
                     owner,
                     account_id,
-                    int(row.hour),
+                    hours_of(row.hour),
                     model,
                     "",
                     row.cost_basis,
