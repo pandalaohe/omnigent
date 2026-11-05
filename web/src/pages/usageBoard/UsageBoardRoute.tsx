@@ -13,13 +13,15 @@ import { UsageAccountPage } from "./UsageAccountPage";
 import { UsageAccountSettingsPage } from "./UsageAccountSettingsPage";
 import { UsageBoardPage } from "./UsageBoardPage";
 import { UsageModelsPage } from "./UsageModelsPage";
+import { UsageCostPage } from "./UsageCostPage";
+import { UsageIssuesPage } from "./UsageIssuesPage";
 
 export const USAGE_BOARD_SETTINGS_PATH = "/settings/general#usage-settings";
 
 export function UsageBoardRoute({
   view = "board",
 }: {
-  view?: "board" | "account" | "account_settings" | "models";
+  view?: "board" | "account" | "account_settings" | "models" | "cost" | "issues";
 }) {
   const info = useServerInfo();
   const board = useUsageContextPreferences().board;
@@ -60,5 +62,7 @@ export function UsageBoardRoute({
   if (view === "account") return <UsageAccountPage />;
   if (view === "account_settings") return <UsageAccountSettingsPage />;
   if (view === "models") return <UsageModelsPage />;
+  if (view === "cost") return <UsageCostPage />;
+  if (view === "issues") return <UsageIssuesPage />;
   return <UsageBoardPage />;
 }

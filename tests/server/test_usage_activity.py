@@ -202,9 +202,32 @@ def test_marks_coverage_and_hour_boundaries():
     assert value["totals"]["tokens"] == 200
     assert value["totals"]["per_million"] == 10000
     assert value["totals"]["cost_coverage_pct"] == 25
+    assert value["totals"]["covered_tokens"] == 100
+    assert value["totals"]["covered_cost_usd"] == 1
     assert value["mark"] == "≥"
     assert summarize([row(basis="subscription")], span, ZoneInfo("UTC"))["mark"] == "~"
     assert summarize([row()], span, ZoneInfo("UTC"))["mark"] == "≈"
+
+
+def test_metered_projection_keeps_coverage_and_estimates_separate():
+    rows = [
+        row(total_tokens=1000, cost_usd=2),
+        row(basis="subscription", total_tokens=9000, cost_usd=90),
+        row(total_tokens=0, cost_usd=3),
+        row(total_tokens=500, cost_usd=0, priced=False),
+    ]
+    result = summarize(rows, Span.starting(HOUR, NOW), ZoneInfo("UTC"))
+    assert result["mark"] == "~"
+    assert result["totals"]["cost_usd"] == 95
+    metered = result["totals"]["metered"]
+    assert metered["cost_usd"] == 5
+    assert metered["covered_cost_usd"] == 2
+    assert metered["covered_tokens"] == 1000
+    assert metered["per_million"] == 2000
+    assert metered["cost_coverage_pct"] == 40
+    assert metered["tokens"] == 1500
+    assert metered["unpriced"] == 1
+    assert result["series"][0]["metered"] == metered
 
 
 @pytest.mark.parametrize("failed,level", [(1, "notice"), (4, "serious"), (10, "down"), (0, None)])

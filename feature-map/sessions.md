@@ -152,6 +152,11 @@ the header menu), and each place is a separate entry point.
 - `canvas-navigation`: Canvas uses the same collapsed-sidebar button and hover
   preview as other pages, including the macOS titlebar controls. Opening it
   reveals the shared destinations, including Usage when enabled.
+- `usage_board`: when enabled in Settings, the Usage board summary opens Cost;
+  a tile opens its account. One remembered range and Money/Tokens measure drive
+  amounts, Previous, the chart and By model. Account and global Issues are
+  reached through the failure row or Settings; the tile's error triangle opens
+  its last-24-hour card without navigating. Hidden accounts leave the total.
 - `canvas-create`: the plus button on Main or a project opens the new-session
   composer; sending returns to that board with the new session selected.
 - `canvas-session-health`: an opened Canvas session receives host health and
@@ -964,6 +969,17 @@ plain `uv run pytest`, which starts a private server for the test.
   native title bar at 14px/16px host roots and 80%, 100%, 110%, and 125% page zoom.
   `web/src/shell/ChatHeader.test.tsx` checks the shared toggle's desktop/mobile
   icons, peek cancellation, and hover/keyboard tooltip behavior.
+- **`usage_board` (amounts, ranges, errors and navigation):**
+  `web/src/pages/usageBoard/usageAmounts.test.tsx` checks weighted coverage,
+  metered money versus subscription tokens, aligned Previous buckets, hidden
+  accounts, summary-to-Cost and failure-row-to-Issues navigation, stale error
+  suppression and read failures. `web/src/pages/usageBoard/usagePriceSource.test.tsx`
+  checks Custom dates and shared model ranges. `tests/server/test_usage_activity.py`
+  covers owner isolation, attribution, UTC-hour cutoffs and server error levels.
+  In the enabled board, compare Money and Tokens, select a range, open Cost and
+  an account, then its Issues row. At phone width a tile or summary tap opens
+  detail; the dedicated triangle stays on the board and opens its data card.
+  Native accounts without reported request/failure counts have no failure row.
 - **`canvas-create` (Main/project plus button, desktop/mobile):**
   `tests/e2e_ui/sessions/test_canvas_creation.py::test_canvas_plus_creates_session_on_the_selected_board`.
   The composer uses a fixture host; session creation, binding to the isolated

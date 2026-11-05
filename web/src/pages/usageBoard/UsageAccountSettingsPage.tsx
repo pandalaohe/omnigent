@@ -119,6 +119,30 @@ export function UsageAccountSettingsPage() {
                 update({ renewals });
               }}
             />
+            <label className="flex min-h-12 flex-wrap items-center gap-2 border-t border-border py-2 text-sm">
+              Monthly fee
+              <span className="ml-auto text-xs text-muted-foreground">USD</span>
+              <Input
+                type="number"
+                aria-label="Monthly fee"
+                className="h-8 w-24"
+                min={0}
+                max={1e9}
+                step="0.01"
+                placeholder="None"
+                value={board.fees?.[account.id] ?? ""}
+                onChange={(event) => {
+                  const fees = { ...board.fees };
+                  if (event.target.value === "") Reflect.deleteProperty(fees, account.id);
+                  else {
+                    const fee = Number(event.target.value);
+                    if (!Number.isFinite(fee) || fee < 0 || fee > 1e9) return;
+                    fees[account.id] = fee;
+                  }
+                  update({ fees });
+                }}
+              />
+            </label>
             {account.kind === "account" ? (
               <div className="flex min-h-[46px] flex-wrap items-center justify-between gap-2 border-t border-border py-2">
                 <span />

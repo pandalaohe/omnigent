@@ -738,6 +738,7 @@ describe("usage/context preferences", () => {
         ],
         windows: { codex: "5h", broken: 7 as unknown as string },
         renewals: { codex: 1_800_000_000_000, nope: -1 },
+        fees: { codex: 200, free: 0, invalid: -1, infinite: Infinity },
         hidden: ["grok"],
       },
     });
@@ -749,6 +750,7 @@ describe("usage/context preferences", () => {
     ]);
     expect(board.windows).toEqual({ codex: "5h" });
     expect(board.renewals).toEqual({ codex: 1_800_000_000_000 });
+    expect(board.fees).toEqual({ codex: 200, free: 0 });
     expect(board.hidden).toEqual(["grok"]);
   });
 
@@ -767,6 +769,12 @@ describe("usage/context preferences", () => {
     expect(isDefaultUsageBoardPreferences(DEFAULT_USAGE_CONTEXT_PREFERENCES.board)).toBe(true);
     expect(
       isDefaultUsageBoardPreferences({ ...DEFAULT_USAGE_CONTEXT_PREFERENCES.board, enabled: true }),
+    ).toBe(false);
+    expect(
+      isDefaultUsageBoardPreferences({
+        ...DEFAULT_USAGE_CONTEXT_PREFERENCES.board,
+        fees: { codex: 200 },
+      }),
     ).toBe(false);
   });
 

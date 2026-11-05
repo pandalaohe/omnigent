@@ -30,6 +30,8 @@ import { UsageBoardFrame } from "./UsageBoardFrame";
 import { boardBands, moveTile, seedBands } from "./usageBoardLayout";
 import { UsageTile } from "./UsageTile";
 import { useUsageOverview, type UsageAccountView } from "./usageBoardData";
+import { useUsageActivity } from "./usageActivityData";
+import { UsageSummary } from "./UsageAmounts";
 
 /** The renewal a tile counts down to: the provider's date wins over the user's. */
 export function renewalOf(
@@ -46,6 +48,10 @@ export function UsageBoardPage() {
   const preferences = useUsageContextPreferences();
   const board = preferences.board;
   const overview = useUsageOverview(info !== "loading" && info.usage_board_enabled === true);
+  const activity = useUsageActivity(
+    undefined,
+    info !== "loading" && info.usage_board_enabled === true,
+  );
   const navigate = useNavigate();
   const [arranging, setArranging] = useState(false);
   const accounts = overview.data?.accounts ?? [];
@@ -104,7 +110,7 @@ export function UsageBoardPage() {
     <UsageBoardFrame
       title="Usage board"
       loading={overview.isPending}
-      error={overview.error}
+      error={overview.error ?? activity.error}
       actions={
         arranging ? (
           <>
@@ -156,6 +162,17 @@ export function UsageBoardPage() {
         )
       }
     >
+      {!arranging ? (
+        <UsageSummary
+          accounts={
+            activity.data?.accounts.filter(
+              (item) =>
+                accounts.some((account) => account.id === item.account) &&
+                !board.hidden.includes(item.account),
+            ) ?? []
+          }
+        />
+      ) : null}
       {!arranging && total === 0 ? (
         <EmptyBoard />
       ) : (
@@ -260,6 +277,8 @@ export function UsageBoardPage() {
                             />
                           )
                         }
+                        amount={activity.data?.accounts.find((item) => item.account === account.id)}
+                        tokens={board.unit === "tokens"}
                         onOpen={() => navigate(`/usage/board/${encodeURIComponent(account.id)}`)}
                         onMove={(direction) => nudgeTile(account.id, direction)}
                       />
