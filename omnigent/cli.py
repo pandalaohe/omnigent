@@ -10658,12 +10658,13 @@ def _windows_process_ancestor_pids(
         parent = by_pid.get(current.ppid)
         if parent is None:
             break
-        if _normalize_windows_fs_path(parent.exe) == _normalize_windows_fs_path(
-            cli_bin_path
-        ) and _windows_path_holds_tool_venv(
+        # Windows venv Python can be a launcher between omni.exe and the CLI.
+        if _windows_path_holds_tool_venv(
             parent, tool_venv_path=tool_venv_path, cli_bin_path=cli_bin_path
         ):
             ancestors.add(parent.pid)
+        if _normalize_windows_fs_path(parent.exe) == _normalize_windows_fs_path(cli_bin_path):
+            break
         current = parent
     return ancestors
 
