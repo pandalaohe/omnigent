@@ -10,10 +10,10 @@
 // Two render states, for every session shape (SDK and native alike):
 // the AGENT's terminal (the SDK REPL or the native vendor pane)
 // renders chrome-free, and a rail-opened user shell renders with a
-// single header row (identity + close X). There is no tab strip here —
+// single header row (identity + Back to chat). There is no tab strip here —
 // shells are opened and created from the rail's tab strip ("+" menu).
 
-import { Loader2Icon, TerminalIcon, XIcon } from "lucide-react";
+import { Loader2Icon, TerminalIcon } from "lucide-react";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -367,7 +367,7 @@ export function MainTerminalView({
         ) : (
           <>
             {isShellView && activeTerminal && (
-              // Shell header — identity + close, nothing else.
+              // Returning to chat leaves the shell running.
               <div className="flex shrink-0 items-center gap-1.5 border-b border-border px-2 pt-1 pb-2">
                 <span className="flex items-center gap-1.5 rounded-sm bg-muted px-2 py-1 text-foreground text-sm">
                   <TerminalIcon className="size-3 shrink-0" />
@@ -382,11 +382,11 @@ export function MainTerminalView({
                 <span className="flex-1" />
                 <button
                   type="button"
-                  aria-label="Close shell"
+                  aria-label="Back to chat"
                   onClick={() => terminalFirstCtx?.setView("chat")}
-                  className="cursor-pointer rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                  className="min-h-11 cursor-pointer rounded px-3 text-ui text-muted-foreground hover:bg-muted hover:text-foreground"
                 >
-                  <XIcon className="size-3.5" />
+                  Back to chat
                 </button>
               </div>
             )}

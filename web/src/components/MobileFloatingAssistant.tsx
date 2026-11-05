@@ -376,7 +376,7 @@ export function MobileFloatingAssistant() {
   const buttons: WheelItem[] =
     count > 0
       ? preferences.terminalButtons.slice(0, MOBILE_ASSISTANT_MAX_BUTTONS)
-      : visibleChatButtons(preferences);
+      : visibleChatButtons(preferences).slice(0, MOBILE_ASSISTANT_MAX_BUTTONS);
   const circle = layoutMobileAssistantCircle(buttons.length, center, viewport);
   const displayCenter = open ? circle.center : center;
   const actionPositions = circle.actions;

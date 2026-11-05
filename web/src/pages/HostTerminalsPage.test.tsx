@@ -51,13 +51,19 @@ function terminal(id: string, elevated = false): HostTerminal {
   };
 }
 
-function mount() {
+function mount(returnTo?: string) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const view = render(
     <QueryClientProvider client={client}>
-      <MemoryRouter initialEntries={["/hosts/host-a/terminals"]}>
+      <MemoryRouter
+        initialEntries={[
+          { pathname: "/hosts/host-a/terminals", state: returnTo ? { returnTo } : null },
+        ]}
+      >
         <Routes>
           <Route path="/hosts/:hostId/terminals" element={<HostTerminalsPage />} />
+          <Route path="/settings/shortcuts" element={<p>Returned to settings</p>} />
+          <Route path="/c/session-a" element={<p>Returned to session</p>} />
         </Routes>
       </MemoryRouter>
     </QueryClientProvider>,
@@ -87,6 +93,17 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("host terminal page", () => {
+  it.each([
+    ["/settings/shortcuts", "Returned to settings"],
+    ["/c/session-a", "Returned to session"],
+  ])("returns to the Terminals entry's source %s", async (returnTo, expected) => {
+    vi.mocked(authenticatedFetch).mockResolvedValue(Response.json({ terminals: [] }));
+    const view = mount(returnTo);
+    await screen.findByText(/No open terminals/);
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    expect(screen.getByText(expected)).toBeVisible();
+    view.dispose();
+  });
   it.each([401, 403])(
     "does not attach terminals when the server denies access: %s",
     async (status) => {

@@ -83,7 +83,7 @@ afterEach(() => {
 });
 
 describe("NewTerminalButton access gate", () => {
-  it("keeps the phone header's root creation callback after its menu closes", async () => {
+  it("keeps the shell picker's admin creation callback after its menu closes", async () => {
     elevated.allowed = true;
     fetchMock.mockImplementation(async (_url, init) =>
       mockResponse(
@@ -115,7 +115,7 @@ describe("NewTerminalButton access gate", () => {
       </QueryClientProvider>,
     );
     fireEvent.pointerDown(screen.getByRole("button", { name: "Session menu" }), { button: 0 });
-    fireEvent.click(await screen.findByRole("menuitem", { name: "Admin" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "New admin shell" }));
     await waitFor(() => expect(created).toHaveBeenCalledWith("terminal:terminal_root"));
     expect(screen.queryByRole("menu")).toBeNull();
     client.clear();
@@ -143,7 +143,7 @@ describe("NewTerminalButton access gate", () => {
     renderButton(created);
     await screen.findByRole("button", { name: "Choose shell" });
     fireEvent.pointerDown(screen.getByRole("button", { name: "Choose shell" }), { button: 0 });
-    fireEvent.click(screen.getByRole("menuitem", { name: "Admin" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "New admin shell" }));
     await waitFor(() => expect(created).toHaveBeenCalledWith("terminal:terminal_root"));
     const post = fetchMock.mock.calls.find(([, init]) => init?.method === "POST");
     expect(JSON.parse(post?.[1].body)).toMatchObject({ terminal: "shell", elevated: true });
@@ -256,6 +256,15 @@ function launchedTerminal(): string {
 }
 
 describe("NewTerminalButton native shell picker", () => {
+  it("keeps admin creation absent when its capability is off", async () => {
+    mockAgentAndCreate(["zsh", "bash"]);
+    renderButton(vi.fn(), "row", true);
+    fireEvent.pointerDown(await screen.findByRole("button", { name: "Choose shell" }), {
+      button: 0,
+    });
+    expect(screen.getByRole("menuitem", { name: "zsh (default)" })).toBeVisible();
+    expect(screen.queryByRole("menuitem", { name: "New admin shell" })).toBeNull();
+  });
   it("split button launches the default shell (declared[0]) on primary click", async () => {
     // Native wrapper declares the host's installed shells, $SHELL first.
     mockAgentAndCreate(["zsh", "bash", "fish"]);

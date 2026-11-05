@@ -57,6 +57,13 @@ function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): 
 const fetchMock = vi.fn();
 
 describe("terminalInfoFromResource", () => {
+  it.each(["user", "agent", "harness", undefined, "unknown"])(
+    "copies only recognized origin %s",
+    (origin) => {
+      const info = terminalInfoFromResource({ id: "terminal_shell", metadata: { origin } });
+      expect(info?.origin).toBe(origin === "unknown" ? undefined : origin);
+    },
+  );
   it("keeps root identity, denies missing agent consent and strips direct attach", () => {
     const info = terminalInfoFromResource({
       id: "root-a",

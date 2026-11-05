@@ -143,9 +143,7 @@ export function NewTerminalButton({
         </DropdownMenuItem>
       ))}
       {canCreateElevated && (
-        <DropdownMenuItem className="max-md:min-h-11" onSelect={() => launch(declared[0], true)}>
-          Admin
-        </DropdownMenuItem>
+        <NewAdminTerminalMenuItem conversationId={conversationId} onCreated={onCreated} />
       )}
     </DropdownMenuContent>
   );
@@ -191,7 +189,7 @@ export function NewTerminalButton({
   );
 }
 
-/** Direct mobile header action; the drawer also retains its existing shell picker. */
+/** Admin creation lives in the shell picker and retains its capability gate. */
 export function NewAdminTerminalMenuItem({
   conversationId,
   onCreated,
@@ -216,7 +214,7 @@ export function NewAdminTerminalMenuItem({
           .catch((error: Error) => showToast(`Couldn't open an admin terminal: ${error.message}`));
       }}
     >
-      Admin{create.isError && <span role="alert">{create.error.message}</span>}
+      New admin shell{create.isError && <span role="alert">{create.error.message}</span>}
     </DropdownMenuItem>
   );
 }

@@ -587,7 +587,7 @@ describe("MobileFloatingAssistant", () => {
     expect(screen.queryByRole("button", { name: "Esc" })).toBeNull();
   });
 
-  it("gives every chat default a real effect through its existing consumer", async () => {
+  it("gives approval and navigation defaults real effects through their existing consumers", async () => {
     const before = useChatStore.getState();
     const submitApproval = vi.fn().mockResolvedValue(undefined);
     const onArchive = vi.fn().mockResolvedValue(undefined);
@@ -626,6 +626,8 @@ describe("MobileFloatingAssistant", () => {
       render(<Consumers />);
       fireEvent.click(screen.getByRole("button", { name: "Open floating assistant" }));
       expect(readMobileAssistantPreferences().buttons.map((button) => button.label)).toEqual([
+        "Terminals",
+        "Stop",
         "Approve",
         "Poll",
         "Previous",

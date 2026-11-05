@@ -604,6 +604,7 @@ describe("user preference synchronization", () => {
   it("syncs both mobile key sets and row switches while keeping placement local", async () => {
     const value = {
       version: 2,
+      chatActionsRevision: 1,
       enabled: true,
       buttons: [],
       terminalButtons: [{ id: "ctrl", label: "Ctrl", kind: "modifier", modifier: "ctrl" }],

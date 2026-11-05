@@ -239,7 +239,7 @@ describe("MainTerminalView — terminal-first SDK sessions", () => {
 
     // The close X is the way back to chat (the Chat/Terminal pill is
     // hidden in shell view — ConnectionIndicator gates on isShellView).
-    fireEvent.click(screen.getByRole("button", { name: "Close shell" }));
+    fireEvent.click(screen.getByRole("button", { name: "Back to chat" }));
     expect(setView).toHaveBeenCalledWith("chat");
   });
 
@@ -535,7 +535,7 @@ describe("MainTerminalView — native wrapper sessions", () => {
       "terminal_bash_s1",
     );
     expect(screen.queryByText("claude")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Close shell" }));
+    fireEvent.click(screen.getByRole("button", { name: "Back to chat" }));
     expect(setView).toHaveBeenCalledWith("chat");
   });
 });
@@ -602,7 +602,7 @@ describe("MainTerminalView — persistent hidden mount", () => {
       "terminal_tui_main",
     );
     // No shell header: the pane is the agent's, not a phantom shell.
-    expect(screen.queryByRole("button", { name: "Close shell" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Back to chat" })).toBeNull();
   });
 
   it("resets a shell selection to the agent terminal while hidden", () => {

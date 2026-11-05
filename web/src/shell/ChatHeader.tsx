@@ -51,7 +51,6 @@ import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { TAB_BADGE_BASE } from "./railTabs";
 import { TerminalSplitControls } from "./TerminalSplitControls";
-import { NewAdminTerminalMenuItem } from "./NewTerminalButton";
 import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
 import { SidebarOpenButton } from "./SidebarOpenButton";
 import { ReceiveAnnotationsButton } from "@/components/ReceiveAnnotationsButton";
@@ -108,7 +107,6 @@ interface MobileSessionMenuProps {
   onOpenArchive: () => void;
   /** Open the mobile shells drawer. */
   onOpenShells: () => void;
-  onCreatedTerminal?: (key: string) => void;
   /** Open the mobile agents drawer. */
   onOpenSubagents: () => void;
   /** True while the mobile Pull Requests drawer is open. */
@@ -488,12 +486,6 @@ export function ChatHeader({
             visible when a real shell exists, or when the agent spec
             declares shell access so the empty-state "+ New shell"
             affordance is reachable on mobile too. */}
-        {!mobileMenu.hideTerminalsTab && mobileMenu.showShellsTab && (
-          <NewAdminTerminalMenuItem
-            conversationId={conversationId}
-            onCreated={mobileMenu.onCreatedTerminal}
-          />
-        )}
         {!mobileMenu.hideTerminalsTab && mobileMenu.showShellsTab && (
           <DropdownMenuItem
             onSelect={mobileMenu.onOpenShells}

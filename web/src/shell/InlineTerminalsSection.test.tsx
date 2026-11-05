@@ -12,6 +12,7 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   // network-backed hook is replaced.
   ...(await importOriginal<typeof UseTerminalsModule>()),
   useTerminals: vi.fn(),
+  useDeleteTerminal: () => close,
 }));
 
 // The "+ New shell" button needs a QueryClient (reads the session agent for
@@ -24,6 +25,13 @@ vi.mock("./NewTerminalButton", () => ({
 }));
 
 const useTerminalsMock = vi.mocked(useTerminals);
+const close = vi.hoisted(() => ({
+  mutate: vi.fn(),
+  reset: vi.fn(),
+  isPending: false,
+  isError: false,
+  error: null as Error | null,
+}));
 
 function makeTerminal(id: string, name: string, session: string): TerminalInfo {
   return {
@@ -73,6 +81,9 @@ function renderInlineSection(
 
 beforeEach(() => {
   useTerminalsMock.mockReset();
+  close.isError = false;
+  close.error = null;
+  close.mutate.mockReset();
 });
 
 afterEach(() => {
@@ -81,6 +92,48 @@ afterEach(() => {
 });
 
 describe("InlineTerminalsSection rows open shells in the main view", () => {
+  it("keeps a failed close visible with its error and allows a retry", () => {
+    const terminal = makeTerminal("terminal_bash_s1", "bash", "s1");
+    const view = renderInlineSection([terminal]);
+    fireEvent.click(screen.getByRole("button", { name: "Close bash · s1" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close shell" }));
+    close.isError = true;
+    close.error = new Error("terminal delete failed: 503 Service Unavailable");
+    view.rerender(
+      <TerminalFirstContextProvider value={TERMINAL_FIRST_SDK_CTX}>
+        <InlineTerminalsSection conversationId="conv_terminal" onExpand={vi.fn()} />
+      </TerminalFirstContextProvider>,
+    );
+    expect(screen.getByRole("dialog", { name: "Close bash · s1?" })).toBeVisible();
+    expect(screen.getByRole("alert")).toHaveTextContent("503 Service Unavailable");
+    expect(
+      screen.getByRole("button", { name: "Open bash · s1", hidden: true }),
+    ).toBeInTheDocument();
+    close.mutate.mockImplementation((_id, options) => options.onSuccess());
+    fireEvent.click(screen.getByRole("button", { name: "Close shell" }));
+    expect(close.mutate).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+  it("labels known origins and closes only after confirmation; cancel leaves the shell intact", () => {
+    renderInlineSection([
+      { ...makeTerminal("terminal_bash_s1", "bash", "s1"), origin: "user" },
+      { ...makeTerminal("terminal_worker_s2", "worker", "s2"), origin: "agent" },
+      makeTerminal("terminal_old_s3", "old", "s3"),
+    ]);
+    expect(screen.getByText("Opened by you")).toBeVisible();
+    expect(screen.getByText("Opened by the agent")).toBeVisible();
+    expect(screen.getAllByText(/^Opened by/)).toHaveLength(2);
+    fireEvent.click(screen.getByRole("button", { name: "Close bash · s1" }));
+    expect(close.mutate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(close.mutate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Close bash · s1" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close shell" }));
+    expect(close.mutate).toHaveBeenCalledWith(
+      "terminal_bash_s1",
+      expect.objectContaining({ onSuccess: expect.any(Function) }),
+    );
+  });
   it("clicking a shell row hands its key to onExpand instead of mounting an in-rail xterm", () => {
     const onExpand = vi.fn();
     renderInlineSection(
@@ -91,7 +144,7 @@ describe("InlineTerminalsSection rows open shells in the main view", () => {
       onExpand,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: /s1/ }));
+    fireEvent.click(screen.getByRole("button", { name: /^Open .*s1/ }));
 
     // The shell must take over the MAIN view via onExpand — the rail
     // never mounts an xterm of its own. A missing call means rows went
@@ -106,8 +159,8 @@ describe("InlineTerminalsSection rows open shells in the main view", () => {
       makeTerminal("terminal_worker_s2", "worker", "s2"),
     ]);
 
-    expect(screen.getByRole("button", { name: /s1/ })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /s2/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^Open .*s1/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^Open .*s2/ })).toBeInTheDocument();
     expect(screen.queryByTestId("terminal-view")).toBeNull();
   });
 
@@ -120,7 +173,7 @@ describe("InlineTerminalsSection rows open shells in the main view", () => {
     // The REPL backs the Chat/Terminal pill — a row for it here is the
     // phantom "main" terminal regression.
     expect(screen.queryByText("main")).toBeNull();
-    expect(screen.getByRole("button", { name: /s1/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^Open .*s1/ })).toBeInTheDocument();
   });
 
   it("renders an empty list (no new-shell row) when the only terminal is the embedded REPL", () => {
@@ -141,7 +194,7 @@ describe("InlineTerminalsSection rows open shells in the main view", () => {
     const row = screen.getByTestId("new-shell-button");
     expect(row).toHaveAttribute("data-variant", "row");
     // Leading — it sits before the shell rows so it stays at a fixed spot.
-    const shellRow = screen.getByRole("button", { name: /s1/ });
+    const shellRow = screen.getByRole("button", { name: /^Open .*s1/ });
     expect(row.compareDocumentPosition(shellRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 });

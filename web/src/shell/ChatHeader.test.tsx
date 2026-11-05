@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
@@ -12,6 +12,7 @@ import type * as NativeBridgeModule from "@/lib/nativeBridge";
 import { setOmnigentHostConfig } from "@/lib/host";
 import type { SessionStartupHold, Session } from "@/lib/types";
 import { writeShortcutPreference } from "@/lib/keyboardShortcutPreferences";
+import { dispatchMobileAssistantButton } from "@/lib/mobileAssistantPreferences";
 import type { ChildSessionLike } from "./subagentRailGroups";
 import * as sessionsApi from "@/lib/sessionsApi";
 import { ChatHeader } from "./ChatHeader";
@@ -976,6 +977,42 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     labels: {},
     permission_level: 3,
   };
+
+  it("renames from a phone action through the header menu's real dialog and mutation", async () => {
+    isMobileMock.mockReturnValue(true);
+    isIOSShellMock.mockReturnValue(true);
+    const fetch = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(
+        async () => new Response(JSON.stringify({ ...conversation, title: "Phone planning" })),
+      );
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: conversation,
+    });
+    expect(screen.queryByRole("textbox", { name: "Session name" })).toBeNull();
+    act(() =>
+      dispatchMobileAssistantButton({
+        id: "rename",
+        label: "Rename",
+        binding: { kind: "shortcut", actionId: "renameSession" },
+      }),
+    );
+    const dialog = screen.getByRole("dialog", { name: "Rename session" });
+    fireEvent.change(within(dialog).getByRole("textbox"), { target: { value: "Phone planning" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Rename" }));
+    await waitFor(() =>
+      expect(fetch).toHaveBeenCalledWith(
+        expect.stringContaining("/v1/sessions/conv-1"),
+        expect.objectContaining({
+          method: "PATCH",
+          body: JSON.stringify({ title: "Phone planning" }),
+        }),
+      ),
+    );
+  });
 
   it.each([
     { name: "landing", actionConversation: null },

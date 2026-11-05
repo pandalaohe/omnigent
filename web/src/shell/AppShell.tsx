@@ -43,7 +43,7 @@ import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
-import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
+import { derivePermissionLevel, isOwnerLevel, isEditorLevel } from "@/lib/permissionsApi";
 import {
   isAndroidShell,
   isElectronShell,
@@ -162,6 +162,12 @@ import { PermissionsModal } from "@/components/PermissionsModal";
 import { PeerHeldPanel } from "@/components/PeerHeldPanel";
 import { KeyboardShortcutsDialog } from "@/components/KeyboardShortcutsDialog";
 import { MobileFloatingAssistant } from "@/components/MobileFloatingAssistant";
+import {
+  MOBILE_ASSISTANT_ACTION_EVENT,
+  type MobileAssistantDirectAction,
+} from "@/lib/mobileAssistantPreferences";
+import { computeIsTurnActive } from "@/components/chat/chatBubbleParts";
+import { TerminalsSheet } from "./TerminalsSheet";
 import { ImportReviewGate } from "@/components/onboarding/HostImportReview";
 import { CommandPalette } from "./CommandPalette";
 import { RecentSessionsSwitcher } from "./RecentSessionsSwitcher";
@@ -556,6 +562,7 @@ function AppShellImpl() {
   // on a phone they open as full-screen overlays from the session-menu FAB.
   const [subagentsPanelOpen, setSubagentsPanelOpen] = useState(false);
   const [shellsPanelOpen, setShellsPanelOpen] = useState(false);
+  const [terminalsSheetOpen, setTerminalsSheetOpen] = useState(false);
   const [githubPanelOpen, setGithubPanelOpen] = useState(false);
   const [sideChatsPanelOpen, setSideChatsPanelOpen] = useState(false);
   // The right "Workspace" rail (WorkspacePanel) remembers its open/closed
@@ -2118,17 +2125,20 @@ function AppShellImpl() {
   // drawer even when this harness can't start side chats.
   const [hasSubagentTabs, setHasSubagentTabs] = useState(false);
 
-  function openTerminalsPanel(key: string) {
-    setSelectedFilePath(null); // close file viewer
-    clearFileViewerUrl();
-    setExecutionLogsKey(null); // close execution-logs panel
-    setFilesPanelOpen(false); // close files drawer
-    setArchivePanelOpen(false); // close mobile archive drawer
-    setSubagentsPanelOpen(false); // close mobile agents drawer
-    setShellsPanelOpen(false); // close mobile shells drawer
-    setGithubPanelOpen(false); // close mobile github drawer
-    setPanelInitialKey(key);
-  }
+  const openTerminalsPanel = useCallback(
+    (key: string) => {
+      setSelectedFilePath(null); // close file viewer
+      clearFileViewerUrl();
+      setExecutionLogsKey(null); // close execution-logs panel
+      setFilesPanelOpen(false); // close files drawer
+      setArchivePanelOpen(false); // close mobile archive drawer
+      setSubagentsPanelOpen(false); // close mobile agents drawer
+      setShellsPanelOpen(false); // close mobile shells drawer
+      setGithubPanelOpen(false); // close mobile github drawer
+      setPanelInitialKey(key);
+    },
+    [clearFileViewerUrl, setPanelInitialKey],
+  );
 
   // Open a shell as a tab in the desktop workspace rail (the mobile path
   // still uses ``openTerminalsPanel`` → full-screen drawer). Adds the key to
@@ -2176,7 +2186,11 @@ function AppShellImpl() {
     if (name === null) return;
     markShellCreateStarted();
     createTerminal.mutate(name, {
-      onSuccess: (info) => openTerminalTab(terminalTabKey(info)),
+      onSuccess: (info) => {
+        const key = terminalTabKey(info);
+        if (isMobileViewport()) openTerminalsPanel(key);
+        else openTerminalTab(key);
+      },
       onError: () => clearShellCreatePending(),
     });
   }, [
@@ -2185,6 +2199,7 @@ function AppShellImpl() {
     markShellCreateStarted,
     clearShellCreatePending,
     openTerminalTab,
+    openTerminalsPanel,
   ]);
   useNewShellHotkey(launchDefaultShell, shellLaunchable);
 
@@ -2292,7 +2307,6 @@ function AppShellImpl() {
   function openShellsPanel() {
     setSelectedFilePath(null); // close file viewer
     clearFileViewerUrl();
-    setPanelInitialKey(null); // close terminals panel / terminal-first view
     setExecutionLogsKey(null); // close execution-logs panel
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
@@ -2357,6 +2371,41 @@ function AppShellImpl() {
     handleRightRailTabChange(tab);
     revealRightPanel();
   }
+
+  const mobileActionRef = useRef<(action: MobileAssistantDirectAction) => void>(() => {});
+  mobileActionRef.current = (action) => {
+    if (action === "openTerminals") {
+      setTerminalsSheetOpen(true);
+      return;
+    }
+    if (!conversationId) return;
+    if (action === "openFiles" && showFilesPanel) handleWorkspaceTabShortcut("files");
+    else if (action === "openChanges" && showFilesPanel) handleWorkspaceTabShortcut("changes");
+    else if (action === "openAgents") handleWorkspaceTabShortcut("subagents");
+    else if (action === "openSideChats" && showSideChats) openSideChatsPanel();
+    else if (action === "stopResponse" && isEditorLevel(permissionLevel)) {
+      const chat = useChatStore.getState();
+      if (
+        chat.conversationId === conversationId &&
+        (computeIsTurnActive(chat.sessionStatus, chat.status === "streaming") ||
+          chat.pendingUserMessages.some((message) => message.initialDraft))
+      ) {
+        void chat
+          .stop()
+          .catch((error: unknown) =>
+            toast.error(error instanceof Error ? error.message : "Couldn't stop the response."),
+          );
+      }
+    }
+  };
+  useEffect(() => {
+    const onAction = (event: Event) =>
+      mobileActionRef.current(
+        (event as CustomEvent<{ actionId: MobileAssistantDirectAction }>).detail.actionId,
+      );
+    window.addEventListener(MOBILE_ASSISTANT_ACTION_EVENT, onAction);
+    return () => window.removeEventListener(MOBILE_ASSISTANT_ACTION_EVENT, onAction);
+  }, []);
 
   function openArchivePanel() {
     setSelectedFilePath(null);
@@ -2802,7 +2851,6 @@ function AppShellImpl() {
                       onOpenChanges: openChangesPanel,
                       onOpenArchive: openArchivePanel,
                       onOpenShells: openShellsPanel,
-                      onCreatedTerminal: openTerminalsPanel,
                       onOpenSubagents: openSubagentsPanel,
                       onOpenGithub: openGithubPanel,
                       onOpenSideChats: openSideChatsPanel,
@@ -2994,6 +3042,7 @@ function AppShellImpl() {
                   <InlineTerminalsSection
                     conversationId={conversationId}
                     onExpand={openTerminalsPanel}
+                    canClose={isEditorLevel(permissionLevel)}
                     // Mobile has no tab strip "+" menu, so the drawer carries
                     // the "+ New shell" create row.
                     showNewShell
@@ -3097,6 +3146,12 @@ function AppShellImpl() {
               ⌘/Ctrl+/ opener); ungated so it works on every route. */}
           <KeyboardShortcutsDialog />
           <MobileFloatingAssistant />
+          <TerminalsSheet
+            open={terminalsSheetOpen}
+            onOpenChange={setTerminalsSheetOpen}
+            conversationId={conversationId}
+            onSelectTerminal={openTerminalsPanel}
+          />
           {/* Opens the import modal once per newly connected host. */}
           {!isEmbedded && <ImportReviewGate />}
           {/* Keep this after Outlet so a visible chat banner wins before the toast effect runs. */}

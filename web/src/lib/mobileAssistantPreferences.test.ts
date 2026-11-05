@@ -26,6 +26,30 @@ import { queueUserPreferencePatch } from "./userPreferencesSync";
 vi.mock("./userPreferencesSync", () => ({ queueUserPreferencePatch: vi.fn() }));
 
 describe("mobileAssistantPreferences", () => {
+  it("adds Terminals to a legacy custom chat set without losing the tenth button, and respects removal after writing", () => {
+    const buttons = Array.from({ length: 10 }, (_, index) => ({
+      id: `phrase-${index}`,
+      label: `Phrase ${index}`,
+      binding: { kind: "text", text: `text ${index}` },
+    }));
+    const raw = JSON.stringify({
+      version: 2,
+      enabled: true,
+      buttons,
+      terminalButtons: defaultTerminalButtons(),
+    });
+    localStorage.setItem(MOBILE_ASSISTANT_STORAGE_KEY, raw);
+    const read = readMobileAssistantPreferences();
+    expect(read.buttons).toHaveLength(11);
+    expect(read.buttons[0].binding).toEqual({ kind: "shortcut", actionId: "openTerminals" });
+    expect(read.buttons.at(-1)?.id).toBe("phrase-9");
+    expect(localStorage.getItem(MOBILE_ASSISTANT_STORAGE_KEY)).toBe(raw);
+    writeMobileAssistantPreferences({ ...read, buttons: read.buttons.slice(1) });
+    expect(readMobileAssistantPreferences().buttons).toEqual(buttons);
+    expect(
+      JSON.parse(localStorage.getItem(MOBILE_ASSISTANT_STORAGE_KEY)!).chatActionsRevision,
+    ).toBe(1);
+  });
   beforeEach(() => {
     localStorage.clear();
     vi.mocked(queueUserPreferencePatch).mockClear();
@@ -124,7 +148,7 @@ describe("mobileAssistantPreferences", () => {
     const preferences = readMobileAssistantPreferences();
     expect(preferences.version).toBe(2);
     expect(preferences.position).toEqual({ x: 0.2, y: 0.3 });
-    expect(preferences.buttons.map((button) => button.label)).toEqual(["Poll"]);
+    expect(preferences.buttons.map((button) => button.label)).toEqual(["Terminals", "Poll"]);
     expect(preferences.terminalButtons.find((item) => item.id === "tab")).toMatchObject({
       label: "Tab",
     });
@@ -158,8 +182,15 @@ describe("mobileAssistantPreferences", () => {
     );
 
     const preferences = readMobileAssistantPreferences();
-    expect(preferences.buttons.map((button) => button.id)).toEqual(["card", "poll"]);
-    expect(visibleChatButtons(preferences).map((button) => button.id)).toEqual(["poll"]);
+    expect(preferences.buttons.map((button) => button.id)).toEqual([
+      "default-terminals",
+      "card",
+      "poll",
+    ]);
+    expect(visibleChatButtons(preferences).map((button) => button.id)).toEqual([
+      "default-terminals",
+      "poll",
+    ]);
   });
 
   it("derives custom old keys into the terminal tail without writing or losing chat phrases and actions", () => {
@@ -185,7 +216,11 @@ describe("mobileAssistantPreferences", () => {
     });
     localStorage.setItem(MOBILE_ASSISTANT_STORAGE_KEY, raw);
     const preferences = readMobileAssistantPreferences();
-    expect(preferences.buttons.map((button) => button.id)).toEqual(["phrase", "poll"]);
+    expect(preferences.buttons.map((button) => button.id)).toEqual([
+      "default-terminals",
+      "phrase",
+      "poll",
+    ]);
     expect(preferences.terminalButtons).toHaveLength(19);
     expect(preferences.terminalButtons.at(-1)).toMatchObject({
       label: "Save",

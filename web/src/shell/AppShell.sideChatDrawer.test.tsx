@@ -98,6 +98,7 @@ import { useConversations } from "@/hooks/useConversations";
 import { useChatStore } from "@/store/chatStore";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { subagentTabId } from "@/lib/subagentTabs";
+import { dispatchMobileAssistantButton } from "@/lib/mobileAssistantPreferences";
 
 const usePullRequestInfoMock = vi.mocked(usePullRequestInfo);
 
@@ -201,6 +202,20 @@ describe("mobile side-chats drawer", () => {
     expect(within(drawer).getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_a");
     // The same signal reveals the rail, which is what desktop shows it in.
     expect(rail()).toHaveAttribute("data-state", "open");
+  });
+
+  it("opens the existing side-chat consumer from the mobile action", () => {
+    renderShell();
+    act(() =>
+      dispatchMobileAssistantButton({
+        id: "side-chats",
+        label: "Side chats",
+        binding: { kind: "shortcut", actionId: "openSideChats" },
+      }),
+    );
+    const drawer = screen.getByTestId("side-chats-panel-drawer");
+    expect(drawer).toHaveAttribute("data-state", "open");
+    expect(within(drawer).getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_a");
   });
 
   it("stays shut for a side chat belonging to another conversation", () => {
