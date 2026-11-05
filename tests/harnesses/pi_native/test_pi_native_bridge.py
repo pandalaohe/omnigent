@@ -16,6 +16,43 @@ from omnigent.permission_tiers.host import HostPermissionState, write_host_permi
 
 
 @pytest.mark.parametrize(
+    "changed,field",
+    [
+        ({"extension_sha256": "wrong"}, "extension_sha256"),
+        ({"installation_id": "old"}, "installation_id"),
+        ({"revision": 2}, "revision"),
+        ({"tier": "plan"}, "tier"),
+        ({"tools_verified": False}, "tools_verified"),
+        ({"active_tools": [1]}, "active_tools"),
+    ],
+)
+def test_permission_installation_failure_identifies_field(tmp_path, changed, field):
+    extension = tmp_path / "guard.js"
+    extension.write_text("// original extension\n")
+    pi_native_bridge.prepare_permission_installation(
+        tmp_path, session_id="session", harness="pi", extension=extension
+    )
+    write_host_permission_state(
+        tmp_path / "permission_state.json",
+        HostPermissionState("session", "host", str(tmp_path), "auto", 1, "blocked"),
+    )
+    expected = json.loads((tmp_path / "permission_expected.json").read_text())
+    installed = {
+        **expected,
+        "tier": "auto",
+        "revision": 1,
+        "tools_verified": True,
+        "active_tools": ["read"],
+    }
+    receipt = tmp_path / "permission_installation.json"
+    receipt.write_text(json.dumps(installed))
+    assert pi_native_bridge.pi_permission_installation_failure(tmp_path, "auto") is None
+    receipt.write_text(json.dumps({**installed, **changed}))
+    assert pi_native_bridge.pi_permission_installation_failure(tmp_path, "auto") == field
+    assert not pi_native_bridge.verify_pi_permission_installation(tmp_path, "auto")
+
+
+@pytest.mark.parametrize(
     "changed",
     [
         {"id": "old-change"},

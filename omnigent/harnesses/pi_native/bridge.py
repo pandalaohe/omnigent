@@ -72,6 +72,24 @@ PERMISSION_INSTALLATION_FILE = "permission_installation.json"
 PERMISSION_EXPECTED_FILE = "permission_expected.json"
 PERMISSION_ACK_FILE = "permission_ack.json"
 PERMISSION_TOOLS_FILE = "permission_tools.json"
+PI_PERMISSION_INSTALLATION_FIELDS = frozenset(
+    {
+        HOST_PERMISSION_STATE_FILE,
+        PERMISSION_EXPECTED_FILE,
+        PERMISSION_INSTALLATION_FILE,
+        "version",
+        "installation_id",
+        "session_id",
+        "harness",
+        "extension_sha256",
+        "tier",
+        "revision",
+        "tools_verified",
+        "active_tools",
+        "extension_path",
+        "extension_file_sha256",
+    }
+)
 
 
 def bridge_root() -> Path:
@@ -467,52 +485,77 @@ def prepare_permission_installation(
 
 def verify_pi_permission_installation(bridge_dir: Path, tier: PermissionTier) -> bool:
     """Require a fresh extension hook and active-tool ACK for this launch."""
+    return pi_permission_installation_failure(bridge_dir, tier) is None
+
+
+def pi_permission_installation_failure(bridge_dir: Path, tier: PermissionTier) -> str | None:
+    """Return the failed field name without exposing receipt values or paths."""
     try:
         state = read_host_permission_state(bridge_dir / HOST_PERMISSION_STATE_FILE)
-        if state.tier != tier:
-            return False
-        return _pi_permission_installation_matches(
-            bridge_dir, tier=tier, revision=state.revision, session_id=state.session_id
-        )
     except (OSError, ValueError, TypeError):
-        return False
+        return HOST_PERMISSION_STATE_FILE
+    if state.tier != tier:
+        return "tier"
+    return _pi_permission_installation_failure(
+        bridge_dir, tier=tier, revision=state.revision, session_id=state.session_id
+    )
 
 
 def _pi_permission_installation_matches(
     bridge_dir: Path, *, tier: PermissionTier, revision: int, session_id: str
 ) -> bool:
     """Check the extension's proof against the expected launch and active tools."""
+    return (
+        _pi_permission_installation_failure(
+            bridge_dir, tier=tier, revision=revision, session_id=session_id
+        )
+        is None
+    )
+
+
+def _pi_permission_installation_failure(
+    bridge_dir: Path, *, tier: PermissionTier, revision: int, session_id: str
+) -> str | None:
+    receipts: list[dict[str, object]] = []
+    for name in (PERMISSION_EXPECTED_FILE, PERMISSION_INSTALLATION_FILE):
+        try:
+            path = bridge_dir / name
+            if path.is_symlink():
+                return name
+            receipt = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(receipt, dict):
+                return name
+            receipts.append(receipt)
+        except (OSError, ValueError, TypeError):
+            return name
+    expected, installed = receipts
+    for field in ("version", "installation_id", "session_id", "harness", "extension_sha256"):
+        if installed.get(field) != expected.get(field):
+            return field
+    if expected.get("version") != 1:
+        return "version"
+    if expected.get("session_id") != session_id:
+        return "session_id"
+    if installed.get("tier") != tier:
+        return "tier"
+    if installed.get("revision") != revision:
+        return "revision"
+    if installed.get("tools_verified") is not True:
+        return "tools_verified"
+    active = installed.get("active_tools")
+    if not isinstance(active, list) or not all(isinstance(name, str) for name in active):
+        return "active_tools"
+    if tier == "plan" and tuple(active) != plan_visible_tool_names(active):
+        return "active_tools"
     try:
-        expected_path = bridge_dir / PERMISSION_EXPECTED_FILE
-        installed_path = bridge_dir / PERMISSION_INSTALLATION_FILE
-        if expected_path.is_symlink() or installed_path.is_symlink():
-            return False
-        expected = json.loads(expected_path.read_text(encoding="utf-8"))
-        installed = json.loads(installed_path.read_text(encoding="utf-8"))
-        if not isinstance(expected, dict) or not isinstance(installed, dict):
-            return False
-        for field in ("version", "installation_id", "session_id", "harness", "extension_sha256"):
-            if installed.get(field) != expected.get(field):
-                return False
-        if expected.get("version") != 1 or expected.get("session_id") != session_id:
-            return False
-        if installed.get("tier") != tier or installed.get("revision") != revision:
-            return False
-        if installed.get("tools_verified") is not True:
-            return False
-        active = installed.get("active_tools")
-        if not isinstance(active, list) or not all(isinstance(name, str) for name in active):
-            return False
-        if tier == "plan" and tuple(active) != plan_visible_tool_names(active):
-            return False
         extension = Path(str(expected.get("extension_path", "")))
         if not extension.is_file() or extension.is_symlink():
-            return False
-        return hashlib.sha256(extension.read_bytes()).hexdigest() == expected.get(
-            "extension_sha256"
-        )
+            return "extension_path"
+        if hashlib.sha256(extension.read_bytes()).hexdigest() != expected.get("extension_sha256"):
+            return "extension_file_sha256"
     except (OSError, ValueError, TypeError, KeyError):
-        return False
+        return "extension_path"
+    return None
 
 
 def enqueue_permission_tier_change(

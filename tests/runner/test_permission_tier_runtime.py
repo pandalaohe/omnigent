@@ -27,19 +27,37 @@ from omnigent.server.permission_tiers import ConfirmedPermissionState
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("installed", [True, False])
-async def test_first_pi_turn_waits_for_permission_bootstrap(monkeypatch, installed, caplog):
-    from tests.runner.conftest import _build_app_for_spec, _runner_client
+@pytest.mark.parametrize("phase", ["bootstrap", "before-fence"])
+async def test_first_pi_turn_waits_for_permission_bootstrap(monkeypatch, installed, phase, caplog):
+    from omnigent.runner import create_runner_app
+    from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient
+    from tests.runner.helpers import NullServerClient
     from tests.runner.native_helpers import _harness_spec
 
-    app, pm = await _build_app_for_spec(_harness_spec("pi"))
-    harness = pm._client
     entered, release = asyncio.Event(), asyncio.Event()
+    spec = _harness_spec("pi")
+    resolved = False
+
+    async def resolve(*_args):
+        nonlocal resolved
+        if not resolved and phase == "before-fence":
+            resolved = True
+            entered.set()
+            await release.wait()
+        return spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm, spec_resolver=resolve, server_client=NullServerClient()
+    )
+    harness = pm._client
     original_post = harness.post
 
     async def bootstrap(url, **kwargs):
         if url == "/v1/permission-tier/bootstrap":
-            entered.set()
-            await release.wait()
+            if phase == "bootstrap":
+                entered.set()
+                await release.wait()
             return httpx.Response(200 if installed else 503, json={"installed": installed})
         return await original_post(url, **kwargs)
 
@@ -64,7 +82,9 @@ async def test_first_pi_turn_waits_for_permission_bootstrap(monkeypatch, install
             assert turn is not None
             done, _ = await asyncio.wait([turn], timeout=0.05)
             assert not done, "first turn failed while permission bootstrap was still running"
-            assert app.state.permission_tiers.state("cold-pi").status == "blocked"
+            state = app.state.permission_tiers.state("cold-pi")
+            assert state is None if phase == "before-fence" else state.status == "blocked"
+            assert not harness.posted_bodies
         finally:
             release.set()
             initialized = await asyncio.wait_for(init, 5)

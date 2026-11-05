@@ -65,9 +65,11 @@ from omnigent.debug_logging import debug_event
 from omnigent.harnesses.pi_cli import pi_cli_argv
 from omnigent.harnesses.pi_native.bridge import (
     PERMISSION_INSTALLATION_FILE,
+    PI_PERMISSION_INSTALLATION_FIELDS,
     bridge_dir_for_session_id,
     clear_inbox,
     permission_tool_registry_source,
+    pi_permission_installation_failure,
     prepare_bridge_dir,
     prepare_permission_installation,
     verify_pi_permission_installation,
@@ -161,6 +163,17 @@ _TOOL_REQUEST_DRAIN_TIMEOUT_S = 2
 
 class PiPermissionBootstrapError(RuntimeError):
     """Fixed startup diagnostic without subprocess output or receipt contents."""
+
+    code = "pi_permission_bootstrap_failed"
+
+    def __init__(self, reason: str) -> None:
+        safe = reason in {"timeout", "missing_ack", "ack_mismatch", "unknown"} or reason in {
+            f"ack_mismatch (field={name})" for name in PI_PERMISSION_INSTALLATION_FIELDS
+        }
+        if not safe and re.fullmatch(r"process_exit \(status=(?:-?[0-9]{1,10}|None)\)", reason):
+            safe = True
+        self.reason = reason if safe else "unknown"
+        super().__init__(f"Pi permission bootstrap failed: {self.reason}")
 
 
 def _permission_stderr_tail(lines: list[str]) -> str:
@@ -909,6 +922,10 @@ function writePermissionInstallation(pi, confirmedState, confirmedTools) {
   }
   if (!active) return false;
   try {
+    const extensionSha256 = crypto.createHash("sha256")
+      .update(fs.readFileSync(__filename)).digest("hex");
+    if (extensionSha256 !== expected.extension_sha256 ||
+        fs.realpathSync(expected.extension_path) !== fs.realpathSync(__filename)) return false;
     if (state.tier !== "full") {
       permissionToolRegistry = permissionToolSources.capture(pi, {
         version: 1, installation_id: expected.installation_id,
@@ -920,8 +937,7 @@ function writePermissionInstallation(pi, confirmedState, confirmedTools) {
     writePermissionJson("permission_installation.json", {
       version: 1, installation_id: expected.installation_id,
       session_id: PERMISSION_SESSION_ID, harness: "pi",
-      extension_sha256: crypto.createHash("sha256")
-        .update(fs.readFileSync(__filename)).digest("hex"),
+      extension_sha256: extensionSha256,
       tier: state.tier, revision: state.revision,
       tools_verified: true, active_tools: active,
     });
@@ -2382,6 +2398,7 @@ class _PiPeerPending:
 
 @dataclass
 class _PiSessionState:
+    startup_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     rpc: _PiRpcSession | None = None
     system_prompt: str | None = None
     model: str | None = None
@@ -4289,6 +4306,31 @@ class PiExecutor(Executor):
             signature. A model change respawns, which re-asserts the level.
         """
         state = self._session_states.setdefault(session_key, _PiSessionState())
+        async with state.startup_lock:
+            if self._session_states.get(session_key) is not state:
+                raise RuntimeError("Pi RPC owner changed during startup")
+            return await self._ensure_rpc_locked(
+                state,
+                session_key,
+                system_prompt,
+                model,
+                tools,
+                thinking,
+                permission_bootstrap=permission_bootstrap,
+            )
+
+    async def _ensure_rpc_locked(
+        self,
+        state: _PiSessionState,
+        session_key: str,
+        system_prompt: str,
+        model: str | None,
+        tools: list[ToolSpec],
+        thinking: str | None,
+        *,
+        permission_bootstrap: bool,
+    ) -> _PiRpcSession:
+        """Keep launch files and their acknowledgement under one session owner."""
         if self._permission_controlled:
             if not session_key or session_key == "__default__":
                 raise ValueError("Pi permission session is not bound")
@@ -4432,17 +4474,19 @@ class PiExecutor(Executor):
                 return
             await asyncio.sleep(0.05)
         else:
-            reason = (
-                "ack_mismatch"
-                if (bridge_dir / PERMISSION_INSTALLATION_FILE).exists()
-                else "missing_ack"
-            )
+            if (bridge_dir / PERMISSION_INSTALLATION_FILE).exists():
+                failure = pi_permission_installation_failure(bridge_dir, state.tier)
+                if failure is None:
+                    return
+                reason = f"ack_mismatch (field={failure})"
+            else:
+                reason = "missing_ack"
         logger.warning(
             "Pi permission bootstrap failed: reason=%s; filtered stderr tail=%s",
             reason,
             _permission_stderr_tail(rpc._stderr_lines),
         )
-        raise PiPermissionBootstrapError(f"Pi permission bootstrap failed: {reason}")
+        raise PiPermissionBootstrapError(reason)
 
     async def bootstrap_permission_tier(self, session_id: str) -> bool:
         """Spawn Pi without a user prompt and prove the installed extension."""

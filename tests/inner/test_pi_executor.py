@@ -357,7 +357,7 @@ class _FakeProcess:
         (True, 12.0, None),
         (False, None, "missing_ack"),
         (True, None, "missing_ack"),
-        (False, None, "ack_mismatch"),
+        (False, None, "ack_mismatch (field=permission_expected.json)"),
         (False, None, "process_exit (status=7)"),
     ],
 )
@@ -385,7 +385,7 @@ async def test_permission_bootstrap_waits_for_live_process_and_reports_safe_reas
             status="blocked",
         ),
     )
-    if expected == "ack_mismatch":
+    if expected and expected.startswith("ack_mismatch"):
         (bridge / "permission_installation.json").write_text("{}")
     rpc = _PiRpcSession()
     rpc.process = _FakeProcess()
@@ -475,6 +475,82 @@ async def context_v2_pi(monkeypatch):
         yield executor, spawn, create, processes
     finally:
         await executor.close()
+
+
+async def test_concurrent_permission_bootstrap_reuses_one_proven_process(
+    context_v2_pi, tmp_path, monkeypatch
+):
+    from omnigent.inner import pi_executor as module
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the controlled Pi extension test")
+    executor, spawn, create, _ = context_v2_pi
+    executor._permission_controlled = True
+    bridge = tmp_path / "bridge"
+    (bridge / "inbox").mkdir(parents=True)
+    write_host_permission_state(
+        bridge / "permission_state.json",
+        HostPermissionState("same-key", "host", str(tmp_path), "auto", 1, "blocked"),
+    )
+    monkeypatch.setattr(module, "bridge_dir_for_session_id", lambda _: bridge)
+    launches = []
+
+    def config(*args, **kwargs):
+        directory = tmp_path / f"launch-{len(launches)}"
+        directory.mkdir()
+        extension = directory / "tools.js"
+        extension.write_text(
+            _generate_extension_js(
+                12345 + len(launches),
+                [],
+                "test-token",
+                permission_bridge_dir=bridge,
+                session_id="same-key",
+            )
+        )
+        prepare_permission_installation(
+            bridge, session_id="same-key", harness="pi", extension=extension
+        )
+        launches.append(extension)
+        return PiSubprocessConfig({}, str(directory), ["--extension", str(extension)])
+
+    monkeypatch.setattr(executor, "_build_env_and_dir", config)
+
+    async def start(*args, **kwargs):
+        extension = Path(args[args.index("--extension") + 1])
+        process = await create(*args, **kwargs)
+        await asyncio.sleep(0)
+        if extension == launches[0]:
+            await asyncio.sleep(0)
+        subprocess.run(
+            [
+                node,
+                "-e",
+                "const handlers = {}; global.setInterval = () => 0;"
+                "process.env.OMNIGENT_PI_PERMISSION_INLINE = "
+                "require('fs').realpathSync(process.argv[1]);"
+                "require(process.argv[1])({ on: (n, h) => handlers[n] = h,"
+                "registerTool() {}, getAllTools: () => [],"
+                "getActiveTools: () => ['read'], setActiveTools() {} });"
+                "handlers.session_start({}, { isIdle: () => true });",
+                str(extension),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        await asyncio.sleep(0)
+        return process
+
+    spawn.side_effect = start
+    results = await asyncio.gather(
+        executor.bootstrap_permission_tier("same-key"),
+        executor.bootstrap_permission_tier("same-key"),
+        return_exceptions=True,
+    )
+    assert results == [True, True]
+    assert verify_pi_permission_installation(bridge, "auto")
+    assert len(launches) == 1
 
 
 async def test_context_v2_pi_primary_reuse_replacement_and_close(context_v2_pi):
@@ -1782,7 +1858,10 @@ class TestGenerateExtensionJs(unittest.TestCase):
 
 
 @pytest.mark.parametrize("tier", ["plan", "full"])
-def test_controlled_rpc_extension_proves_plan_tools_before_prompt(tmp_path: Path, tier) -> None:
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_controlled_rpc_extension_proves_plan_tools_before_prompt(
+    tmp_path: Path, tier, newline
+) -> None:
     """The real generated JS must install itself and hide executable tools in plan."""
     node = shutil.which("node")
     if node is None:
@@ -1811,7 +1890,9 @@ def test_controlled_rpc_extension_proves_plan_tools_before_prompt(tmp_path: Path
             "test-token",
             permission_bridge_dir=bridge_dir,
             session_id="test-session",
-        )
+        ),
+        encoding="utf-8",
+        newline=newline,
     )
     prepare_permission_installation(
         bridge_dir, session_id="test-session", harness="pi", extension=extension
@@ -1853,6 +1934,18 @@ assert.deepEqual(active, process.argv[2] === "safe" && tier === "plan"
     installed = json.loads((bridge_dir / "permission_installation.json").read_text())
     assert installed["active_tools"] == (
         ["read", "sys_os_read"] if tier == "plan" else ["read", "sys_os_read", "sys_os_shell"]
+    )
+    replacement = tmp_path / "replacement.js"
+    replacement.write_bytes(extension.read_bytes() + b"\n// replacement\n")
+    prepare_permission_installation(
+        bridge_dir, session_id="test-session", harness="pi", extension=replacement
+    )
+    result = subprocess.run(
+        [node, "-e", script, str(extension), "safe", tier], capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
+    assert not (bridge_dir / "permission_installation.json").exists(), (
+        "a superseded process must not overwrite this launch's acknowledgement"
     )
 
 

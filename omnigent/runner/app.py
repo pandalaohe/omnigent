@@ -4600,6 +4600,7 @@ def create_runner_app(
                         _publish_terminal_pending(_publish_event, session_id, False)
 
         permission_tier_ack: str | None = None
+        from omnigent.inner.pi_executor import PiPermissionBootstrapError
         from omnigent.inner.pi_settings import PiSdkLoaderUnavailableError
 
         try:
@@ -4635,6 +4636,12 @@ def create_runner_app(
                         and bootstrap_body.get("error") == PiSdkLoaderUnavailableError.code
                     ):
                         raise PiSdkLoaderUnavailableError
+                    if (
+                        isinstance(bootstrap_body, dict)
+                        and bootstrap_body.get("error") == PiPermissionBootstrapError.code
+                        and isinstance(reason := bootstrap_body.get("reason"), str)
+                    ):
+                        raise PiPermissionBootstrapError(reason)
                     raise ValueError("Pi permission extension did not acknowledge startup")
             elif harness_name == "pi-native" and init_context.envelope is not None:
                 from omnigent.harnesses.pi_native.bridge import (
@@ -4657,10 +4664,18 @@ def create_runner_app(
             permission_state = permission_tiers.install(init_context.envelope, harness_name)
             if permission_state is not None:
                 permission_tier_ack = PERMISSION_TIERS_CAPABILITY
-        except (OSError, ValueError, TypeError, ImportError, httpx.HTTPError, TimeoutError) as exc:
+        except (
+            OSError,
+            ValueError,
+            TypeError,
+            ImportError,
+            httpx.HTTPError,
+            TimeoutError,
+            PiPermissionBootstrapError,
+        ) as exc:
             detail = (
-                str(PiSdkLoaderUnavailableError())
-                if isinstance(exc, PiSdkLoaderUnavailableError)
+                str(exc)
+                if isinstance(exc, (PiSdkLoaderUnavailableError, PiPermissionBootstrapError))
                 else _client_safe_error_detail(exc, context="permission tier startup")
             )
             permission_startup_errors[session_id] = detail
@@ -8349,7 +8364,7 @@ def create_runner_app(
         with phase_scope(ErrorPhase.TURN):
             try:
                 permission_state = permission_tiers.state(conv)
-                if permission_state is not None and permission_state.status != "ready":
+                if permission_state is None or permission_state.status != "ready":
                     # Initialization owns the deny-safe fence until bootstrap settles.
                     initializations = [
                         task for key, task in list(_session_init_tasks.items()) if key[0] == conv

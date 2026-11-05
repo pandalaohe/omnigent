@@ -197,16 +197,18 @@ def test_permission_bootstrap_requires_harness_auth() -> None:
     assert response.status_code == 401
 
 
-@pytest.mark.parametrize("sdk_missing", [True, False])
-def test_permission_bootstrap_reports_safe_startup_failure(tmp_path, monkeypatch, sdk_missing):
-    from omnigent.inner.pi_executor import PiExecutor
+@pytest.mark.parametrize("failure", ["sdk", "ack", "unknown"])
+def test_permission_bootstrap_reports_safe_startup_failure(tmp_path, monkeypatch, failure):
+    from omnigent.inner.pi_executor import PiExecutor, PiPermissionBootstrapError
     from omnigent.inner.pi_settings import ordered_pi_launch
 
     executor = PiExecutor(pi_path="/opt/bin/pi", permission_controlled=True)
 
     async def fail_start(*args, **kwargs):
-        if sdk_missing:
+        if failure == "sdk":
             ordered_pi_launch("/opt/bin/unsupported-pi", [], extension=tmp_path / "guard.js")
+        if failure == "ack":
+            raise PiPermissionBootstrapError("ack_mismatch (field=extension_sha256)")
         raise OSError("private host path and credential must stay in logs")
 
     monkeypatch.setattr(executor, "_ensure_rpc", fail_start)
@@ -220,8 +222,11 @@ def test_permission_bootstrap_reports_safe_startup_failure(tmp_path, monkeypatch
     assert response.status_code == 503
     body = response.json()
     assert body["installed"] is False
-    if sdk_missing:
+    if failure == "sdk":
         assert body["error"] == "pi_sdk_loader_unavailable"
+    elif failure == "ack":
+        assert body["error"] == "pi_permission_bootstrap_failed"
+        assert body["reason"] == "ack_mismatch (field=extension_sha256)"
     else:
         assert "private host path" not in response.text
 

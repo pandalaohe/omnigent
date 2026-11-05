@@ -118,9 +118,9 @@ async def test_pi_rpc_relay_is_ready_before_permission_bootstrap(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("sdk_missing", [True, False])
+@pytest.mark.parametrize("failure", ["sdk", "ack", "unknown", "untrusted-ack"])
 async def test_permission_bootstrap_failure_reaches_turn_without_confirmation_wait(
-    monkeypatch, sdk_missing
+    monkeypatch, failure
 ):
     spec = AgentSpec(
         spec_version=1,
@@ -137,13 +137,20 @@ async def test_permission_bootstrap_failure_reaches_turn_without_confirmation_wa
             503,
             json={
                 "installed": False,
-                "error": "pi_sdk_loader_unavailable" if sdk_missing else "unknown",
+                "error": "pi_sdk_loader_unavailable"
+                if failure == "sdk"
+                else "pi_permission_bootstrap_failed"
+                if failure in ("ack", "untrusted-ack")
+                else "unknown",
+                "reason": "ack_mismatch (field=extension_sha256)"
+                if failure == "ack"
+                else "private untrusted exception text",
                 "detail": "private untrusted exception text",
             },
         )
 
     monkeypatch.setattr(harness, "post", bootstrap_failure)
-    session_id = f"pi-startup-failed-{sdk_missing}"
+    session_id = f"pi-startup-failed-{failure}"
     async with _runner_client(app, permission_harness="pi") as client:
         response = await client.post(
             "/v1/sessions", json={"session_id": session_id, "agent_id": "test-agent"}
@@ -151,8 +158,10 @@ async def test_permission_bootstrap_failure_reaches_turn_without_confirmation_wa
         assert response.status_code == 503
         detail = response.json()["detail"]
         assert "private untrusted" not in detail
-        if sdk_missing:
+        if failure == "sdk":
             assert "supported Pi SDK loader" in detail
+        if failure == "ack":
+            assert "ack_mismatch (field=extension_sha256)" in detail
         assert app.state.permission_tiers.state(session_id).status == "blocked"
         response = await client.post(
             f"/v1/sessions/{session_id}/events",
