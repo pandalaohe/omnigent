@@ -996,6 +996,21 @@ def test_nightly_pipx_spells_out_the_tag_instead_of_reinstall() -> None:
     assert same_source.command == "pipx reinstall omnigent"
 
 
+@pytest.mark.parametrize("quote", ["'", '"'])
+def test_windows_recovery_invokes_quoted_interpreter(
+    monkeypatch: pytest.MonkeyPatch, quote: str
+) -> None:
+    monkeypatch.setattr("omnigent.update_check.IS_WINDOWS", True)
+    command = (
+        f"{quote}C:\\Program Files\\Python\\python.exe{quote} -m pip install --upgrade "
+        "git+ssh://build-host/srv/git/omnigent.git@release/stable#egg=omnigent[all]"
+    )
+
+    message = _upgrade_failure_message(1, recovery_command=command)
+
+    assert f"\n    & {command}\n" in message
+
+
 def test_upgrade_failure_message_reports_a_destroyed_install(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

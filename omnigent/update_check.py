@@ -1841,6 +1841,8 @@ def _upgrade_failure_message(
     :returns: The message body for the raised ``ClickException``.
     """
     if IS_WINDOWS and recovery_command is not None:
+        if recovery_command.startswith(("'", '"')):
+            recovery_command = f"& {recovery_command}"
         return (
             f"Upgrade command exited with status {code}. Windows may keep this CLI's files "
             "in use. Close this CLI and stop the Host supervisor before retrying from an "
