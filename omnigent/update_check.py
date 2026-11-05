@@ -174,8 +174,6 @@ class _InstalledWheelInfo:
     :param extras: Optional extras recorded by the installer, e.g.
         ``["all"]``. Empty when the installer does not preserve them
         (e.g. ``pip``) or when none were requested.
-    :param extras_known: Whether installer metadata was readable enough to
-        distinguish no extras from an unknown extras set.
     """
 
     install_time_epoch: float
@@ -186,7 +184,6 @@ class _InstalledWheelInfo:
     package_version: str
     detected_installer: str | None
     extras: tuple[str, ...] = ()
-    extras_known: bool = True
 
 
 def maybe_show_update_notice() -> None:
@@ -1172,18 +1169,13 @@ def _read_installed_wheel_info() -> _InstalledWheelInfo | None:
 
     # Read requested extras from installer-specific receipts when available.
     extras: list[str] = []
-    extras_known = True
     if detected_installer == "uv":
         uv_extras = _read_uv_tool_extras()
-        if uv_extras is None:
-            extras_known = False
-        else:
+        if uv_extras is not None:
             extras = uv_extras
     elif detected_installer == "pipx":
         pipx_extras = _read_pipx_extras()
-        if pipx_extras is None:
-            extras_known = False
-        else:
+        if pipx_extras is not None:
             extras = pipx_extras
 
     return _InstalledWheelInfo(
@@ -1195,7 +1187,6 @@ def _read_installed_wheel_info() -> _InstalledWheelInfo | None:
         package_version=dist.version,
         detected_installer=detected_installer,
         extras=tuple(extras),
-        extras_known=extras_known,
     )
 
 
@@ -1514,7 +1505,6 @@ def _build_upgrade_suggestion(
     extra_overrides: tuple[str, ...] = (),
     target_version: str | None = None,
     target_vcs_url: str | None = None,
-    force_uv_tool_install: bool = False,
 ) -> _UpgradeSuggestion:
     """Build the right upgrade command for the user's install shape.
 
@@ -1535,8 +1525,6 @@ def _build_upgrade_suggestion(
         recorded at install time, so a registry install can be moved onto a
         git source (how ``--nightly`` hops onto a tag). Takes precedence
         over ``info.vcs_url``.
-    :param force_uv_tool_install: Replace owned uv tool entrypoints during
-        a managed reinstall; package-only reinstalls do not replace stale launchers.
     :returns: A :class:`_UpgradeSuggestion` whose ``command`` is the
         line printed in the nag panel and whose ``runnable`` flag
         tells the caller whether the line is an actual invocation
@@ -1546,7 +1534,6 @@ def _build_upgrade_suggestion(
     installer = info.detected_installer or info.installer
     pre = _PRERELEASE_FLAG.get(installer or "", "") if allow_prerelease else ""
     extras = sorted(set(info.extras) | set(extra_overrides))
-    uv_force = " --force" if force_uv_tool_install else ""
 
     source_url = target_vcs_url or info.vcs_url
     if source_url:
@@ -1560,8 +1547,7 @@ def _build_upgrade_suggestion(
         if installer == "uv":
             return _UpgradeSuggestion(
                 command=(
-                    f"uv tool install{uv_force} --reinstall{_uv_python_pin()} "
-                    f"{vcs_url_with_extras}{pre}"
+                    f"uv tool install --reinstall{_uv_python_pin()} {vcs_url_with_extras}{pre}"
                 ),
                 runnable=True,
             )
@@ -1605,9 +1591,7 @@ def _build_upgrade_suggestion(
             # version), not extras. Reinstall with the full PEP 508 spec
             # to preserve the extras the user originally requested.
             return _UpgradeSuggestion(
-                command=(
-                    f"uv tool install{uv_force} --reinstall{_uv_python_pin()} {registry_spec}{pre}"
-                ),
+                command=(f"uv tool install --reinstall{_uv_python_pin()} {registry_spec}{pre}"),
                 runnable=True,
             )
         return _UpgradeSuggestion(command=f"uv tool upgrade {_DIST_NAME}{pre}", runnable=True)
@@ -1728,81 +1712,7 @@ def _build_nightly_upgrade_suggestion(
     )
 
 
-def _prepare_uv_git_install(
-    args: list[str], directory: Path, *, env: dict[str, str] | None = None
-) -> list[str]:
-    """Constrain a uv git install to the target's runtime lock, before mutating the tool."""
-    from urllib.parse import parse_qs
-
-    if args[:3] != ["uv", "tool", "install"]:
-        return args
-    source = next((arg for arg in args[3:] if arg.startswith("git+")), None)
-    if source is None:
-        return args
-    url, revision = _split_vcs_url(source)
-    fragment = source.partition("#")[2]
-    options = parse_qs(fragment)
-    repo = directory / "source"
-    run_git(["git", "init", "--quiet", str(repo)], check=True, env=env)
-    run_git(
-        ["git", "-C", str(repo), "fetch", "--quiet", "--depth=1", "--", url, revision or "HEAD"],
-        check=True,
-        env=env,
-    )
-    run_git(
-        ["git", "-C", str(repo), "checkout", "--quiet", "--detach", "FETCH_HEAD"],
-        check=True,
-        env=env,
-    )
-    sha = run_git(
-        ["git", "-C", str(repo), "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-        env=env,
-    ).stdout.strip()
-    project = (repo / options.get("subdirectory", [""])[0]).resolve()
-    if not project.is_relative_to(repo.resolve()):
-        raise ValueError("Git install subdirectory must be inside the target repository")
-    if not (project / "uv.lock").is_file():
-        raise ValueError("The target git revision has no uv.lock; refusing an unlocked upgrade")
-    constraints = directory / "constraints.txt"
-    export = [
-        "uv",
-        "export",
-        "--project",
-        str(project),
-        "--frozen",
-        "--no-dev",
-        "--no-default-groups",
-        "--no-emit-project",
-        "--no-emit-local",
-        "--no-hashes",
-        "--output-file",
-        str(constraints),
-    ]
-    for extra in _parse_extras_from_spec(options.get("egg", [""])[0]):
-        export.extend(["--extra", extra])
-    subprocess.run(export, check=True, env=env, stdout=subprocess.DEVNULL)
-    # Refresh the application build while reusing locked dependency wheels.
-    # Windows still forces environment recreation to replace stale entrypoints.
-    prepared: list[str] = []
-    for arg in args:
-        if arg == "--reinstall":
-            prepared.extend(["--reinstall-package", _DIST_NAME])
-        elif arg == source:
-            prepared.append(f"git+{url}@{sha}" + (f"#{fragment}" if fragment else ""))
-        else:
-            prepared.append(arg)
-    return [*prepared, "--constraints", str(constraints)]
-
-
-def _run_upgrade_command(
-    command: str,
-    console: Console,
-    *,
-    env: dict[str, str] | None = None,
-) -> int:
+def _run_upgrade_command(command: str, console: Console) -> int:
     """Run the upgrade command in a foreground subprocess.
 
     The subprocess inherits stdin/stdout/stderr so the user sees
@@ -1814,8 +1724,6 @@ def _run_upgrade_command(
     :param console: Rich console (stderr) used for the surrounding
         "Running:" / failure status lines, kept consistent with the
         panel above.
-    :param env: Optional complete subprocess environment. ``None`` inherits
-        the current process environment.
     :returns: The subprocess's exit code, or ``-1`` when the binary
         couldn't be started (binary missing from PATH, invalid
         command string). The caller treats any non-zero return as
@@ -1825,23 +1733,7 @@ def _run_upgrade_command(
 
     console.print(f"[yellow]Running:[/yellow] {command}")
     try:
-        args = shlex.split(command)
-        if args[:3] == ["uv", "tool", "install"] and any(
-            arg.startswith("git+") for arg in args[3:]
-        ):
-            with tempfile.TemporaryDirectory(prefix="omnigent-upgrade-") as temporary:
-                args = _prepare_uv_git_install(args, Path(temporary), env=env)
-                console.print("Installing dependencies from the target uv.lock.")
-                result = subprocess.run(args, check=False, env=env)
-        else:
-            result = (
-                subprocess.run(args, check=False)
-                if env is None
-                else subprocess.run(args, check=False, env=env)
-            )
-    except subprocess.CalledProcessError as exc:
-        console.print(f"[red]Upgrade preparation failed:[/red] {exc}")
-        return exc.returncode
+        result = subprocess.run(shlex.split(command), check=False)
     except (OSError, ValueError) as exc:
         # OSError: binary not on PATH. ValueError: shlex.split
         # rejected the command (extremely unlikely for our
