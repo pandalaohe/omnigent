@@ -5986,25 +5986,19 @@ def _upgrade_host_service(*, force: bool) -> Iterator[None]:
         try:
             stop_user_host_service(service)
             yield
+            enable_user_host_service(
+                server_url, environment=_build_host_daemon_env(server_url=server_url)
+            )
             succeeded = True
         finally:
-            if succeeded:
-                try:
-                    enable_user_host_service(
-                        server_url, environment=_build_host_daemon_env(server_url=server_url)
-                    )
-                except HostServiceError:
-                    with contextlib.suppress(HostServiceError):
-                        start_user_host_service(service)
-                    raise
-                click.echo("Refreshed and restarted the host user service.")
-            else:
+            if not succeeded:
                 try:
                     start_user_host_service(service)
-                except HostServiceError as exc:
+                except (HostServiceError, OSError) as exc:
                     click.echo(
                         f"Additionally failed to restore the host user service: {exc}", err=True
                     )
+        click.echo("Refreshed and restarted the host user service.")
     except HostServiceError as exc:
         raise click.ClickException(str(exc)) from exc
 

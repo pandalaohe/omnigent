@@ -74,7 +74,9 @@ def _wheel_install(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("omnigent.cli._stop_local_server_and_daemon", lambda *, force: False)
 
 
-@pytest.mark.parametrize("outcome", ["success", "install-failure", "no-op", "refresh-failure"])
+@pytest.mark.parametrize(
+    "outcome", ["success", "install-failure", "no-op", "refresh-failure", "write-failure"]
+)
 @pytest.mark.parametrize("origin", ["registry", "git", "nightly"])
 def test_upgrade_preserves_enabled_service(
     tmp_path: Path,
@@ -105,6 +107,12 @@ def test_upgrade_preserves_enabled_service(
 
     monkeypatch.setattr(service, "_run_checked", _manager)
     monkeypatch.setattr(service, "_run_best_effort", lambda args: events.append(args[2]))
+    if outcome == "write-failure":
+
+        def _write(*_: object) -> None:
+            raise PermissionError("definition is read-only")
+
+        monkeypatch.setattr(service, "_atomic_write", _write)
     monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda **_: "0.2.0")
 
     def _install(*_: object) -> int:
@@ -136,6 +144,9 @@ def test_upgrade_preserves_enabled_service(
     else:
         assert events.index("install") < events.index("start")
         assert installed.path.read_bytes() == original
+    if outcome == "write-failure":
+        assert isinstance(result.exception, PermissionError)
+        assert str(result.exception) == "definition is read-only"
 
 
 @pytest.mark.parametrize("origin", ["registry", "git", "nightly"])
