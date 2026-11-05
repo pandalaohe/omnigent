@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "run_keys": ["agent", "task", "model", "cwd", "async", "options", "tasks", "chain"],
+  "option_keys": ["context", "timeoutMs", "toolTimeoutMs", "agentScope", "includeProgress", "maxOutput"],
+  "step_keys": ["agent", "task", "cwd", "model"],
+  "chain_step_keys": ["agent", "task", "cwd", "model", "as"],
+  "read_actions": ["children.list", "doctor", "get", "guide", "inspector.status", "list", "models", "status", "validate"],
+  "control_actions": ["command.cancel", "command.yield", "dismiss", "interrupt", "stop"],
+  "read_keys": ["action", "cwd", "options", "agent", "id", "runId", "index", "view", "lines", "capabilities"],
+  "control_keys": ["action", "cwd", "options", "id", "runId", "message", "mode", "childId", "toolCallId"],
+  "outside_kinds": ["external_cli", "remote", "gist", "schedule", "management", "unsupported_runner"],
+  "launch_actions": ["append-step", "inspector.open", "project.open", "refine", "resume", "schedule.create", "schedule.delete", "schedule.history", "schedule.list", "schedule.pause", "schedule.resume", "schedule.run", "schedule.run-due", "schedule.show", "steer"],
+  "outside_actions": ["command.status", "create", "debug.run", "delete", "disable", "eject", "enable", "grant-spawn-budget", "inspector.close", "inspector.command", "lane.recordMerge", "lane.recordSupersession", "lane.status", "mission.attach-run", "mission.close", "mission.create", "mission.list", "mission.resolve-decision", "mission.show", "mission.update", "project.close", "project.status", "refine.rollback", "refine.show", "reset", "update", "watchdog.check", "watchdog.configure", "watchdog.recommend-model", "watchdog.status", "worktree.cleanup", "worktree.discard"]
+}

@@ -477,6 +477,94 @@ async def context_v2_pi(monkeypatch):
         await executor.close()
 
 
+async def test_scoped_prepare_waits_for_startup_lock_before_spawning(
+    context_v2_pi, tmp_path, monkeypatch
+):
+    from omnigent.inner import pi_executor as module
+
+    executor, spawn, _, _ = context_v2_pi
+    executor._permission_controlled = True
+    write_host_permission_state(
+        tmp_path / "permission_state.json",
+        HostPermissionState("scoped", "host", str(tmp_path), "auto", 1, "ready"),
+    )
+    monkeypatch.setattr(module, "bridge_dir_for_session_id", lambda _: tmp_path)
+    monkeypatch.setattr("omnigent.runner.pi_bootstrap.process_identity", lambda pid: (pid, 10.0))
+    proof = AsyncMock(side_effect=AssertionError("prepare must wait for runner attestation"))
+    monkeypatch.setattr(executor, "_await_permission_installation", proof)
+    lock = executor._session_startup_locks.setdefault("scoped", asyncio.Lock())
+    locator = tmp_path / "pi-bootstrap" / ("a" * 32 + ".json")
+    async with lock:
+        preparation = asyncio.create_task(executor.prepare_scoped_bootstrap("scoped", locator))
+        await asyncio.sleep(0)
+        assert not preparation.done()
+        spawn.assert_not_called()
+    identity = await asyncio.wait_for(preparation, 2)
+    assert identity == {"pid": 2**22 + 1, "started_at": 10.0, "handoff": str(locator)}
+    spawn.assert_awaited_once()
+    proof.assert_not_awaited()
+    rpc = executor._session_states["scoped"].rpc
+    assert rpc is not None
+    proof.side_effect = None
+    assert await executor._ensure_rpc("scoped", "", None, [], permission_bootstrap=True) is rpc
+    proof.assert_awaited_once_with("scoped", rpc)
+    spawn.assert_awaited_once()
+
+
+@pytest.mark.parametrize("concurrent_close", [False, True], ids=["replace", "close-during-switch"])
+async def test_full_tier_rpc_switch_respects_close_requests(
+    context_v2_pi, tmp_path, monkeypatch, concurrent_close
+):
+    from omnigent.inner import pi_executor as module
+
+    executor, spawn, _, _ = context_v2_pi
+    old = await executor._ensure_rpc("switch-full", "system", None, [])
+    executor._permission_controlled = True
+    executor._scoped_handoffs["switch-full"] = tmp_path / "retired.json"
+    write_host_permission_state(
+        tmp_path / "permission_state.json",
+        HostPermissionState("switch-full", "host", str(tmp_path), "full", 2, "ready"),
+    )
+    monkeypatch.setattr(module, "bridge_dir_for_session_id", lambda _: tmp_path)
+    monkeypatch.setattr(executor, "_await_permission_installation", AsyncMock())
+    entered, release = asyncio.Event(), asyncio.Event()
+    close = old._close_unobserved
+
+    async def pending_close():
+        entered.set()
+        await release.wait()
+        await close()
+
+    monkeypatch.setattr(old, "_close_unobserved", pending_close)
+    switching = asyncio.create_task(executor._ensure_rpc("switch-full", "system", None, []))
+    closing = None
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        if concurrent_close:
+            closing = asyncio.create_task(executor.close_session("switch-full"))
+            await asyncio.sleep(0)
+            assert executor._session_states["switch-full"].closing
+        release.set()
+        if concurrent_close:
+            with pytest.raises(RuntimeError, match=r"owner.*closing|owner changed"):
+                await asyncio.wait_for(switching, 2)
+            await asyncio.wait_for(closing, 2)
+            assert "switch-full" not in executor._session_states
+            assert spawn.await_count == 1
+        else:
+            current = await asyncio.wait_for(switching, 2)
+            assert current is not old
+            assert executor._session_states["switch-full"].rpc is current
+            assert spawn.await_count == 2
+        assert old.process is None
+        assert "switch-full" not in executor._scoped_handoffs
+    finally:
+        release.set()
+        await asyncio.gather(
+            *(task for task in (switching, closing) if task is not None), return_exceptions=True
+        )
+
+
 async def test_concurrent_permission_bootstrap_reuses_one_proven_process(
     context_v2_pi, tmp_path, monkeypatch, caplog
 ):
@@ -2494,6 +2582,51 @@ async def test_rpc_pi_usage_bridge_requires_session_token_and_fails_closed() -> 
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
+async def test_pi_private_authority_is_excluded_before_rpc_error_return():
+    server = _ToolServer()
+
+    async def failing(_name, _arguments):
+        raise RuntimeError("pi_origin_receipt=fixture-private-receipt")
+
+    server._tool_executor = failing
+    response = await server._execute("read", {})
+    assert "fixture-private-receipt" not in json.dumps(response)
+    assert "error" in response
+
+
+@pytest.mark.asyncio
+async def test_pi_private_stderr_never_reaches_logs_errors_or_saved_records(
+    tmp_path, monkeypatch, caplog
+):
+    caplog.set_level(logging.DEBUG, logger="omnigent.inner.pi_executor")
+    rpc = _PiRpcSession()
+    stream = asyncio.StreamReader()
+    stream.feed_data(b"pi_origin_receipt=fixture-private-receipt\n")
+    stream.feed_eof()
+    rpc.process = MagicMock()
+    rpc.process.stderr = stream
+    rpc.process.returncode = None
+    rpc.process.stdin = _FakeStreamWriter()
+    await rpc._stderr_reader()
+    assert "fixture-private-receipt" not in caplog.text
+    assert "fixture-private-receipt" not in json.dumps(rpc._stderr_lines)
+    # Exercise the independent EOF/error sink even if a producer bypasses the drainer.
+    rpc._stderr_lines = ["pi_origin_receipt=fixture-private-receipt"]
+    rpc._line_queue.put_nowait(None)
+    executor = TestRunTurn()._make_executor()
+    monkeypatch.setattr(executor, "_ensure_rpc", AsyncMock(return_value=rpc))
+    events = [
+        event
+        async for event in executor.run_turn([{"role": "user", "content": "read"}], [], "system")
+    ]
+    errors = [event.message for event in events if isinstance(event, ExecutorError)]
+    assert errors
+    record = tmp_path / "public-errors.json"
+    record.write_text(json.dumps(errors))
+    assert "fixture-private-receipt" not in record.read_text()
+
+
 class TestToolServer(unittest.TestCase):
     def setUp(self):
         try:
@@ -4062,6 +4195,33 @@ class TestResolveModel(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("tier", "status"), [("full", "ready"), ("auto", "blocked")])
+async def test_scoped_prepare_requires_ready_restricted_state_before_spawn(
+    tmp_path, monkeypatch, tier, status
+):
+    from omnigent.inner.pi_executor import PiPermissionBootstrapError
+
+    monkeypatch.setattr("omnigent.inner.pi_executor._find_pi_cli", lambda: "/opt/bin/pi")
+    monkeypatch.setattr("omnigent.harnesses.pi_native.main.pi_version", lambda _: (1, 3, 0))
+    monkeypatch.setattr("omnigent.inner.pi_executor.bridge_dir_for_session_id", lambda _: tmp_path)
+    write_host_permission_state(
+        tmp_path / "permission_state.json",
+        HostPermissionState("session", "host", str(tmp_path), tier, 3, status),
+    )
+    executor = PiExecutor(cwd=str(tmp_path), permission_controlled=True)
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("scoped preparation must refuse before spawn")
+
+    monkeypatch.setattr(executor, "_ensure_rpc", forbidden)
+    with pytest.raises(PiPermissionBootstrapError):
+        await executor.prepare_scoped_bootstrap(
+            "session", tmp_path / "pi-bootstrap" / ("a" * 32 + ".json")
+        )
+    assert executor._scoped_handoffs == {}
+
+
 @pytest.mark.parametrize("permission_tier", ["ask", "full"])
 def test_controlled_rpc_launch_orders_user_extensions_before_guard(
     tmp_path, monkeypatch, permission_tier
@@ -4079,7 +4239,8 @@ def test_controlled_rpc_launch_orders_user_extensions_before_guard(
     monkeypatch.setattr("omnigent.inner.pi_executor.prepare_bridge_dir", lambda _: bridge)
     observed = []
 
-    def ordered(executable, args, *, extension):
+    def ordered(executable, args, *, extension, scoped_handoff=None):
+        assert scoped_handoff is None
         observed.append(executable)
         return "/opt/launchers/permission-pi", ["--approve", "--model", "demo"]
 

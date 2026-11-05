@@ -16256,6 +16256,9 @@ async def _handle_mcp_tools_call(
     ):
         return _mcp_error_response(rpc_id, -32000, "Invalid runner MCP operation id")
     operation_id = cast("str | None", operation_id_value)
+    pi_continuation = params.get("_omnigent_pi_origin_receipt") is not None
+    if pi_continuation and operation_id is None:
+        return _mcp_error_response(rpc_id, -32000, "Pi MCP execution operation is missing")
     is_retry = request_state_str is not None
     permission_execution_binding: dict[str, object] | None = None
 
@@ -16268,7 +16271,10 @@ async def _handle_mcp_tools_call(
         if permission_execution_binding is not None:
             body["_omnigent_permission"] = permission_execution_binding
         if operation_id is not None:
-            body["_omnigent_operation"] = {"id": operation_id, "step": step}
+            body["_omnigent_operation"] = {
+                "id": operation_id,
+                "step": "pi-mcp:" + step if pi_continuation else step,
+            }
         return body
 
     _logger.debug(
@@ -16324,6 +16330,8 @@ async def _handle_mcp_tools_call(
         call_id=permission_call_id,
         runner_router=runner_router,
         local_execution=tier_local_execution,
+        origin_receipt=params.get("_omnigent_pi_origin_receipt"),
+        execution_operation_id=operation_id if pi_continuation else None,
     )
     if tier_inspection.decision.action == Verdict.DENY:
         return _mcp_error_response(rpc_id, -32000, tier_inspection.decision.reason)
@@ -16521,6 +16529,8 @@ async def _handle_mcp_tools_call(
             call_id=permission_call_id,
             runner_router=runner_router,
             local_execution=tier_local_execution,
+            origin_receipt=params.get("_omnigent_pi_origin_receipt"),
+            execution_operation_id=operation_id if pi_continuation else None,
         )
     tier_decision = await authorize_permission_call(
         tier_inspection,
@@ -16534,19 +16544,66 @@ async def _handle_mcp_tools_call(
         return _mcp_error_response(rpc_id, -32000, tier_decision.reason)
     permission_execution_binding = tier_inspection.execution_binding()
 
+    registry_config = None
+    if request is not None and getattr(request.app.state, "mcp_registry", None) is not None:
+        registry_config = next(
+            (
+                c
+                for c in spec.mcp_servers
+                if c.transport == "registry" and namespaced_name.startswith(c.name + "__")
+            ),
+            None,
+        )
+    server_advisor = namespaced_name in (
+        "sys_advise_models",
+        "mcp__omnigent__sys_advise_models",
+    )
+    if pi_continuation and (
+        server_advisor or execute_tool is not None or registry_config is not None
+    ):
+        # These branches bypass the runner's retained MCP execution cache.
+        binding = tier_inspection.binding
+        if binding is None:
+            return _mcp_error_response(rpc_id, -32000, "Pi MCP execution binding is missing")
+        try:
+            client = await _get_runner_client(session_id, runner_router, conversation=conv)
+            if client is None:
+                raise ValueError("Execution host unavailable")
+            consumed = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "permission_tier_execute",
+                    "call_id": binding.call_id,
+                    "expected_revision": binding.tier_revision,
+                    "arguments_digest": binding.arguments_digest,
+                    "name": namespaced_name,
+                    "arguments": arguments,
+                    "operation_id": operation_id,
+                    "step": "pi-mcp:initial",
+                    "pi_origin_receipt": tier_inspection.origin_receipt,
+                },
+                timeout=10.0,
+            )
+            consumed.raise_for_status()
+            if consumed.json().get("executed") is not True:
+                raise ValueError("Execution step rejected")
+        except Exception:  # noqa: BLE001 - unconfirmed consumption cannot execute
+            return _mcp_error_response(rpc_id, -32000, "Pi MCP execution step rejected")
+
     async def finish_server_execution() -> None:
-        if tier_inspection.binding is not None:
+        if tier_inspection.binding is not None and not pi_continuation:
             await finish_permission_call(
                 conv,
                 call_id=tier_inspection.binding.call_id,
                 revision=tier_inspection.binding.tier_revision,
                 runner_router=runner_router,
+                origin_receipt=tier_inspection.origin_receipt,
             )
 
     # ── Server-side sys_advise_models intercept ──────────────────────────
     # After policy evaluation (DENY/ASK handled above); arguments may have
     # been transformed. The advisor runs server-side where routing_client lives.
-    if namespaced_name in ("sys_advise_models", "mcp__omnigent__sys_advise_models"):
+    if server_advisor:
         try:
             return await _handle_advise_models_mcp(
                 rpc_id,
@@ -16562,16 +16619,6 @@ async def _handle_mcp_tools_call(
     from omnigent.runner.tool_dispatch import MCP_PROXY_FORWARD_TIMEOUT_S
 
     runner_client: httpx.AsyncClient | None = None
-    registry_config = None
-    if request is not None and getattr(request.app.state, "mcp_registry", None) is not None:
-        registry_config = next(
-            (
-                c
-                for c in spec.mcp_servers
-                if c.transport == "registry" and namespaced_name.startswith(c.name + "__")
-            ),
-            None,
-        )
     if execute_tool is not None:
         try:
             exec_data = await execute_tool(arguments)
@@ -16681,6 +16728,29 @@ async def _handle_mcp_tools_call(
         if runner_client is None:
             return _mcp_error_response(rpc_id, -32000, "Registry MCP elicitation is not supported")
 
+        if pi_continuation:
+            continuation_ctx = EvaluationContext(
+                phase=Phase.TOOL_CALL,
+                content={"name": namespaced_name, "arguments": arguments},
+                tool_name=namespaced_name,
+                actor=actor,
+            )
+            engine, continuation_policy = await _evaluate_policy_with_fresh_engine(
+                session_id, spec, conversation_store, conv, continuation_ctx
+            )
+            if continuation_policy.set_labels and continuation_policy.action != PolicyAction.ASK:
+                await asyncio.to_thread(engine.apply_label_writes, continuation_policy.set_labels)
+            # MCP input approval cannot approve a new server-policy ASK.
+            if continuation_policy.action != PolicyAction.ALLOW:
+                return _mcp_error_response(
+                    rpc_id,
+                    -32000,
+                    "MCP continuation denied by policy: "
+                    f"{continuation_policy.reason or 'approval required'}",
+                )
+            if continuation_policy.data is not None:
+                arguments = cast("dict[str, object]", continuation_policy.data)
+
         # Retry on the runner with the user's inputResponses.
         if tier_inspection.binding is not None:
             tier_inspection = await inspect_permission_call(
@@ -16688,9 +16758,15 @@ async def _handle_mcp_tools_call(
                 harness=permission_harness,
                 name=namespaced_name,
                 arguments=arguments,
-                call_id=str(permission_call_id) + ":elicitation-response",
+                call_id=(
+                    permission_call_id
+                    if pi_continuation
+                    else str(permission_call_id) + ":elicitation-response"
+                ),
                 runner_router=runner_router,
                 local_execution=tier_local_execution,
+                origin_receipt=params.get("_omnigent_pi_origin_receipt"),
+                execution_operation_id=operation_id if pi_continuation else None,
             )
             retry_permission = await authorize_permission_call(
                 tier_inspection,

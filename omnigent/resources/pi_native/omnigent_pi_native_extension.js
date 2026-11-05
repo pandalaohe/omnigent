@@ -4,6 +4,7 @@ const path = require("path");
 const crypto = require("crypto");
 const { spawnSync } = require("child_process");
 const permissionToolSources = require("./permission_tool_registry.cjs");
+const nativeSupport = require("./native_support.cjs");
 let permissionToolRegistry = null;
 
 // Tuning for the TOOL_CALL policy long-poll (see evalNativePolicyHttp).
@@ -3524,6 +3525,13 @@ module.exports = function (pi) {
     if (!event || typeof event.toolCallId !== "string" || !event.toolCallId ||
         !event.input || typeof event.input !== "object" || Array.isArray(event.input)) {
       return { block: true, reason: "invalid tool call" };
+    }
+    if (permissionState.tier !== "full" && config?.nativeSupportRequired === true) {
+      const support = await nativeSupport.classifyNativeCall(event, ctx, permissionState);
+      if (support.status === "failed_native") return {block:true, reason:support.reason};
+      if (!nativeSupport.hasScopedEvaluator(ctx)) return {block:true, reason:"Scoped native policy transport is not installed"};
+      // The independently installed final hook owns the scoped policy call.
+      return;
     }
     if (permissionState.tier !== "full" && permissionToolRegistry &&
         !permissionToolSources.matches(pi, permissionToolRegistry, event.toolName)) {

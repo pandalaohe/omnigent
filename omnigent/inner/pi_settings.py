@@ -38,7 +38,10 @@ const { pathToFileURL } = require("node:url");
 const dist = __PI_SDK_DIR__;
 const extensionPath = __OMNIGENT_EXTENSION__;
 const resourceAgentSource = __PI_RESOURCE_AGENT_DIR__;
+const scopedHandoff = __OMNIGENT_SCOPED_HANDOFF__;
 (async () => {
+  const handoff = scopedHandoff
+    ? await require(__OMNIGENT_SCOPED_CLIENT__).connectFromHandoff(scopedHandoff) : null;
   const load = (name) => import(pathToFileURL(path.join(dist, name)).href);
   const { setupCli } = await load("cli/setup.js");
   const { main } = await load("main.js");
@@ -66,7 +69,13 @@ const resourceAgentSource = __PI_RESOURCE_AGENT_DIR__;
   if (typeof factory !== "function") throw new Error("Omnigent extension factory unavailable");
   // Validate the real loader result, including built-ins and project trust passes.
   const getExtensions = DefaultResourceLoader.prototype.getExtensions;
-  DefaultResourceLoader.prototype.getExtensions = function () {
+  if (scopedHandoff) {
+    const sdk = await load("index.js");
+    const bootstrapUrl = pathToFileURL(__OMNIGENT_SCOPED_BOOTSTRAP__).href;
+    const { installScopedSdk } = await import(bootstrapUrl);
+    installScopedSdk(sdk, handoff, {sdkVersion:"1.3.0", sdkEntry:path.join(dist,"index.js")});
+  }
+  if (!scopedHandoff) DefaultResourceLoader.prototype.getExtensions = function () {
     const result = getExtensions.call(this);
     const last = result.extensions.at(-1);
     if (result.errors.length || !last || last.path !== "<inline:omnigent-permission>") {
@@ -104,6 +113,7 @@ def ordered_pi_launch(
     *,
     extension: Path,
     resource_agent_dir: Path | None = None,
+    scoped_handoff: Path | None = None,
 ) -> tuple[str, list[str]]:
     """Use Pi's own CLI/resource loader with a verified final inline policy factory."""
     required = (
@@ -124,6 +134,12 @@ def ordered_pi_launch(
     )
     if dist is None:
         raise PiSdkLoaderUnavailableError
+    if scoped_handoff is not None:
+        try:
+            if json.loads((dist.parent / "package.json").read_text()).get("version") != "1.3.0":
+                raise PiSdkLoaderUnavailableError
+        except (OSError, ValueError, AttributeError):
+            raise PiSdkLoaderUnavailableError from None
     remaining: list[str] = []
     index = 0
     while index < len(args):
@@ -141,6 +157,28 @@ def ordered_pi_launch(
         _INLINE_LAUNCHER_JS.lstrip()
         .replace("__PI_SDK_DIR__", json.dumps(str(dist)))
         .replace("__OMNIGENT_EXTENSION__", json.dumps(str(extension)))
+        .replace(
+            "__OMNIGENT_SCOPED_CLIENT__",
+            json.dumps(
+                str(
+                    Path(__file__).resolve().parent.parent
+                    / "resources/pi_native/scoped_client.cjs"
+                )
+            ),
+        )
+        .replace(
+            "__OMNIGENT_SCOPED_HANDOFF__",
+            json.dumps(str(scoped_handoff)) if scoped_handoff else "null",
+        )
+        .replace(
+            "__OMNIGENT_SCOPED_BOOTSTRAP__",
+            json.dumps(
+                str(
+                    Path(__file__).resolve().parent.parent
+                    / "resources/pi_native/scoped_bootstrap.mjs"
+                )
+            ),
+        )
         .replace(
             "__PI_RESOURCE_AGENT_DIR__",
             json.dumps(

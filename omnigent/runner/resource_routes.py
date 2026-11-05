@@ -607,6 +607,18 @@ def register_resource_routes(
                     event = {**event, "persist_resource_event": False}
                 _publish_event(event_session_id, event)
 
+            async def _pi_native_bootstrap():
+                from omnigent.harnesses.pi_native.bridge import bridge_dir_for_session_id
+
+                await _ensure_comment_relay_started(
+                    session_id,
+                    explicit_bridge_dir=bridge_dir_for_session_id(session_id),
+                )
+                binding = _session_comment_relays.get(session_id)
+                if binding is None or binding.pi_scope_relay is None:
+                    raise ValueError("Pi scoped permission relay unavailable")
+                return binding.pi_scope_relay.bootstrap
+
             _ensure_ctx = NativeLaunchContext(
                 session_id=session_id,
                 resource_registry=resource_registry,
@@ -614,6 +626,7 @@ def register_resource_routes(
                 server_client=server_client,
                 event_dispatcher=getattr(app.state, "runner_event_dispatcher", None),
                 ensure_comment_relay=_ensure_comment_relay_started,
+                pi_bootstrap=_pi_native_bootstrap,
                 peer_messaging_enabled=_session_peer_messaging_enabled.get(session_id, False),
                 session_open_enabled=_session_open_enabled.get(session_id, False),
                 global_instructions=_session_global_instructions.get(session_id),

@@ -2298,6 +2298,7 @@ def create_runner_app(
     _session_comment_relays: dict[str, _CommentRelayBinding] = {}
     _pending_codex_releases: dict[str, _CodexReleaseSnapshot] = {}
     _active_codex_release_captures: set[int] = set()
+    _session_pi_bootstraps: dict[str, tuple[httpx.AsyncClient, object | None, bool]] = {}
 
     # Process-lifetime monotonic fill-generation counter per session id.
     # Incremented (never popped) at delete_session so a fill parked across a
@@ -3222,6 +3223,10 @@ def create_runner_app(
         # app-server turn; the native-terminal ensure path can recreate it.
         if event.lifecycle != TerminalLifecycle.REQUIRED:
             return
+        if event.terminal_name == "pi" and event.session_key == "main":
+            binding = _session_comment_relays.get(event.session_id)
+            if binding is not None and binding.pi_scope_relay is not None:
+                binding.pi_scope_relay.bootstrap.invalidate()
 
         # Omnigent killed this pane after a delivery timeout. The turn's own
         # error is the failure; a terminal-exit failure would be a second one.
@@ -4297,6 +4302,20 @@ def create_runner_app(
             # claude/codex, a build_context enrichment. All wire the comment
             # relay (pi/opencode route their policy hook through it).
             _launch_locks = _native_terminal_ensure_locks[_native_agent.key]
+
+            async def _pi_native_bootstrap():
+                from omnigent.harnesses.pi_native.bridge import bridge_dir_for_session_id
+
+                await _ensure_comment_relay_started(
+                    session_id,
+                    explicit_bridge_dir=bridge_dir_for_session_id(session_id),
+                    session_labels=init_context.labels,
+                )
+                binding = _session_comment_relays.get(session_id)
+                if binding is None or binding.pi_scope_relay is None:
+                    raise ValueError("Pi scoped permission relay unavailable")
+                return binding.pi_scope_relay.bootstrap
+
             _launch_ctx = NativeLaunchContext(
                 session_id=session_id,
                 resource_registry=resource_registry,
@@ -4304,6 +4323,7 @@ def create_runner_app(
                 server_client=server_client,
                 event_dispatcher=getattr(app.state, "runner_event_dispatcher", None),
                 ensure_comment_relay=_ensure_comment_relay_started,
+                pi_bootstrap=_pi_native_bootstrap,
                 peer_messaging_enabled=_session_peer_messaging_enabled.get(session_id, False),
                 session_open_enabled=_session_open_enabled.get(session_id, False),
                 global_instructions=_session_global_instructions.get(session_id),
@@ -4619,30 +4639,7 @@ def create_runner_app(
                 and init_context.envelope is not None
                 and PERMISSION_STATE_LABEL_KEY in init_context.envelope.snapshot.labels
             ):
-                bootstrap = await asyncio.wait_for(
-                    init_harness_client.post(
-                        "/v1/permission-tier/bootstrap", json={"session_id": session_id}
-                    ),
-                    timeout=45.0 if IS_WINDOWS else 20.0,
-                )
-                bootstrap_body = bootstrap.json()
-                if (
-                    bootstrap.status_code != 200
-                    or not isinstance(bootstrap_body, dict)
-                    or bootstrap_body.get("installed") is not True
-                ):
-                    if (
-                        isinstance(bootstrap_body, dict)
-                        and bootstrap_body.get("error") == PiSdkLoaderUnavailableError.code
-                    ):
-                        raise PiSdkLoaderUnavailableError
-                    if (
-                        isinstance(bootstrap_body, dict)
-                        and bootstrap_body.get("error") == PiPermissionBootstrapError.code
-                        and isinstance(reason := bootstrap_body.get("reason"), str)
-                    ):
-                        raise PiPermissionBootstrapError(reason)
-                    raise ValueError("Pi permission extension did not acknowledge startup")
+                await _bootstrap_pi_harness(session_id, init_harness_client, force=True)
             elif harness_name == "pi-native" and init_context.envelope is not None:
                 from omnigent.harnesses.pi_native.bridge import (
                     verify_pi_permission_installation,
@@ -5388,6 +5385,7 @@ def create_runner_app(
         _session_tool_schemas.pop(session_id, None)
         _instruction_delivery_warned.pop(session_id, None)
         _session_sub_agent_resolved.pop(session_id, None)
+        _session_pi_bootstraps.pop(session_id, None)
         if _binding := _session_comment_relays.pop(session_id, None):
             _binding.relay.close()
         _session_histories.pop(session_id, None)
@@ -8078,12 +8076,14 @@ def create_runner_app(
         # startup paths — all pass a bridge hint and take the branch below.
         peer_for_relay = _session_peer_messaging_enabled.get(session_id, False)
         open_for_relay = _session_open_enabled.get(session_id, False)
+        pi_scoped_relay = permission_tiers.observation_harness(session_id) in ("pi", "pi-native")
         current = _session_comment_relays.get(session_id)
         if (
             current is not None
             and current.spec_entry is spec_entry
             and current.peer_messaging_enabled == peer_for_relay
             and current.session_open_enabled == open_for_relay
+            and (current.pi_scope_relay is not None) == pi_scoped_relay
             and known_bridge_dir is None
         ):
             return
@@ -8118,6 +8118,7 @@ def create_runner_app(
             and current.bridge_dir == bridge_dir
             and current.peer_messaging_enabled == peer_for_relay
             and current.session_open_enabled == open_for_relay
+            and (current.pi_scope_relay is not None) == pi_scoped_relay
         ):
             return
 
@@ -8149,6 +8150,7 @@ def create_runner_app(
                 and current.bridge_dir == bridge_dir
                 and current.peer_messaging_enabled == peer_for_relay
                 and current.session_open_enabled == open_for_relay
+                and (current.pi_scope_relay is not None) == pi_scoped_relay
             ):
                 return
 
@@ -8228,7 +8230,13 @@ def create_runner_app(
                         name=cast(str, event.get("name")),
                         arguments=arguments,
                         expected_revision=cast(int, event.get("expected_revision")),
-                        local_execution=True,
+                        local_execution=permission_tiers.pi_execution_kind(
+                            _captured_session_id,
+                            event.get("pi_origin_receipt"),
+                            legacy_local_execution=True,
+                        ),
+                        origin_receipt=event.get("pi_origin_receipt"),
+                        execution_operation_id=event.get("execution_operation_id"),
                     )
                     return {
                         **decision_payload(decision),
@@ -8248,6 +8256,7 @@ def create_runner_app(
                         name=event.get("name"),
                         arguments_digest=event.get("arguments_digest"),
                         expected_revision=event.get("expected_revision"),
+                        origin_receipt=event.get("pi_origin_receipt"),
                     )
                     if not authorized:
                         raise ValueError("Permission authorization stale")
@@ -8262,11 +8271,26 @@ def create_runner_app(
                         "tier_revision": state.revision,
                         "permission_tiers_capability": PERMISSION_TIERS_CAPABILITY,
                     }
+                if event_type == "permission_tier_execute":
+                    arguments = event.get("arguments")
+                    executed = isinstance(arguments, dict) and permission_tiers.verify_execute(
+                        _captured_session_id,
+                        call_id=event.get("call_id"),
+                        revision=event.get("expected_revision"),
+                        arguments_digest=event.get("arguments_digest"),
+                        name=cast(str, event.get("name")),
+                        arguments=arguments,
+                        operation_id=event.get("operation_id"),
+                        step=event.get("step"),
+                        origin_receipt=event.get("pi_origin_receipt"),
+                    )
+                    return {"executed": executed}
                 if event_type == "permission_tier_finish":
                     finished = permission_tiers.finish(
                         _captured_session_id,
                         call_id=event.get("call_id"),
                         revision=event.get("expected_revision"),
+                        origin_receipt=event.get("pi_origin_receipt"),
                     )
                     return {"finished": finished}
             except (KeyError, OSError, TypeError, ValueError):
@@ -8274,11 +8298,21 @@ def create_runner_app(
             return {"error": "invalid_input"}
 
         try:
-            if current is not None and current.bridge_dir == bridge_dir:
+            if (
+                current is not None
+                and current.bridge_dir == bridge_dir
+                and (current.pi_scope_relay is not None) == pi_scoped_relay
+            ):
                 # Native policy hooks can cache the relay URL/token at startup.
                 relay = current.relay
+                pi_scope_relay = current.pi_scope_relay
                 relay.update_tools(relay_schemas, _relay_tool_executor)
             else:
+                from omnigent.runner.pi_scope_relay import PiScopeRelay
+
+                pi_scope_relay = (
+                    PiScopeRelay(permission_tiers, session_id) if pi_scoped_relay else None
+                )
                 relay = start_tool_relay(
                     bridge_dir=bridge_dir,
                     tools=relay_schemas,
@@ -8288,6 +8322,7 @@ def create_runner_app(
                     session_id=session_id,
                     file_change_observer=_observe_native_file_changes,
                     permission_tier_control=_permission_tier_control,
+                    pi_scope_relay=pi_scope_relay,
                 )
         except (OSError, RuntimeError):
             _logger.warning(
@@ -8298,12 +8333,15 @@ def create_runner_app(
             )
             return
         superseded = _session_comment_relays.get(session_id)
+        if superseded is not None and superseded.pi_scope_relay is not pi_scope_relay:
+            _session_pi_bootstraps.pop(session_id, None)
         _session_comment_relays[session_id] = _CommentRelayBinding(
             relay=relay,
             spec_entry=spec_entry,
             bridge_dir=bridge_dir,
             peer_messaging_enabled=peer_for_relay,
             session_open_enabled=open_for_relay,
+            pi_scope_relay=pi_scope_relay,
         )
         # Close last: the new advertisement is already written, and
         # ClaudeNativeToolRelay.close only unlinks a tool_relay.json that
@@ -8341,6 +8379,82 @@ def create_runner_app(
             )
             _background_tasks.add(_notify_task)
             _notify_task.add_done_callback(_background_tasks.discard)
+
+    async def _bootstrap_pi_harness(
+        session_id: str, client: httpx.AsyncClient, *, force: bool = False
+    ) -> None:
+        """Bind each Python harness incarnation before its first dispatch."""
+        from omnigent.inner.pi_executor import PiPermissionBootstrapError
+        from omnigent.inner.pi_settings import PiSdkLoaderUnavailableError
+
+        generation = _session_cache_generation(session_id)
+        permission = permission_tiers.state(session_id)
+        if permission is None:
+            raise ValueError("Pi startup permission state unavailable")
+        relay_binding = _session_comment_relays.get(session_id)
+        relay = relay_binding.pi_scope_relay if relay_binding is not None else None
+        scoped_pi = permission.tier != "full"
+        previous = _session_pi_bootstraps.get(session_id)
+        if (
+            not force
+            and previous is not None
+            and previous[0] is client
+            and previous[1] is relay
+            and previous[2] == scoped_pi
+        ):
+            return
+        _session_pi_bootstraps.pop(session_id, None)
+        payload: dict[str, object] = {"session_id": session_id}
+        prior_epoch: str | None = None
+        if scoped_pi:
+            if relay is None:
+                raise ValueError("Pi scoped permission relay unavailable")
+            with contextlib.suppress(ValueError):
+                prior_epoch = permission_tiers.pi_scopes.parent_scope(
+                    session_id
+                ).admission.principal.launch_epoch
+            payload.update(phase="configure", launcher=relay.bootstrap.launcher_descriptor())
+        response = await asyncio.wait_for(
+            client.post("/v1/permission-tier/bootstrap", json=payload),
+            timeout=45.0 if IS_WINDOWS else 20.0,
+        )
+        body = response.json()
+        if (
+            response.status_code != 200
+            or not isinstance(body, dict)
+            or body.get("installed") is not True
+        ):
+            if isinstance(body, dict) and body.get("error") == PiSdkLoaderUnavailableError.code:
+                raise PiSdkLoaderUnavailableError
+            if (
+                isinstance(body, dict)
+                and body.get("error") == PiPermissionBootstrapError.code
+                and isinstance(reason := body.get("reason"), str)
+            ):
+                raise PiPermissionBootstrapError(reason)
+            raise ValueError("Pi permission extension did not acknowledge startup")
+        if scoped_pi:
+            parent = permission_tiers.pi_scopes.parent_scope(session_id)
+            if (
+                parent.admission.principal.launch_epoch == prior_epoch
+                or parent.native_classifier is None
+                or not permission_tiers.acknowledge_pi_scope(
+                    session_id, parent.admission.credential
+                )
+            ):
+                raise ValueError("Pi scope startup registration is incomplete")
+            permission_tiers._verify_installation(
+                permission_tiers.path(session_id), "pi", permission.tier
+            )
+        current_binding = _session_comment_relays.get(session_id)
+        current_relay = current_binding.pi_scope_relay if current_binding is not None else None
+        if (
+            not _session_cache_generation_is_current(session_id, generation)
+            or permission_tiers.state(session_id) != permission
+            or current_relay is not relay
+        ):
+            raise ValueError("Pi harness bootstrap owner changed")
+        _session_pi_bootstraps[session_id] = (client, relay, scoped_pi)
 
     async def _run_turn_bg(
         msg_body: _JsonObject,
@@ -9271,6 +9385,27 @@ def create_runner_app(
                     "detail": _client_safe_error_detail(exc, context="harness spawn"),
                 },
             )
+
+        pi_permission = permission_tiers.state(conv_id) if harness_name == "pi" else None
+        if pi_permission is not None and pi_permission.status == "ready":
+            try:
+                await _bootstrap_pi_harness(conv_id, client)
+            except (
+                OSError,
+                ValueError,
+                TypeError,
+                ImportError,
+                RuntimeError,
+                httpx.HTTPError,
+                TimeoutError,
+            ) as exc:
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "permission_tier_unavailable",
+                        "detail": _client_safe_error_detail(exc, context="Pi harness bootstrap"),
+                    },
+                )
 
         _turn_agent_id = dispatch.agent_id if dispatch else cast(str | None, body.get("agent_id"))
         _has_mcp_hint = dispatch.has_mcp_servers if dispatch else body.get("has_mcp_servers")
@@ -11463,7 +11598,13 @@ def create_runner_app(
                     name=body["name"],
                     arguments=body["arguments"],
                     expected_revision=body["expected_revision"],
-                    local_execution=local_execution,
+                    local_execution=permission_tiers.pi_execution_kind(
+                        conversation_id,
+                        body.get("pi_origin_receipt"),
+                        legacy_local_execution=local_execution,
+                    ),
+                    origin_receipt=body.get("pi_origin_receipt"),
+                    execution_operation_id=body.get("execution_operation_id"),
                 )
             except (KeyError, OSError, TypeError, ValueError):
                 return JSONResponse(status_code=409, content={"error": "permission_tier_stale"})
@@ -11490,6 +11631,7 @@ def create_runner_app(
                 name=body.get("name"),
                 arguments_digest=body.get("arguments_digest"),
                 expected_revision=body.get("expected_revision"),
+                origin_receipt=body.get("pi_origin_receipt"),
             )
             if not authorized:
                 return JSONResponse(status_code=409, content={"error": "permission_tier_stale"})
@@ -11507,11 +11649,33 @@ def create_runner_app(
                 }
             )
 
+        if body_type == "permission_tier_execute":
+            if (
+                not isinstance(body, dict)
+                or not isinstance(body.get("arguments"), dict)
+                or not isinstance(body.get("name"), str)
+            ):
+                return JSONResponse(status_code=400, content={"error": "invalid_input"})
+            if not permission_tiers.verify_execute(
+                conversation_id,
+                call_id=body.get("call_id"),
+                revision=body.get("expected_revision"),
+                arguments_digest=body.get("arguments_digest"),
+                name=body["name"],
+                arguments=body["arguments"],
+                operation_id=body.get("operation_id"),
+                step=body.get("step"),
+                origin_receipt=body.get("pi_origin_receipt"),
+            ):
+                return JSONResponse(status_code=409, content={"error": "permission_tier_stale"})
+            return JSONResponse(content={"executed": True})
+
         if body_type == "permission_tier_finish":
             if not isinstance(body, dict) or not permission_tiers.finish(
                 conversation_id,
                 call_id=body.get("call_id"),
                 revision=body.get("expected_revision"),
+                origin_receipt=body.get("pi_origin_receipt"),
             ):
                 return JSONResponse(status_code=409, content={"error": "permission_tier_stale"})
             return JSONResponse(content={"finished": True})
