@@ -74,6 +74,57 @@ def _wheel_install(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("omnigent.cli._stop_local_server_and_daemon", lambda *, force: False)
 
 
+@pytest.mark.parametrize("outcome", ["success", "install-failure", "no-op", "refresh-failure"])
+def test_upgrade_preserves_enabled_service(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _wheel_install: None, outcome: str
+) -> None:
+    from omnigent.host import service
+
+    target = "https://remote.example/space%2Fname"
+    installed = service.HostService("systemd_user", tmp_path / "host.service", "host.service")
+    original = service._systemd_unit(
+        command=["python", "-m", "omnigent.host.service_entry", "--server", target],
+        environment={"PATH": "/old/bin"},
+    )
+    installed.path.write_bytes(original)
+    monkeypatch.setattr(service, "_service_for_current_platform", lambda: installed)
+    monkeypatch.setattr(service, "_record_service", lambda _: None)
+    monkeypatch.setattr("omnigent.cli._build_host_daemon_env", lambda **_: {"PATH": "/new/bin"})
+    monkeypatch.setattr("omnigent.cli._find_daemon_record", lambda _: None)
+    events: list[str] = []
+
+    def _manager(args: list[str]) -> None:
+        events.append(args[2])
+        if args[2] == "enable" and outcome == "refresh-failure":
+            raise service.HostServiceError("refresh failed")
+
+    monkeypatch.setattr(service, "_run_checked", _manager)
+    monkeypatch.setattr(service, "_run_best_effort", lambda args: events.append(args[2]))
+    monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda **_: "0.2.0")
+
+    def _install(*_: object) -> int:
+        events.append("install")
+        return 2 if outcome == "install-failure" else 0
+
+    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", _install)
+    version = "0.1.0" if outcome in {"install-failure", "no-op"} else "0.2.0"
+    monkeypatch.setattr(
+        "omnigent.update_check._probe_installed_distribution", lambda: (version, None)
+    )
+
+    result = CliRunner().invoke(cli, ["upgrade"])
+
+    assert result.exit_code == (0 if outcome == "success" else 1), result.output
+    assert events.index("stop") < events.index("install")
+    if outcome == "success":
+        assert events.index("install") < events.index("enable")
+        assert 'Environment="PATH=/new/bin"' in installed.path.read_text()
+        assert service.installed_user_host_service() == (installed, target)
+    else:
+        assert events.index("install") < events.index("start")
+        assert installed.path.read_bytes() == original
+
+
 def test_upgrade_up_to_date(monkeypatch: pytest.MonkeyPatch, _wheel_install: None) -> None:
     """Latest == installed → reports up to date, exit 0, nothing stopped/run."""
     monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda *_a, **_k: "0.1.0")

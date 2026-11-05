@@ -5899,6 +5899,61 @@ def _drain_and_stop_local_server(*, force: bool) -> None:
         click.echo("Stopped the background server before upgrading.")
 
 
+@contextlib.contextmanager
+def _upgrade_host_service(*, force: bool) -> Iterator[None]:
+    """Keep an enabled service stopped until the install and version check finish."""
+    from omnigent.host.service import (
+        HostServiceError,
+        enable_user_host_service,
+        installed_user_host_service,
+        start_user_host_service,
+        stop_user_host_service,
+    )
+
+    try:
+        snapshot = installed_user_host_service()
+    except HostServiceError as exc:
+        raise click.ClickException(str(exc)) from exc
+    _drain_and_stop_local_server(force=force)
+    if snapshot is None:
+        yield
+        return
+    service, server_url = snapshot
+    if server_url is not None and not force:
+        record = _find_daemon_record(_normalize_daemon_target(server_url))
+        if record is not None:
+            _wait_for_running_sessions(
+                lambda: _count_running_daemon_sessions(record),
+                force_hint="re-run with --force to stop them now",
+            )
+    succeeded = False
+    try:
+        try:
+            stop_user_host_service(service)
+            yield
+            succeeded = True
+        finally:
+            if succeeded:
+                try:
+                    enable_user_host_service(
+                        server_url, environment=_build_host_daemon_env(server_url=server_url)
+                    )
+                except HostServiceError:
+                    with contextlib.suppress(HostServiceError):
+                        start_user_host_service(service)
+                    raise
+                click.echo("Refreshed and restarted the host user service.")
+            else:
+                try:
+                    start_user_host_service(service)
+                except HostServiceError as exc:
+                    click.echo(
+                        f"Additionally failed to restore the host user service: {exc}", err=True
+                    )
+    except HostServiceError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
 def _echo_upgrade_plan(
     info: _InstalledWheelInfo,
     suggestion: _UpgradeSuggestion,
@@ -6407,42 +6462,41 @@ def upgrade(
         _echo_upgrade_plan(info, suggestion, extra_overrides)
         return
 
-    _drain_and_stop_local_server(force=force)
+    with _upgrade_host_service(force=force):
+        console = Console()
+        code = _run_upgrade_command(suggestion.command, console)
+        if code != 0:
+            raise click.ClickException(
+                _upgrade_failure_message(code, set(info.extras) | set(extra_overrides))
+            )
 
-    console = Console()
-    code = _run_upgrade_command(suggestion.command, console)
-    if code != 0:
+        # Trust the installed version, not the installer's exit code. The running
+        # process still has the OLD version loaded, so re-read it in a fresh
+        # subprocess. A no-op upgrade (version-pinned spec, a cooldown /
+        # exclude-newer that excludes the new release, or a stale index cache)
+        # exits 0 without moving — claiming "✓ Upgraded" there is exactly the
+        # "I upgraded but it still says an update is available" bug.
+        new_version, _ = _probe_installed_distribution()
+        if new_version is None:
+            click.echo(
+                "Ran the upgrade command, but couldn't confirm the installed version. "
+                f"Run `{cli_invocation(name='omni')} upgrade --check` to verify."
+            )
+            return
+        expected_version = target_version or latest
+        if _is_newer(new_version, current):
+            click.echo(
+                f"✓ Upgraded to v{new_version}. Re-run your command — the local "
+                "server will start on the new version."
+            )
+            return
         raise click.ClickException(
-            _upgrade_failure_message(code, set(info.extras) | set(extra_overrides))
+            f"The upgrade command ran but omnigent is still v{new_version} (expected "
+            f"v{expected_version}). The install is likely version-pinned, a cooldown / "
+            "exclude-newer is excluding the new release, or the index cache is stale. "
+            "Reinstall it explicitly — e.g. `uv tool upgrade --reinstall omnigent` or "
+            f"`pip install --force-reinstall 'omnigent=={expected_version}'`."
         )
-
-    # Trust the installed version, not the installer's exit code. The running
-    # process still has the OLD version loaded, so re-read it in a fresh
-    # subprocess. A no-op upgrade (version-pinned spec, a cooldown /
-    # exclude-newer that excludes the new release, or a stale index cache)
-    # exits 0 without moving — claiming "✓ Upgraded" there is exactly the
-    # "I upgraded but it still says an update is available" bug.
-    new_version, _ = _probe_installed_distribution()
-    if new_version is None:
-        click.echo(
-            "Ran the upgrade command, but couldn't confirm the installed version. "
-            f"Run `{cli_invocation(name='omni')} upgrade --check` to verify."
-        )
-        return
-    expected_version = target_version or latest
-    if _is_newer(new_version, current):
-        click.echo(
-            f"✓ Upgraded to v{new_version}. Re-run your command — the local "
-            "server will start on the new version."
-        )
-        return
-    raise click.ClickException(
-        f"The upgrade command ran but omnigent is still v{new_version} (expected "
-        f"v{expected_version}). The install is likely version-pinned, a cooldown / "
-        "exclude-newer is excluding the new release, or the index cache is stale. "
-        "Reinstall it explicitly — e.g. `uv tool upgrade --reinstall omnigent` or "
-        f"`pip install --force-reinstall 'omnigent=={expected_version}'`."
-    )
 
 
 # ``omni update`` is an alias for ``omni upgrade`` — mistyping the latter as
