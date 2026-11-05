@@ -1,11 +1,10 @@
-import { useState } from "react";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import {
   patchUsageBoardPreferences,
   type UsageBoardPreferences,
 } from "@/lib/usageContextPreferences";
 import { Input } from "@/components/ui/input";
-import { Button } from "@/components/ui/button";
+import { toDateInput } from "./usageBoardSelect";
 
 export const USAGE_RANGES = {
   today: "Today",
@@ -33,9 +32,10 @@ export function usageRangeQuery(range: UsageRange): URLSearchParams {
 export function UsageRangeControl() {
   const board = useUsageContextPreferences().board;
   const range = board.range ?? { key: "d7" };
-  const [custom, setCustom] = useState(range.key === "custom");
-  const [from, setFrom] = useState(range.from ?? "");
-  const [to, setTo] = useState(range.to ?? "");
+  const today = toDateInput(Date.now());
+  const from = range.from ?? today;
+  const to = range.to ?? today;
+  const valid = (date: string) => /^\d{4}-\d{2}-\d{2}$/.test(date) && date <= today;
   return (
     <div className="flex flex-wrap items-center gap-2">
       <label className="flex items-center gap-2 text-sm">
@@ -43,11 +43,12 @@ export function UsageRangeControl() {
         <select
           aria-label="Usage range"
           className="h-9 rounded-md border border-input bg-background px-2 text-sm"
-          value={custom ? "custom" : range.key}
+          value={range.key}
           onChange={(event) => {
             const key = event.target.value as UsageRange["key"];
-            setCustom(key === "custom");
-            if (key !== "custom") patchUsageBoardPreferences({ range: { key } });
+            patchUsageBoardPreferences({
+              range: key === "custom" ? { key, from, to } : { key },
+            });
           }}
         >
           {Object.entries(USAGE_RANGES).map(([key, name]) => (
@@ -57,22 +58,22 @@ export function UsageRangeControl() {
           ))}
         </select>
       </label>
-      {custom ? (
-        <form
-          className="flex flex-wrap items-center gap-2"
-          onSubmit={(event) => {
-            event.preventDefault();
-            patchUsageBoardPreferences({ range: { key: "custom", from, to } });
-          }}
-        >
+      {range.key === "custom" ? (
+        <div className="flex flex-wrap items-center gap-2">
           <Input
             type="date"
             aria-label="Usage from date"
             className="h-9 w-36"
             required
             value={from}
-            max={to || undefined}
-            onChange={(event) => setFrom(event.target.value)}
+            max={today}
+            onChange={(event) => {
+              const next = event.target.value;
+              if (valid(next))
+                patchUsageBoardPreferences({
+                  range: { key: "custom", from: next, to: next > to ? next : to },
+                });
+            }}
           />
           <span className="text-xs text-muted-foreground">to</span>
           <Input
@@ -82,12 +83,16 @@ export function UsageRangeControl() {
             required
             value={to}
             min={from || undefined}
-            onChange={(event) => setTo(event.target.value)}
+            max={today}
+            onChange={(event) => {
+              const next = event.target.value;
+              if (valid(next) && next >= from)
+                patchUsageBoardPreferences({
+                  range: { key: "custom", from, to: next },
+                });
+            }}
           />
-          <Button size="sm" variant="outline" type="submit">
-            Apply
-          </Button>
-        </form>
+        </div>
       ) : null}
     </div>
   );

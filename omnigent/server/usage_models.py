@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Any
 
+from omnigent.harness_plugins import native_agents
 from omnigent.llms.context_window import fetch_model_pricing_with_provider
 from omnigent.runtime.instruction_layers import agent_key_for_harness
 from omnigent.server.agent_quota import AgentQuotaService
@@ -62,8 +63,21 @@ def usage_models(
                 )
     for model in used:
         row(model)
+    from omnigent.onboarding.provider_config import load_config
+
+    provider_config = load_config()
+    product_harness = next(
+        (agent.harness for agent in native_agents() if agent.key == account.product), None
+    )
     for model, value in rows.items():
-        price = fetch_model_pricing_with_provider(model)
+        harnesses = {source["harness"] for source in value["sources"] if "harness" in source}
+        price_candidates = {
+            fetch_model_pricing_with_provider(
+                model, provider_config=provider_config, harness=harness, cached_only=True
+            )
+            for harness in harnesses or {product_harness}
+        }
+        price = next(iter(price_candidates)) if len(price_candidates) == 1 else None
         value["pricing"] = asdict(price) if price is not None else None
     return {
         "account": account_id,

@@ -6,16 +6,18 @@ import asyncio
 import json
 import logging
 import math
+import re
 import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Literal, Self
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.exc import SQLAlchemyError
 
+from omnigent.diagnostics import redact_url
 from omnigent.llms.context_window import ModelPricing, fetch_model_pricing_with_provider
 from omnigent.llms.price_source import READERS, PriceMap, install_price_map
 from omnigent.server.auth import RESERVED_USER_LOCAL
@@ -25,6 +27,9 @@ from omnigent.stores.usage_snapshot_store import UsageSnapshotStore
 _logger = logging.getLogger(__name__)
 _MAX_BYTES = 10 * 1024 * 1024
 _DAY = 86400
+_CREDENTIAL_QUERY_NAME = re.compile(
+    r"(?:key|token|secret|password|passwd|signature|credential|authorization|auth|sig)$"
+)
 _PRESETS = {
     "litellm": "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",
     "openrouter": "https://openrouter.ai/api/v1/models",
@@ -56,9 +61,14 @@ class PriceSourceSelection(BaseModel):
                     and not any(char.isspace() for char in self.url)
                 )
             except ValueError:
-                valid = False
+                raise ValueError("Use an HTTPS URL without credentials or a fragment") from None
             if not valid:
                 raise ValueError("Use an HTTPS URL without credentials or a fragment")
+            if any(
+                _CREDENTIAL_QUERY_NAME.search(re.sub(r"[^a-z0-9]", "", name.lower()))
+                for name, _ in parse_qsl(url.query, keep_blank_values=True)
+            ):
+                raise ValueError("Price source URLs cannot contain credential query parameters")
         elif self.url is not None or self.format is not None:
             raise ValueError("A built-in choice does not take a URL or format")
         return self
@@ -80,17 +90,22 @@ async def fetch_prices(selection: PriceSourceSelection) -> PriceMap:
     url, format_name = location
     try:
         async with asyncio.timeout(30):
-            async with (
-                httpx.AsyncClient(trust_env=False, follow_redirects=False, timeout=30) as client,
-                client.stream("GET", url) as response,
-            ):
-                if response.status_code != 200:
-                    raise ValueError(f"Price source returned HTTP {response.status_code}")
-                content = bytearray()
-                async for chunk in response.aiter_bytes():
-                    content.extend(chunk)
-                    if len(content) > _MAX_BYTES:
-                        raise ValueError("Price source exceeds 10 MB")
+            # The transport has no client INFO URL logging, redirects or inherited auth.
+            async with httpx.AsyncHTTPTransport(trust_env=False) as transport:
+                request = httpx.Request(
+                    "GET", url, extensions={"timeout": httpx.Timeout(30).as_dict()}
+                )
+                response = await transport.handle_async_request(request)
+                try:
+                    if response.status_code != 200:
+                        raise ValueError(f"Price source returned HTTP {response.status_code}")
+                    content = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        content.extend(chunk)
+                        if len(content) > _MAX_BYTES:
+                            raise ValueError("Price source exceeds 10 MB")
+                finally:
+                    await response.aclose()
         payload = json.loads(content)
     except (httpx.HTTPError, TimeoutError):
         raise ValueError("Price source could not be reached within 30 seconds") from None
@@ -171,6 +186,7 @@ class UsagePriceSource:
     def status(self) -> dict[str, Any]:
         return {
             **self.selection.model_dump(),
+            "url": redact_url(self.selection.url),
             "fetched_at": self.fetched_at,
             "last_attempt_at": self.last_attempt_at,
             "model_count": len(self.prices.prices) if self.prices else 0,

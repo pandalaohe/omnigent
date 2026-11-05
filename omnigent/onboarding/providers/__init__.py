@@ -317,7 +317,7 @@ def _download_provider_catalog(provider: str) -> dict[str, Any] | None:
         return None
 
 
-def _fetch_provider_catalog(provider: str) -> dict[str, Any]:
+def _fetch_provider_catalog(provider: str, *, cached_only: bool = False) -> dict[str, Any]:
     """
     Return the MLflow catalog for *provider* through memory and disk caches.
 
@@ -328,6 +328,7 @@ def _fetch_provider_catalog(provider: str) -> dict[str, Any]:
     tier and network.
 
     :param provider: Provider name, e.g. ``"anthropic"``.
+    :param cached_only: Read validated memory/disk data without refreshing over the network.
     :returns: Parsed catalog dict (``schema_version`` + ``models`` keys),
         or ``{}`` on failure.
     """
@@ -348,6 +349,13 @@ def _fetch_provider_catalog(provider: str) -> dict[str, Any]:
                 return cached.catalog
             del _catalog_cache[provider]
     disk_entry = _read_disk_catalog(provider, source_url)
+    if cached_only:
+        return (
+            disk_entry.catalog
+            if disk_entry is not None
+            and _catalog_age_seconds(disk_entry, now) <= _CATALOG_STALE_IF_ERROR_SECONDS
+            else {}
+        )
     if disk_entry is not None and _catalog_age_seconds(disk_entry, now) <= _CATALOG_TTL_SECONDS:
         with _catalog_cache_lock:
             _catalog_cache[provider] = disk_entry
@@ -541,7 +549,7 @@ def get_all_providers() -> list[str]:
     return popular + rest
 
 
-def get_models(provider: str) -> list[ModelInfo]:
+def get_models(provider: str, *, cached_only: bool = False) -> list[ModelInfo]:
     """
     Return all models for a provider, loaded from the catalog JSON files.
 
@@ -549,6 +557,7 @@ def get_models(provider: str) -> list[ModelInfo]:
     variant files are included.
 
     :param provider: Provider name, e.g. ``"anthropic"``.
+    :param cached_only: Avoid network discovery on cache misses or expiry.
     :returns: List of :class:`ModelInfo` for all models under that provider.
     """
     matching_files = [
@@ -561,7 +570,11 @@ def get_models(provider: str) -> list[ModelInfo]:
     seen: set[str] = set()
 
     for file_provider in matching_files:
-        catalog = _fetch_provider_catalog(file_provider)
+        catalog = (
+            _fetch_provider_catalog(file_provider, cached_only=True)
+            if cached_only
+            else _fetch_provider_catalog(file_provider)
+        )
         for model_name, entry in catalog.get("models", {}).items():
             # Strip provider prefix if present (e.g. "gemini/gemini-2.5-flash")
             if model_name.startswith(f"{provider}/"):
@@ -689,7 +702,7 @@ def _catalog_lookup_targets(model: str) -> list[tuple[str, str]]:
     return targets
 
 
-def find_catalog_models(model: str) -> list[ModelInfo]:
+def find_catalog_models(model: str, *, cached_only: bool = False) -> list[ModelInfo]:
     """Find exact or unambiguous-family candidates in the shared catalog.
 
     Provider-qualified ids query that provider directly. Vendor-namespaced ids
@@ -699,11 +712,12 @@ def find_catalog_models(model: str) -> list[ModelInfo]:
     accept a field only when every candidate reports the same value.
 
     :param model: Provider-local, provider-qualified, or vendor-namespaced id.
+    :param cached_only: Read the same candidates from local caches without downloads.
     :returns: One exact match, compatible family-prefix matches, or an empty list.
     """
     family_matches: list[ModelInfo] = []
     for provider, lookup_id in _catalog_lookup_targets(model):
-        models = get_models(provider)
+        models = get_models(provider, cached_only=True) if cached_only else get_models(provider)
         lookup_lower = lookup_id.lower()
         for candidate in models:
             names = {candidate.name.lower()}

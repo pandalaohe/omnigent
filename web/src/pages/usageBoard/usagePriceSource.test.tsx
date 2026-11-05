@@ -8,6 +8,7 @@ import {
 } from "@/lib/usageContextPreferences";
 import { UsagePriceSourceSettings } from "./UsagePriceSourceSettings";
 import { UsageModelsPage } from "./UsageModelsPage";
+import { UsageRangeControl } from "./UsageRangeControl";
 
 const { fetchMock } = vi.hoisted(() => ({ fetchMock: vi.fn() }));
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: fetchMock }));
@@ -26,7 +27,7 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 
-function mount(view: "settings" | "models") {
+function mount(view: "settings" | "models" | "range") {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
     <QueryClientProvider client={client}>
@@ -34,7 +35,15 @@ function mount(view: "settings" | "models") {
         <Routes>
           <Route
             path="/usage/board/:accountId/models"
-            element={view === "models" ? <UsageModelsPage /> : <UsagePriceSourceSettings />}
+            element={
+              view === "models" ? (
+                <UsageModelsPage />
+              ) : view === "range" ? (
+                <UsageRangeControl />
+              ) : (
+                <UsagePriceSourceSettings />
+              )
+            }
           />
         </Routes>
       </MemoryRouter>
@@ -66,6 +75,43 @@ it("saves a selected map and leaves the prior selection after a rejected URL", a
   await screen.findByText("No valid prices");
   expect((select as HTMLSelectElement).value).toBe("litellm");
   expect(screen.getByRole("dialog")).toBeTruthy();
+});
+
+it("applies Custom dates live, moves the end with the start and rejects future dates", () => {
+  const today = new Date();
+  const day = (offset: number) => {
+    const date = new Date(today.getFullYear(), today.getMonth(), today.getDate() + offset);
+    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+  };
+  patchUsageBoardPreferences({ range: { key: "d7" } });
+  mount("range");
+  fireEvent.change(screen.getByLabelText("Usage range"), { target: { value: "custom" } });
+  expect(screen.queryByRole("button", { name: "Apply" })).toBeNull();
+  expect(readUsageContextPreferences().board.range?.key).toBe("custom");
+  const start = screen.getByLabelText("Usage from date");
+  const end = screen.getByLabelText("Usage to date");
+  expect(start.getAttribute("max")).toBe(day(0));
+  expect(end.getAttribute("max")).toBe(day(0));
+  fireEvent.change(start, { target: { value: day(-4) } });
+  fireEvent.change(end, { target: { value: day(-3) } });
+  expect(readUsageContextPreferences().board.range).toEqual({
+    key: "custom",
+    from: day(-4),
+    to: day(-3),
+  });
+  fireEvent.change(start, { target: { value: day(-1) } });
+  expect(readUsageContextPreferences().board.range).toEqual({
+    key: "custom",
+    from: day(-1),
+    to: day(-1),
+  });
+  fireEvent.change(start, { target: { value: day(1) } });
+  fireEvent.change(end, { target: { value: day(1) } });
+  expect(readUsageContextPreferences().board.range).toEqual({
+    key: "custom",
+    from: day(-1),
+    to: day(-1),
+  });
 });
 
 it("shows a server-wide source read-only to a member", async () => {

@@ -1,12 +1,15 @@
 """Source selection, restart, failures and the owner-scoped Models join."""
 
+import logging
+
 import httpx
 import pytest
 from fastapi import FastAPI
 from pydantic import ValidationError
 
 from omnigent.llms.context_window import ModelPricing, fetch_model_pricing_with_provider
-from omnigent.llms.price_source import install_price_map
+from omnigent.llms.price_source import PriceMap, install_price_map
+from omnigent.onboarding import providers
 from omnigent.server.routes.agent_quota import create_agent_quota_router
 from omnigent.server.usage_models import usage_models
 from omnigent.server.usage_price_source import PriceSourceSelection, UsagePriceSource, fetch_prices
@@ -49,6 +52,44 @@ def price_source(service, tmp_path, monkeypatch):
 def test_custom_requires_https_without_credentials(url):
     with pytest.raises(ValidationError):
         PriceSourceSelection(source="custom", format="litellm", url=url)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "api_key",
+        "API-KEY",
+        "access_token",
+        "password",
+        "X-Amz-Credential",
+        "X-Amz-Signature",
+        "%61pi_key",
+    ],
+)
+def test_custom_rejects_credential_query_names(name):
+    with pytest.raises(ValidationError):
+        PriceSourceSelection(source="custom", format="litellm", url=f"{URL}?{name}=made-up")
+
+
+@pytest.mark.asyncio
+async def test_query_is_sent_but_never_exposed_in_status_or_http_logs(
+    price_source, respx_mock, caplog
+):
+    url = f"{URL}?edition=private-query-marker"
+    selection = PriceSourceSelection(source="custom", format="litellm", url=url)
+    route = respx_mock.get(url).respond(200, json=PAYLOAD)
+    with caplog.at_level(logging.INFO, logger="httpx"):
+        status = await price_source.select(selection)
+    assert route.call_count == 1
+    assert "private-query-marker" not in caplog.text
+    assert "?edition=" not in caplog.text
+    assert status["url"] == URL
+    caplog.clear()
+    route.respond(500)
+    with caplog.at_level(logging.INFO, logger="httpx"), pytest.raises(ValueError):
+        await price_source.select(selection)
+    assert "private-query-marker" not in caplog.text
+    assert "?edition=" not in str(price_source.status())
 
 
 @pytest.mark.asyncio
@@ -135,7 +176,7 @@ def test_models_join_keeps_stale_owned_hosts_and_scopes_product(service, db_uri,
     monkeypatch.setattr("omnigent.server.agent_quota.time.time", lambda: NOW)
     monkeypatch.setattr(
         "omnigent.server.usage_models.fetch_model_pricing_with_provider",
-        lambda _: ModelPricing(2e-6, 6e-6),
+        lambda *args, **kwargs: ModelPricing(2e-6, 6e-6),
     )
     service.host_store = HostStore(db_uri)
     catalogs = HostModelCatalogCacheStore(db_uri)
@@ -163,6 +204,74 @@ def test_models_join_keeps_stale_owned_hosts_and_scopes_product(service, db_uri,
     assert result["models"][2]["usage"]["cost_usd"] == 1
     with pytest.raises(LookupError):
         usage_models(service, catalogs, "other@example.test", "gateway", now=NOW)
+
+
+def test_models_read_uses_catalog_caches_without_downloading(service, tmp_path, monkeypatch):
+    monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
+    monkeypatch.setattr(providers, "_catalog_cache_root", lambda: tmp_path / "catalog")
+    providers._catalog_cache.clear()
+    requests = []
+
+    def download(*args, **kwargs):
+        requests.append(args)
+        raise OSError("offline")
+
+    monkeypatch.setattr("urllib.request.urlopen", download)
+    report(service, product="codex", models=[{"id": "openai/review-model"}])
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
+    try:
+        result = usage_models(service, None, OWNER, "gateway", now=NOW)
+        assert result["models"][0]["pricing"] is None
+        assert not requests
+        providers._write_disk_catalog(
+            providers._DiskCatalogEntry(
+                catalog={
+                    "schema_version": "1.0",
+                    "models": {
+                        "review-model": {
+                            "pricing": {
+                                "input_per_million_tokens": 2,
+                                "output_per_million_tokens": 6,
+                            }
+                        }
+                    },
+                },
+                source_url=providers._catalog_source_url("openai"),
+                fetched_at=NOW - 7200,
+            ),
+            "openai",
+        )
+        monkeypatch.setattr(providers, "_catalog_now", lambda: NOW)
+        result = usage_models(service, None, OWNER, "gateway", now=NOW)
+        assert result["models"][0]["pricing"]["input_per_token"] == 2e-6
+        assert not requests
+    finally:
+        providers._catalog_cache.clear()
+
+
+def test_models_read_honors_configured_provider_prices_before_selected_map(service, monkeypatch):
+    config = {
+        "providers": {
+            "free": {
+                "kind": "local",
+                "default": True,
+                "openai": {
+                    "base_url": "http://localhost:11434/v1",
+                    "api_key": "test",
+                    "pricing": {"input_per_million": 0, "output_per_million": 0},
+                },
+            }
+        }
+    }
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", lambda: config)
+    report(service, product="codex", models=[{"id": "paid-table-model"}])
+    install_price_map(PriceMap({"paid-table-model": ModelPricing(2e-6, 6e-6)}))
+    try:
+        result = usage_models(service, None, OWNER, "gateway", now=NOW)
+        assert result["models"][0]["pricing"]["input_per_token"] == 0
+        assert result["models"][0]["pricing"]["output_per_token"] == 0
+    finally:
+        install_price_map(None)
 
 
 @pytest.mark.asyncio
