@@ -131,7 +131,8 @@ import { ApprovalTimeoutSettings } from "@/components/ApprovalTimeoutSettings";
 import { ArtifactSharingSettings } from "@/components/ArtifactSharingSettings";
 import { ContextUsageSettings } from "@/components/ContextUsageSettings";
 import { KeepWarmSettings } from "@/components/KeepWarmSettings";
-import { ChildIdleSettings } from "@/components/ChildIdleSettings";
+import { SettingRow } from "@/components/SettingsFields";
+import { ChildSessionsPanel } from "@/pages/instructions/ChildSessionsPanel";
 import { SessionChoiceSettings } from "@/pages/settings/sessionChoice/SessionChoiceSettings";
 import { MobileAssistantSettings } from "@/components/MobileAssistantSettings";
 import { HostColorsSettings, SessionCollabSettings } from "@/components/SessionCollabSettings";
@@ -505,17 +506,25 @@ function ExpandableSettings({
   title,
   children,
   className,
+  aliases,
 }: {
   id: string;
   title: string;
   children: ReactNode;
   className?: string;
+  aliases?: readonly string[];
 }) {
   const { hash } = useLocation();
-  const [open, setOpen] = useState(hash === `#${id}`);
+  const matchesHash = hash === `#${id}` || aliases?.includes(hash) === true;
+  const [open, setOpen] = useState(matchesHash);
   useEffect(() => {
-    if (hash === `#${id}`) setOpen(true);
-  }, [hash, id]);
+    if (matchesHash) setOpen(true);
+  }, [hash, matchesHash]);
+  useEffect(() => {
+    if (open && matchesHash && hash !== `#${id}`) {
+      document.getElementById(hash.slice(1))?.scrollIntoView?.();
+    }
+  }, [hash, id, matchesHash, open]);
   return (
     <details
       id={id}
@@ -2172,8 +2181,6 @@ function BackgroundSessionTitlesControl() {
 
 function OpenSubagentsInPanelControl() {
   const [enabled, setEnabled] = useState(readOpenSubagentsInPanel);
-  const labelId = useId();
-  const descriptionId = useId();
 
   const toggle = useCallback((next: boolean) => {
     // Sub-agent clicks read the stored value, so only show what was saved.
@@ -2182,25 +2189,19 @@ function OpenSubagentsInPanelControl() {
   }, []);
 
   return (
-    <div className="flex items-start justify-between gap-6">
-      <SettingsLabel
-        label="Open sub-agents in the Workspace panel"
-        labelId={labelId}
-        descriptionId={descriptionId}
-        className="flex-1"
-        description="Show a sub-agent's chat as a tab beside the main chat instead of replacing it. On phones, sub-agents still open full screen."
-        descriptionClassName="text-ui"
-      />
+    <SettingRow
+      label="Open sub-agents in the Workspace panel"
+      note="On: opens beside the main chat. Off: replaces the chat."
+      hint="Applies to a plain click on a sub-agent, in this browser only. Phones always open it full screen."
+    >
       <Switch
-        aria-labelledby={labelId}
-        aria-describedby={descriptionId}
+        aria-label="Open sub-agents in the Workspace panel"
         checked={enabled}
         onCheckedChange={toggle}
         data-testid="open-subagents-in-panel-toggle"
-        className="mt-0.5 shrink-0"
         componentId="settings.general.open_subagents_in_panel"
       />
-    </div>
+    </SettingRow>
   );
 }
 
@@ -2286,12 +2287,6 @@ function GeneralSection() {
           aria-label="General settings sections"
           className="flex flex-wrap gap-x-4 gap-y-2 text-sm"
         >
-          <Link to="#keep-warm" className="text-primary underline underline-offset-2">
-            Keep-warm
-          </Link>
-          <Link to="#child-idle" className="text-primary underline underline-offset-2">
-            Child check-ins
-          </Link>
           <Link to="#session-choice" className="text-primary underline underline-offset-2">
             Session choice
           </Link>
@@ -2300,6 +2295,12 @@ function GeneralSection() {
               Session collaboration
             </Link>
           )}
+          <Link to="#child-sessions" className="text-primary underline underline-offset-2">
+            Child sessions
+          </Link>
+          <Link to="#keep-warm" className="text-primary underline underline-offset-2">
+            Keep-warm
+          </Link>
           <Link to="#context-usage" className="text-primary underline underline-offset-2">
             Saved context values
           </Link>
@@ -2333,7 +2334,6 @@ function GeneralSection() {
           </SettingsGroup>
         )}
         <SettingsGroup title="Sessions" testId="settings-group-sessions" className="max-w-none">
-          <OpenSubagentsInPanelControl />
           <BackgroundSessionTitlesControl />
           <ExpandableSettings
             id="session-choice"
@@ -2341,20 +2341,6 @@ function GeneralSection() {
             className="mt-4 border-t border-border pt-4"
           >
             <SessionChoiceSettings />
-          </ExpandableSettings>
-          <ExpandableSettings
-            id="keep-warm"
-            title="Keep-warm"
-            className="mt-4 border-t border-border pt-4"
-          >
-            <KeepWarmSettings />
-          </ExpandableSettings>
-          <ExpandableSettings
-            id="child-idle"
-            title="Child check-ins"
-            className="mt-4 border-t border-border pt-4"
-          >
-            <ChildIdleSettings />
           </ExpandableSettings>
           {sessionCollabEnabled && (
             <ExpandableSettings
@@ -2365,6 +2351,21 @@ function GeneralSection() {
               <SessionCollabSettings />
             </ExpandableSettings>
           )}
+          <ExpandableSettings
+            id="child-sessions"
+            aliases={["#child-idle"]}
+            title="Child sessions"
+            className="mt-4 border-t border-border pt-4"
+          >
+            <ChildSessionsPanel openingControls={<OpenSubagentsInPanelControl />} />
+          </ExpandableSettings>
+          <ExpandableSettings
+            id="keep-warm"
+            title="Keep-warm"
+            className="mt-4 border-t border-border pt-4"
+          >
+            <KeepWarmSettings />
+          </ExpandableSettings>
         </SettingsGroup>
         <SettingsGroup
           title="Display & usage"

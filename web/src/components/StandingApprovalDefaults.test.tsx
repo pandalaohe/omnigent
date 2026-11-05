@@ -16,23 +16,30 @@ describe("standing approval defaults", () => {
   it("starts empty and preserves other collaboration preferences", () => {
     writeSessionCollabPreferences({ ...readSessionCollabPreferences(), childCap: 3 });
     render(<StandingApprovalDefaults />);
-    expect(screen.getByRole("checkbox", { name: "Install" })).not.toBeChecked();
-    expect(screen.getByRole("checkbox", { name: "Answer child approvals" })).not.toBeChecked();
-    fireEvent.click(screen.getByRole("checkbox", { name: "Install" }));
+    expect(screen.getByRole("button", { name: "Install" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+    expect(screen.getByRole("button", { name: "Answer child approvals" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Install" }));
     expect(readSessionCollabPreferences()).toMatchObject({
       standingPassDefault: ["install"],
       childCap: 3,
     });
-    fireEvent.click(screen.getByRole("checkbox", { name: "Install" }));
+    expect(screen.getByRole("button", { name: "Install" })).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(screen.getByRole("button", { name: "Install" }));
     expect(readSessionCollabPreferences().standingPassDefault).toEqual([]);
-    fireEvent.click(screen.getByRole("checkbox", { name: "Answer child approvals" }));
+    fireEvent.click(screen.getByRole("button", { name: "Answer child approvals" }));
     expect(readSessionCollabPreferences().standingPassDefault).toEqual(["answer-child-approvals"]);
   });
 
   it("adds and removes custom kinds while preserving built-ins", () => {
     render(<StandingApprovalDefaults />);
-    fireEvent.click(screen.getByRole("checkbox", { name: "Merge" }));
-    fireEvent.change(screen.getByLabelText("Extra standing approval kind"), {
+    fireEvent.click(screen.getByRole("button", { name: "Merge" }));
+    fireEvent.change(screen.getByLabelText("Another action"), {
       target: { value: "  local   preview " },
     });
     fireEvent.click(screen.getByRole("button", { name: "Add kind" }));

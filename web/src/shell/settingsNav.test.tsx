@@ -355,6 +355,7 @@ describe("SettingsSidebarBody", () => {
     expect(members).toHaveAttribute("href", "/settings/members");
     expect(policies).toHaveAttribute("href", "/settings/policies");
     expect(globalInstructions).toHaveAttribute("href", "/settings/instructions");
+    expect(globalInstructions).toHaveTextContent("Startup prompts");
   });
 
   it("renders the admin sub-categories for an admin under OIDC (accounts off)", () => {

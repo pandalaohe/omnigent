@@ -1,5 +1,6 @@
-import { useState } from "react";
+import { useId, useState } from "react";
 import { Button } from "@/components/ui/button";
+import { HelpTip } from "@/components/HelpTip";
 import { Input } from "@/components/ui/input";
 import { useSessionCollabPreferences } from "@/hooks/useSessionCollabPreferences";
 import {
@@ -15,6 +16,7 @@ const KINDS = [
 ];
 
 export function StandingApprovalDefaults() {
+  const actionId = useId();
   const preferences = useSessionCollabPreferences();
   const [extra, setExtra] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -37,28 +39,34 @@ export function StandingApprovalDefaults() {
     setExtra("");
   };
   return (
-    <div className="mt-5 space-y-3 border-t border-border pt-4">
-      <h3 className="text-sm font-medium">Default standing approval</h3>
+    <div className="space-y-3">
+      <div className="flex items-center gap-1.5 text-ui font-medium">
+        Standing approval
+        <HelpTip label="About standing approval" className="size-11 md:size-4">
+          Omnigent adds the selected actions to a new parent session&apos;s instructions as plain
+          text, and its children read them. The agent decides by that text: it answers no Claude or
+          Codex permission prompt and no policy. A project can remove an action, and a parent can
+          lose or gain one for itself. Changes affect new sessions only.
+        </HelpTip>
+      </div>
       <p className="text-sm text-muted-foreground">
-        Allow these kinds of actions for new parent sessions and their children. Project exceptions
-        and actions that always require approval still apply. Changes affect new sessions only.
+        Selected: the parent goes ahead. Others: it asks first.
       </p>
-      <div className="flex flex-wrap gap-x-6 gap-y-3">
+      <div className="flex flex-wrap gap-2">
         {KINDS.map(({ key, label }) => (
-          <label key={key} className="flex items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={kinds.includes(key)}
-              disabled={!kinds.includes(key) && kinds.length >= 32}
-              onChange={(event) =>
-                update(
-                  event.target.checked ? [...kinds, key] : kinds.filter((kind) => kind !== key),
-                )
-              }
-              className="size-4 accent-primary"
-            />
+          <Button
+            key={key}
+            type="button"
+            size="sm"
+            variant={kinds.includes(key) ? "secondary" : "outline"}
+            aria-pressed={kinds.includes(key)}
+            disabled={!kinds.includes(key) && kinds.length >= 32}
+            onClick={() =>
+              update(kinds.includes(key) ? kinds.filter((kind) => kind !== key) : [...kinds, key])
+            }
+          >
             {label}
-          </label>
+          </Button>
         ))}
       </div>
       {kinds
@@ -81,9 +89,38 @@ export function StandingApprovalDefaults() {
           </div>
         ))}
       <div className="flex flex-wrap items-end gap-2">
-        <label className="min-w-0 flex-1 text-sm font-medium">
-          Extra standing approval kind
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-1.5">
+            <label htmlFor={actionId} className="text-ui font-medium">
+              Another action
+            </label>
+            <HelpTip label="About another action" className="size-11 md:size-4">
+              <table className="w-full text-left">
+                <thead>
+                  <tr>
+                    <th>Write</th>
+                    <th>The agent reads</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td className="pr-2 align-top">run local checks</td>
+                    <td>Go ahead with local checks.</td>
+                  </tr>
+                  <tr>
+                    <td className="pr-2 align-top">update docs</td>
+                    <td>Go ahead with documentation updates.</td>
+                  </tr>
+                </tbody>
+              </table>
+              <p className="mt-2">
+                Use an action your agent understands, up to 120 characters. Select at most 32
+                actions.
+              </p>
+            </HelpTip>
+          </div>
           <Input
+            id={actionId}
             className="mt-1"
             value={extra}
             maxLength={120}
@@ -94,9 +131,9 @@ export function StandingApprovalDefaults() {
                 add();
               }
             }}
-            placeholder="Enter another kind"
+            placeholder="e.g. run local checks"
           />
-        </label>
+        </div>
         <Button type="button" variant="outline" onClick={add}>
           Add kind
         </Button>

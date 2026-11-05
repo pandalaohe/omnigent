@@ -42,7 +42,6 @@ import {
   KEEP_WARM_DEFAULT_MAX_SECONDS,
   clearKeepWarmBelow,
   clearKeepWarmLevel,
-  clampHostOfflineArchiveSeconds,
   defaultKeepWarmIntervalSeconds,
   dropKeepWarmCellEquals,
   keepWarmIntervalBoundsSeconds,
@@ -57,7 +56,6 @@ import {
   setKeepWarmHostWins,
   setKeepWarmLayer,
   KEEP_WARM_COLD_AFTER_BOUNDS_SECONDS,
-  KEEP_WARM_HOST_OFFLINE_ARCHIVE_BOUNDS_SECONDS,
   KEEP_WARM_MAX_BOUNDS_SECONDS,
   type KeepWarmFamily,
   type KeepWarmLayerField,
@@ -1467,29 +1465,6 @@ function ScopedKeepWarmTable({ scope }: { scope: string }) {
           </div>
         )
       )}
-      <div className="space-y-3 border-t pt-4">
-        <p className="text-ui font-semibold">Offline hosts</p>
-        <SettingRow
-          label="Archive children of an offline host"
-          hint="Children whose host stays offline this long are archived automatically."
-          note="0 = off"
-        >
-          <NumericField
-            ariaLabel="Archive children of an offline host after in hours"
-            value={(preferencesWithLayers.hostOfflineArchiveSeconds ?? 0) / 3600}
-            min={0}
-            max={KEEP_WARM_HOST_OFFLINE_ARCHIVE_BOUNDS_SECONDS.max / 3600}
-            disabled={!editable || busy}
-            onCommit={(hours) => {
-              void save((base) => ({
-                ...base,
-                hostOfflineArchiveSeconds: clampHostOfflineArchiveSeconds(hours * 3600),
-              }));
-            }}
-          />
-          <span className="text-sm text-muted-foreground">h</span>
-        </SettingRow>
-      </div>
     </div>
   );
 }

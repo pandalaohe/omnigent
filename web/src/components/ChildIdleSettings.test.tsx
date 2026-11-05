@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as RegistryModule from "@/hooks/useAgentRegistry";
 
 import {
   CHILD_IDLE_DEFAULTS,
@@ -14,7 +15,8 @@ const { queuePatch, registryState } = vi.hoisted(() => ({
   registryState: { isError: false, retry: vi.fn() },
 }));
 vi.mock("@/lib/userPreferencesSync", () => ({ queueUserPreferencePatch: queuePatch }));
-vi.mock("@/hooks/useAgentRegistry", () => ({
+vi.mock("@/hooks/useAgentRegistry", async (original) => ({
+  ...(await original<typeof RegistryModule>()),
   SECTION_LABELS: {
     yours: "Your agents",
     native: "Native CLI",
@@ -66,10 +68,7 @@ describe("child check-ins", () => {
     localStorage.setItem("omnigent:keep-warm", '{"agents":{}}');
     render(<ChildIdleSettings />);
     expect(screen.getByRole("spinbutton", { name: "Idle threshold in minutes" })).toBeDisabled();
-    expect(screen.getByRole("switch", { name: "Remind again" })).not.toBeChecked();
-    expect(screen.getByText("Off")).toBeInTheDocument();
-    expect(screen.queryByRole("spinbutton", { name: "Repeat interval in minutes" })).toBeNull();
-    expect(screen.getByText(/Completion and approval notices are unaffected/)).toBeInTheDocument();
+    expect(screen.getByRole("spinbutton", { name: "Repeat interval in minutes" })).toHaveValue(0);
     fireEvent.click(screen.getByRole("switch", { name: /Remind parent sessions/ }));
     expect(queuePatch).toHaveBeenLastCalledWith("child_idle", {
       ...CHILD_IDLE_DEFAULTS,
@@ -104,7 +103,7 @@ describe("child check-ins", () => {
       JSON.stringify({ enabled: true, repeatSeconds: 7200, coverage: "summary" }),
     );
     render(<ChildIdleSettings />);
-    expect(screen.getByRole("switch", { name: "Remind again" })).toBeChecked();
+    expect(screen.queryByRole("switch", { name: "Remind again" })).toBeNull();
     expect(screen.getByRole("spinbutton", { name: "Repeat interval in minutes" })).toHaveValue(120);
     expect(
       screen.getByRole("radio", { name: "Changed children + all other open children" }),
@@ -114,10 +113,11 @@ describe("child check-ins", () => {
     });
     expect(readChildIdlePreferences().repeatSeconds).toBe(7200);
     expect(readChildIdlePreferences().minGapSeconds).toBe(0);
-    fireEvent.click(screen.getByRole("switch", { name: "Remind again" }));
+    fireEvent.change(screen.getByRole("spinbutton", { name: "Repeat interval in minutes" }), {
+      target: { value: "0" },
+    });
     expect(readChildIdlePreferences().repeatSeconds).toBe(0);
-    expect(screen.queryByRole("spinbutton", { name: "Repeat interval in minutes" })).toBeNull();
-    fireEvent.click(screen.getByRole("switch", { name: "Remind again" }));
+    expect(screen.getByRole("spinbutton", { name: "Repeat interval in minutes" })).toHaveValue(0);
     fireEvent.change(screen.getByRole("spinbutton", { name: "Repeat interval in minutes" }), {
       target: { value: "30" },
     });
@@ -202,7 +202,12 @@ describe("child check-ins", () => {
     expect(
       screen.getByRole("spinbutton", { name: "Minimum check-in gap in minutes" }),
     ).toBeEnabled();
-    expect(screen.getByRole("switch", { name: "Remind again" })).toBeEnabled();
+    expect(screen.getByRole("spinbutton", { name: "Repeat interval in minutes" })).toBeEnabled();
+    const done = screen.getByRole("button", { name: "Done editing Agent A" });
+    expect(done).toHaveTextContent("Done");
+    fireEvent.click(done);
+    expect(screen.getByRole("button", { name: "Edit Agent A" })).toHaveTextContent("Edit");
+    expect(screen.queryByRole("switch", { name: "Monitor Agent A children" })).toBeNull();
   });
 
   it("keeps a legacy raw-id row while saving a new harness exception", () => {

@@ -13,6 +13,7 @@ export function ExceptionList<T>({
   legacyLabels = EMPTY_LABELS,
   savedItems = EMPTY_SAVED_ITEMS,
   summary,
+  renderLabel,
   editor,
   onAdd,
   onPatch,
@@ -27,6 +28,7 @@ export function ExceptionList<T>({
   legacyLabels?: Record<string, string>;
   savedItems?: Record<string, RegistryItem>;
   summary: (row: T) => string;
+  renderLabel?: (key: RegistryKey, label: string) => ReactNode;
   editor: (row: T, patch: (next: Partial<T>) => void, key: RegistryKey) => ReactNode;
   onAdd: (key: RegistryKey) => void;
   onPatch: (key: RegistryKey, next: Partial<T>) => void;
@@ -73,7 +75,7 @@ export function ExceptionList<T>({
           <div key={key} className="rounded-lg border border-border px-3 py-2">
             <div className="flex min-w-0 flex-wrap items-center justify-between gap-2 text-sm">
               <div className="min-w-0">
-                <span className="font-medium break-all">{label}</span>
+                <span className="font-medium break-all">{renderLabel?.(key, label) ?? label}</span>
                 <span className="ml-2 text-xs text-muted-foreground">
                   {item ? SECTION_LABELS[item.section] : "Saved agent"}
                 </span>
@@ -87,7 +89,7 @@ export function ExceptionList<T>({
                   type="button"
                   size="sm"
                   variant="ghost"
-                  aria-label={`Edit ${label}`}
+                  aria-label={openKey === key ? `Done editing ${label}` : `Edit ${label}`}
                   onClick={() => setOpenKey(openKey === key ? null : key)}
                 >
                   {openKey === key ? "Done" : "Edit"}

@@ -78,8 +78,8 @@ resolving conflicts, or continuing with temporary defaults. The API above can
 save shared defaults and resolve conflicts. Add CLI/UI routes and their journey
 tests here as those controls are implemented.
 
-**Standing pass:** Settings → Instructions → Child sessions → Default standing
-pass controls the defaults for new parent sessions. In an existing session,
+**Standing pass:** Settings → General → Sessions → Child sessions → Opening → Standing
+approval controls the defaults for new parent sessions. In an existing session,
 open the shield chip in the header to inspect active and revoked kinds and
 exceptions. Parent sessions offer Revoke and Grant back; Grant back waits for an
 approval in that conversation. The same chip in a child session is read-only.

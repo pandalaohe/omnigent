@@ -1,5 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as RegistryModule from "@/hooks/useAgentRegistry";
+import type * as AgentLabelsModule from "@/lib/agentLabels";
 
 const { queuePatchMock } = vi.hoisted(() => ({ queuePatchMock: vi.fn() }));
 const { fetchMock } = vi.hoisted(() => ({ fetchMock: vi.fn() }));
@@ -12,7 +14,8 @@ vi.mock("@/lib/userPreferencesSync", () => ({
   queueUserPreferencePatch: queuePatchMock,
   USER_PREFERENCES_PATCH_REJECTED_EVENT: "omnigent:user-preference-rejected",
 }));
-vi.mock("@/lib/agentLabels", () => ({
+vi.mock("@/lib/agentLabels", async (original) => ({
+  ...(await original<typeof AgentLabelsModule>()),
   useHarnessCatalog: (select: (catalog: unknown) => unknown) =>
     select({
       capabilitiesByHarness: {
@@ -23,7 +26,8 @@ vi.mock("@/lib/agentLabels", () => ({
       },
     }),
 }));
-vi.mock("@/hooks/useAgentRegistry", () => ({
+vi.mock("@/hooks/useAgentRegistry", async (original) => ({
+  ...(await original<typeof RegistryModule>()),
   SECTION_LABELS: {
     yours: "Your agents",
     native: "Native CLI",
@@ -110,6 +114,12 @@ afterEach(() => {
   fetchMock.mockReset();
 });
 
+function renderChildPanel() {
+  const view = render(<ChildSessionsPanel />);
+  fireEvent.click(screen.getByText("Check-in instructions", { selector: "summary" }));
+  return view;
+}
+
 describe("ChildSessionsPanel", () => {
   it("loads the default and saves custom, opt-out and reset without dropping idle settings", async () => {
     writeChildIdlePreferences({
@@ -117,7 +127,7 @@ describe("ChildSessionsPanel", () => {
       minGapSeconds: 7200,
       enabled: true,
     });
-    render(<ChildSessionsPanel />);
+    renderChildPanel();
     const editor = screen.getByRole("textbox", { name: "Check-in instructions" });
     await waitFor(() => expect(editor).toHaveValue("Collect results first."));
     expect(fetchMock).toHaveBeenCalledWith("/v1/child-checkin/defaults", expect.any(Object));
@@ -146,7 +156,7 @@ describe("ChildSessionsPanel", () => {
   });
 
   it("rejects blank-only and overlong drafts and reports an instruction save rejection", async () => {
-    render(<ChildSessionsPanel />);
+    renderChildPanel();
     const editor = screen.getByRole("textbox", { name: "Check-in instructions" });
     await waitFor(() => expect(editor).toBeEnabled());
     for (const value of ["   ", "x".repeat(4001)]) {
@@ -161,12 +171,12 @@ describe("ChildSessionsPanel", () => {
       window,
       new CustomEvent("omnigent:user-preference-rejected", { detail: { namespace: "child_idle" } }),
     );
-    expect(screen.getByRole("alert")).toHaveTextContent("server rejected these instructions");
+    expect(screen.getByRole("alert")).toHaveTextContent("server rejected these check-in settings");
   });
 
   it("retries failed default loading", async () => {
     fetchMock.mockRejectedValueOnce(new Error("offline"));
-    render(<ChildSessionsPanel />);
+    renderChildPanel();
     await screen.findByText(/Could not load default instructions/);
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     await waitFor(() =>
@@ -177,7 +187,7 @@ describe("ChildSessionsPanel", () => {
   });
 
   it("keeps unsaved instructions through preference hydration and unrelated storage events", async () => {
-    render(<ChildSessionsPanel />);
+    renderChildPanel();
     const editor = screen.getByRole("textbox", { name: "Check-in instructions" });
     await waitFor(() => expect(editor).toBeEnabled());
     fireEvent.change(editor, { target: { value: "Unsaved draft" } });
@@ -200,11 +210,11 @@ describe("ChildSessionsPanel", () => {
       }),
     );
     expect(editor).toHaveValue("Newer unsaved draft");
-    expect(screen.getByRole("alert")).toHaveTextContent("server rejected these instructions");
+    expect(screen.getByRole("alert")).toHaveTextContent("server rejected these check-in settings");
   });
 
   it("refreshes a clean editor when a rejected save is rolled back by the server", async () => {
-    render(<ChildSessionsPanel />);
+    renderChildPanel();
     const editor = screen.getByRole("textbox", { name: "Check-in instructions" });
     await waitFor(() => expect(editor).toBeEnabled());
     fireEvent.change(editor, { target: { value: "Saved draft" } });
@@ -319,8 +329,8 @@ describe("ChildSessionsPanel", () => {
   });
 
   it("reports a server rejection after a local save", () => {
-    render(<ChildSessionsPanel />);
-    fireEvent.change(screen.getByRole("textbox", { name: /Child session limit/ }), {
+    renderChildPanel();
+    fireEvent.change(screen.getByRole("textbox", { name: "Open children per parent" }), {
       target: { value: "2" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Save child settings" }));

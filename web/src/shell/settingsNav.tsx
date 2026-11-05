@@ -116,7 +116,7 @@ export function settingsNavGroups(
   };
   const instructions: SettingsNavItem = {
     id: "instructions",
-    label: "Instructions",
+    label: "Startup prompts",
     icon: FileTextIcon,
   };
   const general: SettingsNavItem[] = [

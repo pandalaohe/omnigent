@@ -5,7 +5,7 @@
 
 import type { ReactNode } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter, useLocation } from "react-router-dom";
+import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
@@ -75,6 +75,7 @@ const mocks = vi.hoisted(() => ({
   authenticatedFetch: vi.fn(),
   // Deployment gate for the Usage board module (server config usage.enabled).
   usageBoardEnabled: true,
+  sessionCollabEnabled: false,
 }));
 
 vi.mock("next-themes", () => ({
@@ -94,6 +95,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     single_user: mocks.singleUser,
     enabled_connections: mocks.enabledConnections,
     usage_board_enabled: mocks.usageBoardEnabled,
+    features: { session_peer_messaging: mocks.sessionCollabEnabled },
   }),
 }));
 vi.mock("@/shell/ImportSessionsPanel", () => ({
@@ -312,7 +314,7 @@ function LocationProbe() {
   return <span data-testid="location">{useLocation().pathname}</span>;
 }
 
-function renderPage(path = "/settings") {
+function renderPage(path = "/settings", navigation?: ReactNode) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
@@ -320,9 +322,27 @@ function renderPage(path = "/settings") {
         <MemoryRouter initialEntries={[path]}>
           <SettingsPage />
           <LocationProbe />
+          {navigation}
         </MemoryRouter>
       </TooltipProvider>
     </QueryClientProvider>,
+  );
+}
+
+function LegacyChildNavigation() {
+  const navigate = useNavigate();
+  return (
+    <>
+      <button type="button" onClick={() => navigate("/settings/general#child-idle")}>
+        Open old child check-ins link
+      </button>
+      <button type="button" onClick={() => navigate("/settings/general")}>
+        Clear hash
+      </button>
+      <button type="button" onClick={() => navigate(-1)}>
+        History back
+      </button>
+    </>
   );
 }
 
@@ -363,6 +383,7 @@ beforeEach(() => {
   mocks.importSessionsPanel.mockClear();
   mocks.enabledConnections = [];
   mocks.realContextUsage = false;
+  mocks.sessionCollabEnabled = false;
   mocks.loginUrl = "/login";
   mocks.me = { id: "alice", is_admin: false };
   mocks.conversations = [];
@@ -405,6 +426,50 @@ describe("Import sessions", () => {
     expect(mocks.importSessionsPanel).toHaveBeenCalled();
     expect(screen.queryByRole("heading", { name: "Harness imports" })).toBeNull();
   });
+});
+
+it.each(["#child-sessions", "#child-idle"])(
+  "opens the child settings fold from %s",
+  async (hash) => {
+    mocks.sessionCollabEnabled = true;
+    renderPage(`/settings/general${hash}`);
+    const group = screen.getByTestId("settings-group-sessions");
+    expect(
+      within(group)
+        .getAllByText(/^(Session choice|Session collaboration|Child sessions|Keep-warm)$/, {
+          selector: "summary",
+        })
+        .map((node) => node.textContent),
+    ).toEqual(["Session choice", "Session collaboration", "Child sessions", "Keep-warm"]);
+    const opening = within(group).getByRole("region", { name: "Opening" });
+    const checkins = within(group).getByRole("region", { name: "Check-ins" });
+    const offline = within(group).getByRole("region", { name: "Offline hosts" });
+    expect(
+      within(opening).getByRole("textbox", { name: "Open children per parent" }),
+    ).toBeVisible();
+    expect(within(checkins).getByTestId("child-idle-settings")).toBeVisible();
+    expect(within(offline).getByRole("spinbutton", { name: /Archive children/ })).toHaveValue(4);
+    expect(screen.getAllByRole("spinbutton", { name: /Archive children/ })).toHaveLength(1);
+  },
+);
+
+it("scrolls to legacy child check-ins after mounting the target during same-page navigation and history", async () => {
+  const scrolled: Element[] = [];
+  vi.spyOn(Element.prototype, "scrollIntoView").mockImplementation(function (this: Element) {
+    scrolled.push(this);
+  });
+  renderPage("/settings/general", <LegacyChildNavigation />);
+  expect(screen.queryByRole("region", { name: "Check-ins" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Open old child check-ins link" }));
+  const checkins = await screen.findByRole("region", { name: "Check-ins" });
+  await waitFor(() => expect(scrolled).toContain(checkins));
+  fireEvent.click(screen.getByRole("button", { name: "Clear hash" }));
+  fireEvent.click(screen.getByText("Child sessions", { selector: "summary" }));
+  await waitFor(() => expect(screen.queryByRole("region", { name: "Check-ins" })).toBeNull());
+  scrolled.length = 0;
+  fireEvent.click(screen.getByRole("button", { name: "History back" }));
+  const restored = await screen.findByRole("region", { name: "Check-ins" });
+  await waitFor(() => expect(scrolled).toContain(restored));
 });
 
 describe("MCP settings", () => {
@@ -626,7 +691,7 @@ describe("SettingsPage", () => {
   });
 
   it("opens sub-agents full screen by default and persists the panel setting", async () => {
-    renderPage("/settings/general");
+    renderPage("/settings/general#child-sessions");
     const toggle = await screen.findByTestId("open-subagents-in-panel-toggle");
     expect(screen.getByTestId("settings-group-sessions")).toContainElement(toggle);
     expect(toggle).toHaveAccessibleName("Open sub-agents in the Workspace panel");
