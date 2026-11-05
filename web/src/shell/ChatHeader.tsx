@@ -32,7 +32,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { AgentInfoButton } from "@/components/AgentInfo";
+import { AgentInfoButton, agentDisplayLabel } from "@/components/AgentInfo";
 import { ConversationBreadcrumb } from "./ConversationBreadcrumb";
 import type { ChildSessionLike } from "./subagentRailGroups";
 import { CreatedBySession } from "./CreatedBySession";
@@ -56,6 +56,7 @@ import { SidebarOpenButton } from "./SidebarOpenButton";
 import { ReceiveAnnotationsButton } from "@/components/ReceiveAnnotationsButton";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { StandingApprovalChip } from "@/components/StandingApprovalChip";
+import { SessionChoiceCard } from "@/pages/settings/sessionChoice/SessionChoiceCard";
 import { isEditorLevel } from "@/lib/permissionsApi";
 
 /**
@@ -660,6 +661,12 @@ export function ChatHeader({
         )}
         {conversationId && createdBySessionId && (
           <CreatedBySession key={createdBySessionId} sessionId={createdBySessionId} />
+        )}
+        {conversationId && (
+          <SessionChoiceCard
+            labels={actionConversation?.labels}
+            agentName={boundAgent ? agentDisplayLabel(boundAgent.name) : undefined}
+          />
         )}
       </div>
 

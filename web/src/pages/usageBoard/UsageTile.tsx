@@ -10,6 +10,7 @@ import {
   ChevronRightIcon,
   GripVerticalIcon,
 } from "lucide-react";
+import type { ReactNode } from "react";
 
 import { cn } from "@/lib/utils";
 
@@ -42,6 +43,8 @@ interface UsageTileProps {
   arrange?: boolean;
   onOpen: () => void;
   onMove?: (direction: -1 | 1) => void;
+  shownModel?: string;
+  floorControl?: ReactNode;
 }
 
 export function UsageTile({
@@ -52,6 +55,8 @@ export function UsageTile({
   arrange = false,
   onOpen,
   onMove,
+  shownModel,
+  floorControl,
 }: UsageTileProps) {
   const stale = isStale(account);
   const empty = neverRead(account);
@@ -102,7 +107,11 @@ export function UsageTile({
         <div className="flex min-w-0 flex-1 flex-col leading-tight">
           <span className="truncate font-semibold">{name}</span>
           {plan ? <span className="truncate text-[11px] text-muted-foreground">{plan}</span> : null}
+          {shownModel && (
+            <span className="truncate text-xs text-muted-foreground">{shownModel}</span>
+          )}
         </div>
+        {floorControl}
         <div className="flex shrink-0 flex-col items-end leading-tight">
           {first?.window && first.window.percent_used !== null ? (
             <span
@@ -151,9 +160,18 @@ export function UsageTile({
         <div className="flex min-w-0 flex-1 flex-col leading-tight">
           <span className="truncate font-semibold">{name}</span>
           {plan ? <span className="truncate text-[11px] text-muted-foreground">{plan}</span> : null}
+          {shownModel && (
+            <span className="truncate text-xs text-muted-foreground">{shownModel}</span>
+          )}
         </div>
         <ReadingButton account={account} />
       </div>
+
+      {floorControl && (
+        <div className="mb-1" onClick={(e) => e.stopPropagation()}>
+          {floorControl}
+        </div>
+      )}
 
       <div className="mb-2 mt-0.5 flex min-w-0 justify-evenly gap-2.5">
         {picks.length === 0 ? (

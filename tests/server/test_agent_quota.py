@@ -70,6 +70,81 @@ def service_with_store(db_uri, store=None):
     )
 
 
+def test_pool_readings_use_tile_not_latest_product_projection(db_uri):
+    service = service_with_store(db_uri)
+    service.report_account(OWNER, "a", usage_report(account_product="codex"), now=NOW)
+    service.report_account(
+        OWNER,
+        "b",
+        usage_report(
+            account_product="codex",
+            windows=[
+                {
+                    "id": "weekly",
+                    "kind": "weekly",
+                    "percent_used": 100,
+                    "window_minutes": 10080,
+                    "resets_at": NOW + 86400,
+                }
+            ],
+        ),
+        now=NOW,
+    )
+    readings = service.pool_readings(QuotaContext(OWNER, HOST), now=NOW)
+    assert readings["a"].windows[0].remaining_pct == 60
+    assert readings["b"].windows[0].remaining_pct == 0
+    assert readings["a"].windows[0].resets_at == NOW + 4 * 86400
+    assert (
+        service.pool_readings(QuotaContext("other", HOST), now=NOW).keys().isdisjoint({"a", "b"})
+    )
+    assert service.pool_readings(QuotaContext(OWNER, HOST), now=NOW + 3601)["a"].freshness == "old"
+
+
+@pytest.mark.parametrize("report_host", [None, HOST])
+@pytest.mark.parametrize("read_host", [None, HOST])
+def test_pool_readings_with_board_disabled_use_reported_products(service, report_host, read_host):
+    service.usage_enabled = False
+    service.report(OWNER, report_host, "claude", snapshot(), now=NOW)
+    readings = service.pool_readings(QuotaContext(OWNER, read_host), now=NOW)
+    assert set(readings) == {"claude"}
+    assert readings["claude"].windows[0].remaining_pct == 15
+    assert service.pool_readings(QuotaContext("other", read_host), now=NOW) == {}
+
+
+def test_discovery_lists_pools_for_exclusion_without_duplicate_or_extra_prompt(service):
+    conv = service.conversations.create_conversation(host_id=HOST, workspace="/opt/work/project")
+    owner = service.context(conv).owner_id
+    settings = {
+        "enabled": True,
+        "workTypes": [{"id": "work", "label": "Work"}],
+        "presets": [
+            {"id": "code", "name": "Code", "links": [{"agent": "codex-native", "meter": "plan"}]}
+        ],
+        "hosts": {
+            HOST: {
+                "work": [
+                    [
+                        {
+                            "links": [
+                                {"agent": "codex-native", "meter": "plan"},
+                                {"agent": "pi", "model": "kimi"},
+                            ]
+                        }
+                    ]
+                ]
+            }
+        },
+    }
+    service.preferences.replace_session_choice(
+        owner, settings, service.preferences.session_choice(owner)["revision"]
+    )
+    assert service.payload(conv)["session_choice"] == {
+        "enabled": True,
+        "work_types": ["work"],
+        "pools": ["plan", "pi:kimi"],
+    }
+
+
 @pytest.fixture
 def service(db_uri):
     return AgentQuotaService(
@@ -348,6 +423,15 @@ async def test_report_and_session_read_auth_and_bounds(request, db_uri):
 
 def account(overview, account_id):
     return next(item for item in overview.accounts if item.id == account_id)
+
+
+def test_reported_models_are_account_display_suggestions(service):
+    service.report_account(
+        OWNER, "plan", usage_report(models=[{"id": "model-a"}, {"id": "model-b"}]), now=NOW
+    )
+    tile = account(service.overview(OWNER, now=NOW), "plan")
+    assert [model.id for model in tile.models] == ["model-a", "model-b"]
+    assert "plan" not in {tile.id for tile in service.overview("other", now=NOW).accounts}
 
 
 def test_push_value_and_percent_windows_stay_out_of_agents(service):

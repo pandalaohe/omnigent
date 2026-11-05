@@ -1924,6 +1924,72 @@
         "title": "ChildSessionSummary",
         "type": "object"
       },
+      "ChoicePreview": {
+        "additionalProperties": false,
+        "properties": {
+          "caller_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Caller Id"
+          },
+          "differ_from": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Differ From"
+          },
+          "exclude": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Exclude",
+            "type": "array"
+          },
+          "host_id": {
+            "title": "Host Id",
+            "type": "string"
+          },
+          "pin": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pin"
+          },
+          "work_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Work Type"
+          }
+        },
+        "required": [
+          "host_id"
+        ],
+        "title": "ChoicePreview",
+        "type": "object"
+      },
       "ClearCodexGoalResponse": {
         "description": "Response body for `DELETE /v1/sessions/{id}/codex_goal`.",
         "properties": {
@@ -7144,6 +7210,30 @@
         "title": "QueuedEvent",
         "type": "object"
       },
+      "QuotaFloorChange": {
+        "additionalProperties": false,
+        "properties": {
+          "keep": {
+            "default": false,
+            "title": "Keep",
+            "type": "boolean"
+          },
+          "off": {
+            "title": "Off",
+            "type": "boolean"
+          },
+          "tile": {
+            "title": "Tile",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tile",
+          "off"
+        ],
+        "title": "QuotaFloorChange",
+        "type": "object"
+      },
       "QuotaReport": {
         "additionalProperties": false,
         "properties": {
@@ -7457,6 +7547,61 @@
           "policy"
         ],
         "title": "ReplaceCliRetentionPolicyRequest",
+        "type": "object"
+      },
+      "ReportModel": {
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "input_per_million": {
+            "anyOf": [
+              {
+                "anyOf": [
+                  {
+                    "format": "double",
+                    "type": "number"
+                  },
+                  {
+                    "format": "int64",
+                    "type": "integer"
+                  }
+                ],
+                "ge": 0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Input Per Million"
+          },
+          "output_per_million": {
+            "anyOf": [
+              {
+                "anyOf": [
+                  {
+                    "format": "double",
+                    "type": "number"
+                  },
+                  {
+                    "format": "int64",
+                    "type": "integer"
+                  }
+                ],
+                "ge": 0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output Per Million"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "ReportModel",
         "type": "object"
       },
       "RepositoryPutRequest": {
@@ -8791,6 +8936,33 @@
           "child"
         ],
         "title": "SessionChildSessionUpdatedEvent",
+        "type": "object"
+      },
+      "SessionChoiceUpdate": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_revision": {
+            "title": "Expected Revision",
+            "type": "string"
+          },
+          "settings": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Settings"
+          }
+        },
+        "required": [
+          "settings",
+          "expected_revision"
+        ],
+        "title": "SessionChoiceUpdate",
         "type": "object"
       },
       "SessionCodexApprovalModeEvent": {
@@ -11386,6 +11558,18 @@
               }
             ],
             "description": "Managed-sandbox launch progress while the session's background sandbox launch is in flight or has failed \u2014 see `SandboxStatus`. `None` for sessions without a managed launch and once the launch succeeds. Sourced from the Omnigent server's in-memory `_session_sandbox_status_cache` at snapshot build time, so a client opening the session mid-launch sees the current stage."
+          },
+          "session_choice": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Choice"
           },
           "share_workspace_files": {
             "default": false,
@@ -14232,6 +14416,13 @@
             ],
             "title": "Mark"
           },
+          "models": {
+            "items": {
+              "$ref": "#/components/schemas/ReportModel"
+            },
+            "title": "Models",
+            "type": "array"
+          },
           "pace_pct": {
             "anyOf": [
               {
@@ -14908,11 +15099,42 @@
             ],
             "title": "Child Cap"
           },
+          "session_choice": {
+            "anyOf": [
+              {
+                "const": "off",
+                "type": "string"
+              },
+              {
+                "$ref": "#/components/schemas/_ProjectChoicePin"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Choice"
+          },
           "standing_approval": {
             "$ref": "#/components/schemas/_ProjectStandingApprovalPatch"
           }
         },
         "title": "_OrchestrationPatch",
+        "type": "object"
+      },
+      "_ProjectChoicePin": {
+        "additionalProperties": false,
+        "properties": {
+          "pin": {
+            "maxLength": 32,
+            "minLength": 1,
+            "title": "Pin",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pin"
+        ],
+        "title": "_ProjectChoicePin",
         "type": "object"
       },
       "_ProjectPatch": {
@@ -19641,6 +19863,348 @@
         "summary": "List Recent Sessions",
         "tags": [
           "sessions"
+        ]
+      }
+    },
+    "/v1/me/session-choice": {
+      "get": {
+        "operationId": "read_v1_me_session_choice_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Read V1 Me Session Choice Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Read",
+        "tags": [
+          "session_choice"
+        ]
+      },
+      "put": {
+        "operationId": "update_v1_me_session_choice_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionChoiceUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Update V1 Me Session Choice Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update",
+        "tags": [
+          "session_choice"
+        ]
+      }
+    },
+    "/v1/me/session-choice/floor": {
+      "get": {
+        "operationId": "read_floors_v1_me_session_choice_floor_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Read Floors V1 Me Session Choice Floor Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Read Floors",
+        "tags": [
+          "session_choice"
+        ]
+      },
+      "post": {
+        "operationId": "change_floor_v1_me_session_choice_floor_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QuotaFloorChange"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Change Floor V1 Me Session Choice Floor Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Change Floor",
+        "tags": [
+          "session_choice"
+        ]
+      }
+    },
+    "/v1/me/session-choice/meters": {
+      "get": {
+        "operationId": "meters_v1_me_session_choice_meters_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Meters V1 Me Session Choice Meters Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Meters",
+        "tags": [
+          "session_choice"
+        ]
+      }
+    },
+    "/v1/me/session-choice/notice": {
+      "get": {
+        "operationId": "notice_v1_me_session_choice_notice_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "model",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Model"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Notice V1 Me Session Choice Notice Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Notice",
+        "tags": [
+          "session_choice"
+        ]
+      }
+    },
+    "/v1/me/session-choice/preview": {
+      "get": {
+        "operationId": "preview_query_v1_me_session_choice_preview_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "work_type",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Work Type"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Preview Query V1 Me Session Choice Preview Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Preview Query",
+        "tags": [
+          "session_choice"
+        ]
+      },
+      "post": {
+        "operationId": "preview_v1_me_session_choice_preview_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChoicePreview"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Preview V1 Me Session Choice Preview Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Preview",
+        "tags": [
+          "session_choice"
         ]
       }
     },

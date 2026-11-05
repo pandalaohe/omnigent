@@ -12646,7 +12646,11 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     if any(
         _may_collate_to(key, prefix, prefix=True)
         for key in labels
-        for prefix in ("omnigent.standing_pass", "omnigent.standing_approval")
+        for prefix in (
+            "omnigent.standing_pass",
+            "omnigent.standing_approval",
+            "omnigent.session_choice",
+        )
     ):
         raise OmnigentError(
             "label 'omnigent.standing_approval' is server-internal and cannot be set by clients",
@@ -12669,6 +12673,7 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
                 STARTUP_REGISTRATION_LABEL_KEY,
                 STARTUP_CREATE_PREPARATION_LABEL_KEY,
                 "omnigent.startup.host_load",
+                "omnigent.startup.session_choice",
             )
             if key in labels
         ),

@@ -66,6 +66,7 @@ export interface UsageAccountView {
   period: UsageAccountPeriod | null;
   windows: UsageWindowView[];
   hosts: UsageHostView[];
+  models?: { id: string }[];
 }
 
 export interface UsageOverview {

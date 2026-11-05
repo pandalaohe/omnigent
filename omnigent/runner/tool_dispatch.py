@@ -539,6 +539,9 @@ _INSTRUCTION_LAYER_TOOLS = frozenset(
     {"sys_instruction_layers_read", "sys_instruction_layer_update"}
 )
 _PROJECT_SETTINGS_TOOLS = frozenset({"sys_project_settings_read", "sys_project_settings_update"})
+_SESSION_CHOICE_TOOLS = frozenset(
+    {"sys_session_choice_read", "sys_session_choice_update", "sys_quota_floor"}
+)
 _STANDING_APPROVAL_TOOLS = frozenset({"sys_standing_approval", "sys_standing_pass"})
 _APPROVAL_ANSWER_TOOLS = frozenset({"sys_approval_answer"})
 
@@ -626,6 +629,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _POLICY_TOOLS
     | _INSTRUCTION_LAYER_TOOLS
     | _PROJECT_SETTINGS_TOOLS
+    | _SESSION_CHOICE_TOOLS
     | _STANDING_APPROVAL_TOOLS
     | _APPROVAL_ANSWER_TOOLS
     | _SCHEDULED_TASK_TOOLS
@@ -1130,6 +1134,7 @@ _ALL_LOCAL_TOOLS = (
     | _POLICY_TOOLS
     | _INSTRUCTION_LAYER_TOOLS
     | _PROJECT_SETTINGS_TOOLS
+    | _SESSION_CHOICE_TOOLS
     | _STANDING_APPROVAL_TOOLS
     | _APPROVAL_ANSWER_TOOLS
     | _SCHEDULED_TASK_TOOLS
@@ -5771,11 +5776,13 @@ async def _complete_created_session(
                 startup = _string_object_dict(data.get("startup"))
                 held = (
                     startup is not None
-                    and startup.get("reason") == "host_load"
+                    and startup.get("reason") in {"host_load", "pool_full"}
                     and startup.get("status") == "queued"
                 )
                 initial_message = (
-                    {"status": "queued", "reason": "host_load"} if held else {"status": "sent"}
+                    {"status": "queued", "reason": (startup or {}).get("reason")}
+                    if held
+                    else {"status": "sent"}
                 )
                 if remote and not held:
                     _subagent_work.mark_subagent_work_started(child_id)
@@ -5815,6 +5822,7 @@ async def _complete_created_session(
             **({"initial_message": initial_message} if initial_message is not None else {}),
             **({"host_load": data["host_load"]} if "host_load" in data else {}),
             **({"startup": data["startup"]} if "startup" in data else {}),
+            **({"session_choice": data["session_choice"]} if data.get("session_choice") else {}),
         }
     )
 
@@ -5833,6 +5841,11 @@ _SESSION_OPEN_ALLOWED_ARGS = frozenset(
         "branch",
         "wait_for_host",
         "title",
+        "work_type",
+        "user_named",
+        "choice_reason",
+        "exclude",
+        "differ_from",
     }
 )
 
@@ -5868,7 +5881,7 @@ async def _execute_session_open_tool(
     extra = set(args) - _SESSION_OPEN_ALLOWED_ARGS
     if extra:
         return invalid(f"unexpected argument: {sorted(extra)[0]}")
-    for key in ("project", "host", "agent"):
+    for key in ("project", "host"):
         value = args.get(key)
         if not isinstance(value, str) or not value:
             return invalid(f"'{key}' must be a non-empty string")
@@ -5879,6 +5892,7 @@ async def _execute_session_open_tool(
         response = await server_client.post(
             f"/v1/sessions/{conversation_id}/open",
             json=dict(args),
+            headers={"x-omnigent-session-choice": "1"},
             timeout=180.0,
         )
     except Exception as exc:  # noqa: BLE001
@@ -6082,7 +6096,7 @@ async def _execute_session_create_impl(
     placement_mode = args.get("placement", "child")
     if placement_mode not in ("child", "same_host", "managed"):
         return json.dumps({"error": "placement must be child, same_host or managed"})
-    if placement_mode != "child" and (has_config_path or not has_agent_id):
+    if placement_mode != "child" and has_config_path:
         return json.dumps({"error": "Independent sessions require agent_id"})
     message = args.get("message")
     if placement_mode != "child" and message is not None:
@@ -6169,6 +6183,10 @@ async def _execute_session_create_impl(
         speed=args.get("speed"),
     )
     headers: dict[str, str] = dict(_AGENT_CREATE_HEADERS)
+    headers["x-omnigent-session-choice"] = "1"
+    for key in ("work_type", "user_named", "choice_reason", "exclude", "differ_from"):
+        if key in args:
+            body[key] = args[key]
     if placement_mode != "child":
         from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 
@@ -6238,7 +6256,13 @@ async def _execute_session_create_impl(
         from omnigent.runner.session_requests import is_wrong_replica
 
         # Host loss can be reported before persistence or during the later launch.
-        if is_wrong_replica(resp) or resp.status_code == 409:
+        if is_wrong_replica(resp) or (
+            resp.status_code == 409
+            and not any(
+                code in resp.text
+                for code in ("session_choice_ask", "agent_busy", "agent_exhausted")
+            )
+        ):
             return json.dumps(unconfirmed_creation)
     if placement_mode != "child" and resp.status_code in (404, 405):
         return json.dumps(
@@ -6255,6 +6279,14 @@ async def _execute_session_create_impl(
         return _open_rate_error(resp)
     if resp.status_code == 409 and (cap_error := _child_cap_error(resp)) is not None:
         return cap_error
+    if resp.status_code == 409:
+        detail = resp.json().get("detail")
+        if isinstance(detail, dict) and detail.get("code") in {
+            "session_choice_ask",
+            "agent_busy",
+            "agent_exhausted",
+        }:
+            return json.dumps({"error": detail["code"], **detail})
     if resp.status_code >= 400:
         return json.dumps(
             {"error": f"sys_session_create returned {resp.status_code}", "detail": resp.text}
@@ -6279,6 +6311,7 @@ async def _execute_session_create_impl(
             "status": data.get("status") or "created",
             "agent_id": data.get("agent_id") or agent_id,
             "title": data.get("title") or args.get("title"),
+            **({"session_choice": data["session_choice"]} if data.get("session_choice") else {}),
         }
         initial_message = data.get("initial_message")
         if placement_mode == "same_host" and args.get("message"):
@@ -7586,6 +7619,36 @@ async def _execute_project_settings_tool(
             response = await server_client.put(url, json=args, timeout=30.0)
         else:
             response = await server_client.get(url, params=args, timeout=30.0)
+        if response.status_code != 200:
+            return json.dumps(
+                {"error": f"server returned {response.status_code}", "details": response.text}
+            )
+        return json.dumps(response.json())
+    except (ValueError, httpx.HTTPError) as exc:
+        return json.dumps({"error": f"{tool_name}: {exc}"})
+
+
+async def _execute_session_choice_tool(
+    tool_name: str,
+    arguments: str,
+    *,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    if server_client is None:
+        return json.dumps({"error": f"{tool_name} requires server access"})
+    try:
+        args = json.loads(arguments)
+        if not isinstance(args, dict):
+            raise ValueError("arguments must be an object")
+        url = "/v1/me/session-choice"
+        if tool_name == "sys_session_choice_update":
+            response = await server_client.put(url, json=args, timeout=30.0)
+        elif tool_name == "sys_quota_floor":
+            response = await server_client.post(url + "/floor", json=args, timeout=30.0)
+        else:
+            if args:
+                raise ValueError("read takes no arguments")
+            response = await server_client.get(url, timeout=30.0)
         if response.status_code != 200:
             return json.dumps(
                 {"error": f"server returned {response.status_code}", "details": response.text}
@@ -9389,8 +9452,7 @@ async def _agent_quotas_via_rest(
         async with asyncio.timeout(2):
             response = await client.get(f"/v1/sessions/{conversation_id}/agent-quota")
             response.raise_for_status()
-            payload = _string_object_dict(response.json()) or {}
-            return _string_object_dict(payload.get("agents")) or {}
+            return _string_object_dict(response.json()) or {}
     except Exception:  # noqa: BLE001 — quota is advisory, discovery remains usable
         return {}
 
@@ -9625,7 +9687,8 @@ async def _agent_list_via_rest(
         row["available_on_host"] = available
         row["unavailable_reason"] = reason
         product = agent_key_for_harness(_optional_string(row.get("harness")))
-        quota = _string_object_dict(quotas.get(product)) if product else None
+        quota_map = _string_object_dict(quotas.get("agents")) or {}
+        quota = _string_object_dict(quota_map.get(product)) if product else None
         if quota is not None:
             quota = dict(quota)
             windows = quota.get("windows")
@@ -9637,7 +9700,7 @@ async def _agent_list_via_rest(
                 )
                 quota["windows"] = evidence[:4]
         row["quota"] = quota
-    return _bounded_discovery_result(
+    result = _bounded_discovery_result(
         listing,
         limit=limit,
         cursor_state=cursor_state,
@@ -9653,6 +9716,10 @@ async def _agent_list_via_rest(
             ),
         },
     )
+    choice = _string_object_dict(quotas.get("session_choice"))
+    if choice is not None:
+        return json.dumps({**json.loads(result), "session_choice": choice})
+    return result
 
 
 def _project_agent_list(
@@ -11141,6 +11208,10 @@ async def execute_tool(
             )
         elif tool_name in _INSTRUCTION_LAYER_TOOLS:
             output = await _execute_instruction_layer_tool(
+                tool_name, arguments, server_client=server_client
+            )
+        elif tool_name in _SESSION_CHOICE_TOOLS:
+            output = await _execute_session_choice_tool(
                 tool_name, arguments, server_client=server_client
             )
         elif tool_name in _PROJECT_SETTINGS_TOOLS:

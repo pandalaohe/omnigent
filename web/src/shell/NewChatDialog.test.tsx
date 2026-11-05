@@ -18,6 +18,10 @@ vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
   })),
 }));
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+
+vi.mock("@/pages/settings/sessionChoice/NewChatChoiceNotice", () => ({
+  NewChatChoiceNotice: () => null,
+}));
 import { useConversations as useTestConversations } from "@/hooks/useConversations";
 
 vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => useTestConversations() }));

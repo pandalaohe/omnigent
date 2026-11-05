@@ -37,6 +37,28 @@ def store(db_uri: str) -> SqlAlchemyProjectStore:
     return SqlAlchemyProjectStore(db_uri)
 
 
+@pytest.mark.parametrize("choice", ["on", True, {"pin": ""}, {"pin": "code", "other": 1}])
+def test_config_rejects_malformed_project_choice(store, choice):
+    with pytest.raises(OmnigentError, match="session_choice"):
+        store.create(
+            _uid("choice"), "Choice", None, config={"orchestration": {"session_choice": choice}}
+        )
+
+
+@pytest.mark.parametrize("choice", ["off", {"pin": "code"}])
+def test_project_choice_survives_store_roundtrip(store, choice):
+    project = store.create(
+        _uid("choice"),
+        "Choice",
+        None,
+        config={"orchestration": {"session_choice": choice, "child_cap": 3}},
+    )
+    assert store.get(project.id, user_id=None).config["orchestration"] == {
+        "session_choice": choice,
+        "child_cap": 3,
+    }
+
+
 # ── create / get ──────────────────────────────────────────────────────────
 
 

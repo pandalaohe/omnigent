@@ -12,6 +12,8 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { cn } from "@/lib/utils";
 import {
   patchUsageBoardPreferences,
+  readUsageContextPreferences,
+  writeUsageContextPreferences,
   type UsageBoardPreferences,
 } from "@/lib/usageContextPreferences";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
@@ -26,7 +28,8 @@ import { renewalOf } from "./UsageBoardPage";
 export function UsageAccountSettingsPage() {
   const { accountId = "" } = useParams();
   const info = useServerInfo();
-  const board = useUsageContextPreferences().board;
+  const preferences = useUsageContextPreferences();
+  const board = preferences.board;
   const overview = useUsageOverview(info !== "loading" && info.usage_board_enabled === true);
   const navigate = useNavigate();
   const account = overview.data?.accounts.find((item) => item.id === accountId);
@@ -64,10 +67,34 @@ export function UsageAccountSettingsPage() {
               pinnedWindowId={board.windows[account.id]}
               renewal={renewalOf(account, board.renewals[account.id])}
               density={board.density}
+              shownModel={preferences.shownModels?.[account.id]}
               onOpen={() => navigate(`/usage/board/${encodeURIComponent(account.id)}`)}
             />
           </div>
           <div className="rounded-[11px] border border-border bg-card px-3.5 py-1">
+            <label className="flex min-h-12 flex-wrap items-center gap-2 py-2 text-sm">
+              Shown model
+              <Input
+                aria-label="Shown model"
+                className="h-8 w-52"
+                maxLength={128}
+                value={preferences.shownModels?.[account.id] ?? ""}
+                list="shown-model-options"
+                placeholder="None"
+                onChange={(event) => {
+                  const current = readUsageContextPreferences();
+                  const shownModels = { ...current.shownModels };
+                  if (event.target.value) shownModels[account.id] = event.target.value;
+                  else Reflect.deleteProperty(shownModels, account.id);
+                  writeUsageContextPreferences({ ...current, shownModels });
+                }}
+              />
+              <datalist id="shown-model-options">
+                {account.models?.map((model) => (
+                  <option key={model.id} value={model.id} />
+                ))}
+              </datalist>
+            </label>
             <WindowRow
               account={account}
               board={board}

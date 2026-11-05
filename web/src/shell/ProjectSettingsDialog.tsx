@@ -8,6 +8,10 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Fragment, type FormEvent, useEffect, useId, useMemo, useRef, useState } from "react";
 import { SessionDefaultModeSelect } from "@/components/SessionDefaultModeSelect";
 import { ProjectOrchestrationView } from "@/components/ProjectOrchestrationView";
+import {
+  ProjectSessionChoiceField,
+  type ProjectChoiceOverride,
+} from "@/pages/settings/sessionChoice/ProjectSessionChoiceField";
 import { PickerShell } from "@/components/PickerShell";
 import { SelectionList, type PickerItem } from "@/components/SelectionList";
 import { resolveMulti, summarizeMulti, type MultiValue } from "@/lib/multiSelection";
@@ -699,6 +703,7 @@ export function ProjectSettingsDialog({
   // Draft fields. Seeded from the stored config + entries each time the dialog
   // opens (or the fetches arrive); local until saved.
   const [hostId, setHostId] = useState<string>(NONE);
+  const [sessionChoice, setSessionChoice] = useState<ProjectChoiceOverride>();
   // One row per host: its directory entry plus its `calling_defaults` draft.
   // The Host field above is the default host; the rows are independent of it.
   const [hostRows, setHostRows] = useState<HostRowDraft[]>([]);
@@ -866,6 +871,7 @@ export function ProjectSettingsDialog({
     seededKeyRef.current = seedKey;
     const c: ProjectConfig = stored ?? {};
     setHostId(c.host_id ?? NONE);
+    setSessionChoice(c.orchestration?.session_choice);
     const rows = seedHostRows(entries, c);
     if (
       c.host_id &&
@@ -1011,6 +1017,11 @@ export function ProjectSettingsDialog({
     // Preserve config keys owned by other dialogs, then replace only the fields
     // this form edits.
     const config: ProjectConfig = { ...(stored ?? {}) };
+    const orchestration = { ...config.orchestration };
+    if (sessionChoice === undefined) delete orchestration.session_choice;
+    else orchestration.session_choice = sessionChoice;
+    if (Object.keys(orchestration).length) config.orchestration = orchestration;
+    else delete config.orchestration;
     if (hostId !== NONE) config.host_id = hostId;
     else delete config.host_id;
     // The single-host mirror follows the same draft that the entry writes use.
@@ -1262,6 +1273,7 @@ export function ProjectSettingsDialog({
     model === (stored?.model ?? NONE) &&
     worktreeOverride === stored?.use_worktree &&
     baseBranch === (stored?.base_branch ?? "") &&
+    JSON.stringify(sessionChoice) === JSON.stringify(stored?.orchestration?.session_choice) &&
     sameDefaults(
       buildCallingDefaults(hostRows) ?? {},
       buildCallingDefaults(seedHostRows([], stored ?? {})) ?? {},
@@ -2710,7 +2722,12 @@ export function ProjectSettingsDialog({
 
           {!isRealProject && worktreeFields}
           {isRealProject && !isLoading && !loadFailed && (
-            <ProjectOrchestrationView orchestration={stored?.orchestration} />
+            <ProjectOrchestrationView
+              orchestration={stored?.orchestration}
+              choiceControl={
+                <ProjectSessionChoiceField value={sessionChoice} onChange={setSessionChoice} />
+              }
+            />
           )}
         </form>
         {projectId !== null && (

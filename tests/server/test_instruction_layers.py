@@ -65,6 +65,35 @@ def conversation(**overrides):
 
 
 @pytest.mark.asyncio
+async def test_session_choice_line_is_injected_with_blank_parent_layer(instructions):
+    from omnigent.server.instruction_layers import InstructionRoute, route_session_text
+    from omnigent.server.session_choice import generated_line, parse_session_choice
+
+    instructions.save("", created_by=None, scope="parent")
+    settings = parse_session_choice(
+        {
+            "enabled": True,
+            "workTypes": [
+                {"id": "design", "label": "Design", "definition": "Visual work."},
+                {"id": "implementation", "label": "Implementation"},
+            ],
+        }
+    )
+    line = generated_line(settings)
+    route = InstructionRoute(
+        "host-a", "codex", "codex-native", AgentSpec(spec_version=1, spawn=True)
+    )
+    text = route_session_text(
+        instructions, route, has_parent=False, choice_line=line + " Quota: account-a low 7d 4%."
+    )
+    assert text.count("Session choice is on:") == 1
+    assert "work_type=<design|implementation>" in text
+    assert "design: Visual work." in text
+    assert "implementation:" not in text
+    assert "Quota: account-a low 7d 4%." in text
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("empty_layers", [False, True, None])
 @pytest.mark.parametrize("authenticated_local", [False, True])
 async def test_retired_project_setup_is_ignored_in_parent_init_and_rebind(

@@ -16,6 +16,10 @@ vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
   })),
 }));
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/pages/settings/sessionChoice/NewChatChoiceNotice", () => ({
+  NewChatChoiceNotice: () => null,
+}));
 import {
   useConversations as useTestConversations,
   useProjectConfig,

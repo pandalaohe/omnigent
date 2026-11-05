@@ -712,13 +712,14 @@ async def test_same_host_still_requires_host_ownership(auth_client, auth_app, pe
 
 
 @pytest.mark.parametrize(
-    "child_manager,move_before_recheck,policy_denied",
+    "child_manager,move_before_recheck,policy_denied,choose_agent",
     [
-        (False, False, False),
-        (True, False, False),
-        (False, True, False),
-        (True, True, False),
-        (False, False, True),
+        (False, False, False, False),
+        (True, False, False, False),
+        (False, True, False, False),
+        (True, True, False, False),
+        (False, False, True, False),
+        (False, False, False, True),
     ],
 )
 async def test_same_host_creation_uses_current_source_and_stays_private(
@@ -730,6 +731,7 @@ async def test_same_host_creation_uses_current_source_and_stays_private(
     move_before_recheck,
     child_manager,
     policy_denied,
+    choose_agent,
 ):
     from omnigent.host.frames import HostLaunchRunnerFrame, HostStatFrame, decode_host_frame
     from omnigent.server.routes.sessions import routes_core, routes_events
@@ -743,6 +745,22 @@ async def test_same_host_creation_uses_current_source_and_stays_private(
         auth_app.state.host_store.upsert_on_connect(host_id, host_id, owner)
     store = SqlAlchemyConversationStore(db_uri)
     store.set_host_id(source["id"], hosts[0], workspace="/original")
+    if choose_agent:
+        preferences = auth_app.state.user_preferences_store
+        link = {"agent": source["agent_id"]}
+        preferences.replace_session_choice(
+            "alice",
+            {
+                "enabled": True,
+                "workTypes": [{"id": "work", "label": "Work"}],
+                "hosts": {hosts[0]: {"work": [[{"links": [link]}]]}},
+            },
+            preferences.session_choice("alice")["revision"],
+        )
+        legacy = await auth_client.post("/v1/sessions", json={})
+        legacy_null = await auth_client.post("/v1/sessions", json={"project_id": None})
+        assert legacy.status_code == legacy_null.status_code == 422
+        assert legacy.json()["detail"][0]["loc"] == ["agent_id"]
     manager = source
     if child_manager:
         response = await auth_client.post(
@@ -806,6 +824,19 @@ async def test_same_host_creation_uses_current_source_and_stays_private(
         assert all(path == "/v1/sessions" for path, _ in captured.get("posts", []))
         created_id = result["conversation_id"]
         assert {s.id for s in store.list_conversations().data} - before == {created_id}
+    elif choose_agent:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps({"placement": "same_host", "work_type": "work"}),
+                server_client=auth_client,
+                conversation_id=manager["id"],
+            )
+        )
+        assert "error" not in result, result
+        created_id = result["conversation_id"]
+        assert result["session_choice"]["work_type"] == "work"
+        assert result["session_choice"]["agent"] == source["agent_id"]
     else:
         response = await auth_client.post(
             "/v1/sessions/orchestrated",
@@ -829,7 +860,7 @@ async def test_same_host_creation_uses_current_source_and_stays_private(
 
     assert CREATED_BY_SESSION_LABEL_KEY not in store.get_conversation(manager["id"]).labels
     # Discovery and label-write rules are independent of the routing variants above.
-    if child_manager or move_before_recheck or policy_denied:
+    if child_manager or move_before_recheck or policy_denied or choose_agent:
         return
 
     info = json.loads(

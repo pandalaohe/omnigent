@@ -266,6 +266,18 @@ class ToolManager:
 
         for tool in (SysProjectSettingsReadTool(), SysProjectSettingsUpdateTool()):
             self._tools[tool.name()] = tool
+        from omnigent.tools.builtins.session_choice import (
+            SysQuotaFloorTool,
+            SysSessionChoiceReadTool,
+            SysSessionChoiceUpdateTool,
+        )
+
+        for tool in (
+            SysSessionChoiceReadTool(),
+            SysSessionChoiceUpdateTool(),
+            SysQuotaFloorTool(),
+        ):
+            self._tools[tool.name()] = tool
         from omnigent.tools.builtins.standing_approval import SysStandingApprovalTool
 
         self._tools[SysStandingApprovalTool.name()] = SysStandingApprovalTool()

@@ -1,5 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+it("retains shown model labels as display preferences alongside the board", () => {
+  const next = normalizeUsageContextPreferences({
+    shownModels: { plan: "My model", bad: 2 },
+    board: { density: "compact" },
+  });
+  expect(next.shownModels).toEqual({ plan: "My model" });
+  writeUsageContextPreferences(next);
+  expect(readUsageContextPreferences().shownModels).toEqual({ plan: "My model" });
+});
+
 import { queueUserPreferencePatch } from "./userPreferencesSync";
 
 vi.mock("./userPreferencesSync", () => ({ queueUserPreferencePatch: vi.fn() }));

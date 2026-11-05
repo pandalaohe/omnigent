@@ -37,6 +37,11 @@ class HostLoadHold:
 def held_host(conv: Conversation) -> str | None:
     """Read only the two server-owned hold states."""
     parts = conv.labels.get(LABEL, "").split("@")
+    if len(parts) >= 2 and parts[0] in {"queued", "releasing"}:
+        return parts[1]
+    from omnigent.server.session_choice import SLOT_LABEL
+
+    parts = conv.labels.get(SLOT_LABEL, "").split("@")
     return parts[1] if len(parts) >= 2 and parts[0] in {"queued", "releasing"} else None
 
 
@@ -54,6 +59,18 @@ def require_start_allowed(conv: Conversation) -> None:
 
 def presentation(conv: Conversation) -> dict[str, Any] | None:
     host = held_host(conv)
+    from omnigent.server.session_choice import SLOT_LABEL
+    from omnigent.server.session_choice_runtime import choice_record
+
+    if host and conv.labels.get(SLOT_LABEL, "").startswith(("queued@", "releasing@")):
+        record = choice_record(conv) or {}
+        return {
+            "reason": "pool_full",
+            "host_id": host,
+            "pool": record.get("pool"),
+            "clears_at": record.get("clears_at"),
+            "since": conv.created_at,
+        }
     return {"reason": "host_load", "host_id": host, "since": conv.created_at} if host else None
 
 
@@ -101,6 +118,15 @@ def create_presentation(request: Any, response: Any, host_id: str | None) -> Non
             "host_id": host_id,
             "load_per_core": load["load_per_core"],
             "line": load["lines"]["new_session"],
+        }
+    from omnigent.server.session_choice import SLOT_LABEL
+
+    if response.labels.get(SLOT_LABEL, "").startswith("queued@"):
+        response.startup = {
+            "status": "queued",
+            "reason": "pool_full",
+            "pool": (response.session_choice or {}).get("pool"),
+            "clears_at": (response.session_choice or {}).get("clears_at"),
         }
 
 
@@ -226,23 +252,41 @@ class HostLoadQueue:
         conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
         if conv is None or held_host(conv) != host:
             return False
-        marker = conv.labels[LABEL]
+        from omnigent.server.session_choice import SLOT_LABEL
+        from omnigent.server.session_choice_runtime import choice_record, release_choice
+
+        queue_label = LABEL if LABEL in conv.labels else SLOT_LABEL
+        marker = conv.labels[queue_label]
         inputs = app.state.host_load_inputs
         if conv.archived or is_session_closed(conv.labels, conv.title):
             await inputs.cancel(session_id)
             await asyncio.to_thread(
-                self.conversations.compare_and_set_label, session_id, LABEL, marker, None
+                self.conversations.compare_and_set_label, session_id, queue_label, marker, None
             )
             return False
         was_queued = marker.startswith("queued@")
         now = time.time()
         if not was_queued:
             with contextlib.suppress(ValueError):
-                if now - float(marker.rsplit("@", 1)[-1]) < 600:
+                if now - float(marker.rsplit("@", 1)[-1]) < (
+                    120 if queue_label == SLOT_LABEL else 600
+                ):
                     return False
+        if not await release_choice(app, conv, host):
+            return False
+        current = await asyncio.to_thread(self.conversations.get_conversation, session_id)
+        if current is None:
+            return False
+        choice_marker = current.labels.get(SLOT_LABEL)
+        if queue_label == SLOT_LABEL:
+            assert choice_marker is not None
+            marker = choice_marker
         releasing = f"releasing@{host}@{now}"
+        if queue_label == SLOT_LABEL:
+            assert choice_marker is not None
+            releasing = choice_marker
         if not await asyncio.to_thread(
-            self.conversations.compare_and_set_label, session_id, LABEL, marker, releasing
+            self.conversations.compare_and_set_label, session_id, queue_label, marker, releasing
         ):
             return False
         token = _release_session.set(session_id)
@@ -250,9 +294,22 @@ class HostLoadQueue:
             try:
                 await self._start(app, conv, host, was_queued)
                 await inputs.deliver_session(app, session_id)
-                await asyncio.to_thread(
-                    self.conversations.compare_and_set_label, session_id, LABEL, releasing, None
-                )
+                if queue_label != SLOT_LABEL:
+                    await asyncio.to_thread(
+                        self.conversations.compare_and_set_label,
+                        session_id,
+                        queue_label,
+                        releasing,
+                        None,
+                    )
+                if choice_marker:
+                    await asyncio.to_thread(
+                        self.conversations.compare_and_set_label,
+                        session_id,
+                        SLOT_LABEL,
+                        choice_marker,
+                        f"admitted@{host}@{(choice_record(conv) or {}).get('pool')}@{time.time()}",
+                    )
                 await inputs.deliver_session(app, session_id)
                 current = await asyncio.to_thread(self.conversations.get_conversation, session_id)
                 raw = current.labels.get("omnigent.initial_message") if current else None
@@ -272,7 +329,7 @@ class HostLoadQueue:
                     await asyncio.to_thread(
                         self.conversations.compare_and_set_label,
                         session_id,
-                        LABEL,
+                        queue_label,
                         releasing,
                         None,
                     )
@@ -281,7 +338,7 @@ class HostLoadQueue:
                     await asyncio.to_thread(
                         self.conversations.compare_and_set_label,
                         session_id,
-                        LABEL,
+                        queue_label,
                         releasing,
                         f"queued@{host}",
                     )
@@ -296,7 +353,7 @@ class HostLoadQueue:
                 await asyncio.to_thread(
                     self.conversations.compare_and_set_label,
                     session_id,
-                    LABEL,
+                    queue_label,
                     releasing,
                     f"queued@{host}",
                 )
@@ -305,6 +362,14 @@ class HostLoadQueue:
                     session_id,
                     exc_info=True,
                 )
+                if choice_marker:
+                    await asyncio.to_thread(
+                        self.conversations.compare_and_set_label,
+                        session_id,
+                        SLOT_LABEL,
+                        choice_marker,
+                        f"queued@{host}@{(choice_record(conv) or {}).get('pool')}",
+                    )
             finally:
                 _release_session.reset(token)
         return True

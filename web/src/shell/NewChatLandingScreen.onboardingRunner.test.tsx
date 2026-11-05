@@ -1,6 +1,10 @@
 // The new-session picker preselects the runner picked in desktop onboarding
 // (resolved by useOnboardingRunnerHost), ahead of the remembered host.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/pages/settings/sessionChoice/NewChatChoiceNotice", () => ({
+  NewChatChoiceNotice: () => null,
+}));
 import type * as SandboxModelOptionsModule from "@/hooks/useSandboxModelOptions";
 
 vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({

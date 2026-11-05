@@ -824,7 +824,6 @@ def register_core_routes(
     model_refresh_inflight: WorkspaceScopedCache[str, asyncio.Task[list[dict[str, Any]]]] = (
         WorkspaceScopedCache()
     )
-    child_cap_locks = ChildCapLocks()
 
     async def standing_approval_session(
         request: Request, session_id: str, level: int
@@ -1003,7 +1002,7 @@ def register_core_routes(
         await _require_access_and_level(
             user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
         )
-        async with child_cap_locks.hold(session_id):
+        async with request.app.state.child_cap_locks.hold(session_id):
             await complete_child_write(
                 asyncio.to_thread(
                     conversation_store.set_labels, session_id, {CHILD_CAP_LABEL_KEY: str(body.cap)}
@@ -1561,9 +1560,15 @@ def register_core_routes(
         if event is None:
             return
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        from omnigent.server.session_choice import SLOT_LABEL
+
         startup = (
             request.app.state.host_load_inputs
-            if conv and conv.labels.get(HOST_LOAD_LABEL)
+            if conv
+            and (
+                conv.labels.get(HOST_LOAD_LABEL)
+                or conv.labels.get(SLOT_LABEL, "").startswith("queued@")
+            )
             else request.app.state.startup_inputs
         )
         try:
@@ -2195,7 +2200,7 @@ def register_core_routes(
                 permission_store,
                 conversation_store,
             )
-        async with child_cap_locks.hold(parent_session_id):
+        async with request.app.state.child_cap_locks.hold(parent_session_id):
             parent = await asyncio.to_thread(
                 conversation_store.get_conversation, parent_session_id
             )
@@ -2344,6 +2349,10 @@ def register_core_routes(
                 if isinstance(payload, dict)
                 and (
                     payload.get("project_id") is not None
+                    or (
+                        request.headers.get("x-omnigent-session-choice") == "1"
+                        and ORCHESTRATION_SOURCE_HEADER in request.headers
+                    )
                     or (
                         payload.get("parent_session_id") is not None
                         and payload.get("agent_id") is None
@@ -2505,6 +2514,13 @@ def register_core_routes(
         # manages its own terminal and would strand the flag. Clears come
         # from the runner's finally, the relay's resource.created
         # self-heal, or the host-launch-failure path below.
+        from omnigent.server.session_choice import SLOT_LABEL
+        from omnigent.server.session_choice_runtime import choice_record
+
+        if conv is not None:
+            resp.session_choice = choice_record(conv)
+            if conv.labels.get(SLOT_LABEL, "").startswith("queued@"):
+                hold = hold or HostLoadHold(conv.labels[SLOT_LABEL].split("@")[1], time.time())
         _terminal_first_create = (
             hold is None
             and conv is not None

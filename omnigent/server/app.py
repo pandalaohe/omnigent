@@ -2054,6 +2054,7 @@ def create_app(
         tunnel_registry,
         server_version=_server_version(),
         quota_resolver=agent_quota_service.line,
+        session_choice_resolver=agent_quota_service.session_choice_line,
         standing_approval_resolver=standing_approval_service.line,
         peer_messaging_enabled=resolved_feature_flags.enabled(Feature.SESSION_PEER_MESSAGING),
         peer_messaging_resolver=partial(
@@ -2669,6 +2670,9 @@ def create_app(
 
     app.state.host_load_inputs = ManagedStartupInputs(conversation_store, host_registry)
     app.state.host_load_queue = HostLoadQueue(conversation_store)
+    from omnigent.server.child_cap import ChildCapLocks
+
+    app.state.child_cap_locks = ChildCapLocks()
 
     def _register_startup_dispatch(handler: StartupDispatch) -> None:
         app.state.host_load_inputs.dispatch = handler
@@ -2773,6 +2777,8 @@ def create_app(
 
     host_registry.launch_authorizer = _admit_host_launch
     app.state.agent_store = agent_store
+    app.state.conversation_store = conversation_store
+    app.state.permission_store = permission_store
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
     app.state.feature_flags = resolved_feature_flags
@@ -4223,6 +4229,14 @@ def create_app(
                 detail="Synced user preferences are unavailable",
             )
         return user_preferences_store
+
+    from omnigent.server.routes.session_choice import create_session_choice_router
+
+    app.include_router(
+        create_session_choice_router(user_preferences_store, auth_provider),
+        prefix="/v1",
+        tags=["session_choice"],
+    )
 
     def _preferences_owner(request: Request) -> tuple[str, bool]:
         owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL

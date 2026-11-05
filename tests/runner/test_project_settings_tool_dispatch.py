@@ -78,3 +78,42 @@ async def test_update_rejects_identity_and_missing_guard_before_server():
     assert json.loads(result) == {"revision": "next"}
     assert requests[0].url.path == "/v1/projects/project-a/settings"
     assert "user_id" not in json.loads(requests[0].content)
+
+
+@pytest.mark.asyncio
+async def test_session_choice_tools_registered_on_native_and_dispatch_routes(tmp_path):
+    names = {"sys_session_choice_read", "sys_session_choice_update", "sys_quota_floor"}
+    manager = ToolManager(AgentSpec(spec_version=1))
+    try:
+        schemas = {
+            schema["function"]["name"]: schema["function"] for schema in manager.get_tool_schemas()
+        }
+    finally:
+        manager.shutdown()
+    assert names <= _ALL_LOCAL_TOOLS & _NATIVE_RELAY_BUILTIN_TOOLS
+    assert names <= set(build_mcp_config(tmp_path)["mcpServers"]["omnigent"]["autoApprove"])
+    assert names <= set(_AGY_ENABLED_TOOLS)
+    seen = []
+
+    def receive(request):
+        seen.append((request.method, request.url.path))
+        return httpx.Response(200, json={"revision": "next"})
+
+    async with httpx.AsyncClient(
+        base_url="http://server", transport=httpx.MockTransport(receive)
+    ) as client:
+        for name, args in (
+            ("sys_session_choice_read", {}),
+            ("sys_session_choice_update", {"settings": None, "expected_revision": "current"}),
+            ("sys_quota_floor", {"tile": "account-a", "off": True, "keep": True}),
+        ):
+            validate(args, schemas[name]["parameters"])
+            result = await execute_tool(
+                tool_name=name, arguments=json.dumps(args), server_client=client
+            )
+            assert json.loads(result) == {"revision": "next"}
+    assert seen == [
+        ("GET", "/v1/me/session-choice"),
+        ("PUT", "/v1/me/session-choice"),
+        ("POST", "/v1/me/session-choice/floor"),
+    ]

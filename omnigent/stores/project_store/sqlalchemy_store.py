@@ -102,6 +102,19 @@ def _encode_config(config: dict[str, Any] | None) -> str | None:
     config = _approval_config(_without_retired_setup(config), persisted=True) if config else None
     if not config:
         return None
+    orchestration = config.get("orchestration")
+    if isinstance(orchestration, dict) and "session_choice" in orchestration:
+        choice = orchestration["session_choice"]
+        if choice != "off" and not (
+            isinstance(choice, dict)
+            and set(choice) == {"pin"}
+            and isinstance(choice["pin"], str)
+            and 0 < len(choice["pin"]) <= 32
+        ):
+            raise OmnigentError(
+                "orchestration.session_choice must be 'off' or a preset pin",
+                code=ErrorCode.INVALID_INPUT,
+            )
     blob = json.dumps(config, separators=(",", ":"))
     if len(blob) > _CONFIG_MAX_SERIALIZED_LEN:
         raise OmnigentError(

@@ -1,9 +1,12 @@
 import type { ProjectConfig } from "@/lib/projectsApi";
+import type { ReactNode } from "react";
 
 export function ProjectOrchestrationView({
   orchestration,
+  choiceControl,
 }: {
   orchestration: ProjectConfig["orchestration"];
+  choiceControl?: ReactNode;
 }) {
   const standingApproval = orchestration?.standing_approval ?? orchestration?.standing_pass;
   return (
@@ -34,6 +37,7 @@ export function ProjectOrchestrationView({
             : "None"}
         </dd>
       </dl>
+      {choiceControl}
     </section>
   );
 }

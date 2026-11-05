@@ -148,6 +148,15 @@ _PROJECT_SETTINGS_UPDATE_APPROVAL_SPEC = FunctionPolicySpec(
     ),
 )
 
+_SESSION_CHOICE_UPDATE_APPROVAL_SPEC = FunctionPolicySpec(
+    name="__ask_on_session_choice_update",
+    on=None,
+    function=FunctionRef(
+        path="omnigent.policies.builtins.safety.ask_on_session_choice_update",
+        arguments=None,
+    ),
+)
+
 # Bounded cache of ``conversation_id -> session owner``. The owner
 # (``LEVEL_OWNER`` grantee) is immutable for a session's lifetime, so
 # caching it avoids a ``session_permissions`` lookup on every
@@ -164,7 +173,7 @@ _POLICY_SPECS_CACHE_TTL_S = 30.0
 # so a no-policy answer can say how old it is (see policy_specs_cache_age).
 _CachedPolicySpecs = tuple[list[PolicySpec], float]
 
-_DefaultPolicyConfiguration = tuple[list[PolicySpec], bool, bool]
+_DefaultPolicyConfiguration = tuple[list[PolicySpec], bool, bool, bool]
 _CachedDefaultPolicyConfiguration = tuple[_DefaultPolicyConfiguration, float]
 
 # TTL cache of enabled specs and explicit approval configuration for DB-stored default
@@ -503,6 +512,7 @@ def any_policies_apply(
             "sys_add_policy",
             "sys_instruction_layer_update",
             "sys_project_settings_update",
+            "sys_session_choice_update",
             "sys_standing_approval",
             "sys_standing_pass",
             "sys_host_restart",
@@ -704,6 +714,7 @@ def build_policy_engine(
         db_default_policy_specs,
         instruction_approval_configured,
         project_settings_approval_configured,
+        session_choice_approval_configured,
     ) = _load_default_policy_configuration(policy_store)
     admin_policy_specs: list[PolicySpec] = db_default_policy_specs + list(default_policies or [])
     all_policy_specs = session_policy_specs + agent_policy_specs + admin_policy_specs
@@ -859,6 +870,16 @@ def build_policy_engine(
     )
     if not project_configured:
         all_policy_specs.append(_PROJECT_SETTINGS_UPDATE_APPROVAL_SPEC)
+    assert _SESSION_CHOICE_UPDATE_APPROVAL_SPEC.function is not None
+    choice_handler = _SESSION_CHOICE_UPDATE_APPROVAL_SPEC.function.path
+    choice_configured = session_choice_approval_configured or any(
+        isinstance(policy, FunctionPolicySpec)
+        and policy.function is not None
+        and policy.function.path == choice_handler
+        for policy in admin_policy_specs
+    )
+    if not choice_configured:
+        all_policy_specs.append(_SESSION_CHOICE_UPDATE_APPROVAL_SPEC)
     root_conv = (
         conv
         if root_conversation_id == conversation_id
@@ -1820,7 +1841,7 @@ def _load_default_policy_specs(
 
 def _load_default_policy_configuration(
     policy_store: PolicyStore | None,
-) -> tuple[list[PolicySpec], bool, bool]:
+) -> _DefaultPolicyConfiguration:
     """
     Load enabled server-wide default policies from the store.
 
@@ -1841,7 +1862,7 @@ def _load_default_policy_configuration(
     :raises OmnigentError: If an enabled policy has an unsupported type.
     """
     if policy_store is None:
-        return [], False, False
+        return [], False, False, False
     from omnigent.db.db_models import current_workspace_id
 
     workspace_id = current_workspace_id()
@@ -1854,11 +1875,14 @@ def _load_default_policy_configuration(
     specs: list[PolicySpec] = []
     instruction_approval_configured = False
     project_settings_approval_configured = False
+    session_choice_approval_configured = False
     for policy in policy_store.list_defaults():
         if policy.handler == "omnigent.policies.builtins.safety.ask_on_instruction_layer_update":
             instruction_approval_configured = True
         if policy.handler == "omnigent.policies.builtins.safety.ask_on_project_settings_update":
             project_settings_approval_configured = True
+        if policy.handler == "omnigent.policies.builtins.safety.ask_on_session_choice_update":
+            session_choice_approval_configured = True
         if not policy.enabled:
             continue
         if policy.type != "python":
@@ -1881,10 +1905,20 @@ def _load_default_policy_configuration(
         # An invalidation during the DB read must also prevent a stale refill.
         if generation == _POLICY_SPECS_CACHE_GENERATION:
             _DEFAULT_POLICY_SPECS_CACHE[workspace_id] = (
-                (specs, instruction_approval_configured, project_settings_approval_configured),
+                (
+                    specs,
+                    instruction_approval_configured,
+                    project_settings_approval_configured,
+                    session_choice_approval_configured,
+                ),
                 loaded_at,
             )
-    return specs, instruction_approval_configured, project_settings_approval_configured
+    return (
+        specs,
+        instruction_approval_configured,
+        project_settings_approval_configured,
+        session_choice_approval_configured,
+    )
 
 
 def invalidate_default_policy_specs_cache() -> None:

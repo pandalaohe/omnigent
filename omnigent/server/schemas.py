@@ -1928,6 +1928,11 @@ class _SessionCreateRequestBase(BaseModel):
     parent_session_id: str | None = None
     sub_agent_name: str | None = None
     host_type: Literal["external", "managed"] = "external"
+    work_type: str | None = None
+    choice_reason: str | None = None
+    user_named: bool = False
+    exclude: list[str] = Field(default_factory=list)
+    differ_from: str | None = None
     host_id: str | None = None
     # A managed create's ``host_id``, moved here at validation so ``host_id``
     # keeps meaning the caller's existing host everywhere downstream.
@@ -2738,6 +2743,7 @@ class SessionResponse(BaseModel):
     background_tasks: list[BackgroundTaskInfo] | None = None
     created_at: int
     updated_at: int | None = None
+    session_choice: dict[str, Any] | None = None
     archived_at: int | None = None
     title: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)

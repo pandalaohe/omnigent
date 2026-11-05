@@ -24,6 +24,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { cn } from "@/lib/utils";
 import { patchUsageBoardPreferences, type UsageBoardBand } from "@/lib/usageContextPreferences";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
+import { QuotaFloorControl } from "@/pages/settings/sessionChoice/QuotaFloorControl";
 
 import { UsageBoardFrame } from "./UsageBoardFrame";
 import { boardBands, moveTile, seedBands } from "./usageBoardLayout";
@@ -42,7 +43,8 @@ export function renewalOf(
 
 export function UsageBoardPage() {
   const info = useServerInfo();
-  const board = useUsageContextPreferences().board;
+  const preferences = useUsageContextPreferences();
+  const board = preferences.board;
   const overview = useUsageOverview(info !== "loading" && info.usage_board_enabled === true);
   const navigate = useNavigate();
   const [arranging, setArranging] = useState(false);
@@ -248,6 +250,16 @@ export function UsageBoardPage() {
                         renewal={renewalOf(account, board.renewals[account.id])}
                         density={board.density}
                         arrange={arranging}
+                        shownModel={preferences.shownModels?.[account.id]}
+                        floorControl={
+                          !arranging && (
+                            <QuotaFloorControl
+                              tile={account.id}
+                              label={account.display_name}
+                              account={account}
+                            />
+                          )
+                        }
                         onOpen={() => navigate(`/usage/board/${encodeURIComponent(account.id)}`)}
                         onMove={(direction) => nudgeTile(account.id, direction)}
                       />

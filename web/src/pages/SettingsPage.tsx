@@ -132,6 +132,7 @@ import { ArtifactSharingSettings } from "@/components/ArtifactSharingSettings";
 import { ContextUsageSettings } from "@/components/ContextUsageSettings";
 import { KeepWarmSettings } from "@/components/KeepWarmSettings";
 import { ChildIdleSettings } from "@/components/ChildIdleSettings";
+import { SessionChoiceSettings } from "@/pages/settings/sessionChoice/SessionChoiceSettings";
 import { MobileAssistantSettings } from "@/components/MobileAssistantSettings";
 import { HostColorsSettings, SessionCollabSettings } from "@/components/SessionCollabSettings";
 import { SoundAlertSettings } from "@/components/SoundAlertSettings";
@@ -2291,6 +2292,9 @@ function GeneralSection() {
           <Link to="#child-idle" className="text-primary underline underline-offset-2">
             Child check-ins
           </Link>
+          <Link to="#session-choice" className="text-primary underline underline-offset-2">
+            Session choice
+          </Link>
           {sessionCollabEnabled && (
             <Link to="#session-collab" className="text-primary underline underline-offset-2">
               Session collaboration
@@ -2331,6 +2335,13 @@ function GeneralSection() {
         <SettingsGroup title="Sessions" testId="settings-group-sessions" className="max-w-none">
           <OpenSubagentsInPanelControl />
           <BackgroundSessionTitlesControl />
+          <ExpandableSettings
+            id="session-choice"
+            title="Session choice"
+            className="mt-4 border-t border-border pt-4"
+          >
+            <SessionChoiceSettings />
+          </ExpandableSettings>
           <ExpandableSettings
             id="keep-warm"
             title="Keep-warm"

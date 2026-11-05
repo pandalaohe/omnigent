@@ -437,6 +437,18 @@ def ask_on_project_settings_update(event: PolicyEvent) -> PolicyResponse:
     }
 
 
+def ask_on_session_choice_update(event: PolicyEvent) -> PolicyResponse:
+    """Changing the owner's model routing asks by default, like project defaults."""
+    if event.get("type") != "tool_call" or event.get("target") != "sys_session_choice_update":
+        return _ALLOW
+    return {
+        "result": "ASK",
+        "reason": (
+            "Change the session choice table for future sessions across your hosts. Approve?"
+        ),
+    }
+
+
 # Agent tools that create or reshape unattended work. The builder injects
 # ``ask_on_scheduled_task_change`` into every engine and exempts these names
 # from its no-policy fast path; both read this set so they cannot drift.
