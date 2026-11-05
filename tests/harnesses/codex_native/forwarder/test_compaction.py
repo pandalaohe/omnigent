@@ -419,8 +419,9 @@ async def test_no_summary_recovery_retries_only_proven_compaction_refusal(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("retry_turn", ["turn", "resumed-turn"])
 async def test_reconnected_forwarder_retries_refused_recovery_on_model_event(
-    tmp_path: Path,
+    tmp_path: Path, retry_turn: str
 ) -> None:
     """Reconnect retries through the event entry without replaying accepted input."""
     from tests.harnesses.codex_native.session._support import _forwarder_context
@@ -468,9 +469,49 @@ async def test_reconnected_forwarder_retries_refused_recovery_on_model_event(
                 "thread_id": "thread",
                 "window_id": "window",
                 "refused": True,
+                "source_turn_id": "turn",
             }
         )
     )
+    if retry_turn != "turn":
+        with rollout.open("a") as stream:
+            stream.write(
+                json.dumps(
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": "INTERMEDIATE_CANCEL: stop all edits.",
+                                }
+                            ],
+                            "internal_chat_message_metadata_passthrough": {
+                                "turn_id": "intermediate"
+                            },
+                        },
+                    }
+                )
+                + "\n"
+            )
+            stream.write(
+                json.dumps(
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {"type": "input_text", "text": "New scope: report only; no edits."}
+                            ],
+                            "internal_chat_message_metadata_passthrough": {"turn_id": retry_turn},
+                        },
+                    }
+                )
+                + "\n"
+            )
     native = MagicMock()
     native.request = AsyncMock(return_value={"result": {"turnId": "turn"}})
     state = fwd._CodexForwarderState(active_parent_turn_id="turn", mcp_startup_settled=True)
@@ -491,7 +532,7 @@ async def test_reconnected_forwarder_retries_refused_recovery_on_model_event(
             "method": "item/started",
             "params": {
                 "threadId": "thread",
-                "turnId": "turn",
+                "turnId": retry_turn,
                 "item": {"type": "reasoning", "id": "reasoning"},
             },
         }
@@ -509,3 +550,8 @@ async def test_reconnected_forwarder_retries_refused_recovery_on_model_event(
         )
     native.request.assert_awaited_once()
     assert "Cancel edits." in native.request.call_args.args[1]["input"][0]["text"]
+    if retry_turn != "turn":
+        assert native.request.call_args.args[1]["expectedTurnId"] == retry_turn
+        notice = native.request.call_args.args[1]["input"][0]["text"]
+        assert "New scope: report only" in notice
+        assert notice.index("INTERMEDIATE_CANCEL") < notice.index("New scope: report only")

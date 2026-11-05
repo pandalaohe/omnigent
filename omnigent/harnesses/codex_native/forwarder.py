@@ -4306,7 +4306,7 @@ async def _handle_event(
                     turn_id=turn_id,
                     model_resumed=resumed,
                 )
-        elif terminal_event:
+        elif terminal_event and not recovery.refused:
             recovery.pending_window = None
             recovery.refused = False
     event_state = forwarder_state

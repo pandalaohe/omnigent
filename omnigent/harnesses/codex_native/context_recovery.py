@@ -23,8 +23,10 @@ _logger = logging.getLogger(__name__)
 _NOTICE_PREFIX = "[Omnigent context recovery]"
 
 
-def _current_assignment(rollout: Path, turn_id: str) -> tuple[str, list[str]] | None:
-    """Read only this thread's current native turn, including post-reset steering."""
+def _current_assignment(
+    rollout: Path, turn_id: str, pending: tuple[str, str] | None = None
+) -> tuple[str, str, list[str]] | None:
+    """Read this thread's latest assignment and pending-window steering in order."""
     boundary = None
     later: list[dict] = []
     with rollout.open(encoding="utf-8") as stream:
@@ -51,7 +53,10 @@ def _current_assignment(rollout: Path, turn_id: str) -> tuple[str, list[str]] | 
         not isinstance(window_id, str)
         or not window_id
         or not isinstance(resume, dict)
-        or resume.get("last_started_turn_id") != turn_id
+        or (
+            resume.get("last_started_turn_id") != turn_id
+            and (pending is None or pending[0] != window_id)
+        )
         or not isinstance(retained, dict)
         or retained.get("user_messages_incomplete") is not False
     ):
@@ -59,16 +64,33 @@ def _current_assignment(rollout: Path, turn_id: str) -> tuple[str, list[str]] | 
     messages = retained.get("user_messages")
     if not isinstance(messages, list):
         return None
+    user_turns = [
+        message["turn_id"]
+        for message in messages
+        if isinstance(message, dict)
+        and isinstance(message.get("turn_id"), str)
+        and isinstance(message.get("text"), str)
+        and not message["text"].startswith((_NOTICE_PREFIX, "[System:"))
+    ]
+    if not user_turns:
+        return None
+    # A manual compact turn carries no new assignment of its own.
+    source_turn = pending[1] if pending and pending[0] == window_id else user_turns[-1]
     texts = [
         message["text"]
         for message in messages
         if isinstance(message, dict)
-        and message.get("turn_id") == turn_id
+        and message.get("turn_id") == source_turn
         and isinstance(message.get("text"), str)
     ]
     for message in later:
         metadata = message.get("internal_chat_message_metadata_passthrough")
-        if not isinstance(metadata, dict) or metadata.get("turn_id") != turn_id:
+        if not isinstance(metadata, dict) or not isinstance(metadata.get("turn_id"), str):
+            continue
+        if not (pending and pending[0] == window_id) and metadata["turn_id"] not in {
+            source_turn,
+            turn_id,
+        }:
             continue
         texts.extend(
             block["text"]
@@ -84,7 +106,7 @@ def _current_assignment(rollout: Path, turn_id: str) -> tuple[str, list[str]] | 
         if not text.startswith((_NOTICE_PREFIX, "[System: standing approval changed:"))
     ]
     texts = [text for text in texts if text]
-    return (window_id, texts) if texts else None
+    return (window_id, source_turn, texts) if texts else None
 
 
 @dataclass
@@ -94,6 +116,7 @@ class ChildContextRecovery:
     pending_window: str | None = None
     refused: bool = False
     loaded_identity: tuple[str, str] | None = None
+    source_turn: str | None = None
 
     def restore_pending(self, bridge_dir: Path, session_id: str, thread_id: str) -> None:
         """Reconcile a proven refusal after reconnect without resubmitting unknown input."""
@@ -114,6 +137,7 @@ class ChildContextRecovery:
         ):
             self.pending_window = saved["window_id"]
             self.refused = True
+            self.source_turn = saved.get("source_turn_id")
 
     async def restore(
         self,
@@ -129,10 +153,16 @@ class ChildContextRecovery:
     ) -> None:
         """Steer the ongoing turn only; never start work after a stop or cancellation."""
         try:
-            assignment = await asyncio.to_thread(_current_assignment, rollout, turn_id)
+            self.restore_pending(bridge_dir, session_id, thread_id)
+            pending = (
+                (self.pending_window, self.source_turn)
+                if self.refused and self.pending_window and self.source_turn
+                else None
+            )
+            assignment = await asyncio.to_thread(_current_assignment, rollout, turn_id, pending)
             if assignment is None:
                 return
-            window_id, messages = assignment
+            window_id, source_turn, messages = assignment
             if self.pending_window != window_id:
                 self.refused = False
             marker = bridge_dir / "context-recovery.json"
@@ -145,7 +175,11 @@ class ChildContextRecovery:
                 saved = json.loads(marker.read_text(encoding="utf-8"))
                 if saved == identity:
                     return
-                if saved == {**identity, "refused": True}:
+                if saved == {**identity, "refused": True} or saved == {
+                    **identity,
+                    "refused": True,
+                    "source_turn_id": source_turn,
+                }:
                     self.pending_window = window_id
                     self.refused = True
             if self.refused and not model_resumed:
@@ -175,12 +209,16 @@ class ChildContextRecovery:
                 )
             except CodexAppServerResponseError as error:
                 if is_compaction_steer_refusal(error) and not self.refused:
-                    atomic_write_json(marker, {**identity, "refused": True})
+                    atomic_write_json(
+                        marker, {**identity, "refused": True, "source_turn_id": source_turn}
+                    )
                     self.refused = True
+                    self.source_turn = source_turn
                     return
                 raise
             self.pending_window = None
             self.refused = False
+            self.source_turn = None
         except Exception:
             self.pending_window = None
             _logger.warning(
