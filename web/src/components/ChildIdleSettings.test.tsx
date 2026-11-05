@@ -258,7 +258,7 @@ describe("child check-ins", () => {
     expect(readChildIdlePreferences().freezeDefault.enabled).toBe(true);
     fireEvent.click(screen.getByRole("button", { name: "Add exception" }));
     expect(screen.getByText("Couldn't load agents")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading agents" }));
     expect(registryState.retry).toHaveBeenCalledOnce();
   });
 });

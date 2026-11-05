@@ -1211,7 +1211,7 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
       "Pull Requests",
       "Agents1",
       "Archive",
-      "Delete",
+      "Delete this session",
     ]);
   });
 

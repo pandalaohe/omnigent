@@ -10023,7 +10023,7 @@ describe("NewChatLandingScreen skills menu", () => {
     mockSkills({ skillsStatus: "error", refetch: retry });
     renderLanding();
     typeMessage("/");
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading skills" }));
     expect(retry).toHaveBeenCalledOnce();
     mockSkills({ skills: [] });
     typeMessage("/missing");

@@ -1086,7 +1086,7 @@ describe("AppShell header", () => {
     fireEvent.pointerDown(screen.getByTestId("header-conversation-actions"), { button: 0 });
     expect(screen.getByRole("menuitem", { name: "Fork" })).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: "Rename" })).toBeInTheDocument();
-    expect(screen.getByRole("menuitem", { name: "Delete" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Delete this session" })).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: "Archive" })).toBeInTheDocument();
     expect(screen.queryByRole("menuitem", { name: /^Pin$/ })).toBeNull();
     expect(screen.queryByRole("menuitem", { name: /^Share$/ })).toBeNull();
@@ -6400,9 +6400,9 @@ describe("AppShell design-mode submission", () => {
       browserSignalDesignResult: signal,
     });
     mockConversations([{ id: "conv_design", permission_level: null }]);
-    useSessionAgentMock.mockReturnValue({ data: { id: "agent_design" } } as ReturnType<
-      typeof useSessionAgent
-    >);
+    useSessionAgentMock.mockReturnValue({
+      data: { id: "agent_design", name: "developer" },
+    } as ReturnType<typeof useSessionAgent>);
     Object.assign(chat, {
       conversationId: "conv_design",
       boundAgentId: "agent_design",

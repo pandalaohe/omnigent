@@ -347,13 +347,12 @@ export function SharingPage() {
                         note={
                           !defaultPublicEditable
                             ? "Managed by this deployment."
-                            : "New sessions can start with public read access."
+                            : "New sessions start with public read access."
                         }
                         labelId="default-public-label"
                         descriptionId="default-public-description"
                         descriptionClassName="max-md:block"
                         className="flex-1"
-                        note="New sessions start with public read access."
                         description={
                           <>
                             New sessions start with public read access for anyone with the link who

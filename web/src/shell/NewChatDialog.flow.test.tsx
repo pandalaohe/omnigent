@@ -816,7 +816,7 @@ describe("NewChatLandingScreen create flow", () => {
       }
       const service = { id: "tracker", title: "Tracker", auth: "oauth", connected: false };
       vi.mocked(registryRequest).mockResolvedValue({ data: [service] });
-      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      fireEvent.click(screen.getByRole("button", { name: "Retry loading MCP services" }));
       expect(await screen.findByRole("switch", { name: "Tracker" })).toBeChecked();
       expect(
         screen.getByRole("button", { name: "MCP services: 1 selected, 1 needs sign-in" }),
