@@ -5,7 +5,7 @@
 
 import type { ReactNode } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter, useLocation } from "react-router-dom";
+import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
@@ -314,7 +314,7 @@ function LocationProbe() {
   return <span data-testid="location">{useLocation().pathname}</span>;
 }
 
-function renderPage(path = "/settings") {
+function renderPage(path = "/settings", navigation?: ReactNode) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
@@ -322,9 +322,27 @@ function renderPage(path = "/settings") {
         <MemoryRouter initialEntries={[path]}>
           <SettingsPage />
           <LocationProbe />
+          {navigation}
         </MemoryRouter>
       </TooltipProvider>
     </QueryClientProvider>,
+  );
+}
+
+function LegacyChildNavigation() {
+  const navigate = useNavigate();
+  return (
+    <>
+      <button type="button" onClick={() => navigate("/settings/general#child-idle")}>
+        Open old child check-ins link
+      </button>
+      <button type="button" onClick={() => navigate("/settings/general")}>
+        Clear hash
+      </button>
+      <button type="button" onClick={() => navigate(-1)}>
+        History back
+      </button>
+    </>
   );
 }
 
@@ -434,6 +452,25 @@ it.each(["#child-sessions", "#child-idle"])(
     expect(screen.getAllByRole("spinbutton", { name: /Archive children/ })).toHaveLength(1);
   },
 );
+
+it("scrolls to legacy child check-ins after mounting the target during same-page navigation and history", async () => {
+  const scrolled: Element[] = [];
+  vi.spyOn(Element.prototype, "scrollIntoView").mockImplementation(function (this: Element) {
+    scrolled.push(this);
+  });
+  renderPage("/settings/general", <LegacyChildNavigation />);
+  expect(screen.queryByRole("region", { name: "Check-ins" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Open old child check-ins link" }));
+  const checkins = await screen.findByRole("region", { name: "Check-ins" });
+  await waitFor(() => expect(scrolled).toContain(checkins));
+  fireEvent.click(screen.getByRole("button", { name: "Clear hash" }));
+  fireEvent.click(screen.getByText("Child sessions", { selector: "summary" }));
+  await waitFor(() => expect(screen.queryByRole("region", { name: "Check-ins" })).toBeNull());
+  scrolled.length = 0;
+  fireEvent.click(screen.getByRole("button", { name: "History back" }));
+  const restored = await screen.findByRole("region", { name: "Check-ins" });
+  await waitFor(() => expect(scrolled).toContain(restored));
+});
 
 describe("MCP settings", () => {
   it("renders configured MCP accounts at their own URL", () => {

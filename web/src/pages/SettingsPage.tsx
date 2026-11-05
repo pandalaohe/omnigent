@@ -520,6 +520,11 @@ function ExpandableSettings({
   useEffect(() => {
     if (matchesHash) setOpen(true);
   }, [hash, matchesHash]);
+  useEffect(() => {
+    if (open && matchesHash && hash !== `#${id}`) {
+      document.getElementById(hash.slice(1))?.scrollIntoView?.();
+    }
+  }, [hash, id, matchesHash, open]);
   return (
     <details
       id={id}
