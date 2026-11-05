@@ -355,7 +355,7 @@ function ImportContextBody({
           <DialogTitle className="min-h-0 pr-0 text-2xl leading-8 font-normal tracking-[-0.02em]">
             Your setup is ready
           </DialogTitle>
-          <DialogDescription className="max-w-[480px] text-[14px] leading-5">
+          <DialogDescription className="max-w-[480px] text-ui leading-5">
             {hostName ? `Found in your harnesses on ${hostName}.` : "Found in your harnesses."}{" "}
             These carry over automatically.
           </DialogDescription>

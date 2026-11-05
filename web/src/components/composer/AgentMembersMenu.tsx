@@ -55,12 +55,12 @@ function AgentMemberRow({
         <ComposerAgentIcon agent={{ name: "", harness: member.harness }} />
       </span>
       <div className="min-w-0 flex-1">
-        <div className="flex min-w-0 items-center gap-1.5 text-[13px] leading-5">
+        <div className="flex min-w-0 items-center gap-1.5 text-ui leading-5">
           <span className="truncate font-medium">{member.role}</span>
           {member.lead && (
             <span
               data-testid={`agent-member-lead-${member.role}`}
-              className="shrink-0 rounded-full border border-border px-1.5 text-[10px] leading-4 text-muted-foreground"
+              className="shrink-0 rounded-full border border-border px-1.5 text-sm leading-4 text-muted-foreground"
             >
               Lead
             </span>
@@ -88,7 +88,7 @@ function AgentMemberRow({
             data-testid={`agent-member-open-${member.role}`}
             className="flex h-6 items-center gap-0.5 rounded-md px-1.5 text-xs text-muted-foreground hover:text-foreground focus-visible:outline-none"
           >
-            Open
+            Open this session
           </Link>
         </DropdownMenuItem>
       )}

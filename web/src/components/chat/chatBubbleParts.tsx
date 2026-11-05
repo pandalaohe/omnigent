@@ -986,7 +986,7 @@ function UserBubble({
         {/* Always visible: a mid-turn message can wait minutes behind a long tool call. */}
         {bubble.pending && bubble.awaitingAgent && (
           <div
-            className="flex items-center gap-1 pt-1 text-[11px] leading-4 text-muted-foreground"
+            className="flex items-center gap-1 pt-1 text-sm leading-4 text-muted-foreground"
             data-testid="message-awaiting-agent"
           >
             <ClockIcon size={12} aria-hidden />
@@ -997,7 +997,7 @@ function UserBubble({
         <div className="flex items-center justify-end gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
           {ts && (
             <span
-              className="select-none text-[11px] leading-4 text-foreground/56"
+              className="select-none text-sm leading-4 text-foreground/56"
               data-testid="message-timestamp"
             >
               {ts}
@@ -1272,7 +1272,7 @@ function AssistantBubble({
             </MessageActions>
             {ts && (
               <span
-                className="select-none text-[11px] leading-4 text-foreground/56"
+                className="select-none text-sm leading-4 text-foreground/56"
                 data-testid="message-timestamp"
               >
                 {ts}

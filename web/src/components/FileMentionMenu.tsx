@@ -113,7 +113,7 @@ export function FileMentionMenu({
             <>
               <div className="flex items-center justify-between gap-2 px-1.5 py-1 text-sm font-medium text-muted-foreground">
                 <span className="truncate">{currentDir ? `/${currentDir}` : "Workspace"}</span>
-                <span className="shrink-0 text-[10px]">↵ open · ⇥ attach</span>
+                <span className="shrink-0 text-sm">↵ open · ⇥ attach</span>
               </div>
               {entries.length === 0 && loading ? (
                 <div className="px-1.5 py-1 text-ui text-muted-foreground">Loading…</div>

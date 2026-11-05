@@ -47,7 +47,7 @@ function ChildPlacementChip({
       title={cwd ?? undefined}
       onClick={copy}
       className={cn(
-        "min-w-0 shrink truncate rounded-[5px] border border-border px-1.5 py-px font-mono text-[12px] text-muted-foreground",
+        "min-w-0 shrink truncate rounded-[5px] border border-border px-1.5 py-px font-mono text-ui text-muted-foreground",
         "hover:text-foreground max-md:basis-full max-md:text-left md:ml-auto",
       )}
     >

@@ -128,7 +128,7 @@ describe("MarkdownLinkBubble", () => {
     placeCaret(ed, posInText(ed, "ES-1"));
     expect(bubble()).not.toBeNull();
     expect(screen.getByText("https://tracker.example.com/browse/ES-1")).toBeDefined();
-    const open = screen.getByRole("link", { name: "Open" });
+    const open = screen.getByRole("link", { name: "Open this link" });
     expect(open.getAttribute("href")).toBe("https://tracker.example.com/browse/ES-1");
     expect(open.getAttribute("target")).toBe("_blank");
     expect(open.getAttribute("rel")).toBe("noopener noreferrer");
@@ -187,13 +187,13 @@ describe("MarkdownLinkBubble", () => {
   it("shows while the caret is at the end of the link", () => {
     const ed = renderBubble();
     placeCaret(ed, posInText(ed, "ES-1", "ES-1".length));
-    expect(screen.getByRole("link", { name: "Open" })).toBeDefined();
+    expect(screen.getByRole("link", { name: "Open this link" })).toBeDefined();
   });
 
   it("opens a workspace-relative link in the FileViewer", () => {
     const ed = renderBubble();
     placeCaret(ed, posInText(ed, "the plan"));
-    fireEvent.click(screen.getByRole("button", { name: "Open" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open this file" }));
     expect(openFile).toHaveBeenCalledWith("notes/plan.md");
   });
 
@@ -222,7 +222,7 @@ describe("MarkdownLinkBubble", () => {
   it("shows for a link at the start of a paragraph", () => {
     const ed = renderBubble({ content: "[ES-1](https://tracker.example.com/browse/ES-1) first." });
     placeCaret(ed, posInText(ed, "ES-1"));
-    expect(screen.getByRole("link", { name: "Open" }).getAttribute("href")).toBe(
+    expect(screen.getByRole("link", { name: "Open this link" }).getAttribute("href")).toBe(
       "https://tracker.example.com/browse/ES-1",
     );
   });
@@ -298,7 +298,7 @@ describe("MarkdownLinkBubble", () => {
     const ed = renderBubble();
     placeCaret(ed, posInText(ed, "the plan"));
     await user.keyboard("{Alt>}{Enter}{/Alt}");
-    const open = screen.getByRole("button", { name: "Open" });
+    const open = screen.getByRole("button", { name: "Open this file" });
     expect(document.activeElement).toBe(open);
     expect(open.getAttribute("aria-keyshortcuts")).toBe("Alt+Enter");
     await user.keyboard("{Enter}");
@@ -318,7 +318,7 @@ describe("MarkdownLinkBubble", () => {
     const ed = renderBubble();
     placeCaret(ed, posInText(ed, "ES-1"));
     await user.keyboard("{Alt>}{Enter}{/Alt}");
-    expect(document.activeElement).toBe(screen.getByRole("link", { name: "Open" }));
+    expect(document.activeElement).toBe(screen.getByRole("link", { name: "Open this link" }));
     await user.keyboard("{Enter}");
     expect(openSpy).toHaveBeenCalledWith("about:blank", "_blank");
     expect(followed).toEqual(["https://tracker.example.com/browse/ES-1"]);
@@ -329,7 +329,7 @@ describe("MarkdownLinkBubble", () => {
     const ed = renderBubble();
     placeCaret(ed, posInText(ed, "ES-1"));
     await user.keyboard("{Alt>}{Enter}{/Alt}");
-    expect(document.activeElement).toBe(screen.getByRole("link", { name: "Open" }));
+    expect(document.activeElement).toBe(screen.getByRole("link", { name: "Open this link" }));
     await user.keyboard("{Escape}");
     expect(document.activeElement).toBe(ed.view.dom);
     expect(bubble()).not.toBeNull();

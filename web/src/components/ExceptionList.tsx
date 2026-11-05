@@ -104,7 +104,7 @@ export function ExceptionList<T>({
                     if (openKey === key) setOpenKey(null);
                   }}
                 >
-                  Remove
+                  Remove this exception
                 </Button>
               </div>
             </div>

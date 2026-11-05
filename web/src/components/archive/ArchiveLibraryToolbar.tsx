@@ -220,7 +220,7 @@ export function ArchiveLibraryToolbar({
                   type="button"
                   aria-pressed={value.searchScope === scope}
                   className={cn(
-                    "h-6 rounded px-1.5 text-[10px] text-muted-foreground",
+                    "h-6 rounded px-1.5 text-ui text-muted-foreground",
                     value.searchScope === scope && "bg-background text-foreground shadow-sm",
                   )}
                   onClick={() => onChange({ searchScope: scope, searchQuery: "" })}
@@ -245,7 +245,7 @@ export function ArchiveLibraryToolbar({
                     type="button"
                     variant="outline"
                     size="sm"
-                    className="h-8 gap-1 px-2 text-[10px] font-normal"
+                    className="h-8 gap-1 px-2 text-ui font-normal"
                     aria-label={`Archive sort: ${sortLabel(value)}`}
                   >
                     {sortLabel(value)} <ChevronDownIcon className="size-3" />

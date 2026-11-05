@@ -238,7 +238,7 @@ function AttachmentBadge({
     <button
       type="button"
       onClick={onClick}
-      className="absolute -bottom-1 left-1 rounded-full border border-border bg-background px-1.5 py-0 text-[10px] text-muted-foreground shadow-sm"
+      className="absolute -bottom-1 left-1 rounded-full border border-border bg-background px-1.5 py-0 text-sm text-muted-foreground shadow-sm"
     >
       {badge.label}
       {badge.unreferenced && <span className="text-muted-foreground/70"> · not in text</span>}

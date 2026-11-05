@@ -96,11 +96,11 @@ export function ScheduledTaskRow({
   const body = (
     <>
       <span className="flex min-w-0 items-center gap-2">
-        <span className="truncate text-[15px] font-semibold">{task.name}</span>
+        <span className="truncate text-ui font-semibold">{task.name}</span>
         {paused && (
           <span
             data-testid="task-paused-pill"
-            className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+            className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-sm font-medium text-muted-foreground"
           >
             Paused
           </span>
@@ -207,7 +207,7 @@ export function ScheduledTaskRow({
                 data-testid="task-run-now"
               >
                 <PlayIcon className="size-4" />
-                Run now
+                Run this automation now
               </DropdownMenuItem>
               <DropdownMenuItem
                 onSelect={() => {
@@ -217,7 +217,7 @@ export function ScheduledTaskRow({
                 data-testid="task-edit"
               >
                 <PencilIcon className="size-4" />
-                Edit
+                Edit this automation
               </DropdownMenuItem>
               <DropdownMenuItem
                 onSelect={() => {
@@ -247,7 +247,7 @@ export function ScheduledTaskRow({
                 data-testid="task-delete"
               >
                 <Trash2Icon className="size-4" />
-                Delete
+                Delete this automation
               </DropdownMenuItem>
             </>
           )}

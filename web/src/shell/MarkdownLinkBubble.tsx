@@ -224,7 +224,7 @@ export function MarkdownLinkBubble({
           className={OPEN_ACTION_CLASS_NAME}
         >
           <ExternalLinkIcon className="size-3.5" />
-          Open
+          Open this link
         </ExternalPreviewLink>
       ) : (
         <button
@@ -236,7 +236,7 @@ export function MarkdownLinkBubble({
           onClick={() => openFile?.(filePath)}
         >
           <ExternalLinkIcon className="size-3.5" />
-          Open
+          Open this file
         </button>
       )}
     </div>,

@@ -343,7 +343,7 @@ export function ArchiveLibraryRail({
           agentOptions={agentOptions}
           onChange={changeView}
         />
-        <div className="flex h-6 shrink-0 items-center border-b px-2 text-[10px] text-muted-foreground">
+        <div className="flex h-6 shrink-0 items-center border-b px-2 text-sm text-muted-foreground">
           <span>
             {archived.length} sessions
             {view.searchScope === "content" && debouncedQuery ? " · content matches" : ""}
@@ -405,12 +405,12 @@ export function ArchiveLibraryRail({
                         {conversationDisplayLabel(conversation)}
                       </span>
                       {projectName && (
-                        <span className="max-w-24 shrink-0 truncate rounded bg-muted px-1 text-[9px] text-muted-foreground">
+                        <span className="max-w-24 shrink-0 truncate rounded bg-muted px-1 text-sm text-muted-foreground">
                           {projectName}
                         </span>
                       )}
                     </span>
-                    <span className="mt-1 block truncate text-[10px] text-muted-foreground">
+                    <span className="mt-1 block truncate text-sm text-muted-foreground">
                       {hostNames.get(conversation.host_id ?? "") ??
                         conversation.host_id ??
                         "Host not recorded"}
@@ -480,7 +480,7 @@ export function ArchiveLibraryRail({
                         onSelect={() => setDeleteTarget(conversation)}
                       >
                         <Trash2Icon className="size-4" />
-                        Delete
+                        Delete this session
                       </DropdownMenuItem>
                     </DropdownMenuContent>
                   </DropdownMenu>
@@ -504,7 +504,7 @@ export function ArchiveLibraryRail({
             >
               <ChevronLeftIcon /> Previous
             </Button>
-            <span className="text-[10px] text-muted-foreground">Page {pageHistory.length + 1}</span>
+            <span className="text-sm text-muted-foreground">Page {pageHistory.length + 1}</span>
             <Button
               type="button"
               variant="ghost"

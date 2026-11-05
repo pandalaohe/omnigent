@@ -202,14 +202,14 @@ describe("CommentsPanel read-only collaborator gating", () => {
 
   it("hides per-comment Edit and Delete actions when read-only", () => {
     renderGated({ canEdit: false, comments: [makeComment("c1")] });
-    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Edit this comment" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Delete this comment" })).toBeNull();
   });
 
   it("shows per-comment Edit and Delete actions for editors", () => {
     renderGated({ canEdit: true, comments: [makeComment("c1")] });
-    expect(screen.getByRole("button", { name: "Edit" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Delete" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Edit this comment" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Delete this comment" })).toBeInTheDocument();
   });
 
   it("still lets a read-only viewer read comments and copy links", () => {
@@ -250,8 +250,8 @@ describe("CommentsPanel author-only edit/delete gating", () => {
     });
     // Alice authored c1 → her own affordances appear. Failure means
     // canModify rejected a self-authored comment (over-restriction).
-    expect(screen.getByRole("button", { name: "Edit" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Delete" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Edit this comment" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Delete this comment" })).toBeInTheDocument();
   });
 
   it("hides Edit/Delete on another user's comment even with edit access", () => {
@@ -263,8 +263,8 @@ describe("CommentsPanel author-only edit/delete gating", () => {
     // Bob is an editor but did NOT author c1 → no mutation affordances.
     // Failure here is the actual bug being fixed: an editor able to edit or
     // delete another user's comment from the UI.
-    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Edit this comment" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Delete this comment" })).toBeNull();
     // Reading and copy-link stay available — gating is on mutation only.
     expect(screen.getByText("Comment c1")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Copy link to comment" })).toBeInTheDocument();
@@ -279,8 +279,8 @@ describe("CommentsPanel author-only edit/delete gating", () => {
     // created_by null → no author to protect, so any editor may modify,
     // matching the backend's `created_by is None` fallback. Failure would
     // mean legacy comments became uneditable after this change.
-    expect(screen.getByRole("button", { name: "Edit" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Delete" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Edit this comment" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Delete this comment" })).toBeInTheDocument();
   });
 
   it("renders own-vs-others affordances correctly in a mixed-author list", () => {
@@ -295,8 +295,8 @@ describe("CommentsPanel author-only edit/delete gating", () => {
     // Exactly one Edit and one Delete button — Alice's c1 only, not Bob's c2.
     // A count of 2 would mean Bob's comment leaked mutation affordances; 0
     // would mean Alice's own comment was wrongly suppressed.
-    expect(screen.getAllByRole("button", { name: "Edit" })).toHaveLength(1);
-    expect(screen.getAllByRole("button", { name: "Delete" })).toHaveLength(1);
+    expect(screen.getAllByRole("button", { name: "Edit this comment" })).toHaveLength(1);
+    expect(screen.getAllByRole("button", { name: "Delete this comment" })).toHaveLength(1);
   });
 
   it("shows the visitor label on a visitor comment", () => {
@@ -315,8 +315,8 @@ describe("CommentsPanel author-only edit/delete gating", () => {
       canEdit: true,
       comments: [makeAuthoredComment("c1", "visitor:Alice")],
     });
-    expect(screen.getByRole("button", { name: "Delete" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Delete this comment" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Edit this comment" })).toBeNull();
   });
 
   it("hides visitor delete from a read-only viewer", () => {
@@ -324,8 +324,8 @@ describe("CommentsPanel author-only edit/delete gating", () => {
       canEdit: false,
       comments: [makeAuthoredComment("c1", "visitor:Alice")],
     });
-    expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Delete this comment" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Edit this comment" })).toBeNull();
   });
 });
 

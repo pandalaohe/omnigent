@@ -340,7 +340,7 @@ export function CommentsPanel({
             >
               {t === "open" ? "Open" : "Sent"}
               {count > 0 && (
-                <span className="ml-1 rounded-full bg-muted px-1.5 py-0.5 text-[10px] tabular-nums">
+                <span className="ml-1 rounded-full bg-muted px-1.5 py-0.5 text-sm tabular-nums">
                   {count}
                 </span>
               )}
@@ -369,7 +369,7 @@ export function CommentsPanel({
           (canEdit ? (
             <div className="space-y-2 border-b border-border px-3 py-2">
               {activeSelection.anchor_content && (
-                <div className="truncate rounded bg-muted/40 px-2 py-1 font-mono text-[10px] text-muted-foreground">
+                <div className="truncate rounded bg-muted/40 px-2 py-1 font-mono text-sm text-muted-foreground">
                   <span className="text-foreground/60">Selection: </span>
                   {displayAnchorContent(activeSelection.anchor_content).split("\n")[0]}
                 </div>
@@ -592,7 +592,7 @@ function CommentCard({
           />
           <div className="flex gap-1.5">
             <Button type="button" size="xs" disabled={!editBody.trim()} onClick={saveEdit}>
-              Save
+              Save this comment
             </Button>
             <Button type="button" size="xs" variant="ghost" onClick={() => setEditing(false)}>
               Cancel
@@ -614,7 +614,7 @@ function CommentCard({
             <button
               type="button"
               aria-expanded={expanded}
-              className="cursor-pointer text-[10px] font-medium text-blue-600 hover:underline dark:text-blue-400"
+              className="cursor-pointer text-ui font-medium text-blue-600 hover:underline dark:text-blue-400"
               onClick={(e) => {
                 e.stopPropagation();
                 setExpanded((v) => !v);
@@ -646,13 +646,11 @@ function CommentCard({
                 </Tooltip>
               </TooltipProvider>
             </div>
-            <span className="text-[10px] text-muted-foreground/70">
+            <span className="text-sm text-muted-foreground/70">
               {formatCommentTime(c.created_at, now)}
             </span>
             {statusLabel && (
-              <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] w-fit">
-                {statusLabel}
-              </span>
+              <span className="rounded bg-muted px-1.5 py-0.5 text-sm w-fit">{statusLabel}</span>
             )}
           </div>
           {(onEdit || onDelete || onCopyLink) && (
@@ -666,7 +664,7 @@ function CommentCard({
                     startEdit();
                   }}
                 >
-                  Edit
+                  Edit this comment
                 </button>
               )}
               {onDelete && (
@@ -678,7 +676,7 @@ function CommentCard({
                     onDelete();
                   }}
                 >
-                  Delete
+                  Delete this comment
                 </button>
               )}
               {onCopyLink && (

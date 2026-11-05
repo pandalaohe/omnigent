@@ -97,7 +97,7 @@ export function AnnotationCards({
                   >
                     {item.label}
                   </code>
-                  <span className="shrink-0 text-[11px] text-muted-foreground">
+                  <span className="shrink-0 text-sm text-muted-foreground">
                     {pending ? "Sending" : "Sent"}
                   </span>
                 </div>

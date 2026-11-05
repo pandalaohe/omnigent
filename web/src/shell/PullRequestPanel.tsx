@@ -1315,7 +1315,7 @@ export function PullRequestPanel({
   const refreshButton = (
     <Button size="sm" variant="ghost" disabled={refreshing} onClick={refresh}>
       {refreshIcon}
-      Refresh
+      Refresh pull requests
     </Button>
   );
   // Servers that store PRs decide which PRs the session links, so the controls
@@ -1480,7 +1480,7 @@ export function PullRequestPanel({
   const showTrackingControls = !!associations?.tracking_available && !linkInEmptyState;
   const headerActions = (
     <TooltipProvider delayDuration={0}>
-      <IconButton label="Refresh" disabled={refreshing} onClick={refresh}>
+      <IconButton label="Refresh pull requests" disabled={refreshing} onClick={refresh}>
         {refreshIcon}
       </IconButton>
       {showTrackingControls && (

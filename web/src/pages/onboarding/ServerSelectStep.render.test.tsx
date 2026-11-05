@@ -143,7 +143,7 @@ describe("ServerSelectStep", () => {
         button: 0,
       },
     );
-    fireEvent.click(screen.getByRole("menuitem", { name: "Delete from list" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Remove this server from the list" }));
     expect(onRemove).toHaveBeenCalledWith("https://mine.example.com/");
   });
 });

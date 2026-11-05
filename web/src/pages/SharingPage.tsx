@@ -60,17 +60,20 @@ const TIERS: { id: SharingMode; label: string; description: string }[] = [
 const DEFAULT_PUBLIC_OPTIONS: {
   id: Exclude<DefaultPublicSessions, "off">;
   label: string;
+  note: string;
   description: string;
 }[] = [
   {
     id: "sandbox",
     label: "Managed hosts only",
+    note: "Managed-host sessions start shared; local ones stay private.",
     description:
       "Share sessions on server-managed sandboxes. Sessions on local hosts start private.",
   },
   {
     id: "all",
     label: "All sessions",
+    note: "Managed and local sessions start with public read access.",
     description: "Share sessions on both managed and local hosts.",
   },
 ];
@@ -260,7 +263,11 @@ export function SharingPage() {
                   <div className="flex items-center justify-between gap-4">
                     <SettingsLabel
                       label="Public access"
-                      note={!publicEditable ? "Managed by this deployment." : null}
+                      note={
+                        !publicEditable
+                          ? "Managed by this deployment."
+                          : "Public links give signed-in people session access."
+                      }
                       className="flex-1"
                       description={
                         <>
@@ -288,7 +295,11 @@ export function SharingPage() {
                 <div className="mt-4 flex items-center justify-between gap-4 border-t border-border pt-4">
                   <SettingsLabel
                     label="Maximum public permission"
-                    note={!publicMaxEditable ? "Managed by this deployment." : null}
+                    note={
+                      !publicMaxEditable
+                        ? "Managed by this deployment."
+                        : "Public links can grant at most this access level."
+                    }
                     className="min-w-0 flex-1"
                     description={
                       <>
@@ -342,6 +353,7 @@ export function SharingPage() {
                         descriptionId="default-public-description"
                         descriptionClassName="max-md:block"
                         className="flex-1"
+                        note="New sessions start with public read access."
                         description={
                           <>
                             New sessions start with public read access for anyone with the link who
@@ -397,12 +409,8 @@ export function SharingPage() {
                               />
                               <SettingsLabel
                                 label={option.label}
-                                note={
-                                  option.id === "sandbox"
-                                    ? "Local sessions start private."
-                                    : "Includes managed and local hosts."
-                                }
                                 labelId={`default-public-${option.id}-label`}
+                                note={option.note}
                                 description={option.description}
                                 descriptionId={`default-public-${option.id}-description`}
                                 descriptionClassName="max-md:block"

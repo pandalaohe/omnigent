@@ -309,7 +309,7 @@ function VideoPlayerContent(props: VideoPlayerProps) {
                       pendingSeek.current = null;
                     }}
                   >
-                    Retry
+                    Retry loading this video
                   </button>
                 </>
               ) : loading ? (

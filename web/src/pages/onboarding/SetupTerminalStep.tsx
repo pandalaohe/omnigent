@@ -182,7 +182,7 @@ export function SetupTerminalStep({
 
       <div
         ref={logBox}
-        className="min-h-0 flex-1 overflow-y-auto text-[13px] leading-4"
+        className="min-h-0 flex-1 overflow-y-auto text-ui leading-4"
         style={{ fontFamily: '"SF Mono", Monaco, Consolas, monospace' }}
       >
         {streamed ? (
@@ -221,7 +221,7 @@ export function SetupTerminalStep({
             )}
             <Button onClick={() => setAttempt((n) => n + 1)}>
               <RotateCw className="size-4" aria-hidden />
-              Retry
+              Retry setup
             </Button>
           </div>
         </div>

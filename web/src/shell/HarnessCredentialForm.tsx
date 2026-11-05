@@ -281,7 +281,7 @@ function SaveButton({
       data-testid={testId}
       className="shrink-0"
     >
-      Save
+      Save this credential
     </Button>
   );
 }
@@ -291,7 +291,7 @@ function SaveButton({
 function OrDivider() {
   return (
     <div
-      className="flex items-center justify-center gap-2 text-[10px] uppercase tracking-wide text-muted-foreground"
+      className="flex items-center justify-center gap-2 text-sm uppercase tracking-wide text-muted-foreground"
       aria-hidden
     >
       <span className="h-px w-6 bg-border" />

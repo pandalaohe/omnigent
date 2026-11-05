@@ -538,7 +538,7 @@ export function CommandPalette({
                     disabled={retrying}
                     onClick={retryLoad}
                   >
-                    Retry
+                    Retry loading sessions
                   </button>
                 )}
               </p>

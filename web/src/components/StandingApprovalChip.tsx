@@ -80,7 +80,7 @@ export function StandingApprovalChip({
           <div role="alert">
             <p>Could not load the standing approval.</p>
             <Button type="button" variant="outline" size="sm" onClick={() => void query.refetch()}>
-              Retry
+              Retry loading this approval
             </Button>
           </div>
         ) : !record ? (

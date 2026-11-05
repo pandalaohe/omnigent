@@ -231,7 +231,7 @@ export function ArchiveProjectDialog({
                 size="sm"
                 onClick={() => void preview.refetch()}
               >
-                Retry
+                Retry loading the preview
               </Button>
             </p>
           )}

@@ -84,7 +84,7 @@ export function StandingApprovalDefaults() {
               aria-label={`Remove ${kind}`}
               onClick={() => update(kinds.filter((value) => value !== kind))}
             >
-              Remove
+              Remove this approval kind
             </Button>
           </div>
         ))}

@@ -204,7 +204,7 @@ function SearchFilterInput({
 }) {
   return (
     <label className="flex flex-col gap-0.5">
-      <span className="font-medium text-[10px] text-muted-foreground uppercase tracking-wide">
+      <span className="font-medium text-ui text-muted-foreground uppercase tracking-wide">
         {label}
       </span>
       <input
@@ -594,7 +594,7 @@ export function FilesPanel({
               <TooltipTrigger asChild>
                 <span
                   data-testid="files-host-served-badge"
-                  className="flex shrink-0 items-center gap-1 rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
+                  className="flex shrink-0 items-center gap-1 rounded-full bg-muted px-1.5 py-0.5 text-sm text-muted-foreground"
                 >
                   <MoonIcon className="size-3 shrink-0" />
                   Asleep

@@ -875,7 +875,7 @@ export function InboxPage() {
             }}
             componentId="inbox.retry"
           >
-            Retry
+            Retry loading inbox items
           </Button>
         </div>
       )}

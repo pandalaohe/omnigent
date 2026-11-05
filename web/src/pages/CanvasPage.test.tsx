@@ -803,7 +803,7 @@ describe("CanvasPage", () => {
     const { unmount } = renderPage();
     expect(screen.getByRole("alert")).toHaveTextContent("Canvas could not load");
     expect(screen.getByRole("alert")).toHaveTextContent("boom");
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading Canvas" }));
     expect(refresh).toHaveBeenCalled();
     unmount();
 

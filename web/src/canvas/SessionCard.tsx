@@ -77,7 +77,7 @@ function SessionCardComponent({ data, selected }: NodeProps<SessionCardNode>) {
   return (
     <div
       className={cn(
-        "flex w-[280px] min-h-[116px] cursor-grab select-none flex-col gap-1.5 rounded-lg border bg-card px-4 py-3.5 text-[13px] shadow-sm active:cursor-grabbing",
+        "flex w-[280px] min-h-[116px] cursor-grab select-none flex-col gap-1.5 rounded-lg border bg-card px-4 py-3.5 text-ui shadow-sm active:cursor-grabbing",
         selected && "border-brand-accent ring-2 ring-brand-accent/25",
       )}
       data-testid="session-card"

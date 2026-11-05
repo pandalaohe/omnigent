@@ -331,7 +331,7 @@ export function ServerSelectStep({
               </span>
               <span className="flex items-center gap-1.5 text-base text-muted-foreground">
                 {isFirstRecent && (
-                  <span className="rounded-full bg-muted px-1.5 py-0.5 text-[11px] leading-none">
+                  <span className="rounded-full bg-muted px-1.5 py-0.5 text-sm leading-none">
                     Last used
                   </span>
                 )}
@@ -386,7 +386,7 @@ export function ServerSelectStep({
               <DropdownMenuContent align="end">
                 <DropdownMenuItem variant="destructive" onSelect={() => removeServer(url)}>
                   <Trash2 className="size-4" aria-hidden />
-                  Delete from list
+                  Remove this server from the list
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>

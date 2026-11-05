@@ -115,7 +115,7 @@ describe("SharingPage", () => {
     ).toBeDisabled();
   });
 
-  it("uses titled outlined groups with detailed help on every viewport", async () => {
+  it("uses titled groups, visible notes and description tooltips", async () => {
     setSharingState(state());
 
     renderPage();
@@ -131,6 +131,12 @@ describe("SharingPage", () => {
       );
     }
 
+    expect(screen.getByText("Public links give signed-in people session access.")).not.toHaveClass(
+      "max-md:hidden",
+    );
+    expect(
+      screen.queryByText(/Allow sharing a session with anyone who has the link/),
+    ).not.toBeInTheDocument();
     const help = screen.getByRole("button", { name: "About Public access" });
     expect(help).not.toHaveClass("md:hidden");
     fireEvent.click(help);
@@ -322,7 +328,14 @@ describe("SharingPage", () => {
       expect(radios.map((r) => r.value)).toEqual(["sandbox", "all"]);
       expect(radios.find((r) => r.value === "sandbox")!.checked).toBe(true);
       expect(screen.getByRole("radio", { name: "Managed hosts only" })).toBeChecked();
-      expect(screen.getByText("Local sessions start private.")).toBeInTheDocument();
+      expect(
+        screen.getByText("Managed-host sessions start shared; local ones stay private."),
+      ).toBeInTheDocument();
+      expect(screen.queryByText(/Sessions on local hosts start private/)).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "About Managed hosts only" }));
+      expect(await screen.findByRole("tooltip")).toHaveTextContent(
+        /Sessions on local hosts start private/,
+      );
     });
 
     it("hides scope while off and enables managed hosts only by default", async () => {

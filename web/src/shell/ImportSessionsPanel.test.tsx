@@ -103,6 +103,22 @@ describe("ImportSessionsPanel", () => {
     expect(screen.getByRole("link", { name: "View sessions" })).toHaveAttribute("href", "/");
   });
 
+  it("keeps the recent-count explanation behind its help trigger", async () => {
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_1", name: "mac-laptop", owner: "alice", status: "online" }],
+    } as unknown as ReturnType<typeof useHosts>);
+    renderPanel();
+
+    expect(screen.getByText(/How many recent sessions/)).toHaveClass("text-ui");
+    expect(
+      screen.queryByText(/The most recent sessions you opened in the harness/),
+    ).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("import-limit-help"));
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(
+      /The most recent sessions you opened in the harness/,
+    );
+  });
+
   it("collapses reasons for failed sessions and retries without re-importing successes", async () => {
     useHostsMock.mockReturnValue({
       data: [{ host_id: "host_1", name: "mac-laptop", owner: "alice", status: "online" }],
@@ -125,6 +141,7 @@ describe("ImportSessionsPanel", () => {
     fireEvent.click(screen.getByTestId("import-submit"));
 
     await waitFor(() => expect(screen.getByTestId("import-failures")).toBeInTheDocument());
+    expect(screen.getByTestId("import-retry")).toHaveTextContent("Retry failed imports");
     expect(screen.getByTestId("import-result").textContent).toContain("2 failed");
     const failures = screen.getAllByTestId("import-failure-item");
     expect(failures).toHaveLength(2);
@@ -224,7 +241,7 @@ describe("ImportSessionsPanel", () => {
   });
 });
 
-it("Retry failed preserves the original request after leaving Settings", async () => {
+it("Retry failed imports preserves the original request after leaving Settings", async () => {
   useHostsMock.mockReturnValue({
     data: [
       { host_id: "host_1", name: "first-machine", owner: "alice", status: "online" },

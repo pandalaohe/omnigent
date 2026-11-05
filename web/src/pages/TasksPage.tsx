@@ -249,7 +249,7 @@ export function TasksPage() {
             onClick={() => void refetch()}
             componentId="tasks.retry"
           >
-            Retry
+            Retry loading automations
           </Button>
         </div>
       ) : isLoading ? (

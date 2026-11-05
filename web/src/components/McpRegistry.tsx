@@ -245,7 +245,7 @@ export function McpRegistryPicker({
             {error}
           </p>
           <Button size="sm" variant="link" onClick={() => void refresh()}>
-            Retry
+            Retry loading MCP services
           </Button>
         </div>
       )}

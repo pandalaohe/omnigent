@@ -161,7 +161,7 @@ describe("standing approval chip", () => {
     fetchMock.mockRejectedValueOnce(new Error("offline"));
     mount();
     fireEvent.click(await screen.findByRole("button", { name: "Standing approval: unavailable" }));
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading this approval" }));
     await screen.findByRole("button", { name: "Revoke install" });
   });
 
