@@ -124,8 +124,9 @@ function nativeRetryAdmission(config, request) {
       try { fs.unlinkSync(temporary); } catch (_error) {}
     }
   }
+  // -P keeps the child's workspace (possibly an omnigent checkout) off sys.path.
   const result = spawnSync(config.autoRetryPython, [
-    "-m", "omnigent.native.auto_retry", "--bridge-dir", config.bridgeDir,
+    "-P", "-m", "omnigent.native.auto_retry", "--bridge-dir", config.bridgeDir,
   ], {
     input: JSON.stringify({ ...request, session_id: config.sessionId }),
     encoding: "utf8", timeout: 5000, windowsHide: true,
