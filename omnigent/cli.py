@@ -10394,7 +10394,7 @@ def _windows_path_holds_tool_venv(
     tool_venv_path: Path | str,
     cli_bin_path: Path | str,
 ) -> bool:
-    """Detect executable/argv provenance and observable native-module or file holders."""
+    """Detect executable/argv provenance and observable native-module mappings."""
     venv_norm = _normalize_windows_fs_path(tool_venv_path)
     cli_norm = _normalize_windows_fs_path(cli_bin_path)
     exe_norm = _normalize_windows_fs_path(proc.exe) if proc.exe else ""
@@ -10445,16 +10445,6 @@ def _list_windows_processes() -> list[_WindowsProcessInfo]:
                 cmdline = cmdline_raw
             else:
                 cmdline = ""
-            loaded_paths: set[str] = set()
-            # uv's base interpreter can load the tool's DLLs without naming
-            # its venv in either exe or argv. Keep partial observations if a
-            # process exits or denies inspection; the detached helper also
-            # checks exclusive access to every installation file.
-            with contextlib.suppress(psutil.Error, OSError):
-                memory_maps = proc.memory_maps()  # pyrefly: ignore[missing-attribute]
-                loaded_paths.update(item.path for item in memory_maps)
-            with contextlib.suppress(psutil.Error, OSError):
-                loaded_paths.update(item.path for item in proc.open_files())
             rows.append(
                 _WindowsProcessInfo(
                     pid=pid,
@@ -10462,7 +10452,6 @@ def _list_windows_processes() -> list[_WindowsProcessInfo]:
                     name=str(info.get("name") or ""),
                     exe=str(info.get("exe") or ""),
                     cmdline=cmdline,
-                    loaded_paths=tuple(loaded_paths),
                     created_at=float(info.get("create_time") or 0),
                 )
             )
@@ -10471,13 +10460,105 @@ def _list_windows_processes() -> list[_WindowsProcessInfo]:
     return rows
 
 
+def _inspect_windows_processes(
+    processes: Sequence[_WindowsProcessInfo],
+    *,
+    tool_venv_path: Path | str,
+    cli_bin_path: Path | str,
+    process_identities: Sequence[_WindowsProcessInfo],
+    timeout_s: float,
+) -> list[_WindowsProcessInfo]:
+    """Inspect candidate mappings outside the CLI so native queries have a deadline."""
+    if os.name != "nt":
+        return list(processes)
+    started = time.monotonic()
+    captured = {proc.pid: proc.created_at for proc in process_identities if proc.created_at > 0}
+    candidates = [
+        {"pid": proc.pid, "created_at": proc.created_at}
+        for proc in processes
+        if (
+            _windows_path_holds_tool_venv(
+                proc, tool_venv_path=tool_venv_path, cli_bin_path=cli_bin_path
+            )
+            or any(
+                image.startswith("python")
+                or image in {"omni.exe", "omnigent.exe", "omni", "omnigent"}
+                for image in (
+                    proc.name.casefold(),
+                    _normalize_windows_fs_path(proc.exe).rsplit("\\", 1)[-1],
+                )
+            )
+            or (proc.pid in captured and proc.created_at == captured[proc.pid])
+        )
+    ]
+    if not candidates:
+        return list(processes)
+    # Bypass Windows' venv trampoline: killing it on timeout could leave the
+    # actual scanning interpreter alive. Preserve the tool's import environment.
+    scan_env = os.environ.copy()
+    scan_env["__PYVENV_LAUNCHER__"] = sys.executable
+    scan_python = (
+        getattr(sys, "_base_executable", sys.executable)
+        if sys.platform == "win32"
+        else sys.executable
+    )
+    paths: dict[str, list[str]] = {}
+    try:
+        if timeout_s <= 0:
+            raise subprocess.TimeoutExpired("process mapping scan", timeout_s)
+        # Windows communicate() can block writing stdin before its timed wait.
+        # A file also lets us kill a scanner stuck importing before it reads.
+        with tempfile.TemporaryDirectory(prefix="omnigent-process-scan-") as request_dir:
+            request_path = Path(request_dir) / "candidates.json"
+            request_path.write_text(json.dumps(candidates), encoding="utf-8")
+            remaining = timeout_s - (time.monotonic() - started)
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired("process mapping scan", timeout_s)
+            result = subprocess.run(
+                [
+                    scan_python,
+                    "-I",
+                    "-m",
+                    "omnigent.host.windows_process_scan",
+                    str(request_path),
+                ],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=remaining,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                env=scan_env,
+            )
+        paths = json.loads(result.stdout)
+        if not isinstance(paths, dict) or any(
+            not isinstance(items, list) or not all(isinstance(path, str) for path in items)
+            for items in paths.values()
+        ):
+            raise ValueError("Invalid process mapping snapshot")
+    except subprocess.TimeoutExpired as exc:
+        raise click.ClickException(
+            "Timed out inspecting Windows process mappings. "
+            "Aborted before modifying the installation."
+        ) from exc
+    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+        raise click.ClickException(
+            "Cannot inspect Windows process mappings. Aborted before modifying the installation."
+        ) from exc
+    return [
+        replace(proc, loaded_paths=proc.loaded_paths + tuple(paths.get(str(proc.pid), ())))
+        for proc in processes
+    ]
+
+
 def _terminate_windows_process(pid: int, created_at: float) -> None:
     """Stop a captured process only while its creation identity still matches."""
     with contextlib.suppress(psutil.Error, OSError):
         proc = psutil.Process(pid)
         if created_at > 0 and proc.create_time() == created_at:
             proc.kill()
-            proc.wait(timeout=5)
+            # The next process-table pass observes exit; per-PID waits would
+            # multiply the overall deadline by the size of the captured tree.
 
 
 def _windows_process_arguments(proc: _WindowsProcessInfo) -> list[str]:
@@ -10695,21 +10776,12 @@ def _wait_for_windows_custom_host_venv_release(
     tree_excluded = set(base_excluded)
     if parent_pid is not None and parent_pid > 0:
         tree_excluded.add(parent_pid)
+    started = time.monotonic()
+    deadline = started + max(timeout_s, 0.0)
+    grace_deadline = min(deadline, started + max(grace_s, 0.0))
     captured = list(process_identities)
-    if not captured:
-        initial = _list_windows_processes()
-        initial_tree = _windows_stopped_host_tree_pids(
-            initial,
-            stopped_host_pids=stopped_host_pids,
-            tool_venv_path=tool_venv_path,
-            cli_bin_path=cli_bin_path,
-            excluded_pids=tree_excluded,
-        )
-        captured = [proc for proc in initial if proc.pid in initial_tree]
-    captured_times = {proc.pid: proc.created_at for proc in captured if proc.created_at > 0}
-
-    grace_deadline = time.monotonic() + max(grace_s, 0.0)
-    while time.monotonic() < grace_deadline:
+    captured_initially = bool(captured)
+    while True:
         processes = _list_windows_processes()
         ancestors = (
             _windows_process_ancestor_pids(
@@ -10728,41 +10800,25 @@ def _wait_for_windows_custom_host_venv_release(
             cli_bin_path=cli_bin_path,
             excluded_pids=tree_excluded | ancestors,
         )
-        if not host_tree and not any(proc.pid in captured_times for proc in processes):
-            break
-        time.sleep(0.05)
-
-    processes = _list_windows_processes()
-    ancestors = (
-        _windows_process_ancestor_pids(
-            processes,
-            helper_pid,
-            tool_venv_path=tool_venv_path,
-            cli_bin_path=cli_bin_path,
-        )
-        if allow_ancestor_cli and helper_pid is not None
-        else set()
-    )
-    for pid, expected in captured_times.items():
-        if pid not in tree_excluded | ancestors:
-            _terminate_windows_process(pid, expected)
-
-    deadline = time.monotonic() + max(timeout_s, 0.0)
-    while True:
-        processes = _list_windows_processes()
-        ancestors = (
-            _windows_process_ancestor_pids(
-                processes,
-                helper_pid,
-                tool_venv_path=tool_venv_path,
-                cli_bin_path=cli_bin_path,
-            )
-            if allow_ancestor_cli and helper_pid is not None
-            else set()
-        )
+        if not captured_initially:
+            captured = [proc for proc in processes if proc.pid in host_tree]
+            captured_initially = True
+        captured_times = {proc.pid: proc.created_at for proc in captured if proc.created_at > 0}
+        if time.monotonic() < grace_deadline and (
+            host_tree or any(proc.pid in captured_times for proc in processes)
+        ):
+            time.sleep(min(0.05, max(0.0, grace_deadline - time.monotonic())))
+            continue
         for pid, expected in captured_times.items():
             if pid not in tree_excluded | ancestors:
                 _terminate_windows_process(pid, expected)
+        processes = _inspect_windows_processes(
+            [proc for proc in processes if proc.pid not in base_excluded | ancestors],
+            tool_venv_path=tool_venv_path,
+            cli_bin_path=cli_bin_path,
+            process_identities=captured,
+            timeout_s=deadline - time.monotonic(),
+        )
         locking = _windows_venv_locking_processes(
             processes,
             tool_venv_path=tool_venv_path,
@@ -10778,7 +10834,7 @@ def _wait_for_windows_custom_host_venv_release(
                 "Stop the remaining process(es) and retry. "
                 "Aborted before modifying the installation."
             )
-        time.sleep(0.05)
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
 
 def _reconcile_custom_host_update_result(
