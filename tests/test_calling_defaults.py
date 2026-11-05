@@ -22,6 +22,28 @@ _LAYERED_CASES = json.loads(
     (Path(__file__).parents[1] / "web/src/lib/__fixtures__/layeredCases.json").read_text()
 )["permissionCases"]
 
+_VALIDITY_CASES = json.loads(
+    (
+        Path(__file__).parents[1] / "web/src/lib/__fixtures__/callingDefaultValidity.json"
+    ).read_text()
+)
+
+
+@pytest.mark.parametrize("case", _VALIDITY_CASES, ids=lambda case: case["name"])
+def test_shared_agent_defaults_validity(case: dict) -> None:
+    harness = case["harness"]
+    result = resolve_calling(
+        explicit={"harness_override": harness},
+        explicit_fields={"harness_override"},
+        project_config=None,
+        master={"*": {harness: case["row"]}, "desktop": {harness: case["cell"]}},
+        host_id="desktop",
+        agent_harness=lambda _: None,
+    )
+    for field, expected in case["expected"].items():
+        assert getattr(result, field) == expected
+        assert result.level[field] == case["level"]
+
 
 @pytest.mark.parametrize("case", _LAYERED_CASES, ids=lambda case: case["name"])
 def test_shared_permission_layers(case: dict) -> None:

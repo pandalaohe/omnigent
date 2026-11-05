@@ -48,6 +48,7 @@ export interface HarnessCatalogRow {
 
 export interface HarnessCapability {
   label?: string | null;
+  effort?: string | null;
   integration_mode?: string | null;
   keep_warm_family?: string | null;
   native_agent_key?: string | null;

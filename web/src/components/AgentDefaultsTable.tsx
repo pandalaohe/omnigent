@@ -54,8 +54,42 @@ import { effortLevelsFor, reconcileEffortOnModelChange } from "@/lib/modelEffort
 import { reconcileSpeed } from "@/lib/speedTiers";
 import { sessionModeHandler, sessionDefaultModeOptions } from "@/lib/sessionDefaultModes";
 import type { HarnessCapabilityMap } from "@/lib/sessionDefaultModes";
+import { effortLevelsForFamily } from "@/lib/sessionCapabilities";
 
 export type AgentField = "permission" | "model" | "effort" | "speed";
+const LEGACY_EFFORT_FAMILIES: Readonly<Record<string, string>> = {
+  "claude-native": "anthropic",
+  "claude-sdk": "anthropic",
+  codex: "codex-native",
+  "codex-native": "codex-native",
+  "pi-native": "pi",
+  pi: "pi",
+  "antigravity-native": "gemini",
+  "devin-native": "anthropic",
+};
+
+/** Match runtime validation without depending on a host's model catalog. */
+function canHoldAgentValue(
+  harness: string,
+  field: AgentField,
+  value: string,
+  capabilities?: HarnessCapabilityMap,
+): boolean {
+  if (field === "speed") {
+    return sessionModeHandler(harness, "speed", capabilities) === "codex-service-tier"
+      ? /^[a-z][a-z0-9_-]{0,63}$/.test(value)
+      : sessionDefaultModeOptions(harness, "speed", [], null, "default", capabilities).some(
+          (option) => option.value === value,
+        );
+  }
+  if (field !== "effort") return true;
+  const family = capabilities?.[harness]?.effort ?? LEGACY_EFFORT_FAMILIES[harness];
+  if (!family || family === "dynamic") return true;
+  if ((family === "pi" || family === "codex-native") && ["max", "ultra"].includes(value))
+    return true;
+  return effortLevelsForFamily(family === "codex-native" ? "openai" : family).includes(value);
+}
+
 const FIELDS = [
   { value: "permission", label: "Permission" },
   { value: "model", label: "Model" },
@@ -342,7 +376,11 @@ export function AgentDefaultsTable({
         : field === "speed"
           ? speeds(row, col)
           : efforts(row, col).map((value) => ({ value, label: normalizeEffortLabel(value) }));
-  const layerOptions = (col?: string) => callingLayerOptions((row) => permissions(row, col));
+  const layerOptions = (col?: string) =>
+    callingLayerOptions(
+      (row) => permissions(row, col),
+      (row, key, value) => canHoldAgentValue(row, key, value, capabilities),
+    );
   const resolve = (row: string, col: string) =>
     resolveAgentMasterField(master, col, row, field, capabilities, layerOptions(col));
   const label = (row: string) => names?.[row] ?? callingHarnessLabel(row, capabilities);

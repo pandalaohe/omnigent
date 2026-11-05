@@ -12,6 +12,7 @@ import {
   type CallingDefaultsTable,
 } from "@/lib/callingDefaults";
 import { AgentDefaultsTable, type AgentField } from "./AgentDefaultsTable";
+import validityCases from "@/lib/__fixtures__/callingDefaultValidity.json";
 
 const { queuePatch } = vi.hoisted(() => ({ queuePatch: vi.fn() }));
 vi.mock("@/lib/userPreferencesSync", () => ({ queueUserPreferencePatch: queuePatch }));
@@ -72,6 +73,25 @@ afterEach(() => {
 });
 
 describe("agent layered defaults", () => {
+  it.each(
+    validityCases.flatMap((testCase) =>
+      Object.entries(testCase.expected).map(([field, value]) => ({ ...testCase, field, value })),
+    ),
+  )("matches resolve_calling: $name ($field)", ({ harness, row, cell, level, field, value }) => {
+    seed({ "*": { [harness]: row }, desktop: { [harness]: cell } });
+    render(
+      <Table
+        field={field as AgentField}
+        hostList={[{ ...hosts[0], configured_harnesses: { [harness]: true } }]}
+      />,
+    );
+    const displayed = screen.getByTestId(`layered-cell-${harness}-desktop`);
+    expect(displayed).toHaveTextContent(new RegExp(value!, "i"));
+    expect(displayed).toHaveAccessibleName(
+      level === "cell" ? /From This cell/ : /From .+ on all hosts/,
+    );
+  });
+
   it("keeps a details entry for the SDK identity beside its Native product", () => {
     render(
       <MemoryRouter>

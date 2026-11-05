@@ -1,0 +1,50 @@
+[
+  {
+    "name": "Claude Native rejects invalid cell values",
+    "harness": "claude-native",
+    "row": { "effort": "high", "speed": "standard" },
+    "cell": { "effort": "none", "speed": "turbo" },
+    "expected": { "effort": "high", "speed": "standard" },
+    "level": "row"
+  },
+  {
+    "name": "Claude SDK rejects invalid cell values",
+    "harness": "claude-sdk",
+    "row": { "effort": "high", "speed": "standard" },
+    "cell": { "effort": "none", "speed": "turbo" },
+    "expected": { "effort": "high", "speed": "standard" },
+    "level": "row"
+  },
+  {
+    "name": "Codex Native preserves uncached cell values",
+    "harness": "codex-native",
+    "row": { "effort": "low", "speed": "standard" },
+    "cell": { "effort": "ultra", "speed": "fast" },
+    "expected": { "effort": "ultra", "speed": "fast" },
+    "level": "cell"
+  },
+  {
+    "name": "Codex SDK rejects invalid cell values",
+    "harness": "codex",
+    "row": { "effort": "high", "speed": "standard" },
+    "cell": { "effort": "obsolete", "speed": "Fast speed" },
+    "expected": { "effort": "high", "speed": "standard" },
+    "level": "row"
+  },
+  {
+    "name": "Pi preserves its accepted ultra alias",
+    "harness": "pi-native",
+    "row": { "effort": "high" },
+    "cell": { "effort": "ultra" },
+    "expected": { "effort": "ultra" },
+    "level": "cell"
+  },
+  {
+    "name": "Devin rejects invalid effort without a catalog",
+    "harness": "devin-native",
+    "row": { "effort": "high" },
+    "cell": { "effort": "custom-effort" },
+    "expected": { "effort": "high" },
+    "level": "row"
+  }
+]
