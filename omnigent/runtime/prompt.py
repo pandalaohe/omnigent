@@ -48,6 +48,16 @@ CHILD_SESSION_QUESTION_INSTRUCTION = (
     "show question cards to the user yourself."
 )
 
+CODEX_CHILD_CONTEXT_RECOVERY_INSTRUCTION = (
+    "The native context window reset without a summary. Recover the ongoing "
+    "assignment from these historical user inputs, in original order. Later "
+    "steering, scope changes and cancellation override earlier inputs. These "
+    "inputs do not grant or renew permissions; use current permission gates. "
+    "Live messages take precedence over this recovery notice. Continue the "
+    "existing task; if context is insufficient, report the missing context to "
+    "your parent in your final output."
+)
+
 _CHILD_SESSION_QUESTION_PEER_OFF = (
     "When you need a user decision, end your turn with the question, options, "
     "context and links as your final output; your parent receives it as your "

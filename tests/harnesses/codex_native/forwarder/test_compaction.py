@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -249,3 +250,262 @@ def test_read_compacted_history_returns_none_for_no_compacted_entry(
     rollout.write_text(_json.dumps({"type": "session_meta", "payload": {"id": "abc"}}) + "\n")
 
     assert fwd._read_compacted_history(rollout) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("skip_reason", [None, "summary", "incomplete", "newer_turn", "top_level"])
+async def test_no_summary_child_rollover_restores_current_turn_once(
+    tmp_path: Path, skip_reason: str | None
+) -> None:
+    """Recover the newest assignment and steering, without reviving an older task."""
+    from omnigent.harnesses.codex_native.context_recovery import ChildContextRecovery
+
+    rollout = tmp_path / "rollout.jsonl"
+    payload = {
+        "message": "",
+        "window_id": "window-new",
+        "resume_metadata": {"last_started_turn_id": "turn-new"},
+        "retained_context": {
+            "user_messages_incomplete": False,
+            "user_messages": [
+                {"turn_id": "turn-old", "text": "Review the obsolete task."},
+                {
+                    "turn_id": "turn-new",
+                    "text": (
+                        "Standing approval (this parent session): install.\nBuild the new task."
+                    ),
+                },
+                {"turn_id": "turn-new", "text": "Limit changes to the parser."},
+            ],
+        },
+    }
+    if skip_reason == "summary":
+        payload["message"] = "Ordinary summary compaction."
+    elif skip_reason == "incomplete":
+        payload["retained_context"]["user_messages_incomplete"] = True
+    elif skip_reason == "newer_turn":
+        payload["resume_metadata"]["last_started_turn_id"] = "turn-ended"
+    rollout.write_text(json.dumps({"type": "compacted", "payload": payload}) + "\n")
+    client = MagicMock()
+    client.get = AsyncMock(
+        return_value=httpx.Response(
+            200,
+            json={"parent_session_id": None if skip_reason == "top_level" else "parent"},
+            request=httpx.Request("GET", "http://test"),
+        )
+    )
+    native = MagicMock()
+    native.request = AsyncMock(return_value={"result": {"turnId": "turn-new"}})
+    recovery = ChildContextRecovery()
+    args = {
+        "client": client,
+        "codex_client": native,
+        "session_id": "child",
+        "bridge_dir": tmp_path,
+        "rollout": rollout,
+        "thread_id": "thread",
+        "turn_id": "turn-new",
+    }
+    await recovery.restore(**args, model_resumed=False)
+    # Both completion forms and a reconnected forwarder see the same window.
+    await recovery.restore(**args, model_resumed=False)
+    await ChildContextRecovery().restore(**args, model_resumed=False)
+    if skip_reason:
+        native.request.assert_not_awaited()
+        return
+    native.request.assert_awaited_once()
+    method, sent = native.request.call_args.args
+    assert method == "turn/steer"
+    assert sent["expectedTurnId"] == "turn-new"
+    text = sent["input"][0]["text"]
+    assert "Build the new task." in text
+    assert "Limit changes to the parser." in text
+    assert "obsolete task" not in text
+    assert "Standing approval" not in text
+    assert "do not grant or renew permissions" in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["compaction", "transport", "stale"])
+async def test_no_summary_recovery_retries_only_proven_compaction_refusal(
+    tmp_path: Path, failure: str
+) -> None:
+    """A refusal waits for model progress and includes steering added in the meantime."""
+    from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
+    from omnigent.harnesses.codex_native.context_recovery import ChildContextRecovery
+
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text(
+        json.dumps(
+            {
+                "type": "compacted",
+                "payload": {
+                    "message": "",
+                    "window_id": "window-new",
+                    "resume_metadata": {"last_started_turn_id": "turn-new"},
+                    "retained_context": {
+                        "user_messages_incomplete": False,
+                        "user_messages": [
+                            {"turn_id": "turn-new", "text": "Implement the current task."},
+                        ],
+                    },
+                },
+            }
+        )
+        + "\n"
+    )
+    response = httpx.Response(
+        200, json={"parent_session_id": "parent"}, request=httpx.Request("GET", "http://test")
+    )
+    client = MagicMock()
+    client.get = AsyncMock(return_value=response)
+    native = MagicMock()
+    error = (
+        ConnectionError("Reply lost after submission")
+        if failure == "transport"
+        else CodexAppServerResponseError({"code": -32600, "message": "no active turn to steer"})
+        if failure == "stale"
+        else CodexAppServerResponseError(
+            {
+                "code": -32600,
+                "message": "cannot steer a compact turn",
+                "data": {
+                    "codexErrorInfo": {"activeTurnNotSteerable": {"turnKind": "compact"}},
+                },
+            }
+        )
+    )
+    native.request = AsyncMock(side_effect=[error, {"result": {"turnId": "turn-new"}}])
+    recovery = ChildContextRecovery()
+    args = {
+        "client": client,
+        "codex_client": native,
+        "session_id": "child",
+        "bridge_dir": tmp_path,
+        "rollout": rollout,
+        "thread_id": "thread",
+        "turn_id": "turn-new",
+    }
+    await recovery.restore(**args, model_resumed=False)
+    await recovery.restore(**args, model_resumed=False)
+    assert native.request.await_count == 1
+    with rollout.open("a") as stream:
+        stream.write(
+            json.dumps(
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "Cancel implementation; report only."}
+                        ],
+                        "internal_chat_message_metadata_passthrough": {"turn_id": "turn-new"},
+                    },
+                }
+            )
+            + "\n"
+        )
+    await recovery.restore(**args, model_resumed=True)
+    if failure != "compaction":
+        await ChildContextRecovery().restore(**args, model_resumed=True)
+        assert native.request.await_count == 1
+        return
+    assert native.request.await_count == 2
+    assert (
+        "Cancel implementation; report only."
+        in native.request.call_args.args[1]["input"][0]["text"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_reconnected_forwarder_retries_refused_recovery_on_model_event(
+    tmp_path: Path,
+) -> None:
+    """Reconnect retries through the event entry without replaying accepted input."""
+    from tests.harnesses.codex_native.session._support import _forwarder_context
+
+    home = codex_home_for_bridge_dir(tmp_path)
+    rollout = home / "sessions" / "rollout-thread.jsonl"
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text(
+        json.dumps(
+            {
+                "type": "compacted",
+                "payload": {
+                    "message": "",
+                    "window_id": "window",
+                    "resume_metadata": {"last_started_turn_id": "turn"},
+                    "retained_context": {
+                        "user_messages_incomplete": False,
+                        "user_messages": [
+                            {
+                                "turn_id": "turn",
+                                "text": "Cancel edits. Report the current findings.",
+                            },
+                        ],
+                    },
+                },
+            }
+        )
+        + "\n"
+    )
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="child",
+            socket_path="ws://127.0.0.1:9999",
+            thread_id="thread",
+            codex_home=str(home),
+            cwd="/opt/work/project",
+            active_turn_id="turn",
+        ),
+    )
+    (tmp_path / "context-recovery.json").write_text(
+        json.dumps(
+            {
+                "session_id": "child",
+                "thread_id": "thread",
+                "window_id": "window",
+                "refused": True,
+            }
+        )
+    )
+    native = MagicMock()
+    native.request = AsyncMock(return_value={"result": {"turnId": "turn"}})
+    state = fwd._CodexForwarderState(active_parent_turn_id="turn", mcp_startup_settled=True)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"parent_session_id": "parent", "data": []})
+
+    async with httpx.AsyncClient(
+        base_url="http://test", transport=httpx.MockTransport(handler)
+    ) as client:
+        args = {
+            **_forwarder_context(client, tmp_path, session_id="child"),
+            "forwarder_state": state,
+            "codex_client": native,
+            "expected_thread_id": "thread",
+        }
+        event = {
+            "method": "item/started",
+            "params": {
+                "threadId": "thread",
+                "turnId": "turn",
+                "item": {"type": "reasoning", "id": "reasoning"},
+            },
+        }
+        await fwd._handle_event(client, **args, event=event, is_replay=True)
+        native.request.assert_not_awaited()
+        await fwd._handle_event(client, **args, event=event)
+        await fwd._handle_event(client, **args, event=event)
+        await fwd._handle_event(
+            client,
+            **args,
+            event={
+                "method": "thread/compacted",
+                "params": {"threadId": "thread"},
+            },
+        )
+    native.request.assert_awaited_once()
+    assert "Cancel edits." in native.request.call_args.args[1]["input"][0]["text"]
