@@ -16,7 +16,7 @@ import click
 import pytest
 from click.testing import CliRunner
 
-from omnigent.cli import _HostDaemonRecord, cli
+from omnigent.cli import _HostDaemonRecord, _list_windows_processes, cli
 from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
 from omnigent.update_check import _InstalledWheelInfo
 
@@ -1532,6 +1532,226 @@ def test_windows_custom_update_stops_host_tree_and_waits_for_cli_parent(
         )
         == []
     )
+
+
+def test_windows_process_listing_never_queries_handles_or_mappings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omnigent.cli as cli_module
+
+    class Process:
+        info = {
+            "pid": 10,
+            "ppid": 1,
+            "name": "browser.exe",
+            "exe": r"C:\Browser\browser.exe",
+            "cmdline": [r"C:\Browser\browser.exe", "--profile", "user data"],
+            "create_time": 1.0,
+        }
+
+        def memory_maps(self) -> None:
+            pytest.fail("a process-table snapshot must not inspect mappings")
+
+        def open_files(self) -> None:
+            pytest.fail("a process-table snapshot must not enumerate file handles")
+
+    monkeypatch.setattr(cli_module, "os", SimpleNamespace(name="nt", environ=os.environ))
+    monkeypatch.setattr(cli_module.psutil, "process_iter", lambda _attrs: iter([Process()]))
+    processes = _list_windows_processes()
+    assert len(processes) == 1
+    assert processes[0].exe == Process.info["exe"]
+    assert processes[0].cmdline.endswith('--profile "user data"')
+    assert processes[0].loaded_paths == ()
+
+
+def test_windows_process_inspection_selects_candidates_and_keeps_loaded_holder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omnigent.cli as cli_module
+    from omnigent.host import windows_process_scan
+
+    tool = r"C:\Users\<user>\AppData\Roaming\uv\tools\omnigent"
+    wrapper = r"C:\Users\<user>\.local\bin\omni.exe"
+    row = cli_module._WindowsProcessInfo
+    processes = [
+        row(10, 1, "browser.exe", r"C:\Browser\browser.exe"),
+        row(20, 1, "python.exe", r"C:\Python\python.exe", created_at=2.0),
+        row(30, 1, "worker.exe", tool + r"\Scripts\worker.exe", created_at=3.0),
+        row(
+            40, 1, "worker.exe", r"C:\Other\worker.exe", f'worker "{tool}\\job.py"', created_at=4.0
+        ),
+        row(50, 1, "omni.exe", wrapper, created_at=5.0),
+        row(60, 1, "worker.exe", r"C:\Other\worker.exe", created_at=6.0),
+        row(70, 1, "worker.exe", r"C:\Other\worker.exe", created_at=7.0),
+    ]
+    inspected: list[int] = []
+
+    class Process:
+        def __init__(self, pid: int) -> None:
+            assert pid != 10, "a non-candidate must never be deep-inspected"
+            assert pid != 70, "a reused captured PID must not be deep-inspected"
+            self.pid = pid
+
+        def create_time(self) -> float:
+            return self.pid / 10
+
+        def memory_maps(self) -> list[SimpleNamespace]:
+            inspected.append(self.pid)
+            return [SimpleNamespace(path=tool + r"\Lib\worker.pyd")] if self.pid == 20 else []
+
+        def open_files(self) -> None:
+            pytest.fail("open_files is not a reliable Windows lock check")
+
+    def scan(command: list[str], **kwargs: object) -> SimpleNamespace:
+        assert command == [
+            r"C:\Python\python.exe",
+            "-I",
+            "-m",
+            "omnigent.host.windows_process_scan",
+        ]
+        scan_env = kwargs["env"]
+        assert isinstance(scan_env, dict)
+        assert scan_env["__PYVENV_LAUNCHER__"] == tool + r"\Scripts\python.exe"
+        request = json.loads(str(kwargs["input"]))
+        return SimpleNamespace(
+            stdout=json.dumps(windows_process_scan.inspect_loaded_paths(request))
+        )
+
+    monkeypatch.setattr(cli_module, "os", SimpleNamespace(name="nt", environ=os.environ))
+    monkeypatch.setattr(
+        cli_module,
+        "sys",
+        SimpleNamespace(
+            platform="win32",
+            executable=tool + r"\Scripts\python.exe",
+            _base_executable=r"C:\Python\python.exe",
+        ),
+    )
+    monkeypatch.setattr(windows_process_scan.psutil, "Process", Process)
+    monkeypatch.setattr(cli_module.subprocess, "run", scan)
+    inspected_rows = cli_module._inspect_windows_processes(
+        processes,
+        tool_venv_path=tool,
+        cli_bin_path=wrapper,
+        process_identities=[processes[5], row(70, 1, "worker.exe", created_at=1.0)],
+        timeout_s=1.0,
+    )
+    assert inspected == [20, 30, 40, 50, 60]
+    holders = cli_module._windows_venv_locking_processes(
+        inspected_rows, tool_venv_path=tool, cli_bin_path=wrapper, excluded_pids=set()
+    )
+    assert [proc.pid for proc in holders] == [20, 30, 40, 50]
+
+
+def test_windows_custom_update_bounds_hung_mapping_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omnigent.cli as cli_module
+
+    processes = [cli_module._WindowsProcessInfo(20, 1, "python.exe", created_at=2.0)]
+    monkeypatch.setattr(cli_module, "_list_windows_processes", lambda: processes)
+    monkeypatch.setattr(cli_module, "os", SimpleNamespace(name="nt", environ=os.environ))
+    run = subprocess.run
+
+    def hang(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return run([command[0], "-c", "import time; time.sleep(60)"], **kwargs)
+
+    monkeypatch.setattr(cli_module.subprocess, "run", hang)
+    started = time.monotonic()
+    with pytest.raises(click.ClickException, match=r"Timed out.*process"):
+        cli_module._wait_for_windows_custom_host_venv_release(
+            tool_venv_path=r"C:\Users\<user>\AppData\Roaming\uv\tools\omnigent",
+            cli_bin_path=r"C:\Users\<user>\.local\bin\omni.exe",
+            stopped_host_pids=[],
+            timeout_s=0.2,
+            grace_s=0,
+        )
+    assert time.monotonic() - started < 1.5
+
+
+def test_windows_custom_update_uses_one_deadline_for_grace_and_scans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omnigent.cli as cli_module
+
+    tool = r"C:\Users\<user>\AppData\Roaming\uv\tools\omnigent"
+    process = cli_module._WindowsProcessInfo(
+        20, 1, "python.exe", tool + r"\Scripts\python.exe", created_at=2.0
+    )
+    clock = [0.0]
+    listings: list[float] = []
+    budgets: list[float] = []
+
+    def snapshot() -> list[object]:
+        listings.append(clock[0])
+        return [process]
+
+    def inspect(processes: list[object], **kwargs: object) -> list[object]:
+        budget = float(kwargs["timeout_s"])  # type: ignore[arg-type]
+        budgets.append(budget)
+        clock[0] += min(0.07, budget)
+        return processes
+
+    monkeypatch.setattr(cli_module, "_list_windows_processes", snapshot)
+    monkeypatch.setattr(cli_module, "_inspect_windows_processes", inspect)
+    monkeypatch.setattr(cli_module, "_terminate_windows_process", lambda *_a: None)
+    monkeypatch.setattr(cli_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        cli_module.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+    )
+    with pytest.raises(click.ClickException, match="pid 20"):
+        cli_module._wait_for_windows_custom_host_venv_release(
+            tool_venv_path=tool,
+            cli_bin_path=r"C:\Users\<user>\.local\bin\omni.exe",
+            stopped_host_pids=[],
+            process_identities=[process],
+            timeout_s=0.2,
+            grace_s=0.1,
+        )
+    assert clock[0] == pytest.approx(0.2)
+    assert listings == pytest.approx([0, 0.05, 0.1, 0.2])
+    assert budgets == pytest.approx([0.1, 0])
+
+
+@pytest.mark.parametrize("outcome", ["gone", "reused", "access-denied"])
+def test_windows_mapping_scan_tolerates_unavailable_candidate(
+    monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    from omnigent.host import windows_process_scan
+
+    class Process:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+            if outcome == "gone":
+                raise windows_process_scan.psutil.NoSuchProcess(pid)
+
+        def create_time(self) -> float:
+            return 1.0 if outcome == "reused" else 2.0
+
+        def memory_maps(self) -> None:
+            assert outcome == "access-denied"
+            raise windows_process_scan.psutil.AccessDenied(self.pid)
+
+    monkeypatch.setattr(windows_process_scan.psutil, "Process", Process)
+    assert windows_process_scan.inspect_loaded_paths([{"pid": 20, "created_at": 2.0}]) == {}
+
+
+def test_windows_mapping_scan_subprocess_preserves_tool_imports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omnigent.cli as cli_module
+
+    # A stale creation identity exercises the real subprocess/JSON boundary
+    # without querying a real process's mappings on the developer host.
+    process = cli_module._WindowsProcessInfo(os.getpid(), 1, "python.exe", created_at=0)
+    monkeypatch.setattr(cli_module, "os", SimpleNamespace(name="nt", environ=os.environ))
+    assert cli_module._inspect_windows_processes(
+        [process],
+        tool_venv_path=r"C:\Users\<user>\AppData\Roaming\uv\tools\omnigent",
+        cli_bin_path=r"C:\Users\<user>\.local\bin\omni.exe",
+        process_identities=[],
+        timeout_s=3,
+    ) == [process]
 
 
 @pytest.mark.parametrize("launcher_binary", ["python.exe", "pythonw.exe"])
