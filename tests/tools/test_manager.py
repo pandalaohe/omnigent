@@ -89,6 +89,9 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_instruction_layer_update",
         "sys_project_settings_read",
         "sys_project_settings_update",
+        "sys_session_choice_read",
+        "sys_session_choice_update",
+        "sys_quota_floor",
         "sys_standing_approval",
         "sys_approval_answer",
         # Scheduled-task management tools are always auto-registered
