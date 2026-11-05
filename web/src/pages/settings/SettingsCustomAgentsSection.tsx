@@ -289,7 +289,11 @@ function InstalledAgentsSettingsSection({
           }
         />
       </section>
-      {(!embedded || builtins.length > 0) && (
+      {(!embedded ||
+        builtins.length > 0 ||
+        servers.hasNextPage ||
+        servers.isPending ||
+        servers.isError) && (
         <section aria-label="Server agents">
           <h2 className="mb-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">
             Built-in &amp; server agents

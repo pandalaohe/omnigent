@@ -1,7 +1,7 @@
 import { cleanup, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { Host } from "@/hooks/useHosts";
+import type { HarnessAccount, Host } from "@/hooks/useHosts";
 import type { InstructionLayers, InstructionPreview } from "@/hooks/useInstructionLayers";
 import { AgentContextTable, AgentPromptCard } from "./AgentContextTable";
 
@@ -56,6 +56,49 @@ afterEach(() => {
 });
 
 describe("agent context lenses", () => {
+  it.each([
+    ["none", "Not signed in"],
+    ["unknown", "Not reported"],
+    ["subscription", "Personal subscription"],
+    ["chatgpt", "Personal subscription"],
+    ["api_key", "API key"],
+  ] as const)("describes the %s account state accurately", (kind, label) => {
+    render(
+      <MemoryRouter>
+        <AgentContextTable
+          {...props}
+          field="provider"
+          hosts={[{ ...host, harness_accounts: { codex: { kind } as HarnessAccount } }]}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getAllByText(label)).toHaveLength(2);
+    if (kind === "none" || kind === "unknown")
+      expect(screen.queryByText("Personal subscription")).toBeNull();
+  });
+
+  it("reads the same Claude account for Native and SDK through the product family", () => {
+    render(
+      <MemoryRouter>
+        <AgentContextTable
+          {...props}
+          field="provider"
+          harnesses={["claude-native", "claude-sdk"]}
+          names={{ "claude-native": "Claude Code", "claude-sdk": "Claude SDK" }}
+          hosts={[
+            {
+              ...host,
+              configured_harnesses: { "claude-native": true, "claude-sdk": true },
+              harness_accounts: { claude: { kind: "api_key" } },
+            },
+          ]}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getAllByText("API key")).toHaveLength(2);
+    expect(screen.queryByText("Not reported")).toBeNull();
+  });
+
   it("shows reported providers as text and leaves selection and editing out", () => {
     render(
       <MemoryRouter>

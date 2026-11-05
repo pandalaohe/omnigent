@@ -1,4 +1,5 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { Host } from "@/hooks/useHosts";
@@ -71,6 +72,71 @@ afterEach(() => {
 });
 
 describe("agent layered defaults", () => {
+  it("keeps a details entry for the SDK identity beside its Native product", () => {
+    render(
+      <MemoryRouter>
+        <AgentDefaultsTable
+          hosts={[{ ...hosts[0], configured_harnesses: { "codex-native": true, codex: true } }]}
+          master={{}}
+          field="model"
+          catalogs={[]}
+          harnesses={["codex-native", "codex"]}
+          agentIds={{ "codex-native": "ag_native", codex: "ag_sdk" }}
+          linkToDetails
+          visibleHostId="desktop"
+          onChange={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByRole("link", { name: "Codex SDK details" })).toHaveAttribute(
+      "href",
+      "/settings/agents/codex?host=desktop",
+    );
+  });
+
+  it.each(["speed", "effort"] as const)(
+    "shows the saved cell %s before the catalog is cached instead of its row default",
+    (field) => {
+      const value = field === "speed" ? "fast" : "high";
+      seed({
+        "*": { "codex-native": { [field]: field === "speed" ? "standard" : "low" } },
+        desktop: { "codex-native": { [field]: value } },
+      });
+      render(<Table field={field} />);
+      const cell = screen.getByTestId("layered-cell-codex-native-desktop");
+      expect(cell).toHaveTextContent(new RegExp(value, "i"));
+      expect(cell).toHaveAccessibleName(/From This cell/);
+      expect(cell).not.toHaveTextContent(field === "speed" ? "Standard" : "Low");
+    },
+  );
+
+  it("keeps a saved speed override visible when a cached catalog omits its tier", () => {
+    seed({
+      "*": { "codex-native": { speed: "standard" } },
+      desktop: { "codex-native": { model: "code", speed: "fast" } },
+    });
+    render(
+      <Table
+        field="speed"
+        catalogs={[
+          {
+            host_id: "desktop",
+            harness: "codex-native",
+            models: [{ id: "code" }],
+            fetched_at: 1,
+            stale: true,
+            error: "Could not refresh",
+          },
+        ]}
+      />,
+    );
+    const cell = screen.getByTestId("layered-cell-codex-native-desktop");
+    expect(cell).toHaveTextContent(/fast/i);
+    expect(cell).toHaveAccessibleName(/From This cell/);
+    fireEvent.click(cell);
+    expect(screen.getByRole("combobox", { name: "Speed" })).toHaveTextContent("Unavailable (fast)");
+  });
+
   it("discards the previous field's editor before opening a Permission editor", () => {
     seed({ desktop: { "codex-native": { model: "code", effort: "medium" } } });
     const catalogs: CallingDefaultsCatalogRow[] = [

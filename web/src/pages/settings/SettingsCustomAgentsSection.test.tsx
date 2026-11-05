@@ -157,6 +157,47 @@ afterEach(() => {
 });
 
 describe("Custom agents settings", () => {
+  it("loads later server agents when the first page contains only hidden built-ins", async () => {
+    const builtins = Array.from({ length: 50 }, (_, index) => ({
+      ...polly,
+      id: `builtin-${index}`,
+    }));
+    vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
+      const url = new URL(String(input), "http://localhost");
+      if (url.searchParams.get("scope") === "user") return response(page([]));
+      return response(
+        url.searchParams.has("after")
+          ? page([agent("later-server", "Later server agent")])
+          : page(builtins, true, "builtin-49"),
+      );
+    });
+    mount();
+    fireEvent.click(await screen.findByRole("button", { name: "Load more server agents" }));
+    expect(await screen.findByRole("link", { name: /Later server agent/ })).toBeVisible();
+    expect(authenticatedFetch).toHaveBeenCalledWith(
+      expect.stringContaining("after=builtin-49"),
+      expect.anything(),
+    );
+  });
+
+  it("keeps server loading and failure visible before any row can be shown", async () => {
+    let finish!: (value: Response) => void;
+    vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
+      const url = new URL(String(input), "http://localhost");
+      return url.searchParams.get("scope") === "user"
+        ? response(page([]))
+        : new Promise<Response>((resolve) => {
+            finish = resolve;
+          });
+    });
+    mount();
+    const server = screen.getByRole("region", { name: "Server agents" });
+    expect(within(server).getByText("Loading agents…")).toBeVisible();
+    finish(response({ error: { message: "Unavailable" } }, 500));
+    expect(await within(server).findByRole("alert")).toHaveTextContent("Could not load agents");
+    expect(within(server).getByRole("button", { name: "Retry" })).toBeVisible();
+  });
+
   it("keeps duplicate names by ID and reviews server agents without mutation actions", async () => {
     mount();
     expect(await screen.findAllByRole("link", { name: "research" })).toHaveLength(2);

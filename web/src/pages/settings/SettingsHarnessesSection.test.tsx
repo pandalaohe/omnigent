@@ -4,8 +4,8 @@
 // host inventory, and the heavy composer/dialog imports are mocked so it renders
 // without a backend.
 
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { cleanup, fireEvent, render, screen, within, waitFor } from "@testing-library/react";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -15,14 +15,21 @@ import type { HarnessInventory } from "@/hooks/useHarnessInventory";
 import { ApiError } from "@/lib/sessionsApi";
 import type { HarnessStartup, Host } from "@/hooks/useHosts";
 import { SettingsHarnessesSection } from "./SettingsHarnessesSection";
+import type { RegistryItem } from "@/hooks/useAgentRegistry";
+import { AgentDefaultsTable } from "@/components/AgentDefaultsTable";
+import { readAgentBadgePreferences } from "@/lib/agentBadgePreferences";
 
 vi.mock("@/components/CallingDefaultsSection", () => ({
   CallingDefaultsSection: () => <div data-testid="calling-defaults-section">Master defaults</div>,
 }));
 
+const registryData = vi.hoisted(() => ({
+  items: [] as RegistryItem[],
+  legacyProducts: {} as Record<string, RegistryItem>,
+}));
 vi.mock("@/hooks/useAgentRegistry", async (original) => ({
   ...(await original<Record<string, unknown>>()),
-  useAgentRegistry: () => ({ items: [], legacyProducts: {}, isLoading: false, isError: false }),
+  useAgentRegistry: () => ({ ...registryData, isLoading: false, isError: false }),
 }));
 vi.mock("@/lib/agentLabels", async (original) => ({
   ...(await original<Record<string, unknown>>()),
@@ -277,6 +284,9 @@ afterEach(() => {
   accountRefreshCalls.mockClear();
   startupData = STARTUP;
   startupError = null;
+  registryData.items = [];
+  registryData.legacyProducts = {};
+  localStorage.clear();
 });
 
 describe("Agent setup list", () => {
@@ -341,6 +351,61 @@ describe("Agent setup list", () => {
 });
 
 describe("Harness details", () => {
+  it("opens the SDK identity from its dependent row and saves its badge independently", async () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": true, codex: true } }];
+    const product = (harness: string, label: string): RegistryItem => ({
+      key: `harness:${harness}`,
+      harness,
+      label,
+      source: "builtin",
+      section: "sdk",
+      deployed: true,
+      description: null,
+    });
+    registryData.items = [product("codex-native", "Codex"), product("codex", "Codex SDK")];
+    registryData.legacyProducts = {
+      ag_native: product("codex-native", "Codex"),
+      ag_sdk: product("codex", "Codex SDK"),
+    };
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/settings/agents"]}>
+            <Routes>
+              <Route
+                path="/settings/agents"
+                element={
+                  <AgentDefaultsTable
+                    hosts={hosts}
+                    master={{}}
+                    field="model"
+                    catalogs={[]}
+                    harnesses={["codex-native", "codex"]}
+                    agentIds={{ "codex-native": "ag_native", codex: "ag_sdk" }}
+                    linkToDetails
+                    onChange={vi.fn()}
+                  />
+                }
+              />
+              <Route path="/settings/agents/:harness" element={<SettingsHarnessesSection />} />
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+    fireEvent.click(screen.getByRole("link", { name: "Codex SDK details" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit badge for Codex SDK" }));
+    fireEvent.click(await screen.findByRole("switch", { name: "Show badge" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Badge text" }), {
+      target: { value: "S" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(readAgentBadgePreferences().entries.ag_sdk?.label).toBe("S");
+    expect(readAgentBadgePreferences().entries.ag_native).toBeUndefined();
+  });
+
   it("shows the header, gateway credential, and catalog tabs for an installed harness", () => {
     hosts = [{ ...ONLINE, gateway_inference: { "claude-native": true } }];
     renderHarnesses("claude-native");

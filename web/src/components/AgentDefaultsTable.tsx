@@ -342,16 +342,7 @@ export function AgentDefaultsTable({
         : field === "speed"
           ? speeds(row, col)
           : efforts(row, col).map((value) => ({ value, label: normalizeEffortLabel(value) }));
-  const layerOptions = (col?: string) =>
-    callingLayerOptions(
-      (row) => permissions(row, col),
-      (row, key, value) =>
-        key === "effort"
-          ? efforts(row, col).includes(value)
-          : key === "speed"
-            ? optionsFor(row, col).some((option) => option.value === value)
-            : true,
-    );
+  const layerOptions = (col?: string) => callingLayerOptions((row) => permissions(row, col));
   const resolve = (row: string, col: string) =>
     resolveAgentMasterField(master, col, row, field, capabilities, layerOptions(col));
   const label = (row: string) => names?.[row] ?? callingHarnessLabel(row, capabilities);
@@ -434,10 +425,10 @@ export function AgentDefaultsTable({
     const options = header
       ? COLUMN_CONCEPTS.map((value) => ({ value, label: CONCEPT_LABELS[value] }))
       : optionsFor(row, col === "*" ? undefined : col);
-    if (!header && field !== "model" && options.length === 0)
+    if (!header && field !== "model" && options.length === 0 && current === undefined)
       return (
         <div className="px-2.5 py-1.75">
-          {at.level === "row" && (trigger.props as { children: ReactNode }).children}
+          {(trigger.props as { children: ReactNode }).children}
           <span className="block text-sm text-muted-foreground">
             No advertised {field === "effort" ? "thinking" : field} options
           </span>
@@ -590,17 +581,16 @@ export function AgentDefaultsTable({
               {dependent(row) && <span className="sr-only">{label(row)}</span>}
             </span>
           ),
-          action:
-            linkToDetails && !dependent(row) ? (
-              <Link
-                to={agentSettingsPath(row, visibleHostId)}
-                aria-label={`${label(row)} details`}
-                className="flex min-h-11 w-11 shrink-0 items-center justify-center rounded-sm text-muted-foreground hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
-                componentId="settings.agents.detail"
-              >
-                <ArrowRightIcon className="size-4" aria-hidden />
-              </Link>
-            ) : undefined,
+          action: linkToDetails ? (
+            <Link
+              to={agentSettingsPath(row, visibleHostId)}
+              aria-label={`${label(row)} details`}
+              className="flex min-h-11 w-11 shrink-0 items-center justify-center rounded-sm text-muted-foreground hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
+              componentId="settings.agents.detail"
+            >
+              <ArrowRightIcon className="size-4" aria-hidden />
+            </Link>
+          ) : undefined,
           detail: master["*"]?.[row]?.[field]
             ? valueLabel(master["*"][row][field], row)
             : undefined,

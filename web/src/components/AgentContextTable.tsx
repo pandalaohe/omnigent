@@ -35,13 +35,24 @@ function startupPromptsPath(agentKey: string, hostId: string) {
   return `/settings/instructions?${new URLSearchParams({ view: "route", agent: agentKey, host: hostId })}`;
 }
 
-function ProviderValue({ harness, host }: { harness: string; host: Host }) {
+function ProviderValue({
+  harness,
+  host,
+  capabilities,
+}: {
+  harness: string;
+  host: Host;
+  capabilities: HarnessCapabilityMap;
+}) {
   if (host.gateway_inference?.[harness] === true) return "Unity Gateway";
-  const account = host.harness_accounts?.[harnessAccountKey(harness)];
+  const account =
+    host.harness_accounts?.[harnessAccountKey(agentProductHarness(harness, capabilities))];
   if (!account) return "Not reported";
   if (account.kind === "providers")
     return account.providers?.map((provider) => provider.label).join(", ") || "Not reported";
-  return account.kind === "api_key" ? "API key" : "Personal subscription";
+  if (account.kind === "api_key") return "API key";
+  if (account.kind === "chatgpt" || account.kind === "subscription") return "Personal subscription";
+  return account.kind === "none" ? "Not signed in" : "Not reported";
 }
 
 export function AgentContextTable({
@@ -129,7 +140,7 @@ function ContextTable({
             {dependent(harness) && <span className="sr-only">{names[harness] ?? harness}</span>}
           </span>
         ),
-        action: !dependent(harness) ? (
+        action: (
           <Link
             to={agentSettingsPath(harness, hosts.length === 1 ? hosts[0].host_id : undefined)}
             aria-label={`${names[harness] ?? harness} details`}
@@ -138,7 +149,7 @@ function ContextTable({
           >
             <ArrowRightIcon className="size-4" aria-hidden />
           </Link>
-        ) : undefined,
+        ),
       }))}
       columns={hosts.map((host) => ({ id: host.host_id, label: host.name || host.host_id }))}
       renderEditor={(_at, trigger: ReactElement) => (
@@ -151,7 +162,9 @@ function ContextTable({
         if (!agentPresentOnHost(harness, host))
           return { content: null, unavailable: missingCellText(harness, host.platform) };
         if (field === "provider")
-          return { content: <ProviderValue harness={harness} host={host} /> };
+          return {
+            content: <ProviderValue harness={harness} host={host} capabilities={capabilities} />,
+          };
         const agent = instructionAgent(layers, harness, capabilities);
         const size =
           agent &&
