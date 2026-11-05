@@ -28,11 +28,13 @@ export interface MintedArtifactLink {
 /** An HTTP status from the mint or the artifact read, so callers can branch. */
 export class ArtifactLinkError extends Error {
   readonly status: number;
+  readonly maxBytes?: number;
 
-  constructor(status: number) {
+  constructor(status: number, maxBytes?: number) {
     super(`artifact request failed (${status})`);
     this.name = "ArtifactLinkError";
     this.status = status;
+    this.maxBytes = maxBytes;
   }
 }
 
@@ -68,7 +70,13 @@ export async function mintArtifactLink(
 export async function fetchArtifactSource(url: string, nonce: string): Promise<string> {
   // oxlint-disable-next-line no-restricted-globals -- an artifact URL is token-authorized; identity/embed headers must not be attached.
   const res = await fetch(withBasePath(url));
-  if (!res.ok) throw new ArtifactLinkError(res.status);
+  if (!res.ok) {
+    const maxBytes = Number(res.headers.get("X-Omnigent-Artifact-Max-Bytes"));
+    throw new ArtifactLinkError(
+      res.status,
+      Number.isSafeInteger(maxBytes) && maxBytes > 0 ? maxBytes : undefined,
+    );
+  }
   return stripInjectedScripts(await res.text(), nonce);
 }
 
@@ -111,7 +119,9 @@ export function artifactErrorMessage(err: unknown): string {
     case 410:
       return "Link revoked";
     case 413:
-      return "File too large to preview (10 MiB limit)";
+      return err instanceof ArtifactLinkError && err.maxBytes
+        ? `File too large to preview (${err.maxBytes} bytes limit)`
+        : "File too large to preview";
     case 502:
       return "The session's host or runner needs an update";
     case 503:

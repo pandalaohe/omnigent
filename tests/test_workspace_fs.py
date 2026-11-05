@@ -10,6 +10,7 @@ the subprocess/os codepaths are exercised end to end.
 
 from __future__ import annotations
 
+import base64
 import os
 import subprocess
 import sys
@@ -145,6 +146,26 @@ def test_read_raw_keeps_byte_cap(tmp_path: Path, monkeypatch) -> None:
 
     assert result["truncated"] is True
     assert result["content"] == "01234567"
+
+
+@pytest.mark.parametrize("content", [b"\x00" * 17, '报告\\"'.encode() * 4, b"\xff" * 17])
+def test_raw_artifact_cap_and_base64_bound(tmp_path: Path, monkeypatch, content: bytes) -> None:
+    """Explicit raw reads use their cap and avoid JSON's sixfold text expansion."""
+    monkeypatch.setattr("omnigent.workspace_fs._MAX_READ_BYTES", 4)
+    monkeypatch.setattr("omnigent.workspace_fs.HOST_FILESYSTEM_MAX_READ_BYTES", 16)
+    (tmp_path / "report.html").write_bytes(content)
+    reader = WorkspaceReader(tmp_path)
+    result = reader.list_or_read("report.html", raw=True, max_bytes=100)
+    assert result["truncated"] is True
+    assert result["encoding"] == "base64"
+    assert base64.b64decode(result["content"]) == content[:16]
+    assert reader.list_or_read("report.html")["bytes"] <= 4
+
+
+@pytest.mark.parametrize("invalid", [0, -1, True, "100", 1.5])
+def test_raw_artifact_cap_rejects_invalid_values(tmp_path: Path, invalid) -> None:
+    with pytest.raises(WorkspaceReaderError, match="max_bytes must be positive"):
+        WorkspaceReader(tmp_path).list_or_read("report.html", raw=True, max_bytes=invalid)
 
 
 def test_read_missing_file_raises_not_found(tmp_path: Path) -> None:

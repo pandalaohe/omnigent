@@ -67,6 +67,25 @@ omnigent server --config server_config.yaml
 
 After starting, you can also add or remove policies at runtime through the REST API (see [Admin policy REST API](#admin-policy-rest-api)).
 
+### File preview limit
+
+Set top-level `artifact_max_bytes` in the server YAML config to change the
+per-file artifact preview limit. For example, `artifact_max_bytes: 33554432`
+allows 32 MiB. The default is 67108864 bytes (64 MiB). Settings are read on
+each preview request, so editing the active config needs no server restart.
+
+Values above 75497472 bytes (72 MiB), including `0` (unlimited), are clamped
+to 72 MiB with a server-log warning. A host fallback sends each file as one
+base64 JSON message; 72 MiB uses 96 MiB of the 100 MiB tunnel message budget.
+Invalid values fall back to 64 MiB. Ordinary filesystem JSON reads retain
+their 10 MiB cap. Hosts must support configurable raw reads; an older host
+returns an update notice when the runner is offline.
+
+Larger HTML previews buffer the file and injected page on the server and
+load the source and document into browser memory. Several concurrent views
+multiply that cost; raising the cap does not guarantee smooth mobile viewing.
+Files over the effective cap return HTTP 413 with the limit in bytes.
+
 ### Attachment admission controls
 
 The upload, copy, and fork routes apply additional server settings to files

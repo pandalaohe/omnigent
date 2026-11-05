@@ -13,6 +13,10 @@ from typing import TypedDict
 
 RUNNER_TUNNEL_MAX_MESSAGE_BYTES = 100 * 1024 * 1024
 
+# A filesystem result is one base64 JSON frame: 72 MiB becomes 96 MiB,
+# leaving 4 MiB for the envelope and tracing metadata.
+HOST_FILESYSTEM_MAX_READ_BYTES = 72 * 1024 * 1024
+
 # Protocol-level WebSocket keepalive budget for the runner<->server tunnel —
 # the websockets library's own PING/PONG (set on the runner's ``connect`` and the
 # server's uvicorn). This is DISTINCT from, and a backstop to, the app-level

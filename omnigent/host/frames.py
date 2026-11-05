@@ -99,6 +99,7 @@ CAP_HOST_TERMINALS = "host_terminals_v1"
 
 # The server gates ``raw``/``within`` reads on this: an old host ignores unknown params silently.
 CAP_FS_READ_RAW = "fs_read_raw"
+CAP_FS_READ_RAW_LIMIT = "fs_read_raw_limit"
 
 # The host samples machine + process-tree resource metrics and answers
 # ``host.resource_sampling`` leases; the server gates fast-mode on this.
@@ -120,6 +121,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_FILESYSTEM_ATTACHMENTS,
     CAP_PATH_ATTACHMENTS,
     CAP_FS_READ_RAW,
+    CAP_FS_READ_RAW_LIMIT,
     CAP_KEEP_WARM,
     CAP_WORKTREE_SAFE_ARCHIVE,
     CAP_WORKTREE_ARCHIVE_CONTENT,

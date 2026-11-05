@@ -227,6 +227,27 @@ def _pin_values(monkeypatch: pytest.MonkeyPatch, values: dict[str, object]) -> N
 
 
 @pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, 64),
+        (-1, 64),
+        (True, 64),
+        (0.5, 64),
+        ("bad", 64),
+        ("1048576", 1),
+        (0, 72),
+        (100 * 1024 * 1024, 72),
+        (72 * 1024 * 1024, 72),
+    ],
+)
+def test_artifact_limit_keeps_host_frame_headroom(
+    monkeypatch: pytest.MonkeyPatch, value: object, expected: int
+) -> None:
+    _pin_values(monkeypatch, {"artifact_max_bytes": value})
+    assert server_config_module.artifact_max_bytes() == expected * 1024 * 1024
+
+
+@pytest.mark.parametrize(
     ("values", "expected"),
     [
         ({}, 17),  # absent → default
