@@ -1535,7 +1535,7 @@ def test_windows_custom_update_stops_host_tree_and_waits_for_cli_parent(
 
 
 @pytest.mark.parametrize("launcher_provenance", ["exe", "argv"])
-@pytest.mark.parametrize("other_holder", [None, "sibling", "above-wrapper"])
+@pytest.mark.parametrize("other_holder", [None, "sibling", "above-wrapper", "above-shell"])
 def test_windows_custom_update_allows_own_launcher_chain_only(
     monkeypatch: pytest.MonkeyPatch,
     launcher_provenance: str,
@@ -1557,12 +1557,23 @@ def test_windows_custom_update_allows_own_launcher_chain_only(
             venv_python if launcher_provenance == "exe" else base_python,
             "python" if launcher_provenance == "exe" else f'"{venv_python}" -m omnigent.cli up',
         ),
-        row(580, 30, "omni.exe", cli_bin, f'"{cli_bin}" up'),
+        row(
+            580,
+            30,
+            "pwsh.exe" if other_holder == "above-shell" else "omni.exe",
+            r"C:\PowerShell\pwsh.exe" if other_holder == "above-shell" else cli_bin,
+            "pwsh" if other_holder == "above-shell" else f'"{cli_bin}" up',
+        ),
         row(
             30,
             1,
-            "python.exe" if other_holder == "above-wrapper" else "pwsh.exe",
-            venv_python if other_holder == "above-wrapper" else r"C:\PowerShell\pwsh.exe",
+            "python.exe" if other_holder in {"above-wrapper", "above-shell"} else "pwsh.exe",
+            venv_python
+            if other_holder in {"above-wrapper", "above-shell"}
+            else r"C:\PowerShell\pwsh.exe",
+            "python -m omnigent.host._daemon_entry"
+            if other_holder in {"above-wrapper", "above-shell"}
+            else "pwsh",
         ),
     ]
     if other_holder == "sibling":
