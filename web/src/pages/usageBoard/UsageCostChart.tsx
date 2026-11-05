@@ -59,6 +59,10 @@ export function usageChartPoints(
       at = date.getTime() / 1000;
     }
   }
+  const firstBucket = buckets.keys().next().value;
+  const lastBucket = [...buckets.keys()].at(-1);
+  if (firstBucket === undefined || lastBucket === undefined) return [];
+  const opening = { now: 0, previous: 0 };
   for (const account of accounts) {
     for (const kind of ["now", "previous"] as const) {
       const amount = kind === "now" ? account : account.previous;
@@ -68,15 +72,23 @@ export function usageChartPoints(
         // A partial day's server bucket names midnight, before its accounting
         // cutoff. Align the counted part so Previous cannot lose that first day.
         const at = Math.max(point.at, amount.span.counted_from) + offset;
-        const bucket = buckets.get(bucketAt(at));
-        if (!bucket) continue;
         const value = total && !tokens ? (point.metered ?? point) : point;
-        bucket[kind] += (tokens ? value.tokens : value.cost_usd) ?? 0;
+        const figure = (tokens ? value.tokens : value.cost_usd) ?? 0;
+        const key = bucketAt(at);
+        if (key < firstBucket) {
+          // The axis is bounded; earlier in-window spend still opens the line.
+          opening[kind] += figure;
+        } else {
+          // A calendar Previous can be longer across DST. Keep its tail in
+          // the last comparison bucket instead of discarding counted usage.
+          const bucket = buckets.get(Math.min(key, lastBucket));
+          if (bucket) bucket[kind] += figure;
+        }
       }
     }
   }
-  let current = 0,
-    previous = 0;
+  let current = opening.now,
+    previous = opening.previous;
   const hasPrevious = accounts.some((account) => account.previous !== null);
   return [...buckets].map(([at, value]) => {
     current += value.now;

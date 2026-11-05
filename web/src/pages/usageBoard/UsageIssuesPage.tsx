@@ -46,80 +46,83 @@ export function UsageIssuesPage() {
       error={query.error}
       actions={<UsageRangeControl />}
     >
-      <div className="grid min-w-0 gap-3 lg:grid-cols-3">
-        <section
-          className="min-w-0 rounded-[11px] border border-border bg-card p-3.5"
-          aria-label="Failures"
-        >
-          <h2 className="mb-2 text-sm font-semibold">Failures</h2>
-          {!failures.length ? (
-            <p className="text-xs text-muted-foreground">No reported failures in this range.</p>
-          ) : (
-            failures.map((item) => (
-              <div key={item.account} className="mb-3 text-xs last:mb-0">
-                {accountLink(item.account)}
-                <p className="my-1 tabular-nums">
-                  {item.failed} of {item.requests} requests · {(item.failure_pct ?? 0).toFixed(1)}%
-                </p>
-                <dl className="text-muted-foreground">
-                  {Object.entries(item.reasons).map(([reason, count]) => (
-                    <div key={reason} className="flex gap-3">
-                      <dt className="min-w-0 flex-1 break-words">{reason}</dt>
-                      <dd>{count}</dd>
-                    </div>
-                  ))}
-                </dl>
-              </div>
-            ))
-          )}
-        </section>
-        <section
-          className="min-w-0 rounded-[11px] border border-border bg-card p-3.5"
-          aria-label="Unpriced models"
-        >
-          <h2 className="mb-2 text-sm font-semibold">Unpriced models</h2>
-          {!unpriced.length ? (
-            <p className="text-xs text-muted-foreground">No unpriced usage in this range.</p>
-          ) : (
-            unpriced.map((item) => (
-              <div key={`${item.account}:${item.model}`} className="mb-3 text-xs last:mb-0">
-                {accountLink(item.account)}
-                <p className="my-1 break-all text-muted-foreground">
-                  {item.model || "Unknown model"}
-                </p>
-                <p>{item.unpriced} unpriced rows</p>
-              </div>
-            ))
-          )}
-        </section>
-        <section
-          className="min-w-0 rounded-[11px] border border-border bg-card p-3.5"
-          aria-label="Source reports"
-        >
-          <h2 className="mb-2 text-sm font-semibold">Source reports</h2>
-          {!reports.length ? (
-            <p className="text-xs text-muted-foreground">No source issues in this range.</p>
-          ) : (
-            reports.map((item) => (
-              <div
-                key={`${item.account}:${item.at}:${item.kind}`}
-                className="mb-3 text-xs last:mb-0"
-              >
-                {accountLink(item.account)}
-                <p className="my-1">{SOURCE_LABELS[item.kind] ?? item.kind}</p>
+      {query.data && !query.error ? (
+        <div className="grid min-w-0 gap-3 lg:grid-cols-3">
+          <section
+            className="min-w-0 rounded-[11px] border border-border bg-card p-3.5"
+            aria-label="Failures"
+          >
+            <h2 className="mb-2 text-sm font-semibold">Failures</h2>
+            {!failures.length ? (
+              <p className="text-xs text-muted-foreground">No reported failures in this range.</p>
+            ) : (
+              failures.map((item) => (
+                <div key={item.account} className="mb-3 text-xs last:mb-0">
+                  {accountLink(item.account)}
+                  <p className="my-1 tabular-nums">
+                    {item.failed} of {item.requests} requests · {(item.failure_pct ?? 0).toFixed(1)}
+                    %
+                  </p>
+                  <dl className="text-muted-foreground">
+                    {Object.entries(item.reasons).map(([reason, count]) => (
+                      <div key={reason} className="flex gap-3">
+                        <dt className="min-w-0 flex-1 break-words">{reason}</dt>
+                        <dd>{count}</dd>
+                      </div>
+                    ))}
+                  </dl>
+                </div>
+              ))
+            )}
+          </section>
+          <section
+            className="min-w-0 rounded-[11px] border border-border bg-card p-3.5"
+            aria-label="Unpriced models"
+          >
+            <h2 className="mb-2 text-sm font-semibold">Unpriced models</h2>
+            {!unpriced.length ? (
+              <p className="text-xs text-muted-foreground">No unpriced usage in this range.</p>
+            ) : (
+              unpriced.map((item) => (
+                <div key={`${item.account}:${item.model}`} className="mb-3 text-xs last:mb-0">
+                  {accountLink(item.account)}
+                  <p className="my-1 break-all text-muted-foreground">
+                    {item.model || "Unknown model"}
+                  </p>
+                  <p>{item.unpriced} unpriced rows</p>
+                </div>
+              ))
+            )}
+          </section>
+          <section
+            className="min-w-0 rounded-[11px] border border-border bg-card p-3.5"
+            aria-label="Source reports"
+          >
+            <h2 className="mb-2 text-sm font-semibold">Source reports</h2>
+            {!reports.length ? (
+              <p className="text-xs text-muted-foreground">No source issues in this range.</p>
+            ) : (
+              reports.map((item) => (
+                <div
+                  key={`${item.account}:${item.at}:${item.kind}`}
+                  className="mb-3 text-xs last:mb-0"
+                >
+                  {accountLink(item.account)}
+                  <p className="my-1">{SOURCE_LABELS[item.kind] ?? item.kind}</p>
+                  <p className="text-muted-foreground">{formatFullDate(item.at)}</p>
+                </div>
+              ))
+            )}
+            {query.data?.price_source?.map((item) => (
+              <div key={`price:${item.at}:${item.error}`} className="mt-3 text-xs">
+                <p className="font-medium">Price source</p>
+                <p className="my-1">{item.error}</p>
                 <p className="text-muted-foreground">{formatFullDate(item.at)}</p>
               </div>
-            ))
-          )}
-          {query.data?.price_source?.map((item) => (
-            <div key={`price:${item.at}:${item.error}`} className="mt-3 text-xs">
-              <p className="font-medium">Price source</p>
-              <p className="my-1">{item.error}</p>
-              <p className="text-muted-foreground">{formatFullDate(item.at)}</p>
-            </div>
-          ))}
-        </section>
-      </div>
+            ))}
+          </section>
+        </div>
+      ) : null}
     </UsageBoardFrame>
   );
 }

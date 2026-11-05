@@ -69,6 +69,38 @@ function mount(path = "/usage/board/cost") {
 }
 
 describe("money projections", () => {
+  it.each([
+    ["account", "money"],
+    ["account", "tokens"],
+    ["overview", "money"],
+    ["overview", "tokens"],
+  ] as const)("uses metered Per 1M on the %s card in %s mode", (surface, unit) => {
+    patchUsageBoardPreferences({ unit });
+    const item = usageActivityFixture().accounts[2];
+    const mixed = {
+      ...item,
+      totals: { ...sampleTotals(92, 10000), metered: sampleTotals(2, 1000) },
+      previous: {
+        ...item.previous!,
+        totals: { ...sampleTotals(46, 10000), metered: sampleTotals(1, 1000) },
+      },
+    };
+    render(
+      <MemoryRouter>
+        <UsageCostCard
+          accounts={[mixed]}
+          account={surface === "account" ? usageBoardData().accounts[2] : undefined}
+          now={Date.now() / 1000}
+        />
+      </MemoryRouter>,
+    );
+    const efficiency = screen.getByRole("button", { name: /Per 1M tokens/ });
+    expect(efficiency.textContent).toContain("$2,000");
+    expect(efficiency.querySelector('[aria-label="Higher than previous"]')).toBeTruthy();
+    fireEvent.click(efficiency);
+    const tip = screen.getByTestId("usage-tip-card");
+    expect(tip.textContent).toContain("$1,000");
+  });
   it("weights only covered costs and tokens, including a zero-price row", () => {
     const result = sumUsage([
       sampleTotals(4, 1000000),
@@ -137,6 +169,108 @@ describe("money projections", () => {
     );
     expect(points.at(-1)!.previous).toBe(5);
   });
+  it("keeps all thirteen Previous hours on the shorter New York spring-forward Today axis", () => {
+    const start = Date.parse("2026-03-08T00:00:00-05:00") / 1000;
+    const until = Date.parse("2026-03-08T12:40:00-04:00") / 1000;
+    const before = Date.parse("2026-03-07T00:00:00-05:00") / 1000;
+    const previousUntil = Date.parse("2026-03-07T12:40:00-05:00") / 1000;
+    const item = usageActivityFixture().accounts[2];
+    const points = usageChartPoints(
+      [
+        {
+          ...item,
+          span: { requested_from: start, counted_from: start, until, approx: false },
+          totals: sampleTotals(12, 12000),
+          series: Array.from({ length: 12 }, (_, index) => ({
+            at: start + index * 3600,
+            ...sampleTotals(1, 1000),
+          })),
+          previous: {
+            span: {
+              requested_from: before,
+              counted_from: before,
+              until: previousUntil,
+              approx: false,
+            },
+            mark: null,
+            totals: sampleTotals(13, 13000),
+            series: Array.from({ length: 13 }, (_, index) => ({
+              at: before + index * 3600,
+              ...sampleTotals(1, 1000),
+            })),
+          },
+        },
+      ],
+      false,
+      false,
+      false,
+      until,
+    );
+    expect(points).toHaveLength(12);
+    expect(points.at(-1)!.now).toBe(12);
+    expect(points.at(-1)!.previous).toBe(13);
+  });
+  it("carries a 31-day reset window's opening spend onto the 30-day total axis", () => {
+    const until = new Date(2026, 10, 5).getTime() / 1000;
+    const start = until - 31 * 86400;
+    const item = usageActivityFixture().accounts[2];
+    const points = usageChartPoints(
+      [
+        {
+          ...item,
+          span: { requested_from: start, counted_from: start, until, approx: false },
+          totals: sampleTotals(31, 31000),
+          previous: null,
+          series: Array.from({ length: 31 }, (_, index) => ({
+            at: start + index * 86400,
+            ...sampleTotals(1, 1000),
+          })),
+        },
+      ],
+      false,
+      true,
+      true,
+      until,
+    );
+    expect(points).toHaveLength(30);
+    expect(points.at(-1)!.now).toBe(31);
+    expect(points[0].now).toBe(2);
+    expect(points.reduce((sum, point) => sum + point.bucket, 0)).toBe(30);
+  });
+});
+
+it.each(["/usage/board/issues", "/usage/board/litellm/issues"])(
+  "does not call an unsuccessful Issues read empty at %s",
+  async (path) => {
+    fetchMock.mockImplementation(async (url: string) =>
+      url.includes("/issues")
+        ? new Response(JSON.stringify({ detail: "Issue store unavailable" }), { status: 503 })
+        : new Response(JSON.stringify(usageBoardData())),
+    );
+    mount(path);
+    await screen.findByText("Issue store unavailable");
+    expect(screen.queryByText("No reported failures in this range.")).toBeNull();
+    expect(screen.queryByText("No unpriced usage in this range.")).toBeNull();
+    expect(screen.queryByText("No source issues in this range.")).toBeNull();
+  },
+);
+
+it("shows empty Issues only after a successful empty read", async () => {
+  fetchMock.mockImplementation(
+    async (url: string) =>
+      new Response(
+        JSON.stringify(
+          url.includes("/issues")
+            ? { failures: [], unpriced_models: [], source_reports: [] }
+            : usageBoardData(),
+        ),
+      ),
+  );
+  mount("/usage/board/issues");
+  expect(screen.queryByText("No reported failures in this range.")).toBeNull();
+  await screen.findByText("No reported failures in this range.");
+  expect(screen.getByText("No unpriced usage in this range.")).toBeTruthy();
+  expect(screen.getByText("No source issues in this range.")).toBeTruthy();
 });
 
 it("keeps hidden accounts out of totals, the account list and By model", async () => {

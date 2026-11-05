@@ -158,8 +158,14 @@ export function UsageCostCard({
   const issuesPath = account
     ? `/usage/board/${encodeURIComponent(account.id)}/issues`
     : "/usage/board/issues";
-  const perMillion = amount?.totals.per_million;
-  const oldPerMillion = previous?.totals.per_million;
+  const efficiency = sumUsage(accounts.map((item) => item.totals.metered ?? item.totals));
+  const previousEfficiency = sumUsage(
+    accounts.flatMap((item) =>
+      item.previous ? [item.previous.totals.metered ?? item.previous.totals] : [],
+    ),
+  );
+  const perMillion = efficiency.per_million;
+  const oldPerMillion = previousEfficiency.per_million;
   return (
     <section
       aria-label="Cost"
@@ -195,11 +201,11 @@ export function UsageCostCard({
               ...(oldPerMillion == null
                 ? []
                 : [{ label: "Previous", value: formatMoney(oldPerMillion) }]),
-              ...(amount.totals.cost_coverage_pct !== null && amount.totals.cost_coverage_pct < 100
+              ...(efficiency.cost_coverage_pct !== null && efficiency.cost_coverage_pct < 100
                 ? [
                     {
                       label: "Covers",
-                      value: `${Math.round(amount.totals.cost_coverage_pct)}% of cost`,
+                      value: `${Math.round(efficiency.cost_coverage_pct)}% of cost`,
                     },
                   ]
                 : []),
