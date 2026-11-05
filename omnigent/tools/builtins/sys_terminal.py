@@ -39,6 +39,7 @@ from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.spec.types import AgentSpec
 from omnigent.terminals import TerminalRegistry
+from omnigent.terminals.registry import HostShellLaunchError
 from omnigent.terminals.user_shells import user_shell_terminals
 from omnigent.tools.base import Tool, ToolContext
 
@@ -759,7 +760,8 @@ class SysTerminalLaunchTool(Tool):
             # surface as these. Wrap in the LLM-facing JSON envelope
             # so the LLM can recover (e.g. by adjusting cwd / sandbox).
             _logger.exception("sys_terminal_launch failed")
-            return _terminal_tool_result({"error": f"launch failed: {exc}"}, existing)
+            failed = exc.instance if isinstance(exc, HostShellLaunchError) else existing
+            return _terminal_tool_result({"error": f"launch failed: {exc}"}, failed)
 
     def _validate_launch_args(self, arguments: str) -> str | _ValidatedLaunchArgs:
         """

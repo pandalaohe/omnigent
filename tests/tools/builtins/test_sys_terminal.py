@@ -25,6 +25,7 @@ import pytest
 
 from omnigent.entities.conversation import MessageData
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
+from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner.identity import RUNNER_INTERACTIVE_SHELLS_ENV_VAR
 from omnigent.runner.tool_dispatch import _execute_terminal_tool
 from omnigent.runtime import _globals
@@ -208,6 +209,44 @@ async def test_sdk_agent_can_use_plain_host_shells(
     assert (await invoke("close", target))["status"] == "closed"
     assert await invoke("list", {}) == []
     assert spec.terminals is None
+
+
+@pytest.mark.parametrize("rebuild", [False, True])
+@pytest.mark.parametrize("host_shell", [False, True])
+async def test_launch_failure_hides_the_new_host_shell_socket(
+    registry: TerminalRegistry,
+    ctx: ToolContext,
+    cleanup_registry: None,
+    monkeypatch: pytest.MonkeyPatch,
+    rebuild: bool,
+    host_shell: bool,
+) -> None:
+    monkeypatch.setenv(RUNNER_INTERACTIVE_SHELLS_ENV_VAR, '["bash"]')
+    spec = _make_spec(terminals=None if host_shell else {"bash": TerminalEnvSpec(command="bash")})
+    tool = SysTerminalLaunchTool(spec, registry)
+    target = {"terminal": "bash", "session": "start-error"}
+    old_socket = None
+    if rebuild:
+        assert (await _invoke(tool, target, ctx))["status"] == "launched"
+        old = registry.get(ctx.conversation_id, "bash", "start-error")
+        assert old is not None
+        old_socket = old.socket_path
+        await old.close()
+
+    attempted_sockets: list[Path] = []
+
+    async def fail_launch(instance: TerminalInstance, *, cwd: Path | None = None) -> None:
+        attempted_sockets.append(instance.socket_path)
+        raise RuntimeError(f"error creating {instance.socket_path} (Permission denied)")
+
+    monkeypatch.setattr(TerminalInstance, "launch", fail_launch)
+    result = await _invoke(tool, target, ctx)
+    assert len(attempted_sockets) == 1
+    new_socket = attempted_sockets[0]
+    assert new_socket != old_socket
+    assert "Permission denied" in result["error"]
+    assert (str(new_socket) in result["error"]) is not host_shell
+    assert registry.get(ctx.conversation_id, "bash", "start-error") is None
 
 
 def test_launch_unknown_terminal_returns_error(
