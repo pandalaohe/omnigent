@@ -8862,9 +8862,11 @@ async def test_external_session_usage_broadcasts_parent_subtree_cost_not_own(
     assert parent_usage[-1]["total_cost_usd"] == 3.5
 
 
+@pytest.mark.parametrize("context_model", ["claude-opus-5", "vendor/" + "m" * 300])
 async def test_post_external_session_usage_dynamic_context_window_overrides_snapshot(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    context_model: str,
 ) -> None:
     """
     A posted ``context_window`` overrides the spec's static value on snapshot.
@@ -8888,6 +8890,7 @@ async def test_post_external_session_usage_dynamic_context_window_overrides_snap
                 "context_tokens": 250_000,
                 "context_window": 1_000_000,
                 "auto_compact_token_limit": 900_000,
+                "context_model": context_model,
             },
         },
     )
@@ -8897,11 +8900,16 @@ async def test_post_external_session_usage_dynamic_context_window_overrides_snap
     assert published[0][1]["context_tokens"] == 250_000
     assert published[0][1]["context_window"] == 1_000_000
     assert published[0][1]["auto_compact_token_limit"] == 900_000
+    assert published[0][1]["context_model"] == context_model
 
     snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
     assert snapshot["last_total_tokens"] == 250_000
     assert snapshot["context_window"] == 1_000_000
     assert snapshot["auto_compact_token_limit"] == 900_000
+    # Never file a reading under a model id truncated by the label store.
+    assert snapshot["labels"]["omnigent.last_context_model"] == (
+        context_model if len(context_model) <= 256 else ""
+    )
 
 
 async def test_post_external_session_usage_window_only_payload_persists_window(

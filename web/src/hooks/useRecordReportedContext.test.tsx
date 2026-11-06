@@ -13,6 +13,11 @@ const store = vi.hoisted(() => ({
   conversationId: "session-1" as string | null,
   contextWindow: 1_000_000 as number | null,
   autoCompactTokenLimit: 550_000 as number | null,
+  reportedContextReading: {
+    model: "claude-opus-5-5",
+    contextWindow: 1_000_000 as number | null,
+    autoCompactTokenLimit: 550_000 as number | null,
+  },
 }));
 
 vi.mock("@/store/chatStore", () => ({
@@ -38,6 +43,11 @@ describe("useRecordReportedContext", () => {
     store.conversationId = "session-1";
     store.contextWindow = 1_000_000;
     store.autoCompactTokenLimit = 550_000;
+    store.reportedContextReading = {
+      model: SOURCE.model,
+      contextWindow: 1_000_000,
+      autoCompactTokenLimit: 550_000,
+    };
   });
 
   it("records the session's figures under its exact source", () => {
@@ -62,6 +72,11 @@ describe("useRecordReportedContext", () => {
   it("records nothing until the session reports a figure", () => {
     store.contextWindow = null;
     store.autoCompactTokenLimit = null;
+    store.reportedContextReading = {
+      model: SOURCE.model,
+      contextWindow: null,
+      autoCompactTokenLimit: null,
+    };
     record(DEFAULT_USAGE_CONTEXT_PREFERENCES, usageContextSourceKey(SOURCE));
     expect(readUsageContextPreferences().reportedContext).toBeUndefined();
   });
@@ -81,6 +96,11 @@ describe("useRecordReportedContext", () => {
     expect(readUsageContextPreferences().reportedContext?.[key]?.autoCompactTokenLimit).toBe(
       367_000,
     );
+    store.reportedContextReading = { ...store.reportedContextReading };
+    rerender({ preferences: readUsageContextPreferences() });
+    expect(readUsageContextPreferences().reportedContext?.[key]?.autoCompactTokenLimit).toBe(
+      550_000,
+    );
   });
 
   it("keeps the old model's reading when the model switches before the new reading", () => {
@@ -95,6 +115,11 @@ describe("useRecordReportedContext", () => {
 
     store.contextWindow = 200_000;
     store.autoCompactTokenLimit = 167_000;
+    store.reportedContextReading = {
+      model: "claude-sonnet-5-5",
+      contextWindow: 200_000,
+      autoCompactTokenLimit: 167_000,
+    };
     rerender({ key: sonnet });
     const reported = readUsageContextPreferences().reportedContext;
     expect(reported?.[sonnet]).toMatchObject({
@@ -117,6 +142,54 @@ describe("useRecordReportedContext", () => {
     store.conversationId = "session-2";
     rerender({ key: second });
     expect(readUsageContextPreferences().reportedContext?.[second]).toMatchObject({
+      contextWindow: 1_000_000,
+      autoCompactTokenLimit: 550_000,
+    });
+  });
+
+  it.each([true, false])(
+    "attributes usage arriving before the model change (same figures: %s)",
+    (sameFigures) => {
+      const opus = usageContextSourceKey(SOURCE);
+      const sonnet = usageContextSourceKey({ ...SOURCE, model: "claude-sonnet-5-5" });
+      const { rerender } = renderHook(
+        ({ key }) => useRecordReportedContext(readUsageContextPreferences(), key),
+        { initialProps: { key: opus } },
+      );
+      const reading = {
+        model: "claude-sonnet-5-5",
+        contextWindow: sameFigures ? 1_000_000 : 200_000,
+        autoCompactTokenLimit: sameFigures ? 550_000 : 167_000,
+      };
+      store.contextWindow = reading.contextWindow;
+      store.autoCompactTokenLimit = reading.autoCompactTokenLimit;
+      store.reportedContextReading = reading;
+      rerender({ key: opus });
+      expect(readUsageContextPreferences().reportedContext?.[sonnet]).toMatchObject({
+        contextWindow: reading.contextWindow,
+        autoCompactTokenLimit: reading.autoCompactTokenLimit,
+      });
+      expect(readUsageContextPreferences().reportedContext?.[opus]).toMatchObject({
+        contextWindow: 1_000_000,
+        autoCompactTokenLimit: 550_000,
+      });
+      rerender({ key: sonnet });
+      expect(Object.keys(readUsageContextPreferences().reportedContext ?? {})).toHaveLength(2);
+    },
+  );
+
+  it("records a new identical reading after switching models in the same session", () => {
+    const opus = usageContextSourceKey(SOURCE);
+    const sonnet = usageContextSourceKey({ ...SOURCE, model: "claude-sonnet-5-5" });
+    const { rerender } = renderHook(
+      ({ key }) => useRecordReportedContext(readUsageContextPreferences(), key),
+      { initialProps: { key: opus } },
+    );
+    rerender({ key: sonnet });
+    expect(readUsageContextPreferences().reportedContext?.[sonnet]).toBeUndefined();
+    store.reportedContextReading = { ...store.reportedContextReading, model: "claude-sonnet-5-5" };
+    rerender({ key: sonnet });
+    expect(readUsageContextPreferences().reportedContext?.[sonnet]).toMatchObject({
       contextWindow: 1_000_000,
       autoCompactTokenLimit: 550_000,
     });

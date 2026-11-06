@@ -228,6 +228,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _EXTERNAL_SESSION_STATUS_TYPE,
     _FENCE_EXEMPT_EVENT_TYPES,
     _GOAL_STATE_LABEL_KEY,
+    _LABEL_VALUE_MAX_LEN,
     _LAST_AUTO_COMPACT_TOKEN_LIMIT_LABEL_KEY,
     _LAST_CACHE_LABEL_KEY,
     _LAST_CONTEXT_TOKENS_LABEL_KEY,
@@ -3928,6 +3929,19 @@ async def _persist_external_session_usage(
             )
         )
     label_updates: dict[str, str] = {}
+    context_model = body.data.get("context_model", body.data.get("model"))
+    context_model = (
+        context_model if isinstance(context_model, str) and context_model.strip() else None
+    )
+    if raw_window is not None or has_auto_compact_token_limit:
+        # Bind the persisted window to this reading, never to a later model pill.
+        label_updates["omnigent.last_context_model"] = (
+            context_model
+            if raw_window is not None
+            and context_model
+            and len(context_model) <= _LABEL_VALUE_MAX_LEN
+            else ""
+        )
     if has_pi_cache and pi_cache_ttl is not None:
         label_updates["omnigent.pi_cache"] = pi_cache_label(pi_cache_ttl, *pi_cache_values)
     if raw_tokens is not None:
@@ -4005,6 +4019,8 @@ async def _persist_external_session_usage(
         event_payload["context_tokens"] = raw_tokens
     if raw_window is not None:
         event_payload["context_window"] = raw_window
+    if context_model is not None and (raw_window is not None or has_auto_compact_token_limit):
+        event_payload["context_model"] = context_model
     if has_auto_compact_token_limit:
         event_payload["auto_compact_token_limit"] = raw_auto_compact_token_limit
     if has_provider_usage_limits:
@@ -4059,6 +4075,11 @@ def _context_labels_from_turn_usage(
     if not isinstance(context_tokens, int) or context_tokens < 0:
         return {}
     labels: dict[str, str] = {_LAST_CONTEXT_TOKENS_LABEL_KEY: str(context_tokens)}
+    model = resp_usage.get("model")
+    if isinstance(model, str) and model.strip() and len(model) <= _LABEL_VALUE_MAX_LEN:
+        labels["omnigent.last_context_model"] = model
+    else:
+        labels["omnigent.last_context_model"] = ""
     compact_limit = resp_usage.get("auto_compact_token_limit")
     if type(compact_limit) is int and compact_limit > 0:
         labels[_LAST_AUTO_COMPACT_TOKEN_LIMIT_LABEL_KEY] = str(compact_limit)
@@ -4066,7 +4087,6 @@ def _context_labels_from_turn_usage(
     if isinstance(window, int) and not isinstance(window, bool) and window > 0:
         labels[_LAST_CONTEXT_WINDOW_LABEL_KEY] = str(window)
         return labels
-    model = resp_usage.get("model")
     if isinstance(model, str) and model:
         from omnigent.llms.context_window import get_model_context_window
 
@@ -4076,6 +4096,8 @@ def _context_labels_from_turn_usage(
             window = None
         if isinstance(window, int) and window > 0:
             labels[_LAST_CONTEXT_WINDOW_LABEL_KEY] = str(window)
+    if _LAST_CONTEXT_WINDOW_LABEL_KEY not in labels:
+        labels["omnigent.last_context_model"] = ""
     return labels
 
 
@@ -12536,6 +12558,10 @@ async def _relay_runner_stream_once(
                                     "type": "session.usage",
                                     "conversation_id": session_id,
                                 }
+                                if _context_labels.get("omnigent.last_context_model"):
+                                    _usage_payload["context_model"] = _context_labels[
+                                        "omnigent.last_context_model"
+                                    ]
                                 _ctx_tokens_label = _context_labels.get(
                                     _LAST_CONTEXT_TOKENS_LABEL_KEY
                                 )

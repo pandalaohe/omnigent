@@ -3,6 +3,7 @@ import { useEffect, useRef } from "react";
 import { useChatStore } from "@/store/chatStore";
 import {
   usageContextSourceFromKey,
+  usageContextSourceKey,
   writeReportedContext,
   type UsageContextPreferences,
 } from "@/lib/usageContextPreferences";
@@ -10,8 +11,7 @@ import {
 interface Observation {
   conversationId: string | null;
   sourceKey: string;
-  contextWindow: number | null;
-  autoCompactTokenLimit: number | null;
+  reading: NonNullable<ReturnType<typeof useChatStore.getState>["reportedContextReading"]>;
 }
 
 /**
@@ -26,30 +26,28 @@ export function useRecordReportedContext(
   sourceKey: string,
 ): void {
   const conversationId = useChatStore((state) => state.conversationId);
-  const contextWindow = useChatStore((state) => state.contextWindow);
-  const autoCompactTokenLimit = useChatStore((state) => state.autoCompactTokenLimit);
-  const source = usageContextSourceFromKey(sourceKey);
-  const complete = !!source?.hostId && !!source.agentName && !!source.harness && !!source.model;
+  const reading = useChatStore((state) => state.reportedContextReading);
   const latestPreferences = useRef(preferences);
   const lastObservation = useRef<Observation | null>(null);
   useEffect(() => {
     latestPreferences.current = preferences;
   }, [preferences]);
   useEffect(() => {
-    if (!complete) return;
+    const source = usageContextSourceFromKey(sourceKey);
+    if (!source?.hostId || !source.agentName || !source.harness || !source.model || !reading?.model)
+      return;
+    const readingKey = usageContextSourceKey({ ...source, model: reading.model });
     const last = lastObservation.current;
-    lastObservation.current = { conversationId, sourceKey, contextWindow, autoCompactTokenLimit };
-    // A model switch inside one session arrives apart from the new model's reading:
-    // until the figures change they are still the previous model's.
+    lastObservation.current = { conversationId, sourceKey: readingKey, reading };
     if (
       last?.conversationId === conversationId &&
-      last.contextWindow === contextWindow &&
-      last.autoCompactTokenLimit === autoCompactTokenLimit
+      last.sourceKey === readingKey &&
+      last.reading === reading
     )
       return;
-    writeReportedContext(latestPreferences.current, sourceKey, {
-      contextWindow,
-      autoCompactTokenLimit,
+    writeReportedContext(latestPreferences.current, readingKey, {
+      contextWindow: reading.contextWindow,
+      autoCompactTokenLimit: reading.autoCompactTokenLimit,
     });
-  }, [conversationId, sourceKey, complete, contextWindow, autoCompactTokenLimit]);
+  }, [conversationId, sourceKey, reading]);
 }

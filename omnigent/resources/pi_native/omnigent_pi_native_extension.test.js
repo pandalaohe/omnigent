@@ -1006,7 +1006,7 @@ async function testReportedCompactionTracksModelSettings() {
   assert("disabled compaction clears old threshold", usage.auto_compact_token_limit === null);
 }
 
-async function testModelChangePrecedesItsUsage() {
+async function testModelChangePrecedesItsUsage(window) {
   const h = makeHarness({ captureEvents: true });
   h.pi.getSettings = () => ({ compaction: {} });
   const ctx = makeCtx({ idle: true });
@@ -1015,19 +1015,21 @@ async function testModelChangePrecedesItsUsage() {
   await h.handlers.session_start({}, ctx);
   const start = h.postedEvents.length;
   ctx.model = { provider: "provider-1", id: "model-2" };
-  ctx.getContextUsage = () => ({ tokens: 100, contextWindow: 550000 });
+  ctx.getContextUsage = () => ({ tokens: 100, contextWindow: window });
   await h.handlers.model_select({ model: ctx.model }, ctx);
   const posted = h.postedEvents.slice(start);
   const change = posted.findIndex(e => e.type === "external_model_change");
   const usage = posted.findIndex(e => e.type === "external_session_usage" &&
-    e.data.context_window === 550000);
+    e.data.context_window === window);
   assert("the switched model is posted before the usage it measures",
     change >= 0 && usage > change, posted.map(e => e.type));
+  assert("the reading carries its actual model even with identical figures",
+    posted[usage].data.context_model === "model-2");
 }
 
 (async () => {
   try {
-    await testModelChangePrecedesItsUsage();
+    for (const window of [128000, 550000]) await testModelChangePrecedesItsUsage(window);
     await testReportedCompactionTracksModelSettings();
     await testStartupInstructionsReachEveryAgentStart();
     await testSessionStartupDoesNotCompleteATurn();

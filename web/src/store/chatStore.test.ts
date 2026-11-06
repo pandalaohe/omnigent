@@ -719,6 +719,65 @@ describe("test harness teardown", () => {
 });
 
 describe("chatStore — lazy subtree usage", () => {
+  it("keeps context readings bound to their wire model across model changes and identical receipts", () => {
+    const conversation = bindConversationForTest("conv_reading", { llmModel: "model-a" });
+    const receive = () =>
+      handleSessionEvent(
+        parseEvent("session.usage", {
+          conversation_id: "conv_reading",
+          context_model: "model-b",
+          context_window: 1_000_000,
+          auto_compact_token_limit: 517_000,
+        })!,
+        "conv_reading",
+      );
+    receive();
+    const reading = conversation.get().reportedContextReading;
+    expect(reading).toEqual({
+      model: "model-b",
+      contextWindow: 1_000_000,
+      autoCompactTokenLimit: 517_000,
+    });
+    expect(conversation.get().llmModel).toBe("model-a");
+    handleSessionEvent(
+      { type: "session_model", conversationId: "conv_reading", model: "model-b" },
+      "conv_reading",
+    );
+    expect(conversation.get().reportedContextReading).toBe(reading);
+    receive();
+    expect(conversation.get().reportedContextReading).toEqual(reading);
+    expect(conversation.get().reportedContextReading).not.toBe(reading);
+    handleSessionEvent(
+      { type: "session_usage", conversationId: "conv_reading", totalCostUsd: 1 },
+      "conv_reading",
+    );
+    expect(conversation.get().reportedContextReading).toEqual(reading);
+    handleSessionEvent(
+      { type: "session_usage", conversationId: "conv_reading", contextWindow: 200_000 },
+      "conv_reading",
+    );
+    expect(conversation.get().reportedContextReading).toBeNull();
+  });
+
+  it("hydrates a reading from its saved model even when the session's model has moved on", async () => {
+    routeUsage(
+      "conv_usage",
+      () => usage("conv_usage", 0),
+      snapshot("conv_usage", {
+        llm_model: "model-b",
+        context_window: 1_000_000,
+        auto_compact_token_limit: 517_000,
+        labels: { "omnigent.last_context_model": "model-a" },
+      }),
+    );
+    await useChatStore.getState().switchTo("conv_usage");
+    expect(useChatStore.getState().reportedContextReading).toEqual({
+      model: "model-a",
+      contextWindow: 1_000_000,
+      autoCompactTokenLimit: 517_000,
+    });
+  });
+
   function snapshot(id: string, fields: Record<string, unknown> = {}): Response {
     return mockResponse({
       id,
@@ -861,13 +920,27 @@ describe("chatStore — lazy subtree usage", () => {
       type: "session_usage",
       conversationId: "conv_usage",
       totalCostUsd: 8,
+      contextModel: "model-b",
+      contextWindow: 200_000,
+      autoCompactTokenLimit: 167_000,
     });
 
-    finishSnapshot(snapshot("conv_usage"));
+    finishSnapshot(
+      snapshot("conv_usage", {
+        context_window: 1_000_000,
+        auto_compact_token_limit: 517_000,
+        labels: { "omnigent.last_context_model": "model-a" },
+      }),
+    );
     await binding;
     await tick();
 
     expect(useChatStore.getState().sessionCostUsd).toBe(8);
+    expect(useChatStore.getState().reportedContextReading).toEqual({
+      model: "model-b",
+      contextWindow: 200_000,
+      autoCompactTokenLimit: 167_000,
+    });
   });
 
   it("does not overwrite newer streamed cost or model usage with a slow read", async () => {

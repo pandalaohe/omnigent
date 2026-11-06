@@ -4061,6 +4061,8 @@ class SessionUsageEvent(_SSEEventBase):
     :param context_window: Resolved window in tokens (e.g. 200_000
         normally, 1_000_000 with ``opus[1m]`` / ``sonnet[1m]``).
         ``None`` on a tokens-only broadcast.
+    :param context_model: Model that produced the context reading, independent
+        of the session's separately reported active model.
     :param total_cost_usd: Cumulative session spend in USD after this
         update, e.g. ``0.42`` — the server-computed total the
         cost-budget policy gates on. Present **only when the session
@@ -4083,6 +4085,7 @@ class SessionUsageEvent(_SSEEventBase):
 
     type: Literal["session.usage"]
     conversation_id: str
+    context_model: str | None = None
     context_tokens: int | None = None
     context_window: int | None = None
     auto_compact_token_limit: int | None = None

@@ -610,6 +610,7 @@ export interface SessionUsageEvent {
   contextTokens?: number;
   contextWindow?: number;
   autoCompactTokenLimit?: number | null;
+  contextModel?: string;
   providerUsageLimits?: ProviderUsageLimitsSnapshot | null;
   totalCostUsd?: number;
   usageByModel?: Record<string, ModelUsage>;

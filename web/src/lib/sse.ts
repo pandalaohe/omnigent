@@ -710,6 +710,9 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       ...(contextTokens !== undefined ? { contextTokens } : {}),
       ...(contextWindow !== undefined ? { contextWindow } : {}),
       ...(autoCompactTokenLimit !== undefined ? { autoCompactTokenLimit } : {}),
+      ...(typeof raw.context_model === "string" && raw.context_model.trim()
+        ? { contextModel: raw.context_model }
+        : {}),
       ...(providerUsageLimits !== undefined ? { providerUsageLimits } : {}),
       ...(totalCostUsd !== undefined ? { totalCostUsd } : {}),
       ...(usageByModel !== undefined ? { usageByModel } : {}),

@@ -1002,6 +1002,7 @@ class _ForwardDedupeState:
     # fresh one every poll.
     pending_usage: dict[str, float] | None = None
     context_window: int | None = None
+    context_model: str | None = None
     auto_compact_token_limit: int | None = None
     provider_usage_limits: dict[str, object] | None = None
     recorded_token_usage: dict[str, int] | None = None
@@ -7695,6 +7696,9 @@ async def _post_forward_side_channel_updates(
         resolved_context_window = (
             context_window_value if isinstance(context_window_value, int) else None
         )
+        context_model = (
+            concrete_reported_model(status_state.get("model")) if status_state else None
+        )
         usage_from_status = (
             _usage_from_status_state(status_state) if status_state is not None else None
         )
@@ -7784,7 +7788,11 @@ async def _post_forward_side_channel_updates(
         # span on them drops that call's tokens for good: nothing retries, and by
         # the next post ``result.latest_usage`` has moved to the following call.
         usage_post_needed = (
-            usage_changed or window_changed or provider_limits_changed or auto_compact_changed
+            usage_changed
+            or window_changed
+            or provider_limits_changed
+            or auto_compact_changed
+            or (resolved_context_window is not None and context_model != dedupe.context_model)
         )
         if usage_post_needed or record_token_usage is not None:
             try:
@@ -7793,6 +7801,7 @@ async def _post_forward_side_channel_updates(
                     session_id=session_id,
                     usage=posted_usage if usage_post_needed else None,
                     context_window=resolved_context_window if usage_post_needed else None,
+                    context_model=context_model if usage_post_needed else None,
                     auto_compact_token_limit=(
                         auto_compact_token_limit if usage_post_needed else None
                     ),
@@ -7806,6 +7815,8 @@ async def _post_forward_side_channel_updates(
                 )
                 if usage_changed:
                     dedupe.usage = posted_usage
+                if usage_post_needed and resolved_context_window is not None:
+                    dedupe.context_model = context_model
                 if window_changed:
                     dedupe.context_window = resolved_context_window
                 if auto_compact_changed:
@@ -8421,6 +8432,7 @@ async def _post_external_session_usage(
     session_id: str,
     usage: Mapping[str, object] | None,
     context_window: int | None = None,
+    context_model: str | None = None,
     auto_compact_token_limit: int | None = None,
     clear_auto_compact_token_limit: bool = False,
     provider_usage_limits: dict[str, object] | None = None,
@@ -8442,6 +8454,7 @@ async def _post_external_session_usage(
         cost with the active model for per-model attribution.
     :param context_window: Resolved window in tokens, or ``None`` to
         leave the server's persisted value untouched.
+    :param context_model: Model from the same statusLine sample as the window.
     :param auto_compact_token_limit: Harness auto-compaction window in
         tokens, or ``None`` to leave the server's persisted value untouched.
     :param token_usage: One API call's final token counters to record on the
@@ -8456,6 +8469,8 @@ async def _post_external_session_usage(
         payload.update(usage)
     if context_window is not None:
         payload["context_window"] = context_window
+        if context_model is not None:
+            payload["context_model"] = context_model
     if auto_compact_token_limit is not None or clear_auto_compact_token_limit:
         payload["auto_compact_token_limit"] = auto_compact_token_limit
     if provider_usage_limits is not None:

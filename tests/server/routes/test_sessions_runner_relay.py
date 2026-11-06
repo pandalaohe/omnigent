@@ -594,22 +594,24 @@ def test_context_labels_from_turn_usage_shapes() -> None:
 
     # Numerator without a resolvable model → tokens only.
     no_model = _context_labels_from_turn_usage({"context_tokens": 42})
-    assert no_model == {"omnigent.last_context_tokens": "42"}
+    assert no_model == {"omnigent.last_context_tokens": "42", "omnigent.last_context_model": ""}
 
 
 @pytest.mark.parametrize("window", [550_000, None, 0, -1, True, "550000"])
+@pytest.mark.parametrize("model", ["uncatalogued-model", "vendor/" + "m" * 300])
 def test_context_labels_prefer_valid_reported_window(
-    monkeypatch: pytest.MonkeyPatch, window: object
+    monkeypatch: pytest.MonkeyPatch, window: object, model: str
 ) -> None:
     from omnigent.server.routes.sessions import _context_labels_from_turn_usage
 
     monkeypatch.setattr("omnigent.llms.context_window.get_model_context_window", lambda _: 128_000)
     labels = _context_labels_from_turn_usage(
-        {"context_tokens": 42, "model": "uncatalogued-model", "context_window": window}
+        {"context_tokens": 42, "model": model, "context_window": window}
     )
     assert labels == {
         "omnigent.last_context_tokens": "42",
         "omnigent.last_context_window": "550000" if window == 550_000 else "128000",
+        "omnigent.last_context_model": model if len(model) <= 256 else "",
     }
 
 
@@ -694,12 +696,14 @@ async def test_relay_persists_context_window_labels_for_inprocess_turn(
         assert usage_event["context_window"] == expected_window
         assert "auto_compact_token_limit" in usage_event
         assert usage_event["auto_compact_token_limit"] == compact_limit
+        assert usage_event["context_model"] == "claude-sonnet-5"
 
         # Labels are persisted (durable across reload/snapshot).
         refreshed = store.get_conversation(session_id)
         assert refreshed is not None
         assert refreshed.labels.get("omnigent.last_context_tokens") == "45678"
         assert refreshed.labels.get("omnigent.last_context_window") == str(expected_window)
+        assert refreshed.labels.get("omnigent.last_context_model") == "claude-sonnet-5"
         assert refreshed.labels.get("omnigent.last_auto_compact_token_limit") == (
             str(compact_limit) if compact_limit is not None else None
         )
