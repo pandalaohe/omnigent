@@ -55,29 +55,38 @@ _TRUTHY_STRINGS = ("1", "true", "yes")
 USAGE_READ_TOKEN_PRINCIPAL: Final = "config:usage-read"
 
 
+def scope_allows(scope: str, method: str, path: str) -> bool:
+    """Fail closed on paths and methods outside the credential's usage authority."""
+    if method == "GET" and path in {"/v1/usage-events", "/v1/usage-cutover/receipts"}:
+        return scope in {"usage", "usage:read"}
+    if scope != "usage":
+        return False
+    if method == "GET":
+        return path in {
+            "/v1/me/usage",
+            "/v1/me/usage/activity",
+            "/v1/me/usage/issues",
+            "/v1/me/usage/models",
+        }
+    account = r"/v1/me/usage/accounts/[A-Za-z0-9][A-Za-z0-9_-]{0,31}"
+    return (
+        (method == "PUT" and re.fullmatch(account, path) is not None)
+        or (method == "POST" and re.fullmatch(account + "/import", path) is not None)
+        or (
+            method == "POST"
+            and path
+            in {
+                "/v1/me/usage/otlp/v1/metrics",
+                "/v1/me/usage/otlp/v1/traces",
+                "/v1/me/usage/otlp/v1/logs",
+            }
+        )
+    )
+
+
 def usage_read_request_allowed(request: HTTPConnection) -> bool:
     """Confine usage readers to the feed and cutover receipts GETs."""
-    return request.scope.get("method") == "GET" and request.url.path in {
-        "/v1/usage-events",
-        "/v1/usage-cutover/receipts",
-    }
-
-
-def resolve_usage_read_token() -> tuple[str, bytes] | None:
-    """Read the account and opaque token digest without echoing invalid values."""
-    from omnigent.server.routes.accounts_auth import _USERNAME_RE
-
-    value = os.environ.get("OMNIGENT_USAGE_READ_TOKEN", "")
-    if not value:
-        return None
-    account, separator, token = value.partition(":")
-    if (
-        not separator
-        or re.fullmatch(_USERNAME_RE, account) is None
-        or re.fullmatch(r"[A-Za-z0-9_-]{32,256}", token) is None
-    ):
-        raise ValueError("Invalid OMNIGENT_USAGE_READ_TOKEN")
-    return account, hashlib.sha256(token.encode()).digest()
+    return scope_allows("usage:read", request.scope.get("method", ""), request.url.path)
 
 
 # Path prefixes a restricted (device-grant or machine client-credential)
@@ -520,8 +529,8 @@ class UnifiedAuthProvider(AuthProvider):
         back to ``""`` (strip nothing; see
         :func:`resolve_auth_header_strip_prefix`). Only consulted in
         header mode. Tests pass an explicit prefix.
-    :param usage_read_token: Account and opaque token digest for the two usage
-        GETs. None resolves from OMNIGENT_USAGE_READ_TOKEN; accounts mode only.
+    :param api_keys: User-owned digest-only usage credentials. None upgrades
+        OMNIGENT_USAGE_READ_TOKEN; accounts mode only.
     """
 
     def __init__(
@@ -532,7 +541,7 @@ class UnifiedAuthProvider(AuthProvider):
         local_single_user: bool | None = None,
         header_name: str | None = None,
         header_strip_prefix: str | None = None,
-        usage_read_token: tuple[str, bytes] | None = None,
+        api_keys: tuple[ApiKey, ...] | None = None,
     ) -> None:
         self._source = source
         self._oidc_config = oidc_config
@@ -558,15 +567,25 @@ class UnifiedAuthProvider(AuthProvider):
         # OIDC and machine principals retain their independent lifecycle.
         self._account_check: Callable[[str, str], bool] | None = None
         self._usage_read_account_lookup: Callable[[str], str | None] | None = None
-        self._usage_read_token: tuple[str, bytes] | None = None
-        if source == "accounts":
-            self._usage_read_token = (
-                usage_read_token if usage_read_token is not None else resolve_usage_read_token()
-            )
-            if self._usage_read_token is not None:
-                logger.info("usage read token enabled for %s", self._usage_read_token[0])
-        elif usage_read_token is not None or os.environ.get("OMNIGENT_USAGE_READ_TOKEN"):
+        from omnigent.server.server_config import load_api_keys
+
+        self._api_keys: tuple[ApiKey, ...] = ()
+        if source != "accounts" and os.environ.get("OMNIGENT_USAGE_READ_TOKEN"):
             logger.warning("OMNIGENT_USAGE_READ_TOKEN ignored outside accounts mode")
+        if api_keys is None:
+            api_keys = load_api_keys({}, os.environ) if source == "accounts" else ()
+        self.set_api_keys(api_keys)
+
+    def set_api_keys(self, keys: tuple[ApiKey, ...]) -> None:
+        """Apply validated server config; other auth modes never accept API keys."""
+        if self._source == "accounts":
+            self._api_keys = keys
+        elif keys:
+            logger.warning("api_keys ignored outside accounts mode")
+
+    def has_usage_api_key(self, user: str) -> bool:
+        """Whether this owner's configured keys can corroborate a feed receipt."""
+        return any(key.user == user and "usage" in key.scopes for key in self._api_keys)
 
     def set_grant_revocation_check(self, check: Callable[[str], bool]) -> None:
         """Wire the device-grant revocation lookup.
@@ -589,13 +608,8 @@ class UnifiedAuthProvider(AuthProvider):
         self._account_check = check
 
     def set_usage_read_account_lookup(self, lookup: Callable[[str], str | None]) -> None:
-        """Resolve a configured reader's live account generation on every read."""
+        """Resolve a configured key's live account generation on every request."""
         self._usage_read_account_lookup = lookup
-
-    @property
-    def usage_read_token_user(self) -> str | None:
-        """Configured accounts reader, or None when disabled or ignored."""
-        return self._usage_read_token[0] if self._usage_read_token is not None else None
 
     def accepts_account_generation(self, user_id: str, generation: str | None) -> bool:
         return self._account_check is None or (
@@ -789,15 +803,20 @@ class UnifiedAuthProvider(AuthProvider):
             auth_header = request.headers.get("Authorization", "")
             if auth_header.startswith("Bearer "):
                 token = auth_header[7:]
-                if self._usage_read_token is not None and hmac.compare_digest(
-                    hashlib.sha256(token.encode()).digest(), self._usage_read_token[1]
-                ):
+                digest = hashlib.sha256(token.encode()).digest()
+                for key in self._api_keys:
+                    if not hmac.compare_digest(digest, key.sha256):
+                        continue
                     if (
-                        not usage_read_request_allowed(request)
+                        re.fullmatch(r"[A-Za-z0-9_-]{32,256}", token) is None
+                        or not any(
+                            scope_allows(scope, request.scope.get("method", ""), request.url.path)
+                            for scope in key.scopes
+                        )
                         or self._usage_read_account_lookup is None
                     ):
                         return None
-                    account = self._usage_read_token[0]
+                    account = key.user
                     generation = self._usage_read_account_lookup(account)
                     if generation is None:
                         return None
@@ -1123,3 +1142,4 @@ if TYPE_CHECKING:
 
     from omnigent.server.accounts_config import AccountsConfig
     from omnigent.server.oidc import OIDCConfig
+    from omnigent.server.server_config import ApiKey

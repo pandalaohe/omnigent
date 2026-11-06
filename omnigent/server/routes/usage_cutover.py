@@ -259,8 +259,9 @@ def create_usage_cutover_router(
                     consumer_receipt,
                     cutover_at,
                     rescan,
-                    config_reader_user=auth_provider.usage_read_token_user
+                    config_reader_user=owner
                     if isinstance(auth_provider, UnifiedAuthProvider)
+                    and auth_provider.has_usage_api_key(owner)
                     else None,
                 )
         except UsageExportError as exc:

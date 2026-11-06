@@ -1860,6 +1860,7 @@ def create_app(
     )
 
     from omnigent.server.server_config import (
+        load_api_keys,
         load_branding_snapshot,
         load_server_config,
         session_title_instructions,
@@ -1867,6 +1868,20 @@ def create_app(
     )
 
     resolved_server_config = load_server_config() if server_config is None else server_config
+    from omnigent.server.auth import UnifiedAuthProvider
+
+    if "api_keys" in resolved_server_config:
+        api_keys = load_api_keys(
+            resolved_server_config,
+            os.environ
+            if isinstance(auth_provider, UnifiedAuthProvider)
+            and auth_provider._source == "accounts"
+            else {},
+        )
+        if isinstance(auth_provider, UnifiedAuthProvider):
+            auth_provider.set_api_keys(api_keys)
+        elif api_keys:
+            _logger.warning("api_keys ignored without accounts authentication")
     branding_snapshot = load_branding_snapshot(resolved_server_config)
     title_instructions = session_title_instructions(resolved_server_config)
     startup_policy = startup_admission_policy(resolved_server_config)
