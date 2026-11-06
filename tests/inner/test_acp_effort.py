@@ -46,6 +46,67 @@ def test_acp_effort_is_deferred_to_the_session_advertisement():
     assert efforts_for_harness("acp:neutral") is None
 
 
+@pytest.mark.asyncio
+async def test_start_effort_is_in_initialize_and_not_a_live_control(executor):
+    executor._start_effort = "high"
+    executor._rpc = AsyncMock(
+        return_value={"result": {"_meta": {"omnigent": {"start_efforts": ["low", "high"]}}}}
+    )
+    await executor._ensure_initialized()
+    assert executor._rpc.await_args.args[1]["_meta"] == {"omnigent": {"start_effort": "high"}}
+    executor._note_config_options(options(values=()))
+    assert executor.model_options()[0]["start_efforts"] == ["low", "high"]
+    assert executor.model_options()[0]["efforts"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", ["config", "legacy"])
+@pytest.mark.parametrize("result_mode", ["auto", "review", "refused"])
+async def test_agent_mode_switch_uses_its_protocol_and_reports_refusal(
+    executor, protocol, result_mode
+):
+    executor._config = replace(executor._config, permission_concepts={"auto": "automatic"})
+    rows = [{"id": "review", "name": "Review"}, {"id": "auto", "name": "Auto"}]
+
+    def state(mode):
+        if protocol == "legacy":
+            return {"modes": {"currentModeId": mode, "availableModes": rows}}
+        return {
+            "configOptions": [
+                {
+                    "id": "agent-mode",
+                    "category": "mode",
+                    "currentValue": mode,
+                    "options": [{"value": row["id"], "name": row["name"]} for row in rows],
+                }
+            ]
+        }
+
+    initial = state("review")
+    executor._note_session_modes(initial.get("modes"))
+    executor._note_config_options(initial.get("configOptions"))
+    response = (
+        {"error": {"code": -1}} if result_mode == "refused" else {"result": state(result_mode)}
+    )
+    executor._rpc = AsyncMock(return_value=response)
+    notice = await executor._apply_session_mode("fresh-session", "auto")
+    method, params = executor._rpc.await_args.args
+    assert method == ("session/set_config_option" if protocol == "config" else "session/set_mode")
+    assert params == (
+        {"sessionId": "fresh-session", "configId": "agent-mode", "value": "auto"}
+        if protocol == "config"
+        else {"sessionId": "fresh-session", "modeId": "auto"}
+    )
+    assert notice == (None if result_mode == "auto" else "Agent kept review.\n\n")
+    from omnigent.models.model_catalog_store import read_catalog
+
+    key = fingerprint_of(executor._config.command, binary_identity(executor._argv[0]))
+    assert read_catalog("acp-modes", key) == [
+        {"value": "review", "label": "Review"},
+        {"value": "auto", "label": "Auto", "concept": "automatic"},
+    ]
+
+
 def test_effort_without_a_model_option_is_visible(executor):
     executor._note_config_options(options()[1:])
     assert executor.model_options()[0]["isDefault"]

@@ -413,6 +413,7 @@ class CallingDefaultsCatalogRow(BaseModel):
     host_id: str
     harness: str
     models: list[dict[str, Any]]
+    permission_options: list[dict[str, str]] = Field(default_factory=list)
     fetched_at: int | None = None
     stale: bool
     error: str | None = None
@@ -1397,6 +1398,8 @@ class CreateResponseRequest(BaseModel):
     # Reasoning config, e.g. {"effort": "low"|"medium"|"high"}
     reasoning: dict[str, str] | None = None
     permission_mode: str | None = None
+    session_mode: SkipJsonSchema[str | None] = None
+    session_mode_selection: SkipJsonSchema[str | None] = None
     approval_mode: str | None = None
     service_tier: str | None = None
     # Per-request LLM model override (distinct from ``model``, which
@@ -2772,6 +2775,7 @@ class SessionResponse(BaseModel):
     llm_model: str | None = None
     harness: str | None = None
     permission_tier: Literal["ask", "plan", "accept-edits", "auto", "full"] | None = None
+    harness_namespace: str | None = None
     permission_tier_revision: int | None = None
     permission_tier_state: Literal["ready", "switching", "blocked"] | None = None
     permission_tiers_capability: bool = False
@@ -4183,7 +4187,7 @@ class SessionCollaborationModeEvent(_SSEEventBase):
 
 class SessionPermissionModeEvent(_SSEEventBase):
     """
-    Active permission-mode update from a claude-native session.
+    Active permission-mode update from a native Claude or ACP session.
 
     Emitted after the web UI switches the mode, and after the Claude forwarder
     observes a different mode in the pane footer — a shift+tab pressed inside
@@ -4197,12 +4201,17 @@ class SessionPermissionModeEvent(_SSEEventBase):
     Category: **transient** (SSE-only). The server also writes
     ``omnigent.claude_native.permission_mode`` on the conversation labels, so
     reconnecting clients restore the same state from the session snapshot.
+    ACP reports carry a selection id so repeated readbacks follow one choice
+    while a newer choice rejects stale reports.
     """
 
     type: Literal["session.permission_mode"]
     conversation_id: str
     permission_mode: str
     permission_tier_revision: int | None = None
+    harness: Literal["acp"] | None = None
+    requested_mode: str | None = None
+    selection_id: str | None = None
 
 
 class SessionCodexApprovalModeEvent(_SSEEventBase):

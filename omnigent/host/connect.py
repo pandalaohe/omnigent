@@ -4525,12 +4525,24 @@ class HostProcess:
                 refresh = frame.refresh if frame.refresh in ("auto", "force") else "none"
                 rows = await fetch_model_source(harness, source, refresh=refresh)
                 permissions = []
-                if source.lane == "agent":
+                if source.lane == "agent" or harness == "acp" or harness.startswith("acp:"):
+                    from omnigent.inner.acp_harness import probe_acp_model_options
                     from omnigent.models.model_catalog_store import read_catalog
-                    from omnigent.models.model_source import _source_catalog
+                    from omnigent.models.model_source import ModelSource, _source_catalog
+                    from omnigent.onboarding.acp_auth import classify_permission_options
 
-                    _, key, _ = _source_catalog(harness, source)
-                    permissions = read_catalog("acp-modes", key) or []
+                    _, key, entry = _source_catalog(harness, ModelSource(lane="agent"))
+                    permission_rows = read_catalog("acp-modes", key)
+                    if source.lane != "agent" and (permission_rows is None or refresh == "force"):
+                        probe = await probe_acp_model_options(entry)
+                        if probe["error"] is None:
+                            from omnigent.models.model_catalog_store import write_catalog
+
+                            permission_rows = probe["permission_options"]
+                            write_catalog("acp-modes", key, permission_rows)
+                    permissions = classify_permission_options(
+                        permission_rows or [], entry.permission_concepts
+                    )
                 return HostModelOptionsResultFrame(
                     request_id=frame.request_id,
                     status="ok",

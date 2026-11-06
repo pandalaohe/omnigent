@@ -2461,9 +2461,14 @@ class SqlAlchemyConversationStore(ConversationStore):
                 owner = None
 
         def write(session: Session) -> None:
+            from omnigent.sdk_permission_modes import ACP_SESSION_MODE_SELECTION_LABEL_KEY
+
             if project_name and self._conv_engine is self._engine:
                 assert_project_name_admits(session, project_name, user_id=owner)
-            if CLOSED_LABEL_KEY in stable_updates:
+            if (
+                CLOSED_LABEL_KEY in stable_updates
+                or ACP_SESSION_MODE_SELECTION_LABEL_KEY in stable_updates
+            ):
                 self._lock_conversation(session, conversation_id)
             _upsert_labels(session, conversation_id, stable_updates, stamp)
 
@@ -2543,10 +2548,18 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
 
     def compare_and_set_label(
-        self, conversation_id: str, key: str, expected: str, value: str | None
+        self,
+        conversation_id: str,
+        key: str,
+        expected: str,
+        value: str | None,
+        *,
+        updates: dict[str, str] | None = None,
     ) -> bool:
         """Fence a label transition against concurrent observers and stale retries."""
         if value is not None and len(value) > LABEL_VALUE_MAX_LEN:
+            raise ValueError("label value exceeds its storage limit")
+        if updates and any(len(item) > LABEL_VALUE_MAX_LEN for item in updates.values()):
             raise ValueError("label value exceeds its storage limit")
 
         def write(session: Session) -> bool:
@@ -2568,6 +2581,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .values(value=value, updated_at=now_epoch())
             )
             result = cast(_RowCountResult, session.execute(statement))
+            if result.rowcount == 1 and updates:
+                _upsert_labels(session, conversation_id, updates, now_epoch())
             return result.rowcount == 1
 
         return run_write_transaction(self._conv_session_immediate, "compare_and_set_label", write)

@@ -24,6 +24,33 @@ def test_init_timeout_defaults_to_thirty_seconds() -> None:
     assert acp_agents_settings(entries) == {"acp": {"agents": [row]}}
 
 
+def test_permission_concepts_survive_registry_rewrites() -> None:
+    row = {
+        "name": "Neutral",
+        "command": "neutral acp",
+        "permission_concepts": {"yolo": "full-access", "review": "manual"},
+    }
+    entries = acp_agents({"acp": {"agents": [row]}})
+    assert entries[0].permission_concepts == {"yolo": "full-access", "review": "manual"}
+    assert acp_agents_settings(entries) == {"acp": {"agents": [row]}}
+
+
+@pytest.mark.parametrize(
+    "value", [[], "manual", {"plan": "plan"}, {"plan": []}, {1: "manual"}, {"": "manual"}]
+)
+def test_permission_concepts_reject_invalid_meanings(value: object) -> None:
+    with pytest.raises(ValueError, match="permission_concepts"):
+        acp_agents(
+            {
+                "acp": {
+                    "agents": [
+                        {"name": "Neutral", "command": "neutral acp", "permission_concepts": value}
+                    ]
+                }
+            }
+        )
+
+
 @pytest.mark.parametrize(
     "value",
     [0, -1, float("inf"), float("-inf"), float("nan"), "120", "bad", None, True, [], {}, 10**400],

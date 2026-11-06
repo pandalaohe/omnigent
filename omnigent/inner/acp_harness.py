@@ -74,7 +74,12 @@ from omnigent.inner.acp_extension import NO_ACP_EXTENSION, AcpExtension
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import Executor
 from omnigent.inner.os_env_serialization import decode_sandbox_spec
-from omnigent.onboarding.acp_auth import AcpAgentEntry, parse_init_timeout_s
+from omnigent.onboarding.acp_auth import (
+    AcpAgentEntry,
+    classify_permission_options,
+    parse_init_timeout_s,
+    parse_permission_concepts,
+)
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 
 _logger = logging.getLogger(__name__)
@@ -226,6 +231,11 @@ async def probe_acp_model_options(
                                 {
                                     "value": choice["value"],
                                     "label": str(choice.get("name") or choice["value"]),
+                                    **(
+                                        {"description": choice["description"]}
+                                        if isinstance(choice.get("description"), str)
+                                        else {}
+                                    ),
                                 }
                                 for choice in choices
                             ]
@@ -250,7 +260,15 @@ async def probe_acp_model_options(
                     if not permissions:
                         modes = result.get("modes") or {}
                         permissions = [
-                            {"value": item["id"], "label": item.get("name", item["id"])}
+                            {
+                                "value": item["id"],
+                                "label": item.get("name", item["id"]),
+                                **(
+                                    {"description": item["description"]}
+                                    if isinstance(item.get("description"), str)
+                                    else {}
+                                ),
+                            }
                             for item in modes.get("availableModes", [])
                             if isinstance(item, dict) and isinstance(item.get("id"), str)
                         ]
@@ -261,6 +279,14 @@ async def probe_acp_model_options(
                         .get("start_efforts")
                     )
                     if isinstance(start, list):
+                        if not models:
+                            models = [
+                                {
+                                    "id": "__default__",
+                                    "displayName": "Agent's default",
+                                    "isDefault": True,
+                                }
+                            ]
                         for row in models:
                             row["start_efforts"] = [
                                 value for value in start if isinstance(value, str)
@@ -293,7 +319,11 @@ async def probe_acp_model_options(
             "permission_options": [],
             "error": f"ACP probe failed ({type(exc).__name__})",
         }
-    return {"models": models, "permission_options": permissions, "error": None}
+    return {
+        "models": models,
+        "permission_options": classify_permission_options(permissions, entry.permission_concepts),
+        "error": None,
+    }
 
 
 def _env_enabled(name: str, *, default: bool) -> bool:
@@ -394,6 +424,9 @@ def _build_acp_executor(extension: AcpExtension = NO_ACP_EXTENSION) -> AcpExecut
         inject_system_prompt=inject_system_prompt,
         init_timeout_s=parse_init_timeout_s(
             float(os.environ.get("HARNESS_ACP_INIT_TIMEOUT_S", "30"))
+        ),
+        permission_concepts=parse_permission_concepts(
+            json.loads(os.environ.get("HARNESS_ACP_PERMISSION_CONCEPTS", "{}"))
         ),
     )
     return AcpExecutor(config=config, cwd=cwd, os_env=_resolve_os_env(), extension=extension)

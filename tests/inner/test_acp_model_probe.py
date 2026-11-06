@@ -40,8 +40,9 @@ for line in sys.stdin:
         result = {
             "protocolVersion": 1,
             "agentCapabilities": {"sessionCapabilities": {"close": {}}},
-            "_meta": {"omnigent": {"start_efforts": ["high"]}},
         }
+        if mode != "empty":
+            result["_meta"] = {"omnigent": {"start_efforts": ["high"]}}
     elif method == "session/new":
         if mode == "orphan":
             child = subprocess.Popen([sys.executable, "-c",
@@ -80,7 +81,9 @@ for line in sys.stdin:
 """
 
 
-@pytest.mark.parametrize("mode", ["config", "legacy", "empty", "auth", "exit", "hang", "stubborn"])
+@pytest.mark.parametrize(
+    "mode", ["config", "legacy", "start-only", "empty", "auth", "exit", "hang", "stubborn"]
+)
 async def test_probe_lifecycle_and_catalog(tmp_path, monkeypatch, caplog, mode):
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
     script = tmp_path / "catalog_agent.py"
@@ -102,7 +105,7 @@ async def test_probe_lifecycle_and_catalog(tmp_path, monkeypatch, caplog, mode):
     expected = ["initialize"]
     if mode not in ("exit", "hang", "stubborn"):
         expected.append("session/new")
-    if mode in ("config", "legacy", "empty"):
+    if mode in ("config", "legacy", "start-only", "empty"):
         expected.append("session/close")
     assert [message["method"] for message in messages] == expected
     if len(messages) >= 2:
@@ -111,6 +114,16 @@ async def test_probe_lifecycle_and_catalog(tmp_path, monkeypatch, caplog, mode):
         assert result["error"]
     elif mode == "empty":
         assert result == {"models": [], "permission_options": [], "error": None}
+    elif mode == "start-only":
+        assert result["error"] is None
+        assert result["models"] == [
+            {
+                "id": "__default__",
+                "displayName": "Agent's default",
+                "isDefault": True,
+                "start_efforts": ["high"],
+            }
+        ]
     else:
         assert result["error"] is None
         assert [row["id"] for row in result["models"]] == ["model-a", "model-b"]

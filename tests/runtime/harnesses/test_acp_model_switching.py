@@ -24,6 +24,7 @@ record_path, protocol, *options = sys.argv[1:]
 failure = options[0] if options else ""
 failed_once = False
 model = "model-a"
+mode = "review"
 session_id = "fake-" + str(os.getpid())
 turn = 0
 
@@ -31,14 +32,30 @@ def send(value):
     print(json.dumps(value), flush=True)
 
 def model_options():
-    return [{"id": "model", "currentValue": model,
-             "options": [{"value": value} for value in ("model-a", "model-b", "model-c")]}]
+    options = [{"id": "model", "currentValue": model,
+                "options": [{"value": value} for value in ("model-a", "model-b", "model-c")]}]
+    if protocol == "mode-config":
+        options.append({"id": "agent-mode", "category": "mode", "currentValue": mode,
+                        "options": [{"value": "review", "name": "Review"},
+                                    {"value": "go", "name": "Go"}]})
+    return options
 
 for line in sys.stdin:
     request = json.loads(line)
     with open(record_path, "a") as record:
         record.write(json.dumps({"pid": os.getpid(), **request}) + "\n")
     method, params = request.get("method"), request.get("params", {})
+    if failure in ("mode-notify-refusal", "mode-multiple-readbacks") and method in (
+        "session/set_mode", "session/set_config_option"
+    ):
+        if protocol == "mode-config":
+            update = {"sessionUpdate": "config_option_update", "configOptions": model_options()}
+        else:
+            update = {"sessionUpdate": "current_mode_update", "currentModeId": mode}
+        send({"jsonrpc": "2.0", "method": "session/update",
+              "params": {"sessionId": session_id, "update": update}})
+        send({"jsonrpc": "2.0", "id": request["id"], "result": {}})
+        continue
     if method in ("session/set_model", "session/set_config_option") and not failed_once:
         if failure == "reject-once":
             failed_once = True
@@ -52,6 +69,8 @@ for line in sys.stdin:
             continue
     if method == "initialize":
         result = {"protocolVersion": 1, "agentCapabilities": {}}
+        if protocol.startswith("mode-"):
+            result["_meta"] = {"omnigent": {"start_efforts": ["low", "high"]}}
     elif method == "session/new":
         model = params.get("model", model)
         result = {"sessionId": session_id}
@@ -64,20 +83,36 @@ for line in sys.stdin:
             }
         else:
             result["configOptions"] = model_options()
+        if protocol == "mode-legacy":
+            result["modes"] = {"currentModeId": mode, "availableModes": [
+                {"id": "review", "name": "Review"}, {"id": "go", "name": "Go"}]}
     elif method == "session/set_model" and protocol == "catalog":
         assert params["sessionId"] == session_id
         model = params["modelId"]
         result = {}
-    elif method == "session/set_config_option" and protocol == "config":
+    elif method == "session/set_config_option" and protocol in ("config", "mode-config"):
         assert params["sessionId"] == session_id
-        model = params["value"]
+        if params.get("configId") == "agent-mode":
+            mode = params["value"]
+        else:
+            model = params["value"]
         result = {"configOptions": model_options()}
+    elif method == "session/set_mode" and protocol == "mode-legacy":
+        mode = params["modeId"]
+        result = {"modes": {"currentModeId": mode}}
     elif method == "session/prompt":
         assert params["sessionId"] == session_id
         turn += 1
+        if failure == "mode-multiple-readbacks" and turn == 1:
+            mode = "manual"
+            update = ({"sessionUpdate": "config_option_update", "configOptions": model_options()}
+                      if protocol == "mode-config" else
+                      {"sessionUpdate": "current_mode_update", "currentModeId": mode})
+            send({"jsonrpc": "2.0", "method": "session/update",
+                  "params": {"sessionId": session_id, "update": update}})
         send({"jsonrpc": "2.0", "method": "session/update", "params": {
             "sessionId": session_id, "update": {"sessionUpdate": "agent_message_chunk",
-            "content": {"type": "text", "text": f"turn={turn};model={model}"}}}})
+            "content": {"type": "text", "text": f"turn={turn};model={model};mode={mode}"}}}})
         result = {"stopReason": "end_turn"}
     else:
         send({"jsonrpc": "2.0", "id": request["id"],

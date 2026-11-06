@@ -760,6 +760,9 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       type: "session_permission_mode",
       conversationId,
       permissionMode,
+      ...(data.harness === "acp" ? { harness: "acp" as const } : {}),
+      ...(typeof data.requested_mode === "string" ? { requestedMode: data.requested_mode } : {}),
+      ...(typeof data.selection_id === "string" ? { selectionId: data.selection_id } : {}),
       ...(typeof data.permission_tier_revision === "number"
         ? { permissionTierRevision: data.permission_tier_revision }
         : {}),

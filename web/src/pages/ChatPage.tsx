@@ -1,3 +1,8 @@
+import { Input } from "@/components/ui/input";
+import {
+  listCallingDefaultCatalogs,
+  type CallingDefaultsCatalogRow,
+} from "@/lib/callingDefaultsApi";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { SelectionPopup } from "@/components/chat/SelectionPopup";
 import { useConversationRedirect } from "@/hooks/useConversationRedirect";
@@ -3116,6 +3121,36 @@ function ComposerImpl(
     (hostMcpRoutingId ? `?host=${encodeURIComponent(hostMcpRoutingId)}` : "");
   const composerBranch = useChatStore((s) => s.gitBranch);
   const storedPermissionMode = useChatStore((s) => s.claudePermissionMode);
+  const acpHarnessId =
+    composerSession?.harnessNamespace ??
+    (sessionHarness?.startsWith("acp:") ? sessionHarness : undefined);
+  const acpPermissionControl = sessionHarness === "acp" || sessionHarness?.startsWith("acp:");
+  const acpHostId = composerSession?.effectiveHostId ?? composerSession?.hostId;
+  const [acpCatalog, setAcpCatalog] = useState<CallingDefaultsCatalogRow | null>(null);
+  useEffect(() => {
+    let current = true;
+    setAcpCatalog(null);
+    if (acpPermissionControl && acpHostId && acpHarnessId) {
+      void listCallingDefaultCatalogs()
+        .then((rows) => {
+          if (current)
+            setAcpCatalog(
+              rows.find((row) => row.host_id === acpHostId && row.harness === acpHarnessId) ?? null,
+            );
+        })
+        .catch(() => {
+          if (current) setAcpCatalog(null);
+        });
+    }
+    return () => {
+      current = false;
+    };
+  }, [acpPermissionControl, acpHostId, acpHarnessId]);
+  const acpMode = composerSession?.labels?.["omnigent.acp.session_mode"] ?? "";
+  const acpOptions =
+    acpCatalog !== null && acpCatalog.host_id === acpHostId && acpCatalog.harness === acpHarnessId
+      ? (acpCatalog.permission_options ?? [])
+      : [];
   const tierPermissionControl = composerSession?.permissionTierState != null;
   const claudePermissionMode = tierPermissionControl
     ? (composerSession?.permissionTier ?? "")
@@ -3217,6 +3252,13 @@ function ComposerImpl(
   const devinPermissionControl = modelPickerKind === "devin";
   const sdkPermissionControl = modelPickerKind === "sdk";
   const permissionOptions =
+    (acpPermissionControl
+      ? acpOptions.map((option) => ({
+          ...option,
+          description:
+            option.description ?? "Sets the agent's own mode. What it covers is up to the agent.",
+        }))
+      : null) ??
     (sdkPermissionControl ? sdkPermissionOptions(sessionHarness) : null) ??
     (showClaudePermissionMode
       ? tierPermissionControl
@@ -3225,25 +3267,29 @@ function ComposerImpl(
           ? DEVIN_NATIVE_PERMISSION_MODES
           : CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES
       : CODEX_NATIVE_RUNTIME_PERMISSION_OPTIONS);
-  const permissionLabel = showClaudePermissionMode
-    ? tierPermissionControl
-      ? composerSession?.permissionTierState === "blocked"
-        ? PERMISSION_TIER_BLOCKED
-        : (AGY_NATIVE_PERMISSION_TIERS.find((tier) => tier.value === claudePermissionMode)?.label ??
-          "Permission state unconfirmed")
-      : devinPermissionControl
-        ? (DEVIN_NATIVE_PERMISSION_MODES.find((m) => m.value === claudePermissionMode)?.label ??
-          claudePermissionMode)
-        : claudePermissionModeLabel(claudePermissionMode)
-    : sdkPermissionControl
-      ? (permissionOptions.find((mode) => mode.value === codexApprovalMode)?.label ??
-        codexApprovalMode)
-      : (nativePermissionReadback?.value ?? codexApprovalModeLabel(codexApprovalMode));
+  const permissionLabel = acpPermissionControl
+    ? (acpOptions.find((option) => option.value === acpMode)?.label ?? acpMode)
+    : showClaudePermissionMode
+      ? tierPermissionControl
+        ? composerSession?.permissionTierState === "blocked"
+          ? PERMISSION_TIER_BLOCKED
+          : (AGY_NATIVE_PERMISSION_TIERS.find((tier) => tier.value === claudePermissionMode)
+              ?.label ?? "Permission state unconfirmed")
+        : devinPermissionControl
+          ? (DEVIN_NATIVE_PERMISSION_MODES.find((m) => m.value === claudePermissionMode)?.label ??
+            claudePermissionMode)
+          : claudePermissionModeLabel(claudePermissionMode)
+      : sdkPermissionControl
+        ? (permissionOptions.find((mode) => mode.value === codexApprovalMode)?.label ??
+          codexApprovalMode)
+        : (nativePermissionReadback?.value ?? codexApprovalModeLabel(codexApprovalMode));
   const selectedPermissionMode = showClaudePermissionMode
     ? claudePermissionMode
     : codexApprovalMode;
   const permissionControlInteractive =
-    (showClaudePermissionMode || showCodexApprovalMode) &&
+    (showClaudePermissionMode ||
+      showCodexApprovalMode ||
+      (acpPermissionControl && acpOptions.length > 0)) &&
     !isReadOnly &&
     !unreachable &&
     !nativePermissionOffline &&
@@ -3266,7 +3312,11 @@ function ComposerImpl(
   );
   const currentPermissionMode = (): string => {
     const state = useChatStore.getState();
-    return showClaudePermissionMode ? state.claudePermissionMode : state.codexApprovalMode;
+    return acpPermissionControl
+      ? acpMode
+      : showClaudePermissionMode
+        ? state.claudePermissionMode
+        : state.codexApprovalMode;
   };
   const changePermission = async (mode: string): Promise<boolean> => {
     if (
@@ -3284,7 +3334,12 @@ function ComposerImpl(
     const sourceSessionId = useChatStore.getState().conversationId;
     try {
       const store = useChatStore.getState();
-      if (
+      if (acpPermissionControl && sourceSessionId) {
+        const updated = await updateSession(sourceSessionId, { claudePermissionMode: mode });
+        chatQueryClient()?.setQueryData(["session", sourceSessionId], updated);
+        void chatQueryClient()?.invalidateQueries({ queryKey: ["session", sourceSessionId] });
+        return updated.labels?.["omnigent.acp.session_mode"] === mode;
+      } else if (
         tierPermissionControl &&
         sourceSessionId &&
         composerSession?.permissionTierRevision != null
@@ -5071,7 +5126,10 @@ function ComposerImpl(
                   onReconnect={onShowReconnectHelp}
                 />
               )}
-              {(showClaudePermissionMode || showCodexApprovalMode) &&
+              {(showClaudePermissionMode ||
+                showCodexApprovalMode ||
+                (acpPermissionControl && acpOptions.length > 0) ||
+                false) &&
                 (!nativePermissionControl || nativePermissionReadback) && (
                   <ComposerPermissionPicker
                     label="Permission mode"
@@ -5079,11 +5137,13 @@ function ComposerImpl(
                     harness={sessionHarness}
                     readback={nativePermissionReadback}
                     selectedValue={
-                      nativePermissionControl
-                        ? nativePermissionReadback?.selectedValue
-                        : showClaudePermissionMode
-                          ? claudePermissionMode
-                          : codexApprovalMode
+                      acpPermissionControl
+                        ? acpMode
+                        : nativePermissionControl
+                          ? nativePermissionReadback?.selectedValue
+                          : showClaudePermissionMode
+                            ? claudePermissionMode
+                            : codexApprovalMode
                     }
                     options={
                       sessionHarness === "antigravity-native"
@@ -5736,6 +5796,15 @@ function SessionHarnessPicker({
         refreshRequestId.current !== requestId
       )
         return;
+      const current = useChatStore.getState();
+      // Older hosts may answer a probe with an empty cache while the snapshot
+      // already carries the agent's live catalog.
+      if (
+        models.length === 0 &&
+        current.codexModelOptions.length > 0 &&
+        (modelPickerKind === "acp" || current.sessionHarness === "pi")
+      )
+        return;
       useChatStore.setState({ codexModelOptions: models });
       chatQueryClient()?.setQueryData<Session>(["session", sourceSessionId], (session) =>
         session ? { ...session, codexModelOptions: models } : session,
@@ -5976,6 +6045,17 @@ function SessionHarnessPicker({
               )}
               {refreshError && <div role="alert">{refreshError}</div>}
             </div>
+            {modelPickerKind === "acp" && modelOptions.length < 2 && (
+              <Input
+                aria-label="Model"
+                placeholder="Agent's default"
+                defaultValue={pickerSelectedModel ?? ""}
+                onKeyDown={(event) => {
+                  event.stopPropagation();
+                  if (event.key === "Enter") selectModel(event.currentTarget.value.trim() || null);
+                }}
+              />
+            )}
             {!inferenceConfigured && modelPickerKind !== "configured" && (
               <button
                 type="button"
@@ -6450,25 +6530,29 @@ function useResolvedComposerModel(
   // highlight, and the hover summary all resolve from it alone. The user's
   // request (`sessionModelOverride`) is input, never display state — rendering
   // a request as if it were truth is exactly how a record/pane divergence hides.
-  const isReportedModelPicker = modelPickerKind === "claude" || modelPickerKind === "codex";
+  const isReportedModelPicker =
+    modelPickerKind === "claude" || modelPickerKind === "codex" || modelPickerKind === "acp";
   const pickerSelectedModel =
-    modelPickerKind === "sdk" || modelPickerKind === "acp" || modelPickerKind === "antigravity"
+    modelPickerKind === "sdk" || modelPickerKind === "antigravity"
       ? (sessionModelOverride ?? llmModel)
       : selectedModelForPicker(modelPickerKind, codexModelOptions, sessionModelOverride, llmModel);
-  const effectiveModel = sessionModelSeeded
-    ? (sessionModelOverride ?? llmModel)
-    : nativeVendorOwnsModel
-      ? modelPickerKind === "cursor" || modelPickerKind === "kiro"
-        ? sessionModelOverride
-        : modelPickerKind === "opencode" ||
-            modelPickerKind === "pi" ||
-            modelPickerKind === "devin" ||
-            modelPickerKind === "antigravity"
-          ? (sessionModelOverride ?? llmModel)
-          : null
-      : isReportedModelPicker
-        ? llmModel
-        : (sessionModelOverride ?? llmModel);
+  const effectiveModel =
+    modelPickerKind === "acp"
+      ? (llmModel ?? sessionModelOverride)
+      : sessionModelSeeded
+        ? (sessionModelOverride ?? llmModel)
+        : nativeVendorOwnsModel
+          ? modelPickerKind === "cursor" || modelPickerKind === "kiro"
+            ? sessionModelOverride
+            : modelPickerKind === "opencode" ||
+                modelPickerKind === "pi" ||
+                modelPickerKind === "devin" ||
+                modelPickerKind === "antigravity"
+              ? (sessionModelOverride ?? llmModel)
+              : null
+          : isReportedModelPicker
+            ? llmModel
+            : (sessionModelOverride ?? llmModel);
   const {
     label: modelLabel,
     loading: modelLabelLoading,

@@ -50,7 +50,7 @@ import {
   missingCellText,
   type LayeredLevel,
 } from "@/lib/layeredValues";
-import { effortLevelsFor, reconcileEffortOnModelChange } from "@/lib/modelEffortOptions";
+import { startEffortLevelsFor, reconcileEffortOnModelChange } from "@/lib/modelEffortOptions";
 import { reconcileSpeed } from "@/lib/speedTiers";
 import { sessionModeHandler, sessionDefaultModeOptions } from "@/lib/sessionDefaultModes";
 import type { HarnessCapabilityMap } from "@/lib/sessionDefaultModes";
@@ -128,6 +128,7 @@ function AgentLayerEditor({
   from,
   options,
   header,
+  startOnlyEffort,
   hostWins,
   skipped,
   canPromote,
@@ -147,6 +148,7 @@ function AgentLayerEditor({
   from: string;
   options: readonly PermissionOption[];
   header: boolean;
+  startOnlyEffort?: boolean;
   hostWins?: boolean;
   skipped: (value: string) => string[];
   canPromote: boolean;
@@ -229,6 +231,9 @@ function AgentLayerEditor({
       <div className="flex min-w-0 flex-col gap-1.5">
         <span className="inline-flex items-center gap-1.5 text-sm font-medium">
           {FIELDS.find((item) => item.value === field)?.label}
+          {startOnlyEffort && (
+            <HelpTip label="About this thinking setting">Applies when a chat starts.</HelpTip>
+          )}
           {field === "speed" && ["claude-native", "claude-sdk"].includes(harness) && (
             <ClaudeFastModeHelp />
           )}
@@ -272,6 +277,12 @@ function AgentLayerEditor({
           </Select>
         )}
       </div>
+      {field === "permission" && harness.startsWith("acp:") && value && (
+        <p className="text-sm text-muted-foreground">
+          {options.find((option) => option.value === value)?.description ??
+            "Sets the agent's own mode. What it covers is up to the agent."}
+        </p>
+      )}
       {field === "model" && options.length > 0 && (
         <LayeredEditorAction onClick={() => setCustom(!custom)}>
           {custom ? "Choose a model" : "Enter another model"}
@@ -347,7 +358,7 @@ export function AgentDefaultsTable({
       (col ? [col] : hostList.map((host) => host.host_id)).flatMap((host) => {
         const rows = models(row, host);
         const model = resolveAgentMasterField(master, host, row, "model", capabilities).value;
-        return effortLevelsFor(row, rows, typeof model === "string" ? model : null) ?? [];
+        return startEffortLevelsFor(row, rows, typeof model === "string" ? model : null);
       }),
     ),
   ];
@@ -406,6 +417,16 @@ export function AgentDefaultsTable({
         ? optionsFor(row, col).find((option) => option.value === value)?.label
         : CONCEPT_LABELS[value]) ?? value
     );
+  };
+  const displayValue = (value: unknown, row: string, col?: string) => {
+    const labelText = valueLabel(value, row, col);
+    const fullAccess =
+      field === "permission" &&
+      typeof value === "string" &&
+      permissions(row, col).some(
+        (option) => option.value === value && option.concept === "full-access",
+      );
+    return fullAccess ? <span className="text-destructive">{labelText}</span> : labelText;
   };
   function save(next: CallingDefaultsTable, message = "Saved") {
     setUndo({ before: master, after: next });
@@ -513,6 +534,13 @@ export function AgentDefaultsTable({
         }
         options={options}
         header={header}
+        startOnlyEffort={
+          field === "effort" &&
+          row.startsWith("acp:") &&
+          models(row, col === "*" ? undefined : col).some(
+            (model) => (model.start_efforts?.length ?? 0) > 0 && !model.efforts?.length,
+          )
+        }
         hostWins={at.level === "col" ? !!layers.hostWins?.[col] : undefined}
         skipped={(value) =>
           affectedRows
@@ -630,7 +658,7 @@ export function AgentDefaultsTable({
             </Link>
           ) : undefined,
           detail: master["*"]?.[row]?.[field]
-            ? valueLabel(master["*"][row][field], row)
+            ? displayValue(master["*"][row][field], row)
             : undefined,
           mark:
             master["*"]?.[row]?.[field] !== undefined &&
@@ -681,7 +709,7 @@ export function AgentDefaultsTable({
           return {
             content: (
               <>
-                {valueLabel(resolved.value, resolved.parent ?? row, col)}
+                {displayValue(resolved.value, resolved.parent ?? row, col)}
                 {resolved.parent && (
                   <span className="block text-xs text-muted-foreground">
                     Follows {label(resolved.parent)}

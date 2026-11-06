@@ -32,8 +32,8 @@ from __future__ import annotations
 import math
 import re
 import shutil
-from collections.abc import Iterable
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
 
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.onboarding.provider_config import load_config
@@ -81,6 +81,33 @@ class AcpAgentEntry:
     inject_system_prompt: bool = True
     env_passthrough: tuple[str, ...] = ()
     init_timeout_s: float = 30.0
+    permission_concepts: Mapping[str, str] = field(default_factory=dict)
+
+
+def parse_permission_concepts(raw: object) -> dict[str, str]:
+    """Read owner-declared meanings; agent mode ids carry no implicit meaning."""
+    if raw is None:
+        return {}
+    concepts = {"manual", "edit-automatic", "automatic", "read-only", "full-access"}
+    if not isinstance(raw, dict) or any(
+        not isinstance(key, str) or not key or not isinstance(value, str) or value not in concepts
+        for key, value in raw.items()
+    ):
+        raise ValueError("acp agent permission_concepts must map mode ids to permission concepts")
+    return dict(raw)
+
+
+def classify_permission_options(
+    rows: list[dict[str, str]], concepts: Mapping[str, str]
+) -> list[dict[str, str]]:
+    """Attach only the owner's meaning, never one supplied by an agent."""
+    return [
+        {
+            **{key: value for key, value in row.items() if key != "concept"},
+            **({"concept": concepts[row["value"]]} if row["value"] in concepts else {}),
+        }
+        for row in rows
+    ]
 
 
 def slugify(name: str) -> str:
@@ -199,6 +226,7 @@ def acp_agents(config: dict[str, object] | None = None) -> list[AcpAgentEntry]:
                 inject_system_prompt=inject_system_prompt,
                 env_passthrough=parse_env_passthrough(raw.get("env_passthrough")),
                 init_timeout_s=parse_init_timeout_s(raw.get("init_timeout_s", 30.0)),
+                permission_concepts=parse_permission_concepts(raw.get("permission_concepts")),
             )
         )
     return entries
@@ -265,6 +293,8 @@ def acp_agents_settings(entries: list[AcpAgentEntry]) -> dict[str, object]:
             item["env_passthrough"] = list(e.env_passthrough)
         if e.init_timeout_s != 30.0:
             item["init_timeout_s"] = e.init_timeout_s
+        if e.permission_concepts:
+            item["permission_concepts"] = dict(e.permission_concepts)
         agents.append(item)
     return {ACP_CONFIG_KEY: {_AGENTS_FIELD: agents}}
 

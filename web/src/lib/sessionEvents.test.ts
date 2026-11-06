@@ -1650,6 +1650,25 @@ describe("session.permission_mode (FLAT envelope)", () => {
     expect(ev.permissionMode).toBe("auto");
   });
 
+  it.each([undefined, "selection-a"])(
+    "parses ACP readback with selection identity %s",
+    (selectionId) => {
+      const [event] = parse("session.permission_mode", {
+        conversation_id: "conv_acp",
+        permission_mode: "plan",
+        harness: "acp",
+        requested_mode: "yolo",
+        ...(selectionId !== undefined ? { selection_id: selectionId } : {}),
+      }) as SessionPermissionModeEvent[];
+      expect(event).toMatchObject({
+        harness: "acp",
+        permissionMode: "plan",
+        requestedMode: "yolo",
+      });
+      expect(event.selectionId).toBe(selectionId);
+    },
+  );
+
   it("carries the confirmed tier revision and recovery state", () => {
     const [event] = parse("session.permission_mode", {
       conversation_id: "conv_pi",

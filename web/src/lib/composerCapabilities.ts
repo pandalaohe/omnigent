@@ -38,7 +38,7 @@ export function selectedModelForPicker(
   requestedModel: string | null,
   reportedModel: string | null,
 ): string | null {
-  if (kind === "claude" || kind === "codex") {
+  if (kind === "claude" || kind === "codex" || kind === "acp") {
     const model = reportedModel || requestedModel;
     return model ? (findModelLabelOption(options, model)?.id ?? model) : null;
   }
@@ -114,7 +114,7 @@ export function modelPickerKindForConv(
       }
     | null
     | undefined,
-  modelOptions: readonly NativeModelOption[] = [],
+  _modelOptions: readonly NativeModelOption[] = [],
 ): NativeModelPickerKind | null {
   switch (effectiveWrapperLabel(conv)) {
     case "claude-code-native-ui":
@@ -147,10 +147,11 @@ export function modelPickerKindForConv(
       return "pi";
     default:
       if (conv?.inferenceConfigured) return "configured";
-      if (isSdkHarnessSession(conv)) return "sdk";
+      if (isSdkHarnessSession(conv) || (conv?.harness === "pi" && !effectiveWrapperLabel(conv)))
+        return "sdk";
       // Generic ACP sessions carry no wrapper label; the server canonicalizes
       // ``acp:<slug>`` ids to "acp" in the snapshot's harness field.
-      if (conv?.harness === "acp" && modelOptions.length > 1) return "acp";
+      if (conv?.harness === "acp" || conv?.harness?.startsWith("acp:")) return "acp";
       return null;
   }
 }

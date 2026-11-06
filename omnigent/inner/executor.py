@@ -142,6 +142,15 @@ class ExecutorEvent:
 
 
 @dataclass
+class SessionModeChanged(ExecutorEvent):
+    """Agent mode readback fenced to the selection applied by this turn."""
+
+    mode: str
+    requested_mode: str
+    selection_id: str | None = None
+
+
+@dataclass
 class TextChunk(ExecutorEvent):
     """Streaming text output.
 

@@ -9884,6 +9884,162 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
   });
 
   describe("session.permission_mode", () => {
+    it("accepts successive ACP readbacks for one selection and rejects older selections", () => {
+      useChatStore.setState({ conversationId: "conv_acp", claudePermissionMode: "default" });
+      const key = ["session", "conv_acp"];
+      const labels = {
+        "omnigent.acp.session_mode": "go",
+        "omnigent.acp.session_mode_selection": "selection-a",
+        other: "preserved",
+      };
+      client.setQueryData(key, { labels });
+      const report = {
+        type: "session_permission_mode" as const,
+        conversationId: "conv_acp",
+        harness: "acp" as const,
+        requestedMode: "go",
+        selectionId: "selection-a",
+      };
+      for (const permissionMode of ["review", "manual"]) {
+        handleSessionEvent({ ...report, permissionMode });
+        expect(client.getQueryData<{ labels: Record<string, string> }>(key)?.labels).toEqual({
+          ...labels,
+          "omnigent.acp.session_mode": permissionMode,
+        });
+      }
+      // The mode text can repeat across distinct user selections.
+      const newerLabels = { ...labels, "omnigent.acp.session_mode_selection": "selection-b" };
+      client.setQueryData(key, { labels: newerLabels });
+      handleSessionEvent({ ...report, permissionMode: "manual" });
+      expect(client.getQueryData<{ labels: Record<string, string> }>(key)?.labels).toEqual(
+        newerLabels,
+      );
+      expect(client.getQueryState(key)?.isInvalidated).toBe(false);
+      client.setQueryData(["session", "conv_other"], { labels });
+      handleSessionEvent({ ...report, conversationId: "conv_other", permissionMode: "manual" });
+      expect(
+        client.getQueryData<{ labels: Record<string, string> }>(["session", "conv_other"])?.labels,
+      ).toEqual(labels);
+      expect(useChatStore.getState().claudePermissionMode).toBe("default");
+    });
+
+    it.each([true, false])(
+      "refreshes a legacy ACP snapshot after the server seeds its selection (active=%s)",
+      async (active) => {
+        const id = "conv_legacy_acp";
+        const key = ["session", id];
+        seedSession(id);
+        sessionLabels.set(id, { "omnigent.acp.session_mode": "go" });
+        const options = { queryKey: key, queryFn: () => getSessionSlim(id), staleTime: Infinity };
+        await client.fetchQuery(options);
+        if (active) {
+          const observer = new QueryObserver(client, options);
+          onTestFinished(observer.subscribe(() => {}));
+        }
+        useChatStore.setState({ conversationId: id, claudePermissionMode: "default" });
+        const confirmed = {
+          "omnigent.acp.session_mode": "review",
+          "omnigent.acp.session_mode_selection": "go",
+        };
+        sessionLabels.set(id, confirmed);
+        const report = {
+          type: "session_permission_mode" as const,
+          conversationId: id,
+          harness: "acp" as const,
+          requestedMode: "go",
+          selectionId: "go",
+        };
+        handleSessionEvent({ ...report, permissionMode: "review" });
+        await vi.waitFor(() => {
+          expect(client.getQueryData<Session>(key)?.labels).toEqual(confirmed);
+        });
+        handleSessionEvent({ ...report, permissionMode: "manual" });
+        expect(client.getQueryData<Session>(key)?.labels?.["omnigent.acp.session_mode"]).toBe(
+          "manual",
+        );
+        expect(useChatStore.getState().claudePermissionMode).toBe("default");
+      },
+    );
+
+    it("refreshes past an in-flight snapshot from before the ACP selection seed", async () => {
+      const id = "conv_legacy_inflight";
+      const key = ["session", id];
+      seedSession(id);
+      sessionLabels.set(id, { "omnigent.acp.session_mode": "go" });
+      const legacy = await getSessionSlim(id);
+      const confirmed = {
+        ...legacy,
+        labels: {
+          "omnigent.acp.session_mode": "review",
+          "omnigent.acp.session_mode_selection": "go",
+        },
+      };
+      let finishInitial!: (session: Session) => void;
+      const initialResponse = new Promise<Session>((resolve) => {
+        finishInitial = resolve;
+      });
+      const queryFn = vi.fn().mockReturnValueOnce(initialResponse).mockResolvedValue(confirmed);
+      const initial = client
+        .fetchQuery({ queryKey: key, queryFn, staleTime: Infinity })
+        .catch(() => undefined);
+      useChatStore.setState({ conversationId: id });
+      sessionLabels.set(id, confirmed.labels);
+      handleSessionEvent({
+        type: "session_permission_mode",
+        conversationId: id,
+        harness: "acp",
+        requestedMode: "go",
+        selectionId: "go",
+        permissionMode: "review",
+      });
+      await vi.waitFor(() =>
+        expect(client.getQueryData<Session>(key)?.labels).toEqual(confirmed.labels),
+      );
+      finishInitial(legacy);
+      await initial;
+      expect(client.getQueryData<Session>(key)?.labels).toEqual(confirmed.labels);
+    });
+
+    it("applies ACP readback only to the matching request and session", () => {
+      useChatStore.setState({ conversationId: "conv_acp", claudePermissionMode: "default" });
+      client.setQueryData(["session", "conv_acp"], {
+        labels: { "omnigent.acp.session_mode": "yolo", other: "preserved" },
+      });
+      handleSessionEvent({
+        type: "session_permission_mode",
+        conversationId: "conv_acp",
+        harness: "acp",
+        permissionMode: "plan",
+        requestedMode: "yolo",
+      });
+      expect(
+        client.getQueryData<{ labels: Record<string, string> }>(["session", "conv_acp"])?.labels,
+      ).toEqual({ "omnigent.acp.session_mode": "plan", other: "preserved" });
+      expect(useChatStore.getState().claudePermissionMode).toBe("default");
+      client.setQueryData(["session", "conv_acp"], {
+        labels: { "omnigent.acp.session_mode": "newer" },
+      });
+      handleSessionEvent({
+        type: "session_permission_mode",
+        conversationId: "conv_acp",
+        harness: "acp",
+        permissionMode: "plan",
+        requestedMode: "yolo",
+      });
+      expect(
+        client.getQueryData<{ labels: Record<string, string> }>(["session", "conv_acp"])?.labels[
+          "omnigent.acp.session_mode"
+        ],
+      ).toBe("newer");
+      handleSessionEvent({
+        type: "session_permission_mode",
+        conversationId: "conv_other",
+        harness: "acp",
+        permissionMode: "plan",
+      });
+      expect(client.getQueryData(["session", "conv_other"])).toBeUndefined();
+    });
+
     it("moves the picker to a mode switched inside the terminal", () => {
       // A shift+tab in the Claude TUI emits no event of its own; the
       // forwarder observes the pane footer and the server republishes it
@@ -9893,6 +10049,8 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         type: "session_permission_mode",
         conversationId: "conv_abc",
         permissionMode: "auto",
+        selectionId: "unrelated-acp-selection",
+        requestedMode: "go",
       });
       expect(useChatStore.getState().claudePermissionMode).toBe("auto");
     });

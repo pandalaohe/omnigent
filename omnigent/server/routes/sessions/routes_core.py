@@ -82,6 +82,8 @@ from omnigent.runtime import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.sdk_permission_modes import (
+    ACP_SESSION_MODE_LABEL_KEY,
+    ACP_SESSION_MODE_SELECTION_LABEL_KEY,
     CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY,
     CODEX_SDK_APPROVAL_MODE_LABEL_KEY,
     CODEX_SDK_APPROVAL_MODES,
@@ -1146,7 +1148,20 @@ def register_core_routes(
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is None:
             raise _session_not_found()
+        from omnigent.server.routes._session_create_validation import session_acp_harness
+        from omnigent.server.routes._sessions import orchestration as catalog_routes
+
+        acp_harness = await asyncio.to_thread(session_acp_harness, conv, agent_store, agent_cache)
         cached = _model_options_cache.get(session_id)
+        curated = (
+            await catalog_routes._load_acp_model_options(session_id, conv, agent_store)
+            if acp_harness
+            else []
+        )
+        if acp_harness:
+            cached = catalog_routes._acp_model_options_with_effort(
+                curated, catalog_routes._acp_effort_options_cache.get(session_id, [])
+            )
         if refresh is None or (
             refresh == "auto"
             and cached is not None
@@ -1156,13 +1171,14 @@ def register_core_routes(
 
         async def probe() -> list[dict[str, Any]]:
             wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
-            if wrapper is not None:
+            client = await _get_runner_client(session_id, runner_router) if acp_harness else None
+            if wrapper is not None or client is not None:
                 from omnigent.server.routes._sessions.common import (
                     _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER,
                 )
 
-                legacy_endpoint = _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER.get(wrapper)
-                if legacy_endpoint is None:
+                legacy_endpoint = _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER.get(wrapper or "")
+                if legacy_endpoint is None and not acp_harness:
                     raise HTTPException(status_code=409, detail="session catalog is push-owned")
                 client = await _get_runner_client(session_id, runner_router)
                 if client is None:
@@ -1171,7 +1187,7 @@ def register_core_routes(
                     response = await client.get(
                         f"/v1/sessions/{session_id}/model-options", timeout=10.0
                     )
-                    if response.status_code == 404:
+                    if response.status_code == 404 and legacy_endpoint:
                         response = await client.get(
                             f"/v1/sessions/{session_id}/{legacy_endpoint}", timeout=10.0
                         )
@@ -1186,11 +1202,16 @@ def register_core_routes(
                 from omnigent.server.routes._sessions.common import get_server_host_registry
                 from omnigent.server.routes.hosts import _proxy_model_options
 
-                harness = canonicalize_harness(
+                harness = acp_harness or canonicalize_harness(
                     _resolve_harness(conv, agent_store=agent_store, agent_cache=agent_cache)
                 )
                 registry = get_server_host_registry()
-                connection = registry.get(conv.host_id) if registry and conv.host_id else None
+                catalog_host_id = await asyncio.to_thread(
+                    effective_host_id, conversation_store, conv
+                )
+                connection = (
+                    registry.get(catalog_host_id) if registry and catalog_host_id else None
+                )
                 if registry is None or connection is None or harness is None:
                     raise HTTPException(status_code=503, detail="session host unavailable")
                 result = await _proxy_model_options(
@@ -1210,7 +1231,11 @@ def register_core_routes(
                 ) from exc
             if not options and cached:
                 raise HTTPException(status_code=502, detail="empty session model catalog")
-            _model_options_cache[session_id] = options
+            if acp_harness:
+                catalog_routes._acp_effort_options_cache[session_id] = options
+                options = catalog_routes._acp_model_options_with_effort(curated, options)
+            else:
+                _model_options_cache[session_id] = options
             model_refresh_at[session_id] = time.monotonic()
             _publish_model_options(session_id)
             return options
@@ -5773,6 +5798,7 @@ def register_core_routes(
         permission_mode_requested = "permission_mode" in body.model_fields_set
         requested_permission_mode: str | None = None
         sdk_permission_mode = False
+        acp_permission_mode = False
         agy_permission_mode = False
         if permission_mode_requested:
             if body.permission_mode is None:
@@ -5792,7 +5818,33 @@ def register_core_routes(
             wrapper_for_permission_mode = conv_for_permission_mode.labels.get(
                 _CLAUDE_NATIVE_WRAPPER_LABEL_KEY
             )
-            if wrapper_for_permission_mode == _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE:
+            from omnigent.server.routes._session_create_validation import (
+                cached_acp_permission_options,
+                require_acp_permission_mode,
+                session_acp_harness,
+            )
+
+            permission_harness = await asyncio.to_thread(
+                session_acp_harness, conv_for_permission_mode, agent_store, agent_cache
+            )
+            if permission_harness and (
+                permission_harness == "acp" or permission_harness.startswith("acp:")
+            ):
+                permission_host_id = await asyncio.to_thread(
+                    effective_host_id, conversation_store, conv_for_permission_mode
+                )
+                options = await cached_acp_permission_options(
+                    request, permission_host_id, permission_harness
+                )
+                require_acp_permission_mode(
+                    body.permission_mode,
+                    options,
+                    permission_harness,
+                    permission_host_id,
+                )
+                allowed_permission_modes = tuple(row["value"] for row in options)
+                acp_permission_mode = True
+            elif wrapper_for_permission_mode == _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE:
                 allowed_permission_modes: tuple[str, ...] = tuple(_CLAUDE_NATIVE_PERMISSION_MODES)
             elif wrapper_for_permission_mode == ANTIGRAVITY_NATIVE_WRAPPER_VALUE:
                 agy_permission_mode = True
@@ -6682,6 +6734,7 @@ def register_core_routes(
             )
         if (
             requested_permission_mode is not None
+            and not acp_permission_mode
             and live_forward
             and (not sdk_permission_mode or sdk_runner_bound)
         ):
@@ -6749,6 +6802,20 @@ def register_core_routes(
                     )
         if requested_permission_mode is not None and sdk_permission_mode and live_forward:
             labels_to_set[CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY] = requested_permission_mode
+        if requested_permission_mode is not None and acp_permission_mode:
+            labels_to_set[ACP_SESSION_MODE_LABEL_KEY] = requested_permission_mode
+            selection_id = secrets.token_hex(16)
+            labels_to_set[ACP_SESSION_MODE_SELECTION_LABEL_KEY] = selection_id
+            if live_forward:
+                await _forward_session_change_to_runner(
+                    session_id,
+                    runner_router,
+                    {
+                        "type": "permission_mode_change",
+                        "permission_mode": requested_permission_mode,
+                        "selection_id": selection_id,
+                    },
+                )
         if (
             requested_codex_approval_mode is not None
             and live_forward
@@ -7277,6 +7344,8 @@ def register_core_routes(
             from omnigent.mcp_selection import MCP_SELECTION_PREFIX
 
             dropped_label_keys_set.add(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
+            dropped_label_keys_set.add(ACP_SESSION_MODE_LABEL_KEY)
+            dropped_label_keys_set.add(ACP_SESSION_MODE_SELECTION_LABEL_KEY)
             dropped_label_keys_set.add("omnigent:agent-template-id")
             # A joint session's frozen member roster belongs to the source
             # agent; on an agent switch the fork must not inherit it (the
@@ -7343,13 +7412,40 @@ def register_core_routes(
                 code=ErrorCode.INVALID_INPUT,
             )
         if body.permission_mode is not None:
+            from omnigent.server.routes._session_create_validation import (
+                cached_acp_permission_options,
+                require_acp_permission_mode,
+            )
             from omnigent.session_default_modes import apply_mode, valid_mode
 
-            if not valid_mode(body.permission_mode, target_harness, "permission", "create"):
+            if target_harness == "acp":
+                from omnigent.server.routes._sessions.orchestration import _create_resolved_harness
+
+                target_harness = await asyncio.to_thread(
+                    _create_resolved_harness,
+                    base_agent,
+                    None if switching_agent else source.harness_override,
+                    agent_cache,
+                )
+            permission_host_id = await asyncio.to_thread(
+                effective_host_id, conversation_store, source
+            )
+            acp_options = await cached_acp_permission_options(
+                request, permission_host_id, target_harness
+            )
+            if target_harness and (target_harness == "acp" or target_harness.startswith("acp:")):
+                require_acp_permission_mode(
+                    body.permission_mode, acp_options, target_harness, permission_host_id
+                )
+            if not valid_mode(
+                body.permission_mode, target_harness, "permission", "create", acp_options
+            ):
                 raise OmnigentError(
                     "Unsupported fork permission mode", code=ErrorCode.INVALID_INPUT
                 )
-            application = apply_mode(target_harness, "permission", body.permission_mode)
+            application = apply_mode(
+                target_harness, "permission", body.permission_mode, acp_options=acp_options
+            )
             if application.tier is not None:
                 raise OmnigentError(
                     "Use permission_tier for tiered forks", code=ErrorCode.INVALID_INPUT
@@ -7910,6 +8006,8 @@ def register_core_routes(
                 _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY,
                 CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY,
                 CODEX_SDK_APPROVAL_MODE_LABEL_KEY,
+                ACP_SESSION_MODE_LABEL_KEY,
+                ACP_SESSION_MODE_SELECTION_LABEL_KEY,
                 AUTO_HARNESS_LABEL_KEY,
                 "omnigent:agent-template-id",
             )

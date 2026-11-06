@@ -723,11 +723,11 @@ def test_usage_with_active_model_skips_stamp_when_model_unknown() -> None:
     assert ex._usage_with_active_model({"usage": {"totalTokens": 15}}) == {"total_tokens": 15}
 
 
-def test_usage_with_active_model_is_none_when_no_usage_reported() -> None:
-    """No usage on the result → ``None`` (never a model-only dict)."""
+def test_usage_with_active_model_reports_model_without_token_counts() -> None:
+    """An agent with notification-only usage still reports its actual model."""
     ex = AcpExecutor(AcpAgentConfig(command="x"))
     ex._active_model = "system.ai.claude-haiku-4-5"
-    assert ex._usage_with_active_model({}) is None
+    assert ex._usage_with_active_model({}) == {"model": "system.ai.claude-haiku-4-5"}
 
 
 def test_in_progress_tool_update_emits_nothing() -> None:

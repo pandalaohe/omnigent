@@ -211,7 +211,8 @@ import {
 } from "./projectPrefill";
 import { callingLastContext, resolveCallingSeed } from "@/lib/callingDefaultsSeed";
 import { recordCallingLast, callingDefaultHasModels } from "@/lib/callingDefaults";
-import type { CallingDefaultsProblem } from "@/lib/callingDefaultsApi";
+import { HelpTip } from "@/components/HelpTip";
+import { listCallingDefaultCatalogs, type CallingDefaultsProblem } from "@/lib/callingDefaultsApi";
 import { getCliServerUrl, getOmnigentHostConfig } from "@/lib/host";
 import { quoteShellArgument } from "@/lib/shell";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
@@ -377,7 +378,11 @@ import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation, ProjectSummary } from "@/hooks/useConversations";
 import { effectiveWorktree, type NativeModelOption } from "@/lib/types";
 import { codexEffortLevelsForModel } from "@/lib/codexNativeModels";
-import { effortLevelsFor, reconcileEffortOnModelChange } from "@/lib/modelEffortOptions";
+import {
+  effortLevelsFor,
+  startEffortLevelsFor,
+  reconcileStartEffortOnModelChange,
+} from "@/lib/modelEffortOptions";
 import {
   currentFusionCombo,
   fusionModelLabel,
@@ -3696,6 +3701,7 @@ export function NewChatLandingScreen() {
   const selectionHarness =
     selectedNativeHarness ??
     sdkHarness ??
+    (selectedAgent?.harness?.startsWith("acp:") ? selectedAgent.harness : null) ??
     (activeSdk &&
     (sessionModeHandler(activeSdk, "permission", harnessCapabilities) ||
       sessionModeHandler(activeSdk, "speed", harnessCapabilities) ||
@@ -3974,6 +3980,18 @@ export function NewChatLandingScreen() {
           })),
     [availablePiModels, sandboxSelected, sandboxCatalog],
   );
+  const acpHarness = selectionHarness?.startsWith("acp:") ? selectionHarness : null;
+  const { data: callingCatalogs } = useQuery({
+    queryKey: ["calling-default-catalogs"],
+    queryFn: listCallingDefaultCatalogs,
+    enabled: acpHarness !== null && selectedHostId !== null,
+  });
+  const acpPermissionOptions = useMemo(
+    () =>
+      callingCatalogs?.find((row) => row.host_id === selectedHostId && row.harness === acpHarness)
+        ?.permission_options ?? [],
+    [callingCatalogs, selectedHostId, acpHarness],
+  );
   const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
   const supportsAgyMode =
     selectionHarness !== null && callingDefaultHasModels(selectionHarness, harnessCapabilities);
@@ -3986,21 +4004,29 @@ export function NewChatLandingScreen() {
     sessionModeHandler(selectionHarness, "permission", harnessCapabilities) === "agy-tier";
   const declaredPermissionOptions = useMemo(
     () =>
-      selectionHarness
-        ? sessionDefaultModeOptions(
-            selectionHarness,
-            "permission",
-            [],
-            null,
-            "create",
-            harnessCapabilities,
-          )
-        : [],
-    [selectionHarness, harnessCapabilities],
+      acpHarness
+        ? acpPermissionOptions.map((option) => ({
+            ...option,
+            description:
+              option.description ?? "Sets the agent's own mode. What it covers is up to the agent.",
+          }))
+        : selectionHarness
+          ? sessionDefaultModeOptions(
+              selectionHarness,
+              "permission",
+              [],
+              null,
+              "create",
+              harnessCapabilities,
+            )
+          : [],
+    [selectionHarness, harnessCapabilities, acpHarness, acpPermissionOptions],
   );
   const hasDeclaredPermissionMode =
     selectionHarness !== null &&
-    harnessCapabilities[selectionHarness]?.session_modes?.permission != null;
+    (acpHarness !== null
+      ? acpPermissionOptions.length > 0
+      : harnessCapabilities[selectionHarness]?.session_modes?.permission != null);
   const hasGenericPermissionMode =
     hasDeclaredPermissionMode &&
     !supportsPermissionMode &&
@@ -4542,8 +4568,12 @@ export function NewChatLandingScreen() {
   const pickerEffortOptions = (
     sandboxHasModelCatalog
       ? codexEffortLevelsForModel(pickerEffortRows, pickerEffortModel)
-      : (effortLevelsFor(selectionHarness, pickerEffortRows, pickerEffortModel) ?? [])
+      : startEffortLevelsFor(selectionHarness, pickerEffortRows, pickerEffortModel)
   ).map((value) => ({ value, label: normalizeEffortLabel(value) }));
+  const pickerStartOnlyEffort =
+    acpHarness !== null &&
+    pickerEffortOptions.length > 0 &&
+    (effortLevelsFor(selectionHarness, pickerEffortRows, pickerEffortModel) ?? []).length === 0;
   const pickerInheritedEffort =
     pickerEffortRows.find((option) => option.id === pickerEffortModel)?.defaultReasoningEffort ??
     null;
@@ -4626,7 +4656,7 @@ export function NewChatLandingScreen() {
       ? picked
       : picked || codexModelOptions.find((option) => option.isDefault)?.id;
     const effort =
-      reconcileEffortOnModelChange(
+      reconcileStartEffortOnModelChange(
         modelSelectionHarness,
         pickerEffortRows,
         effortModel || pickerEffortRows.find((option) => option.isDefault)?.id,
@@ -4778,6 +4808,9 @@ export function NewChatLandingScreen() {
           ),
           choices: [
             ...(!sandboxSelectedUnsupported &&
+            !(
+              acpHarness && pickerModelOptions.some((option) => option.isActive || option.isDefault)
+            ) &&
             (sandboxDefaultModelsEnabled ||
               (!sandboxInferenceConfigured &&
                 (sdkHarness !== null ||
@@ -4787,7 +4820,7 @@ export function NewChatLandingScreen() {
               ? [
                   {
                     key: "__default__",
-                    label: "Default",
+                    label: acpHarness ? "Agent's default" : "Default",
                     checked: !routingOn && pickedModel === "",
                     onSelect: () => selectPickerModel(MODEL_SELECT_DEFAULT),
                     testId: "new-chat-landing-agent-model-default",
@@ -4796,14 +4829,20 @@ export function NewChatLandingScreen() {
               : []),
             ...pickerModelOptions.map((option) => ({
               key: option.id,
-              label: visibleModelLabel(nativeModelLabel(option)),
+              label:
+                acpHarness && (option.isActive || option.isDefault)
+                  ? `${visibleModelLabel(nativeModelLabel(option))} (Agent's default)`
+                  : visibleModelLabel(nativeModelLabel(option)),
               checked:
                 !routingOn &&
                 (option.fusion !== undefined
                   ? isFusionModelUid(pickedModel) ||
                     (pickedModel === "" && option.isDefault === true)
                   : pickedModel === option.id ||
-                    (sdkHarness === null && pickedModel === "" && option.isDefault === true)),
+                    (sdkHarness === null &&
+                      pickedModel === "" &&
+                      (option.isDefault === true ||
+                        (acpHarness !== null && option.isActive === true)))),
               // The Fusion row always opens its Lead/Sidekick selectors,
               // even when Fusion is the catalog default (routing it
               // through MODEL_SELECT_DEFAULT would hide them).
@@ -4811,7 +4850,10 @@ export function NewChatLandingScreen() {
                 ? () => selectFusionModel(option.fusion!.default)
                 : () =>
                     selectPickerModel(
-                      option.isDefault && sdkHarness === null ? MODEL_SELECT_DEFAULT : option.id,
+                      (option.isDefault || (acpHarness !== null && option.isActive)) &&
+                        sdkHarness === null
+                        ? MODEL_SELECT_DEFAULT
+                        : option.id,
                     ),
               testId: `new-chat-landing-agent-model-${option.id}`,
               title: nativeModelTooltip(option),
@@ -4847,7 +4889,14 @@ export function NewChatLandingScreen() {
     pickerEffortOptions.length > 0
       ? {
           testId: "new-chat-landing-agent-efforts",
-          header: effortHeader,
+          header: (
+            <span className="inline-flex items-center gap-1">
+              {effortHeader}
+              {pickerStartOnlyEffort && (
+                <HelpTip label="About this thinking setting">Applies when a chat starts.</HelpTip>
+              )}
+            </span>
+          ),
           level: {
             label: effortHeader,
             inherited: pickerInheritedEffort,
@@ -5312,7 +5361,7 @@ export function NewChatLandingScreen() {
       setPickedModel(model);
       setPickedEffort(
         stored.effort &&
-          effortLevelsFor(
+          startEffortLevelsFor(
             genericModelHarness,
             genericModelOptions,
             model || genericModelOptions.find((row) => row.isDefault)?.id,

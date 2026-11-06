@@ -447,6 +447,8 @@ export interface Session {
    * composer's "Polly (Pi)" pill suffix.
    */
   harness?: string | null;
+  /** Effective host catalog namespace, including an ACP agent slug. */
+  harnessNamespace?: string | null;
   /**
    * Per-session LLM model override, e.g. ``"claude-opus-4-7"``. Set
    * via the picker or REPL's ``/model`` — both write the same column
@@ -796,6 +798,7 @@ export interface NativeModelOption {
   /** Reasoning efforts advertised for this model. */
   supportedReasoningEfforts?: NativeReasoningEffortOption[];
   efforts?: string[];
+  start_efforts?: string[];
   /** Service tiers advertised by the host for this specific model. */
   serviceTiers?: { id: string; name: string }[];
   /** Host's effective service tier when this model is selected and no override is sent. */

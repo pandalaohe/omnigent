@@ -41,6 +41,7 @@ import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import * as host from "@/lib/host";
 import * as identity from "@/lib/identity";
 import * as sessionsApi from "@/lib/sessionsApi";
+import * as callingDefaultsApi from "@/lib/callingDefaultsApi";
 import { authorizeRegistryService, registryRequest } from "@/lib/mcpRegistry";
 import {
   getSessionModelLabelCacheKey,
@@ -173,6 +174,8 @@ const { composerSessionSnapshot, composerSessionAccess } = vi.hoisted(() => ({
     id: null as string | null,
     runnerId: null as string | null,
     hostId: null as string | null,
+    effectiveHostId: null as string | null,
+    harnessNamespace: null as string | null,
     workspace: null as string | null,
     labels: {} as Record<string, string>,
     gitBranch: null as string | null,
@@ -401,6 +404,33 @@ describe("running Codex speed and catalog refresh", () => {
       );
       expect(trigger).toHaveAttribute("aria-label", "Speed: Fast");
       expect(errorToast).toHaveBeenCalledWith("tier rejected");
+    },
+  );
+
+  it.each([
+    ["acp", "acp"],
+    ["sdk", "pi"],
+  ] as const)(
+    "refreshes %s and preserves live rows when the cached response is empty",
+    async (modelPickerKind, sessionHarness) => {
+      const rows = [{ id: "actual", isActive: true }, { id: "other" }];
+      useChatStore.setState({
+        conversationId: "conv_refresh",
+        sessionHarness,
+        codexModelOptions: rows,
+      });
+      const refresh = vi.spyOn(sessionsApi, "refreshSessionModelOptions").mockResolvedValue([]);
+      renderWithTooltips(
+        <Composer
+          {...composerProps({ showModels: true, modelPickerKind, codexModelOptions: rows })}
+        />,
+      );
+      await openSessionModels();
+      await waitFor(() => expect(refresh).toHaveBeenCalledWith("conv_refresh", "auto"));
+      expect(useChatStore.getState().codexModelOptions).toEqual(rows);
+      fireEvent.click(screen.getByTestId("composer-model-refresh"));
+      await waitFor(() => expect(refresh).toHaveBeenCalledWith("conv_refresh", "force"));
+      expect(useChatStore.getState().codexModelOptions).toEqual(rows);
     },
   );
 
@@ -2934,6 +2964,8 @@ describe("Composer shared visible controls", () => {
       id: null,
       runnerId: null,
       hostId: null,
+      effectiveHostId: null,
+      harnessNamespace: null,
       workspace: null,
       labels: {},
       gitBranch: null,
@@ -2949,6 +2981,82 @@ describe("Composer shared visible controls", () => {
   // The workspace/worktree popover markup moved into the shared
   // ComposerWorkspaceStatus component (its own tests cover the popover text
   // wrapping); the two page-local inline-dropdown popover cases retired with it.
+
+  it.each([
+    {
+      harness: "acp",
+      harness_namespace: "acp:neutral",
+      host_id: "host_acp",
+      effective_host_id: null,
+    },
+    {
+      harness: "acp",
+      harness_namespace: "acp:neutral",
+      host_id: null,
+      effective_host_id: "host_acp",
+    },
+    {
+      harness: "acp",
+      harness_namespace: "acp:neutral",
+      host_id: "host_other",
+      effective_host_id: "host_acp",
+    },
+    { harness: "acp:neutral", host_id: "host_acp", effective_host_id: null },
+  ])("decodes an ACP snapshot into the real Composer mode picker: %j", async (placement) => {
+    const fetchSnapshot = vi.spyOn(identity, "authenticatedFetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          id: "conv_acp_snapshot",
+          agent_id: "agent_acp",
+          status: "idle",
+          created_at: 1,
+          kind: placement.host_id === null ? "sub_agent" : "default",
+          parent_session_id: placement.host_id === null ? "conv_parent" : null,
+          ...placement,
+          labels: { "omnigent.acp.session_mode": "go" },
+        }),
+      ),
+    );
+    const session = await sessionsApi.getSession("conv_acp_snapshot");
+    fetchSnapshot.mockRestore();
+    expect(session.harnessNamespace).toBe(placement.harness_namespace ?? null);
+    Object.assign(composerSessionSnapshot, {
+      id: session.id,
+      hostId: session.hostId,
+      effectiveHostId: session.effectiveHostId,
+      harnessNamespace: session.harnessNamespace,
+      labels: session.labels,
+    });
+    useChatStore.setState({ conversationId: session.id, sessionHarness: session.harness });
+    const catalog = {
+      host_id: "host_acp",
+      harness: "acp:neutral",
+      models: [],
+      permission_options: [
+        { value: "go", label: "Go" },
+        { value: "review", label: "Review" },
+      ],
+      fetched_at: null,
+      stale: false,
+      error: null,
+    };
+    vi.spyOn(callingDefaultsApi, "listCallingDefaultCatalogs").mockResolvedValue([
+      { ...catalog, host_id: "host_other", permission_options: [] },
+      { ...catalog, harness: "acp:other", permission_options: [] },
+      catalog,
+    ]);
+    const patch = vi.spyOn(sessionsApi, "updateSession").mockResolvedValue({
+      ...session,
+      labels: { ...session.labels, "omnigent.acp.session_mode": "review" },
+    });
+    renderWithTooltips(<Composer {...composerProps()} />);
+    const chip = await screen.findByRole("button", { name: "Permission mode: Go" });
+    fireEvent.keyDown(chip, { key: "ArrowDown" });
+    fireEvent.click(await screen.findByRole("menuitemradio", { name: "Review" }));
+    await waitFor(() =>
+      expect(patch).toHaveBeenCalledWith(session.id, { claudePermissionMode: "review" }),
+    );
+  });
 
   it("renders the same workspace, host, permission and model controls as landing", () => {
     Object.assign(composerSessionSnapshot, {
@@ -8196,6 +8304,43 @@ describe("Composer config gear", () => {
       }
       fireEvent.click(screen.getByTestId(`composer-agent-effort-${efforts[0]}`));
       await waitFor(() => expect(setEffort).toHaveBeenCalledWith(efforts[0]));
+    },
+  );
+
+  it("renders an ACP composer before session and catalog data are available", () => {
+    useChatStore.setState({ conversationId: null, sessionHarness: "acp" });
+    renderWithTooltips(<Composer {...composerProps({ modelPickerKind: "acp" })} />);
+    expect(textarea()).toBeInTheDocument();
+  });
+
+  it.each([[[]], [[{ id: "only" }]]])(
+    "sends typed ACP models for a small catalog",
+    async (options) => {
+      const setModel = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({
+        sessionHarness: "acp",
+        llmModel: "actual",
+        sessionModelOverride: "requested",
+        setModel,
+      });
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            modelPickerKind: "acp",
+            showModels: true,
+            showEffort: false,
+            codexModelOptions: options,
+          })}
+        />,
+      );
+      await openSessionModels();
+      const input = screen.getByRole("textbox", { name: "Model" });
+      expect(input).toHaveValue("actual");
+      fireEvent.change(input, { target: { value: "new-model" } });
+      fireEvent.keyDown(input, { key: "Enter" });
+      await waitFor(() =>
+        expect(setModel).toHaveBeenCalledWith("new-model", { expectConfirmation: false }),
+      );
     },
   );
 

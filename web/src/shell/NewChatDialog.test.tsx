@@ -12475,6 +12475,80 @@ describe("NewChatLandingScreen generic model catalog", () => {
       ).toBe(true);
     },
   );
+  it("sends an ACP mode from the selected host catalog", async () => {
+    const harness = "acp:neutral";
+    mockAgents([testAgent("generic", "Generic agent", { harness, display_name: "Generic agent" })]);
+    mockHosts([{ ...host("online"), configured_harnesses: { [harness]: true } }]);
+    mockModelQueries(() => ({ ...SUCCESS_QUERY_STATE, data: [] }));
+    listCallingDefaultCatalogsMock.mockResolvedValue([
+      {
+        host_id: "host_1",
+        harness,
+        models: [],
+        permission_options: [{ value: "plan", label: "Agent plan" }],
+        fetched_at: null,
+        stale: false,
+        error: null,
+      },
+    ]);
+    renderLanding();
+    await screen.findByTestId("new-chat-landing-permission-chip");
+    pickPermissionOption("plan");
+    const { body } = await submitAndReadBody();
+    expect(body.permission_mode).toBe("plan");
+  });
+  it("offers the active ACP model as the agent default and startup effort", async () => {
+    const harness = "acp:neutral";
+    mockAgents([testAgent("generic", "Generic agent", { harness, display_name: "Generic agent" })]);
+    mockHosts([{ ...host("online"), configured_harnesses: { [harness]: true } }]);
+    mockModelQueries((target) => ({
+      ...SUCCESS_QUERY_STATE,
+      data:
+        target === harness
+          ? [{ id: "model-a", displayName: "Model A", isActive: true, start_efforts: ["high"] }]
+          : [],
+    }));
+    renderLanding();
+    openAgentModels("generic");
+    expect(screen.getByText("Model A (Agent's default)")).toBeInTheDocument();
+    pickPrimaryOption("effort", "High");
+    closePrimaryPicker();
+    const { body } = await submitAndReadBody();
+    expect(body.reasoning_effort).toBe("high");
+    expect(body.model_override).toBeUndefined();
+  });
+  it("keeps startup-only ACP high effort across a model change and sends it", async () => {
+    const harness = "acp:neutral";
+    mockAgents([testAgent("generic", "Generic agent", { harness, display_name: "Generic agent" })]);
+    mockHosts([{ ...host("online"), configured_harnesses: { [harness]: true } }]);
+    mockModelQueries((target) => ({
+      ...SUCCESS_QUERY_STATE,
+      data:
+        target === harness
+          ? [
+              {
+                id: "model-a",
+                displayName: "Model A",
+                isActive: true,
+                efforts: [],
+                start_efforts: ["high"],
+              },
+              { id: "model-b", displayName: "Model B", efforts: [], start_efforts: ["high"] },
+            ]
+          : [],
+    }));
+    renderLanding();
+    openAgentModels("generic");
+    pickPrimaryOption("effort", "High");
+    pickPrimaryOption("model", "Model B");
+    expect(screen.getByTestId("new-chat-landing-agent-effort-high")).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    closePrimaryPicker();
+    const { body } = await submitAndReadBody();
+    expect(body).toMatchObject({ model_override: "model-b", reasoning_effort: "high" });
+  });
   it("accepts a typed model when ACP advertises no list", async () => {
     const harness = "acp:neutral";
     mockAgents([testAgent("generic", "Generic agent", { harness, display_name: "Generic agent" })]);

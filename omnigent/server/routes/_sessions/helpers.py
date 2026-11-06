@@ -2509,6 +2509,7 @@ def _resolve_harness_impl(
     agent_cache: AgentCache | None = None,
     agent: Agent | None = None,
     agents_by_id: Mapping[str, Agent] | None = None,
+    preserve_acp_namespace: bool = False,
 ) -> str | None:
     """
     Resolve the canonical harness for a conversation's bound agent.
@@ -2577,6 +2578,8 @@ def _resolve_harness_impl(
             or loaded.spec.executor.config.get("harness")
             or executor.type
         )
+        if preserve_acp_namespace and harness.startswith("acp:"):
+            return harness
         return canonicalize_harness(harness) or harness
     # UUID bind failures are wrapped by SQLAlchemy; do not hide broader DB errors.
     except (
@@ -12642,7 +12645,21 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     """
     if not labels:
         return
+    from omnigent.sdk_permission_modes import (
+        ACP_SESSION_MODE_LABEL_KEY,
+        ACP_SESSION_MODE_SELECTION_LABEL_KEY,
+    )
     from omnigent.stores.conversation_store import _may_collate_to
+
+    if any(
+        _may_collate_to(key, reserved, prefix=False)
+        for key in labels
+        for reserved in (ACP_SESSION_MODE_LABEL_KEY, ACP_SESSION_MODE_SELECTION_LABEL_KEY)
+    ):
+        raise OmnigentError(
+            f"label {ACP_SESSION_MODE_LABEL_KEY!r} is server-internal; use permission_mode",
+            code=ErrorCode.INVALID_INPUT,
+        )
 
     if any(
         _may_collate_to(key, prefix, prefix=True)

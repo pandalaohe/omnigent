@@ -38,6 +38,7 @@ from omnigent.inner.executor import (
     InjectionDeliveryAmbiguous,
     Message,
     ReasoningChunk,
+    SessionModeChanged,
     SubAgentCompleted,
     SubAgentStarted,
     SubAgentToolCall,
@@ -81,6 +82,7 @@ from omnigent.server.schemas import (
     ReasoningSummaryTextDeltaEvent,
     ReasoningTextDeltaEvent,
     SDKPeerReceiptEvent,
+    SessionPermissionModeEvent,
     StartupProofEvent,
 )
 from omnigent.startup_evidence import (
@@ -333,6 +335,9 @@ class ExecutorAdapter(HarnessApp):
                 extra["reasoning_effort"] = effort
         if request.max_output_tokens is not None:
             extra["max_tokens"] = int(request.max_output_tokens)
+        if request.session_mode is not None:
+            extra["session_mode"] = request.session_mode
+            extra["session_mode_selection"] = request.session_mode_selection
         # model_override is the per-request override; takes precedence over the spec default.
         config = ExecutorConfig(
             model=request.model_override,
@@ -1399,7 +1404,18 @@ class ExecutorAdapter(HarnessApp):
 
     def _translate_event(self, event: ExecutorEvent, ctx: TurnContext) -> None:
         """Translate one inner ExecutorEvent into Omnigent SSE events via ``ctx.emit``."""
-        if isinstance(event, TextChunk):
+        if isinstance(event, SessionModeChanged):
+            ctx.emit(
+                SessionPermissionModeEvent(
+                    type="session.permission_mode",
+                    conversation_id=ctx.session_id or self._session_key,
+                    permission_mode=event.mode,
+                    harness="acp",
+                    requested_mode=event.requested_mode,
+                    selection_id=event.selection_id,
+                )
+            )
+        elif isinstance(event, TextChunk):
             ctx.emit(
                 OutputTextDeltaEvent(
                     type="response.output_text.delta",
