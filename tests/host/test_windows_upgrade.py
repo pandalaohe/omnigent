@@ -344,6 +344,29 @@ def test_shutdown_does_not_follow_reused_parent_pid(
     assert reused.alive and child.alive
 
 
+def test_live_reused_parent_is_rejected_after_clock_steps_back(
+    monkeypatch: pytest.MonkeyPatch, process_table: list[Process]
+) -> None:
+    host = Process(100, ["captured host"])
+    reused = Process(100, ["unrelated reused parent"])
+    child = Process(500, ["unrelated worker"], parent=100)
+    monkeypatch.setattr(reused, "create_time", lambda: 241.0)
+    monkeypatch.setattr(child, "create_time", lambda: 242.0)
+    clock = {"now": 250.0}
+    monkeypatch.setattr(windows, "time", lambda: clock["now"])
+
+    def wait(processes: list[Process], timeout: float) -> tuple[list[Process], list[Process]]:
+        if not host.alive:
+            clock["now"] = 242.0
+            process_table[:] = [reused, child]
+        return [p for p in processes if not p.alive], [p for p in processes if p.alive]
+
+    monkeypatch.setattr(windows.psutil, "wait_procs", wait)
+    windows.stop_host_tree([host])
+    assert not host.alive
+    assert reused.alive and child.alive
+
+
 @pytest.mark.parametrize("born", [99.0, 100.0, 250.0, 250.001, 500.0])
 def test_child_of_absent_parent_must_fit_recorded_lifetime(
     monkeypatch: pytest.MonkeyPatch, process_table: list[Process], born: float

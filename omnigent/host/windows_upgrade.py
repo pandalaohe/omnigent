@@ -134,8 +134,8 @@ def stop_host_tree(processes: list[psutil.Process]) -> None:
             raise RuntimeError(f"Host processes did not exit: {[proc.pid for proc in alive]}")
         pending = []
         current = {proc.pid: proc for proc in _fresh_processes()}
-        # Exited, unrecorded intermediaries can hide orphans. Do not chase them;
-        # if a survivor blocks staging/install, retained_install restores the old paths.
+        # Exited intermediaries and clock rollback with an absent parent remain risks.
+        # Locks from survivors fall back to rename-aside/restore; this is not containment.
         for proc in current.values():
             try:
                 parent = proc.ppid()
@@ -144,13 +144,12 @@ def stop_host_tree(processes: list[psutil.Process]) -> None:
                 born = proc.create_time()
                 if born < created[parent]:
                     continue
-                parent_alive = (
-                    parent in current
-                    and current[parent].create_time() == created[parent]
-                    and current[parent].is_running()
-                )
-                # Signal time is a conservative end bound; waiting can outlast PID reuse.
-                if not parent_alive and born > ended.get(parent, float("-inf")):
+                parent_alive = parent in current and current[parent].is_running()
+                if parent_alive:
+                    if current[parent].create_time() != created[parent]:
+                        continue
+                # Signal time bounds enrollment only when the recorded parent is gone.
+                elif born > ended.get(parent, float("-inf")):
                     continue
                 created[proc.pid] = born
                 captured[proc.pid] = proc
