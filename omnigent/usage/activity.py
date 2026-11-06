@@ -75,9 +75,9 @@ def totals(rows: Sequence[HourRow]) -> dict[str, Any]:
 def _totals(rows: Sequence[HourRow]) -> dict[str, Any]:
     cost = sum(row.cost_usd for row in rows)
     counted = [row for row in rows if row.basis in COUNTED_BASES]
-    covered = [row for row in rows if row.priced and row.total_tokens > 0]
+    covered = [row for row in rows if row.priced and (row.total_tokens or 0) > 0]
     covered_cost = sum(row.cost_usd for row in covered)
-    covered_tokens = sum(row.total_tokens for row in covered)
+    covered_tokens = sum(row.total_tokens or 0 for row in covered)
     failures = [row for row in rows if row.requests is not None and row.failed is not None]
     requests = sum(row.requests or 0 for row in failures)
     failed = sum(row.failed or 0 for row in failures)
@@ -88,13 +88,19 @@ def _totals(rows: Sequence[HourRow]) -> dict[str, Any]:
     return {
         "cost_usd": cost if any(row.priced for row in rows) else None,
         "counted_cost_usd": sum(row.cost_usd for row in counted if row.priced),
-        "tokens": sum(row.total_tokens for row in rows) or None,
+        "tokens": (
+            sum(row.total_tokens or 0 for row in rows) or None
+            if all(row.total_tokens is not None for row in rows)
+            else None
+        ),
         "unpriced": sum(not row.priced for row in rows),
+        "partial_rows": sum(row.coverage == "partial" for row in rows),
         "per_million": covered_cost / covered_tokens * 1e6 if covered_tokens else None,
         "covered_cost_usd": covered_cost,
         "covered_tokens": covered_tokens,
         "cost_coverage_pct": covered_cost / cost * 100 if cost > 0 else None,
-        "tokens_complete": bool(rows) and all(row.total_tokens > 0 for row in rows if row.priced),
+        "tokens_complete": bool(rows)
+        and all((row.total_tokens or 0) > 0 for row in rows if row.priced),
         "requests": requests if failures else None,
         "failed": failed if failures else None,
         "failure_pct": failed / requests * 100 if requests else None,

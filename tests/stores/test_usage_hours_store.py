@@ -176,7 +176,52 @@ def test_replace_activity_estimate_basis_is_kept(db_uri):
         [ActivityHour(hour=HOUR, model="m", tokens=10, cost_usd=0.1, cost_basis="estimate")],
     )
     [row] = store.read("a@example.test", HOUR, HOUR + 1)
-    assert row.basis == "estimate"
+    assert row.basis == "list"
+
+
+def test_v1_missing_tokens_keep_zero_buckets_and_do_not_hide_known_totals(db_uri):
+    from omnigent.usage.activity import totals
+
+    store = UsageHoursStore(db_uri)
+    store.replace_activity(
+        "a@example.test",
+        "gw",
+        [
+            ActivityHour(hour=HOUR, model="requests-only", requests=3),
+            ActivityHour(hour=HOUR, model="known", tokens=100),
+        ],
+    )
+    rows = store.read("a@example.test", HOUR, HOUR + 1)
+    counts = {r.model: r for r in rows}
+    unknown = counts["requests-only"]
+    assert (
+        unknown.input_tokens,
+        unknown.cached_tokens,
+        unknown.cache_write_tokens,
+        unknown.output_tokens,
+        unknown.total_tokens,
+    ) == (0, 0, 0, 0, 0)
+    assert counts["known"].total_tokens == 100
+    assert totals(rows)["tokens"] == 100
+
+
+def test_v1_lower_reread_replaces_complete_and_ignores_new_coverage_fields(db_uri):
+    store = UsageHoursStore(db_uri)
+    for tokens in (100, 70):
+        store.replace_activity(
+            "a@example.test",
+            "gw",
+            [
+                ActivityHour.model_validate(
+                    {
+                        "hour": HOUR,
+                        "tokens": tokens,
+                        "coverage": "partial",
+                    }
+                )
+            ],
+        )
+    assert store.read("a@example.test", HOUR, HOUR + 1)[0].total_tokens == 70
 
 
 def test_activity_turn_does_not_erase_reported_counts(db_uri):
