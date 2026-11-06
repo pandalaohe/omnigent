@@ -1475,11 +1475,11 @@ class ConversationStore(ABC):
             ``None`` or empty disables the filter. Lets callers hide a
             category of children (e.g. harness sub-agent mirrors) without
             the store knowing what the label means.
-        :param touched_label_key: When set, restrict to conversations
-            carrying this label key (the caller's per-user
-            ``omnigent.touched.<user>`` key) and order by that label's value
-            — the epoch-ms last-interaction time — descending, with the
-            store's standard tiebreaker. ``None`` disables the filter.
+        :param touched_label_key: When set, order by this label's epoch-ms
+            last-interaction time (the caller's per-user
+            ``omnigent.touched.<user>`` key), falling back to creation time
+            for conversations without it, descending with the store's
+            standard tiebreaker. ``None`` uses the normal ``sort_by`` order.
             Cannot be combined with ``after`` / ``before`` (the cursor is
             defined on the ``sort_by`` column, not the label value), which
             raises ``ValueError``.

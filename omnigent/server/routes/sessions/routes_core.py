@@ -4386,9 +4386,10 @@ def register_core_routes(
         "Interaction" is a human-origin user message, approval, or
         elicitation resolve, recorded per user on the session's root as an
         ``omnigent.touched.<user>`` label. Results are the caller's
-        accessible, non-archived, ``kind="default"`` sessions carrying that
-        label, newest interaction first. Powers the sidebar's Recent
-        sessions section, which shows a bounded count; cursors are rejected
+        accessible, non-archived, ``kind="default"`` sessions, newest
+        interaction first, falling back to creation time for sessions with
+        no interaction. Agent activity never changes this order. Powers
+        the sidebar's Recent sessions section, which shows a bounded count; cursors are rejected
         because the order is a label value with no row position.
 
         :param request: The incoming FastAPI request (for auth).

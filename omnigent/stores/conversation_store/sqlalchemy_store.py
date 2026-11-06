@@ -16,6 +16,7 @@ from uuid import uuid4
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     ColumnElement,
     LargeBinary,
     Select,
@@ -6154,11 +6155,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``None`` or empty disables the filter. Lets callers hide a
             category of children (e.g. harness sub-agent mirrors) without
             the store knowing what the label means.
-        :param touched_label_key: When set, restrict to conversations
-            carrying this label key (the caller's per-user
-            ``omnigent.touched.<user>`` key) and order by that label's value
-            — the epoch-ms last-interaction time — descending, with the
-            store's standard tiebreaker. ``None`` disables the filter.
+        :param touched_label_key: When set, order by this label's epoch-ms
+            last-interaction time (the caller's per-user
+            ``omnigent.touched.<user>`` key), falling back to creation time
+            for conversations without it, descending with the store's
+            standard tiebreaker. ``None`` uses the normal ``sort_by`` order.
             Cannot be combined with ``after`` / ``before`` (the cursor is
             defined on the ``sort_by`` column, not the label value), which
             raises ``ValueError``.
@@ -6603,13 +6604,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             touched_sort_col: ColumnElement[Any] | None = None
             if touched_label_key is not None:
-                # Recent sessions: inner-join the caller's own per-user touch
-                # row (same workspace scope as the pin filter) and order by its
-                # value. The value is epoch-ms zero-padded to 13 digits, so the
-                # string ordering is the time ordering; the alias keeps the
-                # joined row distinct from the label reads below.
+                # Untouched sessions keep their creation position. Convert
+                # seconds to milliseconds after widening to avoid overflow.
                 touched_label = aliased(SqlConversationLabel)
-                stmt = stmt.join(
+                stmt = stmt.outerjoin(
                     touched_label,
                     and_(
                         touched_label.workspace_id == current_workspace_id(),
@@ -6617,7 +6615,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                         touched_label.key == touched_label_key,
                     ),
                 )
-                touched_sort_col = cast(ColumnElement[Any], touched_label.value)
+                touched_sort_col = func.coalesce(
+                    sql_cast(touched_label.value, BigInteger),
+                    sql_cast(SqlConversation.created_at, BigInteger) * 1000,
+                )
             for exclude_key, exclude_values in (exclude_labels or {}).items():
                 # Labels are colocated on the AP DB, so an inline anti-join
                 # drops labelled conversations without a cross-DB prefetch.

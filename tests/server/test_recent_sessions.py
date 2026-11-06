@@ -152,30 +152,44 @@ async def recent_route(
 # ── Store: filter, ordering, cursors ────────────────────────────────────────
 
 
-def test_store_orders_by_touched_value_and_excludes_untouched(db_uri: str) -> None:
-    """Only sessions with the key are returned, newest touch first."""
+def test_store_orders_by_own_touch_or_creation(db_uri: str) -> None:
+    """Untouched sessions mix with touches by creation, never by activity."""
     store = SqlAlchemyConversationStore(db_uri)
     agent_id = _seed_agent(db_uri, "store-order-agent")
     key = touched_label_key(ALICE)
-    first = store.create_conversation(agent_id=agent_id)
-    newest = store.create_conversation(agent_id=agent_id)
-    middle = store.create_conversation(agent_id=agent_id)
-    untouched = store.create_conversation(agent_id=agent_id)
-    other_user = store.create_conversation(agent_id=agent_id)
-    store.set_labels(first.id, {key: "0000000000001"})
-    store.set_labels(newest.id, {key: "0000000000003"})
-    store.set_labels(middle.id, {key: "0000000000002"})
-    store.set_labels(other_user.id, {touched_label_key(BOB): "0000000000009"})
+    with patch(
+        "omnigent.stores.conversation_store.sqlalchemy_store.now_epoch",
+        side_effect=[1_800_000_001, 1_800_000_002, 1_800_000_003, 1_800_000_004, 1_800_000_005],
+    ):
+        first = store.create_conversation(agent_id=agent_id)
+        newest = store.create_conversation(agent_id=agent_id)
+        middle = store.create_conversation(agent_id=agent_id)
+        untouched = store.create_conversation(agent_id=agent_id)
+        other_user = store.create_conversation(agent_id=agent_id)
+    store.set_labels(first.id, {key: "1800000006000"})
+    store.set_labels(newest.id, {key: "1800000007000"})
+    store.set_labels(middle.id, {key: "1800000004500"})
+    store.set_labels(other_user.id, {touched_label_key(BOB): "1800000009000"})
+
+    expected = [newest.id, first.id, other_user.id, middle.id, untouched.id]
 
     page = store.list_conversations(touched_label_key=key)
 
-    assert [conv.id for conv in page.data] == [newest.id, middle.id, first.id]
+    assert [conv.id for conv in page.data] == expected
     assert page.has_more is False
-    assert untouched.id not in {conv.id for conv in page.data}
+
+    with patch(
+        "omnigent.stores.conversation_store.sqlalchemy_store.now_epoch", return_value=1_800_000_020
+    ):
+        store.update_conversation(untouched.id, title="automatic activity")
+    assert [conv.id for conv in store.list_conversations(touched_label_key=key).data] == expected
 
     capped = store.list_conversations(touched_label_key=key, limit=2)
-    assert [conv.id for conv in capped.data] == [newest.id, middle.id]
+    assert [conv.id for conv in capped.data] == expected[:2]
     assert capped.has_more is True
+
+    store.set_labels(untouched.id, {key: "1800000010000"})
+    assert store.list_conversations(touched_label_key=key, limit=1).data[0].id == untouched.id
 
 
 @pytest.mark.parametrize("cursor", ["after", "before"])
@@ -265,7 +279,7 @@ async def test_recent_route_rejects_cursors(client: httpx.AsyncClient, cursor: s
 async def test_recent_route_lists_own_touches_newest_first(
     client: httpx.AsyncClient, db_uri: str
 ) -> None:
-    """The route returns accessible, non-archived touched sessions in order."""
+    """Recent includes untouched roots, excluding archived sessions and children."""
     store = SqlAlchemyConversationStore(db_uri)
     agent_id = _seed_agent(db_uri, "route-list-agent")
     key = touched_label_key(None)
@@ -273,6 +287,11 @@ async def test_recent_route_lists_own_touches_newest_first(
     newer = store.create_conversation(agent_id=agent_id, title="newer")
     archived = store.create_conversation(agent_id=agent_id, title="archived")
     untouched = store.create_conversation(agent_id=agent_id, title="untouched")
+    store.create_conversation(
+        agent_id=agent_id, kind="sub_agent", parent_conversation_id=untouched.id
+    )
+    archived_untouched = store.create_conversation(agent_id=agent_id)
+    store.update_conversation(archived_untouched.id, archived=True)
     store.set_labels(older.id, {key: "0000000000001"})
     store.set_labels(newer.id, {key: "0000000000002"})
     store.set_labels(archived.id, {key: "0000000000003"})
@@ -283,8 +302,7 @@ async def test_recent_route_lists_own_touches_newest_first(
     assert resp.status_code == 200
     body = resp.json()
     assert body["object"] == "list"
-    assert [row["id"] for row in body["data"]] == [newer.id, older.id]
-    assert untouched.id not in {row["id"] for row in body["data"]}
+    assert [row["id"] for row in body["data"]] == [untouched.id, newer.id, older.id]
 
 
 async def test_recent_rows_match_the_session_list_rows(
@@ -480,7 +498,7 @@ async def test_side_chat_source_read_failure_does_not_fail_message(
         assert not any(is_touched_label_key(key) for key in session_after.labels)
     recent = await route.client.get("/v1/me/recent-sessions")
     assert recent.status_code == 200, recent.text
-    assert recent.json()["data"] == []
+    assert [row["id"] for row in recent.json()["data"]] == [source.id]
 
 
 async def test_touch_write_failure_does_not_fail_message(
@@ -519,7 +537,7 @@ async def test_touch_write_failure_does_not_fail_message(
         assert not any(is_touched_label_key(label) for label in session_after.labels)
     recent = await route.client.get("/v1/me/recent-sessions")
     assert recent.status_code == 200, recent.text
-    assert recent.json()["data"] == []
+    assert [row["id"] for row in recent.json()["data"]] == [source.id]
 
 
 @pytest.mark.parametrize("source_kind", ["missing_label", "missing_session", "cycle", "too_deep"])
@@ -770,9 +788,11 @@ async def multi_user(db_uri: str, tmp_path: Path) -> AsyncIterator[_MultiUser]:
     alice_new = store.create_conversation(agent_id=agent_id, title="alice-new")
     shared = store.create_conversation(agent_id=agent_id, title="shared")
     bob_new = store.create_conversation(agent_id=agent_id, title="bob-new")
+    alice_untouched = store.create_conversation(agent_id=agent_id, title="alice-untouched")
     for user, conv in (
         (ALICE, alice_old),
         (ALICE, alice_new),
+        (ALICE, alice_untouched),
         (ALICE, shared),
         (BOB, shared),
         (BOB, bob_new),
@@ -795,7 +815,7 @@ async def multi_user(db_uri: str, tmp_path: Path) -> AsyncIterator[_MultiUser]:
         yield _MultiUser(
             client,
             shared.id,
-            [alice_new.id, shared.id, alice_old.id],
+            [alice_untouched.id, alice_new.id, shared.id, alice_old.id],
             [bob_new.id, shared.id],
         )
 
