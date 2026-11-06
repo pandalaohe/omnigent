@@ -1036,6 +1036,56 @@ def test_preload_codex_thread_retries_provider_mismatch_once(
     assert fake_client.closed is (retry_refused or not retain_client)
 
 
+@pytest.mark.asyncio
+async def test_cancelled_resume_waits_for_rollout_replacement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import threading
+
+    entered = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+    rollout = tmp_path / "rollout-thread_test.jsonl"
+    rollout.write_text('{"type":"session_meta","payload":{"model_provider":"openai"}}\n')
+    restamp = codex_native_app_server._restamp_codex_rollout_model_provider
+
+    def delayed_restamp(path: Path, provider: str) -> None:
+        entered.set()
+        assert release.wait(5)
+        restamp(path, provider)
+        completed.set()
+
+    client = _ScriptedResumeClient(
+        [codex_native_app_server.CodexAppServerResponseError(_PROVIDER_MISMATCH)]
+    )
+    monkeypatch.setattr(codex_native_app_server, "client_for_transport", lambda *a, **k: client)
+    monkeypatch.setattr(
+        codex_native_app_server, "_restamp_codex_rollout_model_provider", delayed_restamp
+    )
+    task = asyncio.create_task(
+        codex_native_app_server.preload_codex_thread_for_resume(
+            "ws://127.0.0.1:9876",
+            "thread_test",
+            rollout_path=rollout,
+        )
+    )
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert not client.closed
+    finally:
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert completed.is_set()
+    assert client.closed
+    assert len(client.requests) == 1
+
+
 @pytest.mark.parametrize(
     ("exc", "expected"),
     [

@@ -96,6 +96,7 @@ from omnigent.harnesses.codex_native.stderr_diagnostics import (
     report_capture_start_failure,
 )
 from omnigent.inner import _liveness_exec, _proc
+from omnigent.inner._subprocess_lifecycle import await_cleanup_task
 from omnigent.inner.codex_binary import CODEX_RUNTIME_BIN_ENV, snapshot_codex_binary
 from omnigent.inner.codex_executor import (
     _CODEX_ROUTER_HOOK_MODULE,
@@ -5602,6 +5603,19 @@ async def preload_codex_thread_for_resume(
         try:
             await client.request("thread/resume", resume_params)
         except CodexAppServerResponseError as exc:
+            data = exc.error.get("data") if isinstance(exc.error, dict) else None
+            if (
+                exc.code == _CODEX_INVALID_REQUEST_CODE
+                and isinstance(data, dict)
+                and data.get("type") == "modelProviderNotConfigured"
+                and isinstance(data.get("modelProvider"), str)
+                and data["modelProvider"]
+            ):
+                raise OmnigentError(
+                    f"Cannot resume Codex thread: provider {data['modelProvider']!r} is no longer "
+                    "configured. Restore its provider configuration and retry this session.",
+                    code=ErrorCode.HARNESS_NOT_CONFIGURED,
+                ) from exc
             current_provider = codex_resume_current_model_provider(exc)
             if current_provider is None or rollout_path is None:
                 raise
@@ -5613,9 +5627,18 @@ async def preload_codex_thread_for_resume(
                 model_provider,
                 rollout_path,
             )
-            await asyncio.to_thread(
-                _restamp_codex_rollout_model_provider, rollout_path, current_provider
+            restamp = asyncio.create_task(
+                asyncio.to_thread(
+                    _restamp_codex_rollout_model_provider, rollout_path, current_provider
+                )
             )
+            try:
+                await asyncio.shield(restamp)
+            except asyncio.CancelledError:
+                # Keep ownership until the worker can no longer replace the rollout.
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await await_cleanup_task(restamp)
+                raise
             await client.request(
                 "thread/resume", {**resume_params, "modelProvider": current_provider}
             )
