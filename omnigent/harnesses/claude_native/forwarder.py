@@ -7192,6 +7192,7 @@ async def _handle_compact_summary_item_unlocked(
                     compacted_messages_override=None,
                     fallback_snapshot_loaded=False,
                     snapshot_source="transcript_degraded",
+                    summary_source_id=item.source_id,
                     allow_snapshot_fallback=True,
                 )
             except Exception:
@@ -9207,6 +9208,29 @@ def _restore_preserved_compaction_messages(
     return snapshot
 
 
+def _compaction_summary_uuid(summary_source_id: str | None) -> str | None:
+    """
+    Return the compact-summary record uuid a transcript source id names.
+
+    Claude's ``isCompactSummary`` record is projected as a transcript item
+    whose source id is ``"<record uuid>:0:compact_summary"``. That record
+    uuid identifies one compaction for good, so the boundary stored for it
+    can be posted again with the same id.
+
+    :param summary_source_id: Transcript item source id, e.g.
+        ``"0f1e2d3c-...:0:compact_summary"``, or ``None`` for the
+        hook-driven path.
+    :returns: The record uuid, or ``None`` when the id is absent or names
+        another item type.
+    """
+    if summary_source_id is None:
+        return None
+    suffix = ":0:compact_summary"
+    if not summary_source_id.endswith(suffix):
+        return None
+    return summary_source_id[: -len(suffix)] or None
+
+
 async def _persist_native_compaction_item(
     client: httpx.AsyncClient,
     *,
@@ -9250,7 +9274,10 @@ async def _persist_native_compaction_item(
     :param summary_source_id: Transcript item source id for the
         ``isCompactSummary`` path. When supplied, the local snapshot must
         resolve the same Claude summary UUID; hook-driven calls omit it and
-        bind to the transcript's latest ``compact_boundary`` instead.
+        bind to the transcript's latest ``compact_boundary`` instead. The
+        resolved summary UUID is also the boundary's ``source_id``, so a
+        retried POST or the hook path resolving the same boundary stores
+        one item.
     :param summary_not_before: Unix timestamp the completed compaction's
         ``PreCompact`` fired, for hook-driven calls. A latest boundary
         written before it belongs to an earlier compaction and is retried.
@@ -9278,6 +9305,10 @@ async def _persist_native_compaction_item(
     last_item_id = items[0]["id"] if items else f"compact_boundary_{session_id}"
 
     compacted_messages = compacted_messages_override
+    # The boundary's own identity: the summary record's uuid, known from the
+    # transcript item when the caller has one and otherwise resolved below
+    # from the transcript's latest compact boundary.
+    summary_uuid = _compaction_summary_uuid(summary_source_id)
     if compacted_messages is None and not fallback_snapshot_loaded:
         native_messages: list[tuple[str, dict[str, object]]] | None = None
         sdk_message_count = 0
@@ -9329,6 +9360,7 @@ async def _persist_native_compaction_item(
                     transcript_path,
                     not_before=summary_not_before,
                 )
+            summary_uuid = expected_summary_uuid
             if transcript_path is not None:
                 native_messages = await asyncio.to_thread(
                     _restore_preserved_compaction_messages,
@@ -9396,6 +9428,18 @@ async def _persist_native_compaction_item(
     if compacted_messages is None and fallback_snapshot_loaded and not allow_snapshot_fallback:
         raise _CompactionSnapshotError("Claude SDK fallback snapshot is unavailable")
 
+    if summary_uuid is None and summary_not_before is not None:
+        # Hook-driven boundary: no summary record reached the forwarder yet, so
+        # bind the identity to the transcript's boundary for this compaction.
+        hook_transcript_path = read_transcript_path(bridge_dir)
+        if hook_transcript_path is not None:
+            with contextlib.suppress(ValueError):
+                summary_uuid = await asyncio.to_thread(
+                    _latest_compact_summary_uuid,
+                    hook_transcript_path,
+                    not_before=summary_not_before,
+                )
+
     summary = (
         summary_override
         if summary_override
@@ -9408,6 +9452,8 @@ async def _persist_native_compaction_item(
         "token_count": 0,
         "snapshot_source": snapshot_source,
     }
+    if summary_uuid is not None:
+        event_data["source_id"] = summary_uuid
     if compacted_messages is not None:
         event_data["compacted_messages"] = compacted_messages
 

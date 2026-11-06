@@ -254,6 +254,88 @@ async def test_compaction_snapshot_source_survives_server_parse(
     assert boundaries[0]["snapshot_source"] == snapshot_source
 
 
+async def test_compaction_source_id_makes_a_repeated_post_a_no_op(
+    client: httpx.AsyncClient,
+) -> None:
+    """Two posts of one compaction boundary under one source id store one item.
+
+    A forwarder that cannot tell whether its POST was delivered re-posts the
+    boundary, and a replayed native turn posts it again; both carry the
+    boundary's own identity so the store keeps the first row.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    data = {
+        "summary": "retained summary",
+        "last_item_id": "previous-item",
+        "token_count": 0,
+        "snapshot_source": "transcript",
+        "source_id": "0f1e2d3c-1a2b:0:compact_summary",
+    }
+
+    first = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "compaction", "data": data},
+    )
+    assert first.status_code == 202, first.text
+    second = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "compaction", "data": data},
+    )
+    assert second.status_code == 202, second.text
+
+    items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+    boundaries = [item for item in items if item["type"] == "compaction"]
+    assert len(boundaries) == 1
+    assert first.json()["item_id"] == boundaries[0]["id"]
+    assert second.json()["item_id"] == boundaries[0]["id"]
+    assert first.json()["replayed"] is False
+    assert second.json()["replayed"] is True
+
+
+async def test_compaction_without_source_id_keeps_appending(client: httpx.AsyncClient) -> None:
+    """A boundary with no identity behaves as before: every post appends."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    data = {"summary": "retained summary", "last_item_id": "previous-item", "token_count": 0}
+
+    for _ in range(2):
+        response = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={"type": "compaction", "data": data},
+        )
+        assert response.status_code == 202, response.text
+        assert response.json()["replayed"] is False
+
+    items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+    assert len([item for item in items if item["type"] == "compaction"]) == 2
+
+
+@pytest.mark.parametrize("source_id", ["", "   ", "x" * 257])
+async def test_compaction_source_id_must_be_a_bounded_string(
+    client: httpx.AsyncClient, source_id: str
+) -> None:
+    """A malformed boundary identity is refused instead of stored as an id."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "compaction",
+            "data": {
+                "summary": "retained summary",
+                "last_item_id": "previous-item",
+                "token_count": 0,
+                "source_id": source_id,
+            },
+        },
+    )
+
+    assert response.status_code == 400, response.text
+    items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+    assert [item for item in items if item["type"] == "compaction"] == []
+
+
 async def test_compaction_resume_deduplicates_real_external_item_ids(
     client: httpx.AsyncClient,
     tmp_path: Path,

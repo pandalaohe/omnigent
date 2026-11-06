@@ -133,6 +133,7 @@ async def test_persist_codex_compaction_item_posts_uuid_window_id(tmp_path: Path
         client,
         session_id="conv_codex",
         bridge_dir=tmp_path,
+        thread_id="thread_1",
     )
 
     client.post.assert_called_once()
@@ -142,7 +143,77 @@ async def test_persist_codex_compaction_item_posts_uuid_window_id(tmp_path: Path
     assert body["data"]["last_item_id"] == "item_codex"
     assert "Codex" in body["data"]["summary"]
     assert body["data"]["window_id"] == "01a070e2-2665-7d62-9b74-973decf239b7"
+    assert body["data"]["source_id"] == "thread_1:01a070e2-2665-7d62-9b74-973decf239b7", (
+        "the boundary names its rollout window so a replay stores one item"
+    )
     assert body["data"]["compacted_messages"][0]["role"] == "user"
+
+
+@pytest.mark.asyncio
+async def test_persist_codex_compaction_item_names_the_item_without_a_rollout_window() -> None:
+    """With no rollout window, the completed item's id names the boundary."""
+    empty_resp = MagicMock()
+    empty_resp.json.return_value = {"data": []}
+    empty_resp.raise_for_status = MagicMock()
+
+    client = MagicMock()
+    client.get = AsyncMock(return_value=empty_resp)
+
+    post_resp = MagicMock()
+    post_resp.raise_for_status = MagicMock()
+    client.post = AsyncMock(return_value=post_resp)
+
+    await _persist_codex_compaction_item(
+        client, session_id="conv_codex", thread_id="thread_1", item_id="item_c"
+    )
+
+    _url, kwargs = client.post.call_args
+    assert kwargs["json"]["data"]["source_id"] == "thread_1:item_c"
+    assert "window_id" not in kwargs["json"]["data"]
+
+
+@pytest.mark.asyncio
+async def test_persist_codex_compaction_item_without_identity_posts_as_before() -> None:
+    """An unnamed boundary keeps today's payload: no source id, no dedupe."""
+    empty_resp = MagicMock()
+    empty_resp.json.return_value = {"data": []}
+    empty_resp.raise_for_status = MagicMock()
+
+    client = MagicMock()
+    client.get = AsyncMock(return_value=empty_resp)
+
+    post_resp = MagicMock()
+    post_resp.raise_for_status = MagicMock()
+    client.post = AsyncMock(return_value=post_resp)
+
+    await _persist_codex_compaction_item(client, session_id="conv_codex")
+
+    _url, kwargs = client.post.call_args
+    assert "source_id" not in kwargs["json"]["data"]
+
+
+@pytest.mark.parametrize(
+    ("thread_id", "window_id", "item_id", "expected"),
+    [
+        ("thread_1", "01a070e2", "item_c", "thread_1:01a070e2"),
+        ("thread_1", 2, "item_c", "thread_1:2"),
+        ("thread_1", None, "item_c", "thread_1:item_c"),
+        ("thread_1", "   ", "item_c", "thread_1:item_c"),
+        (None, "01a070e2", "item_c", None),
+        ("thread_1", None, None, None),
+    ],
+)
+def test_codex_compaction_source_id_prefers_the_rollout_window(
+    thread_id: str | None,
+    window_id: object,
+    item_id: str | None,
+    expected: str | None,
+) -> None:
+    """Both Codex paths read the same rollout entry, so the window id wins."""
+    assert (
+        fwd._codex_compaction_source_id(thread_id, window_id=window_id, item_id=item_id)
+        == expected
+    )
 
 
 def test_compaction_persist_failure_reason_includes_server_body() -> None:
