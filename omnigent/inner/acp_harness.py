@@ -57,20 +57,24 @@ Env vars read at startup:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import tempfile
+from typing import Any, TypedDict
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
 from omnigent.cli_invocation import cli_invocation
+from omnigent.inner import _proc
 from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
 from omnigent.inner.acp_extension import NO_ACP_EXTENSION, AcpExtension
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import Executor
 from omnigent.inner.os_env_serialization import decode_sandbox_spec
-from omnigent.onboarding.acp_auth import parse_init_timeout_s
+from omnigent.onboarding.acp_auth import AcpAgentEntry, parse_init_timeout_s
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 
 _logger = logging.getLogger(__name__)
@@ -90,6 +94,206 @@ _ENV_OS_ENV = "HARNESS_ACP_OS_ENV"
 _ENV_ENV_PASSTHROUGH = "HARNESS_ACP_ENV_PASSTHROUGH"
 _ENV_PERMISSION_MODE = "HARNESS_ACP_PERMISSION_MODE"
 _DEFAULT_PERMISSION_MODE = "auto"
+
+
+class AcpProbeResult(TypedDict):
+    models: list[dict[str, Any]]
+    permission_options: list[dict[str, str]]
+    error: str | None
+
+
+class _CatalogProbeExecutor(AcpExecutor):
+    async def _read_stderr(self) -> None:
+        # A listing command's diagnostics can contain credentials.
+        assert self._proc and self._proc.stderr
+        while await self._proc.stderr.read(65536):
+            pass
+
+    async def _read_stdout_unobserved(self) -> None:
+        assert self._proc and self._proc.stdout
+        try:
+            while line := await self._proc.stdout.readline():
+                try:
+                    message = json.loads(line)
+                except (ValueError, UnicodeError):
+                    continue
+                if not isinstance(message, dict):
+                    continue
+                identifier = message.get("id")
+                if not isinstance(identifier, int | str):
+                    continue
+                if "method" in message:
+                    await self._send(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": identifier,
+                            "error": {
+                                "code": -32601,
+                                "message": "Model probes do not execute agent requests",
+                            },
+                        }
+                    )
+                else:
+                    future = (
+                        self._pending.pop(identifier, None)
+                        if isinstance(identifier, int)
+                        else None
+                    )
+                    if future is not None and not future.done():
+                        future.set_result(message)
+        finally:
+            for future in self._pending.values():
+                if not future.done():
+                    future.set_exception(EOFError("ACP model probe stopped"))
+            self._pending.clear()
+
+
+async def probe_acp_model_options(
+    entry: AcpAgentEntry, *, timeout_s: float = 30.0
+) -> AcpProbeResult:
+    """Ask only initialize/session-new in a disposable cwd, then stop the process."""
+    models: list[dict[str, Any]] = []
+    permissions: list[dict[str, str]] = []
+    executor: AcpExecutor | None = None
+    try:
+        timeout_s = min(parse_init_timeout_s(timeout_s), 30.0)
+        cleanup_budget = min(5.0, timeout_s / 5)
+        with tempfile.TemporaryDirectory(prefix="model-probe-") as cwd:
+            executor = _CatalogProbeExecutor(
+                config=AcpAgentConfig(
+                    command=entry.command,
+                    name="model probe",
+                    env_passthrough=entry.env_passthrough,
+                    env_unset=_csv_names("OMNIGENT_ACP_ENV_UNSET"),
+                    omnigent_mcp=False,
+                ),
+                cwd=cwd,
+            )
+            try:
+                async with asyncio.timeout(max(0.001, timeout_s - cleanup_budget)):
+                    await executor._start_process()
+                    if executor._proc is not None:
+                        _proc.remember_process_group(executor._proc)
+                    initialized = await executor._rpc(
+                        "initialize",
+                        {
+                            "protocolVersion": 1,
+                            "clientCapabilities": {
+                                "fs": {"readTextFile": False, "writeTextFile": False},
+                                "terminal": False,
+                            },
+                        },
+                    )
+                    if "error" in initialized:
+                        raise RuntimeError("initialize refused")
+                    params: dict[str, Any] = {"cwd": cwd, "mcpServers": []}
+                    if entry.session_id_mode == "client":
+                        params["sessionId"] = "model-probe"
+                    if entry.send_model and entry.model:
+                        params["model"] = entry.model
+                    response = await executor._rpc("session/new", params)
+                    if "error" in response:
+                        raise RuntimeError("session/new refused or authentication required")
+                    result = response.get("result") or {}
+                    legacy = result.get("models") or {}
+                    current = legacy.get("currentModelId")
+                    models = [
+                        {
+                            "id": item["modelId"],
+                            "displayName": item.get("name", item["modelId"]),
+                            "isActive": item["modelId"] == current,
+                            "modelSwitch": True,
+                        }
+                        for item in legacy.get("availableModels", [])
+                        if isinstance(item, dict) and isinstance(item.get("modelId"), str)
+                    ]
+                    for option in result.get("configOptions") or []:
+                        if not isinstance(option, dict):
+                            continue
+                        choices = AcpExecutor._select_choices(option.get("options"))
+                        if option.get("category", option.get("id")) == "model":
+                            models = [
+                                {
+                                    "id": choice["value"],
+                                    "displayName": choice.get("name", choice["value"]),
+                                    "isActive": choice["value"] == option.get("currentValue"),
+                                    "modelSwitch": True,
+                                }
+                                for choice in choices
+                            ]
+                        if option.get("category", option.get("id")) == "mode":
+                            permissions = [
+                                {
+                                    "value": choice["value"],
+                                    "label": str(choice.get("name") or choice["value"]),
+                                }
+                                for choice in choices
+                            ]
+                    effort_option = next(
+                        (
+                            option
+                            for option in result.get("configOptions") or []
+                            if isinstance(option, dict)
+                            and option.get("category") == "thought_level"
+                        ),
+                        {},
+                    )
+                    for row in models:
+                        row["isDefault"] = row.get("isActive", False)
+                        if row.get("isActive") and effort_option:
+                            row["efforts"] = [
+                                choice["value"]
+                                for choice in AcpExecutor._select_choices(
+                                    effort_option.get("options")
+                                )
+                            ]
+                    if not permissions:
+                        modes = result.get("modes") or {}
+                        permissions = [
+                            {"value": item["id"], "label": item.get("name", item["id"])}
+                            for item in modes.get("availableModes", [])
+                            if isinstance(item, dict) and isinstance(item.get("id"), str)
+                        ]
+                    start = (
+                        initialized.get("result", {})
+                        .get("_meta", {})
+                        .get("omnigent", {})
+                        .get("start_efforts")
+                    )
+                    if isinstance(start, list):
+                        for row in models:
+                            row["start_efforts"] = [
+                                value for value in start if isinstance(value, str)
+                            ]
+                    caps = (
+                        initialized.get("result", {})
+                        .get("agentCapabilities", {})
+                        .get("sessionCapabilities", {})
+                    )
+                    # Capture helpers before session/close can make their parent exit.
+                    _proc.refresh_process_tree(executor._proc)
+                    if (
+                        caps.get("close") is not None
+                        and caps.get("close") is not False
+                        and result.get("sessionId")
+                    ):
+                        await executor._rpc("session/close", {"sessionId": result["sessionId"]})
+            finally:
+                process = executor._proc
+                _proc.refresh_process_tree(process)
+                try:
+                    await asyncio.wait_for(executor.close(), timeout=cleanup_budget * 0.8)
+                finally:
+                    if process is not None:
+                        _proc.kill_tree(process)
+                        await asyncio.wait_for(process.wait(), timeout=cleanup_budget * 0.2)
+    except Exception as exc:  # noqa: BLE001 — never expose agent output in a catalog error
+        return {
+            "models": [],
+            "permission_options": [],
+            "error": f"ACP probe failed ({type(exc).__name__})",
+        }
+    return {"models": models, "permission_options": permissions, "error": None}
 
 
 def _env_enabled(name: str, *, default: bool) -> bool:

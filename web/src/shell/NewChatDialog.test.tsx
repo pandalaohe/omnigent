@@ -2244,7 +2244,9 @@ describe("NewChatLandingScreen initial picker loading", () => {
         skills: [],
       },
     ]);
-    mockModelQueries(() => pendingModels);
+    mockModelQueries((target) =>
+      target === harness ? { ...SUCCESS_QUERY_STATE, data: [] } : pendingModels,
+    );
     renderLanding();
 
     expect(expectReadyPicker()).toHaveAccessibleName(new RegExp(label));
@@ -2254,6 +2256,17 @@ describe("NewChatLandingScreen initial picker loading", () => {
       false,
       expect.any(Object),
     );
+    expect(useHostModelOptionsMock).toHaveBeenCalledWith(
+      "host_1",
+      harness,
+      true,
+      expect.any(Object),
+    );
+    expect(
+      useHostModelOptionsMock.mock.calls.filter(
+        ([, target, enabled]) => enabled && target !== harness,
+      ),
+    ).toHaveLength(0);
   });
 
   it("waits for project config, the resolved agent's pin, and the configured host's model before showing its defaults", async () => {
@@ -12407,6 +12420,74 @@ describe("NewChatLandingScreen smart routing", () => {
     expect(body.cost_control_mode_override).toBe("on");
     expect(body.model_override).toBeUndefined();
     expect(body.reasoning_effort).toBeUndefined();
+  });
+});
+
+describe("NewChatLandingScreen generic model catalog", () => {
+  beforeEach(() => {
+    setupLandingMocks();
+    Object.assign(emptyHarnessCapabilities, {
+      copilot: { calling_defaults: { model_options: true } },
+    });
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_generic" }),
+    } as Response);
+  });
+  afterEach(() => {
+    cleanup();
+    Reflect.deleteProperty(emptyHarnessCapabilities, "copilot");
+  });
+  it.each(["copilot", "acp:neutral"])(
+    "lists and sends a declared model for %s",
+    async (harness) => {
+      mockAgents([
+        testAgent("generic", "Generic agent", {
+          harness,
+          display_name: "Generic agent",
+          builtin: true,
+          product_of: harness,
+          integration_mode: harness.startsWith("acp:") ? "acp-subprocess" : "cli-subprocess",
+        }),
+      ]);
+      mockHosts([{ ...host("online"), configured_harnesses: { [harness]: true } }]);
+      mockModelQueries((target) => ({
+        ...SUCCESS_QUERY_STATE,
+        data:
+          target === harness
+            ? [
+                { id: "model-a", displayName: "Model A" },
+                { id: "model-b", displayName: "Model B" },
+              ]
+            : [],
+      }));
+      renderLanding();
+      openAgentModels("generic");
+      pickPrimaryOption("model", "Model B");
+      closePrimaryPicker();
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent("Model B");
+      const { body } = await submitAndReadBody();
+      expect(body.model_override).toBe("model-b");
+      expect(
+        useHostModelOptionsMock.mock.calls.some(
+          ([, target, enabled]) => target === harness && enabled,
+        ),
+      ).toBe(true);
+    },
+  );
+  it("accepts a typed model when ACP advertises no list", async () => {
+    const harness = "acp:neutral";
+    mockAgents([testAgent("generic", "Generic agent", { harness, display_name: "Generic agent" })]);
+    mockHosts([{ ...host("online"), configured_harnesses: { [harness]: true } }]);
+    mockModelQueries(() => ({ ...SUCCESS_QUERY_STATE, data: [] }));
+    renderLanding();
+    openAgentModels("generic");
+    const input = screen.getByRole("textbox", { name: /^Model$/ });
+    expect(input).toHaveAttribute("placeholder", "Agent's default");
+    fireEvent.change(input, { target: { value: "model-custom" } });
+    closePrimaryPicker();
+    const { body } = await submitAndReadBody();
+    expect(body.model_override).toBe("model-custom");
   });
 });
 

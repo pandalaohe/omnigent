@@ -56,6 +56,7 @@ from omnigent.cli_config import (
 )
 from omnigent.cli_diagnostics import printable as _printable
 from omnigent.cli_invocation import WRAPPER_COMMAND_ENV, cli_invocation
+from omnigent.cli_models import models as _models_group
 from omnigent.cli_native import register_native_commands as _register_native_commands
 from omnigent.cli_sandbox import lakebox as _lakebox_alias_group
 from omnigent.cli_sandbox import sandbox as _sandbox_group
@@ -2188,6 +2189,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "kiro",
         "lakebox",
         "login",
+        "models",
         "opencode",
         "pane-picker",
         "pane-split",
@@ -2239,6 +2241,7 @@ def _should_skip_update_check(argv: list[str]) -> bool:
         "upgrade",
         "pane-split",
         "pane-picker",
+        "models",
     }
 
 
@@ -3912,6 +3915,10 @@ def _build_host_daemon_env(
     with contextlib.suppress(OSError, OmnigentError):
         # A reusable daemon must use host config, independent of session overlays.
         forwarded_names.update(provider_credential_env_vars(_load_config()))
+    from omnigent.models.model_source import model_source_env_names
+
+    with contextlib.suppress(OSError):
+        forwarded_names.update(model_source_env_names(_load_config()))
 
     identity_env_vars = frozenset(
         {
@@ -16550,6 +16557,8 @@ def _run_harness_shorthand(harness: str, run_args: tuple[str, ...]) -> None:
 # omnigent.cli_native; register them on the group here, at module bottom, so the
 # shared launch helpers their bodies close over are already defined.
 _register_native_commands(cli)
+
+cli.add_command(_models_group)
 
 
 if __name__ == "__main__":

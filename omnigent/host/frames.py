@@ -1585,6 +1585,7 @@ class HostModelOptionsResultFrame:
     models: list[_JsonObject] = field(default_factory=list)
     error: str | None = None
     routable_models: list[str] = field(default_factory=list)
+    permission_options: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -2663,6 +2664,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "models": frame.models,
                 "error": frame.error,
                 "routable_models": frame.routable_models,
+                "permission_options": frame.permission_options,
             }
         )
     if isinstance(frame, HostSkillsFrame):
@@ -4364,12 +4366,19 @@ def _decode_model_options_result(msg: _JsonObject) -> HostModelOptionsResultFram
     routable = msg.get("routable_models", [])
     if not isinstance(routable, list) or not all(isinstance(model, str) for model in routable):
         raise ValueError("frame field must be a list of strings: 'routable_models'")
+    permissions = msg.get("permission_options", [])
+    if not isinstance(permissions, list) or not all(
+        isinstance(option, dict) and all(isinstance(value, str) for value in option.values())
+        for option in permissions
+    ):
+        raise ValueError("frame field must be a list of string mappings: 'permission_options'")
     return HostModelOptionsResultFrame(
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
         models=models,
         error=_optional_nullable_str(msg, "error"),
         routable_models=routable,
+        permission_options=permissions,
     )
 
 

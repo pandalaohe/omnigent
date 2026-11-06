@@ -118,7 +118,12 @@ def read_catalog(harness: str, fingerprint: str) -> list[dict[str, Any]] | None:
     rows = payload.get("models") if isinstance(payload, dict) else None
     if not isinstance(rows, list):
         return None
-    return [row for row in rows if isinstance(row, dict) and row.get("id")]
+    return [
+        row
+        for row in rows
+        if isinstance(row, dict)
+        and (row.get("id") or (harness == "acp-modes" and row.get("value")))
+    ]
 
 
 def catalog_age_s(harness: str, fingerprint: str) -> float | None:

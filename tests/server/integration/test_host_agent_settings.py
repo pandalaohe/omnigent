@@ -180,3 +180,14 @@ async def test_settings_routes_write_undo_and_re_sync_new_root(
     rows = catalog_store.list([_HOST_ID])
     assert {row["harness"] for row in rows} == {"claude-native", "claude-sdk"}
     assert all(row["models"] == [{"id": "model-from-claude-new"}] for row in rows)
+
+
+async def test_settings_route_cannot_write_model_sources(_settings_stack, tmp_path):
+    client, _communicator, _catalog_store = _settings_stack
+    sentinel = tmp_path / "source-command-ran"
+    response = await client.put(
+        f"/v1/hosts/{_HOST_ID}/agent-settings/claude",
+        json={"key": "model_sources", "value": {"command": f"touch {sentinel}"}},
+    )
+    assert response.status_code == 400, response.text
+    assert not sentinel.exists()

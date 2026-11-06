@@ -506,16 +506,18 @@ def kill_tree(process: _ProcessLike | None) -> None:
         return
 
     owned_pgid = _owned_process_group(process, remove=True)
-    if process.returncode is not None and owned_pgid is None:
+    observed = _remember_identities(process, {})
+    if process.returncode is not None and owned_pgid is None and not observed:
         return
     leader_live = process.returncode is None
-    observed = _remember_identities(process, {})
     current = _snapshot_identities(pid) if leader_live else {}
     if observed.get(pid) is not None and current.get(pid) != observed[pid]:
         current = {}
         leader_live = False
     observed = _remember_identities(process, current)
-    group_is_owned = owned_pgid is None or _identity_in_group(observed, owned_pgid)
+    group_is_owned = (
+        leader_live if owned_pgid is None else _identity_in_group(observed, owned_pgid)
+    )
     identities = _signal_tree_census(
         process,
         pid,

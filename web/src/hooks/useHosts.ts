@@ -513,29 +513,34 @@ async function fetchHostModelOptions(
   hostId: string,
   harness: string,
   refresh?: "auto" | "force",
+  timeoutMs = 8_000,
 ): Promise<NativeModelOption[]> {
   const suffix = refresh ? `?refresh=${refresh}` : "";
-  return withHostRequestTimeout(async (signal) => {
-    const res = await authenticatedFetch(
-      `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/model-options${suffix}`,
-      { signal },
-    );
-    if (!res.ok) {
-      let detail = `${res.status} ${res.statusText}`;
-      try {
-        const body = (await res.json()) as { detail?: unknown };
-        if (typeof body.detail === "string" && body.detail) detail = body.detail;
-      } catch {
-        // Non-JSON error body — keep the status-line detail.
+  return withHostRequestTimeout(
+    async (signal) => {
+      const res = await authenticatedFetch(
+        `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/model-options${suffix}`,
+        { signal },
+      );
+      if (!res.ok) {
+        let detail = `${res.status} ${res.statusText}`;
+        try {
+          const body = (await res.json()) as { detail?: unknown };
+          if (typeof body.detail === "string" && body.detail) detail = body.detail;
+        } catch {
+          // Non-JSON error body — keep the status-line detail.
+        }
+        throw new ApiError(detail, res.status, null);
       }
-      throw new ApiError(detail, res.status, null);
-    }
-    const body = (await res.json()) as { models?: NativeModelOption[]; error?: string };
-    const models = body.models ?? [];
-    // Backward compatibility with servers that encoded probe failure in a 200.
-    if (body.error) throw new Error(body.error);
-    return models;
-  });
+      const body = (await res.json()) as { models?: NativeModelOption[]; error?: string };
+      const models = body.models ?? [];
+      // Backward compatibility with servers that encoded probe failure in a 200.
+      if (body.error) throw new Error(body.error);
+      return models;
+    },
+    undefined,
+    timeoutMs,
+  );
 }
 
 /** Refresh a catalog while retaining the last usable rows if the probe fails. */
@@ -544,9 +549,13 @@ export async function refreshHostModelOptions(
   hostId: string,
   harness: string,
   mode: "auto" | "force",
+  { timeoutMs = 8_000 }: { timeoutMs?: number } = {},
 ): Promise<NativeModelOption[]> {
-  const models = await fetchHostModelOptions(hostId, harness, mode);
-  queryClient.setQueryData(["host-model-options", hostId, harness], models);
+  const queryKey = ["host-model-options", hostId, harness];
+  await queryClient.cancelQueries({ queryKey, exact: true });
+  const models = await fetchHostModelOptions(hostId, harness, mode, timeoutMs);
+  await queryClient.cancelQueries({ queryKey, exact: true });
+  queryClient.setQueryData(queryKey, models);
   return models;
 }
 
@@ -558,7 +567,7 @@ export function useHostModelOptions(
   hostId: string | null,
   harness: string,
   enabled = true,
-  { poll = true }: { poll?: boolean } = {},
+  { poll = true, timeoutMs = 8_000 }: { poll?: boolean; timeoutMs?: number } = {},
 ) {
   const queryClient = useQueryClient();
   const canRefresh = enabled && hostId !== null && poll;
@@ -581,7 +590,7 @@ export function useHostModelOptions(
   }, [queryClient, pollerKey, canRefresh]);
   const query = useQuery({
     queryKey: ["host-model-options", hostId, harness],
-    queryFn: () => fetchHostModelOptions(hostId as string, harness),
+    queryFn: () => fetchHostModelOptions(hostId as string, harness, undefined, timeoutMs),
     enabled: enabled && hostId !== null,
     // Poll the active picker for provider changes; inactive harnesses can
     // fetch eagerly without periodic refreshes or background retries.
