@@ -8818,6 +8818,275 @@ async def test_post_external_session_usage_publishes_session_usage(
     assert snapshot["last_total_tokens"] == 44568
 
 
+@pytest.mark.parametrize(
+    ("patch_data", "expected"),
+    [
+        (
+            {"context_model": "model-a", "auto_compact_token_limit": 400_000},
+            ("model-a", 475_000, 400_000),
+        ),
+        (
+            {"context_model": "model-a", "auto_compact_token_limit": None},
+            ("model-a", 475_000, None),
+        ),
+        ({"model": "model-b", "context_tokens": 200}, ("model-a", 475_000, 450_000)),
+        ({"model": "model-b", "cumulative_cost_usd": 0.5}, ("model-a", 475_000, 450_000)),
+        ({"model": "model-b"}, ("model-a", 475_000, 450_000)),
+        ({"context_model": "model-b", "context_window": 128_000}, ("model-b", 128_000, None)),
+        (
+            {"context_model": "model-b", "auto_compact_token_limit": 100_000},
+            ("model-b", None, 100_000),
+        ),
+        ({"context_window": 128_000}, (None, 128_000, None)),
+        ({"context_model": "m" * 257, "context_window": 128_000}, (None, 128_000, None)),
+        ({"model": "model-b", "context_window": 128_000}, (None, 128_000, None)),
+        (
+            {"context_model": "model-a", "context_window": None, "auto_compact_token_limit": None},
+            ("model-a", None, None),
+        ),
+    ],
+)
+async def test_context_limits_patches_match_live_and_reloaded_reading(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    patch_data: dict[str, Any],
+    expected: tuple[str | None, int | None, int | None],
+) -> None:
+    """A partial reading inherits limits only from its own sampling model."""
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    endpoint = f"/v1/sessions/{session['id']}/events"
+    for data in [
+        {
+            "context_model": "model-a",
+            "context_window": 475_000,
+            "auto_compact_token_limit": 450_000,
+        },
+        patch_data,
+    ]:
+        response = await client.post(
+            endpoint, json={"type": "external_session_usage", "data": data}
+        )
+        assert response.status_code == 202, response.text
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    model, window, limit = expected
+    assert snapshot["labels"].get("omnigent.last_context_model") == (model or "")
+    assert (snapshot["context_window"], snapshot["auto_compact_token_limit"]) == (window, limit)
+    event = published[-1][1]
+    if {"context_window", "auto_compact_token_limit"} & patch_data.keys():
+        assert (
+            event["context_model"],
+            event["context_window"],
+            event["auto_compact_token_limit"],
+        ) == expected
+    else:
+        assert not {"context_model", "context_window", "auto_compact_token_limit"} & event.keys()
+
+
+@pytest.mark.parametrize("seeded_child", [False, True])
+@pytest.mark.parametrize("tokens_advance", [False, True])
+async def test_codex_context_model_switch_reaches_route_and_snapshot(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    seeded_child: bool,
+    tokens_advance: bool,
+) -> None:
+    """Real coalescer posts preserve B even when its context limits equal A's."""
+    from omnigent.harnesses.codex_native import forwarder
+
+    monkeypatch.setattr(
+        forwarder, "resolve_codex_auto_compact_token_limit", lambda *a, **kw: 450_000
+    )
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    coalescer = forwarder._SessionUsageCoalescer(
+        client, session["id"], model="model-a" if seeded_child else None, bridge_dir=tmp_path
+    )
+    for model, input_tokens in [("model-a", 100), ("model-b", 200 if tokens_advance else 100)]:
+        coalescer.record(
+            {
+                "tokenUsage": {
+                    "modelContextWindow": 475_000,
+                    "last": {"inputTokens": input_tokens},
+                    "total": {"inputTokens": input_tokens, "outputTokens": 5},
+                }
+            },
+            model=None if seeded_child and model == "model-a" else model,
+        )
+        await coalescer.flush()
+    readings = [event for _, event in published if "context_window" in event]
+    assert [event.get("context_model") for event in readings] == ["model-a", "model-b"]
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["labels"]["omnigent.last_context_model"] == "model-b"
+    assert (snapshot["context_window"], snapshot["auto_compact_token_limit"]) == (475_000, 450_000)
+
+
+async def test_pi_rpc_context_reading_survives_extension_and_both_relays(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Run the generated JS through the socket and HTTP allowlists to the real store."""
+    import shutil
+
+    from omnigent.harnesses.claude_native import bridge as relay_bridge
+    from omnigent.harnesses.pi_native import bridge as pi_bridge
+    from omnigent.inner.pi_executor import _generate_extension_js, _ToolServer
+    from omnigent.inner.pi_harness import _post_pi_session_usage
+
+    node = shutil.which("node")
+    assert node is not None, "Node is required for the real Pi RPC usage chain"
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+    monkeypatch.setattr(pi_bridge, "_BRIDGE_ROOT", tmp_path / "pi-native")
+    bridge_dir = pi_bridge.prepare_bridge_dir(session_id)
+    tool_server = _ToolServer()
+    await tool_server.start()
+    usage_token = tool_server.issue_pi_usage_token(session_id)
+
+    async def unused_tool(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("no model call or tool execution is needed to report context")
+
+    relay = relay_bridge.start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=[],
+        tool_executor=unused_tool,
+        loop=asyncio.get_running_loop(),
+        policy_client=client,
+        session_id=session_id,
+    )
+    tool_server._pi_session_event = _post_pi_session_usage
+    extension = tmp_path / "pi-extension.js"
+    extension.write_text(
+        _generate_extension_js(
+            tool_server.port,
+            [],
+            tool_server.token,
+            usage_session_id=session_id,
+            usage_token=usage_token,
+        )
+    )
+    runner = tmp_path / "run-pi.js"
+    runner.write_text("""
+const handlers = {};
+global.setInterval = () => ({ unref() {} });
+global.clearInterval = () => {};
+require(process.argv[2])({
+  on(name, handler) { handlers[name] = handler; }, registerTool() {},
+  getSettings() { return { compaction: { reserveTokens: 20000 } }; },
+});
+const ctx = {
+  model: { provider: "provider", id: "model-a" },
+  getContextUsage() { return { tokens: 1200, contextWindow: 550000 }; },
+};
+(async () => {
+  await handlers.session_start({}, ctx);
+  ctx.model = { provider: "provider", id: "model-b" };
+  await handlers.model_select({}, ctx);
+  await handlers.session_shutdown();
+})().catch(error => { console.error(error); process.exitCode = 1; });
+""")
+    process = None
+    try:
+        process = await asyncio.create_subprocess_exec(
+            node,
+            str(runner),
+            str(extension),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(process.communicate(), 20)
+        assert process.returncode == 0, stderr.decode(errors="replace")
+        readings = [event for _, event in published if "context_window" in event]
+        assert [event["context_model"] for event in readings] == ["model-a", "model-b"]
+        assert all(event["auto_compact_token_limit"] == 530_000 for event in readings)
+        snapshot = (await client.get(f"/v1/sessions/{session_id}")).json()
+        assert snapshot["labels"]["omnigent.last_context_model"] == "model-b"
+        assert (snapshot["context_window"], snapshot["auto_compact_token_limit"]) == (
+            550_000,
+            530_000,
+        )
+    finally:
+        if process is not None and process.returncode is None:
+            process.kill()
+            await process.wait()
+        relay.close()
+        await tool_server.stop()
+
+
+@pytest.mark.parametrize("model", ["model-a", "model-b"])
+async def test_context_reading_concurrent_patches_do_not_mix_models(
+    client: httpx.AsyncClient, model: str
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    endpoint = f"/v1/sessions/{session['id']}/events"
+    seeded = await client.post(
+        endpoint,
+        json={
+            "type": "external_session_usage",
+            "data": {
+                "context_model": "model-a",
+                "context_window": 475_000,
+                "auto_compact_token_limit": 450_000,
+            },
+        },
+    )
+    assert seeded.status_code == 202
+    responses = await asyncio.gather(
+        *[
+            client.post(endpoint, json={"type": "external_session_usage", "data": patch})
+            for patch in [
+                {"context_model": model, "context_window": 500_000},
+                {"context_model": "model-a", "auto_compact_token_limit": 400_000},
+            ]
+        ]
+    )
+    assert [response.status_code for response in responses] == [202, 202]
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    result = (
+        snapshot["labels"].get("omnigent.last_context_model"),
+        snapshot["context_window"],
+        snapshot["auto_compact_token_limit"],
+    )
+    if model == "model-a":
+        assert result == ("model-a", 500_000, 400_000)
+    else:
+        assert result in [("model-b", 500_000, None), ("model-a", None, 400_000)]
+
+
+async def test_context_reading_failed_commit_emits_no_reading(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    with patch.object(
+        SqlAlchemyConversationStore, "mutate_label_group", side_effect=RuntimeError("write failed")
+    ):
+        with pytest.raises(RuntimeError, match="write failed"):
+            await client.post(
+                f"/v1/sessions/{session['id']}/events",
+                json={
+                    "type": "external_session_usage",
+                    "data": {"context_model": "model-a", "context_window": 475_000},
+                },
+            )
+    assert not any("context_window" in event for _, event in published)
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert "omnigent.last_context_model" not in snapshot["labels"]
+
+
 async def test_external_session_usage_broadcasts_parent_subtree_cost_not_own(
     client: httpx.AsyncClient,
     db_uri: str,
@@ -8900,7 +9169,9 @@ async def test_post_external_session_usage_dynamic_context_window_overrides_snap
     assert published[0][1]["context_tokens"] == 250_000
     assert published[0][1]["context_window"] == 1_000_000
     assert published[0][1]["auto_compact_token_limit"] == 900_000
-    assert published[0][1]["context_model"] == context_model
+    assert published[0][1]["context_model"] == (
+        context_model if len(context_model) <= 256 else None
+    )
 
     snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
     assert snapshot["last_total_tokens"] == 250_000

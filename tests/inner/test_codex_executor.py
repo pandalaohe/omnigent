@@ -6421,6 +6421,7 @@ def test_codex_sdk_reports_runtime_window_and_total_compact_limit() -> None:
     assert usage is not None
     assert usage["context_window"] == 475_000
     assert usage["model"] == "model-1"
+    assert usage["context_model"] == "model-1"
     assert usage["auto_compact_token_limit"] == 450_000
     session._observe_token_usage(
         {
@@ -6434,6 +6435,7 @@ def test_codex_sdk_reports_runtime_window_and_total_compact_limit() -> None:
     usage = session._consume_turn_usage()
     assert usage is not None
     assert usage["context_window"] == 258_400
+    assert usage["context_model"] is None
     assert usage["auto_compact_token_limit"] is None
 
 

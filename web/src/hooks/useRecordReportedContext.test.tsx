@@ -63,7 +63,6 @@ describe("useRecordReportedContext", () => {
     ["host", { ...SOURCE, hostId: "" }],
     ["agent", { ...SOURCE, agentName: "" }],
     ["harness", { ...SOURCE, harness: "" }],
-    ["model", { ...SOURCE, model: "" }],
   ])("waits for a source with no %s", (_part, source) => {
     record(DEFAULT_USAGE_CONTEXT_PREFERENCES, usageContextSourceKey(source));
     expect(readUsageContextPreferences().reportedContext).toBeUndefined();
@@ -79,6 +78,43 @@ describe("useRecordReportedContext", () => {
     };
     record(DEFAULT_USAGE_CONTEXT_PREFERENCES, usageContextSourceKey(SOURCE));
     expect(readUsageContextPreferences().reportedContext).toBeUndefined();
+  });
+
+  it("records an identified reading before the session has a model pill", () => {
+    record(DEFAULT_USAGE_CONTEXT_PREFERENCES, usageContextSourceKey({ ...SOURCE, model: "" }));
+    expect(
+      readUsageContextPreferences().reportedContext?.[usageContextSourceKey(SOURCE)],
+    ).toMatchObject({
+      contextWindow: 1_000_000,
+      autoCompactTokenLimit: 550_000,
+    });
+  });
+
+  it("waits for a reading with a model identity", () => {
+    store.reportedContextReading = { ...store.reportedContextReading, model: "" };
+    record(DEFAULT_USAGE_CONTEXT_PREFERENCES, usageContextSourceKey(SOURCE));
+    expect(readUsageContextPreferences().reportedContext).toBeUndefined();
+  });
+
+  it("clears this model's cached Auto values when its identified limits are cleared", () => {
+    const key = usageContextSourceKey(SOURCE);
+    const other = usageContextSourceKey({ ...SOURCE, model: "other-model" });
+    writeReportedContext(DEFAULT_USAGE_CONTEXT_PREFERENCES, other, {
+      contextWindow: 200_000,
+      autoCompactTokenLimit: 167_000,
+    });
+    const { rerender } = renderHook(() =>
+      useRecordReportedContext(readUsageContextPreferences(), key),
+    );
+    expect(readUsageContextPreferences().reportedContext?.[key]).toBeDefined();
+    store.reportedContextReading = {
+      model: SOURCE.model,
+      contextWindow: null,
+      autoCompactTokenLimit: null,
+    };
+    rerender();
+    expect(readUsageContextPreferences().reportedContext?.[key]).toBeUndefined();
+    expect(readUsageContextPreferences().reportedContext?.[other]?.contextWindow).toBe(200_000);
   });
 
   it("does not write its reading back over another tab's for the same source", () => {

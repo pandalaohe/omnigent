@@ -1198,6 +1198,8 @@ class Usage(BaseModel):
         The toolbar context ring and ``/context`` command use this
         field when present, falling back to ``total_tokens``.
     :param context_window: Effective window reported by the running harness.
+    :param context_model: Model reference measured with the context limits,
+        independent of the billing model. Unknown identity stays unbound.
     :param auto_compact_token_limit: Total-context automatic compaction threshold;
         an explicit null clears a previous report, absence leaves it unchanged.
     :param cache_read_input_tokens: Prompt tokens served from a
@@ -1230,21 +1232,21 @@ class Usage(BaseModel):
     output_tokens_details: UsageDetails = Field(default_factory=UsageDetails)
     total_tokens: int = 0
     context_tokens: int | None = None
-    context_window: int | None = Field(default=None, gt=0)
-    auto_compact_token_limit: int | None = Field(default=None, gt=0)
+    context_window: int | None = Field(default=None, gt=0, strict=True)
+    context_model: str | None = None
+    auto_compact_token_limit: int | None = Field(default=None, gt=0, strict=True)
     cache_read_input_tokens: int = 0
     cache_creation_input_tokens: int = 0
     model: str | None = None
     cost_usd: float | None = None
 
     @model_serializer(mode="wrap")
-    def _preserve_cleared_compact_limit(
-        self, handler: SerializerFunctionWrapHandler
-    ) -> dict[str, Any]:
-        """An explicit null clears a preceding model's threshold across SSE hops."""
+    def _preserve_context_clears(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        """Preserve explicit clears without turning absent fields into patches."""
         data = handler(self)
-        if "auto_compact_token_limit" in self.model_fields_set:
-            data["auto_compact_token_limit"] = self.auto_compact_token_limit
+        for field in ("context_model", "context_window", "auto_compact_token_limit"):
+            if field in self.model_fields_set:
+                data[field] = getattr(self, field)
         return data
 
 
@@ -4046,12 +4048,13 @@ class SessionStatusEvent(_SSEEventBase):
 
 class SessionUsageEvent(_SSEEventBase):
     """
-    Token-usage update from a terminal-backed integration.
+    Token-usage update from a terminal-backed or SDK integration.
 
     Emitted after an ``external_session_usage`` POST from an
     out-of-AP runtime (e.g. the ``omnigent claude`` transcript
-    forwarder). Either field may be absent; clients should leave
-    cached values untouched for missing fields.
+    forwarder), or an SDK turn. Missing fields leave cached values untouched.
+    A limits observation carries the full committed model/window/threshold tuple;
+    explicit nulls clear unknown or removed values.
 
     :param type: Always ``"session.usage"``.
     :param conversation_id: Session identifier.
@@ -4060,9 +4063,11 @@ class SessionUsageEvent(_SSEEventBase):
         window-only broadcast.
     :param context_window: Resolved window in tokens (e.g. 200_000
         normally, 1_000_000 with ``opus[1m]`` / ``sonnet[1m]``).
-        ``None`` on a tokens-only broadcast.
+        An explicit null clears the window; absent on a tokens-only broadcast.
     :param context_model: Model that produced the context reading, independent
-        of the session's separately reported active model.
+        of the session's separately reported active model; null means unattributed.
+    :param auto_compact_token_limit: Reported automatic-compaction threshold;
+        null clears it, while absence leaves the previous reading unchanged.
     :param total_cost_usd: Cumulative session spend in USD after this
         update, e.g. ``0.42`` — the server-computed total the
         cost-budget policy gates on. Present **only when the session

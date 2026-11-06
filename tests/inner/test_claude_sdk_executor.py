@@ -5852,6 +5852,7 @@ async def test_context_tokens_uses_last_call_not_cumulative_on_multi_iteration_t
     assert turn.usage is not None, "TurnComplete.usage is None on a multi-call turn."
     assert turn.usage["context_window"] == 1_000_000
     assert turn.usage["auto_compact_token_limit"] == 517_000
+    assert turn.usage["context_model"] == "claude-opus-4-8"
 
     # context_tokens = LAST call's prompt (500 + 0 + 10300), NOT the
     # cumulative sum (800 + 20300 = 21100). This is the whole point of the
@@ -5897,6 +5898,11 @@ async def test_context_tokens_uses_last_call_not_cumulative_on_multi_iteration_t
         ),
         # The SDK's default sources are user and project, so settings.local.json is unread.
         ("all", {}, None),
+        (
+            "all",
+            {"modelSettings": {"claude-opus-4-8": {"autoCompactWindow": 400_000}}},
+            367_000,
+        ),
     ],
 )
 async def test_compact_point_follows_the_cli_setting_sources(

@@ -743,7 +743,7 @@ async def test_pi_reported_context_window_follows_rpc_model(context_v2_pi, monke
                     "id": "usage",
                     "session_id": "session-1",
                     "kind": "pi_usage_event",
-                    "data": {"context_window": window},
+                    "data": {"context_window": window, "context_model": model},
                 }
             )
         processes[-1].stdout.feed_data(
@@ -769,6 +769,7 @@ async def test_pi_reported_context_window_follows_rpc_model(context_v2_pi, monke
         completed = next(event for event in events if isinstance(event, TurnComplete))
         assert completed.usage is not None
         assert completed.usage.get("context_window") == expected
+        assert completed.usage.get("context_model") == (model if expected is not None else None)
 
 
 @pytest.mark.parametrize("outcome", ["success", "failed", "cancel", "owner-removed"])
@@ -2310,6 +2311,7 @@ async def test_rpc_pi_usage_extension_reports_idle_warm_and_checks_owner(
             data.get("context_tokens") == 1201
             and data.get("context_window") == 8192
             and data.get("auto_compact_token_limit") == 6192
+            and data.get("context_model") == "model-1"
             for data in received
         )
         assert any(
@@ -8005,7 +8007,7 @@ def test_pi_usage_captured_from_message_end(
                 "id": "usage",
                 "session_id": "session-1",
                 "kind": "pi_usage_event",
-                "data": {"context_window": 550_000},
+                "data": {"context_window": 550_000, "context_model": "provider-1/observed-model"},
             }
         )
         await executor._tool_server.stop()
@@ -8034,6 +8036,7 @@ def test_pi_usage_captured_from_message_end(
         # model comes from the assistant message (used for cost pricing).
         assert usage["model"] == "claude-sonnet-4-6"
         assert usage["context_window"] == 550_000
+        assert usage["context_model"] == "provider-1/observed-model"
         # The text still streams through unaffected by usage capture.
         assert turn_complete[0].response == "Done."
         import sqlite3

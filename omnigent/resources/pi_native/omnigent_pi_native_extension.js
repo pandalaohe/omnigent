@@ -2703,7 +2703,7 @@ module.exports = function (pi) {
           if (Number.isInteger(snapshot.contextWindow) && snapshot.contextWindow > 0)
             data.context_window = snapshot.contextWindow;
           if (data.context_window) {
-            if (ctx.model?.id) data.context_model = ctx.model.id;
+            data.context_model = modelReference(ctx.model) || null;
             data.auto_compact_token_limit = null;
             if (typeof pi.getSettings === "function") {
               const settings = pi.getSettings().compaction || {};

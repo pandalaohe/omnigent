@@ -9979,6 +9979,13 @@ def test_pi_usage_relay_validates_compaction_threshold(limit, valid):
     )
 
 
+@pytest.mark.parametrize("model", ["provider/model", "m" * 256, "", " ", "m" * 257, None, 42])
+def test_pi_usage_relay_validates_context_model(model):
+    assert claude_native_bridge._valid_pi_session_usage(
+        {"context_window": 550_000, "context_model": model}
+    ) is (isinstance(model, str) and bool(model.strip()) and len(model) <= 256)
+
+
 def test_read_user_auto_compact_window_uses_environment_when_settings_has_none(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

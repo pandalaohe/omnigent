@@ -848,8 +848,14 @@ export function writeReportedContext(
   capturedAt = Date.now(),
 ): void {
   if (sourceKey.length === 0 || sourceKey.length > 512) return;
-  if (report.contextWindow === null && report.autoCompactTokenLimit === null) return;
   const previous = preferences.reportedContext?.[sourceKey];
+  if (report.contextWindow === null && report.autoCompactTokenLimit === null) {
+    if (!previous) return;
+    const reportedContext = { ...preferences.reportedContext };
+    delete reportedContext[sourceKey];
+    writeUsageContextPreferences({ ...preferences, version: 6, reportedContext });
+    return;
+  }
   if (
     previous?.contextWindow === report.contextWindow &&
     previous.autoCompactTokenLimit === report.autoCompactTokenLimit

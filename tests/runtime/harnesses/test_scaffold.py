@@ -1024,6 +1024,7 @@ async def test_scaffold_response_completed_preserves_context_tokens(
     usage = completed.data["response"]["usage"]
     assert usage["total_tokens"] == 10_800
     assert usage["context_window"] == 200_000
+    assert usage["context_model"] == "reported-model"
     assert "auto_compact_token_limit" in usage
     assert usage["auto_compact_token_limit"] == compact_limit
     assert usage["context_tokens"] == 5_700, (

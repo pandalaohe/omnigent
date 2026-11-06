@@ -2411,6 +2411,8 @@ class _SessionUsageCoalescer:
         self._pending: dict[str, int | None] = {}
         self._last_posted: dict[str, int | None] = {}
         self._model: str | None = model
+        self._pending_context: tuple[str | None, int, int | None] | None = None
+        self._last_context: tuple[str | None, int, int | None] | None = None
         self._bridge_dir = bridge_dir
         self._baseline = baseline
 
@@ -2436,6 +2438,9 @@ class _SessionUsageCoalescer:
         )
         if data is None:
             return
+        window = data.get("context_window")
+        if isinstance(window, int) and not isinstance(window, bool) and window > 0:
+            self._pending_context = (self._model, window, data.get("auto_compact_token_limit"))
         if self._baseline is not None:
             for key, inherited in zip(_CUMULATIVE_TOKEN_KEYS, self._baseline, strict=True):
                 value = data.get(key)
@@ -2457,8 +2462,13 @@ class _SessionUsageCoalescer:
             for key, value in self._pending.items()
             if key not in self._last_posted or self._last_posted[key] != value
         }
+        context = self._pending_context
+        if context is not None and context != self._last_context:
+            data["context_window"] = context[1]
+            data["auto_compact_token_limit"] = context[2]
         if not data:
             self._pending.clear()
+            self._pending_context = None
             return
         if data.keys() & _CUMULATIVE_TOKEN_KEYS:
             # Re-attach every cumulative count so the post stays self-contained:
@@ -2474,6 +2484,14 @@ class _SessionUsageCoalescer:
         # counts changed) — the server reprices cumulative tokens into
         # ``total_cost_usd`` per turn and needs the model each time.
         payload: _JsonObject = dict(data)
+        if context is not None and (
+            "context_window" in data or "auto_compact_token_limit" in data
+        ):
+            payload.update(
+                context_model=context[0],
+                context_window=context[1],
+                auto_compact_token_limit=context[2],
+            )
         if self._model:
             payload["model"] = self._model
         response = await _post_session_event(
@@ -2485,7 +2503,10 @@ class _SessionUsageCoalescer:
         _log_failed_session_event_post("external_session_usage", response)
         if response is not None and response.status_code < 400:
             self._last_posted.update(data)
+            if "context_window" in payload:
+                self._last_context = context
             self._pending.clear()
+            self._pending_context = None
 
     async def close(self) -> None:
         """

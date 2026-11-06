@@ -72,6 +72,7 @@ class _UsageHarness(HarnessApp):
             "total_tokens": 10_800,
             "context_tokens": 5_700,
             "context_window": 200_000,
+            "context_model": "reported-model",
             "auto_compact_token_limit": (
                 None if os.environ.get("HARNESS_TEST_COMPACT_DISABLED") else 167_000
             ),

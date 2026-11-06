@@ -8891,7 +8891,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // per-bucket breakdown fields follow the same merge rule.
       const patch: {
         tokensUsed?: number;
-        contextWindow?: number;
+        contextWindow?: number | null;
         autoCompactTokenLimit?: number | null;
         reportedContextReading?: ConversationState["reportedContextReading"];
         providerUsageLimits?: ProviderUsageLimitsSnapshot | null;
@@ -8931,22 +8931,14 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         }
       }
       if (Object.keys(patch).length > 0) {
-        applyToConversation((state) => {
+        applyToConversation(() => {
           if (event.contextWindow !== undefined || event.autoCompactTokenLimit !== undefined) {
-            const previous =
-              state.reportedContextReading?.model === event.contextModel
-                ? state.reportedContextReading
-                : null;
-            // Each receipt is a new observation, including identical figures.
-            // Partial readings inherit only from the same reported model.
+            // The server publishes the committed limits tuple, including clears.
             patch.reportedContextReading = event.contextModel
               ? {
                   model: event.contextModel,
-                  contextWindow: event.contextWindow ?? previous?.contextWindow ?? null,
-                  autoCompactTokenLimit:
-                    event.autoCompactTokenLimit === undefined
-                      ? (previous?.autoCompactTokenLimit ?? null)
-                      : event.autoCompactTokenLimit,
+                  contextWindow: event.contextWindow ?? null,
+                  autoCompactTokenLimit: event.autoCompactTokenLimit ?? null,
                 }
               : null;
           }

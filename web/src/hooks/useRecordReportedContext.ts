@@ -34,8 +34,7 @@ export function useRecordReportedContext(
   }, [preferences]);
   useEffect(() => {
     const source = usageContextSourceFromKey(sourceKey);
-    if (!source?.hostId || !source.agentName || !source.harness || !source.model || !reading?.model)
-      return;
+    if (!source?.hostId || !source.agentName || !source.harness || !reading?.model) return;
     const readingKey = usageContextSourceKey({ ...source, model: reading.model });
     const last = lastObservation.current;
     lastObservation.current = { conversationId, sourceKey: readingKey, reading };

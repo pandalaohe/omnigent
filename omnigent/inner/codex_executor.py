@@ -4261,6 +4261,11 @@ class _CodexAppServerSession:
             )
             if isinstance(window, int) and not isinstance(window, bool) and window > 0:
                 self._last_turn_usage["context_window"] = window
+                self._last_turn_usage["context_model"] = (
+                    model
+                    if model == self._thread_model or model in self._usage_context_models
+                    else None
+                )
                 entry = self._usage_context_models.get(model or "")
                 self._last_turn_usage["auto_compact_token_limit"] = (
                     codex_auto_compact_token_limit(

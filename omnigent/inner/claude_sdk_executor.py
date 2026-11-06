@@ -4691,8 +4691,9 @@ class ClaudeSDKExecutor(Executor):
                                 "model": observed_model or model,
                             }
                             model_usage = getattr(result_msg, "model_usage", None)
+                            context_model = observed_model or model
                             active_usage = (
-                                model_usage.get(observed_model or model)
+                                model_usage.get(context_model)
                                 if isinstance(model_usage, dict)
                                 else None
                             )
@@ -4701,7 +4702,7 @@ class ClaudeSDKExecutor(Executor):
                                 and isinstance(model_usage, dict)
                                 and len(model_usage) == 1
                             ):
-                                active_usage = next(iter(model_usage.values()))
+                                context_model, active_usage = next(iter(model_usage.items()))
                             window = (
                                 active_usage.get("contextWindow")
                                 if isinstance(active_usage, dict)
@@ -4713,11 +4714,12 @@ class ClaudeSDKExecutor(Executor):
                                 and window > 0
                             ):
                                 turn_usage["context_window"] = window
+                                turn_usage["context_model"] = context_model
                                 max_output = active_usage.get("maxOutputTokens")
                                 turn_usage["auto_compact_token_limit"] = await asyncio.to_thread(
                                     read_claude_auto_compact_token_limit,
                                     window,
-                                    model=observed_model or model,
+                                    model=context_model,
                                     cwd=pathlib.Path(self._cwd) if self._cwd else None,
                                     max_output_tokens=max_output
                                     if type(max_output) is int and max_output > 0

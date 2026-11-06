@@ -719,6 +719,29 @@ describe("test harness teardown", () => {
 });
 
 describe("chatStore — lazy subtree usage", () => {
+  it("replaces limits with the canonical reading, including a cleared window", () => {
+    const id = "conv_canonical_reading";
+    const conversation = bindConversationForTest(id, { llmModel: "model-a" });
+    for (const reading of [
+      { context_model: "model-a", context_window: 475_000, auto_compact_token_limit: 450_000 },
+      { context_model: "model-b", context_window: null, auto_compact_token_limit: 400_000 },
+    ]) {
+      const event = parseEvent("session.usage", { conversation_id: id, ...reading });
+      expect(event).not.toBeNull();
+      handleSessionEvent(event!, id);
+    }
+    expect(conversation.get().contextWindow).toBeNull();
+    expect(conversation.get().reportedContextReading).toEqual({
+      model: "model-b",
+      contextWindow: null,
+      autoCompactTokenLimit: 400_000,
+    });
+    const reading = conversation.get().reportedContextReading;
+    handleSessionEvent({ type: "session_usage", conversationId: id, contextTokens: 50 }, id);
+    expect(conversation.get().reportedContextReading).toBe(reading);
+    expect(parseEvent("session.usage", { conversation_id: id, context_window: 0 })).toBeNull();
+  });
+
   it("keeps context readings bound to their wire model across model changes and identical receipts", () => {
     const conversation = bindConversationForTest("conv_reading", { llmModel: "model-a" });
     const receive = () =>

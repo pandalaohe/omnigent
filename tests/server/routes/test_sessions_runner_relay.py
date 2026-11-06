@@ -568,51 +568,34 @@ async def test_relay_text_flush_publishes_persisted_item(db_uri: str) -> None:
         session_stream.close(session_id)
 
 
-def test_context_labels_from_turn_usage_shapes() -> None:
-    """The label builder is in-process-only and degrades gracefully.
+def test_context_tokens_do_not_establish_or_relabel_a_limits_reading(db_uri: str) -> None:
+    from omnigent.server.routes._sessions.context_readings import persist_context_reading
 
-    * ``context_tokens`` + a resolvable model → both labels.
-    * a turn with no ``context_tokens`` → empty (native harnesses post their
-      own usage, so this path must not double-write their labels).
-    * ``context_tokens`` but an unknown/blank model → numerator only (the ring
-      simply won't render without a denominator, rather than guessing one).
-    """
-    from omnigent.llms.context_window import get_model_context_window
-    from omnigent.server.routes.sessions import _context_labels_from_turn_usage
-
-    both = _context_labels_from_turn_usage({"context_tokens": 1234, "model": "claude-sonnet-5"})
-    assert both["omnigent.last_context_tokens"] == "1234"
-    assert both["omnigent.last_context_window"] == str(get_model_context_window("claude-sonnet-5"))
-
-    # No window-fill signal → no labels (native external_session_usage owns it).
-    assert _context_labels_from_turn_usage({"input_tokens": 10, "output_tokens": 5}) == {}
-    assert _context_labels_from_turn_usage({}) == {}
-
-    # A negative/invalid count is not a real fill signal.
-    negative = _context_labels_from_turn_usage({"context_tokens": -1, "model": "claude-sonnet-5"})
-    assert negative == {}
-
-    # Numerator without a resolvable model → tokens only.
-    no_model = _context_labels_from_turn_usage({"context_tokens": 42})
-    assert no_model == {"omnigent.last_context_tokens": "42", "omnigent.last_context_model": ""}
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = store.create_conversation().id
+    assert persist_context_reading(
+        store, session_id, {"context_tokens": 1234, "model": "catalog-model"}
+    ) == {"context_tokens": 1234}
+    assert "omnigent.last_context_model" not in store.get_conversation(session_id).labels
+    for payload in ({"input_tokens": 10, "output_tokens": 5}, {}, {"context_tokens": -1}):
+        assert persist_context_reading(store, session_id, payload) == {}
 
 
 @pytest.mark.parametrize("window", [550_000, None, 0, -1, True, "550000"])
 @pytest.mark.parametrize("model", ["uncatalogued-model", "vendor/" + "m" * 300])
 def test_context_labels_prefer_valid_reported_window(
-    monkeypatch: pytest.MonkeyPatch, window: object, model: str
+    db_uri: str, window: object, model: str
 ) -> None:
-    from omnigent.server.routes.sessions import _context_labels_from_turn_usage
+    from omnigent.server.routes._sessions.context_readings import persist_context_reading
 
-    monkeypatch.setattr("omnigent.llms.context_window.get_model_context_window", lambda _: 128_000)
-    labels = _context_labels_from_turn_usage(
-        {"context_tokens": 42, "model": model, "context_window": window}
+    store = SqlAlchemyConversationStore(db_uri)
+    result = persist_context_reading(
+        store,
+        store.create_conversation().id,
+        {"context_tokens": 42, "context_model": model, "context_window": window},
     )
-    assert labels == {
-        "omnigent.last_context_tokens": "42",
-        "omnigent.last_context_window": "550000" if window == 550_000 else "128000",
-        "omnigent.last_context_model": model if len(model) <= 256 else "",
-    }
+    assert result["context_window"] == (550_000 if type(window) is int and window > 0 else None)
+    assert result["context_model"] == (model if len(model) <= 256 else None)
 
 
 @pytest.mark.asyncio
@@ -625,49 +608,50 @@ async def test_relay_persists_context_window_labels_for_inprocess_turn(
     compact_limit: int | None,
 ) -> None:
     """
-    An in-process turn's usage fills the context-window indicator.
+    The SDK scaffold preserves the sampling model independently of billing.
 
-    A claude-sdk (or any in-process) turn reports ``context_tokens`` (window
-    fill) and its observed ``model`` on ``response.completed``. The relay must
-    persist both context labels — ``omnigent.last_context_tokens`` (numerator)
-    and ``omnigent.last_context_window`` (denominator, resolved from the
-    model's window) — and publish them on the live ``session.usage`` event, so
-    the web context ring renders live AND survives a reload/snapshot. Before
-    this, only the claude-native external_session_usage POST wrote those
-    labels, leaving a model-unpinned claude-sdk session with no ring.
+    A limits patch from B replaces A's tuple. A missing B window remains
+    unknown instead of inheriting A's window or a model-catalog estimate.
     """
     from omnigent.runtime import session_stream
+    from omnigent.runtime.harnesses._scaffold import HarnessApp, TurnContext
     from omnigent.server.routes import sessions as sessions_module
 
     sessions_module._runner_relay_tasks.clear()
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation()
     session_id = conv.id
-    store.set_labels(session_id, {"omnigent.last_auto_compact_token_limit": "100000"})
+    store.set_labels(
+        session_id,
+        {
+            "omnigent.last_context_model": "model-a",
+            "omnigent.last_context_window": "100000",
+            "omnigent.last_auto_compact_token_limit": "90000",
+        },
+    )
 
     monkeypatch.setattr("omnigent.llms.context_window.get_model_context_window", lambda _: 128_000)
-    expected_window = reported_window or 128_000
+    expected_window = reported_window
 
     response_id = "resp_ctx_ring_1"
     # The observed model (a full id, not a bare alias) is what the SDK reports.
+    ctx = TurnContext(response_id, asyncio.Queue(), asyncio.Event())
+    ctx.provider_usage = {
+        "input_tokens": 1000,
+        "output_tokens": 200,
+        "total_tokens": 1200,
+        "context_tokens": 45678,
+        "model": "billing-model",
+        "context_model": "claude-sonnet-5",
+        "auto_compact_token_limit": compact_limit,
+        **({"context_window": reported_window} if reported_window is not None else {}),
+    }
+    terminal = await HarnessApp()._build_terminal_event(
+        ctx, model="jarvis", run_task=asyncio.create_task(asyncio.sleep(0)), sequence=1
+    )
     turn_events: list[dict[str, Any]] = [
         {"type": "response.in_progress", "response": {"id": response_id, "model": "jarvis"}},
-        {
-            "type": "response.completed",
-            "response": {
-                "id": response_id,
-                "model": "jarvis",
-                "usage": {
-                    "input_tokens": 1000,
-                    "output_tokens": 200,
-                    "total_tokens": 1200,
-                    "context_tokens": 45678,
-                    "model": "claude-sonnet-5",
-                    "auto_compact_token_limit": compact_limit,
-                    **({"context_window": reported_window} if reported_window is not None else {}),
-                },
-            },
-        },
+        terminal.model_dump(exclude_none=True),
     ]
     release = asyncio.Event()
     fake_runner = _ScriptedRunnerClient(release, turn_events)
@@ -702,7 +686,9 @@ async def test_relay_persists_context_window_labels_for_inprocess_turn(
         refreshed = store.get_conversation(session_id)
         assert refreshed is not None
         assert refreshed.labels.get("omnigent.last_context_tokens") == "45678"
-        assert refreshed.labels.get("omnigent.last_context_window") == str(expected_window)
+        assert refreshed.labels.get("omnigent.last_context_window") == (
+            str(expected_window) if expected_window is not None else None
+        )
         assert refreshed.labels.get("omnigent.last_context_model") == "claude-sonnet-5"
         assert refreshed.labels.get("omnigent.last_auto_compact_token_limit") == (
             str(compact_limit) if compact_limit is not None else None
