@@ -504,7 +504,7 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
       "permission_mode",
       "workspace",
     ]);
-    expect(body.permission_mode).toBe("default");
+    expect(body.permission_mode).toBe("auto");
     expect(body.agent_id).toBe("ag_hello");
     expect(body.host_id).toBe("host_1");
     expect(body.workspace).toBe(RECENT_WORKSPACE);
