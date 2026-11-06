@@ -532,8 +532,10 @@ def test_owned_zombie_leader_keeps_group_identity(
     assert _proc._identity_in_group({43210: 100.0}, 43210) is expected
 
 
+@pytest.mark.parametrize("group_support", [True, False])
 def test_kill_tree_does_not_adopt_reused_reaped_leader_pid(
     monkeypatch: pytest.MonkeyPatch,
+    group_support: bool,
 ) -> None:
     class _ReapedProcess:
         pid = 43210
@@ -547,7 +549,8 @@ def test_kill_tree_does_not_adopt_reused_reaped_leader_pid(
     reused.create_time.return_value = 200.0
     reused.children.return_value = []
     sent: list[tuple[int, int]] = []
-    _proc._owned_process_groups[process] = process.pid
+    if group_support:
+        _proc._owned_process_groups[process] = process.pid
     _proc._owned_process_identities[process] = {process.pid: 100.0}
     monkeypatch.setattr(_proc.psutil, "Process", lambda pid: reused)
     monkeypatch.setattr(

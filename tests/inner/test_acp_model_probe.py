@@ -13,6 +13,7 @@ import time
 import psutil
 import pytest
 
+from omnigent.inner import _proc
 from omnigent.inner.acp_harness import probe_acp_model_options
 from omnigent.onboarding.acp_auth import AcpAgentEntry
 
@@ -120,7 +121,10 @@ async def test_probe_lifecycle_and_catalog(tmp_path, monkeypatch, caplog, mode):
             assert result["models"][0]["efforts"] == ["deliberate"]
 
 
-async def test_probe_cleans_helper_after_agent_exits(tmp_path, monkeypatch):
+@pytest.mark.parametrize("group_support", [True, False])
+async def test_probe_cleans_helper_after_agent_exits(tmp_path, monkeypatch, group_support):
+    if not group_support:
+        monkeypatch.setattr(_proc, "_getpgid_fn", None)
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
     script = tmp_path / "catalog_agent.py"
     script.write_text(AGENT)
