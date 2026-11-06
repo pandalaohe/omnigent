@@ -1295,6 +1295,16 @@
             "title": "Models",
             "type": "array"
           },
+          "permission_options": {
+            "items": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "title": "Permission Options",
+            "type": "array"
+          },
           "stale": {
             "description": "Whether the row should be treated as untrustworthy \u2014 its last sync failed, or the host is offline on this replica.",
             "title": "Stale",
@@ -10347,15 +10357,28 @@
         "type": "object"
       },
       "SessionPermissionModeEvent": {
-        "description": "Active permission-mode update from a claude-native session.\n\nEmitted after the web UI switches the mode, and after the Claude forwarder\nobserves a different mode in the pane footer \u2014 a shift+tab pressed inside\nthe TUI, which Omnigent has no other way to see. Lets the composer's mode\npicker track the pane without a reload.",
+        "description": "Active permission-mode update from a native Claude or ACP session.\n\nEmitted after the web UI switches the mode, and after the Claude forwarder\nobserves a different mode in the pane footer \u2014 a shift+tab pressed inside\nthe TUI, which Omnigent has no other way to see. Lets the composer's mode\npicker track the pane without a reload.",
         "properties": {
           "conversation_id": {
             "description": "Session identifier, e.g. `\"conv_abc123\"`.",
             "title": "Conversation Id",
             "type": "string"
           },
+          "harness": {
+            "anyOf": [
+              {
+                "const": "acp",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Harness"
+          },
           "permission_mode": {
-            "description": "The active mode, e.g. `\"auto\"` or `\"plan\"`. Category: **transient** (SSE-only). The server also writes `omnigent.claude_native.permission_mode` on the conversation labels, so reconnecting clients restore the same state from the session snapshot.",
+            "description": "The active mode, e.g. `\"auto\"` or `\"plan\"`. Category: **transient** (SSE-only). The server also writes `omnigent.claude_native.permission_mode` on the conversation labels, so reconnecting clients restore the same state from the session snapshot. ACP reports carry a selection id so repeated readbacks follow one choice while a newer choice rejects stale reports.",
             "title": "Permission Mode",
             "type": "string"
           },
@@ -10371,6 +10394,30 @@
             ],
             "default": null,
             "title": "Permission Tier Revision"
+          },
+          "requested_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Requested Mode"
+          },
+          "selection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Selection Id"
           },
           "sequence_number": {
             "anyOf": [
@@ -11220,6 +11267,17 @@
             ],
             "description": "The bound agent's canonical harness, e.g. `\"claude-sdk\"` or `\"openai-agents\"`. Lets the client render the active credential for the correct provider family instead of inferring it from the model string (which is wrong when the agent declares no model). `None` when the agent cannot be looked up.",
             "title": "Harness"
+          },
+          "harness_namespace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Harness Namespace"
           },
           "host_id": {
             "anyOf": [
