@@ -15,7 +15,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from omnigent.stores.usage_hours_store import HourRow, UsageHoursStore
 from omnigent.stores.usage_snapshot_store import UsageSnapshotStore
 from omnigent.usage.activity import MarkSettings, attributed_rows, error_mark, summarize
-from omnigent.usage.contract import UsagePeriodView, UsageReport
+from omnigent.usage.contract import ActivityEntryV2, UsagePeriodView, UsageReport, UsageReportV2
 from omnigent.usage.ranges import Span, range_spans
 from tests.server.helpers import create_test_agent
 from tests.server.integration.test_global_instructions_routes import (
@@ -53,6 +53,550 @@ def row(**changes):
         ),
         **changes,
     )
+
+
+def test_v2_rows_keep_hosts_models_pages_and_bills(service):
+    store = service.hours_store
+
+    def write(entries):
+        return store.replace_rows(
+            OWNER, "gateway", [ActivityEntryV2(hour=HOUR, **entry) for entry in entries]
+        )
+
+    write(
+        [
+            {"model": "a", "host": "x", "tokens": 100},
+            {"model": "b", "host": "x", "tokens": 50},
+            {"model": "a", "host": "y", "tokens": 20},
+        ]
+    )
+    write([{"model": "a", "host": "x", "tokens": 120}])
+    write([{"model": "a", "host": "x", "cost_basis": "billed", "cost_usd": 3}])
+    write([{"model": "b", "host": "x", "removed": True}])
+    rows = store.read(OWNER, HOUR, HOUR + 3600)
+    assert {(r.model, r.host_id, r.basis, r.total_tokens) for r in rows} == {
+        ("a", "x", "metered", 120),
+        ("a", "y", "metered", 20),
+        ("a", "x", "billed", None),
+    }
+    assert (
+        summarize(rows, Span.starting(HOUR, NOW), ZoneInfo("UTC"))["totals"]["counted_cost_usd"]
+        == 3
+    )
+
+
+def test_v2_coverage_and_lower_reread_are_protected_and_logged(service):
+    def push(**entry):
+        service.report_account(
+            OWNER,
+            "gateway",
+            UsageReportV2(
+                schema_version=2,
+                observed_at=NOW,
+                source="reader",
+                activity=[ActivityEntryV2(hour=HOUR, **entry)],
+            ),
+            now=NOW,
+        )
+
+    push(tokens=100, requests=10, cost_usd=2)
+    push(tokens=70, requests=7, cost_usd=1, coverage="partial")
+    assert service.hours_store.read(OWNER, HOUR, HOUR + 3600)[0].total_tokens == 100
+    push(tokens=70, requests=7, cost_usd=1)
+    assert service.hours_store.read(OWNER, HOUR, HOUR + 3600)[0].total_tokens == 100
+    logs = service.issues(OWNER, now=NOW + 1)["source_reports"]
+    assert any(log["kind"] == "lower_reread_held" and log["hour"] == HOUR for log in logs)
+    push(tokens=70, requests=7, cost_usd=1, correction=True)
+    assert service.hours_store.read(OWNER, HOUR, HOUR + 3600)[0].total_tokens == 70
+    assert any(
+        log["kind"] == "correction" and log["source"] == "reader"
+        for log in service.issues(OWNER, now=NOW + 1)["source_reports"]
+    )
+
+
+def test_v2_unknown_tokens_and_external_price_fill(service):
+    service.report_account(
+        OWNER,
+        "gateway",
+        UsageReportV2(
+            schema_version=2,
+            observed_at=NOW,
+            activity=[
+                ActivityEntryV2(hour=HOUR, model="requests", requests=3),
+                ActivityEntryV2(hour=HOUR, model="bill", cost_basis="billed", cost_usd=2),
+                ActivityEntryV2(
+                    hour=HOUR,
+                    model="split",
+                    uncached_input_tokens=10,
+                    cache_read_input_tokens=2,
+                    cache_creation_input_tokens=1,
+                    output_tokens=3,
+                    reasoning_tokens=1,
+                ),
+            ],
+        ),
+        now=NOW,
+    )
+    rows = {r.model: r for r in service.hours_store.read(OWNER, HOUR, HOUR + 3600)}
+    assert rows["requests"].input_tokens is None
+    assert rows["requests"].total_tokens is None
+    assert rows["bill"].total_tokens is None
+    assert rows["split"].total_tokens == 16
+    assert rows["split"].reasoning_tokens == 1
+    from omnigent.llms.context_window import ModelPricing
+
+    assert (
+        service.hours_store.fill_unpriced(
+            lambda _: ModelPricing(input_per_token=1, output_per_token=1), HOUR + 3600
+        )
+        == 0
+    )
+    amounts = next(
+        item
+        for item in service.activity(OWNER, now=NOW)["accounts"]
+        if item["account"] == "gateway"
+    )
+    assert amounts["totals"]["tokens"] is None
+    assert amounts["totals"]["counted_cost_usd"] == 2
+    assert service.issues(OWNER, now=NOW) is not None
+
+
+def test_v2_reading_sections_age_independently_and_survive_restart(service, db_uri):
+    service.report_account(
+        OWNER,
+        "gateway",
+        UsageReportV2(
+            schema_version=2,
+            observed_at=NOW,
+            fresh_until=NOW + 60,
+            product="codex",
+            source_type="subscription",
+            windows=[{"id": "day", "kind": "daily", "percent_used": 30, "note": "held"}],
+            balances=[{"id": "wallet", "remaining": 8, "unit": "CNY", "usd_per_unit": 0.14}],
+        ),
+        now=NOW,
+    )
+    service.report_account(
+        OWNER,
+        "gateway",
+        UsageReportV2(
+            schema_version=2,
+            observed_at=NOW + 120,
+            fresh_until=NOW + 600,
+            source="cron",
+            balances=[{"id": "wallet", "remaining": 7, "unit": "CNY"}],
+        ),
+        now=NOW + 120,
+    )
+    service.report_account(
+        OWNER,
+        "gateway",
+        UsageReportV2(
+            schema_version=2,
+            observed_at=NOW + 130,
+            activity=[ActivityEntryV2(hour=HOUR, cost_usd=1)],
+        ),
+        now=NOW + 130,
+    )
+    tile = next(a for a in service.overview(OWNER, now=NOW + 131).accounts if a.id == "gateway")
+    assert tile.read_at == NOW and tile.freshness == "old"
+    assert tile.windows[0].note == "held"
+    assert tile.balance_read_at == NOW + 120 and tile.balance_freshness == "fresh"
+    assert tile.balances[0].remaining == 7 and tile.source == "cron"
+    assert service.hours_store.read(OWNER, HOUR, HOUR + 3600)[0].basis == "list"
+    service.flush(now=NOW + 131, force=True)
+    restarted = AgentQuotaService(
+        SqlAlchemyConversationStore(db_uri), None, None, None, None, UsageSnapshotStore(db_uri)
+    )
+    again = next(a for a in restarted.overview(OWNER, now=NOW + 131).accounts if a.id == "gateway")
+    assert again.model_dump() == tile.model_dump()
+    service.report_account(
+        OWNER,
+        "gateway",
+        UsageReportV2(schema_version=2, observed_at=NOW + 140, status="unavailable", balances=[]),
+        now=NOW + 140,
+    )
+    tile = next(a for a in service.overview(OWNER, now=NOW + 141).accounts if a.id == "gateway")
+    assert tile.balance_freshness == "old" and tile.balances[0].remaining == 7
+    assert tile.read_at == NOW
+
+
+def test_v2_outcome_names_held_skipped_removed_and_defaulted_basis(service):
+    def push(entries):
+        return service.report_account(
+            OWNER,
+            "plan",
+            UsageReportV2.model_validate(
+                {
+                    "schema_version": 2,
+                    "observed_at": NOW,
+                    "source_type": "subscription",
+                    "activity": [{"hour": HOUR, **entry} for entry in entries],
+                }
+            ),
+            now=NOW,
+        )
+
+    push(
+        [
+            {"model": "lower", "tokens": 100},
+            {"model": "complete", "tokens": 50},
+            {"model": "remove", "tokens": 20},
+        ]
+    )
+    outcome = push(
+        [
+            {"model": "lower", "tokens": 70},
+            {"model": "complete", "tokens": 30, "coverage": "partial"},
+            {"hour": HOUR + 2 * 86400, "model": "future", "tokens": 1},
+            {"hour": HOUR - 401 * 86400, "model": "old", "tokens": 1},
+            {"model": "remove", "removed": True},
+            {"model": "new", "host": "host-x", "tokens": 4},
+        ]
+    )
+    assert outcome is not None
+    assert outcome.model_dump() == {
+        "applied": 2,
+        "held": [
+            {
+                "hour": HOUR,
+                "host": "",
+                "model": "lower",
+                "cost_basis": "list",
+                "reason": "lower_reread",
+            }
+        ],
+        "skipped": [
+            {
+                "hour": HOUR,
+                "host": "",
+                "model": "complete",
+                "cost_basis": "list",
+                "reason": "partial_over_complete",
+            },
+            {
+                "hour": HOUR + 2 * 86400,
+                "host": "",
+                "model": "future",
+                "cost_basis": "list",
+                "reason": "out_of_range",
+            },
+            {
+                "hour": HOUR - 401 * 86400,
+                "host": "",
+                "model": "old",
+                "cost_basis": "list",
+                "reason": "out_of_range",
+            },
+        ],
+        "older_sections": [],
+    }
+    assert "remove" not in {r.model for r in service.hours_store.read(OWNER, HOUR, HOUR + 1)}
+
+
+def test_v2_older_sections_keep_readings_but_apply_other_fields(service):
+    service.report_account(
+        OWNER,
+        "plan",
+        UsageReportV2.model_validate(
+            {
+                "schema_version": 2,
+                "observed_at": NOW,
+                "windows": [{"id": "day", "used_value": 10}],
+            }
+        ),
+        now=NOW,
+    )
+    service.report_account(
+        OWNER,
+        "plan",
+        UsageReportV2.model_validate(
+            {
+                "schema_version": 2,
+                "observed_at": NOW + 60,
+                "balances": [{"id": "wallet", "remaining": 5, "unit": "USD"}],
+            }
+        ),
+        now=NOW + 60,
+    )
+    outcome = service.report_account(
+        OWNER,
+        "plan",
+        UsageReportV2.model_validate(
+            {
+                "schema_version": 2,
+                "observed_at": NOW + 30,
+                "display_name": "Arrived later",
+                "windows": [{"id": "day", "used_value": 11}],
+                "balances": [],
+                "models": [{"id": "late-model"}],
+                "activity": [{"hour": HOUR, "tokens": 7}],
+            }
+        ),
+        now=NOW + 70,
+    )
+    assert outcome is not None
+    assert outcome.model_dump() == {
+        "applied": 1,
+        "held": [],
+        "skipped": [],
+        "older_sections": ["balances"],
+    }
+    older = service.report_account(
+        OWNER,
+        "plan",
+        UsageReportV2.model_validate(
+            {
+                "schema_version": 2,
+                "observed_at": NOW - 1,
+                "windows": [],
+                "activity": [{"hour": HOUR, "tokens": 8}],
+            }
+        ),
+        now=NOW + 71,
+    )
+    assert older.older_sections == ["windows"] and older.applied == 1
+    tile = next(a for a in service.overview(OWNER, now=NOW + 71).accounts if a.id == "plan")
+    assert tile.display_name == "Arrived later" and tile.models[0].id == "late-model"
+    assert tile.windows[0].used_value == 11 and tile.read_at == NOW + 30
+    assert tile.balances[0].remaining == 5 and tile.balance_read_at == NOW + 60
+    service.report_account(
+        OWNER,
+        "plan",
+        UsageReportV2.model_validate(
+            {
+                "schema_version": 2,
+                "observed_at": NOW + 80,
+                "status": "unavailable",
+                "windows": [],
+            }
+        ),
+        now=NOW + 80,
+    )
+    failed = service.report_account(
+        OWNER,
+        "plan",
+        UsageReportV2.model_validate(
+            {
+                "schema_version": 2,
+                "observed_at": NOW + 79,
+                "windows": [],
+            }
+        ),
+        now=NOW + 81,
+    )
+    assert failed.older_sections == ["windows"]
+
+
+@pytest.mark.parametrize("source_type,mark", [("metered", "≥"), ("subscription", "~")])
+def test_v2_missing_span_marker_counts_partial_until_replaced_or_removed(
+    service, source_type, mark
+):
+    def push(entry):
+        return service.report_account(
+            OWNER,
+            "plan",
+            UsageReportV2.model_validate(
+                {
+                    "schema_version": 2,
+                    "observed_at": NOW,
+                    "source_type": source_type,
+                    "activity": [{"hour": HOUR, **entry}],
+                }
+            ),
+            now=NOW,
+        )
+
+    push({"coverage": "partial"})
+    item = next(a for a in service.activity(OWNER, now=NOW)["accounts"] if a["account"] == "plan")
+    assert item["totals"]["partial_rows"] == 1
+    assert item["totals"]["tokens"] is None and item["totals"]["requests"] is None
+    assert item["mark"] == mark
+    assert push({"coverage": "partial", "tokens": 9}).applied == 1
+    assert service.hours_store.read(OWNER, HOUR, HOUR + 1)[0].total_tokens == 9
+    assert push({"removed": True}).applied == 1
+    assert service.hours_store.read(OWNER, HOUR, HOUR + 1) == []
+
+
+@pytest.mark.asyncio
+async def test_v2_http_outcome_and_marker_rejection(service):
+    app = FastAPI()
+    app.include_router(
+        create_agent_quota_router(service, auth_provider=None, host_store=None), prefix="/v1"
+    )
+    observed = datetime.now(UTC).timestamp()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        path = "/v1/me/usage/accounts/plan"
+        response = await client.put(
+            path,
+            json={
+                "schema_version": 2,
+                "observed_at": observed,
+                "activity": [{"hour": HOUR, "tokens": 1}],
+            },
+        )
+        assert response.status_code == 200
+        assert response.json() == {"applied": 1, "held": [], "skipped": [], "older_sections": []}
+        rejected = await client.put(
+            path,
+            json={
+                "schema_version": 2,
+                "observed_at": observed,
+                "activity": [{"hour": HOUR, "model": "missing"}],
+            },
+        )
+        assert rejected.status_code == 422
+        assert (
+            "activity[0]" in rejected.json()["detail"] and "partial" in rejected.json()["detail"]
+        )
+        legacy = await client.put(
+            path,
+            json={
+                "observed_at": observed,
+                "windows": [],
+                "activity": [{"hour": HOUR, "tokens": 0}],
+            },
+        )
+        assert legacy.status_code == 204 and legacy.content == b""
+
+
+@pytest.mark.parametrize(
+    "section,limit,entry",
+    [
+        ("windows", 16, {"id": "window", "used_value": 0}),
+        ("balances", 16, {"id": "balance", "remaining": 0, "unit": "USD"}),
+        ("activity", 500, {"hour": HOUR, "tokens": 0}),
+        ("models", 128, {"id": "model"}),
+    ],
+)
+async def test_v2_limits_name_section_and_leave_reading_unchanged(service, section, limit, entry):
+    app = FastAPI()
+    app.include_router(
+        create_agent_quota_router(service, auth_provider=None, host_store=None), prefix="/v1"
+    )
+    observed = datetime.now(UTC).timestamp()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        path = "/v1/me/usage/accounts/plan"
+        assert (
+            await client.put(
+                path,
+                json={
+                    "schema_version": 2,
+                    "observed_at": observed,
+                    "windows": [{"id": "kept", "used_value": 1}],
+                },
+            )
+        ).status_code == 200
+        entries = [
+            dict(entry, id=f"entry-{i}") if "id" in entry else entry for i in range(limit + 1)
+        ]
+        rejected = await client.put(
+            path, json={"schema_version": 2, "observed_at": observed, section: entries}
+        )
+        assert rejected.status_code == 422
+        assert section in rejected.json()["detail"] and str(limit) in rejected.json()["detail"]
+        tile = next(
+            a for a in (await client.get("/v1/me/usage")).json()["accounts"] if a["id"] == "plan"
+        )
+        assert [window["id"] for window in tile["windows"]] == ["kept"]
+        legacy = await client.put(
+            path,
+            json={
+                "observed_at": observed,
+                "windows": [{"id": f"window-{i}", "used_value": 0} for i in range(17)],
+            },
+        )
+        assert legacy.status_code == 422 and legacy.json()["detail"] == "Invalid usage report"
+
+
+@pytest.mark.parametrize("activity", [[], [{"hour": HOUR, "cost_basis": "billed", "cost_usd": 3}]])
+def test_v2_any_activity_takes_over_all_linked_native_rows(service, activity):
+    service.hours_store.add_turn(
+        OWNER, "native:codex", HOUR, "m", "native-host", "metered", True, 10, 0, 0, 2, 12, 1
+    )
+    service.report_account(
+        OWNER,
+        "plan",
+        UsageReportV2.model_validate(
+            {
+                "schema_version": 2,
+                "observed_at": NOW,
+                "product": "codex",
+                "activity": activity,
+            }
+        ),
+        now=NOW,
+    )
+    amounts = next(
+        a for a in service.activity(OWNER, now=NOW)["accounts"] if a["account"] == "plan"
+    )
+    assert amounts["totals"]["counted_cost_usd"] == (3 if activity else 0)
+
+
+def test_v2_activity_applies_even_when_reading_failed(service):
+    outcome = service.report_account(
+        OWNER,
+        "plan",
+        UsageReportV2.model_validate(
+            {
+                "schema_version": 2,
+                "observed_at": NOW,
+                "status": "unavailable",
+                "activity": [{"hour": HOUR, "tokens": 3}],
+            }
+        ),
+        now=NOW,
+    )
+    assert outcome.applied == 1 and outcome.held == [] and outcome.skipped == []
+    assert service.hours_store.read(OWNER, HOUR, HOUR + 1)[0].total_tokens == 3
+
+
+def test_v1_still_drops_whole_report_after_a_newer_v2_metadata_report(service):
+    service.report_account(
+        OWNER,
+        "plan",
+        UsageReportV2.model_validate(
+            {
+                "schema_version": 2,
+                "observed_at": NOW,
+                "windows": [{"id": "kept", "used_value": 1}],
+            }
+        ),
+        now=NOW,
+    )
+    service.report_account(
+        OWNER,
+        "plan",
+        UsageReportV2.model_validate(
+            {
+                "schema_version": 2,
+                "observed_at": NOW + 60,
+                "display_name": "Newest",
+            }
+        ),
+        now=NOW + 60,
+    )
+    legacy = service.report_account(
+        OWNER,
+        "plan",
+        UsageReport.model_validate(
+            {
+                "observed_at": NOW + 30,
+                "windows": [],
+                "display_name": "Old",
+                "activity": [{"hour": HOUR, "tokens": 100}],
+            }
+        ),
+        now=NOW + 70,
+    )
+    assert legacy is None
+    tile = next(a for a in service.overview(OWNER, now=NOW + 70).accounts if a.id == "plan")
+    assert tile.display_name == "Newest" and tile.windows[0].id == "kept"
+    assert service.hours_store.read(OWNER, HOUR, HOUR + 1) == []
 
 
 @pytest.fixture

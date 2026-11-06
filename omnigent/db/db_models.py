@@ -1919,11 +1919,23 @@ class SqlUsageHour(OmnigentBase):
     basis: Mapped[str] = mapped_column(String(16), primary_key=True, server_default="unknown")
     # 0/1 rather than BOOLEAN: a portable primary-key member on every engine.
     priced: Mapped[int] = mapped_column(SmallInteger, primary_key=True, server_default="0")
-    input_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
-    cached_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
-    cache_write_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
-    output_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
-    total_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    input_tokens: Mapped[int | None] = mapped_column(
+        BigInteger().evaluates_none(), nullable=True, server_default="0"
+    )
+    cached_tokens: Mapped[int | None] = mapped_column(
+        BigInteger().evaluates_none(), nullable=True, server_default="0"
+    )
+    cache_write_tokens: Mapped[int | None] = mapped_column(
+        BigInteger().evaluates_none(), nullable=True, server_default="0"
+    )
+    output_tokens: Mapped[int | None] = mapped_column(
+        BigInteger().evaluates_none(), nullable=True, server_default="0"
+    )
+    total_tokens: Mapped[int | None] = mapped_column(
+        BigInteger().evaluates_none(), nullable=True, server_default="0"
+    )
+    reasoning_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    coverage: Mapped[str | None] = mapped_column(String(16), nullable=True)
     requests: Mapped[int | None] = mapped_column(Integer, nullable=True)
     failed: Mapped[int | None] = mapped_column(Integer, nullable=True)
     reasons: Mapped[str | None] = mapped_column(Text, nullable=True)

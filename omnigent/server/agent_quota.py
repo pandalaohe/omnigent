@@ -48,9 +48,12 @@ from omnigent.usage.contract import (
     UsageOverview,
     UsagePeriodView,
     UsageReport,
+    UsageReportV2,
     UsageWindow,
     UsageWindowView,
+    WriteOutcome,
     next_mark,
+    parse_usage_report,
     period_of,
     window_start,
 )
@@ -369,14 +372,185 @@ class AgentQuotaService:
         self,
         owner: str,
         account_id: str,
-        report: UsageReport,
+        report: UsageReport | UsageReportV2,
         *,
         now: float | None = None,
-    ) -> None:
+        event: dict[str, Any] | None = None,
+    ) -> WriteOutcome | None:
         # Serialize source replacements without holding the native reading
         # cache's lock during database I/O.
         with self._account_write_lock:
+            if isinstance(report, UsageReportV2):
+                return self._report_account_v2(owner, account_id, report, now=now, event=event)
             self._report_account(owner, account_id, report, now=now)
+            if event:
+                key = (current_workspace_id(), owner, account_id)
+                with self._lock:
+                    record = self._accounts[key]
+                    self._append_log(record, "cloudevent", float(report.observed_at), **event)
+                    record["source"] = event["source"][:64]
+                    record["source_at"] = report.observed_at
+        return None
+
+    def _report_account_v2(
+        self,
+        owner: str,
+        account_id: str,
+        report: UsageReportV2,
+        *,
+        now: float | None,
+        event: dict[str, Any] | None,
+    ) -> WriteOutcome:
+        outcome = WriteOutcome()
+        now = time.time() if now is None else now
+        if not self.usage_enabled:
+            return outcome
+        self._hydrate(owner)
+        key = (current_workspace_id(), owner, account_id)
+        observed = float(report.observed_at)
+        with self._lock:
+            previous = deepcopy(self._accounts.get(key))
+            if (
+                previous is None
+                and sum(1 for ws, user, _ in self._accounts if (ws, user) == key[:2]) >= 32
+            ):
+                raise UsageAccountLimitError("at most 32 usage accounts per owner")
+        record = previous or {"schema_version": 1, "account_id": account_id, "report_log": []}
+        record["last_report_at"] = max(
+            observed, float(record.get("last_report_at") or record.get("last_attempt_at") or 0)
+        )
+        stored = dict(record.get("report") or {})
+        stored.update(schema_version=2, observed_at=observed)
+        fields = report.model_fields_set
+        data = report.model_dump(mode="json")
+        for name in fields - {
+            "windows",
+            "balances",
+            "activity",
+            "status",
+            "observed_at",
+            "fresh_until",
+        }:
+            stored[name] = data[name]
+        record["product"] = stored.get("product") or record.get("product")
+        if record["product"] is None:
+            from omnigent.harness_plugins import native_agents
+
+            if account_id in {agent.key for agent in native_agents()}:
+                record["product"] = account_id
+        record["host_id"] = stored.get("host_id") or record.get("host_id")
+        source = report.source or (event or {}).get("source") or record.get("source")
+        if source is not None:
+            record["source"] = str(source)[:64]
+            record["source_at"] = observed
+            stored["source"] = record["source"]
+        reading_sections = fields & {"windows", "balances"}
+        if report.status == "unavailable" and not reading_sections:
+            reading_sections = {"windows", "balances"}
+        sections = dict(record.get("sections") or {})
+        # Old accounts already have a windows reading, predating section metadata.
+        sections.setdefault(
+            "windows",
+            {
+                name: record.get(name)
+                for name in ("read_at", "fresh_until", "last_attempt_at", "last_attempt_status")
+            },
+        )
+        windows_changed = False
+        for name in ("windows", "balances"):
+            if name not in reading_sections:
+                continue
+            section = dict(sections.get(name) or {})
+            if observed < float(section.get("last_attempt_at") or 0):
+                outcome.older_sections.append(name)
+                continue
+            section.update(last_attempt_at=observed, last_attempt_status=report.status)
+            if report.status == "available":
+                stored[name] = data[name]
+                section.update(read_at=observed, fresh_until=report.fresh_until)
+            else:
+                self._append_log(record, "read_failed", observed, section=name)
+            sections[name] = section
+            if name == "windows":
+                windows_changed = True
+                record.update(section)
+        record["sections"] = sections
+        stored.setdefault("windows", [])
+        stored.setdefault("balances", [])
+        if "pinned_window" in fields:
+            record["pinned_window"] = report.pinned_window
+        # A persisted pin may be temporarily absent from the latest window set.
+        stored.pop("pinned_window", None)
+        merged = UsageReportV2.model_validate(stored)
+        if report.activity is not None and self.hours_store is not None:
+            entries = [
+                entry.model_copy(update={"cost_basis": "list"})
+                if "cost_basis" not in entry.model_fields_set
+                and merged.source_type == "subscription"
+                else entry
+                for entry in report.activity
+            ]
+            written = self.hours_store.replace_rows(owner, account_id, entries)
+            outcome.applied = written.applied
+            outcome.held = written.held
+            outcome.skipped = written.skipped
+            for entry in outcome.held:
+                self._append_log(record, "lower_reread_held", observed, **entry.model_dump())
+            for entry in entries:
+                if entry.correction and not entry.removed:
+                    self._append_log(
+                        record, "correction", observed, hour=entry.hour, source=source
+                    )
+            record["has_activity"] = True
+            record["activity_writer"] = "report"
+        marks = dict(record.get("reset_marks") or {})
+        if windows_changed and report.status == "available":
+            for window in merged.windows:
+                span = window_start(window, now)
+                if span is not None:
+                    marks[window.id] = next_mark(marks.get(window.id), *span)
+        record["reset_marks"] = marks
+        record["report"] = merged.stored()
+        if event:
+            self._append_log(record, "cloudevent", observed, **event)
+        snapshot = None
+        if windows_changed and record.get("product"):
+            snapshot = {
+                "provider": merged.display_name or account_id,
+                "captured_at": observed,
+                "fresh_until": report.fresh_until,
+                "pinned_period": record.get("pinned_window"),
+                "windows": [
+                    {
+                        "id": window.id,
+                        "kind": window.kind,
+                        "label": window.id,
+                        "aria_label": window.label or window.id,
+                        "used_percent": window.percent_used,
+                        "duration_mins": window.window_minutes,
+                        "resets_at": window.resets_at,
+                        "used_value": window.used_value,
+                        "limit_value": window.limit_value,
+                        "unit": window.unit,
+                    }
+                    for window in merged.windows
+                ]
+                if report.status == "available"
+                else [],
+            }
+            record["routing_snapshot"] = deepcopy(snapshot)
+        elif "pinned_window" in fields and isinstance(record.get("routing_snapshot"), dict):
+            snapshot = deepcopy(record["routing_snapshot"])
+            snapshot["pinned_period"] = record.get("pinned_window")
+            record["routing_snapshot"] = deepcopy(snapshot)
+        with self._lock:
+            self._accounts[key] = record
+            self._dirty[(key[0], owner, self._account_key(account_id))] = record
+        if snapshot is not None:
+            self._store_snapshot(
+                owner, record.get("host_id"), record["product"], snapshot, now=now
+            )
+        return outcome
 
     def _report_account(
         self,
@@ -397,7 +571,9 @@ class AgentQuotaService:
         snapshot: dict[str, Any] | None = None
         with self._lock:
             previous = self._accounts.get(key)
-            if previous is not None and observed < float(previous.get("last_attempt_at") or 0):
+            if previous is not None and observed < float(
+                previous.get("last_report_at") or previous.get("last_attempt_at") or 0
+            ):
                 return
             if (
                 previous is None
@@ -412,7 +588,9 @@ class AgentQuotaService:
             self.hours_store.replace_activity(owner, account_id, report.activity)
         with self._lock:
             previous = self._accounts.get(key)
-            if previous is not None and observed < float(previous.get("last_attempt_at") or 0):
+            if previous is not None and observed < float(
+                previous.get("last_report_at") or previous.get("last_attempt_at") or 0
+            ):
                 return
             if (
                 previous is None
@@ -442,6 +620,7 @@ class AgentQuotaService:
             record["product"] = product
             record["host_id"] = host_id
             record["last_attempt_at"] = observed
+            record["last_report_at"] = observed
             record["last_attempt_status"] = report.status
             if report.status == "available":
                 if report.activity is not None and self.hours_store is not None:
@@ -460,6 +639,17 @@ class AgentQuotaService:
                 record["reset_marks"] = marks
             else:
                 self._append_log(record, "read_failed", observed)
+            record["sections"] = {
+                "windows": {
+                    name: record.get(name)
+                    for name in (
+                        "read_at",
+                        "fresh_until",
+                        "last_attempt_at",
+                        "last_attempt_status",
+                    )
+                }
+            }
             self._accounts[key] = record
             self._dirty[(key[0], owner, self._account_key(account_id))] = record
             if product is not None:
@@ -490,7 +680,7 @@ class AgentQuotaService:
             self._store_snapshot(owner, host_id, product, snapshot, now=now)
 
     @staticmethod
-    def _append_log(record: dict[str, Any], kind: str, at: float) -> None:
+    def _append_log(record: dict[str, Any], kind: str, at: float, **details: Any) -> None:
         entries = list(record.get("report_log") or [])
         if (
             not entries
@@ -498,7 +688,7 @@ class AgentQuotaService:
             or entries[-1]["at"] <= (record.get("read_at") or 0)
         ):
             _logger.warning("Usage source report: %s", kind)
-        entries.append({"kind": kind, "at": at})
+        entries.append({"kind": kind, "at": at, **details})
         record["report_log"] = entries[-200:]
 
     def note_rejected(self, owner: str, account_id: str, *, now: float | None = None) -> None:
@@ -1084,7 +1274,7 @@ class AgentQuotaService:
         now: float,
     ) -> UsageAccountView:
         raw = record.get("report")
-        report = UsageReport.model_validate(raw) if raw is not None else None
+        report = parse_usage_report(raw) if raw is not None else None
         latest_native = max(
             native_records, key=lambda item: item[2].get("read_at") or 0, default=None
         )
@@ -1117,6 +1307,14 @@ class AgentQuotaService:
             view.band = report.band
             view.details_url = str(report.details_url) if report.details_url else None
             view.renews_at = report.renews_at
+        if isinstance(report, UsageReportV2):
+            view.balances = report.balances
+            section = (record.get("sections") or {}).get("balances") or {}
+            view.balance_read_at = section.get("read_at")
+            view.balance_freshness = self._freshness(section, now)
+            view.source_type = report.source_type
+        view.source = record.get("source")
+        view.source_at = record.get("source_at")
         host_id = record.get("host_id")
         host_readings = {
             native_host: (
@@ -1288,6 +1486,7 @@ class AgentQuotaService:
                     used_value=None if past_reset else window.used_value,
                     limit_value=None if past_reset else window.limit_value,
                     unit=window.unit,
+                    note=window.note,
                     past_reset=past_reset,
                 )
             )
