@@ -41,7 +41,7 @@ interface LayoutEdge {
 }
 
 export const NODE_WIDTH = 180;
-const NODE_HEIGHT = 60;
+export const NODE_HEIGHT = 60;
 const HORIZONTAL_GAP = 40;
 const VERTICAL_GAP = 30;
 
