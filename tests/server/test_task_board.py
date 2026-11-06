@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -215,7 +216,7 @@ def test_filters_and_cursor_remain_bound_to_the_query(store):
     with pytest.raises(ReportError):
         store.list_items("owner", ItemQuery(state="closed", cursor=cursor))
     closed = store.list_items(
-        "owner", ItemQuery(state="closed", closed_after=NOW.timestamp() - 7200)
+        "owner", ItemQuery(state="closed", closed_after=utc_text(NOW.timestamp() - 7200))
     )[0]
     assert [entry["uid"] for entry in closed] == ["b"]
 
@@ -324,3 +325,423 @@ def test_group_filters_preserve_case_and_trailing_spaces(store):
         assert [
             entry["uid"] for entry in store.list_items("owner", ItemQuery(group=group_id))[0]
         ] == [group_id]
+
+
+def test_completeness_scope_versions_and_returned_bodies(store):
+    entries = [task("open"), task("closed", progress="completed")]
+    store.write("owner", "example", parse(group(*entries)), NOW)
+    complete = {"omnigent.ai:complete": "open", "updated": "2026-11-06T06:30:00.0000002Z"}
+    outcome = store.write("owner", "example", parse(group(**complete)), NOW)
+    assert (outcome.gone, outcome.complete) == (1, "applied")
+    assert [row["uid"] for row in store.list_items("owner", ItemQuery())[0]] == ["closed"]
+    assert store.get_item("owner", "example", "open")["omnigent.ai:gone"]
+    assert store.get_item("owner", "example", "open")["progress"] == "needs-action"
+    older = {**complete, "omnigent.ai:complete": "all", "updated": "2026-11-06T06:30:00.0000001Z"}
+    outcome = store.write("owner", "example", parse(group(*entries, **older)), NOW)
+    assert (outcome.returned, outcome.gone, outcome.complete) == (1, 0, "skipped_older")
+    assert store.write("owner", "example", parse(task("extra")), NOW).complete is None
+    assert len(store.list_items("owner", ItemQuery())[0]) == 3
+    outcome = store.write(
+        "owner", "example", parse(group(**{**complete, "omnigent.ai:complete": "all"})), NOW
+    )
+    assert (outcome.gone, outcome.complete) == (3, "applied")
+    assert store.list_items("owner", ItemQuery())[0] == []
+    assert store.write("owner", "example", parse(group(**complete)), NOW).gone == 0
+    assert len(store.list_items("owner", ItemQuery(include_gone=True))[0]) == 3
+
+
+async def test_item_history_closed_seen_and_lazy_relations(board_client, store):
+    history = [{"id": "new", "time": STAMP, "kind": "closed"}]
+    relation = {"@type": "Relation", "relation": {"parent": True}}
+    body = task(
+        progress="completed",
+        relatedTo={"target": relation, "missing": relation},
+        **{"omnigent.ai:history": history},
+    )
+    store.write("owner@example.com", "example", parse(body), NOW)
+    item_url = "/v1/me/tasks/item?source=example&uid=eng-1"
+    item = (await board_client.get(item_url)).json()
+    assert item["omnigent.ai:closedSeen"] == utc_text(NOW.timestamp())
+    assert "progressUpdated" not in item
+    assert item["omnigent.ai:history"] == history
+    assert item["omnigent.ai:unresolved"] == ["target", "missing"]
+    store.write("other@example.com", "other", parse(task("target")), NOW)
+    assert (await board_client.get(item_url)).json()["omnigent.ai:unresolved"] == [
+        "target",
+        "missing",
+    ]
+    store.write("owner@example.com", "other", parse(task("target")), NOW)
+    assert (await board_client.get(item_url)).json()["omnigent.ai:unresolved"] == ["missing"]
+    read = await board_client.get(
+        "/v1/me/tasks", params={"closed_after": utc_text(NOW.timestamp())}
+    )
+    assert [entry["uid"] for entry in read.json()["entries"]] == ["eng-1"]
+    assert (
+        await board_client.get(item_url, headers={"X-Forwarded-Email": "other@example.com"})
+    ).status_code == 404
+    store.write(
+        "owner@example.com",
+        "example",
+        parse(task(sequence=1, progress="completed")),
+        NOW + timedelta(seconds=1),
+    )
+    assert (await board_client.get(item_url)).json()["omnigent.ai:closedSeen"] == utc_text(
+        NOW.timestamp()
+    )
+    store.write(
+        "owner@example.com", "example", parse(task(sequence=2)), NOW + timedelta(seconds=2)
+    )
+    assert "omnigent.ai:closedSeen" not in (await board_client.get(item_url)).json()
+
+
+async def test_history_time_order_cursor_and_query_errors(board_client, store):
+    for source in ("a", "b"):
+        body = task(
+            **{
+                "omnigent.ai:history": [
+                    {"id": "later", "time": "2026-11-06T06:30:00.0000002Z", "kind": "comment"},
+                    {"id": "earlier", "time": "2026-11-06T06:30:00.0000001Z", "kind": "created"},
+                ]
+            }
+        )
+        store.write("owner@example.com", source, parse(body), NOW)
+    params = {"limit": 1}
+    found = []
+    while True:
+        response = await board_client.get("/v1/me/tasks/history", params=params)
+        assert response.status_code == 200
+        page = response.json()
+        found.extend((entry["source"], entry["id"]) for entry in page["entries"])
+        if "cursor" not in page:
+            break
+        params["cursor"] = page["cursor"]
+    assert found == [("b", "later"), ("a", "later"), ("b", "earlier"), ("a", "earlier")]
+    precise = (
+        await board_client.get(
+            "/v1/me/tasks/history",
+            params={
+                "after": "2026-11-06T06:30:00.0000001Z",
+                "before": "2026-11-06T06:30:00.0000002Z",
+            },
+        )
+    ).json()
+    assert [(entry["source"], entry["id"]) for entry in precise["entries"]] == [
+        ("b", "earlier"),
+        ("a", "earlier"),
+    ]
+    assert (
+        await board_client.get("/v1/me/tasks/history", params={**params, "source": "a"})
+    ).status_code == 422
+    filtered = (
+        await board_client.get(
+            "/v1/me/tasks/history",
+            params={"source": "a", "after": STAMP, "before": "2026-11-07T00:00:00Z"},
+        )
+    ).json()
+    assert len(filtered["entries"]) == 2
+    assert (await board_client.get("/v1/me/tasks/history?before=invalid")).json()[
+        "path"
+    ] == "before"
+    assert (await board_client.get("/v1/me/tasks?changed_after=invalid")).json()[
+        "path"
+    ] == "changed_after"
+    for cursor in ("not-base64", "W10=", "e30=", "bnVsbA=="):
+        assert (
+            await board_client.get("/v1/me/tasks", params={"cursor": cursor})
+        ).status_code == 422
+
+
+async def test_closed_counts_offset_observed_time_and_gone(board_client, store):
+    owner = "owner@example.com"
+    store.write(
+        owner,
+        "example",
+        parse(
+            group(
+                task("explicit", progress="completed", progressUpdated="2025-10-01T23:30:00Z"),
+                task("observed", progress="failed"),
+                task("open"),
+            )
+        ),
+        NOW,
+    )
+    store.write(
+        owner,
+        "other",
+        parse(task("cancelled", progress="cancelled", progressUpdated="2025-10-01T23:30:00Z")),
+        NOW,
+    )
+    params = {"from": "2025-10-01T00:00:00Z", "to": "2025-10-03T00:00:00Z", "offset": 60}
+    days = (await board_client.get("/v1/me/tasks/closed-counts", params=params)).json()["days"]
+    assert days == [
+        {"day": "2025-10-02", "source": "example", "closed": 1},
+        {"day": "2025-10-02", "source": "other", "closed": 1},
+    ]
+    days = (
+        await board_client.get("/v1/me/tasks/closed-counts", params={"source": "example"})
+    ).json()["days"]
+    assert days == [
+        {"day": "2025-10-01", "source": "example", "closed": 1},
+        {"day": "2026-11-06", "source": "example", "closed": 1},
+    ]
+    store.write(owner, "example", parse(group(**{"omnigent.ai:complete": "all"})), NOW)
+    assert (
+        await board_client.get("/v1/me/tasks/closed-counts", params={"source": "example"})
+    ).json() == {"days": []}
+    assert (await board_client.get("/v1/me/tasks/closed-counts?offset=1440")).status_code == 422
+
+
+async def test_delete_source_is_owner_scoped_atomic_and_recreation_is_new(board_client, store):
+    body = task(**{"omnigent.ai:history": [{"id": "h", "time": STAMP, "kind": "created"}]})
+    for owner in ("owner@example.com", "other@example.com"):
+        store.write(owner, "example", parse(body), NOW)
+    created = (await board_client.get("/v1/me/tasks/sources")).json()["sources"][0]["created"]
+    cached_sources = {"example": created}
+    cache = {
+        (item["omnigent.ai:source"], item["uid"]): item
+        for item in (await board_client.get("/v1/me/tasks")).json()["entries"]
+    }
+    assert ("example", "eng-1") in cache
+    assert (
+        await board_client.delete(
+            "/v1/me/tasks/sources/example", headers={"Origin": "https://untrusted.example.com"}
+        )
+    ).status_code == 403
+    response = await board_client.delete("/v1/me/tasks/sources/example")
+    assert response.status_code == 204 and response.content == b""
+    assert (await board_client.get("/v1/me/tasks/sources")).json()["sources"] == []
+    assert (await board_client.get("/v1/me/tasks/history")).json()["entries"] == []
+    assert (
+        await board_client.get("/v1/me/tasks/item?source=example&uid=eng-1")
+    ).status_code == 404
+    assert store.get_item("other@example.com", "example", "eng-1") is not None
+    assert (await board_client.delete("/v1/me/tasks/sources/example")).status_code == 404
+    store.write(
+        "owner@example.com", "example", parse(task("replacement")), NOW + timedelta(seconds=1)
+    )
+    source = (await board_client.get("/v1/me/tasks/sources")).json()["sources"][0]
+    assert source["created"] != created
+    # Reader skipped the deletion interval; the source generation invalidates its cache.
+    live_sources = {source["id"]: source["created"]}
+    cache = {
+        identity: item
+        for identity, item in cache.items()
+        if cached_sources.get(identity[0]) == live_sources.get(identity[0])
+    }
+    assert cache == {}
+    for source_id, generation in live_sources.items():
+        if cached_sources.get(source_id) != generation:
+            page = (await board_client.get("/v1/me/tasks", params={"source": source_id})).json()
+            cache.update(
+                ((item["omnigent.ai:source"], item["uid"]), item) for item in page["entries"]
+            )
+    assert cache == {
+        ("example", "replacement"): {
+            **task("replacement"),
+            "progress": "needs-action",
+            "omnigent.ai:source": "example",
+        }
+    }
+
+
+async def test_change_reader_converges_across_pages_and_concurrent_reports(board_client, store):
+    owner = "owner@example.com"
+    entries = [task(f"eng-{index:04}") for index in range(2500)]
+    store.write(owner, "example", parse(group(*entries)), NOW)
+    params = {"changed_after": STAMP, "limit": 1000}
+    first = (await board_client.get("/v1/me/tasks", params=params)).json()
+    assert len(first["entries"]) == 1000
+    through = first["omnigent.ai:changedThrough"]
+    cache = {item["uid"]: item for item in first["entries"]}
+    changed = datetime.now(UTC)
+    entries[0] = task("eng-0000", sequence=1, title="Changed during read")
+    store.write(
+        owner,
+        "example",
+        parse(group(*entries[:-20], task("new"), **{"omnigent.ai:complete": "open"})),
+        changed,
+    )
+    page = first
+    pages = 1
+    while "omnigent.ai:cursor" in page:
+        page = (
+            await board_client.get(
+                "/v1/me/tasks", params={**params, "cursor": page["omnigent.ai:cursor"]}
+            )
+        ).json()
+        pages += 1
+        cache.update((item["uid"], item) for item in page["entries"])
+    assert pages == 3
+    params = {
+        "changed_after": utc_text(datetime.fromisoformat(through).timestamp() - 60),
+        "limit": 7,
+    }
+    page = (await board_client.get("/v1/me/tasks", params=params)).json()
+    tombstones = 0
+    while True:
+        for item in page["entries"]:
+            if "omnigent.ai:gone" in item:
+                cache.pop(item["uid"], None)
+                tombstones += 1
+            else:
+                cache[item["uid"]] = item
+        if "omnigent.ai:cursor" not in page:
+            break
+        page = (
+            await board_client.get(
+                "/v1/me/tasks", params={**params, "cursor": page["omnigent.ai:cursor"]}
+            )
+        ).json()
+    assert tombstones == 20
+    assert cache == {
+        entry["uid"]: {
+            **entry,
+            "progress": "needs-action",
+            "omnigent.ai:source": "example",
+        }
+        for entry in [*entries[:-20], task("new")]
+    }
+
+
+def test_history_only_and_returned_are_changes_for_every_body_outcome(store):
+    for index, body in enumerate((task(sequence=1), task(sequence=1), task())):
+        body["omnigent.ai:history"] = [{"id": str(index), "time": STAMP, "kind": "comment"}]
+        when = NOW + timedelta(seconds=index)
+        store.write("owner", "example", parse(body), when)
+        entries, _ = store.list_items(
+            "owner", ItemQuery(changed_after=utc_text(when.timestamp()), read_at=when.timestamp())
+        )
+        assert [entry["uid"] for entry in entries] == ["eng-1"]
+    when = NOW + timedelta(minutes=1)
+    store.write("owner", "example", parse(group(**{"omnigent.ai:complete": "all"})), when)
+    store.write("owner", "example", parse(task()), when + timedelta(seconds=1))
+    entries, _ = store.list_items(
+        "owner",
+        ItemQuery(changed_after=utc_text(when.timestamp() + 1), read_at=when.timestamp() + 1),
+    )
+    assert len(entries) == 1 and "omnigent.ai:gone" not in entries[0]
+
+
+async def test_default_report_limits_never_truncate_or_partially_write(board_client):
+    oversized = group(*(task(str(index)) for index in range(10_001)))
+    response = await board_client.put("/v1/me/tasks/sources/entries", json=oversized)
+    assert response.status_code == 413 and response.json()["code"] == "too_many_entries"
+    response = await board_client.put(
+        "/v1/me/tasks/sources/body",
+        content=b" " * (8 * 1024 * 1024 + 1),
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 413 and response.json()["code"] == "body_too_large"
+    assert (await board_client.get("/v1/me/tasks")).json()["entries"] == []
+    for index in range(62):
+        assert (
+            await board_client.put(f"/v1/me/tasks/sources/source-{index}", json=task())
+        ).status_code == 200
+    response = await board_client.put("/v1/me/tasks/sources/extra", json=task())
+    assert response.status_code == 409 and response.json()["code"] == "source_limit"
+    sources = (await board_client.get("/v1/me/tasks/sources")).json()["sources"]
+    assert len(sources) == 64 and "extra" not in {source["id"] for source in sources}
+    for source in sources[:2]:
+        assert source["issues"][0]["code"] in {"too_many_entries", "body_too_large"}
+
+
+async def test_issue_retention_keeps_only_twenty_metadata_records(board_client):
+    for _ in range(22):
+        response = await board_client.put(
+            "/v1/me/tasks/sources/example", json={"@type": "Task", "uid": "private task text"}
+        )
+        assert response.status_code == 422
+    source = (await board_client.get("/v1/me/tasks/sources")).json()["sources"][0]
+    assert len(source["issues"]) == 20
+    assert "private task text" not in json.dumps(source)
+
+
+@pytest.mark.parametrize("limits", [{"max_entries": 0}, {"max_sources": True}, {"unknown": 3}, []])
+def test_limits_reject_invalid_configuration(limits):
+    with pytest.raises(ValueError):
+        TaskBoardLimits.from_config({"task_board": {"limits": limits}})
+
+
+async def test_upload_finished_after_a_read_watermark_is_seen_by_the_next_read(
+    board_client, monkeypatch
+):
+    clock = [NOW]
+
+    class RequestClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock[0]
+
+    monkeypatch.setattr("omnigent.server.routes.task_board.datetime", RequestClock)
+    monkeypatch.setattr("omnigent.stores.task_board_store.datetime", RequestClock)
+    report = json.dumps(task()).encode()
+    observed = []
+
+    async def upload():
+        yield report[:20]
+        clock[0] = NOW + timedelta(seconds=70)
+        response = await board_client.get("/v1/me/tasks", params={"changed_after": STAMP})
+        observed.append(response.json()["omnigent.ai:changedThrough"])
+        clock[0] = NOW + timedelta(seconds=80)
+        yield report[20:]
+
+    response = await board_client.put(
+        "/v1/me/tasks/sources/example",
+        content=upload(),
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 200
+    response = await board_client.get(
+        "/v1/me/tasks",
+        params={
+            "changed_after": utc_text(datetime.fromisoformat(observed[0]).timestamp() - 60),
+        },
+    )
+    assert [item["uid"] for item in response.json()["entries"]] == ["eng-1"]
+
+
+def test_parallel_new_sources_cannot_overrun_the_owner_limit(store):
+    for index in range(63):
+        store.write("owner", f"source-{index}", parse(task()), NOW)
+
+    def write(source):
+        try:
+            return store.write("owner", source, parse(task()), NOW).applied
+        except ReportError as error:
+            return error.code
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        outcomes = list(workers.map(write, ["last-a", "last-b"]))
+    assert sorted(outcomes, key=str) == [1, "source_limit"]
+    assert len(store.list_sources("owner")) == 64
+
+
+async def test_time_window_queries_keep_fractional_precision(board_client, store):
+    store.write(
+        "owner@example.com",
+        "example",
+        parse(
+            group(
+                task(
+                    "earlier", progress="completed", progressUpdated="2026-11-06T06:30:00.0000001Z"
+                ),
+                task(
+                    "later", progress="completed", progressUpdated="2026-11-06T06:30:00.0000002Z"
+                ),
+            )
+        ),
+        NOW,
+    )
+    after, before = "2026-11-06T06:30:00.0000001Z", "2026-11-06T06:30:00.0000002Z"
+    response = await board_client.get(
+        "/v1/me/tasks", params={"closed_after": after, "closed_before": before}
+    )
+    assert [item["uid"] for item in response.json()["entries"]] == ["earlier"]
+    response = await board_client.get(
+        "/v1/me/tasks/closed-counts", params={"from": after, "to": before}
+    )
+    assert response.json()["days"] == [{"day": "2026-11-06", "source": "example", "closed": 1}]
+    response = await board_client.get(
+        "/v1/me/tasks", params={"changed_after": "2026-11-06T07:00:00.0000001Z"}
+    )
+    assert response.json()["entries"] == []

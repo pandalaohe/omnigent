@@ -2788,11 +2788,15 @@ def create_app(
     app.state.host_model_catalog_cache_store = host_model_catalog_cache_store
     if task_board_enabled(resolved_server_config):
         from omnigent.server.routes.task_board import create_task_board_router
+        from omnigent.server.task_board.models import TaskBoardLimits
         from omnigent.stores.task_board_store import TaskBoardStore
 
         app.include_router(
             create_task_board_router(
-                TaskBoardStore(conversation_store.storage_location),
+                TaskBoardStore(
+                    conversation_store.storage_location,
+                    TaskBoardLimits.from_config(resolved_server_config),
+                ),
                 auth_provider=auth_provider,
             ),
             prefix="/v1",

@@ -2944,6 +2944,7 @@ class SqlTaskBoardSource(OmnigentBase):
     created_at: Mapped[float] = mapped_column(Double, nullable=False)
     last_write: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     complete_updated: Mapped[float | None] = mapped_column(Double)
+    complete_version: Mapped[str | None] = mapped_column(Text)
     issues: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
 
 

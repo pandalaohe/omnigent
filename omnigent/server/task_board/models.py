@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import math
 import re
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass, field, fields
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
@@ -83,6 +84,21 @@ class TaskBoardLimits:
     max_history_per_task: int = 5_000
     max_source_fields: int = 32
     max_sources: int = 64
+
+    @classmethod
+    def from_config(cls, config: Mapping[str, Any]) -> TaskBoardLimits:
+        board = config.get("task_board", {})
+        limits = board.get("limits", {}) if isinstance(board, Mapping) else {}
+        names = {item.name for item in fields(cls)}
+        if (
+            not isinstance(limits, Mapping)
+            or set(limits) - names
+            or any(type(value) is not int or value <= 0 for value in limits.values())
+        ):
+            raise ValueError(
+                "task_board.limits requires known limits with positive integer values"
+            )
+        return cls(**limits)
 
 
 class ReportError(ValueError):

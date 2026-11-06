@@ -8,7 +8,7 @@ from dataclasses import asdict
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.routing import APIRoute
 from starlette.responses import JSONResponse, Response
@@ -23,7 +23,17 @@ from omnigent.server.task_board.models import (
     utc_text,
     utc_timestamp,
 )
-from omnigent.stores.task_board_store import ItemQuery, TaskBoardStore
+from omnigent.stores.task_board_store import HistoryQuery, ItemQuery, TaskBoardStore
+
+
+def _query_time(value: str | None, path: str) -> str | None:
+    if value is None:
+        return None
+    try:
+        utc_timestamp(value)
+        return value
+    except ValueError:
+        raise ReportError("bad_value", path, "Invalid query time") from None
 
 
 class _TaskBoardRoute(APIRoute):
@@ -33,11 +43,23 @@ class _TaskBoardRoute(APIRoute):
         async def report_validation_error(request: Request) -> Response:
             try:
                 return await handler(request)
+            except ReportError as error:
+                return JSONResponse(
+                    error.payload(),
+                    status_code=error.status,
+                    headers={"Cache-Control": "no-store"},
+                )
             except RequestValidationError as error:
                 first = error.errors()[0]
                 path = ".".join(str(part) for part in first["loc"][1:])
                 kind = first["type"]
-                code = "bad_type" if kind.endswith(("_type", "_parsing")) else "bad_value"
+                code = (
+                    "too_long"
+                    if kind.endswith("_too_long")
+                    else "bad_type"
+                    if kind.endswith(("_type", "_parsing"))
+                    else "bad_value"
+                )
                 return JSONResponse(
                     ReportError(
                         code, path, "Invalid request parameter", params={"path": path}
@@ -63,7 +85,6 @@ def create_task_board_router(
                 ReportError("bad_value", "source_id", "Invalid source id").payload(),
                 status_code=422,
             )
-        now = datetime.now(UTC)
         try:
             body = bytearray()
             async for chunk in request.stream():
@@ -75,11 +96,13 @@ def create_task_board_router(
             report = parse_report(
                 bytes(body), request.headers.get("content-type", ""), store.limits
             )
-            outcome = await asyncio.to_thread(store.write, owner, source_id, report, now)
+            outcome = await asyncio.to_thread(store.write, owner, source_id, report)
         except ReportError as error:
             if error.status in {413, 422}:
                 try:
-                    await asyncio.to_thread(store.record_issue, owner, source_id, error, now)
+                    await asyncio.to_thread(
+                        store.record_issue, owner, source_id, error, datetime.now(UTC)
+                    )
                 except ReportError as issue_error:
                     if issue_error.code != "source_limit":
                         raise
@@ -96,37 +119,28 @@ def create_task_board_router(
         state: Literal["open", "closed", "all"] = "all",
         closed_after: str | None = None,
         closed_before: str | None = None,
+        changed_after: str | None = None,
         include_gone: Literal["0", "1"] = "0",
         include_history: Literal["0", "1"] = "0",
-        cursor: str | None = None,
-        limit: int = 1000,
+        cursor: str | None = Query(default=None, max_length=4096),
+        limit: int = Query(default=1000, ge=1, le=5000),
     ) -> JSONResponse:
         owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
-        try:
-            if not 1 <= limit <= 5000:
-                raise ReportError("bad_value", "limit", "limit must be between 1 and 5000")
-            if cursor is not None and len(cursor) > 4096:
-                raise ReportError("too_long", "cursor", "Cursor exceeds the length limit")
-            query = ItemQuery(
-                source=source,
-                group=group,
-                state=state,
-                closed_after=utc_timestamp(closed_after) if closed_after is not None else None,
-                closed_before=utc_timestamp(closed_before) if closed_before is not None else None,
-                include_gone=include_gone == "1",
-                include_history=include_history == "1",
-                cursor=cursor,
-                limit=limit,
-            )
-            entries, next_cursor = await asyncio.to_thread(store.list_items, owner, query)
-        except ReportError as error:
-            return JSONResponse(
-                error.payload(), status_code=error.status, headers={"Cache-Control": "no-store"}
-            )
-        except ValueError:
-            return JSONResponse(
-                ReportError("bad_value", "", "Invalid query time").payload(), status_code=422
-            )
+        started = datetime.now(UTC).timestamp()
+        query = ItemQuery(
+            source=source,
+            group=group,
+            state=state,
+            closed_after=_query_time(closed_after, "closed_after"),
+            closed_before=_query_time(closed_before, "closed_before"),
+            changed_after=_query_time(changed_after, "changed_after"),
+            read_at=started,
+            include_gone=include_gone == "1",
+            include_history=include_history == "1",
+            cursor=cursor,
+            limit=limit,
+        )
+        entries, next_cursor = await asyncio.to_thread(store.list_items, owner, query)
         payload = {
             "@type": "Group",
             "uid": "omnigent:tasks",
@@ -135,7 +149,72 @@ def create_task_board_router(
         }
         if next_cursor is not None:
             payload["omnigent.ai:cursor"] = next_cursor
+        if changed_after is not None and cursor is None:
+            payload["omnigent.ai:changedThrough"] = utc_text(started)
         return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @router.get("/item")
+    async def read_item(request: Request, source: str, uid: str) -> JSONResponse:
+        owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
+        item = await asyncio.to_thread(store.get_item, owner, source, uid)
+        if item is None:
+            raise ReportError("not_found", "uid", "Task not found", status=404)
+        return JSONResponse(item, headers={"Cache-Control": "no-store"})
+
+    @router.get("/history")
+    async def read_history(
+        request: Request,
+        after: str | None = None,
+        before: str | None = None,
+        source: str | None = None,
+        cursor: str | None = Query(default=None, max_length=4096),
+        limit: int = Query(default=500, ge=1, le=5000),
+    ) -> JSONResponse:
+        owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
+        _query_time(after, "after")
+        _query_time(before, "before")
+        entries, next_cursor = await asyncio.to_thread(
+            store.list_history,
+            owner,
+            HistoryQuery(
+                source=source,
+                after=after,
+                before=before,
+                cursor=cursor,
+                limit=limit,
+            ),
+        )
+        payload: dict[str, Any] = {"entries": entries}
+        if next_cursor is not None:
+            payload["cursor"] = next_cursor
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @router.get("/closed-counts")
+    async def read_closed_counts(
+        request: Request,
+        from_: str | None = Query(default=None, alias="from"),
+        to: str | None = None,
+        offset: int = Query(default=0, ge=-1439, le=1439),
+        source: str | None = None,
+    ) -> JSONResponse:
+        owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
+        days = await asyncio.to_thread(
+            store.closed_counts,
+            owner,
+            after=_query_time(from_, "from"),
+            before=_query_time(to, "to"),
+            offset=offset,
+            source=source,
+        )
+        return JSONResponse({"days": days}, headers={"Cache-Control": "no-store"})
+
+    @router.delete("/sources/{source_id}", status_code=204)
+    async def delete_source(source_id: str, request: Request) -> Response:
+        owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
+        require_trusted_origin(request)
+        if not await asyncio.to_thread(store.delete_source, owner, source_id):
+            raise ReportError("not_found", "source_id", "Source not found", status=404)
+        return Response(status_code=204, headers={"Cache-Control": "no-store"})
 
     @router.get("/sources")
     async def read_sources(request: Request) -> JSONResponse:
