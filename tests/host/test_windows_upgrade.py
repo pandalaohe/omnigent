@@ -338,9 +338,36 @@ def test_shutdown_does_not_follow_reused_parent_pid(
     reused = Process(100, ["unrelated new process"])
     monkeypatch.setattr(reused, "create_time", lambda: 400.0)
     child = Process(500, ["unrelated child"], parent=100)
+    monkeypatch.setattr(windows, "time", lambda: 250.0)
     process_table.extend([reused, child])
     windows.stop_host_tree([old])
     assert reused.alive and child.alive
+
+
+@pytest.mark.parametrize("born", [99.0, 100.0, 250.0, 250.001, 500.0])
+def test_child_of_absent_parent_must_fit_recorded_lifetime(
+    monkeypatch: pytest.MonkeyPatch, process_table: list[Process], born: float
+) -> None:
+    host = Process(100, ["captured host"])
+    worker = Process(300, ["worker of an exited parent"], parent=100)
+    monkeypatch.setattr(worker, "create_time", lambda: born)
+    monkeypatch.setattr(windows, "time", lambda: 250.0)
+    # The reused parent has also exited; the sweep sees only its worker.
+    process_table.append(worker)
+    windows.stop_host_tree([host])
+    assert not host.alive
+    assert worker.alive == (born < 100.0 or born > 250.0)
+
+
+def test_parent_gone_before_stop_does_not_authorize_unknown_children(
+    process_table: list[Process],
+) -> None:
+    host = Process(100, ["already exited host"])
+    host.alive = False
+    worker = Process(300, ["unknown worker"], parent=100)
+    process_table.append(worker)
+    windows.stop_host_tree([host])
+    assert worker.alive
 
 
 def test_capture_uses_fresh_identity_after_pid_reuse(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -448,3 +475,52 @@ def test_launcher_paths_belong_to_current_receipt_and_environment(
     assert (bindir / "omni.exe").read_bytes() == b"current environment"
     assert (bindir / "omnigent.exe").read_bytes() == b"other environment"
     assert other.read_bytes() == b"other environment"
+
+
+def test_orphan_venv_holder_aborts_install_and_restores(
+    monkeypatch: pytest.MonkeyPatch,
+    process_table: list[Process],
+    uv_layout: tuple[Path, Path],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from omnigent.cli import _upgrade_host_service
+
+    prefix, bindir = uv_layout
+    host = Process(100, ["captured host"])
+    orphan = Process(300, ["worker whose intermediary already exited"], parent=200)
+    process_table.append(orphan)
+    locked_file = prefix / "Scripts" / "omni.exe"
+    original_rename = Path.rename
+    events: list[str] = []
+
+    def rename(path: Path, target: Path) -> Path:
+        if path == prefix and orphan.alive:
+            raise PermissionError(32, "File is in use by the surviving worker", str(locked_file))
+        return original_rename(path, target)
+
+    def service(_wrapper: Path, action: str) -> None:
+        events.append(action)
+        if action == "start":
+            assert locked_file.read_bytes() == b"current environment"
+            for name in ("omni", "omnigent"):
+                assert (bindir / f"{name}.exe").read_bytes() == b"current environment"
+
+    def unexpected_install(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("locked venv must abort before launching the installer")
+
+    monkeypatch.setattr(Path, "rename", rename)
+    monkeypatch.setattr("omnigent.cli.IS_WINDOWS", True)
+    monkeypatch.setattr("omnigent.update_check.IS_WINDOWS", True)
+    monkeypatch.setattr(
+        "omnigent.cli._windows_host_service_wrapper", lambda: bindir / "wrapper.cmd"
+    )
+    monkeypatch.setattr("omnigent.cli._drain_and_stop_local_server", lambda **_: None)
+    monkeypatch.setattr("omnigent.cli._run_windows_host_service", service)
+    monkeypatch.setattr(windows, "capture_host_tree", lambda: [host])
+    monkeypatch.setattr("omnigent.update_check.subprocess.run", unexpected_install)
+    with _upgrade_host_service(force=True):
+        code = _run_upgrade_command("uv tool install --reinstall omnigent", Console())
+    assert code == -1
+    assert not host.alive and orphan.alive
+    assert events == ["stop", "start"]
+    assert "File is in use by the surviving worker" in capsys.readouterr().out

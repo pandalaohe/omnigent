@@ -11,6 +11,7 @@ import tomllib
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
+from time import time
 
 import psutil
 
@@ -108,31 +109,50 @@ def stop_host_tree(processes: list[psutil.Process]) -> None:
         return
     captured = {proc.pid: proc for proc in processes}
     created = {proc.pid: proc.create_time() for proc in processes}
+    ended: dict[int, float] = {}
     _, pending = psutil.wait_procs(list(captured.values()), timeout=2)
     while True:
         for proc in pending:
-            with contextlib.suppress(psutil.NoSuchProcess):
+            stopping_at = time()
+            try:
                 proc.terminate()
+            except psutil.NoSuchProcess:
+                pass
+            else:
+                ended[proc.pid] = stopping_at
         _, alive = psutil.wait_procs(pending, timeout=5)
         for proc in alive:
-            with contextlib.suppress(psutil.NoSuchProcess):
+            stopping_at = time()
+            try:
                 proc.kill()
+            except psutil.NoSuchProcess:
+                pass
+            else:
+                ended[proc.pid] = stopping_at
         _, alive = psutil.wait_procs(alive, timeout=5)
         if alive:
             raise RuntimeError(f"Host processes did not exit: {[proc.pid for proc in alive]}")
         pending = []
         current = {proc.pid: proc for proc in _fresh_processes()}
+        # Exited, unrecorded intermediaries can hide orphans. Do not chase them;
+        # if a survivor blocks staging/install, retained_install restores the old paths.
         for proc in current.values():
             try:
                 parent = proc.ppid()
                 if proc.pid in captured or parent not in created:
                     continue
-                if proc.create_time() <= created[parent]:
+                born = proc.create_time()
+                if born < created[parent]:
                     continue
-                # A reused parent PID does not bind an unrelated new tree.
-                if parent in current and current[parent].create_time() != created[parent]:
+                parent_alive = (
+                    parent in current
+                    and current[parent].create_time() == created[parent]
+                    and current[parent].is_running()
+                )
+                # Signal time is a conservative end bound; waiting can outlast PID reuse.
+                if not parent_alive and born > ended.get(parent, float("-inf")):
                     continue
-                created[proc.pid] = proc.create_time()
+                created[proc.pid] = born
                 captured[proc.pid] = proc
                 pending.append(proc)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
