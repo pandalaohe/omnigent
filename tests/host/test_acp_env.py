@@ -15,6 +15,28 @@ from omnigent.runtime.workflow import _build_acp_spawn_env
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 
 
+@pytest.mark.parametrize("server_url", [None, "https://example.test"])
+def test_model_source_env_reference_reaches_daemon(tmp_path, server_url):
+    (tmp_path / "config.yaml").write_text(
+        "model_sources:\n  copilot:\n    url: https://example.test/v1\n"
+        "    api_key_ref: env:SOURCE_KEY\n"
+    )
+    with patch.dict(
+        os.environ,
+        {
+            "OMNIGENT_CONFIG_HOME": str(tmp_path),
+            "SOURCE_KEY": "synthetic-key",
+            "OMNIGENT_SOURCE_KEY": "synthetic-alias",
+            "UNRELATED_SECRET": "synthetic-unrelated",
+        },
+        clear=True,
+    ):
+        daemon = _build_host_daemon_env(server_url=server_url)
+    assert daemon["SOURCE_KEY"] == "synthetic-key"
+    assert daemon["OMNIGENT_SOURCE_KEY"] == "synthetic-alias"
+    assert "UNRELATED_SECRET" not in daemon
+
+
 @pytest.mark.parametrize("server_url", [None, "https://example.databricksapps.com"])
 def test_acp_env_exclusion_reaches_vendor_through_daemon_and_runner(
     tmp_path: Path, server_url: str | None

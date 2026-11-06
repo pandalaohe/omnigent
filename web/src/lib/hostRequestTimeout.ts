@@ -2,9 +2,10 @@
 export async function withHostRequestTimeout<T>(
   request: (signal: AbortSignal) => Promise<T>,
   signal?: AbortSignal,
+  timeoutMs = 8_000,
 ): Promise<T> {
   if (typeof AbortSignal.timeout === "function" && typeof AbortSignal.any === "function") {
-    const timeout = AbortSignal.timeout(8_000);
+    const timeout = AbortSignal.timeout(timeoutMs);
     return request(signal ? AbortSignal.any([signal, timeout]) : timeout);
   }
 
@@ -17,7 +18,7 @@ export async function withHostRequestTimeout<T>(
   const timer = setTimeout(() => {
     timedOut = true;
     controller.abort(timeoutError);
-  }, 8_000);
+  }, timeoutMs);
   try {
     return await request(controller.signal);
   } catch (error) {

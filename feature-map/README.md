@@ -113,6 +113,9 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 
 ## Features
 
+- [Model lists](./model-sources.md) covers host-owned model sources, the Settings
+  card, offline `models check` / `models guide`, and bounded ACP probing.
+
 - [Host restart](./host-restart.md) covers restart previews, ownership, draining, reconnect deadlines and result notices.
 
 - [Session orchestration](./session-orchestration.md) covers private-owner

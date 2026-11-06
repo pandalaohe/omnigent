@@ -1981,6 +1981,14 @@ class AcpExecutor(Executor):
             restore()
         return response
 
+    def _model_override_target(self, model: str | None) -> str | None:
+        default_model = self._config.default_model
+        if default_model is None:
+            default_model = self._config.model
+        elif not default_model:
+            default_model = self._initial_model
+        return model or default_model
+
     async def _apply_model_override(self, session_id: str, model: str | None) -> None:
         """Warm-switch the agent's model via ACP ``session/set_config_option``.
 
@@ -1997,12 +2005,7 @@ class AcpExecutor(Executor):
         :param model: Requested model id, or ``None`` to restore the configured default.
         """
         # A launch override must not replace the default restored by later turns.
-        default_model = self._config.default_model
-        if default_model is None:
-            default_model = self._config.model
-        elif not default_model:
-            default_model = self._initial_model
-        model = model or default_model
+        model = self._model_override_target(model)
         if not model:
             return
         available = getattr(self._config, "available_models", ())
@@ -2205,6 +2208,7 @@ class AcpExecutor(Executor):
                     self._active_model = None
                 yield ExecutorError(
                     message=f"ACP model selection failed: {describe_exception(exc)}. "
+                    f"Agent kept {self._active_model or 'its current model'}. "
                     "No prompt was sent; retry or select another configured model.",
                     retryable=True,
                     preserve_session=(
@@ -2327,6 +2331,11 @@ class AcpExecutor(Executor):
         opening_settled()
         deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
         accumulated_text: list[str] = []
+        target_model = self._model_override_target(requested_model)
+        if target_model and target_model != self._active_model:
+            notice = f"Agent kept {self._active_model or 'its current model'}.\n\n"
+            accumulated_text.append(notice)
+            yield TextChunk(text=notice)
 
         while True:
             remaining = deadline - loop.time()

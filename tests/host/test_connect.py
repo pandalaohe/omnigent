@@ -945,17 +945,17 @@ async def test_handle_model_options_codex_probe_failure_is_failed(
 
 
 async def test_handle_model_options_rejects_unsupported_harness() -> None:
-    """Only launch paths with host-resolved model catalogs are accepted."""
+    """Unregistered launch paths cannot query a host catalog."""
     host = _make_host_process()
 
     result = await host._handle_model_options(
-        HostModelOptionsFrame(request_id="req_models", harness="cursor-native"),
+        HostModelOptionsFrame(request_id="req_models", harness="unknown-harness"),
     )
 
     assert result == HostModelOptionsResultFrame(
         request_id="req_models",
         status="failed",
-        error="model options are unsupported for harness 'cursor-native'",
+        error="model options are unsupported for harness 'unknown-harness'",
     )
 
 

@@ -17,29 +17,32 @@ afterEach(() => {
   Object.defineProperty(AbortSignal, "any", { configurable: true, value: originalAny });
 });
 
-it.each([false, true])(
-  "bounds a stalled operation (abort reason unsupported: %s)",
-  async (legacy) => {
-    if (legacy) {
-      const abort = AbortController.prototype.abort;
-      vi.spyOn(AbortController.prototype, "abort").mockImplementation(function (
-        this: AbortController,
-      ) {
-        abort.call(this);
-      });
-    }
-    const pending = withHostRequestTimeout(
-      (signal) =>
-        new Promise((_, reject) => {
-          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
-        }),
-    );
-    const rejected = expect(pending).rejects.toMatchObject({ name: "TimeoutError" });
-    await vi.advanceTimersByTimeAsync(8_000);
-    await rejected;
-    expect(vi.getTimerCount()).toBe(0);
-  },
-);
+it.each<[boolean, number]>([
+  [false, 8_000],
+  [true, 8_000],
+  [false, 35_000],
+])("bounds a stalled operation (legacy: %s, budget: %s)", async (legacy, timeoutMs) => {
+  if (legacy) {
+    const abort = AbortController.prototype.abort;
+    vi.spyOn(AbortController.prototype, "abort").mockImplementation(function (
+      this: AbortController,
+    ) {
+      abort.call(this);
+    });
+  }
+  const pending = withHostRequestTimeout(
+    (signal) =>
+      new Promise((_, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      }),
+    undefined,
+    timeoutMs,
+  );
+  const rejected = expect(pending).rejects.toMatchObject({ name: "TimeoutError" });
+  await vi.advanceTimersByTimeAsync(timeoutMs);
+  await rejected;
+  expect(vi.getTimerCount()).toBe(0);
+});
 
 it("cleans up after an operation failure and follows an already-aborted caller", async () => {
   const error = new Error("lookup failed");

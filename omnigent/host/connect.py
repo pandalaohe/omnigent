@@ -4413,11 +4413,27 @@ class HostProcess:
         results = await asyncio.gather(
             self._probed_codex_model_options(),
             self._probed_claude_model_options(),
+            self._prewarm_model_sources(),
             return_exceptions=True,
         )
         return all(
             result is not None and not isinstance(result, BaseException) for result in results
         )
+
+    async def _prewarm_model_sources(self) -> bool:
+        from omnigent.models.model_source import fetch_model_source, model_source_for
+        from omnigent.onboarding.provider_config import load_config
+
+        config = load_config()
+        sources = config.get("model_sources")
+        if not isinstance(sources, dict):
+            return True
+        for harness in sources:
+            with contextlib.suppress(ValueError, RuntimeError):
+                source = model_source_for(harness, config)
+                if source is not None and source.lane in ("url", "command"):
+                    await fetch_model_source(harness, source)
+        return True
 
     def _ensure_model_options_prewarm(self) -> None:
         """Start or retry the host-owned catalog prewarm when needed."""
@@ -4501,28 +4517,31 @@ class HostProcess:
             else canonicalize_harness(frame.harness) or frame.harness
         )
         with_source = functools.partial(_with_model_configuration_source, harness=harness)
-        if harness == "acp" or harness.startswith("acp:"):
-            import shlex
+        from omnigent.models.model_source import fetch_model_source, model_source_for
 
-            from omnigent.models.model_catalog_store import (
-                binary_identity,
-                fingerprint_of,
-                read_catalog,
-            )
-            from omnigent.onboarding.acp_auth import acp_agents, resolve_acp_agent
+        try:
+            source = model_source_for(harness)
+            if source is not None:
+                refresh = frame.refresh if frame.refresh in ("auto", "force") else "none"
+                rows = await fetch_model_source(harness, source, refresh=refresh)
+                permissions = []
+                if source.lane == "agent":
+                    from omnigent.models.model_catalog_store import read_catalog
+                    from omnigent.models.model_source import _source_catalog
 
-            entries = acp_agents()
-            entry = (
-                resolve_acp_agent(harness[4:])
-                if harness.startswith("acp:")
-                else next(iter(entries), None)
-            )
-            rows = []
-            if entry is not None:
-                key = fingerprint_of(entry.command, binary_identity(shlex.split(entry.command)[0]))
-                rows = read_catalog("acp", key) or []
+                    _, key, _ = _source_catalog(harness, source)
+                    permissions = read_catalog("acp-modes", key) or []
+                return HostModelOptionsResultFrame(
+                    request_id=frame.request_id,
+                    status="ok",
+                    models=rows,
+                    permission_options=permissions,
+                )
+        except Exception as exc:  # noqa: BLE001 — config exceptions can carry credential values
             return HostModelOptionsResultFrame(
-                request_id=frame.request_id, status="ok", models=rows
+                request_id=frame.request_id,
+                status="failed",
+                error=f"model source failed ({type(exc).__name__}); run omnigent models check",
             )
         if harness in ("codex-native", "codex"):
             # Harness-truth lane: every launch shape is answered from the
@@ -4671,6 +4690,26 @@ class HostProcess:
                 routable_models=[model.id for model in listing.models],
             )
         if harness != "claude-native":
+            from omnigent.harness_plugins import capability_for_harness
+            from omnigent.models.model_catalog import list_models_for_worker
+            from omnigent.spec.types import AgentSpec, ExecutorSpec
+
+            try:
+                if capability_for_harness(harness) is None:
+                    raise ValueError("unregistered harness")
+                spec = AgentSpec(
+                    spec_version=1,
+                    name="host-model-preview",
+                    executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
+                )
+                listing = await asyncio.to_thread(list_models_for_worker, spec, harness)
+                return HostModelOptionsResultFrame(
+                    request_id=frame.request_id,
+                    status="ok",
+                    models=with_source([{"id": model.id} for model in listing.models]),
+                )
+            except Exception:  # noqa: BLE001 — keep optional listing failures on this frame
+                pass
             return HostModelOptionsResultFrame(
                 request_id=frame.request_id,
                 status="failed",

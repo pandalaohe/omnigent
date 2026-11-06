@@ -1547,6 +1547,53 @@ async def test_model_override_noops_when_already_active_or_unset() -> None:
     ex._rpc.assert_not_awaited()
 
 
+@pytest.mark.parametrize("failure", ["no-option", "latched", "rpc-error", "echo"])
+async def test_failed_model_pick_names_the_model_kept(failure, tmp_path, monkeypatch):
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    ex = AcpExecutor(AcpAgentConfig(command="neutral-agent", omnigent_mcp=False))
+    ex._session_id = "sid"
+    ex._initialized = True
+    ex._active_model = "model-a"
+    ex._proc = type("Process", (), {"returncode": None})()
+    if failure == "no-option":
+        ex._config_option_ids = {"mode"}
+    elif failure == "latched":
+        ex._model_switch_supported = False
+    elif failure == "rpc-error":
+        ex._rpc = AsyncMock(return_value={"error": {"message": "unsupported"}})
+    else:
+        ex._rpc = AsyncMock(
+            return_value={
+                "result": {"configOptions": [{"id": "model", "currentValue": "model-c"}]}
+            }
+        )
+
+    async def send(message):
+        assert message["method"] == "session/prompt"
+        ex._pending[message["id"]].set_result({"result": {}})
+
+    ex._send = send
+    events = [
+        event
+        async for event in ex.run_turn(
+            messages=[{"role": "user", "content": "hello"}],
+            tools=[],
+            system_prompt="",
+            config=ExecutorConfig(model="model-b"),
+        )
+    ]
+    kept = "model-c" if failure == "echo" else "model-a"
+    assert any(
+        isinstance(event, TextChunk) and event.text == f"Agent kept {kept}.\n\n"
+        for event in events
+    )
+    assert any(
+        isinstance(event, TurnComplete) and event.response == f"Agent kept {kept}.\n\n"
+        for event in events
+    )
+    assert ex._active_model == kept
+
+
 @pytest.mark.asyncio
 async def test_model_override_skipped_when_agent_has_no_model_option() -> None:
     """

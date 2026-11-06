@@ -26,9 +26,13 @@ def _isolated_data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
 
 
-def test_write_then_read_round_trips_verbatim() -> None:
-    store.write_catalog("claude-native", "abc123", _ROWS)
-    assert store.read_catalog("claude-native", "abc123") == _ROWS
+@pytest.mark.parametrize(
+    ("namespace", "rows"),
+    [("claude-native", _ROWS), ("acp-modes", [{"value": "review", "label": "Review"}])],
+)
+def test_write_then_read_round_trips_verbatim(namespace, rows) -> None:
+    store.write_catalog(namespace, "abc123", rows)
+    assert store.read_catalog(namespace, "abc123") == rows
 
 
 def test_fingerprint_mismatch_is_a_miss_never_a_close_hit() -> None:
@@ -45,7 +49,9 @@ def test_damaged_file_reads_as_a_miss() -> None:
 
 
 def test_rows_without_ids_are_dropped_on_read() -> None:
-    store.write_catalog("claude-native", "abc123", [*_ROWS, {"displayName": "no id"}])
+    store.write_catalog(
+        "claude-native", "abc123", [*_ROWS, {"displayName": "no id"}, {"value": "not-a-model"}]
+    )
     assert store.read_catalog("claude-native", "abc123") == _ROWS
 
 

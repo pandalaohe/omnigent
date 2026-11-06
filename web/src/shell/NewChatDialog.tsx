@@ -3701,7 +3701,10 @@ export function NewChatLandingScreen() {
       sessionModeHandler(activeSdk, "speed", harnessCapabilities) ||
       callingDefaultHasModels(activeSdk, harnessCapabilities))
       ? activeSdk
-      : null);
+      : selectedAgent?.harness &&
+          callingDefaultHasModels(selectedAgent.harness, harnessCapabilities)
+        ? selectedAgent.harness
+        : null);
   // Probe only the selected, available harness. Older hosts without readiness
   // metadata remain eligible, matching the picker's setup warnings.
   const canLoadHostModels = (harness: string) =>
@@ -3709,6 +3712,25 @@ export function NewChatLandingScreen() {
     hostSelected &&
     selectedHost?.status === "online" &&
     !harnessUnconfiguredOnHost(harness, selectedHost);
+  const genericModelHarness =
+    !sandboxSelected &&
+    effectiveAgentId !== PENDING_AGENT_ID &&
+    selectionHarness &&
+    selectionHarness !== AUTO_HARNESS_ID &&
+    selectionHarness !== AUTO_NATIVE_HARNESS_ID &&
+    sdkHarness === null &&
+    !["claude-native", "codex-native", "pi-native", "antigravity-native", "devin-native"].includes(
+      selectionHarness,
+    )
+      ? selectionHarness
+      : null;
+  const genericModels = useHostModelOptions(
+    selectedHostId,
+    genericModelHarness ?? "",
+    genericModelHarness !== null && canLoadHostModels(genericModelHarness),
+    { poll: genericModelHarness !== null },
+  );
+  const genericModelOptions = useMemo(() => genericModels.data ?? [], [genericModels.data]);
   const {
     data: hostClaudeModelOptions,
     isLoading: hostClaudeModelsLoading,
@@ -4041,7 +4063,7 @@ export function NewChatLandingScreen() {
     (pickedHarness === AUTO_HARNESS_ID &&
       selectedAgent?.harness != null &&
       selectedAgent.harness in brainHarnessLabelsAll);
-  const configSummary = useMemo((): { label: string; value: string }[] => {
+  const baseConfigSummary = useMemo((): { label: string; value: string }[] => {
     const sourceRows = (options: readonly NativeModelOption[]) => {
       if (routingOn) return [];
       if (sandboxHasModelCatalog && sandboxModels.data?.provider_label) {
@@ -4265,6 +4287,34 @@ export function NewChatLandingScreen() {
     sdkHarness,
     sdkModelOptions,
   ]);
+  const configSummary = useMemo(
+    () =>
+      genericModelHarness
+        ? [
+            {
+              label: "Model",
+              value: pickedModel
+                ? visibleModelLabel(
+                    nativeModelLabel(
+                      genericModelOptions.find((row) => row.id === pickedModel) ?? {
+                        id: pickedModel,
+                      },
+                    ),
+                  )
+                : "Agent's default",
+            },
+            ...(pickedEffort
+              ? [{ label: "Effort", value: normalizeEffortLabel(pickedEffort) }]
+              : []),
+            ...baseConfigSummary.filter((row) => row.label !== "Model" && row.label !== "Effort"),
+            ...modelConfigurationSourceRows(
+              genericModelOptions.find((row) => row.id === pickedModel)?.source ??
+                genericModelOptions[0]?.source,
+            ),
+          ]
+        : baseConfigSummary,
+    [genericModelHarness, genericModelOptions, pickedModel, pickedEffort, baseConfigSummary],
+  );
   const harnessTriggerDetails = configSummary.filter(
     (row) =>
       row.label === "SDK" ||
@@ -4299,7 +4349,7 @@ export function NewChatLandingScreen() {
               ? codexModelOptions
               : sdkHarness
                 ? sdkModelOptions
-                : [];
+                : genericModelOptions;
   const [pickerModelSearch, setPickerModelSearch] = useState("");
   const [modelRefreshBusy, setModelRefreshBusy] = useState(false);
   const [modelRefreshError, setModelRefreshError] = useState<string | null>(null);
@@ -4346,7 +4396,7 @@ export function NewChatLandingScreen() {
                 ? hostDevinModelsLoading
                 : sdkHarness !== null
                   ? hostSdkModelsLoading
-                  : false));
+                  : genericModelHarness !== null && genericModels.isLoading));
   const pickerModelsError = sandboxSelected
     ? sandboxCatalogError || sandboxDefaultCatalogError
       ? new Error((sandboxCatalogError ?? sandboxDefaultCatalogError)!)
@@ -4361,7 +4411,7 @@ export function NewChatLandingScreen() {
             ? hostDevinModelsError
             : sdkHarness !== null
               ? hostSdkModelsError
-              : null;
+              : genericModels.error;
   const modelCatalogLookupEnabled = sandboxSelected
     ? sandboxPreviewEnabled && sandboxHasModelCatalog
     : selectionHarness !== null && canLoadHostModels(selectionHarness);
@@ -4479,13 +4529,15 @@ export function NewChatLandingScreen() {
   useEffect(() => setPickerModelSearch(""), [selectionHarness]);
   const pickerEffortRows = sandboxHasModelCatalog
     ? pickerModelOptions
-    : sdkHarness !== null
-      ? sdkModelOptions
-      : selectedNativeHarness === "antigravity-native"
-        ? agyModelOptions
-        : selectedNativeHarness === "devin-native"
-          ? devinModelOptions
-          : codexModelOptions;
+    : genericModelHarness !== null
+      ? genericModelOptions
+      : sdkHarness !== null
+        ? sdkModelOptions
+        : selectedNativeHarness === "antigravity-native"
+          ? agyModelOptions
+          : selectedNativeHarness === "devin-native"
+            ? devinModelOptions
+            : codexModelOptions;
   const pickerEffortModel = pickedModel || pickerEffortRows.find((option) => option.isDefault)?.id;
   const pickerEffortOptions = (
     sandboxHasModelCatalog
@@ -4653,7 +4705,8 @@ export function NewChatLandingScreen() {
     supportsDevinMode ||
     supportsAgyMode ||
     selectedNativeHarness === "codex-native" ||
-    sdkHarness !== null
+    sdkHarness !== null ||
+    genericModelHarness !== null
       ? {
           testId: "new-chat-landing-agent-models",
           header: "Models",
@@ -4708,6 +4761,19 @@ export function NewChatLandingScreen() {
                   {pickerModelsError?.message ?? "Models unavailable"}
                 </div>
               )}
+              {!pickerModelsLoading &&
+                pickerModelOptions.length === 0 &&
+                genericModelHarness !== null && (
+                  <Input
+                    aria-label="Model"
+                    placeholder="Agent's default"
+                    value={pickedModel}
+                    onChange={(event) =>
+                      selectPickerModel(event.target.value.trim() || MODEL_SELECT_DEFAULT)
+                    }
+                    onKeyDown={(event) => event.stopPropagation()}
+                  />
+                )}
             </>
           ),
           choices: [
@@ -4715,6 +4781,7 @@ export function NewChatLandingScreen() {
             (sandboxDefaultModelsEnabled ||
               (!sandboxInferenceConfigured &&
                 (sdkHarness !== null ||
+                  genericModelHarness !== null ||
                   (pickerModelOptions.length > 0 &&
                     !pickerModelOptions.some((option) => option.isDefault)))))
               ? [
@@ -5235,6 +5302,25 @@ export function NewChatLandingScreen() {
     } else if (hasGenericPermissionMode) {
       setPermissionMode(seededPermission ?? resolve(declaredPermissionOptions, ""));
     }
+    if (genericModelHarness !== null && !projectVisit) {
+      const model =
+        stored.model &&
+        (genericModelOptions.length === 0 ||
+          genericModelOptions.some((row) => row.id === stored.model))
+          ? stored.model
+          : "";
+      setPickedModel(model);
+      setPickedEffort(
+        stored.effort &&
+          effortLevelsFor(
+            genericModelHarness,
+            genericModelOptions,
+            model || genericModelOptions.find((row) => row.isDefault)?.id,
+          )?.includes(stored.effort)
+          ? stored.effort
+          : "",
+      );
+    }
     // Reseed on harness changes and when the selected host's catalog resolves;
     // capability flags are derived from the same harness and stay omitted.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -5244,6 +5330,8 @@ export function NewChatLandingScreen() {
     sdkHarness,
     hostSdkModelOptions,
     sdkModelOptions,
+    genericModelHarness,
+    genericModelOptions,
     claudeModelOptions,
     codexModelOptions,
     piModelOptions,
@@ -6157,6 +6245,7 @@ export function NewChatLandingScreen() {
         : pickerEdits && pickerEdits.agentId !== effectiveAgentId
           ? "The selected agent is no longer available. Choose an agent to continue."
           : pickerEdits?.options.model &&
+              !(genericModelHarness !== null && pickerModelOptions.length === 0) &&
               !pickerModelOptions.some((option) => option.id === pickerEdits.options.model)
             ? "The selected model is no longer available. Choose a model to continue."
             : null;
@@ -6788,7 +6877,8 @@ export function NewChatLandingScreen() {
           nativeAgent?.harness === "codex-native" ||
           nativeAgent?.harness === "devin-native" ||
           nativeAgent?.harness === "antigravity-native" ||
-          sdkHarness !== null) &&
+          sdkHarness !== null ||
+          genericModelHarness !== null) &&
         submittedModel
           ? submittedModel
           : null;
@@ -6801,7 +6891,8 @@ export function NewChatLandingScreen() {
           nativeAgent?.harness === "codex-native" ||
           nativeAgent?.harness === "devin-native" ||
           nativeAgent?.harness === "antigravity-native" ||
-          sdkHarness !== null) &&
+          sdkHarness !== null ||
+          genericModelHarness !== null) &&
         pickedEffort
           ? pickedEffort
           : null;
@@ -7201,11 +7292,13 @@ export function NewChatLandingScreen() {
           supportsModelPicker:
             agentSupportsModelPicker ||
             nativeAgent?.harness === "codex-native" ||
-            sdkHarness !== null,
+            sdkHarness !== null ||
+            genericModelHarness !== null,
           supportsEffortPicker:
             selectedNativeHarness === "pi-native" ||
             selectedNativeHarness === "codex-native" ||
-            sdkHarness !== null,
+            sdkHarness !== null ||
+            genericModelHarness !== null,
           permissionMode,
           approvalMode,
           bypassSandbox,

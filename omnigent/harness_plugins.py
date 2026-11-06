@@ -802,6 +802,12 @@ for _harness, _modes in BUILTIN_SESSION_MODES.items():
         _BUILTIN_CAPABILITIES[_harness], session_modes=_modes
     )
 
+for _harness, _capabilities in _BUILTIN_CAPABILITIES.items():
+    if _capabilities.calling_defaults is None:
+        _BUILTIN_CAPABILITIES[_harness] = replace(
+            _capabilities, calling_defaults=CallingDefaultsSupport(model_options=True)
+        )
+
 
 _BUILTIN_CONTRIBUTION = HarnessContribution(
     name="omnigent",

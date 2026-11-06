@@ -1307,7 +1307,9 @@ def _redacted_failure_reason(exc: Exception) -> str:
     return type(exc).__name__
 
 
-def listing_for_provider(provider: ResolvedModelProvider) -> ModelListing:
+def listing_for_provider(
+    provider: ResolvedModelProvider, *, refresh: bool = False
+) -> ModelListing:
     """Enumerate one provider's model listing (cached, failures not cached).
 
     The public face of :func:`_listing_for_provider` for callers that already
@@ -1315,9 +1317,13 @@ def listing_for_provider(provider: ResolvedModelProvider) -> ModelListing:
     what its gateway transport serves — rather than an agent spec.
 
     :param provider: The resolved provider descriptor.
+    :param refresh: Ignore the process cache and query the provider now.
     :returns: The provider's :class:`ModelListing`; ``verified`` is ``False``
         with a ``note`` when the fetch failed.
     """
+    if refresh:
+        with _listing_cache_lock:
+            _listing_cache.pop(_listing_cache_key(provider), None)
     return _listing_for_provider(provider, transport=None)
 
 
@@ -1376,9 +1382,7 @@ def _listing_for_provider(
         ValueError,
         subprocess.SubprocessError,
     ) as exc:
-        _logger.debug(
-            "model enumeration failed for %s", provider.detail or provider.kind, exc_info=True
-        )
+        _logger.debug("model enumeration failed (%s)", type(exc).__name__)
         if provider.kind == SUBSCRIPTION_KIND:
             # A failed cursor-agent listing probe says nothing about
             # dispatchability: the CLI brings its own stored login, so the
@@ -2015,6 +2019,8 @@ def _models_url(base_url: str) -> str:
         ``<base>/v1/models``.
     """
     trimmed = base_url.rstrip("/")
+    if urlsplit(trimmed).path.endswith("/models"):
+        return trimmed
     # A base that already names its API version lists at <base>/models;
     # appending /v1 again builds a path no server serves.
     if re.search(r"/v[0-9]+\Z", urlsplit(trimmed).path):
@@ -2062,16 +2068,16 @@ def _fetch_openai_compatible_listing(
     :param transport: Optional httpx transport override for tests.
     :returns: A ``source="openai-compatible"`` listing; entries carry
         ``context_window`` when the endpoint reports ``context_length``.
-    :raises ValueError: When the provider has no base URL or credential.
+    :raises ValueError: When the provider has no base URL.
     :raises httpx.HTTPError: On transport/HTTP failures.
     """
     if not provider.base_url:
         raise ValueError("provider has no base_url to list models from")
-    token = _resolve_bearer_token(provider)
+    token = _resolve_bearer_token(provider) if provider.api_key or provider.auth_command else None
     with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
         resp = client.get(
             _models_url(provider.base_url),
-            headers={"Authorization": f"Bearer {token}"},
+            headers={"Authorization": f"Bearer {token}"} if token else {},
         )
         resp.raise_for_status()
         payload = resp.json()
