@@ -41,6 +41,34 @@ from omnigent.startup_protocol import StartupAttemptRef, StartupObservation
 
 # ── Shared ──────────────────────────────────────────────────────
 
+
+class AutoRotationPatch(BaseModel):
+    """Session overrides; an explicit default removes that override."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    enabled: Literal["on", "off", "default"] = "default"
+    compactions: Annotated[int, Field(ge=1, le=20)] | Literal["default"] = "default"
+    remaining_pct: Annotated[int, Field(ge=1, le=90)] | Literal["default"] = "default"
+
+
+class AutoRotationStatus(BaseModel):
+    """Resolved settings and the latest context round of one session."""
+
+    eligible: bool
+    ineligible_reason: Literal["not_top_level", "archived", "harness"] | None
+    harness: str | None
+    enabled: bool = False
+    compactions_setting: int = 4
+    remaining_pct_setting: int = 25
+    sources: dict[str, Literal["session", "user", "default"]]
+    compactions: int = 0
+    round_marker: int = Field(default=0, exclude=True)
+    remaining_pct: int | None = None
+    approximate: list[Literal["usage", "compaction_point", "compactions"]]
+    due: bool = False
+    rotation_pending: bool = False
+
+
 McpRegistryServiceId = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]{0,39}$")]
 PermissionTierRequest = Literal[
     "ask",

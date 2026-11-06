@@ -534,6 +534,9 @@ class CollabSettings:
     keep_warm_codex_interval_s: int = 1500
     keep_warm_max_s: int = 28800
     child_cap: int | None = None
+    auto_rotation_enabled: bool = False
+    auto_rotation_compactions: int = 4
+    auto_rotation_remaining_pct: int = 25
     standing_approval_default: list[str] = field(default_factory=list)
     quota_tight_below_pct: float = 50
     quota_low_below_pct: float = 20
@@ -562,6 +565,7 @@ _COLLAB_SETTING_FIELDS: tuple[tuple[str, str, _CollabFieldKind], ...] = (
     ("undeliveredTtlSeconds", "undelivered_ttl_s", "positive_int"),
     ("flowTimerEnabled", "flow_timer_enabled", "bool"),
     ("childKeepWarmEnabled", "keep_warm_enabled", "bool"),
+    ("autoRotationEnabled", "auto_rotation_enabled", "bool"),
     ("childKeepWarmClaudeIntervalSeconds", "keep_warm_claude_interval_s", "positive_int"),
     ("childKeepWarmCodexIntervalSeconds", "keep_warm_codex_interval_s", "positive_int"),
     ("childKeepWarmMaxSeconds", "keep_warm_max_s", "positive_int"),
@@ -649,6 +653,13 @@ def _parse_collab_settings(value: Any) -> CollabSettings:
     child_cap = _parse_collab_value("positive_int", value.get("childCap"))
     if child_cap is not None:
         resolved["child_cap"] = child_cap
+    for key, name, upper in (
+        ("autoRotationCompactions", "auto_rotation_compactions", 20),
+        ("autoRotationRemainingPct", "auto_rotation_remaining_pct", 90),
+    ):
+        raw = value.get(key)
+        if type(raw) is int and 1 <= raw <= upper:
+            resolved[name] = raw
     low = _collab_percentage(value.get("quotaLowBelowPct"), 0, 100)
     tight = _collab_percentage(value.get("quotaTightBelowPct"), 0, 100)
     if low is not None and tight is not None and 0 < low < tight:
