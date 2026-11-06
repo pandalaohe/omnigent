@@ -506,6 +506,21 @@ def test_get_runner_ids_reads_from_omnigent_db(store: SqlAlchemyConversationStor
     assert ids[b.id] is None
 
 
+def test_get_session_list_state_across_databases(store: SqlAlchemyConversationStore) -> None:
+    from omnigent.db.db_models import workspace_scope
+
+    child = store.create_conversation(runner_id="runner_child")
+    key = "omnigent.subagent.activity_unverified"
+    store.set_labels(child.id, {key: "true", "other": "not requested"})
+    store.set_pending_elicitation_count(child.id, 3)
+    state = store.get_session_list_state([child.id], label_keys=(key,))[child.id]
+    assert state.runner_id == "runner_child"
+    assert state.pending_elicitation_count == 3
+    assert state.labels == {key: "true"}
+    with workspace_scope(42):
+        assert store.get_session_list_state([child.id], label_keys=(key,)) == {}
+
+
 @pytest.mark.parametrize(
     ("runner_id", "stamp"), [("runner_a", 1_000_000), ("runner_a", None), (None, None)]
 )

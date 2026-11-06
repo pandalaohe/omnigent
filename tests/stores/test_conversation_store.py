@@ -536,6 +536,36 @@ def test_get_session_activity(
     assert conversation_store.get_session_activity([]) == {}
 
 
+def test_get_session_list_state_reads_only_rollup_fields(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    a = conversation_store.create_conversation(title="alpha", runner_id="runner_alpha")
+    b = conversation_store.create_conversation(title="beta")
+    key = "omnigent.subagent.activity_unverified"
+    conversation_store.set_labels(a.id, {key: "true", "other": "unrelated history"})
+    conversation_store.set_pending_elicitation_count(a.id, 2)
+    statements: list[str] = []
+
+    def capture(_conn, _cursor, statement, _parameters, _context, _many):
+        statements.append(statement)
+
+    engine = conversation_store._engine
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        result = conversation_store.get_session_list_state(
+            [a.id, b.id, a.id, "5eca720dc2bc6cdc3a99028d7bd0f917"], label_keys=(key,)
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+    assert set(result) == {a.id, b.id}
+    assert result[a.id].runner_id == "runner_alpha"
+    assert result[a.id].pending_elicitation_count == 2
+    assert result[a.id].labels == {key: "true"}
+    assert result[b.id].runner_id is None and result[b.id].labels == {}
+    assert not any("session_usage" in statement for statement in statements)
+    assert conversation_store.get_session_list_state([], label_keys=(key,)) == {}
+
+
 def test_list_latest_message_items_for_conversations(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

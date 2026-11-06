@@ -317,6 +317,10 @@ async def test_large_host_inventory_batches_owner_permissions(
     host = HostStore(db_uri).upsert_on_connect("a" * 32, "test-host", _USER_MANY)
     for conv in store.list_conversations(limit=1000, accessible_by=_USER_MANY).data:
         store.set_host_id(conv.id, host_id=host.host_id, workspace="/opt/work/omnigent")
+    for index in range(2):
+        store.create_conversation(
+            parent_conversation_id=conv.id, title=f"child-{index}", labels={"history": "unused"}
+        )
     sql_capture.statements.clear()
     response = await acl_client.get(
         "/v1/sessions",
@@ -338,3 +342,6 @@ async def test_large_host_inventory_batches_owner_permissions(
     assert len(permission_reads) <= 3, (
         f"inventory queried permissions {len(permission_reads)} times for {_N_MANY} sessions"
     )
+    assert not any(
+        "session_usage" in statement and binds == 3 for statement, binds in sql_capture.statements
+    ), "child status rollup loaded full metadata instead of its narrow projection"

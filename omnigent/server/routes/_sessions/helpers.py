@@ -366,6 +366,7 @@ from omnigent.stores.conversation_store import (
     SUCCESSION_OPERATION_LABEL_KEYS,
     ConversationNotFoundError,
     NameAlreadyExistsError,
+    SessionListState,
     drop_server_secret_labels,
     is_artifact_link_key,
     is_codex_permission_observation_label_key,
@@ -1750,7 +1751,7 @@ class ChildPendingElicitations(NamedTuple):
 
 async def _child_pending_elicitations_by_parent(
     child_ids_by_parent: Mapping[str, list[str]],
-    child_rows: Mapping[str, Conversation],
+    child_rows: Mapping[str, Conversation | SessionListState],
     liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None,
 ) -> ChildPendingElicitations:
     """
