@@ -15,6 +15,7 @@ import pytest
 
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import Conversation
+from omnigent.entities.conversation import MessageData, NewConversationItem
 from omnigent.server.child_session_recovery import (
     RECOVERY_STORE_CONCURRENCY,
     restore_active_children,
@@ -22,6 +23,316 @@ from omnigent.server.child_session_recovery import (
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["runner_disconnected", "pi_process_exit"])
+async def test_interrupted_pi_turn_is_saved_and_delivered_once_after_restart(
+    recovery_tree: Any, failure: str
+) -> None:
+    from omnigent.server.routes._sessions.helpers import _persist_session_status_error_labels
+    from omnigent.server.schemas import ErrorDetail
+    from omnigent.server.startup_inputs import ManagedStartupInputs
+
+    store, _, child, *_ = recovery_tree
+    row = child(host_id="b" * 32, harness_override="pi", workspace="/opt/work/fixture")
+    store.append(
+        row.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="turn-original",
+                data=MessageData(
+                    role="assistant",
+                    agent="fixture",
+                    content=[{"type": "output_text", "text": "Work in progress"}],
+                ),
+            )
+        ],
+    )
+    error = ErrorDetail(
+        code="runner_disconnected" if failure == "runner_disconnected" else "RuntimeError",
+        message="Runner disconnected unexpectedly."
+        if failure == "runner_disconnected"
+        else "inner executor error: Pi process ended before the turn settled.",
+    )
+    await _persist_session_status_error_labels(row.id, error, store, owner_runner_id="old")
+    [pending] = store.list_pending_inputs(row.id)
+    assert pending.status == "in_progress"
+    assert "Check any interrupted operation's outcome before repeating it." in str(pending.data)
+    connection = SimpleNamespace(host_id=row.host_id, registered_with_managed_token=False)
+    hosts = Mock(get=lambda _: connection)
+    app = SimpleNamespace(state=SimpleNamespace(startup_admission=None, startup_store=None))
+    received = []
+
+    async def dispatch(context: Any, session_id: str, event: Any) -> dict:
+        assert await context.claim(store, session_id)
+        received.append(context.input_id)
+        store.append(
+            session_id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id="turn-resumed",
+                    stable_id=context.input_id,
+                    replaces_pending_id=context.input_id,
+                    data=pending.data,
+                )
+            ],
+        )
+        return {"item_id": context.input_id}
+
+    async def drain(service: ManagedStartupInputs) -> None:
+        service.dispatch = dispatch
+        await service._recover_session(app, row.id, connection)
+        await asyncio.gather(*tuple(service._deliveries.values()))
+
+    restarted = ManagedStartupInputs(SqlAlchemyConversationStore(store.storage_location), hosts)
+    await drain(restarted)
+    await drain(ManagedStartupInputs(store, hosts))
+    # A repeated failure report from the lost turn cannot enqueue another copy.
+    await _persist_session_status_error_labels(row.id, error, store, owner_runner_id="old")
+    await drain(restarted)
+    assert received == [pending.id]
+    assert store.list_pending_inputs(row.id) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("override", ["cancel", "archive", "hold", "new_input"])
+async def test_interrupted_pi_continuation_yields_to_later_user_work(
+    recovery_tree: Any, override: str
+) -> None:
+    from starlette.datastructures import Headers
+
+    from omnigent.server.host_load_queue import LABEL
+    from omnigent.server.routes._sessions.helpers import _persist_session_status_error_labels
+    from omnigent.server.schemas import ErrorDetail, SessionEventInput
+    from omnigent.server.startup_inputs import ManagedStartupInputs
+
+    store, _, child, *_ = recovery_tree
+    row = child(host_id="b" * 32, harness_override="pi", workspace="/opt/work/fixture")
+    await _persist_session_status_error_labels(
+        row.id,
+        ErrorDetail(code="runner_disconnected", message="Runner disconnected"),
+        store,
+        owner_runner_id="old",
+    )
+    [continuation] = store.list_pending_inputs(row.id)
+    connection = SimpleNamespace(host_id=row.host_id, registered_with_managed_token=False)
+    service = ManagedStartupInputs(store, Mock(get=lambda _: connection))
+    app = SimpleNamespace(state=SimpleNamespace(startup_admission=None, startup_store=None))
+    received = []
+
+    async def dispatch(context: Any, session_id: str, event: Any) -> dict:
+        if await context.claim(store, session_id):
+            received.append(context.input_id)
+        return {"item_id": context.input_id}
+
+    service.dispatch = dispatch
+    if override == "cancel":
+        await service.cancel(row.id)
+    elif override == "archive":
+        store.update_conversation(row.id, archived=True)
+    elif override == "hold":
+        store.set_labels(row.id, {LABEL: f"queued@{row.host_id}"})
+    else:
+        await service.enqueue(
+            row.id,
+            SessionEventInput(
+                type="message",
+                data={"role": "user", "content": [{"type": "input_text", "text": "New task"}]},
+            ),
+            user_id=None,
+            headers=Headers(),
+            first=False,
+        )
+    await service._recover_session(app, row.id, connection)
+    await asyncio.gather(*tuple(service._deliveries.values()))
+    assert continuation.id not in received
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("override", ["cancel", "archive", "hold"])
+async def test_resume_claim_checks_user_control_in_the_same_transaction(
+    recovery_tree: Any, monkeypatch: pytest.MonkeyPatch, override: str
+) -> None:
+    from starlette.datastructures import Headers
+
+    from omnigent.server.host_load_queue import LABEL
+    from omnigent.server.routes._sessions.helpers import _persist_session_status_error_labels
+    from omnigent.server.schemas import ErrorDetail
+    from omnigent.server.startup_inputs import StartupInputContext
+    from omnigent.server.turn_recovery import RECOVERY_INPUT_LABEL
+
+    store, _, child, *_ = recovery_tree
+    row = child(host_id="b" * 32, harness_override="pi", workspace="/opt/work/fixture")
+    await _persist_session_status_error_labels(
+        row.id,
+        ErrorDetail(code="runner_disconnected", message="Runner disconnected"),
+        store,
+        owner_runner_id="old",
+    )
+    [saved] = store.list_pending_inputs(row.id)
+    transition = store.transition_pending_input
+
+    def race(*args: Any, **kwargs: Any) -> bool:
+        if override == "cancel":
+            store.set_labels(row.id, {RECOVERY_INPUT_LABEL: f"cancelled:{saved.id}"})
+        elif override == "archive":
+            store.update_conversation(row.id, archived=True)
+        else:
+            store.set_labels(row.id, {LABEL: f"queued@{row.host_id}"})
+        return transition(*args, **kwargs)
+
+    monkeypatch.setattr(store, "transition_pending_input", race)
+    app = SimpleNamespace(state=SimpleNamespace(startup_store=None, startup_admission=None))
+    context = StartupInputContext(app, Headers(), None, saved.id, recovery_id=saved.id)
+    assert not await context.claim(store, row.id)
+    assert store.get_item(row.id, saved.id).status == "in_progress"
+
+
+@pytest.mark.asyncio
+async def test_delayed_failure_cannot_replace_newer_interrupted_turn(recovery_tree: Any) -> None:
+    from omnigent.entities.subagent_retry import InputExecutionClaim
+    from omnigent.server.routes._sessions.helpers import _persist_session_status_error_labels
+    from omnigent.server.schemas import ErrorDetail
+    from omnigent.server.turn_recovery import RECOVERY_INPUT_LABEL
+    from omnigent.stores.subagent_retry_store.sqlalchemy_store import SqlAlchemySubagentRetryStore
+
+    store, _, child, *_ = recovery_tree
+    row = child(host_id="b" * 32, harness_override="pi", workspace="/opt/work/fixture")
+    journal = SqlAlchemySubagentRetryStore(store.storage_location)
+    error = ErrorDetail(code="runner_disconnected", message="Runner disconnected")
+    first = journal.admit_execution(
+        row.id, InputExecutionClaim(input_id="input-a", turn_id="turn-a"), runner_id="old"
+    )
+    assert first.accepted
+    await _persist_session_status_error_labels(
+        row.id, error, store, owner_runner_id="old", turn_id="turn-a"
+    )
+    [a] = store.list_pending_inputs(row.id)
+    store.transition_pending_input(row.id, a.id, expected="in_progress", status=None)
+    second = journal.admit_execution(
+        row.id, InputExecutionClaim(input_id="input-b", turn_id="turn-b"), runner_id="old"
+    )
+    assert second.accepted
+    await _persist_session_status_error_labels(
+        row.id, error, store, owner_runner_id="old", turn_id="turn-b"
+    )
+    [b] = store.list_pending_inputs(row.id)
+    assert a.id != b.id
+    await _persist_session_status_error_labels(
+        row.id, error, store, owner_runner_id="old", turn_id="turn-a"
+    )
+    assert store.get_conversation(row.id).labels[RECOVERY_INPUT_LABEL] == b.id
+    assert [item.id for item in store.list_pending_inputs(row.id)] == [b.id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pending_status", ["in_progress", "incomplete"])
+async def test_replacement_runner_keeps_saved_continuation_identity(
+    recovery_tree: Any, pending_status: str
+) -> None:
+    from omnigent.server.routes._sessions.helpers import _persist_session_status_error_labels
+    from omnigent.server.schemas import ErrorDetail
+    from omnigent.server.turn_recovery import RECOVERY_INPUT_LABEL
+
+    store, _, child, *_ = recovery_tree
+    row = child(host_id="b" * 32, harness_override="pi", workspace="/opt/work/fixture")
+    error = ErrorDetail(code="runner_disconnected", message="Runner disconnected")
+    await _persist_session_status_error_labels(
+        row.id, error, store, owner_runner_id="old", turn_id="interrupted-turn"
+    )
+    [saved] = store.list_pending_inputs(row.id)
+    if pending_status == "incomplete":
+        store.transition_pending_input(
+            row.id, saved.id, expected="in_progress", status=pending_status
+        )
+    assert store.replace_runner_id(row.id, "replacement")
+    from omnigent.server.turn_recovery import record_interrupted_turn
+
+    await record_interrupted_turn(
+        store, store.get_conversation(row.id), error, owner_runner_id="replacement"
+    )
+    assert store.get_conversation(row.id).labels[RECOVERY_INPUT_LABEL] == saved.id
+    [current] = store.list_pending_inputs(row.id)
+    assert current.id == saved.id and current.status == pending_status
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("accepted", [False, True])
+async def test_cancel_settles_claimed_recovery_without_blocking_new_input(
+    recovery_tree: Any, accepted: bool
+) -> None:
+    from omnigent.entities.subagent_retry import InputExecutionClaim
+    from omnigent.server.schemas import ErrorDetail
+    from omnigent.server.turn_recovery import (
+        cancel_turn_recovery,
+        record_interrupted_turn,
+        recovery_journal,
+    )
+
+    store, _, child, *_ = recovery_tree
+    row = child(host_id="b" * 32, harness_override="pi", workspace="/opt/work/fixture")
+    await record_interrupted_turn(
+        store, row, ErrorDetail(code="runner_disconnected", message="Lost"), owner_runner_id="old"
+    )
+    [pending] = store.list_pending_inputs(row.id)
+    store.transition_pending_input(row.id, pending.id, expected="in_progress", status="incomplete")
+    if accepted:
+        assert (
+            recovery_journal(store)
+            .admit_execution(
+                row.id,
+                InputExecutionClaim(input_id=pending.id, turn_id="resumed", kind="recovery"),
+                runner_id="old",
+            )
+            .accepted
+        )
+    await cancel_turn_recovery(store, row.id)
+    saved = store.get_item(row.id, pending.id)
+    assert saved.status == ("completed" if accepted else "failed")
+    assert all(item.status != "incomplete" for item in store.list_pending_inputs(row.id))
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_recovery_fences_current_ordinary_turn_after_restart(
+    recovery_tree: Any,
+) -> None:
+    from omnigent.entities.subagent_retry import InputExecutionClaim
+    from omnigent.server.schemas import ErrorDetail
+    from omnigent.server.turn_recovery import (
+        cancel_turn_recovery,
+        reconcile_turn_recovery,
+        record_interrupted_turn,
+        recovery_journal,
+    )
+
+    store, _, child, *_ = recovery_tree
+    row = child(host_id="b" * 32, harness_override="pi", workspace="/opt/work/fixture")
+    error = ErrorDetail(code="runner_disconnected", message="Lost")
+    await record_interrupted_turn(store, row, error, owner_runner_id="old", turn_id="first")
+    [saved] = store.list_pending_inputs(row.id)
+    journal = recovery_journal(store)
+    assert journal.admit_execution(
+        row.id,
+        InputExecutionClaim(input_id=saved.id, kind="recovery", turn_id="resumed"),
+        runner_id="old",
+    ).accepted
+    await reconcile_turn_recovery(store, store.get_conversation(row.id))
+    assert journal.admit_execution(
+        row.id, InputExecutionClaim(input_id="second", turn_id="ordinary"), runner_id="old"
+    ).accepted
+    await cancel_turn_recovery(store, row.id)
+    restarted = SqlAlchemyConversationStore(store.storage_location)
+    await record_interrupted_turn(
+        restarted,
+        restarted.get_conversation(row.id),
+        error,
+        owner_runner_id="old",
+        turn_id="ordinary",
+    )
+    assert restarted.list_pending_inputs(row.id) == []
 
 
 @pytest.fixture

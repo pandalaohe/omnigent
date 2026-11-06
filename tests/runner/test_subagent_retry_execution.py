@@ -191,7 +191,10 @@ async def test_native_definite_refusal_finalizes_once_without_attempt(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("production_http", [False, True], ids=["component", "http"])
-async def test_human_buffered_during_retry_admission_executes_on_own_turn(db_uri, production_http):
+@pytest.mark.parametrize("queued_seconds", [0, 120])
+async def test_human_buffered_during_retry_admission_executes_on_own_turn(
+    db_uri, production_http, queued_seconds, monkeypatch
+):
     from omnigent.runtime.harnesses._scaffold import HarnessApp
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
     from tests._helpers.live_server import reserve_port
@@ -204,6 +207,7 @@ async def test_human_buffered_during_retry_admission_executes_on_own_turn(db_uri
     human_id = uuid4().hex
     entered, release, human_ran = asyncio.Event(), asyncio.Event(), asyncio.Event()
     executed, admissions, markers = [], [], []
+    wall_time = time.time
 
     class Harness(HarnessApp):
         async def run_turn(self, request, ctx):
@@ -234,6 +238,11 @@ async def test_human_buffered_during_retry_admission_executes_on_own_turn(db_uri
                                 entered.set()
                                 await release.wait()
                             result = await receive(body)
+                            if body.input_id == claim.input_id and queued_seconds:
+                                monkeypatch.setattr(
+                                    "omnigent.runner.app.time.time",
+                                    lambda: wall_time() + queued_seconds,
+                                )
                             return httpx.Response(
                                 200,
                                 json=result.model_dump(),
@@ -247,6 +256,9 @@ async def test_human_buffered_during_retry_admission_executes_on_own_turn(db_uri
                 ) as hc:
                     runner = create_runner_app(
                         process_manager=_FakeProcessManager(hc), server_client=Server()
+                    )
+                    monkeypatch.setattr(
+                        "omnigent.runner.app.pending_approvals.has_pending", lambda _: True
                     )
                     async with _runner_test_client(runner) as client:
                         body = {

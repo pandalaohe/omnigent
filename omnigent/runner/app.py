@@ -9675,6 +9675,19 @@ def create_runner_app(
             _dispatch_owner = (stream_epoch or 0, _cancel_dispatch_tasks)
             _turn_dispatch_cancellers[conv_id] = _dispatch_owner
             try:
+                execution_key = (conv_id, str(event_body.get("input_id", "")))
+                execution = _input_execution_claims.get(execution_key)
+                if (
+                    event_body.get("input_admission_required") is True
+                    and execution is not None
+                    and execution[0] is None
+                    and execution[2] == "ordinary"
+                    and execution[1] <= time.time()
+                ):
+                    # Queue wait and harness setup are outside the consumption attempt.
+                    deadline = time.time() + 60
+                    event_body["input_admission_deadline"] = deadline
+                    _input_execution_claims[execution_key] = (None, deadline, "ordinary")
                 async with client.stream(
                     "POST",
                     f"/v1/sessions/{conv_id}/events",
@@ -10641,7 +10654,9 @@ def create_runner_app(
                 _input_execution_claims[(conversation_id, input_id)] = (
                     retry_guard,
                     deadline,
-                    "wake" if message_body.get("_final_wake") is True else "ordinary",
+                    "wake"
+                    if message_body.get("_final_wake") is True
+                    else ("recovery" if message_body.get("recovered") is True else "ordinary"),
                 )
             _apply_archive_states(
                 conversation_id,

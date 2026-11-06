@@ -1229,6 +1229,7 @@ let warmUsagePolling = false;
 let lastPostedUsage = "";
 let warmUsagePoller = null;
 let usageFrameNumber = 0;
+let historyRestored = false;
 
 function usageCounter(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : 0;
@@ -1291,7 +1292,7 @@ function cacheUsageData(ctx) {
     try {
       const snapshot = ctx.getContextUsage();
       if (snapshot) {
-        if (Number.isSafeInteger(snapshot.tokens) && snapshot.tokens >= 0)
+        if (historyRestored && Number.isSafeInteger(snapshot.tokens) && snapshot.tokens >= 0)
           data.context_tokens = snapshot.tokens;
         if (Number.isSafeInteger(snapshot.contextWindow) && snapshot.contextWindow > 0)
           data.context_window = snapshot.contextWindow;
@@ -1358,6 +1359,7 @@ function installUsageHooks(pi) {
     warmUsagePoller = null;
   });
   pi.on("message_end", async (event, ctx) => {
+    historyRestored = true;
     latestUsageContext = ctx;
     const message = event && event.message;
     const split = usageSplit(message);
@@ -1373,6 +1375,12 @@ function installUsageHooks(pi) {
         ? { pi_provider_usage_limits_headers: {} } : undefined);
   });
   pi.on("agent_settled", async (_event, ctx) => {
+    historyRestored = true;
+    latestUsageContext = ctx;
+    await reportPiUsage(ctx);
+  });
+  pi.on("session_compact", async (_event, ctx) => {
+    historyRestored = true;
     latestUsageContext = ctx;
     await reportPiUsage(ctx);
   });

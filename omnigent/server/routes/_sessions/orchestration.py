@@ -6697,7 +6697,7 @@ async def _mark_runner_sessions_offline_once(
             conv.id, "returned", conversation_store, turn_id=turn_id, status="failed"
         )
         await _persist_session_status_error_labels(
-            conv.id, error, conversation_store, owner_runner_id=conv.runner_id
+            conv.id, error, conversation_store, owner_runner_id=conv.runner_id, turn_id=turn_id
         )
     return retry
 
@@ -9576,12 +9576,12 @@ async def _forward_event_to_runner(
         ):
             raise HTTPException(409, "Annotation input owner changed")
         persisted_items = [canonical]
-    elif startup_attempt is not None:
+    elif startup_attempt is not None or (
+        startup_context is not None and startup_context.recovery_id is not None
+    ):
         canonical = (
-            await asyncio.to_thread(
-                conversation_store.get_item, session_id, startup_attempt.input_id
-            )
-            if startup_attempt.input_id is not None
+            await asyncio.to_thread(conversation_store.get_item, session_id, startup_input_id)
+            if startup_input_id is not None
             else None
         )
         if (
@@ -9720,12 +9720,23 @@ async def _forward_event_to_runner(
         "persisted_item_id": persisted_items[0].id,
     }
     runner_body.pop("recovered", None)
+    if startup_context is not None and startup_context.recovery_id is not None:
+        runner_body.update(
+            recovered=True,
+            input_admission_required=True,
+            input_id=startup_context.recovery_id,
+            turn_id="recovery_turn_" + uuid.uuid4().hex,
+        )
     runner_body.pop("input_generation", None)
     runner_body.pop("_input_admission_required", None)
     if body.data.get("_input_admission_required") is True:
         runner_body["input_admission_required"] = True
         runner_body["input_id"] = persisted_items[0].id
-    if conv.parent_conversation_id is not None:
+    if await _resolve_harness_async(conv) == "pi":
+        runner_body["input_admission_required"] = True
+        runner_body.setdefault("input_id", persisted_items[0].id)
+        runner_body.setdefault("turn_id", "turn_" + persisted_items[0].id)
+    if conv.parent_conversation_id is not None and not runner_body.get("recovered"):
         runner_body.update(
             turn_id="turn_" + persisted_items[0].id,
             input_id=persisted_items[0].id,
@@ -10101,7 +10112,11 @@ async def _forward_event_to_runner(
         if startup_context is not None:
             startup_context.forward_started = True
         if runner_body.get("input_admission_required") is True:
-            runner_body["input_admission_deadline"] = time.time() + _RUNNER_FORWARD_TIMEOUT.read
+            runner_body["input_admission_deadline"] = (
+                startup_context.recovery_deadline
+                if startup_context is not None and startup_context.recovery_id is not None
+                else time.time() + _RUNNER_FORWARD_TIMEOUT.read
+            )
         await claim_retry_forward(
             session_id, runner_body, deadline=time.time() + _RUNNER_FORWARD_TIMEOUT.read
         )
@@ -10177,7 +10192,11 @@ async def _forward_event_to_runner(
                 session_id,
                 [item.model_copy(update={"annotation_delivery_confirmed": True})],
             )
-        if not sdk_peer and startup_attempt is None:
+        if (
+            not sdk_peer
+            and startup_attempt is None
+            and not (startup_context is not None and startup_context.recovery_id is not None)
+        ):
             _publish_input_consumed(session_id, persisted_items[0])
         _logger.info(
             "turn dispatched to runner for session=%s",
@@ -10273,7 +10292,11 @@ async def _forward_event_to_runner(
                     attempted_override=_overridden,
                 )
     except (httpx.HTTPError, ConnectionError) as exc:
-        if sdk_peer or startup_attempt is not None:
+        if (
+            sdk_peer
+            or startup_attempt is not None
+            or (startup_context is not None and startup_context.recovery_id is not None)
+        ):
             raise HTTPException(status_code=502, detail="SDK peer forward has no receipt") from exc
         # Transport failure — the runner never answered. The message is already
         # persisted (invariant I1), and a trailing user item is what
@@ -11975,6 +11998,7 @@ async def _relay_runner_stream_once(
                                     conversation_store,
                                     owner_runner_id=runner_id,
                                     agent_name=failure_agent_name,
+                                    turn_id=event.get("response_id") or current_response_id,
                                 )
                             elif status == "running":
                                 failure_agent_name = None

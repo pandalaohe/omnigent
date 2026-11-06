@@ -850,8 +850,9 @@ class ConversationStore(ABC):
         *,
         expected: str,
         status: str | None,
+        expected_labels: Mapping[str, str | None] | None = None,
     ) -> bool:
-        """Compare-and-set delivery state; None discards a canceled, unsent input."""
+        """Change delivery state, optionally fencing it by live labels and archive status."""
         raise NotImplementedError
 
     def list_host_conversation_ids(

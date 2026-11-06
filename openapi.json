@@ -13154,6 +13154,17 @@
             ],
             "title": "Model Override"
           },
+          "recovery_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recovery Id"
+          },
           "tools": {
             "anyOf": [
               {

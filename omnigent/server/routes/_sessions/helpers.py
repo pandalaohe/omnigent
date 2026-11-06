@@ -6474,6 +6474,7 @@ async def _persist_session_status_error_labels(
     owner_runner_id: str | None = None,
     agent_name: str | None = None,
     item_id: str | None = None,
+    turn_id: str | None = None,
 ) -> None:
     """
     Persist or clear the reload-visible failure detail for a session status.
@@ -6523,6 +6524,18 @@ async def _persist_session_status_error_labels(
         }
     )
     try:
+        if error is not None:
+            from omnigent.server.turn_recovery import record_interrupted_turn
+
+            conversation = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conversation is not None:
+                await record_interrupted_turn(
+                    conversation_store,
+                    conversation,
+                    error,
+                    owner_runner_id=owner_runner_id,
+                    turn_id=turn_id,
+                )
         await asyncio.to_thread(conversation_store.set_labels, session_id, updates)
     except Exception:  # noqa: BLE001
         _logger.exception(

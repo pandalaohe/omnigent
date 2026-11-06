@@ -140,6 +140,101 @@ def test_permission_init_ack_requires_exact_revision_and_runner_epoch() -> None:
 
 
 @pytest.mark.asyncio
+async def test_permission_epoch_recovery_is_shared_by_distinct_joiners(db_uri: str) -> None:
+    from omnigent.server.permission_tiers import (
+        PERMISSION_RUNTIME_ID_LABEL_KEY,
+        PERMISSION_STATE_LABEL_KEY,
+    )
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conversation = store.create_conversation(
+        agent_id=generate_agent_id(), runner_id="runner-init", workspace="/opt/work/fixture"
+    )
+    store.set_labels(
+        conversation.id,
+        {
+            PERMISSION_STATE_LABEL_KEY: json.dumps(
+                {"tier": "auto", "revision": 1, "status": "ready"}
+            ),
+            PERMISSION_RUNTIME_ID_LABEL_KEY: "a" * 32,
+        },
+    )
+    conversation = store.get_conversation(conversation.id)
+    assert conversation is not None
+    joiner = dataclasses.replace(conversation, labels=dict(conversation.labels))
+
+    class EpochClient(_Client):
+        async def post(self, path: str, **kwargs: Any) -> httpx.Response:
+            response = await super().post(path, **kwargs)
+            if len(self.calls) == 1:
+                return httpx.Response(
+                    409,
+                    json={
+                        "error": "permission_tier_epoch_changed",
+                        "permission_tier_runtime_id": "b" * 32,
+                    },
+                )
+            return response
+
+    client = EpochClient()
+    client.response_json = {
+        "permission_tiers_capability": "permission_tiers_v1",
+        "permission_tier_revision": 2,
+        "permission_tier_runtime_id": "b" * 32,
+    }
+    initializer = RunnerSessionInitializer(
+        _Registry(), server_version="test", conversation_store=store
+    )
+    first = asyncio.create_task(initializer.initialize(conversation, client, timeout=1))
+    await client.entered.wait()
+    second = asyncio.create_task(initializer.initialize(joiner, client, timeout=1))
+    await asyncio.sleep(0)
+    client.release.set()
+    responses = await asyncio.gather(first, second)
+    assert [response.status_code for response in responses] == [201, 201]
+    assert responses[0] is responses[1]
+    assert len(client.calls) == 2
+    assert json.loads(joiner.labels[PERMISSION_STATE_LABEL_KEY])["status"] == "ready"
+    assert joiner.labels[PERMISSION_RUNTIME_ID_LABEL_KEY] == "b" * 32
+    assert initializer.is_initialized(joiner, client)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [409, 503])
+async def test_permission_init_preserves_runner_rejection(status: int) -> None:
+    from omnigent.server.permission_tiers import PERMISSION_STATE_LABEL_KEY
+
+    conversation = _conversation()
+    conversation.labels[PERMISSION_STATE_LABEL_KEY] = json.dumps(
+        {"tier": "auto", "revision": 1, "status": "blocked"}
+    )
+    client = _Client()
+    client.status_code = status
+    client.response_json = {
+        "error": "permission_tier_unavailable",
+        "detail": "Pi permission bootstrap failed: missing_ack",
+    }
+    client.release.set()
+    initializer = RunnerSessionInitializer(_Registry(), server_version="test")
+    response = await initializer.initialize(conversation, client, timeout=1)
+    assert response.status_code == status
+    assert response.json() == client.response_json
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["", "cancelled:", "sent:"])
+async def test_saved_continuation_owns_recovery_instead_of_history_heuristic(phase: str) -> None:
+    conversation = _conversation()
+    conversation.labels["omnigent.interrupted_turn.recovery_id"] = phase + "c" * 32
+    client = _Client()
+    client.release.set()
+    initializer = RunnerSessionInitializer(_Registry(), server_version="test")
+    await initializer.initialize(conversation, client, timeout=1, resume_interrupted_turn=True)
+    assert client.calls[0]["session_init"]["suppress_recovery_turn"] is True
+    assert client.calls[0]["session_init"]["resume_interrupted_turn"] is False
+
+
+@pytest.mark.asyncio
 async def test_initializer_shares_result_for_one_tunnel_generation(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

@@ -2253,13 +2253,15 @@ async def test_rpc_pi_usage_extension_reports_idle_warm_and_checks_owner(
               registerTool() {},
             });
             const entries = [];
+            let tokens = 0;
             const ctx = {
               model: { id: "model-1", provider: "provider-1", promptCache: { short: 15 } },
-              getContextUsage() { return { tokens: 1201, contextWindow: 8192 }; },
+              getContextUsage() { return { tokens, contextWindow: 8192 }; },
               sessionManager: { getEntries() { return entries; } },
             };
             (async () => {
               await handlers.session_start({}, ctx);
+              tokens = 1201;
               await handlers.message_end({ message: {
                 role: "assistant", model: "model-1", provider: "provider-1",
                 content: "never-forward", usage: {
@@ -2287,6 +2289,8 @@ async def test_rpc_pi_usage_extension_reports_idle_warm_and_checks_owner(
               await handlers.message_end({ message: {
                 role: "assistant", stopReason: "error",
               } }, ctx);
+              tokens = 0;
+              await handlers.session_compact({}, ctx);
               await handlers.session_shutdown();
             })().catch((error) => { console.error(error); process.exitCode = 1; });
             """
@@ -2302,6 +2306,8 @@ async def test_rpc_pi_usage_extension_reports_idle_warm_and_checks_owner(
         )
         _stdout, stderr = await asyncio.wait_for(proc.communicate(), 5)
         assert proc.returncode == 0, stderr.decode(errors="replace")
+        assert "context_tokens" not in received[0], "bootstrap must preserve saved context"
+        assert received[-1].get("context_tokens") == 0, "real compaction can empty context"
         assert any(
             data.get("context_tokens") == 1201 and data.get("context_window") == 8192
             for data in received

@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import re
+import time
 import weakref
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
@@ -173,6 +174,8 @@ class StartupInputContext:
     forward_started: bool = False
     forward_rejected: bool = False
     startup: StartupAttemptRef | None = None
+    recovery_id: str | None = None
+    recovery_deadline: float | None = None
 
     async def is_disconnected(self) -> bool:
         return False
@@ -217,12 +220,39 @@ class StartupInputContext:
         live = await asyncio.to_thread(store.get_conversation, session_id)
         if live is None or live.archived:
             return False
+        expected_labels = None
+        if self.recovery_id is not None:
+            from omnigent.server.host_load_queue import LABEL as LOAD_LABEL
+            from omnigent.server.routes._sessions.common import _RUNNER_FORWARD_TIMEOUT
+            from omnigent.server.session_choice import SLOT_LABEL
+            from omnigent.server.turn_recovery import (
+                RECOVERY_DEADLINE_LABEL,
+                RECOVERY_INPUT_LABEL,
+                recovery_allowed,
+            )
+
+            if live.labels.get(
+                RECOVERY_INPUT_LABEL
+            ) != self.recovery_id or not await recovery_allowed(store, live):
+                return False
+            expected_labels = {
+                RECOVERY_INPUT_LABEL: self.recovery_id,
+                LOAD_LABEL: live.labels.get(LOAD_LABEL),
+                SLOT_LABEL: live.labels.get(SLOT_LABEL),
+            }
+            self.recovery_deadline = time.time() + _RUNNER_FORWARD_TIMEOUT.read
+            await asyncio.to_thread(
+                store.set_labels,
+                session_id,
+                {RECOVERY_DEADLINE_LABEL: str(self.recovery_deadline)},
+            )
         self.submitted = await asyncio.to_thread(
             store.transition_pending_input,
             session_id,
             self.input_id,
             expected="in_progress",
             status="incomplete",
+            **({"expected_labels": expected_labels} if expected_labels is not None else {}),
         )
         return self.submitted
 
@@ -335,11 +365,13 @@ class ManagedStartupInputs:
             _build_new_item,
             _stable_id_reuse_is_exact_retry,
         )
+        from omnigent.server.turn_recovery import cancel_turn_recovery
 
         try:
             SessionStartupInput.model_validate(event.model_dump())
         except ValueError as exc:
             raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+        await cancel_turn_recovery(self.conversations, session_id)
         raw_id = event.data.get("stable_id")
         input_id = (
             initial_input_id(session_id)
@@ -569,6 +601,17 @@ class ManagedStartupInputs:
 
         if held_host(conv):
             return False
+        from omnigent.server.turn_recovery import (
+            RECOVERY_INPUT_LABEL,
+            ensure_turn_recovery_input,
+            reconcile_turn_recovery,
+        )
+
+        await reconcile_turn_recovery(self.conversations, conv)
+        await ensure_turn_recovery_input(self.conversations, conv)
+        conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
+        if conv is None:
+            return False
         from omnigent.server.startup_registration import (
             STARTUP_CREATE_PREPARATION_LABEL_KEY,
             STARTUP_CREATE_PREPARATION_PENDING,
@@ -587,6 +630,21 @@ class ManagedStartupInputs:
         state = conv.labels.get(STARTUP_LABEL)
         if state == "failed":
             return False
+        items = await asyncio.to_thread(self.conversations.list_pending_inputs, session_id)
+        for item in items:
+            options = item.data.startup_options if isinstance(item.data, MessageData) else None
+            if (
+                options is not None
+                and options.recovery_id is not None
+                and options.recovery_id != conv.labels.get(RECOVERY_INPUT_LABEL)
+            ):
+                await asyncio.to_thread(
+                    self.conversations.transition_pending_input,
+                    session_id,
+                    item.id,
+                    expected="in_progress",
+                    status=None,
+                )
         items = await asyncio.to_thread(self.conversations.list_pending_inputs, session_id)
         if state == "cancelled":
             if not items:
@@ -770,10 +828,16 @@ class ManagedStartupInputs:
                 item.created_by,
                 item.id,
                 startup=startup,
+                recovery_id=options.recovery_id if options else None,
             )
             event = SessionEventInput(
                 type=item.type,
-                data={**item.data.model_dump(exclude={"startup_options"}), "stable_id": item.id},
+                data={
+                    **item.data.model_dump(
+                        exclude=set() if options and options.recovery_id else {"startup_options"}
+                    ),
+                    "stable_id": item.id,
+                },
                 model_override=options.model_override if options else None,
                 tools=options.tools if options else None,
             )
@@ -786,6 +850,14 @@ class ManagedStartupInputs:
                     return "not_dispatched"
                 raise ValueError(str(response.get("reason", "Input denied by policy")))
             if context.submitted:
+                if context.recovery_id is not None:
+                    from omnigent.server.turn_recovery import reconcile_turn_recovery
+
+                    current = await asyncio.to_thread(
+                        self.conversations.get_conversation, session_id
+                    )
+                    if current is not None:
+                        await reconcile_turn_recovery(self.conversations, current)
                 if not response.get("pending_id") and not response.get("item_id"):
                     # Native overlays such as /btw have no transcript echo.
                     from omnigent.server.routes.sessions import (
@@ -833,6 +905,8 @@ class ManagedStartupInputs:
             raise
         except Exception as exc:
             _logger.exception("Unable to deliver saved message for session %s", session_id)
+            if context is not None and context.recovery_id is not None:
+                return "unconfirmed" if context.submitted else "not_dispatched"
             if annotation:
                 if context is None or not context.forward_started or context.forward_rejected:
                     return "not_dispatched"
@@ -903,6 +977,9 @@ class ManagedStartupInputs:
 
     async def cancel(self, session_id: str) -> bool:
         """Cancel saved inputs; return whether startup was cancelled before dispatch."""
+        from omnigent.server.turn_recovery import cancel_turn_recovery
+
+        await cancel_turn_recovery(self.conversations, session_id)
         fenced_before_dispatch = (
             await self.cancel_attempt(session_id) if self.cancel_attempt is not None else False
         )

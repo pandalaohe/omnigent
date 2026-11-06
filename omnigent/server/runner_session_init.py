@@ -34,6 +34,7 @@ from omnigent.server.permission_tiers import (
     legacy_permission_tier,
 )
 from omnigent.server.project_placement import project_code_locations
+from omnigent.server.turn_recovery import RECOVERY_INPUT_LABEL, recovery_input_id
 from omnigent.startup_protocol import STARTUP_QUEUE_V1, StartupAttemptRef
 from omnigent.update_check import _read_build_info
 
@@ -142,6 +143,7 @@ _SessionInitKey = tuple[
     str | None,
     bool,
     StartupAttemptRef | None,
+    str | None,
 ]
 _BODY_SNIPPET_MAX = 500
 
@@ -187,6 +189,7 @@ def is_session_agent_removed(response: httpx.Response) -> bool:
 
 
 _logger = logging.getLogger(__name__)
+_CONFIRMED_PERMISSION_LABELS = "omnigent.confirmed_permission_labels"
 
 
 class RunnerSessionInitializer:
@@ -432,6 +435,7 @@ class RunnerSessionInitializer:
                     conversation.host_id,
                     conversation.worktree or conversation.workspace,
                     *startup_control,
+                    conversation.labels.get(RECOVERY_INPUT_LABEL),
                 )
             ):
                 continue
@@ -473,6 +477,9 @@ class RunnerSessionInitializer:
         conversation = await self._migrate_legacy_permission_state(
             conversation, store_slots=store_slots
         )
+        if RECOVERY_INPUT_LABEL in conversation.labels:
+            suppress_recovery_turn = True
+            resume_interrupted_turn = False
         startup_control = self._startup_control(conversation)
         async with store_slots or nullcontext():
             peer = await self.resolve_peer_messaging(conversation)
@@ -512,6 +519,7 @@ class RunnerSessionInitializer:
             conversation.host_id,
             conversation.worktree or conversation.workspace,
             *startup_control,
+            conversation.labels.get(RECOVERY_INPUT_LABEL),
         )
         task = self._tasks.get(key)
         if (
@@ -748,6 +756,13 @@ class RunnerSessionInitializer:
                 ready,
             )
         if changed:
+            conversation.labels.update(
+                {
+                    PERMISSION_STATE_LABEL_KEY: ready,
+                    PERMISSION_CAPABILITY_LABEL_KEY: PERMISSION_CAPABILITY_VALUE,
+                    PERMISSION_RUNTIME_ID_LABEL_KEY: runtime_id,
+                }
+            )
             return response
         return httpx.Response(
             409,
@@ -875,8 +890,33 @@ class RunnerSessionInitializer:
                 response = await self.confirm_permission_ready(
                     conversation, response, store_slots=store_slots
                 )
+            if (
+                200 <= response.status_code < 300
+                and recovery_input_id(conversation) is not None
+                and self._conversation_store is not None
+                and response.json().get("status") in {"running", "waiting"}
+            ):
+                from omnigent.server.turn_recovery import cancel_turn_recovery
+
+                await cancel_turn_recovery(self._conversation_store, conversation.id)
+                current = await asyncio.to_thread(
+                    self._conversation_store.get_conversation, conversation.id
+                )
+                if current is not None:
+                    conversation.labels[RECOVERY_INPUT_LABEL] = current.labels[
+                        RECOVERY_INPUT_LABEL
+                    ]
             if 200 <= response.status_code < 300:
                 self._applied_peer[pkey] = peer
+                response.extensions[_CONFIRMED_PERMISSION_LABELS] = {
+                    name: conversation.labels[name]
+                    for name in (
+                        PERMISSION_STATE_LABEL_KEY,
+                        PERMISSION_CAPABILITY_LABEL_KEY,
+                        PERMISSION_RUNTIME_ID_LABEL_KEY,
+                    )
+                    if name in conversation.labels
+                }
             return response
 
         task = asyncio.create_task(
@@ -899,6 +939,18 @@ class RunnerSessionInitializer:
             response = done.result()
             if response.status_code >= 400:
                 self._tasks.pop(key, None)
+                return
+            confirmed_key: _SessionInitKey = (
+                *key[:7],
+                conversation.labels.get(PERMISSION_STATE_LABEL_KEY),
+                conversation.labels.get(PERMISSION_RUNTIME_ID_LABEL_KEY),
+                *key[9:],
+            )
+            if confirmed_key != key:
+                self._tasks.pop(key, None)
+                self._tasks.setdefault(confirmed_key, done)
+                if key in self._recovery_ids:
+                    self._recovery_ids.setdefault(confirmed_key, self._recovery_ids.pop(key))
 
         task.add_done_callback(_drop_finished)
         return task
@@ -927,6 +979,13 @@ class RunnerSessionInitializer:
                 self._tasks.pop(key, None)
             raise
         self.require_generation(runner_id, runner_client, generation)
+        if response.status_code >= 400:
+            return response
+        # Joined callers hold separate snapshots. Use the permission state
+        # acknowledged by their shared post, including an epoch-recovery retry.
+        confirmed = response.extensions.get(_CONFIRMED_PERMISSION_LABELS)
+        if isinstance(confirmed, dict):
+            conversation.labels.update(confirmed)
         if not runner_inference_verified(conversation, response):
             response = httpx.Response(
                 409,

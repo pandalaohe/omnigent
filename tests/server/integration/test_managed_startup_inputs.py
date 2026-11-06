@@ -39,7 +39,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
-from tests.server.helpers import build_agent_bundle, create_test_agent
+from tests.server.helpers import PERMISSION_TIERS_HEADERS, build_agent_bundle, create_test_agent
 from tests.server.integration.test_managed_launch_failure_teardown import (
     _Env,
 )
@@ -1482,3 +1482,176 @@ async def test_waking_a_host_worker_sets_its_event(startup_env: _Env) -> None:
     finally:
         worker.cancel()
         await asyncio.gather(worker, return_exceptions=True)
+
+
+async def test_host_recovery_dispatches_one_saved_pi_continuation_through_event_api(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.entities.conversation import MessageData, NewConversationItem
+    from omnigent.entities.subagent_retry import InputExecutionClaim
+    from omnigent.server.routes._sessions.helpers import _persist_session_status_error_labels
+    from omnigent.server.schemas import ErrorDetail
+    from tests._helpers.polling import poll_until_async
+
+    env = startup_env
+    session_id = await _create(env, initial_input=None)
+    host_id = uuid4().hex
+    env.conv_store.set_host_id(session_id, host_id, "/opt/work/fixture")
+    env.conv_store.set_runner_id(session_id, "lost-runner")
+    env.conv_store.update_conversation(session_id, harness_override="pi")
+    env.conv_store.append(
+        session_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="interrupted-turn",
+                data=MessageData(
+                    role="assistant",
+                    agent="fixture",
+                    content=[{"type": "output_text", "text": "Partial work"}],
+                ),
+            )
+        ],
+    )
+    await _persist_session_status_error_labels(
+        session_id,
+        ErrorDetail(code="runner_disconnected", message="Runner disconnected"),
+        env.conv_store,
+        owner_runner_id="lost-runner",
+        turn_id="interrupted-turn",
+    )
+    [saved] = env.conv_store.list_pending_inputs(session_id)
+    forwarded: list[dict[str, Any]] = []
+
+    async def receiver(request: httpx.Request) -> httpx.Response:
+        event = json.loads(request.content)
+        forwarded.append(event)
+        if request.url.path.endswith("/events"):
+            receipt = await env.app.state.subagent_retry_admission.admit_execution(
+                session_id,
+                InputExecutionClaim(
+                    input_id=event["input_id"],
+                    turn_id=event["turn_id"],
+                    kind="recovery" if event.get("recovered") else "ordinary",
+                    admission_deadline=event.get("input_admission_deadline"),
+                ),
+                runner_id="lost-runner",
+            )
+            assert receipt.accepted
+        return httpx.Response(202, json={"queued": True})
+
+    runner = httpx.AsyncClient(transport=httpx.MockTransport(receiver), base_url="http://runner")
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_runner_client", AsyncMock(return_value=runner)
+    )
+    startup = env.app.state.startup_inputs
+    _connect_host(env, host_id)
+    startup.host_changed(env.app, host_id)
+    try:
+        await poll_until_async(
+            lambda: any(event.get("type") == "message" for event in forwarded), timeout_s=5
+        )
+        await asyncio.gather(*tuple(startup._deliveries.values()))
+        turns = [event for event in forwarded if event.get("type") == "message"]
+        assert len(turns) == 1
+        assert turns[0]["input_id"] == saved.id
+        assert "Check any interrupted operation's outcome" in str(turns[0]["content"])
+        assert env.conv_store.list_pending_inputs(session_id) == []
+        await startup._recover_session(env.app, session_id, startup.hosts.get(host_id))
+        assert len([event for event in forwarded if event.get("type") == "message"]) == 1
+        response = await env.client.post(
+            f"/v1/sessions/{session_id}/events",
+            headers=PERMISSION_TIERS_HEADERS,
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Second task"}],
+                },
+            },
+        )
+        assert response.status_code == 202, response.text
+        ordinary = [event for event in forwarded if event.get("type") == "message"][-1]
+        assert ordinary["input_admission_required"] is True
+        await _persist_session_status_error_labels(
+            session_id,
+            ErrorDetail(code="RuntimeError", message="Pi process ended before the turn settled"),
+            env.conv_store,
+            owner_runner_id="lost-runner",
+            turn_id=ordinary["turn_id"],
+        )
+        [second] = env.conv_store.list_pending_inputs(session_id)
+        assert second.id != saved.id
+    finally:
+        await startup.shutdown()
+        await runner.aclose()
+
+
+@pytest.mark.parametrize("crash_at", ["before_post", "after_acceptance"])
+async def test_pi_continue_reconciles_receiver_receipt_after_ap_restart(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch, crash_at: str
+) -> None:
+    from omnigent.entities.subagent_retry import InputExecutionClaim
+    from omnigent.server.routes._sessions.helpers import _persist_session_status_error_labels
+    from omnigent.server.schemas import ErrorDetail
+    from omnigent.server.turn_recovery import RECOVERY_INPUT_LABEL
+
+    env = startup_env
+    session_id = await _create(env, initial_input=None)
+    host_id = uuid4().hex
+    env.conv_store.set_host_id(session_id, host_id, "/opt/work/fixture")
+    env.conv_store.set_runner_id(session_id, "runner-recovery")
+    env.conv_store.update_conversation(session_id, harness_override="pi")
+    await _persist_session_status_error_labels(
+        session_id,
+        ErrorDetail(code="runner_disconnected", message="Runner disconnected"),
+        env.conv_store,
+        owner_runner_id="runner-recovery",
+        turn_id="turn-lost",
+    )
+    [saved] = env.conv_store.list_pending_inputs(session_id)
+    posted = []
+    admission = env.app.state.subagent_retry_admission
+
+    async def receiver(request: httpx.Request) -> httpx.Response:
+        event = json.loads(request.content)
+        if request.url.path.endswith("/events"):
+            posted.append(event)
+            if len(posted) == 1 and crash_at == "before_post":
+                raise asyncio.CancelledError()
+            receipt = await admission.admit_execution(
+                session_id,
+                InputExecutionClaim(input_id=saved.id, turn_id="turn-continue", kind="recovery"),
+                runner_id="runner-recovery",
+            )
+            assert receipt.accepted
+            if len(posted) == 1 and crash_at == "after_acceptance":
+                raise asyncio.CancelledError()
+        return httpx.Response(202, json={"queued": True})
+
+    runner = httpx.AsyncClient(transport=httpx.MockTransport(receiver), base_url="http://runner")
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_runner_client", AsyncMock(return_value=runner)
+    )
+    original = env.app.state.startup_inputs
+    connection = _connect_host(env, host_id)
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await original._deliver(env.app, session_id, saved)
+        [pending] = env.conv_store.list_pending_inputs(session_id)
+        assert pending.id == saved.id and pending.status == "incomplete"
+        # Expire only the unconfirmed attempt; no real waiting or new identity.
+        env.conv_store.set_labels(session_id, {"omnigent.interrupted_turn.deadline": "0"})
+        restarted = ManagedStartupInputs(env.conv_store, original.hosts)
+        restarted.dispatch = original.dispatch
+        await restarted._recover_session(env.app, session_id, connection)
+        await asyncio.gather(*tuple(restarted._deliveries.values()))
+        await restarted._recover_session(env.app, session_id, connection)
+        assert len(posted) == (2 if crash_at == "before_post" else 1)
+        assert env.conv_store.list_pending_inputs(session_id) == []
+        assert (
+            env.conv_store.get_conversation(session_id).labels[RECOVERY_INPUT_LABEL]
+            == f"sent:{saved.id}"
+        )
+    finally:
+        await runner.aclose()

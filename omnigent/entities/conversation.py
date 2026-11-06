@@ -314,6 +314,7 @@ class StartupInputOptions(BaseModel):
     model_override: str | None = None
     tools: list[dict[str, Any]] | None = None
     background_titles_enabled: bool = False
+    recovery_id: str | None = None
 
 
 # Longest harness message phase kept, e.g. Codex ``"partial_answer"``.
