@@ -23780,6 +23780,101 @@
         "summary": "Report Usage Account"
       }
     },
+    "/v1/me/usage/accounts/{account_id}/import": {
+      "post": {
+        "operationId": "import_usage_account_v1_me_usage_accounts__account_id__import_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "account_id",
+            "required": true,
+            "schema": {
+              "title": "Account Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "format",
+            "required": true,
+            "schema": {
+              "title": "Format",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "observed_at",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Observed At"
+            }
+          },
+          {
+            "in": "query",
+            "name": "units_per_usd",
+            "required": false,
+            "schema": {
+              "default": "500000",
+              "title": "Units Per Usd",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "correction",
+            "required": false,
+            "schema": {
+              "default": "0",
+              "title": "Correction",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "description": "Unmodified vendor response for the selected format",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteOutcome"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Import Usage Account"
+      }
+    },
     "/v1/me/usage/activity": {
       "get": {
         "operationId": "read_activity_v1_me_usage_activity_get",

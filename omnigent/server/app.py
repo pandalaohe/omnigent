@@ -1999,6 +1999,7 @@ def create_app(
     from omnigent.server.agent_quota import AgentQuotaService
     from omnigent.server.routes.agent_quota import create_agent_quota_router
     from omnigent.server.server_config import usage_enabled as usage_module_enabled
+    from omnigent.server.server_config import usage_import_body_limit
     from omnigent.server.usage_price_source import UsagePriceSource
     from omnigent.stores.usage_hours_store import (
         UsageHoursRecorder,
@@ -2765,6 +2766,7 @@ def create_app(
             host_store=host_store,
             price_source=usage_price_source,
             model_catalogs=host_model_catalog_cache_store,
+            import_max_body_bytes=usage_import_body_limit(resolved_server_config),
         ),
         prefix="/v1",
     )

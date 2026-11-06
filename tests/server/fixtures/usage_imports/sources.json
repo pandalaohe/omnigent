@@ -1,0 +1,19 @@
+{
+  "checked_at": "2026-11-06",
+  "fixture_policy": "Neutral examples derived from official response schemas and documentation examples. Import tests pass each file unchanged; timestamps use UTC and models use neutral names. These are not captured customer responses.",
+  "openai-usage.json": "https://developers.openai.com/api/reference/resources/admin/subresources/organization/subresources/usage/methods/completions",
+  "openai-costs.json": "https://developers.openai.com/api/reference/resources/admin/subresources/organization/subresources/usage/methods/costs",
+  "anthropic-usage.json": "https://platform.claude.com/docs/en/api/beta/organization/usage_report/retrieve_messages",
+  "anthropic-cost.json": "https://platform.claude.com/docs/en/api/beta/organization/cost_report/retrieve",
+  "anthropic-analytics-usage.json": "https://platform.claude.com/docs/en/manage-claude/usage-cost-analytics-api",
+  "anthropic-analytics-cost.json": "https://platform.claude.com/docs/en/manage-claude/usage-cost-analytics-api",
+  "openrouter-key.json": "https://openrouter.ai/docs/api/api-reference/api-keys/get-current-api-key",
+  "openrouter-credits.json": "https://openrouter.ai/docs/api/api-reference/credits/get-remaining-credits",
+  "newapi-user.json": "https://github.com/QuantumNous/new-api/blob/main/controller/user.go#L446-L502",
+  "litellm-key.json": "https://docs.litellm.ai/docs/proxy/users",
+  "notes": {
+    "anthropic-analytics-usage.json": "Current docs use cache_creation.ephemeral_5m_input_tokens and ephemeral_1h_input_tokens; the spec also permits ephemeral_5m and ephemeral_1h. Both are covered.",
+    "newapi-user.json": "The official controller is the primary schema source; it has no complete fixed example response.",
+    "openai-usage.json": "The official daily sample is deliberately narrowed to a UTC hour as required by this door; the response envelope and field names stay unchanged."
+  }
+}

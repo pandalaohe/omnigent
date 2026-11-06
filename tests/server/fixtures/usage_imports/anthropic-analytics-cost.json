@@ -1,0 +1,18 @@
+{
+  "data": [
+    {
+      "starting_at": "2026-09-03T00:00:00Z",
+      "ending_at": "2026-09-04T00:00:00Z",
+      "group": {
+        "model": "model-a"
+      },
+      "cost": {
+        "amount": "123.45",
+        "currency": "USD"
+      }
+    }
+  ],
+  "has_more": false,
+  "next_page": null,
+  "data_refreshed_at": "2026-09-05T00:00:00Z"
+}

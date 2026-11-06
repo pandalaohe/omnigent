@@ -31,6 +31,7 @@ from omnigent.usage.contract import (
     WriteOutcome,
     parse_usage_report,
 )
+from omnigent.usage.imports import READERS, ImportFormatError, ImportOptions, read_import
 from omnigent.usage.ranges import RangeKey, range_spans
 
 _Number = Annotated[StrictFloat | StrictInt, Field(allow_inf_nan=False)]
@@ -159,6 +160,7 @@ def create_agent_quota_router(
     host_store: HostStore | None,
     price_source: UsagePriceSource | None = None,
     model_catalogs: HostModelCatalogCacheStore | None = None,
+    import_max_body_bytes: int = 5 * 1024 * 1024,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -200,6 +202,78 @@ def create_agent_quota_router(
             await asyncio.to_thread(service.note_rejected, owner, account_id)
         except UsageAccountLimitError as exc:
             raise HTTPException(409, str(exc)) from None
+
+    @router.post(
+        "/me/usage/accounts/{account_id}/import",
+        response_model=WriteOutcome,
+        openapi_extra={
+            "requestBody": {
+                "required": True,
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "description": "Unmodified vendor response for the selected format",
+                        }
+                    }
+                },
+            }
+        },
+    )
+    async def import_usage_account(
+        request: Request,
+        account_id: str,
+        format: str,
+        observed_at: str | None = None,
+        units_per_usd: str = "500000",
+        correction: str = "0",
+    ) -> WriteOutcome:
+        require_usage()
+        owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
+        if _ACCOUNT_ID.fullmatch(account_id) is None:
+            raise HTTPException(422, "Invalid usage account id")
+        if format not in READERS:
+            raise HTTPException(404, "Unknown usage import format")
+        media = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if media != "application/json":
+            raise HTTPException(415, "Expected application/json")
+        data = bytearray()
+        async for chunk in request.stream():
+            if len(data) + len(chunk) > import_max_body_bytes:
+                raise HTTPException(413, "Usage import is too large")
+            data.extend(chunk)
+        now = time.time()
+        try:
+            if correction not in {"0", "1"}:
+                raise ImportFormatError("correction must be 0 or 1")
+            try:
+                options = ImportOptions(
+                    observed_at=None if observed_at is None else float(observed_at),
+                    units_per_usd=float(units_per_usd),
+                    correction=correction == "1",
+                )
+            except ValueError:
+                raise ImportFormatError(
+                    "Invalid import observation time or units_per_usd"
+                ) from None
+            body = read_import(format, json.loads(data), options, now)
+        except (ValueError, OverflowError, RecursionError) as exc:
+            try:
+                await asyncio.to_thread(
+                    service.note_rejected, owner, account_id, now=now, format=format
+                )
+            except UsageAccountLimitError as limit:
+                raise HTTPException(409, str(limit)) from None
+            detail = str(exc) if isinstance(exc, ImportFormatError) else "Invalid vendor JSON body"
+            raise HTTPException(422, detail) from None
+        try:
+            outcome = await asyncio.to_thread(
+                service.report_account, owner, account_id, body, now=now, source=format
+            )
+        except UsageAccountLimitError as exc:
+            raise HTTPException(409, str(exc)) from None
+        assert outcome is not None
+        return outcome
 
     @router.put(
         "/me/usage/accounts/{account_id}",
