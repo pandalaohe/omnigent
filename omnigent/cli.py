@@ -11829,7 +11829,7 @@ def _daemon_session_request_params(
     :returns: Query parameters for ``GET /v1/sessions``.
     """
     params: dict[str, str | int] = {
-        "limit": 1000,
+        "limit": 100,
         "include_archived": "true",
         "visibility": "all",
     }

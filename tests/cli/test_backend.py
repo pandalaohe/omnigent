@@ -2114,7 +2114,7 @@ def test_host_stop_stops_sessions_before_daemon(
             if params.get("kind") == "sub_agent":
                 return cli._HostHttpResult(status_code=200, body={"data": []})
             assert params == {
-                "limit": 1000,
+                "limit": 100,
                 "include_archived": "true",
                 "visibility": "all",
                 "host_id": "host_abc",
@@ -2959,6 +2959,7 @@ def test_daemon_session_pages_are_host_scoped(
         assert params["host_id"] == "host_abc"
         assert params["include_archived"] == "true"
         assert params["visibility"] == "all"
+        assert params["limit"] == 100
         assert params.get("connected") == ("true" if connected_only else None)
         assert kwargs["timeout_s"] == 10.0
         after = params.get("after")
