@@ -2079,6 +2079,26 @@ class SqlAlchemyConversationStore(ConversationStore):
         )
         return matches[0] if matches else None
 
+    def find_conversations_by_external_session_ids(
+        self, session_ids: set[str]
+    ) -> list[Conversation]:
+        """Resolve distinct exporter session ids without per-point queries."""
+        ids: list[str] = []
+        values = sorted(session_ids)
+        with self._session("find_exported_sessions") as session:
+            for offset in range(0, len(values), 500):
+                ids.extend(
+                    session.execute(
+                        select(SqlConversationMetadata.id).where(
+                            SqlConversationMetadata.workspace_id == current_workspace_id(),
+                            SqlConversationMetadata.external_session_id.in_(
+                                values[offset : offset + 500]
+                            ),
+                        )
+                    ).scalars()
+                )
+        return list(self.get_conversations(ids).values())
+
     def get_runner_ids(self, conversation_ids: list[str]) -> dict[str, str | None]:
         """
         Single ``SELECT id, runner_id WHERE id IN (...)`` — bulk

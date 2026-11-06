@@ -131,6 +131,34 @@ def test_empty_turn_creates_no_row(db_uri):
     assert store.read("a@example.test", HOUR, HOUR + 1) == []
 
 
+def test_otlp_adds_nullable_buckets_requests_and_failures(db_uri):
+    from omnigent.stores.usage_hours_store import UsageBuckets
+
+    store = UsageHoursStore(db_uri)
+    for buckets, requests, failed, cost in (
+        (UsageBuckets(output_tokens=20, total_tokens=120), 1, 1, 0.25),
+        (UsageBuckets(30, 60, 10, 20, 120, 5), 1, 0, 0.25),
+        (UsageBuckets(), None, None, 0.5),
+    ):
+        store.add_activity(
+            "a@example.test",
+            "gateway",
+            HOUR,
+            "m",
+            "otel:",
+            "metered",
+            True,
+            buckets,
+            requests,
+            failed,
+            cost,
+        )
+    [row] = store.read("a@example.test", HOUR, HOUR + 3600)
+    assert (row.input_tokens, row.cached_tokens, row.cache_write_tokens) == (30, 60, 10)
+    assert (row.output_tokens, row.total_tokens, row.reasoning_tokens) == (40, 240, 5)
+    assert (row.requests, row.failed, row.cost_usd) == (2, 1, 1.0)
+
+
 def test_unpriced_turn_keeps_its_token_split(db_uri):
     store = UsageHoursStore(db_uri)
     store.add_turn(

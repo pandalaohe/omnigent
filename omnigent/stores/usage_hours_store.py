@@ -21,7 +21,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -38,6 +38,7 @@ from omnigent.db.utils import (
     now_epoch,
     run_write_transaction,
 )
+from omnigent.stores.usage_snapshot_store import UsageSnapshotStore
 from omnigent.usage.contract import ActivityEntryV2, ActivityHour, EntryOutcome, WriteOutcome
 
 _logger = logging.getLogger(__name__)
@@ -79,6 +80,18 @@ class HourRow:
     updated_at: int
     reasoning_tokens: int | None = None
     coverage: str | None = None
+
+
+@dataclass(frozen=True)
+class UsageBuckets:
+    """Nullable OTLP figures; an absent figure must not erase a known one."""
+
+    input_tokens: int | None = None
+    cached_tokens: int | None = None
+    cache_write_tokens: int | None = None
+    output_tokens: int | None = None
+    total_tokens: int | None = None
+    reasoning_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -176,6 +189,39 @@ class UsageHoursStore:
         return self._write_sessions
 
     # -- writes ---------------------------------------------------------
+
+    def add_activity(
+        self,
+        owner: str,
+        account_id: str,
+        hour: int,
+        model: str,
+        host_id: str,
+        basis: str,
+        priced: bool,
+        buckets: UsageBuckets,
+        requests: int | None,
+        failed: int | None,
+        cost_usd: float,
+        *,
+        account_record: dict[str, Any] | None = None,
+    ) -> None:
+        """Atomically add normalized OTLP usage, preserving unknown counters."""
+        self._increment(
+            owner,
+            account_id,
+            hours_of(hour),
+            model,
+            host_id,
+            basis,
+            priced,
+            buckets,
+            requests,
+            failed,
+            None,
+            cost_usd,
+            account_record=account_record,
+        )
 
     def add_turn(
         self,
@@ -413,6 +459,22 @@ class UsageHoursStore:
 
     # -- reads ----------------------------------------------------------
 
+    def has_activity(self, owner: str, account_id: str) -> bool:
+        """Detect committed replacement rows even before their cache snapshot flushes."""
+        with self._read_session()("check_usage_activity_writer") as session:
+            return (
+                session.execute(
+                    select(SqlUsageHour.account_id)
+                    .where(
+                        SqlUsageHour.workspace_id == current_workspace_id(),
+                        SqlUsageHour.owner_id == owner,
+                        SqlUsageHour.account_id == account_id,
+                    )
+                    .limit(1)
+                ).first()
+                is not None
+            )
+
     def read(
         self,
         owner: str,
@@ -542,11 +604,13 @@ class UsageHoursStore:
         host_id: str,
         basis: str,
         priced: bool,
-        growth: TokenGrowth,
+        growth: TokenGrowth | UsageBuckets,
         requests: int | None,
         failed: int | None,
         reasons: Mapping[str, int] | None,
         cost_usd: float,
+        *,
+        account_record: dict[str, Any] | None = None,
     ) -> None:
         def write(session: Session) -> None:
             require_active_account(session, owner)
@@ -566,6 +630,10 @@ class UsageHoursStore:
                 cost_usd=cost_usd,
                 increment=True,
             )
+            if account_record is not None:
+                UsageSnapshotStore.write_in_session(
+                    session, owner, "usage.account." + account_id, account_record
+                )
 
         run_write_transaction(self._write_session(), "add_usage_hour", write)
 
@@ -579,7 +647,7 @@ class UsageHoursStore:
         host_id: str,
         basis: str,
         priced: bool,
-        growth: TokenGrowth,
+        growth: TokenGrowth | UsageBuckets,
         *,
         requests: int | None,
         failed: int | None,
@@ -619,6 +687,8 @@ class UsageHoursStore:
             "basis",
             "priced",
         ]
+        if isinstance(growth, UsageBuckets):
+            values["reasoning_tokens"] = growth.reasoning_tokens
         dialect = session.get_bind().dialect.name
         if dialect == "mysql":
             # MySQL names the proposed row ``inserted``; the others ``excluded``.
@@ -666,6 +736,9 @@ class UsageHoursStore:
             "cache_write_tokens",
             "output_tokens",
             "total_tokens",
+            "reasoning_tokens",
+            "requests",
+            "failed",
             "cost_usd",
         )
         merged: dict[str, Any] = {}
@@ -673,7 +746,10 @@ class UsageHoursStore:
             if column in key:
                 continue
             if increment and column in counters:
-                merged[column] = getattr(SqlUsageHour, column) + getattr(proposed, column)
+                if value is not None:
+                    merged[column] = func.coalesce(getattr(SqlUsageHour, column), 0) + getattr(
+                        proposed, column
+                    )
             elif column in {"requests", "failed", "reasons"} and value is None:
                 # A turn carries no request counts: keep whatever a source
                 # already reported for the hour instead of erasing it.

@@ -1,0 +1,26 @@
+{
+  "_fixture": {
+    "source": "https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-token-metrics.md",
+    "legacy_histogram_source": "https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-metrics/",
+    "encoding_source": "https://opentelemetry.io/docs/specs/otlp/",
+    "accessed": "2026-11-06",
+    "kind": "documentation example, not a live recording"
+  },
+  "body": {
+    "resourceMetrics": [{
+      "resource": {"attributes": [{"key": "service.name", "value": {"stringValue": "generic"}}]},
+      "scopeMetrics": [{"metrics": [
+        {"name": "gen_ai.client.inference.usage.input_tokens", "sum": {"aggregationTemporality": 1, "dataPoints": [{"timeUnixNano": "1793923200000000000", "asInt": "100"}]}},
+        {"name": "gen_ai.client.inference.usage.cache_read.input_tokens", "sum": {"aggregationTemporality": 1, "dataPoints": [{"timeUnixNano": "1793923200000000000", "asInt": "60"}]}},
+        {"name": "gen_ai.client.inference.usage.output_tokens", "sum": {"aggregationTemporality": 1, "dataPoints": [{"timeUnixNano": "1793923200000000000", "asInt": "20"}]}},
+        {"name": "gen_ai.client.token.usage", "histogram": {"aggregationTemporality": 1, "dataPoints": [{"attributes": [{"key": "gen_ai.token.type", "value": {"stringValue": "input"}}], "timeUnixNano": "1793923200000000000", "count": "1", "sum": 999}]}}
+      ]}]
+    }, {
+      "resource": {"attributes": [{"key": "service.name", "value": {"stringValue": "fallback"}}]},
+      "scopeMetrics": [{"metrics": [{"name": "gen_ai.client.token.usage", "histogram": {"aggregationTemporality": 1, "dataPoints": [
+        {"attributes": [{"key": "gen_ai.token.type", "value": {"stringValue": "input"}}], "timeUnixNano": "1793923200000000000", "count": "1", "sum": 10},
+        {"attributes": [{"key": "gen_ai.token.type", "value": {"stringValue": "output"}}], "timeUnixNano": "1793923200000000000", "count": "1", "sum": 2}
+      ]}}]}]
+    }]
+  }
+}

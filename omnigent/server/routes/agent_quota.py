@@ -6,6 +6,7 @@ import asyncio
 import json
 import re
 import time
+import zlib
 from copy import deepcopy
 from datetime import date, datetime
 from typing import Annotated, Any, Literal
@@ -13,14 +14,22 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
+from google.protobuf.json_format import ParseError
+from google.protobuf.message import DecodeError
 from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, ValidationError
 from sqlalchemy.exc import SQLAlchemyError, StatementError
 
 from omnigent.harness_plugins import native_agents
 from omnigent.quota_pace import accept_snapshot
-from omnigent.server.agent_quota import AgentQuotaService, UsageAccountLimitError
+from omnigent.server.agent_quota import (
+    AgentQuotaService,
+    UsageAccountLimitError,
+    UsageStorageUnavailableError,
+    UsageWriterConflictError,
+)
 from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes._auth_helpers import require_access, require_user
+from omnigent.server.server_config import load_server_config
 from omnigent.server.usage_price_source import PriceSourceSelection, UsagePriceSource
 from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
 from omnigent.stores.host_store import HostStore
@@ -32,6 +41,7 @@ from omnigent.usage.contract import (
     parse_usage_report,
 )
 from omnigent.usage.imports import READERS, ImportFormatError, ImportOptions, read_import
+from omnigent.usage.otlp import OtlpReceiver, Signal, decode_export, export_response
 from omnigent.usage.ranges import RangeKey, range_spans
 
 _Number = Annotated[StrictFloat | StrictInt, Field(allow_inf_nan=False)]
@@ -39,6 +49,19 @@ _Period = Annotated[
     str, Field(min_length=1, max_length=32, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
 ]
 _ACCOUNT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
+_OTLP_CONTENT = {
+    "application/x-protobuf": {"schema": {"type": "string", "format": "binary"}},
+    "application/json": {"schema": {"type": "object"}},
+}
+_OTLP_OPENAPI = {
+    "requestBody": {"required": True, "content": _OTLP_CONTENT},
+    "responses": {
+        "200": {"description": "OTLP success or partial success", "content": _OTLP_CONTENT},
+        "400": {"description": "Malformed OTLP export"},
+        "413": {"description": "Decompressed body too large"},
+        "503": {"description": "Storage unavailable; retry later"},
+    },
+}
 
 
 async def _usage_report_body(request: Request) -> tuple[Any, dict[str, Any] | None]:
@@ -163,6 +186,67 @@ def create_agent_quota_router(
     import_max_body_bytes: int = 5 * 1024 * 1024,
 ) -> APIRouter:
     router = APIRouter()
+    otlp_receiver = OtlpReceiver(service)
+
+    @router.post("/me/usage/otlp/v1/metrics", response_class=Response, openapi_extra=_OTLP_OPENAPI)
+    async def report_otlp_metrics(request: Request) -> Response:
+        return await report_otlp(request, "metrics")
+
+    @router.post("/me/usage/otlp/v1/traces", response_class=Response, openapi_extra=_OTLP_OPENAPI)
+    async def report_otlp_traces(request: Request) -> Response:
+        return await report_otlp(request, "traces")
+
+    @router.post("/me/usage/otlp/v1/logs", response_class=Response, openapi_extra=_OTLP_OPENAPI)
+    async def report_otlp_logs(request: Request) -> Response:
+        return await report_otlp(request, "logs")
+
+    async def report_otlp(request: Request, signal: Signal) -> Response:
+        require_usage()
+        owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
+        media = (
+            request.headers.get("content-type", "application/x-protobuf")
+            .split(";", 1)[0]
+            .strip()
+            .lower()
+        )
+        if media not in {"application/x-protobuf", "application/json"}:
+            raise HTTPException(415, "Expected OTLP protobuf or JSON")
+        if signal == "logs":
+            return Response(export_response(signal, media), media_type=media)
+        encoding = request.headers.get("content-encoding", "identity").strip().lower()
+        if encoding not in {"identity", "gzip"}:
+            raise HTTPException(415, "Expected identity or gzip encoding")
+        limit = (
+            load_server_config()
+            .get("usage", {})
+            .get("ingest", {})
+            .get("max_body_bytes", {})
+            .get("otlp", 4 * 1024 * 1024)
+        )
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+            limit = 4 * 1024 * 1024
+        body = bytearray()
+        decoder = zlib.decompressobj(16 + zlib.MAX_WBITS) if encoding == "gzip" else None
+        try:
+            async for chunk in request.stream():
+                decoded = (
+                    decoder.decompress(chunk, max(1, limit + 1 - len(body))) if decoder else chunk
+                )
+                body.extend(decoded)
+                if len(body) > limit or (decoder is not None and decoder.unconsumed_tail):
+                    raise HTTPException(413, "OTLP body exceeds the decompressed size limit")
+            if decoder is not None and (not decoder.eof or decoder.unused_data):
+                raise ValueError("Invalid gzip stream")
+            message = decode_export(bytes(body), media, signal)
+        except (DecodeError, ParseError, ValueError, TypeError, AttributeError, zlib.error):
+            raise HTTPException(400, "Malformed OTLP export") from None
+        try:
+            result = await asyncio.to_thread(otlp_receiver.receive, owner, message)
+        except (SQLAlchemyError, RuntimeError):
+            raise HTTPException(503, "Usage storage unavailable; retry later") from None
+        return Response(
+            export_response(signal, media, result.rejected, result.reasons), media_type=media
+        )
 
     @router.put("/me/agent-quota/{product}", status_code=204)
     async def report_quota(request: Request, product: str, body: QuotaReport) -> Response:
@@ -200,7 +284,9 @@ def create_agent_quota_router(
     async def reject_report(owner: str, account_id: str) -> None:
         try:
             await asyncio.to_thread(service.note_rejected, owner, account_id)
-        except UsageAccountLimitError as exc:
+        except UsageStorageUnavailableError:
+            raise HTTPException(503, "Usage storage unavailable; retry later") from None
+        except (UsageAccountLimitError, UsageWriterConflictError) as exc:
             raise HTTPException(409, str(exc)) from None
 
     @router.post(
@@ -262,7 +348,9 @@ def create_agent_quota_router(
                 await asyncio.to_thread(
                     service.note_rejected, owner, account_id, now=now, format=format
                 )
-            except UsageAccountLimitError as limit:
+            except UsageStorageUnavailableError:
+                raise HTTPException(503, "Usage storage unavailable; retry later") from None
+            except (UsageAccountLimitError, UsageWriterConflictError) as limit:
                 raise HTTPException(409, str(limit)) from None
             detail = str(exc) if isinstance(exc, ImportFormatError) else "Invalid vendor JSON body"
             raise HTTPException(422, detail) from None
@@ -270,7 +358,9 @@ def create_agent_quota_router(
             outcome = await asyncio.to_thread(
                 service.report_account, owner, account_id, body, now=now, source=format
             )
-        except UsageAccountLimitError as exc:
+        except UsageStorageUnavailableError:
+            raise HTTPException(503, "Usage storage unavailable; retry later") from None
+        except (UsageAccountLimitError, UsageWriterConflictError) as exc:
             raise HTTPException(409, str(exc)) from None
         assert outcome is not None
         return outcome
@@ -347,7 +437,9 @@ def create_agent_quota_router(
             outcome = await asyncio.to_thread(
                 service.report_account, owner, account_id, body, now=now, event=event
             )
-        except UsageAccountLimitError as exc:
+        except UsageStorageUnavailableError:
+            raise HTTPException(503, "Usage storage unavailable; retry later") from None
+        except (UsageAccountLimitError, UsageWriterConflictError) as exc:
             raise HTTPException(409, str(exc)) from None
         if outcome is not None:
             return JSONResponse(outcome.model_dump(mode="json"))

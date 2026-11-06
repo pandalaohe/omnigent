@@ -24876,6 +24876,153 @@
         "summary": "Read Models"
       }
     },
+    "/v1/me/usage/otlp/v1/logs": {
+      "post": {
+        "operationId": "report_otlp_logs_v1_me_usage_otlp_v1_logs_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            },
+            "application/x-protobuf": {
+              "schema": {
+                "format": "binary",
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              },
+              "application/x-protobuf": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "OTLP success or partial success"
+          },
+          "400": {
+            "description": "Malformed OTLP export"
+          },
+          "413": {
+            "description": "Decompressed body too large"
+          },
+          "503": {
+            "description": "Storage unavailable; retry later"
+          }
+        },
+        "summary": "Report Otlp Logs"
+      }
+    },
+    "/v1/me/usage/otlp/v1/metrics": {
+      "post": {
+        "operationId": "report_otlp_metrics_v1_me_usage_otlp_v1_metrics_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            },
+            "application/x-protobuf": {
+              "schema": {
+                "format": "binary",
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              },
+              "application/x-protobuf": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "OTLP success or partial success"
+          },
+          "400": {
+            "description": "Malformed OTLP export"
+          },
+          "413": {
+            "description": "Decompressed body too large"
+          },
+          "503": {
+            "description": "Storage unavailable; retry later"
+          }
+        },
+        "summary": "Report Otlp Metrics"
+      }
+    },
+    "/v1/me/usage/otlp/v1/traces": {
+      "post": {
+        "operationId": "report_otlp_traces_v1_me_usage_otlp_v1_traces_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            },
+            "application/x-protobuf": {
+              "schema": {
+                "format": "binary",
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              },
+              "application/x-protobuf": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "OTLP success or partial success"
+          },
+          "400": {
+            "description": "Malformed OTLP export"
+          },
+          "413": {
+            "description": "Decompressed body too large"
+          },
+          "503": {
+            "description": "Storage unavailable; retry later"
+          }
+        },
+        "summary": "Report Otlp Traces"
+      }
+    },
     "/v1/me/usage/price-source": {
       "get": {
         "operationId": "read_price_source_v1_me_usage_price_source_get",
