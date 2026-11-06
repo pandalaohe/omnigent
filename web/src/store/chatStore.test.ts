@@ -26,8 +26,10 @@ import {
   useQuery,
 } from "@tanstack/react-query";
 import { createElement } from "react";
+import { MemoryRouter } from "react-router-dom";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { ComposerContextRing } from "@/components/composer/ComposerContextRing";
 import { CodexPermissionReadbackChip } from "@/pages/ChatPage";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { toast } from "sonner";
@@ -798,6 +800,96 @@ describe("chatStore — lazy subtree usage", () => {
       model: "model-a",
       contextWindow: 1_000_000,
       autoCompactTokenLimit: 517_000,
+    });
+  });
+
+  it.each([null, undefined])(
+    "applies a reconnect window of %s without retaining another model's capacity",
+    async (window) => {
+      const id = "conv_usage";
+      routeUsage(id, () => usage(id, 0));
+      await useChatStore.getState().switchTo(id);
+      handleSessionEvent({
+        type: "session_usage",
+        conversationId: id,
+        contextModel: "model-a",
+        contextTokens: 100_000,
+        contextWindow: 475_000,
+        autoCompactTokenLimit: 450_000,
+      });
+      function Ring() {
+        const state = useChatStore();
+        return createElement(ComposerContextRing, {
+          contextWindow: state.contextWindow,
+          tokensUsed: state.tokensUsed,
+          autoCompactTokenLimit: state.autoCompactTokenLimit,
+        });
+      }
+      const view = render(createElement(MemoryRouter, null, createElement(Ring)));
+      expect(screen.getByTestId("composer-context-ring")).toBeInTheDocument();
+      await act(async () => {
+        await useChatStore.getState().switchTo("conv_other");
+        routeUsage(
+          id,
+          () => usage(id, 0),
+          snapshot(id, {
+            context_window: window,
+            auto_compact_token_limit: 400_000,
+            labels: { "omnigent.last_context_model": "model-b" },
+          }),
+        );
+        await useChatStore.getState().switchTo(id);
+        await tick();
+      });
+      expect(useChatStore.getState().reportedContextReading).toEqual({
+        model: "model-b",
+        contextWindow: null,
+        autoCompactTokenLimit: 400_000,
+      });
+      expect(useChatStore.getState().contextWindow).toBe(window === null ? null : 475_000);
+      expect(useChatStore.getState().autoCompactTokenLimit).toBe(400_000);
+      expect(screen.queryByTestId("composer-context-ring") !== null).toBe(window !== null);
+      view.unmount();
+    },
+  );
+
+  it("preserves the whole newer limits reading while a reconnect snapshot is in flight", async () => {
+    const id = "conv_usage";
+    routeUsage(id, () => usage(id, 0));
+    await useChatStore.getState().switchTo(id);
+    await useChatStore.getState().switchTo("conv_other");
+    let finishSnapshot!: (response: Response) => void;
+    const pending = new Promise<Response>((resolve) => {
+      finishSnapshot = resolve;
+    });
+    routeUsage(id, () => usage(id, 0), pending);
+    const reconnect = useChatStore.getState().switchTo(id);
+    await tick();
+    handleSessionEvent(
+      {
+        type: "session_usage",
+        conversationId: id,
+        contextModel: "model-b",
+        contextWindow: 200_000,
+        autoCompactTokenLimit: 167_000,
+      },
+      id,
+    );
+    finishSnapshot(
+      snapshot(id, {
+        context_window: 475_000,
+        auto_compact_token_limit: 450_000,
+        labels: { "omnigent.last_context_model": "model-a" },
+      }),
+    );
+    await reconnect;
+    await tick();
+    expect(useChatStore.getState().contextWindow).toBe(200_000);
+    expect(useChatStore.getState().autoCompactTokenLimit).toBe(167_000);
+    expect(useChatStore.getState().reportedContextReading).toEqual({
+      model: "model-b",
+      contextWindow: 200_000,
+      autoCompactTokenLimit: 167_000,
     });
   });
 

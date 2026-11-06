@@ -5743,9 +5743,10 @@ function reconnectStatusPatch(
   // returns to "N background tasks still running" rather than vanishing on reconnect.
   patch.backgroundTaskCount = session.backgroundTaskCount ?? 0;
   patch.backgroundTasks = session.backgroundTasks ?? [];
-  if (session.contextWindow != null) patch.contextWindow = session.contextWindow;
-  patch.autoCompactTokenLimit = session.autoCompactTokenLimit ?? null;
   if (s.reportedContextReading === readingBeforeFetch) {
+    if (session.contextWindow !== undefined) patch.contextWindow = session.contextWindow;
+    if (session.autoCompactTokenLimit !== undefined)
+      patch.autoCompactTokenLimit = session.autoCompactTokenLimit;
     patch.reportedContextReading = reportedContextReadingFromSession(
       session,
       s.reportedContextReading,
