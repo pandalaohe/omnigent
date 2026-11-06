@@ -1,13 +1,15 @@
 # Task board
 
-The Task board lists tasks reported by external sources. Tasks are grouped by
-source and group, with a progress icon and a link to the source's task page.
-Editing happens in the source. A missing task-page link is shown as text.
+The Task board opens with native sessions, their child sessions and plan steps.
+Routes shows reported tasks as ordered rails or a time map, grouped by source
+and group. A task opens its status, next step, waiting reason, related tasks,
+history and linked sessions. Editing happens in the source; a missing task-page
+link is shown as text. Waiting on me combines source tasks and native prompts.
 
 ## Entry points
 
 - Settings → General → Task board → Show Task board enables the sidebar row.
-- The sidebar's Task board row opens the list. On a phone, open the sidebar first.
+- The sidebar's Task board row opens the board. On a phone, open the sidebar first.
 - A direct `/task-board` link explains an inactive user switch and links to it in
   Settings. A server with `task_board.enabled: false` hides the row and settings
   group, disables task routes and explains its disabled state at the direct link.
@@ -25,8 +27,11 @@ Editing happens in the source. A missing task-page link is shown as text.
 Use the [verification recipe](skills/verify-omnigent/SKILL.md) for an isolated
 instance. On that instance, report two tasks in a Group: one in progress with
 an `alternate` HTTPS link, and one cancelled without a page. Enable the display
-switch, open the sidebar row and confirm both tasks appear under their source,
-with distinct progress icons. Open the task's source link and confirm its URL.
+switch and open the sidebar row. Confirm Sessions shows a parent and child,
+their real session links, available plan steps and recently archived sessions.
+Open Routes and confirm both tasks appear under their source with distinct
+progress icons. Open a task and follow its source link; a cancelled task without
+a link explains that the source gives no page.
 Repeat through a direct link and at 390 px width. The board should fit the
 viewport and preserve the saved display switch after reloading.
 
@@ -54,6 +59,20 @@ For the report and read API, use an isolated instance and a disposable source:
 Report failed API checks with the route, HTTP status and response code, omitting
 credentials. Report pagination failures with page sizes and the first watermark.
 
+In Routes, switch to By time. Pan with the wheel, zoom with Ctrl or Command plus
+wheel, and reset to the initial window. Zooming keeps the right edge fixed and
+stops at twelve hours. At wider ranges, stations become groups and density bars.
+Use Focus to select groups, change modes and confirm the choice persists; Reset
+shows all groups again. Search supports repeated Enter picks, arrows, select all,
+invert, and Escape to clear before closing. At 390 px, By order uses task rails
+with explicit relation links.
+
+Report a task waiting on the user and open a native prompt. Waiting on me shows
+both; its session link opens the native session. Inspect network requests while
+using the board: task and native reads use GET, and its dedicated updates socket
+sends only watch frames. A later source report, gone task, deleted/recreated source
+and a change spanning multiple pages should converge on the next visible refresh.
+
 Related automated checks:
 
 - `tests/server/test_task_board.py`: report/read, replay, older and conflicting
@@ -66,10 +85,12 @@ Related automated checks:
 - `tests/server/test_app.py::test_task_board_raised_limits_reach_the_live_report_router`:
   configured body, entry and source limits through the real app router.
 - `tests/db/test_migration_task_board.py`: additive SQLite migration round trip.
-- `web/src/pages/taskBoard/`: component, pagination, safe-link, catalogue and
-  literal-label tests; existing App, Settings and Sidebar tests cover mounting.
-- `tests/browser_ui/test_task_board.py`: built-SPA settings → sidebar → list at
-  desktop and phone widths, safe links and runtime errors. It uses synthetic
+- `web/src/pages/taskBoard/`: native session trees, wait joins, incremental page
+  reads, source recreation, safe links, route geometry, search keys, catalogue
+  and literal-label tests; existing App, Settings and Sidebar tests cover mounting.
+- `tests/browser_ui/test_task_board.py`: built-SPA settings → sidebar → Sessions
+  and Routes at desktop dark/light and phone widths, details, safe links,
+  watch-only frames and GET-only interactions. It uses synthetic
   backend responses; it does not prove live report transport or account login.
 
 Capture the visible list and any failed request when reporting a failure. Include
