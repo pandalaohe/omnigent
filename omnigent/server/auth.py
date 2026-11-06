@@ -56,7 +56,23 @@ USAGE_READ_TOKEN_PRINCIPAL: Final = "config:usage-read"
 
 
 def scope_allows(scope: str, method: str, path: str) -> bool:
-    """Fail closed on paths and methods outside the credential's usage authority."""
+    """Fail closed on paths and methods outside the credential's declared authority."""
+    if scope == "tasks":
+        return (
+            method == "GET"
+            and path
+            in {
+                "/v1/me/tasks",
+                "/v1/me/tasks/item",
+                "/v1/me/tasks/history",
+                "/v1/me/tasks/closed-counts",
+                "/v1/me/tasks/sources",
+            }
+        ) or (
+            method == "PUT"
+            and re.fullmatch(r"/v1/me/tasks/sources/[A-Za-z0-9][A-Za-z0-9_-]{0,63}", path)
+            is not None
+        )
     if method == "GET" and path in {"/v1/usage-events", "/v1/usage-cutover/receipts"}:
         return scope in {"usage", "usage:read"}
     if scope != "usage":
@@ -823,7 +839,12 @@ class UnifiedAuthProvider(AuthProvider):
                     from omnigent.db.account_authority import bind_account_authority
 
                     bind_account_authority(account, generation)
-                    request.state.usage_read_grant_id = USAGE_READ_TOKEN_PRINCIPAL
+                    if any(
+                        scope in {"usage", "usage:read"}
+                        and scope_allows(scope, request.scope.get("method", ""), request.url.path)
+                        for scope in key.scopes
+                    ):
+                        request.state.usage_read_grant_id = USAGE_READ_TOKEN_PRINCIPAL
                     return account
         if not token:
             return None

@@ -147,6 +147,8 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 - [Native harnesses](./native-harnesses.md) is the matrix of every native
   harness against launch, authentication, model and effort selection,
   approvals, resume, and terminal behavior, with native disconnect test boundaries.
+- [Task board](./task-board.md) covers reported tasks, display switches, source
+  links and owner-scoped report/read checks.
 - [Preferences and config defaults](./preferences.md) covers local user/project
   defaults, invocation overrides, related settings surfaces, and the boundary
   between explicit cloud save/import, the shared-preference foundation, and

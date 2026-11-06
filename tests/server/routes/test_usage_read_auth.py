@@ -276,6 +276,8 @@ def test_config_key_wins_over_legacy_digest(caplog: pytest.LogCaptureFixture) ->
         {"scopes": ["usage:write"]},
         {"scopes": "usage"},
         {"scopes": []},
+        {"scopes": ["tasks", "tasks"]},
+        {"scopes": ["tasks:write"]},
         {"user": "__public__"},
         {"user": "PrivateOwner"},
         {"name": ""},
@@ -354,3 +356,46 @@ def test_api_key_ambiguous_config_refused(duplicate: str) -> None:
     other[duplicate] = entry[duplicate]
     with pytest.raises(ValueError, match="repeats"):
         load_api_keys({"api_keys": [entry, other]}, {})
+
+
+@pytest.mark.parametrize("scopes", [["tasks"], ["usage", "tasks"]])
+def test_tasks_scope_is_exact_and_never_corroborates_usage(scopes: list[str]) -> None:
+    from omnigent.server.server_config import load_api_keys
+
+    token = secrets.token_urlsafe(32)
+    provider = _provider()
+    provider.set_api_keys(
+        load_api_keys(
+            {
+                "api_keys": [
+                    {
+                        "name": "tasks-feeder",
+                        "user": "owner",
+                        "scopes": scopes,
+                        "sha256": hashlib.sha256(token.encode()).hexdigest(),
+                    }
+                ]
+            },
+            {},
+        )
+    )
+    provider.set_usage_read_account_lookup(lambda _: "generation")
+    for path in ("", "/item", "/history", "/closed-counts", "/sources"):
+        request = _request(token, "/v1/me/tasks" + path)
+        assert provider.get_user_id(request) == "owner"
+        assert not hasattr(request.state, "usage_read_grant_id")
+    request = _request(token, "/v1/me/tasks/sources/example", "PUT")
+    assert provider.get_user_id(request) == "owner"
+    assert not hasattr(request.state, "usage_read_grant_id")
+    assert provider.has_usage_api_key("owner") == ("usage" in scopes)
+    for method, path in [
+        ("DELETE", "/v1/me/tasks/sources/example"),
+        ("PUT", "/v1/me/tasks/sources/example/extra"),
+        ("GET", "/v1/me/tasks/unknown"),
+        ("GET", "/v1/sessions"),
+        ("GET", "/v1/preferences"),
+    ]:
+        assert provider.get_user_id(_request(token, path, method)) is None
+    usage = _request(token, "/v1/me/usage/accounts/example", "PUT")
+    assert provider.get_user_id(usage) == ("owner" if "usage" in scopes else None)
+    assert hasattr(usage.state, "usage_read_grant_id") == ("usage" in scopes)

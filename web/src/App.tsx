@@ -69,6 +69,12 @@ const UsagePage = withPageView(
 const UsageBoardRoute = lazy(() =>
   import("@/pages/usageBoard").then((m) => ({ default: m.UsageBoardRoute })),
 );
+const TaskBoardPage = withPageView(
+  "task_board",
+  lazy(() =>
+    import("@/pages/taskBoard/TaskBoardRoute").then((m) => ({ default: m.TaskBoardRoute })),
+  ),
+);
 const UsageBoardPage = withPageView("usage_board", () => <UsageBoardRoute view="board" />);
 const UsageBoardCostPage = withPageView("usage_board.cost", () => <UsageBoardRoute view="cost" />);
 const UsageBoardIssuesPage = withPageView("usage_board.issues", () => (
@@ -251,6 +257,7 @@ function AppRoutes({ basename }: AppProps) {
           {/* The board's routes exist only where the deployment allows the
               module: with usage.enabled false the server serves no usage route,
               so a registered page would only offer a dead surface. */}
+          <Route path={`${prefix}/task-board`} element={<TaskBoardPage />} />
           {usageBoardAvailable(info) && (
             <>
               <Route path={`${prefix}/usage/board`} element={<UsageBoardPage />} />

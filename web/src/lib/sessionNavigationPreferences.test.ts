@@ -19,6 +19,7 @@ describe("sessionNavigationPreferences", () => {
       scrollToBottomOnSessionOpen: true,
       nativeMobileHeaderMode: "server",
       showGoalSessionMarkers: true,
+      showTaskBoard: false,
     });
     localStorage.setItem(SESSION_NAVIGATION_STORAGE_KEY, "{broken");
     expect(readSessionNavigationPreferences()).toEqual({
@@ -27,6 +28,7 @@ describe("sessionNavigationPreferences", () => {
       scrollToBottomOnSessionOpen: true,
       nativeMobileHeaderMode: "server",
       showGoalSessionMarkers: true,
+      showTaskBoard: false,
     });
   });
 
@@ -47,6 +49,7 @@ describe("sessionNavigationPreferences", () => {
       scrollToBottomOnSessionOpen: false,
       nativeMobileHeaderMode: "conversation-title",
       showGoalSessionMarkers: false,
+      showTaskBoard: false,
     });
   });
 

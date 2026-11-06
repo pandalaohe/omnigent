@@ -75,7 +75,10 @@ def load_api_keys(config: Mapping[str, Any], env: Mapping[str, str]) -> tuple[Ap
     names: set[str] = set()
     digests: set[bytes] = set()
     for index, entry in enumerate(entries):
-        error = f"api_keys[{index}] requires name, user, scopes: [usage] and a SHA-256 digest"
+        error = (
+            f"api_keys[{index}] requires name, user, distinct scopes from usage/tasks "
+            "and a SHA-256 digest"
+        )
         if not isinstance(entry, Mapping) or set(entry) != {"name", "user", "scopes", "sha256"}:
             raise ValueError(error)
         name, user, scopes, digest = (
@@ -87,7 +90,12 @@ def load_api_keys(config: Mapping[str, Any], env: Mapping[str, str]) -> tuple[Ap
             or not isinstance(user, str)
             or user in {"local", "__public__"}
             or re.fullmatch(_USERNAME_RE, user) is None
-            or scopes != ["usage"]
+            or not isinstance(scopes, list)
+            or not scopes
+            or any(
+                not isinstance(scope, str) or scope not in {"usage", "tasks"} for scope in scopes
+            )
+            or len(set(scopes)) != len(scopes)
             or not isinstance(digest, str)
             or re.fullmatch(r"[0-9a-fA-F]{64}", digest) is None
         ):
@@ -134,6 +142,12 @@ def load_api_keys(config: Mapping[str, Any], env: Mapping[str, str]) -> tuple[Ap
 def usage_enabled(config: Mapping[str, Any]) -> bool:
     """Deployment gate for usage routes and recording; existing quota routing stays on."""
     raw = config.get("usage")
+    return not isinstance(raw, Mapping) or raw.get("enabled", True) is not False
+
+
+def task_board_enabled(config: Mapping[str, Any]) -> bool:
+    """Deployment gate for task reports and reads, independent of user display preferences."""
+    raw = config.get("task_board")
     return not isinstance(raw, Mapping) or raw.get("enabled", True) is not False
 
 

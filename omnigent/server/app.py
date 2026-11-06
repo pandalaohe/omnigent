@@ -291,6 +291,7 @@ class ServerInfoResponse(BaseModel):
     # The Usage board module may run here (server config ``usage.enabled``);
     # absent on older servers, which clients read as off.
     usage_board_enabled: bool = False
+    task_board_enabled: bool = False
     worktree_status: bool = True
     # GET /v1/sessions accepts ``search_scope``; older servers ignore it.
     session_search_scope: bool = True
@@ -2013,6 +2014,7 @@ def create_app(
     from omnigent.server.admin_list import resolve_data_dir
     from omnigent.server.agent_quota import AgentQuotaService
     from omnigent.server.routes.agent_quota import create_agent_quota_router
+    from omnigent.server.server_config import task_board_enabled
     from omnigent.server.server_config import usage_enabled as usage_module_enabled
     from omnigent.server.usage_price_source import UsagePriceSource
     from omnigent.stores.usage_hours_store import (
@@ -2784,6 +2786,17 @@ def create_app(
         prefix="/v1",
     )
     app.state.host_model_catalog_cache_store = host_model_catalog_cache_store
+    if task_board_enabled(resolved_server_config):
+        from omnigent.server.routes.task_board import create_task_board_router
+        from omnigent.stores.task_board_store import TaskBoardStore
+
+        app.include_router(
+            create_task_board_router(
+                TaskBoardStore(conversation_store.storage_location),
+                auth_provider=auth_provider,
+            ),
+            prefix="/v1",
+        )
     app.state.mcp_gateway_backend = mcp_gateway_backend
     app.state.mcp_registry = mcp_registry
     app.state.mcp_registry_auth = auth_provider
@@ -4147,6 +4160,7 @@ def create_app(
                 "automations_enabled": scheduled_task_store is not None
                 and deployment_gate_enabled(app.state.automations, "automations"),
                 "usage_board_enabled": agent_quota_service.usage_enabled,
+                "task_board_enabled": task_board_enabled(resolved_server_config),
                 "branding": branding_snapshot.config(),
                 "attachment_limits": attachment_limits(),
             }
