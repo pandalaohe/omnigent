@@ -23,7 +23,9 @@ not just structure, each test fails if its feature is deleted.
 
 from __future__ import annotations
 
+import hashlib
 import secrets
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -1072,6 +1074,92 @@ def accounts_app_needs_setup(
     ``/auth/setup`` first-admin claim.
     """
     yield from _build_accounts_app(tmp_path, monkeypatch, init_admin_password=None)
+
+
+@pytest.mark.parametrize("credential", ["legacy", "config"])
+def test_usage_api_key_upgrade_through_configured_app(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, credential: str
+) -> None:
+    import yaml
+
+    token = secrets.token_urlsafe(32)
+    if credential == "legacy":
+        monkeypatch.setenv("OMNIGENT_USAGE_READ_TOKEN", f"admin:{token}")
+    else:
+        config_path = tmp_path / "server.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "api_keys": [
+                        {
+                            "name": "feeder",
+                            "user": "admin",
+                            "scopes": ["usage"],
+                            "sha256": hashlib.sha256(token.encode()).hexdigest(),
+                        }
+                    ]
+                }
+            )
+        )
+        monkeypatch.setenv("OMNIGENT_CONFIG", str(config_path))
+    with contextmanager(_build_accounts_app)(
+        tmp_path, monkeypatch, init_admin_password="admin-pw-12345"
+    ) as client:
+        headers = {"Authorization": f"Bearer {token}"}
+        assert client.get("/v1/usage-events", headers=headers).status_code == 200
+        assert (
+            client.put(
+                "/v1/me/usage/accounts/vendor",
+                headers=headers,
+                json={
+                    "schema_version": 1,
+                    "observed_at": time.time(),
+                    "status": "available",
+                    "windows": [
+                        {
+                            "id": "weekly",
+                            "kind": "weekly",
+                            "percent_used": 40,
+                            "window_minutes": 10080,
+                            "resets_at": time.time() + 3600,
+                        }
+                    ],
+                },
+            ).status_code
+            == 204
+        )
+        assert client.get("/v1/me/usage", headers=headers).status_code == 200
+        assert client.get("/v1/sessions", headers=headers).status_code == 401
+        assert client.delete("/v1/me/usage/accounts/vendor", headers=headers).status_code == 401
+        assert client.put("/v1/me/usage/price-source", headers=headers, json={}).status_code == 401
+
+
+def test_usage_api_key_bad_scope_refuses_app_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import yaml
+
+    config_path = tmp_path / "server.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "api_keys": [
+                    {
+                        "name": "feeder",
+                        "user": "admin",
+                        "scopes": ["usage:write"],
+                        "sha256": "a" * 64,
+                    }
+                ]
+            }
+        )
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config_path))
+    with pytest.raises(ValueError, match="api_keys"):
+        with contextmanager(_build_accounts_app)(
+            tmp_path, monkeypatch, init_admin_password="admin-pw-12345"
+        ):
+            pytest.fail("Invalid scope must refuse startup")
 
 
 @pytest.fixture
