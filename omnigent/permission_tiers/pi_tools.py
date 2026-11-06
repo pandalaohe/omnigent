@@ -53,7 +53,7 @@ def _read_file(
         raise ValueError("Registration target is not regular")
     fd = os.open(
         resolved if resolved_target is not None else path,
-        os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0),
+        os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0),
     )
     try:
         opened = os.fstat(fd)
@@ -342,19 +342,27 @@ def read_pi_tool_registry(
                         or source.get("scope") != "user"
                     ):
                         raise ValueError("Unreviewed native helper package")
-                    exports = manifest.get("exports")
-                    if not isinstance(exports, dict) or not all(
-                        key in exports
-                        for key in (
-                            "./preflight",
-                            "./required-child-extensions",
-                            "./native-child-lifecycle",
-                        )
-                    ):
-                        raise ValueError("Native helper public contract is unavailable")
-                    native_tools[name] = ""
                     native_packages[str(manifest_path)] = hashlib.sha256(manifest_raw).hexdigest()
                     controls.append(str(manifest_path))
+                    exports = manifest.get("exports")
+                    missing = next(
+                        (
+                            key
+                            for key in (
+                                "./preflight",
+                                "./required-child-extensions",
+                                "./native-child-lifecycle",
+                            )
+                            if not isinstance(exports, dict) or not exports.get(key)
+                        ),
+                        None,
+                    )
+                    if missing:
+                        native_tools[name] = (
+                            f"pi-subagents is missing {missing}; subagent tools are off"
+                        )
+                        continue
+                    native_tools[name] = ""
             except (OSError, ValueError, KeyError, TypeError, RuntimeError):
                 invalid.add(name)
                 extensions[name] = (

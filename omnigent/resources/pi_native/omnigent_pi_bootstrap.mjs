@@ -15,7 +15,7 @@ export function installNativeSupportBootstrap(sdk, {prepareLoader, describeSessi
   const store = globalThis[Symbol.for("omnigent.pi.native-support.v2")];
   const original = Object.fromEntries(required.map(name => [name, loader[name]]));
   const bind = session.bindExtensions;
-  const installation = {active:true};
+  const installation = {active:true, notified:false};
   const wraps = {};
   wraps.loadCurrentExtensionSet = function (...args) {
     const profile = prepareLoader(this);
@@ -64,6 +64,14 @@ export function installNativeSupportBootstrap(sdk, {prepareLoader, describeSessi
           return nativeSupport.evaluateNativeCall(event, ctx, support);
         };
         api.on("tool_call", state.finalHook);
+        api.on("session_start", async (_event, ctx) => {
+          await state.bind(store.sessions.get(ctx.sessionManager));
+          if (state.notice && !installation.notified) {
+            api.sendMessage({customType:"omnigent-pi-compatibility", content:state.notice, display:true});
+            api.events.emit("omnigent:pi-compatibility", state.notice);
+            installation.notified = true;
+          }
+        });
         api.on("session_shutdown", (_event, ctx) => nativeSupport.closeNativeSession(ctx.sessionManager));
       }}]}, result.runtime);
     if (final.errors.length || final.extensions.length !== 1) throw new Error("Native final hook could not be installed");
@@ -79,6 +87,7 @@ export function installNativeSupportBootstrap(sdk, {prepareLoader, describeSessi
       if (state.manager === actual.sessionManager) return;
       if (!state.binding) state.binding = (async () => {
         const descriptor = await describeSession(actual, state);
+        state.notice = descriptor.nativePackageFailure;
         if (!installation.active || store.loaders.get(this) !== state)
           throw new Error("Native installation changed while binding");
         nativeSupport.bindNativeSession(actual, {...descriptor, sources:state.sources,

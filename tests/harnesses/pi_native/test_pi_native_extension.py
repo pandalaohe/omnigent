@@ -209,6 +209,9 @@ fs.writeFileSync(configPath, JSON.stringify({
 }));
 process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
 const postedEvents = [];
+const compatibilityListeners = new Map();
+const compatibilityEvents = {on:(name,handler)=>compatibilityListeners.set(name,handler),
+  emit:(name,text)=>compatibilityListeners.get(name)?.(text)};
 global.fetch = async (_url, request) => {
   postedEvents.push(JSON.parse(request.body));
   return { ok: true };
@@ -218,6 +221,7 @@ function launchExtension(overrides = {}) {
   delete require.cache[require.resolve(extensionPath)];
   const handlers = {};
   require(extensionPath)({
+    events: compatibilityEvents,
     registerCommand() {},
     on(name, handler) { handlers[name] = handler; },
     ...overrides,
@@ -240,6 +244,32 @@ async function recordUsage(handlers, timestamp, input, output, cost) {
   }}, ctx);
 }
 """
+
+
+def test_compatibility_notice_is_forwarded_to_the_session_once() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension test")
+    extension_path = (
+        Path(__file__).resolve().parents[3]
+        / "omnigent/resources/pi_native/omnigent_pi_native_extension.js"
+    )
+    script = (
+        _usage_test_preamble()
+        + r"""
+(async () => {
+  const text="pi-subagents is missing ./native-child-lifecycle. Subagent tools are off.";
+  compatibilityEvents.emit("omnigent:pi-compatibility",text);
+  await new Promise(setImmediate);
+  compatibilityEvents.emit("omnigent:pi-compatibility",text);
+  await new Promise(setImmediate);
+  const items=postedEvents.filter(event=>event.data?.item_type==="message");
+  assert.equal(items.length,1,JSON.stringify(postedEvents));
+  assert.deepEqual(items[0].data.item_data.content,[{type:"output_text",text}]);
+})().catch(error=>{console.error(error);process.exit(1);});
+"""
+    )
+    _run_extension_script(node, extension_path, script)
 
 
 def test_message_end_posts_external_session_usage(tmp_path: Path) -> None:

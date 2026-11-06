@@ -7,7 +7,7 @@ const {pathToFileURL} = require("node:url");
 const support = require("./native_support.cjs");
 const {createChildNativeGate} = require("./omnigent_pi_child_extension.js");
 
-async function fixture(t, {origin = "parent", tier = "auto", duplicate = false, definition = {name:"reader"}, noEvaluator = false, refuseNativeAdmission = false, settings, projectSettings, projectTrusted=false, definitionSource="user", missingRequired=false, scopedClient, asyncDescriptor=false} = {}) {
+async function fixture(t, {origin = "parent", tier = "auto", duplicate = false, definition = {name:"reader"}, noEvaluator = false, refuseNativeAdmission = false, settings, projectSettings, projectTrusted=false, definitionSource="user", missingRequired=false, scopedClient, asyncDescriptor=false, missingExport} = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "native-support-"));
   t.after(() => fs.rmSync(root, {recursive:true, force:true}));
   const workspace = path.join(root, "workspace");
@@ -35,11 +35,22 @@ export async function resolveSubagentLaunchContract(input) {
  protocol:{packageVersion:"0.80.0"}, tools:{disableAmbientExtensions:true,requiredExtensionIds:${JSON.stringify(missingRequired?[]:["omnigent.permission"])},
  extensionArgs:[],configuredExtensions:[],runtimeExtensions:[],toolExtensionPaths:[]}, diagnostics:[]}}; }`);
   fs.writeFileSync(path.join(packageRoot, "lifecycle.js"), "export function getNativeChildLifecycle(manager) { return globalThis[Symbol.for('fixture.native-lifecycles')].get(manager); }");
+  fs.writeFileSync(path.join(packageRoot, "required.js"), "export function registerRequiredChildExtensions() { return {dispose(){}}; }");
+  if (missingExport) {
+    const manifestPath=path.join(packageRoot,"package.json");
+    const manifest=JSON.parse(fs.readFileSync(manifestPath));
+    if (missingExport.startsWith("./")) delete manifest.exports[missingExport];
+    else fs.writeFileSync(path.join(packageRoot, {
+      resolveSubagentLaunchContract:"preflight.js",getNativeChildLifecycle:"lifecycle.js",
+      registerRequiredChildExtensions:"required.js",
+    }[missingExport]),"export {};\n");
+    fs.writeFileSync(manifestPath,JSON.stringify(manifest));
+  }
   globalThis[Symbol.for("fixture.native-lifecycles")] ||= new WeakMap();
   const api = await support.loadPackageApi(packageRoot, {parseFrontmatter:text=>({frontmatter:JSON.parse(text)}),getAgentDir:()=>root,CONFIG_DIR_NAME:".pi"});
   const state = {tier,revision:3,status:"ready",workspace};
   let backendStarts = 0, policyCalls = 0;
-  const facts = [];
+  const facts = [], notices = [];
   const scope = {scope_id:"scope",installation_id:"installation",registry_generation:"generation",origin,canonical_cwd:fs.realpathSync(workspace)};
   const toolRows = [
     {name:"subagent",sourceInfo:{path:entry,scope:"user",source:"npm:pi-subagents@0.80.0",origin:"package",baseDir:root}},
@@ -62,7 +73,7 @@ export async function resolveSubagentLaunchContract(input) {
       const extensions=[];
       for (const item of this.extensionFactories) {
         const extension={path:`<inline:${item.name}>`,handlers:new Map()};
-        await item.factory({on(name, handler) { const handlers=extension.handlers.get(name)||[]; handlers.push((...args)=>handler(...args)); extension.handlers.set(name,handlers); }});
+        await item.factory({events:{emit(){}},sendMessage:message=>notices.push(message),on(name, handler) { const handlers=extension.handlers.get(name)||[]; handlers.push((...args)=>handler(...args)); extension.handlers.set(name,handlers); }});
         extensions.push(extension);
       }
       return {extensions,errors:[],runtime};
@@ -83,7 +94,7 @@ export async function resolveSubagentLaunchContract(input) {
   const dispose = installNativeSupportBootstrap(sdk, {
     sdkVersion:"1.3.0",
     prepareLoader:() => ({getState:()=>state,checkInput(file){assert.ok(path.isAbsolute(file));}}),
-    describeSession:() => (asyncDescriptor ? value=>Promise.resolve(value) : value=>value)({scope,api,getState:()=>state,workspace,bridgeDir:root,parentSession:actual,scopedClient,
+    describeSession:() => (asyncDescriptor ? value=>Promise.resolve(value) : value=>value)({scope,api:api.unavailable?undefined:api,nativePackageFailure:api.unavailable,getState:()=>state,workspace,bridgeDir:root,parentSession:actual,scopedClient,
       requiredIdentities:[support.snapshot(guard)],configInputs:[],settingsPaths:[],
       beforeClose:async()=>({revoked:true,scope_id:scope.scope_id,installation_id:scope.installation_id})}),
     evaluate:noEvaluator ? undefined : async (_event, _ctx, fact) => {policyCalls++;facts.push(fact);return {block:false};},
@@ -104,8 +115,30 @@ export async function resolveSubagentLaunchContract(input) {
     return result;
   }
   return {root,workspace,agentPath,guard,entry,packageRoot,scope,api,state,loader,actual,ctx,final,run,dispose,lifecycle,
-    backendStarts:()=>backendStarts,policyCalls:()=>policyCalls,facts};
+    backendStarts:()=>backendStarts,policyCalls:()=>policyCalls,facts,notices};
 }
+
+test("missing package APIs leave ordinary tools gated and helper tools denied",async t=>{
+  for(const missingExport of ["./native-child-lifecycle","./preflight","./required-child-extensions",
+    "resolveSubagentLaunchContract","getNativeChildLifecycle","registerRequiredChildExtensions"]){
+    await t.test(missingExport,async t=>{
+      const f=await fixture(t,{missingExport});
+      const start=f.loader.getExtensions().extensions.at(-1).handlers.get("session_start")[0];
+      await start({},f.ctx);
+      await start({},f.ctx);
+      assert.equal(f.notices.length,1);
+      assert.ok(f.notices[0].content.includes(missingExport));
+      assert.equal(f.notices[0].display,true);
+      assert.equal(await f.run("read",{path:"notes.txt"}),undefined);
+      assert.equal(f.backendStarts(),1);
+      for(const input of [{agent:"reader",task:"read"},{action:"status"},{action:"gist"}]){
+        const result=await f.run("subagent",input);
+        assert.equal(result.block,true);
+      }
+      assert.equal(f.backendStarts(),1);
+    });
+  }
+});
 
 test("verified native source still requires admitted sync/async and action semantics", async t => {
   for (const [input, action] of [[{agent:"reader",task:"read",async:false},"delegate"], [{agent:"reader",task:"read",async:true},"delegate"], [{action:"list"},"read"], [{action:"stop",id:"child"},"control"]]) {
