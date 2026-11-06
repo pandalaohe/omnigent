@@ -13,11 +13,45 @@ from omnigent.stores.usage_hours_store import (
     UsageHoursStore,
     hours_of,
 )
-from omnigent.usage.contract import ActivityHour
+from omnigent.usage.contract import ActivityEntryV2, ActivityHour
 
 # Two hours ago: a pushed ``activity`` hour must be in the past to be kept.
 HOUR = hours_of(int(datetime.now(UTC).timestamp())) - 7200
 OTHER_HOUR = HOUR + 3600
+
+
+@pytest.mark.parametrize(
+    "figure",
+    [
+        "uncached_input_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "tokens",
+        "requests",
+        "failed",
+        "cost_usd",
+    ],
+)
+def test_hostless_accounts_require_figures_and_follow_owner_workspace_and_removal(db_uri, figure):
+    from omnigent.db.db_models import workspace_scope
+
+    store = UsageHoursStore(db_uri)
+    for owner in ("a@example.test", "b@example.test"):
+        store.replace_rows(owner, "plan", [ActivityEntryV2(hour=HOUR, **{figure: 0})])
+    store.replace_rows(
+        "a@example.test", "marker", [ActivityEntryV2(hour=HOUR, coverage="partial")]
+    )
+    store.replace_rows(
+        "a@example.test", "hosted", [ActivityEntryV2(hour=HOUR, host="h", tokens=1)]
+    )
+    assert store.hostless_accounts("a@example.test") == {"plan"}
+    with workspace_scope(9):
+        assert store.hostless_accounts("a@example.test") == set()
+    store.replace_rows("a@example.test", "plan", [ActivityEntryV2(hour=HOUR, removed=True)])
+    assert store.hostless_accounts("a@example.test") == set()
+    assert store.hostless_accounts("b@example.test") == {"plan"}
 
 
 def test_add_turn_accumulates_one_row_per_model_and_hour(db_uri):

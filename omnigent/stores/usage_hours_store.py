@@ -21,7 +21,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -443,6 +443,31 @@ class UsageHoursStore:
                 SqlUsageHour.model,
             )
             return [_row_from_orm(row) for row in session.execute(query).scalars()]
+
+    def hostless_accounts(self, owner: str) -> set[str]:
+        """Accounts holding host-less figures in any hour, scoped to this owner."""
+        with self._read_session()("read_hostless_usage_accounts") as session:
+            query = (
+                select(SqlUsageHour.account_id)
+                .where(
+                    SqlUsageHour.workspace_id == current_workspace_id(),
+                    SqlUsageHour.owner_id == owner,
+                    SqlUsageHour.host_id == "",
+                    or_(
+                        SqlUsageHour.priced == 1,
+                        SqlUsageHour.input_tokens.is_not(None),
+                        SqlUsageHour.cached_tokens.is_not(None),
+                        SqlUsageHour.cache_write_tokens.is_not(None),
+                        SqlUsageHour.output_tokens.is_not(None),
+                        SqlUsageHour.reasoning_tokens.is_not(None),
+                        SqlUsageHour.total_tokens.is_not(None),
+                        SqlUsageHour.requests.is_not(None),
+                        SqlUsageHour.failed.is_not(None),
+                    ),
+                )
+                .distinct()
+            )
+            return set(session.scalars(query))
 
     def _read_unpriced(self, closed_before: int) -> list[HourRow]:
         with self._read_session()("read_unpriced_usage_hours") as session:

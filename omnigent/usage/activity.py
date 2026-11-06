@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, Sequence, Set
 from dataclasses import asdict
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -35,8 +35,47 @@ def attributed_rows(
     accounts: Mapping[str, Mapping[str, Any]],
     meters: Mapping[tuple[str, str], set[str | None]],
     native_accounts: Sequence[str] = (),
+    hostless: Set[str] = frozenset(),
 ) -> dict[str, list[HourRow]]:
     result: dict[str, list[HourRow]] = defaultdict(list)
+    coverage = {
+        (row.account_id, row.host_id, row.hour_utc)
+        for row in rows
+        if row.account_id in accounts
+        and accounts[row.account_id].get("activity_writer") != "otlp"
+        and (
+            row.priced
+            or any(
+                value is not None
+                for value in (
+                    row.input_tokens,
+                    row.cached_tokens,
+                    row.cache_write_tokens,
+                    row.output_tokens,
+                    row.reasoning_tokens,
+                    row.total_tokens,
+                    row.requests,
+                    row.failed,
+                )
+            )
+        )
+    }
+    account_wide = {
+        account
+        for account in hostless
+        if account in accounts and accounts[account].get("activity_writer") != "otlp"
+    } | {account for account, host, _ in coverage if not host}
+    # V1 also treated an empty activity section as account-wide replacement.
+    account_wide.update(
+        account
+        for account, record in accounts.items()
+        if record.get("has_activity")
+        and record.get(
+            "activity_schema_version", (record.get("report") or {}).get("schema_version", 1)
+        )
+        == 1
+        and record.get("activity_writer") != "otlp"
+    )
     linked: dict[str, str] = {}
     for account, record in sorted(accounts.items()):
         if record.get("product"):
@@ -56,7 +95,7 @@ def attributed_rows(
                 )
             else:
                 target = linked.get(product, product)
-            if accounts.get(target, {}).get("has_activity"):
+            if target in account_wide or (target, row.host_id, row.hour_utc) in coverage:
                 continue
         elif target not in accounts:
             # A removed source's hours never resurrect its tile.

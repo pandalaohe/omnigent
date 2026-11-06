@@ -514,7 +514,7 @@ async def test_v2_limits_name_section_and_leave_reading_unchanged(service, secti
 
 
 @pytest.mark.parametrize("activity", [[], [{"hour": HOUR, "cost_basis": "billed", "cost_usd": 3}]])
-def test_v2_any_activity_takes_over_all_linked_native_rows(service, activity):
+def test_v2_only_hostless_figures_take_over_all_linked_native_rows(service, activity):
     service.hours_store.add_turn(
         OWNER, "native:codex", HOUR, "m", "native-host", "metered", True, 10, 0, 0, 2, 12, 1
     )
@@ -534,7 +534,165 @@ def test_v2_any_activity_takes_over_all_linked_native_rows(service, activity):
     amounts = next(
         a for a in service.activity(OWNER, now=NOW)["accounts"] if a["account"] == "plan"
     )
-    assert amounts["totals"]["counted_cost_usd"] == (3 if activity else 0)
+    assert amounts["totals"]["counted_cost_usd"] == (3 if activity else 1)
+
+
+@pytest.mark.parametrize(
+    "entry,expected",
+    [
+        ({"host": "host-1", "tokens": 10}, 12),
+        ({"host": "host-1", "coverage": "partial"}, 3),
+        ({"host": "gateway-a", "tokens": 10}, 13),
+    ],
+)
+def test_v2_native_takeover_matches_host_and_hour(service, entry, expected):
+    for host, hour in [("host-1", HOUR - 3600), ("host-2", HOUR - 3600), ("host-1", HOUR)]:
+        service.hours_store.add_turn(
+            OWNER, "native:claude", hour, "m", host, "subscription", True, 1, 0, 0, 0, 1, 1
+        )
+    service.report_account(
+        OWNER,
+        "plan",
+        UsageReportV2(
+            schema_version=2,
+            observed_at=NOW,
+            product="claude",
+            activity=[ActivityEntryV2(hour=HOUR - 3600, **entry)],
+        ),
+        now=NOW,
+    )
+    item = service.activity(OWNER, account="plan", now=NOW)["accounts"][0]
+    assert item["totals"]["counted_cost_usd"] == 0
+    if "tokens" in entry:
+        assert item["totals"]["tokens"] == expected
+    assert {h["host_id"]: h["cost_usd"] for h in item["hosts"] if h["cost_usd"] is not None} == {
+        "host-1": 1 if entry.get("tokens") and entry["host"] == "host-1" else 2,
+        "host-2": 1,
+    }
+
+
+def test_hostless_takeover_outside_range_reverts_after_removal(service):
+    for host in ("host-1", "host-2"):
+        service.hours_store.add_turn(
+            OWNER, "native:claude", HOUR, "m", host, "metered", True, 1, 0, 0, 0, 1, 1
+        )
+
+    def push(entries):
+        service.report_account(
+            OWNER,
+            "plan",
+            UsageReportV2(schema_version=2, observed_at=NOW, product="claude", activity=entries),
+            now=NOW,
+        )
+
+    old = HOUR - 90 * 86400
+    push(
+        [ActivityEntryV2(hour=old, tokens=0), ActivityEntryV2(hour=HOUR, host="host-1", tokens=10)]
+    )
+    assert service.hours_store.read(OWNER, HOUR - 3 * 86400, HOUR + 1)[0].host_id == "host-1"
+    for range_key in ("today", "h24", "d7"):
+        item = service.activity(OWNER, account="plan", range_key=range_key, now=NOW)["accounts"][0]
+        assert item["totals"]["cost_usd"] is None
+        assert item["totals"]["tokens"] == 10
+    push([ActivityEntryV2(hour=old, removed=True)])
+    item = service.activity(OWNER, account="plan", now=NOW)["accounts"][0]
+    assert item["totals"]["cost_usd"] == 1
+    assert item["totals"]["tokens"] == 11
+
+
+@pytest.mark.parametrize("activity", [[], [{"hour": HOUR, "tokens": 0}]])
+def test_v1_keeps_account_wide_native_takeover(service, activity):
+    for host in ("host-1", "host-2"):
+        service.hours_store.add_turn(
+            OWNER, "native:codex", HOUR, "m", host, "metered", True, 1, 0, 0, 0, 1, 1
+        )
+    report(service, "plan", product="codex", activity=activity)
+    item = service.activity(OWNER, account="plan", now=NOW)["accounts"][0]
+    assert item["totals"]["cost_usd"] is None
+
+
+def test_v1_empty_activity_keeps_takeover_after_v2_metadata_and_restart(service, db_uri):
+    for host in ("host-1", "host-2"):
+        service.hours_store.add_turn(
+            OWNER, "native:codex", HOUR, "m", host, "metered", True, 1, 0, 0, 0, 1, 1
+        )
+    report(service, "plan", product="codex", activity=[])
+    service.report_account(
+        OWNER,
+        "plan",
+        UsageReportV2(schema_version=2, observed_at=NOW + 1, display_name="Upgraded"),
+        now=NOW + 1,
+    )
+    item = service.activity(OWNER, account="plan", now=NOW + 1)["accounts"][0]
+    assert item["totals"]["cost_usd"] is None
+    service.flush()
+    restored = AgentQuotaService(
+        service.conversations,
+        None,
+        service.preferences,
+        None,
+        None,
+        UsageSnapshotStore(db_uri),
+        hours_store=service.hours_store,
+    )
+    item = restored.activity(OWNER, account="plan", now=NOW + 1)["accounts"][0]
+    assert item["totals"]["cost_usd"] is None
+    restored.report_account(
+        OWNER,
+        "plan",
+        UsageReportV2(
+            schema_version=2,
+            observed_at=NOW + 2,
+            activity=[ActivityEntryV2(hour=HOUR, host="host-1", tokens=10)],
+        ),
+        now=NOW + 2,
+    )
+    item = restored.activity(OWNER, account="plan", now=NOW + 2)["accounts"][0]
+    assert item["totals"]["cost_usd"] == 1
+    assert item["totals"]["tokens"] == 11
+
+
+@pytest.mark.parametrize("writer", ["report", "import", "otlp"])
+@pytest.mark.parametrize("host", ["host", ""])
+def test_native_coverage_requires_non_otlp_figures(writer, host):
+    source = row()
+    marker = row(
+        account_id="plan",
+        host_id=host,
+        priced=False,
+        cost_usd=0,
+        input_tokens=None,
+        cached_tokens=None,
+        cache_write_tokens=None,
+        output_tokens=None,
+        total_tokens=None,
+        coverage="partial",
+    )
+    accounts = {
+        "plan": {
+            "product": "pi",
+            "has_activity": True,
+            "activity_writer": writer,
+            "report": {"schema_version": 2},
+        }
+    }
+    assert attributed_rows([source, marker], accounts, {})["plan"] == [source, marker]
+    for figure in (
+        "input_tokens",
+        "cached_tokens",
+        "cache_write_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "total_tokens",
+        "requests",
+        "failed",
+        "priced",
+    ):
+        evidence = replace(marker, **{figure: True if figure == "priced" else 0})
+        result = attributed_rows(
+            [source, evidence], accounts, {}, hostless={"plan"} if not host else set()
+        )
+        assert result["plan"] == ([source, evidence] if writer == "otlp" else [evidence])
 
 
 def test_v2_activity_applies_even_when_reading_failed(service):

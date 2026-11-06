@@ -416,6 +416,9 @@ class AgentQuotaService:
             ):
                 raise UsageAccountLimitError("at most 32 usage accounts per owner")
         record = previous or {"schema_version": 1, "account_id": account_id, "report_log": []}
+        record.setdefault(
+            "activity_schema_version", (record.get("report") or {}).get("schema_version", 1)
+        )
         record["last_report_at"] = max(
             observed, float(record.get("last_report_at") or record.get("last_attempt_at") or 0)
         )
@@ -505,6 +508,7 @@ class AgentQuotaService:
                     )
             record["has_activity"] = True
             record["activity_writer"] = "report"
+            record["activity_schema_version"] = 2
         marks = dict(record.get("reset_marks") or {})
         if windows_changed and report.status == "available":
             for window in merged.windows:
@@ -627,6 +631,7 @@ class AgentQuotaService:
             if report.status == "available":
                 if report.activity is not None and self.hours_store is not None:
                     record["has_activity"] = True
+                    record["activity_schema_version"] = 1
                 if report.pinned_window is not None:
                     record["pinned_window"] = report.pinned_window
                 record["report"] = report.stored()
@@ -1046,7 +1051,10 @@ class AgentQuotaService:
             [int((now - 86400) // 3600) * 3600, *(prev.counted_from for _, prev in spans.values())]
         )
         rows = self.hours_store.read(owner, since, int(now) + 1) if self.hours_store else []
-        projected = attributed_rows(rows, records, self._activity_meters(owner), list(views))
+        hostless = self.hours_store.hostless_accounts(owner) if self.hours_store else set()
+        projected = attributed_rows(
+            rows, records, self._activity_meters(owner), list(views), hostless=hostless
+        )
         result = []
         for key, view in views.items():
             if account is not None and key != account:
@@ -1525,6 +1533,7 @@ class AgentQuotaService:
                 "host_id",
                 "report_log",
                 "has_activity",
+                "activity_schema_version",
             ):
                 if field in stored:
                     merged[field] = deepcopy(stored[field])
