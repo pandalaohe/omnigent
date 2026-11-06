@@ -420,6 +420,8 @@ class AgentQuotaService:
             observed, float(record.get("last_report_at") or record.get("last_attempt_at") or 0)
         )
         stored = dict(record.get("report") or {})
+        # Activity lives in usage_hours; old v1 payloads need not satisfy v2 validation.
+        stored.pop("activity", None)
         stored.update(schema_version=2, observed_at=observed)
         fields = report.model_fields_set
         data = report.model_dump(mode="json")

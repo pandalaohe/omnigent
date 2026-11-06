@@ -599,6 +599,51 @@ def test_v1_still_drops_whole_report_after_a_newer_v2_metadata_report(service):
     assert service.hours_store.read(OWNER, HOUR, HOUR + 1) == []
 
 
+def test_v1_figureless_activity_survives_v2_metadata_upgrade_and_restart(service):
+    legacy = service.report_account(
+        OWNER,
+        "plan",
+        UsageReport.model_validate(
+            {
+                "observed_at": NOW,
+                "windows": [{"id": "kept", "used_value": 1}],
+                "activity": [{"hour": HOUR}],
+            }
+        ),
+        now=NOW,
+    )
+    assert legacy is None
+    before = service.hours_store.read(OWNER, HOUR, HOUR + 1)
+    assert before[0].total_tokens == 0
+    upgraded = service.report_account(
+        OWNER,
+        "plan",
+        UsageReportV2.model_validate(
+            {
+                "schema_version": 2,
+                "observed_at": NOW + 1,
+                "display_name": "Upgraded",
+            }
+        ),
+        now=NOW + 1,
+    )
+    assert upgraded.model_dump() == {"applied": 0, "held": [], "skipped": [], "older_sections": []}
+    assert service.hours_store.read(OWNER, HOUR, HOUR + 1) == before
+    service.flush(force=True)
+    restored = AgentQuotaService(
+        service.conversations,
+        None,
+        service.preferences,
+        None,
+        None,
+        service.snapshot_store,
+        hours_store=service.hours_store,
+    )
+    tile = next(a for a in restored.overview(OWNER, now=NOW + 1).accounts if a.id == "plan")
+    assert tile.display_name == "Upgraded" and tile.windows[0].id == "kept"
+    assert tile.read_at == NOW
+
+
 @pytest.fixture
 def service(db_uri, monkeypatch):
     monkeypatch.setattr("omnigent.stores.usage_hours_store.now_epoch", lambda: int(NOW))
