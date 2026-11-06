@@ -10,7 +10,8 @@ import {
   type Ref,
 } from "react";
 
-import { AgentNameTag } from "@/components/AgentNameTag";
+import { AgentBadgeMark } from "@/components/AgentBadge";
+import { AGENT_MARK_CLASS, AgentIntegrationMark, AgentNameTag } from "@/components/AgentNameTag";
 import { HelpTip } from "@/components/HelpTip";
 import { LayeredEditor, LayeredEditorAction } from "@/components/LayeredEditor";
 import { LayeredMark } from "@/components/LayeredTable";
@@ -29,16 +30,19 @@ import { Segmented } from "@/components/ui/segmented";
 import { Switch } from "@/components/ui/switch";
 import {
   harnessSection,
+  productIdFor,
   registrySourceLabels,
   rowsForAgentIds,
   useAgentRegistry,
   useAgentsWithSessions,
   type RegistryItem,
 } from "@/hooks/useAgentRegistry";
+import { useAgentBadgePreferences } from "@/hooks/useAgentBadgePreferences";
 import { useCodexRateLimits, useHosts, type Host } from "@/hooks/useHosts";
 import { useSession } from "@/hooks/useSession";
 import { useStableProviderUsageLimits } from "@/hooks/useStableProviderUsageLimits";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
+import { agentBadgeFor } from "@/lib/agentBadgePreferences";
 import { formatTokenCountShort } from "@/lib/formatCost";
 import { harnessUnavailableReasonOnHost } from "@/lib/harnessSetup";
 import { missingCellText } from "@/lib/layeredValues";
@@ -104,7 +108,6 @@ interface ContextRow {
 interface ContextGroup {
   id: string;
   agent: ContextRow;
-  agentId: string | null;
   models: ContextRow[];
 }
 
@@ -212,12 +215,17 @@ function agentLabelFor(items: readonly RegistryItem[], agentName: string, harnes
   return product?.label ?? registrySourceLabels(items, agentName, harness).agentLabel;
 }
 
-function agentIdFor(
-  items: readonly RegistryItem[],
-  agentName: string,
-  harness: string,
-): string | null {
-  return items.find((item) => item.name === agentName && item.harness === harness)?.key ?? null;
+interface RegistryView {
+  items: readonly RegistryItem[];
+  legacyProducts: Record<string, RegistryItem>;
+}
+
+/** The catalog id the agent's badge is saved under. */
+function badgeIdFor(registry: RegistryView, agentName: string, harness: string): string | null {
+  return productIdFor(
+    registry.items.find((item) => item.name === agentName && item.harness === harness),
+    registry,
+  );
 }
 
 function groupIdOf(entry: UsageContextListEntry): string {
@@ -258,7 +266,6 @@ function contextGroups(
       groups.set(id, {
         id,
         agent: rowFor(agentEntry, agentLabelFor(items, entry.agentName, entry.harness)),
-        agentId: agentIdFor(items, entry.agentName, entry.harness),
         models: [],
       });
     }
@@ -749,35 +756,51 @@ function ValueEditor({
   );
 }
 
-/** Add an agent or a recorded combination; typing offers a model that has no record yet. */
-function AddEntryPicker({
-  agents,
-  combos,
-  typedAgents,
-  labelOf,
-  agentIdOf,
-  listed,
+interface PickerOption {
+  key: string;
+  /** What the search matches. */
+  value: string;
+  entry: UsageContextListEntry;
+  content: ReactNode;
+}
+
+/** A searchable list of entries to add; `typedEntry` turns the search itself into one. */
+function EntryPicker({
+  trigger,
+  label,
+  placeholder,
+  heading,
+  options,
+  typedEntry,
+  emptyText,
+  testId,
+  opensEditor = false,
   onAdd,
 }: {
-  agents: readonly UsageContextListEntry[];
-  combos: readonly UsageContextListEntry[];
-  typedAgents: readonly UsageContextListEntry[];
-  labelOf: (entry: UsageContextListEntry) => string;
-  agentIdOf: (entry: UsageContextListEntry) => string | null;
-  listed: ReadonlySet<string>;
+  trigger: ReactElement;
+  label: string;
+  placeholder: string;
+  heading: string;
+  options: readonly PickerOption[];
+  /** The entry the search itself would add, or null when it adds nothing. */
+  typedEntry?: (typed: string) => UsageContextListEntry | null;
+  emptyText: (typed: string) => string;
+  testId: string;
+  /** The choice opens a cell editor, which keeps the focus the closing picker would take back. */
+  opensEditor?: boolean;
   onAdd: (entry: UsageContextListEntry) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState("");
+  const chosenRef = useRef(false);
   const typed = search.trim().slice(0, 256);
+  const typedChoice = typed && typedEntry ? typedEntry(typed) : null;
   const choose = (entry: UsageContextListEntry) => {
-    onAdd(entry);
+    chosenRef.current = true;
     setOpen(false);
     setSearch("");
+    onAdd(entry);
   };
-  const typedChoices = typed
-    ? typedAgents.filter((agent) => !listed.has(usageContextEntryKey({ ...agent, model: typed })))
-    : [];
   return (
     <Popover
       open={open}
@@ -786,87 +809,41 @@ function AddEntryPicker({
         if (!next) setSearch("");
       }}
     >
-      <PopoverTrigger asChild>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          className="min-h-11 md:min-h-7"
-          data-testid="context-add-entry"
-        >
-          <PlusIcon aria-hidden className="size-3.5" />
-          Add agent or model
-        </Button>
-      </PopoverTrigger>
+      <PopoverTrigger asChild>{trigger}</PopoverTrigger>
       <PopoverContent
         align="start"
         data-pop=""
         className="w-[min(24rem,calc(100vw-1rem))] p-0"
-        data-testid="context-add-picker"
+        data-testid={testId}
+        onCloseAutoFocus={(event) => {
+          if (opensEditor && chosenRef.current) event.preventDefault();
+          chosenRef.current = false;
+        }}
       >
-        <Command label="Add agent or model">
-          <CommandInput
-            value={search}
-            onValueChange={setSearch}
-            placeholder="Search, or type a model"
-          />
+        <Command label={label}>
+          <CommandInput value={search} onValueChange={setSearch} placeholder={placeholder} />
           <CommandList>
-            <CommandEmpty>
-              {typed ? "No agent to add it to." : "Everything recorded is listed. Type a model."}
-            </CommandEmpty>
-            {agents.length > 0 ? (
-              <CommandGroup heading="Agents in use">
-                {agents.map((agent) => (
+            <CommandEmpty>{emptyText(typed)}</CommandEmpty>
+            {options.length > 0 ? (
+              <CommandGroup heading={heading}>
+                {options.map((option) => (
                   <CommandItem
-                    key={usageContextEntryKey(agent)}
-                    value={`agent ${labelOf(agent)} ${agent.harness}`}
-                    onSelect={() => choose(agent)}
+                    key={option.key}
+                    value={option.value}
+                    onSelect={() => choose(option.entry)}
                   >
-                    <AgentNameTag
-                      agentId={agentIdOf(agent)}
-                      name={labelOf(agent)}
-                      harness={agent.harness}
-                    />
+                    {option.content}
                   </CommandItem>
                 ))}
               </CommandGroup>
             ) : null}
-            {combos.length > 0 ? (
-              <CommandGroup heading="Used with a model">
-                {combos.map((combo) => (
-                  <CommandItem
-                    key={usageContextEntryKey(combo)}
-                    value={`combo ${labelOf(combo)} ${combo.harness} ${combo.model}`}
-                    onSelect={() => choose(combo)}
-                  >
-                    <AgentNameTag
-                      agentId={agentIdOf(combo)}
-                      name={labelOf(combo)}
-                      harness={combo.harness}
-                    />
-                    <span className="min-w-0 wrap-anywhere text-muted-foreground">
-                      {combo.model}
-                    </span>
-                  </CommandItem>
-                ))}
-              </CommandGroup>
-            ) : null}
-            {typedChoices.length > 0 ? (
-              <CommandGroup heading={`Add ${typed} to`} forceMount>
-                {typedChoices.map((agent) => (
-                  <CommandItem
-                    key={usageContextEntryKey(agent)}
-                    forceMount
-                    value={`typed ${labelOf(agent)} ${agent.harness} ${typed}`}
-                    onSelect={() => choose({ ...agent, model: typed })}
-                  >
-                    <AgentNameTag
-                      agentId={agentIdOf(agent)}
-                      name={labelOf(agent)}
-                      harness={agent.harness}
-                    />
-                  </CommandItem>
-                ))}
+            {typedChoice ? (
+              <CommandGroup forceMount>
+                <CommandItem forceMount value={`add ${typed}`} onSelect={() => choose(typedChoice)}>
+                  <span className="min-w-0 wrap-anywhere">
+                    Add <span className="font-medium">{typed}</span>
+                  </span>
+                </CommandItem>
               </CommandGroup>
             ) : null}
           </CommandList>
@@ -877,10 +854,10 @@ function AddEntryPicker({
 }
 
 /** Two value slots on one grid, shared with the column's header so everything lines up. */
-const SLOT_GRID = "grid w-full grid-cols-[repeat(2,minmax(3.5rem,1fr))] gap-x-3";
-const CELL_PADDING = "pr-2 pl-4";
+const SLOT_GRID = "grid w-full grid-cols-[repeat(2,minmax(3.5rem,1fr))] gap-x-2";
+const CELL_PADDING = "pr-1 pl-3.5";
 /** Room for the warning mark, kept on every cell so a warning never moves a number. */
-const WARNING_GUTTER = "flex w-11 shrink-0 items-center justify-center md:w-6";
+const WARNING_GUTTER = "flex w-11 shrink-0 items-center justify-center md:w-5";
 
 function ValueSlot({
   slot,
@@ -1005,14 +982,15 @@ function cellWarning(
 
 const TABLE_CELL = "h-px border-b border-border bg-background p-0 text-left align-middle";
 const FIRST_COLUMN =
-  "lt-c sticky left-0 z-10 min-w-44 max-w-44 border-r font-normal md:min-w-64 md:max-w-80";
-const BODY_COLUMN = "min-w-43 border-l-0 md:min-w-40";
-const ROW_NAME = "flex min-w-0 flex-1 flex-wrap items-center gap-x-1.5 py-1.5";
+  "lt-c sticky left-0 z-10 min-w-44 max-w-44 border-r font-normal md:min-w-44 md:max-w-56";
+const BODY_COLUMN = "border-l-0";
+const ROW_HEIGHT = "min-h-11 md:min-h-8";
 const ROW_ACTION =
-  "flex size-11 shrink-0 items-center justify-center rounded-sm text-muted-foreground opacity-100 transition-opacity hover:text-foreground focus-visible:opacity-100 md:size-6 md:opacity-0 md:group-hover/label:opacity-100";
+  "flex h-11 w-8 shrink-0 items-center justify-center rounded-sm text-muted-foreground opacity-100 transition-opacity hover:text-foreground focus-visible:opacity-100 md:size-6 md:opacity-0 md:group-hover/label:opacity-100";
 
 export function ContextUsageSettings() {
   const preferences = useUsageContextPreferences();
+  const badges = useAgentBadgePreferences();
   const registry = useAgentRegistry();
   const sessions = useAgentsWithSessions();
   const { data: hosts = [] } = useHosts();
@@ -1065,8 +1043,8 @@ export function ContextUsageSettings() {
   const severalOpen = preferences.contextList?.severalOpen ?? false;
   const labelOfEntry = (entry: UsageContextListEntry) =>
     agentLabelFor(registry.items, entry.agentName, entry.harness);
-  const agentIdOfEntry = (entry: UsageContextListEntry) =>
-    agentIdFor(registry.items, entry.agentName, entry.harness);
+  const badgeIdOfEntry = (entry: UsageContextListEntry) =>
+    badgeIdFor(registry, entry.agentName, entry.harness);
   const reportedAt = (row: ContextRow, column: ContextColumn): UsageContextReported =>
     row.kind === "all"
       ? NOTHING_REPORTED
@@ -1197,6 +1175,12 @@ export function ContextUsageSettings() {
     if (entry.model) showGroup(groupIdOf(entry));
     revealRowRef.current = usageContextEntryKey(entry);
   };
+  /** A model added from its agent's name opens straight into its values on all computers. */
+  const addModel = (entry: UsageContextListEntry) => {
+    addEntry(entry);
+    focusEditorRef.current = true;
+    setOpenEditor({ row: usageContextEntryKey(entry), col: ALL_COLUMN.id });
+  };
   const setSeveralOpen = (next: boolean) => {
     if (!preferences.contextList) return;
     writeUsageContextPreferences({
@@ -1310,7 +1294,8 @@ export function ContextUsageSettings() {
         <td key={column.id} className={cn(TABLE_CELL, BODY_COLUMN)}>
           <span
             className={cn(
-              "flex size-full min-h-11 items-center py-1.5 text-xs text-muted-foreground md:min-h-9",
+              "flex size-full items-center py-1 text-xs text-muted-foreground",
+              ROW_HEIGHT,
               CELL_PADDING,
             )}
           >
@@ -1346,7 +1331,8 @@ export function ContextUsageSettings() {
                 title={summary}
                 data-testid={`context-cell-${row.testId}-${column.id}`}
                 className={cn(
-                  "flex min-h-11 min-w-0 flex-1 items-center py-1.5 text-left text-sm outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring aria-expanded:bg-muted md:min-h-9",
+                  "flex min-w-0 flex-1 items-center py-1 text-left text-sm outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring aria-expanded:bg-muted",
+                  ROW_HEIGHT,
                   CELL_PADDING,
                 )}
               >
@@ -1419,14 +1405,117 @@ export function ContextUsageSettings() {
   const uniqueOf = (items: readonly UsageContextListEntry[]) => [
     ...new Map(items.map((item) => [usageContextEntryKey(item), item])).values(),
   ];
-  const agentOptions = uniqueOf([
+  const agentOptions: PickerOption[] = uniqueOf([
     ...inUse,
     ...recorded.map((item) => ({ ...item, model: "" })),
-  ]).filter((item) => !listedGroups.has(groupIdOf(item)));
-  const comboOptions = uniqueOf(
-    recorded.filter((item) => item.model && !listedKeys.has(usageContextEntryKey(item))),
-  );
-  const typedAgents = uniqueOf([...groups.map((group) => group.agent.entry), ...agentOptions]);
+  ])
+    .filter((item) => !listedGroups.has(groupIdOf(item)))
+    .map((agent) => ({
+      key: usageContextEntryKey(agent),
+      value: `agent ${labelOfEntry(agent)} ${agent.harness}`,
+      entry: agent,
+      content: (
+        <AgentNameTag
+          agentId={badgeIdOfEntry(agent)}
+          name={labelOfEntry(agent)}
+          harness={agent.harness}
+        />
+      ),
+    }));
+  const modelOptions = (group: ContextGroup): PickerOption[] =>
+    uniqueOf(
+      recorded.filter(
+        (item) =>
+          item.model && groupIdOf(item) === group.id && !listedKeys.has(usageContextEntryKey(item)),
+      ),
+    ).map((item) => ({
+      key: usageContextEntryKey(item),
+      value: `model ${item.model}`,
+      entry: item,
+      content: <span className="min-w-0 wrap-anywhere">{item.model}</span>,
+    }));
+
+  const agentHeader = (group: ContextGroup, open: boolean) => {
+    const label = group.agent.label;
+    const models = group.models.length;
+    const options = modelOptions(group);
+    const badge = agentBadgeFor(badges, badgeIdOfEntry(group.agent.entry));
+    return (
+      <span className={cn("group/label flex items-center gap-1 pr-1 pl-1", ROW_HEIGHT)}>
+        {models > 0 ? (
+          <button
+            type="button"
+            aria-expanded={open}
+            aria-label={`${open ? "Collapse" : "Expand"} ${label}`}
+            className="flex h-11 w-7 shrink-0 items-center justify-center rounded-sm text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring md:h-8 md:w-6"
+            onClick={() => toggleGroup(group.id)}
+          >
+            <ChevronRightIcon
+              aria-hidden
+              className={cn("size-4 transition-transform", open && "rotate-90")}
+            />
+          </button>
+        ) : (
+          <span aria-hidden className="w-7 shrink-0 md:w-6" />
+        )}
+        <span className="flex min-w-0 flex-1 flex-col items-start gap-0.5 py-1">
+          <EntryPicker
+            trigger={
+              <button
+                type="button"
+                aria-label={`Add a model to ${label}`}
+                title={`Add a model to ${label}`}
+                data-testid={`context-add-model-${group.agent.testId}`}
+                className="group/name flex max-w-full min-w-0 items-center gap-1.5 rounded-sm text-left text-ui font-medium text-foreground underline-offset-2 outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring aria-expanded:underline"
+              >
+                {badge ? <AgentBadgeMark badge={badge} data-testid="agent-name-badge" /> : null}
+                <span className="min-w-0 wrap-anywhere">{label}</span>
+                <PlusIcon
+                  aria-hidden
+                  className="hidden size-3 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover/name:opacity-100 group-focus-visible/name:opacity-100 group-aria-expanded/name:opacity-100 md:block"
+                />
+              </button>
+            }
+            label={`Add a model to ${label}`}
+            placeholder="Type a model"
+            heading="Used before"
+            options={options}
+            typedEntry={(typed) => {
+              const entry = { ...group.agent.entry, model: typed };
+              if (listedKeys.has(usageContextEntryKey(entry))) return null;
+              return options.some((option) => option.entry.model === typed) ? null : entry;
+            }}
+            emptyText={(typed) => (typed ? `${typed} is already listed.` : "Type a model name.")}
+            testId="context-model-picker"
+            opensEditor
+            onAdd={addModel}
+          />
+          <span className="flex flex-wrap items-center gap-1">
+            <AgentIntegrationMark harness={group.agent.entry.harness} />
+            {models > 0 ? (
+              <span
+                role="img"
+                aria-label={`${models} ${models === 1 ? "model" : "models"}`}
+                title={`${models} ${models === 1 ? "model" : "models"}`}
+                className={cn(AGENT_MARK_CLASS, "tabular-nums")}
+                data-testid="context-model-count"
+              >
+                {models}
+              </span>
+            ) : null}
+            {!open && groupWarns(group) ? (
+              <TriangleAlertIcon
+                role="img"
+                aria-label="A model here differs from what the agent reports"
+                className="size-3.5 shrink-0 text-warning"
+              />
+            ) : null}
+          </span>
+        </span>
+        {removeButton(group.agent)}
+      </span>
+    );
+  };
 
   return (
     <div className="grid gap-5">
@@ -1456,181 +1545,154 @@ export function ContextUsageSettings() {
         </p>
       ) : null}
 
-      <div
-        className="flex min-w-0 flex-col gap-2 border-t border-border pt-4"
-        data-testid="context-limits"
-      >
-        <div className="max-w-full overflow-x-auto rounded-lg border border-border">
-          <table
-            aria-label="Context limits"
-            className="w-full min-w-max border-separate border-spacing-0 text-sm"
-          >
-            <thead>
-              <tr>
-                <th className={cn("z-20", TABLE_CELL, FIRST_COLUMN, "px-3 py-2")}>
-                  <span className="flex items-center gap-1.5 text-sm font-normal text-muted-foreground">
-                    Agent or model
-                    <HelpTip label="Which value wins" className="-my-3 size-11 md:my-0 md:size-4">
-                      {ORDER_HELP}
-                    </HelpTip>
-                  </span>
-                </th>
-                {columns.map((column) => (
-                  <th
-                    key={column.id}
-                    scope="col"
-                    data-testid={`context-col-${column.id}`}
-                    className={cn(TABLE_CELL, BODY_COLUMN, "py-2 font-normal")}
-                  >
-                    <span className="flex">
-                      <span className={cn("min-w-0 flex-1", CELL_PADDING)}>
-                        <span className="block text-ui font-medium text-foreground wrap-anywhere">
-                          {column.label}
-                        </span>
-                        <span className={cn(SLOT_GRID, "mt-0.5 text-xs text-muted-foreground")}>
-                          <span>Context</span>
-                          <span>Buffer</span>
-                        </span>
-                      </span>
-                      <span aria-hidden className={WARNING_GUTTER} />
+      <div className="flex min-w-0 border-t border-border pt-4" data-testid="context-limits">
+        {/* As wide as the table: the controls and key below wrap to it instead of widening it. */}
+        <div className="flex w-fit max-w-full min-w-0 flex-col gap-2">
+          <div className="max-w-full overflow-x-auto rounded-lg border border-border">
+            <table
+              aria-label="Context limits"
+              className="w-full min-w-max border-separate border-spacing-0 text-sm"
+            >
+              <thead>
+                <tr>
+                  <th className={cn("z-20", TABLE_CELL, FIRST_COLUMN, "px-3 py-2")}>
+                    <span className="flex items-center gap-1.5 text-sm font-normal text-muted-foreground">
+                      Agent or model
+                      <HelpTip label="Which value wins" className="-my-3 size-11 md:my-0 md:size-4">
+                        {ORDER_HELP}
+                      </HelpTip>
                     </span>
                   </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              <tr data-testid={`context-row-${ALL_ROW.testId}`}>
-                <th scope="row" className={cn(TABLE_CELL, FIRST_COLUMN)}>
-                  <span className="flex min-h-11 items-center gap-2 px-3 py-1.5 md:min-h-9">
-                    <span className="text-ui font-medium text-foreground">{ALL_ROW.label}</span>
-                    <span className="text-xs text-muted-foreground">Default</span>
-                  </span>
-                </th>
-                {columns.map((column) => renderCell(ALL_ROW, column))}
-              </tr>
-            </tbody>
-            {groups.map((group) => {
-              const open = openGroups.includes(group.id);
-              const models = group.models.length;
-              const name = (
-                <AgentNameTag
-                  agentId={group.agentId}
-                  name={group.agent.label}
-                  harness={group.agent.entry.harness}
-                  className="contents text-ui font-medium text-foreground"
-                />
-              );
-              return (
-                <tbody key={group.id} data-testid={`context-group-${group.agent.testId}`}>
-                  <tr data-testid={`context-row-${group.agent.testId}`}>
-                    <th scope="row" className={cn(TABLE_CELL, FIRST_COLUMN)}>
-                      <span className="group/label flex min-h-11 items-center gap-1 pr-1 pl-2 md:min-h-9">
-                        {models > 0 ? (
-                          <button
-                            type="button"
-                            aria-expanded={open}
-                            aria-label={`${open ? "Collapse" : "Expand"} ${group.agent.label}`}
-                            className="flex min-h-11 min-w-0 flex-1 items-center gap-1 rounded-sm text-left outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-9"
-                            onClick={() => toggleGroup(group.id)}
-                          >
-                            <ChevronRightIcon
-                              aria-hidden
-                              className={cn(
-                                "size-4 shrink-0 text-muted-foreground transition-transform",
-                                open && "rotate-90",
-                              )}
-                            />
-                            <span className={ROW_NAME}>
-                              {name}
-                              <span className="text-xs text-muted-foreground">
-                                {open
-                                  ? "All models"
-                                  : `${models} ${models === 1 ? "model" : "models"}`}
-                              </span>
-                              {!open && groupWarns(group) ? (
-                                <TriangleAlertIcon
-                                  role="img"
-                                  aria-label="A model here differs from what the agent reports"
-                                  className="size-3.5 shrink-0 text-warning"
-                                />
-                              ) : null}
-                            </span>
-                          </button>
-                        ) : (
-                          <span className="flex min-h-11 min-w-0 flex-1 items-center gap-1 md:min-h-9">
-                            <span aria-hidden className="size-4 shrink-0" />
-                            <span className={ROW_NAME}>{name}</span>
+                  {columns.map((column) => (
+                    <th
+                      key={column.id}
+                      scope="col"
+                      data-testid={`context-col-${column.id}`}
+                      className={cn(TABLE_CELL, BODY_COLUMN, "py-2 font-normal")}
+                    >
+                      <span className="flex">
+                        <span className={cn("min-w-0 flex-1", CELL_PADDING)}>
+                          <span className="block text-ui font-medium text-foreground wrap-anywhere">
+                            {column.label}
                           </span>
-                        )}
-                        {removeButton(group.agent)}
+                          <span className={cn(SLOT_GRID, "mt-0.5 text-xs text-muted-foreground")}>
+                            <span>Context</span>
+                            <span>Buffer</span>
+                          </span>
+                        </span>
+                        <span aria-hidden className={WARNING_GUTTER} />
                       </span>
                     </th>
-                    {columns.map((column) => renderCell(group.agent, column))}
-                  </tr>
-                  {open
-                    ? group.models.map((row) => (
-                        <tr key={row.id} data-testid={`context-row-${row.testId}`}>
-                          <th scope="row" className={cn(TABLE_CELL, FIRST_COLUMN)}>
-                            <span className="group/label flex min-h-11 items-center gap-1 pr-1 pl-7 md:min-h-9">
-                              <span className="min-w-0 flex-1 py-1.5 text-sm wrap-anywhere text-foreground">
-                                {row.label}
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                <tr data-testid={`context-row-${ALL_ROW.testId}`}>
+                  <th scope="row" className={cn(TABLE_CELL, FIRST_COLUMN)}>
+                    <span className={cn("flex items-center gap-2 px-3 py-1", ROW_HEIGHT)}>
+                      <span className="text-ui font-medium text-foreground">{ALL_ROW.label}</span>
+                      <span className="text-xs text-muted-foreground">Default</span>
+                    </span>
+                  </th>
+                  {columns.map((column) => renderCell(ALL_ROW, column))}
+                </tr>
+              </tbody>
+              {groups.map((group) => {
+                const open = openGroups.includes(group.id);
+                return (
+                  <tbody key={group.id} data-testid={`context-group-${group.agent.testId}`}>
+                    <tr data-testid={`context-row-${group.agent.testId}`}>
+                      <th scope="row" className={cn(TABLE_CELL, FIRST_COLUMN)}>
+                        {agentHeader(group, open)}
+                      </th>
+                      {columns.map((column) => renderCell(group.agent, column))}
+                    </tr>
+                    {open
+                      ? group.models.map((row) => (
+                          <tr key={row.id} data-testid={`context-row-${row.testId}`}>
+                            <th scope="row" className={cn(TABLE_CELL, FIRST_COLUMN)}>
+                              <span
+                                className={cn(
+                                  "group/label flex items-center gap-1 pr-1 pl-9 md:pl-8",
+                                  ROW_HEIGHT,
+                                )}
+                              >
+                                <span className="min-w-0 flex-1 py-1 text-sm wrap-anywhere text-foreground">
+                                  {row.label}
+                                </span>
+                                {removeButton(row)}
                               </span>
-                              {removeButton(row)}
-                            </span>
-                          </th>
-                          {columns.map((column) => renderCell(row, column))}
-                        </tr>
-                      ))
-                    : null}
-                </tbody>
-              );
-            })}
-          </table>
-        </div>
-        <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2">
-          <AddEntryPicker
-            agents={agentOptions}
-            combos={comboOptions}
-            typedAgents={typedAgents}
-            labelOf={labelOfEntry}
-            agentIdOf={agentIdOfEntry}
-            listed={listedKeys}
-            onAdd={addEntry}
-          />
-          {undo ? (
-            <span
-              className="flex min-w-0 flex-wrap items-center gap-2 text-sm text-muted-foreground"
-              role="status"
-              data-testid="context-undo-status"
-            >
-              {undo.message}
-              <LayeredEditorAction onClick={restoreUndo}>Undo</LayeredEditorAction>
-            </span>
-          ) : null}
-          <label className="ml-auto flex min-h-11 items-center gap-2 text-sm text-muted-foreground md:min-h-7">
-            Keep several open
-            <Switch
-              size="sm"
-              aria-label="Keep several open"
-              checked={severalOpen}
-              disabled={!preferences.contextList}
-              onCheckedChange={setSeveralOpen}
+                            </th>
+                            {columns.map((column) => renderCell(row, column))}
+                          </tr>
+                        ))
+                      : null}
+                  </tbody>
+                );
+              })}
+            </table>
+          </div>
+          <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2 [contain:inline-size]">
+            <EntryPicker
+              trigger={
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="min-h-11 md:min-h-7"
+                  data-testid="context-add-entry"
+                >
+                  <PlusIcon aria-hidden className="size-3.5" />
+                  Add agent
+                </Button>
+              }
+              label="Add agent"
+              placeholder="Search agents"
+              heading="Agents in use"
+              options={agentOptions}
+              emptyText={() => "Every agent in use is listed."}
+              testId="context-add-picker"
+              onAdd={addEntry}
             />
-          </label>
+            {undo ? (
+              <span
+                className="flex min-w-0 flex-wrap items-center gap-2 text-sm text-muted-foreground"
+                role="status"
+                data-testid="context-undo-status"
+              >
+                {undo.message}
+                <LayeredEditorAction onClick={restoreUndo}>Undo</LayeredEditorAction>
+              </span>
+            ) : null}
+            <label className="ml-auto flex min-h-11 items-center gap-2 text-sm text-muted-foreground md:min-h-7">
+              Keep several open
+              <Switch
+                size="sm"
+                aria-label="Keep several open"
+                checked={severalOpen}
+                disabled={!preferences.contextList}
+                onCheckedChange={setSeveralOpen}
+              />
+            </label>
+          </div>
+          <p className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-muted-foreground [contain:inline-size]">
+            <span className="inline-flex items-center gap-1.5">
+              <PlusIcon aria-hidden className="size-3.5" />
+              Click an agent to add a model
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <LayeredMark />
+              Saved here
+            </span>
+            <span>
+              <span className="italic">Auto</span>: the agent's own value
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <TriangleAlertIcon aria-hidden className="size-3.5 text-warning" />
+              Differs from what the agent reports
+            </span>
+          </p>
         </div>
-        <p className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-muted-foreground">
-          <span className="inline-flex items-center gap-1.5">
-            <LayeredMark />
-            Saved here
-          </span>
-          <span>
-            <span className="italic">Auto</span>: the agent's own value
-          </span>
-          <span className="inline-flex items-center gap-1.5">
-            <TriangleAlertIcon aria-hidden className="size-3.5 text-warning" />
-            Differs from what the agent reports
-          </span>
-        </p>
       </div>
     </div>
   );

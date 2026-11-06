@@ -26,6 +26,7 @@ import { Button } from "@/components/ui/button";
 import { Segmented } from "@/components/ui/segmented";
 import { Switch } from "@/components/ui/switch";
 import {
+  productIdFor,
   reportedOnAnyHost,
   rowsForAgentIds,
   useAgentRegistry,
@@ -191,17 +192,6 @@ function differsAt(
     ? options.normalize(levelRow(at), field, record[field])
     : record[field];
   return !Object.is(own, inheritedAt(store, at, field, options).value);
-}
-
-function productIdFor(
-  item: RegistryItem | undefined,
-  registry: ReturnType<typeof useAgentRegistry>,
-) {
-  if (!item || !item.key.startsWith("harness:")) return item?.key ?? null;
-  return (
-    Object.values(registry.legacyProducts).find((product) => product.harness === item.harness)
-      ?.key ?? null
-  );
 }
 
 function rowRank(item: RegistryItem, capabilities: Record<string, HarnessCapability>): number {

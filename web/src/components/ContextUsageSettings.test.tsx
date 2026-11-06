@@ -26,6 +26,7 @@ const mocks = vi.hoisted(() => ({
   hosts: [] as Host[],
   sessionHostId: "host-a" as string | null,
   sessionAgentIds: new Set<string>() as Set<string> | undefined,
+  legacyProducts: {} as Record<string, RegistryItem>,
 }));
 
 vi.mock("@/store/chatStore", () => ({
@@ -51,7 +52,7 @@ vi.mock("@/hooks/useAgentRegistry", async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   useAgentRegistry: () => ({
     items: mocks.registryItems,
-    legacyProducts: {},
+    legacyProducts: mocks.legacyProducts,
     isLoading: false,
     isError: false,
   }),
@@ -173,6 +174,13 @@ function expand(label: string) {
   fireEvent.click(screen.getByRole("button", { name: `Expand ${label}` }));
 }
 
+async function addModelFromName(label: string, typed: string) {
+  fireEvent.click(screen.getByRole("button", { name: `Add a model to ${label}` }));
+  const picker = await screen.findByTestId("context-model-picker");
+  fireEvent.change(within(picker).getByRole("combobox"), { target: { value: typed } });
+  fireEvent.click(await within(picker).findByText(typed));
+}
+
 function saveFields(context: string, buffer?: string) {
   fireEvent.change(screen.getByRole("spinbutton", { name: /Context total/ }), {
     target: { value: context },
@@ -195,6 +203,7 @@ beforeEach(() => {
   mocks.hosts = HOSTS;
   mocks.sessionHostId = "host-a";
   mocks.sessionAgentIds = new Set(["harness:claude-native", "harness:codex"]);
+  mocks.legacyProducts = {};
 });
 
 describe("ContextUsageSettings", () => {
@@ -253,11 +262,11 @@ describe("ContextUsageSettings", () => {
     renderSettings();
     expect(screen.queryByTestId(`context-row-${OPUS_ROW}`)).not.toBeInTheDocument();
     const group = screen.getByTestId(`context-group-${CLAUDE_ROW}`);
-    expect(within(group).getByText("1 model")).toBeInTheDocument();
+    expect(within(group).getByRole("img", { name: "1 model" })).toHaveTextContent("1");
 
     expand("Claude Code");
     expect(screen.getByTestId(`context-row-${OPUS_ROW}`)).toBeInTheDocument();
-    expect(within(group).getByText("All models")).toBeInTheDocument();
+    expect(within(group).getByTestId("context-model-count")).toHaveTextContent("1");
 
     expand("Codex");
     expect(screen.queryByTestId(`context-row-${OPUS_ROW}`)).not.toBeInTheDocument();
@@ -444,7 +453,7 @@ describe("ContextUsageSettings", () => {
     );
   });
 
-  it("adds a recorded combination into its agent's group from the bottom picker", async () => {
+  it("adds a recorded model from the agent's name and opens its values", async () => {
     store(
       [AGENT, CODEX_AGENT],
       {},
@@ -459,13 +468,22 @@ describe("ContextUsageSettings", () => {
       },
     );
     renderSettings();
-    fireEvent.click(screen.getByTestId("context-add-entry"));
-    const picker = await screen.findByTestId("context-add-picker");
+    fireEvent.click(screen.getByRole("button", { name: "Add a model to Claude Code" }));
+    const picker = await screen.findByTestId("context-model-picker");
     fireEvent.click(within(picker).getByText("claude-sonnet-5-5"));
 
     expect(readUsageContextPreferences().contextList?.entries).toContainEqual(SONNET);
     const group = screen.getByTestId(`context-group-${CLAUDE_ROW}`);
     expect(within(group).getByTestId(`context-row-${SONNET_ROW}`)).toBeInTheDocument();
+    saveFields("200000", "20000");
+    expect(
+      readUsageContextPreferences().overrides[
+        usageContextLevelKey({ ...SONNET, hostId: "" }, "agent-model")
+      ],
+    ).toEqual(
+      expect.objectContaining({ contextWindowTokens: 200_000, autoCompactBufferTokens: 20_000 }),
+    );
+    expect(slot(SONNET_ROW, ALL, "total")).toHaveTextContent("200k");
   });
 
   it("adds an agent in use that is not listed, and never one that is not in use", async () => {
@@ -480,19 +498,82 @@ describe("ContextUsageSettings", () => {
     expect(screen.getByTestId(`context-row-${CODEX_ROW}`)).toBeInTheDocument();
   });
 
-  it("adds a typed model to the agent the user picks", async () => {
+  it("offers each agent only its own recorded models", async () => {
+    store(
+      [AGENT, CODEX_AGENT],
+      {},
+      {
+        reportedContext: {
+          [usageContextSourceKey({ ...SONNET, hostId: "host-a" })]: {
+            contextWindow: 200_000,
+            autoCompactTokenLimit: null,
+            capturedAt: 1,
+          },
+        },
+      },
+    );
+    renderSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Add a model to Codex" }));
+    const picker = await screen.findByTestId("context-model-picker");
+    expect(within(picker).queryByRole("option")).not.toBeInTheDocument();
+    expect(within(picker).getByText("Type a model name.")).toBeInTheDocument();
+  });
+
+  it("adds a typed model from the agent's name and opens its values", async () => {
+    store([AGENT, OPUS]);
+    renderSettings();
+    await addModelFromName("Claude Code", "brand-new");
+    expect(readUsageContextPreferences().contextList?.entries).toContainEqual({
+      ...AGENT,
+      model: "brand-new",
+    });
+    expect(
+      screen.getByRole("spinbutton", { name: /Context total for Claude Code · brand-new/ }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.getByText("brand-new")).toBeInTheDocument();
+  });
+
+  it("offers no typed model that is already listed", async () => {
+    store([AGENT, OPUS]);
+    renderSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Add a model to Claude Code" }));
+    const picker = await screen.findByTestId("context-model-picker");
+    fireEvent.change(within(picker).getByRole("combobox"), { target: { value: OPUS.model } });
+    expect(within(picker).queryByRole("option")).not.toBeInTheDocument();
+    expect(within(picker).getByText(`${OPUS.model} is already listed.`)).toBeInTheDocument();
+  });
+
+  it("adds only agents from the bottom button", async () => {
     store([AGENT]);
     renderSettings();
     fireEvent.click(screen.getByTestId("context-add-entry"));
     const picker = await screen.findByTestId("context-add-picker");
     fireEvent.change(within(picker).getByRole("combobox"), { target: { value: "brand-new" } });
-    const group = await within(picker).findByText("Add brand-new to");
-    fireEvent.click(within(group.closest("[cmdk-group]") as HTMLElement).getByText("Claude Code"));
-    expect(readUsageContextPreferences().contextList?.entries).toContainEqual({
-      ...AGENT,
-      model: "brand-new",
-    });
-    expect(screen.getByText("brand-new")).toBeInTheDocument();
+    expect(within(picker).queryByRole("option")).not.toBeInTheDocument();
+  });
+
+  it("puts the agent's badge before its name and the marks on a second line", () => {
+    mocks.legacyProducts = { "claude-product": { ...CLAUDE, key: "claude-product" } };
+    localStorage.setItem(
+      "omnigent:agent-badge-preferences",
+      JSON.stringify({
+        version: 1,
+        enabled: true,
+        entries: { "claude-product": { label: "CC", borderColor: "#d97757", textColor: "theme" } },
+      }),
+    );
+    store([AGENT, OPUS, CODEX_AGENT]);
+    renderSettings();
+    const name = screen.getByRole("button", { name: "Add a model to Claude Code" });
+    expect(name.firstElementChild).toHaveAttribute("data-testid", "agent-name-badge");
+    expect(name.firstElementChild).toHaveTextContent("CC");
+    const header = screen.getByTestId(`context-row-${CLAUDE_ROW}`).querySelector("th")!;
+    expect(within(header).getByTestId("agent-name-mark")).toHaveTextContent("Native");
+    expect(within(header).getByTestId("context-model-count")).toHaveTextContent("1");
+    expect(name).not.toContainElement(within(header).getByTestId("agent-name-mark"));
+    const codex = screen.getByRole("button", { name: "Add a model to Codex" });
+    expect(within(codex).queryByTestId("agent-name-badge")).not.toBeInTheDocument();
   });
 
   it("removes a group with its saved values and undoes it, list and values together", () => {
@@ -531,11 +612,8 @@ describe("ContextUsageSettings", () => {
     fireEvent.click(screen.getByRole("button", { name: "Remove Codex" }));
     const status = screen.getByTestId("context-undo-status");
 
-    fireEvent.click(screen.getByTestId("context-add-entry"));
-    const picker = await screen.findByTestId("context-add-picker");
-    fireEvent.change(within(picker).getByRole("combobox"), { target: { value: "brand-new" } });
-    const group = await within(picker).findByText("Add brand-new to");
-    fireEvent.click(within(group.closest("[cmdk-group]") as HTMLElement).getByText("Claude Code"));
+    await addModelFromName("Claude Code", "brand-new");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
 
     fireEvent.click(within(status).getByRole("button", { name: "Undo" }));
     const entries = readUsageContextPreferences().contextList?.entries;

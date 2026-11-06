@@ -1183,13 +1183,18 @@ def test_context_table_lists_saved_values_by_agent_and_keeps_their_layers(
     }
     assert synced["value"]["overrides"][claude_column] == layered[claude_column]
 
-    # A typed model lands in its agent's group; a removed row stays removed after a reload.
-    section.get_by_test_id("context-add-entry").click()
-    picker = page.get_by_test_id("context-add-picker")
+    # A model typed on its agent's name lands in that group and opens its values;
+    # a removed row stays removed after a reload.
+    claude_group.get_by_role("button", name=re.compile(r"^Add a model to ")).click()
+    picker = page.get_by_test_id("context-model-picker")
     picker.get_by_role("combobox").fill("typed-model")
     with page.expect_response(is_preferences_write):
-        picker.get_by_role("option", name=re.compile(r"^claude", re.IGNORECASE)).first.click()
+        picker.get_by_role("option", name="Add typed-model", exact=True).click()
     expect(claude_group.get_by_text("typed-model", exact=True)).to_be_visible()
+    expect(
+        editor.get_by_role("spinbutton", name=re.compile(r"· typed-model, all computers$")).first
+    ).to_be_focused()
+    editor.get_by_role("button", name="Cancel", exact=True).click()
     opencode_group = table.get_by_test_id("context-group-opencode-opencode")
     with page.expect_response(is_preferences_write):
         opencode_group.get_by_role("button", name=re.compile(r"^Remove ")).click()
