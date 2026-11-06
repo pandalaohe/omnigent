@@ -45,12 +45,14 @@ function panelEnvironment({
   tree,
   hosts = [],
   past = [],
+  width = 320,
 }: {
   activeId: string;
   session: Session;
   tree: Record<string, ChildSessionInfo[]>;
   hosts?: { host_id: string; name: string; owner: string; status: "online" | "offline" }[];
   past?: ChildSessionInfo[];
+  width?: number;
 }): Decorator {
   const referencedIds = new Set(
     Object.values(tree)
@@ -75,7 +77,7 @@ function panelEnvironment({
         });
       }}
     >
-      <div className="h-[520px] w-[320px] overflow-hidden rounded-lg border bg-card">
+      <div className="h-[520px] overflow-hidden rounded-lg border bg-card" style={{ width }}>
         <Story />
       </div>
     </StoryQueryRouter>
@@ -495,6 +497,39 @@ const mixedPast = [
     archived_at: archivedAt - 3600,
   }),
 ];
+
+function readableGraphStory(count: number, width: number): Story {
+  return {
+    args: { conversationId: "conversation-root" },
+    decorators: [
+      panelEnvironment({
+        activeId: "conversation-root",
+        session: rootSession(),
+        width,
+        tree: {
+          "conversation-root": Array.from({ length: count }, (_, index) =>
+            child({
+              id: `review-${index}`,
+              session_name: `Review section ${index + 1}`,
+              current_task_status: "completed",
+              last_message_preview: "Review complete",
+            }),
+          ),
+        },
+      }),
+    ],
+    play: async ({ canvasElement }) => {
+      const toggle = canvasElement.querySelector<HTMLElement>('[data-testid="view-mode-graph"]');
+      if (!toggle) throw new Error("Graph toggle not found");
+      await userEvent.click(toggle);
+    },
+  };
+}
+
+export const GraphNarrowOne: Story = readableGraphStory(1, 320);
+export const GraphNarrowFive: Story = readableGraphStory(5, 320);
+export const GraphNarrowMany: Story = readableGraphStory(32, 320);
+export const GraphWideMany: Story = readableGraphStory(32, 800);
 
 export const MixedKinds: Story = {
   args: { conversationId: "conversation-root" },
