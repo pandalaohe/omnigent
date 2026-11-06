@@ -53,7 +53,7 @@ def _read_file(
         raise ValueError("Registration target is not regular")
     fd = os.open(
         resolved if resolved_target is not None else path,
-        os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0),
+        os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0),
     )
     try:
         opened = os.fstat(fd)
