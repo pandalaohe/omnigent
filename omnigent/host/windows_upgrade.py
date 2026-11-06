@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import contextlib
+import filecmp
 import os
 import shutil
 import sys
+import tomllib
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -13,29 +15,83 @@ from pathlib import Path
 import psutil
 
 
+def installed_launchers() -> list[Path]:
+    """Return entrypoints owned by this venv, including uv's external copies."""
+    prefix = Path(sys.prefix)
+    scripts = prefix / "Scripts"
+    receipt = prefix / "uv-receipt.toml"
+    candidates = [scripts / f"{name}.exe" for name in ("omni", "omnigent")]
+    if receipt.is_file():
+        tool = tomllib.loads(receipt.read_text(encoding="utf-8"))["tool"]
+        candidates = [
+            Path(entry["install-path"])
+            for entry in tool.get("entrypoints", [])
+            if entry.get("name") in ("omni", "omnigent")
+            and entry.get("from", "omnigent") == "omnigent"
+        ]
+    return [
+        path
+        for path in candidates
+        if path.is_absolute()
+        and path.name.casefold() in ("omni.exe", "omnigent.exe")
+        and path.is_file()
+        and (scripts / path.name).is_file()
+        and filecmp.cmp(path, scripts / path.name, shallow=False)
+    ]
+
+
+def _fresh_processes() -> Iterator[psutil.Process]:
+    """Avoid process_iter's cached Process identities after PID reuse."""
+    for pid in psutil.pids():
+        try:
+            yield psutil.Process(pid)
+        except psutil.NoSuchProcess:
+            continue
+
+
 def capture_host_tree() -> list[psutil.Process]:
     """Capture the installed Host and its autostart loop before disabling it."""
     autostart = Path.home() / ".omnigent" / "autostart"
-    scripts = {
-        str(autostart / name).casefold()
-        for name in ("Start-OmnigentHostDefault.ps1", "Launch-OmnigentHost.pyw")
-    }
-    executables = {
-        str(Path(path)).casefold() for name in ("omni", "omnigent") if (path := shutil.which(name))
-    }
+    script = str(autostart / "Start-OmnigentHostDefault.ps1").casefold()
+    pwsh = shutil.which("pwsh")
+    executables = {str(path).casefold() for path in installed_launchers()}
     protected = {os.getpid(), *(proc.pid for proc in psutil.Process().parents())}
     captured: dict[int, psutil.Process] = {}
-    for proc in psutil.process_iter():
+    for proc in _fresh_processes():
         try:
             args = proc.cmdline()
+            exe = proc.exe().casefold()
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
         try:
-            loop = any(arg.casefold() in scripts for arg in args)
-            host = len(args) > 1 and args[0].casefold() in executables and args[1] == "host"
+            lowered = [arg.casefold() for arg in args]
+            file_arg = 1
+            while file_arg < len(args):
+                option = lowered[file_arg]
+                if option in ("-noprofile", "-nologo", "-noninteractive"):
+                    file_arg += 1
+                elif option in ("-executionpolicy", "-windowstyle"):
+                    file_arg += 2
+                else:
+                    break
+            loop = (
+                pwsh is not None
+                and exe == pwsh.casefold()
+                and file_arg + 1 < len(args)
+                and lowered[file_arg] == "-file"
+                and lowered[file_arg + 1] == script
+            )
+            host = (
+                exe in executables
+                and len(args) >= 4
+                and args[1:3] == ["host", "--server"]
+                and bool(args[3])
+            )
             if not (loop or host):
                 continue
             tree = [proc, *proc.children(recursive=True)]
+            if not proc.is_running() or proc.cmdline() != args:
+                continue
             if any(child.pid in protected for child in tree):
                 raise RuntimeError(
                     "Run the upgrade from a terminal outside the Host process tree."
@@ -48,17 +104,41 @@ def capture_host_tree() -> list[psutil.Process]:
 
 def stop_host_tree(processes: list[psutil.Process]) -> None:
     """Wait for supervisor shutdown, then terminate and reap captured stragglers."""
-    _, alive = psutil.wait_procs(processes, timeout=2)
-    for proc in alive:
-        with contextlib.suppress(psutil.NoSuchProcess):
-            proc.terminate()
-    _, alive = psutil.wait_procs(alive, timeout=5)
-    for proc in alive:
-        with contextlib.suppress(psutil.NoSuchProcess):
-            proc.kill()
-    _, alive = psutil.wait_procs(alive, timeout=5)
-    if alive:
-        raise RuntimeError(f"Host processes did not exit: {[proc.pid for proc in alive]}")
+    if not processes:
+        return
+    captured = {proc.pid: proc for proc in processes}
+    created = {proc.pid: proc.create_time() for proc in processes}
+    _, pending = psutil.wait_procs(list(captured.values()), timeout=2)
+    while True:
+        for proc in pending:
+            with contextlib.suppress(psutil.NoSuchProcess):
+                proc.terminate()
+        _, alive = psutil.wait_procs(pending, timeout=5)
+        for proc in alive:
+            with contextlib.suppress(psutil.NoSuchProcess):
+                proc.kill()
+        _, alive = psutil.wait_procs(alive, timeout=5)
+        if alive:
+            raise RuntimeError(f"Host processes did not exit: {[proc.pid for proc in alive]}")
+        pending = []
+        current = {proc.pid: proc for proc in _fresh_processes()}
+        for proc in current.values():
+            try:
+                parent = proc.ppid()
+                if proc.pid in captured or parent not in created:
+                    continue
+                if proc.create_time() <= created[parent]:
+                    continue
+                # A reused parent PID does not bind an unrelated new tree.
+                if parent in current and current[parent].create_time() != created[parent]:
+                    continue
+                created[proc.pid] = proc.create_time()
+                captured[proc.pid] = proc
+                pending.append(proc)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        if not pending:
+            return
 
 
 @contextlib.contextmanager
@@ -67,7 +147,7 @@ def retained_install(argv: list[str]) -> Iterator[None]:
     suffix = f".previous-{uuid.uuid4().hex}"
     moved: list[tuple[Path, Path]] = []
     try:
-        paths = [Path(path) for name in ("omni", "omnigent") if (path := shutil.which(name))]
+        paths = installed_launchers()
         # uv replaces the tool environment; retaining it also covers a partial
         # removal of the running interpreter (including its loaded DLLs).
         prefix = Path(sys.prefix)
@@ -88,13 +168,26 @@ def retained_install(argv: list[str]) -> Iterator[None]:
             path.rename(backup)
             moved.append((path, backup))
         yield
-    except BaseException:
+        for path, backup in moved:
+            if not path.exists():
+                backup.rename(path)
+    except BaseException as exc:
+        failures: list[str] = []
         for path, backup in reversed(moved):
-            if path.exists():
-                path.rename(path.with_name(path.name + f".failed-{uuid.uuid4().hex}"))
-            backup.rename(path)
+            try:
+                if not backup.exists():
+                    continue
+                if path.exists():
+                    path.rename(path.with_name(path.name + f".failed-{uuid.uuid4().hex}"))
+                backup.rename(path)
+            except OSError as restore_error:
+                failures.append(f"{backup} -> {path}: {restore_error}")
+        if failures:
+            raise OSError(
+                "Could not restore retained install; backups kept: " + "; ".join(failures)
+            ) from exc
         raise
-    finally:
+    else:
         # A live Windows executable/DLL cannot be unlinked yet. Keep that
         # backup until this CLI exits instead of turning success into failure.
         for _, backup in moved:

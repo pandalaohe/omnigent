@@ -5943,9 +5943,14 @@ def _upgrade_host_service(*, force: bool) -> Iterator[None]:
         from omnigent.host.windows_upgrade import capture_host_tree, stop_host_tree
 
         wrapper = _windows_host_service_wrapper()
+        if wrapper is None or shutil.which("pwsh") is None:
+            raise click.ClickException(
+                "The Windows Host supervisor wrapper and PowerShell 7 "
+                "are required before upgrading."
+            )
         try:
             processes = capture_host_tree()
-        except (psutil.Error, RuntimeError) as exc:
+        except (psutil.Error, OSError, ValueError, RuntimeError) as exc:
             raise click.ClickException(str(exc)) from exc
         _drain_and_stop_local_server(force=force)
         try:
