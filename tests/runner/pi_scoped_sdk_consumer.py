@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import tempfile
+from importlib.resources import files
 from pathlib import Path
 
 sys.path.insert(0, str(Path.cwd()))
@@ -108,7 +109,7 @@ async def main():
                     step=payload["step"],
                     origin_receipt=payload["pi_origin_receipt"],
                 )
-                if mode != "normal":
+                if mode in ("loss", "replacement"):
                     if mode == "loss":
                         runtime.pi_scopes.invalidate("session-a")
                     else:
@@ -148,7 +149,7 @@ async def main():
             pi_scope_relay=side,
         )
         locator = side.bootstrap.reserve_handoff()
-        resource = Path.cwd() / "omnigent/resources/pi_native/scoped_bootstrap.mjs"
+        resource = files("omnigent.resources.pi_native").joinpath("scoped_bootstrap.mjs")
         env = {name: os.environ[name] for name in ["PATH"]}
         env.update(
             HOME=str(root),
@@ -186,9 +187,13 @@ async def main():
                 {"evaluate": 0, "execute": 0, "finish": 0}
                 if mode == "missing-bootstrap"
                 else (
-                    {"evaluate": 3, "execute": 3, "finish": 3}
-                    if mode == "normal"
-                    else {"evaluate": 1, "execute": 1, "finish": 0}
+                    {"evaluate": 1, "execute": 1, "finish": 1}
+                    if mode == "incompatible"
+                    else (
+                        {"evaluate": 3, "execute": 3, "finish": 3}
+                        if mode == "normal"
+                        else {"evaluate": 1, "execute": 1, "finish": 0}
+                    )
                 )
             )
             assert counts == expected, counts

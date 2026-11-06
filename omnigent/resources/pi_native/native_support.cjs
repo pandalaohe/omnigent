@@ -328,7 +328,7 @@ async function classifyNativeCall(event, ctx, state) {
     }
     const tool = record.session.getAllTools().find(tool => tool.name === event.toolName);
     if (!tool) return failed(bound, "Native tool is not registered in this loader");
-    const candidate = ["subagent", "subagent_supervisor", "bg_wait"].includes(event.toolName) || /^(?:npm:)?pi-subagents(?:@|$)/.test(tool.sourceInfo?.source || "");
+    const candidate = ["subagent", "subagent_supervisor", "bg_wait", "contact_supervisor", "subagents_enable"].includes(event.toolName) || /^(?:npm:)?pi-subagents(?:@|$)/.test(tool.sourceInfo?.source || "");
     const pkg = candidate ? packageForTool(record, tool, inputs) : null;
     if (!pkg) {
       if (/^(?:npm:)?pi-subagents(?:@|$)/.test(tool.sourceInfo?.source || "")) return failed(bound, "Native helper source is unavailable");
@@ -550,17 +550,29 @@ async function loadPackageApi(directory, sdk) {
     throw new Error("Unreviewed native package or SDK");
   const inputs = [manifest];
   const modules = [];
-  for (const subpath of ["./preflight", "./native-child-lifecycle"]) {
+  const unavailable = detail => Object.freeze({inputs:Object.freeze(inputs),
+    unavailable:`pi-subagents is missing ${detail}. Subagent tools are off until a pi-subagents with that API is installed.`});
+  const exports = ["./preflight", "./native-child-lifecycle", "./required-child-extensions"];
+  for (const subpath of exports) {
     const target = pkg.exports?.[subpath];
     const file = typeof target === "string" ? target : target?.import || target?.default;
-    if (!text(file) || !file.startsWith("./")) throw new Error("Native public export unavailable");
-    const entry = snapshot(path.resolve(directory, file));
+    if (!text(file) || !file.startsWith("./")) return unavailable(subpath);
+  }
+  for (const subpath of exports) {
+    const target = pkg.exports[subpath];
+    const file = typeof target === "string" ? target : target.import || target.default;
+    const entry = snapshot(path.resolve(directory, file), true);
+    inputs.push(entry);
+    if (entry.sha256 === null) return unavailable(subpath);
     if (!inside(entry.resolved_path, fs.realpathSync(directory))) throw new Error("Native public export escapes its package");
     modules.push(await import(pathToFileURL(entry.resolved_path).href));
-    inputs.push(entry);
   }
   if (inputs.some(input => digest(snapshot(input.path)) !== digest(input))) throw new Error("Native public export changed while loading");
+  for (const [index, name] of [[0,"resolveSubagentLaunchContract"],[1,"getNativeChildLifecycle"],[2,"registerRequiredChildExtensions"]])
+    if (typeof modules[index][name] !== "function") return unavailable(`${exports[index]} (${name})`);
+  if (modules[0].SUBAGENT_LAUNCH_CONTRACT_VERSION !== 3) return unavailable("./preflight (launch contract version 3)");
   const result = Object.freeze({...modules[0], ...modules[1], parseFrontmatter:sdk.parseFrontmatter, getAgentDir:sdk.getAgentDir,
+    registerRequiredChildExtensions:modules[2].registerRequiredChildExtensions,
     packageRoot:fs.realpathSync(directory), version:pkg.version, inputs:Object.freeze(inputs)});
   store.apiRecords.set(result, true);
   return result;

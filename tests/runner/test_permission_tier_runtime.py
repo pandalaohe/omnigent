@@ -386,7 +386,13 @@ def test_pi_scope_without_native_bootstrap_fact_denies_every_call(tmp_path, name
 
 
 @pytest.mark.parametrize("fault", ["agent", "absent-settings"])
-def test_native_semantics_and_input_snapshot_refresh_at_authorize_and_execute(tmp_path, fault):
+@pytest.mark.parametrize(
+    "missing_export",
+    [None, "./native-child-lifecycle", "./preflight", "./required-child-extensions"],
+)
+def test_native_semantics_and_input_snapshot_refresh_at_authorize_and_execute(
+    tmp_path, fault, missing_export
+):
     runtime, _parent, _child, source, registry = _scoped_runtime(tmp_path, "ask")
     manifest = source.parent / "package.json"
     manifest.write_text(
@@ -402,10 +408,43 @@ def test_native_semantics_and_input_snapshot_refresh_at_authorize_and_execute(tm
             }
         )
     )
+    if missing_export:
+        metadata = json.loads(manifest.read_text())
+        del metadata["exports"][missing_export]
+        manifest.write_text(json.dumps(metadata))
     child = runtime.open_pi_child_scope("session-a")
-    tool = {**registry["tools"][0], "name": "subagent"}
-    _write_scope_registry(child, [tool])
+    helpers = ["subagent", "bg_wait", "contact_supervisor", "subagents_enable"]
+    _write_scope_registry(
+        child,
+        [
+            *[{**registry["tools"][0], "name": name} for name in helpers],
+            {"name": "read", "sourceInfo": {"source": "builtin", "path": "builtin:read"}},
+        ],
+    )
     assert runtime.acknowledge_pi_scope("session-a", child.credential)
+    if missing_export:
+        snapshot = NativeInputSnapshot(
+            str(source), str(source.resolve()), hashlib.sha256(source.read_bytes()).hexdigest()
+        )
+        runtime.install_pi_native_classifier(
+            child.principal,
+            lambda _id, binding, _args: NativeSupport(
+                binding,
+                NativeSupportStatus.ATTESTED,
+                "ordinary",
+                inputs=(snapshot,),
+                semantics_digest=binding.arguments_digest,
+            ),
+        )
+        for name in helpers:
+            _, _, decision = _scope_call(runtime, child, call_id=name, name=name, arguments={})
+            assert decision.action.value == "DENY"
+            assert missing_export in decision.reason
+        _, _, decision = _scope_call(
+            runtime, child, call_id="ordinary", name="read", arguments={"path": "notes.txt"}
+        )
+        assert decision.action.value == "ALLOW"
+        return
     agent = tmp_path / "workspace/.pi/agents/reader.md"
     agent.parent.mkdir(parents=True)
     agent.write_text("read-only fixture")
@@ -1557,7 +1596,7 @@ def test_legacy_pi_subagents_registry_cannot_replace_native_proof(tmp_path, tier
 
 
 @pytest.mark.parametrize("version", ["0.79.0", "0.80.0"])
-def test_scoped_pi_subagents_registry_still_requires_native_exports(tmp_path, version):
+def test_scoped_pi_subagents_missing_exports_preserves_version_gate(tmp_path, version):
     runtime, source, registry = _extension_runtime(tmp_path, "auto", name="subagent")
     (source.parent / "package.json").write_text(
         json.dumps({"name": "pi-subagents", "version": version})
@@ -1565,7 +1604,7 @@ def test_scoped_pi_subagents_registry_still_requires_native_exports(tmp_path, ve
     registry["tools"][0]["sourceInfo"]["source"] = "npm:pi-subagents@" + version
     parent = runtime.begin_pi_scope_launch("session-a")
     _write_scope_registry(parent, registry["tools"])
-    assert not runtime.acknowledge_pi_scope("session-a", parent.credential)
+    assert runtime.acknowledge_pi_scope("session-a", parent.credential) is (version == "0.80.0")
 
 
 @pytest.mark.parametrize(

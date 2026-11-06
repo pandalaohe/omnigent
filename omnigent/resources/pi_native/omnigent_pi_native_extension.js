@@ -3627,6 +3627,17 @@ module.exports = function (pi) {
     }
   });
 
+  pi.events?.on("omnigent:pi-compatibility", text => {
+    if (typeof text !== "string" || !text) return;
+    const sourceId = `pi:compatibility:${fingerprint(text)}`;
+    if (postedMessages.has(sourceId)) return;
+    history.enqueue({
+      response_id: sourceId,
+      item_type: "message",
+      item_data: {role:"assistant", agent:"Pi", content:[{type:"output_text", text}]},
+    }, sourceId, {onAccepted:() => postedMessages.add(sourceId)});
+  });
+
   pi.on("message_end", async (event, ctx) => {
     rememberContext(ctx);
     replayPendingInterrupt(ctx);

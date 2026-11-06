@@ -342,19 +342,27 @@ def read_pi_tool_registry(
                         or source.get("scope") != "user"
                     ):
                         raise ValueError("Unreviewed native helper package")
-                    exports = manifest.get("exports")
-                    if not isinstance(exports, dict) or not all(
-                        key in exports
-                        for key in (
-                            "./preflight",
-                            "./required-child-extensions",
-                            "./native-child-lifecycle",
-                        )
-                    ):
-                        raise ValueError("Native helper public contract is unavailable")
-                    native_tools[name] = ""
                     native_packages[str(manifest_path)] = hashlib.sha256(manifest_raw).hexdigest()
                     controls.append(str(manifest_path))
+                    exports = manifest.get("exports")
+                    missing = next(
+                        (
+                            key
+                            for key in (
+                                "./preflight",
+                                "./required-child-extensions",
+                                "./native-child-lifecycle",
+                            )
+                            if not isinstance(exports, dict) or not exports.get(key)
+                        ),
+                        None,
+                    )
+                    if missing:
+                        native_tools[name] = (
+                            f"pi-subagents is missing {missing}; subagent tools are off"
+                        )
+                        continue
+                    native_tools[name] = ""
             except (OSError, ValueError, KeyError, TypeError, RuntimeError):
                 invalid.add(name)
                 extensions[name] = (

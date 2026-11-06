@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import {randomUUID} from "node:crypto";
 import {createRequire} from "node:module";
-import {fileURLToPath, pathToFileURL} from "node:url";
+import {fileURLToPath} from "node:url";
 import {installNativeSupportBootstrap} from "./omnigent_pi_bootstrap.mjs";
 const require = createRequire(import.meta.url);
 const support = require("./native_support.cjs");
@@ -41,17 +41,7 @@ export function installScopedSdk(sdk, {connection, bridgeDir, statePath}, {sdkVe
           directory = path.dirname(directory);
         }
         const api = await support.loadPackageApi(directory, sdk);
-        const manifest = JSON.parse(fs.readFileSync(path.join(directory, "package.json")));
-        const exported = manifest.exports?.["./required-child-extensions"];
-        const target = typeof exported === "string" ? exported : exported?.import || exported?.default;
-        if (!target?.startsWith("./")) throw new Error("Native required-extension API unavailable");
-        const file = support.snapshot(path.join(directory, target));
-        if (path.relative(fs.realpathSync(directory), file.resolved_path).startsWith(".."))
-          throw new Error("Native required-extension API escapes package");
-        const required = await import(pathToFileURL(file.resolved_path).href);
-        if (typeof required.registerRequiredChildExtensions !== "function")
-          throw new Error("Native required-extension registration unavailable");
-        return {api, required, inputs:[...api.inputs, file]};
+        return api;
       })();
     }
     return apiPromise;
@@ -77,15 +67,16 @@ export function installScopedSdk(sdk, {connection, bridgeDir, statePath}, {sdkVe
       const binding = await connection.bind({loader:loaders.get(session.resourceLoader), handle, registry:published});
       if (binding.ready !== true) throw new Error("Native registry acknowledgement unavailable");
       const pkg = await packageApi(session);
-      if (pkg) {
+      if (pkg && !pkg.unavailable) {
         const id = session.sessionManager.getSessionId();
         registrations.get(id)?.dispose();
-        registrations.set(id, pkg.required.registerRequiredChildExtensions({sessionId:id,
+        registrations.set(id, pkg.registerRequiredChildExtensions({sessionId:id,
           extensions:[{id:"omnigent.permission", path:guard}], requireForAllRunners:true}));
       }
       const client = connection.client(binding, handle, readState,
         (event, ctx) => support.classifyNativeCall(event, ctx, readState()));
-      return {scope:binding.scope, api:pkg?.api, parentSession:session.resourceLoader === rootLoader ? session : undefined,
+      return {scope:binding.scope, api:pkg?.unavailable ? undefined : pkg,
+        nativePackageFailure:pkg?.unavailable, parentSession:session.resourceLoader === rootLoader ? session : undefined,
         bridgeDir, getState:readState, scopedClient:client,
         requiredIdentities:[support.snapshot(guard)],
         configInputs:[...runtimeInputs, ...(pkg?.inputs || []), support.snapshot(pending.expected.extension_path),
