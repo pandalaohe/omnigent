@@ -55,8 +55,8 @@ import os
 import secrets
 import shlex
 from collections import deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
@@ -75,6 +75,7 @@ from omnigent.inner.executor import (
     ExecutorEvent,
     Message,
     ReasoningChunk,
+    SessionModeChanged,
     SubAgentCompleted,
     SubAgentStarted,
     SubAgentToolCall,
@@ -93,6 +94,7 @@ from omnigent.models.model_catalog_store import (
     read_catalog,
     write_catalog,
 )
+from omnigent.onboarding.acp_auth import classify_permission_options
 from omnigent.process_logging import current_process_log_path, display_log_path
 from omnigent.startup_evidence import claim_startup_boundary, opening_settled
 from omnigent.startup_protocol import ContextEvidenceV2
@@ -272,6 +274,7 @@ class AcpAgentConfig:
     env_unset: tuple[str, ...] = ()
     default_model: str | None = None
     init_timeout_s: float = _INIT_TIMEOUT_SECONDS
+    permission_concepts: Mapping[str, str] = field(default_factory=dict)
 
 
 class _AcpModelSwitchError(RuntimeError):
@@ -503,6 +506,12 @@ class AcpExecutor(Executor):
         self._effort_after_model_switch = False
         self._model_selection_pending = False
         self._model_options: list[_AcpJsonObject] = []
+        self._session_mode_options: list[dict[str, str]] = []
+        self._mode_config_option_id: str | None = None
+        self._active_mode: str | None = None
+        self._mode_report_revision = 0
+        self._start_effort: str | None = None
+        self._start_efforts: list[str] = []
         # Latches off once an agent proves it can't warm-switch, so we don't
         # retry a failing request on every turn.
         self._model_switch_supported: bool = True
@@ -777,13 +786,15 @@ class AcpExecutor(Executor):
                 else:
                     params = msg.get("params", {})
                     update = params.get("update", {}) if isinstance(params, dict) else {}
-                    if (
-                        msg.get("method") == _CLIENT_NOTIFICATION_SESSION_UPDATE
-                        and isinstance(update, dict)
-                        and update.get("sessionUpdate") == _UPDATE_CONFIG_OPTION
+                    if msg.get("method") == _CLIENT_NOTIFICATION_SESSION_UPDATE and isinstance(
+                        update, dict
                     ):
-                        self._note_config_options(update.get("configOptions"))
-                        continue
+                        if update.get("sessionUpdate") == _UPDATE_CONFIG_OPTION:
+                            self._note_config_options(update.get("configOptions"))
+                            continue
+                        if update.get("sessionUpdate") == "current_mode_update":
+                            self._note_session_modes(update)
+                            continue
                     await self._queue.put(msg)
         except (asyncio.CancelledError, EOFError):
             # Expected during shutdown / after the subprocess closes stdout.
@@ -892,6 +903,11 @@ class AcpExecutor(Executor):
                         },
                         "terminal": False,
                     },
+                    **(
+                        {"_meta": {"omnigent": {"start_effort": self._start_effort}}}
+                        if self._start_effort
+                        else {}
+                    ),
                 },
                 timeout=self._config.init_timeout_s,
             )
@@ -916,7 +932,18 @@ class AcpExecutor(Executor):
         # already authenticated via env/disk). ``_ensure_session`` reacts
         # only when ``session/new`` actually demands authentication.
         self._auth_advertisement = result if isinstance(result, dict) else {}
+        self._note_start_efforts(result)
         self._initialized = True
+
+    def _note_start_efforts(self, result: _AcpJsonObject) -> None:
+        meta = result.get("_meta")
+        omnigent = meta.get("omnigent") if isinstance(meta, dict) else None
+        levels = omnigent.get("start_efforts") if isinstance(omnigent, dict) else None
+        self._start_efforts = (
+            [value for value in levels if isinstance(value, str) and value]
+            if isinstance(levels, list)
+            else []
+        )
 
     async def _authenticate(self, method_id: str) -> None:
         """Send ACP ``authenticate`` with *method_id* and latch success.
@@ -1026,6 +1053,7 @@ class AcpExecutor(Executor):
         # server unable to attribute per-model token usage for the turn.
         if isinstance(result, dict):
             self._note_session_models(result.get("models"))
+            self._note_session_modes(result.get("modes"))
             self._note_config_options(result.get("configOptions"))
         self._initial_model = self._active_model
         self._update_effort_catalog()
@@ -1588,8 +1616,8 @@ class AcpExecutor(Executor):
         :returns: The usage dict (with ``model`` when known), or ``None``.
         """
         usage = self._usage_from_result(result)
-        if usage is not None and self._active_model and "model" not in usage:
-            usage["model"] = self._active_model
+        if self._active_model:
+            usage = {"model": self._active_model, **(usage or {})}
         return usage
 
     def _is_bridge_tool_call(self, name: str, update: _AcpJsonObject) -> bool:
@@ -1623,6 +1651,9 @@ class AcpExecutor(Executor):
         self._session_id = None
         self._initial_model = None
         self._active_model = None
+        self._active_mode = None
+        self._mode_config_option_id = None
+        self._session_mode_options = []
         self._config_option_ids.clear()
         self._session_model_ids.clear()
         self._effort_option = None
@@ -1731,6 +1762,8 @@ class AcpExecutor(Executor):
 
         elif update_type == _UPDATE_CONFIG_OPTION:
             self._note_config_options(update.get("configOptions"))
+        elif update_type == "current_mode_update":
+            self._note_session_modes(update)
 
         return events
 
@@ -1752,6 +1785,8 @@ class AcpExecutor(Executor):
             return None
         # Full-state payloads: https://agentclientprotocol.com/protocol/v1/session-config-options
         self._config_option_ids = set()
+        self._model_config_option_id = None
+        self._mode_config_option_id = None
         self._effort_option = None
         model_value: str | None = None
         model_option: _AcpJsonObject | None = None
@@ -1762,6 +1797,16 @@ class AcpExecutor(Executor):
             if not isinstance(opt_id, str):
                 continue
             self._config_option_ids.add(opt_id)
+            if opt.get("category", opt_id) == "mode":
+                self._mode_config_option_id = opt_id
+                current_mode = opt.get("currentValue")
+                if isinstance(current_mode, str):
+                    self._active_mode = current_mode
+                    self._mode_report_revision += 1
+                self._session_mode_options = self._mode_choices(
+                    self._select_choices(opt.get("options"))
+                )
+                self._write_permission_catalog()
             if opt.get("category") == "thought_level" and opt.get("type") == "select":
                 self._effort_option = opt
             if opt_id == _CONFIG_OPTION_MODEL or (
@@ -1812,6 +1857,94 @@ class AcpExecutor(Executor):
                 choices.extend(AcpExecutor._select_choices(option.get("options")))
         return choices
 
+    def _mode_choices(self, choices: list[_AcpJsonObject]) -> list[dict[str, str]]:
+        return classify_permission_options(
+            [
+                {
+                    "value": choice["value"],
+                    "label": str(choice.get("name") or choice["value"]),
+                    **(
+                        {"description": choice["description"]}
+                        if isinstance(choice.get("description"), str)
+                        else {}
+                    ),
+                }
+                for choice in choices
+            ],
+            self._config.permission_concepts,
+        )
+
+    def _write_permission_catalog(self) -> None:
+        key = fingerprint_of(self._config.command, binary_identity(self._argv[0]))
+        write_catalog("acp-modes", key, self._session_mode_options)
+
+    def _note_session_modes(self, modes: object) -> None:
+        if not isinstance(modes, dict):
+            return
+        current = modes.get("currentModeId")
+        if isinstance(current, str):
+            self._active_mode = current
+            self._mode_report_revision += 1
+        available = modes.get("availableModes")
+        if isinstance(available, list):
+            self._session_mode_options = self._mode_choices(
+                [
+                    {**item, "value": item["id"]}
+                    for item in available
+                    if isinstance(item, dict) and isinstance(item.get("id"), str)
+                ]
+            )
+            self._write_permission_catalog()
+
+    async def _apply_session_mode(self, session_id: str, mode: str | None) -> str | None:
+        """Set the agent's own mode; Omnigent's tool approval stance is separate."""
+        if not mode or mode == self._active_mode:
+            return None
+        report_revision = self._mode_report_revision
+        try:
+            response = await self._rpc(
+                _AGENT_METHOD_SET_CONFIG_OPTION
+                if self._mode_config_option_id
+                else "session/set_mode",
+                {
+                    "sessionId": session_id,
+                    **(
+                        {"configId": self._mode_config_option_id, "value": mode}
+                        if self._mode_config_option_id
+                        else {"modeId": mode}
+                    ),
+                },
+            )
+            if "error" not in response:
+                result = response.get("result") or {}
+                if self._mode_config_option_id:
+                    options = result.get("configOptions")
+                    echoed = (
+                        any(
+                            isinstance(option, dict)
+                            and option.get("category", option.get("id")) == "mode"
+                            and isinstance(option.get("currentValue"), str)
+                            for option in options
+                        )
+                        if isinstance(options, list)
+                        else False
+                    )
+                    self._note_config_options(result.get("configOptions"))
+                else:
+                    modes = result.get("modes", result)
+                    echoed = isinstance(modes, dict) and isinstance(
+                        modes.get("currentModeId"), str
+                    )
+                    self._note_session_modes(modes)
+                await self._drain_stale_queue()
+                if not echoed and self._mode_report_revision == report_revision:
+                    self._active_mode = mode
+        except Exception:  # noqa: BLE001 — a refused mode leaves the reported state in place
+            pass
+        if self._active_mode != mode:
+            return f"Agent kept {self._active_mode or 'its current mode'}.\n\n"
+        return None
+
     def _update_effort_catalog(self) -> None:
         option = self._effort_option or {}
         choices = self._select_choices(option.get("options"))
@@ -1829,13 +1962,14 @@ class AcpExecutor(Executor):
         if default_id is None:
             default_id = self._config.model
         default_id = default_id or self._initial_model or active_id
-        if (self._active_model or self._effort_option) and not any(
+        if (self._active_model or self._effort_option or self._start_efforts) and not any(
             row["id"] == active_id for row in self._model_options
         ):
             self._model_options.append(
                 {"id": active_id, "displayName": self._active_model or "Session default"}
             )
         for row in self._model_options:
+            row["start_efforts"] = list(self._start_efforts)
             active = row["id"] == active_id
             row["isDefault"] = row["id"] == default_id
             row["isActive"] = active
@@ -2157,6 +2291,11 @@ class AcpExecutor(Executor):
                     and update.get("sessionUpdate") == _UPDATE_CONFIG_OPTION
                 ):
                     self._note_config_options(update.get("configOptions"))
+                elif (
+                    isinstance(update, dict)
+                    and update.get("sessionUpdate") == "current_mode_update"
+                ):
+                    self._note_session_modes(update)
             elif stale.get("id") is not None and stale.get("method"):
                 await self._respond_to_agent_request(stale)
 
@@ -2188,6 +2327,7 @@ class AcpExecutor(Executor):
                 await claim_startup_boundary("executor_prepare")
             if self._proc is None or self._proc.returncode is not None:
                 await self._start_process()
+            self._start_effort = config.extra.get("reasoning_effort") if config else None
             await self._ensure_initialized()
             session_id = await self._ensure_session()
         except Exception as exc:  # noqa: BLE001
@@ -2198,7 +2338,15 @@ class AcpExecutor(Executor):
         # switch takes effect on this turn with the transcript intact. Drain first:
         # a report queued behind ``session/new`` names the option id to target.
         requested_model = config.model if config is not None else None
+        requested_mode = config.extra.get("session_mode") if config else None
+        mode_selection = config.extra.get("session_mode_selection") if config else None
         await self._drain_stale_queue()
+        mode_notice = await self._apply_session_mode(session_id, requested_mode)
+        reported_mode = self._active_mode
+        if requested_mode and reported_mode:
+            yield SessionModeChanged(
+                mode=reported_mode, requested_mode=requested_mode, selection_id=mode_selection
+            )
         try:
             await self._apply_model_override(session_id, requested_model)
         except Exception as exc:  # noqa: BLE001
@@ -2331,6 +2479,9 @@ class AcpExecutor(Executor):
         opening_settled()
         deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
         accumulated_text: list[str] = []
+        if mode_notice:
+            accumulated_text.append(mode_notice)
+            yield TextChunk(text=mode_notice)
         target_model = self._model_override_target(requested_model)
         if target_model and target_model != self._active_model:
             notice = f"Agent kept {self._active_model or 'its current model'}.\n\n"
@@ -2361,6 +2512,12 @@ class AcpExecutor(Executor):
                     return
                 result = response.get("result", {}) if isinstance(response, dict) else {}
                 usage = self._usage_with_active_model(result) if isinstance(result, dict) else None
+                if requested_mode and self._active_mode and self._active_mode != reported_mode:
+                    yield SessionModeChanged(
+                        mode=self._active_mode,
+                        requested_mode=requested_mode,
+                        selection_id=mode_selection,
+                    )
                 yield TurnComplete(response="".join(accumulated_text), usage=usage)
                 return
 

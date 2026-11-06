@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import secrets
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
@@ -10,6 +11,8 @@ from omnigent.codex_approval_modes import CODEX_NATIVE_PERMISSION_PRESETS
 from omnigent.harness_capabilities import ModeContext, ModeOption, ModeSet, SessionModes
 from omnigent.permission_tiers import NON_FULL_TIERS
 from omnigent.sdk_permission_modes import (
+    ACP_SESSION_MODE_LABEL_KEY,
+    ACP_SESSION_MODE_SELECTION_LABEL_KEY,
     CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY,
     CODEX_SDK_APPROVAL_MODE_LABEL_KEY,
 )
@@ -183,9 +186,16 @@ def mode_set(harness: str | None, field: str) -> ModeSet | None:
     return getattr(capability.session_modes, field, None)
 
 
-def mode_values(harness: str | None, field: str, context: ModeContext) -> frozenset[str]:
+def mode_values(
+    harness: str | None,
+    field: str,
+    context: ModeContext,
+    acp_options: Sequence[Mapping[str, str]] | None = None,
+) -> frozenset[str]:
     if context not in {"default", "create"}:
         raise ValueError(f"unknown mode context: {context!r}")
+    if field == "permission" and harness and (harness == "acp" or harness.startswith("acp:")):
+        return frozenset(row["value"] for row in (acp_options or []) if row.get("value"))
     declared = mode_set(harness, field)
     if declared is None or declared.options == "per-model":
         return frozenset()
@@ -213,12 +223,20 @@ def mode_for_concept(
     return next((row.value for row in declared.options if row.concept == concept), None)
 
 
-def valid_mode(value: object, harness: str | None, field: str, context: ModeContext) -> bool:
+def valid_mode(
+    value: object,
+    harness: str | None,
+    field: str,
+    context: ModeContext,
+    acp_options: Sequence[Mapping[str, str]] | None = None,
+) -> bool:
     if context not in {"default", "create"}:
         raise ValueError(f"unknown mode context: {context!r}")
     if not isinstance(value, str):
         return False
     value = _normalized_mode(value, harness, field)
+    if field == "permission" and harness and (harness == "acp" or harness.startswith("acp:")):
+        return value in mode_values(harness, field, context, acp_options)
     declared = mode_set(harness, field)
     if declared is None:
         return False
@@ -247,11 +265,23 @@ def codex_service_tier(value: str) -> str:
 
 
 def apply_mode(
-    harness: str | None, field: str, value: str, *, context: ModeContext = "create"
+    harness: str | None,
+    field: str,
+    value: str,
+    *,
+    context: ModeContext = "create",
+    acp_options: Sequence[Mapping[str, str]] | None = None,
 ) -> ModeApplication:
     """Validate a declared value, then dispatch only its registered handler."""
-    if not valid_mode(value, harness, field, context):
+    if not valid_mode(value, harness, field, context, acp_options):
         raise ValueError(f"unsupported {field} mode {value!r} for {harness!r}")
+    if field == "permission" and harness and (harness == "acp" or harness.startswith("acp:")):
+        return ModeApplication(
+            labels={
+                ACP_SESSION_MODE_LABEL_KEY: value,
+                ACP_SESSION_MODE_SELECTION_LABEL_KEY: secrets.token_hex(16),
+            }
+        )
     declared = mode_set(harness, field)
     assert declared is not None and harness is not None
     from omnigent.harness_plugins import mode_handlers

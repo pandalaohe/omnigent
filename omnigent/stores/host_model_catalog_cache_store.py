@@ -38,10 +38,13 @@ def _to_record(row: SqlHostModelCatalogCache) -> dict[str, Any]:
         # A payload the app never writes (manual edit / future format) must
         # read as "no models", not break the catalogs route.
         decoded = None
+    models = decoded.get("models") if isinstance(decoded, dict) else decoded
+    permissions = decoded.get("permission_options") if isinstance(decoded, dict) else None
     return {
         "host_id": row.host_id,
         "harness": row.harness,
-        "models": decoded if isinstance(decoded, list) else [],
+        "models": models if isinstance(models, list) else [],
+        "permission_options": permissions if isinstance(permissions, list) else [],
         "fetched_at": row.fetched_at,
         "error": row.error,
     }
@@ -92,9 +95,15 @@ class HostModelCatalogCacheStore:
         harness: str,
         payload: builtins.list[dict[str, Any]],
         fetched_at: int,
+        permission_options: builtins.list[dict[str, str]] | None = None,
     ) -> None:
         """Store a successful sync's catalog and clear any previous error."""
-        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        stored = (
+            {"models": payload, "permission_options": permission_options}
+            if permission_options
+            else payload
+        )
+        encoded = json.dumps(stored, ensure_ascii=False, separators=(",", ":"))
         values = {
             "workspace_id": current_workspace_id(),
             "host_id": host_id,

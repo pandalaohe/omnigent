@@ -21,6 +21,7 @@ from omnigent.calling_defaults import (
     load_master,
     resolve_calling,
 )
+from omnigent.entities.conversation import Conversation
 from omnigent.entities.project import Project
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.models.model_override import validate_model_override
@@ -53,6 +54,45 @@ _logger = logging.getLogger(__name__)
 #: Request fields the calling-defaults chain may fill; presence (even a
 #: JSON ``null``) always wins over a default.
 _CALLING_FIELDS = frozenset({"agent_id", "harness_override", "model_override", "reasoning_effort"})
+
+
+def session_acp_harness(
+    conversation: Conversation, agent_store: AgentStore | None, agent_cache: AgentCache | None
+) -> str | None:
+    """Keep the configured ACP namespace when selecting a host-owned catalog."""
+    from omnigent.server.routes._sessions.helpers import _resolve_harness_impl
+
+    harness = _resolve_harness_impl(
+        conversation, agent_store=agent_store, agent_cache=agent_cache, preserve_acp_namespace=True
+    )
+    return harness if harness and (harness == "acp" or harness.startswith("acp:")) else None
+
+
+async def cached_acp_permission_options(
+    request: Request | None, host_id: str | None, harness: str | None
+) -> list[dict[str, str]]:
+    """Read only the selected host's advertisement; an older host offers no modes."""
+    if not harness or not (harness == "acp" or harness.startswith("acp:")) or not host_id:
+        return []
+    state = getattr(getattr(request, "app", None), "state", None)
+    store = getattr(state, "host_model_catalog_cache_store", None)
+    if store is None:
+        return []
+    records = await asyncio.to_thread(store.list, [host_id])
+    return next(
+        (row.get("permission_options", []) for row in records if row["harness"] == harness), []
+    )
+
+
+def require_acp_permission_mode(
+    value: str, options: list[dict[str, str]], harness: str, host_id: str | None
+) -> None:
+    if value not in {row["value"] for row in options}:
+        raise OmnigentError(
+            f"{harness} has not reported mode {value} on {host_id or 'this host'}. "
+            "Press Sync models on Settings › Agents.",
+            code=ErrorCode.INVALID_INPUT,
+        )
 
 
 @dataclass(frozen=True)
@@ -206,6 +246,9 @@ async def resolve_create_calling_stores(
         return _create_resolved_harness(agent, None, agent_cache)
 
     master = await load_master(user_id, preferences_store)
+    records = (
+        await asyncio.to_thread(catalog_store.list, [host_id]) if host_id and catalog_store else []
+    )
     resolution = await asyncio.to_thread(
         resolve_calling,
         explicit=explicit,
@@ -214,6 +257,14 @@ async def resolve_create_calling_stores(
         master=master,
         host_id=host_id,
         agent_harness=agent_harness,
+        permission_options=lambda host_id, harness: next(
+            (
+                row.get("permission_options", [])
+                for row in records
+                if row["host_id"] == host_id and row["harness"] == harness
+            ),
+            [],
+        ),
     )
 
     if resolution.agent_id is None and "agent_id" not in explicit_fields:

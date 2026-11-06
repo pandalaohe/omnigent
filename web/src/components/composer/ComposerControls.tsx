@@ -203,7 +203,7 @@ export function ComposerPermissionPicker({
   value: string;
   harness?: string | null;
   selectedValue?: string | null;
-  options: readonly { value: string; label: string }[];
+  options: readonly { value: string; label: string; concept?: string; description?: string }[];
   disabledOptions?: readonly string[];
   disabled?: boolean;
   /** Hover text explaining why the picker is disabled. */
@@ -217,7 +217,16 @@ export function ComposerPermissionPicker({
   testIdPrefix?: string;
 }) {
   const writeDisabled = disabled || (loading && !interactiveWhileLoading);
-  const selectedConcept = permissionConceptFor(harness, selectedValue);
+  const optionConcept = (mode: string | null | undefined): PermissionModeConcept => {
+    if (harness === "acp" || harness?.startsWith("acp:")) {
+      const concept = options.find((option) => option.value === mode)?.concept;
+      return concept && concept in PERMISSION_CONCEPT_ICONS
+        ? (concept as PermissionModeConcept)
+        : "default";
+    }
+    return permissionConceptFor(harness, mode);
+  };
+  const selectedConcept = optionConcept(selectedValue);
   const SelectedConceptIcon = PERMISSION_CONCEPT_ICONS[selectedConcept];
   return (
     <DropdownMenu>
@@ -298,7 +307,7 @@ export function ComposerPermissionPicker({
           }}
         >
           {options.map((option) => {
-            const concept = permissionConceptFor(harness, option.value);
+            const concept = optionConcept(option.value);
             const ConceptIcon = PERMISSION_CONCEPT_ICONS[concept];
             return (
               <DropdownMenuRadioItem
@@ -310,7 +319,7 @@ export function ComposerPermissionPicker({
                 title={
                   disabledOptions.includes(option.value)
                     ? `Start a new ${option.label} session to use this mode`
-                    : undefined
+                    : option.description
                 }
                 className="whitespace-normal break-words"
               >

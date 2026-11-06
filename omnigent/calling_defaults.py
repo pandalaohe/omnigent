@@ -413,7 +413,9 @@ def _catalog_efforts(rows: list[Mapping[str, Any]], model: str | None) -> set[st
     for row in rows:
         if row.get("id") != model and row.get("model") != model:
             continue
-        raw = row.get("efforts", row.get("supportedReasoningEfforts"))
+        raw = (
+            row.get("efforts") or row.get("start_efforts") or row.get("supportedReasoningEfforts")
+        )
         if not isinstance(raw, list):
             return None
         values: set[str] = set()

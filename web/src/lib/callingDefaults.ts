@@ -163,6 +163,7 @@ export const COLUMN_CONCEPTS = ["manual", "edit-automatic", "automatic", "read-o
 export interface PermissionOption {
   value: string;
   label: string;
+  description?: string;
   concept?: string;
 }
 

@@ -22,6 +22,7 @@ def test_upsert_round_trips_and_clears_a_previous_error(db_uri: str) -> None:
             "host_id": _HOST,
             "harness": "codex",
             "models": [{"id": "gpt-6-sol"}],
+            "permission_options": [],
             "fetched_at": 1700000000,
             "error": None,
         }
@@ -37,6 +38,18 @@ def test_mark_error_keeps_the_last_payload(db_uri: str) -> None:
     assert record["models"] == [{"id": "gpt-6-sol"}]
     assert record["fetched_at"] == 1700000000
     assert record["error"] == "unsupported"
+
+
+def test_permission_payload_round_trip_and_legacy_list_sync(db_uri: str) -> None:
+    store = _store(db_uri)
+    options = [{"value": "review", "label": "Review", "description": "Review changes"}]
+    store.upsert(_HOST, "acp:neutral", [{"id": "a"}], 1, permission_options=options)
+    store.mark_error(_HOST, "acp:neutral", "offline")
+    record = store.list([_HOST])[0]
+    assert record["models"] == [{"id": "a"}]
+    assert record["permission_options"] == options
+    store.upsert(_HOST, "acp:neutral", [{"id": "b"}], 2)
+    assert store.list([_HOST])[0]["permission_options"] == []
 
 
 def test_mark_error_creates_an_empty_row_when_none_exists(db_uri: str) -> None:

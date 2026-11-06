@@ -3043,6 +3043,7 @@ def _build_session_response(
             permission_tiers_capability = (
                 conv.labels.get(PERMISSION_CAPABILITY_LABEL_KEY) == PERMISSION_CAPABILITY_VALUE
             )
+    from omnigent.server.routes._session_create_validation import session_acp_harness
     from omnigent.server.session_choice_runtime import choice_record
 
     return SessionResponse(
@@ -3082,6 +3083,11 @@ def _build_session_response(
         root_conversation_id=conv.root_conversation_id,
         llm_model=llm_model,
         harness=harness,
+        harness_namespace=(
+            session_acp_harness(conv, agent_store, agent_cache)
+            if harness and (harness == "acp" or harness.startswith("acp:"))
+            else None
+        ),
         permission_tier=permission_tier,
         permission_tier_revision=permission_tier_revision,
         permission_tier_state=permission_tier_state,
@@ -11859,6 +11865,57 @@ async def _relay_runner_stream_once(
                     except json.JSONDecodeError:
                         continue
                     evt_type = event.get("type", "")
+                    if evt_type == "session.permission_mode" and event.get("harness") == "acp":
+                        from omnigent.sdk_permission_modes import (
+                            ACP_SESSION_MODE_LABEL_KEY,
+                            ACP_SESSION_MODE_SELECTION_LABEL_KEY,
+                        )
+                        from omnigent.server.routes._session_create_validation import (
+                            session_acp_harness,
+                        )
+
+                        requested = event.get("requested_mode")
+                        actual = event.get("permission_mode")
+                        selection_id = event.get("selection_id")
+                        conv = await asyncio.to_thread(
+                            conversation_store.get_conversation, session_id
+                        )
+                        if (
+                            not isinstance(requested, str)
+                            or not isinstance(actual, str)
+                            or not actual
+                            or conv is None
+                            or not session_acp_harness(conv, None, None)
+                        ):
+                            continue
+                        if isinstance(selection_id, str):
+                            if ACP_SESSION_MODE_SELECTION_LABEL_KEY not in conv.labels:
+                                await asyncio.to_thread(
+                                    conversation_store.insert_label_if_absent,
+                                    session_id,
+                                    ACP_SESSION_MODE_SELECTION_LABEL_KEY,
+                                    requested,
+                                )
+                            accepted = await asyncio.to_thread(
+                                conversation_store.compare_and_set_label,
+                                session_id,
+                                ACP_SESSION_MODE_SELECTION_LABEL_KEY,
+                                selection_id,
+                                selection_id,
+                                updates={ACP_SESSION_MODE_LABEL_KEY: actual},
+                            )
+                        elif ACP_SESSION_MODE_SELECTION_LABEL_KEY not in conv.labels:
+                            accepted = await asyncio.to_thread(
+                                conversation_store.compare_and_set_label,
+                                session_id,
+                                ACP_SESSION_MODE_LABEL_KEY,
+                                requested,
+                                actual,
+                            )
+                        else:
+                            accepted = False
+                        if not accepted:
+                            continue
                     # The runner emits session.status events
                     # directly.
                     # Re-publish via _publish_status so the event
@@ -14828,6 +14885,7 @@ async def _create_session_from_existing_agent_impl(
         )
 
     sdk_permission_labels: dict[str, str] = {}
+    permission_host_id = body.host_id or parent_host_id
     explicit_permission_application = None
     if body.permission_mode is not None or body.approval_mode is not None:
         if body.sub_agent_name is not None:
@@ -14839,14 +14897,30 @@ async def _create_session_from_existing_agent_impl(
             _create_resolved_harness, agent, harness_override, agent_cache
         )
         if body.permission_mode is not None:
-            if not valid_mode(body.permission_mode, resolved_harness, "permission", "create"):
+            from omnigent.server.routes._session_create_validation import (
+                cached_acp_permission_options,
+                require_acp_permission_mode,
+            )
+
+            acp_options = await cached_acp_permission_options(
+                request, permission_host_id, resolved_harness
+            )
+            if resolved_harness and (
+                resolved_harness == "acp" or resolved_harness.startswith("acp:")
+            ):
+                require_acp_permission_mode(
+                    body.permission_mode, acp_options, resolved_harness, permission_host_id
+                )
+            if not valid_mode(
+                body.permission_mode, resolved_harness, "permission", "create", acp_options
+            ):
                 raise OmnigentError(
                     f"permission_mode {body.permission_mode!r} is not supported "
                     f"for {resolved_harness!r}",
                     code=ErrorCode.INVALID_INPUT,
                 )
             explicit_permission_application = apply_mode(
-                resolved_harness, "permission", body.permission_mode
+                resolved_harness, "permission", body.permission_mode, acp_options=acp_options
             )
             if (
                 explicit_permission_application.tier is not None
@@ -15400,7 +15474,16 @@ async def _create_session_from_existing_agent_impl(
         )
         permission = project_resolution.permission
         if permission is not None:
-            if permission not in mode_values(resolved_harness, "permission", "default"):
+            from omnigent.server.routes._session_create_validation import (
+                cached_acp_permission_options,
+            )
+
+            acp_options = await cached_acp_permission_options(
+                request, permission_host_id, resolved_harness
+            )
+            if permission not in mode_values(
+                resolved_harness, "permission", "default", acp_options
+            ):
                 _logger.warning(
                     "Ignoring unsupported permission default %r for %s",
                     permission,
@@ -15413,7 +15496,11 @@ async def _create_session_from_existing_agent_impl(
                 and not _launch_args_set_permission(validated_launch_args, resolved_harness)
             ):
                 application = apply_mode(
-                    resolved_harness, "permission", permission, context="default"
+                    resolved_harness,
+                    "permission",
+                    permission,
+                    context="default",
+                    acp_options=acp_options,
                 )
                 sdk_permission_labels.update(application.labels)
                 if application.args:
@@ -16888,6 +16975,7 @@ async def _fetch_model_options(
     agent_store: AgentStore | None = None,
     *,
     allow_host_fill: bool = True,
+    host_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """
     Resolve the Web UI model-picker options for a session.
@@ -16965,13 +17053,14 @@ async def _fetch_model_options(
         from omnigent.harness_aliases import canonicalize_harness
 
         harness = canonicalize_harness(_resolve_harness(conv, agent_store=agent_store))
-        if harness in {"claude-sdk", "codex"} and conv.host_id is not None:
+        if harness in {"claude-sdk", "codex", "pi"}:
             cached = _model_options_cache.get(session_id)
             if cached is not None:
                 return cached
-            if allow_host_fill and session_id not in _model_options_inflight:
+            catalog_host_id = host_id or conv.host_id
+            if allow_host_fill and catalog_host_id and session_id not in _model_options_inflight:
                 task = asyncio.create_task(
-                    _load_model_options_from_host(session_id, conv.host_id, harness)
+                    _load_model_options_from_host(session_id, catalog_host_id, harness)
                 )
                 _model_options_inflight[session_id] = task
 
@@ -17184,22 +17273,16 @@ def _validate_session_model_selection(
 def _acp_model_options_with_effort(
     curated: list[dict[str, Any]], live: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
-    """Enrich the shortlist without adopting the agent's model-picker vocabulary."""
-    effort_fields = ("efforts", "supportedReasoningEfforts", "defaultReasoningEffort", "isActive")
-    if not curated:
-        # An effort-only default row carries no selectable model shortlist.
-        active = next((row for row in live if row.get("isActive")), None)
-        active = active or next((row for row in live if row.get("isDefault")), None)
-        if active is None:
-            return []
-        return [
-            {
-                "id": "__default__",
-                "displayName": "Session default",
-                "isDefault": True,
-                **{key: active[key] for key in effort_fields if key in active},
-            }
-        ]
+    """Keep a curated shortlist; otherwise serve the agent's own advertisement."""
+    effort_fields = (
+        "efforts",
+        "start_efforts",
+        "supportedReasoningEfforts",
+        "defaultReasoningEffort",
+        "isActive",
+    )
+    if len(curated) < 2:
+        return live
     by_id = {row["id"]: row for row in live}
     return [
         {
@@ -17229,7 +17312,7 @@ async def _load_acp_model_options(
     session sleeps without needing a runner round trip. Spec and provider
     configuration reads run off the event loop.
 
-    Fewer than two curated models returns ``[]`` so the picker does not render.
+    Fewer than two curated models returns ``[]`` so callers use the agent's catalog.
 
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
     :param conv: Conversation row the options are resolved for.
@@ -17706,8 +17789,18 @@ async def _get_session_snapshot(
             llm_model = conv.model_override or catalog.get("default_model")
     else:
         model_options = await _fetch_model_options(
-            runner_client, session_id, conv, agent_store, allow_host_fill=allow_host_fill
+            runner_client,
+            session_id,
+            conv,
+            agent_store,
+            allow_host_fill=allow_host_fill,
+            host_id=await asyncio.to_thread(effective_host_id, conv_store, conv),
         )
+        if not conv.reported_model and _resolve_harness_impl_is_acp(conv, agent_store):
+            live_options = _acp_effort_options_cache.get(session_id) or model_options
+            active = next((row.get("id") for row in live_options if row.get("isActive")), None)
+            if active and active != "__default__":
+                llm_model = active
     # Dynamic override from the forwarder (real Claude Code window).
     # Only present after the first statusLine tick; before that the
     # spec default applies.

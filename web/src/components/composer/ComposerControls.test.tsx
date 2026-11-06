@@ -530,6 +530,42 @@ describe("shared composer controls", () => {
     },
   );
 
+  it("uses only owner concepts for ACP mode colors", () => {
+    render(
+      <ComposerPermissionPicker
+        label="Permission mode"
+        value="Plan"
+        harness="acp"
+        selectedValue="plan"
+        options={[
+          { value: "plan", label: "Plan" },
+          {
+            value: "yolo",
+            label: "Agent mode",
+            concept: "full-access",
+            description: "Agent description",
+          },
+        ]}
+        onSelect={vi.fn()}
+      />,
+    );
+    const chip = screen.getByRole("button", { name: "Permission mode: Plan" });
+    expect(chip).toHaveAttribute("data-permission-concept", "default");
+    fireEvent.keyDown(chip, { key: "ArrowDown" });
+    expect(screen.getByTestId("composer-permission-option-plan")).toHaveAttribute(
+      "data-permission-concept",
+      "default",
+    );
+    expect(screen.getByTestId("composer-permission-option-yolo")).toHaveAttribute(
+      "data-permission-concept",
+      "full-access",
+    );
+    expect(screen.getByTestId("composer-permission-option-yolo")).toHaveAttribute(
+      "title",
+      "Agent description",
+    );
+  });
+
   it("keeps the neutral hand icon for an unknown permission concept", () => {
     render(
       <ComposerPermissionPicker

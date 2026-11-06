@@ -100,7 +100,14 @@ async def _sync_pair(
         models = result.get("models")
         if result.get("status") == "ok" and isinstance(models, list):
             payload = [row for row in models if isinstance(row, dict)]
-            await asyncio.to_thread(catalog_store.upsert, host_id, harness, payload, now_epoch())
+            await asyncio.to_thread(
+                catalog_store.upsert,
+                host_id,
+                harness,
+                payload,
+                now_epoch(),
+                permission_options=result.get("permission_options"),
+            )
             return
         error = result.get("error")
         if not isinstance(error, str) or not error:
@@ -118,6 +125,7 @@ def _catalog_row(
         host_id=record["host_id"],
         harness=record["harness"],
         models=record["models"],
+        permission_options=record.get("permission_options", []),
         fetched_at=record["fetched_at"],
         stale=bool(record["error"]) or offline,
         error=record["error"],
@@ -311,6 +319,11 @@ def create_calling_defaults_router(
 
         master = await load_master(owner, user_preferences_store)
         resolved_host_id = host.host_id if host is not None else None
+        records = (
+            await asyncio.to_thread(catalog_store.list, [resolved_host_id])
+            if resolved_host_id
+            else []
+        )
         resolution = await asyncio.to_thread(
             resolve_calling,
             explicit=explicit,
@@ -319,6 +332,14 @@ def create_calling_defaults_router(
             master=master,
             host_id=resolved_host_id,
             agent_harness=agent_harness,
+            permission_options=lambda host_id, harness: next(
+                (
+                    row.get("permission_options", [])
+                    for row in records
+                    if row["host_id"] == host_id and row["harness"] == harness
+                ),
+                [],
+            ),
         )
 
         catalog: dict[str, Any] | None = None

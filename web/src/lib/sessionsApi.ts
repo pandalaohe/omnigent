@@ -284,6 +284,7 @@ interface SessionResponseWire {
   llm_model?: string | null;
   /** Effective brain harness (override-aware), e.g. ``"claude-sdk"``. */
   harness?: string | null;
+  harness_namespace?: string | null;
   model_override?: string | null;
   inference_configured?: boolean;
   inference_error?: string | null;
@@ -473,6 +474,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     reasoningEffort: wire.reasoning_effort,
     llmModel: wire.llm_model,
     harness: wire.harness ?? null,
+    harnessNamespace: wire.harness_namespace ?? null,
     modelOverride: wire.model_override,
     costControlModeOverride: wire.cost_control_mode_override,
     subagentRoutingOverride: wire.subagent_routing_override,

@@ -2021,12 +2021,19 @@ class ConversationStore(ABC):
 
     @abstractmethod
     def compare_and_set_label(
-        self, conversation_id: str, key: str, expected: str, value: str | None
+        self,
+        conversation_id: str,
+        key: str,
+        expected: str,
+        value: str | None,
+        *,
+        updates: dict[str, str] | None = None,
     ) -> bool:
         """Replace or delete an existing label only while its value matches.
 
         Returns whether this writer won the conditional change. A missing
         label never matches; use ``insert_label_if_absent`` to seed it.
+        ``updates`` upserts accompanying labels in the same winning transaction.
         """
         ...
 

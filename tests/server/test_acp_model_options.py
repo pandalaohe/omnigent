@@ -93,7 +93,7 @@ async def test_review_minor4_live_catalog_preserves_curated_model_contract():
 
 
 @pytest.mark.asyncio
-async def test_review_minor4_uncurated_session_does_not_adopt_live_models():
+async def test_uncurated_session_offers_agent_models():
     orch._model_options_cache["conv_acp"] = []
     live = [
         {"id": "model-a", "isDefault": True, "isActive": True, "efforts": ["quick"]},
@@ -107,7 +107,7 @@ async def test_review_minor4_uncurated_session_does_not_adopt_live_models():
         await orch._fetch_model_options(client, "conv_acp", conv)
         await asyncio.gather(*list(orch._model_options_inflight.values()))
         merged = await orch._fetch_model_options(None, "conv_acp", conv)
-    assert [row["id"] for row in merged] == ["__default__"]
+    assert [row["id"] for row in merged] == ["model-a", "model-b"]
     assert merged[0]["efforts"] == ["quick"]
     assert await orch._load_acp_model_options("conv_acp", conv, None) == []
 
@@ -163,6 +163,30 @@ def test_resolve_harness_is_acp_for_nested_subagent() -> None:
     cache.load.return_value.spec = root
     with patch("omnigent.runtime.get_agent_cache", return_value=cache):
         assert orch._resolve_harness_impl_is_acp(_conv(sub_agent_name="worker"), MagicMock())
+    from omnigent.server.routes._session_create_validation import session_acp_harness
+
+    assert (
+        session_acp_harness(_conv(sub_agent_name="worker"), MagicMock(), cache) == "acp:synthetic"
+    )
+    root.executor.config["harness"] = "acp:root"
+    worker.executor.config["harness"] = "claude-sdk"
+    assert session_acp_harness(_conv(sub_agent_name="worker"), MagicMock(), cache) is None
+
+
+@pytest.mark.asyncio
+async def test_pi_child_uses_cached_and_effective_host_catalog(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    conv = _conv(harness_override="pi", host_id=None)
+    expected = [{"id": "model-a"}]
+    orch._model_options_cache[conv.id] = expected
+    assert await orch._fetch_model_options(None, conv.id, conv) == expected
+    orch._model_options_cache.clear()
+    load = AsyncMock()
+    monkeypatch.setattr(orch, "_load_model_options_from_host", load)
+    assert await orch._fetch_model_options(None, conv.id, conv, host_id="parent-host") == []
+    await asyncio.gather(*list(orch._model_options_inflight.values()))
+    load.assert_awaited_once_with(conv.id, "parent-host", "pi")
 
 
 @pytest.mark.asyncio

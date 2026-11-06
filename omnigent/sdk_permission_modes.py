@@ -14,6 +14,8 @@ CODEX_SDK_TURN_POLICIES: dict[str, tuple[str, str, str]] = {
 CODEX_SDK_APPROVAL_MODES: frozenset[str] = frozenset(CODEX_SDK_TURN_POLICIES)
 CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY = "omnigent.claude_sdk.permission_mode"
 CODEX_SDK_APPROVAL_MODE_LABEL_KEY = "omnigent.codex_sdk.approval_mode"
+ACP_SESSION_MODE_LABEL_KEY = "omnigent.acp.session_mode"
+ACP_SESSION_MODE_SELECTION_LABEL_KEY = "omnigent.acp.session_mode_selection"
 
 
 def codex_approval_mode_tightens(previous: str | None, requested: str | None) -> bool:

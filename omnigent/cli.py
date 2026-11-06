@@ -8155,6 +8155,8 @@ def _materialize_harness_launcher_file(
             agent_dict["env_passthrough"] = list(acp_agent.env_passthrough)
         if acp_agent.init_timeout_s != 30.0:
             agent_dict["init_timeout_s"] = acp_agent.init_timeout_s
+        if acp_agent.permission_concepts:
+            agent_dict["permission_concepts"] = dict(acp_agent.permission_concepts)
         executor["acp_agent"] = agent_dict
 
     raw = {

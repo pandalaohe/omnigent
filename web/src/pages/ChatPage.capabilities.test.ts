@@ -118,10 +118,10 @@ it("uses declared effort families only for SDK harnesses", () => {
 });
 
 describe("effortLevelsForConv", () => {
-  it("shows ACP effort without inventing selectable models for an uncurated session", () => {
+  it("shows ACP effort and model entry for an uncurated session", () => {
     const conv = { labels: {}, harness: "acp" };
     const rows = [{ id: "__default__", isDefault: true, isActive: true, efforts: ["precise"] }];
-    expect(shouldShowModelPicker(conv, rows)).toBe(false);
+    expect(shouldShowModelPicker(conv, rows)).toBe(true);
     expect(shouldShowEffortPicker(conv, null, rows)).toBe(true);
     expect(effortLevelsForConv(conv, rows, "agent-current-model")).toEqual(["precise"]);
   });
@@ -238,6 +238,9 @@ describe("shouldShowModelPicker", () => {
     const catalog = [{ id: "gpt-5.4" }, { id: "claude-fable-5" }];
     expect(shouldShowModelPicker({ labels: {}, harness: "acp" }, catalog)).toBe(true);
     expect(modelPickerKindForConv({ labels: {}, harness: "acp" }, catalog)).toBe("acp");
+    expect(modelPickerKindForConv({ labels: {}, harness: "acp" }, [])).toBe("acp");
+    expect(modelPickerKindForConv({ labels: {}, harness: "pi" })).toBe("sdk");
+    expect(selectedModelForPicker("acp", catalog, "requested", "reported")).toBe("reported");
   });
 
   it("shows the SDK picker for unlabelled SDK sessions", () => {
@@ -258,11 +261,11 @@ describe("shouldShowModelPicker", () => {
     }
   });
 
-  it("hides the ACP picker until there are models to choose between", () => {
+  it("offers ACP model entry with fewer than two models", () => {
     const conv = { labels: {}, harness: "acp" };
-    expect(shouldShowModelPicker(conv)).toBe(false);
-    expect(shouldShowModelPicker(conv, [])).toBe(false);
-    expect(shouldShowModelPicker(conv, [{ id: "gpt-5.4" }])).toBe(false);
+    expect(shouldShowModelPicker(conv)).toBe(true);
+    expect(shouldShowModelPicker(conv, [])).toBe(true);
+    expect(shouldShowModelPicker(conv, [{ id: "gpt-5.4" }])).toBe(true);
   });
 
   it("keeps an explicit sandbox policy authoritative for SDK and single-model ACP sessions", () => {
@@ -287,10 +290,7 @@ describe("shouldShowModelPicker", () => {
     // (nativeCodingAgentForHarness), so the negative cases pin harnesses that
     // map to no picker family.
     expect(shouldShowModelPicker({ labels: {}, harness: "openai-agents" })).toBe(false);
-    // WHY RPC Pi: a model change closes and respawns its Pi process and
-    // replays the transcript as text, so the control would overstate the
-    // switch pi-native does live (Pi's RPC set_model is not wired yet).
-    expect(shouldShowModelPicker({ labels: {}, harness: "pi" })).toBe(false);
+    expect(shouldShowModelPicker({ labels: {}, harness: "pi" })).toBe(true);
     expect(shouldShowModelPicker({ labels: {}, harness: null })).toBe(false);
     // WHY: a wrapper-looking string is not a resolved harness, and
     // pre-hydration rows still have no capability evidence.
@@ -405,7 +405,7 @@ describe("label-less native sessions (e.g. created before a harness rename)", ()
 
   it("still fails closed for a label-less non-native harness", () => {
     expect(modelPickerKindForConv({ labels: {}, harness: "openai-agents" })).toBeNull();
-    expect(shouldShowModelPicker({ labels: {}, harness: "pi" })).toBe(false);
+    expect(shouldShowModelPicker({ labels: {}, harness: "pi" })).toBe(true);
   });
 });
 

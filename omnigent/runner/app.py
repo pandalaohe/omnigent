@@ -258,6 +258,8 @@ from omnigent.sdk_peer_delivery import (
     SDKPeerOutcome,
 )
 from omnigent.sdk_permission_modes import (
+    ACP_SESSION_MODE_LABEL_KEY,
+    ACP_SESSION_MODE_SELECTION_LABEL_KEY,
     CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY,
     CODEX_SDK_APPROVAL_MODE_LABEL_KEY,
 )
@@ -2212,6 +2214,8 @@ def create_runner_app(
         return [value] if value and value.strip() else []
 
     _session_permission_mode: dict[str, str] = {}
+    _session_acp_mode: dict[str, str] = {}
+    _session_acp_mode_selection: dict[str, str] = {}
     _session_approval_mode: dict[str, str] = {}
     _session_service_tier: dict[str, str] = {}
     _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
@@ -2853,6 +2857,15 @@ def create_runner_app(
 
     def _publish_event(session_id: str, event: Mapping[str, object]) -> None:
         event_body = cast(_JsonObject, event)
+        if (
+            event_body.get("type") == "session.permission_mode"
+            and event_body.get("harness") == "acp"
+        ):
+            if _session_acp_mode_selection.get(session_id) != event_body.get("selection_id"):
+                return
+            actual_mode = event_body.get("permission_mode")
+            if isinstance(actual_mode, str):
+                _session_acp_mode[session_id] = actual_mode
         queue = _session_event_queues.get(session_id)
         if queue is None:
             queue = asyncio.Queue()
@@ -3641,6 +3654,14 @@ def create_runner_app(
         _session_tool_schemas.pop(session_id, None)
         if permission_mode := snapshot.labels.get(CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY):
             _session_permission_mode[session_id] = permission_mode
+        if acp_mode := snapshot.labels.get(ACP_SESSION_MODE_LABEL_KEY):
+            _session_acp_mode[session_id] = acp_mode
+            _session_acp_mode_selection[session_id] = (
+                snapshot.labels.get(ACP_SESSION_MODE_SELECTION_LABEL_KEY) or acp_mode
+            )
+        else:
+            _session_acp_mode.pop(session_id, None)
+            _session_acp_mode_selection.pop(session_id, None)
         if approval_mode := snapshot.labels.get(CODEX_SDK_APPROVAL_MODE_LABEL_KEY):
             _session_approval_mode[session_id] = approval_mode
         service_tier = snapshot.labels.get(SPEED_TIER_LABEL_KEY)
@@ -5377,6 +5398,8 @@ def create_runner_app(
         _session_global_instructions.pop(session_id, None)
         _session_project_code.pop(session_id, None)
         _session_permission_mode.pop(session_id, None)
+        _session_acp_mode.pop(session_id, None)
+        _session_acp_mode_selection.pop(session_id, None)
         _session_approval_mode.pop(session_id, None)
         _session_service_tier.pop(session_id, None)
         _session_spec_locks.pop(session_id, None)
@@ -8878,6 +8901,13 @@ def create_runner_app(
             harness_body["permission_mode"] = permission_mode
         if harness_name == "codex" and (approval_mode := _session_approval_mode.get(conv)):
             harness_body["approval_mode"] = approval_mode
+        if (
+            harness_name
+            and (harness_name == "acp" or harness_name.startswith("acp:"))
+            and (acp_mode := _session_acp_mode.get(conv))
+        ):
+            harness_body["session_mode"] = acp_mode
+            harness_body["session_mode_selection"] = _session_acp_mode_selection.get(conv)
         if harness_name in {"codex", "claude-sdk"} and (
             service_tier := _session_service_tier.get(conv)
         ):
@@ -11960,6 +11990,18 @@ def create_runner_app(
 
         if body_type == "permission_mode_change":
             harness = _session_harness_name(conversation_id)
+            if harness and (harness == "acp" or harness.startswith("acp:")):
+                mode = body.get("permission_mode") if isinstance(body, dict) else None
+                if not isinstance(mode, str) or not mode:
+                    return JSONResponse(
+                        status_code=400,
+                        content={"error": "invalid_input", "detail": "Invalid permission_mode"},
+                    )
+                _session_acp_mode[conversation_id] = mode
+                _session_acp_mode_selection[conversation_id] = str(
+                    body.get("selection_id") or mode
+                )
+                return JSONResponse(content={"permission_mode": mode})
             if harness == "claude-sdk":
                 mode = body.get("permission_mode") if isinstance(body, dict) else None
                 if not isinstance(mode, str) or not mode:

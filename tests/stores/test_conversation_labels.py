@@ -180,6 +180,26 @@ def test_insert_label_if_absent_first_writer_wins(
     assert got.labels[ARTIFACT_LINK_KEY_LABEL] == "first"
 
 
+def test_conditional_label_updates_follow_selection_until_it_changes(conversation_store):
+    from omnigent.sdk_permission_modes import ACP_SESSION_MODE_LABEL_KEY as mode
+    from omnigent.sdk_permission_modes import ACP_SESSION_MODE_SELECTION_LABEL_KEY as selection
+
+    conv = conversation_store.create_conversation(labels={mode: "go", selection: "first"})
+    for actual in ("review", "manual"):
+        assert conversation_store.compare_and_set_label(
+            conv.id, selection, "first", "first", updates={mode: actual}
+        )
+        assert conversation_store.get_conversation(conv.id).labels == {
+            mode: actual,
+            selection: "first",
+        }
+    conversation_store.set_labels(conv.id, {mode: "go", selection: "second"})
+    assert not conversation_store.compare_and_set_label(
+        conv.id, selection, "first", "first", updates={mode: "manual"}
+    )
+    assert conversation_store.get_conversation(conv.id).labels == {mode: "go", selection: "second"}
+
+
 @pytest.mark.parametrize(
     ("key", "expected"),
     [

@@ -111,7 +111,7 @@ def stores(runtime_init: None, db_uri: str, tmp_path: Path) -> _Stores:
     )
 
 
-def _build_app(stores: _Stores, *, auth: bool = False) -> FastAPI:
+def _build_app(stores: _Stores, *, auth: bool = False, permission_store=None) -> FastAPI:
     return create_app(
         agent_store=stores.agent_store,
         file_store=SqlAlchemyFileStore(stores.agent_store.storage_location),
@@ -122,6 +122,7 @@ def _build_app(stores: _Stores, *, auth: bool = False) -> FastAPI:
         host_model_catalog_cache_store=stores.cache,
         project_store=stores.project_store,
         user_preferences_store=stores.prefs,
+        permission_store=permission_store,
         auth_provider=UnifiedAuthProvider(source="header", local_single_user=False)
         if auth
         else None,
@@ -539,6 +540,541 @@ async def test_acp_session_patch_preserves_literal_values_and_null_reset(
         )
         assert response.status_code == 200, response.text
         assert response.json()["reasoning_effort"] == effort
+
+
+async def test_acp_modes_sync_resolve_create_and_offline_patch(client, app, stores, monkeypatch):
+    from omnigent.sdk_permission_modes import ACP_SESSION_MODE_LABEL_KEY
+
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    stores.host_store.update_harness_readiness(HOST_A, {"acp": True, "acp:neutral": True})
+    _register_host(app, HOST_A)
+    options = [
+        {"value": "review", "label": "Review"},
+        {"value": "go", "label": "Go", "concept": "automatic"},
+    ]
+    proxy = AsyncMock(
+        return_value={
+            "status": "ok",
+            "models": [{"id": "model-a", "isDefault": True, "start_efforts": ["high"]}],
+            "permission_options": options,
+        }
+    )
+    monkeypatch.setattr("omnigent.server.routes.calling_defaults._proxy_model_options", proxy)
+    synced = await client.post(
+        "/v1/calling-defaults/sync", json={"host_id": HOST_A, "harness": "acp:neutral"}
+    )
+    assert synced.status_code == 200, synced.text
+    assert synced.json()["rows"][0]["permission_options"] == options
+    stores.prefs.patch_namespace(
+        "local", "calling_defaults", {"*": {"*": {"permission": "automatic"}}}
+    )
+    resolved = await client.get(
+        "/v1/calling-defaults/resolve", params={"host_id": HOST_A, "harness": "acp:neutral"}
+    )
+    assert resolved.json()["permission"] == "go", resolved.text
+    _seed_agent(stores, AGENT_ID, "acp:neutral")
+    conversations = SqlAlchemyConversationStore(stores.agent_store.storage_location)
+    parent = conversations.create_conversation(
+        agent_id=AGENT_ID, host_id=HOST_A, workspace="/neutral/project", runner_id="test-runner"
+    )
+    created = await client.post(
+        "/v1/sessions",
+        json={"agent_id": AGENT_ID, "parent_session_id": parent.id, "permission_mode": "review"},
+    )
+    assert created.status_code == 201, created.text
+    sid = created.json()["id"]
+    assert created.json()["labels"][ACP_SESSION_MODE_LABEL_KEY] == "review"
+    changed = await client.patch(f"/v1/sessions/{sid}", json={"permission_mode": "go"})
+    assert changed.status_code == 200, changed.text
+    assert changed.json()["labels"][ACP_SESSION_MODE_LABEL_KEY] == "go"
+    refused = await client.patch(f"/v1/sessions/{sid}", json={"permission_mode": "plan"})
+    assert refused.status_code == 400, refused.text
+    assert "Press Sync models" in refused.text
+    assert conversations.get_conversation(sid).labels[ACP_SESSION_MODE_LABEL_KEY] == "go"
+
+
+async def test_acp_unclassified_modes_never_supply_permission_totals(client, stores):
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    stores.cache.upsert(
+        HOST_A,
+        "acp:neutral",
+        [],
+        1,
+        permission_options=[
+            {"value": "plan", "label": "Plan"},
+            {"value": "default", "label": "Default"},
+        ],
+    )
+    stores.prefs.patch_namespace(
+        "local", "calling_defaults", {"*": {"*": {"permission": "read-only"}}}
+    )
+    params = {"host_id": HOST_A, "harness": "acp:neutral"}
+    result = await client.get("/v1/calling-defaults/resolve", params=params)
+    assert result.json()["permission"] is None
+    stores.prefs.patch_namespace(
+        "local", "calling_defaults", {HOST_A: {"acp:neutral": {"permission": "plan"}}}
+    )
+    result = await client.get("/v1/calling-defaults/resolve", params=params)
+    assert result.json()["permission"] == "plan"
+
+
+async def test_acp_mode_label_survives_fork_and_continue(client, stores):
+    from omnigent.sdk_permission_modes import ACP_SESSION_MODE_LABEL_KEY
+
+    _seed_agent(stores, AGENT_ID, "acp:neutral")
+    conversations = SqlAlchemyConversationStore(stores.agent_store.storage_location)
+    source = conversations.create_conversation(
+        agent_id=AGENT_ID, labels={ACP_SESSION_MODE_LABEL_KEY: "review"}
+    )
+    for operation in ("fork", "continue"):
+        if operation == "continue":
+            archived = await client.patch(f"/v1/sessions/{source.id}", json={"archived": True})
+            assert archived.status_code == 200, archived.text
+        response = await client.post(f"/v1/sessions/{source.id}/{operation}", json={})
+        assert response.status_code == 201, response.text
+        assert response.json()["labels"][ACP_SESSION_MODE_LABEL_KEY] == "review"
+
+
+async def test_acp_mode_unreported_by_an_older_host_is_refused(client, stores):
+    _seed_agent(stores, AGENT_ID, "acp:neutral")
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    stores.cache.upsert(HOST_A, "acp:neutral", [{"id": "model-a"}], 1)
+    conversations = SqlAlchemyConversationStore(stores.agent_store.storage_location)
+    parent = conversations.create_conversation(
+        agent_id=AGENT_ID, host_id=HOST_A, workspace="/neutral/project", runner_id="test-runner"
+    )
+    response = await client.post(
+        "/v1/sessions",
+        json={"agent_id": AGENT_ID, "parent_session_id": parent.id, "permission_mode": "plan"},
+    )
+    assert response.status_code == 400, response.text
+    assert "Press Sync models" in response.text
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "omnigent.acp.session_mode",
+        "OMNIGENT.ACP.SESSION_MODE",
+        "omnigent.acp.session_mode_selection",
+        "OMNIGENT.ACP.SESSION_MODE_SELECTION",
+    ],
+)
+async def test_acp_permission_label_cannot_bypass_selection_validation(client, stores, key):
+    _seed_agent(stores, AGENT_ID, "acp:neutral")
+    created = await client.post("/v1/sessions", json={"agent_id": AGENT_ID, "labels": {key: "go"}})
+    assert created.status_code == 400, created.text
+    conversations = SqlAlchemyConversationStore(stores.agent_store.storage_location)
+    conv = conversations.create_conversation(agent_id=AGENT_ID)
+    changed = await client.patch(f"/v1/sessions/{conv.id}", json={"labels": {key: "go"}})
+    assert changed.status_code == 400, changed.text
+    assert "use permission_mode" in changed.text
+    assert not conversations.get_conversation(conv.id).labels.get("omnigent.acp.session_mode")
+
+
+async def test_acp_permission_editor_cannot_set_internal_label(stores):
+    from omnigent.server.auth import LEVEL_EDIT
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    conv = SqlAlchemyConversationStore(stores.agent_store.storage_location).create_conversation(
+        harness_override="acp:neutral"
+    )
+    permissions = SqlAlchemyPermissionStore(stores.agent_store.storage_location)
+    permissions.grant(BOB, conv.id, LEVEL_EDIT)
+    app = _build_app(stores, auth=True, permission_store=permissions)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+        headers=PERMISSION_TIERS_HEADERS,
+    ) as editor:
+        for body, status in (
+            ({"permission_mode": "go"}, 403),
+            ({"labels": {"omnigent.acp.session_mode": "go"}}, 400),
+        ):
+            response = await editor.patch(
+                f"/v1/sessions/{conv.id}", json=body, headers=_as_user(BOB)
+            )
+            assert response.status_code == status, response.text
+
+
+@pytest.mark.parametrize("current,expected", [("go", "review"), ("new-choice", "new-choice")])
+async def test_acp_readback_relay_persists_actual_mode_without_overwriting_new_choice(
+    stores, monkeypatch, current, expected
+):
+    from omnigent.sdk_permission_modes import ACP_SESSION_MODE_LABEL_KEY
+    from omnigent.server.routes._sessions import orchestration as orch
+
+    store = SqlAlchemyConversationStore(stores.agent_store.storage_location)
+    conv = store.create_conversation(
+        harness_override="acp:neutral", labels={ACP_SESSION_MODE_LABEL_KEY: current}
+    )
+    event = {
+        "type": "session.permission_mode",
+        "harness": "acp",
+        "conversation_id": conv.id,
+        "requested_mode": "go",
+        "permission_mode": "review",
+    }
+    published = []
+    monkeypatch.setattr(
+        orch.session_stream, "publish", lambda sid, payload: published.append(payload)
+    )
+    stream = "data: " + json.dumps(event) + "\n\ndata: [DONE]\n\n"
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, text=stream)),
+        base_url="http://runner",
+    ) as runner:
+        await orch._relay_runner_stream_once(conv.id, runner, store)
+    assert store.get_conversation(conv.id).labels[ACP_SESSION_MODE_LABEL_KEY] == expected
+    assert (event in published) is (current == "go")
+
+
+async def test_model_only_usage_reports_model_without_creating_a_usage_bucket(client, stores):
+    from omnigent.server.routes._sessions import orchestration
+
+    _seed_agent(stores, AGENT_ID, "acp:neutral")
+    conversations = SqlAlchemyConversationStore(stores.agent_store.storage_location)
+    source = conversations.create_conversation(agent_id=AGENT_ID)
+    response = {"usage": {"model": "model-a"}}
+    await orchestration._persist_relay_reported_model(response, source.id, conversations)
+    orchestration._accumulate_session_usage(response, source.id, conversations)
+    saved = conversations.get_conversation(source.id)
+    assert saved.reported_model == "model-a"
+    assert not saved.session_usage
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_acp_readback_selection_accepts_repeated_reports_and_fences_new_choice(
+    stores, monkeypatch, legacy
+):
+    from omnigent.sdk_permission_modes import ACP_SESSION_MODE_LABEL_KEY as mode
+    from omnigent.sdk_permission_modes import ACP_SESSION_MODE_SELECTION_LABEL_KEY as selection
+    from omnigent.server.routes._sessions import orchestration as orch
+
+    store = SqlAlchemyConversationStore(stores.agent_store.storage_location)
+    selection_id = "go" if legacy else "first"
+    labels = {mode: "go", **({selection: selection_id} if not legacy else {})}
+    conv = store.create_conversation(harness_override="acp:neutral", labels=labels)
+    events = [
+        {
+            "type": "session.permission_mode",
+            "harness": "acp",
+            "conversation_id": conv.id,
+            "requested_mode": "go",
+            "selection_id": selection_id,
+            "permission_mode": actual,
+        }
+        for actual in ("review", "manual")
+    ]
+    published = []
+    monkeypatch.setattr(
+        orch.session_stream, "publish", lambda sid, payload: published.append(payload)
+    )
+
+    async def relay():
+        stream = (
+            "".join("data: " + json.dumps(event) + "\n\n" for event in events) + "data: [DONE]\n\n"
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda _: httpx.Response(200, text=stream)),
+            base_url="http://runner",
+        ) as runner:
+            await orch._relay_runner_stream_once(conv.id, runner, store)
+
+    await relay()
+    assert store.get_conversation(conv.id).labels[mode] == "manual"
+    assert len(published) == 2
+    store.set_labels(conv.id, {mode: "go", selection: "second"})
+    await relay()
+    assert store.get_conversation(conv.id).labels[mode] == "go"
+    assert len(published) == 2
+
+
+async def test_snapshot_uses_active_agent_model_until_the_turn_end_report(stores):
+    from omnigent.server.routes._sessions import orchestration as orch
+
+    _seed_agent(stores, AGENT_ID, "acp:neutral")
+    store = SqlAlchemyConversationStore(stores.agent_store.storage_location)
+    conv = store.create_conversation(agent_id=AGENT_ID, harness_override="acp:neutral")
+    orch._model_options_cache[conv.id] = []
+    orch._acp_effort_options_cache[conv.id] = [
+        {"id": "model-a", "isActive": False},
+        {"id": "model-b", "isActive": True},
+    ]
+    for reported, expected in ((None, "model-b"), ("model-c", "model-c")):
+        if reported:
+            store.update_conversation(conv.id, reported_model=reported)
+        response = await orch._get_session_snapshot(
+            store,
+            conv.id,
+            agent_store=stores.agent_store,
+            agent_cache=stores.agent_cache,
+            include_live_status=False,
+            include_items=False,
+        )
+        assert response.llm_model == expected
+
+
+@pytest.mark.parametrize("curated", [[], [{"id": "model-a"}, {"id": "model-b"}]])
+async def test_acp_running_model_refresh_keeps_catalog_sources_separate(
+    client, stores, monkeypatch, curated
+):
+    from omnigent.server.routes._sessions import orchestration as orch
+
+    _seed_agent(stores, AGENT_ID, "acp:neutral")
+    store = SqlAlchemyConversationStore(stores.agent_store.storage_location)
+    conv = store.create_conversation(agent_id=AGENT_ID)
+    orch._model_options_cache[conv.id] = list(curated)
+    orch._acp_effort_options_cache[conv.id] = [{"id": "model-c", "isActive": True}]
+    initial = await client.get(f"/v1/sessions/{conv.id}/model-options")
+    assert [row["id"] for row in initial.json()["models"]] == (
+        ["model-a", "model-b"] if curated else ["model-c"]
+    )
+    live = [{"id": "model-d", "isActive": True}]
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"models": live})),
+        base_url="http://runner",
+    ) as runner:
+        monkeypatch.setattr(
+            "omnigent.server.routes.sessions.routes_core._get_runner_client",
+            AsyncMock(return_value=runner),
+        )
+        refreshed = await client.get(
+            f"/v1/sessions/{conv.id}/model-options", params={"refresh": "force"}
+        )
+    assert refreshed.status_code == 200, refreshed.text
+    assert [row["id"] for row in refreshed.json()["models"]] == (
+        ["model-a", "model-b"] if curated else ["model-d"]
+    )
+    assert orch._model_options_cache[conv.id] == curated
+
+
+@pytest.mark.parametrize("protocol", ["mode-config", "mode-legacy"])
+@pytest.mark.parametrize("failure", ["", "mode-notify-refusal", "mode-multiple-readbacks"])
+async def test_acp_mode_crosses_server_runner_and_scripted_agent(
+    client, app, stores, tmp_path, protocol, failure, monkeypatch
+):
+    import asyncio
+    import shlex
+    import sys
+    import tempfile
+
+    from starlette.websockets import WebSocketDisconnect
+
+    from omnigent.host.frames import (
+        HostModelOptionsResultFrame,
+        decode_host_frame,
+        encode_host_frame,
+    )
+    from omnigent.runner import create_runner_app
+    from omnigent.runner.session_init_protocol import build_runner_session_init_payload
+    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+    from omnigent.sdk_permission_modes import (
+        ACP_SESSION_MODE_LABEL_KEY,
+        ACP_SESSION_MODE_SELECTION_LABEL_KEY,
+    )
+    from omnigent.server.routes.host_tunnel import _receive_loop
+    from tests._helpers.polling import poll_until_async
+    from tests.runner.conftest import _runner_client
+    from tests.runtime.harnesses.test_acp_model_switching import _FAKE_ACP_AGENT
+
+    script = tmp_path / "agent.py"
+    script.write_text(_FAKE_ACP_AGENT)
+    record = tmp_path / "requests.jsonl"
+    entry = {
+        "name": "Neutral",
+        "command": shlex.join([sys.executable, str(script), str(record), protocol, failure]),
+        "omnigent_mcp": False,
+        "permission_concepts": {"go": "automatic"},
+    }
+    location = f"{AGENT_ID}/bundle"
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({"acp": {"agents": [entry]}}))
+    stores.artifact_store.put(location, _bundle("acp:neutral"))
+    stores.agent_store.create(AGENT_ID, "calling-defaults-agent", location)
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    options = [
+        {"value": "review", "label": "Review"},
+        {"value": "go", "label": "Go", "concept": "automatic"},
+    ]
+    _register_host(app, HOST_A)
+    conn = app.state.host_registry.get(HOST_A)
+
+    async def receive_host_reply():
+        outgoing = await conn.outbound_queue.get()
+        request = decode_host_frame(outgoing.data)
+        response = HostModelOptionsResultFrame(
+            request_id=request.request_id,
+            status="ok",
+            models=[{"id": "model-a", "start_efforts": ["low", "high"]}],
+            permission_options=options,
+        )
+        ws = AsyncMock()
+        ws.receive.side_effect = [
+            {"type": "websocket.receive", "text": encode_host_frame(response)},
+            {"type": "websocket.disconnect"},
+        ]
+        with pytest.raises(WebSocketDisconnect):
+            await _receive_loop(
+                ws,
+                conn,
+                HOST_A,
+                stores.host_store,
+                app.state.host_registry,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+
+    reply = asyncio.create_task(receive_host_reply())
+    synced = await client.post(
+        "/v1/calling-defaults/sync", json={"host_id": HOST_A, "harness": "acp:neutral"}
+    )
+    await reply
+    assert synced.status_code == 200, synced.text
+    assert synced.json()["rows"][0]["permission_options"] == options
+    catalogs = await client.get("/v1/calling-defaults/catalogs")
+    assert catalogs.status_code == 200, catalogs.text
+    assert catalogs.json()["rows"][0]["permission_options"] == options
+    conversations = SqlAlchemyConversationStore(stores.agent_store.storage_location)
+    parent = conversations.create_conversation(
+        agent_id=AGENT_ID, host_id=HOST_A, workspace=str(tmp_path), runner_id="test-runner"
+    )
+    created = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": AGENT_ID,
+            "parent_session_id": parent.id,
+            "permission_mode": "go",
+            "reasoning_effort": "high",
+        },
+    )
+    assert created.status_code == 201, created.text
+    saved = conversations.get_conversation(created.json()["id"])
+    assert saved.labels[ACP_SESSION_MODE_LABEL_KEY] == "go"
+    assert created.json()["harness"] == "acp"
+    assert created.json()["harness_namespace"] == "acp:neutral"
+    assert created.json()["effective_host_id"] == HOST_A
+
+    async def resolve_spec(_agent_id, _session_id=None):
+        return stores.agent_cache.load(AGENT_ID, location).spec
+
+    def requests():
+        return (
+            [json.loads(line) for line in record.read_text().splitlines()]
+            if record.exists()
+            else []
+        )
+
+    with tempfile.TemporaryDirectory(
+        prefix="acp-mode-", dir="/tmp" if sys.platform != "win32" else None
+    ) as sockets:
+        manager = HarnessProcessManager(tmp_parent=Path(sockets))
+        await manager.start(sweep_orphans=False)
+        runner = create_runner_app(
+            process_manager=manager, spec_resolver=resolve_spec, server_client=client
+        )
+        try:
+            async with _runner_client(runner) as runner_client:
+                initialized = await runner_client.post(
+                    "/v1/sessions",
+                    json=build_runner_session_init_payload(
+                        saved, server_version="test", suppress_recovery_turn=True
+                    ),
+                )
+                assert initialized.status_code == 201, initialized.text
+                sent = await runner_client.post(
+                    f"/v1/sessions/{saved.id}/events",
+                    json={
+                        "type": "message",
+                        "role": "user",
+                        "model": "calling-defaults-agent",
+                        "harness": "acp:neutral",
+                        "content": "hello",
+                    },
+                )
+                assert sent.status_code == 202, sent.text
+                await poll_until_async(
+                    lambda: any(row.get("method") == "session/prompt" for row in requests()),
+                    timeout_s=15,
+                )
+                await poll_until_async(lambda: not manager.has_active_turn(saved.id))
+
+                async def mode_readback():
+                    queue = runner.state.session_event_queues[saved.id]
+                    while True:
+                        event = await queue.get()
+                        if event and event.get("type") == "session.permission_mode":
+                            return event
+
+                observed = await asyncio.wait_for(mode_readback(), timeout=10)
+                assert observed["harness"] == "acp"
+                assert observed["requested_mode"] == "go"
+                assert observed["permission_mode"] == ("review" if failure else "go")
+                assert (
+                    observed["selection_id"] == saved.labels[ACP_SESSION_MODE_SELECTION_LABEL_KEY]
+                )
+                from omnigent.server.routes._sessions import orchestration as orch
+
+                monkeypatch.setattr("omnigent.runtime._globals._agent_store", stores.agent_store)
+                monkeypatch.setattr("omnigent.runtime.get_agent_cache", lambda: stores.agent_cache)
+                observations = [observed]
+                if failure == "mode-multiple-readbacks":
+                    final_readback = await asyncio.wait_for(mode_readback(), timeout=10)
+                    assert final_readback["permission_mode"] == "manual"
+                    assert final_readback["selection_id"] == observed["selection_id"]
+                    observations.append(final_readback)
+                stream = (
+                    "".join("data: " + json.dumps(item) + "\n\n" for item in observations)
+                    + "data: [DONE]\n\n"
+                )
+                async with httpx.AsyncClient(
+                    transport=httpx.MockTransport(lambda _: httpx.Response(200, text=stream)),
+                    base_url="http://runner",
+                ) as readback_client:
+                    await orch._relay_runner_stream_once(saved.id, readback_client, conversations)
+                assert (
+                    conversations.get_conversation(saved.id).labels[ACP_SESSION_MODE_LABEL_KEY]
+                    == observations[-1]["permission_mode"]
+                )
+                monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: runner_client)
+                changed = await client.patch(
+                    f"/v1/sessions/{saved.id}", json={"permission_mode": "review"}
+                )
+                assert changed.status_code == 200, changed.text
+                sent = await runner_client.post(
+                    f"/v1/sessions/{saved.id}/events",
+                    json={
+                        "type": "message",
+                        "role": "user",
+                        "model": "calling-defaults-agent",
+                        "harness": "acp:neutral",
+                        "content": "again",
+                    },
+                )
+                assert sent.status_code == 202, sent.text
+                await poll_until_async(
+                    lambda: sum(row.get("method") == "session/prompt" for row in requests()) == 2
+                )
+                await poll_until_async(lambda: not manager.has_active_turn(saved.id))
+        finally:
+            await manager.shutdown()
+    recorded = requests()
+    handshake = next(row for row in recorded if row.get("method") == "initialize")
+    assert handshake["params"]["_meta"] == {"omnigent": {"start_effort": "high"}}
+    method = "session/set_config_option" if protocol == "mode-config" else "session/set_mode"
+    switch = next(row for row in recorded if row.get("method") == method)
+    assert switch["params"].get("value", switch["params"].get("modeId")) == "go"
+    assert recorded.index(switch) < next(
+        i for i, row in enumerate(recorded) if row.get("method") == "session/prompt"
+    )
+    switches = [row for row in recorded if row.get("method") == method]
+    assert switches[-1]["params"].get("value", switches[-1]["params"].get("modeId")) == (
+        "go" if failure == "mode-notify-refusal" else "review"
+    )
 
 
 @pytest.mark.asyncio

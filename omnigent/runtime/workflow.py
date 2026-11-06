@@ -1916,6 +1916,7 @@ def _build_acp_spawn_env(
         acp_agents,
         parse_env_passthrough,
         parse_init_timeout_s,
+        parse_permission_concepts,
         resolve_acp_agent,
     )
 
@@ -1960,6 +1961,7 @@ def _build_acp_spawn_env(
             inject_system_prompt=inject_system_prompt,
             env_passthrough=parse_env_passthrough(embedded.get("env_passthrough")),
             init_timeout_s=parse_init_timeout_s(embedded.get("init_timeout_s", 30.0)),
+            permission_concepts=parse_permission_concepts(embedded.get("permission_concepts")),
         )
     else:
         agent = resolve_acp_agent(slug) if slug else None
@@ -1978,6 +1980,7 @@ def _build_acp_spawn_env(
         env["HARNESS_ACP_NAME"] = agent.name
         env["HARNESS_ACP_SESSION_ID_MODE"] = agent.session_id_mode
         env["HARNESS_ACP_INIT_TIMEOUT_S"] = str(agent.init_timeout_s)
+        env["HARNESS_ACP_PERMISSION_CONCEPTS"] = json.dumps(dict(agent.permission_concepts))
         if agent.send_model:
             env["HARNESS_ACP_SEND_MODEL"] = "1"
         env["HARNESS_ACP_OMNIGENT_MCP"] = "1" if agent.omnigent_mcp else "0"

@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { NativeModelOption } from "@/lib/types";
-import { effortLevelsFor, reconcileEffortOnModelChange } from "./modelEffortOptions";
+import {
+  effortLevelsFor,
+  startEffortLevelsFor,
+  reconcileEffortOnModelChange,
+  reconcileStartEffortOnModelChange,
+} from "./modelEffortOptions";
 
 const rows: NativeModelOption[] = [
   {
@@ -9,6 +14,19 @@ const rows: NativeModelOption[] = [
   },
   { id: "model-b", supportedReasoningEfforts: [{ reasoningEffort: "medium" }] },
 ];
+
+describe("startEffortLevelsFor", () => {
+  it("offers startup-only ACP efforts without exposing them to running sessions", () => {
+    const models = [
+      { id: "agent-model", isActive: true, efforts: [], start_efforts: ["low", "high"] },
+    ];
+    expect(startEffortLevelsFor("acp:agent", models, null)).toEqual(["low", "high"]);
+    expect(effortLevelsFor("acp", models, null)).toEqual([]);
+    expect(
+      startEffortLevelsFor("acp:agent", [{ ...models[0], efforts: ["medium"] }], null),
+    ).toEqual(["medium"]);
+  });
+});
 
 describe("effortLevelsFor", () => {
   it("keeps ACP effort-only data usable without adopting a model shortlist", () => {
@@ -62,6 +80,30 @@ describe("reconcileEffortOnModelChange", () => {
     [null, "model-b", "high", "high"],
   ])("reconciles %s on %s", (harness, model, effort, expected) => {
     expect(reconcileEffortOnModelChange(harness, rows, model, effort)).toBe(expected);
+  });
+});
+
+describe("reconcileStartEffortOnModelChange", () => {
+  const models = [
+    { id: "a", isActive: true, efforts: [], start_efforts: ["high"] },
+    { id: "b", efforts: [], start_efforts: ["high"] },
+    { id: "c", efforts: [], start_efforts: ["low"] },
+    { id: "d", efforts: ["low"], start_efforts: ["high"] },
+  ];
+  it.each([
+    ["a", "high"],
+    ["b", "high"],
+    ["c", null],
+    ["d", null],
+    [null, "high"],
+  ])("reconciles startup effort for model %s without enabling live effort", (model, expected) => {
+    expect(reconcileStartEffortOnModelChange("acp:neutral", models, model, "high")).toBe(expected);
+    expect(reconcileEffortOnModelChange("acp:neutral", models, model, "high")).toBeNull();
+  });
+  it("keeps non-ACP model reconciliation unchanged", () => {
+    expect(reconcileStartEffortOnModelChange("codex", rows, "model-a", "high")).toBe("high");
+    expect(reconcileStartEffortOnModelChange("codex", rows, "model-b", "high")).toBeNull();
+    expect(reconcileStartEffortOnModelChange("claude-sdk", rows, "model-b", "high")).toBe("high");
   });
 });
 

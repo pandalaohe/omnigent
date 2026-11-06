@@ -58,10 +58,14 @@ async def test_declared_sources_share_the_host_frame(tmp_path, monkeypatch, lane
     assert result.request_id == "listing"
     assert [row["id"] for row in result.models] == ["model-a"]
     assert result.models[0]["source"]["kind"] == "model-source"
-    if lane == "agent":
-        assert result.permission_options == [{"value": "review", "label": "Review"}]
-    else:
-        probe.assert_not_awaited()
+    assert result.permission_options == [{"value": "review", "label": "Review"}]
+    probe.assert_awaited_once()
+    probe.reset_mock()
+    cached = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="cached", harness="acp:neutral")
+    )
+    assert cached.permission_options == result.permission_options
+    probe.assert_not_awaited()
 
 
 async def test_prewarm_skips_agent_processes(tmp_path, monkeypatch):

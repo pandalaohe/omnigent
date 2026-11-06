@@ -23,7 +23,7 @@ export function effortLevelsFor(
   if (harness === "acp" || harness?.startsWith("acp:")) {
     const selected = model
       ? (rows.find((row) => row.id === model) ?? rows.find((row) => row.id === "__default__"))
-      : rows.find((row) => row.isDefault);
+      : rows.find((row) => row.isDefault || row.isActive);
     return (
       selected?.efforts ??
       selected?.supportedReasoningEfforts?.map((option) => option.reasoningEffort) ??
@@ -58,6 +58,20 @@ export function effortLevelsFor(
   }
 }
 
+/** Efforts advertised only at startup are available before creating a chat. */
+export function startEffortLevelsFor(
+  harness: string | null | undefined,
+  rows: readonly NativeModelOption[],
+  model: string | null | undefined,
+): readonly string[] {
+  const live = effortLevelsFor(harness, rows, model) ?? [];
+  if (live.length || !(harness === "acp" || harness?.startsWith("acp:"))) return live;
+  const selected = model
+    ? (rows.find((row) => row.id === model) ?? rows.find((row) => row.id === "__default__"))
+    : rows.find((row) => row.isDefault || row.isActive);
+  return selected?.start_efforts ?? [];
+}
+
 export function reconcileEffortOnModelChange(
   harness: string | null | undefined,
   rows: readonly NativeModelOption[],
@@ -76,4 +90,18 @@ export function reconcileEffortOnModelChange(
     return effortLevelsFor(harness, rows, model)?.includes(effort) ? effort : null;
   }
   return effort;
+}
+
+export function reconcileStartEffortOnModelChange(
+  harness: string | null | undefined,
+  rows: readonly NativeModelOption[],
+  model: string | null | undefined,
+  effort: string | null,
+): string | null {
+  if (harness === "acp" || harness?.startsWith("acp:")) {
+    return effort !== null && startEffortLevelsFor(harness, rows, model).includes(effort)
+      ? effort
+      : null;
+  }
+  return reconcileEffortOnModelChange(harness, rows, model, effort);
 }

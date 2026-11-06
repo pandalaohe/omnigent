@@ -12,7 +12,7 @@ export interface CallingDefaultsCatalogRow {
   host_id: string;
   harness: string;
   models: NativeModelOption[];
-  permission_options?: { value: string; label: string; concept?: string }[];
+  permission_options?: { value: string; label: string; description?: string; concept?: string }[];
   /** Unix epoch seconds of the last successful sync; `null` when none. */
   fetched_at: number | null;
   /** The last sync failed, or the host is offline on this replica. */

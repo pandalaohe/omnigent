@@ -8923,6 +8923,47 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       });
       return;
     case "session_permission_mode":
+      if (event.harness === "acp") {
+        if (event.conversationId !== sourceConversationId) return;
+        const key = ["session", event.conversationId];
+        const cached = queryClient?.getQueryData<Session>(key);
+        if (
+          queryClient &&
+          event.selectionId !== undefined &&
+          cached?.labels?.["omnigent.acp.session_mode_selection"] === undefined
+        ) {
+          const client = queryClient;
+          // A legacy snapshot predates the server's first selection seed.
+          void client
+            .cancelQueries({ queryKey: key, exact: true })
+            .then(() =>
+              client.fetchQuery({
+                queryKey: key,
+                queryFn: () => getSessionSlim(event.conversationId),
+                staleTime: 0,
+                retry: false,
+              }),
+            )
+            .catch(() => undefined);
+          return;
+        }
+        queryClient?.setQueryData<Session>(["session", event.conversationId], (session) => {
+          if (!session) return session;
+          if (event.selectionId !== undefined) {
+            if (session.labels?.["omnigent.acp.session_mode_selection"] !== event.selectionId)
+              return session;
+          } else if (
+            event.requestedMode !== undefined &&
+            session.labels?.["omnigent.acp.session_mode"] !== event.requestedMode
+          )
+            return session;
+          return {
+            ...session,
+            labels: { ...session.labels, "omnigent.acp.session_mode": event.permissionMode },
+          };
+        });
+        return;
+      }
       if (event.permissionTierRevision !== undefined) {
         queryClient?.setQueryData<Session>(["session", event.conversationId], (session) => {
           if (!session || (session.permissionTierRevision ?? 0) > event.permissionTierRevision!)

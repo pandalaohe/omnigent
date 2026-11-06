@@ -15,6 +15,10 @@ list without changing the agent's provider connection.
 - `check`: offline CLI checks with structured results and exit codes 0, 1 and 2.
 - `probe`: ACP initialization and temporary session creation, without a prompt,
   authentication flow or MCP relay, followed by process cleanup.
+- `ACP session controls`: New Chat uses the agent's model list or text entry;
+  a running chat shows its reported model and offers the agent's selectable modes.
+- `start thinking`: agents may offer thinking levels that apply when a chat starts;
+  those levels appear before creation and do not add a running thinking control.
 
 ## How to get to it (user POV)
 
@@ -26,6 +30,9 @@ list without changing the agent's provider connection.
 - Use an available model menu or the Settings defaults table after configuring
   the source. An empty list permits a model name where that surface supports
   text entry. The listing does not itself enable model switching on an agent.
+- In New Chat, select the configured ACP agent on its host, then pick a model,
+  thinking level and mode where offered. In a running chat, open the model or
+  permission control. Pi RPC uses its host's model dropdown in the running chat.
 
 ## Driving it with the repro environment
 
@@ -37,6 +44,12 @@ configuration. Never point a verification run at the operator's home directory.
 - `tests/inner/test_acp_model_probe.py` starts a real neutral stdio peer and
   checks advertisements, refusal, exit, timeout, request inventory and cleanup.
 - `tests/host/test_acp_model_options.py` exercises the host model-options entry.
+- `tests/server/routes/test_calling_defaults_routes.py` exercises cached mode
+  sync, resolution, creation, offline changes, fork/continue and model reports.
+  Its scripted ACP journeys cross the real server, runner, harness and stdio
+  agent for both config-option and legacy mode selection.
+- `tests/inner/test_acp_executor.py` and `tests/inner/test_acp_effort.py` cover
+  model refusal notices, actual-model reports, mode confirmation and start thinking.
 - `web/src/pages/settings/AgentModelList.test.tsx` drives the production card's
   refresh, failed refresh, empty state, rule copy and host changes.
 - In the isolated app, open a configured agent's Model list, verify its source
@@ -47,6 +60,14 @@ configuration. Never point a verification run at the operator's home directory.
   to an isolated global config and run `omnigent models check copilot --json`.
   Expect a count of 1. Change the list to `[]` and expect an empty result with
   exit 0. A malformed YAML document exits 2; a failed listing exits 1.
+- With an isolated scripted ACP agent, press Sync models in Settings → Agents.
+  Open New Chat and check that its active model is the agent default, that an
+  empty list allows text entry, and that a start-only thinking level says
+  Applies when a chat starts. Start a chat, send one message, and check the model
+  shown agrees with the agent's report. Change the model and mode, then send
+  another message: each setting must reach the same agent session before its
+  next prompt. A rejected setting prints Agent kept followed by the retained
+  setting. Repeat with zero or one model row, Pi RPC, both themes and 390 px.
 
 ## Gotchas
 
@@ -61,3 +82,13 @@ configuration. Never point a verification run at the operator's home directory.
 - ACP probing is bounded to 30 seconds and creates no model prompt. Ordinary
   New Chat picker requests keep their shorter request budget; explicit Settings
   model-list requests allow the probe to finish.
+- ACP mode names have agent-defined meanings. An unclassified mode is selectable
+  by its label; totals skip it and it is not marked Full access. Only the host
+  owner's `permission_concepts` mapping assigns a shared meaning. This changes
+  the agent's own mode, independently of Omnigent's tool approval stance.
+- An older host that has not reported modes cannot accept an explicit ACP mode;
+  the error directs the owner to Sync models. A running chat can save a mode
+  while its runner is offline; its next initialization carries the saved choice.
+- Token-free model reports update the model label without adding a zero-token
+  usage row. A curated model shortlist keeps its labels and ordering when a
+  running agent advertises a wider catalog.

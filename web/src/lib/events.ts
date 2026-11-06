@@ -671,7 +671,7 @@ export interface SessionCollaborationModeEvent {
 }
 
 /**
- * `session.permission_mode` — active claude-native permission-mode switch.
+ * `session.permission_mode` — confirmed permission or ACP session mode.
  *
  * Emitted when the web picker switches the mode, and when the Claude
  * forwarder sees the pane's footer change (a shift+tab pressed in the TUI).
@@ -680,6 +680,9 @@ export interface SessionPermissionModeEvent {
   type: "session_permission_mode";
   conversationId: string;
   permissionMode: string;
+  harness?: "acp";
+  requestedMode?: string;
+  selectionId?: string;
   permissionTierRevision?: number;
   permissionTierState?: "ready" | "switching" | "blocked";
   permissionTiersCapability?: boolean;
