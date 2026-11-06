@@ -3017,14 +3017,17 @@ async def test_cold_after_for_many_deduplicates_ancestors_and_owner_grants(
     for owner, root in zip(["alice", "bob"], roots, strict=True):
         permissions.ensure_user(owner)
         permissions.grant(owner, root.id, LEVEL_OWNER)
+    permissions.grant("bob", roots[0].id, LEVEL_OWNER)
     harness.sweeper._permission_store = permissions
     single_reads: list[str] = []
     batch_reads: list[set[str]] = []
     grant_reads: list[str] = []
+    grant_batches: list[set[str]] = []
     settings_reads: list[str] = []
     get_one = harness.store.get_conversation
     get_many = harness.store.get_conversations
     get_grants = permissions.list_for_session
+    get_grant_batch = permissions.list_for_sessions
 
     def single(session_id: str) -> Conversation | None:
         single_reads.append(session_id)
@@ -3037,6 +3040,12 @@ async def test_cold_after_for_many_deduplicates_ancestors_and_owner_grants(
     def grants(session_id: str, **kwargs: Any) -> Any:
         grant_reads.append(session_id)
         return get_grants(session_id, **kwargs)
+
+    def batch_grants(session_ids: list[str]) -> Any:
+        grant_batches.append(set(session_ids))
+        return {
+            sid: list(reversed(grants)) for sid, grants in get_grant_batch(session_ids).items()
+        }
 
     class OwnerPrefs:
         def get(self, owner: str) -> dict[str, Any]:
@@ -3054,6 +3063,7 @@ async def test_cold_after_for_many_deduplicates_ancestors_and_owner_grants(
     monkeypatch.setattr(harness.store, "get_conversation", single)
     monkeypatch.setattr(harness.store, "get_conversations", batch)
     monkeypatch.setattr(permissions, "list_for_session", grants)
+    monkeypatch.setattr(permissions, "list_for_sessions", batch_grants)
     inputs = [*children, other]
     expected: dict[str, int | None] = {**{child.id: 0 for child in children}, other.id: 900}
     if preloaded:
@@ -3062,7 +3072,8 @@ async def test_cold_after_for_many_deduplicates_ancestors_and_owner_grants(
     assert harness.sweeper.cold_after_for_many(inputs, OwnerPrefs()) == expected
     assert single_reads == []
     assert batch_reads == ([] if preloaded else [{middle.id, roots[1].id}, {roots[0].id}])
-    assert sorted(grant_reads) == sorted(root.id for root in roots)
+    assert grant_reads == []
+    assert grant_batches == [{root.id for root in roots}]
     assert sorted(settings_reads) == ["alice", "bob"]
 
     # The next read batch must see a changed root grant, even with the same rows.
@@ -3072,10 +3083,13 @@ async def test_cold_after_for_many_deduplicates_ancestors_and_owner_grants(
         child.id: 900 for child in [*children, other]
     }
     assert settings_reads[-1] == "bob" and len(settings_reads) == 3
-    assert len(grant_reads) == 4
+    assert grant_reads == []
+    assert grant_batches == [{root.id for root in roots}] * 2
 
 
-@pytest.mark.parametrize("failure", ["batch", "ancestor", "grant", "settings", "missing"])
+@pytest.mark.parametrize(
+    "failure", ["batch", "ancestor", "grant_batch", "grant", "settings", "missing"]
+)
 async def test_cold_after_batch_preserves_fallbacks_and_isolates_failures(
     harness: _Harness,
     db_uri: str,
@@ -3093,6 +3107,7 @@ async def test_cold_after_batch_preserves_fallbacks_and_isolates_failures(
     get_one = harness.store.get_conversation
     get_many = harness.store.get_conversations
     get_grants = permissions.list_for_session
+    get_grant_batch = permissions.list_for_sessions
 
     def single(sid: str) -> Conversation | None:
         if failure == "ancestor" and sid == roots[0].id:
@@ -3112,6 +3127,11 @@ async def test_cold_after_batch_preserves_fallbacks_and_isolates_failures(
             raise RuntimeError("grants unavailable")
         return get_grants(sid, **kwargs)
 
+    def batch_grants(sids: list[str]) -> Any:
+        if failure in {"grant_batch", "grant"}:
+            raise RuntimeError("grant batch unavailable")
+        return get_grant_batch(sids)
+
     class OwnerPrefs:
         def get(self, owner: str) -> dict[str, Any]:
             if failure == "settings" and owner == "alice":
@@ -3130,13 +3150,16 @@ async def test_cold_after_batch_preserves_fallbacks_and_isolates_failures(
     monkeypatch.setattr(harness.store, "get_conversation", single)
     monkeypatch.setattr(harness.store, "get_conversations", batch)
     monkeypatch.setattr(permissions, "list_for_session", grants)
-    expected = 0 if failure == "batch" else 600 if failure == "missing" else None
+    monkeypatch.setattr(permissions, "list_for_sessions", batch_grants)
+    expected = 0 if failure in {"batch", "grant_batch"} else 600 if failure == "missing" else None
     assert harness.sweeper.cold_after_for_many(children, OwnerPrefs()) == {
         children[0].id: expected,
         children[1].id: 900,
     }
     if failure in {"batch", "ancestor"}:
         assert "Collaboration ancestor batch read failed" in caplog.text
+    if failure in {"grant_batch", "grant"}:
+        assert "Collaboration owner batch read failed" in caplog.text
 
 
 @pytest.mark.parametrize("error_type", [RuntimeError, ImportError])
@@ -3222,6 +3245,13 @@ async def test_collab_owner_batch_matches_bounded_single_walk(
             [SimpleNamespace(user_id=f"owner-{sid}", level=LEVEL_OWNER)],
             None,
         ),
+    )
+    monkeypatch.setattr(
+        permissions,
+        "list_for_sessions",
+        lambda ids: {
+            sid: [SimpleNamespace(user_id=f"owner-{sid}", level=LEVEL_OWNER)] for sid in ids
+        },
     )
     inputs = [rows["0"], rows["1"]]
     expected = (

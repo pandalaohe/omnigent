@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Literal
 
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.auth import RESERVED_USER_LOCAL
+from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
 from omnigent.server.user_preferences_store import (
     CollabSettings,
     read_collab_settings,
@@ -185,7 +185,29 @@ def collab_owners_for(
                 tops[sid] = parent
                 active.add(sid)
 
+    root_ids = sorted({top.id for sid, top in tops.items() if sid not in failed_sessions})
     owner_by_root: dict[str, str | None] = {}
+    if root_ids:
+        try:
+            grants_by_root = permission_store.list_for_sessions(root_ids)
+            owner_by_root = {
+                root_id: next(
+                    (
+                        grant.user_id
+                        for grant in sorted(
+                            grants_by_root.get(root_id, []), key=lambda grant: grant.user_id
+                        )
+                        if grant.level >= LEVEL_OWNER
+                    ),
+                    RESERVED_USER_LOCAL,
+                )
+                for root_id in root_ids
+            }
+        except Exception:
+            _logger.warning(
+                "Collaboration owner batch read failed; falling back to individual reads",
+                exc_info=True,
+            )
     owners: dict[str, str | None] = {}
     for sid, top in tops.items():
         if sid in failed_sessions:

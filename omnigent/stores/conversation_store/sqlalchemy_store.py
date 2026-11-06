@@ -177,6 +177,7 @@ from omnigent.stores.conversation_store import (
     NativeSubagentReconcileWriteResult,
     SessionActivity,
     SessionConnectivity,
+    SessionListState,
     SessionSuccession,
     SuccessionRefusedError,
     pinned_label_key,
@@ -2265,6 +2266,60 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             for row in rows
         }
+
+    def get_session_list_state(
+        self, conversation_ids: list[str], *, label_keys: tuple[str, ...] = ()
+    ) -> dict[str, SessionListState]:
+        """Project child rollup state; large historical usage and label blobs stay in SQL."""
+        if not conversation_ids:
+            return {}
+        ids = list(set(conversation_ids))
+        with self._conv_session("read_session_list_state") as session:
+            existing = (
+                session.execute(
+                    select(SqlConversation.id).where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.id.in_(ids),
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            labels: dict[str, dict[str, str]] = {}
+            if existing and label_keys:
+                for cid, key, value in session.execute(
+                    select(
+                        SqlConversationLabel.conversation_id,
+                        SqlConversationLabel.key,
+                        SqlConversationLabel.value,
+                    ).where(
+                        SqlConversationLabel.workspace_id == current_workspace_id(),
+                        SqlConversationLabel.conversation_id.in_(existing),
+                        SqlConversationLabel.key.in_(label_keys),
+                    )
+                ):
+                    labels.setdefault(cid, {})[key] = value
+        if not existing:
+            return {}
+        with self._session("read_session_list_state") as session:
+            rows = session.execute(
+                select(
+                    SqlConversationMetadata.id,
+                    SqlConversationMetadata.runner_id,
+                    SqlConversationMetadata.pending_elicitation_count,
+                ).where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id.in_(existing),
+                )
+            ).all()
+        result = {cid: SessionListState(None, None, labels.get(cid, {})) for cid in existing}
+        result.update(
+            {
+                cid: SessionListState(runner_id, pending_count, labels.get(cid, {}))
+                for cid, runner_id, pending_count in rows
+            }
+        )
+        return result
 
     def list_child_conversation_ids_by_parent(
         self,

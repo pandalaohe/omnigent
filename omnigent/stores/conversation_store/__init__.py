@@ -8,6 +8,7 @@ import unicodedata
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
@@ -360,6 +361,7 @@ def is_artifact_link_key(key: str) -> bool:
     return _may_collate_to(key, ARTIFACT_LINK_KEY_LABEL, prefix=False)
 
 
+@lru_cache(maxsize=8192)
 def _may_collate_to(key: str, target: str, *, prefix: bool) -> bool:
     # MySQL's accent-insensitive collation equates characters a skeleton
     # cannot list. Over-approximating only refuses a look-alike key on a
@@ -672,6 +674,15 @@ class SessionActivity:
 
     updated_at: int
     live_status: str | None
+
+
+@dataclass(frozen=True)
+class SessionListState:
+    """Only the child state needed to roll up a session list row."""
+
+    runner_id: str | None
+    pending_elicitation_count: int | None
+    labels: dict[str, str]
 
 
 # Freshness window for ``omnigent_conversation_metadata.runner_last_seen``. The tunnel
@@ -1103,6 +1114,19 @@ class ConversationStore(ABC):
             smaller than the input.
         """
         ...
+
+    def get_session_list_state(
+        self, conversation_ids: list[str], *, label_keys: tuple[str, ...] = ()
+    ) -> dict[str, SessionListState]:
+        """Read rollup fields and selected labels without loading chat or usage state."""
+        return {
+            cid: SessionListState(
+                conv.runner_id,
+                conv.pending_elicitation_count,
+                {key: value for key, value in conv.labels.items() if key in label_keys},
+            )
+            for cid, conv in self.get_conversations(conversation_ids).items()
+        }
 
     @abstractmethod
     def list_child_conversation_ids_by_parent(

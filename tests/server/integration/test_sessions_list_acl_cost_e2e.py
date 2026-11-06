@@ -302,3 +302,46 @@ async def test_sessions_list_cost_does_not_scale_with_accessible_total(
         f"{many_binds} at {_N_MANY} — page cost must be O(limit), "
         f"independent of how many sessions the user can access"
     )
+
+
+async def test_large_host_inventory_batches_owner_permissions(
+    acl_client: httpx.AsyncClient,
+    seeded_users: dict[str, int],
+    sql_capture: _SqlCapture,
+    db_uri: str,
+) -> None:
+    """A full inventory must not query permissions once per top-level session."""
+    from omnigent.stores.host_store import HostStore
+
+    store = SqlAlchemyConversationStore(db_uri)
+    host = HostStore(db_uri).upsert_on_connect("a" * 32, "test-host", _USER_MANY)
+    for conv in store.list_conversations(limit=1000, accessible_by=_USER_MANY).data:
+        store.set_host_id(conv.id, host_id=host.host_id, workspace="/opt/work/omnigent")
+    for index in range(2):
+        store.create_conversation(
+            parent_conversation_id=conv.id, title=f"child-{index}", labels={"history": "unused"}
+        )
+    sql_capture.statements.clear()
+    response = await acl_client.get(
+        "/v1/sessions",
+        params={
+            "limit": 1000,
+            "include_archived": "true",
+            "visibility": "all",
+            "host_id": host.host_id,
+        },
+        headers={"X-Forwarded-Email": _USER_MANY},
+    )
+    assert response.status_code == 200, response.text
+    assert len(response.json()["data"]) == _N_MANY
+    permission_reads = [
+        statement
+        for statement, _ in sql_capture.relevant()
+        if "FROM session_permissions" in statement
+    ]
+    assert len(permission_reads) <= 3, (
+        f"inventory queried permissions {len(permission_reads)} times for {_N_MANY} sessions"
+    )
+    assert not any(
+        "session_usage" in statement and binds == 3 for statement, binds in sql_capture.statements
+    ), "child status rollup loaded full metadata instead of its narrow projection"

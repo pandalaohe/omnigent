@@ -4014,7 +4014,11 @@ def register_core_routes(
         # status straight from the (now-updated) cache.
         all_child_ids = {child_id for ids in child_ids_by_parent.values() for child_id in ids}
         child_rows = (
-            await asyncio.to_thread(conversation_store.get_conversations, list(all_child_ids))
+            await asyncio.to_thread(
+                conversation_store.get_session_list_state,
+                list(all_child_ids),
+                label_keys=(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY,),
+            )
             if all_child_ids
             else {}
         )
@@ -4656,7 +4660,11 @@ def register_core_routes(
         own_pending_ids = pending_elicitations.latest_ids_for(conv_ids)
         all_child_ids = {child_id for ids in child_ids_by_parent.values() for child_id in ids}
         child_rows = (
-            await asyncio.to_thread(conversation_store.get_conversations, list(all_child_ids))
+            await asyncio.to_thread(
+                conversation_store.get_session_list_state,
+                list(all_child_ids),
+                label_keys=(_SUBAGENT_ACTIVITY_UNVERIFIED_LABEL_KEY,),
+            )
             if all_child_ids
             else {}
         )
