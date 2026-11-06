@@ -4806,6 +4806,8 @@ def server(
     from omnigent.server.server_config import (
         SESSION_TITLE_INSTRUCTIONS_KEY,
         config_str_list,
+        load_server_config,
+        resolve_config_path,
     )
     from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
     from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -4839,6 +4841,9 @@ def server(
             if title_instructions is not None
             else {}
         )
+        key_config = global_cfg if resolve_config_path() is None else load_server_config()
+        if "api_keys" in key_config:
+            title_server_config["api_keys"] = key_config["api_keys"]
 
     # Let the server-config reader (branding) see the same ``-c`` file.
     if config_path:

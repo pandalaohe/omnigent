@@ -1132,6 +1132,13 @@ def test_usage_api_key_upgrade_through_configured_app(
         assert client.get("/v1/sessions", headers=headers).status_code == 401
         assert client.delete("/v1/me/usage/accounts/vendor", headers=headers).status_code == 401
         assert client.put("/v1/me/usage/price-source", headers=headers, json={}).status_code == 401
+        store = SqlAlchemyAccountStore(f"sqlite:///{tmp_path}/test.db")
+        store.create_user_with_password("backup", "unused", is_admin=True)
+        assert store.delete_user("admin") is True
+        assert client.get("/v1/usage-events", headers=headers).status_code == 401
+        assert (
+            client.put("/v1/me/usage/accounts/vendor", headers=headers, json={}).status_code == 401
+        )
 
 
 def test_usage_api_key_bad_scope_refuses_app_startup(
