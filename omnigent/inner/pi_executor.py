@@ -232,6 +232,8 @@ class _PiScopedLauncher:
         self._closing: set[asyncio.Task[None]] = set()
 
     async def request(self, operation: str, launch_id: str, **values: object) -> dict[str, object]:
+        status: int | None = None
+        category = "request"
         try:
             async with httpx.AsyncClient(trust_env=False, timeout=2.0) as client:
                 response = await client.post(
@@ -244,15 +246,30 @@ class _PiScopedLauncher:
                         **values,
                     },
                 )
+                status = response.status_code
+                category = "http_status"
+                if status != 200:
+                    raise ValueError("Unconfirmed Pi launch operation")
+                category = "decode"
                 raw: object = response.json()
-            if (
-                response.status_code != 200
-                or not isinstance(raw, dict)
-                or raw.get("launch_id") != launch_id
-            ):
+            category = "shape"
+            if not isinstance(raw, dict):
+                raise ValueError("Unconfirmed Pi launch operation")
+            category = "launch_id"
+            if raw.get("launch_id") != launch_id:
                 raise ValueError("Unconfirmed Pi launch operation")
             return raw
-        except (httpx.HTTPError, OSError, ValueError, TypeError):
+        except (httpx.HTTPError, OSError, ValueError, TypeError) as exc:
+            # Exception text, HTTP bodies and request objects may contain authority.
+            logger.warning(
+                "Pi scoped launcher failed: operation=%s category=%s exception=%s status=%s",
+                operation
+                if operation in {"reserve", "publish", "confirm", "revoke"}
+                else "unknown",
+                category,
+                type(exc).__name__,
+                status,
+            )
             raise PiPermissionBootstrapError("Pi scoped launcher transport unavailable") from None
 
     async def reserve(self) -> tuple[str, pathlib.Path]:

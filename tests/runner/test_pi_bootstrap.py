@@ -510,6 +510,97 @@ def test_python_launcher_rejects_unbound_or_nonloopback_descriptor(tmp_path, fau
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fault", "category", "exception", "status"),
+    [
+        ("connect", "request", "ConnectError", None),
+        ("timeout", "request", "ReadTimeout", None),
+        ("forbidden", "http_status", "ValueError", 403),
+        ("decode", "decode", "JSONDecodeError", 200),
+        ("shape", "shape", "ValueError", 200),
+        ("launch", "launch_id", "ValueError", 200),
+    ],
+)
+async def test_windows_launcher_failure_diagnostics_exclude_private_data(
+    tmp_path, monkeypatch, caplog, fault, category, exception, status
+):
+    from omnigent.inner import pi_executor
+
+    monkeypatch.setattr(pi_executor, "IS_WINDOWS", True)
+    private = "private-authority-and-response"
+    launch_id = "a" * 32
+
+    def respond(request):
+        if fault == "connect":
+            raise httpx.ConnectError(private, request=request)
+        if fault == "timeout":
+            raise httpx.ReadTimeout(private, request=request)
+        if fault == "forbidden":
+            return httpx.Response(403, text=private)
+        if fault == "decode":
+            return httpx.Response(200, text=private)
+        return httpx.Response(200, json=[private] if fault == "shape" else {"launch_id": private})
+
+    client = httpx.AsyncClient
+    monkeypatch.setattr(
+        pi_executor.httpx,
+        "AsyncClient",
+        lambda **kwargs: client(transport=httpx.MockTransport(respond), **kwargs),
+    )
+    launcher = pi_executor._PiScopedLauncher(
+        "session-a",
+        tmp_path,
+        {
+            "protocol": 1,
+            "session_id": "session-a",
+            "endpoint": "http://127.0.0.1:1",
+            "process_capability": private,
+        },
+    )
+    with pytest.raises(pi_executor.PiPermissionBootstrapError) as rejected:
+        await launcher.request("reserve", launch_id)
+    assert rejected.value.reason == "Pi scoped launcher transport unavailable"
+    assert f"category={category}" in caplog.text
+    assert f"exception={exception}" in caplog.text
+    assert f"status={status}" in caplog.text
+    assert "operation=reserve" in caplog.text
+    assert private not in caplog.text
+    assert launch_id not in caplog.text
+    assert "127.0.0.1" not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("windows", [False, True])
+async def test_python_launcher_real_loopback_and_broker_failure_diagnostics(
+    attestor_relay, tmp_path, monkeypatch, caplog, windows
+):
+    from omnigent.inner import pi_executor
+    from omnigent.runner import pi_bootstrap
+
+    monkeypatch.setattr(pi_executor, "IS_WINDOWS", windows)
+    monkeypatch.setattr(pi_bootstrap, "IS_WINDOWS", windows)
+    runtime, broker, relay, _source, _registry = attestor_relay
+    descriptor = broker.launcher_descriptor()
+    launcher = pi_executor._PiScopedLauncher("session-a", tmp_path, descriptor)
+    launch_id = "b" * 32
+    reserved = await launcher.request("reserve", launch_id)
+    assert Path(reserved["handoff"]).parent == runtime.path("session-a").parent / "pi-bootstrap"
+    assert descriptor["endpoint"] == relay._advertised_url
+    assert relay._httpd.socket.getsockname()[0] == "127.0.0.1"
+    assert relay._httpd.socket.getsockname()[1] == int(relay._advertised_url.rsplit(":", 1)[1])
+    with pytest.raises(pi_executor.PiPermissionBootstrapError):
+        await launcher.request("publish", launch_id, pid="private-invalid-pid", started_at=0)
+    assert "stage=operation exception=ValueError" in caplog.text
+    assert "status=403" in caplog.text
+    launcher._capability = "private-invalid-credential"
+    with pytest.raises(pi_executor.PiPermissionBootstrapError):
+        await launcher.request("reserve", launch_id)
+    assert "stage=authentication exception=ValueError" in caplog.text
+    assert "private-invalid" not in caplog.text
+    assert descriptor["process_capability"] not in caplog.text
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("ready", [False, True])
 async def test_scoped_confirmation_uses_the_callers_remaining_deadline(
     tmp_path, monkeypatch, ready

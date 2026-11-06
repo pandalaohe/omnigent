@@ -8790,8 +8790,12 @@ def _tool_relay_handler_factory(
             )
             try:
                 future.result(timeout=5.0)
-            except Exception:  # noqa: BLE001 - authenticate before body decoding
+            except Exception as exc:  # noqa: BLE001 - authenticate before body decoding
                 future.cancel()
+                _logger.warning(
+                    "Pi bootstrap rejected: stage=authentication exception=%s",
+                    type(exc).__name__,
+                )
                 self.send_error(HTTPStatus.FORBIDDEN)
                 return
             payload = self._read_json_body()
@@ -8803,8 +8807,11 @@ def _tool_relay_handler_factory(
             )
             try:
                 response = future.result(timeout=5.0)
-            except Exception:  # noqa: BLE001 - no exception or authority in public diagnostics
+            except Exception as exc:  # noqa: BLE001 - no exception or authority in public diagnostics
                 future.cancel()
+                _logger.warning(
+                    "Pi bootstrap rejected: stage=operation exception=%s", type(exc).__name__
+                )
                 self.send_error(HTTPStatus.FORBIDDEN)
                 return
             self._send_json(response)
