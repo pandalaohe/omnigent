@@ -851,8 +851,9 @@ export function writeReportedContext(
   const previous = preferences.reportedContext?.[sourceKey];
   if (report.contextWindow === null && report.autoCompactTokenLimit === null) {
     if (!previous) return;
-    const reportedContext = { ...preferences.reportedContext };
-    delete reportedContext[sourceKey];
+    const reportedContext = Object.fromEntries(
+      Object.entries(preferences.reportedContext ?? {}).filter(([key]) => key !== sourceKey),
+    );
     writeUsageContextPreferences({ ...preferences, version: 6, reportedContext });
     return;
   }
