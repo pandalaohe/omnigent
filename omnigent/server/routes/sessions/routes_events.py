@@ -2449,6 +2449,14 @@ def register_events_routes(
         from omnigent.server.host_load_queue import LABEL, start_allowed
         from omnigent.stores.conversation_store import ConversationLabelConditionFailed
 
+        if (
+            (body.type == "message" and body.data.get("role", "user") == "user")
+            or body.type in (_INTERRUPT_TYPE, _STOP_SESSION_TYPE, _CLEAR_TYPE)
+        ) and not (isinstance(request, StartupInputContext) and request.recovery_id is not None):
+            from omnigent.server.turn_recovery import cancel_turn_recovery
+
+            await cancel_turn_recovery(conversation_store, session_id)
+
         if not start_allowed(conv):
             if body.type == "message" and body.data.get("role") == "user":
                 try:
@@ -5897,6 +5905,16 @@ def register_events_routes(
         if conv is None or not _has_bound_runner_authority(request, conv):
             raise HTTPException(403, "Bound receiver authority required")
         assert conv.runner_id is not None
+        saved_input = await asyncio.to_thread(
+            conversation_store.get_item, session_id, body.input_id
+        )
+        if (
+            saved_input is not None
+            and isinstance(saved_input.data, MessageData)
+            and saved_input.data.startup_options is not None
+            and saved_input.data.startup_options.recovery_id == body.input_id
+        ):
+            body = body.model_copy(update={"kind": "recovery"})
         harness = await asyncio.to_thread(
             _resolve_harness, conv, agent_store=agent_store, agent_cache=agent_cache
         )
@@ -5907,6 +5925,10 @@ def register_events_routes(
         ):
             return InputExecutionReceipt(reason="native_reservation_required")
         result = await service.admit_execution(session_id, body, runner_id=conv.runner_id)
+        if result.accepted and body.kind == "recovery":
+            from omnigent.server.turn_recovery import reconcile_turn_recovery
+
+            await reconcile_turn_recovery(conversation_store, conv)
         if (
             result.accepted
             and result.receipt is not None

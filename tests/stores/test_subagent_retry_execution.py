@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid4
 
@@ -10,6 +11,125 @@ import pytest
 from omnigent.entities.subagent_retry import InputExecutionClaim, RetryExecutionGuard
 from tests.stores.test_subagent_retry_store import _journal, _open
 from tests.stores.test_subagent_retry_store import journal as journal
+
+
+@pytest.mark.parametrize("override", ["cancel", "hold", "new_input", "none"])
+def test_recovery_receiver_fences_controls_and_can_retry_only_expired_attempts(journal, override):
+    from omnigent.server.host_load_queue import LABEL
+    from omnigent.server.turn_recovery import RECOVERY_INPUT_LABEL
+
+    identity = uuid4().hex
+    journal.conversations.set_runner_id(journal.child, journal.owner.runner_id)
+    journal.conversations.set_labels(journal.child, {RECOVERY_INPUT_LABEL: identity})
+    stale = InputExecutionClaim(
+        input_id=identity, kind="recovery", turn_id="abandoned", admission_deadline=1
+    )
+    assert not journal.store.resolve_execution(
+        journal.child, stale, runner_id=journal.owner.runner_id, close=True
+    ).accepted
+    # The same abandoned frame remains fenced; only a new, live attempt may consume it.
+    assert (
+        journal.store.admit_execution(
+            journal.child, stale, runner_id=journal.owner.runner_id
+        ).reason
+        == "input_closed"
+    )
+    if override in {"cancel", "new_input"}:
+        journal.conversations.set_labels(
+            journal.child, {RECOVERY_INPUT_LABEL: f"cancelled:{identity}"}
+        )
+    elif override == "hold":
+        journal.conversations.set_labels(journal.child, {LABEL: "queued@host"})
+    fresh = stale.model_copy(
+        update={"turn_id": "replacement", "admission_deadline": time.time() + 30}
+    )
+    result = journal.store.admit_execution(journal.child, fresh, runner_id=journal.owner.runner_id)
+    assert result.accepted is (override == "none")
+    if result.accepted:
+        duplicate = fresh.model_copy(update={"turn_id": "duplicate"})
+        assert not journal.store.admit_execution(
+            journal.child, duplicate, runner_id=journal.owner.runner_id
+        ).accepted
+
+
+def test_closed_recovery_attempt_never_revives_and_successor_waits_for_deadline(
+    journal, monkeypatch
+):
+    from omnigent.server.turn_recovery import RECOVERY_INPUT_LABEL
+
+    journal.conversations.set_runner_id(journal.child, journal.owner.runner_id)
+    identity = uuid4().hex
+    journal.conversations.set_labels(journal.child, {RECOVERY_INPUT_LABEL: identity})
+    first = InputExecutionClaim(
+        input_id=identity, turn_id="abandoned", kind="recovery", admission_deadline=200
+    )
+    monkeypatch.setattr(
+        "omnigent.stores.subagent_retry_store.sqlalchemy_store.time.time", lambda: 100
+    )
+    assert not journal.store.resolve_execution(
+        journal.child, first, runner_id=journal.owner.runner_id, close=True
+    ).accepted
+    assert not journal.store.admit_execution(
+        journal.child, first, runner_id=journal.owner.runner_id
+    ).accepted
+    successor = first.model_copy(update={"turn_id": "successor", "admission_deadline": 300})
+    assert not journal.store.admit_execution(
+        journal.child, successor, runner_id=journal.owner.runner_id
+    ).accepted
+    monkeypatch.setattr(
+        "omnigent.stores.subagent_retry_store.sqlalchemy_store.time.time", lambda: 201
+    )
+    assert journal.store.admit_execution(
+        journal.child, successor, runner_id=journal.owner.runner_id
+    ).accepted
+
+
+def test_every_abandoned_recovery_attempt_is_fenced(journal, monkeypatch):
+    from omnigent.server.turn_recovery import RECOVERY_INPUT_LABEL
+
+    journal.conversations.set_runner_id(journal.child, journal.owner.runner_id)
+    identity = uuid4().hex
+    journal.conversations.set_labels(journal.child, {RECOVERY_INPUT_LABEL: identity})
+    first = InputExecutionClaim(
+        input_id=identity, turn_id="first", kind="recovery", admission_deadline=200
+    )
+    second = first.model_copy(update={"turn_id": "second", "admission_deadline": 250})
+    monkeypatch.setattr(
+        "omnigent.stores.subagent_retry_store.sqlalchemy_store.time.time", lambda: 100
+    )
+    for claim in (first, second):
+        assert not journal.store.resolve_execution(
+            journal.child, claim, runner_id=journal.owner.runner_id, close=True
+        ).accepted
+    monkeypatch.setattr(
+        "omnigent.stores.subagent_retry_store.sqlalchemy_store.time.time", lambda: 201
+    )
+    assert not journal.store.admit_execution(
+        journal.child, second, runner_id=journal.owner.runner_id
+    ).accepted
+    third = first.model_copy(update={"turn_id": "third", "admission_deadline": 300})
+    monkeypatch.setattr(
+        "omnigent.stores.subagent_retry_store.sqlalchemy_store.time.time", lambda: 251
+    )
+    assert journal.store.admit_execution(
+        journal.child, third, runner_id=journal.owner.runner_id
+    ).accepted
+
+
+@pytest.mark.parametrize(
+    "key", ["omnigent.interrupted_turn.recovery_id", "omnigent.startup.host_load"]
+)
+def test_recovery_control_labels_take_admission_conversation_lock(journal, monkeypatch, key):
+    locked = []
+    original = journal.conversations._lock_conversation
+
+    def lock(db, identity):
+        locked.append(identity)
+        return original(db, identity)
+
+    monkeypatch.setattr(journal.conversations, "_lock_conversation", lock)
+    journal.conversations.set_labels(journal.child, {key: "cancelled"})
+    assert journal.child in locked
 
 
 @pytest.mark.parametrize("drained", [False, True])

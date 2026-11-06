@@ -5764,6 +5764,16 @@ def create_app(
                     if fresh is None or fresh.runner_id != runner_id:
                         return
                     conv = fresh
+                    if _interrupted(conv):
+                        from omnigent.server.schemas import ErrorDetail
+                        from omnigent.server.turn_recovery import record_interrupted_turn
+
+                        await record_interrupted_turn(
+                            conversation_store,
+                            conv,
+                            ErrorDetail(code="runner_disconnected", message="Runner reconnected"),
+                            owner_runner_id=runner_id,
+                        )
                     runner_session_initializer.require_generation(
                         runner_id, client, connection.generation
                     )

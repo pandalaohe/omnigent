@@ -92,6 +92,25 @@ def _input(row: SqlRetryInput) -> RetryInput:
     )
 
 
+def _abandon_recovery_attempt(row: SqlRetryInput, claim: InputExecutionClaim) -> None:
+    now = time.time()
+    refused = {
+        turn: deadline
+        for turn, deadline in (row.reason or {}).get("refused_turns", {}).items()
+        if deadline is None or deadline > now
+    }
+    if claim.turn_id is not None:
+        refused[claim.turn_id] = claim.admission_deadline
+    deadlines = list(refused.values())
+    row.reason = {
+        "code": "acceptance_unknown",
+        "refused_turns": refused,
+        "retry_after": max((value for value in deadlines if value is not None), default=None)
+        if None not in deadlines
+        else None,
+    }
+
+
 def _final(row: SqlRetryFinal) -> RetryFinal:
     return RetryFinal.model_validate(
         {
@@ -145,6 +164,7 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
         write: Callable[[Session], InputExecutionReceipt],
         *,
         parent_id: str | None = None,
+        recovery_id: str | None = None,
     ) -> InputExecutionReceipt:
         """Hold AP ancestor locks through the metadata admission commit.
 
@@ -183,6 +203,33 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
                     or is_session_closed({CLOSED_LABEL_KEY: closed} if closed else {}, row.title)
                 ):
                     return InputExecutionReceipt(reason="child_retired")
+                if recovery_id is not None:
+                    from omnigent.server.host_load_queue import LABEL as LOAD_LABEL
+                    from omnigent.server.session_choice import SLOT_LABEL
+                    from omnigent.server.turn_recovery import RECOVERY_INPUT_LABEL
+
+                    labels = dict(
+                        ap.execute(
+                            select(SqlConversationLabel.key, SqlConversationLabel.value).where(
+                                SqlConversationLabel.workspace_id == current_workspace_id(),
+                                SqlConversationLabel.conversation_id == identity,
+                            )
+                        )
+                        .tuples()
+                        .all()
+                    )
+                    if (
+                        labels.get("omnigent.startup") == "cancelled"
+                        or any(
+                            labels.get(name, "").startswith(("queued@", "releasing@"))
+                            for name in (LOAD_LABEL, SLOT_LABEL)
+                        )
+                        or (
+                            identity == child_id
+                            and labels.get(RECOVERY_INPUT_LABEL) != recovery_id
+                        )
+                    ):
+                        return InputExecutionReceipt(reason="recovery_superseded")
             if self._conversation_session.engine is self._session.engine:
                 return write(ap)
             return run_write_transaction(self._session, "admit_execution", write)
@@ -368,11 +415,38 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
                 if (
                     receipt.target_id != child_id
                     or receipt.kind not in {"human", "control"}
-                    or original_turn != claim.turn_id
+                    or (
+                        original_turn != claim.turn_id
+                        and not (claim.kind == "recovery" and receipt.state == "closed")
+                    )
                 ):
                     return InputExecutionReceipt(reason="input_identity_conflict")
                 if receipt.state != "accepted":
-                    return InputExecutionReceipt(reason="input_closed", receipt=_input(receipt))
+                    retry_after = (receipt.reason or {}).get("retry_after")
+                    if (
+                        claim.kind != "recovery"
+                        or receipt.state != "closed"
+                        or claim.admission_deadline is None
+                        or (
+                            claim.admission_deadline is not None
+                            and time.time() >= claim.admission_deadline
+                        )
+                        or original_turn == claim.turn_id
+                        or claim.turn_id in (receipt.reason or {}).get("refused_turns", {})
+                        or retry_after is None
+                        or time.time() < retry_after
+                    ):
+                        return InputExecutionReceipt(
+                            reason="input_closed", receipt=_input(receipt)
+                        )
+                    receipt.state = "accepted"
+                    control = self._child_control(db, child_id)
+                    receipt.expected_input_generation = control.generation
+                    control.generation += 1
+                    control.turn_id, control.input_id = claim.turn_id, claim.input_id
+                    receipt.input_generation = control.generation
+                    receipt.turn_id, receipt.reason = claim.turn_id, None
+                    receipt.version += 1
                 return InputExecutionReceipt(
                     state="accepted", reason="accepted", receipt=_input(receipt)
                 )
@@ -418,7 +492,10 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
             )
 
         return self._execution_write(
-            child_id, write, parent_id=claim.retry.owner.parent_id if claim.retry else None
+            child_id,
+            write,
+            parent_id=claim.retry.owner.parent_id if claim.retry else None,
+            recovery_id=claim.input_id if claim.kind == "recovery" else None,
         )
 
     def _refuse_native_input(
@@ -463,6 +540,9 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
                 if receipt.kind == "wake" and claim.kind != "wake":
                     return InputExecutionReceipt(reason="input_identity_conflict")
                 if receipt.state in {"closed", "rejected"}:
+                    if close and claim.kind == "recovery" and receipt.state == "closed":
+                        _abandon_recovery_attempt(receipt, claim)
+                        receipt.version += 1
                     return InputExecutionReceipt(
                         reason=(receipt.reason or {}).get("code", "input_closed"),
                         receipt=_input(receipt),
@@ -497,7 +577,16 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
                     return InputExecutionReceipt(
                         reason="wake_attempt_abandoned", receipt=_input(receipt)
                     )
-                receipt.state, receipt.reason = "closed", {"code": "acceptance_unknown"}
+                receipt.state, receipt.reason = (
+                    "closed",
+                    {
+                        "code": "acceptance_unknown",
+                        "retry_after": claim.admission_deadline,
+                    },
+                )
+                receipt.turn_id = claim.turn_id
+                if claim.kind == "recovery":
+                    _abandon_recovery_attempt(receipt, claim)
                 receipt.version += 1
                 if receipt.chain_id:
                     chain = _current(db, SqlRetryChain, (current_workspace_id(), receipt.chain_id))
@@ -517,9 +606,11 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
                     expected_input_generation=None,
                     turn_id=claim.turn_id,
                     input_generation=None,
-                    reason={"code": "acceptance_unknown"},
+                    reason={"code": "acceptance_unknown", "retry_after": claim.admission_deadline},
                 )
                 db.add(receipt)
+                if claim.kind == "recovery":
+                    _abandon_recovery_attempt(receipt, claim)
             else:
                 return InputExecutionReceipt(state="pending", reason="acceptance_unknown")
             return InputExecutionReceipt(reason="input_closed", receipt=_input(receipt))

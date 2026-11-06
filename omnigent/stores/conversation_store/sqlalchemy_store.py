@@ -2468,6 +2468,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             if (
                 CLOSED_LABEL_KEY in stable_updates
                 or ACP_SESSION_MODE_SELECTION_LABEL_KEY in stable_updates
+                or any(
+                    key.startswith(("omnigent.interrupted_turn.", "omnigent.startup"))
+                    for key in stable_updates
+                )
             ):
                 self._lock_conversation(session, conversation_id)
             _upsert_labels(session, conversation_id, stable_updates, stamp)
@@ -4688,6 +4692,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         *,
         expected: str,
         status: str | None,
+        expected_labels: Mapping[str, str | None] | None = None,
     ) -> bool:
         item = self.get_item(conversation_id, item_id)
         if item is None or item.response_id != PENDING_INPUT_RESPONSE_ID:
@@ -4695,6 +4700,27 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         def write(session: Session) -> bool:
             self._lock_conversation(session, conversation_id)
+            if expected_labels is not None:
+                conversation = session.get(
+                    SqlConversation, (current_workspace_id(), conversation_id)
+                )
+                labels = dict(
+                    session.execute(
+                        select(SqlConversationLabel.key, SqlConversationLabel.value).where(
+                            SqlConversationLabel.workspace_id == current_workspace_id(),
+                            SqlConversationLabel.conversation_id == conversation_id,
+                            SqlConversationLabel.key.in_(expected_labels),
+                        )
+                    )
+                    .tuples()
+                    .all()
+                )
+                if (
+                    conversation is None
+                    or conversation.archived
+                    or any(labels.get(name) != value for name, value in expected_labels.items())
+                ):
+                    return False
             row = session.get(
                 SqlConversationItem,
                 (

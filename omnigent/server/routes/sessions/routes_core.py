@@ -687,11 +687,13 @@ async def apply_session_archive_transition(
         return update_result
     updated = update_result.conversation
     if body.archived is not None:
+        from omnigent.server.turn_recovery import cancel_turn_recovery
         from omnigent.stores.conversation_store import archive_cascade_members
 
         for child_id in archive_cascade_members(updated if body.archived else conv):
             _publish_child_status_to_parent(child_id, None)
             if body.archived:
+                await cancel_turn_recovery(conversation_store, child_id)
                 _prune_session_read_state(child_id)
     # Archive / unarchive changes a child's rail membership, and an
     # archived child emits no further status edges — publish its fresh
@@ -707,6 +709,9 @@ async def apply_session_archive_transition(
     # dot), so drop its per-user read-state to bound in-memory growth.
     # Only on archive→true; unarchiving leaves it pruned (reads as seen).
     if body.archived is True:
+        from omnigent.server.turn_recovery import cancel_turn_recovery
+
+        await cancel_turn_recovery(conversation_store, session_id)
         _prune_session_read_state(session_id)
         if archive_stop_when_idle:
             # D5 / D4: a deferred teardown leaves the runner's start gate
