@@ -376,12 +376,15 @@ class AgentQuotaService:
         *,
         now: float | None = None,
         event: dict[str, Any] | None = None,
+        source: str | None = None,
     ) -> WriteOutcome | None:
         # Serialize source replacements without holding the native reading
         # cache's lock during database I/O.
         with self._account_write_lock:
             if isinstance(report, UsageReportV2):
-                return self._report_account_v2(owner, account_id, report, now=now, event=event)
+                return self._report_account_v2(
+                    owner, account_id, report, now=now, event=event, source=source
+                )
             self._report_account(owner, account_id, report, now=now)
             if event:
                 key = (current_workspace_id(), owner, account_id)
@@ -400,6 +403,7 @@ class AgentQuotaService:
         *,
         now: float | None,
         event: dict[str, Any] | None,
+        source: str | None,
     ) -> WriteOutcome:
         outcome = WriteOutcome()
         now = time.time() if now is None else now
@@ -444,7 +448,7 @@ class AgentQuotaService:
             if account_id in {agent.key for agent in native_agents()}:
                 record["product"] = account_id
         record["host_id"] = stored.get("host_id") or record.get("host_id")
-        source = report.source or (event or {}).get("source") or record.get("source")
+        source = report.source or (event or {}).get("source") or record.get("source") or source
         if source is not None:
             record["source"] = str(source)[:64]
             record["source_at"] = observed
@@ -698,7 +702,25 @@ class AgentQuotaService:
         entries.append({"kind": kind, "at": at, **details})
         record["report_log"] = entries[-200:]
 
-    def note_rejected(self, owner: str, account_id: str, *, now: float | None = None) -> None:
+    def note_rejected(
+        self,
+        owner: str,
+        account_id: str,
+        *,
+        now: float | None = None,
+        format: str | None = None,
+    ) -> None:
+        with self._account_write_lock:
+            self._note_rejected(owner, account_id, now=now, format=format)
+
+    def _note_rejected(
+        self,
+        owner: str,
+        account_id: str,
+        *,
+        now: float | None,
+        format: str | None,
+    ) -> None:
         if not self.usage_enabled:
             return
         now = time.time() if now is None else now
@@ -723,7 +745,10 @@ class AgentQuotaService:
                 "reset_marks": {},
                 "report_log": [],
             }
-            self._append_log(record, "rejected", now)
+            if format is None:
+                self._append_log(record, "rejected", now)
+            else:
+                self._append_log(record, "import_rejected", now, format=format)
             self._accounts[key] = record
             self._dirty[(key[0], owner, self._account_key(account_id))] = record
 

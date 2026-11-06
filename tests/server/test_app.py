@@ -630,6 +630,25 @@ async def test_task_board_raised_limits_reach_the_live_report_router(
 
 
 @pytest.mark.asyncio
+async def test_usage_import_uses_configured_body_cap(
+    db_uri: str, runtime_init: None, tmp_path: Path
+) -> None:
+    app = _build_branding_app(
+        db_uri,
+        tmp_path,
+        "import-limit",
+        server_config={"usage": {"ingest": {"max_body_bytes": {"import": 128}}}},
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        path = "/v1/me/usage/accounts/vendor/import?format=openrouter-credits"
+        body = {"data": {"total_credits": 100, "total_usage": 25}}
+        assert (await client.post(path, json=body)).status_code == 200
+        assert (await client.post(path, json={**body, "padding": "x" * 128})).status_code == 413
+
+
+@pytest.mark.asyncio
 async def test_info_harness_install_gate_overrides_feature_snapshot(
     db_uri: str,
     runtime_init: None,

@@ -151,6 +151,21 @@ def task_board_enabled(config: Mapping[str, Any]) -> bool:
     return not isinstance(raw, Mapping) or raw.get("enabled", True) is not False
 
 
+def usage_import_body_limit(config: Mapping[str, Any]) -> int:
+    """Validate the import door's byte cap at server startup."""
+    raw: Any = config
+    for name in ("usage", "ingest", "max_body_bytes"):
+        raw = raw.get(name, {})
+        if raw is None:
+            raw = {}
+        if not isinstance(raw, Mapping):
+            raise ValueError("usage.ingest.max_body_bytes.import requires a positive integer")
+    limit = raw.get("import", 5 * 1024 * 1024)
+    if type(limit) is not int or limit <= 0:
+        raise ValueError("usage.ingest.max_body_bytes.import requires a positive integer")
+    return limit
+
+
 @dataclass(frozen=True)
 class StartupAdmissionPolicy:
     host_resident_limit: int | None
