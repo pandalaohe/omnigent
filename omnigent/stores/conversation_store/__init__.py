@@ -1021,6 +1021,16 @@ class ConversationStore(ABC):
         """
         ...
 
+    def find_conversations_by_external_session_ids(
+        self, session_ids: set[str]
+    ) -> list[Conversation]:
+        """Batch session lookup; stores may override this compatibility fallback."""
+        return [
+            conv
+            for session_id in session_ids
+            if (conv := self.find_conversation_by_external_session_id(session_id)) is not None
+        ]
+
     @abstractmethod
     def get_runner_ids(self, conversation_ids: list[str]) -> dict[str, str | None]:
         """

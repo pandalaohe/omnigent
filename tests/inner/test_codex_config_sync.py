@@ -18,6 +18,31 @@ _SOURCE = 'model = "host"\n[auto_review]\nextra_policy = "abc"\n'
 _PRIVATE = 'model = "session" # retain private selection\n'
 
 
+@pytest.mark.parametrize("profile", [False, True])
+@pytest.mark.parametrize("host", ["usage.example", "collector.example"])
+def test_managed_home_drops_only_this_usage_exporter(homes, monkeypatch, profile, host):
+    source, target = homes
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://usage.example")
+    layer = "[profiles.work.otel]" if profile else "[otel]"
+    text = (
+        _SOURCE
+        + f'\n{layer}\nenvironment = "test"\nmetrics_exporter = {{ otlp-http = {{ '
+        + f'endpoint = "https://{host}/v1/me/usage/otlp/v1/metrics", protocol = "binary" }} }}\n'
+    )
+    (source / "config.toml").write_text(text)
+    codex_config_sync.sync_codex_config(
+        source / "config.toml",
+        target / "config.toml",
+        minimal_config=False,
+        include_credentials=True,
+    )
+    data = tomllib.loads((target / "config.toml").read_text())
+    otel = data["profiles"]["work"]["otel"] if profile else data["otel"]
+    assert otel["environment"] == "test"
+    assert ("metrics_exporter" in otel) is (host != "usage.example")
+    assert (source / "config.toml").read_text() == text
+
+
 @pytest.fixture
 def homes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
     config_home = tmp_path / "deployment"

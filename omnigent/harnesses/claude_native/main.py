@@ -1648,6 +1648,13 @@ def build_native_claude_terminal_env(
                 f"carries a raw {name}; the credential must reach "
                 "Claude Code via the helper, not the environment."
             )
+    from omnigent.inner.agent_env import managed_telemetry_attributes
+
+    terminal_env["OTEL_RESOURCE_ATTRIBUTES"] = managed_telemetry_attributes(
+        terminal_env.get(
+            "OTEL_RESOURCE_ATTRIBUTES", os.environ.get("OTEL_RESOURCE_ATTRIBUTES", "")
+        )
+    )
     return terminal_env
 
 

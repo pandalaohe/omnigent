@@ -3345,6 +3345,7 @@ async def test_hermetic_turn_carries_user_settings_env_under_omnigent_env(
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
     monkeypatch.setenv("OMNIGENT_CLAUDE_CODE_ENTRYPOINT", "omnigent-entrypoint")
     monkeypatch.setenv("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "0")
+    monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "deployment=example,launch_mode=direct")
     executor = make_executor(skills_filter=skills_filter)
 
     options = await _turn_options(executor, ExecutorConfig(extra={"max_tokens": 32}))
@@ -3353,6 +3354,7 @@ async def test_hermetic_turn_carries_user_settings_env_under_omnigent_env(
     assert options.env["CLAUDE_CODE_ENTRYPOINT"] == "omnigent-entrypoint"
     assert options.env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "32"
     assert options.env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] == "1"
+    assert options.env["OTEL_RESOURCE_ATTRIBUTES"] == "deployment=example,launch_mode=omni"
     assert (
         json.loads(options.settings or "{}")["env"]["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] == "1"
     )

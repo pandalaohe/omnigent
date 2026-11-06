@@ -77,7 +77,11 @@ from omnigent.harnesses.codex_native.launch_args import (
 from omnigent.harnesses.codex_native.side_chat import (
     is_keep_warm_fork as _is_keep_warm_fork,
 )
-from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
+from omnigent.inner.agent_env import (
+    clean_agent_env,
+    declared_passthrough,
+    managed_telemetry_attributes,
+)
 from omnigent.inner.codex_binary import CODEX_RUNTIME_BIN_ENV, snapshot_codex_binary
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.models import model_catalog
@@ -112,7 +116,11 @@ from omnigent.util.reasoning_effort import (
 from . import _proc
 from ._subprocess_lifecycle import close_subprocess_transport, terminate_subprocess
 from .async_utils import run_sync_on_thread
-from .codex_config_sync import normalize_codex_catalog_paths, sync_codex_config
+from .codex_config_sync import (
+    drop_usage_metrics_exporter,
+    normalize_codex_catalog_paths,
+    sync_codex_config,
+)
 from .codex_goal_command import goal_objective_from_content as _goal_objective_from_content
 from .codex_goal_command import goal_objective_length_error as _goal_objective_length_error
 from .codex_staging import (
@@ -844,12 +852,9 @@ def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
         deny_exact=_CODEX_ENV_DENY_EXACT,
         extra_allowed=extra_allow,
     )
-    resource_attributes = [
-        attribute
-        for attribute in env.get("OTEL_RESOURCE_ATTRIBUTES", "").split(",")
-        if attribute.strip() and attribute.partition("=")[0].strip() != "launch_mode"
-    ]
-    env["OTEL_RESOURCE_ATTRIBUTES"] = ",".join([*resource_attributes, "launch_mode=omni"])
+    env["OTEL_RESOURCE_ATTRIBUTES"] = managed_telemetry_attributes(
+        env.get("OTEL_RESOURCE_ATTRIBUTES", "")
+    )
     return env
 
 
@@ -1422,6 +1427,7 @@ def _apply_codex_current_route(
                 parent.pop(parts[-1], None)
         if source_home is not None:
             normalize_codex_catalog_paths(document, source_home)
+        drop_usage_metrics_exporter(document)
         if _write_codex_config(config_path, tomlkit.dumps(document)):
             return hashlib.sha256(route_content).hexdigest()
     except (OSError, UnicodeError, ValueError, tomlkit.exceptions.TOMLKitError) as exc:
@@ -1685,6 +1691,7 @@ def _populate_codex_home_config(
             for key in ("model_provider", "model_providers", "profiles"):
                 if key in source_config:
                     minimal_document[key] = source_config[key]
+            drop_usage_metrics_exporter(minimal_document)
             dest_path.write_text(tomlkit.dumps(minimal_document))
             _normalize_copied_codex_catalog_paths(dest_path, source_dir)
             continue

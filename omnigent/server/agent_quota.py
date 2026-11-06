@@ -57,6 +57,7 @@ from omnigent.usage.contract import (
     period_of,
     window_start,
 )
+from omnigent.usage.otlp import UsageDelta
 from omnigent.usage.ranges import RangeKey, range_spans
 
 _logger = logging.getLogger(__name__)
@@ -71,6 +72,14 @@ class QuotaContext:
 
 class UsageAccountLimitError(ValueError):
     """The owner already has the contract's 32 reported accounts."""
+
+
+class UsageWriterConflictError(ValueError):
+    """Replacement and additive activity cannot share an account."""
+
+
+class UsageStorageUnavailableError(RuntimeError):
+    """Writer admission requires a complete reading of durable account authority."""
 
 
 def _fresh(snapshot: dict[str, Any], now: float) -> bool:
@@ -196,6 +205,7 @@ class AgentQuotaService:
         self._last_written: dict[tuple[int, str, str], float] = {}
         self._persisted_windows: dict[tuple[int, str, str], str] = {}
         self._lock = threading.Lock()
+        self._hydration_lock = threading.Lock()
         self._account_write_lock = threading.Lock()
 
     def context(self, conversation: Conversation, owner_hint: str | None = None) -> QuotaContext:
@@ -380,17 +390,139 @@ class AgentQuotaService:
         # Serialize source replacements without holding the native reading
         # cache's lock during database I/O.
         with self._account_write_lock:
-            if isinstance(report, UsageReportV2):
-                return self._report_account_v2(owner, account_id, report, now=now, event=event)
-            self._report_account(owner, account_id, report, now=now)
-            if event:
+            self._hydrate(owner, required=True)
+            if report.activity is not None:
                 key = (current_workspace_id(), owner, account_id)
                 with self._lock:
-                    record = self._accounts[key]
-                    self._append_log(record, "cloudevent", float(report.observed_at), **event)
-                    record["source"] = event["source"][:64]
-                    record["source_at"] = report.observed_at
-        return None
+                    record = self._accounts.get(key, {})
+                    if record.get("activity_writer") == "otlp":
+                        self._append_log(record, "writer_conflict", time.time())
+                        self._dirty[(key[0], owner, self._account_key(account_id))] = record
+                        raise UsageWriterConflictError(
+                            "writer_conflict: account uses OTLP activity"
+                        )
+            if isinstance(report, UsageReportV2):
+                outcome = self._report_account_v2(owner, account_id, report, now=now, event=event)
+            else:
+                outcome = None
+                self._report_account(owner, account_id, report, now=now)
+                if event:
+                    key = (current_workspace_id(), owner, account_id)
+                    with self._lock:
+                        record = self._accounts[key]
+                        self._append_log(record, "cloudevent", float(report.observed_at), **event)
+                        record["source"] = event["source"][:64]
+                        record["source_at"] = report.observed_at
+            if (
+                report.activity is not None
+                and self.snapshot_store is not None
+                and self.usage_enabled
+            ):
+                key = (current_workspace_id(), owner, account_id)
+                with self._lock:
+                    record = deepcopy(self._accounts[key])
+                self.snapshot_store.write(owner, self._account_key(account_id), record)
+        return outcome
+
+    def managed_external_sessions(self, owner: str, session_ids: set[str]) -> set[str]:
+        """Resolve one export's distinct session ids within its owner's scope."""
+        return {
+            conv.external_session_id
+            for conv in self.conversations.find_conversations_by_external_session_ids(session_ids)
+            if conv.external_session_id is not None and self.context(conv).owner_id == owner
+        }
+
+    def note_otlp_issue(
+        self, owner: str, account_id: str, kind: str, *, metric: str | None = None
+    ) -> None:
+        """Keep bounded, body-free OTLP diagnostics on the account's Issues."""
+        self._hydrate(owner, required=True)
+        key = (current_workspace_id(), owner, account_id)
+        now = time.time()
+        with self._account_write_lock, self._lock:
+            record: dict[str, Any] | None = self._accounts.get(key)
+            if record is None:
+                if sum(1 for ws, user, _ in self._accounts if (ws, user) == key[:2]) >= 32:
+                    raise UsageAccountLimitError("at most 32 usage accounts per owner")
+                record = {"schema_version": 1, "account_id": account_id, "report_log": []}
+            if not any(
+                entry["kind"] == kind
+                and entry.get("metric") == metric
+                and int(entry["at"] // 86400) == int(now // 86400)
+                for entry in record.get("report_log", [])
+            ):
+                self._append_log(record, kind, now, **({"metric": metric} if metric else {}))
+            self._accounts[key] = record
+            self._dirty[(key[0], owner, self._account_key(account_id))] = record
+
+    def add_otlp(self, owner: str, delta: UsageDelta) -> None:
+        """Claim the additive writer under the same lock as report/import writes."""
+        from omnigent.harness_plugins import native_agents
+
+        with self._account_write_lock:
+            if delta.account in {agent.key for agent in native_agents()}:
+                raise UsageWriterConflictError("OTLP cannot write a native product account")
+            if self.hours_store is None:
+                raise RuntimeError("Usage hours storage unavailable")
+            self._hydrate(owner, required=True)
+            key = (current_workspace_id(), owner, delta.account)
+            with self._lock:
+                previous = self._accounts.get(key)
+                if (
+                    previous is None
+                    and sum(1 for ws, user, _ in self._accounts if (ws, user) == key[:2]) >= 32
+                ):
+                    raise UsageAccountLimitError("at most 32 usage accounts per owner")
+                record = deepcopy(previous) or {
+                    "schema_version": 1,
+                    "account_id": delta.account,
+                    "report_log": [],
+                }
+            if record.get("activity_writer") != "otlp" and (
+                record.get("has_activity") or self.hours_store.has_activity(owner, delta.account)
+            ):
+                with self._lock:
+                    self._append_log(record, "writer_conflict", time.time())
+                    self._accounts[key] = record
+                    self._dirty[(key[0], owner, self._account_key(delta.account))] = record
+                raise UsageWriterConflictError(
+                    "writer_conflict: account uses report/import activity"
+                )
+            source_type = (record.get("report") or {}).get("source_type")
+            basis = delta.basis
+            if source_type == "metered":
+                basis = "metered"
+            elif source_type == "subscription":
+                basis = "list"
+            now = time.time()
+            record.update(
+                has_activity=True,
+                activity_writer="otlp",
+                read_at=now,
+                last_attempt_at=now,
+                last_attempt_status="available",
+            )
+            if record.get("report") is None:
+                record["report"] = UsageReportV2(
+                    schema_version=2, observed_at=now, source="otlp"
+                ).stored()
+            self.hours_store.add_activity(
+                owner,
+                delta.account,
+                delta.hour,
+                delta.model,
+                delta.host,
+                basis,
+                delta.priced,
+                delta.buckets,
+                delta.requests,
+                delta.failed,
+                delta.cost,
+                account_record=record if self.snapshot_store is not None else None,
+            )
+            with self._lock:
+                self._accounts[key] = record
+                self._dirty[(key[0], owner, self._account_key(delta.account))] = record
 
     def _report_account_v2(
         self,
@@ -627,6 +759,7 @@ class AgentQuotaService:
             if report.status == "available":
                 if report.activity is not None and self.hours_store is not None:
                     record["has_activity"] = True
+                    record["activity_writer"] = "report"
                 if report.pinned_window is not None:
                     record["pinned_window"] = report.pinned_window
                 record["report"] = report.stored()
@@ -697,9 +830,9 @@ class AgentQuotaService:
         if not self.usage_enabled:
             return
         now = time.time() if now is None else now
-        self._hydrate(owner)
+        self._hydrate(owner, required=True)
         key = (current_workspace_id(), owner, account_id)
-        with self._lock:
+        with self._account_write_lock, self._lock:
             previous = self._accounts.get(key)
             if (
                 previous is None
@@ -1525,6 +1658,7 @@ class AgentQuotaService:
                 "host_id",
                 "report_log",
                 "has_activity",
+                "activity_writer",
             ):
                 if field in stored:
                     merged[field] = deepcopy(stored[field])
@@ -1536,18 +1670,24 @@ class AgentQuotaService:
                 merged[field] = deepcopy(stored.get(field))
         return merged
 
-    def _hydrate(self, owner: str) -> None:
+    def _hydrate(self, owner: str, *, required: bool = False) -> None:
+        # A reader loading a snapshot must not expose half-loaded writer authority.
+        with self._hydration_lock:
+            self._hydrate_locked(owner, required=required)
+
+    def _hydrate_locked(self, owner: str, *, required: bool) -> None:
         if not self.usage_enabled or self.snapshot_store is None:
             return
         scope = (current_workspace_id(), owner)
         with self._lock:
             if scope in self._hydrated:
                 return
-            self._hydrated.add(scope)
         try:
             rows = self.snapshot_store.read(owner)
         except Exception:
             _logger.warning("Could not hydrate usage readings for %s", owner, exc_info=True)
+            if required:
+                raise UsageStorageUnavailableError("Usage account storage unavailable") from None
             return
         with self._lock:
             for storage_key, record in rows.items():
@@ -1592,6 +1732,7 @@ class AgentQuotaService:
             )
             for host_id, product in slots:
                 self._rebuild_projection(scope[0], owner, host_id, product)
+            self._hydrated.add(scope)
 
     @staticmethod
     def _window_signature(record: dict[str, Any]) -> str:
@@ -1608,6 +1749,10 @@ class AgentQuotaService:
 
     def flush(self, *, now: float | None = None, force: bool = False) -> int:
         """Write due dirty rows; a failure stays dirty and never reaches the status path."""
+        with self._account_write_lock:
+            return self._flush(now=now, force=force)
+
+    def _flush(self, *, now: float | None, force: bool) -> int:
         if not self.usage_enabled or self.snapshot_store is None:
             return 0
         now = time.time() if now is None else now

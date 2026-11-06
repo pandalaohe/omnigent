@@ -500,6 +500,13 @@ def test_build_native_claude_terminal_env_rejects_credentials_on_helper_path(
         build_native_claude_terminal_env(leaking)
 
 
+def test_claude_launch_marks_managed_telemetry_without_losing_metadata(monkeypatch):
+    monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "deployment=example,launch_mode=direct")
+    env = build_native_claude_terminal_env(None)
+    assert env["OTEL_RESOURCE_ATTRIBUTES"] == "deployment=example,launch_mode=omni"
+    assert os.environ["OTEL_RESOURCE_ATTRIBUTES"] == "deployment=example,launch_mode=direct"
+
+
 @pytest.mark.parametrize(
     ("configured", "managed", "ambient", "disabled"),
     [

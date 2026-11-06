@@ -1,0 +1,31 @@
+{
+  "_fixture": {
+    "source": "https://code.claude.com/docs/en/monitoring-usage",
+    "encoding_source": "https://opentelemetry.io/docs/specs/otlp/",
+    "accessed": "2026-11-06",
+    "kind": "documentation example, not a live recording"
+  },
+  "body": {
+    "resourceMetrics": [{
+      "resource": {"attributes": [
+        {"key": "service.name", "value": {"stringValue": "claude-code"}},
+        {"key": "host.name", "value": {"stringValue": "test-host"}}
+      ]},
+      "scopeMetrics": [{"metrics": [
+        {"name": "claude_code.token.usage", "sum": {
+          "aggregationTemporality": 1, "isMonotonic": true,
+          "dataPoints": [
+            {"attributes": [{"key": "type", "value": {"stringValue": "input"}}, {"key": "model", "value": {"stringValue": "model-a"}}, {"key": "session.id", "value": {"stringValue": "external-test-session"}}], "timeUnixNano": "1793923200000000000", "asInt": "40"},
+            {"attributes": [{"key": "type", "value": {"stringValue": "cacheRead"}}, {"key": "model", "value": {"stringValue": "model-a"}}, {"key": "session.id", "value": {"stringValue": "external-test-session"}}], "timeUnixNano": "1793923200000000000", "asInt": "60"},
+            {"attributes": [{"key": "type", "value": {"stringValue": "cacheCreation"}}, {"key": "model", "value": {"stringValue": "model-a"}}, {"key": "session.id", "value": {"stringValue": "external-test-session"}}], "timeUnixNano": "1793923200000000000", "asInt": "10"},
+            {"attributes": [{"key": "type", "value": {"stringValue": "output"}}, {"key": "model", "value": {"stringValue": "model-a"}}, {"key": "session.id", "value": {"stringValue": "external-test-session"}}], "timeUnixNano": "1793923200000000000", "asInt": "20"}
+          ]
+        }},
+        {"name": "claude_code.cost.usage", "sum": {
+          "aggregationTemporality": 1, "isMonotonic": true,
+          "dataPoints": [{"attributes": [{"key": "model", "value": {"stringValue": "model-a"}}, {"key": "session.id", "value": {"stringValue": "external-test-session"}}], "timeUnixNano": "1793923200000000000", "asDouble": 0.125}]
+        }}
+      ]}]
+    }]
+  }
+}

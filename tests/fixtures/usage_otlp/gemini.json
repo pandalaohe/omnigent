@@ -1,0 +1,24 @@
+{
+  "_fixture": {
+    "source": "https://geminicli.com/docs/cli/telemetry/",
+    "encoding_source": "https://opentelemetry.io/docs/specs/otlp/",
+    "accessed": "2026-11-06",
+    "kind": "documentation example, not a live recording",
+    "unverified": "CLI delta temporality support; thought/tool semantics remain provisional per the design"
+  },
+  "body": {
+    "resourceMetrics": [{
+      "resource": {"attributes": [{"key": "service.name", "value": {"stringValue": "gemini-cli"}}]},
+      "scopeMetrics": [{"metrics": [{
+        "name": "gemini_cli.token.usage",
+        "sum": {"aggregationTemporality": 1, "isMonotonic": true, "dataPoints": [
+          {"attributes": [{"key": "type", "value": {"stringValue": "input"}}, {"key": "model", "value": {"stringValue": "model-a"}}], "timeUnixNano": "1793923200000000000", "asInt": "100"},
+          {"attributes": [{"key": "type", "value": {"stringValue": "cache"}}, {"key": "model", "value": {"stringValue": "model-a"}}], "timeUnixNano": "1793923200000000000", "asInt": "60"},
+          {"attributes": [{"key": "type", "value": {"stringValue": "output"}}, {"key": "model", "value": {"stringValue": "model-a"}}], "timeUnixNano": "1793923200000000000", "asInt": "20"},
+          {"attributes": [{"key": "type", "value": {"stringValue": "thought"}}, {"key": "model", "value": {"stringValue": "model-a"}}], "timeUnixNano": "1793923200000000000", "asInt": "5"},
+          {"attributes": [{"key": "type", "value": {"stringValue": "tool"}}, {"key": "model", "value": {"stringValue": "model-a"}}], "timeUnixNano": "1793923200000000000", "asInt": "3"}
+        ]}
+      }]}]
+    }]
+  }
+}

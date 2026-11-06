@@ -12,6 +12,7 @@ import tomllib
 from collections.abc import MutableMapping
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 import tomlkit
 import tomlkit.exceptions
@@ -24,6 +25,49 @@ _logger = logging.getLogger(__name__)
 _LEAF = "auto_review.extra_policy"
 _STANCE_KEYS = ("approval_policy", "sandbox_mode", "approvals_reviewer", "default_permissions")
 SyncResult = Literal["created", "unchanged", "updated", "conflict"]
+
+
+def drop_usage_metrics_exporter(document: MutableMapping) -> bool:
+    """Suppress this server's usage export in a managed copy, including profiles."""
+    server = (
+        os.environ.get("RUNNER_SERVER_URL")
+        or os.environ.get("OMNIGENT_SERVER")
+        or load_global_config().get("server")
+    )
+    if not isinstance(server, str) or not server:
+        return False
+    target = urlsplit(server)
+    expected_path = target.path.rstrip("/") + "/v1/me/usage/otlp/v1/metrics"
+    layers: list[MutableMapping] = [document]
+    profiles = document.get("profiles")
+    if isinstance(profiles, MutableMapping):
+        layers.extend(
+            profile for profile in profiles.values() if isinstance(profile, MutableMapping)
+        )
+    changed = False
+    for layer in layers:
+        otel = layer.get("otel")
+        if not isinstance(otel, MutableMapping):
+            continue
+        exporter = otel.get("metrics_exporter")
+        if not isinstance(exporter, MutableMapping):
+            continue
+        for options in exporter.values():
+            endpoint = options.get("endpoint") if isinstance(options, MutableMapping) else None
+            if not isinstance(endpoint, str):
+                continue
+            address = urlsplit(endpoint)
+            if (
+                address.scheme == target.scheme
+                and address.hostname == target.hostname
+                and (address.port or (443 if address.scheme == "https" else 80))
+                == (target.port or (443 if target.scheme == "https" else 80))
+                and address.path.rstrip("/") == expected_path
+            ):
+                otel.pop("metrics_exporter", None)
+                changed = True
+                break
+    return changed
 
 
 def normalize_codex_catalog_paths(document: MutableMapping, source_home: Path) -> bool:
@@ -156,6 +200,7 @@ def sync_codex_config(
         else:
             text = target_snapshot[1].decode("utf-8") if target_snapshot else ""
         document = tomlkit.parse(text)
+        drop_usage_metrics_exporter(document)
         if target_snapshot is None and include_credentials:
             normalize_codex_catalog_paths(document, source.parent)
         for key in _STANCE_KEYS:

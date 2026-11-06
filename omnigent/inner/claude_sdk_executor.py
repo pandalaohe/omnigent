@@ -4026,6 +4026,11 @@ class ClaudeSDKExecutor(Executor):
             env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(max_output_tokens)
         # A headless turn must wait for its helpers before ResultMessage ends it.
         env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
+        from omnigent.inner.agent_env import managed_telemetry_attributes
+
+        env["OTEL_RESOURCE_ATTRIBUTES"] = managed_telemetry_attributes(
+            env.get("OTEL_RESOURCE_ATTRIBUTES", os.environ.get("OTEL_RESOURCE_ATTRIBUTES", ""))
+        )
         options_kwargs: dict[str, Any] = {  # type: ignore[explicit-any]  # ClaudeAgentOptions accepts mixed-typed kwargs (str / list / dict / callable / etc.)
             "tools": base_tools,
             "system_prompt": system_prompt or None,
