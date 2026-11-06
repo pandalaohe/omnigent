@@ -6,6 +6,7 @@ import os
 import platform
 import plistlib
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -344,11 +345,43 @@ def disable_user_host_service() -> HostService:
     return service
 
 
-def pause_user_host_service() -> HostService | None:
-    """Stop the user's Host service while preserving its definition."""
-    service = _service_for_current_platform()
+def installed_user_host_service() -> tuple[HostService, str | None] | None:
+    """Read the installed service and its target; unsupported platforms return None."""
+    try:
+        service = _service_for_current_platform()
+    except HostServiceError:
+        return None
     if not service.path.exists():
         return None
+    try:
+        content = service.path.read_bytes()
+        command: list[str] = []
+        if service.kind == "launchd":
+            payload = plistlib.loads(content)
+            if not isinstance(payload, dict):
+                raise ValueError("Expected a plist dictionary")
+            command = payload.get("ProgramArguments", [])
+            if not isinstance(command, list) or not all(isinstance(p, str) for p in command):
+                raise ValueError("Expected program arguments")
+        else:
+            for line in content.decode().splitlines():
+                if line.startswith("ExecStart="):
+                    # Undo the escaping emitted by _systemd_quote.
+                    command = [
+                        part.replace("%%", "%").replace("$$", "$")
+                        for part in shlex.split(line[len("ExecStart=") :])
+                    ]
+                    break
+        target = None if "--local" in command else command[command.index("--server") + 1]
+    except (OSError, ValueError, IndexError, plistlib.InvalidFileException) as exc:
+        raise HostServiceError(
+            f"Cannot read the target of the installed host service {service.path}."
+        ) from exc
+    return service, target
+
+
+def stop_user_host_service(service: HostService) -> None:
+    """Stop the service while preserving its installed definition."""
     if service.kind == "launchd":
         domain = f"gui/{_current_uid()}"
         service_target = f"{domain}/{service.label}"
@@ -359,11 +392,10 @@ def pause_user_host_service() -> HostService | None:
             )
     else:
         _run_checked(["systemctl", "--user", "stop", service.label])
-    return service
 
 
-def resume_user_host_service(service: HostService) -> None:
-    """Start a service previously returned by :func:`pause_user_host_service`."""
+def start_user_host_service(service: HostService) -> None:
+    """Start the installed service definition as-is."""
     if not service.path.exists():
         raise HostServiceError(f"Host service definition disappeared: {service.path}")
     if service.kind == "launchd":

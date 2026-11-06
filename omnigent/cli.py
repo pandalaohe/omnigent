@@ -120,16 +120,6 @@ from omnigent.process_logging import (
     env_truthy,
     process_log_dir_reference,
 )
-from omnigent.update_check import (
-    _build_upgrade_suggestion,
-    _find_repo_root,
-    _prepare_uv_git_install,
-    _probe_installed_distribution,
-    _read_installed_wheel_info,
-    _run_upgrade_command,
-    _split_vcs_url,
-    _uv_tool_receipt_path,
-)
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.server_url import ServerUrl
 from omnigent.util.server_url import org_id_from_url as _org_id_from_url
@@ -144,7 +134,7 @@ if TYPE_CHECKING:
     from omnigent.server.smart_routing import LLMRoutingClient
     from omnigent.smart_routing_cli import ArmedSession
     from omnigent.spec.types import LLMConfig
-    from omnigent.update_check import _InstalledWheelInfo
+    from omnigent.update_check import _InstalledWheelInfo, _UpgradeSuggestion
 
 
 # Any: YAML configs have heterogeneous value types (str, int, list, etc.)
@@ -709,16 +699,6 @@ _HOST_SESSION_ACTIVE_STATUSES = frozenset({"running", "waiting"})
 # How often ``omni upgrade`` re-polls the local server for in-flight
 # (connected) sessions while draining before it stops the server.
 _UPGRADE_DRAIN_POLL_S = 2.0
-# Built-in custom channel: the public distribution repository's ``main``.
-_CUSTOM_HOST_VCS_URL = "git+https://github.com/pandalaohe/omnigent-wukong.git"
-_CUSTOM_HOST_DEFAULT_SOURCE = f"{_CUSTOM_HOST_VCS_URL}@main"
-# Branch of a configured ``custom_host_sources`` entry written without ``@<branch>``.
-_CUSTOM_HOST_CHANNEL = "local/host-custom"
-# Earlier home of the channel; installs made from it still count as custom.
-_CUSTOM_HOST_LEGACY_VCS_URL = "git+https://github.com/pandalaohe/omnigent.git"
-_CUSTOM_HOST_SESSION_QUERY_TIMEOUT_S = 60.0
-_CUSTOM_HOST_RECONNECT_TIMEOUT_S = 60.0
-_CUSTOM_HOST_HELPER_START_TIMEOUT_S = 10.0
 # When reusing an existing daemon, how long to let a live-but-offline daemon
 # (re)establish its server tunnel before treating it as a zombie and
 # respawning. Covers the daemon's reconnect backoff after a transient drop.
@@ -5919,6 +5899,143 @@ def _drain_and_stop_local_server(*, force: bool) -> None:
         click.echo("Stopped the background server before upgrading.")
 
 
+def _windows_host_service_wrapper() -> Path | None:
+    """Locate the installed Windows Host supervisor, if present."""
+    command = shutil.which("omni-host-service.cmd") or shutil.which("omni-host-service")
+    wrapper = Path(command) if command else Path.home() / ".local/bin/omni-host-service.cmd"
+    return wrapper if wrapper.is_file() else None
+
+
+def _run_windows_host_service(wrapper: Path, action: Literal["start", "stop"]) -> None:
+    """Control the existing supervisor through PowerShell without a shell string path."""
+    pwsh = shutil.which("pwsh")
+    if pwsh is None:
+        raise click.ClickException("PowerShell 7 is required to control the Windows Host service.")
+    try:
+        result = subprocess.run(
+            [
+                pwsh,
+                "-NoProfile",
+                "-Command",
+                "& $env:OMNIGENT_HOST_SERVICE_WRAPPER "
+                "$env:OMNIGENT_HOST_SERVICE_ACTION; exit $LASTEXITCODE",
+            ],
+            check=False,
+            timeout=60,
+            env={
+                **os.environ,
+                "OMNIGENT_HOST_SERVICE_WRAPPER": str(wrapper),
+                "OMNIGENT_HOST_SERVICE_ACTION": action,
+            },
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise click.ClickException(f"Windows Host supervisor could not {action}: {exc}") from exc
+    if result.returncode:
+        raise click.ClickException(
+            f"Windows Host supervisor failed to {action} (status {result.returncode}): {wrapper}"
+        )
+
+
+@contextlib.contextmanager
+def _upgrade_host_service(*, force: bool) -> Iterator[None]:
+    """Keep an enabled service stopped until the install and version check finish."""
+    if IS_WINDOWS:
+        from omnigent.host.windows_upgrade import capture_host_tree, stop_host_tree
+
+        wrapper = _windows_host_service_wrapper()
+        if wrapper is None or shutil.which("pwsh") is None:
+            raise click.ClickException(
+                "The Windows Host supervisor wrapper and PowerShell 7 "
+                "are required before upgrading."
+            )
+        try:
+            processes = capture_host_tree()
+        except (psutil.Error, OSError, ValueError, RuntimeError) as exc:
+            raise click.ClickException(str(exc)) from exc
+        _drain_and_stop_local_server(force=force)
+        try:
+            try:
+                try:
+                    if wrapper is not None:
+                        _run_windows_host_service(wrapper, "stop")
+                finally:
+                    # The loop may have replaced a daemon while it was draining.
+                    processes.extend(capture_host_tree())
+                    stop_host_tree(processes)
+            except (psutil.Error, RuntimeError) as exc:
+                raise click.ClickException(str(exc)) from exc
+            yield
+        finally:
+            if wrapper is not None:
+                failed = sys.exc_info()[0] is not None
+                try:
+                    _run_windows_host_service(wrapper, "start")
+                except click.ClickException as exc:
+                    if not failed:
+                        raise
+                    click.echo(f"Additionally failed to restart the Windows Host: {exc}", err=True)
+        return
+
+    from omnigent.host.service import (
+        HostServiceError,
+        enable_user_host_service,
+        installed_user_host_service,
+        start_user_host_service,
+        stop_user_host_service,
+    )
+
+    try:
+        snapshot = installed_user_host_service()
+    except HostServiceError as exc:
+        raise click.ClickException(str(exc)) from exc
+    _drain_and_stop_local_server(force=force)
+    if snapshot is None:
+        yield
+        return
+    service, server_url = snapshot
+    if server_url is not None and not force:
+        record = _find_daemon_record(_normalize_daemon_target(server_url))
+        if record is not None:
+            _wait_for_running_sessions(
+                lambda: _count_running_daemon_sessions(record),
+                force_hint="re-run with --force to stop them now",
+            )
+    succeeded = False
+    try:
+        try:
+            stop_user_host_service(service)
+            yield
+            enable_user_host_service(
+                server_url, environment=_build_host_daemon_env(server_url=server_url)
+            )
+            succeeded = True
+        finally:
+            if not succeeded:
+                try:
+                    start_user_host_service(service)
+                except (HostServiceError, OSError) as exc:
+                    click.echo(
+                        f"Additionally failed to restore the host user service: {exc}", err=True
+                    )
+        click.echo("Refreshed and restarted the host user service.")
+    except HostServiceError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+def _echo_upgrade_plan(
+    info: _InstalledWheelInfo,
+    suggestion: _UpgradeSuggestion,
+    extra_overrides: tuple[str, ...],
+) -> None:
+    """Print the ``--dry-run`` plan shared by every ``omni upgrade`` path."""
+    extras = sorted(set(extra_overrides or info.extras))
+    click.echo(
+        f"Detected installer: {info.detected_installer or info.installer}\n"
+        f"Detected extras: {', '.join(extras) if extras else '(none)'}\n"
+        f"Would run: {suggestion.command}"
+    )
+
+
 def _upgrade_vcs_install(
     info: _InstalledWheelInfo,
     *,
@@ -5926,6 +6043,7 @@ def _upgrade_vcs_install(
     force: bool,
     pre: bool,
     extra_overrides: tuple[str, ...],
+    dry_run: bool,
 ) -> None:
     """Update a git/VCS ``omni`` install by re-pulling its tracked ref.
 
@@ -5943,6 +6061,7 @@ def _upgrade_vcs_install(
     :param force: Stop in-flight sessions immediately instead of draining.
     :param pre: Pass the installer's allow-pre-releases flag (no-op for git).
     :param extra_overrides: Extras supplied by ``omni upgrade --extra``.
+    :param dry_run: Print the command and exit without running it.
     """
     from omnigent.update_check import (
         _build_upgrade_suggestion,
@@ -5998,45 +6117,53 @@ def _upgrade_vcs_install(
             f"No automatic upgrade command is known for this install. {suggestion.command}."
         )
 
-    _drain_and_stop_local_server(force=force)
-
-    console = Console()
-    code = _run_upgrade_command(suggestion.command, console)
-    if code != 0:
-        raise click.ClickException(
-            _upgrade_failure_message(code, set(info.extras) | set(extra_overrides))
-        )
-
-    # Verify by commit, not exit code: a re-pull of a ref that hasn't moved (or
-    # a pinned ref, or a cached reinstall) exits 0 without changing anything.
-    _, new_sha = _probe_installed_distribution()
-    if new_sha and current_sha and new_sha != current_sha:
-        click.echo(
-            f"✓ Updated to git {new_sha[:9]}. Re-run your command — the local "
-            "server will start on the new version."
-        )
+    if dry_run:
+        _echo_upgrade_plan(info, suggestion, extra_overrides)
         return
-    if known_behind and new_sha and new_sha == current_sha:
-        # We positively confirmed the ref had advanced, yet the re-pull left the
-        # install on the same commit — a silent no-op that would otherwise
-        # recreate the "still behind" loop. Fail loudly, mirroring the PyPI guard.
-        raise click.ClickException(
-            f"The re-pull ran but the install is still at {cur_short} (the ref is at "
-            f"{remote_short}). The ref may be pinned or the reinstall reused a cached "
-            f"commit; try `uv tool install --reinstall {info.vcs_url}`."
-        )
-    if new_sha and current_sha and new_sha == current_sha:
-        # Remote was indeterminate, so we never claimed it was behind — a
-        # no-change re-pull is fine here.
+
+    with _upgrade_host_service(force=force):
+        console = Console()
+        code = _run_upgrade_command(suggestion.command, console)
+        if code != 0:
+            raise click.ClickException(
+                _upgrade_failure_message(
+                    code,
+                    set(info.extras) | set(extra_overrides),
+                    recovery_command=suggestion.command,
+                )
+            )
+
+        # Verify by commit, not exit code: a re-pull of a ref that hasn't moved (or
+        # a pinned ref, or a cached reinstall) exits 0 without changing anything.
+        _, new_sha = _probe_installed_distribution()
+        if new_sha and current_sha and new_sha != current_sha:
+            click.echo(
+                f"✓ Updated to git {new_sha[:9]}. Re-run your command — the local "
+                "server will start on the new version."
+            )
+            return
+        if known_behind and new_sha and new_sha == current_sha:
+            # We positively confirmed the ref had advanced, yet the re-pull left the
+            # install on the same commit — a silent no-op that would otherwise
+            # recreate the "still behind" loop. Fail loudly, mirroring the PyPI guard.
+            raise click.ClickException(
+                f"The re-pull ran but the install is still at {cur_short} (the ref is at "
+                f"{remote_short}). The ref may be pinned or the reinstall reused a cached "
+                f"commit; try `uv tool install --reinstall {info.vcs_url}`."
+            )
+        if new_sha and current_sha and new_sha == current_sha:
+            # Remote was indeterminate, so we never claimed it was behind — a
+            # no-change re-pull is fine here.
+            click.echo(
+                f"Already on the latest commit of the tracked ref ({cur_short}); nothing changed."
+            )
+            return
+        # Couldn't read the new commit — the re-pull ran, but don't assert a
+        # result we can't confirm.
         click.echo(
-            f"Already on the latest commit of the tracked ref ({cur_short}); nothing changed."
+            f"Re-pulled the git ref. Run "
+            f"`{cli_invocation(name='omni')} upgrade --check` to confirm."
         )
-        return
-    # Couldn't read the new commit — the re-pull ran, but don't assert a
-    # result we can't confirm.
-    click.echo(
-        f"Re-pulled the git ref. Run `{cli_invocation(name='omni')} upgrade --check` to confirm."
-    )
 
 
 def _upgrade_to_nightly(
@@ -6138,42 +6265,40 @@ def _upgrade_to_nightly(
         )
 
     if dry_run:
-        extras = sorted(set(extra_overrides or info.extras))
-        click.echo(
-            f"Detected installer: {info.detected_installer or info.installer}\n"
-            f"Detected extras: {', '.join(extras) if extras else '(none)'}\n"
-            f"Would run: {suggestion.command}"
-        )
+        _echo_upgrade_plan(info, suggestion, extra_overrides)
         return
 
-    _drain_and_stop_local_server(force=force)
+    with _upgrade_host_service(force=force):
+        console = Console()
+        code = _run_upgrade_command(suggestion.command, console)
+        if code != 0:
+            raise click.ClickException(
+                _upgrade_failure_message(
+                    code,
+                    set(info.extras) | set(extra_overrides),
+                    recovery_command=suggestion.command,
+                )
+            )
 
-    console = Console()
-    code = _run_upgrade_command(suggestion.command, console)
-    if code != 0:
+        # Same trust-the-disk verification as the release path: re-read the
+        # version in a fresh subprocess instead of believing the exit code.
+        new_version, _ = _probe_installed_distribution()
+        if new_version == target:
+            click.echo(
+                f"✓ Upgraded to nightly v{target}. Re-run your command; the local "
+                "server will start on the new version."
+            )
+            return
+        if new_version is None:
+            click.echo(
+                "Ran the upgrade command, but couldn't confirm the installed version. "
+                f"Run `{cli_invocation(name='omni')} upgrade --nightly --check` to verify."
+            )
+            return
         raise click.ClickException(
-            _upgrade_failure_message(code, set(info.extras) | set(extra_overrides))
+            f"The upgrade command ran but omnigent is still v{new_version} (expected "
+            f"v{target}). Try the command directly: {suggestion.command}"
         )
-
-    # Same trust-the-disk verification as the release path: re-read the
-    # version in a fresh subprocess instead of believing the exit code.
-    new_version, _ = _probe_installed_distribution()
-    if new_version == target:
-        click.echo(
-            f"✓ Upgraded to nightly v{target}. Re-run your command; the local "
-            "server will start on the new version."
-        )
-        return
-    if new_version is None:
-        click.echo(
-            "Ran the upgrade command, but couldn't confirm the installed version. "
-            f"Run `{cli_invocation(name='omni')} upgrade --nightly --check` to verify."
-        )
-        return
-    raise click.ClickException(
-        f"The upgrade command ran but omnigent is still v{new_version} (expected "
-        f"v{target}). Try the command directly: {suggestion.command}"
-    )
 
 
 @cli.command("upgrade")
@@ -6304,15 +6429,6 @@ def upgrade(
             "This is an editable install — update it with `git pull`, "
             f"not `{cli_invocation(name='omni')} upgrade`."
         )
-    if info.vcs_url and _is_custom_host_vcs_url(info.vcs_url):
-        raise click.ClickException(
-            "This install uses a custom repository. For moving-channel updates, use "
-            f"`{cli_invocation(name='omni')} up` to preserve the branch, "
-            "Host restart, and rollback receipt. For pinned releases, re-run the installer "
-            f"with `--repo {_CUSTOM_HOST_VCS_URL.removeprefix('git+')}@v<ver>`. "
-            f"`{cli_invocation(name='omni')} up` follows the moving channel."
-        )
-
     # Nightly channel: resolved from git tags, not the index, and applies to
     # every install shape, so it dispatches before the VCS-vs-registry split
     # (a VCS install pinned to an older nightly tag must move tags, not
@@ -6341,6 +6457,7 @@ def upgrade(
             force=force,
             pre=pre,
             extra_overrides=extra_overrides,
+            dry_run=dry_run,
         )
         return
 
@@ -6417,50 +6534,48 @@ def upgrade(
         )
 
     if dry_run:
-        extras = sorted(set(extra_overrides or info.extras))
-        click.echo(
-            f"Detected installer: {info.detected_installer or info.installer}\n"
-            f"Detected extras: {', '.join(extras) if extras else '(none)'}\n"
-            f"Would run: {suggestion.command}"
-        )
+        _echo_upgrade_plan(info, suggestion, extra_overrides)
         return
 
-    _drain_and_stop_local_server(force=force)
+    with _upgrade_host_service(force=force):
+        console = Console()
+        code = _run_upgrade_command(suggestion.command, console)
+        if code != 0:
+            raise click.ClickException(
+                _upgrade_failure_message(
+                    code,
+                    set(info.extras) | set(extra_overrides),
+                    recovery_command=suggestion.command,
+                )
+            )
 
-    console = Console()
-    code = _run_upgrade_command(suggestion.command, console)
-    if code != 0:
+        # Trust the installed version, not the installer's exit code. The running
+        # process still has the OLD version loaded, so re-read it in a fresh
+        # subprocess. A no-op upgrade (version-pinned spec, a cooldown /
+        # exclude-newer that excludes the new release, or a stale index cache)
+        # exits 0 without moving — claiming "✓ Upgraded" there is exactly the
+        # "I upgraded but it still says an update is available" bug.
+        new_version, _ = _probe_installed_distribution()
+        if new_version is None:
+            click.echo(
+                "Ran the upgrade command, but couldn't confirm the installed version. "
+                f"Run `{cli_invocation(name='omni')} upgrade --check` to verify."
+            )
+            return
+        expected_version = target_version or latest
+        if _is_newer(new_version, current):
+            click.echo(
+                f"✓ Upgraded to v{new_version}. Re-run your command — the local "
+                "server will start on the new version."
+            )
+            return
         raise click.ClickException(
-            _upgrade_failure_message(code, set(info.extras) | set(extra_overrides))
+            f"The upgrade command ran but omnigent is still v{new_version} (expected "
+            f"v{expected_version}). The install is likely version-pinned, a cooldown / "
+            "exclude-newer is excluding the new release, or the index cache is stale. "
+            "Reinstall it explicitly — e.g. `uv tool upgrade --reinstall omnigent` or "
+            f"`pip install --force-reinstall 'omnigent=={expected_version}'`."
         )
-
-    # Trust the installed version, not the installer's exit code. The running
-    # process still has the OLD version loaded, so re-read it in a fresh
-    # subprocess. A no-op upgrade (version-pinned spec, a cooldown /
-    # exclude-newer that excludes the new release, or a stale index cache)
-    # exits 0 without moving — claiming "✓ Upgraded" there is exactly the
-    # "I upgraded but it still says an update is available" bug.
-    new_version, _ = _probe_installed_distribution()
-    if new_version is None:
-        click.echo(
-            "Ran the upgrade command, but couldn't confirm the installed version. "
-            f"Run `{cli_invocation(name='omni')} upgrade --check` to verify."
-        )
-        return
-    expected_version = target_version or latest
-    if _is_newer(new_version, current):
-        click.echo(
-            f"✓ Upgraded to v{new_version}. Re-run your command — the local "
-            "server will start on the new version."
-        )
-        return
-    raise click.ClickException(
-        f"The upgrade command ran but omnigent is still v{new_version} (expected "
-        f"v{expected_version}). The install is likely version-pinned, a cooldown / "
-        "exclude-newer is excluding the new release, or the index cache is stale. "
-        "Reinstall it explicitly — e.g. `uv tool upgrade --reinstall omnigent` or "
-        f"`pip install --force-reinstall 'omnigent=={expected_version}'`."
-    )
 
 
 # ``omni update`` is an alias for ``omni upgrade`` — mistyping the latter as
@@ -10027,1302 +10142,17 @@ def host(
             _prompt_stop_local_server()
 
 
-def _custom_host_rollback_path() -> Path:
-    """Return the single overwrite-style receipt used by custom Host rollback."""
-    return data_dir() / "updates" / "custom-host-rollback.json"
-
-
-def _custom_host_update_paths() -> dict[str, Path]:
-    """Return the fixed Windows helper artifacts reused by every update."""
-    root = data_dir() / "updates"
-    return {
-        "root": root,
-        "helper": root / "custom-host-update-helper.ps1",
-        "instruction": root / "custom-host-update-instruction.json",
-        "result": root / "custom-host-update-result.json",
-        "log": root / "custom-host-update.log",
-        "lock": root / "custom-host-update.lock",
-    }
-
-
-def _custom_host_repo_identity(vcs_url: str) -> tuple[str, str] | None:
-    """
-    Reduce a VCS URL to a ``(hostname, repository path)`` identity.
-
-    Identity ignores the ``git+`` prefix, scheme, userinfo (installers record
-    redacted ``****@host`` userinfo), and a trailing ``@<rev>``, so the same
-    repository compares equal across HTTPS, SSH URL, and scp spellings.
-
-    :param vcs_url: e.g.
-        ``"git+ssh://git@fn.example.invalid/srv/git/omnigent.git"``.
-    :returns: Casefolded host and ``.git``-stripped path, e.g.
-        ``("fn.example.invalid", "srv/git/omnigent")``; ``None`` when no
-        repository can be derived.
-    """
-    from urllib.parse import urlsplit
-
-    repo_url, _revision = _split_vcs_url(vcs_url)
-    repo_url = repo_url.removeprefix("git+").strip()
-    if "://" in repo_url:
-        parsed = urlsplit(repo_url)
-        host = (parsed.hostname or "").casefold()
-        path = parsed.path
-    else:
-        host_part, separator, path = repo_url.partition(":")
-        if not separator:
-            return None
-        host = host_part.rsplit("@", 1)[-1].casefold()
-    normalized_path = path.strip("/").casefold().removesuffix(".git")
-    if not host or not normalized_path:
-        return None
-    return host, normalized_path
-
-
-def _custom_host_source_urls() -> list[str]:
-    """
-    Return the ordered custom Host source repositories from the user config.
-
-    An entry may end in ``@<branch>``; without it the entry tracks
-    :data:`_CUSTOM_HOST_CHANNEL`.
-
-    :returns: The configured ``custom_host_sources`` entries, or
-        ``[_CUSTOM_HOST_DEFAULT_SOURCE]`` when the key is absent.
-    :raises click.ClickException: When the key is present but is not a
-        non-empty list of ``git+https://``/``git+ssh://`` repository URLs,
-        each optionally ending in ``@<branch>``.
-    """
-    config = _load_global_config()
-    if "custom_host_sources" not in config:
-        return [_CUSTOM_HOST_DEFAULT_SOURCE]
-    raw = config["custom_host_sources"]
-    sources: list[str] = []
-    if isinstance(raw, list):
-        for source in raw:
-            if not isinstance(source, str):
-                sources = []
-                break
-            entry = source.strip()
-            repo_spelling = entry.removeprefix("git+")
-            if not repo_spelling.lower().startswith(("https://", "ssh://")) or entry.endswith("@"):
-                sources = []
-                break
-            sources.append(entry)
-    if not sources:
-        raise click.ClickException(
-            f"Invalid `custom_host_sources` in "
-            f"{_display_path(_effective_global_config_path())}: expected a non-empty "
-            "list of `git+https://…` or `git+ssh://…` repository URLs, each optionally "
-            "ending in `@<branch>`."
-        )
-    return sources
-
-
-def _custom_host_install_source(vcs_url: str | None) -> str | None:
-    """
-    Return the custom Host repository an installed build came from.
-
-    :param vcs_url: An installed wheel VCS URL, e.g.
-        ``"git+ssh://****@fn.example.invalid/srv/git/omnigent.git@local/host-custom"``.
-    :returns: ``git+<repository URL>`` spelled as the first matching
-        configured entry, built-in default or legacy repository (installers
-        redact userinfo, so the installed URL itself is not reusable), or
-        ``None`` when no custom repository matches.
-    """
-    identity = _custom_host_repo_identity(vcs_url) if vcs_url else None
-    if identity is None:
-        return None
-    for source in [
-        *_custom_host_source_urls(),
-        _CUSTOM_HOST_VCS_URL,
-        _CUSTOM_HOST_LEGACY_VCS_URL,
-    ]:
-        if _custom_host_repo_identity(source) == identity:
-            return f"git+{_split_vcs_url(source)[0]}"
-    return None
-
-
-def _is_custom_host_vcs_url(vcs_url: str) -> bool:
-    """
-    Recognize the default, legacy or a configured custom Host repository.
-
-    :param vcs_url: An installed wheel VCS URL, e.g.
-        ``"git+https://github.com/pandalaohe/omnigent.git@local/host-custom"``.
-    :returns: ``True`` when its repository identity is a custom Host source.
-    """
-    return _custom_host_install_source(vcs_url) is not None
-
-
-def _valid_git_sha(value: object) -> str | None:
-    """Return a normalized full git SHA, or ``None`` for invalid input."""
-    if not isinstance(value, str):
-        return None
-    candidate = value.strip().lower()
-    if len(candidate) != 40 or any(char not in "0123456789abcdef" for char in candidate):
-        return None
-    return candidate
-
-
-_CUSTOM_HOST_LOOKUP_TIMEOUT_S = 20.0
-_CUSTOM_HOST_LOOKUP_ATTEMPTS = 2
-
-
-def _resolve_custom_host_channel_head(*, allow_fallback: bool = True) -> tuple[str, str]:
-    """
-    Resolve the custom Host channel commit from the first reachable source.
-
-    Sources are tried in configured order, each with its own retry loop, so an
-    unreachable primary does not block an update. A missing ``git`` binary
-    stops the search at once because no later source could be reached either.
-
-    Each source resolves its own branch: the entry's ``@<branch>``, else
-    :data:`_CUSTOM_HOST_CHANNEL`.
-
-    :param allow_fallback: When ``False``, try only the first configured
-        source. Rollback uses this because a lagging fallback may lack the
-        saved commit.
-    :returns: The winning source repository URL and the exact commit, e.g.
-        ``("git+https://github.com/pandalaohe/omnigent-wukong.git", "a" * 40)``.
-    :raises click.ClickException: When every tried source fails to resolve
-        its branch.
-    """
-    from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
-
-    sources = _custom_host_source_urls()
-    if not allow_fallback:
-        sources = sources[:1]
-    failures: list[tuple[str, str]] = []
-    for index, source in enumerate(sources):
-        repo_url, branch = _split_vcs_url(source)
-        install_source = f"git+{repo_url}"
-        label = branch or _CUSTOM_HOST_CHANNEL
-        failure = ""
-        git_missing = False
-        for _attempt in range(_CUSTOM_HOST_LOOKUP_ATTEMPTS):
-            try:
-                result = run_git(
-                    ["git", "ls-remote", repo_url, label],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=_CUSTOM_HOST_LOOKUP_TIMEOUT_S,
-                    check=False,
-                )
-            except subprocess.TimeoutExpired:
-                failure = f"`git ls-remote` timed out after {_CUSTOM_HOST_LOOKUP_TIMEOUT_S:.0f}s"
-                continue
-            except FileNotFoundError:
-                failure = "`git` was not found on PATH"
-                git_missing = True
-                break
-            except OSError as exc:
-                failure = f"`git ls-remote` could not start ({exc})"
-                break
-            if result.returncode != 0:
-                stderr = result.stderr.strip() or "(no stderr)"
-                failure = f"`git ls-remote` exited with status {result.returncode}: {stderr}"
-                continue
-            # The pattern also matches tags and ``refs/heads/<x>/<label>``.
-            resolved = next(
-                (
-                    _valid_git_sha(sha)
-                    for sha, _tab, ref in (
-                        line.strip().partition("\t") for line in result.stdout.splitlines()
-                    )
-                    if ref == f"refs/heads/{label}"
-                ),
-                None,
-            )
-            if resolved is not None:
-                if index:
-                    reasons = "; ".join(f"{url} ({why})" for url, why in failures)
-                    click.echo(
-                        f"Warning: {reasons}; falling back to {install_source}, which may "
-                        f"lag behind {failures[0][0]}.",
-                        err=True,
-                    )
-                return install_source, resolved
-            failure = f"the source has no {label!r} branch"
-            break
-        failures.append((source, failure))
-        if git_missing:
-            break
-    details = "\n".join(f"  {url}: {why}" for url, why in failures)
-    if allow_fallback:
-        scope = "any custom Host source"
-    else:
-        scope = "the first custom Host source (rollback uses only the first configured source)"
-    exc = click.ClickException(
-        f"Couldn't resolve the custom Host channel from {scope}:\n"
-        f"{details}\n"
-        "Check network/git access, then retry."
-    )
-    setattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, True)
-    raise exc
-
-
-def _write_custom_host_rollback(commit_sha: str, source_url: str | None = None) -> None:
-    """
-    Atomically remember the one commit the custom Host can roll back to.
-
-    :param commit_sha: The installed commit, e.g. ``"a" * 40``.
-    :param source_url: The repository that commit came from (see
-        :func:`_custom_host_install_source`), or ``None`` when unknown; a
-        rollback then asks the first configured source.
-    """
-    from omnigent.install_ledger import atomic_write_json
-
-    normalized = _valid_git_sha(commit_sha)
-    if normalized is None:
-        raise click.ClickException("Cannot save rollback state: installed git commit is invalid.")
-    atomic_write_json(
-        _custom_host_rollback_path(),
-        {"schema_version": 2, "commit_sha": normalized, "source_url": source_url},
-    )
-
-
-def _read_custom_host_rollback() -> tuple[str, str | None]:
-    """
-    Read and validate the saved custom Host rollback receipt.
-
-    :returns: The saved commit and its source repository; the source is
-        ``None`` for a version-1 receipt or an unknown source.
-    """
-    path = _custom_host_rollback_path()
-    try:
-        raw = json.loads(path.read_text())
-    except FileNotFoundError as exc:
-        raise click.ClickException(
-            "No custom Host rollback is available yet; complete one custom update first."
-        ) from exc
-    except (OSError, json.JSONDecodeError) as exc:
-        raise click.ClickException(
-            f"Cannot read custom Host rollback state at {path}: {exc}"
-        ) from exc
-    commit_sha = _valid_git_sha(raw.get("commit_sha") if isinstance(raw, dict) else None)
-    if not isinstance(raw, dict) or commit_sha is None:
-        raise click.ClickException(f"Custom Host rollback state is invalid: {path}")
-    if raw.get("schema_version") == 1:
-        return commit_sha, None
-    # Version 2 always carries the key: a URL or an explicit null.
-    source_url = raw.get("source_url", False)
-    if raw.get("schema_version") != 2 or not (
-        source_url is None or (isinstance(source_url, str) and source_url)
-    ):
-        raise click.ClickException(f"Custom Host rollback state is invalid: {path}")
-    return commit_sha, source_url
-
-
-def _windows_host_service_wrapper() -> Path | None:
-    """Locate our machine-local Windows Host supervisor wrapper."""
-    discovered = shutil.which("omni-host-service") or shutil.which("omni-host-service.cmd")
-    candidates = [
-        Path(discovered) if discovered else None,
-        Path.home() / ".local" / "bin" / "omni-host-service.cmd",
-    ]
-    return next(
-        (candidate for candidate in candidates if candidate is not None and candidate.exists()),
-        None,
-    )
-
-
-def _read_custom_host_update_result() -> dict[str, object] | None:
-    """Read the fixed helper result when it contains a JSON object."""
-    path = _custom_host_update_paths()["result"]
-    try:
-        raw = json.loads(path.read_text())
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
-        return None
-    return raw if isinstance(raw, dict) else None
-
-
-@dataclass(frozen=True)
-class _WindowsProcessInfo:
-    """Snapshot of one Windows process used to capture the managed Host tree."""
-
-    pid: int
-    ppid: int
-    name: str
-    exe: str = ""
-    cmdline: str = ""
-    created_at: float = 0.0
-
-
-_CUSTOM_HOST_TREE_EXIT_TIMEOUT_S = 15.0
-_CUSTOM_HOST_TREE_GRACE_S = 2.0
-
-
-def _custom_host_tool_venv_path() -> Path:
-    """Return the uv/pipx tool venv root for this installed CLI."""
-    receipt = _uv_tool_receipt_path()
-    if receipt is not None:
-        return receipt.parent
-    return Path(sys.prefix)
-
-
-def _windows_custom_host_cli_path(cli_executable: str | None = None) -> Path:
-    """Return the machine-local ``~\\.local\\bin\\omni.exe`` wrapper path."""
-    if cli_executable:
-        candidate = Path(cli_executable)
-        if candidate.name.casefold() in {"omni.exe", "omnigent.exe"}:
-            return candidate
-    return Path.home() / ".local" / "bin" / "omni.exe"
-
-
-def _normalize_windows_fs_path(raw: Path | str) -> str:
-    """Normalize a Windows path for case-insensitive prefix comparisons."""
-    return str(raw).strip().strip('"').replace("/", "\\").rstrip("\\").casefold()
-
-
-def _list_windows_processes() -> list[_WindowsProcessInfo]:
-    """List Windows processes with parent PID, executable path, and command line."""
-    if os.name != "nt":
-        return []
-    rows: list[_WindowsProcessInfo] = []
-    for proc in psutil.process_iter(["pid", "ppid", "name", "exe", "cmdline", "create_time"]):
-        try:
-            info = proc.info
-            pid = int(info.get("pid") or 0)
-            if pid <= 0:
-                continue
-            cmdline_raw = info.get("cmdline")
-            if isinstance(cmdline_raw, list):
-                cmdline = subprocess.list2cmdline([str(part) for part in cmdline_raw])
-            elif isinstance(cmdline_raw, str):
-                cmdline = cmdline_raw
-            else:
-                cmdline = ""
-            rows.append(
-                _WindowsProcessInfo(
-                    pid=pid,
-                    ppid=int(info.get("ppid") or 0),
-                    name=str(info.get("name") or ""),
-                    exe=str(info.get("exe") or ""),
-                    cmdline=cmdline,
-                    created_at=float(info.get("create_time") or 0),
-                )
-            )
-        except (psutil.Error, OSError, ValueError):
-            continue
-    return rows
-
-
-def _windows_process_arguments(proc: _WindowsProcessInfo) -> list[str]:
-    """Split the quoted path arguments used by our Windows launchers; fail closed."""
-    arguments: list[str] = []
-    previous_end = 0
-    for match in re.finditer(r'"[^"]*"|[^\s"]+', proc.cmdline):
-        gap = proc.cmdline[previous_end : match.start()]
-        if gap.strip() or (arguments and not gap):
-            return []
-        arguments.append(match.group().strip('"').replace("/", "\\").casefold())
-        previous_end = match.end()
-    if proc.cmdline[previous_end:].strip():
-        return []
-    return arguments
-
-
-def _windows_is_host_daemon(proc: _WindowsProcessInfo) -> bool:
-    args = _windows_process_arguments(proc)[1:]
-    if _normalize_windows_fs_path(proc.exe).rsplit("\\", 1)[-1] not in {
-        "python.exe",
-        "pythonw.exe",
-    }:
-        return False
-    while args and args[0] in {"-i", "-u", "-b", "-e", "-s"}:
-        args = args[1:]
-    return args[:2] == ["-m", "omnigent.host._daemon_entry"] or args[:3] == [
-        "-m",
-        "omnigent.cli",
-        "host",
-    ]
-
-
-def _windows_is_host_launcher(proc: _WindowsProcessInfo, cli_bin_path: Path | str) -> bool:
-    """Identify a dedicated Host launcher/supervisor, independently of file holdings."""
-    args = _windows_process_arguments(proc)[1:]
-    cli = _normalize_windows_fs_path(cli_bin_path)
-    home = (
-        cli[: -len("\\.local\\bin\\omni.exe")] if cli.endswith("\\.local\\bin\\omni.exe") else ""
-    )
-    exe = _normalize_windows_fs_path(proc.exe)
-    if exe == cli and args[:1] == ["host"]:
-        return True
-    if not home:
-        return False
-    binary = exe.rsplit("\\", 1)[-1]
-    if binary == "pwsh.exe":
-        while args:
-            option = args.pop(0)
-            if option == "-file":
-                return bool(args) and args[0] == home + (
-                    "\\.omnigent\\autostart\\start-omnigenthostdefault.ps1"
-                )
-            if option in {"-nologo", "-noprofile", "-noninteractive"}:
-                continue
-            if option in {"-executionpolicy", "-windowstyle"} and args:
-                args.pop(0)
-                continue
-            return False
-    if binary in {"python.exe", "pythonw.exe"}:
-        while args and args[0] in {"-i", "-u", "-b", "-e", "-s"}:
-            args = args[1:]
-        return bool(args) and args[0] == home + "\\.omnigent\\autostart\\launch-omnigenthost.pyw"
-    return False
-
-
-def _windows_stopped_host_tree_pids(
-    processes: Sequence[_WindowsProcessInfo],
-    *,
-    stopped_host_pids: Sequence[int],
-    cli_bin_path: Path | str,
-    excluded_pids: set[int],
-) -> list[int]:
-    """Identify the stopped Host supervisor loop, ``omni.exe host``, and runner descendants."""
-    by_pid = {proc.pid: proc for proc in processes}
-    children_by_ppid: dict[int, list[int]] = {}
-    for proc in processes:
-        children_by_ppid.setdefault(proc.ppid, []).append(proc.pid)
-
-    roots: set[int] = set()
-    stopped_ids = {int(pid) for pid in stopped_host_pids if int(pid) > 0}
-    for pid in stopped_ids:
-        if pid in excluded_pids:
-            continue
-        current = by_pid.get(pid)
-        if current is None or current.created_at <= 0:
-            continue
-        is_host_identity = _windows_is_host_daemon(current) or _windows_is_host_launcher(
-            current, cli_bin_path
-        )
-        if is_host_identity:
-            roots.add(pid)
-            visited: set[int] = set()
-            while current is not None and current.ppid > 0 and current.ppid not in visited:
-                visited.add(current.ppid)
-                parent = by_pid.get(current.ppid)
-                if parent is None or parent.pid in excluded_pids:
-                    break
-                if 0 < parent.created_at <= current.created_at and (
-                    _windows_is_host_launcher(parent, cli_bin_path)
-                    or _windows_is_host_daemon(parent)
-                ):
-                    roots.add(parent.pid)
-                    current = parent
-                    continue
-                break
-
-    tree: set[int] = set()
-    queue = list(roots)
-    while queue:
-        current_pid = queue.pop(0)
-        if current_pid in tree or current_pid in excluded_pids:
-            continue
-        tree.add(current_pid)
-        for child_pid in children_by_ppid.get(current_pid, ()):
-            if (
-                child_pid not in tree
-                and child_pid not in excluded_pids
-                and by_pid[child_pid].created_at >= by_pid[current_pid].created_at > 0
-            ):
-                queue.append(child_pid)
-    return sorted(pid for pid in tree if pid in by_pid)
-
-
-def _wait_for_windows_host_tree_exit(
-    process_identities: Sequence[_WindowsProcessInfo],
-    *,
-    timeout_s: float = _CUSTOM_HOST_TREE_EXIT_TIMEOUT_S,
-    grace_s: float = _CUSTOM_HOST_TREE_GRACE_S,
-) -> None:
-    """Allow the captured Host tree to exit, then end only its remaining processes."""
-    deadline = time.monotonic() + max(timeout_s, 0.0)
-    processes: list[psutil.Process] = []
-    for identity in process_identities:
-        try:
-            process = psutil.Process(identity.pid)
-            if identity.created_at > 0 and process.create_time() == identity.created_at:
-                processes.append(process)
-        except psutil.NoSuchProcess:
-            continue
-        except (psutil.Error, OSError) as exc:
-            raise click.ClickException(
-                f"Cannot inspect stopped Host process {identity.pid}: {exc}"
-            ) from exc
-    _gone, alive = psutil.wait_procs(
-        processes, timeout=min(max(grace_s, 0.0), max(0.0, deadline - time.monotonic()))
-    )
-    for process in alive:
-        try:
-            process.kill()
-        except psutil.NoSuchProcess:
-            continue
-        except (psutil.Error, OSError) as exc:
-            raise click.ClickException(f"Cannot stop Host process {process.pid}: {exc}") from exc
-    _gone, alive = psutil.wait_procs(alive, timeout=max(0.0, deadline - time.monotonic()))
-    if alive:
-        summary = ", ".join(str(process.pid) for process in alive)
-        raise click.ClickException(
-            f"Stopped Host processes did not exit: {summary}. Retry the update."
-        )
-
-
-def _reconcile_custom_host_update_result(
-    current_sha: str,
-    *,
-    persist: bool,
-) -> dict[str, object] | None:
-    """Clear a stale ``failed`` helper receipt once manual recovery has updated the install."""
-    from omnigent.install_ledger import atomic_write_json
-
-    result = _read_custom_host_update_result()
-    if result is None or result.get("status") != "failed":
-        return result
-    target_commit = _valid_git_sha(result.get("target_commit"))
-    old_commit = _valid_git_sha(result.get("old_commit"))
-    if current_sha != target_commit and (old_commit is None or current_sha == old_commit):
-        return result
-    error_text = str(result.get("error") or "").casefold()
-    if (
-        "did not reconnect" in error_text
-        or "supervisor restart exited" in error_text
-        or "additionally failed to restart host" in error_text
-    ):
-        host_id = _load_existing_host_id()
-        if not host_id or not any(
-            _daemon_host_online(record, timeout_s=2.0) for record in _custom_host_records(host_id)
-        ):
-            return result
-    reconciled: dict[str, object] = {
-        **result,
-        "status": "complete",
-        "phase": "completed",
-        "target_commit": current_sha,
-        "error": None,
-    }
-    if persist:
-        paths = _custom_host_update_paths()
-        backup = result.get("backup_path")
-        if isinstance(backup, str) and backup:
-            transaction = Path(backup).parent
-            venv = _custom_host_tool_venv_path().resolve()
-            if (
-                transaction.resolve().parent != venv.parent
-                or not re.fullmatch(
-                    re.escape(venv.name) + r"\.update-[0-9a-f]{32}", transaction.name
-                )
-                or Path(backup).name != "previous"
-            ):
-                raise click.ClickException("Invalid custom Host update transaction path.")
-            atomic_write_json(transaction / "transaction.json", reconciled)
-        atomic_write_json(paths["result"], reconciled)
-        paths["lock"].unlink(missing_ok=True)
-    return reconciled
-
-
-@contextlib.contextmanager
-def _custom_host_update_launch_guard() -> Iterator[None]:
-    """Serialize the entire Windows update launch before stopping its Host.
-
-    The guard file is permanent: deleting it would let two callers lock
-    different file identities. The OS releases the lock if a launcher exits.
-    Once the launcher returns, the existing live-helper receipt owns exclusion.
-    """
-    root = _custom_host_update_paths()["root"]
-    root.mkdir(parents=True, exist_ok=True)
-    with (root / "custom-host-launch.guard").open("a+b") as guard:
-        if os.name == "nt":
-            import msvcrt
-
-            try:
-                msvcrt.locking(guard.fileno(), msvcrt.LK_NBLCK, 1)
-            except OSError as exc:
-                raise click.ClickException(
-                    "A custom Host update is already being started."
-                ) from exc
-            try:
-                yield
-            finally:
-                guard.seek(0)
-                msvcrt.locking(guard.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            # Exercise the same ownership boundary in Linux release tests.
-            import fcntl
-
-            try:
-                fcntl.flock(guard.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError as exc:
-                raise click.ClickException(
-                    "A custom Host update is already being started."
-                ) from exc
-            try:
-                yield
-            finally:
-                fcntl.flock(guard.fileno(), fcntl.LOCK_UN)
-
-
-def _ensure_no_running_custom_host_helper() -> None:
-    """Refuse overlapping Windows helpers and clear only a stale lock."""
-    lock_path = _custom_host_update_paths()["lock"]
-    result = _read_custom_host_update_result()
-    status = result.get("status") if result is not None else None
-    if status in {"starting", "running"}:
-        helper_pid = result.get("helper_pid") if result is not None else None
-        launcher_pid = result.get("launcher_pid") if result is not None else None
-        live_pid = next(
-            (
-                pid
-                for pid in (helper_pid, launcher_pid)
-                if isinstance(pid, int) and _pid_alive(pid)
-            ),
-            None,
-        )
-        if live_pid is not None:
-            raise click.ClickException(
-                f"A custom Host update is already running (process pid {live_pid})."
-            )
-    if (
-        result
-        and result.get("status") != "complete"
-        and result.get("backup_path")
-        and result.get("phase") not in {"completed", "restored"}
-    ):
-        raise click.ClickException(
-            "An interrupted update needs independent recovery. Exit this CLI, run "
-            "`omni-host-service start`, then retry the update. Previous files retained."
-        )
-    lock_path.unlink(missing_ok=True)
-
-
-def _copy_windows_custom_host_helper(target: Path) -> None:
-    """Copy the bundled PowerShell helper to its fixed data-directory path."""
-    source = resources.files("omnigent.host").joinpath("windows_custom_update.ps1")
-    content = source.read_bytes()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_suffix(".ps1.tmp")
-    temporary.write_bytes(content)
-    os.replace(temporary, target)
-
-
-def _arm_windows_custom_host_recovery(wrapper: Path, helper: Path, instruction: Path) -> None:
-    """Arm independent startup recovery before the working tool environment is moved."""
-    _validate_windows_custom_host_recovery_paths(wrapper)
-    marker = "REM omnigent custom update recovery"
-    text = wrapper.read_text(encoding="utf-8")
-    pwsh = shutil.which("pwsh")
-    if pwsh is None:
-        raise click.ClickException("PowerShell 7 is required for update recovery.")
-    command = f'"{pwsh}" -NoProfile -File "{helper}" -RecoverOnly -InstructionPath "{instruction}"'
-    if marker not in text:
-        temporary = wrapper.with_suffix(".recovery.tmp")
-        temporary.write_text(
-            f'@echo off\n{marker}\nif /I "%~1"=="start" (\n'
-            f"  {command}\n  if errorlevel 1 exit /b 1\n)\n{text}",
-            encoding="utf-8",
-        )
-        os.replace(temporary, wrapper)
-    # The default scheduled task starts its supervisor directly on logon.
-    # Arm that entry too; custom supervisors still recover via their wrapper.
-    default_wrapper = Path.home() / ".local" / "bin" / "omni-host-service.cmd"
-    startup = Path.home() / ".omnigent" / "autostart" / "Start-OmnigentHostDefault.ps1"
-    if wrapper == default_wrapper and startup.is_file():
-        # Keep CRLF intact: the parser's UTF-16 offsets refer to the file bytes.
-        startup_text = startup.read_bytes().decode("utf-8-sig")
-        startup_marker = "# omnigent custom update recovery"
-        if startup_marker not in startup_text:
-            ps_command = (
-                f"& '{pwsh.replace(chr(39), chr(39) * 2)}' -NoProfile -File "
-                f"'{str(helper).replace(chr(39), chr(39) * 2)}' -RecoverOnly "
-                f"-InstructionPath '{str(instruction).replace(chr(39), chr(39) * 2)}' "
-                "-ResumeAutostart\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\n"
-            )
-            temporary = startup.with_suffix(".recovery.tmp")
-            # A script param block (and #requires/using statements) must remain
-            # at the beginning. Ask PowerShell's parser for the body boundary.
-            parsed = subprocess.run(
-                [
-                    pwsh,
-                    "-NoProfile",
-                    "-Command",
-                    "$t=$null; $e=$null; "
-                    "$a=[Management.Automation.Language.Parser]::ParseFile("
-                    "$env:OMNIGENT_STARTUP_SCRIPT,[ref]$t,[ref]$e); "
-                    "if($e.Count){exit 1}; "
-                    "if($a.BeginBlock -or $a.ProcessBlock -or $a.CleanBlock){exit 1}; "
-                    "if($a.EndBlock.Statements.Count){$a.EndBlock.Statements[0].Extent.StartOffset}"
-                    "else{$a.Extent.EndOffset}",
-                ],
-                env={**os.environ, "OMNIGENT_STARTUP_SCRIPT": str(startup)},
-                capture_output=True,
-                text=True,
-                timeout=15,
-                check=False,
-            )
-            if parsed.returncode:
-                raise click.ClickException("Cannot safely arm the Host startup script.")
-            # Parser offsets count UTF-16 code units, unlike Python string offsets.
-            offset = int(parsed.stdout.strip())
-            encoded = startup_text.encode("utf-16-le")
-            before = encoded[: offset * 2].decode("utf-16-le")
-            after = encoded[offset * 2 :].decode("utf-16-le")
-            temporary.write_bytes(
-                (before + "\n" + startup_marker + "\n" + ps_command + after).encode("utf-8")
-            )
-            os.replace(temporary, startup)
-
-
-def _validate_windows_custom_host_recovery_paths(wrapper: Path) -> None:
-    """Recovery entry points must survive moving the tool environment."""
-    venv = _custom_host_tool_venv_path().resolve()
-    paths = _custom_host_update_paths()
-    startup = Path.home() / ".omnigent" / "autostart" / "Start-OmnigentHostDefault.ps1"
-    if any(
-        path.resolve().is_relative_to(venv)
-        for path in (
-            wrapper,
-            paths["helper"],
-            paths["instruction"],
-            startup,
-        )
-    ):
-        raise click.ClickException(
-            "Windows Host recovery entries must be outside the tool environment. "
-            "Move the supervisor wrapper/data directory before updating."
-        )
-
-
-def _launch_windows_custom_host_update(
-    *,
-    install_command: str,
-    old_commit: str,
-    target_commit: str,
-    host_id: str,
-    previous_records: Sequence[_HostDaemonRecord],
-    wrapper: Path,
-    rollback_source_url: str | None = None,
-    skip_web_ui: bool = True,
-    process_identities: Sequence[_WindowsProcessInfo] = (),
-) -> tuple[int, Path, Path]:
-    """Start the detached helper that updates after this locked CLI exits."""
-    import shlex
-
-    from omnigent.install_ledger import atomic_write_json
-
-    paths = _custom_host_update_paths()
-    _ensure_no_running_custom_host_helper()
-    paths["root"].mkdir(parents=True, exist_ok=True)
-    try:
-        lock_fd = os.open(paths["lock"], os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError as exc:
-        raise click.ClickException(
-            "A custom Host update started concurrently; retry later."
-        ) from exc
-    os.close(lock_fd)
-
-    pwsh = shutil.which("pwsh")
-    cli_executable = shutil.which("omni") or shutil.which("omnigent")
-    if pwsh is None or cli_executable is None:
-        paths["lock"].unlink(missing_ok=True)
-        raise click.ClickException(
-            "Windows custom update requires PowerShell 7 and the installed omni "
-            "executable on PATH."
-        )
-    process: subprocess.Popen[bytes] | None = None
-    constraints_dir: Path | None = None
-    try:
-        install_args = shlex.split(install_command)
-        if install_args[:3] == ["uv", "tool", "install"] and any(
-            arg.startswith("git+") for arg in install_args[3:]
-        ):
-            constraints_dir = Path(tempfile.mkdtemp(prefix="locked-install-", dir=paths["root"]))
-            install_args = _prepare_uv_git_install(install_args, constraints_dir)
-        _copy_windows_custom_host_helper(paths["helper"])
-        _arm_windows_custom_host_recovery(wrapper, paths["helper"], paths["instruction"])
-        paths["log"].write_text("", encoding="utf-8")
-        probe_code = (
-            "import omnigent.cli, omnigent.runner._entry; "
-            "from omnigent.update_check import _read_installed_wheel_info as r; "
-            "i=r(); print((i.commit_sha or '') if i is not None else '')"
-        )
-        tool_venv_path = _custom_host_tool_venv_path()
-        cli_bin_path = _windows_custom_host_cli_path(cli_executable)
-        instruction: dict[str, object] = {
-            "schema_version": 1,
-            "parent_pid": os.getpid(),
-            "install_argv": install_args,
-            "helper_path": str(paths["helper"]),
-            "disabled_marker": str(Path.home() / ".omnigent" / "autostart" / "disabled"),
-            "constraints_dir": str(constraints_dir) if constraints_dir is not None else "",
-            "tool_venv_path": str(tool_venv_path),
-            "cli_bin_path": str(cli_bin_path),
-            "old_commit": old_commit,
-            "target_commit": target_commit,
-            "host_id": host_id,
-            "previous_records": [
-                {"target": record.target, "pid": record.pid} for record in previous_records
-            ],
-            "previous_processes": [
-                {"pid": proc.pid, "created_at": proc.created_at}
-                for proc in process_identities
-                if proc.created_at > 0
-            ],
-            "probe_argv": [str(tool_venv_path / "Scripts" / "python.exe"), "-I", "-c", probe_code],
-            "version_argv": [cli_executable, "--version"],
-            "status_argv": [cli_executable, "host", "status", "--json"],
-            "wrapper_path": str(wrapper),
-            "rollback_path": str(_custom_host_rollback_path()),
-            "rollback_source_url": rollback_source_url,
-            "skip_web_ui": skip_web_ui,
-            "result_path": str(paths["result"]),
-            "log_path": str(paths["log"]),
-            "lock_path": str(paths["lock"]),
-        }
-        atomic_write_json(paths["instruction"], instruction)
-        atomic_write_json(
-            paths["result"],
-            {
-                "schema_version": 1,
-                "status": "starting",
-                "old_commit": old_commit,
-                "target_commit": target_commit,
-                "launcher_pid": os.getpid(),
-                "helper_pid": None,
-                "error": None,
-            },
-        )
-        # DETACHED_PROCESS can make pwsh exit before evaluating -File. A hidden
-        # process group plus the readiness handshake survives the launcher exit.
-        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(
-            subprocess, "CREATE_NO_WINDOW", 0
-        )
-        with paths["log"].open("ab", buffering=0) as helper_output:
-            process = subprocess.Popen(
-                [
-                    pwsh,
-                    "-NoProfile",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-File",
-                    str(paths["helper"]),
-                    "-InstructionPath",
-                    str(paths["instruction"]),
-                    "-ResultPath",
-                    str(paths["result"]),
-                    "-LogPath",
-                    str(paths["log"]),
-                    "-LockPath",
-                    str(paths["lock"]),
-                    "-WrapperPath",
-                    str(wrapper),
-                    "-OldCommit",
-                    old_commit,
-                    "-TargetCommit",
-                    target_commit,
-                    "-HostId",
-                    host_id,
-                    "-ConstraintsDirectory",
-                    str(constraints_dir) if constraints_dir is not None else "",
-                ],
-                stdin=subprocess.DEVNULL,
-                stdout=helper_output,
-                stderr=helper_output,
-                close_fds=True,
-                creationflags=creationflags,
-            )
-        deadline = time.monotonic() + _CUSTOM_HOST_HELPER_START_TIMEOUT_S
-        while time.monotonic() < deadline:
-            result = _read_custom_host_update_result()
-            if result is not None and result.get("helper_pid") == process.pid:
-                if result.get("status") in {"running", "complete"}:
-                    return process.pid, paths["result"], paths["log"]
-                if result.get("status") == "failed":
-                    error = result.get("error")
-                    raise click.ClickException(
-                        "Windows custom Host update helper failed during startup"
-                        + (f": {error}" if isinstance(error, str) and error else ".")
-                    )
-            return_code = process.poll()
-            if return_code is not None:
-                raise click.ClickException(
-                    "Windows custom Host update helper exited before reporting readiness "
-                    f"(status {return_code}). Check {paths['log']}."
-                )
-            time.sleep(0.05)
-        raise click.ClickException(
-            "Windows custom Host update helper did not report readiness within "
-            f"{_CUSTOM_HOST_HELPER_START_TIMEOUT_S:.0f}s. Check {paths['log']}."
-        )
-    except Exception as exc:
-        if process is not None and process.poll() is None:
-            with contextlib.suppress(OSError):
-                process.terminate()
-            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
-                process.wait(timeout=5)
-        result = _read_custom_host_update_result()
-        if result is None or result.get("status") != "failed":
-            with contextlib.suppress(Exception):
-                atomic_write_json(
-                    paths["result"],
-                    {
-                        "schema_version": 1,
-                        "status": "failed",
-                        "old_commit": old_commit,
-                        "target_commit": target_commit,
-                        "helper_pid": process.pid if process is not None else None,
-                        "error": str(exc),
-                    },
-                )
-        paths["lock"].unlink(missing_ok=True)
-        if constraints_dir is not None:
-            shutil.rmtree(constraints_dir, ignore_errors=True)
-        raise
-
-
-def _run_windows_host_service(wrapper: Path, action: Literal["start", "stop"]) -> None:
-    """Run one action through the existing machine-local Windows supervisor."""
-    pwsh = shutil.which("pwsh")
-    if pwsh is None:
-        raise click.ClickException("PowerShell 7 is required to control the Windows Host service.")
-    child_env = os.environ.copy()
-    child_env["OMNIGENT_HOST_SERVICE_WRAPPER"] = str(wrapper)
-    child_env["OMNIGENT_HOST_SERVICE_ACTION"] = action
-    try:
-        result = subprocess.run(
-            [
-                pwsh,
-                "-NoProfile",
-                "-Command",
-                "& $env:OMNIGENT_HOST_SERVICE_WRAPPER "
-                "$env:OMNIGENT_HOST_SERVICE_ACTION; exit $LASTEXITCODE",
-            ],
-            check=False,
-            timeout=60,
-            env=child_env,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise click.ClickException(
-            f"Windows Host supervisor could not {action} the service: {exc}"
-        ) from exc
-    if result.returncode != 0:
-        raise click.ClickException(
-            f"Windows Host supervisor failed to {action} the service "
-            f"(status {result.returncode}): {wrapper}"
-        )
-
-
-def _custom_host_has_service() -> bool:
-    """
-    Whether a managed Host service will be stopped and restarted around the update.
-
-    Windows always goes through its supervisor wrapper: the running CLI cannot
-    replace its own tool files, so a detached helper installs and restarts.
-    """
-    if IS_WINDOWS:
-        return True
-    from omnigent.host.service import HostServiceError, _service_for_current_platform
-
-    try:
-        return _service_for_current_platform().path.exists()
-    except HostServiceError:
-        return False
-
-
-def _custom_host_installed_web_ui() -> bool:
-    """Whether the running install carries a built web UI bundle."""
-    return (
-        resources.files("omnigent").joinpath("server", "static", "web-ui", "index.html").is_file()
-    )
-
-
-def _custom_host_web_ui_tools_missing() -> list[str]:
-    """Name the web build tools that are missing or below ``setup.py``'s floor."""
-    missing: list[str] = []
-    node = shutil.which("node")
-    supported_node = False
-    if node is not None:
-        try:
-            result = subprocess.run(
-                [node, "--version"], check=True, capture_output=True, text=True, timeout=10
-            )
-            match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", result.stdout.strip())
-            if match is not None:
-                supported_node = tuple(int(part) for part in match.groups()) >= (22, 13, 0)
-        except (OSError, subprocess.SubprocessError):
-            pass
-    if not supported_node:
-        missing.append("Node.js 22.13+")
-    if shutil.which("pnpm") is None and shutil.which("corepack") is None:
-        missing.append("pnpm")
-    return missing
-
-
-def _preflight_custom_host_supervisor() -> None:
-    """Fail before draining sessions when no managed supervisor is installed."""
-    if IS_WINDOWS:
-        _ensure_no_running_custom_host_helper()
-        wrapper = _windows_host_service_wrapper()
-        if wrapper is None:
-            raise click.ClickException(
-                "No managed Windows Host supervisor was found. Install our "
-                "omni-host-service wrapper before using custom self-update."
-            )
-        _validate_windows_custom_host_recovery_paths(wrapper)
-        return
-
-    from omnigent.host.service import HostServiceError, _service_for_current_platform
-
-    try:
-        service = _service_for_current_platform()
-    except HostServiceError as exc:
-        raise click.ClickException(str(exc)) from exc
-    if not service.path.exists():
-        raise click.ClickException(
-            "No managed Host service is installed. Run "
-            f"`{cli_invocation(name='omni')} host enable` "
-            "first so the updater can restart the Host safely."
-        )
-
-
-def _pause_custom_host_supervisor() -> object:
-    """Stop the managed Host while preserving its exact supervisor definition."""
-    if IS_WINDOWS:
-        wrapper = _windows_host_service_wrapper()
-        if wrapper is None:
-            raise click.ClickException(
-                "No managed Windows Host supervisor was found. Install our "
-                "omni-host-service wrapper before using custom self-update."
-            )
-        token = ("windows", wrapper)
-        try:
-            _run_windows_host_service(wrapper, "stop")
-        except Exception:
-            try:
-                _resume_custom_host_supervisor(token)
-            except (click.ClickException, OSError, subprocess.SubprocessError) as resume_error:
-                click.echo(f"Additionally failed to restart the Host: {resume_error}", err=True)
-            raise
-        return token
-
-    from omnigent.host.service import HostServiceError, pause_user_host_service
-
-    try:
-        service = pause_user_host_service()
-    except HostServiceError as exc:
-        raise click.ClickException(str(exc)) from exc
-    if service is None:
-        raise click.ClickException(
-            "No managed Host service is installed. Run "
-            f"`{cli_invocation(name='omni')} host enable` "
-            "first so the updater can restart the Host safely."
-        )
-    return service
-
-
-def _resume_custom_host_supervisor(token: object) -> None:
-    """Resume the same supervisor returned by :func:`_pause_custom_host_supervisor`."""
-    if isinstance(token, tuple) and len(token) == 2 and token[0] == "windows":
-        wrapper = token[1]
-        if not isinstance(wrapper, Path):
-            raise click.ClickException("Invalid Windows Host supervisor state.")
-        _run_windows_host_service(wrapper, "start")
-        return
-
-    from omnigent.host.service import HostService, HostServiceError, resume_user_host_service
-
-    if not isinstance(token, HostService):
-        raise click.ClickException("Invalid Host supervisor state.")
-    try:
-        resume_user_host_service(token)
-    except HostServiceError as exc:
-        raise click.ClickException(str(exc)) from exc
-
-
-def _custom_host_records(host_id: str) -> list[_HostDaemonRecord]:
-    """Return local daemon records belonging to this machine's Host identity."""
-    fallback_host_id = _load_existing_host_id()
-    return [
-        record
-        for record in _list_daemon_records()
-        if (record.host_id or fallback_host_id) == host_id and _daemon_owner_is_live(record)
-    ]
-
-
-def _query_custom_host_sessions(
-    records: Sequence[_HostDaemonRecord],
-) -> list[tuple[_HostDaemonRecord, _DaemonSessionsResult]]:
-    """Query owned sessions once and fail before any destructive action."""
-    snapshots: list[tuple[_HostDaemonRecord, _DaemonSessionsResult]] = []
-    for record in records:
-        result = _sessions_for_daemon(
-            record, connected_only=True, timeout_s=_CUSTOM_HOST_SESSION_QUERY_TIMEOUT_S
-        )
-        if result.error is not None:
-            raise click.ClickException(
-                f"Cannot verify sessions for {_host_display_url(record.target)}: {result.error}. "
-                "The Host was left running; restore server access and retry. "
-                "--force does not bypass this safety check."
-            )
-        snapshots.append((record, result))
-    return snapshots
-
-
-def _count_custom_running_snapshots(
-    snapshots: Sequence[tuple[_HostDaemonRecord, _DaemonSessionsResult]],
-) -> int:
-    """Count only session rows that are actively running a turn."""
-    return sum(
-        1
-        for _record, result in snapshots
-        for session in result.sessions
-        if session.get("status") == "running"
-    )
-
-
-def _stop_custom_running_snapshots(
-    snapshots: Sequence[tuple[_HostDaemonRecord, _DaemonSessionsResult]],
-) -> None:
-    """Stop only running sessions after every Host query succeeded."""
-    for _record, result in snapshots:
-        if result.base_url is None:
-            continue
-        for session in result.sessions:
-            session_id = session.get("id")
-            if session.get("status") != "running" or not isinstance(session_id, str):
-                continue
-            _stop_session_on_server(base_url=result.base_url, session_id=session_id)
-
-
-def _drain_custom_host_sessions(host_id: str, *, force: bool) -> None:
-    """Wait for this Host's running turns, or stop them when ``force`` is set."""
-    records = _custom_host_records(host_id)
-    snapshots = _query_custom_host_sessions(records)
-    if force:
-        _stop_custom_running_snapshots(snapshots)
-        return
-    count = _count_custom_running_snapshots(snapshots)
-    if count == 0:
-        return
-    click.echo(
-        f"Waiting for {count} running session(s) on this Host to finish — press Ctrl-C "
-        "to abort, or re-run with --force to stop them now."
-    )
-    last = count
-    while True:
-        time.sleep(_UPGRADE_DRAIN_POLL_S)
-        count = _count_custom_running_snapshots(
-            _query_custom_host_sessions(_custom_host_records(host_id))
-        )
-        if count == 0:
-            return
-        if count != last:
-            click.echo(f"  {count} session(s) still running…")
-            last = count
-
-
-def _wait_for_custom_host_online(
-    host_id: str,
-    previous_records: Sequence[_HostDaemonRecord],
-) -> None:
-    """Wait until the same Host identity reconnects after its supervisor restarts."""
-    deadline = time.monotonic() + _CUSTOM_HOST_RECONNECT_TIMEOUT_S
-    previous_by_target = {
-        record.target: (record.pid, record.started_at) for record in previous_records
-    }
-    while time.monotonic() < deadline:
-        records = _custom_host_records(host_id)
-        for record in records:
-            previous_generation = previous_by_target.get(record.target)
-            if previous_by_target and previous_generation is None:
-                continue
-            if previous_generation == (record.pid, record.started_at):
-                continue
-            if _daemon_host_online(record, timeout_s=2.0):
-                return
-        time.sleep(0.5)
-    raise click.ClickException(
-        f"The update installed, but Host {host_id!r} did not reconnect within "
-        f"{_CUSTOM_HOST_RECONNECT_TIMEOUT_S:.0f}s. Check "
-        f"`{cli_invocation(name='omni')} host status`."
-    )
-
-
-def _custom_host_upgrade_failure_message(
-    code: int,
-    *,
-    installer: str,
-    recovery_command: str,
-) -> str:
-    """Describe a failed install without redirecting the Host to upstream."""
-    version, _commit = _probe_installed_distribution()
-    if version is not None:
-        return f"Update command exited with status {code}; the previous install is intact."
-    return (
-        f"Update command exited with status {code}, and omnigent is no longer installed. "
-        "Host data, history, credentials, and the rollback receipt are untouched. "
-        f"Reinstall our custom channel with the same {installer} command:\n\n"
-        f"    {recovery_command}\n\n"
-        "Then restart the existing Host supervisor. After the CLI is restored, "
-        f"`{cli_invocation(name='omni')} host update custom --rollback` can return to the "
-        "saved commit."
-    )
-
-
 @host.group("update")
 def host_update() -> None:
-    """Update a managed Host installation."""
-
-
-@host_update.command("custom")
-@click.option(
-    "--check",
-    "check_only",
-    is_flag=True,
-    help="Report whether the custom Host channel has a newer commit.",
-)
-@click.option(
-    "--dry-run",
-    is_flag=True,
-    help="Preview the installer request without stopping the Host.",
-)
-@click.option(
-    "--force",
-    is_flag=True,
-    help="Stop this Host's running sessions instead of waiting for them to finish.",
-)
-@click.option(
-    "--rollback",
-    is_flag=True,
-    help="Reinstall the commit saved immediately before the previous custom update.",
-)
-@click.option(
-    "--web-ui/--no-web-ui",
-    "web_ui",
-    default=None,
-    help="Rebuild or skip the bundled web UI. Default: keep the install's current shape.",
-)
-def host_update_custom(
-    check_only: bool,
-    dry_run: bool,
-    force: bool,
-    rollback: bool,
-    web_ui: bool | None = None,
-) -> None:
-    """Update this Host from the custom channel."""
-    # Hold exclusion across preflight, draining, supervisor stop, and receipt
-    # handoff. Locking only inside the final helper launch is too late: another
-    # caller could stop/restart the Host while the first installer is running.
-    guard = (
-        _custom_host_update_launch_guard()
-        if IS_WINDOWS and not check_only and not dry_run
-        else contextlib.nullcontext()
+    """Deprecated update group; removed in v0.22.0."""
+    click.echo(
+        "`omni host update custom` is deprecated and will be removed in v0.22.0; use `omni up`.",
+        err=True,
     )
-    with guard:
-        _host_update_custom_impl(check_only, dry_run, force, rollback, web_ui)
 
 
-# ``update`` stays upstream's alias of ``upgrade`` (installs the upstream
-# PyPI release), so the fork's short spelling is ``up``.
-cli.add_command(host_update_custom, name="up")
+host_update.add_command(upgrade, name="custom")
+cli.add_command(upgrade, name="up")
 
 
 def _register_usage_export_commands() -> None:
@@ -11333,245 +10163,6 @@ def _register_usage_export_commands() -> None:
 
 
 _register_usage_export_commands()
-
-
-def _host_update_custom_impl(
-    check_only: bool,
-    dry_run: bool,
-    force: bool,
-    rollback: bool,
-    web_ui: bool | None = None,
-) -> None:
-    """Run update checks and the guarded installation workflow.
-
-    :param web_ui: ``True`` / ``False`` from ``--web-ui`` / ``--no-web-ui``;
-        ``None`` keeps the install's shape (rebuild only when it has a bundle).
-    """
-    if check_only and rollback:
-        raise click.UsageError("--check and --rollback cannot be used together.")
-    if _find_repo_root() is not None:
-        raise click.ClickException(
-            "This is a source checkout. Update the local/host-custom branch with git; "
-            "the Host self-updater only manages installed tools."
-        )
-    info = _read_installed_wheel_info()
-    if info is None:
-        raise click.ClickException("Couldn't determine how omnigent is installed.")
-    if info.is_editable:
-        raise click.ClickException(
-            "Editable installs must be updated with git, not Host self-update."
-        )
-    if info.detected_installer not in {"uv", "pipx"}:
-        raise click.ClickException(
-            "Custom Host self-update supports uv tool and pipx installs only, so extras and "
-            "the target environment can be preserved safely."
-        )
-    if info.detected_installer == "uv" and _uv_tool_receipt_path() is None:
-        raise click.ClickException(
-            "This uv install is not managed by `uv tool`. Bootstrap it with `uv tool install` "
-            "before using custom Host self-update."
-        )
-    if not info.extras_known:
-        raise click.ClickException(
-            f"The {info.detected_installer} install receipt is missing or unreadable, so the "
-            "Host's extras cannot be preserved safely. Repair or bootstrap the custom "
-            "channel before using self-update."
-        )
-    current_sha = _valid_git_sha(info.commit_sha)
-    if current_sha is None:
-        raise click.ClickException(
-            "The installed build does not record a full git commit, so a verified update and "
-            "rollback cannot be performed. Bootstrap the custom channel once manually."
-        )
-
-    if rollback:
-        target_sha, saved_source = _read_custom_host_rollback()
-        # A receipt naming its repository survives a source switch; without
-        # one the first configured source must still hold the saved commit.
-        source_url = saved_source or _resolve_custom_host_channel_head(allow_fallback=False)[0]
-    else:
-        source_url, target_sha = _resolve_custom_host_channel_head()
-
-    # Resolve the moving channel once, then install that exact revision on
-    # every platform. A push during uv/pipx installation must not change it.
-    target_url = f"{source_url}@{target_sha}"
-    suggestion = _build_upgrade_suggestion(
-        info,
-        target_vcs_url=target_url,
-        force_uv_tool_install=IS_WINDOWS and info.detected_installer == "uv",
-    )
-    if not suggestion.runnable:
-        raise click.ClickException(
-            f"No automatic update command is known for this install. {suggestion.command}."
-        )
-
-    if IS_WINDOWS:
-        _reconcile_custom_host_update_result(
-            current_sha,
-            persist=not check_only and not dry_run,
-        )
-
-    if current_sha == target_sha:
-        click.echo(f"Custom Host is up to date (git {current_sha[:9]}).")
-        return
-    if check_only:
-        click.echo(f"A custom Host update is available: {current_sha[:9]} → {target_sha[:9]}.")
-        raise SystemExit(1)
-
-    has_web_ui = _custom_host_installed_web_ui()
-    build_web_ui = has_web_ui if web_ui is None else web_ui
-    if build_web_ui:
-        missing = _custom_host_web_ui_tools_missing()
-        if missing:
-            reason = "--web-ui was given" if web_ui else "this install has a web UI"
-            raise click.ClickException(
-                f"Rebuilding the web UI needs {' and '.join(missing)} on PATH ({reason}). "
-                "Nothing was changed. Install them, or pass --no-web-ui to update "
-                "without the web UI."
-            )
-        web_ui_plan = "rebuilt" + ("" if web_ui else " (this install has a web UI)")
-    elif web_ui is False:
-        web_ui_plan = "skipped (--no-web-ui)"
-    else:
-        web_ui_plan = "skipped for this Host-only install"
-    has_service = _custom_host_has_service()
-    restart_hint = (
-        f"run `{cli_invocation(name='omnigent')} stop`, then "
-        f"`{cli_invocation(name='omnigent')}` to start the new version"
-    )
-    rollback_source = _custom_host_install_source(info.vcs_url)
-
-    if dry_run:
-        click.echo(
-            f"Custom source: {target_url}\n"
-            f"Detected installer: {info.detected_installer}\n"
-            f"Detected extras: {', '.join(sorted(info.extras)) if info.extras else '(none)'}\n"
-            f"Web UI build: {web_ui_plan}\n"
-            + (
-                "Host restart: managed Host service\n"
-                if has_service
-                else f"Host restart: none (no managed Host service; {restart_hint})\n"
-            )
-            + (
-                "Dependencies: target uv.lock (exported before installation)\n"
-                if info.detected_installer == "uv"
-                else ""
-            )
-            + f"Would run: {suggestion.command}"
-        )
-        return
-
-    host_id = _load_existing_host_id() or ""
-    if has_service:
-        if not host_id:
-            raise click.ClickException(
-                "No existing Host identity was found; start the Host once first."
-            )
-        _preflight_custom_host_supervisor()
-    # Without a service nothing restarts, but running turns still finish
-    # before their package files are replaced.
-    previous_records: list[_HostDaemonRecord] = []
-    if host_id:
-        _drain_custom_host_sessions(host_id, force=force)
-        previous_records = _custom_host_records(host_id)
-
-    paused: object | None = None
-    if IS_WINDOWS:
-        try:
-            processes = _list_windows_processes()
-            old_tree = _windows_stopped_host_tree_pids(
-                processes,
-                stopped_host_pids=[record.pid for record in previous_records],
-                cli_bin_path=_windows_custom_host_cli_path(shutil.which("omni")),
-                excluded_pids={os.getpid()},
-            )
-            process_identities = [proc for proc in processes if proc.pid in old_tree]
-            paused = _pause_custom_host_supervisor()
-            if not (
-                isinstance(paused, tuple)
-                and len(paused) == 2
-                and paused[0] == "windows"
-                and isinstance(paused[1], Path)
-            ):
-                raise click.ClickException("Invalid Windows Host supervisor state.")
-            _wait_for_windows_host_tree_exit(process_identities)
-            helper_pid, result_path, log_path = _launch_windows_custom_host_update(
-                install_command=suggestion.command,
-                old_commit=current_sha,
-                target_commit=target_sha,
-                host_id=host_id,
-                previous_records=previous_records,
-                wrapper=paused[1],
-                rollback_source_url=rollback_source,
-                skip_web_ui=not build_web_ui,
-                process_identities=process_identities,
-            )
-        except Exception:
-            if paused is not None:
-                try:
-                    _resume_custom_host_supervisor(paused)
-                except (click.ClickException, OSError, subprocess.SubprocessError) as resume_error:
-                    click.echo(
-                        f"Additionally failed to restart the Host: {resume_error}", err=True
-                    )
-            raise
-        click.echo(
-            f"Scheduled custom Host update in detached helper pid {helper_pid}. "
-            "This CLI must exit before Windows releases the tool files."
-        )
-        click.echo(f"Result: {result_path}")
-        click.echo(f"Log: {log_path}")
-        return
-
-    try:
-        if has_service:
-            paused = _pause_custom_host_supervisor()
-        _write_custom_host_rollback(current_sha, rollback_source)
-        # Set either way so an inherited value cannot override the decision.
-        install_env = {
-            **os.environ,
-            "OMNIGENT_SKIP_WEB_UI": "false" if build_web_ui else "true",
-            "OMNIGENT_BUILD_WEB_UI": "1" if build_web_ui else "0",
-        }
-        code = _run_upgrade_command(suggestion.command, Console(), env=install_env)
-        if code != 0:
-            raise click.ClickException(
-                _custom_host_upgrade_failure_message(
-                    code,
-                    installer=info.detected_installer,
-                    recovery_command=suggestion.command,
-                )
-            )
-    finally:
-        if paused is not None:
-            had_primary_error = sys.exc_info()[0] is not None
-            try:
-                _resume_custom_host_supervisor(paused)
-            except Exception as resume_error:
-                if not had_primary_error:
-                    if isinstance(resume_error, click.ClickException):
-                        raise
-                    raise click.ClickException(
-                        f"The Host could not be restarted: {resume_error}"
-                    ) from resume_error
-                click.echo(f"Additionally failed to restart the Host: {resume_error}", err=True)
-
-    _version, installed_sha = _probe_installed_distribution()
-    if _valid_git_sha(installed_sha) != target_sha:
-        actual = installed_sha[:9] if installed_sha else "unknown"
-        raise click.ClickException(
-            f"The installer exited successfully, but the installed commit is {actual}; "
-            f"expected {target_sha[:9]}."
-            + (" The Host was restarted on the available install." if has_service else "")
-        )
-    if has_service and host_id:
-        _wait_for_custom_host_online(host_id, previous_records)
-    click.echo(f"Updated custom Host: {current_sha[:9]} → {target_sha[:9]} from {source_url}")
-    if not has_service:
-        click.echo(
-            f"No managed Host service is installed, so nothing was restarted: {restart_hint}."
-        )
-    click.echo(f"Rollback: {cli_invocation(name='omni')} host update custom --rollback")
 
 
 def _host_group_option(ctx: click.Context, key: str) -> str | None:

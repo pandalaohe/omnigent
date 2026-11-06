@@ -1185,16 +1185,25 @@ def test_help_hides_update_alias_but_keeps_it_runnable() -> None:
     assert cli.commands["update"] is cli.commands["upgrade"]
 
 
-def test_up_is_short_spelling_of_host_update_custom() -> None:
-    """``up`` is the same command object as ``host update custom``."""
+def test_up_is_short_spelling_of_upgrade() -> None:
+    """All update spellings share the upstream command and options."""
+    assert cli.commands["up"] is cli.commands["upgrade"]
     assert cli.commands["up"] is cli.commands["host"].commands["update"].commands["custom"]
 
     result = CliRunner().invoke(cli, ["up", "--help"])
 
     assert result.exit_code == 0, result.output
-    assert "--rollback" in result.output
-    assert "Update this Host from the custom channel." in result.output
-    assert "--no-web-ui" in result.output
+    assert "--rollback" not in result.output
+    assert "--no-web-ui" not in result.output
+    assert "--check" in result.output
+
+
+def test_legacy_custom_update_warns_for_one_release() -> None:
+    result = CliRunner().invoke(cli, ["host", "update", "custom", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "removed in v0.22.0" in result.output
+    assert "use `omni up`" in result.output
 
 
 def test_help_hides_extras_gated_harness_when_sdk_missing(
