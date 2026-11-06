@@ -211,7 +211,7 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => ({
 }));
 vi.mock("@/lib/agentLabels", async (importOriginal) => ({
   ...(await importOriginal<typeof AgentLabelsModule>()),
-  useBrainHarnessLabels: () => ({}),
+  useBrainHarnessLabels: () => ({ "claude-sdk": "Claude SDK" }),
   useHarnessSetupSteps: () => ({}),
 }));
 
@@ -497,7 +497,14 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     );
 
     const body = await submitAndReadBody();
-    expect(Object.keys(body).sort()).toEqual(["agent_id", "host_id", "labels", "workspace"]);
+    expect(Object.keys(body).sort()).toEqual([
+      "agent_id",
+      "host_id",
+      "labels",
+      "permission_mode",
+      "workspace",
+    ]);
+    expect(body.permission_mode).toBe("default");
     expect(body.agent_id).toBe("ag_hello");
     expect(body.host_id).toBe("host_1");
     expect(body.workspace).toBe(RECENT_WORKSPACE);

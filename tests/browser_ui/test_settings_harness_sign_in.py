@@ -51,6 +51,7 @@ def test_expired_codex_account_recovers_on_selected_machine(
         )
         contract.json("/v1/harnesses", {"data": [], "setup_steps": {}})
         prefix = f"/v1/hosts/{host_id}"
+        contract.json(prefix + "/harnesses/codex-native/model-options", {"models": []})
         contract.json(prefix + "/mcp-servers", {"mcp_servers": []})
         contract.json(prefix + "/plugins", {"plugins": []})
         contract.json(re.compile(r"/v1/skills(?:\?.*)?$"), {"skills": []})
