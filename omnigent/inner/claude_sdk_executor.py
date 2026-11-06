@@ -4722,6 +4722,11 @@ class ClaudeSDKExecutor(Executor):
                                     max_output_tokens=max_output
                                     if type(max_output) is int and max_output > 0
                                     else 20_000,
+                                    # The SDK passes user and project when unset.
+                                    setting_sources=resolved.setting_sources
+                                    if resolved.setting_sources is not None
+                                    else ["user", "project"],
+                                    env={**os.environ, **env},
                                 )
 
                     elif isinstance(message, sdk.SystemMessage):

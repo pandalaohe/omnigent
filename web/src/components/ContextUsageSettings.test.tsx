@@ -758,6 +758,26 @@ describe("ContextUsageSettings", () => {
     expect(entries).toContainEqual(OPUS);
   });
 
+  it("holds the ring's entry while what is in use is still loading, then seeds first", async () => {
+    mocks.sessionAgentIds = undefined;
+    const key = usageContextSourceKey({ ...OPUS, hostId: "host-a" });
+    const view = renderSettings(`/settings/general?ctx=${encodeURIComponent(key)}#context-usage`);
+    expect(readUsageContextPreferences().contextList).toBeUndefined();
+
+    mocks.sessionAgentIds = new Set(["harness:claude-native", "harness:codex"]);
+    view.rerender(
+      <MemoryRouter initialEntries={[`/settings/general?ctx=${encodeURIComponent(key)}`]}>
+        <ContextUsageSettings />
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+    await screen.findByRole("spinbutton", { name: /Context total/ });
+    const entries = readUsageContextPreferences().contextList?.entries ?? [];
+    expect(entries).toContainEqual(AGENT);
+    expect(entries).toContainEqual(CODEX_AGENT);
+    expect(entries).toContainEqual(OPUS);
+  });
+
   it("says so when the ring's entry names no agent", async () => {
     store([AGENT]);
     renderSettings(`/settings/general?ctx=${encodeURIComponent('["","","",""]')}#context-usage`);

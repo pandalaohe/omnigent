@@ -5,10 +5,12 @@ import {
   DEFAULT_USAGE_CONTEXT_PREFERENCES,
   readUsageContextPreferences,
   usageContextSourceKey,
+  writeReportedContext,
   type UsageContextPreferences,
 } from "@/lib/usageContextPreferences";
 
 const store = vi.hoisted(() => ({
+  conversationId: "session-1" as string | null,
   contextWindow: 1_000_000 as number | null,
   autoCompactTokenLimit: 550_000 as number | null,
 }));
@@ -33,6 +35,7 @@ function record(preferences: UsageContextPreferences, key: string) {
 describe("useRecordReportedContext", () => {
   beforeEach(() => {
     localStorage.clear();
+    store.conversationId = "session-1";
     store.contextWindow = 1_000_000;
     store.autoCompactTokenLimit = 550_000;
   });
@@ -61,5 +64,61 @@ describe("useRecordReportedContext", () => {
     store.autoCompactTokenLimit = null;
     record(DEFAULT_USAGE_CONTEXT_PREFERENCES, usageContextSourceKey(SOURCE));
     expect(readUsageContextPreferences().reportedContext).toBeUndefined();
+  });
+
+  it("does not write its reading back over another tab's for the same source", () => {
+    const key = usageContextSourceKey(SOURCE);
+    const { rerender } = renderHook(
+      ({ preferences }) => useRecordReportedContext(preferences, key),
+      { initialProps: { preferences: DEFAULT_USAGE_CONTEXT_PREFERENCES } },
+    );
+    // Another tab's session on the same source reports a different compact point.
+    writeReportedContext(readUsageContextPreferences(), key, {
+      contextWindow: 1_000_000,
+      autoCompactTokenLimit: 367_000,
+    });
+    rerender({ preferences: readUsageContextPreferences() });
+    expect(readUsageContextPreferences().reportedContext?.[key]?.autoCompactTokenLimit).toBe(
+      367_000,
+    );
+  });
+
+  it("keeps the old model's reading when the model switches before the new reading", () => {
+    const opus = usageContextSourceKey(SOURCE);
+    const sonnet = usageContextSourceKey({ ...SOURCE, model: "claude-sonnet-5-5" });
+    const { rerender } = renderHook(
+      ({ key }) => useRecordReportedContext(readUsageContextPreferences(), key),
+      { initialProps: { key: opus } },
+    );
+    rerender({ key: sonnet });
+    expect(readUsageContextPreferences().reportedContext?.[sonnet]).toBeUndefined();
+
+    store.contextWindow = 200_000;
+    store.autoCompactTokenLimit = 167_000;
+    rerender({ key: sonnet });
+    const reported = readUsageContextPreferences().reportedContext;
+    expect(reported?.[sonnet]).toMatchObject({
+      contextWindow: 200_000,
+      autoCompactTokenLimit: 167_000,
+    });
+    expect(reported?.[opus]).toMatchObject({
+      contextWindow: 1_000_000,
+      autoCompactTokenLimit: 550_000,
+    });
+  });
+
+  it("records another session's source even when its figures match the last one", () => {
+    const first = usageContextSourceKey(SOURCE);
+    const second = usageContextSourceKey({ ...SOURCE, hostId: "host-b" });
+    const { rerender } = renderHook(
+      ({ key }) => useRecordReportedContext(readUsageContextPreferences(), key),
+      { initialProps: { key: first } },
+    );
+    store.conversationId = "session-2";
+    rerender({ key: second });
+    expect(readUsageContextPreferences().reportedContext?.[second]).toMatchObject({
+      contextWindow: 1_000_000,
+      autoCompactTokenLimit: 550_000,
+    });
   });
 });

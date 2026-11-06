@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from pathlib import Path
 
 from omnigent.models.claude_model_vocabulary import normalized_model_id
@@ -66,21 +66,34 @@ def read_claude_auto_compact_token_limit(
     model: str | None = None,
     cwd: Path | None = None,
     max_output_tokens: int = 20_000,
+    setting_sources: Collection[str] | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> int | None:
-    """Read user and project settings without changing the CLI's configuration."""
+    """Read the settings the CLI loads without changing its configuration.
+
+    :param setting_sources: The CLI's ``--setting-sources``, e.g. ``[]`` when it
+        loads no settings file; ``None`` means its default, user, project and local.
+    :param env: The CLI's launch environment; ``None`` means this process's.
+    """
     working_dir = cwd or Path.cwd()
     config_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
     if not config_dir.is_absolute():
         config_dir = working_dir / config_dir
+    sources = {"user", "project", "local"} if setting_sources is None else set(setting_sources)
     settings: dict[str, object] = {}
-    for path in (
-        config_dir / ".claude.json"
-        if os.environ.get("CLAUDE_CONFIG_DIR")
-        else Path.home() / ".claude.json",
-        config_dir / "settings.json",
-        working_dir / ".claude/settings.json",
-        working_dir / ".claude/settings.local.json",
+    for source, path in (
+        (
+            None,
+            config_dir / ".claude.json"
+            if os.environ.get("CLAUDE_CONFIG_DIR")
+            else Path.home() / ".claude.json",
+        ),
+        ("user", config_dir / "settings.json"),
+        ("project", working_dir / ".claude/settings.json"),
+        ("local", working_dir / ".claude/settings.local.json"),
     ):
+        if source is not None and source not in sources:
+            continue
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, ValueError):
@@ -97,7 +110,7 @@ def read_claude_auto_compact_token_limit(
     return claude_auto_compact_token_limit(
         context_window,
         settings=settings,
-        env=os.environ,
+        env=os.environ if env is None else env,
         model=model,
         max_output_tokens=max_output_tokens,
     )

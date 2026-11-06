@@ -3286,7 +3286,6 @@ module.exports = function (pi) {
   pi.on("model_select", async (event, ctx) => {
     rememberContext(ctx);
     await reportThinkingLevel();
-    await postSessionUsage(ctx);
     // Mirror a model switch made inside the Pi TUI (the ``/model`` command or
     // Ctrl+P cycling) back to Omnigent so the web picker reflects it. Skip
     // ``restore`` — that is Pi re-applying the session's saved model at
@@ -3296,25 +3295,18 @@ module.exports = function (pi) {
     // the inbox ``model_change``) round-trips here as a no-op.
     const source =
       event && typeof event.source === "string" ? event.source : "";
-    if (source === "restore") {
-      await postEvent(config, {
-        type: "external_session_usage", data: { pi_cache_ttl_seconds: null },
-      });
-      return;
-    }
     const model = event && event.model ? event.model : undefined;
-    const selectedModel = modelReference(model);
-    if (!selectedModel) {
+    const selectedModel = source === "restore" ? "" : modelReference(model);
+    // The model goes first: the usage below measures it, and the web files a
+    // reading under the model it last heard of.
+    if (selectedModel) {
       await postEvent(config, {
-        type: "external_session_usage", data: { pi_cache_ttl_seconds: null },
+        type: "external_model_change",
+        data: { model: selectedModel },
       });
-      return;
     }
-    await postEvent(config, {
-      type: "external_model_change",
-      data: { model: selectedModel },
-    });
-    if (!lastCacheUsage) await postEvent(config, {
+    await postSessionUsage(ctx);
+    if (!selectedModel || !lastCacheUsage) await postEvent(config, {
       type: "external_session_usage", data: { pi_cache_ttl_seconds: null },
     });
   });

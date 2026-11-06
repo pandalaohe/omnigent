@@ -1016,6 +1016,7 @@ export function ContextUsageSettings() {
     ? rowsForAgentIds(registry.items, registry.legacyProducts, sessions.data)
     : null;
   const inUseKnown = !registry.isLoading && !registry.isError && sessionRows !== null;
+  const inUseFailed = registry.isError || sessions.isError;
   const inUse: UsageContextListEntry[] = registry.items.flatMap((item) =>
     item.deployed && item.name && item.harness && sessionRows?.has(item.key)
       ? [{ agentName: item.name, harness: item.harness, model: "" }]
@@ -1198,8 +1199,9 @@ export function ContextUsageSettings() {
   });
 
   // The ring's entry: open this session's model on all computers, then drop `ctx`
-  // from the URL so a reload does not reopen it. Waits for the seed, which adding
-  // the session's row would otherwise pre-empt.
+  // from the URL so a reload does not reopen it. Waits for the seed, also while what
+  // is in use is loading, since adding the session's row would pre-empt it; only a
+  // failed load, which never seeds, lets the entry go first.
   useEffect(() => {
     const param = searchParams.get("ctx");
     if (!param) {
@@ -1207,7 +1209,7 @@ export function ContextUsageSettings() {
       return;
     }
     if (consumedRef.current === param) return;
-    if (!preferences.contextList && inUseKnown) return;
+    if (!preferences.contextList && !inUseFailed) return;
     consumedRef.current = param;
     const source = usageContextSourceFromKey(param);
     if (source?.agentName && source.harness) {
@@ -1224,7 +1226,7 @@ export function ContextUsageSettings() {
     next.delete("ctx");
     navigate({ search: next.toString(), hash: location.hash }, { replace: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [searchParams, preferences.contextList, inUseKnown]);
+  }, [searchParams, preferences.contextList, inUseFailed]);
 
   // Bring the cell the open editor belongs to on screen: a float anchored past the
   // viewport edge cannot be reached.

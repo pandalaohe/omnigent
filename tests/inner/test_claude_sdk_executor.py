@@ -5884,6 +5884,75 @@ async def test_context_tokens_uses_last_call_not_cumulative_on_multi_iteration_t
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("skills_filter", "user_settings", "expected"),
+    [
+        # ``setting_sources=[]``: a project window the CLI never read stays unknown.
+        ("none", {}, None),
+        # It still runs with the user settings env copied into its launch environment.
+        (
+            "none",
+            {"autoCompactWindow": 300_000, "env": {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "550000"}},
+            517_000,
+        ),
+        # The SDK's default sources are user and project, so settings.local.json is unread.
+        ("all", {}, None),
+    ],
+)
+async def test_compact_point_follows_the_cli_setting_sources(
+    tmp_path, monkeypatch, skills_filter, user_settings, expected
+) -> None:
+    """The reported compact point uses only settings the SDK's CLI loads."""
+    from unittest.mock import patch
+
+    from claude_agent_sdk.types import (
+        ClaudeAgentOptions as SDKClaudeAgentOptions,
+    )
+    from claude_agent_sdk.types import ResultMessage as SDKResultMessage
+
+    user = tmp_path / "user"
+    user.mkdir()
+    (user / "settings.json").write_text(json.dumps(user_settings))
+    project = tmp_path / "project"
+    (project / ".claude").mkdir(parents=True)
+    (project / ".claude/settings.local.json").write_text(
+        json.dumps({"autoCompactWindow": 400_000})
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(user))
+    monkeypatch.delenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", raising=False)
+
+    result = SDKResultMessage(
+        subtype="result",
+        session_id="s1",
+        result="done",
+        total_cost_usd=0.0,
+        duration_ms=100,
+        duration_api_ms=80,
+        is_error=False,
+        num_turns=1,
+        usage={"input_tokens": 10, "output_tokens": 5},
+        model_usage={"claude-opus-4-8": {"contextWindow": 1_000_000, "maxOutputTokens": 64_000}},
+    )
+
+    class _FakeSDK(_sdk_types()):
+        ResultMessage = SDKResultMessage
+        ClaudeAgentOptions = SDKClaudeAgentOptions
+
+        class ClaudeSDKClient(_SDKClient):
+            async def receive_response(self):
+                yield result
+
+    executor = _default_executor(skills_filter=skills_filter, cwd=str(project))
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+        events = [e async for e in executor.run_turn([{"role": "user", "content": "hi"}], [], "")]
+
+    turn = next(e for e in events if isinstance(e, TurnComplete))
+    assert turn.usage is not None
+    assert turn.usage["context_window"] == 1_000_000
+    assert turn.usage["auto_compact_token_limit"] == expected
+
+
+@pytest.mark.asyncio
 async def test_context_tokens_emitted_when_turn_ends_without_result_message() -> None:
     """A turn that never reaches ``ResultMessage`` still reports ``context_tokens``.
 
