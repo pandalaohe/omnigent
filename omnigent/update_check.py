@@ -1736,8 +1736,24 @@ def _run_upgrade_command(command: str, console: Console) -> int:
     import shlex
 
     console.print(f"[yellow]Running:[/yellow] {command}")
+
+    class InstallFailed(Exception):
+        def __init__(self, code: int) -> None:
+            self.code = code
+
     try:
-        result = subprocess.run(shlex.split(command), check=False)
+        argv = shlex.split(command)
+        if IS_WINDOWS:
+            from omnigent.host.windows_upgrade import retained_install
+
+            with retained_install(argv):
+                result = subprocess.run(argv, check=False)
+                if result.returncode:
+                    raise InstallFailed(result.returncode)
+        else:
+            result = subprocess.run(argv, check=False)
+    except InstallFailed as exc:
+        return exc.code
     except (OSError, ValueError) as exc:
         # OSError: binary not on PATH. ValueError: shlex.split
         # rejected the command (extremely unlikely for our

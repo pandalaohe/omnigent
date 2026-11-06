@@ -180,6 +180,8 @@ def test_windows_upgrade_uses_wrapper_and_external_recovery(
     import subprocess
     from dataclasses import replace
 
+    monkeypatch.setattr("omnigent.host.windows_upgrade.capture_host_tree", list)
+
     wrapper = tmp_path / "omni-host-service.cmd"
     wrapper.write_text("@echo off\n")
     source = "git+ssh://build-host/srv/git/omnigent.git@release/stable"

@@ -5940,11 +5940,25 @@ def _run_windows_host_service(wrapper: Path, action: Literal["start", "stop"]) -
 def _upgrade_host_service(*, force: bool) -> Iterator[None]:
     """Keep an enabled service stopped until the install and version check finish."""
     if IS_WINDOWS:
+        from omnigent.host.windows_upgrade import capture_host_tree, stop_host_tree
+
         wrapper = _windows_host_service_wrapper()
+        try:
+            processes = capture_host_tree()
+        except (psutil.Error, RuntimeError) as exc:
+            raise click.ClickException(str(exc)) from exc
         _drain_and_stop_local_server(force=force)
         try:
-            if wrapper is not None:
-                _run_windows_host_service(wrapper, "stop")
+            try:
+                try:
+                    if wrapper is not None:
+                        _run_windows_host_service(wrapper, "stop")
+                finally:
+                    # The loop may have replaced a daemon while it was draining.
+                    processes.extend(capture_host_tree())
+                    stop_host_tree(processes)
+            except (psutil.Error, RuntimeError) as exc:
+                raise click.ClickException(str(exc)) from exc
             yield
         finally:
             if wrapper is not None:
