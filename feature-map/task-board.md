@@ -15,6 +15,10 @@ Editing happens in the source. A missing task-page link is shown as text.
   `PUT /v1/me/tasks/sources/{source_id}`. Readers use `GET /v1/me/tasks` and
   `GET /v1/me/tasks/sources`. These routes use the server's normal login or a
   configured `tasks` API key in accounts mode.
+- Readers open a task through `GET /v1/me/tasks/item`, browse events through
+  `/history`, and get daily closing totals through `/closed-counts`, all under
+  `/v1/me/tasks`. A logged-in owner can delete a source with
+  `DELETE /v1/me/tasks/sources/{source_id}`; a feeder key cannot delete it.
 
 ## Checks
 
@@ -26,14 +30,41 @@ with distinct progress icons. Open the task's source link and confirm its URL.
 Repeat through a direct link and at 390 px width. The board should fit the
 viewport and preserve the saved display switch after reloading.
 
+For the report and read API, use an isolated instance and a disposable source:
+
+1. Report a Group with two open Tasks and one completed Task without
+   `progressUpdated`. Read the completed item and confirm `omnigent.ai:closedSeen`
+   is present, then find it in the daily closing totals using its observed time.
+2. Report just one open Task with `omnigent.ai:complete: "open"` on the Group.
+   The omitted open Task disappears from a normal read and appears with
+   `omnigent.ai:gone` in a change read using `changed_after`. The completed Task
+   remains visible. Resend the omitted Task and confirm the reply reports it as
+   returned.
+3. Read a source with a small page limit, following every cursor. After finishing
+   the change-read pages, reuse the first page's `omnigent.ai:changedThrough`
+   minus 60 seconds for the next read. Make a report between pages and confirm
+   the next change read reconciles the changed tasks and gone markers.
+4. Append a history entry while resending an older Task body. Confirm the reply
+   holds the body and adds the history, then find that entry in the item and in
+   `/history`. Read `/closed-counts` with a fixed UTC offset to check day edges.
+5. Delete the disposable source using login authentication. Confirm it, its
+   items and its history disappear. Recreate it and confirm its `created` value
+   changes; readers use that value to discard the source's previous cache.
+
+Report failed API checks with the route, HTTP status and response code, omitting
+credentials. Report pagination failures with page sizes and the first watermark.
+
 Related automated checks:
 
 - `tests/server/test_task_board.py`: report/read, replay, older and conflicting
-  bodies, history append, invalid-report atomicity, owner/workspace isolation.
+  bodies, completeness/gone, change-read pagination under concurrent reports,
+  item/history/counts/delete, report limits, issues and owner/workspace isolation.
 - `tests/server/routes/test_usage_read_auth.py`: exact key scope and live owner
   authority, including denial of source deletion and unrelated routes.
 - `tests/server/test_app.py::test_task_board_deployment_gate_and_info`: deployment
   gate and capability flag.
+- `tests/server/test_app.py::test_task_board_raised_limits_reach_the_live_report_router`:
+  configured body, entry and source limits through the real app router.
 - `tests/db/test_migration_task_board.py`: additive SQLite migration round trip.
 - `web/src/pages/taskBoard/`: component, pagination, safe-link, catalogue and
   literal-label tests; existing App, Settings and Sidebar tests cover mounting.
