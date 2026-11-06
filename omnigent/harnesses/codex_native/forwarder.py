@@ -9400,7 +9400,8 @@ async def _post_status(
         session_id,
         event_type="external_session_status",
         data=data,
-        max_attempts=None,
+        # Terminal outcomes survive outages; transient status edges use bounded retries.
+        max_attempts=None if status in {"idle", "failed"} else _POST_MAX_ATTEMPTS,
         timeout=_DURABLE_ITEM_POST_TIMEOUT_SECONDS,
     )
     _log_failed_session_event_post("external_session_status", response)
