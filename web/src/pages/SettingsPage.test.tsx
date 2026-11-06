@@ -75,6 +75,7 @@ const mocks = vi.hoisted(() => ({
   authenticatedFetch: vi.fn(),
   // Deployment gate for the Usage board module (server config usage.enabled).
   usageBoardEnabled: true,
+  taskBoardEnabled: false,
   sessionCollabEnabled: false,
 }));
 
@@ -95,6 +96,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     single_user: mocks.singleUser,
     enabled_connections: mocks.enabledConnections,
     usage_board_enabled: mocks.usageBoardEnabled,
+    task_board_enabled: mocks.taskBoardEnabled,
     features: { session_peer_messaging: mocks.sessionCollabEnabled },
   }),
 }));
@@ -2672,5 +2674,24 @@ describe("Usage board group", () => {
     renderPage("/settings/general");
     const group = screen.getByTestId("settings-group-usage-settings");
     expect(within(group).getByRole("heading", { name: "Usage board" })).toBeTruthy();
+  });
+});
+
+describe("Task board group", () => {
+  afterEach(() => {
+    mocks.taskBoardEnabled = false;
+  });
+
+  it("is absent with the deployment off", () => {
+    renderPage("/settings/general");
+    expect(screen.queryByTestId("settings-group-task-board")).toBeNull();
+  });
+
+  it("opens the display switch through its settings link", async () => {
+    mocks.taskBoardEnabled = true;
+    renderPage("/settings/general#task-board-settings");
+    const group = screen.getByTestId("settings-group-task-board");
+    expect(within(group).getByRole("heading", { name: "Task board" })).toBeTruthy();
+    expect(await within(group).findByRole("switch", { name: "Show Task board" })).toBeTruthy();
   });
 });

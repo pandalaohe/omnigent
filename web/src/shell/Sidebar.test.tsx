@@ -34,7 +34,10 @@ import { writeShortcutPreference } from "@/lib/keyboardShortcutPreferences";
 import { isMacPlatform } from "@/lib/hotkeys";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { clearSessionDrafts, setSessionDraft } from "@/lib/sessionDrafts";
-import { writeSessionNavigationPreferences } from "@/lib/sessionNavigationPreferences";
+import {
+  readSessionNavigationPreferences,
+  writeSessionNavigationPreferences,
+} from "@/lib/sessionNavigationPreferences";
 import { NEW_SESSION_TARGET_STORAGE_KEY } from "@/lib/newSessionTarget";
 import * as sessionsApi from "@/lib/sessionsApi";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
@@ -350,6 +353,23 @@ function seedPins(ids: string[]) {
   pinnedIdsRef.current = ids;
 }
 afterEach(cleanup);
+
+it("shows the task board entry only when deployment and user switches are on", () => {
+  mockConversations([]);
+  const info = { ...FALLBACK_SERVER_INFO, task_board_enabled: true };
+  const view = renderSidebar(true, "/task-board", undefined, info);
+  expect(screen.queryByTestId("task-board-nav")).toBeNull();
+  act(() =>
+    writeSessionNavigationPreferences({
+      ...readSessionNavigationPreferences(),
+      showTaskBoard: true,
+    }),
+  );
+  expect(screen.getByRole("link", { name: "Task board" }).getAttribute("href")).toBe("/task-board");
+  view.unmount();
+  renderSidebar(true, "/", undefined, { ...info, task_board_enabled: false });
+  expect(screen.queryByTestId("task-board-nav")).toBeNull();
+});
 
 const TEST_EXTENSION: ExtensionCatalogItem = {
   object: "extension",

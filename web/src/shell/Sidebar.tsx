@@ -55,6 +55,7 @@ import {
   FolderMinusIcon,
   FolderOpenIcon,
   GaugeIcon,
+  PanelsTopLeftIcon,
   GitBranchIcon,
   GitForkIcon,
   GitMergeIcon,
@@ -199,6 +200,7 @@ import {
   isFeatureEnabled,
   isSingleUserMode,
   sandboxOptionLabel,
+  taskBoardAvailable,
   usageBoardAvailable,
 } from "@/lib/capabilities";
 import { useBranding } from "@/lib/branding";
@@ -225,6 +227,7 @@ import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useActiveRootSessionId } from "@/hooks/useSession";
 import { ProjectIconGlyph } from "@/lib/tablerIcon";
 import { useSessionNavigationPreferences } from "@/hooks/useSessionNavigationPreferences";
+import { t as taskBoardText } from "@/pages/taskBoard/taskBoardText";
 import { useNewSessionTarget } from "@/hooks/useNewSessionTarget";
 import {
   newSessionRoute,
@@ -593,6 +596,7 @@ function useActiveNavItem(): {
   isTasksPage: boolean;
   isUsagePage: boolean;
   isUsageBoardPage: boolean;
+  isTaskBoardPage: boolean;
   isSystemStatusPage: boolean;
   activeExtensionPageId: string | null;
   newSessionProjectName: string | null;
@@ -613,6 +617,7 @@ function useActiveNavItem(): {
   // The board's routes are `/usage/board`, `/usage/board/<id>` and its
   // settings; the "usage" segment one before the leaf tells them apart.
   const isUsageBoardPage = !isExtensionRoute && segments.at(-2) === "usage";
+  const isTaskBoardPage = !isExtensionRoute && leaf === "task-board";
   const isSystemStatusPage = !isExtensionRoute && leaf === "system";
   const activeExtensionPageId =
     resolveExtensionPageFromPath(extensions, location.pathname)?.page.id ?? null;
@@ -633,6 +638,7 @@ function useActiveNavItem(): {
     isTasksPage,
     isUsagePage,
     isUsageBoardPage,
+    isTaskBoardPage,
     isSystemStatusPage,
     activeExtensionPageId,
     newSessionProjectName,
@@ -845,7 +851,7 @@ function SidebarImpl({
   const newSessionShortcut = useShortcutHint("newSession");
   const sidebarData = useSidebarData();
   const branding = useBranding();
-  const { showGoalSessionMarkers } = useSessionNavigationPreferences();
+  const { showGoalSessionMarkers, showTaskBoard } = useSessionNavigationPreferences();
   const { data: newSessionProjects } = useProjects();
   const {
     target: newSessionTarget,
@@ -1002,6 +1008,7 @@ function SidebarImpl({
     isTasksPage,
     isUsagePage,
     isUsageBoardPage,
+    isTaskBoardPage,
     isSystemStatusPage,
     activeExtensionPageId,
     newSessionProjectName,
@@ -1567,6 +1574,17 @@ function SidebarImpl({
                 activePageId={activeExtensionPageId}
                 onNavigate={onNavClick}
               />
+              {taskBoardAvailable(serverInfo) && showTaskBoard && (
+                <PrimaryNavLink
+                  to="/task-board"
+                  label={taskBoardText("board.title")}
+                  icon={PanelsTopLeftIcon}
+                  active={isTaskBoardPage}
+                  onClick={onNavClick}
+                  componentId="sidebar.task_board"
+                  testId="task-board-nav"
+                />
+              )}
               {usageBoardOn && (
                 <Button
                   asChild

@@ -278,6 +278,7 @@ export interface ServerInfo {
    * Absent on older servers, which reads as off.
    */
   usage_board_enabled?: boolean;
+  task_board_enabled?: boolean;
   /** Operator branding, or null when the built-in identity should be used. */
   branding?: Branding | null;
   /**
@@ -523,6 +524,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           worktree_status: data.worktree_status === true,
           session_search_scope: data.session_search_scope === true,
           usage_board_enabled: data.usage_board_enabled === true,
+          task_board_enabled: data.task_board_enabled === true,
           scheduled_task_session_modes: data.scheduled_task_session_modes === true,
           request_managed_sandbox_host_id: data.request_managed_sandbox_host_id === true,
           agent_install: data.agent_install === true,
@@ -581,6 +583,10 @@ export function isSingleUserMode(info: ServerInfo | "loading"): boolean {
  */
 export function usageBoardAvailable(info: ServerInfo | "loading"): boolean {
   return info !== "loading" && info.usage_board_enabled === true;
+}
+
+export function taskBoardAvailable(info: ServerInfo | "loading"): boolean {
+  return info !== "loading" && info.task_board_enabled === true;
 }
 
 /**
