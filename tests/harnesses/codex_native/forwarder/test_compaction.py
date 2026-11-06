@@ -82,7 +82,12 @@ async def test_completed_context_compaction_item_clears_spinner() -> None:
 
 
 @pytest.mark.asyncio
-async def test_persist_codex_compaction_item_posts_uuid_window_id(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "history", [None, [], [{"type": "message", "role": "user", "content": []}]]
+)
+async def test_persist_codex_compaction_item_posts_uuid_window_id(
+    tmp_path: Path, history: list[dict[str, object]] | None
+) -> None:
     """Codex's UUID window id is posted with the compaction checkpoint."""
     import json as _json
 
@@ -94,13 +99,7 @@ async def test_persist_codex_compaction_item_posts_uuid_window_id(tmp_path: Path
             {
                 "type": "compacted",
                 "payload": {
-                    "replacement_history": [
-                        {
-                            "type": "message",
-                            "role": "user",
-                            "content": [{"type": "input_text", "text": "hi"}],
-                        }
-                    ],
+                    "replacement_history": history,
                     "window_id": "01a070e2-2665-7d62-9b74-973decf239b7",
                 },
             }
@@ -146,7 +145,19 @@ async def test_persist_codex_compaction_item_posts_uuid_window_id(tmp_path: Path
     assert body["data"]["source_id"] == "thread_1:01a070e2-2665-7d62-9b74-973decf239b7", (
         "the boundary names its rollout window so a replay stores one item"
     )
-    assert body["data"]["compacted_messages"][0]["role"] == "user"
+    if history:
+        assert body["data"]["compacted_messages"][0]["role"] == "user"
+    else:
+        assert "compacted_messages" not in body["data"]
+    # A new forwarder processing the completed item must use the same identity.
+    await _persist_codex_compaction_item(
+        client,
+        session_id="conv_codex",
+        bridge_dir=tmp_path,
+        thread_id="thread_1",
+        item_id="replayed-item",
+    )
+    assert client.post.call_args.kwargs["json"]["data"]["source_id"] == body["data"]["source_id"]
 
 
 @pytest.mark.asyncio

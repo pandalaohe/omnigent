@@ -293,6 +293,53 @@ async def test_compaction_source_id_makes_a_repeated_post_a_no_op(
     assert second.json()["replayed"] is True
 
 
+@pytest.mark.parametrize("fallback_source", ["hook_fallback", "transcript_degraded"])
+@pytest.mark.parametrize("fallback_summary", ["", "fallback summary"])
+async def test_compaction_authoritative_snapshot_upgrades_fallback(
+    client: httpx.AsyncClient, fallback_source: str, fallback_summary: str, db_uri: str
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    url = f"/v1/sessions/{session['id']}/events"
+    data = {
+        "source_id": "summary-uuid",
+        "summary": fallback_summary,
+        "last_item_id": "previous-item",
+        "token_count": 0,
+        "snapshot_source": fallback_source,
+    }
+    first = await client.post(url, json={"type": "compaction", "data": data})
+    assert first.status_code == 202
+    before = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+    boundary = next(item for item in before if item["type"] == "compaction")
+    authoritative = {
+        **data,
+        "summary": "authoritative summary",
+        "snapshot_source": "transcript",
+        "last_item_id": boundary["id"],
+        "compacted_messages": [{"role": "user", "content": "retained context"}],
+    }
+    for payload in (authoritative, authoritative, data):
+        response = await client.post(url, json={"type": "compaction", "data": payload})
+        assert response.status_code == 202, response.text
+        assert response.json()["replayed"] is True
+        assert response.json()["item_id"] == first.json()["item_id"]
+    after = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+    boundaries = [item for item in after if item["type"] == "compaction"]
+    assert len(boundaries) == 1
+    upgraded = boundaries[0]
+    assert upgraded["id"] == boundary["id"]
+    assert upgraded["created_at"] == boundary["created_at"]
+    assert upgraded["last_item_id"] == "previous-item"
+    assert upgraded["snapshot_source"] == "transcript"
+    assert upgraded["summary"] == "authoritative summary"
+    assert upgraded["compacted_messages"] == authoritative["compacted_messages"]
+    matches = SqlAlchemyConversationStore(db_uri).search(
+        "authoritative", conversation_id=session["id"]
+    )
+    assert [item.id for item in matches] == [boundary["id"]]
+
+
 async def test_compaction_without_source_id_keeps_appending(client: httpx.AsyncClient) -> None:
     """A boundary with no identity behaves as before: every post appends."""
     agent = await create_test_agent(client)

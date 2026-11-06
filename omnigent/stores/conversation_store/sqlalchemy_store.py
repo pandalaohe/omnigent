@@ -112,6 +112,7 @@ from omnigent.db.utils import (
     strip_nul_bytes,
 )
 from omnigent.entities import (
+    CompactionData,
     Conversation,
     ConversationItem,
     MessageData,
@@ -5331,6 +5332,43 @@ class SqlAlchemyConversationStore(ConversationStore):
                         if row is not None:
                             decoded = self._decode_item_data_batch([row.data])[0]
                             existing = _to_item(row, decoded)
+                            if (
+                                item.stable_id is not None
+                                and isinstance(existing.data, CompactionData)
+                                and isinstance(item.data, CompactionData)
+                                and existing.data.snapshot_source
+                                in ("hook_fallback", "transcript_degraded")
+                                and item.data.snapshot_source == "transcript"
+                                and item.data.compacted_messages
+                            ):
+                                # Upgrade the snapshot under the append lock without
+                                # advancing the boundary's position or round timestamp.
+                                upgraded = item.data.model_copy(
+                                    update={"last_item_id": existing.data.last_item_id}
+                                )
+                                row.data = self._encode_item_data_batch(
+                                    [
+                                        strip_nul_bytes(
+                                            json.dumps(upgraded.model_dump(exclude_none=True))
+                                        )
+                                    ]
+                                )[0]
+                                if search is not None:
+                                    row.search_text = search
+                                    if session.bind and _supports_fts5(session.bind.dialect.name):
+                                        session.execute(
+                                            text(
+                                                "DELETE FROM conversation_items_fts "
+                                                "WHERE item_id = :id AND conversation_id = :cid"
+                                            ),
+                                            {
+                                                "id": item_id,
+                                                "cid": conversation_id,
+                                            },
+                                        )
+                                    if search:
+                                        fts_rows.append((item_id, conversation_id, search))
+                                existing = existing.model_copy(update={"data": upgraded})
                     if existing is not None:
                         if item.idempotency_key is not None and not existing.matches_native_replay(
                             item, exact_source=True

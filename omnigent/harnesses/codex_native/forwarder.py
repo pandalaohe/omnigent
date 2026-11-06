@@ -9940,15 +9940,17 @@ def _read_compacted_history(rollout_path: Path) -> dict[str, object] | None:
     if not isinstance(payload, dict):
         return None
     history = payload.get("replacement_history")
-    if not isinstance(history, list) or not history:
-        return None
     # Store the full replacement_history — messages + compaction
     # tokens. Although the messages duplicate pre-compaction items
     # in the conversation store, they are needed for rollout
     # reconstruction (e.g. sandbox recovery where the rollout file
     # is lost).
     return {
-        "replacement_history": [item for item in history if isinstance(item, dict)],
+        "replacement_history": (
+            [item for item in history if isinstance(item, dict)]
+            if isinstance(history, list)
+            else []
+        ),
         "window_id": payload.get("window_id"),
     }
 
