@@ -464,7 +464,9 @@ class _PiMessageUsage(TypedDict):
 
 class _PiTurnUsage(_PiMessageUsage):
     context_tokens: int
+    context_model: NotRequired[str | None]
     context_window: NotRequired[int]
+    auto_compact_token_limit: NotRequired[int | None]
 
 
 # ---------------------------------------------------------------------------
@@ -774,6 +776,8 @@ class _ToolServer:
             allowed = {
                 "context_tokens",
                 "context_window",
+                "context_model",
+                "auto_compact_token_limit",
                 "pi_cache_ttl_seconds",
                 "pi_cache_observed_at",
                 "pi_cache_read_input_tokens",
@@ -781,6 +785,13 @@ class _ToolServer:
                 "pi_provider_usage_limits_headers",
             }
             if not data or not set(data).issubset(allowed):
+                return {"id": req_id, "accepted": False, "allowed": False}
+            context_model = data.get("context_model")
+            if "context_model" in data and not (
+                isinstance(context_model, str)
+                and context_model.strip()
+                and len(context_model) <= 256
+            ):
                 return {"id": req_id, "accepted": False, "allowed": False}
         else:
             return {"id": req_id, "accepted": False, "allowed": False}
@@ -1254,6 +1265,7 @@ def _rpc_usage_extension_setup(session_id: str, token: str) -> str:
 const USAGE_SESSION_ID = __USAGE_SESSION_ID__;
 const USAGE_TOKEN = __USAGE_TOKEN__;
 let latestUsageContext = null;
+let readUsageSettings = null;
 let lastCacheUsage = null;
 let lastWarmEntryId = null;
 let warmUsagePolling = false;
@@ -1327,6 +1339,23 @@ function cacheUsageData(ctx) {
           data.context_tokens = snapshot.tokens;
         if (Number.isSafeInteger(snapshot.contextWindow) && snapshot.contextWindow > 0)
           data.context_window = snapshot.contextWindow;
+        if (data.context_window) {
+          // RPC session model reports use the assistant's model id.
+          if (typeof ctx.model?.id === "string" && ctx.model.id.trim() &&
+              ctx.model.id.length <= 256)
+            data.context_model = ctx.model.id;
+          data.auto_compact_token_limit = null;
+          if (readUsageSettings) {
+            const settings = readUsageSettings().compaction || {};
+            const model = ctx.model;
+            const override = model && settings.modelOverrides?.[`${model.provider}/${model.id}`];
+            const reserve = override?.reserveTokens ?? settings.reserveTokens ?? 16384;
+            const limit = data.context_window - reserve;
+            if (settings.enabled !== false && Number.isSafeInteger(reserve) &&
+                reserve >= 0 && limit > 0)
+              data.auto_compact_token_limit = limit;
+          }
+        }
       }
     } catch (_err) {}
   }
@@ -1377,6 +1406,7 @@ async function observeWarmUsage(ctx) {
   }
 }
 function installUsageHooks(pi) {
+  readUsageSettings = typeof pi.getSettings === "function" ? () => pi.getSettings() : null;
   pi.on("session_start", async (_event, ctx) => {
     latestUsageContext = ctx;
     if (warmUsagePoller) clearInterval(warmUsagePoller);
@@ -2650,6 +2680,8 @@ class _PiSessionState:
     model: str | None = None
     model_selection: str | None = None
     context_window: int | None = None
+    context_model: str | None = None
+    auto_compact_token_limit: int | None = None
     tool_names: tuple[str, ...] = ()
     # Thinking level (Pi vocabulary) this process is known to be running at,
     # so an unchanged effort costs no RPC and a changed one is applied live.
@@ -3257,6 +3289,8 @@ def _aggregate_pi_turn_usage(
     message_usages: list[_PiMessageUsage],
     fallback_model: str | None,
     context_window: int | None = None,
+    auto_compact_token_limit: int | None = None,
+    context_model: str | None = None,
 ) -> _PiTurnUsage | None:
     """Aggregate per-message Pi usage into one turn-level usage dict.
 
@@ -3319,6 +3353,8 @@ def _aggregate_pi_turn_usage(
     }
     if context_window is not None:
         usage["context_window"] = context_window
+        usage["context_model"] = context_model
+        usage["auto_compact_token_limit"] = auto_compact_token_limit
     return usage
 
 
@@ -4065,6 +4101,12 @@ class PiExecutor(Executor):
             and window > 0
         ):
             state.context_window = window
+            model = data.get("context_model")
+            state.context_model = model if isinstance(model, str) else None
+            compact_limit = data.get("auto_compact_token_limit")
+            state.auto_compact_token_limit = (
+                compact_limit if type(compact_limit) is int and compact_limit > 0 else None
+            )
         return (
             self._pi_session_event(session_id, data)
             if self._pi_session_event is not None
@@ -4676,6 +4718,8 @@ class PiExecutor(Executor):
 
         # A replacement process may use a different model; its own report wins.
         state.context_window = None
+        state.context_model = None
+        state.auto_compact_token_limit = None
         tool_server_port = await self._ensure_tool_server(tools)
         tool_server = self._tool_server
         tool_server_token = tool_server.token if tool_server is not None else None
@@ -5101,7 +5145,11 @@ class PiExecutor(Executor):
                     )
                 else:
                     turn_usage = _aggregate_pi_turn_usage(
-                        message_usages, model, turn_state.context_window if turn_state else None
+                        message_usages,
+                        model,
+                        turn_state.context_window if turn_state else None,
+                        turn_state.auto_compact_token_limit if turn_state else None,
+                        turn_state.context_model if turn_state else None,
                     )
                     _notify_usage_from_dict(model=model, usage=turn_usage)
                     await self.finish_peer_messages(session_key)
@@ -5304,7 +5352,11 @@ class PiExecutor(Executor):
                     yield ExecutorError(message=pending_error)
                     return
                 turn_usage = _aggregate_pi_turn_usage(
-                    message_usages, model, turn_state.context_window if turn_state else None
+                    message_usages,
+                    model,
+                    turn_state.context_window if turn_state else None,
+                    turn_state.auto_compact_token_limit if turn_state else None,
+                    turn_state.context_model if turn_state else None,
                 )
                 _notify_usage_from_dict(model=model, usage=turn_usage)
                 await self.finish_peer_messages(session_key)
@@ -5324,7 +5376,11 @@ class PiExecutor(Executor):
                     yield ExecutorError(message=pending_error)
                     return
                 turn_usage = _aggregate_pi_turn_usage(
-                    message_usages, model, turn_state.context_window if turn_state else None
+                    message_usages,
+                    model,
+                    turn_state.context_window if turn_state else None,
+                    turn_state.auto_compact_token_limit if turn_state else None,
+                    turn_state.context_model if turn_state else None,
                 )
                 _notify_usage_from_dict(model=model, usage=turn_usage)
                 await self.finish_peer_messages(session_key)

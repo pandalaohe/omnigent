@@ -154,7 +154,7 @@ export function ComposerContextRing({
             navigate(usageContextSettingsHref(sourceKey));
           }}
         >
-          Change context values
+          Change context limits
         </Button>
       </PopoverContent>
     </Popover>

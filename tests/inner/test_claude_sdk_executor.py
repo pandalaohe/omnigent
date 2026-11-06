@@ -5740,7 +5740,10 @@ async def test_result_message_other_failure_stays_unclassified() -> None:
 
 
 @pytest.mark.asyncio
-async def test_context_tokens_uses_last_call_not_cumulative_on_multi_iteration_turn() -> None:
+async def test_context_tokens_uses_last_call_not_cumulative_on_multi_iteration_turn(
+    tmp_path,
+    monkeypatch,
+) -> None:
     """``context_tokens`` must reflect the LAST API call, not the cumulative sum.
 
     A single user turn can drive several internal API calls (the SDK's
@@ -5773,6 +5776,10 @@ async def test_context_tokens_uses_last_call_not_cumulative_on_multi_iteration_t
     from claude_agent_sdk.types import StreamEvent as SDKStreamEvent
 
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    (tmp_path / "settings.json").write_text(json.dumps({"autoCompactWindow": 550_000}))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.delenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", raising=False)
 
     class _Sentinel:
         pass
@@ -5813,6 +5820,7 @@ async def test_context_tokens_uses_last_call_not_cumulative_on_multi_iteration_t
             "cache_read_input_tokens": 20300,
             "cache_creation_input_tokens": 0,
         },
+        model_usage={"claude-opus-4-8": {"contextWindow": 1_000_000, "maxOutputTokens": 64_000}},
     )
 
     class _FakeSDK(_sdk_types()):
@@ -5842,6 +5850,9 @@ async def test_context_tokens_uses_last_call_not_cumulative_on_multi_iteration_t
 
     turn = next(e for e in events if isinstance(e, TurnComplete))
     assert turn.usage is not None, "TurnComplete.usage is None on a multi-call turn."
+    assert turn.usage["context_window"] == 1_000_000
+    assert turn.usage["auto_compact_token_limit"] == 517_000
+    assert turn.usage["context_model"] == "claude-opus-4-8"
 
     # context_tokens = LAST call's prompt (500 + 0 + 10300), NOT the
     # cumulative sum (800 + 20300 = 21100). This is the whole point of the
@@ -5871,6 +5882,80 @@ async def test_context_tokens_uses_last_call_not_cumulative_on_multi_iteration_t
         f"total_tokens {turn.usage.get('total_tokens')} != 1050 (800+250) — total must "
         "be the cumulative input + output for billing."
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("skills_filter", "user_settings", "expected"),
+    [
+        # ``setting_sources=[]``: a project window the CLI never read stays unknown.
+        ("none", {}, None),
+        # It still runs with the user settings env copied into its launch environment.
+        (
+            "none",
+            {"autoCompactWindow": 300_000, "env": {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "550000"}},
+            517_000,
+        ),
+        # The SDK's default sources are user and project, so settings.local.json is unread.
+        ("all", {}, None),
+        (
+            "all",
+            {"modelSettings": {"claude-opus-4-8": {"autoCompactWindow": 400_000}}},
+            367_000,
+        ),
+    ],
+)
+async def test_compact_point_follows_the_cli_setting_sources(
+    tmp_path, monkeypatch, skills_filter, user_settings, expected
+) -> None:
+    """The reported compact point uses only settings the SDK's CLI loads."""
+    from unittest.mock import patch
+
+    from claude_agent_sdk.types import (
+        ClaudeAgentOptions as SDKClaudeAgentOptions,
+    )
+    from claude_agent_sdk.types import ResultMessage as SDKResultMessage
+
+    user = tmp_path / "user"
+    user.mkdir()
+    (user / "settings.json").write_text(json.dumps(user_settings))
+    project = tmp_path / "project"
+    (project / ".claude").mkdir(parents=True)
+    (project / ".claude/settings.local.json").write_text(
+        json.dumps({"autoCompactWindow": 400_000})
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(user))
+    monkeypatch.delenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", raising=False)
+
+    result = SDKResultMessage(
+        subtype="result",
+        session_id="s1",
+        result="done",
+        total_cost_usd=0.0,
+        duration_ms=100,
+        duration_api_ms=80,
+        is_error=False,
+        num_turns=1,
+        usage={"input_tokens": 10, "output_tokens": 5},
+        model_usage={"claude-opus-4-8": {"contextWindow": 1_000_000, "maxOutputTokens": 64_000}},
+    )
+
+    class _FakeSDK(_sdk_types()):
+        ResultMessage = SDKResultMessage
+        ClaudeAgentOptions = SDKClaudeAgentOptions
+
+        class ClaudeSDKClient(_SDKClient):
+            async def receive_response(self):
+                yield result
+
+    executor = _default_executor(skills_filter=skills_filter, cwd=str(project))
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+        events = [e async for e in executor.run_turn([{"role": "user", "content": "hi"}], [], "")]
+
+    turn = next(e for e in events if isinstance(e, TurnComplete))
+    assert turn.usage is not None
+    assert turn.usage["context_window"] == 1_000_000
+    assert turn.usage["auto_compact_token_limit"] == expected
 
 
 @pytest.mark.asyncio

@@ -656,8 +656,10 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       }
       contextTokens = rawTokens;
     }
-    let contextWindow: number | undefined;
-    if (rawWindow !== undefined && rawWindow !== null) {
+    let contextWindow: number | null | undefined;
+    if (rawWindow === null) {
+      contextWindow = null;
+    } else if (rawWindow !== undefined) {
       if (typeof rawWindow !== "number" || !Number.isFinite(rawWindow) || rawWindow <= 0) {
         return null;
       }
@@ -710,6 +712,10 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       ...(contextTokens !== undefined ? { contextTokens } : {}),
       ...(contextWindow !== undefined ? { contextWindow } : {}),
       ...(autoCompactTokenLimit !== undefined ? { autoCompactTokenLimit } : {}),
+      ...(raw.context_model === null ||
+      (typeof raw.context_model === "string" && raw.context_model.trim())
+        ? { contextModel: raw.context_model }
+        : {}),
       ...(providerUsageLimits !== undefined ? { providerUsageLimits } : {}),
       ...(totalCostUsd !== undefined ? { totalCostUsd } : {}),
       ...(usageByModel !== undefined ? { usageByModel } : {}),

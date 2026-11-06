@@ -97,7 +97,12 @@ async def test_pi_usage_relay_authenticates_and_captures_session(
             assert (await asyncio.to_thread(_post_relay, bridge_dir, ["context_tokens", 19]))[
                 0
             ] == 400
-            assert (await asyncio.to_thread(_post_relay, bridge_dir, {"context_tokens": 19})) == (
+            reading = {
+                "context_tokens": 19,
+                "context_window": 550_000,
+                "context_model": "provider/model",
+            }
+            assert (await asyncio.to_thread(_post_relay, bridge_dir, reading)) == (
                 200,
                 {},
             )
@@ -112,7 +117,7 @@ async def test_pi_usage_relay_authenticates_and_captures_session(
                 "/v1/sessions/bound-session/events"
             ] * 3
             assert [json.loads(request.content) for request in forwarded] == [
-                {"type": "external_session_usage", "data": {"context_tokens": 19}},
+                {"type": "external_session_usage", "data": reading},
                 {"type": "external_session_usage", "data": {"pi_cache_warming_probe": True}},
                 {"type": "external_session_usage", "data": {"pi_cache_warming_probe": True}},
             ]

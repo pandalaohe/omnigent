@@ -690,11 +690,13 @@ describe("SettingsPage", () => {
     });
     try {
       renderPage("/settings/general#context-usage");
-      const table = await screen.findByRole("table", { name: "Saved context values" });
-      expect(within(table).getAllByRole("rowheader")).toHaveLength(4);
+      const table = await screen.findByRole("table", { name: "Context limits" });
+      expect(within(table).getAllByRole("rowheader")).toHaveLength(5);
       for (const agentName of ["A", "B", "C", "D"])
         expect(
-          within(table).getByRole("button", { name: new RegExp(`^Edit ${agentName}:`) }),
+          within(table).getByRole("button", {
+            name: new RegExp(`^Edit ${agentName}, all computers:`),
+          }),
         ).toBeInTheDocument();
       expect(table.closest('[data-testid="settings-group-display-usage"]')).toHaveClass(
         "max-w-none",

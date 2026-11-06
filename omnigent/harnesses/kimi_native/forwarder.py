@@ -1101,7 +1101,7 @@ class _KimiUsageSync:
         # Cumulative totals split per effective model (the model active when
         # each record accrued), so cost is priced per segment — see _flush.
         self._by_model: dict[str, dict[str, Any]] = {}
-        self._last_posted: dict[str, int] | None = None
+        self._last_posted: tuple[str | None, dict[str, int]] | None = None
         self._window_cache: dict[str, int | None] = {}
         # Successful pricing lookups only; a failed lookup retries on the next
         # totals change instead of pinning a permanently-unpriced session.
@@ -1320,11 +1320,15 @@ class _KimiUsageSync:
         window = await self._context_window()
         if window is not None:
             payload["context_window"] = window
-        if payload == self._last_posted:
+        if (self._model, payload) == self._last_posted:
             return
         # The model rides along on every token post (outside the dedup): the
         # server needs it for per-model attribution and token-price fallback.
         body: dict[str, object] = dict(payload)
+        if window is not None:
+            # A catalog capacity is display-only, not an observed harness limit.
+            body["context_model"] = None
+            body["auto_compact_token_limit"] = None
         if self._model:
             body["model"] = self._model
         cost = await self._cumulative_cost()
@@ -1337,7 +1341,7 @@ class _KimiUsageSync:
             # clamp ate the decrease) and overcharged cheap→expensive ones.
             body["cumulative_cost_usd"] = cost
         if await self._post(client, "external_session_usage", body):
-            self._last_posted = payload
+            self._last_posted = (self._model, payload)
 
     async def _cumulative_cost(self) -> float | None:
         """Accrue and sum the per-segment running costs.

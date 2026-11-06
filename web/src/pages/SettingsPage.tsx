@@ -2317,7 +2317,7 @@ function GeneralSection() {
             Keep-warm
           </Link>
           <Link to="#context-usage" className="text-primary underline underline-offset-2">
-            Saved context values
+            Context limits
           </Link>
         </nav>
         <SettingsGroup title="Composer" testId="settings-group-composer">
@@ -2390,7 +2390,7 @@ function GeneralSection() {
           testId="settings-group-display-usage"
           className="max-w-none"
         >
-          <ExpandableSettings id="context-usage" title="Saved context values">
+          <ExpandableSettings id="context-usage" title="Context limits">
             <div className="flex flex-col gap-6">
               <CompactProgressIndicatorControl />
               <ContextUsageSettings />

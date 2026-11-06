@@ -26,8 +26,10 @@ import {
   useQuery,
 } from "@tanstack/react-query";
 import { createElement } from "react";
+import { MemoryRouter } from "react-router-dom";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { ComposerContextRing } from "@/components/composer/ComposerContextRing";
 import { CodexPermissionReadbackChip } from "@/pages/ChatPage";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { toast } from "sonner";
@@ -719,6 +721,178 @@ describe("test harness teardown", () => {
 });
 
 describe("chatStore — lazy subtree usage", () => {
+  it("replaces limits with the canonical reading, including a cleared window", () => {
+    const id = "conv_canonical_reading";
+    const conversation = bindConversationForTest(id, { llmModel: "model-a" });
+    for (const reading of [
+      { context_model: "model-a", context_window: 475_000, auto_compact_token_limit: 450_000 },
+      { context_model: "model-b", context_window: null, auto_compact_token_limit: 400_000 },
+    ]) {
+      const event = parseEvent("session.usage", { conversation_id: id, ...reading });
+      expect(event).not.toBeNull();
+      handleSessionEvent(event!, id);
+    }
+    expect(conversation.get().contextWindow).toBeNull();
+    expect(conversation.get().reportedContextReading).toEqual({
+      model: "model-b",
+      contextWindow: null,
+      autoCompactTokenLimit: 400_000,
+    });
+    const reading = conversation.get().reportedContextReading;
+    handleSessionEvent({ type: "session_usage", conversationId: id, contextTokens: 50 }, id);
+    expect(conversation.get().reportedContextReading).toBe(reading);
+    expect(parseEvent("session.usage", { conversation_id: id, context_window: 0 })).toBeNull();
+  });
+
+  it("keeps context readings bound to their wire model across model changes and identical receipts", () => {
+    const conversation = bindConversationForTest("conv_reading", { llmModel: "model-a" });
+    const receive = () =>
+      handleSessionEvent(
+        parseEvent("session.usage", {
+          conversation_id: "conv_reading",
+          context_model: "model-b",
+          context_window: 1_000_000,
+          auto_compact_token_limit: 517_000,
+        })!,
+        "conv_reading",
+      );
+    receive();
+    const reading = conversation.get().reportedContextReading;
+    expect(reading).toEqual({
+      model: "model-b",
+      contextWindow: 1_000_000,
+      autoCompactTokenLimit: 517_000,
+    });
+    expect(conversation.get().llmModel).toBe("model-a");
+    handleSessionEvent(
+      { type: "session_model", conversationId: "conv_reading", model: "model-b" },
+      "conv_reading",
+    );
+    expect(conversation.get().reportedContextReading).toBe(reading);
+    receive();
+    expect(conversation.get().reportedContextReading).toEqual(reading);
+    expect(conversation.get().reportedContextReading).not.toBe(reading);
+    handleSessionEvent(
+      { type: "session_usage", conversationId: "conv_reading", totalCostUsd: 1 },
+      "conv_reading",
+    );
+    expect(conversation.get().reportedContextReading).toEqual(reading);
+    handleSessionEvent(
+      { type: "session_usage", conversationId: "conv_reading", contextWindow: 200_000 },
+      "conv_reading",
+    );
+    expect(conversation.get().reportedContextReading).toBeNull();
+  });
+
+  it("hydrates a reading from its saved model even when the session's model has moved on", async () => {
+    routeUsage(
+      "conv_usage",
+      () => usage("conv_usage", 0),
+      snapshot("conv_usage", {
+        llm_model: "model-b",
+        context_window: 1_000_000,
+        auto_compact_token_limit: 517_000,
+        labels: { "omnigent.last_context_model": "model-a" },
+      }),
+    );
+    await useChatStore.getState().switchTo("conv_usage");
+    expect(useChatStore.getState().reportedContextReading).toEqual({
+      model: "model-a",
+      contextWindow: 1_000_000,
+      autoCompactTokenLimit: 517_000,
+    });
+  });
+
+  it.each([null, undefined])(
+    "applies a reconnect window of %s without retaining another model's capacity",
+    async (window) => {
+      const id = "conv_usage";
+      routeUsage(id, () => usage(id, 0));
+      await useChatStore.getState().switchTo(id);
+      handleSessionEvent({
+        type: "session_usage",
+        conversationId: id,
+        contextModel: "model-a",
+        contextTokens: 100_000,
+        contextWindow: 475_000,
+        autoCompactTokenLimit: 450_000,
+      });
+      function Ring() {
+        const state = useChatStore();
+        return createElement(ComposerContextRing, {
+          contextWindow: state.contextWindow,
+          tokensUsed: state.tokensUsed,
+          autoCompactTokenLimit: state.autoCompactTokenLimit,
+        });
+      }
+      const view = render(createElement(MemoryRouter, null, createElement(Ring)));
+      expect(screen.getByTestId("composer-context-ring")).toBeInTheDocument();
+      await act(async () => {
+        await useChatStore.getState().switchTo("conv_other");
+        routeUsage(
+          id,
+          () => usage(id, 0),
+          snapshot(id, {
+            context_window: window,
+            auto_compact_token_limit: 400_000,
+            labels: { "omnigent.last_context_model": "model-b" },
+          }),
+        );
+        await useChatStore.getState().switchTo(id);
+        await tick();
+      });
+      expect(useChatStore.getState().reportedContextReading).toEqual({
+        model: "model-b",
+        contextWindow: null,
+        autoCompactTokenLimit: 400_000,
+      });
+      expect(useChatStore.getState().contextWindow).toBe(window === null ? null : 475_000);
+      expect(useChatStore.getState().autoCompactTokenLimit).toBe(400_000);
+      expect(screen.queryByTestId("composer-context-ring") !== null).toBe(window !== null);
+      view.unmount();
+    },
+  );
+
+  it("preserves the whole newer limits reading while a reconnect snapshot is in flight", async () => {
+    const id = "conv_usage";
+    routeUsage(id, () => usage(id, 0));
+    await useChatStore.getState().switchTo(id);
+    await useChatStore.getState().switchTo("conv_other");
+    let finishSnapshot!: (response: Response) => void;
+    const pending = new Promise<Response>((resolve) => {
+      finishSnapshot = resolve;
+    });
+    routeUsage(id, () => usage(id, 0), pending);
+    const reconnect = useChatStore.getState().switchTo(id);
+    await tick();
+    handleSessionEvent(
+      {
+        type: "session_usage",
+        conversationId: id,
+        contextModel: "model-b",
+        contextWindow: 200_000,
+        autoCompactTokenLimit: 167_000,
+      },
+      id,
+    );
+    finishSnapshot(
+      snapshot(id, {
+        context_window: 475_000,
+        auto_compact_token_limit: 450_000,
+        labels: { "omnigent.last_context_model": "model-a" },
+      }),
+    );
+    await reconnect;
+    await tick();
+    expect(useChatStore.getState().contextWindow).toBe(200_000);
+    expect(useChatStore.getState().autoCompactTokenLimit).toBe(167_000);
+    expect(useChatStore.getState().reportedContextReading).toEqual({
+      model: "model-b",
+      contextWindow: 200_000,
+      autoCompactTokenLimit: 167_000,
+    });
+  });
+
   function snapshot(id: string, fields: Record<string, unknown> = {}): Response {
     return mockResponse({
       id,
@@ -861,13 +1035,27 @@ describe("chatStore — lazy subtree usage", () => {
       type: "session_usage",
       conversationId: "conv_usage",
       totalCostUsd: 8,
+      contextModel: "model-b",
+      contextWindow: 200_000,
+      autoCompactTokenLimit: 167_000,
     });
 
-    finishSnapshot(snapshot("conv_usage"));
+    finishSnapshot(
+      snapshot("conv_usage", {
+        context_window: 1_000_000,
+        auto_compact_token_limit: 517_000,
+        labels: { "omnigent.last_context_model": "model-a" },
+      }),
+    );
     await binding;
     await tick();
 
     expect(useChatStore.getState().sessionCostUsd).toBe(8);
+    expect(useChatStore.getState().reportedContextReading).toEqual({
+      model: "model-b",
+      contextWindow: 200_000,
+      autoCompactTokenLimit: 167_000,
+    });
   });
 
   it("does not overwrite newer streamed cost or model usage with a slow read", async () => {

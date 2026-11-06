@@ -6,6 +6,8 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
 from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
 from tests.harnesses.codex_native.session._support import (
@@ -278,15 +280,20 @@ def test_session_usage_data_includes_resolved_auto_compact_limit(tmp_path: Path)
     assert data["auto_compact_token_limit"] == 244_800
 
 
-def test_session_usage_data_does_not_invent_compact_limit_from_percentage(
+@pytest.mark.parametrize("configured_limit", [None, 300_000, 180_000])
+def test_session_usage_data_resolves_default_and_caps_configured_limit(
     tmp_path: Path,
+    configured_limit: int | None,
 ) -> None:
-    """A catalog percentage alone is context sizing, not a Compact policy."""
+    """Codex defaults to 90% of its raw window and caps explicit limits there."""
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
     codex_home = bridge_dir / "codex-home"
     codex_home.mkdir()
-    (codex_home / "config.toml").write_text('model = "gpt-5.6-sol"\n', encoding="utf-8")
+    config = 'model = "gpt-5.6-sol"\n'
+    if configured_limit is not None:
+        config += f"model_auto_compact_token_limit = {configured_limit}\n"
+    (codex_home / "config.toml").write_text(config, encoding="utf-8")
     codex_native_bridge.write_codex_context_catalog(
         bridge_dir,
         {
@@ -308,7 +315,7 @@ def test_session_usage_data_does_not_invent_compact_limit_from_percentage(
     )
 
     assert data is not None
-    assert data["auto_compact_token_limit"] is None
+    assert data["auto_compact_token_limit"] == min(configured_limit or 244_800, 244_800)
 
 
 def test_session_usage_data_omits_compact_limit_for_body_after_prefix_scope(
@@ -352,6 +359,26 @@ def test_session_usage_data_omits_compact_limit_for_body_after_prefix_scope(
 
     assert data is not None
     assert data["auto_compact_token_limit"] is None
+
+
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        ({"features": {"async_compaction": True}}, None),
+        ({"features": {"token_budget": True}}, None),
+        ({"features": {"async_compaction": {"enabled": False}}}, 244_800),
+        ({"model_post_turn_compact_threshold_percent": 80}, 206_720),
+    ],
+)
+def test_codex_context_modes_do_not_report_a_later_static_threshold(config, expected):
+    assert (
+        codex_native_bridge.codex_auto_compact_token_limit(
+            config,
+            {"context_window": 272_000, "effective_context_window_percent": 95},
+            effective_context_window=258_400,
+        )
+        == expected
+    )
 
 
 def test_session_usage_data_prefers_effective_context_window_over_legacy() -> None:

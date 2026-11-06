@@ -12760,7 +12760,7 @@
         "type": "object"
       },
       "SessionUsageEvent": {
-        "description": "Token-usage update from a terminal-backed integration.\n\nEmitted after an `external_session_usage` POST from an\nout-of-AP runtime (e.g. the `omnigent claude` transcript\nforwarder). Either field may be absent; clients should leave\ncached values untouched for missing fields.",
+        "description": "Token-usage update from a terminal-backed or SDK integration.\n\nEmitted after an `external_session_usage` POST from an\nout-of-AP runtime (e.g. the `omnigent claude` transcript\nforwarder), or an SDK turn. Missing fields leave cached values untouched.\nA limits observation carries the full committed model/window/threshold tuple;\nexplicit nulls clear unknown or removed values.",
         "properties": {
           "auto_compact_token_limit": {
             "anyOf": [
@@ -12773,7 +12773,21 @@
               }
             ],
             "default": null,
+            "description": "Reported automatic-compaction threshold; null clears it, while absence leaves the previous reading unchanged.",
             "title": "Auto Compact Token Limit"
+          },
+          "context_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Model that produced the context reading, independent of the session's separately reported active model; null means unattributed.",
+            "title": "Context Model"
           },
           "context_tokens": {
             "anyOf": [
@@ -12800,7 +12814,7 @@
               }
             ],
             "default": null,
-            "description": "Resolved window in tokens (e.g. 200_000 normally, 1_000_000 with `opus[1m]` / `sonnet[1m]`). `None` on a tokens-only broadcast.",
+            "description": "Resolved window in tokens (e.g. 200_000 normally, 1_000_000 with `opus[1m]` / `sonnet[1m]`). An explicit null clears the window; absent on a tokens-only broadcast.",
             "title": "Context Window"
           },
           "conversation_id": {
@@ -14370,6 +14384,21 @@
       "Usage": {
         "description": "Token usage statistics for a response.",
         "properties": {
+          "auto_compact_token_limit": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0,
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Total-context automatic compaction threshold; an explicit null clears a previous report, absence leaves it unchanged.",
+            "title": "Auto Compact Token Limit"
+          },
           "cache_creation_input_tokens": {
             "default": 0,
             "description": "Prompt tokens written to the provider prompt cache (cache creation), billed at a premium rate. Like `cache_read_input_tokens`, this is separate from `input_tokens`; `0` when not reported.",
@@ -14384,6 +14413,19 @@
             "title": "Cache Read Input Tokens",
             "type": "integer"
           },
+          "context_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Model reference measured with the context limits, independent of the billing model. Unknown identity stays unbound.",
+            "title": "Context Model"
+          },
           "context_tokens": {
             "anyOf": [
               {
@@ -14397,6 +14439,21 @@
             "default": null,
             "description": "Context-fill estimate for the next turn \u2014 set only by executors that make multiple LLM sub-calls per turn (e.g. `openai-agents`). For single-call executors this is absent and `total_tokens` serves the same purpose. The toolbar context ring and `/context` command use this field when present, falling back to `total_tokens`.",
             "title": "Context Tokens"
+          },
+          "context_window": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0,
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Effective window reported by the running harness.",
+            "title": "Context Window"
           },
           "cost_usd": {
             "anyOf": [

@@ -9958,6 +9958,34 @@ def test_read_user_auto_compact_window_prefers_settings_env(
     assert claude_native_bridge.read_user_auto_compact_window() == 123000
 
 
+@pytest.mark.parametrize(
+    ("limit", "valid"),
+    [
+        (517_000, True),
+        (None, True),
+        (0, False),
+        (-1, False),
+        (True, False),
+        ("517000", False),
+        (2**53, False),
+    ],
+)
+def test_pi_usage_relay_validates_compaction_threshold(limit, valid):
+    assert (
+        claude_native_bridge._valid_pi_session_usage(
+            {"context_window": 550_000, "auto_compact_token_limit": limit}
+        )
+        is valid
+    )
+
+
+@pytest.mark.parametrize("model", ["provider/model", "m" * 256, "", " ", "m" * 257, None, 42])
+def test_pi_usage_relay_validates_context_model(model):
+    assert claude_native_bridge._valid_pi_session_usage(
+        {"context_window": 550_000, "context_model": model}
+    ) is (isinstance(model, str) and bool(model.strip()) and len(model) <= 256)
+
+
 def test_read_user_auto_compact_window_uses_environment_when_settings_has_none(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

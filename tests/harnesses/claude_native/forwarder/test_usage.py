@@ -1179,6 +1179,52 @@ def test_transcript_cost_size_cached_reprices_after_provider_change(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("same_figures", [False, True])
+async def test_context_reading_carries_model_before_model_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, same_figures: bool
+) -> None:
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text("", encoding="utf-8")
+    state = forwarder.TranscriptForwardState(transcript_path=transcript, line_cursor=0)
+    status: dict[str, Any] = {"model": "claude-opus-5", "context_window_size": 1_000_000}
+    monkeypatch.setattr(forwarder, "read_claude_context_state", lambda _: dict(status))
+    monkeypatch.setattr(
+        forwarder, "read_claude_auto_compact_token_limit", lambda window, **_: window - 33_000
+    )
+    requests: list[dict[str, Any]] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append(body)
+        # A rejected model-change post must not misattribute an independent reading.
+        return httpx.Response(503 if body["type"] == "external_model_change" else 202)
+
+    dedupe = forwarder._ForwardDedupeState()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://test"
+    ) as client:
+        for model in ("claude-opus-5", "claude-sonnet-5", "claude-sonnet-5"):
+            status["model"] = model
+            status["context_window_size"] = (
+                1_000_000 if same_figures or model == "claude-opus-5" else 200_000
+            )
+            state = await forwarder._forward_available_items(
+                client=client,
+                session_id="conv_models",
+                bridge_dir=tmp_path / "bridge",
+                agent_name="claude-native-ui",
+                state=state,
+                retry_tracker=forwarder._PostRetryTracker(),
+                dedupe=dedupe,
+            )
+    readings = [body["data"] for body in requests if body["type"] == "external_session_usage"]
+    assert [(reading.get("context_model"), reading["context_window"]) for reading in readings] == [
+        ("claude-opus-5", 1_000_000),
+        ("claude-sonnet-5", 1_000_000 if same_figures else 200_000),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_forward_available_items_posts_auto_compact_window_once_and_on_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1208,11 +1254,14 @@ async def test_forward_available_items_posts_auto_compact_window_once_and_on_cha
         byte_offset=0,
         cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
     )
-    # No statusLine state, so the auto-compaction window is the only value
-    # that can trigger the usage post — each payload proves the trigger.
-    monkeypatch.setattr(forwarder, "read_claude_context_state", lambda _bridge: None)
+    # A steady statusLine window must still forward a changed or disabled limit.
+    monkeypatch.setattr(
+        forwarder, "read_claude_context_state", lambda _bridge: {"context_window_size": 1_000_000}
+    )
     window = {"value": 400_000}
-    monkeypatch.setattr(forwarder, "read_user_auto_compact_window", lambda: window["value"])
+    monkeypatch.setattr(
+        forwarder, "read_claude_auto_compact_token_limit", lambda *a, **kw: window["value"]
+    )
     requests: list[dict[str, Any]] = []
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
@@ -1222,7 +1271,7 @@ async def test_forward_available_items_posts_auto_compact_window_once_and_on_cha
     transport = httpx.MockTransport(_handle_request)
     dedupe = forwarder._ForwardDedupeState()
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        for value in (400_000, 400_000, 300_000, 300_000):
+        for value in (400_000, 400_000, 300_000, 300_000, None, None):
             window["value"] = value
             state = await forwarder._forward_available_items(
                 client=client,
@@ -1236,10 +1285,11 @@ async def test_forward_available_items_posts_auto_compact_window_once_and_on_cha
 
     usage_posts = [r for r in requests if r["type"] == "external_session_usage"]
     assert [post["data"] for post in usage_posts] == [
-        {"auto_compact_token_limit": 400_000},
-        {"auto_compact_token_limit": 300_000},
+        {"auto_compact_token_limit": 400_000, "context_window": 1_000_000},
+        {"auto_compact_token_limit": 300_000, "context_window": 1_000_000},
+        {"auto_compact_token_limit": None, "context_window": 1_000_000},
     ]
-    assert dedupe.auto_compact_token_limit == 300_000
+    assert dedupe.auto_compact_token_limit is None
 
 
 @pytest.mark.asyncio

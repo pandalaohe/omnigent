@@ -72,6 +72,9 @@ def normalize_status_payload(payload: dict[str, object]) -> dict[str, object] | 
         model_id = model.strip()
     if model_id is not None:
         record["model"] = model_id
+    cwd = payload.get("cwd")
+    if isinstance(cwd, str) and cwd:
+        record["cwd"] = cwd
     # Claude Code exposes each plan window independently. Preserve absence and
     # carry the gateway spend values without account identity.
     rate_limits = payload.get("rate_limits")

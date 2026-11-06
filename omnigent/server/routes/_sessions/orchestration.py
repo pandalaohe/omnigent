@@ -228,6 +228,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _EXTERNAL_SESSION_STATUS_TYPE,
     _FENCE_EXEMPT_EVENT_TYPES,
     _GOAL_STATE_LABEL_KEY,
+    _LABEL_VALUE_MAX_LEN,
     _LAST_AUTO_COMPACT_TOKEN_LIMIT_LABEL_KEY,
     _LAST_CACHE_LABEL_KEY,
     _LAST_CONTEXT_TOKENS_LABEL_KEY,
@@ -284,6 +285,10 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     get_server_runner_router,
     session_stream,
     set_server_runner_router,
+)
+from omnigent.server.routes._sessions.context_readings import (
+    context_reading_from_labels,
+    persist_context_reading,
 )
 
 # Lower-layer helpers (SSE builders, publishers, persistence, runner-forward
@@ -2976,14 +2981,10 @@ def _build_session_response(
     # Collapse per-user pin keys to the canonical bare key for this viewer, so
     # the snapshot never carries another user's pin key (see _labels_for_viewer).
     labels = labels_with_closed_status(_labels_for_viewer(conv.labels, viewer_id), conv.title)
-    raw_auto_compact_token_limit = conv.labels.get(_LAST_AUTO_COMPACT_TOKEN_LIMIT_LABEL_KEY)
-    auto_compact_token_limit = (
-        int(raw_auto_compact_token_limit)
-        if isinstance(raw_auto_compact_token_limit, str)
-        and raw_auto_compact_token_limit.isdigit()
-        and int(raw_auto_compact_token_limit) > 0
-        else None
-    )
+    reading = context_reading_from_labels(conv.labels)
+    auto_compact_token_limit = reading["auto_compact_token_limit"] if reading else None
+    if reading is not None:
+        context_window = reading["context_window"]
     provider_usage_limits = conv.provider_usage_limits
     raw_provider_usage_limits = conv.labels.get(_LAST_PROVIDER_USAGE_LIMITS_LABEL_KEY)
     if provider_usage_limits is None and isinstance(raw_provider_usage_limits, str):
@@ -3800,13 +3801,13 @@ async def _persist_external_session_usage(
     :raises OmnigentError: On missing / malformed fields.
     """
     raw_tokens = body.data.get("context_tokens")
-    if raw_tokens is not None and (not isinstance(raw_tokens, int) or raw_tokens < 0):
+    if raw_tokens is not None and (type(raw_tokens) is not int or raw_tokens < 0):
         raise OmnigentError(
             "external_session_usage data.context_tokens must be a non-negative int",
             code=ErrorCode.INVALID_INPUT,
         )
     raw_window = body.data.get("context_window")
-    if raw_window is not None and (not isinstance(raw_window, int) or raw_window <= 0):
+    if raw_window is not None and (type(raw_window) is not int or raw_window <= 0):
         raise OmnigentError(
             "external_session_usage data.context_window must be a positive int",
             code=ErrorCode.INVALID_INPUT,
@@ -3892,6 +3893,8 @@ async def _persist_external_session_usage(
         and not has_provider_usage_limits
         and not has_pi_cache
         and not has_cumulative
+        and "context_window" not in body.data
+        and not isinstance(body.data.get("model"), str)
     ):
         raise OmnigentError(
             "external_session_usage requires at least one of "
@@ -3933,15 +3936,12 @@ async def _persist_external_session_usage(
                 model=_n_model,
             )
         )
+    context_payload = await asyncio.to_thread(
+        persist_context_reading, conversation_store, session_id, body.data
+    )
     label_updates: dict[str, str] = {}
     if has_pi_cache and pi_cache_ttl is not None:
         label_updates["omnigent.pi_cache"] = pi_cache_label(pi_cache_ttl, *pi_cache_values)
-    if raw_tokens is not None:
-        label_updates[_LAST_CONTEXT_TOKENS_LABEL_KEY] = str(raw_tokens)
-    if raw_window is not None:
-        label_updates[_LAST_CONTEXT_WINDOW_LABEL_KEY] = str(raw_window)
-    if has_auto_compact_token_limit and raw_auto_compact_token_limit is not None:
-        label_updates[_LAST_AUTO_COMPACT_TOKEN_LIMIT_LABEL_KEY] = str(raw_auto_compact_token_limit)
     if (
         last_cache_read is not None
         and last_cache_creation is not None
@@ -3955,12 +3955,6 @@ async def _persist_external_session_usage(
             conversation_store.set_labels,
             session_id,
             label_updates,
-        )
-    if has_auto_compact_token_limit and raw_auto_compact_token_limit is None:
-        await asyncio.to_thread(
-            conversation_store.delete_label,
-            session_id,
-            _LAST_AUTO_COMPACT_TOKEN_LIMIT_LABEL_KEY,
         )
     if has_pi_cache and pi_cache_ttl is None:
         await asyncio.to_thread(conversation_store.delete_label, session_id, "omnigent.pi_cache")
@@ -4006,13 +4000,8 @@ async def _persist_external_session_usage(
     event_payload: dict[str, Any] = {
         "type": "session.usage",
         "conversation_id": session_id,
+        **context_payload,
     }
-    if raw_tokens is not None:
-        event_payload["context_tokens"] = raw_tokens
-    if raw_window is not None:
-        event_payload["context_window"] = raw_window
-    if has_auto_compact_token_limit:
-        event_payload["auto_compact_token_limit"] = raw_auto_compact_token_limit
     if has_provider_usage_limits:
         event_payload["provider_usage_limits"] = provider_usage_limits
     if subtree_cost is not None:
@@ -4035,51 +4024,6 @@ async def _persist_external_session_usage(
         conv,
     )
     return raw_tokens
-
-
-def _context_labels_from_turn_usage(
-    resp_usage: dict[str, Any],  # type: ignore[explicit-any]  # SSE usage payload
-) -> dict[str, str]:
-    """Build context-window indicator labels from an in-process turn's usage.
-
-    An in-process harness (``claude-sdk`` / ``openai-agents`` / ``pi``) reports
-    the turn's window fill as ``usage.context_tokens`` and its observed model as
-    ``usage.model`` on ``response.completed``. Mirror the two labels the
-    claude-native ``external_session_usage`` path writes, so the web context
-    ring renders identically: the numerator
-    (:data:`_LAST_CONTEXT_TOKENS_LABEL_KEY`) from ``context_tokens`` and the
-    denominator (:data:`_LAST_CONTEXT_WINDOW_LABEL_KEY`) from the reported
-    window, falling back to the model's catalog. This lets a model-unpinned
-    claude-sdk session show a context ring without a spec model.
-
-    Returns an empty dict when the turn reports no ``context_tokens`` (a native
-    terminal harness reports its fill via ``external_session_usage`` instead),
-    so this path stays in-process-only and never double-writes the labels.
-
-    :param resp_usage: The ``response.usage`` dict from a ``response.completed``
-        event.
-    :returns: Label updates for :meth:`ConversationStore.set_labels`; empty when
-        the turn carries no window-fill signal.
-    """
-    context_tokens = resp_usage.get("context_tokens")
-    if not isinstance(context_tokens, int) or context_tokens < 0:
-        return {}
-    labels: dict[str, str] = {_LAST_CONTEXT_TOKENS_LABEL_KEY: str(context_tokens)}
-    window = resp_usage.get("context_window")
-    if isinstance(window, int) and not isinstance(window, bool) and window > 0:
-        labels[_LAST_CONTEXT_WINDOW_LABEL_KEY] = str(window)
-        return labels
-    model = resp_usage.get("model")
-    if isinstance(model, str) and model:
-        from omnigent.llms.context_window import get_model_context_window
-
-        try:
-            window = get_model_context_window(model)
-        except Exception:  # noqa: BLE001 — window lookup is best-effort; skip the denominator on a miss
-            window = None
-        if isinstance(window, int) and window > 0:
-            labels[_LAST_CONTEXT_WINDOW_LABEL_KEY] = str(window)
-    return labels
 
 
 async def _persist_model_change_note(
@@ -12537,30 +12481,12 @@ async def _relay_runner_stream_once(
                             )
                         )
                         if evt_type == "response.completed":
-                            # Persist the context-window indicator labels for an
-                            # in-process turn (claude-sdk / openai-agents / pi):
-                            # numerator from usage.context_tokens, denominator
-                            # from the observed model's window. This is the only
-                            # path that gives a model-unpinned claude-sdk session
-                            # a context ring — it has no spec model to size the
-                            # window from — and mirrors the labels the native
-                            # external_session_usage path writes. Empty (a no-op)
-                            # for a turn without context_tokens, so native
-                            # terminal harnesses (which post their own usage) are
-                            # never double-written. Threaded: the label build
-                            # (get_model_context_window may do a cold blocking
-                            # catalog fetch — offload it off the shared relay
-                            # loop, like the snapshot path does) and the DB
-                            # label write below.
-                            _context_labels = await asyncio.to_thread(
-                                _context_labels_from_turn_usage, _resp_usage
+                            _context_payload = await asyncio.to_thread(
+                                persist_context_reading,
+                                conversation_store,
+                                session_id,
+                                _resp_usage,
                             )
-                            if _context_labels:
-                                await asyncio.to_thread(
-                                    conversation_store.set_labels,
-                                    session_id,
-                                    _context_labels,
-                                )
                             # Push the server-computed cost AND token breakdown
                             # to the web client's session indicator, rolled up
                             # over the spawn subtree. The session's own event
@@ -12599,32 +12525,21 @@ async def _relay_runner_stream_once(
                             if (
                                 _subtree_cost is not None
                                 or _usage_by_model is not None
-                                or _context_labels
+                                or _context_payload
                             ):
                                 _usage_payload: dict[str, Any] = {
                                     "type": "session.usage",
                                     "conversation_id": session_id,
+                                    **_context_payload,
                                 }
-                                _ctx_tokens_label = _context_labels.get(
-                                    _LAST_CONTEXT_TOKENS_LABEL_KEY
-                                )
-                                if _ctx_tokens_label is not None:
-                                    _usage_payload["context_tokens"] = int(_ctx_tokens_label)
-                                _ctx_window_label = _context_labels.get(
-                                    _LAST_CONTEXT_WINDOW_LABEL_KEY
-                                )
-                                if _ctx_window_label is not None:
-                                    _usage_payload["context_window"] = int(_ctx_window_label)
                                 if _subtree_cost is not None:
                                     _usage_payload["total_cost_usd"] = _subtree_cost
                                 if _usage_by_model is not None:
                                     _usage_payload["usage_by_model"] = _usage_by_model
-                                session_stream.publish(
-                                    session_id,
-                                    SessionUsageEvent(**_usage_payload).model_dump(
-                                        exclude_none=True
-                                    ),
+                                _usage_event = SessionUsageEvent(**_usage_payload).model_dump(
+                                    exclude_unset=True
                                 )
+                                session_stream.publish(session_id, _usage_event)
                                 # Ancestors' badges only move on cost/usage, not a
                                 # context-only publish — keep the roll-up gated.
                                 if _subtree_cost is not None or _usage_by_model is not None:

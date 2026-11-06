@@ -988,8 +988,50 @@ async function testChildResetDoesNotCreateParent() {
   } finally { global.fetch = previousFetch; }
 }
 
+async function testReportedCompactionTracksModelSettings() {
+  const h = makeHarness({ captureEvents: true });
+  let compaction = { reserveTokens: 20000,
+    modelOverrides: { "provider-1/model-1": { reserveTokens: 32000 } } };
+  h.pi.getSettings = () => ({ compaction });
+  const ctx = makeCtx({ idle: true });
+  ctx.model = { provider: "provider-1", id: "model-1" };
+  ctx.getContextUsage = () => ({ tokens: 100, contextWindow: 550000 });
+  await h.handlers.session_start({}, ctx);
+  let usage = h.postedEvents.filter(e => e.type === "external_session_usage").at(-1).data;
+  assert("model reserve beats default", usage.auto_compact_token_limit === 518000);
+  compaction = { enabled: false };
+  await h.handlers.model_select({ model: ctx.model }, ctx);
+  usage = h.postedEvents.filter(e => e.type === "external_session_usage" &&
+    "auto_compact_token_limit" in e.data).at(-1).data;
+  assert("disabled compaction clears old threshold", usage.auto_compact_token_limit === null);
+}
+
+async function testModelChangePrecedesItsUsage(window, provider = "provider-1", id = "model-2") {
+  const h = makeHarness({ captureEvents: true });
+  h.pi.getSettings = () => ({ compaction: {} });
+  const ctx = makeCtx({ idle: true });
+  ctx.model = { provider: "provider-1", id: "model-1" };
+  ctx.getContextUsage = () => ({ tokens: 100, contextWindow: 128000 });
+  await h.handlers.session_start({}, ctx);
+  const start = h.postedEvents.length;
+  ctx.model = { provider, id };
+  ctx.getContextUsage = () => ({ tokens: 100, contextWindow: window });
+  await h.handlers.model_select({ model: ctx.model }, ctx);
+  const posted = h.postedEvents.slice(start);
+  const change = posted.findIndex(e => e.type === "external_model_change");
+  const usage = posted.findIndex(e => e.type === "external_session_usage" &&
+    e.data.context_window === window);
+  assert("the switched model is posted before the usage it measures",
+    change >= 0 && usage > change, posted.map(e => e.type));
+  assert("the reading carries its actual model even with identical figures",
+    usage >= 0 && posted[usage].data.context_model === `${provider}/${id}`);
+}
+
 (async () => {
   try {
+    for (const window of [128000, 550000]) await testModelChangePrecedesItsUsage(window);
+    await testModelChangePrecedesItsUsage(128000, "provider-2", "model-1");
+    await testReportedCompactionTracksModelSettings();
     await testStartupInstructionsReachEveryAgentStart();
     await testSessionStartupDoesNotCompleteATurn();
     await testSessionStartMarksInputReady();

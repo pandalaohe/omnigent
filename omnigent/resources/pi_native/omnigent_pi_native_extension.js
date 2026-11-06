@@ -2702,6 +2702,19 @@ module.exports = function (pi) {
             data.context_tokens = snapshot.tokens;
           if (Number.isInteger(snapshot.contextWindow) && snapshot.contextWindow > 0)
             data.context_window = snapshot.contextWindow;
+          if (data.context_window) {
+            data.context_model = modelReference(ctx.model) || null;
+            data.auto_compact_token_limit = null;
+            if (typeof pi.getSettings === "function") {
+              const settings = pi.getSettings().compaction || {};
+              const model = ctx.model;
+              const override = model && settings.modelOverrides?.[`${model.provider}/${model.id}`];
+              const reserve = override?.reserveTokens ?? settings.reserveTokens ?? 16384;
+              const limit = data.context_window - reserve;
+              if (settings.enabled !== false && Number.isSafeInteger(reserve) && reserve >= 0 && limit > 0)
+                data.auto_compact_token_limit = limit;
+            }
+          }
         }
       } catch (_err) {
         // Older Pi versions may not expose a usable context snapshot.
@@ -3283,26 +3296,18 @@ module.exports = function (pi) {
     // the inbox ``model_change``) round-trips here as a no-op.
     const source =
       event && typeof event.source === "string" ? event.source : "";
-    if (source === "restore") {
-      await postEvent(config, {
-        type: "external_session_usage", data: { pi_cache_ttl_seconds: null },
-      });
-      return;
-    }
     const model = event && event.model ? event.model : undefined;
-    const selectedModel = modelReference(model);
-    if (!selectedModel) {
+    const selectedModel = source === "restore" ? "" : modelReference(model);
+    // The model goes first: the usage below measures it, and the web files a
+    // reading under the model it last heard of.
+    if (selectedModel) {
       await postEvent(config, {
-        type: "external_session_usage", data: { pi_cache_ttl_seconds: null },
+        type: "external_model_change",
+        data: { model: selectedModel },
       });
-      return;
     }
-    await postEvent(config, {
-      type: "external_model_change",
-      data: { model: selectedModel },
-    });
-    if (lastCacheUsage) await postSessionUsage(ctx);
-    else await postEvent(config, {
+    await postSessionUsage(ctx);
+    if (!selectedModel || !lastCacheUsage) await postEvent(config, {
       type: "external_session_usage", data: { pi_cache_ttl_seconds: null },
     });
   });

@@ -23,6 +23,29 @@ function plainMark(harness: string | null): string {
   return "Other";
 }
 
+/** The small outlined mark beside an agent's name. */
+export const AGENT_MARK_CLASS =
+  "inline-flex shrink-0 items-center rounded border border-border px-1 text-[11px] leading-4 font-normal text-muted-foreground";
+
+/** The integration-type mark: Native, SDK, ACP, RPC or Other. */
+export function AgentIntegrationMark({
+  harness,
+  className,
+}: {
+  harness: string | null;
+  className?: string;
+}) {
+  return (
+    <span
+      aria-hidden="true"
+      data-testid="agent-name-mark"
+      className={cn(AGENT_MARK_CLASS, className)}
+    >
+      {plainMark(harness)}
+    </span>
+  );
+}
+
 /** Agent name with the saved badge, or one consistent integration-type mark. */
 export function AgentNameTag({
   agentId,
@@ -40,13 +63,7 @@ export function AgentNameTag({
       {badge ? (
         <AgentBadgeMark badge={badge} data-testid="agent-name-badge" />
       ) : (
-        <span
-          aria-hidden="true"
-          data-testid="agent-name-mark"
-          className="inline-flex shrink-0 items-center rounded border border-border px-1 text-[11px] leading-4 font-normal text-muted-foreground"
-        >
-          {plainMark(harness)}
-        </span>
+        <AgentIntegrationMark harness={harness} />
       )}
     </span>
   );

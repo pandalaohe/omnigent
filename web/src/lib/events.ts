@@ -595,7 +595,9 @@ export interface SessionStatusEvent {
  *
  * - `contextTokens`: input + cache_creation + cache_read from the
  *   latest Claude `message.usage`.
- * - `contextWindow`: 200k normally, 1M with `opus[1m]`/`sonnet[1m]`.
+ * - A limits observation carries the committed model/window/threshold tuple;
+ *   explicit nulls clear values, while absent fields leave them untouched.
+ * - `contextWindow`: the reported capacity, or null when unknown.
  * - `totalCostUsd`: cumulative session spend in USD after this update
  *   (server-computed, the cost-budget total). Present only when the
  *   session is priced; absent on an unpriced session or a broadcast
@@ -608,8 +610,9 @@ export interface SessionUsageEvent {
   type: "session_usage";
   conversationId: string;
   contextTokens?: number;
-  contextWindow?: number;
+  contextWindow?: number | null;
   autoCompactTokenLimit?: number | null;
+  contextModel?: string | null;
   providerUsageLimits?: ProviderUsageLimitsSnapshot | null;
   totalCostUsd?: number;
   usageByModel?: Record<string, ModelUsage>;

@@ -1045,6 +1045,12 @@ export interface ConversationState {
   contextWindow: number | null;
   /** Host/model-reported automatic compaction point; null when unavailable. */
   autoCompactTokenLimit: number | null;
+  /** One received reading, bound to its reported model rather than the model pill. */
+  reportedContextReading: {
+    model: string;
+    contextWindow: number | null;
+    autoCompactTokenLimit: number | null;
+  } | null;
   /** Account allowance windows reported by the active session's harness. */
   providerUsageLimits: ProviderUsageLimitsSnapshot | null;
   /**
@@ -2278,6 +2284,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   subAgentName: null,
   contextWindow: null,
   autoCompactTokenLimit: null,
+  reportedContextReading: null,
   providerUsageLimits: null,
   tokensUsed: null,
   sessionCostUsd: null,
@@ -4992,6 +4999,25 @@ function mcpStartupSnapshotPatch(
   };
 }
 
+function reportedContextReadingFromSession(
+  session: Session,
+  current: ConversationState["reportedContextReading"],
+): ConversationState["reportedContextReading"] {
+  const model = session.labels?.["omnigent.last_context_model"];
+  if (!model) return null;
+  const reading = {
+    model,
+    contextWindow: session.contextWindow ?? null,
+    autoCompactTokenLimit: session.autoCompactTokenLimit ?? null,
+  };
+  // Re-reading an unchanged snapshot is not another harness observation.
+  return current?.model === model &&
+    current.contextWindow === reading.contextWindow &&
+    current.autoCompactTokenLimit === reading.autoCompactTokenLimit
+    ? current
+    : reading;
+}
+
 /**
  * Store fields derived from the session's agent binding, computed from a
  * session snapshot.
@@ -5020,9 +5046,11 @@ function sessionBindingPatch(
     | "sessionModelOverride"
     | "sandboxActionDismissed"
     | "startup"
+    | "reportedContextReading"
   >,
   launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
   startupBeforeFetch: ConversationState["startup"] | undefined,
+  readingBeforeFetch: ConversationState["reportedContextReading"] | undefined,
 ): Pick<
   ChatState,
   | "isNativeTerminalSession"
@@ -5042,6 +5070,7 @@ function sessionBindingPatch(
   | "codexApprovalMode"
   | "contextWindow"
   | "autoCompactTokenLimit"
+  | "reportedContextReading"
   | "providerUsageLimits"
   | "gitBranch"
   | "worktree"
@@ -5083,6 +5112,10 @@ function sessionBindingPatch(
       (isCodexNativeSession(session) ? (codexApprovalModeFromSession(session) ?? "") : ""),
     contextWindow: session.contextWindow ?? null,
     autoCompactTokenLimit: session.autoCompactTokenLimit ?? null,
+    reportedContextReading:
+      state.reportedContextReading === readingBeforeFetch
+        ? reportedContextReadingFromSession(session, state.reportedContextReading)
+        : state.reportedContextReading,
     providerUsageLimits: session.providerUsageLimits ?? null,
     gitBranch: session.gitBranch ?? null,
     worktree: session.worktree ?? null,
@@ -5133,7 +5166,15 @@ async function refreshSessionBinding(id: string): Promise<void> {
   // an agent switch in a backgrounded conversation must still re-derive its
   // binding (most importantly `isNativeTerminalSession`, which gates the
   // optimistic-bubble lifecycle). `setterFor` no-ops once it is evicted.
-  setterFor(id)((s) => sessionBindingPatch(session, s, launchBeforeFetch, startupBeforeFetch));
+  setterFor(id)((s) =>
+    sessionBindingPatch(
+      session,
+      s,
+      launchBeforeFetch,
+      startupBeforeFetch,
+      stateBeforeFetch?.reportedContextReading,
+    ),
+  );
 }
 
 /**
@@ -5279,6 +5320,7 @@ async function bindStream(
         state,
         launchBeforeFetch,
         startupBeforeFetch,
+        stateBeforeFetch.reportedContextReading,
       );
       const racedOptions = racedNativeModelOptions.get(id);
       const catalogWonBindRace =
@@ -5679,6 +5721,7 @@ function reconnectStatusPatch(
   todosAtReconnectStart: ChatState["todos"] | undefined,
   launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
   startupBeforeFetch: ChatState["startup"],
+  readingBeforeFetch: ConversationState["reportedContextReading"],
 ): Partial<ChatState> {
   const patch: Partial<ChatState> = {
     sessionStatus: session.status,
@@ -5700,8 +5743,15 @@ function reconnectStatusPatch(
   // returns to "N background tasks still running" rather than vanishing on reconnect.
   patch.backgroundTaskCount = session.backgroundTaskCount ?? 0;
   patch.backgroundTasks = session.backgroundTasks ?? [];
-  if (session.contextWindow != null) patch.contextWindow = session.contextWindow;
-  patch.autoCompactTokenLimit = session.autoCompactTokenLimit ?? null;
+  if (s.reportedContextReading === readingBeforeFetch) {
+    if (session.contextWindow !== undefined) patch.contextWindow = session.contextWindow;
+    if (session.autoCompactTokenLimit !== undefined)
+      patch.autoCompactTokenLimit = session.autoCompactTokenLimit;
+    patch.reportedContextReading = reportedContextReadingFromSession(
+      session,
+      s.reportedContextReading,
+    );
+  }
   if (session.lastTotalTokens != null) patch.tokensUsed = session.lastTotalTokens;
   if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
   if (session.usageByModel != null) patch.sessionUsageByModel = session.usageByModel;
@@ -5838,6 +5888,7 @@ async function reconcileActiveSessionStatus(
       undefined,
       stateBeforeFetch.mcpStartupLaunch,
       stateBeforeFetch.startup,
+      stateBeforeFetch.reportedContextReading,
     );
     const blocks = snapshotCompactionSpinners(s.blocks, s.activeResponse, patch.activeResponse);
     return blocks === null ? patch : { ...patch, blocks };
@@ -6263,6 +6314,7 @@ async function rehydrateWindowOnReconnect(
   launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
   startupBeforeFetch: ChatState["startup"],
   pendingAtReconnectStart: Set<string>,
+  readingBeforeFetch: ConversationState["reportedContextReading"],
 ): Promise<void> {
   // Pinned at entry (still the caller's generation — its guards just passed).
   const generation = get().historyGeneration;
@@ -6341,6 +6393,7 @@ async function rehydrateWindowOnReconnect(
       todosAtReconnectStart,
       launchBeforeFetch,
       startupBeforeFetch,
+      readingBeforeFetch,
     );
     const blocks =
       reconcileElicitationBlocks(
@@ -6405,6 +6458,7 @@ async function reconcileOnReconnect(
   if (queryClient === null) return;
   const launchBeforeFetch = mcpStartupBeforeSnapshot(id, get());
   const startupBeforeFetch = get().startup;
+  const readingBeforeFetch = get().reportedContextReading;
   // Captured before any await: the ids rendered BEFORE the gap. The overlap
   // check below must not be satisfied by items the reconnected pump appends
   // while we fetch — those are at the new end of the transcript, not proof
@@ -6484,6 +6538,7 @@ async function reconcileOnReconnect(
       launchBeforeFetch,
       startupBeforeFetch,
       pendingAtReconnectStart,
+      readingBeforeFetch,
     );
     return;
   }
@@ -6510,6 +6565,7 @@ async function reconcileOnReconnect(
         todosAtReconnectStart,
         launchBeforeFetch,
         startupBeforeFetch,
+        readingBeforeFetch,
       ),
       // A gap-committed item can be a send whose POST died in the gap: it
       // retracts the draft, or marks it refused when the snapshot says the
@@ -8495,7 +8551,13 @@ async function refetchRunnerBackedSessionState(
   // A delayed catalog only hydrates this session's runner-backed state.
   const statePatch: Partial<ConversationState> =
     options.applyBindingPatch === true
-      ? sessionBindingPatch(session, currentState, launchBeforeFetch, startupBeforeFetch)
+      ? sessionBindingPatch(
+          session,
+          currentState,
+          launchBeforeFetch,
+          startupBeforeFetch,
+          stateBeforeFetch?.reportedContextReading,
+        )
       : { codexModelOptions: session.codexModelOptions ?? [] };
   setterFor(conversationId)(statePatch);
 }
@@ -8830,8 +8892,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // per-bucket breakdown fields follow the same merge rule.
       const patch: {
         tokensUsed?: number;
-        contextWindow?: number;
+        contextWindow?: number | null;
         autoCompactTokenLimit?: number | null;
+        reportedContextReading?: ConversationState["reportedContextReading"];
         providerUsageLimits?: ProviderUsageLimitsSnapshot | null;
         sessionCostUsd?: number;
         sessionUsageByModel?: Record<string, ModelUsage>;
@@ -8869,7 +8932,19 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         }
       }
       if (Object.keys(patch).length > 0) {
-        applyToConversation(patch);
+        applyToConversation(() => {
+          if (event.contextWindow !== undefined || event.autoCompactTokenLimit !== undefined) {
+            // The server publishes the committed limits tuple, including clears.
+            patch.reportedContextReading = event.contextModel
+              ? {
+                  model: event.contextModel,
+                  contextWindow: event.contextWindow ?? null,
+                  autoCompactTokenLimit: event.autoCompactTokenLimit ?? null,
+                }
+              : null;
+          }
+          return patch;
+        });
       }
       return;
     }

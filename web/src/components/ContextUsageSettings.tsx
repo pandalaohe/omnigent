@@ -1,4 +1,4 @@
-import { ChevronRightIcon } from "lucide-react";
+import { ChevronRightIcon, PlusIcon, TriangleAlertIcon, XIcon } from "lucide-react";
 import {
   useEffect,
   useMemo,
@@ -10,40 +10,43 @@ import {
   type Ref,
 } from "react";
 
-import { AgentNameTag } from "@/components/AgentNameTag";
+import { AgentBadgeMark } from "@/components/AgentBadge";
+import { AGENT_MARK_CLASS, AgentIntegrationMark, AgentNameTag } from "@/components/AgentNameTag";
 import { HelpTip } from "@/components/HelpTip";
 import { LayeredEditor, LayeredEditorAction } from "@/components/LayeredEditor";
-import {
-  LayeredChip,
-  LayeredMark,
-  LayeredOwn,
-  LayeredTable,
-  type LayeredCellLevel,
-} from "@/components/LayeredTable";
-import { SavedContextSources } from "@/components/SavedContextSources";
+import { LayeredMark } from "@/components/LayeredTable";
 import { Button } from "@/components/ui/button";
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@/components/ui/command";
 import { Input } from "@/components/ui/input";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Segmented } from "@/components/ui/segmented";
 import { Switch } from "@/components/ui/switch";
 import {
   harnessSection,
+  productIdFor,
   registrySourceLabels,
+  rowsForAgentIds,
   useAgentRegistry,
+  useAgentsWithSessions,
   type RegistryItem,
 } from "@/hooks/useAgentRegistry";
+import { useAgentBadgePreferences } from "@/hooks/useAgentBadgePreferences";
 import { useCodexRateLimits, useHosts, type Host } from "@/hooks/useHosts";
 import { useSession } from "@/hooks/useSession";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useStableProviderUsageLimits } from "@/hooks/useStableProviderUsageLimits";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
+import { agentBadgeFor } from "@/lib/agentBadgePreferences";
 import { formatTokenCountShort } from "@/lib/formatCost";
 import { harnessUnavailableReasonOnHost } from "@/lib/harnessSetup";
-import {
-  levelsBelow,
-  missingCellText,
-  type LayeredLevel,
-  type LayeredStore,
-} from "@/lib/layeredValues";
+import { missingCellText } from "@/lib/layeredValues";
 import {
   formatProviderUsageLimits,
   providerUsageLimitsFromCodex,
@@ -51,27 +54,34 @@ import {
 } from "@/lib/providerUsageLimits";
 import { useLocation, useNavigate, useSearchParams } from "@/lib/routing";
 import {
+  addUsageContextEntry,
   fixedBufferFitsCapacity,
   inheritedUsageContext,
+  reportedUsageContext,
   resolveUsageContextLevel,
+  seedUsageContextList,
   setUsageContextLevel,
+  usageContextEntryKey,
   usageContextHasValue,
+  usageContextKeysOfEntry,
   usageContextLevelKey,
   usageContextLevelLabel,
+  usageContextRecordedEntries,
   usageContextRecordFromKey,
+  usageContextRows,
   usageContextSourceFromKey,
   usageContextSourceKey,
   writeUsageContextPreferences,
   type ResolvedUsageContext,
   type UsageContextLevel,
+  type UsageContextListEntry,
   type UsageContextOverride,
   type UsageContextPreferences,
+  type UsageContextReported,
   type UsageContextSource,
 } from "@/lib/usageContextPreferences";
+import { cn } from "@/lib/utils";
 import { useChatStore } from "@/store/chatStore";
-
-/** One record holds a level's whole value, so the layered store carries one field. */
-type StoredLevels = LayeredStore<"value">;
 
 interface Draft {
   context: string;
@@ -83,29 +93,56 @@ interface Draft {
 interface UndoState {
   overrides: Record<string, UsageContextOverride>;
   keys: string[];
+  removedEntries: UsageContextListEntry[];
+  message: string;
 }
 
-interface AgentIdentity {
-  agentId: string | null;
-  name: string;
-  harness: string;
-}
-
-interface AgentRow extends AgentIdentity {
+/** A row of the table: each kind meets each kind of column at exactly one level. */
+interface ContextRow {
   id: string;
+  testId: string;
+  kind: "all" | "agent" | "model";
+  entry: UsageContextListEntry;
+  label: string;
 }
 
-interface HostColumn {
+interface ContextGroup {
   id: string;
+  agent: ContextRow;
+  models: ContextRow[];
+}
+
+interface ContextColumn {
+  id: string;
+  all: boolean;
   hostId: string;
   label: string;
   host: Host | null;
 }
 
+interface CellAddress {
+  row: string;
+  col: string;
+}
+
 const NO_HOST_COLUMN = "no-host";
-const CORNER_SOURCE: UsageContextSource = { hostId: "", agentName: "", harness: "", model: "" };
-const CORNER_KEY = usageContextLevelKey(CORNER_SOURCE, "all");
-const NOTHING_REPORTED = { contextWindow: null, autoCompactTokenLimit: null };
+const ALL_COLUMN: ContextColumn = {
+  id: "all-computers",
+  all: true,
+  hostId: "",
+  label: "All computers",
+  host: null,
+};
+const ALL_ROW: ContextRow = {
+  id: "all-agents",
+  testId: "all-agents",
+  kind: "all",
+  entry: { agentName: "", harness: "", model: "" },
+  label: "All agents",
+};
+const NOTHING_REPORTED: UsageContextReported = { contextWindow: null, autoCompactTokenLimit: null };
+const ORDER_HELP =
+  "One model on this computer, then that model on all computers, then the agent on this computer, then the agent on all computers, then all agents on this computer, then all agents, then the agent's own value.";
 
 function slug(value: string): string {
   return (
@@ -146,76 +183,124 @@ function contextTokenText(value: number): string {
   const compact = formatTokenCountShort(value);
   const divisor = { k: 1_000, m: 1_000_000, b: 1_000_000_000 }[compact.at(-1) ?? ""];
   if (!divisor) return compact;
-  return Number(compact.slice(0, -1)) * divisor === value ? compact : String(value);
+  return Number(compact.slice(0, -1)) * divisor === value
+    ? compact.replace(/[mb]$/, (unit) => unit.toUpperCase())
+    : String(value);
 }
 
-function stateSummary(resolved: ResolvedUsageContext, mark: boolean, models = 0): string {
+function stateSummary(resolved: ResolvedUsageContext, own: boolean): string {
   const context = resolved.contextWindow.value;
   const buffer = resolved.buffer.value;
+  const compact = resolved.autoCompactTokenLimit;
   return [
     `context ${context === null ? "Auto" : `${context} tokens`}`,
     `compact buffer ${buffer === null ? "Auto" : resolved.buffer.mode === "percent" ? `${buffer}%` : `${buffer} tokens`}`,
-    mark ? "set here" : "",
-    models > 0 ? `${models} saved model ${models === 1 ? "value" : "values"}` : "",
+    compact === null ? "" : `compacts at ${Math.round(compact)} tokens`,
+    own ? "saved here" : "",
   ]
     .filter(Boolean)
     .join(", ");
 }
 
-function agentRank(agent: AgentIdentity): number {
-  if (agent.harness === "pi" || agent.harness === "pi-rpc") return 2;
-  const section = harnessSection(null, agent.harness);
+function agentRank(entry: UsageContextListEntry): number {
+  if (entry.harness === "pi" || entry.harness === "pi-rpc") return 2;
+  const section = harnessSection(null, entry.harness);
   return section === "native" ? 0 : section === "sdk" ? 1 : section === "acp" ? 2 : 3;
 }
 
-/** Every agent that can hold a Context value: a listed agent, a saved one, or this session's. */
-function agentIdentities(
-  items: readonly RegistryItem[],
-  preferences: UsageContextPreferences,
-  live: AgentIdentity | null,
-): AgentIdentity[] {
-  const found = new Map<string, AgentIdentity>();
-  const itemFor = (name: string, harness: string) =>
-    items.find((item) => item.name === name && item.harness === harness);
-  const add = (identity: AgentIdentity) => {
-    if (!identity.name) return;
-    const key = JSON.stringify([identity.name, identity.harness]);
-    if (!found.has(key)) found.set(key, identity);
-  };
-  for (const item of items) {
-    if (!item.name || !item.harness) continue;
-    add({ agentId: item.key, name: item.name, harness: item.harness });
-  }
-  for (const key of Object.keys(preferences.overrides)) {
-    const record = usageContextRecordFromKey(key);
-    if (!record || !record.source.agentName) continue;
-    add({
-      agentId: itemFor(record.source.agentName, record.source.harness)?.key ?? null,
-      name: record.source.agentName,
-      harness: record.source.harness,
-    });
-  }
-  if (live) {
-    add({
-      name: live.name,
-      harness: live.harness,
-      agentId: itemFor(live.name, live.harness)?.key ?? null,
-    });
-  }
-  return [...found.values()].sort(
-    (left, right) => agentRank(left) - agentRank(right) || left.name.localeCompare(right.name),
+/** An agent's shortest name: the product's own, before any installed copy's suffix. */
+function agentLabelFor(items: readonly RegistryItem[], agentName: string, harness: string): string {
+  const product = items.find(
+    (item) => item.key === `harness:${harness}` && item.name === agentName,
   );
+  return product?.label ?? registrySourceLabels(items, agentName, harness).agentLabel;
+}
+
+interface RegistryView {
+  items: readonly RegistryItem[];
+  legacyProducts: Record<string, RegistryItem>;
+}
+
+/** The catalog id the agent's badge is saved under. */
+function badgeIdFor(registry: RegistryView, agentName: string, harness: string): string | null {
+  return productIdFor(
+    registry.items.find((item) => item.name === agentName && item.harness === harness),
+    registry,
+  );
+}
+
+function groupIdOf(entry: UsageContextListEntry): string {
+  return JSON.stringify([entry.agentName, entry.harness]);
+}
+
+/** One group per agent, its models beneath it, wherever in the list they were added. */
+function contextGroups(
+  entries: readonly UsageContextListEntry[],
+  items: readonly RegistryItem[],
+): ContextGroup[] {
+  const groups = new Map<string, ContextGroup>();
+  const usedTestIds = new Set<string>();
+  const rowFor = (entry: UsageContextListEntry, label: string): ContextRow => {
+    const base = [entry.agentName, entry.harness, entry.model].filter(Boolean).map(slug).join("-");
+    let testId = base;
+    let suffix = 2;
+    while (usedTestIds.has(testId)) testId = `${base}-${suffix++}`;
+    usedTestIds.add(testId);
+    return {
+      id: usageContextEntryKey(entry),
+      testId,
+      kind: entry.model ? "model" : "agent",
+      entry,
+      label,
+    };
+  };
+  const sorted = [...entries].sort(
+    (left, right) =>
+      left.agentName.localeCompare(right.agentName) ||
+      left.harness.localeCompare(right.harness) ||
+      left.model.localeCompare(right.model),
+  );
+  for (const entry of sorted) {
+    const id = groupIdOf(entry);
+    if (!groups.has(id)) {
+      const agentEntry = { agentName: entry.agentName, harness: entry.harness, model: "" };
+      groups.set(id, {
+        id,
+        agent: rowFor(agentEntry, agentLabelFor(items, entry.agentName, entry.harness)),
+        models: [],
+      });
+    }
+    if (entry.model) groups.get(id)!.models.push(rowFor(entry, entry.model));
+  }
+  return [...groups.values()].sort(
+    (left, right) =>
+      agentRank(left.agent.entry) - agentRank(right.agent.entry) ||
+      left.agent.label.localeCompare(right.agent.label),
+  );
+}
+
+/** The level a row and a column meet at: the table is the resolution order, laid out. */
+function levelOf(
+  row: ContextRow,
+  column: ContextColumn,
+): { source: UsageContextSource; level: UsageContextLevel } {
+  const { agentName, harness, model } = row.entry;
+  const source: UsageContextSource = { hostId: column.hostId, agentName, harness, model };
+  if (row.kind === "all") return { source, level: column.all ? "all" : "host" };
+  if (row.kind === "agent") return { source, level: column.all ? "column" : "cell" };
+  return { source, level: column.all ? "agent-model" : "model" };
 }
 
 function hostColumns(
   hosts: readonly Host[],
   preferences: UsageContextPreferences,
   liveHostId: string | null,
-): HostColumn[] {
-  const byHostId = new Map<string, HostColumn>();
+): ContextColumn[] {
+  const byHostId = new Map<string, ContextColumn>();
   for (const host of hosts) {
     byHostId.set(host.host_id, {
       id: host.host_id,
+      all: false,
       hostId: host.host_id,
       label: host.name || host.host_id,
       host,
@@ -223,12 +308,13 @@ function hostColumns(
   }
   const addHost = (hostId: string) => {
     if (!byHostId.has(hostId))
-      byHostId.set(hostId, { id: hostId, hostId, label: hostId, host: null });
+      byHostId.set(hostId, { id: hostId, all: false, hostId, label: hostId, host: null });
   };
   let noHost = liveHostId === "";
   for (const key of Object.keys(preferences.overrides)) {
     const record = usageContextRecordFromKey(key);
     if (!record) continue;
+    if (record.level !== "model" && record.level !== "cell" && record.level !== "host") continue;
     if (record.source.hostId) addHost(record.source.hostId);
     else noHost = true;
   }
@@ -236,17 +322,18 @@ function hostColumns(
   const columns = [...byHostId.values()].sort((left, right) =>
     left.label.localeCompare(right.label),
   );
-  if (noHost) columns.push({ id: NO_HOST_COLUMN, hostId: "", label: "No host", host: null });
-  return columns;
+  if (noHost)
+    columns.push({ id: NO_HOST_COLUMN, all: false, hostId: "", label: "No host", host: null });
+  return [ALL_COLUMN, ...columns];
 }
 
-function unavailableCell(agent: AgentIdentity, column: HostColumn): string | undefined {
-  if (!column.host) return undefined;
-  const reason = harnessUnavailableReasonOnHost(agent.harness, column.host);
-  if (reason === "platform-unsupported")
-    return missingCellText(agent.harness, column.host.platform);
+function unavailableCell(row: ContextRow, column: ContextColumn): string | undefined {
+  if (!column.host || row.kind === "all") return undefined;
+  const { harness } = row.entry;
+  const reason = harnessUnavailableReasonOnHost(harness, column.host);
+  if (reason === "platform-unsupported") return missingCellText(harness, column.host.platform);
   if (reason === "binary-missing" || reason === "unconfigured")
-    return missingCellText(agent.harness, null);
+    return missingCellText(harness, null);
   return undefined;
 }
 
@@ -336,55 +423,6 @@ function dropRepeatedCellFields(
     record,
     resolveUsageContextLevel(withProposedContext, source, "cell"),
     inheritedUsageContext(preferences, source, "cell").contextWindow.value,
-  );
-}
-
-/** Fixed total/buffer slots; a blank mark slot keeps inherited values aligned. */
-function LevelState({
-  resolved,
-  mark,
-  models = 0,
-}: {
-  resolved: ResolvedUsageContext;
-  mark: boolean;
-  models?: number;
-}) {
-  const context = resolved.contextWindow.value;
-  const buffer = resolved.buffer.value;
-  const values = (
-    <span className="inline-flex items-center gap-1">
-      <span data-context-slot="total">
-        <LayeredChip tone="first" title={`Context total: ${context ?? "Auto"}`}>
-          {context === null ? "–" : contextTokenText(context)}
-        </LayeredChip>
-      </span>
-      <span data-context-slot="buffer">
-        <LayeredChip
-          tone="second"
-          title={`Compact buffer: ${buffer ?? "Auto"}${resolved.buffer.mode === "percent" && buffer !== null ? "%" : ""}`}
-        >
-          {buffer === null
-            ? "–"
-            : resolved.buffer.mode === "percent"
-              ? `${buffer}%`
-              : contextTokenText(buffer)}
-        </LayeredChip>
-      </span>
-      {models > 0 && (
-        <span data-context-slot="models">
-          <LayeredChip title={`${models} saved model ${models === 1 ? "value" : "values"}`}>
-            {models}M
-          </LayeredChip>
-        </span>
-      )}
-    </span>
-  );
-  if (mark) return <LayeredOwn>{values}</LayeredOwn>;
-  return (
-    <span className="inline-flex items-center gap-1.5">
-      <span aria-hidden="true" className="size-1.5 shrink-0" />
-      {values}
-    </span>
   );
 }
 
@@ -492,34 +530,44 @@ function DraftFields({
 /** The two fields for one stored level; an empty one shows what it would inherit. */
 function LevelFields({
   preferences,
-  contextInputRef,
   source,
   level,
   label,
   levelText,
+  reported,
   draft,
   onChange,
   onSubmit,
   error,
 }: {
   preferences: UsageContextPreferences;
-  contextInputRef?: Ref<HTMLInputElement>;
   source: UsageContextSource;
   level: UsageContextLevel;
   label: string;
   levelText: (level: UsageContextLevel) => string;
+  reported: UsageContextReported;
   draft: Draft;
   onChange: (next: Draft) => void;
   onSubmit: () => void;
   error: string;
 }) {
-  const stored = draftOf(preferences.overrides[usageContextLevelKey(source, level)]);
-  const inherited = inheritedUsageContext(preferences, source, level);
+  const key = usageContextLevelKey(source, level);
+  const stored = draftOf(preferences.overrides[key]);
+  const inherited = inheritedUsageContext(preferences, source, level, reported);
   const inheritedBuffer = inherited.buffer.value;
-  const fromText = (winner: UsageContextLevel | "reported") =>
-    winner === "reported" ? "The agent reports its own" : `From ${levelText(winner)}`;
-  const valueNote = (typed: string, saved: string, winner: UsageContextLevel | "reported") => {
-    if (typed.trim() === "") return fromText(winner);
+  const autoText = (value: number | null) =>
+    value === null
+      ? "Auto: the agent's own value"
+      : `Auto: the agent reports ${contextTokenText(value)}`;
+  const fromText = (winner: UsageContextLevel | "reported", auto: number | null) =>
+    winner === "reported" ? autoText(auto) : `From ${levelText(winner)}`;
+  const valueNote = (
+    typed: string,
+    saved: string,
+    winner: UsageContextLevel | "reported",
+    auto: number | null,
+  ) => {
+    if (typed.trim() === "") return fromText(winner, auto);
     if (typed !== saved) return "Not saved yet";
     return (
       <span className="inline-flex items-center gap-1.5">
@@ -528,10 +576,19 @@ function LevelFields({
       </span>
     );
   };
+  const outcome = recordFromDraft(draft, inherited.contextWindow.value);
+  const preview = (() => {
+    if ("error" in outcome) return null;
+    const overrides = { ...preferences.overrides };
+    if (outcome.record) overrides[key] = outcome.record;
+    else Reflect.deleteProperty(overrides, key);
+    return resolveUsageContextLevel({ ...preferences, overrides }, source, level, reported)
+      .autoCompactTokenLimit;
+  })();
+  const reportedPoint = reported.autoCompactTokenLimit;
   return (
     <DraftFields
       draft={draft}
-      contextInputRef={contextInputRef}
       onChange={onChange}
       onSubmit={onSubmit}
       error={error}
@@ -548,11 +605,36 @@ function LevelFields({
             : `${inheritedBuffer}${inherited.buffer.mode === "percent" ? "%" : ""}`
       }
       note={(field) =>
-        field === "context"
-          ? valueNote(draft.context, stored.context, inherited.contextWindow.level)
-          : draft.mode === "percent"
-            ? valueNote(draft.percent, stored.percent, inherited.buffer.level)
-            : valueNote(draft.buffer, stored.buffer, inherited.buffer.level)
+        field === "context" ? (
+          valueNote(
+            draft.context,
+            stored.context,
+            inherited.contextWindow.level,
+            reported.contextWindow,
+          )
+        ) : (
+          <span className="grid gap-0.5">
+            <span>
+              {valueNote(
+                draft.mode === "percent" ? draft.percent : draft.buffer,
+                draft.mode === "percent" ? stored.percent : stored.buffer,
+                inherited.buffer.level,
+                inherited.buffer.level === "reported" ? inheritedBuffer : null,
+              )}
+            </span>
+            {preview !== null ? (
+              <span data-testid="context-compact-point">
+                Compacts at {contextTokenText(Math.round(preview))}
+                {reportedPoint !== null && reportedPoint !== preview ? (
+                  <span className="text-warning">
+                    {" "}
+                    · the agent reports {contextTokenText(reportedPoint)}
+                  </span>
+                ) : null}
+              </span>
+            ) : null}
+          </span>
+        )
       }
     />
   );
@@ -563,9 +645,11 @@ function recordForLevel(
   preferences: UsageContextPreferences,
   source: UsageContextSource,
   level: UsageContextLevel,
+  reported: UsageContextReported,
   draft: Draft,
 ): { record: UsageContextOverride | null } | { error: string } {
-  const inheritedContext = inheritedUsageContext(preferences, source, level).contextWindow.value;
+  const inheritedContext = inheritedUsageContext(preferences, source, level, reported).contextWindow
+    .value;
   const outcome = recordFromDraft(draft, inheritedContext);
   if ("error" in outcome || level !== "cell" || !outcome.record) return outcome;
   return { record: dropRepeatedCellFields(preferences, source, outcome.record) };
@@ -590,11 +674,11 @@ function EditorButtons({ onCancel, onSave }: { onCancel: () => void; onSave: () 
   );
 }
 
-/** The editor of a corner, host column or cell: one level, written whole on Save. */
+/** The editor of one cell: one level, written whole on Save. */
 function ValueEditor({
   trigger,
   title,
-  help,
+  note,
   open,
   onOpenChange,
   preferences,
@@ -602,14 +686,13 @@ function ValueEditor({
   level,
   label,
   levelText,
+  reported,
   clearBelowCount,
   onClearBelow,
-  undo,
-  onUndo,
 }: {
   trigger: ReactElement;
   title: string;
-  help?: string;
+  note?: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   preferences: UsageContextPreferences;
@@ -617,10 +700,9 @@ function ValueEditor({
   level: UsageContextLevel;
   label: string;
   levelText: (level: UsageContextLevel) => string;
+  reported: UsageContextReported;
   clearBelowCount: number;
   onClearBelow: () => void;
-  undo: UndoState | null;
-  onUndo: () => void;
 }) {
   const key = usageContextLevelKey(source, level);
   const own = preferences.overrides[key];
@@ -633,7 +715,7 @@ function ValueEditor({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, storedSignature]);
   const save = () => {
-    const outcome = recordForLevel(preferences, source, level, draft);
+    const outcome = recordForLevel(preferences, source, level, reported, draft);
     if ("error" in outcome) {
       setError(outcome.error);
       return;
@@ -641,19 +723,22 @@ function ValueEditor({
     setUsageContextLevel(preferences, key, outcome.record);
     onOpenChange(false);
   };
+  const clear = usageContextHasValue(own)
+    ? () => setUsageContextLevel(preferences, key, null)
+    : undefined;
   return (
     <LayeredEditor
       trigger={trigger}
       title={title}
-      help={help}
+      note={note}
+      help={ORDER_HELP}
       open={open}
       onOpenChange={onOpenChange}
-      onClear={
-        usageContextHasValue(own) ? () => setUsageContextLevel(preferences, key, null) : undefined
-      }
+      useInheritedLabel={level === "all" && clear ? "Use Auto" : undefined}
+      onUseInherited={level === "all" ? clear : undefined}
+      onClear={level === "all" ? undefined : clear}
       clearBelowCount={clearBelowCount}
       onClearBelow={clearBelowCount > 0 ? onClearBelow : undefined}
-      actions={undo ? <LayeredEditorAction onClick={onUndo}>Undo</LayeredEditorAction> : null}
       footer={<EditorButtons onCancel={() => onOpenChange(false)} onSave={save} />}
     >
       <LevelFields
@@ -662,6 +747,7 @@ function ValueEditor({
         level={level}
         label={label}
         levelText={levelText}
+        reported={reported}
         draft={draft}
         onChange={setDraft}
         onSubmit={save}
@@ -671,22 +757,254 @@ function ValueEditor({
   );
 }
 
+interface PickerOption {
+  key: string;
+  /** What the search matches. */
+  value: string;
+  entry: UsageContextListEntry;
+  content: ReactNode;
+}
+
+/** A searchable list of entries to add; `typedEntry` turns the search itself into one. */
+function EntryPicker({
+  trigger,
+  label,
+  placeholder,
+  heading,
+  options,
+  typedEntry,
+  emptyText,
+  testId,
+  opensEditor = false,
+  onAdd,
+}: {
+  trigger: ReactElement;
+  label: string;
+  placeholder: string;
+  heading: string;
+  options: readonly PickerOption[];
+  /** The entry the search itself would add, or null when it adds nothing. */
+  typedEntry?: (typed: string) => UsageContextListEntry | null;
+  emptyText: (typed: string) => string;
+  testId: string;
+  /** The choice opens a cell editor, which keeps the focus the closing picker would take back. */
+  opensEditor?: boolean;
+  onAdd: (entry: UsageContextListEntry) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [search, setSearch] = useState("");
+  const chosenRef = useRef(false);
+  const typed = search.trim().slice(0, 256);
+  const typedChoice = typed && typedEntry ? typedEntry(typed) : null;
+  const choose = (entry: UsageContextListEntry) => {
+    chosenRef.current = true;
+    setOpen(false);
+    setSearch("");
+    onAdd(entry);
+  };
+  return (
+    <Popover
+      open={open}
+      onOpenChange={(next) => {
+        setOpen(next);
+        if (!next) setSearch("");
+      }}
+    >
+      <PopoverTrigger asChild>{trigger}</PopoverTrigger>
+      <PopoverContent
+        align="start"
+        data-pop=""
+        className="w-[min(24rem,calc(100vw-1rem))] p-0"
+        data-testid={testId}
+        onCloseAutoFocus={(event) => {
+          if (opensEditor && chosenRef.current) event.preventDefault();
+          chosenRef.current = false;
+        }}
+      >
+        <Command label={label}>
+          <CommandInput value={search} onValueChange={setSearch} placeholder={placeholder} />
+          <CommandList>
+            <CommandEmpty>{emptyText(typed)}</CommandEmpty>
+            {options.length > 0 ? (
+              <CommandGroup heading={heading}>
+                {options.map((option) => (
+                  <CommandItem
+                    key={option.key}
+                    value={option.value}
+                    onSelect={() => choose(option.entry)}
+                  >
+                    {option.content}
+                  </CommandItem>
+                ))}
+              </CommandGroup>
+            ) : null}
+            {typedChoice ? (
+              <CommandGroup forceMount>
+                <CommandItem forceMount value={`add ${typed}`} onSelect={() => choose(typedChoice)}>
+                  <span className="min-w-0 wrap-anywhere">
+                    Add <span className="font-medium">{typed}</span>
+                  </span>
+                </CommandItem>
+              </CommandGroup>
+            ) : null}
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+/** Two value slots on one grid, shared with the column's header so everything lines up. */
+const SLOT_GRID = "grid w-full grid-cols-[repeat(2,minmax(3.5rem,1fr))] gap-x-2";
+const CELL_PADDING = "pr-1 pl-3.5";
+/** Room for the warning mark, kept on every cell so a warning never moves a number. */
+const WARNING_GUTTER = "flex w-11 shrink-0 items-center justify-center md:w-5";
+
+function ValueSlot({
+  slot,
+  text,
+  own,
+  fromAgent,
+}: {
+  slot: "total" | "buffer";
+  text: string;
+  own: boolean;
+  fromAgent: boolean;
+}) {
+  return (
+    <span
+      data-context-slot={slot}
+      className={cn(
+        "relative whitespace-nowrap tabular-nums",
+        own ? "font-semibold text-foreground" : "text-muted-foreground",
+        fromAgent && "italic",
+      )}
+    >
+      {own ? (
+        <span className="absolute top-1/2 -left-2.5 flex -translate-y-1/2">
+          <LayeredMark />
+        </span>
+      ) : null}
+      {text}
+    </span>
+  );
+}
+
+function ValueSlots({
+  resolved,
+  level,
+}: {
+  resolved: ResolvedUsageContext;
+  level: UsageContextLevel;
+}) {
+  const context = resolved.contextWindow.value;
+  const buffer = resolved.buffer.value;
+  const bufferPercent = resolved.buffer.mode === "percent" && buffer !== null;
+  return (
+    <span className={SLOT_GRID}>
+      <ValueSlot
+        slot="total"
+        text={context === null ? "Auto" : contextTokenText(context)}
+        own={resolved.contextWindow.level === level}
+        fromAgent={resolved.contextWindow.level === "reported"}
+      />
+      <ValueSlot
+        slot="buffer"
+        text={buffer === null ? "Auto" : bufferPercent ? `${buffer}%` : contextTokenText(buffer)}
+        own={resolved.buffer.level === level}
+        fromAgent={resolved.buffer.level === "reported"}
+      />
+    </span>
+  );
+}
+
+/** What a cell should tell about itself: disagreement with the agent, its headers, or itself. */
+function cellWarning(
+  preferences: UsageContextPreferences,
+  row: ContextRow,
+  column: ContextColumn,
+  resolved: ResolvedUsageContext,
+  reported: UsageContextReported,
+  agentLabel: string,
+): string | undefined {
+  if (row.kind === "all") return undefined;
+  const { source, level } = levelOf(row, column);
+  const lines: string[] = [];
+  const reportedWindow = reported.contextWindow;
+  if (
+    resolved.contextWindow.level !== "reported" &&
+    resolved.contextWindow.value !== null &&
+    reportedWindow !== null &&
+    resolved.contextWindow.value !== reportedWindow
+  ) {
+    lines.push(
+      `Context ${contextTokenText(resolved.contextWindow.value)} here; the agent reports ${contextTokenText(reportedWindow)}.`,
+    );
+  }
+  const reportedPoint = reported.autoCompactTokenLimit;
+  if (
+    resolved.buffer.level !== "reported" &&
+    resolved.autoCompactTokenLimit !== null &&
+    reportedPoint !== null &&
+    resolved.autoCompactTokenLimit !== reportedPoint
+  ) {
+    lines.push(
+      `Compacts at ${contextTokenText(Math.round(resolved.autoCompactTokenLimit))} here; the agent reports ${contextTokenText(reportedPoint)}.`,
+    );
+  }
+  if (resolved.ignored.some((item) => item.level === level))
+    lines.push("The buffer saved here is ignored: it is not below the context total.");
+  if (level === "cell") {
+    const cell = preferences.overrides[usageContextLevelKey(source, "cell")];
+    const fromRow = preferences.overrides[usageContextLevelKey(source, "column")];
+    const fromHost = preferences.overrides[usageContextLevelKey(source, "host")];
+    const fields = [
+      { key: "contextWindowTokens" as const, label: "Context total" },
+      { key: "buffer" as const, label: "Compact buffer" },
+    ];
+    for (const field of fields) {
+      if (ownField(cell, field.key) !== null) continue;
+      const rowValue = ownField(fromRow, field.key);
+      const hostValue = ownField(fromHost, field.key);
+      if (rowValue === null || hostValue === null || rowValue === hostValue) continue;
+      const winner =
+        field.key === "contextWindowTokens" ? resolved.contextWindow.level : resolved.buffer.level;
+      const winnerLabel =
+        winner === "column"
+          ? agentLabel
+          : winner === "host"
+            ? column.label
+            : usageContextLevelLabel(winner, { hostLabel: column.label, agentLabel });
+      lines.push(`${field.label}: ${agentLabel} and ${column.label} differ; ${winnerLabel} wins.`);
+    }
+  }
+  return lines.length ? lines.join("\n") : undefined;
+}
+
+const TABLE_CELL = "h-px border-b border-border bg-background p-0 text-left align-middle";
+const FIRST_COLUMN =
+  "lt-c sticky left-0 z-10 min-w-44 max-w-44 border-r font-normal md:min-w-44 md:max-w-56";
+const BODY_COLUMN = "border-l-0";
+const ROW_HEIGHT = "min-h-11 md:min-h-8";
+const ROW_ACTION =
+  "flex h-11 w-8 shrink-0 items-center justify-center rounded-sm text-muted-foreground opacity-100 transition-opacity hover:text-foreground focus-visible:opacity-100 md:size-6 md:opacity-0 md:group-hover/label:opacity-100";
+
 export function ContextUsageSettings() {
   const mobile = useIsMobileViewport();
   const preferences = useUsageContextPreferences();
+  const badges = useAgentBadgePreferences();
   const registry = useAgentRegistry();
+  const sessions = useAgentsWithSessions();
   const { data: hosts = [] } = useHosts();
   const conversationId = useChatStore((state) => state.conversationId);
   const liveAgentName = useChatStore((state) => state.boundAgentName);
   const liveHarness = useChatStore((state) => state.sessionHarness);
   const liveModel = useChatStore((state) => state.llmModel);
-  const reportedContextWindow = useChatStore((state) => state.contextWindow);
-  const reportedCompactLimit = useChatStore((state) => state.autoCompactTokenLimit);
   const sessionProviderUsageLimits = useChatStore((state) => state.providerUsageLimits);
   const { session } = useSession(conversationId);
   const liveHostId: string | null = conversationId ? (session?.hostId ?? "") : null;
-  const [openEditor, setOpenEditor] = useState<LayeredLevel | null>(null);
-  const [focusModel, setFocusModel] = useState<string | null>(null);
+  const [openEditor, setOpenEditor] = useState<CellAddress | null>(null);
+  const [openGroups, setOpenGroups] = useState<readonly string[]>([]);
   const [missingSource, setMissingSource] = useState(false);
   const [undo, setUndo] = useState<UndoState | null>(null);
   const searchParams = useSearchParams()[0];
@@ -694,195 +1012,111 @@ export function ContextUsageSettings() {
   const location = useLocation();
   const consumedRef = useRef<string | null>(null);
   const focusEditorRef = useRef(false);
+  const revealRowRef = useRef<string | null>(null);
 
-  const table = useMemo(() => {
-    const live: AgentIdentity | null =
-      liveAgentName && liveHarness
-        ? { agentId: null, name: liveAgentName, harness: liveHarness }
-        : null;
-    const identities = agentIdentities(registry.items, preferences, live);
-    const usedIds = new Set<string>();
-    const rows: AgentRow[] = identities.map((agent) => {
-      const base = `${slug(agent.name)}-${slug(agent.harness)}`;
-      let id = base;
-      let suffix = 2;
-      while (usedIds.has(id)) id = `${base}-${suffix++}`;
-      usedIds.add(id);
-      return { ...agent, id };
-    });
-    const columns = hostColumns(hosts, preferences, liveHostId);
-    const rowKeys = new Map<string, string>();
-    const colKeys = new Map<string, string>();
-    const cellKeys = new Map<string, string>();
-    for (const row of rows) {
-      rowKeys.set(
-        row.id,
-        usageContextLevelKey(
-          { hostId: "", agentName: row.name, harness: row.harness, model: "" },
-          "column",
-        ),
-      );
-    }
-    for (const column of columns) {
-      colKeys.set(
-        column.id,
-        usageContextLevelKey(
-          { hostId: column.hostId, agentName: "", harness: "", model: "" },
-          "host",
-        ),
-      );
-    }
-    const cells: StoredLevels["cells"] = {};
-    for (const column of columns) {
-      cells[column.id] = {};
-      for (const row of rows) {
-        const key = usageContextLevelKey(
-          { hostId: column.hostId, agentName: row.name, harness: row.harness, model: "" },
-          "cell",
-        );
-        cellKeys.set(`${row.id}\u0000${column.id}`, key);
-        const override = preferences.overrides[key];
-        if (usageContextHasValue(override)) cells[column.id][row.id] = { value: override };
-      }
-    }
-    const store: StoredLevels = { corner: {}, rows: {}, cols: {}, cells };
-    const corner = preferences.overrides[CORNER_KEY];
-    if (usageContextHasValue(corner)) store.corner = { value: corner };
-    for (const row of rows) {
-      const override = preferences.overrides[rowKeys.get(row.id)!];
-      if (usageContextHasValue(override)) store.rows[row.id] = { value: override };
-    }
-    for (const column of columns) {
-      const override = preferences.overrides[colKeys.get(column.id)!];
-      if (usageContextHasValue(override)) store.cols[column.id] = { value: override };
-    }
+  const sessionRows = sessions.data
+    ? rowsForAgentIds(registry.items, registry.legacyProducts, sessions.data)
+    : null;
+  const inUseKnown = !registry.isLoading && !registry.isError && sessionRows !== null;
+  const inUseFailed = registry.isError || sessions.isError;
+  const inUse: UsageContextListEntry[] = registry.items.flatMap((item) =>
+    item.deployed && item.name && item.harness && sessionRows?.has(item.key)
+      ? [{ agentName: item.name, harness: item.harness, model: "" }]
+      : [],
+  );
+
+  // The list starts from what is in use, once; after that only the user changes it.
+  useEffect(() => {
+    if (inUseKnown && !preferences.contextList) seedUsageContextList(preferences, inUse);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [inUseKnown, preferences.contextList]);
+
+  const { groups, columns, rowById, entries } = useMemo(() => {
+    const listed = usageContextRows(preferences);
+    const grouped = contextGroups(listed, registry.items);
+    const rows = [ALL_ROW, ...grouped.flatMap((group) => [group.agent, ...group.models])];
     return {
-      rows,
-      columns,
+      entries: listed,
+      groups: grouped,
+      columns: hostColumns(hosts, preferences, liveHostId),
       rowById: new Map(rows.map((row) => [row.id, row])),
-      columnById: new Map(columns.map((column) => [column.id, column])),
-      rowKeys,
-      colKeys,
-      cellKeys,
-      store,
     };
-  }, [registry.items, preferences, hosts, liveAgentName, liveHarness, liveHostId]);
+  }, [registry.items, preferences, hosts, liveHostId]);
 
-  const { rows, columns, rowById, columnById, rowKeys, colKeys, cellKeys, store } = table;
-  const hostLabelOf = (hostId: string) =>
-    hostId ? (columns.find((column) => column.hostId === hostId)?.label ?? hostId) : "No host";
-  const agentLabelOf = (source: UsageContextSource) =>
-    registrySourceLabels(registry.items, source.agentName, source.harness).agentLabel;
-  const levelLabel = (level: UsageContextLevel, source: UsageContextSource) =>
+  const severalOpen = preferences.contextList?.severalOpen ?? false;
+  const labelOfEntry = (entry: UsageContextListEntry) =>
+    agentLabelFor(registry.items, entry.agentName, entry.harness);
+  const badgeIdOfEntry = (entry: UsageContextListEntry) =>
+    badgeIdFor(registry, entry.agentName, entry.harness);
+  const reportedAt = (row: ContextRow, column: ContextColumn): UsageContextReported =>
+    row.kind === "all"
+      ? NOTHING_REPORTED
+      : reportedUsageContext(preferences, {
+          ...row.entry,
+          hostId: column.all ? null : column.hostId,
+        });
+  const resolveAt = (row: ContextRow, column: ContextColumn): ResolvedUsageContext => {
+    const { source, level } = levelOf(row, column);
+    return resolveUsageContextLevel(preferences, source, level, reportedAt(row, column));
+  };
+  const cellTitle = (row: ContextRow, column: ContextColumn): string => {
+    if (row.kind === "all")
+      return column.all ? "All agents, all computers" : `All agents on ${column.label}`;
+    const agent = labelOfEntry(row.entry);
+    const name = row.kind === "model" ? `${agent} · ${row.entry.model}` : agent;
+    return column.all ? `${name}, all computers` : `${name} on ${column.label}`;
+  };
+  const levelText = (row: ContextRow, column: ContextColumn) => (level: UsageContextLevel) =>
     usageContextLevelLabel(level, {
-      hostLabel: hostLabelOf(source.hostId),
-      agentLabel: agentLabelOf(source),
+      hostLabel: column.all ? "No host" : column.label,
+      agentLabel: labelOfEntry(row.entry),
     });
-  const sourceOf = (row: AgentRow, column: HostColumn): UsageContextSource => ({
-    hostId: column.hostId,
-    agentName: row.name,
-    harness: row.harness,
-    model: "",
-  });
-  const reportedFor = (source: UsageContextSource) =>
-    !!source.agentName &&
-    source.hostId === (liveHostId ?? "") &&
-    source.agentName === (liveAgentName ?? "") &&
-    source.harness === (liveHarness ?? "")
-      ? { contextWindow: reportedContextWindow, autoCompactTokenLimit: reportedCompactLimit }
-      : NOTHING_REPORTED;
-  const resolveAt = (at: LayeredLevel) => {
-    if (at.level === "corner") return resolveUsageContextLevel(preferences, CORNER_SOURCE, "all");
-    if (at.level === "row") {
-      const row = rowById.get(at.row)!;
-      const source = { hostId: "", agentName: row.name, harness: row.harness, model: "" };
-      return resolveUsageContextLevel(preferences, source, "column");
-    }
-    if (at.level === "col") {
-      const column = columnById.get(at.col)!;
-      const source = { hostId: column.hostId, agentName: "", harness: "", model: "" };
-      return resolveUsageContextLevel(preferences, source, "host");
-    }
-    const source = sourceOf(rowById.get(at.row)!, columnById.get(at.col)!);
-    return resolveUsageContextLevel(preferences, source, "cell", reportedFor(source));
-  };
-  const levelAt = (at: LayeredLevel): UsageContextLevel =>
-    at.level === "corner"
-      ? "all"
-      : at.level === "row"
-        ? "column"
-        : at.level === "col"
-          ? "host"
-          : "cell";
-  const sourceAt = (at: LayeredLevel): UsageContextSource => {
-    if (at.level === "corner") return CORNER_SOURCE;
-    if (at.level === "row") {
-      const row = rowById.get(at.row)!;
-      return { hostId: "", agentName: row.name, harness: row.harness, model: "" };
-    }
-    if (at.level === "col") {
-      const column = columnById.get(at.col)!;
-      return { hostId: column.hostId, agentName: "", harness: "", model: "" };
-    }
-    return sourceOf(rowById.get(at.row)!, columnById.get(at.col)!);
-  };
-  const titleAt = (at: LayeredLevel): string => {
-    if (at.level === "corner") return "All agents, all hosts";
-    if (at.level === "row") return `${agentLabelOf(sourceAt(at))}, all hosts`;
-    if (at.level === "col") return `${hostLabelOf(sourceAt(at).hostId)}, all agents`;
-    return `${agentLabelOf(sourceAt(at))} on ${hostLabelOf(sourceAt(at).hostId)}`;
-  };
-  const keyAt = (at: LayeredLevel): string | null => {
-    if (at.level === "corner") return CORNER_KEY;
-    if (at.level === "row") return rowKeys.get(at.row) ?? null;
-    if (at.level === "col") return colKeys.get(at.col) ?? null;
-    return cellKeys.get(`${at.row}\u0000${at.col}`) ?? null;
-  };
 
-  const markAt = (at: LayeredLevel) => {
-    const key = keyAt(at);
-    return key ? usageContextHasValue(preferences.overrides[key]) : false;
-  };
-  const keysBelow = (at: LayeredLevel): string[] => {
-    const keys = new Set(
-      levelsBelow(store, at).flatMap((level) => {
-        const key = keyAt(level);
-        return key ? [key] : [];
-      }),
-    );
-    for (const [key, override] of Object.entries(preferences.overrides)) {
+  /** Every saved value this cell's row and column reach, itself excluded. */
+  const keysBelow = (row: ContextRow, column: ContextColumn): string[] => {
+    const { source, level } = levelOf(row, column);
+    const own = usageContextLevelKey(source, level);
+    return Object.keys(preferences.overrides).filter((key) => {
+      if (key === own) return false;
       const record = usageContextRecordFromKey(key);
-      if (
-        !record ||
-        (record.level !== "model" && record.level !== "agent-model") ||
-        !usageContextHasValue(override)
-      )
-        continue;
-      const sameAgent =
-        record.source.agentName === sourceAt(at).agentName &&
-        record.source.harness === sourceAt(at).harness;
-      const below =
-        at.level === "corner" ||
-        (at.level === "row" && sameAgent) ||
-        (at.level === "col" &&
-          record.level === "model" &&
-          record.source.hostId === sourceAt(at).hostId) ||
-        (at.level === "cell" &&
-          record.level === "model" &&
-          sameAgent &&
-          record.source.hostId === sourceAt(at).hostId);
-      if (below) keys.add(key);
-    }
-    return [...keys];
+      if (!record || !usageContextHasValue(preferences.overrides[key])) return false;
+      const sameRow =
+        row.kind === "all" ||
+        (record.source.agentName === row.entry.agentName &&
+          record.source.harness === row.entry.harness &&
+          (row.kind === "agent" || record.source.model === row.entry.model));
+      const hostLevel =
+        record.level === "model" || record.level === "cell" || record.level === "host";
+      return sameRow && (column.all || (hostLevel && record.source.hostId === column.hostId));
+    });
   };
 
-  const writeOverrides = (overrides: Record<string, UsageContextOverride>) => {
+  const applyChange = (
+    overrides: Record<string, UsageContextOverride>,
+    message: string,
+    removedEntries: UsageContextListEntry[] = [],
+  ) => {
     const keys = [
       ...new Set([...Object.keys(preferences.overrides), ...Object.keys(overrides)]),
     ].filter((key) => preferences.overrides[key] !== overrides[key]);
-    setUndo({ overrides: preferences.overrides, keys });
-    writeUsageContextPreferences({ ...preferences, overrides });
+    setUndo({ overrides: preferences.overrides, keys, removedEntries, message });
+    const removed = new Set(removedEntries.map(usageContextEntryKey));
+    writeUsageContextPreferences({
+      ...preferences,
+      overrides,
+      ...(preferences.contextList && removed.size > 0
+        ? {
+            contextList: {
+              ...preferences.contextList,
+              entries: preferences.contextList.entries.filter(
+                (entry) => !removed.has(usageContextEntryKey(entry)),
+              ),
+            },
+          }
+        : {}),
+    });
   };
+  /** Puts back only what the action changed, so later edits to other rows survive. */
   const restoreUndo = () => {
     if (!undo) return;
     const overrides = { ...preferences.overrides };
@@ -890,33 +1124,74 @@ export function ContextUsageSettings() {
       if (Object.hasOwn(undo.overrides, key)) overrides[key] = undo.overrides[key]!;
       else Reflect.deleteProperty(overrides, key);
     }
-    writeUsageContextPreferences({ ...preferences, overrides });
+    writeUsageContextPreferences({
+      ...preferences,
+      overrides,
+      ...(preferences.contextList
+        ? {
+            contextList: {
+              ...preferences.contextList,
+              entries: [...preferences.contextList.entries, ...undo.removedEntries],
+            },
+          }
+        : {}),
+    });
     setUndo(null);
   };
-  const clearBelow = (at: LayeredLevel) => {
+  const clearBelow = (row: ContextRow, column: ContextColumn) => {
     const overrides = { ...preferences.overrides };
-    for (const key of keysBelow(at)) Reflect.deleteProperty(overrides, key);
-    writeOverrides(overrides);
+    const keys = keysBelow(row, column);
+    for (const key of keys) Reflect.deleteProperty(overrides, key);
+    applyChange(overrides, `Cleared ${keys.length} ${keys.length === 1 ? "value" : "values"}.`);
+  };
+  /** A row and its saved values go together, or the value would keep applying unseen. */
+  const removeRow = (row: ContextRow) => {
+    const overrides = { ...preferences.overrides };
+    const keys = usageContextKeysOfEntry(preferences, row.entry);
+    for (const key of keys) Reflect.deleteProperty(overrides, key);
+    const removedEntries = (preferences.contextList?.entries ?? []).filter((entry) =>
+      row.kind === "agent"
+        ? groupIdOf(entry) === groupIdOf(row.entry)
+        : usageContextEntryKey(entry) === row.id,
+    );
+    const saved = keys.length
+      ? ` and ${keys.length} saved ${keys.length === 1 ? "value" : "values"}`
+      : "";
+    const name = row.kind === "agent" ? row.label : `${labelOfEntry(row.entry)} · ${row.label}`;
+    applyChange(overrides, `Removed ${name}${saved}.`, removedEntries);
   };
 
-  const openAt = (at: LayeredLevel, model: string | null) => {
-    focusEditorRef.current = true;
-    setFocusModel(model);
-    setOpenEditor(at);
+  const toggleGroup = (id: string) => {
+    setOpenGroups((current) => {
+      if (current.includes(id)) return current.filter((item) => item !== id);
+      return severalOpen ? [...current, id] : [id];
+    });
   };
-  const sameLevel = (left: LayeredLevel | null, right: LayeredLevel) =>
-    !!left && JSON.stringify(left) === JSON.stringify(right);
-  const editorProps = (at: LayeredLevel) => ({
-    open: sameLevel(openEditor, at),
-    onOpenChange: (next: boolean) => {
-      focusEditorRef.current = false;
-      if (next) setOpenEditor(at);
-      else if (sameLevel(openEditor, at)) {
-        setOpenEditor(null);
-        setFocusModel(null);
-      }
-    },
-  });
+  const showGroup = (id: string) => {
+    setOpenGroups((current) => {
+      if (current.includes(id)) return current;
+      return severalOpen ? [...current, id] : [id];
+    });
+  };
+  const addEntry = (entry: UsageContextListEntry) => {
+    addUsageContextEntry(preferences, entry);
+    if (entry.model) showGroup(groupIdOf(entry));
+    revealRowRef.current = usageContextEntryKey(entry);
+  };
+  /** A model added from its agent's name opens straight into its values on all computers. */
+  const addModel = (entry: UsageContextListEntry) => {
+    addEntry(entry);
+    focusEditorRef.current = true;
+    setOpenEditor({ row: usageContextEntryKey(entry), col: ALL_COLUMN.id });
+  };
+  const setSeveralOpen = (next: boolean) => {
+    if (!preferences.contextList) return;
+    writeUsageContextPreferences({
+      ...preferences,
+      contextList: { ...preferences.contextList, severalOpen: next },
+    });
+    if (!next) setOpenGroups((current) => current.slice(-1));
+  };
 
   const sessionKey = usageContextSourceKey({
     hostId: liveHostId ?? "",
@@ -925,18 +1200,26 @@ export function ContextUsageSettings() {
     model: liveModel ?? "",
   });
 
-  // The ring's entry: open this session's agent row on its own model, then drop
-  // `ctx` from the URL so a reload does not reopen it.
+  // The ring's entry: open this session's model on all computers, then drop `ctx`
+  // from the URL so a reload does not reopen it. Waits for the seed, also while what
+  // is in use is loading, since adding the session's row would pre-empt it; only a
+  // failed load, which never seeds, lets the entry go first.
   useEffect(() => {
     const param = searchParams.get("ctx");
-    if (!param || consumedRef.current === param) return;
+    if (!param) {
+      consumedRef.current = null;
+      return;
+    }
+    if (consumedRef.current === param) return;
+    if (!preferences.contextList && !inUseFailed) return;
     consumedRef.current = param;
     const source = usageContextSourceFromKey(param);
-    const row = source
-      ? rows.find((item) => item.name === source.agentName && item.harness === source.harness)
-      : null;
-    if (row && source) {
-      openAt({ level: "row", row: row.id }, source.model);
+    if (source?.agentName && source.harness) {
+      const entry = { agentName: source.agentName, harness: source.harness, model: source.model };
+      addUsageContextEntry(preferences, entry);
+      showGroup(groupIdOf(entry));
+      focusEditorRef.current = true;
+      setOpenEditor({ row: usageContextEntryKey(entry), col: ALL_COLUMN.id });
       setMissingSource(false);
     } else {
       setMissingSource(true);
@@ -945,29 +1228,37 @@ export function ContextUsageSettings() {
     next.delete("ctx");
     navigate({ search: next.toString(), hash: location.hash }, { replace: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [searchParams, rows]);
+  }, [searchParams, preferences.contextList, inUseFailed]);
 
-  // Bring the row, header or cell the open editor belongs to on screen: a float
-  // anchored past the viewport edge cannot be reached.
+  // Bring the cell the open editor belongs to on screen: a float anchored past the
+  // viewport edge cannot be reached.
   useEffect(() => {
     if (!openEditor) return;
     const focusFirstField = focusEditorRef.current;
     focusEditorRef.current = false;
-    const selector =
-      openEditor.level === "corner"
-        ? '[data-testid="layered-corner"]'
-        : openEditor.level === "row"
-          ? `[data-testid="layered-row-${openEditor.row}"]`
-          : openEditor.level === "col"
-            ? `[data-testid="layered-col-${openEditor.col}"]`
-            : `[data-testid="layered-cell-${openEditor.row}-${openEditor.col}"]`;
+    const row = rowById.get(openEditor.row);
+    if (!row) return;
     const timer = window.setTimeout(() => {
-      document.querySelector(selector)?.scrollIntoView({ block: "center", inline: "center" });
+      document
+        .querySelector(`[data-testid="context-cell-${row.testId}-${openEditor.col}"]`)
+        ?.scrollIntoView?.({ block: "center", inline: "center" });
       if (focusFirstField)
         document.querySelector<HTMLInputElement>('[data-pop][data-state="open"] input')?.focus();
     }, 0);
     return () => window.clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [openEditor, mobile]);
+
+  // An added row may land off screen: show where it went.
+  useEffect(() => {
+    const id = revealRowRef.current;
+    const row = id ? rowById.get(id) : null;
+    if (!row) return;
+    revealRowRef.current = null;
+    document
+      .querySelector(`[data-testid="context-row-${row.testId}"]`)
+      ?.scrollIntoView?.({ block: "nearest" });
+  }, [rowById, openGroups]);
 
   const codexSession = liveHarness === "codex" || liveHarness === "codex-native";
   const { data: codexRateLimits, isLoading: rateLimitsLoading } = useCodexRateLimits(
@@ -999,76 +1290,236 @@ export function ContextUsageSettings() {
       : liveHarness
         ? `No usage limits received from ${harnessName} for this session.`
         : "Open a session to view usage limits.";
-  const liveHostColumn =
-    liveHostId && liveHostId !== "" ? (columnById.get(liveHostId) ?? null) : null;
 
-  // Stable identity: the table calls this as a render prop, not as a component type.
-  const renderSelectionActions = useMemo(
-    () => (selected: readonly LayeredCellLevel[], clear: () => void) => (
-      <SelectionActions
-        preferences={preferences}
-        selected={selected}
-        cellKeys={cellKeys}
-        undo={undo}
-        onWrite={writeOverrides}
-        onUndo={restoreUndo}
-        clear={clear}
-      />
-    ),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [preferences, cellKeys, undo],
-  );
-
-  const renderValueEditor = (at: LayeredLevel, trigger: ReactElement) => {
-    if (!keyAt(at)) return trigger;
-    const source = sourceAt(at);
-    const level = levelAt(at);
-    const belowCount = keysBelow(at).length;
-    const props = editorProps(at);
+  const renderCell = (row: ContextRow, column: ContextColumn) => {
+    const unavailable = unavailableCell(row, column);
+    if (unavailable) {
+      return (
+        <td key={column.id} className={cn(TABLE_CELL, BODY_COLUMN)}>
+          <span
+            className={cn(
+              "flex size-full items-center py-1 text-xs text-muted-foreground",
+              ROW_HEIGHT,
+              CELL_PADDING,
+            )}
+          >
+            {unavailable}
+          </span>
+        </td>
+      );
+    }
+    const { source, level } = levelOf(row, column);
+    const resolved = resolveAt(row, column);
+    const reported = reportedAt(row, column);
+    const own = resolved.contextWindow.level === level || resolved.buffer.level === level;
+    const summary = stateSummary(resolved, own);
+    const title = cellTitle(row, column);
+    const address = { row: row.id, col: column.id };
+    const warning = cellWarning(
+      preferences,
+      row,
+      column,
+      resolved,
+      reported,
+      labelOfEntry(row.entry),
+    );
+    const belowCount = keysBelow(row, column).length;
     return (
-      <ValueEditor
-        trigger={trigger}
-        title={titleAt(at)}
-        help={
-          at.level === "cell"
-            ? `This cell, then ${levelLabel("column", source)}, then ${levelLabel("host", source)}, then ${levelLabel("all", source)}.`
-            : undefined
-        }
-        open={props.open}
-        onOpenChange={props.onOpenChange}
-        preferences={preferences}
-        source={source}
-        level={level}
-        label={levelLabel(level, source)}
-        levelText={(winner) => levelLabel(winner, source)}
-        clearBelowCount={belowCount}
-        onClearBelow={() => clearBelow(at)}
-        undo={undo}
-        onUndo={restoreUndo}
-      />
+      <td key={column.id} className={cn(TABLE_CELL, BODY_COLUMN)}>
+        <span className="flex size-full">
+          <ValueEditor
+            trigger={
+              <button
+                type="button"
+                aria-label={`Edit ${title}: ${summary}`}
+                title={summary}
+                data-testid={`context-cell-${row.testId}-${column.id}`}
+                className={cn(
+                  "flex min-w-0 flex-1 items-center py-1 text-left text-sm outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring aria-expanded:bg-muted",
+                  ROW_HEIGHT,
+                  CELL_PADDING,
+                )}
+              >
+                <ValueSlots resolved={resolved} level={level} />
+              </button>
+            }
+            title={title}
+            note={row.kind === "agent" ? "All models" : undefined}
+            open={openEditor?.row === row.id && openEditor.col === column.id}
+            onOpenChange={(next) => {
+              focusEditorRef.current = false;
+              setOpenEditor(next ? address : null);
+            }}
+            preferences={preferences}
+            source={source}
+            level={level}
+            label={title}
+            levelText={levelText(row, column)}
+            reported={reported}
+            clearBelowCount={belowCount}
+            onClearBelow={() => clearBelow(row, column)}
+          />
+          <span className={WARNING_GUTTER}>
+            {warning ? (
+              <HelpTip
+                label={`Warning: ${warning}`}
+                icon={<TriangleAlertIcon className="size-3.5" />}
+                className="size-11 text-warning hover:text-warning md:size-4"
+              >
+                <span className="block whitespace-pre-line">{warning}</span>
+              </HelpTip>
+            ) : null}
+          </span>
+        </span>
+      </td>
     );
   };
 
-  const savedSourcesTools = (
-    <SavedContextSources
-      preferences={preferences}
-      hosts={hosts}
-      registryItems={registry.items}
-      currentSourceKey={sessionKey}
-      initialSource={
-        liveAgentName && liveHarness
-          ? {
-              hostId: liveHostId ?? "",
-              agentName: liveAgentName,
-              harness: liveHarness,
-              model: "",
-            }
-          : rows[0]
-            ? { hostId: "", agentName: rows[0].name, harness: rows[0].harness, model: "" }
-            : null
-      }
-    />
+  const groupWarns = (group: ContextGroup) =>
+    group.models.some((row) =>
+      columns.some(
+        (column) =>
+          !unavailableCell(row, column) &&
+          !!cellWarning(
+            preferences,
+            row,
+            column,
+            resolveAt(row, column),
+            reportedAt(row, column),
+            labelOfEntry(row.entry),
+          ),
+      ),
+    );
+
+  const removeButton = (row: ContextRow) => (
+    <button
+      type="button"
+      aria-label={`Remove ${row.kind === "agent" ? row.label : `${labelOfEntry(row.entry)} · ${row.label}`}`}
+      title="Remove from this list"
+      className={ROW_ACTION}
+      onClick={() => removeRow(row)}
+    >
+      <XIcon aria-hidden className="size-3.5" />
+    </button>
   );
+
+  const listedKeys = new Set(entries.map(usageContextEntryKey));
+  const listedGroups = new Set(groups.map((group) => group.id));
+  const recorded = usageContextRecordedEntries(preferences);
+  const uniqueOf = (items: readonly UsageContextListEntry[]) => [
+    ...new Map(items.map((item) => [usageContextEntryKey(item), item])).values(),
+  ];
+  const agentOptions: PickerOption[] = uniqueOf([
+    ...inUse,
+    ...recorded.map((item) => ({ ...item, model: "" })),
+  ])
+    .filter((item) => !listedGroups.has(groupIdOf(item)))
+    .map((agent) => ({
+      key: usageContextEntryKey(agent),
+      value: `agent ${labelOfEntry(agent)} ${agent.harness}`,
+      entry: agent,
+      content: (
+        <AgentNameTag
+          agentId={badgeIdOfEntry(agent)}
+          name={labelOfEntry(agent)}
+          harness={agent.harness}
+        />
+      ),
+    }));
+  const modelOptions = (group: ContextGroup): PickerOption[] =>
+    uniqueOf(
+      recorded.filter(
+        (item) =>
+          item.model && groupIdOf(item) === group.id && !listedKeys.has(usageContextEntryKey(item)),
+      ),
+    ).map((item) => ({
+      key: usageContextEntryKey(item),
+      value: `model ${item.model}`,
+      entry: item,
+      content: <span className="min-w-0 wrap-anywhere">{item.model}</span>,
+    }));
+
+  const agentHeader = (group: ContextGroup, open: boolean) => {
+    const label = group.agent.label;
+    const models = group.models.length;
+    const options = modelOptions(group);
+    const badge = agentBadgeFor(badges, badgeIdOfEntry(group.agent.entry));
+    return (
+      <span className={cn("group/label flex items-center gap-1 pr-1 pl-1", ROW_HEIGHT)}>
+        {models > 0 ? (
+          <button
+            type="button"
+            aria-expanded={open}
+            aria-label={`${open ? "Collapse" : "Expand"} ${label}`}
+            className="flex h-11 w-7 shrink-0 items-center justify-center rounded-sm text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring md:h-8 md:w-6"
+            onClick={() => toggleGroup(group.id)}
+          >
+            <ChevronRightIcon
+              aria-hidden
+              className={cn("size-4 transition-transform", open && "rotate-90")}
+            />
+          </button>
+        ) : (
+          <span aria-hidden className="w-7 shrink-0 md:w-6" />
+        )}
+        <span className="flex min-w-0 flex-1 flex-col items-start gap-0.5 py-1">
+          <EntryPicker
+            trigger={
+              <button
+                type="button"
+                aria-label={`Add a model to ${label}`}
+                title={`Add a model to ${label}`}
+                data-testid={`context-add-model-${group.agent.testId}`}
+                className="group/name flex max-w-full min-w-0 items-center gap-1.5 rounded-sm text-left text-ui font-medium text-foreground underline-offset-2 outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring aria-expanded:underline"
+              >
+                {badge ? <AgentBadgeMark badge={badge} data-testid="agent-name-badge" /> : null}
+                <span className="min-w-0 wrap-anywhere">{label}</span>
+                <PlusIcon
+                  aria-hidden
+                  className="hidden size-3 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover/name:opacity-100 group-focus-visible/name:opacity-100 group-aria-expanded/name:opacity-100 md:block"
+                />
+              </button>
+            }
+            label={`Add a model to ${label}`}
+            placeholder="Type a model"
+            heading="Used before"
+            options={options}
+            typedEntry={(typed) => {
+              const entry = { ...group.agent.entry, model: typed };
+              if (listedKeys.has(usageContextEntryKey(entry))) return null;
+              return options.some((option) => option.entry.model === typed) ? null : entry;
+            }}
+            emptyText={(typed) => (typed ? `${typed} is already listed.` : "Type a model name.")}
+            testId="context-model-picker"
+            opensEditor
+            onAdd={addModel}
+          />
+          <span className="flex flex-wrap items-center gap-1">
+            <AgentIntegrationMark harness={group.agent.entry.harness} />
+            {models > 0 ? (
+              <span
+                role="img"
+                aria-label={`${models} ${models === 1 ? "model" : "models"}`}
+                title={`${models} ${models === 1 ? "model" : "models"}`}
+                className={cn(AGENT_MARK_CLASS, "tabular-nums")}
+                data-testid="context-model-count"
+              >
+                {models}
+              </span>
+            ) : null}
+            {!open && groupWarns(group) ? (
+              <TriangleAlertIcon
+                role="img"
+                aria-label="A model here differs from what the agent reports"
+                className="size-3.5 shrink-0 text-warning"
+              />
+            ) : null}
+          </span>
+        </span>
+        {removeButton(group.agent)}
+      </span>
+    );
+  };
 
   return (
     <div className="grid gap-5">
@@ -1098,581 +1549,155 @@ export function ContextUsageSettings() {
         </p>
       ) : null}
 
-      <LayeredTable
-        label="Saved context values"
-        testId="saved-context-sources"
-        className="border-t border-border pt-4"
-        cornerLabel="All agents, all hosts"
-        cornerContent="All"
-        cornerSummary={stateSummary(resolveAt({ level: "corner" }), markAt({ level: "corner" }))}
-        cornerDetail={
-          <LevelState
-            resolved={resolveAt({ level: "corner" })}
-            mark={markAt({ level: "corner" })}
-          />
-        }
-        note="Rules for every model, new ones included. A session's ring sets one model."
-        tools={savedSourcesTools}
-        legend={
-          <>
-            <span className="inline-flex items-center gap-1">
-              <LayeredChip tone="first">200k</LayeredChip>
-              context
-            </span>
-            <span className="inline-flex items-center gap-1">
-              <LayeredChip tone="second">10%</LayeredChip>
-              buffer
-            </span>
-            <span className="inline-flex items-center gap-1">
-              <LayeredChip>3M</LayeredChip>
-              saved models
-            </span>
-            <span>– Auto</span>
-          </>
-        }
-        rows={rows.map((row) => {
-          const at: LayeredLevel = { level: "row", row: row.id };
-          return {
-            id: row.id,
-            label: row.name,
-            content: (
-              <AgentNameTag
-                agentId={row.agentId}
-                name={registrySourceLabels(registry.items, row.name, row.harness).agentLabel}
-                harness={row.harness}
-              />
-            ),
-            detail: <LevelState resolved={resolveAt(at)} mark={markAt(at)} />,
-            summary: stateSummary(resolveAt(at), markAt(at)),
-          };
-        })}
-        columns={columns.map((column) => {
-          const at: LayeredLevel = { level: "col", col: column.id };
-          return {
-            id: column.id,
-            label: column.label,
-            content: column.label,
-            detail: <LevelState resolved={resolveAt(at)} mark={markAt(at)} />,
-            summary: stateSummary(resolveAt(at), markAt(at)),
-          };
-        })}
-        renderCell={(rowId, colId) => {
-          const row = rowById.get(rowId);
-          const column = columnById.get(colId);
-          if (!row || !column) return { content: null };
-          const unavailable = unavailableCell(row, column);
-          if (unavailable) return { content: null, unavailable };
-          const at: LayeredLevel = { level: "cell", row: rowId, col: colId };
-          const source = sourceOf(row, column);
-          const models = Object.keys(preferences.overrides).filter((key) => {
-            const record = usageContextRecordFromKey(key);
-            return (
-              record?.level === "model" &&
-              record.source.hostId === column.hostId &&
-              record.source.agentName === row.name &&
-              record.source.harness === row.harness
-            );
-          }).length;
-          return {
-            content: <LevelState resolved={resolveAt(at)} mark={markAt(at)} models={models} />,
-            summary: stateSummary(resolveAt(at), markAt(at), models),
-            clash: cellClash(source, column, preferences, reportedFor(source), agentLabelOf),
-          };
-        }}
-        renderEditor={(at, trigger) => {
-          if (at.level !== "row") return renderValueEditor(at, trigger);
-          const row = rowById.get(at.row);
-          if (!row) return trigger;
-          const props = editorProps(at);
-          return (
-            <AgentRowEditor
-              preferences={preferences}
-              registryItems={registry.items}
-              row={row}
-              trigger={trigger}
-              open={props.open}
-              onOpenChange={props.onOpenChange}
-              focusModel={focusModel}
-              hostColumn={liveHostColumn}
-              hostLabel={hostLabelOf}
-              clearBelowCount={keysBelow(at).length}
-              onClearBelow={() => clearBelow(at)}
-              undo={undo}
-              onUndo={restoreUndo}
+      <div className="flex min-w-0 border-t border-border pt-4" data-testid="context-limits">
+        {/* As wide as the table: the controls and key below wrap to it instead of widening it. */}
+        <div className="flex w-fit max-w-full min-w-0 flex-col gap-2">
+          <div className="max-w-full overflow-x-auto rounded-lg border border-border">
+            <table
+              aria-label="Context limits"
+              className="w-full min-w-max border-separate border-spacing-0 text-sm"
+            >
+              <thead>
+                <tr>
+                  <th className={cn("z-20", TABLE_CELL, FIRST_COLUMN, "px-3 py-2")}>
+                    <span className="flex items-center gap-1.5 text-sm font-normal text-muted-foreground">
+                      Agent or model
+                      <HelpTip label="Which value wins" className="-my-3 size-11 md:my-0 md:size-4">
+                        {ORDER_HELP}
+                      </HelpTip>
+                    </span>
+                  </th>
+                  {columns.map((column) => (
+                    <th
+                      key={column.id}
+                      scope="col"
+                      data-testid={`context-col-${column.id}`}
+                      className={cn(TABLE_CELL, BODY_COLUMN, "py-2 font-normal")}
+                    >
+                      <span className="flex">
+                        <span className={cn("min-w-0 flex-1", CELL_PADDING)}>
+                          <span className="block text-ui font-medium text-foreground wrap-anywhere">
+                            {column.label}
+                          </span>
+                          <span className={cn(SLOT_GRID, "mt-0.5 text-xs text-muted-foreground")}>
+                            <span>Context</span>
+                            <span>Buffer</span>
+                          </span>
+                        </span>
+                        <span aria-hidden className={WARNING_GUTTER} />
+                      </span>
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                <tr data-testid={`context-row-${ALL_ROW.testId}`}>
+                  <th scope="row" className={cn(TABLE_CELL, FIRST_COLUMN)}>
+                    <span className={cn("flex items-center gap-2 px-3 py-1", ROW_HEIGHT)}>
+                      <span className="text-ui font-medium text-foreground">{ALL_ROW.label}</span>
+                      <span className="text-xs text-muted-foreground">Default</span>
+                    </span>
+                  </th>
+                  {columns.map((column) => renderCell(ALL_ROW, column))}
+                </tr>
+              </tbody>
+              {groups.map((group) => {
+                const open = openGroups.includes(group.id);
+                return (
+                  <tbody key={group.id} data-testid={`context-group-${group.agent.testId}`}>
+                    <tr data-testid={`context-row-${group.agent.testId}`}>
+                      <th scope="row" className={cn(TABLE_CELL, FIRST_COLUMN)}>
+                        {agentHeader(group, open)}
+                      </th>
+                      {columns.map((column) => renderCell(group.agent, column))}
+                    </tr>
+                    {open
+                      ? group.models.map((row) => (
+                          <tr key={row.id} data-testid={`context-row-${row.testId}`}>
+                            <th scope="row" className={cn(TABLE_CELL, FIRST_COLUMN)}>
+                              <span
+                                className={cn(
+                                  "group/label flex items-center gap-1 pr-1 pl-9 md:pl-8",
+                                  ROW_HEIGHT,
+                                )}
+                              >
+                                <span className="min-w-0 flex-1 py-1 text-sm wrap-anywhere text-foreground">
+                                  {row.label}
+                                </span>
+                                {removeButton(row)}
+                              </span>
+                            </th>
+                            {columns.map((column) => renderCell(row, column))}
+                          </tr>
+                        ))
+                      : null}
+                  </tbody>
+                );
+              })}
+            </table>
+          </div>
+          <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2 [contain:inline-size]">
+            <EntryPicker
+              trigger={
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="min-h-11 md:min-h-7"
+                  data-testid="context-add-entry"
+                >
+                  <PlusIcon aria-hidden className="size-3.5" />
+                  Add agent
+                </Button>
+              }
+              label="Add agent"
+              placeholder="Search agents"
+              heading="Agents in use"
+              options={agentOptions}
+              emptyText={() => "Every agent in use is listed."}
+              testId="context-add-picker"
+              onAdd={addEntry}
             />
-          );
-        }}
-        selectionActions={renderSelectionActions}
-      />
+            {undo ? (
+              <span
+                className="flex min-w-0 flex-wrap items-center gap-2 text-sm text-muted-foreground"
+                role="status"
+                data-testid="context-undo-status"
+              >
+                {undo.message}
+                <LayeredEditorAction onClick={restoreUndo}>Undo</LayeredEditorAction>
+              </span>
+            ) : null}
+            <label className="ml-auto flex min-h-11 items-center gap-2 text-sm text-muted-foreground md:min-h-7">
+              Keep several open
+              <Switch
+                size="sm"
+                aria-label="Keep several open"
+                checked={severalOpen}
+                disabled={!preferences.contextList}
+                onCheckedChange={setSeveralOpen}
+              />
+            </label>
+          </div>
+          <p className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-muted-foreground [contain:inline-size]">
+            <span className="inline-flex items-center gap-1.5">
+              <PlusIcon aria-hidden className="size-3.5" />
+              Click an agent to add a model
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <LayeredMark />
+              Saved here
+            </span>
+            <span>
+              <span className="italic">Auto</span>: the agent's own value
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <TriangleAlertIcon aria-hidden className="size-3.5 text-warning" />
+              Differs from what the agent reports
+            </span>
+          </p>
+        </div>
+      </div>
     </div>
   );
-}
-
-/** A cell whose two headers disagree carries a `?` naming the field and the winner. */
-function cellClash(
-  source: UsageContextSource,
-  column: HostColumn,
-  preferences: UsageContextPreferences,
-  reported: { contextWindow: number | null; autoCompactTokenLimit: number | null },
-  agentLabelOf: (source: UsageContextSource) => string,
-): string | undefined {
-  const cell = preferences.overrides[usageContextLevelKey(source, "cell")];
-  const fromRow = preferences.overrides[usageContextLevelKey(source, "column")];
-  const fromHost = preferences.overrides[usageContextLevelKey(source, "host")];
-  const agentLabel = agentLabelOf(source);
-  const resolved = resolveUsageContextLevel(preferences, source, "cell", reported);
-  const lines: string[] = [];
-  const fields = [
-    { key: "contextWindowTokens" as const, label: "Context total" },
-    { key: "buffer" as const, label: "Compact buffer" },
-  ];
-  for (const field of fields) {
-    if (ownField(cell, field.key) !== null) continue;
-    const rowValue = ownField(fromRow, field.key);
-    const hostValue = ownField(fromHost, field.key);
-    if (rowValue === null || hostValue === null || rowValue === hostValue) continue;
-    const winner =
-      field.key === "contextWindowTokens" ? resolved.contextWindow.level : resolved.buffer.level;
-    const winnerLabel =
-      winner === "column"
-        ? agentLabel
-        : winner === "host"
-          ? column.label
-          : usageContextLevelLabel(winner, { hostLabel: column.label, agentLabel });
-    lines.push(`${field.label}: ${agentLabel} and ${column.label} differ; ${winnerLabel} wins.`);
-  }
-  return lines.length ? lines.join("\n") : undefined;
-}
-
-/** Bulk edits on a selection of cells, with Undo. */
-function SelectionActions({
-  preferences,
-  selected,
-  cellKeys,
-  undo,
-  onWrite,
-  onUndo,
-  clear,
-}: {
-  preferences: UsageContextPreferences;
-  selected: readonly LayeredCellLevel[];
-  cellKeys: Map<string, string>;
-  undo: UndoState | null;
-  onWrite: (overrides: Record<string, UsageContextOverride>) => void;
-  onUndo: () => void;
-  clear: () => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const [draft, setDraft] = useState<Draft>({
-    context: "",
-    buffer: "",
-    percent: "",
-    mode: "tokens",
-  });
-  const [error, setError] = useState("");
-  const keys = selected.flatMap(({ row, col }) => {
-    const key = cellKeys.get(`${row}\u0000${col}`);
-    return key ? [key] : [];
-  });
-  const apply = () => {
-    if (keys.length === 0) return;
-    const outcome = recordFromDraft(draft, null);
-    if ("error" in outcome) {
-      setError(outcome.error);
-      return;
-    }
-    setError("");
-    const overrides = { ...preferences.overrides };
-    for (const key of keys) {
-      const record = usageContextRecordFromKey(key);
-      const deduped =
-        outcome.record && record?.level === "cell"
-          ? dropRepeatedCellFields(preferences, record.source, outcome.record)
-          : outcome.record;
-      if (deduped) overrides[key] = deduped;
-      else Reflect.deleteProperty(overrides, key);
-    }
-    onWrite(overrides);
-    clear();
-  };
-  return (
-    <>
-      <Button
-        type="button"
-        variant="ghost"
-        size="sm"
-        className="min-h-11 md:min-h-7"
-        disabled={!undo}
-        onClick={onUndo}
-      >
-        Undo
-      </Button>
-      <LayeredEditor
-        trigger={
-          <Button type="button" variant="outline" size="sm" className="min-h-11 md:min-h-7">
-            Set values
-          </Button>
-        }
-        title={`${selected.length} selected ${selected.length === 1 ? "cell" : "cells"}`}
-        note="Empty fields inherit."
-        open={open}
-        onOpenChange={setOpen}
-        footer={
-          <>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="min-h-11 md:min-h-7"
-              onClick={() => setOpen(false)}
-            >
-              Cancel
-            </Button>
-            <Button
-              type="button"
-              size="sm"
-              className="min-h-11 md:min-h-7"
-              disabled={keys.length === 0}
-              onClick={apply}
-            >
-              Apply to {keys.length} selected
-            </Button>
-          </>
-        }
-      >
-        <DraftFields
-          draft={draft}
-          onChange={setDraft}
-          onSubmit={apply}
-          error={error}
-          placeholder={() => "Inherit"}
-          labelFor={(field) =>
-            field === "unit"
-              ? "Buffer unit for the selection"
-              : `${field === "context" ? "Context total" : "Compact buffer"} for the selection`
-          }
-        />
-      </LayeredEditor>
-      <Button
-        type="button"
-        variant="ghost"
-        size="sm"
-        className="min-h-11 md:min-h-7"
-        disabled={keys.length === 0}
-        onClick={() => {
-          const overrides = { ...preferences.overrides };
-          for (const key of keys) Reflect.deleteProperty(overrides, key);
-          onWrite(overrides);
-          clear();
-        }}
-      >
-        Use inherited
-      </Button>
-    </>
-  );
-}
-
-/** One stored level the agent row's editor can show. */
-interface RowEditorTarget {
-  key: string;
-  level: UsageContextLevel;
-  source: UsageContextSource;
-  /** Names the fields for assistive tech. */
-  label: string;
-}
-
-/** The agent row: one level in view at a time, the others a step away. */
-function AgentRowEditor({
-  preferences,
-  registryItems,
-  row,
-  trigger,
-  open,
-  onOpenChange,
-  focusModel,
-  hostColumn,
-  hostLabel,
-  clearBelowCount,
-  onClearBelow,
-  undo,
-  onUndo,
-}: {
-  preferences: UsageContextPreferences;
-  registryItems: readonly RegistryItem[];
-  row: AgentRow;
-  trigger: ReactElement;
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  focusModel: string | null;
-  hostColumn: HostColumn | null;
-  hostLabel: (hostId: string) => string;
-  clearBelowCount: number;
-  onClearBelow: () => void;
-  undo: UndoState | null;
-  onUndo: () => void;
-}) {
-  const labels = registrySourceLabels(registryItems, row.name, row.harness);
-  const agentSource: UsageContextSource = {
-    hostId: "",
-    agentName: row.name,
-    harness: row.harness,
-    model: "",
-  };
-  const allModels: RowEditorTarget = {
-    key: usageContextLevelKey(agentSource, "column"),
-    level: "column",
-    source: agentSource,
-    label: `all models of ${labels.agentLabel}`,
-  };
-  const modelSource: UsageContextSource = { ...agentSource, model: focusModel ?? "" };
-  const oneModel: RowEditorTarget | null = focusModel
-    ? {
-        key: usageContextLevelKey(modelSource, "agent-model"),
-        level: "agent-model",
-        source: modelSource,
-        label: focusModel,
-      }
-    : null;
-  const [modelTab, setModelTab] = useState<"model" | "all">("model");
-  const [stepped, setStepped] = useState<(RowEditorTarget & { title: string }) | null>(null);
-  const [typed, setTyped] = useState<Record<string, Draft>>({});
-  const [error, setError] = useState("");
-  const contextInputRef = useRef<HTMLInputElement>(null);
-  const cellEntryRef = useRef<HTMLButtonElement>(null);
-  const hostEntryRef = useRef<HTMLButtonElement>(null);
-  const returnEntryRef = useRef<"cell" | "host" | null>(null);
-  useEffect(() => {
-    setModelTab("model");
-    setStepped(null);
-    setTyped({});
-    setError("");
-  }, [open]);
-  useEffect(() => {
-    if (stepped) contextInputRef.current?.focus();
-    else if (returnEntryRef.current) {
-      const entry = returnEntryRef.current === "host" ? hostEntryRef : cellEntryRef;
-      entry.current?.focus();
-      returnEntryRef.current = null;
-    }
-  }, [stepped]);
-
-  const target = stepped ?? (oneModel && modelTab === "model" ? oneModel : allModels);
-  const onFocusedModel = !stepped && target === oneModel;
-  const draftFor = (key: string) => typed[key] ?? draftOf(preferences.overrides[key]);
-  const draft = draftFor(target.key);
-  const stepTo = (next: RowEditorTarget & { title: string }) => {
-    const changed =
-      JSON.stringify(draft) !== JSON.stringify(draftOf(preferences.overrides[target.key]));
-    if (changed) setTyped({ ...typed, [next.key]: draft });
-    setError("");
-    returnEntryRef.current = next.level === "host" ? "host" : "cell";
-    setStepped(next);
-  };
-  const save = () => {
-    const outcome = recordForLevel(preferences, target.source, target.level, draft);
-    if ("error" in outcome) {
-      setError(outcome.error);
-      return;
-    }
-    setUsageContextLevel(preferences, target.key, outcome.record);
-    onOpenChange(false);
-  };
-  const clear = () => {
-    const rest = { ...typed };
-    Reflect.deleteProperty(rest, target.key);
-    setTyped(rest);
-    setUsageContextLevel(preferences, target.key, null);
-  };
-
-  const savedModels = Object.keys(preferences.overrides).flatMap((key) => {
-    const record = usageContextRecordFromKey(key);
-    if (!record || record.source.agentName !== row.name || record.source.harness !== row.harness)
-      return [];
-    if (record.level !== "model" && record.level !== "agent-model") return [];
-    const override = preferences.overrides[key];
-    if (!override || !usageContextHasValue(override)) return [];
-    return [
-      {
-        key,
-        model: record.source.model,
-        override,
-        scope:
-          record.level === "agent-model" || !record.source.hostId
-            ? "Every computer"
-            : hostLabel(record.source.hostId),
-      },
-    ];
-  });
-  const hostText = hostColumn?.label ?? "";
-
-  return (
-    <LayeredEditor
-      trigger={trigger}
-      title={stepped ? stepped.title : `${labels.agentLabel}, all hosts`}
-      note={
-        stepped
-          ? stepped.level === "model"
-            ? focusModel
-            : undefined
-          : oneModel
-            ? modelTab === "model"
-              ? "This session's model"
-              : "Any model with no value of its own"
-            : "All models"
-      }
-      help={
-        stepped?.level === "cell" || stepped?.level === "model"
-          ? `This cell, then ${labels.agentLabel}, all hosts, then all agents on ${hostText}, then all agents, all hosts.`
-          : undefined
-      }
-      back={
-        stepped
-          ? {
-              label: `${labels.agentLabel}, all hosts`,
-              onBack: () => {
-                setError("");
-                setStepped(null);
-              },
-            }
-          : undefined
-      }
-      open={open}
-      onOpenChange={onOpenChange}
-      onClear={usageContextHasValue(preferences.overrides[target.key]) ? clear : undefined}
-      clearBelowCount={stepped ? 0 : clearBelowCount}
-      onClearBelow={clearBelowCount > 0 ? onClearBelow : undefined}
-      actions={undo ? <LayeredEditorAction onClick={onUndo}>Undo</LayeredEditorAction> : null}
-      footer={<EditorButtons onCancel={() => onOpenChange(false)} onSave={save} />}
-    >
-      {oneModel && !stepped ? (
-        <Segmented
-          quiet
-          stretch
-          label="Which models"
-          value={modelTab}
-          options={[
-            { value: "model", label: oneModel.label },
-            { value: "all", label: "All models" },
-          ]}
-          onChange={(next) => {
-            setError("");
-            setModelTab(next);
-          }}
-        />
-      ) : null}
-      <LevelFields
-        preferences={preferences}
-        contextInputRef={contextInputRef}
-        source={target.source}
-        level={target.level}
-        label={target.label}
-        levelText={(winner) =>
-          usageContextLevelLabel(winner, {
-            hostLabel: hostText || "No host",
-            agentLabel: labels.agentLabel,
-          })
-        }
-        draft={draft}
-        onChange={(next) => setTyped({ ...typed, [target.key]: next })}
-        onSubmit={save}
-        error={error}
-      />
-      {!stepped && hostColumn ? (
-        <nav aria-label="Other levels" className="grid border-t border-border pt-1.5">
-          <StepButton
-            buttonRef={cellEntryRef}
-            onClick={() => {
-              const source: UsageContextSource = {
-                ...agentSource,
-                hostId: hostColumn.hostId,
-                model: onFocusedModel ? (focusModel ?? "") : "",
-              };
-              const level = onFocusedModel ? "model" : "cell";
-              stepTo({
-                key: usageContextLevelKey(source, level),
-                level,
-                source,
-                label: `${labels.agentLabel} on ${hostColumn.label}`,
-                title: `${labels.agentLabel} on ${hostColumn.label}`,
-              });
-            }}
-          >
-            Only on {hostColumn.label}
-          </StepButton>
-          <StepButton
-            buttonRef={hostEntryRef}
-            onClick={() => {
-              const source: UsageContextSource = {
-                hostId: hostColumn.hostId,
-                agentName: "",
-                harness: "",
-                model: "",
-              };
-              stepTo({
-                key: usageContextLevelKey(source, "host"),
-                level: "host",
-                source,
-                label: `all agents on ${hostColumn.label}`,
-                title: `All agents on ${hostColumn.label}`,
-              });
-            }}
-          >
-            All agents on {hostColumn.label}
-          </StepButton>
-        </nav>
-      ) : null}
-      {!stepped && savedModels.length > 0 ? (
-        <section className="grid gap-1 border-t border-border pt-3">
-          <p className="text-xs font-medium text-muted-foreground">Saved for one model</p>
-          {savedModels.map((item) => (
-            <div key={item.key} className="flex items-center gap-2 text-sm">
-              <span className="min-w-0 flex-1">
-                <span className="block break-all">{item.model}</span>
-                <span className="block text-xs text-muted-foreground">
-                  {item.scope} · {savedValueText(item.override)}
-                </span>
-              </span>
-              <LayeredEditorAction
-                aria-label={`Remove the value for ${item.model} on ${item.scope}`}
-                onClick={() => setUsageContextLevel(preferences, item.key, null)}
-              >
-                Remove
-              </LayeredEditorAction>
-            </div>
-          ))}
-        </section>
-      ) : null}
-    </LayeredEditor>
-  );
-}
-
-function StepButton({
-  children,
-  onClick,
-  buttonRef,
-}: {
-  children: ReactNode;
-  onClick: () => void;
-  buttonRef?: Ref<HTMLButtonElement>;
-}) {
-  return (
-    <button
-      ref={buttonRef}
-      type="button"
-      className="-mx-1 flex min-h-11 items-center justify-between gap-2 rounded-md px-1 text-left text-sm text-muted-foreground hover:bg-foreground/5 hover:text-foreground md:min-h-8"
-      onClick={onClick}
-    >
-      <span className="min-w-0 wrap-anywhere">{children}</span>
-      <ChevronRightIcon className="size-4 shrink-0" />
-    </button>
-  );
-}
-
-function savedValueText(override: UsageContextOverride): string {
-  const context = override.contextWindowTokens;
-  const percent = override.compactBufferMode === "percent";
-  const buffer = percent ? override.autoCompactBufferPercent : override.autoCompactBufferTokens;
-  const contextText = context == null ? "Auto" : contextTokenText(context);
-  if (buffer == null) return contextText;
-  return `${contextText} / ${percent ? `${buffer}%` : contextTokenText(buffer)}`;
 }
