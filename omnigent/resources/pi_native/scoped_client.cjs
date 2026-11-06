@@ -194,7 +194,9 @@ async function connectFromHandoff(locator, {timeoutMs=8000}={}) {
   if(typeof locator!=="string" || !path.isAbsolute(locator) || !/^[a-f0-9]{32}\.json$/.test(path.basename(locator)))
     throw new Error("Scoped Pi handoff locator unavailable");
   const directory=path.dirname(locator), info=fs.lstatSync(directory);
-  if(!info.isDirectory() || info.mode&0o077 || process.getuid&&info.uid!==process.getuid() || fs.realpathSync(directory)!==directory)
+  // Windows uses the per-user profile ACL; POSIX mode bits and O_NOFOLLOW are unavailable.
+  const windows=process.platform==="win32";
+  if(!info.isDirectory() || !windows&&(info.mode&0o077) || process.getuid&&info.uid!==process.getuid() || fs.realpathSync(directory)!==directory)
     throw new Error("Scoped Pi handoff directory unavailable");
   const deadline=Date.now()+timeoutMs;
   while(!fs.existsSync(locator) && Date.now()<deadline) await new Promise(resolve=>setTimeout(resolve,10));
@@ -202,7 +204,7 @@ async function connectFromHandoff(locator, {timeoutMs=8000}={}) {
   const fd=fs.openSync(locator,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW|fs.constants.O_NONBLOCK);
   try {
     const opened=fs.fstatSync(fd), before=fs.lstatSync(locator);
-    if(!opened.isFile() || !fs.constants.O_NOFOLLOW || opened.mode&0o077 ||
+    if(!opened.isFile() || !before.isFile() || !windows&&(!fs.constants.O_NOFOLLOW || opened.mode&0o077) ||
       process.getuid&&opened.uid!==process.getuid() || before.ino!==opened.ino || before.dev!==opened.dev || opened.size>16384)
       throw new Error("Scoped Pi handoff identity unavailable");
     descriptor=JSON.parse(fs.readFileSync(fd,"utf8"));

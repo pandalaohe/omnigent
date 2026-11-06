@@ -20,6 +20,7 @@ from uuid import uuid4
 
 import psutil
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.permission_tiers import (
     NativeCallBinding,
     NativeInputSnapshot,
@@ -283,7 +284,8 @@ class PiBootstrapBroker:
         info = directory.lstat()
         if (
             not stat.S_ISDIR(info.st_mode)
-            or stat.S_IMODE(info.st_mode) & 0o077
+            # Windows protects this per-user directory through its ACL, not POSIX bits.
+            or (not IS_WINDOWS and stat.S_IMODE(info.st_mode) & 0o077)
             or (hasattr(os, "getuid") and info.st_uid != os.getuid())
         ):
             raise ValueError("Pi bootstrap handoff directory unavailable")
