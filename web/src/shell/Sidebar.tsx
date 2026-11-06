@@ -5080,7 +5080,7 @@ function ConversationList({
                               ? "Recent sessions need a newer server."
                               : recentQuery.isLoading
                                 ? undefined
-                                : "Sessions you message or answer will show here.";
+                                : "Your sessions will show here.";
                             return (
                               <SidebarSection
                                 key={section.id}
