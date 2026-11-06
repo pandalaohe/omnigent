@@ -172,7 +172,21 @@ class PiPermissionBootstrapError(RuntimeError):
     code = "pi_permission_bootstrap_failed"
 
     def __init__(self, reason: str) -> None:
-        safe = reason in {"timeout", "missing_ack", "ack_mismatch", "unknown"} or reason in {
+        safe = reason in {
+            "timeout",
+            "missing_ack",
+            "ack_mismatch",
+            "unknown",
+            "Pi permission state has wrong session",
+            "Pi scoped launcher descriptor unavailable",
+            "Pi scoped launcher transport unavailable",
+            "Pi scoped handoff reservation unavailable",
+            "Pi scoped process identity unavailable",
+            "Pi scoped process publication unavailable",
+            "Pi scoped process registration unavailable",
+            "Pi scoped launcher configuration unavailable",
+            "Pi scoped process preparation unavailable",
+        } or reason in {
             f"ack_mismatch (field={name})" for name in PI_PERMISSION_INSTALLATION_FIELDS
         }
         if not safe and re.fullmatch(r"process_exit \(status=(?:-?[0-9]{1,10}|None)\)", reason):

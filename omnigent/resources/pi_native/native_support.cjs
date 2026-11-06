@@ -68,7 +68,7 @@ function snapshot(file, optional = false) {
     if (optional && error.code === "ENOENT") return { path: lexical, resolved_path: null, sha256: null };
     throw error;
   }
-  if (!fs.constants.O_NOFOLLOW) throw new Error("No-follow validation unavailable");
+  if (!fs.constants.O_NOFOLLOW && process.platform !== "win32") throw new Error("No-follow validation unavailable");
   const resolved = fs.realpathSync(lexical);
   const target = fs.lstatSync(resolved);
   if (!target.isFile()) throw new Error("Native input is not a file");

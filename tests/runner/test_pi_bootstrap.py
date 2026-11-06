@@ -506,7 +506,7 @@ def test_python_launcher_rejects_unbound_or_nonloopback_descriptor(tmp_path, fau
     with pytest.raises(PiPermissionBootstrapError) as rejected:
         _PiScopedLauncher("session-a", tmp_path, descriptor)
     assert rejected.value.code == "pi_permission_bootstrap_failed"
-    assert rejected.value.reason == "unknown"
+    assert rejected.value.reason == "Pi scoped launcher descriptor unavailable"
 
 
 @pytest.mark.asyncio
@@ -551,7 +551,7 @@ async def test_scoped_confirmation_uses_the_callers_remaining_deadline(
         with pytest.raises(PiPermissionBootstrapError) as rejected:
             await launcher.confirm("a" * 32, rpc, deadline=deadline)
         assert rejected.value.code == "pi_permission_bootstrap_failed"
-        assert rejected.value.reason == "unknown"
+        assert rejected.value.reason == "Pi scoped process registration unavailable"
         assert entered.is_set() and cancelled.is_set()
 
 
@@ -781,7 +781,45 @@ lines.once('line', async line => {
 
 
 @pytest.mark.asyncio
-async def test_private_handoff_reaches_only_registered_node_and_is_consumed_once(attestor_relay):
+@pytest.mark.parametrize("windows", [False, True])
+async def test_handoff_directory_mode_uses_host_permission_semantics(
+    attestor_relay, monkeypatch, windows
+):
+    from types import SimpleNamespace
+
+    from omnigent.runner import pi_bootstrap
+
+    _runtime, broker, relay, _source, _registry = attestor_relay
+    descriptor = broker.launcher_descriptor()
+    monkeypatch.setattr(pi_bootstrap, "IS_WINDOWS", windows, raising=False)
+    original = Path.lstat
+
+    def windows_lstat(path, *args, **kwargs):
+        info = original(path, *args, **kwargs)
+        return (
+            SimpleNamespace(st_mode=info.st_mode | 0o077, st_uid=info.st_uid)
+            if path.name == "pi-bootstrap"
+            else info
+        )
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "lstat", windows_lstat)
+        async with httpx.AsyncClient(base_url=relay._advertised_url, trust_env=False) as client:
+            response = await client.post(
+                "/pi/bootstrap/launcher",
+                headers={"Authorization": "Bearer " + descriptor["process_capability"]},
+                json={"protocol": 1, "op": "reserve", "launch_id": "a" * 32},
+            )
+        assert response.status_code == (200 if windows else 403)
+        if windows:
+            assert Path(response.json()["handoff"]).parent.name == "pi-bootstrap"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("windows", [False, True])
+async def test_private_handoff_reaches_only_registered_node_and_is_consumed_once(
+    attestor_relay, windows
+):
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is required for private handoff proof")
@@ -789,6 +827,21 @@ async def test_private_handoff_reaches_only_registered_node_and_is_consumed_once
     locator = broker.reserve_handoff()
     module = Path(__file__).resolve().parents[2] / "omnigent/resources/pi_native/scoped_client.cjs"
     script = """
+const fs=require('node:fs');
+if(process.argv[3]==='true') {
+  Object.defineProperty(process,'platform',{value:'win32'});
+  const mockFs={...fs,constants:{...fs.constants,O_NOFOLLOW:undefined}};
+  for(const name of ['lstatSync','fstatSync']) {
+    const original=fs[name];
+    mockFs[name]=(...args)=>{const info=original(...args);info.mode|=0o077;return info;};
+  }
+  const Module=require('node:module'), originalLoad=Module._load;
+  Module._load=function(name,...args) {
+    return name==='node:fs'?mockFs:originalLoad.call(this,name,...args);
+  };
+}
+const path=require('node:path');
+require(path.join(path.dirname(process.argv[1]),'native_support.cjs')).snapshot(process.argv[1]);
 require(process.argv[1]).connectFromHandoff(process.argv[2]).then(({connection}) => {
   connection.close(); console.log('consumed');
 }).catch(() => {console.log('handoff refused');process.exitCode=1;});
@@ -799,6 +852,7 @@ require(process.argv[1]).connectFromHandoff(process.argv[2]).then(({connection})
         script,
         str(module),
         str(locator),
+        str(windows).lower(),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )

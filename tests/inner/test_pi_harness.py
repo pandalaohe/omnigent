@@ -251,7 +251,7 @@ def test_scoped_prepare_uses_authenticated_harness_route_without_returning_capab
         assert calls == [("test-session", value)]
 
 
-@pytest.mark.parametrize("failure", ["sdk", "ack", "unknown"])
+@pytest.mark.parametrize("failure", ["sdk", "ack", "scoped", "private", "unknown"])
 def test_permission_bootstrap_reports_safe_startup_failure(tmp_path, monkeypatch, failure):
     from omnigent.inner.pi_executor import PiExecutor, PiPermissionBootstrapError
     from omnigent.inner.pi_settings import ordered_pi_launch
@@ -263,6 +263,10 @@ def test_permission_bootstrap_reports_safe_startup_failure(tmp_path, monkeypatch
             ordered_pi_launch("/opt/bin/unsupported-pi", [], extension=tmp_path / "guard.js")
         if failure == "ack":
             raise PiPermissionBootstrapError("ack_mismatch (field=extension_sha256)")
+        if failure == "scoped":
+            raise PiPermissionBootstrapError("Pi scoped launcher transport unavailable")
+        if failure == "private":
+            raise PiPermissionBootstrapError("private host path and credential")
         raise OSError("private host path and credential must stay in logs")
 
     monkeypatch.setattr(executor, "_ensure_rpc", fail_start)
@@ -281,6 +285,11 @@ def test_permission_bootstrap_reports_safe_startup_failure(tmp_path, monkeypatch
     elif failure == "ack":
         assert body["error"] == "pi_permission_bootstrap_failed"
         assert body["reason"] == "ack_mismatch (field=extension_sha256)"
+    elif failure in ("scoped", "private"):
+        assert body["error"] == "pi_permission_bootstrap_failed"
+        assert body["reason"] == (
+            "Pi scoped launcher transport unavailable" if failure == "scoped" else "unknown"
+        )
     else:
         assert "private host path" not in response.text
 

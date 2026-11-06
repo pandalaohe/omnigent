@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.permission_tiers.host import HostPermissionState
 
 
@@ -39,7 +40,7 @@ def _read_file(
 ) -> bytes:
     """Read one stable file identity; an admitted entry alias must retain its target."""
     nofollow = getattr(os, "O_NOFOLLOW", 0)
-    if require_nofollow and not nofollow:
+    if require_nofollow and not nofollow and not IS_WINDOWS:
         raise ValueError("No-follow file validation is unavailable")
     before = path.lstat()
     if resolved_target is None and not stat.S_ISREG(before.st_mode):

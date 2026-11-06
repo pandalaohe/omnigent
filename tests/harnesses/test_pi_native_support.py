@@ -24,6 +24,30 @@ from tests.harnesses.test_permission_tiers import decision, posix_host
 ACTION_CASES = json.loads(Path(__file__).with_name("pi_native_action_cases.json").read_text())
 
 
+@pytest.mark.parametrize("windows", [False, True])
+def test_registration_read_without_posix_nofollow(tmp_path, monkeypatch, windows):
+    from types import SimpleNamespace
+
+    from omnigent.permission_tiers import pi_tools
+
+    path = tmp_path / "registry.json"
+    path.write_bytes(b"{}")
+    monkeypatch.setattr(pi_tools, "IS_WINDOWS", windows, raising=False)
+    monkeypatch.setattr(
+        pi_tools,
+        "os",
+        SimpleNamespace(
+            **{name: getattr(os, name) for name in ("open", "fstat", "read", "close", "O_RDONLY")},
+            O_NOFOLLOW=0,
+        ),
+    )
+    if windows:
+        assert pi_tools._read_file(path, require_nofollow=True) == b"{}"
+    else:
+        with pytest.raises(ValueError, match="No-follow file validation"):
+            pi_tools._read_file(path, require_nofollow=True)
+
+
 def assert_package_action_domain(package_root: Path) -> None:
     source = (package_root / "src/shared/types.js").read_text()
     declaration = re.search(r"export const SUBAGENT_ACTIONS = (\[[^;]+\]);", source)
