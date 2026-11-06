@@ -814,6 +814,33 @@ def resolve_codex_auto_compact_token_limit(
     )
     if entry is None:
         return None
+    return codex_auto_compact_token_limit(
+        config, entry, effective_context_window=effective_context_window
+    )
+
+
+def codex_auto_compact_token_limit(
+    config: Mapping[str, object],
+    entry: Mapping[str, object],
+    *,
+    effective_context_window: int,
+) -> int | None:
+    """Mirror Codex's total-context threshold, excluding dynamic compaction modes."""
+    if (
+        effective_context_window <= 0
+        or config.get("model_auto_compact_token_limit_scope", "total") != "total"
+    ):
+        return None
+    features = config.get("features")
+    if isinstance(features, dict) and any(
+        features.get(key) is True
+        or (
+            isinstance(features.get(key), dict) and features[key].get("enabled", True) is not False
+        )
+        for key in ("async_compaction", "token_budget")
+    ):
+        # These modes depend on runtime provider capabilities or a prefix budget.
+        return None
     percent = entry.get("effective_context_window_percent")
     if isinstance(percent, bool) or not isinstance(percent, int) or percent <= 0 or percent > 100:
         return None
@@ -840,12 +867,13 @@ def resolve_codex_auto_compact_token_limit(
         if isinstance(configured_limit, int) and not isinstance(configured_limit, bool)
         else catalog_limit
     )
+    limit = raw_window * 9 // 10
     if isinstance(requested, int) and not isinstance(requested, bool) and requested > 0:
-        return min(requested, raw_window)
-    # Do not invent a runtime threshold from a fixed percentage. Codex's
-    # policy can change independently; only an explicit config/catalog limit
-    # is truthful enough to label as the resolved Compact point.
-    return None
+        limit = min(requested, limit)
+    post_turn_percent = config.get("model_post_turn_compact_threshold_percent")
+    if type(post_turn_percent) is int and 0 < post_turn_percent <= 100:
+        limit = min(limit, (effective_context_window * post_turn_percent + 99) // 100)
+    return limit
 
 
 def bridge_dir_for_codex_home(codex_home: Path) -> Path:

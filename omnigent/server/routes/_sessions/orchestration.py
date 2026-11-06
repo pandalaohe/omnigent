@@ -4059,6 +4059,9 @@ def _context_labels_from_turn_usage(
     if not isinstance(context_tokens, int) or context_tokens < 0:
         return {}
     labels: dict[str, str] = {_LAST_CONTEXT_TOKENS_LABEL_KEY: str(context_tokens)}
+    compact_limit = resp_usage.get("auto_compact_token_limit")
+    if type(compact_limit) is int and compact_limit > 0:
+        labels[_LAST_AUTO_COMPACT_TOKEN_LIMIT_LABEL_KEY] = str(compact_limit)
     window = resp_usage.get("context_window")
     if isinstance(window, int) and not isinstance(window, bool) and window > 0:
         labels[_LAST_CONTEXT_WINDOW_LABEL_KEY] = str(window)
@@ -12480,6 +12483,15 @@ async def _relay_runner_stream_once(
                                     session_id,
                                     _context_labels,
                                 )
+                                if (
+                                    "auto_compact_token_limit" in _resp_usage
+                                    and _resp_usage["auto_compact_token_limit"] is None
+                                ):
+                                    await asyncio.to_thread(
+                                        conversation_store.delete_label,
+                                        session_id,
+                                        _LAST_AUTO_COMPACT_TOKEN_LIMIT_LABEL_KEY,
+                                    )
                             # Push the server-computed cost AND token breakdown
                             # to the web client's session indicator, rolled up
                             # over the spawn subtree. The session's own event
@@ -12538,12 +12550,20 @@ async def _relay_runner_stream_once(
                                     _usage_payload["total_cost_usd"] = _subtree_cost
                                 if _usage_by_model is not None:
                                     _usage_payload["usage_by_model"] = _usage_by_model
-                                session_stream.publish(
-                                    session_id,
-                                    SessionUsageEvent(**_usage_payload).model_dump(
-                                        exclude_none=True
-                                    ),
+                                _usage_event = SessionUsageEvent(**_usage_payload).model_dump(
+                                    exclude_none=True
                                 )
+                                _compact_label = _context_labels.get(
+                                    _LAST_AUTO_COMPACT_TOKEN_LIMIT_LABEL_KEY
+                                )
+                                if _compact_label is not None:
+                                    _usage_event["auto_compact_token_limit"] = int(_compact_label)
+                                elif (
+                                    "auto_compact_token_limit" in _resp_usage
+                                    and _resp_usage["auto_compact_token_limit"] is None
+                                ):
+                                    _usage_event["auto_compact_token_limit"] = None
+                                session_stream.publish(session_id, _usage_event)
                                 # Ancestors' badges only move on cost/usage, not a
                                 # context-only publish — keep the roll-up gated.
                                 if _subtree_cost is not None or _usage_by_model is not None:

@@ -987,9 +987,12 @@ async def test_health_endpoint_returns_status_ok(
     assert bad_resp.status_code == 404
 
 
+@pytest.mark.parametrize("compact_limit", [167_000, None])
 async def test_scaffold_response_completed_preserves_context_tokens(
     use_usage: None,
     manager: HarnessProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
+    compact_limit: int | None,
 ) -> None:
     """Terminal usage preserves ``context_tokens`` from the inner executor.
 
@@ -1002,6 +1005,8 @@ async def test_scaffold_response_completed_preserves_context_tokens(
     ``context_tokens``, the REPL/web context ring falls back to the
     inflated billing sum and tool-call turns look like they compacted.
     """
+    if compact_limit is None:
+        monkeypatch.setenv("HARNESS_TEST_COMPACT_DISABLED", "1")
     conv_id = "conv_usage"
     client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
     body = {
@@ -1018,6 +1023,9 @@ async def test_scaffold_response_completed_preserves_context_tokens(
     completed = next(e for e in events if e.event == "response.completed")
     usage = completed.data["response"]["usage"]
     assert usage["total_tokens"] == 10_800
+    assert usage["context_window"] == 200_000
+    assert "auto_compact_token_limit" in usage
+    assert usage["auto_compact_token_limit"] == compact_limit
     assert usage["context_tokens"] == 5_700, (
         "context_tokens must survive scaffold serialization so clients can "
         "render context fill from the last sub-call instead of the billing sum."

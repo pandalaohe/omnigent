@@ -988,8 +988,27 @@ async function testChildResetDoesNotCreateParent() {
   } finally { global.fetch = previousFetch; }
 }
 
+async function testReportedCompactionTracksModelSettings() {
+  const h = makeHarness({ captureEvents: true });
+  let compaction = { reserveTokens: 20000,
+    modelOverrides: { "provider-1/model-1": { reserveTokens: 32000 } } };
+  h.pi.getSettings = () => ({ compaction });
+  const ctx = makeCtx({ idle: true });
+  ctx.model = { provider: "provider-1", id: "model-1" };
+  ctx.getContextUsage = () => ({ tokens: 100, contextWindow: 550000 });
+  await h.handlers.session_start({}, ctx);
+  let usage = h.postedEvents.filter(e => e.type === "external_session_usage").at(-1).data;
+  assert("model reserve beats default", usage.auto_compact_token_limit === 518000);
+  compaction = { enabled: false };
+  await h.handlers.model_select({ model: ctx.model }, ctx);
+  usage = h.postedEvents.filter(e => e.type === "external_session_usage" &&
+    "auto_compact_token_limit" in e.data).at(-1).data;
+  assert("disabled compaction clears old threshold", usage.auto_compact_token_limit === null);
+}
+
 (async () => {
   try {
+    await testReportedCompactionTracksModelSettings();
     await testStartupInstructionsReachEveryAgentStart();
     await testSessionStartupDoesNotCompleteATurn();
     await testSessionStartMarksInputReady();

@@ -615,8 +615,12 @@ def test_context_labels_prefer_valid_reported_window(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reported_window", [None, 550_000])
+@pytest.mark.parametrize("compact_limit", [517_000, None])
 async def test_relay_persists_context_window_labels_for_inprocess_turn(
-    db_uri: str, monkeypatch: pytest.MonkeyPatch, reported_window: int | None
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    reported_window: int | None,
+    compact_limit: int | None,
 ) -> None:
     """
     An in-process turn's usage fills the context-window indicator.
@@ -637,6 +641,7 @@ async def test_relay_persists_context_window_labels_for_inprocess_turn(
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation()
     session_id = conv.id
+    store.set_labels(session_id, {"omnigent.last_auto_compact_token_limit": "100000"})
 
     monkeypatch.setattr("omnigent.llms.context_window.get_model_context_window", lambda _: 128_000)
     expected_window = reported_window or 128_000
@@ -656,6 +661,7 @@ async def test_relay_persists_context_window_labels_for_inprocess_turn(
                     "total_tokens": 1200,
                     "context_tokens": 45678,
                     "model": "claude-sonnet-5",
+                    "auto_compact_token_limit": compact_limit,
                     **({"context_window": reported_window} if reported_window is not None else {}),
                 },
             },
@@ -686,12 +692,17 @@ async def test_relay_persists_context_window_labels_for_inprocess_turn(
         assert usage_event is not None, "no session.usage event carried context_tokens"
         assert usage_event["context_tokens"] == 45678
         assert usage_event["context_window"] == expected_window
+        assert "auto_compact_token_limit" in usage_event
+        assert usage_event["auto_compact_token_limit"] == compact_limit
 
         # Labels are persisted (durable across reload/snapshot).
         refreshed = store.get_conversation(session_id)
         assert refreshed is not None
         assert refreshed.labels.get("omnigent.last_context_tokens") == "45678"
         assert refreshed.labels.get("omnigent.last_context_window") == str(expected_window)
+        assert refreshed.labels.get("omnigent.last_auto_compact_token_limit") == (
+            str(compact_limit) if compact_limit is not None else None
+        )
     finally:
         release.set()
         if collector is not None:

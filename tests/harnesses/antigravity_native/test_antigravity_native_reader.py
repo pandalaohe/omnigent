@@ -3074,14 +3074,14 @@ async def test_agy_context_stream_uses_native_snapshot_and_accepts_compaction(
         {
             "context_tokens": 3400,
             "context_window": 200000,
-            "auto_compact_token_limit": 200000,
+            "auto_compact_token_limit": None,
         },
         {
             "context_tokens": 1200,
             "context_window": 200000,
-            "auto_compact_token_limit": 200000,
+            "auto_compact_token_limit": None,
         },
-        {"context_window": 300000, "auto_compact_token_limit": 300000},
+        {"context_window": 300000, "auto_compact_token_limit": None},
     ]
 
 

@@ -2251,6 +2251,10 @@ async def test_rpc_pi_usage_extension_reports_idle_warm_and_checks_owner(
             require(process.argv[2])({
               on(name, handler) { handlers[name] = handler; },
               registerTool() {},
+              getSettings() { return { compaction: {
+                reserveTokens: 3000,
+                modelOverrides: { "provider-1/model-1": { reserveTokens: 2000 } },
+              } }; },
             });
             const entries = [];
             const ctx = {
@@ -2303,7 +2307,9 @@ async def test_rpc_pi_usage_extension_reports_idle_warm_and_checks_owner(
         _stdout, stderr = await asyncio.wait_for(proc.communicate(), 5)
         assert proc.returncode == 0, stderr.decode(errors="replace")
         assert any(
-            data.get("context_tokens") == 1201 and data.get("context_window") == 8192
+            data.get("context_tokens") == 1201
+            and data.get("context_window") == 8192
+            and data.get("auto_compact_token_limit") == 6192
             for data in received
         )
         assert any(

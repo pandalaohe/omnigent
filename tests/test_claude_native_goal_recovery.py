@@ -13,7 +13,7 @@ from omnigent.harnesses.claude_native import bridge, forwarder
 @pytest.fixture(autouse=True)
 def _isolate_auto_compact_window(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep the host's Claude auto-compact setting out of these tests."""
-    monkeypatch.setattr(forwarder, "read_user_auto_compact_window", lambda: None)
+    monkeypatch.setattr(forwarder, "read_claude_auto_compact_token_limit", lambda *a, **kw: None)
 
 
 def _append(path: Path, record: dict[str, object], *, complete: bool = True) -> None:

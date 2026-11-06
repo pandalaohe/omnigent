@@ -2312,6 +2312,12 @@ class HarnessApp:
                 output_tokens=u.get("output_tokens") or 0,
                 total_tokens=u.get("total_tokens") or 0,
                 context_tokens=u.get("context_tokens"),
+                context_window=u.get("context_window"),
+                **(
+                    {"auto_compact_token_limit": u["auto_compact_token_limit"]}
+                    if "auto_compact_token_limit" in u
+                    else {}
+                ),
                 # Carry the cache breakdown through to response.completed
                 # so the server-side cost path can price cache reads /
                 # writes at their own rates. Anthropic-style executors

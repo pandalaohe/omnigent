@@ -14296,6 +14296,21 @@
       "Usage": {
         "description": "Token usage statistics for a response.",
         "properties": {
+          "auto_compact_token_limit": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0,
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Total-context automatic compaction threshold; an explicit null clears a previous report, absence leaves it unchanged.",
+            "title": "Auto Compact Token Limit"
+          },
           "cache_creation_input_tokens": {
             "default": 0,
             "description": "Prompt tokens written to the provider prompt cache (cache creation), billed at a premium rate. Like `cache_read_input_tokens`, this is separate from `input_tokens`; `0` when not reported.",
@@ -14323,6 +14338,21 @@
             "default": null,
             "description": "Context-fill estimate for the next turn \u2014 set only by executors that make multiple LLM sub-calls per turn (e.g. `openai-agents`). For single-call executors this is absent and `total_tokens` serves the same purpose. The toolbar context ring and `/context` command use this field when present, falling back to `total_tokens`.",
             "title": "Context Tokens"
+          },
+          "context_window": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0,
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Effective window reported by the running harness.",
+            "title": "Context Window"
           },
           "cost_usd": {
             "anyOf": [

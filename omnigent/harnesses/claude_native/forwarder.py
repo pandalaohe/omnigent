@@ -26,6 +26,7 @@ from omnigent.debug_logging import debug_event
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.entities.subagent_terminal import TerminalEnvelope
 from omnigent.errors import ErrorCode
+from omnigent.harnesses.claude_compaction import read_claude_auto_compact_token_limit
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     CONFIRMED_CLAUDE_SESSION_LABEL_KEY,
@@ -58,7 +59,6 @@ from omnigent.harnesses.claude_native.bridge import (
     read_transcript_items_from_offset,
     read_transcript_items_since_with_position,
     read_transcript_path,
-    read_user_auto_compact_window,
     transcript_has_forked_from_marker,
     transcript_has_recent_local_command,
     url_component,
@@ -7736,11 +7736,25 @@ async def _post_forward_side_channel_updates(
             resolved_context_window is not None
             and resolved_context_window != dedupe.context_window
         )
-        auto_compact_token_limit = await asyncio.to_thread(read_user_auto_compact_window)
-        auto_compact_changed = (
-            auto_compact_token_limit is not None
-            and auto_compact_token_limit != dedupe.auto_compact_token_limit
+        auto_compact_token_limit = (
+            await asyncio.to_thread(
+                read_claude_auto_compact_token_limit,
+                resolved_context_window,
+                model=(
+                    str(status_state["model"])
+                    if status_state is not None and isinstance(status_state.get("model"), str)
+                    else dedupe.observed_model
+                ),
+                cwd=(
+                    Path(status_state["cwd"])
+                    if status_state is not None and isinstance(status_state.get("cwd"), str)
+                    else None
+                ),
+            )
+            if resolved_context_window is not None
+            else dedupe.auto_compact_token_limit
         )
+        auto_compact_changed = auto_compact_token_limit != dedupe.auto_compact_token_limit
         raw_provider_usage_limits = (
             status_state.get("provider_usage_limits") if status_state is not None else None
         )
@@ -7781,6 +7795,11 @@ async def _post_forward_side_channel_updates(
                     context_window=resolved_context_window if usage_post_needed else None,
                     auto_compact_token_limit=(
                         auto_compact_token_limit if usage_post_needed else None
+                    ),
+                    clear_auto_compact_token_limit=(
+                        usage_post_needed
+                        and resolved_context_window is not None
+                        and auto_compact_token_limit is None
                     ),
                     provider_usage_limits=(provider_usage_limits if usage_post_needed else None),
                     token_usage=record_token_usage,
@@ -8403,6 +8422,7 @@ async def _post_external_session_usage(
     usage: Mapping[str, object] | None,
     context_window: int | None = None,
     auto_compact_token_limit: int | None = None,
+    clear_auto_compact_token_limit: bool = False,
     provider_usage_limits: dict[str, object] | None = None,
     token_usage: dict[str, int] | None = None,
 ) -> None:
@@ -8436,7 +8456,7 @@ async def _post_external_session_usage(
         payload.update(usage)
     if context_window is not None:
         payload["context_window"] = context_window
-    if auto_compact_token_limit is not None:
+    if auto_compact_token_limit is not None or clear_auto_compact_token_limit:
         payload["auto_compact_token_limit"] = auto_compact_token_limit
     if provider_usage_limits is not None:
         payload["provider_usage_limits"] = provider_usage_limits

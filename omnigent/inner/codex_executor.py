@@ -62,6 +62,7 @@ from omnigent.harnesses.codex_egress import (
     is_connection_failure_text,
     is_connection_retry,
 )
+from omnigent.harnesses.codex_native.bridge import codex_auto_compact_token_limit
 from omnigent.harnesses.codex_native.context_inventory import CodexContextInventory
 from omnigent.harnesses.codex_native.keep_warm import (
     KeepWarmPingResult,
@@ -3401,6 +3402,8 @@ class _CodexAppServerSession:
         # plus a ``context_tokens`` window-fill snapshot from ``last``.
         # Consumed (and cleared) on the next ``turn/completed``.
         self._last_turn_usage: dict[str, object] | None = None
+        self._usage_context_config: dict[str, object] = {}
+        self._usage_context_models: dict[str, dict[str, object]] = {}
         # Raw cumulative ``tokenUsage.total`` counters: the newest observed
         # values, and the snapshot consumed at the last turn boundary.
         self._thread_usage_total_raw: dict[str, int] | None = None
@@ -3614,6 +3617,9 @@ class _CodexAppServerSession:
             self._codex_home_dir,
             self._codex_config_overrides,
             retry_policy=self._retry_policy,
+        )
+        self._usage_context_config, self._usage_context_models = await asyncio.to_thread(
+            self._read_context_metadata
         )
         if self._signer is not None:
             self._codex_config_overrides.extend(
@@ -4197,7 +4203,40 @@ class _CodexAppServerSession:
         if len(self._recent_events) > 20:
             self._recent_events.pop(0)
 
+    def _read_context_metadata(self) -> tuple[dict[str, object], dict[str, dict[str, object]]]:
+        """Use this worker's CLI catalog and private config, never the server estimate."""
+        if self._codex_home_dir is None:
+            return {}, {}
+        try:
+            config = tomllib.loads(
+                (self._codex_home_dir / "config.toml").read_text(encoding="utf-8")
+            )
+            for override in self._codex_config_overrides:
+                if override.split("=", 1)[0].strip() in {
+                    "model_context_window",
+                    "model_auto_compact_token_limit",
+                    "model_auto_compact_token_limit_scope",
+                    "model_post_turn_compact_threshold_percent",
+                    "features.async_compaction",
+                    "features.token_budget",
+                }:
+                    for key, value in tomllib.loads(override).items():
+                        if isinstance(config.get(key), dict) and isinstance(value, dict):
+                            config[key].update(value)
+                        else:
+                            config[key] = value
+            catalog = read_codex_model_catalog(self._codex_path, self._codex_home_dir)
+        except (OSError, ValueError):
+            return {}, {}
+        models = catalog.get("models") if catalog else None
+        return config, {
+            entry["slug"]: entry
+            for entry in models or []
+            if isinstance(entry, dict) and isinstance(entry.get("slug"), str)
+        }
+
     def _observe_token_usage(self, params: object, model: str | None) -> None:
+        model = model or self._thread_model
         total_raw = _extract_codex_thread_total_usage(params)
         if total_raw is not None:
             self._thread_usage_total_raw = total_raw
@@ -4216,6 +4255,20 @@ class _CodexAppServerSession:
             context_tokens = _extract_codex_context_tokens(params)
             if context_tokens is not None:
                 self._last_turn_usage["context_tokens"] = context_tokens
+            token_usage = params.get("tokenUsage") if isinstance(params, dict) else None
+            window = (
+                token_usage.get("modelContextWindow") if isinstance(token_usage, dict) else None
+            )
+            if isinstance(window, int) and not isinstance(window, bool) and window > 0:
+                self._last_turn_usage["context_window"] = window
+                entry = self._usage_context_models.get(model or "")
+                self._last_turn_usage["auto_compact_token_limit"] = (
+                    codex_auto_compact_token_limit(
+                        self._usage_context_config, entry, effective_context_window=window
+                    )
+                    if entry is not None
+                    else None
+                )
 
     def _consume_turn_usage(self) -> dict[str, object] | None:
         """Return the finished turn's usage and advance the thread baseline

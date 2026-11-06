@@ -6397,6 +6397,46 @@ def test_extract_codex_last_turn_usage_handles_missing_or_malformed() -> None:
     assert _extract_codex_last_turn_usage({"tokenUsage": {"total": {}}}, "gpt-5.4-mini") is None
 
 
+def test_codex_sdk_reports_runtime_window_and_total_compact_limit() -> None:
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
+    )
+    session._usage_context_models = {
+        "model-1": {
+            "context_window": 500_000,
+            "effective_context_window_percent": 95,
+        }
+    }
+    session._thread_model = "model-1"
+    session._observe_token_usage(
+        {
+            "tokenUsage": {
+                "modelContextWindow": 475_000,
+                "last": {"inputTokens": 100, "outputTokens": 25, "totalTokens": 125},
+            }
+        },
+        None,
+    )
+    usage = session._consume_turn_usage()
+    assert usage is not None
+    assert usage["context_window"] == 475_000
+    assert usage["model"] == "model-1"
+    assert usage["auto_compact_token_limit"] == 450_000
+    session._observe_token_usage(
+        {
+            "tokenUsage": {
+                "modelContextWindow": 258_400,
+                "last": {"inputTokens": 10, "outputTokens": 2},
+            }
+        },
+        "unknown-model",
+    )
+    usage = session._consume_turn_usage()
+    assert usage is not None
+    assert usage["context_window"] == 258_400
+    assert usage["auto_compact_token_limit"] is None
+
+
 def test_extract_codex_thread_total_usage_reads_cumulative_counters() -> None:
     """``tokenUsage.total`` yields the raw cumulative thread counters."""
     from omnigent.inner.codex_executor import _extract_codex_thread_total_usage

@@ -301,6 +301,7 @@ _PI_SESSION_USAGE_FIELDS = frozenset(
     {
         "context_tokens",
         "context_window",
+        "auto_compact_token_limit",
         "pi_cache_ttl_seconds",
         "pi_cache_observed_at",
         "pi_cache_read_input_tokens",
@@ -334,12 +335,12 @@ def _valid_pi_session_usage(payload: Mapping[str, object]) -> bool:
                 )
             ):
                 return False
-        elif key == "pi_cache_ttl_seconds" and value is None:
+        elif key in {"pi_cache_ttl_seconds", "auto_compact_token_limit"} and value is None:
             continue
         elif (
             type(value) is not int
             or not 0 <= value < 2**53
-            or (key == "context_window" and value == 0)
+            or (key in {"context_window", "auto_compact_token_limit"} and value == 0)
             or (key == "pi_cache_ttl_seconds" and not 1 <= value <= 86400)
         ):
             return False

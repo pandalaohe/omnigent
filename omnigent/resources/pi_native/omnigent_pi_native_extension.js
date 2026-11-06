@@ -2702,6 +2702,18 @@ module.exports = function (pi) {
             data.context_tokens = snapshot.tokens;
           if (Number.isInteger(snapshot.contextWindow) && snapshot.contextWindow > 0)
             data.context_window = snapshot.contextWindow;
+          if (data.context_window) {
+            data.auto_compact_token_limit = null;
+            if (typeof pi.getSettings === "function") {
+              const settings = pi.getSettings().compaction || {};
+              const model = ctx.model;
+              const override = model && settings.modelOverrides?.[`${model.provider}/${model.id}`];
+              const reserve = override?.reserveTokens ?? settings.reserveTokens ?? 16384;
+              const limit = data.context_window - reserve;
+              if (settings.enabled !== false && Number.isSafeInteger(reserve) && reserve >= 0 && limit > 0)
+                data.auto_compact_token_limit = limit;
+            }
+          }
         }
       } catch (_err) {
         // Older Pi versions may not expose a usable context snapshot.
@@ -3274,6 +3286,7 @@ module.exports = function (pi) {
   pi.on("model_select", async (event, ctx) => {
     rememberContext(ctx);
     await reportThinkingLevel();
+    await postSessionUsage(ctx);
     // Mirror a model switch made inside the Pi TUI (the ``/model`` command or
     // Ctrl+P cycling) back to Omnigent so the web picker reflects it. Skip
     // ``restore`` — that is Pi re-applying the session's saved model at
@@ -3301,8 +3314,7 @@ module.exports = function (pi) {
       type: "external_model_change",
       data: { model: selectedModel },
     });
-    if (lastCacheUsage) await postSessionUsage(ctx);
-    else await postEvent(config, {
+    if (!lastCacheUsage) await postEvent(config, {
       type: "external_session_usage", data: { pi_cache_ttl_seconds: null },
     });
   });

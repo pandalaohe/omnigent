@@ -1208,11 +1208,14 @@ async def test_forward_available_items_posts_auto_compact_window_once_and_on_cha
         byte_offset=0,
         cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
     )
-    # No statusLine state, so the auto-compaction window is the only value
-    # that can trigger the usage post — each payload proves the trigger.
-    monkeypatch.setattr(forwarder, "read_claude_context_state", lambda _bridge: None)
+    # A steady statusLine window must still forward a changed or disabled limit.
+    monkeypatch.setattr(
+        forwarder, "read_claude_context_state", lambda _bridge: {"context_window_size": 1_000_000}
+    )
     window = {"value": 400_000}
-    monkeypatch.setattr(forwarder, "read_user_auto_compact_window", lambda: window["value"])
+    monkeypatch.setattr(
+        forwarder, "read_claude_auto_compact_token_limit", lambda *a, **kw: window["value"]
+    )
     requests: list[dict[str, Any]] = []
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
@@ -1222,7 +1225,7 @@ async def test_forward_available_items_posts_auto_compact_window_once_and_on_cha
     transport = httpx.MockTransport(_handle_request)
     dedupe = forwarder._ForwardDedupeState()
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        for value in (400_000, 400_000, 300_000, 300_000):
+        for value in (400_000, 400_000, 300_000, 300_000, None, None):
             window["value"] = value
             state = await forwarder._forward_available_items(
                 client=client,
@@ -1236,10 +1239,11 @@ async def test_forward_available_items_posts_auto_compact_window_once_and_on_cha
 
     usage_posts = [r for r in requests if r["type"] == "external_session_usage"]
     assert [post["data"] for post in usage_posts] == [
-        {"auto_compact_token_limit": 400_000},
-        {"auto_compact_token_limit": 300_000},
+        {"auto_compact_token_limit": 400_000, "context_window": 1_000_000},
+        {"auto_compact_token_limit": 300_000, "context_window": 1_000_000},
+        {"auto_compact_token_limit": None, "context_window": 1_000_000},
     ]
-    assert dedupe.auto_compact_token_limit == 300_000
+    assert dedupe.auto_compact_token_limit is None
 
 
 @pytest.mark.asyncio

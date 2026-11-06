@@ -5740,7 +5740,10 @@ async def test_result_message_other_failure_stays_unclassified() -> None:
 
 
 @pytest.mark.asyncio
-async def test_context_tokens_uses_last_call_not_cumulative_on_multi_iteration_turn() -> None:
+async def test_context_tokens_uses_last_call_not_cumulative_on_multi_iteration_turn(
+    tmp_path,
+    monkeypatch,
+) -> None:
     """``context_tokens`` must reflect the LAST API call, not the cumulative sum.
 
     A single user turn can drive several internal API calls (the SDK's
@@ -5773,6 +5776,10 @@ async def test_context_tokens_uses_last_call_not_cumulative_on_multi_iteration_t
     from claude_agent_sdk.types import StreamEvent as SDKStreamEvent
 
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    (tmp_path / "settings.json").write_text(json.dumps({"autoCompactWindow": 550_000}))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.delenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", raising=False)
 
     class _Sentinel:
         pass
@@ -5813,6 +5820,7 @@ async def test_context_tokens_uses_last_call_not_cumulative_on_multi_iteration_t
             "cache_read_input_tokens": 20300,
             "cache_creation_input_tokens": 0,
         },
+        model_usage={"claude-opus-4-8": {"contextWindow": 1_000_000, "maxOutputTokens": 64_000}},
     )
 
     class _FakeSDK(_sdk_types()):
@@ -5842,6 +5850,8 @@ async def test_context_tokens_uses_last_call_not_cumulative_on_multi_iteration_t
 
     turn = next(e for e in events if isinstance(e, TurnComplete))
     assert turn.usage is not None, "TurnComplete.usage is None on a multi-call turn."
+    assert turn.usage["context_window"] == 1_000_000
+    assert turn.usage["auto_compact_token_limit"] == 517_000
 
     # context_tokens = LAST call's prompt (500 + 0 + 10300), NOT the
     # cumulative sum (800 + 20300 = 21100). This is the whole point of the

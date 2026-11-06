@@ -1197,6 +1197,9 @@ class Usage(BaseModel):
         this is absent and ``total_tokens`` serves the same purpose.
         The toolbar context ring and ``/context`` command use this
         field when present, falling back to ``total_tokens``.
+    :param context_window: Effective window reported by the running harness.
+    :param auto_compact_token_limit: Total-context automatic compaction threshold;
+        an explicit null clears a previous report, absence leaves it unchanged.
     :param cache_read_input_tokens: Prompt tokens served from a
         provider prompt cache (cache hit), billed at a reduced rate.
         Reported by Anthropic-style providers as a count *separate*
@@ -1227,10 +1230,22 @@ class Usage(BaseModel):
     output_tokens_details: UsageDetails = Field(default_factory=UsageDetails)
     total_tokens: int = 0
     context_tokens: int | None = None
+    context_window: int | None = Field(default=None, gt=0)
+    auto_compact_token_limit: int | None = Field(default=None, gt=0)
     cache_read_input_tokens: int = 0
     cache_creation_input_tokens: int = 0
     model: str | None = None
     cost_usd: float | None = None
+
+    @model_serializer(mode="wrap")
+    def _preserve_cleared_compact_limit(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        """An explicit null clears a preceding model's threshold across SSE hops."""
+        data = handler(self)
+        if "auto_compact_token_limit" in self.model_fields_set:
+            data["auto_compact_token_limit"] = self.auto_compact_token_limit
+        return data
 
 
 class ErrorDetail(BaseModel):

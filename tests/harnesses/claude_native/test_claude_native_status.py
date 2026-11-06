@@ -53,6 +53,7 @@ def test_status_wrapper_writes_context_json(
     stdin = json.dumps(
         {
             "session_id": "abc",
+            "cwd": "/opt/work/project",
             "model": {"display_name": "Opus 4.7"},
             "context_window": {
                 "context_window_size": 1_000_000,
@@ -72,6 +73,7 @@ def test_status_wrapper_writes_context_json(
 
     persisted = json.loads((tmp_path / "context.json").read_text(encoding="utf-8"))
     assert persisted["context_window_size"] == 1_000_000
+    assert persisted["cwd"] == "/opt/work/project"
     assert persisted["current_usage"]["input_tokens"] == 6
     assert persisted["current_usage"]["cache_creation_input_tokens"] == 100
     assert persisted["used_percentage"] == 31
