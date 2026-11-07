@@ -7,7 +7,7 @@ import sqlalchemy as sa
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 
-from omnigent.db.migrations.versions import a54c20261106_usage_report_v2 as migration
+from omnigent.db.migrations.versions import a56c20261106_usage_report_v2 as migration
 from tests.db.test_migration_usage_hours import _alembic_command
 
 
@@ -23,7 +23,7 @@ def test_report_v2_sqlite_roundtrip_preserves_native_and_coalesces_unknowns(tmp_
                 "VALUES (0, 'owner', 'native:codex', 3600, 'm', '', 'metered', 1, 10, 12, 1)"
             )
         )
-    _alembic_command(uri, engine, "upgrade", "a54c20261106")
+    _alembic_command(uri, engine, "upgrade", "a56c20261106")
 
     with engine.begin() as conn:
         assert conn.execute(
@@ -56,7 +56,7 @@ def test_report_v2_sqlite_roundtrip_preserves_native_and_coalesces_unknowns(tmp_
         for c in sa.inspect(engine).get_columns("usage_hours")
         if c["name"] in {"input_tokens", "total_tokens"}
     )
-    _alembic_command(uri, engine, "upgrade", "a54c20261106")
+    _alembic_command(uri, engine, "upgrade", "a56c20261106")
 
 
 @pytest.mark.parametrize("direction", ["upgrade", "downgrade"])

@@ -6,8 +6,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects.mysql import MEDIUMBLOB
 
-revision: str = "a54c20261106"
-down_revision: str = "zb1c2d3e4f5a"
+revision: str = "a57c20261106"
+down_revision: str = "a56c20261106"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

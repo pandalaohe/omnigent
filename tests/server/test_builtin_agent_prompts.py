@@ -205,7 +205,7 @@ def test_session_prompt_migration_preserves_existing_rows(tmp_path):
 
     from tests.db.test_migration_preferences import _run
 
-    migration = import_module("omnigent.db.migrations.versions.a54c20261106_add_session_prompt")
+    migration = import_module("omnigent.db.migrations.versions.a57c20261106_add_session_prompt")
     engine = sa.create_engine(f"sqlite:///{tmp_path / 'session-prompts.db'}")
     with engine.begin() as connection:
         connection.execute(sa.text("CREATE TABLE conversations (id VARCHAR PRIMARY KEY)"))

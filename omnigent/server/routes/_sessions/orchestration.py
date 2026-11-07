@@ -3940,9 +3940,7 @@ async def _persist_external_session_usage(
         )
     previous_context_tokens = None
     if raw_tokens is not None and auto_rotation_app_state is not None:
-        previous_context = await asyncio.to_thread(
-            conversation_store.get_conversation, session_id
-        )
+        previous_context = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if previous_context is not None:
             previous_context_tokens = previous_context.labels.get("omnigent.last_context_tokens")
     context_payload = await asyncio.to_thread(
