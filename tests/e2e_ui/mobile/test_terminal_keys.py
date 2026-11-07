@@ -651,10 +651,18 @@ def test_mobile_terminal_keys_byte_delivery_app_cursor_and_gestures(
             "() => document.activeElement?.classList?.contains('xterm-helper-textarea') ?? false"
         ), "Clicking Keyboard while focused and keyboardUp must blur xterm-helper-textarea"
 
-        # 6. Closing the shell returns to chat view and restores the MobileFloatingAssistant wheel.
-        close_shell = page.get_by_role("button", name="Close shell", exact=True)
-        expect(close_shell).to_be_visible()
-        close_shell.click()
+        # Returning to chat keeps the shell alive and restores the assistant wheel.
+        back_to_chat = page.get_by_role("button", name="Back to chat", exact=True)
+        expect(back_to_chat).to_be_visible()
+        back_to_chat.click()
         expect(page.get_by_test_id("mobile-floating-assistant")).to_be_visible(timeout=10_000)
+        resources = httpx.get(
+            f"{base_url}/v1/sessions/{session_id}/resources/terminals", timeout=10
+        )
+        resources.raise_for_status()
+        assert any(
+            resource["id"] == "terminal_zsh_keys1" and resource["metadata"]["running"]
+            for resource in resources.json()["data"]
+        )
     finally:
         context.close()
