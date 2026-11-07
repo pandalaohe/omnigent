@@ -859,7 +859,7 @@ class AgentQuotaService:
         now = time.time() if now is None else now
         self._hydrate(owner, required=True)
         key = (current_workspace_id(), owner, account_id)
-        with self._account_write_lock, self._lock:
+        with self._lock:
             previous = self._accounts.get(key)
             if (
                 previous is None
