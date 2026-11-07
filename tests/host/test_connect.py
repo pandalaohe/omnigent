@@ -3059,11 +3059,12 @@ async def test_watch_runner_reports_refused_credentials_as_sign_in(
 def test_runner_exit_error_redacts_credential_values(tmp_path: Path) -> None:
     """Redact credentials before exit reports reach the server or SPA."""
     log = tmp_path / "runner-x.log"
+    standalone_token = "sk-" + "fixture" * 5
     log.write_text(
         "boot: starting\n"
         "OPENAI_API_KEY=sk-live-abc123\n"
         "authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig\n"
-        "using ghp_0123456789abcdef0123456789abcdef\n"
+        f"using {standalone_token}\n"
         "tunnel rejected: bad frame\n",
         encoding="utf-8",
     )
@@ -3073,7 +3074,7 @@ def test_runner_exit_error_redacts_credential_values(tmp_path: Path) -> None:
     assert "sk-live-abc123" not in error
     assert "eyJhbGciOiJIUzI1NiJ9" not in error
     # Standalone provider-shaped tokens are masked even without a key label.
-    assert "ghp_0123456789abcdef0123456789abcdef" not in error
+    assert standalone_token not in error
     assert "OPENAI_API_KEY=[REDACTED]" in error
     # Keep the diagnostic cause.
     assert "tunnel rejected: bad frame" in error
