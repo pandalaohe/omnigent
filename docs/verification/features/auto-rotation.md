@@ -15,6 +15,8 @@ notice acceptance/rejection, busy-to-idle delivery, handover deferral, startup
 rediscovery, bounded retries and concurrent runner entry points. They use local
 stores and simulated runtime transports; they do not prove live harness behavior.
 
+Raw terminal input remains outside the lifecycle lock: a sub-second race remains between the last live idle check and tmux key delivery, with additional status propagation latency.
+
 For a live trial, launch a fresh isolated instance with the
 [Verify Omnigent recipe](../../../feature-map/skills/verify-omnigent/SKILL.md).
 On each rotation-capable harness (Claude Code, Codex, Pi RPC, Pi native,
@@ -31,6 +33,10 @@ For lost-arm recovery, restart only the isolated runner after recording the
 request and observe recovery after two idle ticks. After two unsuccessful
 re-trigger calls and two further idle ticks, the transcript should tell the
 user to type `/clear`.
+An already injected revision is never injected again automatically; if SessionStart
+is late or absent, expect a rotation-unconfirmed warning instead. If abort cleanup
+cannot confirm an empty input box, the warning says "draft may remain": inspect
+and clear the terminal input before pressing Enter.
 
 Keep the checkout revision, harness/version, request/result transcript, successor
 and child IDs, timestamps, test output and exit code with the run's evidence.

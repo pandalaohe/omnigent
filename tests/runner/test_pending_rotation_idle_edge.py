@@ -181,7 +181,8 @@ def _clean_pending_rotations() -> Iterator[None]:
 
 
 @pytest.mark.asyncio
-async def test_rotation_retention_expires_without_succession(monkeypatch):
+@pytest.mark.parametrize("end", ["succession", "delete", "archive"])
+async def test_injected_revision_survives_late_session_start_and_prunes(monkeypatch, end):
     effects = []
     now = [100.0]
     monkeypatch.setattr(
@@ -190,17 +191,66 @@ async def test_rotation_retention_expires_without_succession(monkeypatch):
     monkeypatch.setattr(
         claude_native_bridge, "inject_slash_command", lambda *a, **kw: effects.append(kw)
     )
-    app = _build_app(_RotationServerClient())
+    server = _RotationServerClient()
+    app = _build_app(server)
     async with _runner_client(app) as client:
         await _seed_session(client)
         url = f"/v1/sessions/{CONV_ID}/pending-rotation"
         assert (await client.post(url)).json() == {"status": "started"}
-        now[0] += runner_app._ROTATION_SUCCESSION_GRACE_S - 0.01
-        assert (await client.post(url)).json() == {"status": "in_flight"}
-        now[0] += 0.01
+        now[0] += 10000
+        for _ in range(3):
+            assert (await client.post(url)).json() == {"status": "unconfirmed"}
+        assert len(effects) == 1
+        server.archive_revision = 1
+        server.labels["omnigent.rotate_requested"] = "1"
         assert (await client.post(url)).json() == {"status": "started"}
-        assert (await client.post(url)).json() == {"status": "in_flight"}
-    assert len(effects) == 2
+        assert len(effects) == 2
+        server.archive_revision = 0
+        server.labels["omnigent.rotate_requested"] = "0"
+        assert (await client.post(url)).json() == {"status": "superseded"}
+        assert len(effects) == 2
+        if end == "succession":
+            response = await client.post(
+                "/v1/sessions", json={"session_id": "conv_next", "agent_id": "ag_rotation"}
+            )
+            assert response.status_code == 201
+            response = await client.post(
+                f"/v1/sessions/{CONV_ID}/succession",
+                json={"target_session_id": "conv_next", "moved_ids": []},
+            )
+            assert response.status_code == 200
+            # Local succession confirms retirement even while metadata is late.
+            assert (await client.post(url)).json() == {"status": "superseded"}
+        elif end == "archive":
+            server.archived = True
+            assert (await client.post(url)).json() == {"status": "not_requested"}
+            server.archived = False
+            assert (await client.post(url)).json() == {"status": "started"}
+        assert (await client.delete(f"/v1/sessions/{CONV_ID}")).status_code == 200
+        await _seed_session(client)
+        assert (await client.post(url)).json() == {"status": "started"}
+    assert len(effects) == (4 if end == "archive" else 3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("draft_may_remain", [False, True])
+async def test_aborted_injection_is_fenced_and_reports_draft(monkeypatch, draft_may_remain):
+    effects = []
+
+    def abort(*args, **kwargs):
+        effects.append(kwargs["command"])
+        raise claude_native_bridge.ClaudeRotationUnconfirmed(draft_may_remain=draft_may_remain)
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", abort)
+    app = _build_app(_RotationServerClient())
+    async with _runner_client(app) as client:
+        await _seed_session(client)
+        for _ in range(3):
+            result = await client.post(f"/v1/sessions/{CONV_ID}/pending-rotation")
+            assert result.json() == {
+                "status": "draft_may_remain" if draft_may_remain else "unconfirmed"
+            }
+    assert effects == ["/clear"]
 
 
 @pytest.mark.asyncio
@@ -574,7 +624,7 @@ async def test_retrigger_and_idle_share_guard_and_skip_superseded(monkeypatch, t
         ]
         await asyncio.wait_for(asyncio.gather(*idle_tasks), timeout=2)
         result = await client.post(f"/v1/sessions/{CONV_ID}/pending-rotation")
-        assert result.json() == {"status": "in_flight"}
+        assert result.json() == {"status": "unconfirmed"}
         assert effects == before
         assert len(server.succession) == int(harness == "pi")
         server.labels["omnigent.succeeded_by"] = "next"

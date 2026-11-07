@@ -369,7 +369,6 @@ _WAITING_STATUS_MIN_SERVER_VERSION = "0.3.0"
 # Published statuses that mean a session's terminal is still working a turn.
 # ``waiting`` is parked on user input, so it keeps the runner alive too.
 _IN_FLIGHT_SESSION_STATUSES = ("running", "waiting")
-_ROTATION_SUCCESSION_GRACE_S = 60.0
 # Cached server version from the /api/version probe; ``None`` until a probe
 # succeeds. A failed probe stays ``None`` and is retried on the next
 # session-create — the GET is cheap and self-heals a transient failure.
@@ -5467,6 +5466,8 @@ def create_runner_app(
         for rid in stale_resp_ids:
             _resp_to_conv.pop(rid, None)
 
+        rotations_started.pop(session_id, None)
+
         return JSONResponse(
             status_code=200,
             content={
@@ -6120,9 +6121,15 @@ def create_runner_app(
             return "not_requested"
         harness = snapshot.get("harness") or _session_harness_name(conv_id)
         labels = snapshot.get("labels")
-        if require_label and isinstance(labels, dict) and labels.get("omnigent.succeeded_by"):
+        if require_label and (
+            conv_id in _succeeded_parents
+            or (isinstance(labels, dict) and labels.get("omnigent.succeeded_by"))
+        ):
             rotations_started.pop(conv_id, None)
             return "superseded"
+        if require_label and snapshot.get("archived") is True:
+            rotations_started.pop(conv_id, None)
+            return "not_requested"
         if require_label and isinstance(labels, dict):
             revision = snapshot.get("archive_revision")
             if (
@@ -6133,10 +6140,8 @@ def create_runner_app(
             ):
                 return "not_requested"
             started = rotations_started.get(conv_id)
-            if started is not None:
-                if started[0] == str(revision) and time.monotonic() < started[1]:
-                    return "in_flight"
-                rotations_started.pop(conv_id, None)
+            if started is not None and revision <= int(started[0]):
+                return started[1] if revision == int(started[0]) else "superseded"
         completed_pi_source = (
             harness == "pi"
             and isinstance(labels, dict)
@@ -6225,11 +6230,8 @@ def create_runner_app(
                 if succession_body.get("status") != "done":
                     return "not_requested"
                 await process_manager.release(conv_id)
-                if require_label:
-                    rotations_started[conv_id] = (
-                        str(snapshot["archive_revision"]),
-                        time.monotonic() + _ROTATION_SUCCESSION_GRACE_S,
-                    )
+                if require_label and conv_id not in _succeeded_parents:
+                    rotations_started[conv_id] = (str(snapshot["archive_revision"]), "unconfirmed")
                 return "started"
             else:
                 _logger.warning(
@@ -6256,17 +6258,21 @@ def create_runner_app(
                 response.status_code,
                 extra={"session_id": conv_id},
             )
-        if response.status_code < 400 and require_label:
-            rotations_started[conv_id] = (
-                str(snapshot["archive_revision"]),
-                time.monotonic() + _ROTATION_SUCCESSION_GRACE_S,
-            )
+        if require_label and isinstance(response, JSONResponse):
+            result = json.loads(bytes(response.body))
+            if result.get("rotation_unconfirmed") is True:
+                outcome = "draft_may_remain" if result.get("draft_may_remain") else "unconfirmed"
+                if conv_id not in _succeeded_parents:
+                    rotations_started[conv_id] = (str(snapshot["archive_revision"]), outcome)
+                return outcome
+        if response.status_code < 400 and require_label and conv_id not in _succeeded_parents:
+            rotations_started[conv_id] = (str(snapshot["archive_revision"]), "unconfirmed")
         return "started" if response.status_code < 400 else "not_requested"
 
     rotations_in_flight: set[str] = set()
-    # Injection acknowledgement precedes succession. Keep the accepted request
-    # fenced for two 30s succession request budgets, then allow bounded recovery.
-    rotations_started: dict[str, tuple[str, float]] = {}
+    # Keep only the newest injected revision for each live session. An absent
+    # succession receipt cannot prove it is safe to inject that command again.
+    rotations_started: dict[str, tuple[str, str]] = {}
 
     def _rotation_session_busy(conv_id: str) -> bool:
         return (
@@ -6282,6 +6288,8 @@ def create_runner_app(
         recovery: bool = False,
         expected_revision: str | None = None,
     ) -> str:
+        if require_label and conv_id in _succeeded_parents:
+            return "superseded"
         if conv_id in rotations_in_flight:
             return "in_flight"
         rotations_in_flight.add(conv_id)
@@ -12492,6 +12500,7 @@ def create_runner_app(
         # re-hold a successor that no later release would drain.
         first_call = _succeeded_parents.get(session_id) != target_session_id
         _succeeded_parents[session_id] = target_session_id
+        rotations_started.pop(session_id, None)
         _rekey_subagent_work_for_succession(session_id, target_session_id)
         if first_call and target_session_id in _session_inboxes:
             # Hold the successor's delivery until the server posts the opening
@@ -13947,6 +13956,8 @@ def create_runner_app(
             _cli_runtime_lifecycle.finish_reclaim(session_id, present=True)
             raise
         _cli_runtime_lifecycle.finish_reclaim(session_id)
+        if body["reason"] == "archive":
+            rotations_started.pop(session_id, None)
         return JSONResponse(
             status_code=200,
             content={"session_id": session_id, "status": "released"},

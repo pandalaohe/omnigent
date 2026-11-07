@@ -2258,6 +2258,7 @@ def build_native_controls(
     ) -> Response:
         """Type one slash command into a live claude-native pane."""
         from omnigent.harnesses.claude_native.bridge import (
+            ClaudeRotationUnconfirmed,
             bridge_dir_for_bridge_id,
             inject_slash_command,
         )
@@ -2285,6 +2286,15 @@ def build_native_controls(
                 timeout_s=1.0,
                 ready_timeout_s=min(_CLAUDE_CONTROL_PROMPT_WAIT_S, deadline.remaining_s()),
                 **injection_options,
+            )
+        except ClaudeRotationUnconfirmed as exc:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "rotation_unconfirmed": True,
+                    "draft_may_remain": exc.draft_may_remain,
+                    "detail": str(exc),
+                },
             )
         except (RuntimeError, ValueError, OSError) as exc:
             return JSONResponse(

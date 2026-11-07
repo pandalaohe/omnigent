@@ -50,6 +50,8 @@ class _Retry:
     revision: str
     idle_ticks: int = 0
     attempts: int = 0
+    unconfirmed: bool = False
+    draft_may_remain: bool = False
 
 
 class AutoRotationNotices:
@@ -252,7 +254,27 @@ class AutoRotationNotices:
         if fresh is None or fresh.runner_id != conv.runner_id or not self._owns(fresh):
             self._retry.pop(key, None)
             return
-        if retry.attempts >= 2:
+        if retry.attempts < 2 and not retry.unconfirmed:
+            if self._router is None:
+                return
+            routed = await asyncio.to_thread(self._router.client_for_session_resources, session_id)
+            fresh = await asyncio.to_thread(self._pending_snapshot, session_id, retry)
+            if fresh is None or fresh.runner_id != conv.runner_id or not self._owns(fresh):
+                self._retry.pop(key, None)
+                return
+            retry.attempts += 1
+            response = await routed.client.post(
+                f"/v1/sessions/{quote(session_id, safe='')}/pending-rotation",
+                json={"archive_revision": retry.revision},
+                timeout=30,
+            )
+            response.raise_for_status()
+            result = response.json()
+            retry.unconfirmed = result.get("status") in {"unconfirmed", "draft_may_remain"}
+            retry.draft_may_remain = result.get("status") == "draft_may_remain"
+            if not retry.unconfirmed:
+                return
+        if retry.attempts >= 2 or retry.unconfirmed:
             items = await asyncio.to_thread(
                 self._store.append,
                 session_id,
@@ -265,7 +287,14 @@ class AutoRotationNotices:
                             code="session_rotation_failed",
                             level="warning",
                             message=(
-                                "This session could not continue in a new session "
+                                "Rotation unconfirmed; draft may remain. Inspect and clear "
+                                "the terminal input before pressing Enter."
+                                if retry.draft_may_remain
+                                else "Rotation unconfirmed. The command was already injected "
+                                "and will not be retried automatically. Inspect the terminal "
+                                "before typing /clear."
+                                if retry.unconfirmed
+                                else "This session could not continue in a new session "
                                 "automatically. Type /clear to continue."
                             ),
                         ),
@@ -280,16 +309,3 @@ class AutoRotationNotices:
                     _publish_external_conversation_item(session_id, item)
             self._retry.pop(key, None)
             return
-        if self._router is None:
-            return
-        routed = await asyncio.to_thread(self._router.client_for_session_resources, session_id)
-        fresh = await asyncio.to_thread(self._pending_snapshot, session_id, retry)
-        if fresh is None or fresh.runner_id != conv.runner_id or not self._owns(fresh):
-            self._retry.pop(key, None)
-            return
-        retry.attempts += 1
-        await routed.client.post(
-            f"/v1/sessions/{quote(session_id, safe='')}/pending-rotation",
-            json={"archive_revision": retry.revision},
-            timeout=30,
-        )

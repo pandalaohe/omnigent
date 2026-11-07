@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
+from typing import cast
 
 import httpx
 import pytest
 
+from omnigent.entities import ErrorData
 from omnigent.server.auto_rotation import FRESH_ROUND_LABEL_KEY, NOTICED_COUNT_LABEL_KEY
 from omnigent.server.auto_rotation_notices import AutoRotationNotices
 from omnigent.stores.conversation_store import ROTATE_REQUESTED_LABEL_KEY, SUCCEEDED_BY_LABEL_KEY
@@ -132,6 +134,41 @@ async def test_recovery_rediscovers_bounds_attempts_and_reports_failure(db_uri):
             assert "Type /clear" in errors[0].data.message
             await notices.tick()
             assert len(calls) == 2
+        finally:
+            await notices.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["unconfirmed", "draft_may_remain"])
+async def test_injected_rotation_warns_without_another_retry(db_uri, outcome):
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = due_session(store)
+    store.set_labels(conv.id, {ROTATE_REQUESTED_LABEL_KEY: "0"})
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.path)
+        return httpx.Response(200, json={"status": outcome})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://runner"
+    ) as client:
+        notices = service(store, client, [], ["idle"], [{}])
+        await notices.start(SimpleNamespace())
+        try:
+            for _ in range(6):
+                await notices.tick()
+            assert len(calls) == 1
+            errors = store.list_items(conv.id, type="error").data
+            assert len(errors) == 1
+            error = cast(ErrorData, errors[0].data)
+            assert error.code == "session_rotation_failed"
+            assert "unconfirmed" in error.message
+            if outcome == "draft_may_remain":
+                assert "draft may remain" in error.message
+                assert "before pressing Enter" in error.message
+            else:
+                assert "will not be retried automatically" in error.message
         finally:
             await notices.shutdown()
 
