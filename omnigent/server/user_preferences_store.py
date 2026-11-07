@@ -73,6 +73,7 @@ USER_PREFERENCE_NAMESPACES = frozenset(
         "sidebar_layout",
         "sound_alerts",
         "worktree_defaults",
+        "builtin_agent_prompts",
     }
 )
 
@@ -1742,6 +1743,13 @@ def validate_preferences_envelope(envelope: Any) -> PreferencesEnvelope:
         _validate_worktree_archive(settings[WORKTREE_ARCHIVE_NAMESPACE])
     if CHILD_IDLE_NAMESPACE in settings:
         parse_child_idle_settings(settings[CHILD_IDLE_NAMESPACE])
+    from omnigent.server.builtin_agent_prompts import NAMESPACE, validate_prompt_preferences
+
+    if NAMESPACE in settings:
+        try:
+            validate_prompt_preferences(settings[NAMESPACE])
+        except ValueError as exc:
+            raise UserPreferencesValidationError(str(exc)) from exc
 
     copied: PreferencesEnvelope = {
         "version": USER_PREFERENCE_VERSION,
@@ -1758,7 +1766,10 @@ def validate_preferences_envelope(envelope: Any) -> PreferencesEnvelope:
         )
     try:
         serialized = json.dumps(
-            copied,
+            {
+                **copied,
+                "settings": {k: v for k, v in copied["settings"].items() if k != NAMESPACE},
+            },
             ensure_ascii=False,
             allow_nan=False,
             separators=(",", ":"),
@@ -1811,7 +1822,14 @@ def _read_settings(session: Session, user_id: str) -> tuple[dict[str, Any], bool
     settings: dict[str, Any] = {}
     for key, raw in rows:
         try:
-            text = decode(raw, max_decoded_bytes=USER_PREFERENCES_MAX_BYTES)
+            from omnigent.server.builtin_agent_prompts import NAMESPACE, PROMPTS_MAX_BYTES
+
+            text = decode(
+                raw,
+                max_decoded_bytes=PROMPTS_MAX_BYTES
+                if key == _settings_key(NAMESPACE)
+                else USER_PREFERENCES_MAX_BYTES,
+            )
         except (ValueError, zstandard.ZstdError) as exc:
             raise UserPreferencesValidationError("stored preferences are invalid JSON") from exc
         if key == _ENVELOPE_VERSION_KEY:
@@ -2091,6 +2109,10 @@ class SqlAlchemyUserPreferencesStore:
                 stored = settings.get(namespace)
                 if isinstance(stored, dict):
                     settings[namespace] = _prune_runner_log_warnings(stored)
+            if namespace == "builtin_agent_prompts" and isinstance(settings.get(namespace), dict):
+                settings[namespace] = {
+                    key: row for key, row in settings[namespace].items() if row is not None
+                }
             merged = _assemble_envelope(settings)
             if namespace in merged["settings"]:
                 self._upsert_row(

@@ -135,6 +135,20 @@ def test_quota_requires_nonblank_parent_block_and_empty_roles_add_no_separators(
     assert compose_session_text("", has_parent=False, spawn=False) == ""
 
 
+def test_session_prompt_is_last_and_preserves_its_text():
+    assert (
+        compose_session_text(
+            "Shared",
+            has_parent=False,
+            spawn=True,
+            parent_text="Parent",
+            quota_line="Quota",
+            session_text="  This chat\nonly  ",
+        )
+        == "Shared\n\nParent\n\nQuota\n\n  This chat\nonly  "
+    )
+
+
 def test_every_declared_harness_maps_to_its_product_or_no_product():
     groups = {
         "claude": "claude claude-sdk claude-native native-claude claude_sdk",

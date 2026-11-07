@@ -390,9 +390,9 @@ describe("AgentsSettings", () => {
     renderSettings();
 
     expect(screen.getByText("Polly")).toBeInTheDocument();
-    expect(screen.getByText("Multi-agent coding · 3 members · read-only")).toBeInTheDocument();
+    expect(screen.getByText("Multi-agent coding · 3 members")).toBeInTheDocument();
     expect(screen.getByText("Debby")).toBeInTheDocument();
-    expect(screen.getByText("Multi-agent debate · read-only")).toBeInTheDocument();
+    expect(screen.getByText("Multi-agent debate")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "View Polly" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Duplicate Polly" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "View Debby" })).toBeEnabled();
@@ -439,7 +439,9 @@ describe("AgentsSettings", () => {
     const dialog = await screen.findByRole("dialog");
 
     expect(within(dialog).getByText("Polly")).toBeInTheDocument();
-    expect(within(dialog).getByText("Built-in · read-only")).toBeInTheDocument();
+    expect(
+      within(dialog).getByText("Built-in · save your own starting prompt"),
+    ).toBeInTheDocument();
     const rows = within(dialog).getAllByTestId("builtin-member-row");
     expect(rows).toHaveLength(3);
     expect(within(rows[0]).getByText("polly")).toBeInTheDocument();
@@ -449,9 +451,7 @@ describe("AgentsSettings", () => {
     expect(within(rows[1]).getByText("Codex · Default · high")).toBeInTheDocument();
     expect(within(rows[1]).queryByText("Lead")).not.toBeInTheDocument();
     expect(
-      within(dialog).getByText(
-        "Built-in agents can't be changed. Duplicate Polly to get a copy you can edit.",
-      ),
+      within(dialog).getByText("Duplicate Polly to change its members and other settings."),
     ).toBeInTheDocument();
   });
 

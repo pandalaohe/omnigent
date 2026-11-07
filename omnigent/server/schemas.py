@@ -143,6 +143,7 @@ UserPreferenceNamespace = Literal[
     "sidebar_layout",
     "sound_alerts",
     "worktree_defaults",
+    "builtin_agent_prompts",
 ]
 
 
@@ -442,6 +443,7 @@ class CallingDefaultsCatalogRow(BaseModel):
     harness: str
     models: list[dict[str, Any]]
     permission_options: list[dict[str, str]] = Field(default_factory=list)
+    injects_prompt: bool | None = None
     fetched_at: int | None = None
     stale: bool
     error: str | None = None
@@ -1965,6 +1967,14 @@ class _SessionCreateRequestBase(BaseModel):
     """
 
     inference_configuration_revision: str | None = None
+    session_prompt: str | None = None
+
+    @field_validator("session_prompt")
+    @classmethod
+    def validate_session_prompt(cls, text: str | None) -> str | None:
+        from omnigent.runtime.instruction_layers import validate_session_prompt
+
+        return validate_session_prompt(text)
 
     # Declared here, in the legacy field position, so validation errors keep
     # main's ordering. Concrete public models narrow the wire type below.
@@ -2220,6 +2230,14 @@ class SessionCreateMetadata(BaseModel):
     """
 
     inference_configuration_revision: str | None = None
+    session_prompt: str | None = None
+
+    @field_validator("session_prompt")
+    @classmethod
+    def validate_session_prompt(cls, text: str | None) -> str | None:
+        from omnigent.runtime.instruction_layers import validate_session_prompt
+
+        return validate_session_prompt(text)
 
     mcp_registry_services: list[McpRegistryServiceId] = Field(default_factory=list, max_length=40)
 
@@ -2317,6 +2335,7 @@ class CreatedSessionResponse(BaseModel):
     """
 
     session_id: str
+    warnings: list[str] = Field(default_factory=list)
     agent_id: str
     agent_name: str
     project_id: str | None = None
@@ -2785,6 +2804,8 @@ class SessionResponse(BaseModel):
     """
 
     id: str
+    session_prompt: str | None = None
+    warnings: list[str] = Field(default_factory=list)
     agent_id: str
     agent_template_id: str | None = None
     agent_name: str | None = None

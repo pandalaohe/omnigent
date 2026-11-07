@@ -1586,6 +1586,7 @@ class HostModelOptionsResultFrame:
     error: str | None = None
     routable_models: list[str] = field(default_factory=list)
     permission_options: list[dict[str, str]] = field(default_factory=list)
+    injects_prompt: bool | None = None
 
 
 @dataclass
@@ -2665,6 +2666,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "error": frame.error,
                 "routable_models": frame.routable_models,
                 "permission_options": frame.permission_options,
+                "injects_prompt": frame.injects_prompt,
             }
         )
     if isinstance(frame, HostSkillsFrame):
@@ -4372,6 +4374,9 @@ def _decode_model_options_result(msg: _JsonObject) -> HostModelOptionsResultFram
         for option in permissions
     ):
         raise ValueError("frame field must be a list of string mappings: 'permission_options'")
+    injects_prompt = msg.get("injects_prompt")
+    if injects_prompt is not None and not isinstance(injects_prompt, bool):
+        raise ValueError("frame field must be boolean: 'injects_prompt'")
     return HostModelOptionsResultFrame(
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
@@ -4379,6 +4384,7 @@ def _decode_model_options_result(msg: _JsonObject) -> HostModelOptionsResultFram
         error=_optional_nullable_str(msg, "error"),
         routable_models=routable,
         permission_options=permissions,
+        injects_prompt=injects_prompt,
     )
 
 

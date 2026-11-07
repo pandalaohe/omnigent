@@ -1430,6 +1430,7 @@ async def _receive_loop(
                         "models": frame.models,
                         "routable_models": frame.routable_models,
                         "permission_options": frame.permission_options,
+                        "injects_prompt": frame.injects_prompt,
                         "error": frame.error,
                     }
                 )

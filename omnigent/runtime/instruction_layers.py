@@ -19,6 +19,15 @@ from omnigent.stores.global_instructions_store import GlobalInstructionRevision
 _logger = logging.getLogger(__name__)
 
 INSTRUCTION_SIZE_REMINDER_CHARS = 10_000
+SESSION_PROMPT_MAX_BYTES = 16 * 1024
+
+
+def validate_session_prompt(text: str | None) -> str | None:
+    if text is not None and "\x00" in text:
+        raise ValueError("session_prompt cannot contain NUL")
+    if text is not None and len(text.encode("utf-8")) > SESSION_PROMPT_MAX_BYTES:
+        raise ValueError("session_prompt exceeds the 16 KiB limit")
+    return text
 
 
 @dataclass(frozen=True)
@@ -169,6 +178,7 @@ def compose_session_text(
     parent_text: str = "",
     child_text: str = "",
     quota_line: str = "",
+    session_text: str = "",
 ) -> str:
     """Append the session's role block, outside the route's independent override."""
     parts = [route_text]
@@ -176,4 +186,5 @@ def compose_session_text(
         parts.append(child_text)
     elif spawn and parent_text.strip():
         parts.extend((parent_text, quota_line))
+    parts.append(session_text)
     return "\n\n".join(part for part in parts if part.strip())

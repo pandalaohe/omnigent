@@ -211,6 +211,7 @@ class RunnerSessionInitializer:
         quota_resolver: Callable[[Conversation], str] | None = None,
         session_choice_resolver: Callable[[Conversation], str] | None = None,
         standing_approval_resolver: Callable[[Conversation], str] | None = None,
+        instructions_override_resolver: Callable[[Conversation], str | None] | None = None,
         conversation_store: ConversationStore | None = None,
         file_store: FileStore | None = None,
         agent_store: AgentStore | None = None,
@@ -227,6 +228,7 @@ class RunnerSessionInitializer:
         self._quota_resolver = quota_resolver
         self._session_choice_resolver = session_choice_resolver
         self._standing_approval_resolver = standing_approval_resolver
+        self._instructions_override_resolver = instructions_override_resolver
         build_info = _read_build_info()
         self._diagnostic_context = {
             "server_version": server_version,
@@ -274,6 +276,12 @@ class RunnerSessionInitializer:
         if self._peer_messaging_resolver is None:
             return self._peer_messaging_enabled
         return await asyncio.to_thread(self._peer_messaging_resolver, conversation)
+
+    async def resolve_instructions_override(self, conversation: Conversation) -> str | None:
+        """Resolve the owner's current saved prompt for every init entry point."""
+        if self._instructions_override_resolver is None:
+            return None
+        return await asyncio.to_thread(self._instructions_override_resolver, conversation)
 
     async def resolve_project_code(
         self, conversation: Conversation
@@ -805,6 +813,7 @@ class RunnerSessionInitializer:
                     standing_approval_resolver=self._standing_approval_resolver,
                 )
                 project_code = await self.resolve_project_code(conversation)
+                instructions_override = await self.resolve_instructions_override(conversation)
             payload = build_runner_session_init_payload(
                 conversation,
                 usage_storage_location=getattr(self._conversation_store, "storage_location", None),
@@ -813,6 +822,7 @@ class RunnerSessionInitializer:
                 archive_states=archive_states,
                 peer_messaging_enabled=peer,
                 global_instructions=global_instructions,
+                instructions_override=instructions_override,
                 project_code=project_code,
                 resume_interrupted_turn=resume_interrupted_turn,
                 recovery_id=recovery_id,
@@ -866,6 +876,7 @@ class RunnerSessionInitializer:
                     archive_states=archive_states,
                     peer_messaging_enabled=peer,
                     global_instructions=global_instructions,
+                    instructions_override=instructions_override,
                     project_code=project_code,
                     resume_interrupted_turn=resume_interrupted_turn,
                     recovery_id=recovery_id,

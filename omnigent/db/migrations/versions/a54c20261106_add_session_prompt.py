@@ -1,0 +1,46 @@
+"""Persist optional startup instructions on each conversation."""
+
+from collections.abc import Sequence
+
+import sqlalchemy as sa
+from alembic import op
+from sqlalchemy.dialects.mysql import MEDIUMBLOB
+
+revision: str = "a54c20261106"
+down_revision: str = "zb1c2d3e4f5a"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
+
+
+def upgrade() -> None:
+    op.add_column("conversations", sa.Column("session_prompt", sa.Text(), nullable=True))
+    if op.get_bind().dialect.name == "mysql":
+        op.alter_column(
+            "preferences",
+            "value",
+            existing_type=sa.LargeBinary(),
+            type_=MEDIUMBLOB(),
+            existing_nullable=False,
+        )
+
+
+def downgrade() -> None:
+    if op.get_bind().dialect.name == "mysql":
+        if (
+            op.get_bind()
+            .execute(
+                sa.text("SELECT 1 FROM preferences WHERE OCTET_LENGTH(value) > 65535 LIMIT 1")
+            )
+            .first()
+        ):
+            raise RuntimeError(
+                "Remove large starting prompts before downgrading preference storage"
+            )
+        op.alter_column(
+            "preferences",
+            "value",
+            existing_type=MEDIUMBLOB(),
+            type_=sa.LargeBinary(),
+            existing_nullable=False,
+        )
+    op.drop_column("conversations", "session_prompt")

@@ -3049,6 +3049,7 @@ def _build_session_response(
 
     return SessionResponse(
         id=conv.id,
+        session_prompt=conv.session_prompt,
         agent_id=conv.agent_id,
         agent_template_id=(
             getattr(agent_store, "get_template_ids", lambda _ids: {})([conv.agent_id]).get(
@@ -15695,6 +15696,7 @@ async def _create_session_from_existing_agent_impl(
                 worktree=worktree,
                 git_branch=git_branch,
                 terminal_launch_args=validated_launch_args,
+                session_prompt=body.session_prompt,
                 project_id=project_resolution.project_id or child_project_id,
                 project_admission="reject"
                 if "project_id" in request_fields_set or explicit_project_label
@@ -15992,6 +15994,14 @@ async def _create_session_from_existing_agent_impl(
         conversation=conv,
         request=request,
         allow_host_fill=False,
+    )
+    from omnigent.server.routes._session_create_validation import (
+        session_acp_harness,
+        session_prompt_warnings,
+    )
+
+    response.warnings = await session_prompt_warnings(
+        request, conv, session_acp_harness(conv, agent_store=agent_store, agent_cache=agent_cache)
     )
     return response, conv
 

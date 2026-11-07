@@ -973,6 +973,7 @@ export async function createBundledSession(
     terminal_launch_args?: string[];
     git?: { branch_name: string; base_branch?: string };
     mcp_registry_services?: string[];
+    session_prompt?: string;
   } = {},
 ): Promise<{ id: string; agentId?: string }> {
   const form = new FormData();

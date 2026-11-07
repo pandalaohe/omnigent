@@ -84,6 +84,43 @@ async def cached_acp_permission_options(
     )
 
 
+async def session_prompt_warnings(
+    request: Request, conversation: Conversation, harness: str | None
+) -> list[str]:
+    if not conversation.session_prompt or not harness or not harness.startswith("acp:"):
+        return []
+    store = getattr(request.app.state, "host_model_catalog_cache_store", None)
+    from omnigent.server.routes._sessions.helpers import effective_host_id
+
+    host_id = conversation.host_id
+    conversations = getattr(request.app.state, "conversation_store", None)
+    if host_id is None and conversations is not None:
+        host_id = await asyncio.to_thread(effective_host_id, conversations, conversation)
+    if store is not None and host_id:
+        records = await asyncio.to_thread(store.list, [host_id])
+        record = next((row for row in records if row["harness"] == harness), None)
+        if record is None or record.get("injects_prompt") is None:
+            from omnigent.server.routes.calling_defaults import _sync_pair
+
+            registry = getattr(request.app.state, "host_registry", None)
+            connection = registry.get(host_id) if registry is not None else None
+            if connection is not None and registry is not None:
+                await _sync_pair(
+                    host_registry=registry,
+                    host_conn=connection,
+                    catalog_store=store,
+                    semaphore=asyncio.Semaphore(1),
+                    host_id=host_id,
+                    harness=harness,
+                )
+                records = await asyncio.to_thread(store.list, [host_id])
+        if any(
+            row["harness"] == harness and row.get("injects_prompt") is False for row in records
+        ):
+            return ["session_prompt not sent: this agent builds its own prompt"]
+    return []
+
+
 def require_acp_permission_mode(
     value: str, options: list[dict[str, str]], harness: str, host_id: str | None
 ) -> None:

@@ -111,6 +111,32 @@ def _conversation() -> Conversation:
     )
 
 
+@pytest.mark.asyncio
+async def test_prompt_override_changes_only_after_runner_generation_changes():
+    registry = _Registry()
+    client = _Client()
+    client.release.set()
+    current = "First owner prompt"
+    initializer = RunnerSessionInitializer(
+        registry,
+        server_version="test",
+        instructions_override_resolver=lambda _: current,
+    )
+    conversation = _conversation()
+    await initializer.initialize(conversation, client, timeout=1)
+    current = "Updated owner prompt"
+    await initializer.initialize(conversation, client, timeout=1)
+    assert len(client.calls) == 1
+    registry.connection.generation = 2
+    await initializer.initialize(conversation, client, timeout=1)
+    assert len(client.calls) == 2
+    snapshots = [parse_runner_session_init_envelope(body).snapshot for body in client.calls]
+    assert [snapshot.instructions_override for snapshot in snapshots] == [
+        "First owner prompt",
+        "Updated owner prompt",
+    ]
+
+
 def test_permission_init_ack_requires_exact_revision_and_runner_epoch() -> None:
     from omnigent.server.permission_tiers import (
         PERMISSION_RUNTIME_ID_LABEL_KEY,

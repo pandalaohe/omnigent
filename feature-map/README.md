@@ -113,6 +113,9 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 
 ## Features
 
+- [Starting prompts](./startup-prompts.md) covers per-session text, owner-edited
+  SDK/RPC and team prompts, restore/Undo and ACP prompt delivery labels.
+
 - [Model lists](./model-sources.md) covers host-owned model sources, the Settings
   card, offline `models check` / `models guide`, and bounded ACP probing.
 

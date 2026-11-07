@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { PlusIcon, TrashIcon } from "lucide-react";
 
 import { AgentMemberTrigger } from "@/components/AgentMemberTrigger";
+import { BuiltinPromptEditor } from "@/components/BuiltinPromptEditor";
 import { AgentNameTag } from "@/components/AgentNameTag";
 import { Button } from "@/components/ui/button";
 import {
@@ -643,8 +644,9 @@ export function BuiltinAgentView({
               harness={agent.harness ?? null}
             />
           </DialogTitle>
-          <DialogDescription>Built-in · read-only</DialogDescription>
+          <DialogDescription>Built-in · save your own starting prompt</DialogDescription>
         </DialogHeader>
+        <BuiltinPromptEditor key={agent.id} agentId={agent.id} />
         {agent.members == null ? (
           <p className="py-2 text-sm text-muted-foreground">Members unavailable</p>
         ) : (
@@ -677,8 +679,7 @@ export function BuiltinAgentView({
         )}
         <DialogFooter className="sm:items-center">
           <p className="text-xs text-muted-foreground sm:mr-auto">
-            Built-in agents can't be changed. Duplicate {agent.display_name} to get a copy you can
-            edit.
+            Duplicate {agent.display_name} to change its members and other settings.
           </p>
           <Button variant="outline" disabled={busy} onClick={() => void duplicate()}>
             Duplicate to edit

@@ -790,11 +790,14 @@ def test_model_options_frames_round_trip() -> None:
                 status="ok",
                 routable_models=["system.ai.claude-opus-5", "system.ai.claude-opus-4-8"],
                 permission_options=[{"value": "review", "label": "Review"}],
+                injects_prompt=False,
             )
         )
     )
     assert isinstance(with_routable, HostModelOptionsResultFrame)
     assert with_routable.permission_options == [{"value": "review", "label": "Review"}]
+    assert with_routable.injects_prompt is False
+    assert result.injects_prompt is None
     assert with_routable.routable_models == [
         "system.ai.claude-opus-5",
         "system.ai.claude-opus-4-8",
