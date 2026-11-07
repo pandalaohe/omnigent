@@ -2650,8 +2650,15 @@ def test_pi_scope_unlisted_bridged_tool_is_denied_in_auto(tmp_path):
         assert decision.reason == "Unknown tool schema"
 
 
-@pytest.mark.parametrize("tier,action", [("auto", "DENY"), ("plan", "DENY"), ("ask", "ASK")])
-def test_pi_scope_agent_declared_calculate_requires_approval(tmp_path, tier, action):
+@pytest.mark.parametrize(
+    "tier,action,reason",
+    [
+        ("auto", "DENY", "Unknown tool schema"),
+        ("plan", "DENY", "Plan tier permits only known reads and user questions"),
+        ("ask", "ASK", "Unknown tool schema"),
+    ],
+)
+def test_pi_scope_agent_declared_calculate_requires_approval(tmp_path, tier, action, reason):
     runtime, _parent, _child, _source, _registry = _scoped_runtime(tmp_path, tier)
     child = runtime.open_pi_child_scope("session-a")
     _publish_scope(
@@ -2683,7 +2690,7 @@ def test_pi_scope_agent_declared_calculate_requires_approval(tmp_path, tier, act
         origin_receipt=receipt.token,
     )
     assert decision.action.value == action
-    assert decision.reason == "Unknown tool schema"
+    assert decision.reason == reason
 
 
 @pytest.mark.asyncio
