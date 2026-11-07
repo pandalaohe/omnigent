@@ -40,11 +40,13 @@ def _to_record(row: SqlHostModelCatalogCache) -> dict[str, Any]:
         decoded = None
     models = decoded.get("models") if isinstance(decoded, dict) else decoded
     permissions = decoded.get("permission_options") if isinstance(decoded, dict) else None
+    injects_prompt = decoded.get("injects_prompt") if isinstance(decoded, dict) else None
     return {
         "host_id": row.host_id,
         "harness": row.harness,
         "models": models if isinstance(models, list) else [],
         "permission_options": permissions if isinstance(permissions, list) else [],
+        "injects_prompt": injects_prompt if isinstance(injects_prompt, bool) else None,
         "fetched_at": row.fetched_at,
         "error": row.error,
     }
@@ -96,11 +98,16 @@ class HostModelCatalogCacheStore:
         payload: builtins.list[dict[str, Any]],
         fetched_at: int,
         permission_options: builtins.list[dict[str, str]] | None = None,
+        injects_prompt: bool | None = None,
     ) -> None:
         """Store a successful sync's catalog and clear any previous error."""
         stored = (
-            {"models": payload, "permission_options": permission_options}
-            if permission_options
+            {
+                "models": payload,
+                "permission_options": permission_options,
+                "injects_prompt": injects_prompt,
+            }
+            if permission_options or injects_prompt is not None
             else payload
         )
         encoded = json.dumps(stored, ensure_ascii=False, separators=(",", ":"))
@@ -118,7 +125,9 @@ class HostModelCatalogCacheStore:
 
         run_write_transaction(self._session_immediate, "upsert_host_model_catalog_cache", write)
 
-    def mark_error(self, host_id: str, harness: str, error: str) -> None:
+    def mark_error(
+        self, host_id: str, harness: str, error: str, *, injects_prompt: bool | None = None
+    ) -> None:
         """Record a failed sync, keeping any previous payload and fetch time."""
         values = {
             "workspace_id": current_workspace_id(),
@@ -132,6 +141,26 @@ class HostModelCatalogCacheStore:
 
         def write(session: Session) -> None:
             self._upsert_row(session, values, clear_error=False)
+            if injects_prompt is not None:
+                row = session.execute(
+                    select(SqlHostModelCatalogCache)
+                    .where(
+                        SqlHostModelCatalogCache.workspace_id == current_workspace_id(),
+                        SqlHostModelCatalogCache.host_id == host_id,
+                        SqlHostModelCatalogCache.harness == harness,
+                    )
+                    .with_for_update()
+                ).scalar_one()
+                previous = _to_record(row)
+                row.payload = json.dumps(
+                    {
+                        "models": previous["models"],
+                        "permission_options": previous["permission_options"],
+                        "injects_prompt": injects_prompt,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
 
         run_write_transaction(self._session_immediate, "mark_host_model_catalog_error", write)
 

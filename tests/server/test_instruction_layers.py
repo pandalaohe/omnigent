@@ -65,6 +65,17 @@ def conversation(**overrides):
 
 
 @pytest.mark.asyncio
+async def test_session_text_is_last_with_and_without_shared_layers(instructions, monkeypatch):
+    conv = conversation(session_prompt="Only this chat")
+    text = await session_instructions_text(conv, standing_approval_resolver=lambda _: "Pass")
+    assert text == "S\n\nA\n\nH\n\nParent\n\nPass\n\nOnly this chat"
+    monkeypatch.setattr(
+        "omnigent.server.instruction_layers.get_global_instructions_store", lambda: None
+    )
+    assert await session_instructions_text(conv) == "Only this chat"
+
+
+@pytest.mark.asyncio
 async def test_session_choice_line_is_injected_with_blank_parent_layer(instructions):
     from omnigent.server.instruction_layers import InstructionRoute, route_session_text
     from omnigent.server.session_choice import generated_line, parse_session_choice

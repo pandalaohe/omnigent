@@ -60,6 +60,40 @@ from tests.runner.conftest import (
 from tests.runner.helpers import NullServerClient
 
 
+@pytest.mark.asyncio
+async def test_session_prompt_override_is_per_session_and_refreshed_on_reinit(monkeypatch):
+    from omnigent.entities import Conversation
+    from omnigent.runner.session_init_protocol import build_runner_session_init_payload
+
+    spec = AgentSpec(spec_version=1, name="shared", instructions="Built-in")
+    observed = []
+
+    async def record_spec(current, _harness):
+        observed.append(current.instructions)
+
+    async def resolve(_agent_id, _session_id):
+        return spec
+
+    monkeypatch.setattr("omnigent.runner.app._evaluate_agent_start_gate", record_spec)
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),
+        spec_resolver=resolve,
+        server_client=NullServerClient(),
+    )
+    conv = Conversation(
+        id="a" * 32, created_at=1, updated_at=1, root_conversation_id="a" * 32, agent_id="b" * 32
+    )
+    async with _runner_client(app) as client:
+        for text in ("Owner version", "", None, "After reconnect"):
+            body = build_runner_session_init_payload(
+                conv, server_version="test", instructions_override=text
+            )
+            response = await client.post("/v1/sessions", json=body)
+            assert response.status_code == 201, response.text
+    assert observed == ["Owner version", "", "Built-in", "After reconnect"]
+    assert spec.instructions == "Built-in"
+
+
 def _stub_permission_start_for_routing_test(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep harness routing tests independent of the permission hook handshake."""
     monkeypatch.setattr(PermissionTierRuntime, "fence_start", lambda *args: None)

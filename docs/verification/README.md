@@ -5,6 +5,8 @@ evidence and cleanup recipes. Start with its Verify Omnigent skill for a running
 app; component checks use their own isolated test environment.
 
 - [Model sources](features/model-sources.md): model list card and offline checks.
+- [Starting prompts](features/startup-prompts.md): session text, owner versions,
+  restore/Undo, reconnect and agents whose prompts are not sent.
 - [Pi RPC interrupted turns](features/pi-rpc-recovery.md): reconnect, continuation
   receipts, user controls, permission initialization and context usage.
 - [OTLP usage ingestion](features/usage-otlp.md): HTTP signals, accounting and managed-session exclusion.

@@ -2088,12 +2088,25 @@ def create_app(
             return False, None
         return await startup_admission.initialization_control(conversation)
 
+    from omnigent.server.builtin_agent_prompts import session_instructions_override
+    from omnigent.server.session_collab import collab_owner_for
+
+    def _instructions_override(conversation: Conversation) -> str | None:
+        return session_instructions_override(
+            conversation,
+            owner=collab_owner_for(conversation, conversation_store, permission_store),
+            agent_store=agent_store,
+            agent_cache=agent_cache,
+            preferences=user_preferences_store,
+        )
+
     runner_session_initializer = RunnerSessionInitializer(
         tunnel_registry,
         server_version=_server_version(),
         quota_resolver=agent_quota_service.line,
         session_choice_resolver=agent_quota_service.session_choice_line,
         standing_approval_resolver=standing_approval_service.line,
+        instructions_override_resolver=_instructions_override,
         peer_messaging_enabled=resolved_feature_flags.enabled(Feature.SESSION_PEER_MESSAGING),
         peer_messaging_resolver=partial(
             session_peer_enabled,
@@ -4778,6 +4791,7 @@ def create_app(
             artifact_store=artifact_store,
             conversation_store=conversation_store,
             auth_provider=auth_provider,
+            user_preferences_store=user_preferences_store,
         ),
         prefix="/v1",
         tags=["agents"],

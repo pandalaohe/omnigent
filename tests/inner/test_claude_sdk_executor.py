@@ -8842,6 +8842,61 @@ async def test_effort_changes_rebuild_client_with_history(initial_effort, compac
     assert [call.args[0] for call in close.await_args_list] == fake_sdk.created_clients[:2]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preset", [None, "claude_code"])
+@pytest.mark.parametrize(
+    "compact_content",
+    [
+        None,
+        "/compact",
+        [{"type": "text", "text": "/compact"}],
+        [{"type": "input_text", "text": "/compact"}],
+    ],
+)
+async def test_prompt_changes_rebuild_client_and_preserve_history(preset, compact_content) -> None:
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    sdk = _make_recovery_fake_sdk()
+    executor = ClaudeSDKExecutor(system_prompt_preset=preset)
+    messages = []
+    versions = ["Built-in", "Saved version", "Saved version", "Built-in", "Saved version", ""]
+    with (
+        patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=sdk),
+        patch.object(executor, "_force_close_client", new_callable=AsyncMock),
+    ):
+        for index, version in enumerate(versions):
+            if index == 1 and compact_content is not None:
+                previous_client = executor._clients["prompts"].client
+                messages.append({"role": "user", "content": compact_content})
+                compact_events = [
+                    event async for event in executor.run_turn(messages, [], version)
+                ]
+                assert not [event for event in compact_events if isinstance(event, ExecutorError)]
+                assert executor._clients["prompts"].client is previous_client
+                assert previous_client.prompts[-1] == "/compact"
+                messages.append({"role": "assistant", "content": "compacted summary"})
+            messages.append(
+                {"role": "user", "content": f"question {index}", "session_id": "prompts"}
+            )
+            events = [event async for event in executor.run_turn(messages, [], version)]
+            assert not [event for event in events if isinstance(event, ExecutorError)]
+            client = executor._clients["prompts"].client
+            actual = client.options.system_prompt
+            assert actual == (
+                {"type": "preset", "preset": "claude_code", "append": version}
+                if preset
+                else version or None
+            )
+            if index == 2:
+                assert client.prompts[-1] == "question 2"
+            else:
+                for previous in range(index):
+                    assert f"question {previous}" in client.prompts[-1]
+                    assert f"answer {previous}" in client.prompts[-1]
+            messages.append({"role": "assistant", "content": f"answer {index}"})
+        assert len(sdk.created_clients) == 5
+
+
 def test_tool_call_metadata_marks_only_omnigent_mcp_tools_as_dispatched() -> None:
     """Only the in-process ``omnigent`` MCP server's tools come back for dispatch.
 

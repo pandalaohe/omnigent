@@ -124,9 +124,7 @@ function rosterSummary(members: CustomAgentMember[], labels: Record<string, stri
 
 function builtinSubtitle(agent: AvailableAgent): string {
   const count = agent.members?.length ?? 0;
-  return [agent.description, count > 1 ? `${count} members` : null, "read-only"]
-    .filter(Boolean)
-    .join(" · ");
+  return [agent.description, count > 1 ? `${count} members` : null].filter(Boolean).join(" · ");
 }
 
 /**

@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { AgentPicker } from "@/components/AgentPicker";
+import { StartupPromptNotices } from "@/components/StartupPromptNotices";
 import { useHarnessCapabilities } from "@/lib/agentLabels";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
@@ -222,6 +223,7 @@ export function InstructionsPage() {
         <header>
           <h1 className="text-2xl font-semibold">Startup prompts</h1>
         </header>
+        <StartupPromptNotices agents={data.data?.agents ?? []} hosts={hosts.data ?? []} />
         {data.isError && (
           <p role="alert" className="text-sm text-destructive">
             {data.error.message}

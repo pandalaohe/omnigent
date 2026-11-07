@@ -9438,6 +9438,31 @@ async def test_slow_codex_picker_keeps_probe_running_and_serves_matching_cache(
         _cleanup_host(host)
 
 
+async def test_acp_probe_failure_still_reports_configured_prompt_delivery(monkeypatch) -> None:
+    from omnigent.models import model_source
+
+    monkeypatch.setattr(
+        model_source, "model_source_for", lambda _: model_source.ModelSource(lane="agent")
+    )
+    monkeypatch.setattr(
+        model_source,
+        "_source_catalog",
+        lambda *_: (None, "neutral", SimpleNamespace(inject_system_prompt=False)),
+    )
+    monkeypatch.setattr(
+        model_source, "fetch_model_source", AsyncMock(side_effect=RuntimeError("probe failed"))
+    )
+    host = _make_host_process()
+    try:
+        response = await host._handle_model_options(
+            HostModelOptionsFrame(request_id="delivery", harness="acp:neutral")
+        )
+        assert response.status == "failed"
+        assert response.injects_prompt is False
+    finally:
+        _cleanup_host(host)
+
+
 async def test_handle_model_options_serves_claude_sdk_endpoint_listing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

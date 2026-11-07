@@ -30,6 +30,7 @@ from sqlalchemy import (
     true,
 )
 from sqlalchemy.dialects.mysql import BINARY as MySQLBinary
+from sqlalchemy.dialects.mysql import MEDIUMBLOB as MySQLMediumBlob
 from sqlalchemy.dialects.mysql import VARCHAR as MySQLVarchar
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -377,6 +378,11 @@ class SqlUser(OmnigentBase):
     )
 
 
+class _PreferenceText(CompressedText):
+    impl = LargeBinary().with_variant(MySQLMediumBlob(), "mysql")
+    cache_ok = True
+
+
 class SqlPreference(OmnigentBase):
     """Named user preferences, scoped to a workspace and stored as opaque JSON."""
 
@@ -391,7 +397,7 @@ class SqlPreference(OmnigentBase):
     )
     user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     key: Mapped[str] = mapped_column(String(128), primary_key=True)
-    value: Mapped[str] = mapped_column(CompressedText, nullable=False)
+    value: Mapped[str] = mapped_column(_PreferenceText, nullable=False)
 
 
 class SqlAccountToken(OmnigentBase):
@@ -1126,6 +1132,7 @@ class SqlConversation(ConversationBase):
     # created without an agent binding. Indexed for the agent→conversation
     # reverse lookup and the list filters (agent_id / has_agent_id / agent_name).
     agent_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    session_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Per-session config overrides packed as a compact JSON object, e.g.
     # ``{"model_override":"claude-opus-4-8","reasoning_effort":"high"}``. Keys:
     # reasoning_effort, model_override, cost_control_mode_override,

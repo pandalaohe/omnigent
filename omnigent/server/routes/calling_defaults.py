@@ -4,7 +4,7 @@ Three surfaces, all scoped to the caller's own hosts:
 
 * ``POST /sync`` — ask each online owned host for the model catalogs of
   the harnesses it reports as configured, and cache the answers.
-* ``GET /catalogs`` — read the caller's cached catalogs back.
+* ``GET /catalogs`` — read cached catalogs, fetching missing ACP delivery metadata.
 * ``GET /resolve`` — resolve the agent / harness / model / effort one
   create would use, and report any default-sourced value the cached
   catalog does not offer. Pure read: it never syncs.
@@ -107,12 +107,19 @@ async def _sync_pair(
                 payload,
                 now_epoch(),
                 permission_options=result.get("permission_options"),
+                injects_prompt=result.get("injects_prompt"),
             )
             return
         error = result.get("error")
         if not isinstance(error, str) or not error:
             error = "host model-options lookup failed"
-        await asyncio.to_thread(catalog_store.mark_error, host_id, harness, error)
+        await asyncio.to_thread(
+            catalog_store.mark_error,
+            host_id,
+            harness,
+            error,
+            injects_prompt=result.get("injects_prompt"),
+        )
 
 
 def _catalog_row(
@@ -126,6 +133,7 @@ def _catalog_row(
         harness=record["harness"],
         models=record["models"],
         permission_options=record.get("permission_options", []),
+        injects_prompt=record.get("injects_prompt"),
         fetched_at=record["fetched_at"],
         stale=bool(record["error"]) or offline,
         error=record["error"],
@@ -241,6 +249,33 @@ def create_calling_defaults_router(
         """
         user_id = require_user(request, auth_provider)
         hosts = await asyncio.to_thread(host_store.list_hosts, _owner(user_id))
+        records = await asyncio.to_thread(catalog_store.list, [host.host_id for host in hosts])
+        # Configuration metadata must be visible on first use, independently
+        # of a model probe succeeding or an explicit Sync models action.
+        known = {
+            (row["host_id"], row["harness"])
+            for row in records
+            if row.get("injects_prompt") is not None
+        }
+        semaphore = asyncio.Semaphore(_SYNC_CONCURRENCY)
+        await asyncio.gather(
+            *(
+                _sync_pair(
+                    host_registry=host_registry,
+                    host_conn=conn,
+                    catalog_store=catalog_store,
+                    semaphore=semaphore,
+                    host_id=host.host_id,
+                    harness=harness,
+                )
+                for host in hosts
+                if (conn := host_registry.get(host.host_id)) is not None
+                for harness, ready in (host.configured_harnesses or {}).items()
+                if harness.startswith("acp:")
+                and ready is not False
+                and (host.host_id, harness) not in known
+            )
+        )
         records = await asyncio.to_thread(catalog_store.list, [host.host_id for host in hosts])
         return CallingDefaultsCatalogsResponse(
             rows=[_catalog_row(record, host_registry) for record in records]

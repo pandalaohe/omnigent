@@ -171,6 +171,57 @@ def _register_host(app: FastAPI, host_id: str) -> None:
     )
 
 
+@pytest.mark.parametrize("surface", ["catalog", "create", "model-refresh"])
+@pytest.mark.parametrize("status", ["ok", "failed"])
+async def test_acp_delivery_metadata_without_manual_sync(
+    client, app, stores, monkeypatch, surface, status
+):
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    stores.host_store.update_harness_readiness(HOST_A, {"acp:neutral": True})
+    _register_host(app, HOST_A)
+    proxy = AsyncMock(
+        return_value={
+            "status": status,
+            "models": [],
+            "error": "probe failed" if status == "failed" else None,
+            "injects_prompt": False,
+        }
+    )
+    monkeypatch.setattr("omnigent.server.routes.calling_defaults._proxy_model_options", proxy)
+    monkeypatch.setattr("omnigent.server.routes.hosts._proxy_model_options", proxy)
+    if surface == "catalog":
+        response = await client.get("/v1/calling-defaults/catalogs")
+        assert response.status_code == 200, response.text
+        assert response.json()["rows"][0]["injects_prompt"] is False
+    elif surface == "create":
+        from starlette.requests import Request
+
+        from omnigent.entities import Conversation
+        from omnigent.server.routes._session_create_validation import session_prompt_warnings
+
+        request = Request({"type": "http", "app": app})
+        warnings = await session_prompt_warnings(
+            request,
+            Conversation(
+                id="test",
+                created_at=1,
+                updated_at=1,
+                root_conversation_id="test",
+                host_id=HOST_A,
+                session_prompt="Keep this",
+            ),
+            "acp:neutral",
+        )
+        assert warnings == ["session_prompt not sent: this agent builds its own prompt"]
+    else:
+        response = await client.get(
+            f"/v1/hosts/{HOST_A}/harnesses/acp:neutral/model-options?refresh=force"
+        )
+        assert response.status_code == (200 if status == "ok" else 502), response.text
+    assert stores.cache.list([HOST_A])[0]["injects_prompt"] is False
+    proxy.assert_awaited_once()
+
+
 async def test_sync_records_ok_unsupported_and_offline_pairs(
     app: FastAPI,
     client: httpx.AsyncClient,
@@ -908,6 +959,7 @@ async def test_acp_mode_crosses_server_runner_and_scripted_agent(
             status="ok",
             models=[{"id": "model-a", "start_efforts": ["low", "high"]}],
             permission_options=options,
+            injects_prompt=False,
         )
         ws = AsyncMock()
         ws.receive.side_effect = [
@@ -939,6 +991,7 @@ async def test_acp_mode_crosses_server_runner_and_scripted_agent(
     catalogs = await client.get("/v1/calling-defaults/catalogs")
     assert catalogs.status_code == 200, catalogs.text
     assert catalogs.json()["rows"][0]["permission_options"] == options
+    assert catalogs.json()["rows"][0]["injects_prompt"] is False
     conversations = SqlAlchemyConversationStore(stores.agent_store.storage_location)
     parent = conversations.create_conversation(
         agent_id=AGENT_ID, host_id=HOST_A, workspace=str(tmp_path), runner_id="test-runner"
@@ -950,11 +1003,16 @@ async def test_acp_mode_crosses_server_runner_and_scripted_agent(
             "parent_session_id": parent.id,
             "permission_mode": "go",
             "reasoning_effort": "high",
+            "session_prompt": "Kept for this chat",
         },
     )
     assert created.status_code == 201, created.text
     saved = conversations.get_conversation(created.json()["id"])
     assert saved.labels[ACP_SESSION_MODE_LABEL_KEY] == "go"
+    assert saved.session_prompt == "Kept for this chat"
+    assert created.json()["warnings"] == [
+        "session_prompt not sent: this agent builds its own prompt"
+    ]
     assert created.json()["harness"] == "acp"
     assert created.json()["harness_namespace"] == "acp:neutral"
     assert created.json()["effective_host_id"] == HOST_A

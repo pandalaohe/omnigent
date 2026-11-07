@@ -1,9 +1,25 @@
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { cleanup, screen, within, render as rtlRender } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { HarnessAccount, Host } from "@/hooks/useHosts";
 import type { InstructionLayers, InstructionPreview } from "@/hooks/useInstructionLayers";
 import { AgentContextTable, AgentPromptCard } from "./AgentContextTable";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { ReactElement } from "react";
+
+function render(ui: ReactElement) {
+  return rtlRender(ui, {
+    wrapper: ({ children }) => (
+      <QueryClientProvider
+        client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
+      >
+        {children}
+      </QueryClientProvider>
+    ),
+  });
+}
+
+vi.mock("@/lib/callingDefaultsApi", () => ({ listCallingDefaultCatalogs: async () => [] }));
 
 const mocks = vi.hoisted(() => ({
   layers: undefined as InstructionLayers | undefined,

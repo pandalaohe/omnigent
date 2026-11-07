@@ -2200,6 +2200,27 @@ def create_runner_app(
     # global text. Read by the launch and composition points, never from the
     # TTL'd envelope cache, so the text outlives the cache. Blank is "off".
     _session_global_instructions: dict[str, str | None] = {}
+    _session_instructions_overrides: dict[str, str | None] = {}
+    _base_spec_resolver = spec_resolver
+
+    if _base_spec_resolver is not None:
+
+        async def _resolve_with_prompt(
+            agent_id: str, session_id: str | None = None
+        ) -> _SpecEntry | None:
+            assert _base_spec_resolver is not None
+            entry = await _base_spec_resolver(agent_id, session_id)
+            spec = _unwrap_spec_entry(entry)
+            override = _session_instructions_overrides.get(session_id) if session_id else None
+            if spec is None or override is None:
+                return entry
+            return _rewrap_like(
+                entry,
+                dataclasses.replace(spec, instructions=override),
+                _resolved_spec_workdir(entry),
+            )
+
+        spec_resolver = _resolve_with_prompt
     # session_id → the project code locations from the first init snapshot:
     # a re-init keeps the first list, so settings changes reach only sessions
     # initialised after the change.
@@ -3599,6 +3620,7 @@ def create_runner_app(
         global _server_version
         _server_version = envelope.server_version
         snapshot = envelope.snapshot
+        _session_instructions_overrides[session_id] = snapshot.instructions_override
         set_session_member_entries(session_id, snapshot.labels)
         _session_snapshot_cache[session_id] = _SessionSnapshot(
             ok=True,
@@ -5396,6 +5418,7 @@ def create_runner_app(
         _session_peer_messaging_enabled.pop(session_id, None)
         _session_open_enabled.pop(session_id, None)
         _session_global_instructions.pop(session_id, None)
+        _session_instructions_overrides.pop(session_id, None)
         _session_project_code.pop(session_id, None)
         _session_permission_mode.pop(session_id, None)
         _session_acp_mode.pop(session_id, None)
@@ -12890,6 +12913,7 @@ def create_runner_app(
         _session_agent_revisions.pop(session_id, None)
         _session_harness_overrides.pop(session_id, None)
         if clear_member_routing:
+            _session_instructions_overrides.pop(session_id, None)
             # Member labels drop with an in-place agent switch; so do the
             # entries the routing note reads and the obligations opened
             # against them. ``reset-state`` and ``agent-cache/reset`` keep

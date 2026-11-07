@@ -943,6 +943,7 @@ _CLAUDE_API_KEY_HELPER_ENV_KEY = "OMNIGENT_CLAUDE_API_KEY_HELPER"
 class _ClaudeClientState:
     client: _ClaudeClient
     model: str | None
+    system_prompt: str | None = None
     effort: str | None = None
     permission_mode: str | None = None
     loop: asyncio.AbstractEventLoop | None = None
@@ -2256,6 +2257,11 @@ class ClaudeSDKExecutor(Executor):
             original_prompt = getattr(options, "system_prompt", None)
             original_extra_args = getattr(options, "extra_args", {})
             state = _ClaudeClientState(client=client, model=model)
+            state.system_prompt = (
+                original_prompt.get("append")
+                if isinstance(original_prompt, dict)
+                else original_prompt
+            ) or None
             state.context_operation = operation
             state.context_lifecycle = "starting"
             token = object()
@@ -3837,12 +3843,19 @@ class ClaudeSDKExecutor(Executor):
             )
             return
         await self._evict_terminated_client(session_key)
+        if tools:
+            system_prompt = _augment_system_prompt_for_omnigent_mcp_tools(system_prompt, tools)
         permission_mode = (
             cfg.permission_mode if cfg.permission_mode is not None else self._permission_mode
         )
         state = self._clients.get(session_key)
         replacing_client = state is not None and (
             state.permission_mode != permission_mode
+            or (
+                state.system_prompt != (system_prompt or None)
+                and (next_input := self._extract_trailing_user_content(messages))
+                and next_input != "/compact"
+            )
             or (
                 state.effort != reasoning_effort
                 and (next_input := self._extract_trailing_user_content(messages))
@@ -3888,10 +3901,6 @@ class ClaudeSDKExecutor(Executor):
                 name="omnigent",
                 version="1.0.0",
                 tools=mcp_tools,
-            )
-            system_prompt = _augment_system_prompt_for_omnigent_mcp_tools(
-                system_prompt,
-                tools,
             )
 
         # Build allowed_tools list.  OS-environment operations route

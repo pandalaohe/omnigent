@@ -4519,9 +4519,15 @@ class HostProcess:
         with_source = functools.partial(_with_model_configuration_source, harness=harness)
         from omnigent.models.model_source import fetch_model_source, model_source_for
 
+        injects_prompt = None
         try:
             source = model_source_for(harness)
             if source is not None:
+                if harness == "acp" or harness.startswith("acp:"):
+                    from omnigent.models.model_source import ModelSource, _source_catalog
+
+                    _, _, entry = _source_catalog(harness, ModelSource(lane="agent"))
+                    injects_prompt = entry.inject_system_prompt
                 refresh = frame.refresh if frame.refresh in ("auto", "force") else "none"
                 rows = await fetch_model_source(harness, source, refresh=refresh)
                 permissions = []
@@ -4532,6 +4538,7 @@ class HostProcess:
                     from omnigent.onboarding.acp_auth import classify_permission_options
 
                     _, key, entry = _source_catalog(harness, ModelSource(lane="agent"))
+                    injects_prompt = entry.inject_system_prompt
                     permission_rows = read_catalog("acp-modes", key)
                     if source.lane != "agent" and (permission_rows is None or refresh == "force"):
                         probe = await probe_acp_model_options(entry)
@@ -4548,12 +4555,14 @@ class HostProcess:
                     status="ok",
                     models=rows,
                     permission_options=permissions,
+                    injects_prompt=injects_prompt,
                 )
         except Exception as exc:  # noqa: BLE001 — config exceptions can carry credential values
             return HostModelOptionsResultFrame(
                 request_id=frame.request_id,
                 status="failed",
                 error=f"model source failed ({type(exc).__name__}); run omnigent models check",
+                injects_prompt=injects_prompt,
             )
         if harness in ("codex-native", "codex"):
             # Harness-truth lane: every launch shape is answered from the

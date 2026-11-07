@@ -450,6 +450,7 @@ def _to_conversation(
         cost_control_mode_override=overrides["cost_control_mode_override"],
         subagent_routing_override=overrides["subagent_routing_override"],
         harness_override=overrides["harness_override"],
+        session_prompt=row.session_prompt,
         # Stored as ``"on"`` / absent; surfaced as a plain bool on the entity.
         share_workspace_files=overrides["share_workspace_files"] == "on",
         sub_agent_name=meta.sub_agent_name if meta else None,
@@ -1732,6 +1733,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         cost_control_mode_override: str | None = None,
         subagent_routing_override: str | None = None,
         harness_override: str | None = None,
+        session_prompt: str | None = None,
     ) -> Conversation:
         """
         Create a new conversation in the database.
@@ -1803,6 +1805,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         now = now_epoch()
         new_id = conversation_id if conversation_id is not None else generate_conversation_id()
         encoded_kind = encode_conversation_kind(kind)
+        from omnigent.runtime.instruction_layers import validate_session_prompt
+
+        validate_session_prompt(session_prompt)
         encoded_terminal_launch_args = (
             json.dumps(terminal_launch_args) if terminal_launch_args is not None else None
         )
@@ -1928,6 +1933,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     root_conversation_id=root_id,
                     agent_id=agent_id,
                     session_overrides=encoded_overrides,
+                    session_prompt=session_prompt,
                 )
                 ap_sess.add(row)
                 if prepared_labels:
@@ -8991,6 +8997,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         host_id: str | None = None,
         inference_snapshot: dict[str, Any] | None = None,
         created_by: str | None = None,
+        session_prompt: str | None = None,
     ) -> CreatedSession:
         """
         Insert a conversation row and session-scoped agent.
@@ -9072,6 +9079,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             host_id=host_id,
             inference_snapshot=inference_snapshot,
             created_by=created_by,
+            session_prompt=session_prompt,
         )
 
     def _create_session_with_agent_with_id(
@@ -9097,11 +9105,15 @@ class SqlAlchemyConversationStore(ConversationStore):
         host_id: str | None = None,
         inference_snapshot: dict[str, Any] | None = None,
         created_by: str | None = None,
+        session_prompt: str | None = None,
     ) -> CreatedSession:
         """Body of :meth:`create_session_with_agent` under a caller-supplied
         ``conversation_id``. The public method generates a fresh id; this seam
         lets a subclass inject one (MAS's WHS-homed store injects the WHS node id)."""
+        from omnigent.runtime.instruction_layers import validate_session_prompt
         from omnigent.stores.conversation_store import ConversationNotFoundError
+
+        validate_session_prompt(session_prompt)
 
         now = now_epoch()
         encoded_overrides = _encode_session_overrides(
@@ -9146,6 +9158,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 agent_id=agent_id,
                 session_overrides=encoded_overrides,
             )
+            conversation_row.session_prompt = session_prompt
             ap_sess.add(conversation_row)
             if prepared_labels:
                 _upsert_prepared_labels(ap_sess, conversation_id, prepared_labels, now)
@@ -9502,6 +9515,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 }
             )
             new_conv_values: dict[str, Any] = {
+                "session_prompt": source.session_prompt,
                 "id": new_conv_id,
                 "created_at": now,
                 "updated_at": now,

@@ -2201,6 +2201,11 @@ def register_core_routes(
                     suppress_recovery_turn=suppress_recovery_turn,
                     peer_messaging_enabled=peer_messaging_enabled,
                     global_instructions=global_instructions,
+                    instructions_override=(
+                        await initializer.resolve_instructions_override(conv)
+                        if initializer is not None
+                        else None
+                    ),
                 )
             except Exception:
                 # Must not fail the request; the fallback drops the seeded
@@ -3464,6 +3469,12 @@ def register_core_routes(
                 host_id=parsed_metadata.host_id,
             )
         create_presentation(request, result, hold.host_id if hold else parsed_metadata.host_id)
+        from omnigent.server.routes._session_create_validation import session_prompt_warnings
+
+        if created_conversation is not None:
+            result.warnings = await session_prompt_warnings(
+                request, created_conversation, spec_harness(spec)
+            )
         return result
 
     # ── GET /sessions/projects ────────────────────────────────────

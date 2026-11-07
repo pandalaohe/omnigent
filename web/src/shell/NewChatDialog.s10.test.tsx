@@ -304,6 +304,27 @@ afterEach(() => {
 });
 
 describe("NewChatLandingScreen tokens", () => {
+  it("sends this chat's startup text separately from the first message", async () => {
+    renderLanding();
+    await waitForWorkspaceSeed();
+    fireEvent.click(screen.getByText("Prompt for this chat", { selector: "summary" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Prompt for this chat" }), {
+      target: { value: "Use this instruction for this chat only." },
+    });
+    typeMessage("First user message");
+    await submitCreate();
+    const created = vi
+      .mocked(authenticatedFetch)
+      .mock.calls.find(([url, options]) => url === "/v1/sessions" && options?.method === "POST");
+    expect(JSON.parse(created![1]!.body as string).session_prompt).toBe(
+      "Use this instruction for this chat only.",
+    );
+    expect(setPendingInitialPromptMock).toHaveBeenCalledWith(
+      "conv_new",
+      expect.objectContaining({ text: "First user message" }),
+    );
+  });
+
   it("inserts a token at the caret for a picked file", async () => {
     renderLanding();
     const field = landingInput();
