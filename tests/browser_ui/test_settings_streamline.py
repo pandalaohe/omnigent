@@ -320,7 +320,7 @@ def test_reserve_width_persists_and_settings_fit(
         ("context-usage", "/settings/general#context-usage"),
         ("runtime-resources", "/system"),
         ("calling-defaults", "/settings/agents#calling-defaults"),
-        ("agents", "/settings/agents"),
+        # Agents is a current navigation entry, not a legacy link.
     ],
 )
 def test_legacy_links_open_the_new_group(

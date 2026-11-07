@@ -249,6 +249,29 @@ def browser_contract(
         ("/v1/custom-agents", {"object": "list", "data": [], "has_more": False}),
         (
             re.compile(
+                rf"^{re.escape(browser_base_url)}/v1/sessions/[^/]+/auto-rotation(?:\?.*)?$"
+            ),
+            {
+                "eligible": False,
+                "ineligible_reason": "harness",
+                "harness": None,
+                "enabled": False,
+                "compactions_setting": 4,
+                "remaining_pct_setting": 25,
+                "sources": {
+                    "enabled": "default",
+                    "compactions": "default",
+                    "remaining_pct": "default",
+                },
+                "compactions": 0,
+                "remaining_pct": None,
+                "approximate": [],
+                "due": False,
+                "rotation_pending": False,
+            },
+        ),
+        (
+            re.compile(
                 rf"^{re.escape(browser_base_url)}/v1/sessions/[^/]+/standing-(?:pass|approval)(?:\?.*)?$"
             ),
             lambda request: {
