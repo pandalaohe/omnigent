@@ -1,4 +1,5 @@
 import {
+  isUserPreferenceNamespaceDirty,
   queueAcknowledgedUserPreferencePatch,
   queueUserPreferencePatch,
 } from "./userPreferencesSync";
@@ -275,18 +276,8 @@ export function mirrorLegacyChildKeepWarm(childKeepWarmEnabled: boolean): void {
   queueUserPreferencePatch("session_collab", merged);
 }
 
-export function isSessionCollabPreferenceDirty(
-  rawDirty: string | null = typeof window !== "undefined"
-    ? window.localStorage.getItem(USER_PREFERENCES_DIRTY_STORAGE_KEY)
-    : null,
-): boolean {
-  if (!rawDirty) return false;
-  try {
-    const parsed = JSON.parse(rawDirty) as unknown;
-    return Array.isArray(parsed) && parsed.includes("session_collab");
-  } catch {
-    return false;
-  }
+export function isSessionCollabPreferenceDirty(rawDirty?: string | null): boolean {
+  return isUserPreferenceNamespaceDirty("session_collab", rawDirty);
 }
 
 function persistNormalizedPreferences(

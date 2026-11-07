@@ -13,6 +13,8 @@ import {
   writeSessionCollabPreferences,
 } from "@/lib/sessionCollabPreferences";
 import {
+  initializeUserPreferencesSync,
+  queueUserPreferencePatch,
   resetUserPreferencesSyncForTests,
   USER_PREFERENCES_PATCH_ACKNOWLEDGED_EVENT,
 } from "@/lib/userPreferencesSync";
@@ -343,17 +345,28 @@ describe("AutoRotationChip", () => {
   });
 
   it("waits for cross-tab sync acknowledgement before refreshing on storage events", async () => {
+    await initializeUserPreferencesSync(
+      { version: 1, settings: {} },
+      vi.fn(() => new Promise<Response>(() => {})),
+      "alice",
+    );
+
     mountChip("parent-1");
     await screen.findByRole("button", { name: "Auto-rotation: Off" });
     expect(fetchMock).toHaveBeenCalledTimes(1);
 
-    // Another tab queues a PATCH (marking session_collab dirty) and writes localStorage.
-    localStorage.setItem(USER_PREFERENCES_DIRTY_STORAGE_KEY, JSON.stringify(["session_collab"]));
-    const updatedRaw = JSON.stringify({
+    // Another tab queues a PATCH through the sync layer (storing {"__default__:alice":["session_collab"]})
+    // and writes SESSION_COLLAB_STORAGE_KEY.
+    const updated = {
       ...SESSION_COLLAB_DEFAULTS,
       autoRotationEnabled: true,
       autoRotationCompactions: 7,
-    });
+    };
+    queueUserPreferencePatch("session_collab", updated);
+    const dirtyRaw = localStorage.getItem(USER_PREFERENCES_DIRTY_STORAGE_KEY);
+    expect(JSON.parse(dirtyRaw ?? "{}")).toEqual({ "__default__:alice": ["session_collab"] });
+
+    const updatedRaw = JSON.stringify(updated);
     localStorage.setItem(SESSION_COLLAB_STORAGE_KEY, updatedRaw);
 
     act(() => {
@@ -385,7 +398,7 @@ describe("AutoRotationChip", () => {
         window,
         new StorageEvent("storage", {
           key: USER_PREFERENCES_DIRTY_STORAGE_KEY,
-          oldValue: JSON.stringify(["session_collab"]),
+          oldValue: dirtyRaw,
           newValue: null,
         }),
       );
@@ -393,5 +406,41 @@ describe("AutoRotationChip", () => {
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
     expect(await screen.findByRole("button", { name: "Auto-rotation: 1/7" })).toBeInTheDocument();
+  });
+
+  it("invalidates every session's auto-rotation query on ACK so an unmounted session refetches on remount", async () => {
+    const { rerenderChip } = mountChip("parent-a");
+    await screen.findByRole("button", { name: "Auto-rotation: Off" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Switch to session B (unmounting A's chip while A's query stays cached under staleTime: 15_000).
+    rerenderChip("parent-b");
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+    fetchMock.mockImplementation(async (url: string) => ({
+      ok: true,
+      json: async () => ({
+        ...initialStatus,
+        enabled: true,
+        compactions_setting: url.includes("parent-a") ? 6 : 5,
+        sources: { enabled: "user", compactions: "user", remaining_pct: "default" },
+      }),
+    }));
+
+    // ACK arrives while session A's chip is unmounted.
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent(USER_PREFERENCES_PATCH_ACKNOWLEDGED_EVENT, {
+          detail: { namespace: "session_collab" },
+        }),
+      );
+    });
+    await screen.findByRole("button", { name: "Auto-rotation: 1/5" });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+
+    // Remount session A within staleTime: 15_000 — it must refetch rather than show cached Off.
+    rerenderChip("parent-a");
+    expect(await screen.findByRole("button", { name: "Auto-rotation: 1/6" })).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(4);
   });
 });

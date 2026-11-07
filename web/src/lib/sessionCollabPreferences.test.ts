@@ -314,11 +314,23 @@ describe("session collab preferences", () => {
     expect(resolved).toBe(true);
 
     expect(isSessionCollabPreferenceDirty()).toBe(false);
-    localStorage.setItem(USER_PREFERENCES_DIRTY_STORAGE_KEY, JSON.stringify(["session_collab"]));
+    const actualSync =
+      await vi.importActual<typeof UserPreferencesSyncModule>("./userPreferencesSync");
+    await initializeUserPreferencesSync(
+      { version: 1, settings: {} },
+      vi.fn(() => new Promise<Response>(() => {})),
+      "alice",
+    );
+    actualSync.queueUserPreferencePatch("sound_alerts", { enabled: true });
+    expect(isSessionCollabPreferenceDirty()).toBe(false);
+
+    actualSync.queueUserPreferencePatch("session_collab", updated);
+    const dirtySnapshot = localStorage.getItem(USER_PREFERENCES_DIRTY_STORAGE_KEY);
+    expect(JSON.parse(dirtySnapshot ?? "{}")).toEqual({
+      "__default__:alice": ["sound_alerts", "session_collab"],
+    });
     expect(isSessionCollabPreferenceDirty()).toBe(true);
-    localStorage.setItem(USER_PREFERENCES_DIRTY_STORAGE_KEY, JSON.stringify(["theme"]));
-    expect(isSessionCollabPreferenceDirty()).toBe(false);
-    localStorage.setItem(USER_PREFERENCES_DIRTY_STORAGE_KEY, "invalid-json");
-    expect(isSessionCollabPreferenceDirty()).toBe(false);
+    expect(isSessionCollabPreferenceDirty(dirtySnapshot)).toBe(true);
+    expect(isSessionCollabPreferenceDirty(null)).toBe(false);
   });
 });

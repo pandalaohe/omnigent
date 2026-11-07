@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { RefreshCwIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -47,6 +47,49 @@ function parseOptionalBoundedInteger(
   const value = Number(trimmed);
   if (!Number.isSafeInteger(value) || value < min || value > max) return null;
   return value;
+}
+
+let sessionCollabSyncEpoch = 0;
+let globalSyncListenerInstalled = false;
+let globalPendingCrossTabSync = false;
+const clientSyncEpochs = new WeakMap<QueryClient, number>();
+
+function ensureGlobalSessionCollabSyncListener(): void {
+  if (globalSyncListenerInstalled || typeof window === "undefined") return;
+  globalSyncListenerInstalled = true;
+  globalPendingCrossTabSync = isSessionCollabPreferenceDirty();
+  window.addEventListener(USER_PREFERENCES_PATCH_ACKNOWLEDGED_EVENT, (event: Event) => {
+    const detail = (event as CustomEvent<{ namespace?: string }>).detail;
+    if (detail?.namespace !== "session_collab") return;
+    globalPendingCrossTabSync = false;
+    sessionCollabSyncEpoch += 1;
+  });
+  window.addEventListener("storage", (event: StorageEvent) => {
+    if (event.key === null) {
+      globalPendingCrossTabSync = false;
+      sessionCollabSyncEpoch += 1;
+      return;
+    }
+    if (event.key === SESSION_COLLAB_STORAGE_KEY) {
+      if (isSessionCollabPreferenceDirty()) {
+        globalPendingCrossTabSync = true;
+        return;
+      }
+      globalPendingCrossTabSync = false;
+      sessionCollabSyncEpoch += 1;
+      return;
+    }
+    if (event.key === USER_PREFERENCES_DIRTY_STORAGE_KEY) {
+      const nowDirty = isSessionCollabPreferenceDirty(
+        event.newValue !== undefined ? event.newValue : undefined,
+      );
+      const wasDirty = globalPendingCrossTabSync || isSessionCollabPreferenceDirty(event.oldValue);
+      globalPendingCrossTabSync = nowDirty;
+      if (wasDirty && !nowDirty) {
+        sessionCollabSyncEpoch += 1;
+      }
+    }
+  });
 }
 
 export function AutoRotationChip({
@@ -128,10 +171,18 @@ export function AutoRotationChip({
   });
 
   useEffect(() => {
+    ensureGlobalSessionCollabSyncListener();
     let pendingCrossTabSync = isSessionCollabPreferenceDirty();
     const invalidate = () => {
-      void client.invalidateQueries({ queryKey: ["auto-rotation", sessionId] });
+      clientSyncEpochs.set(client, sessionCollabSyncEpoch);
+      void client.invalidateQueries({ queryKey: ["auto-rotation"] });
     };
+    const seenEpoch = clientSyncEpochs.get(client);
+    if (seenEpoch === undefined) {
+      clientSyncEpochs.set(client, sessionCollabSyncEpoch);
+    } else if (seenEpoch < sessionCollabSyncEpoch) {
+      invalidate();
+    }
     const onAcknowledged = (event: Event) => {
       const detail = (event as CustomEvent<{ namespace?: string }>).detail;
       if (detail?.namespace !== "session_collab") return;

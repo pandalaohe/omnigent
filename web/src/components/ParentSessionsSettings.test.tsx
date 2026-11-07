@@ -1,11 +1,14 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import type * as UserPreferencesSyncModule from "@/lib/userPreferencesSync";
+
 const { queuePatchMock, queueAcknowledgedPatchMock } = vi.hoisted(() => ({
   queuePatchMock: vi.fn(),
   queueAcknowledgedPatchMock: vi.fn(),
 }));
-vi.mock("@/lib/userPreferencesSync", () => ({
+vi.mock("@/lib/userPreferencesSync", async (importOriginal) => ({
+  ...(await importOriginal<typeof UserPreferencesSyncModule>()),
   queueUserPreferencePatch: queuePatchMock,
   queueAcknowledgedUserPreferencePatch: queueAcknowledgedPatchMock,
   USER_PREFERENCES_PATCH_REJECTED_EVENT: "omnigent:user-preference-rejected",
