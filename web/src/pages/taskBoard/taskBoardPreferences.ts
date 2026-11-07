@@ -3,7 +3,7 @@ import type { RouteMode } from "./taskBoardRoutes";
 
 export const BOARD_PREFERENCES_KEY = "omnigent.taskBoard.display";
 export interface BoardPreferences {
-  view: "sessions" | "routes";
+  view: "sessions" | "routes" | "log" | "history" | "today" | "sources";
   mode: RouteMode;
   focus: string[];
   aliases: Record<string, string>;
@@ -23,7 +23,9 @@ function readPreferences(): BoardPreferences {
     const value = JSON.parse(localStorage.getItem(BOARD_PREFERENCES_KEY) ?? "null");
     if (!value || typeof value !== "object") return defaults;
     return {
-      view: value.view === "routes" ? "routes" : "sessions",
+      view: ["routes", "log", "history", "today", "sources"].includes(value.view)
+        ? value.view
+        : "sessions",
       mode: value.mode === "time" ? "time" : "order",
       focus: Array.isArray(value.focus)
         ? value.focus.filter((item: unknown) => typeof item === "string")
@@ -49,15 +51,15 @@ function readPreferences(): BoardPreferences {
 }
 export function useBoardPreferences() {
   const [preferences, setPreferences] = useState(readPreferences);
-  const update = (change: Partial<BoardPreferences>) =>
-    setPreferences((current) => {
-      const next = { ...current, ...change };
-      try {
-        localStorage.setItem(BOARD_PREFERENCES_KEY, JSON.stringify(next));
-      } catch {
-        /* Display preferences remain usable when storage is disabled. */
-      }
-      return next;
-    });
+  const update = (change: Partial<BoardPreferences>): boolean => {
+    const next = { ...preferences, ...change };
+    setPreferences(next);
+    try {
+      localStorage.setItem(BOARD_PREFERENCES_KEY, JSON.stringify(next));
+      return true;
+    } catch {
+      return false;
+    }
+  };
   return [preferences, update] as const;
 }

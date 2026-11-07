@@ -8,6 +8,10 @@ import {
   ListTreeIcon,
   RouteIcon,
   PinIcon,
+  HistoryIcon,
+  CalendarDaysIcon,
+  ScrollTextIcon,
+  SettingsIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Link } from "@/lib/routing";
@@ -29,6 +33,9 @@ import { TaskBoardRoutes, BoardPager } from "./TaskBoardRoutes";
 import { TaskBoardSearch } from "./TaskBoardSearch";
 import { TaskProgressIcon } from "./TaskProgressIcon";
 import { formatNumber, t } from "./taskBoardText";
+
+import { TaskBoardActivity } from "./TaskBoardActivity";
+import { TaskBoardSources } from "./TaskBoardSources";
 
 function ReadFailure({ label, retry }: { label: string; retry: () => void }) {
   return (
@@ -286,6 +293,24 @@ export function TaskBoardPage() {
             <RouteIcon className="size-4" />
             {t("view.routes")}
           </Button>
+          {(
+            [
+              ["log", ScrollTextIcon],
+              ["history", HistoryIcon],
+              ["today", CalendarDaysIcon],
+              ["sources", SettingsIcon],
+            ] as const
+          ).map(([view, Icon]) => (
+            <Button
+              key={view}
+              variant={preferences.view === view ? "secondary" : "ghost"}
+              aria-pressed={preferences.view === view}
+              onClick={() => updatePreferences({ view })}
+            >
+              <Icon className="size-4" />
+              {t(`view.${view}`)}
+            </Button>
+          ))}
         </nav>
         <span className="ml-auto text-xs text-muted-foreground">
           {t("board.tasks", { count: tasks.length })}
@@ -502,36 +527,51 @@ export function TaskBoardPage() {
           />
         </div>
       )}
-      {preferences.view === "sessions" ? (
-        sessionsQuery.isPending ? (
+      {(["log", "history", "today"] as const).map((view) =>
+        preferences.view === view ? (
+          <TaskBoardActivity
+            key={view}
+            view={view}
+            tasks={tasks}
+            sessions={sessions}
+            onSelect={select}
+          />
+        ) : null,
+      )}
+      {preferences.view === "sources" && (
+        <TaskBoardSources sources={sources} preferences={preferences} update={updatePreferences} />
+      )}
+      {(preferences.view === "sessions" || preferences.view === "routes") &&
+        (preferences.view === "sessions" ? (
+          sessionsQuery.isPending ? (
+            <Spinner aria-label={t("board.loading")} className="mx-auto my-12 size-5" />
+          ) : (
+            <SessionsView
+              sessions={sessions}
+              selected={sessionSelection}
+              onSelect={setSessionSelection}
+              silent={silentIds}
+            />
+          )
+        ) : tasksQuery.isPending ? (
           <Spinner aria-label={t("board.loading")} className="mx-auto my-12 size-5" />
         ) : (
-          <SessionsView
-            sessions={sessions}
-            selected={sessionSelection}
-            onSelect={setSessionSelection}
-            silent={silentIds}
+          <TaskBoardRoutes
+            tasks={tasks.filter(
+              (task) =>
+                !preferences.hiddenSources.includes(task["omnigent.ai:source"]) &&
+                (!taskSelection.length || taskSelection.includes(taskIdentity(task))),
+            )}
+            sources={sources}
+            aliases={preferences.aliases}
+            mode={preferences.mode}
+            onMode={(mode) => updatePreferences({ mode })}
+            focus={preferences.focus}
+            onFocus={(focus) => updatePreferences({ focus })}
+            onSelect={select}
+            scheduled={schedule.data?.scheduled_tasks ?? []}
           />
-        )
-      ) : tasksQuery.isPending ? (
-        <Spinner aria-label={t("board.loading")} className="mx-auto my-12 size-5" />
-      ) : (
-        <TaskBoardRoutes
-          tasks={tasks.filter(
-            (task) =>
-              !preferences.hiddenSources.includes(task["omnigent.ai:source"]) &&
-              (!taskSelection.length || taskSelection.includes(taskIdentity(task))),
-          )}
-          sources={sources}
-          aliases={preferences.aliases}
-          mode={preferences.mode}
-          onMode={(mode) => updatePreferences({ mode })}
-          focus={preferences.focus}
-          onFocus={(focus) => updatePreferences({ focus })}
-          onSelect={select}
-          scheduled={schedule.data?.scheduled_tasks ?? []}
-        />
-      )}
+        ))}
       {preferences.view === "routes" &&
         preferences.mode === "time" &&
         schedule.data?.scheduled_tasks.some(
