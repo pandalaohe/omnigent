@@ -96,7 +96,7 @@ async def test_session_prompt_override_is_per_session_and_refreshed_on_reinit(mo
 
 def _stub_permission_start_for_routing_test(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep harness routing tests independent of the permission hook handshake."""
-    monkeypatch.setattr(PermissionTierRuntime, "fence_start", lambda *args: None)
+    monkeypatch.setattr(PermissionTierRuntime, "fence_start", lambda *args, **kwargs: None)
     monkeypatch.setattr(PermissionTierRuntime, "install", lambda *args: None)
 
 

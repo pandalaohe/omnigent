@@ -8236,6 +8236,7 @@ def create_runner_app(
         explicit_bridge_dir: Path | None = None,
         await_notify: bool = False,
         session_labels: Mapping[str, str] | None = None,
+        retry_mcp_discovery: bool = False,
     ) -> None:
         import json as _json
 
@@ -8290,6 +8291,7 @@ def create_runner_app(
             and current.session_open_enabled == open_for_relay
             and (current.pi_scope_relay is not None) == pi_scoped_relay
             and known_bridge_dir is None
+            and not (retry_mcp_discovery and current.mcp_discovery_failed)
         ):
             return
 
@@ -8324,6 +8326,7 @@ def create_runner_app(
             and current.peer_messaging_enabled == peer_for_relay
             and current.session_open_enabled == open_for_relay
             and (current.pi_scope_relay is not None) == pi_scoped_relay
+            and not (retry_mcp_discovery and current.mcp_discovery_failed)
         ):
             return
 
@@ -8353,10 +8356,12 @@ def create_runner_app(
                         or {"type": "object", "properties": {}},
                     }
                 )
+        mcp_discovery_failed = False
         if relay_spec is not None and relay_spec.mcp_servers:
             # Native terminals consume the persistent relay, not per-turn schemas.
             mcp = await ProxyMcpManager(session_id, server_client).schemas_for(relay_spec)
             relay_schemas.extend(mcp.schemas)
+            mcp_discovery_failed = bool(mcp.failures)
             for service, error in mcp.failures.items():
                 _logger.warning(
                     "Native relay MCP %r unavailable: %s",
@@ -8372,6 +8377,7 @@ def create_runner_app(
                 and current.peer_messaging_enabled == peer_for_relay
                 and current.session_open_enabled == open_for_relay
                 and (current.pi_scope_relay is not None) == pi_scoped_relay
+                and not (retry_mcp_discovery and current.mcp_discovery_failed)
             ):
                 return
 
@@ -8563,6 +8569,7 @@ def create_runner_app(
             peer_messaging_enabled=peer_for_relay,
             session_open_enabled=open_for_relay,
             pi_scope_relay=pi_scope_relay,
+            mcp_discovery_failed=mcp_discovery_failed,
         )
         # Close last: the new advertisement is already written, and
         # ClaudeNativeToolRelay.close only unlinks a tool_relay.json that
@@ -9329,6 +9336,15 @@ def create_runner_app(
         elif binding := _session_comment_relays.get(conv):
             await _ensure_comment_relay_started(
                 conv, explicit_bridge_dir=binding.bridge_dir, await_notify=False
+            )
+
+        # A stable spec can still have an incomplete relay after a gateway outage.
+        # Retry on a new turn without making repeated terminal launches rediscover tools.
+        if (binding := _session_comment_relays.get(conv)) and binding.mcp_discovery_failed:
+            await _ensure_comment_relay_started(
+                conv,
+                explicit_bridge_dir=binding.bridge_dir,
+                retry_mcp_discovery=True,
             )
 
         try:
