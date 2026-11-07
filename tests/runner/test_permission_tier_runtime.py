@@ -2604,10 +2604,7 @@ def test_pi_scope_unlisted_bridged_tool_is_denied_in_auto(tmp_path):
             {"name": "unlisted_bridge_tool", "sourceInfo": bridge_source},
         ],
     )
-    for call_id, name, arguments in (
-        ("inbox-call", "sys_read_inbox", {}),
-        ("calc-call", "calculate", {"expression": "19 * 23"}),
-    ):
+    for call_id, name, arguments in (("inbox-call", "sys_read_inbox", {}),):
         receipt = runtime.pi_origin_receipt(
             "session-a",
             child.credential,
@@ -2628,6 +2625,7 @@ def test_pi_scope_unlisted_bridged_tool_is_denied_in_auto(tmp_path):
         assert decision.action.value == "ALLOW", (name, decision.reason)
 
     for call_id, name, arguments in (
+        ("calc-call", "calculate", {"expression": "19 * 23"}),
         ("terminal-call", "sys_terminal_launch", {"command": "sh"}),
         ("unlisted-call", "unlisted_bridge_tool", {"x": 1}),
     ):
@@ -2650,6 +2648,42 @@ def test_pi_scope_unlisted_bridged_tool_is_denied_in_auto(tmp_path):
         )
         assert decision.action.value == "DENY", (name, decision.reason)
         assert decision.reason == "Unknown tool schema"
+
+
+@pytest.mark.parametrize("tier,action", [("auto", "DENY"), ("plan", "DENY"), ("ask", "ASK")])
+def test_pi_scope_agent_declared_calculate_requires_approval(tmp_path, tier, action):
+    runtime, _parent, _child, _source, _registry = _scoped_runtime(tmp_path, tier)
+    child = runtime.open_pi_child_scope("session-a")
+    _publish_scope(
+        runtime,
+        child,
+        [
+            {
+                "name": "calculate",
+                "sourceInfo": {"source": "inline", "path": "<inline:omnigent-permission>"},
+            }
+        ],
+    )
+    arguments: dict[str, object] = {"expression": "19 * 23"}
+    receipt = runtime.pi_origin_receipt(
+        "session-a",
+        child.credential,
+        call_id="calc-call",
+        name="calculate",
+        arguments=arguments,
+        local_execution=False,
+    )
+    _, decision = runtime.inspect(
+        "session-a",
+        call_id=receipt.binding.call_id,
+        name="calculate",
+        arguments=arguments,
+        expected_revision=3,
+        local_execution=False,
+        origin_receipt=receipt.token,
+    )
+    assert decision.action.value == action
+    assert decision.reason == "Unknown tool schema"
 
 
 @pytest.mark.asyncio

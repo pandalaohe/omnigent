@@ -176,22 +176,38 @@ def test_yaml_agent_with_tools(
     env = _build_harness_env(harness, mock_credentials_env, mock_llm_server_url)
     yaml_path = omnigent_repo_root / "tests" / "resources" / "examples" / "agent_with_tools.yaml"
 
-    result = subprocess.run(
-        [
+    command = [
+        str(omnigent_python),
+        "-m",
+        "omnigent",
+        "run",
+        str(yaml_path),
+        "--model",
+        mock_model,
+        "--harness",
+        harness,
+        "-p",
+        _PROMPT,
+        "--no-log",
+        "--no-session",
+    ]
+    if harness == "pi":
+        # YAML tools have no trusted effect classification. This scenario verifies
+        # tool round-tripping, so select full explicitly through the headless API.
+        command = [
             str(omnigent_python),
-            "-m",
-            "omnigent",
-            "run",
+            "-c",
+            "import sys; from omnigent.chat import ChatOverrides, _run_local_headless_prompt; "
+            "_run_local_headless_prompt(sys.argv[1], None, "
+            "overrides=ChatOverrides(harness='pi', model=sys.argv[2]), "
+            "prompt=sys.argv[3], ephemeral=True, permission_tier='full')",
             str(yaml_path),
-            "--model",
             mock_model,
-            "--harness",
-            harness,
-            "-p",
             _PROMPT,
-            "--no-log",
-            "--no-session",
-        ],
+        ]
+
+    result = subprocess.run(
+        command,
         env=env,
         cwd=str(omnigent_repo_root),
         capture_output=True,
