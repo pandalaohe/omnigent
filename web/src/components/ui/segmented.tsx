@@ -10,6 +10,8 @@ export interface SegmentedProps<T extends string> {
   stretch?: boolean;
   /** For a control that qualifies a value beside it, not the value itself. */
   quiet?: boolean;
+  /** Fit a fixed-height header without the regular touch target minimum. */
+  fitHeight?: boolean;
   className?: string;
 }
 
@@ -21,6 +23,7 @@ export function Segmented<T extends string>({
   onChange,
   stretch,
   quiet,
+  fitHeight,
   className,
 }: SegmentedProps<T>) {
   const buttons = useRef<(HTMLButtonElement | null)[]>([]);
@@ -32,6 +35,7 @@ export function Segmented<T extends string>({
         "inline-flex max-w-full rounded-lg bg-muted p-1",
         quiet && "p-0.5",
         stretch && "flex w-full",
+        fitHeight && "h-full max-h-10",
         className,
       )}
     >
@@ -52,7 +56,8 @@ export function Segmented<T extends string>({
           title={option.title}
           data-testid={option.testId}
           className={cn(
-            "inline-flex min-h-11 min-w-11 items-center justify-center rounded-md px-2 text-ui whitespace-normal wrap-anywhere outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring md:min-h-8 md:px-3",
+            "inline-flex min-w-11 items-center justify-center rounded-md px-2 text-ui whitespace-normal wrap-anywhere outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring md:px-3",
+            fitHeight ? "min-h-0" : "min-h-11 md:min-h-8",
             stretch && "flex-1",
             value === option.value
               ? quiet

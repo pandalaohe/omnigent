@@ -269,6 +269,11 @@ def test_session_grid_drag_persist_live_updates_and_close(
         assert first_cell.locator("header").bounding_box()["height"] == 32
         expect(first_cell.locator('header [data-size="icon-xs"]')).to_have_count(2)
         expect(first_cell.locator("header").get_by_role("radio")).to_have_count(2)
+        header_box = first_cell.locator("header").bounding_box()
+        track_box = first_cell.locator("header").get_by_role("radiogroup").bounding_box()
+        assert header_box and track_box
+        assert track_box["y"] >= header_box["y"]
+        assert track_box["y"] + track_box["height"] <= header_box["y"] + header_box["height"]
         # Both cells use real xterm attaches, with independent input and view selection.
         first_cell.get_by_test_id("side-chat-input").fill("Keep this chat draft")
         for cell in (first_cell, other_cell):
