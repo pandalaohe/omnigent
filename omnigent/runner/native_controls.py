@@ -2268,9 +2268,14 @@ def build_native_controls(
             session_id=conv_id,
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        if lifecycle_locked and _native_pane_status.get(conv_id) in ("running", "waiting"):
+            return Response(status_code=409)
         await _prepare_claude_native_pane_for_injection(
             conv_id, bridge_dir, lifecycle_locked=lifecycle_locked
         )
+        if lifecycle_locked and _native_pane_status.get(conv_id) in ("running", "waiting"):
+            return Response(status_code=409)
+        injection_options = {"require_idle": True} if lifecycle_locked else {}
         try:
             await _drive_claude_pane(
                 deadline,
@@ -2279,6 +2284,7 @@ def build_native_controls(
                 command=command,
                 timeout_s=1.0,
                 ready_timeout_s=min(_CLAUDE_CONTROL_PROMPT_WAIT_S, deadline.remaining_s()),
+                **injection_options,
             )
         except (RuntimeError, ValueError, OSError) as exc:
             return JSONResponse(

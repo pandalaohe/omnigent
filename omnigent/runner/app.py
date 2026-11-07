@@ -369,6 +369,7 @@ _WAITING_STATUS_MIN_SERVER_VERSION = "0.3.0"
 # Published statuses that mean a session's terminal is still working a turn.
 # ``waiting`` is parked on user input, so it keeps the runner alive too.
 _IN_FLIGHT_SESSION_STATUSES = ("running", "waiting")
+_ROTATION_SUCCESSION_GRACE_S = 60.0
 # Cached server version from the /api/version probe; ``None`` until a probe
 # succeeds. A failed probe stays ``None`` and is retried on the next
 # session-create — the GET is cheap and self-heals a transient failure.
@@ -6131,8 +6132,11 @@ def create_runner_app(
                 or (expected_revision is not None and expected_revision != str(revision))
             ):
                 return "not_requested"
-            if rotations_started.get(conv_id) == str(revision):
-                return "in_flight"
+            started = rotations_started.get(conv_id)
+            if started is not None:
+                if started[0] == str(revision) and time.monotonic() < started[1]:
+                    return "in_flight"
+                rotations_started.pop(conv_id, None)
         completed_pi_source = (
             harness == "pi"
             and isinstance(labels, dict)
@@ -6222,7 +6226,10 @@ def create_runner_app(
                     return "not_requested"
                 await process_manager.release(conv_id)
                 if require_label:
-                    rotations_started[conv_id] = str(snapshot["archive_revision"])
+                    rotations_started[conv_id] = (
+                        str(snapshot["archive_revision"]),
+                        time.monotonic() + _ROTATION_SUCCESSION_GRACE_S,
+                    )
                 return "started"
             else:
                 _logger.warning(
@@ -6250,13 +6257,16 @@ def create_runner_app(
                 extra={"session_id": conv_id},
             )
         if response.status_code < 400 and require_label:
-            rotations_started[conv_id] = str(snapshot["archive_revision"])
+            rotations_started[conv_id] = (
+                str(snapshot["archive_revision"]),
+                time.monotonic() + _ROTATION_SUCCESSION_GRACE_S,
+            )
         return "started" if response.status_code < 400 else "not_requested"
 
     rotations_in_flight: set[str] = set()
     # Injection acknowledgement precedes succession. Keep the accepted request
-    # fenced until its successor is observed or a different revision is requested.
-    rotations_started: dict[str, str] = {}
+    # fenced for two 30s succession request budgets, then allow bounded recovery.
+    rotations_started: dict[str, tuple[str, float]] = {}
 
     def _rotation_session_busy(conv_id: str) -> bool:
         return (

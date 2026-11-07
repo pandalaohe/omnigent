@@ -7111,6 +7111,29 @@ def test_kill_session_without_expected_close_leaves_no_marker(
     assert not pane_closed_by_omnigent(private_dir)
 
 
+@pytest.mark.parametrize("busy_check", [0, 1, 2, 3, 4])
+@pytest.mark.parametrize("live_busy", [True, None])
+def test_automatic_clear_rechecks_live_status_before_keys(
+    tmp_path, monkeypatch, busy_check, live_busy
+):
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=_TEST_TMUX_SOCKET, tmux_target="claude:0.0")
+    checks = iter([False] * busy_check + [live_busy])
+    keys = []
+    monkeypatch.setattr(claude_native_bridge, "_claude_turn_running", lambda *a: next(checks))
+    monkeypatch.setattr(
+        claude_native_bridge, "_reclaim_and_wait_for_prompt", lambda *a, **kw: None
+    )
+    monkeypatch.setattr(claude_native_bridge, "_clear_composer", lambda *a: None)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *a: _composer_pane("/clear"))
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", lambda *a: keys.append(a) or "")
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
+    with pytest.raises(RuntimeError, match="confirmed idle"):
+        claude_native_bridge.inject_slash_command(bridge_dir, command="/clear", require_idle=True)
+    assert sum(row[-1] == "Enter" for row in keys) == int(busy_check == 4)
+    assert sum(row[-1] == "/clear" for row in keys) == int(busy_check >= 3)
+
+
 def test_inject_slash_command_clears_draft_pastes_literal_then_enter(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

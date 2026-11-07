@@ -5291,6 +5291,7 @@ def _verify_submit_accepted(
     wait_for_startup: bool = False,
     submit_boundary: SubmitBoundary | None = None,
     submitted_text: str | None = None,
+    before_retry: Callable[[], None] | None = None,
 ) -> bool:
     """
     Wait for a submitted draft to leave the input box, re-sending Enter.
@@ -5315,6 +5316,7 @@ def _verify_submit_accepted(
     :param wait_for_startup: Preserve the first draft through slow terminal startup.
     :param submit_boundary: Native transcript boundary captured before Enter.
     :param submitted_text: Full submitted text; a marker alone cannot identify a refusal.
+    :param before_retry: Optional live idle guard before sending another Enter.
     :returns: ``True`` when the draft left the input box (accepted),
         ``False`` when it is still there after the full window.
     :raises ClaudeSubmitBlockedUnconfirmed: A fresh matching refusal appeared;
@@ -5400,6 +5402,8 @@ def _verify_submit_accepted(
             )
         if _draft_in_input_box(pane, needle) and now - last_enter >= retry_interval:
             _raise_if_user_prompt_pending(bridge_dir, pane)
+            if before_retry is not None:
+                before_retry()
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
             retries += 1
             delivery_diagnostics.record_details(retries=retries)
@@ -5653,6 +5657,7 @@ def inject_slash_command(
     confirm_hint: str | None = None,
     wait_for_startup: bool = False,
     ready_timeout_s: float | None = None,
+    require_idle: bool = False,
 ) -> None:
     """
     Type a Claude Code slash command into the tmux pane and submit it.
@@ -5688,6 +5693,8 @@ def inject_slash_command(
         outliving the request. ``None`` waits like :func:`inject_user_message`
         — *timeout_s* as the base budget, extended while a live pane is still
         booting.
+    :param require_idle: Refuse automatic rotation unless Claude's live status
+        confirms idle immediately before typing and submitting the command.
     :raises ValueError: If *command* is empty, does not start with
         ``/``, contains a newline, or *auto_confirm* is set without a
         *confirm_hint*.
@@ -5711,6 +5718,15 @@ def inject_slash_command(
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
+
+    def check_idle() -> None:
+        if (
+            require_idle
+            and _claude_turn_running(bridge_dir, socket_path, tmux_target) is not False
+        ):
+            raise RuntimeError("Automatic rotation requires a confirmed idle Claude pane")
+
+    check_idle()
     startup_submit = wait_for_startup and (
         _read_json_file(bridge_dir / _STATE_FILE).get("accepted_input_tmux")
         != _tmux_input_identity(bridge_dir)
@@ -5725,6 +5741,7 @@ def inject_slash_command(
         timeout_s=timeout_s,
         ready_timeout_s=ready_timeout_s,
     )
+    check_idle()
     if has_pending_user_prompt(bridge_dir):
         raise ClaudeUserPromptPending(
             "Answer the pending Claude question or permission request before changing settings.",
@@ -5735,6 +5752,7 @@ def inject_slash_command(
     # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
     # not interrupt an in-flight generation.
     _clear_composer(socket_path, tmux_target)
+    check_idle()
     # ``-l`` pastes ``/`` and spaces literally; trailing Enter submits.
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, command)
     # Same delivery hazards as inject_user_message: a coalesced or dropped
@@ -5756,6 +5774,7 @@ def inject_slash_command(
         raise ClaudeUserPromptPending(
             "Claude is waiting for an explicit answer; settings command not sent."
         )
+    check_idle()
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     if draft_seen:
         # Retry only while the command remains drafted and no user decision
@@ -5767,6 +5786,7 @@ def inject_slash_command(
             what="slash command",
             bridge_dir=bridge_dir,
             wait_for_startup=startup_submit,
+            before_retry=check_idle if require_idle else None,
         ):
             raise RuntimeError(
                 f"Claude Code did not accept the slash command within "

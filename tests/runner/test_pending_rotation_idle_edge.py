@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterator
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -180,6 +181,57 @@ def _clean_pending_rotations() -> Iterator[None]:
 
 
 @pytest.mark.asyncio
+async def test_rotation_retention_expires_without_succession(monkeypatch):
+    effects = []
+    now = [100.0]
+    monkeypatch.setattr(
+        runner_app, "time", SimpleNamespace(monotonic=lambda: now[0], time=runner_app.time.time)
+    )
+    monkeypatch.setattr(
+        claude_native_bridge, "inject_slash_command", lambda *a, **kw: effects.append(kw)
+    )
+    app = _build_app(_RotationServerClient())
+    async with _runner_client(app) as client:
+        await _seed_session(client)
+        url = f"/v1/sessions/{CONV_ID}/pending-rotation"
+        assert (await client.post(url)).json() == {"status": "started"}
+        now[0] += runner_app._ROTATION_SUCCESSION_GRACE_S - 0.01
+        assert (await client.post(url)).json() == {"status": "in_flight"}
+        now[0] += 0.01
+        assert (await client.post(url)).json() == {"status": "started"}
+        assert (await client.post(url)).json() == {"status": "in_flight"}
+    assert len(effects) == 2
+
+
+@pytest.mark.asyncio
+async def test_terminal_turn_during_label_read_skips_rotation(monkeypatch):
+    effects = []
+    monkeypatch.setattr(
+        claude_native_bridge, "inject_slash_command", lambda *a, **kw: effects.append(kw)
+    )
+    server = _RotationServerClient()
+    app = _build_app(server)
+    original_get = server.get
+    async with _runner_client(app) as client:
+        await _seed_session(client)
+
+        async def get(url, **kwargs):
+            if url.endswith("/labels"):
+                response = await client.post(
+                    f"/v1/sessions/{CONV_ID}/events",
+                    json={"type": "external_session_status", "data": {"status": "running"}},
+                )
+                assert response.status_code in (200, 204)
+            return await original_get(url, **kwargs)
+
+        server.get = get
+        assert (await client.post(f"/v1/sessions/{CONV_ID}/pending-rotation")).json() == {
+            "status": "not_requested"
+        }
+    assert effects == []
+
+
+@pytest.mark.asyncio
 async def test_idle_edge_clears_session_with_pending_rotation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -194,8 +246,9 @@ async def test_idle_edge_clears_session_with_pending_rotation(
         ready_timeout_s: float,
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
+        require_idle: bool = False,
     ) -> None:
-        del timeout_s, ready_timeout_s, auto_confirm, confirm_hint
+        del timeout_s, ready_timeout_s, auto_confirm, confirm_hint, require_idle
         injected.append((bridge_dir, command))
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
@@ -611,15 +664,23 @@ async def test_recovery_holds_runtime_boundary_through_injection(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_recovery_can_heal_pane_under_rotation_lock(monkeypatch, tmp_path):
+@pytest.mark.parametrize("terminal_input", [False, True])
+async def test_recovery_can_heal_pane_under_rotation_lock(monkeypatch, tmp_path, terminal_input):
     from omnigent.runner.resource_registry import SessionResourceView
     from omnigent.terminals import TerminalRegistry
     from tests.runner.test_app_sessions_native_session_change_heal import _plant_dead_claude_pane
 
     effects = []
+    rotating = False
 
     async def launch(ctx):
         effects.append("heal")
+        if terminal_input and rotating:
+            response = await client.post(
+                f"/v1/sessions/{CONV_ID}/events",
+                json={"type": "external_session_status", "data": {"status": "running"}},
+            )
+            assert response.status_code in (200, 204)
         return SessionResourceView(
             id="terminal_claude_main", type="terminal", session_id=ctx.session_id, name="claude"
         )
@@ -636,14 +697,15 @@ async def test_recovery_can_heal_pane_under_rotation_lock(monkeypatch, tmp_path)
     async with _runner_client(app) as client:
         await _seed_session(client)
         effects.clear()
+        rotating = True
         _plant_dead_claude_pane(
             registry, CONV_ID, tmp_path, claude_native_bridge.bridge_dir_for_bridge_id(CONV_ID)
         )
         result = await asyncio.wait_for(
             client.post(f"/v1/sessions/{CONV_ID}/pending-rotation"), timeout=2
         )
-        assert result.json() == {"status": "started"}
-    assert effects == ["heal", "/clear"]
+        assert result.json() == {"status": "not_requested" if terminal_input else "started"}
+    assert effects == (["heal"] if terminal_input else ["heal", "/clear"])
 
 
 @pytest.mark.asyncio
