@@ -747,7 +747,8 @@ class UsageHoursStore:
                 continue
             if increment and column in counters:
                 if value is not None:
-                    merged[column] = func.coalesce(getattr(SqlUsageHour, column), 0) + getattr(
+                    zero = 0.0 if column == "cost_usd" else 0
+                    merged[column] = func.coalesce(getattr(SqlUsageHour, column), zero) + getattr(
                         proposed, column
                     )
             elif column in {"requests", "failed", "reasons"} and value is None:

@@ -109,6 +109,48 @@ def test_add_turn_accumulates_one_row_per_model_and_hour(db_uri):
     assert (first.output_tokens, first.total_tokens) == (24, 125)
 
 
+@pytest.mark.parametrize(
+    "dialect_name", ["postgresql+psycopg", "cockroachdb+psycopg", "mysql+pymysql", "sqlite"]
+)
+def test_upsert_cost_fallback_binds_as_float(dialect_name):
+    import re
+    from unittest.mock import Mock
+
+    from sqlalchemy import Float, create_mock_engine
+
+    if dialect_name.startswith("cockroachdb"):
+        pytest.importorskip("sqlalchemy_cockroachdb")
+    engine = create_mock_engine(
+        f"{dialect_name}://", lambda *args, **kwargs: None, paramstyle="named"
+    )
+    session = Mock()
+    session.get_bind.return_value = engine
+    store = UsageHoursStore("sqlite://")
+    store._upsert(
+        session,
+        "owner@example.test",
+        "native:codex",
+        HOUR,
+        "m",
+        "h",
+        "metered",
+        True,
+        TokenGrowth(input_tokens=10, total_tokens=10),
+        requests=None,
+        failed=None,
+        reasons=None,
+        cost_usd=0.25,
+        increment=True,
+    )
+    statement = session.execute.call_args.args[0]
+    compiled = statement.compile(dialect=engine.dialect)
+    fallback = re.search(r"coalesce\(usage_hours\.cost_usd, :(\w+)", str(compiled))
+    assert fallback is not None
+    parameter = fallback.group(1)
+    assert isinstance(compiled.binds[parameter].type, Float)
+    assert type(compiled.params[parameter]) is float
+
+
 def test_rows_are_owner_and_account_scoped(db_uri):
     store = UsageHoursStore(db_uri)
     for owner in ("a@example.test", "b@example.test"):
