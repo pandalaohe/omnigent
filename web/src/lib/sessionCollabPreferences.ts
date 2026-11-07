@@ -1,7 +1,12 @@
-import { queueUserPreferencePatch } from "./userPreferencesSync";
+import {
+  isUserPreferenceNamespaceDirty,
+  queueAcknowledgedUserPreferencePatch,
+  queueUserPreferencePatch,
+} from "./userPreferencesSync";
 
 export const SESSION_COLLAB_STORAGE_KEY = "omnigent:session-collab";
 export const SESSION_COLLAB_CHANGED_EVENT = "omnigent:session-collab-changed";
+export const USER_PREFERENCES_DIRTY_STORAGE_KEY = "omnigent:user-preferences-dirty";
 export const QUOTA_PERIOD_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/;
 
 /** Field names are the stored JSON keys the server accessor reads. */
@@ -30,6 +35,9 @@ export interface SessionCollabPreferences {
   quotaFloorPct: number | null;
   quotaPeriodDefault: string | null;
   quotaPeriods: Record<string, string>;
+  autoRotationEnabled: boolean;
+  autoRotationCompactions: number;
+  autoRotationRemainingPct: number;
 }
 
 export type SessionCollabNumericField =
@@ -44,7 +52,9 @@ export type SessionCollabNumericField =
   | "undeliveredTtlSeconds"
   | "childKeepWarmClaudeIntervalSeconds"
   | "childKeepWarmCodexIntervalSeconds"
-  | "childKeepWarmMaxSeconds";
+  | "childKeepWarmMaxSeconds"
+  | "autoRotationCompactions"
+  | "autoRotationRemainingPct";
 
 /** Accepted range per numeric field, in the stored unit (seconds for windows). */
 export const SESSION_COLLAB_BOUNDS: Record<
@@ -63,6 +73,8 @@ export const SESSION_COLLAB_BOUNDS: Record<
   childKeepWarmClaudeIntervalSeconds: { min: 300, max: 3540 },
   childKeepWarmCodexIntervalSeconds: { min: 300, max: 1740 },
   childKeepWarmMaxSeconds: { min: 3600, max: 172800 },
+  autoRotationCompactions: { min: 1, max: 20 },
+  autoRotationRemainingPct: { min: 1, max: 90 },
 };
 
 export const SESSION_COLLAB_DEFAULTS: SessionCollabPreferences = {
@@ -89,6 +101,9 @@ export const SESSION_COLLAB_DEFAULTS: SessionCollabPreferences = {
   quotaFloorPct: null,
   quotaPeriodDefault: null,
   quotaPeriods: {},
+  autoRotationEnabled: false,
+  autoRotationCompactions: 4,
+  autoRotationRemainingPct: 25,
 };
 
 function normalizeInteger(value: unknown, field: SessionCollabNumericField): number {
@@ -193,6 +208,18 @@ function normalizePreferences(value: unknown): SessionCollabPreferences {
     quotaFloorPct: normalizePercentage(raw.quotaFloorPct, 0, 100),
     quotaPeriodDefault: normalizeQuotaPeriod(raw.quotaPeriodDefault),
     quotaPeriods: normalizeQuotaPeriods(raw.quotaPeriods),
+    autoRotationEnabled: normalizeBoolean(
+      raw.autoRotationEnabled,
+      SESSION_COLLAB_DEFAULTS.autoRotationEnabled,
+    ),
+    autoRotationCompactions: normalizeInteger(
+      raw.autoRotationCompactions,
+      "autoRotationCompactions",
+    ),
+    autoRotationRemainingPct: normalizeInteger(
+      raw.autoRotationRemainingPct,
+      "autoRotationRemainingPct",
+    ),
   };
 }
 
@@ -249,10 +276,14 @@ export function mirrorLegacyChildKeepWarm(childKeepWarmEnabled: boolean): void {
   queueUserPreferencePatch("session_collab", merged);
 }
 
-export function writeSessionCollabPreferences(preferences: SessionCollabPreferences): void {
-  if (typeof window === "undefined") return;
-  const normalized = normalizePreferences(preferences);
-  const isDefault = isSessionCollabPreferencesDefault(normalized);
+export function isSessionCollabPreferenceDirty(rawDirty?: string | null): boolean {
+  return isUserPreferenceNamespaceDirty("session_collab", rawDirty);
+}
+
+function persistNormalizedPreferences(
+  normalized: SessionCollabPreferences,
+  isDefault: boolean,
+): void {
   try {
     if (isDefault) window.localStorage.removeItem(SESSION_COLLAB_STORAGE_KEY);
     else window.localStorage.setItem(SESSION_COLLAB_STORAGE_KEY, JSON.stringify(normalized));
@@ -260,5 +291,28 @@ export function writeSessionCollabPreferences(preferences: SessionCollabPreferen
     // Storage denial or quota exhaustion must not break the settings page.
   }
   window.dispatchEvent(new Event(SESSION_COLLAB_CHANGED_EVENT));
+}
+
+export function writeSessionCollabPreferences(preferences: SessionCollabPreferences): void {
+  if (typeof window === "undefined") return;
+  const normalized = normalizePreferences(preferences);
+  const isDefault = isSessionCollabPreferencesDefault(normalized);
   queueUserPreferencePatch("session_collab", isDefault ? null : normalized);
+  persistNormalizedPreferences(normalized, isDefault);
+}
+
+export async function saveSessionCollabPreferences(
+  preferences: SessionCollabPreferences,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (typeof window === "undefined") return;
+  const normalized = normalizePreferences(preferences);
+  const isDefault = isSessionCollabPreferencesDefault(normalized);
+  const patchPromise = queueAcknowledgedUserPreferencePatch(
+    "session_collab",
+    isDefault ? null : normalized,
+    signal,
+  );
+  persistNormalizedPreferences(normalized, isDefault);
+  await patchPromise;
 }

@@ -122,7 +122,7 @@ const CATEGORY_CONFIG: Record<UserPreferenceNamespace, { storageKey: string; eve
   };
 
 const USER_PREFERENCES_SCOPE_KEY = "omnigent:user-preferences-owner";
-const USER_PREFERENCES_DIRTY_KEY = "omnigent:user-preferences-dirty";
+export const USER_PREFERENCES_DIRTY_KEY = "omnigent:user-preferences-dirty";
 const USER_PREFERENCES_DIRTY_VALUES_KEY = "omnigent:user-preferences-dirty-values";
 const MOBILE_ASSISTANT_DEVICE_STORAGE_KEY = "omnigent:mobile-assistant-device-state";
 
@@ -169,14 +169,26 @@ function dirtyOwnerKey(): string {
   return `${activeServerId}:${activeOwnerId ?? "__local__"}`;
 }
 
-function readDirtyNamespaces(): Set<UserPreferenceNamespace> {
-  const parsed = safeParse(window.localStorage.getItem(USER_PREFERENCES_DIRTY_KEY));
+function readDirtyNamespaces(
+  raw: string | null = window.localStorage.getItem(USER_PREFERENCES_DIRTY_KEY),
+): Set<UserPreferenceNamespace> {
+  const parsed = safeParse(raw);
   if (!parsed || typeof parsed !== "object") return new Set();
   const values = (parsed as Record<string, unknown>)[dirtyOwnerKey()];
   if (!Array.isArray(values)) return new Set();
   return new Set(
     values.filter((value): value is UserPreferenceNamespace => value in CATEGORY_CONFIG),
   );
+}
+
+export function isUserPreferenceNamespaceDirty(
+  namespace: UserPreferenceNamespace,
+  rawDirty?: string | null,
+): boolean {
+  if (typeof window === "undefined") return false;
+  return readDirtyNamespaces(
+    rawDirty === undefined ? window.localStorage.getItem(USER_PREFERENCES_DIRTY_KEY) : rawDirty,
+  ).has(namespace);
 }
 
 function writeDirtyNamespaces(values: Set<UserPreferenceNamespace>): void {

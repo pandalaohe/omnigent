@@ -61,7 +61,7 @@ export interface RenderErrorDetails {
   message: string;
   source: string;
   code: string;
-  level?: "error" | "info";
+  level?: "error" | "info" | "warning";
   title?: string;
   cause?: string;
   remediation?: string;

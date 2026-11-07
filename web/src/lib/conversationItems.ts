@@ -78,8 +78,8 @@ export interface ErrorItem extends BaseItem {
   source: string;
   code: string;
   message: string;
-  /** `"info"` renders as a neutral notice pill instead of a destructive error. */
-  level?: "error" | "info";
+  /** `"info"` renders a neutral notice; `"warning"` renders a non-destructive warning pill. */
+  level?: "error" | "info" | "warning";
   /** Friendly headline for a classified failure. Present when the runner classified it. */
   title?: string;
   /** One/two-sentence explanation of why it failed. Paired with `title`. */

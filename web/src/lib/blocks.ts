@@ -457,8 +457,8 @@ export interface ErrorBlock {
   type: "error";
   ctx: BlockContext;
   message: string;
-  /** `"info"` renders as a neutral notice pill instead of a destructive error. */
-  level?: "error" | "info";
+  /** `"info"` renders a neutral notice; `"warning"` renders a non-destructive warning pill. */
+  level?: "error" | "info" | "warning";
   /** Where the error originated, e.g. "llm". */
   source: string;
   /** Machine-readable error code, e.g. "llm_auth_failed". Empty when omitted. */
@@ -492,7 +492,7 @@ export function structuredErrorFields(
   src: {
     code?: string | null;
     source?: string | null;
-    level?: "error" | "info";
+    level?: "error" | "info" | "warning";
     title?: string | null;
     cause?: string | null;
     remediation?: string | null;
@@ -501,7 +501,13 @@ export function structuredErrorFields(
 ): Pick<ErrorBlock, "title" | "cause" | "remediation"> {
   const out: Pick<ErrorBlock, "title" | "cause" | "remediation"> = {};
   if (src?.title) out.title = src.title;
-  if (!out.title && src?.level !== "info" && isAgentTurnError(src) && agentName?.trim()) {
+  if (
+    !out.title &&
+    src?.level !== "info" &&
+    src?.level !== "warning" &&
+    isAgentTurnError(src) &&
+    agentName?.trim()
+  ) {
     const rootName = agentRootName(agentName.trim());
     const displayName =
       nativeCodingAgentForAgentName(rootName)?.displayName ?? capitalizeAgentName(rootName);

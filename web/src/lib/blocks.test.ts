@@ -24,6 +24,12 @@ describe("structuredErrorFields", () => {
     expect(
       structuredErrorFields({ code: "unknown_error", source: "harness", level: "info" }, "polly"),
     ).toEqual({});
+    expect(
+      structuredErrorFields(
+        { code: "session_rotation_failed", source: "harness", level: "warning" },
+        "polly",
+      ),
+    ).toEqual({});
   });
 
   it.each([

@@ -1648,7 +1648,7 @@ function parseErrorInfo(raw: unknown): ErrorInfo {
     if (typeof r.title === "string" && r.title) info.title = r.title;
     if (typeof r.cause === "string" && r.cause) info.cause = r.cause;
     if (typeof r.remediation === "string" && r.remediation) info.remediation = r.remediation;
-    if (r.level === "info") info.level = "info";
+    if (r.level === "info" || r.level === "warning") info.level = r.level;
     return info;
   }
   return { code: "", message: String(raw ?? "") };

@@ -117,8 +117,8 @@ export interface Usage {
 export interface ErrorInfo {
   code: string;
   message: string;
-  /** `"info"` renders as a neutral notice pill instead of a destructive error. */
-  level?: "error" | "info";
+  /** `"info"` renders a neutral notice; `"warning"` renders a non-destructive warning pill. */
+  level?: "error" | "info" | "warning";
   /** Friendly headline for a classified failure, e.g. "Claude Code can't run as root". */
   title?: string;
   /** One/two-sentence explanation of why it failed. Paired with `title`. */
