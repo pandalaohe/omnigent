@@ -1,4 +1,4 @@
-import { focusManager, QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { focusManager, QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { startTransition, Suspense, useState, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -62,6 +62,43 @@ afterEach(() => {
 });
 
 describe("host catalog refresh", () => {
+  it.each([200, 502])(
+    "updates active ACP delivery labels after a %i model probe",
+    async (status) => {
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      let injectsPrompt = true;
+      const { result } = renderHook(
+        () =>
+          useQuery({
+            queryKey: ["calling-default-catalogs"],
+            queryFn: async () => ({
+              rows: [{ host_id: "host", harness: "acp:neutral", injects_prompt: injectsPrompt }],
+            }),
+            initialData: {
+              rows: [{ host_id: "host", harness: "acp:neutral", injects_prompt: true }],
+            },
+            staleTime: Infinity,
+          }),
+        {
+          wrapper: ({ children }) => (
+            <QueryClientProvider client={client}>{children}</QueryClientProvider>
+          ),
+        },
+      );
+      expect(result.current.data.rows[0].injects_prompt).toBe(true);
+      fetchMock.mockImplementationOnce(async () => {
+        injectsPrompt = false;
+        return mockResponse(status === 200 ? { models: [] } : { detail: "probe failed" }, status);
+      });
+      await act(async () => {
+        const refresh = refreshHostModelOptions(client, "host", "acp:neutral", "force");
+        if (status === 200) await expect(refresh).resolves.toEqual([]);
+        else await expect(refresh).rejects.toThrow("probe failed");
+      });
+      await waitFor(() => expect(result.current.data.rows[0].injects_prompt).toBe(false));
+    },
+  );
+
   it("fetches without static abort APIs and clears the fallback timer on success", async () => {
     const originalTimeout = AbortSignal.timeout;
     const originalAny = AbortSignal.any;

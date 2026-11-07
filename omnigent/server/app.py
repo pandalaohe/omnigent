@@ -291,6 +291,7 @@ class ServerInfoResponse(BaseModel):
     # The Usage board module may run here (server config ``usage.enabled``);
     # absent on older servers, which clients read as off.
     usage_board_enabled: bool = False
+    task_board_enabled: bool = False
     worktree_status: bool = True
     # GET /v1/sessions accepts ``search_scope``; older servers ignore it.
     session_search_scope: bool = True
@@ -1860,6 +1861,7 @@ def create_app(
     )
 
     from omnigent.server.server_config import (
+        load_api_keys,
         load_branding_snapshot,
         load_server_config,
         session_title_instructions,
@@ -1867,6 +1869,20 @@ def create_app(
     )
 
     resolved_server_config = load_server_config() if server_config is None else server_config
+    from omnigent.server.auth import UnifiedAuthProvider
+
+    if "api_keys" in resolved_server_config:
+        api_keys = load_api_keys(
+            resolved_server_config,
+            os.environ
+            if isinstance(auth_provider, UnifiedAuthProvider)
+            and auth_provider._source == "accounts"
+            else {},
+        )
+        if isinstance(auth_provider, UnifiedAuthProvider):
+            auth_provider.set_api_keys(api_keys)
+        elif api_keys:
+            _logger.warning("api_keys ignored without accounts authentication")
     branding_snapshot = load_branding_snapshot(resolved_server_config)
     title_instructions = session_title_instructions(resolved_server_config)
     startup_policy = startup_admission_policy(resolved_server_config)
@@ -1998,6 +2014,7 @@ def create_app(
     from omnigent.server.admin_list import resolve_data_dir
     from omnigent.server.agent_quota import AgentQuotaService
     from omnigent.server.routes.agent_quota import create_agent_quota_router
+    from omnigent.server.server_config import task_board_enabled, usage_import_body_limit
     from omnigent.server.server_config import usage_enabled as usage_module_enabled
     from omnigent.server.usage_price_source import UsagePriceSource
     from omnigent.stores.usage_hours_store import (
@@ -2070,12 +2087,25 @@ def create_app(
             return False, None
         return await startup_admission.initialization_control(conversation)
 
+    from omnigent.server.builtin_agent_prompts import session_instructions_override
+    from omnigent.server.session_collab import collab_owner_for
+
+    def _instructions_override(conversation: Conversation) -> str | None:
+        return session_instructions_override(
+            conversation,
+            owner=collab_owner_for(conversation, conversation_store, permission_store),
+            agent_store=agent_store,
+            agent_cache=agent_cache,
+            preferences=user_preferences_store,
+        )
+
     runner_session_initializer = RunnerSessionInitializer(
         tunnel_registry,
         server_version=_server_version(),
         quota_resolver=agent_quota_service.line,
         session_choice_resolver=agent_quota_service.session_choice_line,
         standing_approval_resolver=standing_approval_service.line,
+        instructions_override_resolver=_instructions_override,
         peer_messaging_enabled=resolved_feature_flags.enabled(Feature.SESSION_PEER_MESSAGING),
         peer_messaging_resolver=partial(
             session_peer_enabled,
@@ -2765,10 +2795,26 @@ def create_app(
             host_store=host_store,
             price_source=usage_price_source,
             model_catalogs=host_model_catalog_cache_store,
+            import_max_body_bytes=usage_import_body_limit(resolved_server_config),
         ),
         prefix="/v1",
     )
     app.state.host_model_catalog_cache_store = host_model_catalog_cache_store
+    if task_board_enabled(resolved_server_config):
+        from omnigent.server.routes.task_board import create_task_board_router
+        from omnigent.server.task_board.models import TaskBoardLimits
+        from omnigent.stores.task_board_store import TaskBoardStore
+
+        app.include_router(
+            create_task_board_router(
+                TaskBoardStore(
+                    conversation_store.storage_location,
+                    TaskBoardLimits.from_config(resolved_server_config),
+                ),
+                auth_provider=auth_provider,
+            ),
+            prefix="/v1",
+        )
     app.state.mcp_gateway_backend = mcp_gateway_backend
     app.state.mcp_registry = mcp_registry
     app.state.mcp_registry_auth = auth_provider
@@ -4132,6 +4178,7 @@ def create_app(
                 "automations_enabled": scheduled_task_store is not None
                 and deployment_gate_enabled(app.state.automations, "automations"),
                 "usage_board_enabled": agent_quota_service.usage_enabled,
+                "task_board_enabled": task_board_enabled(resolved_server_config),
                 "branding": branding_snapshot.config(),
                 "attachment_limits": attachment_limits(),
             }
@@ -4743,6 +4790,7 @@ def create_app(
             artifact_store=artifact_store,
             conversation_store=conversation_store,
             auth_provider=auth_provider,
+            user_preferences_store=user_preferences_store,
         ),
         prefix="/v1",
         tags=["agents"],

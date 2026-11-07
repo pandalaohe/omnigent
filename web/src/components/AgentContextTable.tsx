@@ -1,4 +1,11 @@
 import type { ReactElement, ReactNode } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { BuiltinPromptEditor } from "@/components/BuiltinPromptEditor";
+import { PromptNotSent } from "@/components/PromptNotSent";
+import {
+  listCallingDefaultCatalogs,
+  type CallingDefaultsCatalogRow,
+} from "@/lib/callingDefaultsApi";
 import { ArrowRightIcon } from "lucide-react";
 import { AgentNameTag } from "@/components/AgentNameTag";
 import { LayeredTable } from "@/components/LayeredTable";
@@ -93,6 +100,10 @@ export function AgentContextTable({
 type ContextProps = Parameters<typeof AgentContextTable>[0];
 function PromptTable(props: Omit<ContextProps, "field">) {
   const layers = useInstructionLayers();
+  const catalogs = useQuery({
+    queryKey: ["calling-default-catalogs"],
+    queryFn: listCallingDefaultCatalogs,
+  });
   return (
     <>
       {layers.isError && (
@@ -103,7 +114,13 @@ function PromptTable(props: Omit<ContextProps, "field">) {
           </Button>
         </p>
       )}
-      <ContextTable {...props} field="prompt" layers={layers.data} loading={layers.isPending} />
+      <ContextTable
+        {...props}
+        field="prompt"
+        layers={layers.data}
+        loading={layers.isPending}
+        catalogs={catalogs.data}
+      />
     </>
   );
 }
@@ -117,7 +134,12 @@ function ContextTable({
   capabilities,
   layers,
   loading,
-}: ContextProps & { layers?: InstructionLayers; loading?: boolean }) {
+  catalogs,
+}: ContextProps & {
+  layers?: InstructionLayers;
+  loading?: boolean;
+  catalogs?: CallingDefaultsCatalogRow[];
+}) {
   const dependent = (harness: string) =>
     agentProductHarness(harness, capabilities) !== harness &&
     harnesses.includes(agentProductHarness(harness, capabilities));
@@ -165,6 +187,13 @@ function ContextTable({
           return {
             content: <ProviderValue harness={harness} host={host} capabilities={capabilities} />,
           };
+        if (
+          catalogs?.some(
+            (row) =>
+              row.host_id === hostId && row.harness === harness && row.injects_prompt === false,
+          )
+        )
+          return { content: <PromptNotSent name={names[harness] ?? harness} /> };
         const agent = instructionAgent(layers, harness, capabilities);
         const size =
           agent &&
@@ -196,31 +225,52 @@ export function AgentPromptCard({
   harness,
   host,
   capabilities,
+  agentId,
+  name,
 }: {
   harness: string;
   host: Host;
   capabilities?: HarnessCapabilityMap;
+  agentId?: string;
+  name?: string;
 }) {
   const layers = useInstructionLayers();
+  const catalogs = useQuery({
+    queryKey: ["calling-default-catalogs"],
+    queryFn: listCallingDefaultCatalogs,
+    enabled: harness.startsWith("acp:"),
+  });
+  const notSent = catalogs.data?.some(
+    (row) =>
+      row.host_id === host.host_id && row.harness === harness && row.injects_prompt === false,
+  );
+  const mode = capabilities?.[harness]?.integration_mode;
+  const editable = agentId && (mode === "sdk-in-process" || mode === "cli-subprocess");
   const agent = instructionAgent(layers.data, harness, capabilities);
   const preview = useInstructionPreview(
     agent ? new URLSearchParams({ host_id: host.host_id, agent_key: agent.key }) : null,
   );
-  if (!agent) return null;
+  if (!agent && !notSent && !editable) return null;
   return (
     <section className="space-y-3" aria-label="Prompt">
       <div className="flex flex-wrap items-center gap-3">
         <h2 className="text-ui font-medium">Prompt</h2>
-        <Button asChild variant="link" size="sm">
-          <Link
-            to={startupPromptsPath(agent.key, host.host_id)}
-            componentId="settings.agents.edit_prompt"
-          >
-            Edit in Startup prompts
-          </Link>
-        </Button>
+        {agent && !notSent && (
+          <Button asChild variant="link" size="sm">
+            <Link
+              to={startupPromptsPath(agent.key, host.host_id)}
+              componentId="settings.agents.edit_prompt"
+            >
+              Edit in Startup prompts
+            </Link>
+          </Button>
+        )}
       </div>
-      {preview.isPending && <p className="text-sm text-muted-foreground">Loading prompt…</p>}
+      {notSent && <PromptNotSent name={name ?? agent?.display_name ?? harness} />}
+      {editable && <BuiltinPromptEditor key={agentId} agentId={agentId} />}
+      {agent && !notSent && preview.isPending && (
+        <p className="text-sm text-muted-foreground">Loading prompt…</p>
+      )}
       {preview.isError && (
         <p role="alert" className="text-sm text-destructive">
           Could not load prompt.{" "}
@@ -229,23 +279,27 @@ export function AgentPromptCard({
           </Button>
         </p>
       )}
-      {preview.data?.parts
-        .filter((part) => part.chars > 0 || part.text === null)
-        .map((part) => (
-          <details
-            key={JSON.stringify([part.kind, part.scope, part.agent_key, part.host_id])}
-            className="border-b border-border py-2"
-          >
-            <summary className="cursor-pointer text-sm">
-              {part.scope ?? part.kind.replaceAll("_", " ")} ·{" "}
-              {part.text === null ? "Set at launch" : `${part.chars.toLocaleString()} chars`}
-              {!part.sent ? " · Not sent" : ""}
-            </summary>
-            {part.text && (
-              <pre className="mt-2 whitespace-pre-wrap wrap-anywhere text-sm">{part.text}</pre>
-            )}
-          </details>
-        ))}
+      {!notSent &&
+        preview.data?.parts
+          .filter(
+            (part) =>
+              (part.chars > 0 || part.text === null) && (!editable || part.kind !== "author"),
+          )
+          .map((part) => (
+            <details
+              key={JSON.stringify([part.kind, part.scope, part.agent_key, part.host_id])}
+              className="border-b border-border py-2"
+            >
+              <summary className="cursor-pointer text-sm">
+                {part.scope ?? part.kind.replaceAll("_", " ")} ·{" "}
+                {part.text === null ? "Set at launch" : `${part.chars.toLocaleString()} chars`}
+                {!part.sent ? " · Not sent" : ""}
+              </summary>
+              {part.text && (
+                <pre className="mt-2 whitespace-pre-wrap wrap-anywhere text-sm">{part.text}</pre>
+              )}
+            </details>
+          ))}
     </section>
   );
 }

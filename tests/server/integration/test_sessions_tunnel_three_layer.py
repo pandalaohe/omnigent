@@ -1083,18 +1083,11 @@ async def _reconnect_fires_connect_hook(
     router = ap_app.state.runner_router
     real_resolver = router.client_for_session_resources
 
-    class _StubResponse:
-        status_code = 200
-
-        def raise_for_status(self) -> None:
-            return None
-
-        def json(self) -> dict[str, object]:
-            return {}
-
     class _StubClient:
-        async def post(self, *args: Any, **kwargs: Any) -> _StubResponse:
-            return _StubResponse()
+        async def post(self, *args: Any, **kwargs: Any) -> httpx.Response:
+            return httpx.Response(
+                200, json={}, request=httpx.Request("POST", "http://runner/v1/sessions")
+            )
 
     def _spy_resolver(conv_id: str, **kwargs: Any):  # type: ignore[no-untyped-def]
         real_routed = real_resolver(conv_id, **kwargs)

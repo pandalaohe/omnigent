@@ -57,6 +57,7 @@ from omnigent.databricks_ai_gateway import (
     is_ug_route,
     with_gateway_attribution_lines,
 )
+from omnigent.harnesses.claude_compaction import read_claude_auto_compact_token_limit
 from omnigent.inner import _proc
 from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
 from omnigent.inner.hook_scripts import subagent_router
@@ -942,6 +943,7 @@ _CLAUDE_API_KEY_HELPER_ENV_KEY = "OMNIGENT_CLAUDE_API_KEY_HELPER"
 class _ClaudeClientState:
     client: _ClaudeClient
     model: str | None
+    system_prompt: str | None = None
     effort: str | None = None
     permission_mode: str | None = None
     loop: asyncio.AbstractEventLoop | None = None
@@ -2255,6 +2257,11 @@ class ClaudeSDKExecutor(Executor):
             original_prompt = getattr(options, "system_prompt", None)
             original_extra_args = getattr(options, "extra_args", {})
             state = _ClaudeClientState(client=client, model=model)
+            state.system_prompt = (
+                original_prompt.get("append")
+                if isinstance(original_prompt, dict)
+                else original_prompt
+            ) or None
             state.context_operation = operation
             state.context_lifecycle = "starting"
             token = object()
@@ -3836,12 +3843,19 @@ class ClaudeSDKExecutor(Executor):
             )
             return
         await self._evict_terminated_client(session_key)
+        if tools:
+            system_prompt = _augment_system_prompt_for_omnigent_mcp_tools(system_prompt, tools)
         permission_mode = (
             cfg.permission_mode if cfg.permission_mode is not None else self._permission_mode
         )
         state = self._clients.get(session_key)
         replacing_client = state is not None and (
             state.permission_mode != permission_mode
+            or (
+                state.system_prompt != (system_prompt or None)
+                and (next_input := self._extract_trailing_user_content(messages))
+                and next_input != "/compact"
+            )
             or (
                 state.effort != reasoning_effort
                 and (next_input := self._extract_trailing_user_content(messages))
@@ -3887,10 +3901,6 @@ class ClaudeSDKExecutor(Executor):
                 name="omnigent",
                 version="1.0.0",
                 tools=mcp_tools,
-            )
-            system_prompt = _augment_system_prompt_for_omnigent_mcp_tools(
-                system_prompt,
-                tools,
             )
 
         # Build allowed_tools list.  OS-environment operations route
@@ -4020,6 +4030,11 @@ class ClaudeSDKExecutor(Executor):
             env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(max_output_tokens)
         # A headless turn must wait for its helpers before ResultMessage ends it.
         env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
+        from omnigent.inner.agent_env import managed_telemetry_attributes
+
+        env["OTEL_RESOURCE_ATTRIBUTES"] = managed_telemetry_attributes(
+            env.get("OTEL_RESOURCE_ATTRIBUTES", os.environ.get("OTEL_RESOURCE_ATTRIBUTES", ""))
+        )
         options_kwargs: dict[str, Any] = {  # type: ignore[explicit-any]  # ClaudeAgentOptions accepts mixed-typed kwargs (str / list / dict / callable / etc.)
             "tools": base_tools,
             "system_prompt": system_prompt or None,
@@ -4683,6 +4698,46 @@ class ClaudeSDKExecutor(Executor):
                                 # observed_model (config model is None when no model is pinned).
                                 "model": observed_model or model,
                             }
+                            model_usage = getattr(result_msg, "model_usage", None)
+                            context_model = observed_model or model
+                            active_usage = (
+                                model_usage.get(context_model)
+                                if isinstance(model_usage, dict)
+                                else None
+                            )
+                            if (
+                                active_usage is None
+                                and isinstance(model_usage, dict)
+                                and len(model_usage) == 1
+                            ):
+                                context_model, active_usage = next(iter(model_usage.items()))
+                            window = (
+                                active_usage.get("contextWindow")
+                                if isinstance(active_usage, dict)
+                                else None
+                            )
+                            if (
+                                isinstance(active_usage, dict)
+                                and type(window) is int
+                                and window > 0
+                            ):
+                                turn_usage["context_window"] = window
+                                turn_usage["context_model"] = context_model
+                                max_output = active_usage.get("maxOutputTokens")
+                                turn_usage["auto_compact_token_limit"] = await asyncio.to_thread(
+                                    read_claude_auto_compact_token_limit,
+                                    window,
+                                    model=context_model,
+                                    cwd=pathlib.Path(self._cwd) if self._cwd else None,
+                                    max_output_tokens=max_output
+                                    if type(max_output) is int and max_output > 0
+                                    else 20_000,
+                                    # The SDK passes user and project when unset.
+                                    setting_sources=resolved.setting_sources
+                                    if resolved.setting_sources is not None
+                                    else ["user", "project"],
+                                    env={**os.environ, **env},
+                                )
 
                     elif isinstance(message, sdk.SystemMessage):
                         system_msg = cast(_SystemMessageObj, message)

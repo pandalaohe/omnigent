@@ -106,6 +106,7 @@ from omnigent.server.auth import (
     RESERVED_USER_LOCAL,
     AuthProvider,
 )
+from omnigent.server.auto_rotation import AUTO_ROTATION_LABEL_KEYS, auto_rotation_for
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     BackgroundTitleRequest,
@@ -286,6 +287,7 @@ from omnigent.server.schemas import (
     ArchivedSessionFacetsResponse,
     AutomaticSessionRenameRequest,
     AutomaticSessionRenameResponse,
+    AutoRotationPatch,
     CreatedSessionResponse,
     PaginatedList,
     ProjectSessionCreateRequest,
@@ -976,6 +978,71 @@ def register_core_routes(
         permission_store=permission_store,
         auth_provider=auth_provider,
     )
+
+    async def auto_rotation_session(request: Request, session_id: str, level: int) -> Conversation:
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, level, permission_store, conversation_store
+        )
+        conv = access.conversation or await asyncio.to_thread(
+            conversation_store.get_conversation, session_id
+        )
+        if conv is None:
+            raise _session_not_found()
+        return conv
+
+    async def auto_rotation_status(request: Request, conv: Conversation) -> dict[str, Any]:
+        resolved = await asyncio.to_thread(
+            auto_rotation_for,
+            conv,
+            conversation_store,
+            permission_store,
+            getattr(request.app.state, "user_preferences_store", None),
+        )
+        return resolved.model_dump()
+
+    @router.get("/sessions/{session_id}/auto-rotation", include_in_schema=False)
+    async def get_auto_rotation(request: Request, session_id: str) -> dict[str, Any]:
+        conv = await auto_rotation_session(request, session_id, LEVEL_READ)
+        return await auto_rotation_status(request, conv)
+
+    @router.patch("/sessions/{session_id}/auto-rotation", include_in_schema=False)
+    async def patch_auto_rotation(request: Request, session_id: str) -> dict[str, Any]:
+        conv = await auto_rotation_session(request, session_id, LEVEL_EDIT)
+        try:
+            body = AutoRotationPatch.model_validate(await request.json())
+        except (ValueError, ValidationError) as exc:
+            raise OmnigentError(
+                "Invalid auto-rotation settings", code=ErrorCode.INVALID_INPUT
+            ) from exc
+        resolved = await auto_rotation_status(request, conv)
+        if not resolved["eligible"]:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "not_eligible",
+                    "message": "Auto-rotation applies only to top-level Claude Code, Codex, Pi and Antigravity sessions",
+                },
+            )
+        from omnigent.stores.conversation_store import LabelGroupChange
+
+        values = body.model_dump(exclude_unset=True)
+        change = LabelGroupChange(
+            {
+                AUTO_ROTATION_LABEL_KEYS[key]: str(value)
+                for key, value in values.items()
+                if value != "default"
+            },
+            {AUTO_ROTATION_LABEL_KEYS[key] for key, value in values.items() if value == "default"},
+        )
+        await asyncio.to_thread(
+            conversation_store.mutate_label_group,
+            session_id,
+            "omnigent.auto_rotation",
+            lambda _labels: change,
+        )
+        conv = await auto_rotation_session(request, session_id, LEVEL_READ)
+        return await auto_rotation_status(request, conv)
 
     @router.get("/sessions/{session_id}/child-cap", include_in_schema=False)
     async def get_child_cap(request: Request, session_id: str) -> dict[str, Any]:
@@ -2134,6 +2201,11 @@ def register_core_routes(
                     suppress_recovery_turn=suppress_recovery_turn,
                     peer_messaging_enabled=peer_messaging_enabled,
                     global_instructions=global_instructions,
+                    instructions_override=(
+                        await initializer.resolve_instructions_override(conv)
+                        if initializer is not None
+                        else None
+                    ),
                 )
             except Exception:
                 # Must not fail the request; the fallback drops the seeded
@@ -3397,6 +3469,12 @@ def register_core_routes(
                 host_id=parsed_metadata.host_id,
             )
         create_presentation(request, result, hold.host_id if hold else parsed_metadata.host_id)
+        from omnigent.server.routes._session_create_validation import session_prompt_warnings
+
+        if created_conversation is not None:
+            result.warnings = await session_prompt_warnings(
+                request, created_conversation, spec_harness(spec)
+            )
         return result
 
     # ── GET /sessions/projects ────────────────────────────────────
@@ -4386,9 +4464,10 @@ def register_core_routes(
         "Interaction" is a human-origin user message, approval, or
         elicitation resolve, recorded per user on the session's root as an
         ``omnigent.touched.<user>`` label. Results are the caller's
-        accessible, non-archived, ``kind="default"`` sessions carrying that
-        label, newest interaction first. Powers the sidebar's Recent
-        sessions section, which shows a bounded count; cursors are rejected
+        accessible, non-archived, ``kind="default"`` sessions, newest
+        interaction first, falling back to creation time for sessions with
+        no interaction. Agent activity never changes this order. Powers
+        the sidebar's Recent sessions section, which shows a bounded count; cursors are rejected
         because the order is a label value with no row position.
 
         :param request: The incoming FastAPI request (for auth).

@@ -48,12 +48,16 @@ from omnigent.usage.contract import (
     UsageOverview,
     UsagePeriodView,
     UsageReport,
+    UsageReportV2,
     UsageWindow,
     UsageWindowView,
+    WriteOutcome,
     next_mark,
+    parse_usage_report,
     period_of,
     window_start,
 )
+from omnigent.usage.otlp import UsageDelta
 from omnigent.usage.ranges import RangeKey, range_spans
 
 _logger = logging.getLogger(__name__)
@@ -68,6 +72,14 @@ class QuotaContext:
 
 class UsageAccountLimitError(ValueError):
     """The owner already has the contract's 32 reported accounts."""
+
+
+class UsageWriterConflictError(ValueError):
+    """Replacement and additive activity cannot share an account."""
+
+
+class UsageStorageUnavailableError(RuntimeError):
+    """Writer admission requires a complete reading of durable account authority."""
 
 
 def _fresh(snapshot: dict[str, Any], now: float) -> bool:
@@ -193,6 +205,7 @@ class AgentQuotaService:
         self._last_written: dict[tuple[int, str, str], float] = {}
         self._persisted_windows: dict[tuple[int, str, str], str] = {}
         self._lock = threading.Lock()
+        self._hydration_lock = threading.Lock()
         self._account_write_lock = threading.Lock()
 
     def context(self, conversation: Conversation, owner_hint: str | None = None) -> QuotaContext:
@@ -369,14 +382,317 @@ class AgentQuotaService:
         self,
         owner: str,
         account_id: str,
-        report: UsageReport,
+        report: UsageReport | UsageReportV2,
         *,
         now: float | None = None,
-    ) -> None:
+        event: dict[str, Any] | None = None,
+        source: str | None = None,
+    ) -> WriteOutcome | None:
         # Serialize source replacements without holding the native reading
         # cache's lock during database I/O.
         with self._account_write_lock:
-            self._report_account(owner, account_id, report, now=now)
+            self._hydrate(owner, required=True)
+            if report.activity is not None:
+                key = (current_workspace_id(), owner, account_id)
+                with self._lock:
+                    record = self._accounts.get(key, {})
+                    if record.get("activity_writer") == "otlp":
+                        self._append_log(record, "writer_conflict", time.time())
+                        self._dirty[(key[0], owner, self._account_key(account_id))] = record
+                        raise UsageWriterConflictError(
+                            "writer_conflict: account uses OTLP activity"
+                        )
+            if isinstance(report, UsageReportV2):
+                outcome = self._report_account_v2(
+                    owner, account_id, report, now=now, event=event, source=source
+                )
+            else:
+                outcome = None
+                self._report_account(owner, account_id, report, now=now)
+                if event:
+                    key = (current_workspace_id(), owner, account_id)
+                    with self._lock:
+                        record = self._accounts[key]
+                        self._append_log(record, "cloudevent", float(report.observed_at), **event)
+                        record["source"] = event["source"][:64]
+                        record["source_at"] = report.observed_at
+            if (
+                report.activity is not None
+                and self.snapshot_store is not None
+                and self.usage_enabled
+            ):
+                key = (current_workspace_id(), owner, account_id)
+                with self._lock:
+                    record = deepcopy(self._accounts[key])
+                self.snapshot_store.write(owner, self._account_key(account_id), record)
+        return outcome
+
+    def managed_external_sessions(self, owner: str, session_ids: set[str]) -> set[str]:
+        """Resolve one export's distinct session ids within its owner's scope."""
+        return {
+            conv.external_session_id
+            for conv in self.conversations.find_conversations_by_external_session_ids(session_ids)
+            if conv.external_session_id is not None and self.context(conv).owner_id == owner
+        }
+
+    def note_otlp_issue(
+        self, owner: str, account_id: str, kind: str, *, metric: str | None = None
+    ) -> None:
+        """Keep bounded, body-free OTLP diagnostics on the account's Issues."""
+        self._hydrate(owner, required=True)
+        key = (current_workspace_id(), owner, account_id)
+        now = time.time()
+        with self._account_write_lock, self._lock:
+            record: dict[str, Any] | None = self._accounts.get(key)
+            if record is None:
+                if sum(1 for ws, user, _ in self._accounts if (ws, user) == key[:2]) >= 32:
+                    raise UsageAccountLimitError("at most 32 usage accounts per owner")
+                record = {"schema_version": 1, "account_id": account_id, "report_log": []}
+            if not any(
+                entry["kind"] == kind
+                and entry.get("metric") == metric
+                and int(entry["at"] // 86400) == int(now // 86400)
+                for entry in record.get("report_log", [])
+            ):
+                self._append_log(record, kind, now, **({"metric": metric} if metric else {}))
+            self._accounts[key] = record
+            self._dirty[(key[0], owner, self._account_key(account_id))] = record
+
+    def add_otlp(self, owner: str, delta: UsageDelta) -> None:
+        """Claim the additive writer under the same lock as report/import writes."""
+        from omnigent.harness_plugins import native_agents
+
+        with self._account_write_lock:
+            if delta.account in {agent.key for agent in native_agents()}:
+                raise UsageWriterConflictError("OTLP cannot write a native product account")
+            if self.hours_store is None:
+                raise RuntimeError("Usage hours storage unavailable")
+            self._hydrate(owner, required=True)
+            key = (current_workspace_id(), owner, delta.account)
+            with self._lock:
+                previous = self._accounts.get(key)
+                if (
+                    previous is None
+                    and sum(1 for ws, user, _ in self._accounts if (ws, user) == key[:2]) >= 32
+                ):
+                    raise UsageAccountLimitError("at most 32 usage accounts per owner")
+                record = deepcopy(previous) or {
+                    "schema_version": 1,
+                    "account_id": delta.account,
+                    "report_log": [],
+                }
+            if record.get("activity_writer") != "otlp" and (
+                record.get("has_activity") or self.hours_store.has_activity(owner, delta.account)
+            ):
+                with self._lock:
+                    self._append_log(record, "writer_conflict", time.time())
+                    self._accounts[key] = record
+                    self._dirty[(key[0], owner, self._account_key(delta.account))] = record
+                raise UsageWriterConflictError(
+                    "writer_conflict: account uses report/import activity"
+                )
+            source_type = (record.get("report") or {}).get("source_type")
+            basis = delta.basis
+            if source_type == "metered":
+                basis = "metered"
+            elif source_type == "subscription":
+                basis = "list"
+            now = time.time()
+            record.update(
+                has_activity=True,
+                activity_writer="otlp",
+                read_at=now,
+                last_attempt_at=now,
+                last_attempt_status="available",
+            )
+            if record.get("report") is None:
+                record["report"] = UsageReportV2(
+                    schema_version=2, observed_at=now, source="otlp"
+                ).stored()
+            self.hours_store.add_activity(
+                owner,
+                delta.account,
+                delta.hour,
+                delta.model,
+                delta.host,
+                basis,
+                delta.priced,
+                delta.buckets,
+                delta.requests,
+                delta.failed,
+                delta.cost,
+                account_record=record if self.snapshot_store is not None else None,
+            )
+            with self._lock:
+                self._accounts[key] = record
+                self._dirty[(key[0], owner, self._account_key(delta.account))] = record
+
+    def _report_account_v2(
+        self,
+        owner: str,
+        account_id: str,
+        report: UsageReportV2,
+        *,
+        now: float | None,
+        event: dict[str, Any] | None,
+        source: str | None,
+    ) -> WriteOutcome:
+        outcome = WriteOutcome()
+        now = time.time() if now is None else now
+        if not self.usage_enabled:
+            return outcome
+        self._hydrate(owner)
+        key = (current_workspace_id(), owner, account_id)
+        observed = float(report.observed_at)
+        with self._lock:
+            previous = deepcopy(self._accounts.get(key))
+            if (
+                previous is None
+                and sum(1 for ws, user, _ in self._accounts if (ws, user) == key[:2]) >= 32
+            ):
+                raise UsageAccountLimitError("at most 32 usage accounts per owner")
+        record = previous or {"schema_version": 1, "account_id": account_id, "report_log": []}
+        record.setdefault(
+            "activity_schema_version", (record.get("report") or {}).get("schema_version", 1)
+        )
+        record["last_report_at"] = max(
+            observed, float(record.get("last_report_at") or record.get("last_attempt_at") or 0)
+        )
+        stored = dict(record.get("report") or {})
+        # Activity lives in usage_hours; old v1 payloads need not satisfy v2 validation.
+        stored.pop("activity", None)
+        stored.update(schema_version=2, observed_at=observed)
+        fields = report.model_fields_set
+        data = report.model_dump(mode="json")
+        for name in fields - {
+            "windows",
+            "balances",
+            "activity",
+            "status",
+            "observed_at",
+            "fresh_until",
+        }:
+            stored[name] = data[name]
+        record["product"] = stored.get("product") or record.get("product")
+        if record["product"] is None:
+            from omnigent.harness_plugins import native_agents
+
+            if account_id in {agent.key for agent in native_agents()}:
+                record["product"] = account_id
+        record["host_id"] = stored.get("host_id") or record.get("host_id")
+        source = report.source or (event or {}).get("source") or record.get("source") or source
+        if source is not None:
+            record["source"] = str(source)[:64]
+            record["source_at"] = observed
+            stored["source"] = record["source"]
+        reading_sections = fields & {"windows", "balances"}
+        if report.status == "unavailable" and not reading_sections:
+            reading_sections = {"windows", "balances"}
+        sections = dict(record.get("sections") or {})
+        # Old accounts already have a windows reading, predating section metadata.
+        sections.setdefault(
+            "windows",
+            {
+                name: record.get(name)
+                for name in ("read_at", "fresh_until", "last_attempt_at", "last_attempt_status")
+            },
+        )
+        windows_changed = False
+        for name in ("windows", "balances"):
+            if name not in reading_sections:
+                continue
+            section = dict(sections.get(name) or {})
+            if observed < float(section.get("last_attempt_at") or 0):
+                outcome.older_sections.append(name)
+                continue
+            section.update(last_attempt_at=observed, last_attempt_status=report.status)
+            if report.status == "available":
+                stored[name] = data[name]
+                section.update(read_at=observed, fresh_until=report.fresh_until)
+            else:
+                self._append_log(record, "read_failed", observed, section=name)
+            sections[name] = section
+            if name == "windows":
+                windows_changed = True
+                record.update(section)
+        record["sections"] = sections
+        stored.setdefault("windows", [])
+        stored.setdefault("balances", [])
+        if "pinned_window" in fields:
+            record["pinned_window"] = report.pinned_window
+        # A persisted pin may be temporarily absent from the latest window set.
+        stored.pop("pinned_window", None)
+        merged = UsageReportV2.model_validate(stored)
+        if report.activity is not None and self.hours_store is not None:
+            entries = [
+                entry.model_copy(update={"cost_basis": "list"})
+                if "cost_basis" not in entry.model_fields_set
+                and merged.source_type == "subscription"
+                else entry
+                for entry in report.activity
+            ]
+            written = self.hours_store.replace_rows(owner, account_id, entries)
+            outcome.applied = written.applied
+            outcome.held = written.held
+            outcome.skipped = written.skipped
+            for entry in outcome.held:
+                self._append_log(record, "lower_reread_held", observed, **entry.model_dump())
+            for entry in entries:
+                if entry.correction and not entry.removed:
+                    self._append_log(
+                        record, "correction", observed, hour=entry.hour, source=source
+                    )
+            record["has_activity"] = True
+            record["activity_writer"] = "report"
+            record["activity_schema_version"] = 2
+        marks = dict(record.get("reset_marks") or {})
+        if windows_changed and report.status == "available":
+            for window in merged.windows:
+                span = window_start(window, now)
+                if span is not None:
+                    marks[window.id] = next_mark(marks.get(window.id), *span)
+        record["reset_marks"] = marks
+        record["report"] = merged.stored()
+        if event:
+            self._append_log(record, "cloudevent", observed, **event)
+        snapshot = None
+        if windows_changed and record.get("product"):
+            snapshot = {
+                "provider": merged.display_name or account_id,
+                "captured_at": observed,
+                "fresh_until": report.fresh_until,
+                "pinned_period": record.get("pinned_window"),
+                "windows": [
+                    {
+                        "id": window.id,
+                        "kind": window.kind,
+                        "label": window.id,
+                        "aria_label": window.label or window.id,
+                        "used_percent": window.percent_used,
+                        "duration_mins": window.window_minutes,
+                        "resets_at": window.resets_at,
+                        "used_value": window.used_value,
+                        "limit_value": window.limit_value,
+                        "unit": window.unit,
+                    }
+                    for window in merged.windows
+                ]
+                if report.status == "available"
+                else [],
+            }
+            record["routing_snapshot"] = deepcopy(snapshot)
+        elif "pinned_window" in fields and isinstance(record.get("routing_snapshot"), dict):
+            snapshot = deepcopy(record["routing_snapshot"])
+            snapshot["pinned_period"] = record.get("pinned_window")
+            record["routing_snapshot"] = deepcopy(snapshot)
+        with self._lock:
+            self._accounts[key] = record
+            self._dirty[(key[0], owner, self._account_key(account_id))] = record
+        if snapshot is not None:
+            self._store_snapshot(
+                owner, record.get("host_id"), record["product"], snapshot, now=now
+            )
+        return outcome
 
     def _report_account(
         self,
@@ -397,7 +713,9 @@ class AgentQuotaService:
         snapshot: dict[str, Any] | None = None
         with self._lock:
             previous = self._accounts.get(key)
-            if previous is not None and observed < float(previous.get("last_attempt_at") or 0):
+            if previous is not None and observed < float(
+                previous.get("last_report_at") or previous.get("last_attempt_at") or 0
+            ):
                 return
             if (
                 previous is None
@@ -412,7 +730,9 @@ class AgentQuotaService:
             self.hours_store.replace_activity(owner, account_id, report.activity)
         with self._lock:
             previous = self._accounts.get(key)
-            if previous is not None and observed < float(previous.get("last_attempt_at") or 0):
+            if previous is not None and observed < float(
+                previous.get("last_report_at") or previous.get("last_attempt_at") or 0
+            ):
                 return
             if (
                 previous is None
@@ -442,10 +762,13 @@ class AgentQuotaService:
             record["product"] = product
             record["host_id"] = host_id
             record["last_attempt_at"] = observed
+            record["last_report_at"] = observed
             record["last_attempt_status"] = report.status
             if report.status == "available":
                 if report.activity is not None and self.hours_store is not None:
                     record["has_activity"] = True
+                    record["activity_schema_version"] = 1
+                    record["activity_writer"] = "report"
                 if report.pinned_window is not None:
                     record["pinned_window"] = report.pinned_window
                 record["report"] = report.stored()
@@ -460,6 +783,17 @@ class AgentQuotaService:
                 record["reset_marks"] = marks
             else:
                 self._append_log(record, "read_failed", observed)
+            record["sections"] = {
+                "windows": {
+                    name: record.get(name)
+                    for name in (
+                        "read_at",
+                        "fresh_until",
+                        "last_attempt_at",
+                        "last_attempt_status",
+                    )
+                }
+            }
             self._accounts[key] = record
             self._dirty[(key[0], owner, self._account_key(account_id))] = record
             if product is not None:
@@ -490,7 +824,7 @@ class AgentQuotaService:
             self._store_snapshot(owner, host_id, product, snapshot, now=now)
 
     @staticmethod
-    def _append_log(record: dict[str, Any], kind: str, at: float) -> None:
+    def _append_log(record: dict[str, Any], kind: str, at: float, **details: Any) -> None:
         entries = list(record.get("report_log") or [])
         if (
             not entries
@@ -498,14 +832,32 @@ class AgentQuotaService:
             or entries[-1]["at"] <= (record.get("read_at") or 0)
         ):
             _logger.warning("Usage source report: %s", kind)
-        entries.append({"kind": kind, "at": at})
+        entries.append({"kind": kind, "at": at, **details})
         record["report_log"] = entries[-200:]
 
-    def note_rejected(self, owner: str, account_id: str, *, now: float | None = None) -> None:
+    def note_rejected(
+        self,
+        owner: str,
+        account_id: str,
+        *,
+        now: float | None = None,
+        format: str | None = None,
+    ) -> None:
+        with self._account_write_lock:
+            self._note_rejected(owner, account_id, now=now, format=format)
+
+    def _note_rejected(
+        self,
+        owner: str,
+        account_id: str,
+        *,
+        now: float | None,
+        format: str | None,
+    ) -> None:
         if not self.usage_enabled:
             return
         now = time.time() if now is None else now
-        self._hydrate(owner)
+        self._hydrate(owner, required=True)
         key = (current_workspace_id(), owner, account_id)
         with self._lock:
             previous = self._accounts.get(key)
@@ -526,7 +878,10 @@ class AgentQuotaService:
                 "reset_marks": {},
                 "report_log": [],
             }
-            self._append_log(record, "rejected", now)
+            if format is None:
+                self._append_log(record, "rejected", now)
+            else:
+                self._append_log(record, "import_rejected", now, format=format)
             self._accounts[key] = record
             self._dirty[(key[0], owner, self._account_key(account_id))] = record
 
@@ -854,7 +1209,10 @@ class AgentQuotaService:
             [int((now - 86400) // 3600) * 3600, *(prev.counted_from for _, prev in spans.values())]
         )
         rows = self.hours_store.read(owner, since, int(now) + 1) if self.hours_store else []
-        projected = attributed_rows(rows, records, self._activity_meters(owner), list(views))
+        hostless = self.hours_store.hostless_accounts(owner) if self.hours_store else set()
+        projected = attributed_rows(
+            rows, records, self._activity_meters(owner), list(views), hostless=hostless
+        )
         result = []
         for key, view in views.items():
             if account is not None and key != account:
@@ -1084,7 +1442,7 @@ class AgentQuotaService:
         now: float,
     ) -> UsageAccountView:
         raw = record.get("report")
-        report = UsageReport.model_validate(raw) if raw is not None else None
+        report = parse_usage_report(raw) if raw is not None else None
         latest_native = max(
             native_records, key=lambda item: item[2].get("read_at") or 0, default=None
         )
@@ -1117,6 +1475,14 @@ class AgentQuotaService:
             view.band = report.band
             view.details_url = str(report.details_url) if report.details_url else None
             view.renews_at = report.renews_at
+        if isinstance(report, UsageReportV2):
+            view.balances = report.balances
+            section = (record.get("sections") or {}).get("balances") or {}
+            view.balance_read_at = section.get("read_at")
+            view.balance_freshness = self._freshness(section, now)
+            view.source_type = report.source_type
+        view.source = record.get("source")
+        view.source_at = record.get("source_at")
         host_id = record.get("host_id")
         host_readings = {
             native_host: (
@@ -1288,6 +1654,7 @@ class AgentQuotaService:
                     used_value=None if past_reset else window.used_value,
                     limit_value=None if past_reset else window.limit_value,
                     unit=window.unit,
+                    note=window.note,
                     past_reset=past_reset,
                 )
             )
@@ -1324,6 +1691,8 @@ class AgentQuotaService:
                 "host_id",
                 "report_log",
                 "has_activity",
+                "activity_schema_version",
+                "activity_writer",
             ):
                 if field in stored:
                     merged[field] = deepcopy(stored[field])
@@ -1335,18 +1704,24 @@ class AgentQuotaService:
                 merged[field] = deepcopy(stored.get(field))
         return merged
 
-    def _hydrate(self, owner: str) -> None:
+    def _hydrate(self, owner: str, *, required: bool = False) -> None:
+        # A reader loading a snapshot must not expose half-loaded writer authority.
+        with self._hydration_lock:
+            self._hydrate_locked(owner, required=required)
+
+    def _hydrate_locked(self, owner: str, *, required: bool) -> None:
         if not self.usage_enabled or self.snapshot_store is None:
             return
         scope = (current_workspace_id(), owner)
         with self._lock:
             if scope in self._hydrated:
                 return
-            self._hydrated.add(scope)
         try:
             rows = self.snapshot_store.read(owner)
         except Exception:
             _logger.warning("Could not hydrate usage readings for %s", owner, exc_info=True)
+            if required:
+                raise UsageStorageUnavailableError("Usage account storage unavailable") from None
             return
         with self._lock:
             for storage_key, record in rows.items():
@@ -1391,6 +1766,7 @@ class AgentQuotaService:
             )
             for host_id, product in slots:
                 self._rebuild_projection(scope[0], owner, host_id, product)
+            self._hydrated.add(scope)
 
     @staticmethod
     def _window_signature(record: dict[str, Any]) -> str:
@@ -1407,6 +1783,10 @@ class AgentQuotaService:
 
     def flush(self, *, now: float | None = None, force: bool = False) -> int:
         """Write due dirty rows; a failure stays dirty and never reaches the status path."""
+        with self._account_write_lock:
+            return self._flush(now=now, force=force)
+
+    def _flush(self, *, now: float | None, force: bool) -> int:
         if not self.usage_enabled or self.snapshot_store is None:
             return 0
         now = time.time() if now is None else now

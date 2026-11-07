@@ -1,0 +1,24 @@
+{
+  "data": [
+    {
+      "starting_at": "2026-09-03T00:00:00Z",
+      "ending_at": "2026-09-03T01:00:00Z",
+      "group": {
+        "model": "model-a"
+      },
+      "usage": {
+        "uncached_input_tokens": 800,
+        "cache_read_input_tokens": 150,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 30,
+          "ephemeral_1h_input_tokens": 20
+        },
+        "output_tokens": 200,
+        "requests": 10
+      }
+    }
+  ],
+  "has_more": false,
+  "next_page": null,
+  "data_refreshed_at": "2026-09-04T00:00:00Z"
+}

@@ -1,0 +1,26 @@
+{
+  "_fixture": {
+    "source": "https://docs.litellm.ai/docs/observability/opentelemetry_integration",
+    "encoding_source": "https://opentelemetry.io/docs/specs/otlp/",
+    "accessed": "2026-11-06",
+    "kind": "documentation example, not a live recording",
+    "configuration": "OTEL_SEMCONV_STABILITY_OPT_IN unset"
+  },
+  "body": {
+    "resourceSpans": [{
+      "resource": {"attributes": [{"key": "service.name", "value": {"stringValue": "litellm"}}]},
+      "scopeSpans": [{"spans": [{
+        "traceId": "11111111111111111111111111111111",
+        "spanId": "3333333333333333",
+        "name": "litellm.completion", "endTimeUnixNano": "1793923200000000000",
+        "attributes": [
+          {"key": "gen_ai.request.model", "value": {"stringValue": "model-a"}},
+          {"key": "gen_ai.usage.input_tokens", "value": {"intValue": "100"}},
+          {"key": "gen_ai.usage.output_tokens", "value": {"intValue": "20"}},
+          {"key": "gen_ai.usage.total_tokens", "value": {"intValue": "120"}},
+          {"key": "gen_ai.cost.total_cost", "value": {"doubleValue": 0.25}}
+        ]
+      }]}]
+    }]
+  }
+}

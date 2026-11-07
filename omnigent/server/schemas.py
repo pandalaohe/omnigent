@@ -41,6 +41,34 @@ from omnigent.startup_protocol import StartupAttemptRef, StartupObservation
 
 # ── Shared ──────────────────────────────────────────────────────
 
+
+class AutoRotationPatch(BaseModel):
+    """Session overrides; an explicit default removes that override."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    enabled: Literal["on", "off", "default"] = "default"
+    compactions: Annotated[int, Field(ge=1, le=20)] | Literal["default"] = "default"
+    remaining_pct: Annotated[int, Field(ge=1, le=90)] | Literal["default"] = "default"
+
+
+class AutoRotationStatus(BaseModel):
+    """Resolved settings and the latest context round of one session."""
+
+    eligible: bool
+    ineligible_reason: Literal["not_top_level", "archived", "harness"] | None
+    harness: str | None
+    enabled: bool = False
+    compactions_setting: int = 4
+    remaining_pct_setting: int = 25
+    sources: dict[str, Literal["session", "user", "default"]]
+    compactions: int = 0
+    round_marker: int = Field(default=0, exclude=True)
+    remaining_pct: int | None = None
+    approximate: list[Literal["usage", "compaction_point", "compactions"]]
+    due: bool = False
+    rotation_pending: bool = False
+
+
 McpRegistryServiceId = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]{0,39}$")]
 PermissionTierRequest = Literal[
     "ask",
@@ -115,6 +143,7 @@ UserPreferenceNamespace = Literal[
     "sidebar_layout",
     "sound_alerts",
     "worktree_defaults",
+    "builtin_agent_prompts",
 ]
 
 
@@ -414,6 +443,7 @@ class CallingDefaultsCatalogRow(BaseModel):
     harness: str
     models: list[dict[str, Any]]
     permission_options: list[dict[str, str]] = Field(default_factory=list)
+    injects_prompt: bool | None = None
     fetched_at: int | None = None
     stale: bool
     error: str | None = None
@@ -1198,6 +1228,11 @@ class Usage(BaseModel):
         this is absent and ``total_tokens`` serves the same purpose.
         The toolbar context ring and ``/context`` command use this
         field when present, falling back to ``total_tokens``.
+    :param context_window: Effective window reported by the running harness.
+    :param context_model: Model reference measured with the context limits,
+        independent of the billing model. Unknown identity stays unbound.
+    :param auto_compact_token_limit: Total-context automatic compaction threshold;
+        an explicit null clears a previous report, absence leaves it unchanged.
     :param cache_read_input_tokens: Prompt tokens served from a
         provider prompt cache (cache hit), billed at a reduced rate.
         Reported by Anthropic-style providers as a count *separate*
@@ -1228,10 +1263,22 @@ class Usage(BaseModel):
     output_tokens_details: UsageDetails = Field(default_factory=UsageDetails)
     total_tokens: int = 0
     context_tokens: int | None = None
+    context_window: int | None = Field(default=None, gt=0, strict=True)
+    context_model: str | None = None
+    auto_compact_token_limit: int | None = Field(default=None, gt=0, strict=True)
     cache_read_input_tokens: int = 0
     cache_creation_input_tokens: int = 0
     model: str | None = None
     cost_usd: float | None = None
+
+    @model_serializer(mode="wrap")
+    def _preserve_context_clears(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        """Preserve explicit clears without turning absent fields into patches."""
+        data = handler(self)
+        for field in ("context_model", "context_window", "auto_compact_token_limit"):
+            if field in self.model_fields_set:
+                data[field] = getattr(self, field)
+        return data
 
 
 class ErrorDetail(BaseModel):
@@ -1920,6 +1967,14 @@ class _SessionCreateRequestBase(BaseModel):
     """
 
     inference_configuration_revision: str | None = None
+    session_prompt: str | None = None
+
+    @field_validator("session_prompt")
+    @classmethod
+    def validate_session_prompt(cls, text: str | None) -> str | None:
+        from omnigent.runtime.instruction_layers import validate_session_prompt
+
+        return validate_session_prompt(text)
 
     # Declared here, in the legacy field position, so validation errors keep
     # main's ordering. Concrete public models narrow the wire type below.
@@ -2175,6 +2230,14 @@ class SessionCreateMetadata(BaseModel):
     """
 
     inference_configuration_revision: str | None = None
+    session_prompt: str | None = None
+
+    @field_validator("session_prompt")
+    @classmethod
+    def validate_session_prompt(cls, text: str | None) -> str | None:
+        from omnigent.runtime.instruction_layers import validate_session_prompt
+
+        return validate_session_prompt(text)
 
     mcp_registry_services: list[McpRegistryServiceId] = Field(default_factory=list, max_length=40)
 
@@ -2272,6 +2335,7 @@ class CreatedSessionResponse(BaseModel):
     """
 
     session_id: str
+    warnings: list[str] = Field(default_factory=list)
     agent_id: str
     agent_name: str
     project_id: str | None = None
@@ -2740,6 +2804,8 @@ class SessionResponse(BaseModel):
     """
 
     id: str
+    session_prompt: str | None = None
+    warnings: list[str] = Field(default_factory=list)
     agent_id: str
     agent_template_id: str | None = None
     agent_name: str | None = None
@@ -4035,12 +4101,13 @@ class SessionStatusEvent(_SSEEventBase):
 
 class SessionUsageEvent(_SSEEventBase):
     """
-    Token-usage update from a terminal-backed integration.
+    Token-usage update from a terminal-backed or SDK integration.
 
     Emitted after an ``external_session_usage`` POST from an
     out-of-AP runtime (e.g. the ``omnigent claude`` transcript
-    forwarder). Either field may be absent; clients should leave
-    cached values untouched for missing fields.
+    forwarder), or an SDK turn. Missing fields leave cached values untouched.
+    A limits observation carries the full committed model/window/threshold tuple;
+    explicit nulls clear unknown or removed values.
 
     :param type: Always ``"session.usage"``.
     :param conversation_id: Session identifier.
@@ -4049,7 +4116,11 @@ class SessionUsageEvent(_SSEEventBase):
         window-only broadcast.
     :param context_window: Resolved window in tokens (e.g. 200_000
         normally, 1_000_000 with ``opus[1m]`` / ``sonnet[1m]``).
-        ``None`` on a tokens-only broadcast.
+        An explicit null clears the window; absent on a tokens-only broadcast.
+    :param context_model: Model that produced the context reading, independent
+        of the session's separately reported active model; null means unattributed.
+    :param auto_compact_token_limit: Reported automatic-compaction threshold;
+        null clears it, while absence leaves the previous reading unchanged.
     :param total_cost_usd: Cumulative session spend in USD after this
         update, e.g. ``0.42`` — the server-computed total the
         cost-budget policy gates on. Present **only when the session
@@ -4072,6 +4143,7 @@ class SessionUsageEvent(_SSEEventBase):
 
     type: Literal["session.usage"]
     conversation_id: str
+    context_model: str | None = None
     context_tokens: int | None = None
     context_window: int | None = None
     auto_compact_token_limit: int | None = None

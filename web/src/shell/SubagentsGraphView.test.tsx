@@ -500,11 +500,11 @@ describe("layoutTree", () => {
   it("handles a wide flat tree (many siblings)", () => {
     const root: TreeNode = {
       ...leaf("root"),
-      children: Array.from({ length: 10 }, (_, i) => leaf(`c${i}`)),
+      children: Array.from({ length: 32 }, (_, i) => leaf(`c${i}`)),
     };
     const { nodes, edges } = layoutTree(root, "none");
-    expect(nodes).toHaveLength(11);
-    expect(edges).toHaveLength(10);
+    expect(nodes).toHaveLength(33);
+    expect(edges).toHaveLength(32);
     // All children at the same y level
     const childYs = nodes.filter((n) => n.id !== "root").map((n) => n.position.y);
     expect(new Set(childYs).size).toBe(1);

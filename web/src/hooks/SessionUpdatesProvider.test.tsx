@@ -333,6 +333,26 @@ describe("SessionUpdatesProvider comments fingerprint", () => {
 });
 
 describe("SessionUpdatesProvider recent sessions", () => {
+  it("patches activity on an untouched Recent row without moving it ahead of another row", () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a", "conv_b"]);
+    const untouched = { ...conv("conv_b"), created_at: 100, updated_at: 100 };
+    client.setQueryData(["recent-sessions", 5], [conv("conv_a"), untouched]);
+    renderProvider(client, ["/"]);
+
+    for (const type of ["changed", "snapshot"] as const) {
+      act(() =>
+        frameHandler()({
+          type,
+          items: [{ ...untouched, updated_at: 999, status: "running" }],
+        }),
+      );
+      const rows = client.getQueryData<Conversation[]>(["recent-sessions", 5]);
+      expect(rows?.map((row) => row.id)).toEqual(["conv_a", "conv_b"]);
+      expect(rows?.[1]).toMatchObject({ updated_at: 999, status: "running" });
+    }
+  });
+
   it("restores Recent after a failed archive races a streamed update and refetch", async () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     seedConversations(client, ["conv_a", "conv_b"]);

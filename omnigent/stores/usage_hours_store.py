@@ -21,7 +21,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -38,7 +38,8 @@ from omnigent.db.utils import (
     now_epoch,
     run_write_transaction,
 )
-from omnigent.usage.contract import ActivityHour
+from omnigent.stores.usage_snapshot_store import UsageSnapshotStore
+from omnigent.usage.contract import ActivityEntryV2, ActivityHour, EntryOutcome, WriteOutcome
 
 _logger = logging.getLogger(__name__)
 
@@ -48,7 +49,7 @@ NATIVE_ACCOUNT_PREFIX = "native:"
 
 #: Bases that may be counted in a money total. ``subscription`` is a list-price
 #: figure rather than a bill, and ``unknown`` is not a figure at all.
-COUNTED_BASES = frozenset({"metered"})
+COUNTED_BASES = frozenset({"metered", "billed"})
 
 #: Bound for a pushed ``activity`` hour: a source clock can be wrong, and a
 #: future row would land in every "now" range.
@@ -67,16 +68,30 @@ class HourRow:
     host_id: str
     basis: str
     priced: bool
-    input_tokens: int
-    cached_tokens: int
-    cache_write_tokens: int
-    output_tokens: int
-    total_tokens: int
+    input_tokens: int | None
+    cached_tokens: int | None
+    cache_write_tokens: int | None
+    output_tokens: int | None
+    total_tokens: int | None
     requests: int | None
     failed: int | None
     reasons: dict[str, int] | None
     cost_usd: float
     updated_at: int
+    reasoning_tokens: int | None = None
+    coverage: str | None = None
+
+
+@dataclass(frozen=True)
+class UsageBuckets:
+    """Nullable OTLP figures; an absent figure must not erase a known one."""
+
+    input_tokens: int | None = None
+    cached_tokens: int | None = None
+    cache_write_tokens: int | None = None
+    output_tokens: int | None = None
+    total_tokens: int | None = None
+    reasoning_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -136,7 +151,16 @@ def _row_from_orm(row: SqlUsageHour) -> HourRow:
         reasons=reasons,
         cost_usd=row.cost_usd,
         updated_at=row.updated_at,
+        reasoning_tokens=row.reasoning_tokens,
+        coverage=row.coverage,
     )
+
+
+class _V1ActivityEntry(ActivityEntryV2):
+    """V1 had zero-valued buckets and an independent total counter."""
+
+    def total(self) -> int:
+        return self.tokens or 0
 
 
 class UsageHoursStore:
@@ -165,6 +189,39 @@ class UsageHoursStore:
         return self._write_sessions
 
     # -- writes ---------------------------------------------------------
+
+    def add_activity(
+        self,
+        owner: str,
+        account_id: str,
+        hour: int,
+        model: str,
+        host_id: str,
+        basis: str,
+        priced: bool,
+        buckets: UsageBuckets,
+        requests: int | None,
+        failed: int | None,
+        cost_usd: float,
+        *,
+        account_record: dict[str, Any] | None = None,
+    ) -> None:
+        """Atomically add normalized OTLP usage, preserving unknown counters."""
+        self._increment(
+            owner,
+            account_id,
+            hours_of(hour),
+            model,
+            host_id,
+            basis,
+            priced,
+            buckets,
+            requests,
+            failed,
+            None,
+            cost_usd,
+            account_record=account_record,
+        )
 
     def add_turn(
         self,
@@ -230,56 +287,116 @@ class UsageHoursStore:
         )
 
     def replace_activity(self, owner: str, account_id: str, rows: Sequence[ActivityHour]) -> None:
-        """Replace the rows one reported ``activity`` covers.
+        """Keep v1's last-write-wins semantics within the non-billed family."""
+        self.replace_rows(
+            owner,
+            account_id,
+            [
+                _V1ActivityEntry.model_validate(
+                    {
+                        **row.model_dump(exclude_none=True),
+                        "correction": True,
+                        "model": row.model or "",
+                        "uncached_input_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                        "output_tokens": 0,
+                    }
+                )
+                for row in rows
+            ],
+        )
 
-        Each entry replaces the ``(account, hour, model)`` rows it names, so a
-        retry or a source's own correction is safe. An hour in the future or
-        older than the report bound is dropped rather than written.
-
-        :param owner: The account owner.
-        :param account_id: The pushed account the activity belongs to.
-        :param rows: The validated activity entries, at most 500 per report.
-        """
+    def replace_rows(
+        self, owner: str, account_id: str, rows: Sequence[ActivityEntryV2]
+    ) -> WriteOutcome:
+        """Replace named rows only and report every held or skipped entry."""
         now = now_epoch()
-        bounded = [
-            row for row in rows if row.hour <= now and row.hour >= now - _ACTIVITY_MAX_AGE_S
-        ]
-        if not bounded:
-            return
+        if not rows:
+            return WriteOutcome()
 
-        def write(session: Session) -> None:
+        def write(session: Session) -> WriteOutcome:
             require_active_account(session, owner)
-            for row in bounded:
-                model = row.model or ""
-                session.execute(
-                    delete(SqlUsageHour).where(
-                        SqlUsageHour.workspace_id == current_workspace_id(),
-                        SqlUsageHour.owner_id == owner,
-                        SqlUsageHour.account_id == account_id,
-                        SqlUsageHour.hour_utc == hours_of(row.hour),
-                        SqlUsageHour.model == model,
+            outcome = WriteOutcome()
+            for row in rows:
+                entry_key = {
+                    "hour": row.hour,
+                    "host": row.host,
+                    "model": row.model,
+                    "cost_basis": row.cost_basis,
+                }
+                if row.hour > now or row.hour < now - _ACTIVITY_MAX_AGE_S:
+                    outcome.skipped.append(EntryOutcome(**entry_key, reason="out_of_range"))
+                    continue
+                predicates = (
+                    SqlUsageHour.workspace_id == current_workspace_id(),
+                    SqlUsageHour.owner_id == owner,
+                    SqlUsageHour.account_id == account_id,
+                    SqlUsageHour.hour_utc == hours_of(row.hour),
+                    SqlUsageHour.model == row.model,
+                    SqlUsageHour.host_id == row.host,
+                    (
+                        SqlUsageHour.basis == "billed"
+                        if row.cost_basis == "billed"
+                        else SqlUsageHour.basis != "billed"
+                    ),
+                )
+                previous = list(
+                    session.scalars(select(SqlUsageHour).where(*predicates).with_for_update())
+                )
+                complete = [old for old in previous if old.coverage == "complete"]
+                if not row.removed and complete and not isinstance(row, _V1ActivityEntry):
+                    if row.coverage == "partial":
+                        outcome.skipped.append(
+                            EntryOutcome(**entry_key, reason="partial_over_complete")
+                        )
+                        continue
+                    comparisons = (
+                        (row.total(), [old.total_tokens for old in complete]),
+                        (row.requests, [old.requests for old in complete]),
+                        (row.cost_usd, [old.cost_usd for old in complete if old.priced]),
+                    )
+                    if not row.correction and any(
+                        value is not None and known and value < sum(known)
+                        for value, old_values in comparisons
+                        if (known := [old for old in old_values if old is not None])
+                    ):
+                        outcome.held.append(EntryOutcome(**entry_key, reason="lower_reread"))
+                        continue
+                for old in previous:
+                    session.delete(old)
+                # A replacement may have the same primary key as the old row.
+                session.flush()
+                outcome.applied += 1
+                if row.removed:
+                    continue
+                session.add(
+                    SqlUsageHour(
+                        workspace_id=current_workspace_id(),
+                        owner_id=owner,
+                        account_id=account_id,
+                        hour_utc=hours_of(row.hour),
+                        model=row.model,
+                        host_id=row.host,
+                        basis=row.cost_basis,
+                        priced=int(row.cost_usd is not None),
+                        input_tokens=row.uncached_input_tokens,
+                        cached_tokens=row.cache_read_input_tokens,
+                        cache_write_tokens=row.cache_creation_input_tokens,
+                        output_tokens=row.output_tokens,
+                        total_tokens=row.total(),
+                        reasoning_tokens=row.reasoning_tokens,
+                        coverage=row.coverage,
+                        requests=row.requests,
+                        failed=row.failed,
+                        reasons=json.dumps(row.reasons, sort_keys=True) if row.reasons else None,
+                        cost_usd=float(row.cost_usd or 0),
+                        updated_at=now,
                     )
                 )
-                tokens = max(0, row.tokens or 0)
-                cost = 0.0 if row.cost_usd is None else max(0.0, float(row.cost_usd))
-                self._upsert(
-                    session,
-                    owner,
-                    account_id,
-                    hours_of(row.hour),
-                    model,
-                    "",
-                    row.cost_basis,
-                    row.cost_usd is not None,
-                    TokenGrowth(total_tokens=tokens),
-                    requests=row.requests,
-                    failed=row.failed,
-                    reasons=row.reasons,
-                    cost_usd=cost,
-                    increment=False,
-                )
+            return outcome
 
-        run_write_transaction(self._write_session(), "replace_usage_hours", write)
+        return run_write_transaction(self._write_session(), "replace_usage_hours", write)
 
     def delete_account(self, owner: str, account_id: str) -> None:
         """Remove one account's hours."""
@@ -324,11 +441,11 @@ class UsageHoursStore:
         filled = 0
         for row in candidates:
             growth = TokenGrowth(
-                input_tokens=row.input_tokens,
-                cached_tokens=row.cached_tokens,
-                cache_write_tokens=row.cache_write_tokens,
-                output_tokens=row.output_tokens,
-                total_tokens=row.total_tokens,
+                input_tokens=row.input_tokens or 0,
+                cached_tokens=row.cached_tokens or 0,
+                cache_write_tokens=row.cache_write_tokens or 0,
+                output_tokens=row.output_tokens or 0,
+                total_tokens=row.total_tokens or 0,
             )
             if not growth.any() or not row.model:
                 continue
@@ -341,6 +458,22 @@ class UsageHoursStore:
         return filled
 
     # -- reads ----------------------------------------------------------
+
+    def has_activity(self, owner: str, account_id: str) -> bool:
+        """Detect committed replacement rows even before their cache snapshot flushes."""
+        with self._read_session()("check_usage_activity_writer") as session:
+            return (
+                session.execute(
+                    select(SqlUsageHour.account_id)
+                    .where(
+                        SqlUsageHour.workspace_id == current_workspace_id(),
+                        SqlUsageHour.owner_id == owner,
+                        SqlUsageHour.account_id == account_id,
+                    )
+                    .limit(1)
+                ).first()
+                is not None
+            )
 
     def read(
         self,
@@ -373,6 +506,31 @@ class UsageHoursStore:
             )
             return [_row_from_orm(row) for row in session.execute(query).scalars()]
 
+    def hostless_accounts(self, owner: str) -> set[str]:
+        """Accounts holding host-less figures in any hour, scoped to this owner."""
+        with self._read_session()("read_hostless_usage_accounts") as session:
+            query = (
+                select(SqlUsageHour.account_id)
+                .where(
+                    SqlUsageHour.workspace_id == current_workspace_id(),
+                    SqlUsageHour.owner_id == owner,
+                    SqlUsageHour.host_id == "",
+                    or_(
+                        SqlUsageHour.priced == 1,
+                        SqlUsageHour.input_tokens.is_not(None),
+                        SqlUsageHour.cached_tokens.is_not(None),
+                        SqlUsageHour.cache_write_tokens.is_not(None),
+                        SqlUsageHour.output_tokens.is_not(None),
+                        SqlUsageHour.reasoning_tokens.is_not(None),
+                        SqlUsageHour.total_tokens.is_not(None),
+                        SqlUsageHour.requests.is_not(None),
+                        SqlUsageHour.failed.is_not(None),
+                    ),
+                )
+                .distinct()
+            )
+            return set(session.scalars(query))
+
     def _read_unpriced(self, closed_before: int) -> list[HourRow]:
         with self._read_session()("read_unpriced_usage_hours") as session:
             query = (
@@ -380,6 +538,7 @@ class UsageHoursStore:
                 .where(
                     SqlUsageHour.workspace_id == current_workspace_id(),
                     SqlUsageHour.priced == 0,
+                    SqlUsageHour.account_id.startswith(NATIVE_ACCOUNT_PREFIX, autoescape=True),
                     SqlUsageHour.hour_utc < closed_before,
                 )
                 .order_by(SqlUsageHour.hour_utc)
@@ -419,11 +578,11 @@ class UsageHoursStore:
                 row.basis,
                 True,
                 TokenGrowth(
-                    input_tokens=present.input_tokens,
-                    cached_tokens=present.cached_tokens,
-                    cache_write_tokens=present.cache_write_tokens,
-                    output_tokens=present.output_tokens,
-                    total_tokens=present.total_tokens,
+                    input_tokens=present.input_tokens or 0,
+                    cached_tokens=present.cached_tokens or 0,
+                    cache_write_tokens=present.cache_write_tokens or 0,
+                    output_tokens=present.output_tokens or 0,
+                    total_tokens=present.total_tokens or 0,
                 ),
                 requests=present.requests,
                 failed=present.failed,
@@ -445,11 +604,13 @@ class UsageHoursStore:
         host_id: str,
         basis: str,
         priced: bool,
-        growth: TokenGrowth,
+        growth: TokenGrowth | UsageBuckets,
         requests: int | None,
         failed: int | None,
         reasons: Mapping[str, int] | None,
         cost_usd: float,
+        *,
+        account_record: dict[str, Any] | None = None,
     ) -> None:
         def write(session: Session) -> None:
             require_active_account(session, owner)
@@ -469,6 +630,10 @@ class UsageHoursStore:
                 cost_usd=cost_usd,
                 increment=True,
             )
+            if account_record is not None:
+                UsageSnapshotStore.write_in_session(
+                    session, owner, "usage.account." + account_id, account_record
+                )
 
         run_write_transaction(self._write_session(), "add_usage_hour", write)
 
@@ -482,7 +647,7 @@ class UsageHoursStore:
         host_id: str,
         basis: str,
         priced: bool,
-        growth: TokenGrowth,
+        growth: TokenGrowth | UsageBuckets,
         *,
         requests: int | None,
         failed: int | None,
@@ -522,6 +687,8 @@ class UsageHoursStore:
             "basis",
             "priced",
         ]
+        if isinstance(growth, UsageBuckets):
+            values["reasoning_tokens"] = growth.reasoning_tokens
         dialect = session.get_bind().dialect.name
         if dialect == "mysql":
             # MySQL names the proposed row ``inserted``; the others ``excluded``.
@@ -569,6 +736,9 @@ class UsageHoursStore:
             "cache_write_tokens",
             "output_tokens",
             "total_tokens",
+            "reasoning_tokens",
+            "requests",
+            "failed",
             "cost_usd",
         )
         merged: dict[str, Any] = {}
@@ -576,7 +746,11 @@ class UsageHoursStore:
             if column in key:
                 continue
             if increment and column in counters:
-                merged[column] = getattr(SqlUsageHour, column) + getattr(proposed, column)
+                if value is not None:
+                    zero = 0.0 if column == "cost_usd" else 0
+                    merged[column] = func.coalesce(getattr(SqlUsageHour, column), zero) + getattr(
+                        proposed, column
+                    )
             elif column in {"requests", "failed", "reasons"} and value is None:
                 # A turn carries no request counts: keep whatever a source
                 # already reported for the hour instead of erasing it.

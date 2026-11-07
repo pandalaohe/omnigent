@@ -49,6 +49,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.git_commands import run_git
 
 if TYPE_CHECKING:
@@ -174,8 +175,6 @@ class _InstalledWheelInfo:
     :param extras: Optional extras recorded by the installer, e.g.
         ``["all"]``. Empty when the installer does not preserve them
         (e.g. ``pip``) or when none were requested.
-    :param extras_known: Whether installer metadata was readable enough to
-        distinguish no extras from an unknown extras set.
     """
 
     install_time_epoch: float
@@ -186,7 +185,6 @@ class _InstalledWheelInfo:
     package_version: str
     detected_installer: str | None
     extras: tuple[str, ...] = ()
-    extras_known: bool = True
 
 
 def maybe_show_update_notice() -> None:
@@ -1113,6 +1111,9 @@ def _read_installed_wheel_info() -> _InstalledWheelInfo | None:
                     # the reinstall command ssh's in as user ``****``
                     # and fails.
                     vcs_url = _unredact_ssh_userinfo(vcs_url)
+                    revision = vcs_info.get("requested_revision")
+                    if isinstance(revision, str) and revision:
+                        vcs_url = f"{vcs_url}@{revision}"
                 if isinstance(cid, str):
                     commit_sha = cid
 
@@ -1172,18 +1173,13 @@ def _read_installed_wheel_info() -> _InstalledWheelInfo | None:
 
     # Read requested extras from installer-specific receipts when available.
     extras: list[str] = []
-    extras_known = True
     if detected_installer == "uv":
         uv_extras = _read_uv_tool_extras()
-        if uv_extras is None:
-            extras_known = False
-        else:
+        if uv_extras is not None:
             extras = uv_extras
     elif detected_installer == "pipx":
         pipx_extras = _read_pipx_extras()
-        if pipx_extras is None:
-            extras_known = False
-        else:
+        if pipx_extras is not None:
             extras = pipx_extras
 
     return _InstalledWheelInfo(
@@ -1195,7 +1191,6 @@ def _read_installed_wheel_info() -> _InstalledWheelInfo | None:
         package_version=dist.version,
         detected_installer=detected_installer,
         extras=tuple(extras),
-        extras_known=extras_known,
     )
 
 
@@ -1514,7 +1509,6 @@ def _build_upgrade_suggestion(
     extra_overrides: tuple[str, ...] = (),
     target_version: str | None = None,
     target_vcs_url: str | None = None,
-    force_uv_tool_install: bool = False,
 ) -> _UpgradeSuggestion:
     """Build the right upgrade command for the user's install shape.
 
@@ -1535,8 +1529,6 @@ def _build_upgrade_suggestion(
         recorded at install time, so a registry install can be moved onto a
         git source (how ``--nightly`` hops onto a tag). Takes precedence
         over ``info.vcs_url``.
-    :param force_uv_tool_install: Replace owned uv tool entrypoints during
-        a managed reinstall; package-only reinstalls do not replace stale launchers.
     :returns: A :class:`_UpgradeSuggestion` whose ``command`` is the
         line printed in the nag panel and whose ``runnable`` flag
         tells the caller whether the line is an actual invocation
@@ -1546,7 +1538,6 @@ def _build_upgrade_suggestion(
     installer = info.detected_installer or info.installer
     pre = _PRERELEASE_FLAG.get(installer or "", "") if allow_prerelease else ""
     extras = sorted(set(info.extras) | set(extra_overrides))
-    uv_force = " --force" if force_uv_tool_install else ""
 
     source_url = target_vcs_url or info.vcs_url
     if source_url:
@@ -1560,8 +1551,7 @@ def _build_upgrade_suggestion(
         if installer == "uv":
             return _UpgradeSuggestion(
                 command=(
-                    f"uv tool install{uv_force} --reinstall{_uv_python_pin()} "
-                    f"{vcs_url_with_extras}{pre}"
+                    f"uv tool install --reinstall{_uv_python_pin()} {vcs_url_with_extras}{pre}"
                 ),
                 runnable=True,
             )
@@ -1605,9 +1595,7 @@ def _build_upgrade_suggestion(
             # version), not extras. Reinstall with the full PEP 508 spec
             # to preserve the extras the user originally requested.
             return _UpgradeSuggestion(
-                command=(
-                    f"uv tool install{uv_force} --reinstall{_uv_python_pin()} {registry_spec}{pre}"
-                ),
+                command=(f"uv tool install --reinstall{_uv_python_pin()} {registry_spec}{pre}"),
                 runnable=True,
             )
         return _UpgradeSuggestion(command=f"uv tool upgrade {_DIST_NAME}{pre}", runnable=True)
@@ -1728,81 +1716,7 @@ def _build_nightly_upgrade_suggestion(
     )
 
 
-def _prepare_uv_git_install(
-    args: list[str], directory: Path, *, env: dict[str, str] | None = None
-) -> list[str]:
-    """Constrain a uv git install to the target's runtime lock, before mutating the tool."""
-    from urllib.parse import parse_qs
-
-    if args[:3] != ["uv", "tool", "install"]:
-        return args
-    source = next((arg for arg in args[3:] if arg.startswith("git+")), None)
-    if source is None:
-        return args
-    url, revision = _split_vcs_url(source)
-    fragment = source.partition("#")[2]
-    options = parse_qs(fragment)
-    repo = directory / "source"
-    run_git(["git", "init", "--quiet", str(repo)], check=True, env=env)
-    run_git(
-        ["git", "-C", str(repo), "fetch", "--quiet", "--depth=1", "--", url, revision or "HEAD"],
-        check=True,
-        env=env,
-    )
-    run_git(
-        ["git", "-C", str(repo), "checkout", "--quiet", "--detach", "FETCH_HEAD"],
-        check=True,
-        env=env,
-    )
-    sha = run_git(
-        ["git", "-C", str(repo), "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-        env=env,
-    ).stdout.strip()
-    project = (repo / options.get("subdirectory", [""])[0]).resolve()
-    if not project.is_relative_to(repo.resolve()):
-        raise ValueError("Git install subdirectory must be inside the target repository")
-    if not (project / "uv.lock").is_file():
-        raise ValueError("The target git revision has no uv.lock; refusing an unlocked upgrade")
-    constraints = directory / "constraints.txt"
-    export = [
-        "uv",
-        "export",
-        "--project",
-        str(project),
-        "--frozen",
-        "--no-dev",
-        "--no-default-groups",
-        "--no-emit-project",
-        "--no-emit-local",
-        "--no-hashes",
-        "--output-file",
-        str(constraints),
-    ]
-    for extra in _parse_extras_from_spec(options.get("egg", [""])[0]):
-        export.extend(["--extra", extra])
-    subprocess.run(export, check=True, env=env, stdout=subprocess.DEVNULL)
-    # Refresh the application build while reusing locked dependency wheels.
-    # Windows still forces environment recreation to replace stale entrypoints.
-    prepared: list[str] = []
-    for arg in args:
-        if arg == "--reinstall":
-            prepared.extend(["--reinstall-package", _DIST_NAME])
-        elif arg == source:
-            prepared.append(f"git+{url}@{sha}" + (f"#{fragment}" if fragment else ""))
-        else:
-            prepared.append(arg)
-    return [*prepared, "--constraints", str(constraints)]
-
-
-def _run_upgrade_command(
-    command: str,
-    console: Console,
-    *,
-    env: dict[str, str] | None = None,
-) -> int:
+def _run_upgrade_command(command: str, console: Console) -> int:
     """Run the upgrade command in a foreground subprocess.
 
     The subprocess inherits stdin/stdout/stderr so the user sees
@@ -1814,8 +1728,6 @@ def _run_upgrade_command(
     :param console: Rich console (stderr) used for the surrounding
         "Running:" / failure status lines, kept consistent with the
         panel above.
-    :param env: Optional complete subprocess environment. ``None`` inherits
-        the current process environment.
     :returns: The subprocess's exit code, or ``-1`` when the binary
         couldn't be started (binary missing from PATH, invalid
         command string). The caller treats any non-zero return as
@@ -1824,24 +1736,24 @@ def _run_upgrade_command(
     import shlex
 
     console.print(f"[yellow]Running:[/yellow] {command}")
+
+    class InstallFailed(Exception):
+        def __init__(self, code: int) -> None:
+            self.code = code
+
     try:
-        args = shlex.split(command)
-        if args[:3] == ["uv", "tool", "install"] and any(
-            arg.startswith("git+") for arg in args[3:]
-        ):
-            with tempfile.TemporaryDirectory(prefix="omnigent-upgrade-") as temporary:
-                args = _prepare_uv_git_install(args, Path(temporary), env=env)
-                console.print("Installing dependencies from the target uv.lock.")
-                result = subprocess.run(args, check=False, env=env)
+        argv = shlex.split(command)
+        if IS_WINDOWS:
+            from omnigent.host.windows_upgrade import retained_install
+
+            with retained_install(argv):
+                result = subprocess.run(argv, check=False)
+                if result.returncode:
+                    raise InstallFailed(result.returncode)
         else:
-            result = (
-                subprocess.run(args, check=False)
-                if env is None
-                else subprocess.run(args, check=False, env=env)
-            )
-    except subprocess.CalledProcessError as exc:
-        console.print(f"[red]Upgrade preparation failed:[/red] {exc}")
-        return exc.returncode
+            result = subprocess.run(argv, check=False)
+    except InstallFailed as exc:
+        return exc.code
     except (OSError, ValueError) as exc:
         # OSError: binary not on PATH. ValueError: shlex.split
         # rejected the command (extremely unlikely for our
@@ -1927,7 +1839,9 @@ def _probe_installed_distribution() -> tuple[str | None, str | None]:
     return version, commit
 
 
-def _upgrade_failure_message(code: int, extras: Collection[str] = ()) -> str:
+def _upgrade_failure_message(
+    code: int, extras: Collection[str] = (), *, recovery_command: str | None = None
+) -> str:
     """Describe a failed upgrade, after checking whether the install survived.
 
     uv and pipx replace the tool environment before the replacement is built,
@@ -1939,8 +1853,18 @@ def _upgrade_failure_message(code: int, extras: Collection[str] = ()) -> str:
     :param code: The installer's exit status.
     :param extras: Extras this install had, so the recovery line reinstalls
         the same shape.
+    :param recovery_command: Exact installer command, preserving the source and extras.
     :returns: The message body for the raised ``ClickException``.
     """
+    if IS_WINDOWS and recovery_command is not None:
+        if recovery_command.startswith(("'", '"')):
+            recovery_command = f"& {recovery_command}"
+        return (
+            f"Upgrade command exited with status {code}. Windows may keep this CLI's files "
+            "in use. Close this CLI and stop the Host supervisor before retrying from an "
+            f"external terminal:\n\n    {recovery_command}\n\n"
+            "Then start the existing Host supervisor again."
+        )
     version, _ = _probe_installed_distribution()
     if version is not None:
         return f"Upgrade command exited with status {code}; your previous install is intact."
@@ -2005,9 +1929,10 @@ def _remote_git_head(vcs_url: str) -> str | None:
     url, ref = _split_vcs_url(vcs_url)
     if not url:
         return None
+    revision = ref or "HEAD"
     try:
         result = run_git(
-            ["git", "ls-remote", url, ref or "HEAD"],
+            ["git", "ls-remote", url, revision, f"{revision}^{{}}"],
             capture_output=True,
             text=True,
             timeout=_GIT_TIMEOUT_SECONDS,
@@ -2015,6 +1940,18 @@ def _remote_git_head(vcs_url: str) -> str | None:
         )
     except (subprocess.SubprocessError, OSError):
         return None
-    first = result.stdout.split("\n", 1)[0].strip()
+    lines = result.stdout.splitlines()
+    remote_refs: dict[str, str] = {}
+    for line in lines:
+        sha, _, name = line.strip().partition("\t")
+        remote_refs[name] = sha
+    for name in (
+        f"refs/heads/{revision}",
+        f"refs/tags/{revision}^{{}}",
+        f"refs/tags/{revision}",
+    ):
+        if name in remote_refs:
+            return remote_refs[name] or None
+    first = lines[0].strip() if lines else ""
     sha = first.split("\t", 1)[0].strip() if first else ""
     return sha or None

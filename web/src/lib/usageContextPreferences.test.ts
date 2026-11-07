@@ -16,8 +16,6 @@ vi.mock("./userPreferencesSync", () => ({ queueUserPreferencePatch: vi.fn() }));
 
 import {
   DEFAULT_USAGE_CONTEXT_PREFERENCES,
-  deleteUsageContextOverrides,
-  patchUsageContextOverrides,
   readUsageContextPreferences,
   providerUsageLimitsForSource,
   resolveUsageContext,
@@ -25,10 +23,16 @@ import {
   usageContextLevelLabel,
   usageContextRecordFromKey,
   usageContextSettingsHref,
-  proposeUsageContextCollapse,
   usageContextSourceFromKey,
   usageContextSourceKey,
-  writeUsageContextOverride,
+  addUsageContextEntry,
+  reportedUsageContext,
+  seedUsageContextList,
+  setUsageContextLevel,
+  usageContextKeysOfEntry,
+  usageContextRecordedEntries,
+  usageContextRows,
+  writeReportedContext,
   writeUsageContextPreferences,
   writeLastProviderUsageLimits,
   normalizeUsageContextPreferences,
@@ -138,7 +142,7 @@ describe("usage/context preferences", () => {
   );
 
   it("uses a manual context total and Compact buffer when supplied", () => {
-    writeUsageContextOverride(
+    setUsageContextLevel(
       {
         version: 5,
         board: DEFAULT_USAGE_CONTEXT_PREFERENCES.board,
@@ -180,7 +184,7 @@ describe("usage/context preferences", () => {
       contextWindow: 100_000,
       autoCompactTokenLimit: 80_000,
     });
-    writeUsageContextOverride(saved, source, {
+    setUsageContextLevel(saved, source, {
       ...saved.overrides[source],
       autoCompactBufferPercent: 10,
     });
@@ -188,7 +192,7 @@ describe("usage/context preferences", () => {
       resolveUsageContextLimits(readUsageContextPreferences(), source, 90_000, 72_000)
         .autoCompactTokenLimit,
     ).toBe(90_000);
-    writeUsageContextOverride(readUsageContextPreferences(), source, {
+    setUsageContextLevel(readUsageContextPreferences(), source, {
       ...readUsageContextPreferences().overrides[source],
       autoCompactBufferPercent: 0,
       autoCompactBufferTokens: 0,
@@ -406,110 +410,6 @@ describe("usage/context preferences", () => {
     );
   });
 
-  it("patches a batch in one write, keeping each row's absent field", () => {
-    const second = usageContextSourceKey({
-      hostId: "host-a",
-      agentName: "claude",
-      harness: "claude-native",
-      model: "opus",
-    });
-    const preferences: UsageContextPreferences = {
-      version: 5,
-      board: DEFAULT_USAGE_CONTEXT_PREFERENCES.board,
-      showProviderUsageLimits: true,
-      overrides: {
-        [source]: { contextWindowTokens: 100_000, autoCompactBufferTokens: 10_000 },
-        [second]: { contextWindowTokens: null, autoCompactBufferTokens: 20_000 },
-      },
-      lastProviderUsageLimits: {},
-    };
-
-    patchUsageContextOverrides(preferences, [source, second], {
-      autoCompactBufferTokens: 33_000,
-    });
-
-    const saved = readUsageContextPreferences().overrides;
-    expect(saved[source]).toEqual({
-      contextWindowTokens: 100_000,
-      autoCompactBufferTokens: 33_000,
-    });
-    expect(saved[second]).toEqual({ contextWindowTokens: null, autoCompactBufferTokens: 33_000 });
-    expect(queueUserPreferencePatch).toHaveBeenCalledTimes(1);
-  });
-
-  it("clears a patched field to Auto and drops a row left all-Auto", () => {
-    const preferences: UsageContextPreferences = {
-      version: 5,
-      board: DEFAULT_USAGE_CONTEXT_PREFERENCES.board,
-      showProviderUsageLimits: true,
-      overrides: {
-        [source]: { contextWindowTokens: 100_000, autoCompactBufferTokens: 10_000 },
-      },
-      lastProviderUsageLimits: {},
-    };
-
-    patchUsageContextOverrides(preferences, [source], { contextWindowTokens: null });
-    expect(readUsageContextPreferences().overrides[source]).toEqual({
-      contextWindowTokens: null,
-      autoCompactBufferTokens: 10_000,
-    });
-
-    patchUsageContextOverrides(readUsageContextPreferences(), [source], {
-      autoCompactBufferTokens: null,
-    });
-    expect(readUsageContextPreferences().overrides[source]).toBeUndefined();
-    expect(queueUserPreferencePatch).toHaveBeenCalledTimes(2);
-  });
-
-  it("does not write a patch without source keys", () => {
-    patchUsageContextOverrides(DEFAULT_USAGE_CONTEXT_PREFERENCES, [], { contextWindowTokens: 1 });
-
-    expect(queueUserPreferencePatch).not.toHaveBeenCalled();
-    expect(localStorage.getItem("omnigent:usage-context-preferences")).toBeNull();
-  });
-
-  it("deletes only the given sources in one write", () => {
-    const second = usageContextSourceKey({
-      hostId: "host-a",
-      agentName: "claude",
-      harness: "claude-native",
-      model: "opus",
-    });
-    const keep = usageContextSourceKey({
-      hostId: "host-b",
-      agentName: "codex",
-      harness: "codex",
-      model: "gpt-5.6",
-    });
-    const preferences: UsageContextPreferences = {
-      version: 5,
-      board: DEFAULT_USAGE_CONTEXT_PREFERENCES.board,
-      showProviderUsageLimits: true,
-      overrides: {
-        [source]: { contextWindowTokens: 100_000, autoCompactBufferTokens: 10_000 },
-        [second]: { contextWindowTokens: null, autoCompactBufferTokens: 20_000 },
-        [keep]: { contextWindowTokens: 50_000, autoCompactBufferTokens: null },
-      },
-      lastProviderUsageLimits: {},
-    };
-
-    deleteUsageContextOverrides(preferences, [source, second]);
-
-    const saved = readUsageContextPreferences().overrides;
-    expect(saved[source]).toBeUndefined();
-    expect(saved[second]).toBeUndefined();
-    expect(saved[keep]).toEqual({ contextWindowTokens: 50_000, autoCompactBufferTokens: null });
-    expect(queueUserPreferencePatch).toHaveBeenCalledTimes(1);
-  });
-
-  it("does not write a delete without a matching source", () => {
-    deleteUsageContextOverrides(DEFAULT_USAGE_CONTEXT_PREFERENCES, ["missing"]);
-    deleteUsageContextOverrides(DEFAULT_USAGE_CONTEXT_PREFERENCES, []);
-
-    expect(queueUserPreferencePatch).not.toHaveBeenCalled();
-    expect(localStorage.getItem("omnigent:usage-context-preferences")).toBeNull();
-  });
-
   it("resolves each field independently and labels the level actually used", () => {
     const identity = usageContextSourceFromKey(source)!;
     const column = usageContextLevelKey(identity, "column");
@@ -615,85 +515,13 @@ describe("usage/context preferences", () => {
     expect(
       resolveUsageContext(readUsageContextPreferences(), source, reported).contextWindow.value,
     ).toBe(90_000);
-    patchUsageContextOverrides(readUsageContextPreferences(), [source], {
+    setUsageContextLevel(readUsageContextPreferences(), source, {
       contextWindowTokens: 100_000,
+      autoCompactBufferTokens: null,
     });
-    deleteUsageContextOverrides(readUsageContextPreferences(), [exact]);
+    setUsageContextLevel(readUsageContextPreferences(), exact, null);
     expect(readUsageContextPreferences().version).toBe(6);
     expect(readUsageContextPreferences().overrides[unknown]?.contextWindowTokens).toBe(999_000);
-  });
-
-  it("proposes 7 model records → 2 cells for the nine-record fixture without writing", () => {
-    const overrides = Object.fromEntries([
-      ...["opus", "opus[1m]", "sonnet", "sonnet[1m]", "haiku"].map((model) => [
-        usageContextSourceKey({
-          hostId: "host-a",
-          agentName: "claude",
-          harness: "claude-native",
-          model,
-        }),
-        { contextWindowTokens: 550_000, autoCompactBufferTokens: 32_000 },
-      ]),
-      ...["gpt-x", "gpt-y"].map((model) => [
-        usageContextSourceKey({
-          hostId: "host-a",
-          agentName: "codex",
-          harness: "codex-native",
-          model,
-        }),
-        { contextWindowTokens: 400_000, autoCompactBufferTokens: 0 },
-      ]),
-      [
-        usageContextSourceKey({
-          hostId: "host-a",
-          agentName: "opencode",
-          harness: "opencode",
-          model: "",
-        }),
-        { contextWindowTokens: 200_000, autoCompactBufferTokens: null },
-      ],
-      [
-        usageContextSourceKey({
-          hostId: "host-b",
-          agentName: "codex",
-          harness: "codex",
-          model: "gpt-x",
-        }),
-        { contextWindowTokens: 300_000, autoCompactBufferTokens: null },
-      ],
-    ]);
-    const preferences = { ...DEFAULT_USAGE_CONTEXT_PREFERENCES, overrides };
-    const proposal = proposeUsageContextCollapse(preferences);
-    expect(proposal.removed).toHaveLength(7);
-    expect(Object.keys(proposal.added)).toHaveLength(2);
-    expect(Object.keys(preferences.overrides)).toHaveLength(9);
-    expect(queueUserPreferencePatch).not.toHaveBeenCalled();
-    writeLastProviderUsageLimits(preferences, source, {
-      provider: "Codex",
-      capturedAt: 1_900_000_000,
-      windows: [{ label: "5h", ariaLabel: "5 hour", usedPercent: 11 }],
-    });
-    expect(readUsageContextPreferences().overrides).toEqual(overrides);
-    const merged = { ...overrides, ...proposal.added };
-    for (const key of proposal.removed) Reflect.deleteProperty(merged, key);
-    expect(Object.keys(merged)).toHaveLength(4);
-  });
-
-  it("does not collapse exact models across a different every-computer model value", () => {
-    const identity = { hostId: "host-a", agentName: "claude", harness: "claude-native" };
-    const exact = (model: string) => usageContextSourceKey({ ...identity, model });
-    const overrides = {
-      [exact("opus")]: { contextWindowTokens: 200_000, autoCompactBufferTokens: null },
-      [exact("sonnet")]: { contextWindowTokens: 200_000, autoCompactBufferTokens: null },
-      [usageContextLevelKey({ ...identity, model: "opus" }, "agent-model")]: {
-        contextWindowTokens: 300_000,
-        autoCompactBufferTokens: null,
-      },
-    };
-
-    expect(
-      proposeUsageContextCollapse({ ...DEFAULT_USAGE_CONTEXT_PREFERENCES, overrides }),
-    ).toEqual({ removed: [], added: {} });
   });
 
   it("preserves an unknown level's empty record and future fields while ignoring it", () => {
@@ -709,21 +537,11 @@ describe("usage/context preferences", () => {
       resolveUsageContext(saved, source, { contextWindow: 100_000, autoCompactTokenLimit: 90_000 })
         .contextWindow,
     ).toEqual({ value: 100_000, level: "reported" });
-    patchUsageContextOverrides(saved, [source], { contextWindowTokens: 200_000 });
+    setUsageContextLevel(saved, source, {
+      contextWindowTokens: 200_000,
+      autoCompactBufferTokens: null,
+    });
     expect(readUsageContextPreferences().overrides[unknown]).toEqual(entry);
-  });
-
-  it("does not propose mixed values, singleton groups, or groups with an existing cell", () => {
-    const identity = usageContextSourceFromKey(source)!;
-    const second = usageContextSourceKey({ ...identity, model: "other" });
-    const value = { contextWindowTokens: 100_000, autoCompactBufferTokens: null };
-    const preferences = { ...DEFAULT_USAGE_CONTEXT_PREFERENCES, overrides: { [source]: value } };
-    expect(proposeUsageContextCollapse(preferences).removed).toEqual([]);
-    preferences.overrides[second] = { ...value, contextWindowTokens: 200_000 };
-    expect(proposeUsageContextCollapse(preferences).removed).toEqual([]);
-    preferences.overrides[second] = value;
-    preferences.overrides[usageContextLevelKey(identity, "cell")] = value;
-    expect(proposeUsageContextCollapse(preferences).removed).toEqual([]);
   });
 
   it("keeps the Usage board switch and display fields, dropping a malformed value", () => {
@@ -794,6 +612,196 @@ describe("usage/context preferences", () => {
       contextWindowTokens: 100_000,
       autoCompactBufferTokens: null,
     });
+  });
+});
+
+describe("the list of context rows", () => {
+  const agent = { agentName: "claude", harness: "claude-native", model: "" };
+  const opus = { ...agent, model: "claude-opus-5-5" };
+  const codex = { agentName: "codex", harness: "codex", model: "" };
+  const opusOnHost = usageContextSourceKey({ ...opus, hostId: "host-a" });
+
+  beforeEach(() => {
+    localStorage.clear();
+    vi.mocked(queueUserPreferencePatch).mockClear();
+  });
+
+  it("drops malformed entries and repeats, and keeps the switch", () => {
+    const saved = normalizeUsageContextPreferences({
+      contextList: {
+        severalOpen: true,
+        entries: [agent, agent, { agentName: "", harness: "x" }, { harness: "x" }, 7, null, opus],
+      },
+    });
+    expect(saved.contextList).toEqual({ entries: [agent, opus], severalOpen: true });
+  });
+
+  it("reads an envelope written before the list as not seeded", () => {
+    expect(normalizeUsageContextPreferences({ overrides: {} }).contextList).toBeUndefined();
+  });
+
+  it("counts a seeded empty list as a stored choice", () => {
+    writeUsageContextPreferences({
+      ...DEFAULT_USAGE_CONTEXT_PREFERENCES,
+      contextList: { entries: [], severalOpen: false },
+    });
+    expect(readUsageContextPreferences().contextList).toEqual({
+      entries: [],
+      severalOpen: false,
+    });
+  });
+
+  it("seeds from what is in use and recorded, exactly once", () => {
+    const preferences = {
+      ...DEFAULT_USAGE_CONTEXT_PREFERENCES,
+      overrides: {
+        [usageContextLevelKey({ ...opus, hostId: "" }, "agent-model")]: {
+          contextWindowTokens: 1,
+          autoCompactBufferTokens: null,
+        },
+      },
+    };
+    seedUsageContextList(preferences, [agent, codex]);
+    const seeded = readUsageContextPreferences();
+    expect(seeded.contextList).toEqual({ entries: [agent, codex, opus], severalOpen: false });
+
+    const removedByUser = {
+      ...seeded,
+      contextList: { entries: [agent], severalOpen: false },
+    };
+    writeUsageContextPreferences(removedByUser);
+    seedUsageContextList(readUsageContextPreferences(), [agent, codex]);
+    expect(readUsageContextPreferences().contextList?.entries).toEqual([agent]);
+  });
+
+  it("gives every saved value a row, including one the list does not name", () => {
+    const preferences = {
+      ...DEFAULT_USAGE_CONTEXT_PREFERENCES,
+      contextList: { entries: [agent], severalOpen: false },
+      overrides: {
+        [opusOnHost]: { contextWindowTokens: 1, autoCompactBufferTokens: null },
+        [usageContextLevelKey({ ...codex, hostId: "host-a" }, "cell")]: {
+          contextWindowTokens: 2,
+          autoCompactBufferTokens: null,
+        },
+        // A level with no agent, and a record with no value, name no row.
+        [usageContextLevelKey({ ...codex, hostId: "host-a" }, "host")]: {
+          contextWindowTokens: 3,
+          autoCompactBufferTokens: null,
+        },
+        [usageContextLevelKey({ ...agent, model: "m", hostId: "" }, "agent-model")]: {
+          contextWindowTokens: null,
+          autoCompactBufferTokens: null,
+        },
+      },
+    };
+    expect(usageContextRows(preferences)).toEqual([agent, opus, codex]);
+  });
+
+  it("names every level an agent's row owns, and only its model's for a model row", () => {
+    const keys = {
+      column: usageContextLevelKey({ ...agent, hostId: "" }, "column"),
+      cell: usageContextLevelKey({ ...agent, hostId: "host-a" }, "cell"),
+      everywhere: usageContextLevelKey({ ...opus, hostId: "" }, "agent-model"),
+      here: opusOnHost,
+      other: usageContextLevelKey({ ...codex, hostId: "" }, "column"),
+      computer: usageContextLevelKey({ ...agent, hostId: "host-a" }, "host"),
+    };
+    const preferences = {
+      ...DEFAULT_USAGE_CONTEXT_PREFERENCES,
+      overrides: Object.fromEntries(
+        Object.values(keys).map((key) => [
+          key,
+          { contextWindowTokens: 1, autoCompactBufferTokens: null },
+        ]),
+      ),
+    };
+    expect(usageContextKeysOfEntry(preferences, agent).sort()).toEqual(
+      [keys.column, keys.cell, keys.everywhere, keys.here].sort(),
+    );
+    expect(usageContextKeysOfEntry(preferences, opus).sort()).toEqual(
+      [keys.everywhere, keys.here].sort(),
+    );
+  });
+
+  it("shows a reported field only where every covered source agrees", () => {
+    const report = (contextWindow: number, autoCompactTokenLimit: number | null) => ({
+      contextWindow,
+      autoCompactTokenLimit,
+      capturedAt: 1,
+    });
+    const preferences = {
+      ...DEFAULT_USAGE_CONTEXT_PREFERENCES,
+      reportedContext: {
+        [opusOnHost]: report(1_000_000, 967_000),
+        [usageContextSourceKey({ ...opus, hostId: "host-b" })]: report(1_000_000, 500_000),
+        [usageContextSourceKey({ ...agent, model: "small", hostId: "host-a" })]: report(
+          200_000,
+          167_000,
+        ),
+      },
+    };
+    expect(reportedUsageContext(preferences, { ...opus, hostId: "host-a" })).toEqual({
+      contextWindow: 1_000_000,
+      autoCompactTokenLimit: 967_000,
+    });
+    expect(reportedUsageContext(preferences, { ...opus, hostId: null })).toEqual({
+      contextWindow: 1_000_000,
+      autoCompactTokenLimit: null,
+    });
+    expect(reportedUsageContext(preferences, { ...agent, hostId: "host-a" })).toEqual({
+      contextWindow: null,
+      autoCompactTokenLimit: null,
+    });
+    expect(reportedUsageContext(preferences, { ...codex, hostId: null })).toEqual({
+      contextWindow: null,
+      autoCompactTokenLimit: null,
+    });
+  });
+
+  it("writes a report only when a figure changes, and caps the record", () => {
+    writeReportedContext(
+      DEFAULT_USAGE_CONTEXT_PREFERENCES,
+      opusOnHost,
+      { contextWindow: 1_000_000, autoCompactTokenLimit: 550_000 },
+      5,
+    );
+    expect(queueUserPreferencePatch).toHaveBeenCalledTimes(1);
+    writeReportedContext(
+      readUsageContextPreferences(),
+      opusOnHost,
+      { contextWindow: 1_000_000, autoCompactTokenLimit: 550_000 },
+      6,
+    );
+    expect(queueUserPreferencePatch).toHaveBeenCalledTimes(1);
+    expect(readUsageContextPreferences().reportedContext?.[opusOnHost]?.capturedAt).toBe(5);
+
+    const many = Object.fromEntries(
+      Array.from({ length: 70 }, (_, index) => [
+        usageContextSourceKey({ ...opus, hostId: `h${index}` }),
+        { contextWindow: 1, autoCompactTokenLimit: null, capturedAt: index + 1 },
+      ]),
+    );
+    const capped = normalizeUsageContextPreferences({ reportedContext: many }).reportedContext!;
+    expect(Object.keys(capped)).toHaveLength(64);
+    expect(capped[usageContextSourceKey({ ...opus, hostId: "h69" })]).toBeDefined();
+    expect(capped[usageContextSourceKey({ ...opus, hostId: "h0" })]).toBeUndefined();
+  });
+
+  it("offers what stored readings prove was used", () => {
+    const preferences = {
+      ...DEFAULT_USAGE_CONTEXT_PREFERENCES,
+      reportedContext: {
+        [opusOnHost]: { contextWindow: 1, autoCompactTokenLimit: null, capturedAt: 1 },
+      },
+    };
+    expect(usageContextRecordedEntries(preferences)).toEqual([opus]);
+  });
+
+  it("adds an entry without repeating it", () => {
+    addUsageContextEntry(DEFAULT_USAGE_CONTEXT_PREFERENCES, opus);
+    addUsageContextEntry(readUsageContextPreferences(), opus);
+    expect(readUsageContextPreferences().contextList?.entries).toEqual([opus]);
   });
 });
 
@@ -907,11 +915,11 @@ describe("saved context levels", () => {
     const texts = levels.map((level) => usageContextLevelLabel(level, labels));
     expect(texts).toEqual([
       "this model",
-      "Claude Code, every host",
-      "Alpha × Claude Code",
-      "Claude Code, all hosts",
+      "Claude Code, this model on all computers",
+      "Claude Code on Alpha",
+      "Claude Code, all computers",
       "all agents on Alpha",
-      "all agents, all hosts",
+      "all agents, all computers",
       "reported",
     ]);
     for (const text of texts) {

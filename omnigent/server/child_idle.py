@@ -7,7 +7,7 @@ import hashlib
 import json
 import logging
 import secrets
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -35,7 +35,7 @@ from omnigent.server.routes._sessions.helpers import (
     _latest_assistant_tail,
     _session_status_from_cache,
 )
-from omnigent.server.session_collab import collab_owner_for
+from omnigent.server.session_collab import collab_owner_for, collab_owners_for
 from omnigent.server.session_live_state import RUNNING_SINCE_LABEL_KEY
 from omnigent.server.session_overrides import (
     AGENT_TEMPLATE_ID_LABEL,
@@ -330,7 +330,9 @@ class ChildIdleSweeper:
         parent = self._store.get_conversation(conv.parent_conversation_id)
         return self._live_parent(parent)
 
-    def _live_parent(self, parent: Conversation | None) -> Conversation | None:
+    def _live_parent(
+        self, parent: Conversation | None, rows: Mapping[str, Conversation | None] | None = None
+    ) -> Conversation | None:
         current = parent
         seen: set[str] = set()
         for _ in range(32):
@@ -341,7 +343,13 @@ class ChildIdleSweeper:
             seen.add(current.id)
             if current.parent_conversation_id is None:
                 return parent if parent is not None and self._owns_parent(parent) else None
-            current = self._store.get_conversation(current.parent_conversation_id)
+            parent_id = current.parent_conversation_id
+            if rows is not None and parent_id in rows:
+                current = rows[parent_id]
+            else:
+                current = self._store.get_conversation(parent_id)
+                if isinstance(rows, dict):
+                    rows[parent_id] = current
         return None
 
     def _running_has_open_tool(self, conv: Conversation) -> bool:
@@ -363,19 +371,33 @@ class ChildIdleSweeper:
         )
 
     def _signal(
-        self, conv: Conversation, settings: ChildIdleSettings, row: ChildFreezeSettings
+        self,
+        conv: Conversation,
+        settings: ChildIdleSettings,
+        row: ChildFreezeSettings,
+        *,
+        liveness: Mapping[str, SessionLiveness] | None = None,
+        liveness_failed: bool = False,
     ) -> str | None:
         status = _session_status_from_cache(conv.id, conv.live_status)
         if row.enabled:
-            try:
-                live = (
-                    self._liveness_lookup([conv.id]).get(conv.id)
-                    if self._liveness_lookup
-                    else None
-                )
-            except Exception:
-                _logger.warning("Child runner liveness unavailable for %s", conv.id, exc_info=True)
+            if liveness_failed:
+                _logger.warning("Child runner liveness unavailable for %s", conv.id)
                 return None
+            if liveness is not None:
+                live = liveness.get(conv.id)
+            else:
+                try:
+                    live = (
+                        self._liveness_lookup([conv.id]).get(conv.id)
+                        if self._liveness_lookup
+                        else None
+                    )
+                except Exception:
+                    _logger.warning(
+                        "Child runner liveness unavailable for %s", conv.id, exc_info=True
+                    )
+                    return None
             if live is not None and live.runner_online is False:
                 return "runner_offline"
             settled = conv.live_status in ("idle", "failed") and status in ("idle", "failed")
@@ -405,7 +427,18 @@ class ChildIdleSweeper:
         fresh = self._store.get_conversation(conv.id)
         if fresh is None or self._parent(fresh) is None:
             return None
-        conv = fresh
+        return self._observe_fresh(fresh, settings, now, harness_cache)
+
+    def _observe_fresh(
+        self,
+        conv: Conversation,
+        settings: ChildIdleSettings,
+        now: int,
+        harness_cache: dict[str, str | None],
+        *,
+        liveness: Mapping[str, SessionLiveness] | None = None,
+        liveness_failed: bool = False,
+    ) -> _IdleState | None:
         raw = conv.labels.get(CHILD_IDLE_LABEL)
         state = _IdleState.parse(raw)
         row = self._freeze_for(conv, settings, harness_cache)
@@ -436,7 +469,11 @@ class ChildIdleSweeper:
             and not state.queued
         ):
             return None
-        signal = self._signal(conv, settings, row) if eligible else None
+        signal = (
+            self._signal(conv, settings, row, liveness=liveness, liveness_failed=liveness_failed)
+            if eligible
+            else None
+        )
         eligible = eligible and signal is not None
         if not eligible:
             if raw is not None:
@@ -476,60 +513,199 @@ class ChildIdleSweeper:
             return None
         return state
 
+    def _needs_signal_liveness(
+        self,
+        conv: Conversation,
+        settings: ChildIdleSettings,
+        now: int,
+        harness_cache: dict[str, str | None],
+    ) -> bool:
+        raw = conv.labels.get(CHILD_IDLE_LABEL)
+        state = _IdleState.parse(raw)
+        row = self._freeze_for(conv, settings, harness_cache)
+        if not row.enabled:
+            return False
+        eligible = (
+            (settings.enabled or row.enabled)
+            and not conv.archived
+            and conv.labels.get("omnigent.wrapper") not in _MIRRORS
+            and not is_session_closed(conv.labels, conv.title)
+            and not has_pending_card(conv)
+        )
+        live = turn_activity.snapshot_for(conv.id)
+        turn = conv.labels.get(RUNNING_SINCE_LABEL_KEY)
+        activity = hashlib.sha256(
+            f"{conv.updated_at}:{conv.live_status}:"
+            f"{_session_status_from_cache(conv.id, conv.live_status)}:"
+            f"{conv.labels.get('omnigent.last_task_error_code', '')}:"
+            f"{conv.labels.get('omnigent.last_task_error_message', '')}:"
+            f"{live.updated if live and live.active else ''}".encode()
+        ).hexdigest()[:16]
+        return (
+            eligible
+            and row.enabled
+            and not (
+                state is not None
+                and state.signal != "idle"
+                and state.turn == turn
+                and state.activity == activity
+                and 0 <= now - state.checked < row.check_interval_s
+                and not state.queued
+            )
+        )
+
+    def _observe_children(
+        self,
+        parent_id: str,
+        children: list[Conversation],
+        settings: ChildIdleSettings,
+        now: int,
+        harness_cache: dict[str, str | None],
+    ) -> list[tuple[Conversation, _IdleState, bool]]:
+        if not children:
+            return []
+        parent = self._store.get_conversation(parent_id)
+        if self._live_parent(parent) is None:
+            return []
+        fresh_by_id = self._store.get_conversations([child.id for child in children])
+        valid_children = [
+            fresh
+            for child in children
+            if (fresh := fresh_by_id.get(child.id)) is not None
+            and fresh.parent_conversation_id == parent_id
+        ]
+        recheck_ids = [
+            fresh.id
+            for fresh in valid_children
+            if self._needs_signal_liveness(fresh, settings, now, harness_cache)
+        ]
+        liveness_map: Mapping[str, SessionLiveness] | None = None
+        liveness_failed = False
+        if recheck_ids and self._liveness_lookup is not None:
+            try:
+                liveness_map = self._liveness_lookup(recheck_ids)
+            except Exception:
+                _logger.warning(
+                    "Child runner liveness unavailable for %s", recheck_ids[0], exc_info=True
+                )
+                liveness_failed = True
+        results: list[tuple[Conversation, _IdleState, bool]] = []
+        for fresh in valid_children:
+            state = self._observe_fresh(
+                fresh,
+                settings,
+                now,
+                harness_cache,
+                liveness=liveness_map,
+                liveness_failed=liveness_failed,
+            )
+            if state is not None and state.queued:
+                row = self._freeze_for(fresh, settings, harness_cache)
+                should_resume = (
+                    state.signal == "transient_error"
+                    and row.resume_once
+                    and self._resume_child is not None
+                    and CHILD_RESUME_LABEL not in fresh.labels
+                )
+                results.append((fresh, state, should_resume))
+        return results
+
+    def _collect_groups(
+        self,
+    ) -> tuple[dict[str, list[Conversation]], dict[str, ChildIdleSettings]]:
+        prefs = getattr(self._app.state, "user_preferences_store", None)
+        children = self._children()
+        parent_ids = list(
+            {
+                child.parent_conversation_id
+                for child in children
+                if child.parent_conversation_id is not None
+            }
+        )
+        rows: dict[str, Conversation | None] = {}
+        if parent_ids:
+            fetched = self._store.get_conversations(parent_ids)
+            rows.update({pid: fetched.get(pid) for pid in parent_ids})
+        live_parent_by_id: dict[str, Conversation | None] = {}
+        owner_by_parent: dict[str, str] = {}
+        settings_by_owner: dict[str, ChildIdleSettings] = {}
+        groups: dict[str, list[Conversation]] = {}
+        settings_by_parent: dict[str, ChildIdleSettings] = {}
+
+        if rows:
+            live_parents: dict[str, Conversation] = {}
+            for parent_id in parent_ids:
+                try:
+                    parent = self._live_parent(rows[parent_id], rows)
+                except Exception:  # noqa: BLE001 — defer broken lineage to per-child logging
+                    continue
+                live_parent_by_id[parent_id] = parent
+                if parent is not None:
+                    live_parents[parent.id] = parent
+            owners = collab_owners_for(list(live_parents.values()), self._store, self._permissions)
+            owner_by_parent.update(
+                {pid: owner for pid, owner in owners.items() if owner is not None}
+            )
+
+        def resolve_parent_settings(
+            parent_id: str,
+        ) -> tuple[Conversation | None, ChildIdleSettings | None]:
+            if parent_id not in live_parent_by_id:
+                raw_parent = (
+                    rows[parent_id]
+                    if parent_id in rows
+                    else self._store.get_conversation(parent_id)
+                )
+                live_parent_by_id[parent_id] = self._live_parent(raw_parent, rows)
+            parent = live_parent_by_id[parent_id]
+            if parent is None:
+                return None, None
+            if parent.id not in owner_by_parent:
+                owner_by_parent[parent.id] = collab_owner_for(
+                    parent, self._store, self._permissions
+                )
+            owner = owner_by_parent[parent.id]
+            if owner not in settings_by_owner:
+                settings_by_owner[owner] = read_child_idle_settings(prefs, owner)
+            return parent, settings_by_owner[owner]
+
+        for child in children:
+            try:
+                if child.parent_conversation_id is None:
+                    continue
+                parent, settings = resolve_parent_settings(child.parent_conversation_id)
+                if parent is None or settings is None:
+                    continue
+                if (
+                    settings.enabled
+                    or settings.freeze_default.enabled
+                    or any(row.enabled for row in settings.agents.values())
+                    or CHILD_IDLE_LABEL in child.labels
+                    or CHILD_RESUME_LABEL in child.labels
+                ):
+                    groups.setdefault(parent.id, []).append(child)
+                    settings_by_parent[parent.id] = settings
+            except Exception:
+                _logger.exception("Could not inspect idle child %s", child.id)
+        for parent_id, raw in self._store.list_label_values(FOLLOWUP_NEXT_KEY).items():
+            try:
+                if int(raw) > self._clock():
+                    continue
+                parent, settings = resolve_parent_settings(parent_id)
+                if parent is None or settings is None:
+                    continue
+                groups.setdefault(parent_id, [])
+                settings_by_parent[parent_id] = settings
+            except ValueError:
+                _logger.warning("Invalid follow-up discovery timestamp for %s", parent_id)
+            except Exception:
+                _logger.exception("Could not inspect follow-ups for %s", parent_id)
+        return groups, settings_by_parent
+
     async def _tick(self) -> None:
         async with self._tick_lock:
             harness_cache: dict[str, str | None] = {}
-            groups: dict[str, list[Conversation]] = {}
-            settings_by_owner: dict[str, ChildIdleSettings] = {}
-            settings_by_parent: dict[str, ChildIdleSettings] = {}
-            prefs = getattr(self._app.state, "user_preferences_store", None)
-            for child in await asyncio.to_thread(self._children):
-                try:
-                    parent = await asyncio.to_thread(self._parent, child)
-                    if parent is None:
-                        continue
-                    owner = await asyncio.to_thread(
-                        collab_owner_for, parent, self._store, self._permissions
-                    )
-                    if owner not in settings_by_owner:
-                        settings_by_owner[owner] = await asyncio.to_thread(
-                            read_child_idle_settings, prefs, owner
-                        )
-                    settings = settings_by_owner[owner]
-                    if (
-                        settings.enabled
-                        or settings.freeze_default.enabled
-                        or any(row.enabled for row in settings.agents.values())
-                        or CHILD_IDLE_LABEL in child.labels
-                        or CHILD_RESUME_LABEL in child.labels
-                    ):
-                        groups.setdefault(parent.id, []).append(child)
-                        settings_by_parent[parent.id] = settings
-                except Exception:
-                    _logger.exception("Could not inspect idle child %s", child.id)
-            for parent_id, raw in (
-                await asyncio.to_thread(self._store.list_label_values, FOLLOWUP_NEXT_KEY)
-            ).items():
-                try:
-                    if int(raw) > self._clock():
-                        continue
-                    parent = await asyncio.to_thread(self._store.get_conversation, parent_id)
-                    parent = await asyncio.to_thread(self._live_parent, parent)
-                    if parent is None:
-                        continue
-                    owner = await asyncio.to_thread(
-                        collab_owner_for, parent, self._store, self._permissions
-                    )
-                    if owner not in settings_by_owner:
-                        settings_by_owner[owner] = await asyncio.to_thread(
-                            read_child_idle_settings, prefs, owner
-                        )
-                    groups.setdefault(parent_id, [])
-                    settings_by_parent[parent_id] = settings_by_owner[owner]
-                except ValueError:
-                    _logger.warning("Invalid follow-up discovery timestamp for %s", parent_id)
-                except Exception:
-                    _logger.exception("Could not inspect follow-ups for %s", parent_id)
+            groups, settings_by_parent = await asyncio.to_thread(self._collect_groups)
             for parent_id, children in groups.items():
                 settings = settings_by_parent[parent_id]
                 try:
@@ -580,37 +756,45 @@ class ChildIdleSweeper:
     ) -> None:
         now = self._clock()
         current: list[tuple[Conversation, _IdleState]] = []
-        for child in children:
-            fresh = await asyncio.to_thread(self._store.get_conversation, child.id)
-            if fresh is None or fresh.parent_conversation_id != parent_id:
-                continue
-            parent = await asyncio.to_thread(self._parent, fresh)
-            if parent is None:
-                continue
-            state = await asyncio.to_thread(self._observe, fresh, settings, now, harness_cache)
-            if state is not None and state.queued:
+        observed = await asyncio.to_thread(
+            self._observe_children, parent_id, children, settings, now, harness_cache
+        )
+        prior_resume_ran = False
+        for fresh, state, should_resume in observed:
+            if prior_resume_ran:
+                refreshed = await asyncio.to_thread(self._store.get_conversation, fresh.id)
+                if refreshed is None or refreshed.parent_conversation_id != parent_id:
+                    continue
+                fresh = refreshed
+                reobserved = await asyncio.to_thread(
+                    self._observe, fresh, settings, now, harness_cache
+                )
+                if reobserved is None or not reobserved.queued:
+                    continue
+                state = reobserved
                 row = await asyncio.to_thread(self._freeze_for, fresh, settings, harness_cache)
-                if (
+                should_resume = (
                     state.signal == "transient_error"
                     and row.resume_once
                     and self._resume_child is not None
                     and CHILD_RESUME_LABEL not in fresh.labels
-                ):
-                    # One automatic attempt per child, across turns and replicas.
-                    reservation = secrets.token_hex(8)
-                    stored = await asyncio.to_thread(
-                        self._store.insert_label_if_absent,
-                        fresh.id,
-                        CHILD_RESUME_LABEL,
-                        reservation,
+                )
+            if should_resume:
+                assert self._resume_child is not None
+                reservation = secrets.token_hex(8)
+                stored = await asyncio.to_thread(
+                    self._store.insert_label_if_absent,
+                    fresh.id,
+                    CHILD_RESUME_LABEL,
+                    reservation,
+                )
+                if stored == reservation:
+                    prior_resume_ran = True
+                    await asyncio.wait_for(
+                        self._resume_child(fresh, claim), timeout=_POST_TIMEOUT_S
                     )
-                    if stored == reservation:
-                        await asyncio.wait_for(
-                            self._resume_child(fresh, claim), timeout=_POST_TIMEOUT_S
-                        )
-                        # Re-observe next tick: the post may already have started a turn.
-                        continue
-                current.append((fresh, state))
+                    continue
+            current.append((fresh, state))
         labels = await asyncio.to_thread(refresh_checkin_followups, self._store, parent_id)
         followups = {
             key: item
@@ -641,9 +825,10 @@ class ChildIdleSweeper:
             )
         except Exception:  # noqa: BLE001 — roster reachability is unknown on lookup failure
             liveness = {}
+        inherited_placement = await asyncio.to_thread(_inherited_placement, self._store, parent_id)
         for child, state in current:
             agent, _harness = _child_summary_identity(child, None, {})
-            placement = _effective_placement(child, _inherited_placement(self._store, parent_id))
+            placement = _effective_placement(child, inherited_placement)
             tail = _latest_assistant_tail(items.get(child.id, []), limit_chars=400)
             lines[child.id] = json.dumps(
                 {
@@ -668,8 +853,11 @@ class ChildIdleSweeper:
         roster: dict[str, str] = {}
         capacity = None
         if policy.coverage == "summary":
+            fresh_children = await asyncio.to_thread(
+                self._store.get_conversations, [child.id for child in children]
+            )
             for child in children:
-                fresh = await asyncio.to_thread(self._store.get_conversation, child.id)
+                fresh = fresh_children.get(child.id)
                 if (
                     fresh is None
                     or fresh.archived

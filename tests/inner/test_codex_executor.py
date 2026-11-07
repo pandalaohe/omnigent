@@ -6397,6 +6397,162 @@ def test_extract_codex_last_turn_usage_handles_missing_or_malformed() -> None:
     assert _extract_codex_last_turn_usage({"tokenUsage": {"total": {}}}, "gpt-5.4-mini") is None
 
 
+async def test_codex_context_metadata_read_is_lazy_and_resets_on_worker_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.inner import codex_executor as module
+
+    monkeypatch.setattr(module, "_codex_home_config_source_from_env", lambda: tmp_path / "empty")
+    monkeypatch.setattr(module, "codex_minimal_config_requested", lambda: True)
+    monkeypatch.setattr(module._proc, "native_server_pid", lambda *_args: None)
+
+    async def spawn(*_args, **_kwargs):
+        proc = _FakeProcess()
+        proc.stdout = _ScriptedStdoutPipe([])
+        return proc
+
+    monkeypatch.setattr(module, "_create_subprocess_exec", AsyncMock(side_effect=spawn))
+    session = _CodexAppServerSession(
+        codex_path="/opt/work/bin/codex", cwd=str(tmp_path), env={}, tool_executor=None
+    )
+    session._request = AsyncMock(return_value={"result": {}})
+    homes = []
+
+    def metadata():
+        homes.append(session._codex_home_dir)
+        return {}, {}
+
+    read = Mock(side_effect=metadata)
+    monkeypatch.setattr(session, "_read_context_metadata", read)
+
+    async def notice(usage):
+        session._events.put_nowait(
+            {"method": "thread/tokenUsage/updated", "params": {"tokenUsage": usage}}
+        )
+        session._events.put_nowait(
+            {"method": "turn/completed", "params": {"turn": {"id": "turn"}}}
+        )
+        await session._drain_final_answer_tail(active_turn_id="turn", model=None)
+
+    try:
+        for cycle in range(2):
+            await session.start()
+            assert read.call_count == cycle
+            for usage in ({}, {"modelContextWindow": 0}, {"modelContextWindow": True}):
+                await notice(usage)
+                assert read.call_count == cycle
+            for _ in range(2):
+                await notice({"modelContextWindow": 200000})
+                assert read.call_count == cycle + 1
+            assert homes[-1] == session._codex_home_dir
+            await session.close()
+        assert homes[0] != homes[1]
+    finally:
+        await session.close()
+
+
+async def test_codex_context_catalog_loads_on_usage_and_is_reused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+
+    from omnigent.inner import codex_executor as module
+
+    (tmp_path / "config.toml").write_text("", encoding="utf-8")
+    session = _CodexAppServerSession(
+        codex_path="/fixture/codex-context", cwd=str(tmp_path), env={}, tool_executor=None
+    )
+    session._codex_home_dir = tmp_path
+    session._thread_model = "model-1"
+    probes = []
+
+    def probe(argv, **kwargs):
+        probes.append(argv)
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=json.dumps(
+                {
+                    "models": [
+                        {
+                            "slug": "model-1",
+                            "context_window": 500000,
+                            "effective_context_window_percent": 95,
+                        }
+                    ]
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", probe)
+    monkeypatch.setattr(module, "_MODEL_CATALOG_CACHE", {})
+    monkeypatch.setattr(module, "_MODEL_CATALOG_FAILURES", {})
+    for turn in ("one", "two"):
+        session._events.put_nowait(
+            {
+                "method": "thread/tokenUsage/updated",
+                "params": {
+                    "turnId": turn,
+                    "tokenUsage": {
+                        "modelContextWindow": 475000,
+                        "last": {"inputTokens": 100, "outputTokens": 25},
+                    },
+                },
+            }
+        )
+        session._events.put_nowait({"method": "turn/completed", "params": {"turn": {"id": turn}}})
+        await session._drain_final_answer_tail(active_turn_id=turn, model="model-1")
+        usage = session._consume_turn_usage()
+        assert usage is not None
+        assert usage["context_model"] == "model-1"
+        assert usage["context_window"] == 475000
+        assert usage["auto_compact_token_limit"] == 450000
+        assert probes == [["/fixture/codex-context", "debug", "models"]]
+
+
+def test_codex_sdk_reports_runtime_window_and_total_compact_limit() -> None:
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
+    )
+    session._usage_context_models = {
+        "model-1": {
+            "context_window": 500_000,
+            "effective_context_window_percent": 95,
+        }
+    }
+    session._thread_model = "model-1"
+    session._observe_token_usage(
+        {
+            "tokenUsage": {
+                "modelContextWindow": 475_000,
+                "last": {"inputTokens": 100, "outputTokens": 25, "totalTokens": 125},
+            }
+        },
+        None,
+    )
+    usage = session._consume_turn_usage()
+    assert usage is not None
+    assert usage["context_window"] == 475_000
+    assert usage["model"] == "model-1"
+    assert usage["context_model"] == "model-1"
+    assert usage["auto_compact_token_limit"] == 450_000
+    session._observe_token_usage(
+        {
+            "tokenUsage": {
+                "modelContextWindow": 258_400,
+                "last": {"inputTokens": 10, "outputTokens": 2},
+            }
+        },
+        "unknown-model",
+    )
+    usage = session._consume_turn_usage()
+    assert usage is not None
+    assert usage["context_window"] == 258_400
+    assert usage["context_model"] is None
+    assert usage["auto_compact_token_limit"] is None
+
+
 def test_extract_codex_thread_total_usage_reads_cumulative_counters() -> None:
     """``tokenUsage.total`` yields the raw cumulative thread counters."""
     from omnigent.inner.codex_executor import _extract_codex_thread_total_usage

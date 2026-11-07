@@ -1,0 +1,25 @@
+{
+  "_fixture": {
+    "source": "https://developers.openai.com/codex/config-advanced/",
+    "metric_names_source": "https://github.com/openai/codex/blob/main/codex-rs/otel/src/metrics/names.rs",
+    "temporality_source": "https://github.com/openai/codex/blob/main/codex-rs/otel/README.md",
+    "encoding_source": "https://opentelemetry.io/docs/specs/otlp/",
+    "accessed": "2026-11-06",
+    "kind": "documentation example, not a live recording"
+  },
+  "body": {
+    "resourceMetrics": [{
+      "resource": {"attributes": [{"key": "service.name", "value": {"stringValue": "codex-cli"}}]},
+      "scopeMetrics": [{"metrics": [{
+        "name": "codex.turn.token_usage",
+        "histogram": {"aggregationTemporality": 1, "dataPoints": [
+          {"attributes": [{"key": "token_type", "value": {"stringValue": "input"}}, {"key": "model", "value": {"stringValue": "model-a"}}, {"key": "auth_mode", "value": {"stringValue": "api"}}], "timeUnixNano": "1793923200000000000", "count": "1", "sum": 100},
+          {"attributes": [{"key": "token_type", "value": {"stringValue": "cached_input"}}, {"key": "model", "value": {"stringValue": "model-a"}}, {"key": "auth_mode", "value": {"stringValue": "api"}}], "timeUnixNano": "1793923200000000000", "count": "1", "sum": 60},
+          {"attributes": [{"key": "token_type", "value": {"stringValue": "output"}}, {"key": "model", "value": {"stringValue": "model-a"}}, {"key": "auth_mode", "value": {"stringValue": "api"}}], "timeUnixNano": "1793923200000000000", "count": "1", "sum": 20},
+          {"attributes": [{"key": "token_type", "value": {"stringValue": "reasoning_output"}}, {"key": "model", "value": {"stringValue": "model-a"}}, {"key": "auth_mode", "value": {"stringValue": "api"}}], "timeUnixNano": "1793923200000000000", "count": "1", "sum": 5},
+          {"attributes": [{"key": "token_type", "value": {"stringValue": "total"}}, {"key": "model", "value": {"stringValue": "model-a"}}, {"key": "auth_mode", "value": {"stringValue": "api"}}], "timeUnixNano": "1793923200000000000", "count": "1", "sum": 120}
+        ]}
+      }]}]
+    }]
+  }
+}

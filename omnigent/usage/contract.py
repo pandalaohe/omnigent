@@ -19,7 +19,9 @@ class UsageWindow(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     id: _Id
-    kind: Literal["session", "weekly", "weekly_model", "monthly", "other"] = "other"
+    kind: Literal["session", "weekly", "weekly_model", "monthly", "daily", "term", "other"] = (
+        "other"
+    )
     label: str | None = Field(default=None, max_length=32)
     group: str | None = Field(default=None, max_length=32)
     percent_used: Annotated[_Number, Field(ge=0, le=100)] | None = None
@@ -27,7 +29,8 @@ class UsageWindow(BaseModel):
     resets_at: Annotated[_Number, Field(gt=0)] | None = None
     used_value: Annotated[_Number, Field(ge=0)] | None = None
     limit_value: Annotated[_Number, Field(ge=0)] | None = None
-    unit: str | None = Field(default=None, max_length=8)
+    unit: str | None = Field(default=None, max_length=24)
+    note: str | None = Field(default=None, max_length=64)
 
     @model_validator(mode="after")
     def has_measurement(self) -> UsageWindow:
@@ -66,16 +69,117 @@ class ReportModel(BaseModel):
     id: str
     input_per_million: Annotated[_Number, Field(ge=0)] | None = None
     output_per_million: Annotated[_Number, Field(ge=0)] | None = None
+    input_cost_per_token: Annotated[_Number, Field(ge=0)] | None = None
+    output_cost_per_token: Annotated[_Number, Field(ge=0)] | None = None
+    cache_read_input_token_cost: Annotated[_Number, Field(ge=0)] | None = None
+    cache_creation_input_token_cost: Annotated[_Number, Field(ge=0)] | None = None
+    output_cost_per_image: Annotated[_Number, Field(ge=0)] | None = None
+    input_cost_per_request: Annotated[_Number, Field(ge=0)] | None = None
 
 
-class UsageReport(BaseModel):
+class UsageBalance(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    schema_version: Literal[1] = 1
+    id: _Id
+    label: str | None = Field(default=None, max_length=32)
+    group: str | None = Field(default=None, max_length=32)
+    remaining: _Number
+    unit: str = Field(min_length=1, max_length=24)
+    usd_per_unit: Annotated[_Number, Field(gt=0)] | None = None
+    note: str | None = Field(default=None, max_length=64)
+    expires_at: Annotated[_Number, Field(gt=0)] | None = None
+
+
+class ActivityEntryV2(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    hour: Annotated[StrictInt, Field(gt=0)]
+    model: str = Field(default="", max_length=128)
+    host: str = Field(default="", max_length=64)
+    uncached_input_tokens: Annotated[StrictInt, Field(ge=0)] | None = None
+    cache_read_input_tokens: Annotated[StrictInt, Field(ge=0)] | None = None
+    cache_creation_input_tokens: Annotated[StrictInt, Field(ge=0)] | None = None
+    output_tokens: Annotated[StrictInt, Field(ge=0)] | None = None
+    reasoning_tokens: Annotated[StrictInt, Field(ge=0)] | None = None
+    tokens: Annotated[StrictInt, Field(ge=0)] | None = None
+    requests: Annotated[StrictInt, Field(ge=0)] | None = None
+    failed: Annotated[StrictInt, Field(ge=0)] | None = None
+    reasons: dict[str, int] | None = None
+    cost_usd: Annotated[_Number, Field(ge=0)] | None = None
+    cost_basis: Literal["billed", "metered", "list", "estimate"] = "metered"
+    coverage: Literal["complete", "partial"] = "complete"
+    removed: bool = Field(default=False, strict=True)
+    correction: bool = Field(default=False, strict=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def removal_names_only(cls, value: Any) -> Any:
+        if isinstance(value, dict) and value.get("removed") is True:
+            return {
+                key: item
+                for key, item in value.items()
+                if key in {"hour", "model", "host", "cost_basis", "removed"}
+            }
+        return value
+
+    @model_validator(mode="after")
+    def validate_entry(self) -> ActivityEntryV2:
+        ActivityHour(hour=self.hour, reasons=self.reasons)
+        if self.cost_basis == "estimate":
+            self.cost_basis = "list"
+        figures = (
+            self.uncached_input_tokens,
+            self.cache_read_input_tokens,
+            self.cache_creation_input_tokens,
+            self.output_tokens,
+            self.reasoning_tokens,
+            self.tokens,
+            self.requests,
+            self.failed,
+            self.cost_usd,
+        )
+        if (
+            not self.removed
+            and self.coverage != "partial"
+            and not any(value is not None for value in figures)
+            and not self.reasons
+        ):
+            raise ValueError("an activity entry without figures requires coverage: partial")
+        return self
+
+    def total(self) -> int | None:
+        buckets = (
+            self.uncached_input_tokens,
+            self.cache_read_input_tokens,
+            self.cache_creation_input_tokens,
+            self.output_tokens,
+        )
+        if all(value is not None for value in buckets):
+            return sum(value for value in buckets if value is not None)
+        return self.tokens
+
+
+class EntryOutcome(BaseModel):
+    hour: int
+    host: str
+    model: str
+    cost_basis: str
+    reason: Literal["lower_reread", "partial_over_complete", "out_of_range"]
+
+
+class WriteOutcome(BaseModel):
+    applied: int = Field(default=0, ge=0)
+    held: list[EntryOutcome] = Field(default_factory=list)
+    skipped: list[EntryOutcome] = Field(default_factory=list)
+    older_sections: list[Literal["windows", "balances"]] = Field(default_factory=list)
+
+
+class _ReportFields(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     observed_at: Annotated[_Number, Field(gt=0)]
     status: Literal["available", "unavailable"] = "available"
     fresh_until: Annotated[_Number, Field(gt=0)] | None = None
-    windows: Annotated[list[UsageWindow], Field(max_length=16)]
     pinned_window: _Id | None = None
     display_name: str | None = Field(default=None, max_length=64)
     plan: str | None = Field(default=None, max_length=64)
@@ -84,8 +188,16 @@ class UsageReport(BaseModel):
     renews_at: Annotated[_Number, Field(gt=0)] | None = None
     product: str | None = None
     host_id: str | None = Field(default=None, max_length=128)
-    activity: Annotated[list[ActivityHour] | None, Field(max_length=500)] = None
     models: Annotated[list[ReportModel] | None, Field(max_length=128)] = None
+
+    def stored(self) -> dict[str, Any]:
+        return self.model_dump(mode="json", exclude_none=True)
+
+
+class UsageReport(_ReportFields):
+    schema_version: Literal[1] = 1
+    windows: Annotated[list[UsageWindow], Field(max_length=16)]
+    activity: Annotated[list[ActivityHour] | None, Field(max_length=500)] = None
 
     @model_validator(mode="after")
     def window_ids_and_pin(self) -> UsageReport:
@@ -96,8 +208,31 @@ class UsageReport(BaseModel):
             raise ValueError("pinned_window must name a reported window")
         return self
 
-    def stored(self) -> dict[str, Any]:
-        return self.model_dump(mode="json", exclude_none=True)
+
+class UsageReportV2(_ReportFields):
+    schema_version: Literal[2]
+    windows: Annotated[list[UsageWindow], Field(max_length=16)] = Field(default_factory=list)
+    balances: Annotated[list[UsageBalance], Field(max_length=16)] = Field(default_factory=list)
+    activity: Annotated[list[ActivityEntryV2] | None, Field(max_length=500)] = None
+    source_type: Literal["subscription", "metered", "relay", "manual", "other"] | None = None
+    source: str | None = Field(default=None, max_length=64)
+
+    @model_validator(mode="after")
+    def validate_sections(self) -> UsageReportV2:
+        for section in (self.windows, self.balances):
+            ids = [item.id for item in section]
+            if len(ids) != len(set(ids)):
+                raise ValueError("section ids must be unique")
+        if "windows" in self.model_fields_set and self.pinned_window is not None:
+            if self.pinned_window not in {item.id for item in self.windows}:
+                raise ValueError("pinned_window must name a reported window")
+        return self
+
+
+def parse_usage_report(payload: Any) -> UsageReport | UsageReportV2:
+    if isinstance(payload, dict) and payload.get("schema_version") == 2:
+        return UsageReportV2.model_validate(payload)
+    return UsageReport.model_validate(payload)
 
 
 class UsageWindowView(BaseModel):
@@ -116,6 +251,7 @@ class UsageWindowView(BaseModel):
     used_value: float | None = None
     limit_value: float | None = None
     unit: str | None = None
+    note: str | None = None
     past_reset: bool = False
 
 
@@ -153,6 +289,12 @@ class UsageAccountView(BaseModel):
     windows: list[UsageWindowView] = Field(default_factory=list)
     hosts: list[UsageHostView] = Field(default_factory=list)
     models: list[ReportModel] = Field(default_factory=list)
+    balances: list[UsageBalance] = Field(default_factory=list)
+    balance_read_at: float | None = None
+    balance_freshness: Literal["fresh", "old", "none"] = "none"
+    source_type: str | None = None
+    source: str | None = None
+    source_at: float | None = None
 
 
 class UsageOverview(BaseModel):

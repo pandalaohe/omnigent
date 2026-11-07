@@ -1,4 +1,4 @@
-// The caller's recently-touched sessions, newest first. The route is a
+// Sessions ordered by the caller's last interaction, or creation if untouched. The route is a
 // dedicated `/me` endpoint, so a server without it answers 404 — treated as a
 // capability signal (the sidebar shows a note instead of retrying).
 

@@ -10,6 +10,7 @@ from contextvars import ContextVar
 from typing import Any
 
 from sqlalchemy import (
+    JSON,
     BigInteger,
     Boolean,
     CheckConstraint,
@@ -29,6 +30,7 @@ from sqlalchemy import (
     true,
 )
 from sqlalchemy.dialects.mysql import BINARY as MySQLBinary
+from sqlalchemy.dialects.mysql import MEDIUMBLOB as MySQLMediumBlob
 from sqlalchemy.dialects.mysql import VARCHAR as MySQLVarchar
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -376,6 +378,11 @@ class SqlUser(OmnigentBase):
     )
 
 
+class _PreferenceText(CompressedText):
+    impl = LargeBinary().with_variant(MySQLMediumBlob(), "mysql")
+    cache_ok = True
+
+
 class SqlPreference(OmnigentBase):
     """Named user preferences, scoped to a workspace and stored as opaque JSON."""
 
@@ -390,7 +397,7 @@ class SqlPreference(OmnigentBase):
     )
     user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     key: Mapped[str] = mapped_column(String(128), primary_key=True)
-    value: Mapped[str] = mapped_column(CompressedText, nullable=False)
+    value: Mapped[str] = mapped_column(_PreferenceText, nullable=False)
 
 
 class SqlAccountToken(OmnigentBase):
@@ -1125,6 +1132,7 @@ class SqlConversation(ConversationBase):
     # created without an agent binding. Indexed for the agent→conversation
     # reverse lookup and the list filters (agent_id / has_agent_id / agent_name).
     agent_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    session_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Per-session config overrides packed as a compact JSON object, e.g.
     # ``{"model_override":"claude-opus-4-8","reasoning_effort":"high"}``. Keys:
     # reasoning_effort, model_override, cost_control_mode_override,
@@ -1919,11 +1927,23 @@ class SqlUsageHour(OmnigentBase):
     basis: Mapped[str] = mapped_column(String(16), primary_key=True, server_default="unknown")
     # 0/1 rather than BOOLEAN: a portable primary-key member on every engine.
     priced: Mapped[int] = mapped_column(SmallInteger, primary_key=True, server_default="0")
-    input_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
-    cached_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
-    cache_write_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
-    output_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
-    total_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    input_tokens: Mapped[int | None] = mapped_column(
+        BigInteger().evaluates_none(), nullable=True, server_default="0"
+    )
+    cached_tokens: Mapped[int | None] = mapped_column(
+        BigInteger().evaluates_none(), nullable=True, server_default="0"
+    )
+    cache_write_tokens: Mapped[int | None] = mapped_column(
+        BigInteger().evaluates_none(), nullable=True, server_default="0"
+    )
+    output_tokens: Mapped[int | None] = mapped_column(
+        BigInteger().evaluates_none(), nullable=True, server_default="0"
+    )
+    total_tokens: Mapped[int | None] = mapped_column(
+        BigInteger().evaluates_none(), nullable=True, server_default="0"
+    )
+    reasoning_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    coverage: Mapped[str | None] = mapped_column(String(16), nullable=True)
     requests: Mapped[int | None] = mapped_column(Integer, nullable=True)
     failed: Mapped[int | None] = mapped_column(Integer, nullable=True)
     reasons: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -2923,6 +2943,66 @@ class SqlSessionPeerMessage(OmnigentBase):
             "pair_sequence",
         ),
     )
+
+
+def _task_board_key(length: int) -> String:
+    return String(length).with_variant(
+        MySQLVarchar(length, charset="utf8mb4", collation="utf8mb4_0900_bin"), "mysql"
+    )
+
+
+class SqlTaskBoardSource(OmnigentBase):
+    __tablename__ = "task_board_sources"
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id, server_default="0"
+    )
+    owner_id: Mapped[str] = mapped_column(_task_board_key(128), primary_key=True)
+    source_id: Mapped[str] = mapped_column(_task_board_key(64), primary_key=True)
+    name: Mapped[str | None] = mapped_column(String(128))
+    source: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[float] = mapped_column(Double, nullable=False)
+    last_write: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    complete_updated: Mapped[float | None] = mapped_column(Double)
+    complete_version: Mapped[str | None] = mapped_column(Text)
+    issues: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+
+
+class SqlTaskBoardItem(OmnigentBase):
+    __tablename__ = "task_board_items"
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id, server_default="0"
+    )
+    owner_id: Mapped[str] = mapped_column(_task_board_key(128), primary_key=True)
+    source_id: Mapped[str] = mapped_column(_task_board_key(64), primary_key=True)
+    uid: Mapped[str] = mapped_column(_task_board_key(255), primary_key=True)
+    body: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    progress: Mapped[str] = mapped_column(String(16), nullable=False)
+    group_id: Mapped[str] = mapped_column(_task_board_key(64), nullable=False, default="")
+    source_updated: Mapped[float] = mapped_column(Double, nullable=False)
+    sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    closed_at: Mapped[float | None] = mapped_column(Double)
+    closed_seen_at: Mapped[float | None] = mapped_column(Double)
+    changed_at: Mapped[float] = mapped_column(Double, nullable=False)
+    gone_at: Mapped[float | None] = mapped_column(Double)
+    __table_args__ = (
+        Index("ix_task_board_items_changed", "workspace_id", "owner_id", "changed_at"),
+        Index("ix_task_board_items_closed", "workspace_id", "owner_id", "closed_at"),
+    )
+
+
+class SqlTaskBoardHistory(OmnigentBase):
+    __tablename__ = "task_board_history"
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id, server_default="0"
+    )
+    owner_id: Mapped[str] = mapped_column(_task_board_key(128), primary_key=True)
+    source_id: Mapped[str] = mapped_column(_task_board_key(64), primary_key=True)
+    uid: Mapped[str] = mapped_column(_task_board_key(255), primary_key=True)
+    entry_id: Mapped[str] = mapped_column(_task_board_key(128), primary_key=True)
+    time: Mapped[float] = mapped_column(Double, nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    entry: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    __table_args__ = (Index("ix_task_board_history_time", "workspace_id", "owner_id", "time"),)
 
 
 class SqlUsageFeed(OmnigentBase):

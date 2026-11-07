@@ -14,27 +14,37 @@ interface StubNode {
   id: string;
   data: { sessionId: string };
 }
+const flow = vi.hoisted(() => ({
+  zoomIn: vi.fn(),
+  zoomOut: vi.fn(),
+  setCenter: vi.fn(),
+  viewportInitialized: true,
+}));
 vi.mock("@xyflow/react", () => ({
   ReactFlow: ({
     nodes,
     onNodeClick,
+    children,
+    minZoom,
   }: {
     nodes: StubNode[];
     onNodeClick: (event: MouseEvent, node: StubNode) => void;
     children?: ReactNode;
+    minZoom?: number;
   }) => (
-    <div>
+    <div data-testid="graph-canvas" data-min-zoom={minZoom}>
       {nodes.map((node) => (
         <button key={node.id} type="button" onClick={(event) => onNodeClick(event, node)}>
           {node.data.sessionId}
         </button>
       ))}
+      {children}
     </div>
   ),
   Background: () => null,
   Handle: () => null,
   Position: { Top: "top", Bottom: "bottom" },
-  useReactFlow: () => ({ zoomIn: vi.fn(), zoomOut: vi.fn(), fitView: vi.fn() }),
+  useReactFlow: () => flow,
 }));
 vi.mock("@xyflow/react/dist/style.css", () => ({}));
 
@@ -69,11 +79,15 @@ function CurrentPath() {
   return <output data-testid="current-path">{location.pathname + location.search}</output>;
 }
 
-function renderGraph(opener: (id: string) => boolean, initialEntry = "/c/conv_root") {
+function renderGraph(
+  opener: (id: string) => boolean,
+  initialEntry = "/c/conv_root",
+  conversationId = "conv_root",
+) {
   render(
     <MemoryRouter initialEntries={[initialEntry]}>
       <SubagentPanelOpenerContext.Provider value={opener}>
-        <SubagentsGraphView conversationId="conv_root" rootSessionId="conv_root" />
+        <SubagentsGraphView conversationId={conversationId} rootSessionId="conv_root" />
       </SubagentPanelOpenerContext.Provider>
       <CurrentPath />
     </MemoryRouter>,
@@ -83,6 +97,26 @@ function renderGraph(opener: (id: string) => boolean, initialEntry = "/c/conv_ro
 afterEach(() => {
   cleanup();
   localStorage.clear();
+  rootChildren.splice(1);
+  vi.clearAllMocks();
+});
+
+describe("SubagentsGraphView readable viewport", () => {
+  it("opens a large tree around the current session at normal text size", () => {
+    rootChildren.push(...Array.from({ length: 31 }, (_, i) => ({ ...child, id: `sibling-${i}` })));
+    renderGraph(() => false);
+
+    expect(flow.setCenter).toHaveBeenCalledWith(0, 30, { zoom: 1, duration: 0 });
+    expect(screen.getByTestId("graph-canvas")).toHaveAttribute("data-min-zoom", "0.85");
+    expect(screen.getByRole("button", { name: "sibling-30" })).toBeInTheDocument();
+  });
+
+  it("resets the viewport around the selected child instead of shrinking the tree", () => {
+    renderGraph(() => false, "/c/conv_child", "conv_child");
+    fireEvent.click(screen.getByRole("button", { name: "Reset view" }));
+
+    expect(flow.setCenter).toHaveBeenLastCalledWith(0, 120, { zoom: 1, duration: 200 });
+  });
 });
 
 describe("SubagentsGraphView node clicks", () => {

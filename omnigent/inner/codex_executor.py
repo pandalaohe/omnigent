@@ -62,6 +62,7 @@ from omnigent.harnesses.codex_egress import (
     is_connection_failure_text,
     is_connection_retry,
 )
+from omnigent.harnesses.codex_native.bridge import codex_auto_compact_token_limit
 from omnigent.harnesses.codex_native.context_inventory import CodexContextInventory
 from omnigent.harnesses.codex_native.keep_warm import (
     KeepWarmPingResult,
@@ -77,7 +78,11 @@ from omnigent.harnesses.codex_native.launch_args import (
 from omnigent.harnesses.codex_native.side_chat import (
     is_keep_warm_fork as _is_keep_warm_fork,
 )
-from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
+from omnigent.inner.agent_env import (
+    clean_agent_env,
+    declared_passthrough,
+    managed_telemetry_attributes,
+)
 from omnigent.inner.codex_binary import CODEX_RUNTIME_BIN_ENV, snapshot_codex_binary
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.models import model_catalog
@@ -112,7 +117,11 @@ from omnigent.util.reasoning_effort import (
 from . import _proc
 from ._subprocess_lifecycle import close_subprocess_transport, terminate_subprocess
 from .async_utils import run_sync_on_thread
-from .codex_config_sync import normalize_codex_catalog_paths, sync_codex_config
+from .codex_config_sync import (
+    drop_usage_metrics_exporter,
+    normalize_codex_catalog_paths,
+    sync_codex_config,
+)
 from .codex_goal_command import goal_objective_from_content as _goal_objective_from_content
 from .codex_goal_command import goal_objective_length_error as _goal_objective_length_error
 from .codex_staging import (
@@ -844,12 +853,9 @@ def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
         deny_exact=_CODEX_ENV_DENY_EXACT,
         extra_allowed=extra_allow,
     )
-    resource_attributes = [
-        attribute
-        for attribute in env.get("OTEL_RESOURCE_ATTRIBUTES", "").split(",")
-        if attribute.strip() and attribute.partition("=")[0].strip() != "launch_mode"
-    ]
-    env["OTEL_RESOURCE_ATTRIBUTES"] = ",".join([*resource_attributes, "launch_mode=omni"])
+    env["OTEL_RESOURCE_ATTRIBUTES"] = managed_telemetry_attributes(
+        env.get("OTEL_RESOURCE_ATTRIBUTES", "")
+    )
     return env
 
 
@@ -1422,6 +1428,7 @@ def _apply_codex_current_route(
                 parent.pop(parts[-1], None)
         if source_home is not None:
             normalize_codex_catalog_paths(document, source_home)
+        drop_usage_metrics_exporter(document)
         if _write_codex_config(config_path, tomlkit.dumps(document)):
             return hashlib.sha256(route_content).hexdigest()
     except (OSError, UnicodeError, ValueError, tomlkit.exceptions.TOMLKitError) as exc:
@@ -1685,6 +1692,7 @@ def _populate_codex_home_config(
             for key in ("model_provider", "model_providers", "profiles"):
                 if key in source_config:
                     minimal_document[key] = source_config[key]
+            drop_usage_metrics_exporter(minimal_document)
             dest_path.write_text(tomlkit.dumps(minimal_document))
             _normalize_copied_codex_catalog_paths(dest_path, source_dir)
             continue
@@ -3401,6 +3409,9 @@ class _CodexAppServerSession:
         # plus a ``context_tokens`` window-fill snapshot from ``last``.
         # Consumed (and cleared) on the next ``turn/completed``.
         self._last_turn_usage: dict[str, object] | None = None
+        self._usage_context_config: dict[str, object] = {}
+        self._usage_context_models: dict[str, dict[str, object]] = {}
+        self._usage_context_metadata_loaded = False
         # Raw cumulative ``tokenUsage.total`` counters: the newest observed
         # values, and the snapshot consumed at the last turn boundary.
         self._thread_usage_total_raw: dict[str, int] | None = None
@@ -3455,6 +3466,7 @@ class _CodexAppServerSession:
     async def _start_unchecked(self) -> None:
         if self._started:
             return
+        self._usage_context_metadata_loaded = False
         self._resident_connection_generation += 1
         generation = self._resident_connection_generation
         self._resident_established_connection = None
@@ -4197,7 +4209,52 @@ class _CodexAppServerSession:
         if len(self._recent_events) > 20:
             self._recent_events.pop(0)
 
+    def _read_context_metadata(self) -> tuple[dict[str, object], dict[str, dict[str, object]]]:
+        """Use this worker's CLI catalog and private config, never the server estimate."""
+        if self._codex_home_dir is None:
+            return {}, {}
+        try:
+            config = tomllib.loads(
+                (self._codex_home_dir / "config.toml").read_text(encoding="utf-8")
+            )
+            for override in self._codex_config_overrides:
+                if override.split("=", 1)[0].strip() in {
+                    "model_context_window",
+                    "model_auto_compact_token_limit",
+                    "model_auto_compact_token_limit_scope",
+                    "model_post_turn_compact_threshold_percent",
+                    "features.async_compaction",
+                    "features.token_budget",
+                }:
+                    for key, value in tomllib.loads(override).items():
+                        if isinstance(config.get(key), dict) and isinstance(value, dict):
+                            config[key].update(value)
+                        else:
+                            config[key] = value
+            catalog = read_codex_model_catalog(self._codex_path, self._codex_home_dir)
+        except (OSError, ValueError):
+            return {}, {}
+        models = catalog.get("models") if catalog else None
+        return config, {
+            entry["slug"]: entry
+            for entry in models or []
+            if isinstance(entry, dict) and isinstance(entry.get("slug"), str)
+        }
+
+    async def _ensure_context_metadata(self, params: object) -> None:
+        if self._usage_context_metadata_loaded:
+            return
+        usage = params.get("tokenUsage") if isinstance(params, dict) else None
+        window = usage.get("modelContextWindow") if isinstance(usage, dict) else None
+        if type(window) is not int or window <= 0:
+            return
+        self._usage_context_config, self._usage_context_models = await asyncio.to_thread(
+            self._read_context_metadata
+        )
+        self._usage_context_metadata_loaded = True
+
     def _observe_token_usage(self, params: object, model: str | None) -> None:
+        model = model or self._thread_model
         total_raw = _extract_codex_thread_total_usage(params)
         if total_raw is not None:
             self._thread_usage_total_raw = total_raw
@@ -4216,6 +4273,25 @@ class _CodexAppServerSession:
             context_tokens = _extract_codex_context_tokens(params)
             if context_tokens is not None:
                 self._last_turn_usage["context_tokens"] = context_tokens
+            token_usage = params.get("tokenUsage") if isinstance(params, dict) else None
+            window = (
+                token_usage.get("modelContextWindow") if isinstance(token_usage, dict) else None
+            )
+            if isinstance(window, int) and not isinstance(window, bool) and window > 0:
+                self._last_turn_usage["context_window"] = window
+                self._last_turn_usage["context_model"] = (
+                    model
+                    if model == self._thread_model or model in self._usage_context_models
+                    else None
+                )
+                entry = self._usage_context_models.get(model or "")
+                self._last_turn_usage["auto_compact_token_limit"] = (
+                    codex_auto_compact_token_limit(
+                        self._usage_context_config, entry, effective_context_window=window
+                    )
+                    if entry is not None
+                    else None
+                )
 
     def _consume_turn_usage(self) -> dict[str, object] | None:
         """Return the finished turn's usage and advance the thread baseline
@@ -4453,6 +4529,7 @@ class _CodexAppServerSession:
                     continue
                 method = message.get("method")
                 if method == "thread/tokenUsage/updated":
+                    await self._ensure_context_metadata(params)
                     self._observe_token_usage(params, model)
                     continue
                 if method in ("turn/completed", "turn/failed", "error"):
@@ -5102,6 +5179,7 @@ class _CodexAppServerSession:
                         continue
 
                 if method == "thread/tokenUsage/updated":
+                    await self._ensure_context_metadata(params)
                     self._observe_token_usage(params, model)
                     continue
 

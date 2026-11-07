@@ -22,6 +22,7 @@ from omnigent.harnesses.claude_native.bridge import (
     record_hook_event,
 )
 from omnigent.harnesses.claude_native.forwarder import (
+    _compaction_summary_uuid,
     _CompactionSnapshotError,
     _forward_available_status_events,
     _handle_compact_summary_item,
@@ -1100,6 +1101,40 @@ def test_latest_compaction_replaces_older_retained_context(
         "second summary",
         "new retained request",
     ]
+
+
+def test_compaction_boundary_carries_its_summary_uuid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The boundary names its summary record, so a re-posted boundary stores once.
+
+    The hook-driven path has no summary transcript item of its own; it binds the
+    identity to the transcript boundary this compaction wrote, which is the same
+    uuid the transcript path posts for that compaction.
+    """
+    bridge, _ = _write_transcript(tmp_path, monkeypatch, _transcript() + _second_compaction())
+    posted: list[dict[str, Any]] = []
+
+    _persist(bridge, posted)
+
+    assert posted[0]["type"] == "compaction"
+    assert posted[0]["data"]["source_id"] == "summary-2"
+
+
+@pytest.mark.parametrize(
+    ("source_id", "expected"),
+    [
+        ("0f1e2d3c:0:compact_summary", "0f1e2d3c"),
+        ("0f1e2d3c:1:message", None),
+        (":0:compact_summary", None),
+        (None, None),
+    ],
+)
+def test_compaction_summary_uuid_names_the_summary_record(
+    source_id: str | None, expected: str | None
+) -> None:
+    """Only a compact-summary transcript source id names a summary record."""
+    assert _compaction_summary_uuid(source_id) == expected
 
 
 def test_snapshot_log_reports_restored_counts(

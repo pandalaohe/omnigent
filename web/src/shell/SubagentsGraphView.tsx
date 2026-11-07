@@ -4,7 +4,7 @@ import { ReactFlow, Background, Position, Handle, useReactFlow } from "@xyflow/r
 import { useLocation, useNavigate } from "@/lib/routing";
 import { RunningDot } from "@/components/RunningDot";
 import { Badge } from "@/components/ui/badge";
-import { ZoomInIcon, ZoomOutIcon, Maximize2Icon } from "lucide-react";
+import { ZoomInIcon, ZoomOutIcon, RotateCcwIcon } from "lucide-react";
 import { MAX_TREE_DEPTH, useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
 import { cn } from "@/lib/utils";
@@ -12,6 +12,7 @@ import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodi
 import {
   buildGraphLayout,
   NODE_WIDTH,
+  NODE_HEIGHT,
   type AgentActivity,
   type AgentNodeData,
 } from "./subagentGraphLayout";
@@ -72,15 +73,15 @@ function AgentNodeComponent({ data }: NodeProps<Node<AgentNodeData>>) {
         style={{ width: NODE_WIDTH }}
       >
         <div className="flex items-center gap-1.5">
-          <span className="truncate text-sm font-medium leading-tight">{label}</span>
+          <span className="truncate text-[13px] font-medium leading-tight">{label}</span>
           <span className="flex-1" />
           <NodeStatusDot activity={activity} />
         </div>
         {preview && (
-          <p className="mt-1 truncate text-sm leading-tight text-muted-foreground">{preview}</p>
+          <p className="mt-1 truncate text-[13px] leading-tight text-muted-foreground">{preview}</p>
         )}
         {!["idle", "done"].includes(activity) && (
-          <p className="mt-0.5 text-sm text-muted-foreground">{statusLabel}</p>
+          <p className="mt-0.5 text-[13px] text-muted-foreground">{statusLabel}</p>
         )}
       </div>
       <Handle
@@ -92,8 +93,23 @@ function AgentNodeComponent({ data }: NodeProps<Node<AgentNodeData>>) {
   );
 }
 
-function ZoomControls() {
-  const { zoomIn, zoomOut, fitView } = useReactFlow();
+function ZoomControls({ focusNode }: { focusNode: Node<AgentNodeData> }) {
+  const { zoomIn, zoomOut, setCenter, viewportInitialized } = useReactFlow();
+  const focusedId = useRef<string | null>(null);
+  const resetView = useCallback(
+    (duration: number) =>
+      setCenter(focusNode.position.x + NODE_WIDTH / 2, focusNode.position.y + NODE_HEIGHT / 2, {
+        zoom: 1,
+        duration,
+      }),
+    [setCenter, focusNode.position.x, focusNode.position.y],
+  );
+
+  useEffect(() => {
+    if (!viewportInitialized || focusedId.current === focusNode.id) return;
+    focusedId.current = focusNode.id;
+    void resetView(0);
+  }, [viewportInitialized, focusNode.id, resetView]);
   const btnClass =
     "flex items-center justify-center size-7 rounded-md border bg-card text-muted-foreground shadow-sm hover:bg-accent hover:text-accent-foreground transition-colors";
   return (
@@ -117,10 +133,10 @@ function ZoomControls() {
       <button
         type="button"
         className={btnClass}
-        onClick={() => fitView({ duration: 200, padding: 0.3 })}
-        aria-label="Fit view"
+        onClick={() => void resetView(200)}
+        aria-label="Reset view"
       >
-        <Maximize2Icon className="size-4" />
+        <RotateCcwIcon className="size-4" />
       </button>
     </div>
   );
@@ -236,12 +252,11 @@ export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsG
     >
       <div className="h-full w-full" style={{ minHeight: 200 }}>
         <ReactFlow
+          key={rootSessionId}
           nodes={layoutNodes}
           edges={layoutEdges}
           nodeTypes={nodeTypes}
           onNodeClick={handleNodeClick}
-          fitView
-          fitViewOptions={{ padding: 0.3 }}
           panOnDrag
           panOnScroll
           zoomOnDoubleClick={false}
@@ -249,11 +264,13 @@ export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsG
           nodesConnectable={false}
           elementsSelectable={false}
           proOptions={{ hideAttribution: true }}
-          minZoom={0.1}
+          minZoom={0.85}
           maxZoom={3}
         >
           <Background bgColor="var(--card)" />
-          <ZoomControls />
+          <ZoomControls
+            focusNode={layoutNodes.find((node) => node.id === conversationId) ?? layoutNodes[0]}
+          />
         </ReactFlow>
       </div>
       {rootChildren.map((child) => (

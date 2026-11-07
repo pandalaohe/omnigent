@@ -269,6 +269,7 @@ class Conversation:
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
     harness_override: str | None = None
+    session_prompt: str | None = None
     share_workspace_files: bool = False
     sub_agent_name: str | None = None
     task_summary: str | None = None

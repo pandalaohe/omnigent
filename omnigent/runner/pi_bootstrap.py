@@ -6,12 +6,13 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import logging
 import os
 import re
 import secrets
 import stat
-from collections.abc import Mapping
-from contextlib import suppress
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
@@ -35,6 +36,24 @@ if TYPE_CHECKING:
     from http.server import HTTPServer
 
     from omnigent.runner.permission_tiers import PermissionTierRuntime
+
+
+logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _bootstrap_check(check: str) -> Iterator[None]:
+    """Name the failed broker boundary without logging private exception contents."""
+    try:
+        yield
+    except Exception as exc:
+        logger.warning("Pi bootstrap rejected: check=%s exception=%s", check, type(exc).__name__)
+        raise
+
+
+def _reject(check: str, message: str) -> ValueError:
+    logger.warning("Pi bootstrap rejected: check=%s exception=ValueError", check)
+    return ValueError(message)
 
 
 def process_identity(pid: int) -> tuple[int, float] | None:
@@ -133,7 +152,7 @@ class PiBootstrapBroker:
             or state.status not in ("ready", "blocked")
             or state.tier == "full"
         ):
-            raise ValueError("Pi root launcher authentication unavailable")
+            raise _reject("launcher_authentication", "Pi root launcher authentication unavailable")
 
     def handle_launcher(self, payload: dict[str, object]) -> dict[str, object]:
         """Reserve/publish/confirm the exact subprocess observed by the trusted harness."""
@@ -154,20 +173,26 @@ class PiBootstrapBroker:
             or not isinstance(launch_id, str)
             or re.fullmatch(r"[0-9a-f]{32}", launch_id) is None
         ):
-            raise ValueError("Pi root launcher request unavailable")
+            raise _reject("launcher_request_fields", "Pi root launcher request unavailable")
         launch = self._root_process_launch
         if op == "reserve":
             if launch is None or launch.launch_id != launch_id:
                 if launch is not None and launch.actor is not None and self.live(launch.actor):
-                    raise ValueError("Pi root process is still owned by another launch")
+                    raise _reject(
+                        "launcher_process_owned",
+                        "Pi root process is still owned by another launch",
+                    )
                 launch = PiRootProcessLaunch(launch_id, self.reserve_handoff())
                 self._root_process_launch = launch
             if launch.status != "reserved":
-                raise ValueError("Pi root handoff reservation is no longer pending")
+                raise _reject(
+                    "launcher_reservation_pending",
+                    "Pi root handoff reservation is no longer pending",
+                )
             reply: dict[str, object] = {"handoff": str(launch.handoff)}
         else:
             if launch is None or launch.launch_id != launch_id:
-                raise ValueError("Pi root launcher generation changed")
+                raise _reject("launcher_generation", "Pi root launcher generation changed")
             if op == "revoke":
                 if launch.actor is not None:
                     self.revoke_process(launch.actor)
@@ -176,7 +201,9 @@ class PiBootstrapBroker:
             elif op == "publish":
                 pid, started_at = payload.get("pid"), payload.get("started_at")
                 if type(pid) is not int or type(started_at) not in (int, float):
-                    raise ValueError("Pi root process identity unavailable")
+                    raise _reject(
+                        "launcher_identity_fields", "Pi root process identity unavailable"
+                    )
                 identity = (cast(int, pid), cast(float, started_at))
                 if launch.status == "reserved":
                     actor = self.register_process(
@@ -196,7 +223,9 @@ class PiBootstrapBroker:
                     or launch.actor.identity != identity
                     or not self.live(launch.actor)
                 ):
-                    raise ValueError("Pi root process publication is stale")
+                    raise _reject(
+                        "launcher_publication_live", "Pi root process publication is stale"
+                    )
                 reply = {"published": True}
             else:
                 if (
@@ -204,11 +233,13 @@ class PiBootstrapBroker:
                     or launch.actor is None
                     or not self.live(launch.actor)
                 ):
-                    raise ValueError("Pi root process is not published")
-                parent = self.runtime.pi_scopes.parent_scope(self.session_id)
-                ready = parent.status == "ready" and self.runtime.acknowledge_pi_scope(
-                    self.session_id, parent.admission.credential
-                )
+                    raise _reject("launcher_confirmation_live", "Pi root process is not published")
+                with _bootstrap_check("launcher_parent_scope"):
+                    parent = self.runtime.pi_scopes.parent_scope(self.session_id)
+                with _bootstrap_check("launcher_scope_acknowledgement"):
+                    ready = parent.status == "ready" and self.runtime.acknowledge_pi_scope(
+                        self.session_id, parent.admission.credential
+                    )
                 reply = {"ready": ready}
         return {**reply, "launch_id": launch_id}
 
@@ -257,19 +288,22 @@ class PiBootstrapBroker:
             or pid <= 1
             or process_identity(pid) != expected_identity
         ):
-            raise ValueError("Pi bootstrap process or endpoint unavailable")
+            raise _reject(
+                "process_identity_or_endpoint", "Pi bootstrap process or endpoint unavailable"
+            )
         admission: PiScopeAdmission | None = None
         if root:
             self.invalidate()
-            admission = self.runtime.begin_pi_scope_launch(self.session_id, native_guard=True)
+            with _bootstrap_check("process_scope_launch"):
+                admission = self.runtime.begin_pi_scope_launch(self.session_id, native_guard=True)
             epoch = admission.principal.launch_epoch
         else:
             epochs = {a.launch_epoch for a in self._actors.values() if a.root and not a.closed}
             if len(epochs) != 1:
-                raise ValueError("Pi bootstrap root process unavailable")
+                raise _reject("process_root_epoch", "Pi bootstrap root process unavailable")
             epoch = next(iter(epochs))
         if len(self._actors) >= 4096:
-            raise ValueError("Pi bootstrap process limit reached")
+            raise _reject("process_limit", "Pi bootstrap process limit reached")
         token = "pi_attestor_" + secrets.token_urlsafe(32)
         actor = PiAttestorProcess(
             pid, expected_identity, root, epoch, token, initial_root=admission if root else None
@@ -279,45 +313,52 @@ class PiBootstrapBroker:
 
     def reserve_handoff(self) -> Path:
         """Private launcher locator, allocated before the Node process exists."""
-        directory = self.runtime.path(self.session_id).parent.resolve() / "pi-bootstrap"
-        directory.mkdir(mode=0o700, exist_ok=True)
-        info = directory.lstat()
+        with _bootstrap_check("handoff_directory_io"):
+            directory = self.runtime.path(self.session_id).parent.resolve() / "pi-bootstrap"
+            directory.mkdir(mode=0o700, exist_ok=True)
+            info = directory.lstat()
         if (
             not stat.S_ISDIR(info.st_mode)
             # Windows protects this per-user directory through its ACL, not POSIX bits.
             or (not IS_WINDOWS and stat.S_IMODE(info.st_mode) & 0o077)
             or (hasattr(os, "getuid") and info.st_uid != os.getuid())
         ):
-            raise ValueError("Pi bootstrap handoff directory unavailable")
+            raise _reject(
+                "handoff_directory_permissions", "Pi bootstrap handoff directory unavailable"
+            )
         return directory / (uuid4().hex + ".json")
 
     def publish_handoff(self, actor: PiAttestorProcess, destination: Path) -> None:
         """Deliver directly to the independent preload, never through tool results."""
-        directory = self.runtime.path(self.session_id).parent.resolve() / "pi-bootstrap"
-        if (
-            not self.live(actor)
-            or actor.handoff is not None
-            or destination.parent != directory
-            or destination.exists()
-            or destination.is_symlink()
-            or not re.fullmatch(r"[0-9a-f]{32}\.json", destination.name)
-        ):
-            raise ValueError("Pi bootstrap handoff unavailable")
+        with _bootstrap_check("handoff_destination_resolve"):
+            directory = self.runtime.path(self.session_id).parent.resolve() / "pi-bootstrap"
+        with _bootstrap_check("handoff_destination_metadata"):
+            unavailable = (
+                not self.live(actor)
+                or actor.handoff is not None
+                or destination.parent != directory
+                or destination.exists()
+                or destination.is_symlink()
+                or not re.fullmatch(r"[0-9a-f]{32}\.json", destination.name)
+            )
+        if unavailable:
+            raise _reject("handoff_destination", "Pi bootstrap handoff unavailable")
         # Revalidate ownership and no-follow posture at publication as well as reservation.
         self.reserve_handoff()
-        atomic_write_json(
-            destination,
-            {
-                "protocol": 1,
-                "pid": actor.pid,
-                "endpoint": self.endpoint,
-                "credential": actor.token,
-                "brokerIncarnation": self.incarnation,
-                "launchEpoch": actor.launch_epoch,
-                "statePath": str(self.runtime.path(self.session_id)),
-                "bridgeDir": str(directory.parent),
-            },
-        )
+        with _bootstrap_check("handoff_atomic_write"):
+            atomic_write_json(
+                destination,
+                {
+                    "protocol": 1,
+                    "pid": actor.pid,
+                    "endpoint": self.endpoint,
+                    "credential": actor.token,
+                    "brokerIncarnation": self.incarnation,
+                    "launchEpoch": actor.launch_epoch,
+                    "statePath": str(self.runtime.path(self.session_id)),
+                    "bridgeDir": str(directory.parent),
+                },
+            )
         actor.handoff = destination
 
     def authenticate(self, authorization: str | None) -> PiAttestorProcess:

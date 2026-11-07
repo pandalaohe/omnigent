@@ -39,6 +39,67 @@ function originOf(url: string): string | null {
   }
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function stripTrailingDot(value: string): string {
+  return value.replace(/\.$/, "");
+}
+
+/**
+ * True when `text` contains `hostname` (with an optional trailing DNS dot and
+ * optional `:port`) as a whole host token, bounded by start/end or a
+ * non-hostname character.
+ */
+function containsHostToken(text: string, hostname: string): boolean {
+  const canonical = stripTrailingDot(hostname);
+  if (!canonical) return false;
+  const pattern = new RegExp(
+    `(^|[^a-z0-9.-])${escapeRegExp(canonical)}\\.?(?::\\d+)?($|[^a-z0-9.-])`,
+    "i",
+  );
+  return pattern.test(text);
+}
+
+/**
+ * True when a candidate server name repeats or contains the URL, origin,
+ * host:port, or whole hostname token of any of the given server URLs.
+ */
+function repeatsAddress(
+  name: string | null | undefined,
+  ...urls: (string | null | undefined)[]
+): boolean {
+  if (!name) return false;
+  const normalized = name.trim().toLowerCase().replace(/\/+$/, "");
+  if (!normalized) return false;
+  for (const url of urls) {
+    if (!url) continue;
+    const raw = url.trim().toLowerCase().replace(/\/+$/, "");
+    if (raw && normalized.includes(raw)) return true;
+    try {
+      const parsed = new URL(url);
+      const parsedHostname = stripTrailingDot(parsed.hostname.toLowerCase());
+      const parsedHost = parsed.port !== "" ? `${parsedHostname}:${parsed.port}` : parsedHostname;
+      const parsedOrigin = `${parsed.protocol.toLowerCase()}//${parsedHost}`;
+      if (
+        (parsedOrigin && normalized.includes(parsedOrigin)) ||
+        (parsed.origin && normalized.includes(parsed.origin.toLowerCase())) ||
+        (parsed.port !== "" &&
+          ((parsedHost && normalized.includes(parsedHost)) ||
+            normalized.includes(parsed.host.toLowerCase()))) ||
+        containsHostToken(normalized, parsedHostname)
+      ) {
+        return true;
+      }
+    } catch {
+      const host = stripTrailingDot(hostOf(url).trim().toLowerCase());
+      if (host && containsHostToken(normalized, host)) return true;
+    }
+  }
+  return false;
+}
+
 /**
  * A server's name over its host, or just the host. The host stays visible
  * because a server-supplied name is not proof of which server this is.
@@ -52,7 +113,8 @@ function ServerLabel({
   host: string;
   className?: string;
 }) {
-  if (!name) return <span className={cn("min-w-0 truncate", className)}>{host}</span>;
+  if (!name || name === host)
+    return <span className={cn("min-w-0 truncate", className)}>{host}</span>;
   return (
     <span className="flex min-w-0 flex-col">
       <span className={cn("truncate", className)}>{name}</span>
@@ -75,7 +137,8 @@ function serverKey(url: string): string | null {
  * Server picker for the native shells (Electron desktop and iOS), pinned to
  * the sidebar's bottom.
  *
- * A sidebar row (server glyph + current host + an upward chevron) that opens a
+ * A sidebar row (server glyph + server name or generic "Server" label + an
+ * upward chevron) that opens a
  * menu of organization-provided and recently-connected servers — selecting one
  * re-points the whole window via the shell — plus "Connect to new server…",
  * which returns the window to the shell's setup page, and "Sign out" when the
@@ -122,7 +185,6 @@ export function SidebarServerPicker() {
     originOf(url) === info.currentOrigin || (currentKey !== null && serverKey(url) === currentKey);
   const currentIsManaged = managed.some(isCurrent);
   const managedNames = new Map(Object.entries(info.managedServerNames ?? {}));
-  const managedLabel = (url: string) => managedNames.get(url) ?? hostOf(url);
   // A server's own name is display only, so the host is always shown with it.
   const ownName = (url: string) => ownServerName(info.serverNames, url);
   const recentLabels = new Map(Object.entries(info.recentLabels ?? {}));
@@ -147,15 +209,20 @@ export function SidebarServerPicker() {
   // Name and host come from the same URL, so they always describe one server.
   const currentAddress = hostOf(currentServer ?? info.currentOrigin);
   const ownCurrent = ownName(currentServer ?? info.currentOrigin);
-  // A name that only repeats the host adds nothing.
-  const currentOwnName = ownCurrent === currentAddress ? null : ownCurrent;
-  const currentManagedName =
+  // A name that only repeats the host/address adds nothing.
+  const currentOwnName = repeatsAddress(ownCurrent, currentServer, info.currentOrigin)
+    ? null
+    : ownCurrent;
+  const managedCurrent =
     currentManaged !== undefined ? managedNames.get(currentManaged) : undefined;
-  const currentHost = currentManagedName ?? currentOwnName ?? currentAddress;
-  const currentDescription =
-    currentManagedName === undefined && currentOwnName !== null
-      ? `${currentOwnName} (${currentAddress})`
-      : currentHost;
+  const currentManagedName =
+    managedCurrent !== undefined &&
+    !repeatsAddress(managedCurrent, currentManaged, currentServer, info.currentOrigin)
+      ? managedCurrent
+      : undefined;
+  const currentName = currentManagedName ?? currentOwnName;
+  const currentRowLabel = currentName ?? "Server";
+  const currentHost = currentName ?? currentAddress;
 
   return (
     // shrink-0 keeps the row at its natural height so the scrolling session
@@ -182,12 +249,13 @@ export function SidebarServerPicker() {
               "hover:bg-muted hover:text-foreground dark:hover:bg-muted/50",
               "data-[state=open]:bg-muted data-[state=open]:text-foreground",
             )}
-            aria-label={`Server: ${currentDescription}. Switch server`}
-            title={currentDescription}
+            aria-label={
+              currentName ? `Server: ${currentName}. Switch server` : "Server. Switch server"
+            }
             data-testid="sidebar-server-picker"
           >
             <ServerIcon className="ui-icon text-muted-foreground" />
-            <span className="truncate">{currentHost}</span>
+            <span className="truncate">{currentRowLabel}</span>
             {/* Points up: the menu opens upward from the sidebar's bottom. */}
             <ChevronUpIcon className="ui-icon ml-auto shrink-0 text-muted-foreground" />
           </Button>
@@ -220,18 +288,11 @@ export function SidebarServerPicker() {
                     ) : (
                       <span className="size-4 shrink-0" aria-hidden="true" />
                     )}
-                    {managedNames.has(url) ? (
-                      <span className={cn("min-w-0 truncate", current && "font-medium")}>
-                        {managedLabel(url)}
-                      </span>
-                    ) : (
-                      // No organization name: the server's own, beside its host.
-                      <ServerLabel
-                        name={ownName(url)}
-                        host={hostOf(url)}
-                        className={current ? "font-medium" : undefined}
-                      />
-                    )}
+                    <ServerLabel
+                      name={managedNames.get(url) ?? ownName(url)}
+                      host={hostOf(url)}
+                      className={current ? "font-medium" : undefined}
+                    />
                   </DropdownMenuItem>
                 );
               })}

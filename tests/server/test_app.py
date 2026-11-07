@@ -555,6 +555,99 @@ def _build_branding_app(
     )
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_task_board_deployment_gate_and_info(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+    enabled: bool,
+) -> None:
+    app = _build_branding_app(
+        db_uri,
+        tmp_path,
+        "task-board",
+        server_config={"task_board": {"enabled": enabled}},
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app),
+        base_url="http://test",
+    ) as client:
+        assert (await client.get("/v1/info")).json()["task_board_enabled"] is enabled
+        assert (await client.get("/v1/me/tasks")).status_code == (200 if enabled else 404)
+        assert (await client.get("/v1/me/tasks/sources")).status_code == (200 if enabled else 404)
+        if not enabled:
+            for suffix in ("/item", "/history", "/closed-counts"):
+                assert (await client.get("/v1/me/tasks" + suffix)).status_code == 404
+            assert (await client.put("/v1/me/tasks/sources/example", json={})).status_code == 404
+            assert (await client.delete("/v1/me/tasks/sources/example")).status_code == 404
+
+
+async def test_task_board_raised_limits_reach_the_live_report_router(
+    db_uri: str, runtime_init: None, tmp_path: Path
+) -> None:
+    app = _build_branding_app(
+        db_uri,
+        tmp_path,
+        "task-limits",
+        server_config={
+            "task_board": {
+                "limits": {
+                    "max_entries": 10_001,
+                    "max_body_bytes": 16 * 1024 * 1024,
+                    "max_sources": 65,
+                }
+            }
+        },
+    )
+    report = {
+        "@type": "Group",
+        "uid": "feed",
+        "updated": "2026-11-06T06:30:00Z",
+        "entries": [
+            {
+                "@type": "Task",
+                "uid": str(index),
+                "updated": "2026-11-06T06:30:00Z",
+                "description": "x" * 900,
+            }
+            for index in range(10_001)
+        ],
+    }
+    assert len(json.dumps(report)) > 8 * 1024 * 1024
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="http://test"
+    ) as client:
+        response = await client.put("/v1/me/tasks/sources/example", json=report)
+        assert response.status_code == 200 and response.json()["applied"] == 10_001
+        for index in range(64):
+            response = await client.put(
+                f"/v1/me/tasks/sources/source-{index}", json={**report, "entries": []}
+            )
+            assert response.status_code == 200
+        sources = (await client.get("/v1/me/tasks/sources")).json()["sources"]
+        assert len(sources) == 65
+        assert sources[0]["counts"]["open"] == 10_001
+
+
+@pytest.mark.asyncio
+async def test_usage_import_uses_configured_body_cap(
+    db_uri: str, runtime_init: None, tmp_path: Path
+) -> None:
+    app = _build_branding_app(
+        db_uri,
+        tmp_path,
+        "import-limit",
+        server_config={"usage": {"ingest": {"max_body_bytes": {"import": 128}}}},
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        path = "/v1/me/usage/accounts/vendor/import?format=openrouter-credits"
+        body = {"data": {"total_credits": 100, "total_usage": 25}}
+        assert (await client.post(path, json=body)).status_code == 200
+        assert (await client.post(path, json={**body, "padding": "x" * 128})).status_code == 413
+
+
 @pytest.mark.asyncio
 async def test_info_harness_install_gate_overrides_feature_snapshot(
     db_uri: str,

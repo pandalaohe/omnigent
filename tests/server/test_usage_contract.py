@@ -3,7 +3,7 @@
 import pytest
 from pydantic import ValidationError
 
-from omnigent.usage.contract import UsageReport, UsageWindow, next_mark, period_of
+from omnigent.usage.contract import UsageReport, UsageReportV2, UsageWindow, next_mark, period_of
 
 
 def _window(window_id="weekly", **changes):
@@ -57,7 +57,7 @@ def test_report_drops_unknown_fields_at_every_level():
         _report(pinned_window="missing"),
         _report(windows=[_window(percent_used=None, used_value=None)]),
         _report(windows=[_window(percent_used=None, used_value=None, limit_value=10)]),
-        _report(schema_version=2),
+        _report(schema_version=3),
     ],
 )
 def test_report_rejects_ambiguous_or_unsupported_windows(body):
@@ -107,3 +107,58 @@ def test_reset_mark_distinguishes_move_natural_roll_and_jitter():
         "start": 1_000_000 + length + 60,
         "moved_from": None,
     }
+
+
+def test_v2_accepts_sections_without_windows_and_keeps_unknown_figures_absent():
+    report = UsageReportV2.model_validate(
+        {
+            "schema_version": 2,
+            "observed_at": 1_999_000,
+            "activity": [{"hour": 1_998_000, "requests": 3}],
+        }
+    )
+    assert "windows" not in report.model_fields_set
+    assert report.activity[0].tokens is None
+
+
+def test_v2_balance_window_and_model_prices():
+    report = UsageReportV2.model_validate(
+        _report(
+            schema_version=2,
+            source_type="subscription",
+            source="cron",
+            windows=[_window(kind="term", unit="quota units", note="refund held")],
+            balances=[{"id": "wallet", "remaining": -2, "unit": "CNY", "usd_per_unit": 0.14}],
+            models=[{"id": "m", "cache_read_input_token_cost": 0.000001}],
+        )
+    )
+    assert report.balances[0].remaining == -2
+    assert report.models[0].cache_read_input_token_cost == 0.000001
+    assert report.stored()["source"] == "cron"
+
+
+def test_v2_version_is_explicit_so_legacy_requests_match_one_schema():
+    schema = UsageReportV2.model_json_schema()
+    assert "schema_version" in schema["required"]
+    with pytest.raises(ValidationError):
+        UsageReportV2.model_validate({"observed_at": 1_999_000, "windows": [_window()]})
+
+
+@pytest.mark.parametrize("extra", [{}, {"coverage": "complete"}])
+def test_v2_figureless_entries_require_partial(extra):
+    with pytest.raises(ValidationError, match="partial"):
+        UsageReportV2.model_validate(
+            {
+                "schema_version": 2,
+                "observed_at": 1_999_000,
+                "activity": [{"hour": 1_998_000, **extra}],
+            }
+        )
+    removed = UsageReportV2.model_validate(
+        {
+            "schema_version": 2,
+            "observed_at": 1_999_000,
+            "activity": [{"hour": 1_998_000, "removed": True}],
+        }
+    )
+    assert removed.activity[0].removed is True

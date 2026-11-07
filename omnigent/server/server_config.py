@@ -30,8 +30,10 @@ Resolution order for the config path:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import re
 import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -54,10 +56,114 @@ SESSION_TITLE_INSTRUCTIONS_KEY = "session_title_instructions"
 SESSION_TITLE_INSTRUCTIONS_MAX_CHARS = 4_000
 
 
+@dataclass(frozen=True)
+class ApiKey:
+    name: str
+    user: str
+    scopes: tuple[str, ...]
+    sha256: bytes
+
+
+def load_api_keys(config: Mapping[str, Any], env: Mapping[str, str]) -> tuple[ApiKey, ...]:
+    """Validate digest-only keys and upgrade the deprecated usage reader input."""
+    from omnigent.server.routes.accounts_auth import _USERNAME_RE
+
+    entries = config.get("api_keys", [])
+    if not isinstance(entries, list):
+        raise ValueError("api_keys must be a list")
+    keys: list[ApiKey] = []
+    names: set[str] = set()
+    digests: set[bytes] = set()
+    for index, entry in enumerate(entries):
+        error = (
+            f"api_keys[{index}] requires name, user, distinct scopes from usage/tasks "
+            "and a SHA-256 digest"
+        )
+        if not isinstance(entry, Mapping) or set(entry) != {"name", "user", "scopes", "sha256"}:
+            raise ValueError(error)
+        name, user, scopes, digest = (
+            entry[field] for field in ("name", "user", "scopes", "sha256")
+        )
+        if (
+            not isinstance(name, str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name) is None
+            or not isinstance(user, str)
+            or user in {"local", "__public__"}
+            or re.fullmatch(_USERNAME_RE, user) is None
+            or not isinstance(scopes, list)
+            or not scopes
+            or any(
+                not isinstance(scope, str) or scope not in {"usage", "tasks"} for scope in scopes
+            )
+            or len(set(scopes)) != len(scopes)
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-fA-F]{64}", digest) is None
+        ):
+            raise ValueError(error)
+        decoded = bytes.fromhex(digest)
+        if name in names or decoded in digests:
+            raise ValueError(f"api_keys[{index}] repeats a name or digest")
+        names.add(name)
+        digests.add(decoded)
+        keys.append(ApiKey(name, user, tuple(scopes), decoded))
+
+    legacy = env.get("OMNIGENT_USAGE_READ_TOKEN", "")
+    if legacy:
+        user, separator, token = legacy.partition(":")
+        if (
+            not separator
+            or re.fullmatch(_USERNAME_RE, user) is None
+            or user in {"local", "__public__"}
+            or re.fullmatch(r"[A-Za-z0-9_-]{32,256}", token) is None
+        ):
+            raise ValueError("Invalid OMNIGENT_USAGE_READ_TOKEN")
+        digest = hashlib.sha256(token.encode()).digest()
+        if digest in digests:
+            logger.warning(
+                "OMNIGENT_USAGE_READ_TOKEN is deprecated; api_keys already contains its digest; "
+                "remove the environment variable (the config entry wins)"
+            )
+        else:
+            if "usage-read-env" in names:
+                raise ValueError("api_keys name usage-read-env conflicts with the legacy input")
+            keys.append(ApiKey("usage-read-env", user, ("usage",), digest))
+            # Remove the loader one release after the deployment migrates, with release notes.
+            logger.warning(
+                "OMNIGENT_USAGE_READ_TOKEN is deprecated and now grants usage reads and writes; "
+                "move to api_keys: [{name: usage-read-env, user: %s, "
+                "scopes: [usage], sha256: '%s'}] "
+                "and remove the environment variable",
+                user,
+                digest.hex(),
+            )
+    return tuple(keys)
+
+
 def usage_enabled(config: Mapping[str, Any]) -> bool:
     """Deployment gate for usage routes and recording; existing quota routing stays on."""
     raw = config.get("usage")
     return not isinstance(raw, Mapping) or raw.get("enabled", True) is not False
+
+
+def task_board_enabled(config: Mapping[str, Any]) -> bool:
+    """Deployment gate for task reports and reads, independent of user display preferences."""
+    raw = config.get("task_board")
+    return not isinstance(raw, Mapping) or raw.get("enabled", True) is not False
+
+
+def usage_import_body_limit(config: Mapping[str, Any]) -> int:
+    """Validate the import door's byte cap at server startup."""
+    raw: Any = config
+    for name in ("usage", "ingest", "max_body_bytes"):
+        raw = raw.get(name, {})
+        if raw is None:
+            raw = {}
+        if not isinstance(raw, Mapping):
+            raise ValueError("usage.ingest.max_body_bytes.import requires a positive integer")
+    limit = raw.get("import", 5 * 1024 * 1024)
+    if type(limit) is not int or limit <= 0:
+        raise ValueError("usage.ingest.max_body_bytes.import requires a positive integer")
+    return limit
 
 
 @dataclass(frozen=True)

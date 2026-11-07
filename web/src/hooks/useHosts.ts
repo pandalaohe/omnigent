@@ -553,10 +553,16 @@ export async function refreshHostModelOptions(
 ): Promise<NativeModelOption[]> {
   const queryKey = ["host-model-options", hostId, harness];
   await queryClient.cancelQueries({ queryKey, exact: true });
-  const models = await fetchHostModelOptions(hostId, harness, mode, timeoutMs);
-  await queryClient.cancelQueries({ queryKey, exact: true });
-  queryClient.setQueryData(queryKey, models);
-  return models;
+  try {
+    const models = await fetchHostModelOptions(hostId, harness, mode, timeoutMs);
+    await queryClient.cancelQueries({ queryKey, exact: true });
+    queryClient.setQueryData(queryKey, models);
+    return models;
+  } finally {
+    if (harness.startsWith("acp:")) {
+      await queryClient.invalidateQueries({ queryKey: ["calling-default-catalogs"] });
+    }
+  }
 }
 
 // A shared request may start from an inactive observer while another needs retries.

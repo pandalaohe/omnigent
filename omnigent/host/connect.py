@@ -1176,10 +1176,10 @@ def _build_runner_env(
         env[RUNNER_LAUNCH_HARNESS_ENV_VAR] = harness
     if interactive_shells is not None:
         env[RUNNER_INTERACTIVE_SHELLS_ENV_VAR] = json.dumps(interactive_shells)
-    from omnigent.terminals.elevation import ELEVATED_TERMINALS_ENV
+    from omnigent.terminals.elevation import ELEVATED_TERMINALS_ENV, elevated_method_supported
 
     env.pop(ELEVATED_TERMINALS_ENV, None)
-    if elevated_terminals == "sudo":
+    if elevated_terminals is not None and elevated_method_supported(elevated_terminals):
         env[ELEVATED_TERMINALS_ENV] = elevated_terminals
     return env
 
@@ -4519,9 +4519,15 @@ class HostProcess:
         with_source = functools.partial(_with_model_configuration_source, harness=harness)
         from omnigent.models.model_source import fetch_model_source, model_source_for
 
+        injects_prompt = None
         try:
             source = model_source_for(harness)
             if source is not None:
+                if harness == "acp" or harness.startswith("acp:"):
+                    from omnigent.models.model_source import ModelSource, _source_catalog
+
+                    _, _, entry = _source_catalog(harness, ModelSource(lane="agent"))
+                    injects_prompt = entry.inject_system_prompt
                 refresh = frame.refresh if frame.refresh in ("auto", "force") else "none"
                 rows = await fetch_model_source(harness, source, refresh=refresh)
                 permissions = []
@@ -4532,6 +4538,7 @@ class HostProcess:
                     from omnigent.onboarding.acp_auth import classify_permission_options
 
                     _, key, entry = _source_catalog(harness, ModelSource(lane="agent"))
+                    injects_prompt = entry.inject_system_prompt
                     permission_rows = read_catalog("acp-modes", key)
                     if source.lane != "agent" and (permission_rows is None or refresh == "force"):
                         probe = await probe_acp_model_options(entry)
@@ -4548,12 +4555,14 @@ class HostProcess:
                     status="ok",
                     models=rows,
                     permission_options=permissions,
+                    injects_prompt=injects_prompt,
                 )
         except Exception as exc:  # noqa: BLE001 — config exceptions can carry credential values
             return HostModelOptionsResultFrame(
                 request_id=frame.request_id,
                 status="failed",
                 error=f"model source failed ({type(exc).__name__}); run omnigent models check",
+                injects_prompt=injects_prompt,
             )
         if harness in ("codex-native", "codex"):
             # Harness-truth lane: every launch shape is answered from the
@@ -6189,9 +6198,10 @@ class HostProcess:
     def _terminal_capabilities(self) -> list[str]:
         """Advertise elevation only when the host explicitly enabled it."""
         from omnigent.host.frames import CAP_TERMINAL_ELEVATED
+        from omnigent.terminals.elevation import elevated_method_supported
 
         capabilities = list(HOST_CAPABILITIES)
-        if self._elevated_terminals_method is not None:
+        if elevated_method_supported(self._elevated_terminals_method):
             capabilities.append(CAP_TERMINAL_ELEVATED)
         return capabilities
 

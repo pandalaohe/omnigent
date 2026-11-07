@@ -885,7 +885,13 @@ function HarnessDetail({
         <AgentSettingsFolder host={host} harness={entry.harness} />
         <AgentModelList host={host} harness={entry.harness} />
         {agentPresentOnHost(entry.harness, host) && (
-          <AgentPromptCard harness={entry.harness} host={host} capabilities={capabilities} />
+          <AgentPromptCard
+            harness={entry.harness}
+            host={host}
+            capabilities={capabilities}
+            agentId={entry.agentId}
+            name={entry.name}
+          />
         )}
       </div>
     ) : null;

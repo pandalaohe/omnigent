@@ -27,6 +27,7 @@ def replacement_session_labels(labels: Mapping[str, str]) -> dict[str, str]:
         "omnigent.codex_native.subagent_thread_id",
     } | conversation_store.SUCCESSION_OPERATION_LABEL_KEYS
     prefixes = (
+        "omnigent.auto_rotation_state.",
         "cost_control.",
         "omnigent.handoff.",
         "omnigent.member.",

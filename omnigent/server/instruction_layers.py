@@ -154,4 +154,12 @@ async def session_instructions_text(
         if standing_approval_resolver is not None
         else ""
     )
-    return "\n\n".join(part for part in (text, pass_line) if part) or None
+    return (
+        compose_session_text(
+            "\n\n".join(part for part in (text, pass_line) if part),
+            has_parent=False,
+            spawn=False,
+            session_text=conversation.session_prompt or "",
+        )
+        or None
+    )

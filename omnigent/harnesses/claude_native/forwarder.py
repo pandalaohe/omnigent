@@ -26,6 +26,7 @@ from omnigent.debug_logging import debug_event
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.entities.subagent_terminal import TerminalEnvelope
 from omnigent.errors import ErrorCode
+from omnigent.harnesses.claude_compaction import read_claude_auto_compact_token_limit
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     CONFIRMED_CLAUDE_SESSION_LABEL_KEY,
@@ -58,7 +59,6 @@ from omnigent.harnesses.claude_native.bridge import (
     read_transcript_items_from_offset,
     read_transcript_items_since_with_position,
     read_transcript_path,
-    read_user_auto_compact_window,
     transcript_has_forked_from_marker,
     transcript_has_recent_local_command,
     url_component,
@@ -1002,6 +1002,7 @@ class _ForwardDedupeState:
     # fresh one every poll.
     pending_usage: dict[str, float] | None = None
     context_window: int | None = None
+    context_model: str | None = None
     auto_compact_token_limit: int | None = None
     provider_usage_limits: dict[str, object] | None = None
     recorded_token_usage: dict[str, int] | None = None
@@ -7192,6 +7193,7 @@ async def _handle_compact_summary_item_unlocked(
                     compacted_messages_override=None,
                     fallback_snapshot_loaded=False,
                     snapshot_source="transcript_degraded",
+                    summary_source_id=item.source_id,
                     allow_snapshot_fallback=True,
                 )
             except Exception:
@@ -7695,6 +7697,9 @@ async def _post_forward_side_channel_updates(
         resolved_context_window = (
             context_window_value if isinstance(context_window_value, int) else None
         )
+        context_model = (
+            concrete_reported_model(status_state.get("model")) if status_state else None
+        )
         usage_from_status = (
             _usage_from_status_state(status_state) if status_state is not None else None
         )
@@ -7736,11 +7741,25 @@ async def _post_forward_side_channel_updates(
             resolved_context_window is not None
             and resolved_context_window != dedupe.context_window
         )
-        auto_compact_token_limit = await asyncio.to_thread(read_user_auto_compact_window)
-        auto_compact_changed = (
-            auto_compact_token_limit is not None
-            and auto_compact_token_limit != dedupe.auto_compact_token_limit
+        auto_compact_token_limit = (
+            await asyncio.to_thread(
+                read_claude_auto_compact_token_limit,
+                resolved_context_window,
+                model=(
+                    str(status_state["model"])
+                    if status_state is not None and isinstance(status_state.get("model"), str)
+                    else dedupe.observed_model
+                ),
+                cwd=(
+                    Path(status_state["cwd"])
+                    if status_state is not None and isinstance(status_state.get("cwd"), str)
+                    else None
+                ),
+            )
+            if resolved_context_window is not None
+            else dedupe.auto_compact_token_limit
         )
+        auto_compact_changed = auto_compact_token_limit != dedupe.auto_compact_token_limit
         raw_provider_usage_limits = (
             status_state.get("provider_usage_limits") if status_state is not None else None
         )
@@ -7770,7 +7789,11 @@ async def _post_forward_side_channel_updates(
         # span on them drops that call's tokens for good: nothing retries, and by
         # the next post ``result.latest_usage`` has moved to the following call.
         usage_post_needed = (
-            usage_changed or window_changed or provider_limits_changed or auto_compact_changed
+            usage_changed
+            or window_changed
+            or provider_limits_changed
+            or auto_compact_changed
+            or (resolved_context_window is not None and context_model != dedupe.context_model)
         )
         if usage_post_needed or record_token_usage is not None:
             try:
@@ -7779,14 +7802,22 @@ async def _post_forward_side_channel_updates(
                     session_id=session_id,
                     usage=posted_usage if usage_post_needed else None,
                     context_window=resolved_context_window if usage_post_needed else None,
+                    context_model=context_model if usage_post_needed else None,
                     auto_compact_token_limit=(
                         auto_compact_token_limit if usage_post_needed else None
+                    ),
+                    clear_auto_compact_token_limit=(
+                        usage_post_needed
+                        and resolved_context_window is not None
+                        and auto_compact_token_limit is None
                     ),
                     provider_usage_limits=(provider_usage_limits if usage_post_needed else None),
                     token_usage=record_token_usage,
                 )
                 if usage_changed:
                     dedupe.usage = posted_usage
+                if usage_post_needed and resolved_context_window is not None:
+                    dedupe.context_model = context_model
                 if window_changed:
                     dedupe.context_window = resolved_context_window
                 if auto_compact_changed:
@@ -8402,7 +8433,9 @@ async def _post_external_session_usage(
     session_id: str,
     usage: Mapping[str, object] | None,
     context_window: int | None = None,
+    context_model: str | None = None,
     auto_compact_token_limit: int | None = None,
+    clear_auto_compact_token_limit: bool = False,
     provider_usage_limits: dict[str, object] | None = None,
     token_usage: dict[str, int] | None = None,
 ) -> None:
@@ -8422,6 +8455,7 @@ async def _post_external_session_usage(
         cost with the active model for per-model attribution.
     :param context_window: Resolved window in tokens, or ``None`` to
         leave the server's persisted value untouched.
+    :param context_model: Model from the same statusLine sample as the window.
     :param auto_compact_token_limit: Harness auto-compaction window in
         tokens, or ``None`` to leave the server's persisted value untouched.
     :param token_usage: One API call's final token counters to record on the
@@ -8436,7 +8470,9 @@ async def _post_external_session_usage(
         payload.update(usage)
     if context_window is not None:
         payload["context_window"] = context_window
-    if auto_compact_token_limit is not None:
+        if context_model is not None:
+            payload["context_model"] = context_model
+    if auto_compact_token_limit is not None or clear_auto_compact_token_limit:
         payload["auto_compact_token_limit"] = auto_compact_token_limit
     if provider_usage_limits is not None:
         payload["provider_usage_limits"] = provider_usage_limits
@@ -9207,6 +9243,29 @@ def _restore_preserved_compaction_messages(
     return snapshot
 
 
+def _compaction_summary_uuid(summary_source_id: str | None) -> str | None:
+    """
+    Return the compact-summary record uuid a transcript source id names.
+
+    Claude's ``isCompactSummary`` record is projected as a transcript item
+    whose source id is ``"<record uuid>:0:compact_summary"``. That record
+    uuid identifies one compaction for good, so the boundary stored for it
+    can be posted again with the same id.
+
+    :param summary_source_id: Transcript item source id, e.g.
+        ``"0f1e2d3c-...:0:compact_summary"``, or ``None`` for the
+        hook-driven path.
+    :returns: The record uuid, or ``None`` when the id is absent or names
+        another item type.
+    """
+    if summary_source_id is None:
+        return None
+    suffix = ":0:compact_summary"
+    if not summary_source_id.endswith(suffix):
+        return None
+    return summary_source_id[: -len(suffix)] or None
+
+
 async def _persist_native_compaction_item(
     client: httpx.AsyncClient,
     *,
@@ -9250,7 +9309,10 @@ async def _persist_native_compaction_item(
     :param summary_source_id: Transcript item source id for the
         ``isCompactSummary`` path. When supplied, the local snapshot must
         resolve the same Claude summary UUID; hook-driven calls omit it and
-        bind to the transcript's latest ``compact_boundary`` instead.
+        bind to the transcript's latest ``compact_boundary`` instead. The
+        resolved summary UUID is also the boundary's ``source_id``, so a
+        retried POST or the hook path resolving the same boundary stores
+        one item.
     :param summary_not_before: Unix timestamp the completed compaction's
         ``PreCompact`` fired, for hook-driven calls. A latest boundary
         written before it belongs to an earlier compaction and is retried.
@@ -9278,6 +9340,10 @@ async def _persist_native_compaction_item(
     last_item_id = items[0]["id"] if items else f"compact_boundary_{session_id}"
 
     compacted_messages = compacted_messages_override
+    # The boundary's own identity: the summary record's uuid, known from the
+    # transcript item when the caller has one and otherwise resolved below
+    # from the transcript's latest compact boundary.
+    summary_uuid = _compaction_summary_uuid(summary_source_id)
     if compacted_messages is None and not fallback_snapshot_loaded:
         native_messages: list[tuple[str, dict[str, object]]] | None = None
         sdk_message_count = 0
@@ -9329,6 +9395,7 @@ async def _persist_native_compaction_item(
                     transcript_path,
                     not_before=summary_not_before,
                 )
+            summary_uuid = expected_summary_uuid
             if transcript_path is not None:
                 native_messages = await asyncio.to_thread(
                     _restore_preserved_compaction_messages,
@@ -9396,6 +9463,18 @@ async def _persist_native_compaction_item(
     if compacted_messages is None and fallback_snapshot_loaded and not allow_snapshot_fallback:
         raise _CompactionSnapshotError("Claude SDK fallback snapshot is unavailable")
 
+    if summary_uuid is None and summary_not_before is not None:
+        # Hook-driven boundary: no summary record reached the forwarder yet, so
+        # bind the identity to the transcript's boundary for this compaction.
+        hook_transcript_path = read_transcript_path(bridge_dir)
+        if hook_transcript_path is not None:
+            with contextlib.suppress(ValueError):
+                summary_uuid = await asyncio.to_thread(
+                    _latest_compact_summary_uuid,
+                    hook_transcript_path,
+                    not_before=summary_not_before,
+                )
+
     summary = (
         summary_override
         if summary_override
@@ -9408,6 +9487,8 @@ async def _persist_native_compaction_item(
         "token_count": 0,
         "snapshot_source": snapshot_source,
     }
+    if summary_uuid is not None:
+        event_data["source_id"] = summary_uuid
     if compacted_messages is not None:
         event_data["compacted_messages"] = compacted_messages
 

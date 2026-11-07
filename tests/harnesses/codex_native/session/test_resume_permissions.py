@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.codex_native import app_server as codex_native_app_server
 from omnigent.harnesses.codex_native.bridge import (
     CodexNativeBridgeState,
@@ -25,6 +26,35 @@ from tests.harnesses.codex_native.session._support import (
 def _non_git_workspace(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     # Permission transport tests must not inherit a real linked checkout's gitdir.
     monkeypatch.chdir(tmp_path)
+
+
+def test_missing_resume_provider_shows_restore_remedy(monkeypatch: pytest.MonkeyPatch) -> None:
+    from omnigent.runner.native.orchestration import _native_terminal_configuration_message
+
+    client = _FakeCodexAppServerClient(
+        error=codex_native_app_server.CodexAppServerResponseError(
+            {
+                "code": -32600,
+                "data": {
+                    "type": "modelProviderNotConfigured",
+                    "modelProvider": "removed-provider",
+                },
+            }
+        )
+    )
+    monkeypatch.setattr(codex_native_app_server, "client_for_transport", lambda *a, **k: client)
+    with pytest.raises(OmnigentError) as raised:
+        asyncio.run(
+            codex_native_app_server.preload_codex_thread_for_resume(
+                "ws://127.0.0.1:9876",
+                "thread_test",
+            )
+        )
+    assert raised.value.code == ErrorCode.HARNESS_NOT_CONFIGURED
+    assert "Restore its provider configuration" in str(raised.value)
+    assert _native_terminal_configuration_message(raised.value) == str(raised.value)
+    assert len(client.requests) == 1
+    assert client.closed
 
 
 def test_clear_bridge_state_removes_stale_runtime_state(tmp_path: Path) -> None:

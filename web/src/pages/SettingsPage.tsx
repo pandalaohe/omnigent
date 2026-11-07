@@ -168,7 +168,9 @@ import {
 import { authenticatedFetch, getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { archiveDateRangeBounds } from "@/lib/archiveDateRange";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { usageBoardAvailable, isFeatureEnabled } from "@/lib/capabilities";
+import { usageBoardAvailable, taskBoardAvailable, isFeatureEnabled } from "@/lib/capabilities";
+import { TaskBoardSettings } from "@/pages/taskBoard/TaskBoardSettings";
+import { t as taskBoardText } from "@/pages/taskBoard/taskBoardText";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import {
   type Conversation,
@@ -2315,7 +2317,7 @@ function GeneralSection() {
             Keep-warm
           </Link>
           <Link to="#context-usage" className="text-primary underline underline-offset-2">
-            Saved context values
+            Context limits
           </Link>
         </nav>
         <SettingsGroup title="Composer" testId="settings-group-composer">
@@ -2388,7 +2390,7 @@ function GeneralSection() {
           testId="settings-group-display-usage"
           className="max-w-none"
         >
-          <ExpandableSettings id="context-usage" title="Saved context values">
+          <ExpandableSettings id="context-usage" title="Context limits">
             <div className="flex flex-col gap-6">
               <CompactProgressIndicatorControl />
               <ContextUsageSettings />
@@ -2398,6 +2400,13 @@ function GeneralSection() {
         {/* The Usage board module's whole settings surface, present only where
             the deployment allows the module. Its user switch lives inside, so
             turning it off here is how a visitor comes back. */}
+        {taskBoardAvailable(info) && (
+          <SettingsGroup title={taskBoardText("board.title")} testId="settings-group-task-board">
+            <ExpandableSettings id="task-board-settings" title={taskBoardText("board.title")}>
+              <TaskBoardSettings />
+            </ExpandableSettings>
+          </SettingsGroup>
+        )}
         {usageBoardAvailable(info) && (
           <SettingsGroup title="Usage board" testId="settings-group-usage-settings">
             <ExpandableSettings id="usage-settings" title="Usage board">

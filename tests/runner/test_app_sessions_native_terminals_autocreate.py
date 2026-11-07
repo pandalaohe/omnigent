@@ -2891,6 +2891,7 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     # instead of loading all 200+ bridge tools into startup context.
     assert spec.env == {
         **gateway_env,
+        "OTEL_RESOURCE_ATTRIBUTES": "launch_mode=omni",
         "ENABLE_TOOL_SEARCH": "true",
         "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
         "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",

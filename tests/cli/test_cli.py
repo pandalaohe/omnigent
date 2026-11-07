@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import logging
 import os
 import re
+import secrets
 import subprocess
 import sys
 import tarfile
@@ -1185,16 +1187,25 @@ def test_help_hides_update_alias_but_keeps_it_runnable() -> None:
     assert cli.commands["update"] is cli.commands["upgrade"]
 
 
-def test_up_is_short_spelling_of_host_update_custom() -> None:
-    """``up`` is the same command object as ``host update custom``."""
+def test_up_is_short_spelling_of_upgrade() -> None:
+    """All update spellings share the upstream command and options."""
+    assert cli.commands["up"] is cli.commands["upgrade"]
     assert cli.commands["up"] is cli.commands["host"].commands["update"].commands["custom"]
 
     result = CliRunner().invoke(cli, ["up", "--help"])
 
     assert result.exit_code == 0, result.output
-    assert "--rollback" in result.output
-    assert "Update this Host from the custom channel." in result.output
-    assert "--no-web-ui" in result.output
+    assert "--rollback" not in result.output
+    assert "--no-web-ui" not in result.output
+    assert "--check" in result.output
+
+
+def test_legacy_custom_update_warns_for_one_release() -> None:
+    result = CliRunner().invoke(cli, ["host", "update", "custom", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "removed in v0.22.0" in result.output
+    assert "use `omni up`" in result.output
 
 
 def test_help_hides_extras_gated_harness_when_sdk_missing(
@@ -2614,6 +2625,91 @@ def test_server_explicit_config_overrides_omnigent_config_env(
     assert result.exit_code == 0, result.output
     assert captured["config"] == str(explicit.resolve())
     bind_probe.assert_called_once_with("127.0.0.1", 44771)
+
+
+@pytest.mark.parametrize("config_source", ["global", "data", "env", "explicit"])
+@pytest.mark.parametrize("scope", ["usage", "usage:write"])
+def test_server_loads_usage_keys_from_selected_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, config_source: str, scope: str
+) -> None:
+    import uvicorn.server
+    from fastapi.testclient import TestClient
+
+    token = secrets.token_urlsafe(32)
+    config_home = tmp_path / "config"
+    data_dir = tmp_path / "data"
+    config_home.mkdir()
+    data_dir.mkdir()
+    config_path = {
+        "global": config_home / "config.yaml",
+        "data": data_dir / "config.yaml",
+        "env": tmp_path / "env.yaml",
+        "explicit": tmp_path / "explicit.yaml",
+    }[config_source]
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "api_keys": [
+                    {
+                        "name": "feeder",
+                        "user": "admin",
+                        "scopes": [scope],
+                        "sha256": hashlib.sha256(token.encode()).hexdigest(),
+                    }
+                ]
+            }
+        )
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("OMNIGENT_ADMIN_CREDENTIALS_PATH", str(data_dir / "admin-creds"))
+    monkeypatch.delenv("OMNIGENT_USAGE_READ_TOKEN", raising=False)
+    monkeypatch.delenv("OMNIGENT_CONFIG", raising=False)
+    if config_source == "env":
+        monkeypatch.setenv("OMNIGENT_CONFIG", str(config_path))
+    monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "1")
+    monkeypatch.setenv("OMNIGENT_AUTH_PROVIDER", "accounts")
+    monkeypatch.setenv("OMNIGENT_ACCOUNTS_COOKIE_SECRET", secrets.token_hex(32))
+    monkeypatch.setenv("OMNIGENT_ACCOUNTS_BASE_URL", "http://127.0.0.1")
+    monkeypatch.setenv("OMNIGENT_ACCOUNTS_INIT_ADMIN_USERNAME", "admin")
+    monkeypatch.setenv("OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD", "admin-pw-12345")
+    observed: list[int] = []
+
+    def drive_app(server: Any, **kwargs: Any) -> None:
+        with TestClient(server.config.app) as client:
+            observed.append(
+                client.get(
+                    "/v1/usage-events",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                    },
+                ).status_code
+            )
+
+    monkeypatch.setattr(uvicorn.server.Server, "run", drive_app)
+    args = [
+        "server",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+        "--no-open",
+        "--database-uri",
+        f"sqlite:///{tmp_path / 'test.db'}",
+        "--artifact-location",
+        str(tmp_path / "artifacts"),
+    ]
+    if config_source == "explicit":
+        args += ["-c", str(config_path)]
+    result = CliRunner().invoke(cli, args)
+    if scope == "usage":
+        assert result.exit_code == 0, result.output
+        assert observed == [200]
+    else:
+        assert result.exit_code != 0
+        assert isinstance(result.exception, ValueError)
+        assert "api_keys" in str(result.exception)
+        assert observed == []
 
 
 @pytest.mark.parametrize("authority", [False, 123, [], {}, "", " ", "x" * 129])

@@ -7,6 +7,8 @@ import {
 export const USAGE_CONTEXT_STORAGE_KEY = "omnigent:usage-context-preferences";
 export const USAGE_CONTEXT_CHANGED_EVENT = "omnigent:usage-context-preferences-changed";
 const MAX_PROVIDER_USAGE_SOURCES = 24;
+const MAX_CONTEXT_LIST_ENTRIES = 200;
+const MAX_REPORTED_CONTEXT_SOURCES = 64;
 /** Levels whose keys exist, so a key carrying any other tag stays stored and unread. */
 const KNOWN_LEVELS: readonly string[] = ["agent-model", "cell", "column", "host", "all"];
 
@@ -14,14 +16,6 @@ export interface UsageContextOverride {
   contextWindowTokens: number | null;
   /** Tokens reserved before the context total; compact point = total - buffer. */
   autoCompactBufferTokens: number | null;
-  autoCompactBufferPercent?: number | null;
-  compactBufferMode?: "tokens" | "percent";
-}
-
-/** Only present fields are applied; `null` clears the field to Auto. */
-export interface UsageContextOverridePatch {
-  contextWindowTokens?: number | null;
-  autoCompactBufferTokens?: number | null;
   autoCompactBufferPercent?: number | null;
   compactBufferMode?: "tokens" | "percent";
 }
@@ -38,6 +32,35 @@ export interface UsageContextPreferences {
   board: UsageBoardPreferences;
   /** Account display labels; these never participate in session selection. */
   shownModels?: Record<string, string>;
+  /** The rows of Context limits; absent until the list is seeded, once. */
+  contextList?: UsageContextList;
+  /** What each exact Host/agent/harness/model source last reported, for Auto. */
+  reportedContext?: Record<string, UsageContextReport>;
+}
+
+/** One row the user keeps in Context limits; an empty `model` is the agent's own row. */
+export interface UsageContextListEntry {
+  agentName: string;
+  harness: string;
+  model: string;
+}
+
+export interface UsageContextList {
+  entries: UsageContextListEntry[];
+  /** Several agents may stay open at once; otherwise opening one closes the others. */
+  severalOpen: boolean;
+}
+
+export interface UsageContextReport {
+  contextWindow: number | null;
+  autoCompactTokenLimit: number | null;
+  capturedAt: number;
+}
+
+/** What the agent itself said, with nothing saved applied. */
+export interface UsageContextReported {
+  contextWindow: number | null;
+  autoCompactTokenLimit: number | null;
 }
 
 export interface UsageContextSource {
@@ -131,6 +154,8 @@ export function normalizeUsageContextPreferences(value: unknown): UsageContextPr
     lastProviderUsageLimits?: unknown;
     board?: unknown;
     shownModels?: unknown;
+    contextList?: unknown;
+    reportedContext?: unknown;
   };
   const overrides: Record<string, UsageContextOverride> = {};
   if (raw.overrides && typeof raw.overrides === "object") {
@@ -204,6 +229,8 @@ export function normalizeUsageContextPreferences(value: unknown): UsageContextPr
       .slice(0, MAX_PROVIDER_USAGE_SOURCES);
     for (const [key, snapshot] of entries) lastProviderUsageLimits[key] = snapshot;
   }
+  const contextList = normalizeContextList(raw.contextList);
+  const reportedContext = normalizeReportedContext(raw.reportedContext);
   return {
     version: 6,
     showProviderUsageLimits:
@@ -213,6 +240,8 @@ export function normalizeUsageContextPreferences(value: unknown): UsageContextPr
     overrides,
     lastProviderUsageLimits,
     board: normalizeUsageBoardPreferences(raw.board),
+    ...(contextList ? { contextList } : {}),
+    ...(reportedContext ? { reportedContext } : {}),
     ...(raw.shownModels && typeof raw.shownModels === "object"
       ? {
           shownModels: Object.fromEntries(
@@ -229,6 +258,47 @@ export function normalizeUsageContextPreferences(value: unknown): UsageContextPr
         }
       : {}),
   };
+}
+
+function normalizeContextList(value: unknown): UsageContextList | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const raw = value as { entries?: unknown; severalOpen?: unknown };
+  const entries = new Map<string, UsageContextListEntry>();
+  for (const candidate of Array.isArray(raw.entries) ? raw.entries : []) {
+    const entry = candidate as Partial<UsageContextListEntry> | null;
+    if (
+      typeof entry?.agentName !== "string" ||
+      typeof entry.harness !== "string" ||
+      !entry.agentName ||
+      !entry.harness ||
+      entry.agentName.length > 128 ||
+      entry.harness.length > 128 ||
+      (typeof entry.model !== "string" && entry.model !== undefined) ||
+      (entry.model?.length ?? 0) > 256
+    )
+      continue;
+    const clean = { agentName: entry.agentName, harness: entry.harness, model: entry.model ?? "" };
+    entries.set(usageContextEntryKey(clean), clean);
+    if (entries.size === MAX_CONTEXT_LIST_ENTRIES) break;
+  }
+  return { entries: [...entries.values()], severalOpen: raw.severalOpen === true };
+}
+
+function normalizeReportedContext(value: unknown): Record<string, UsageContextReport> | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const entries = Object.entries(value)
+    .flatMap(([key, candidate]) => {
+      const report = candidate as Partial<UsageContextReport> | null;
+      const contextWindow = positiveInteger(report?.contextWindow);
+      const autoCompactTokenLimit = positiveInteger(report?.autoCompactTokenLimit);
+      const capturedAt = positiveInteger(report?.capturedAt);
+      if (key.length === 0 || key.length > 512 || capturedAt === null) return [];
+      if (contextWindow === null && autoCompactTokenLimit === null) return [];
+      return [[key, { contextWindow, autoCompactTokenLimit, capturedAt }] as const];
+    })
+    .sort((a, b) => b[1].capturedAt - a[1].capturedAt)
+    .slice(0, MAX_REPORTED_CONTEXT_SOURCES);
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
 }
 
 function idMap(value: unknown): Record<string, string> {
@@ -445,15 +515,15 @@ export function usageContextLevelLabel(
   labels: { hostLabel: string; agentLabel: string },
 ): string {
   if (level === "model") return "this model";
-  if (level === "agent-model") return `${labels.agentLabel}, every host`;
-  if (level === "cell") return `${labels.hostLabel} × ${labels.agentLabel}`;
-  if (level === "column") return `${labels.agentLabel}, all hosts`;
+  if (level === "agent-model") return `${labels.agentLabel}, this model on all computers`;
+  if (level === "cell") return `${labels.agentLabel} on ${labels.hostLabel}`;
+  if (level === "column") return `${labels.agentLabel}, all computers`;
   if (level === "host") return `all agents on ${labels.hostLabel}`;
-  if (level === "all") return "all agents, all hosts";
+  if (level === "all") return "all agents, all computers";
   return "reported";
 }
 
-/** The composer ring's one entry: this session's row in Settings, opened on its model. */
+/** The composer ring's one entry: this session's model row in Settings, opened for editing. */
 export function usageContextSettingsHref(sourceKey: string): string {
   const query = new URLSearchParams({ ctx: sourceKey });
   return `/settings/general?${query.toString()}#context-usage`;
@@ -498,11 +568,9 @@ export function inheritedUsageContext(
   preferences: UsageContextPreferences,
   source: UsageContextSource,
   level: UsageContextLevel,
+  reported: UsageContextReported = { contextWindow: null, autoCompactTokenLimit: null },
 ): ResolvedUsageContext {
-  return resolveUsageContextAt(preferences, source, usageContextLevelsAt(level).slice(1), {
-    contextWindow: null,
-    autoCompactTokenLimit: null,
-  });
+  return resolveUsageContextAt(preferences, source, usageContextLevelsAt(level).slice(1), reported);
 }
 
 function resolveUsageContextAt(
@@ -572,57 +640,6 @@ function resolveUsageContextAt(
   };
 }
 
-/** Pure proposal; only the manager's Merge action persists these replacements. */
-export function proposeUsageContextCollapse(preferences: UsageContextPreferences): {
-  removed: string[];
-  added: Record<string, UsageContextOverride>;
-} {
-  const normalized = normalizeUsageContextPreferences(preferences);
-  const groups = new Map<string, { key: string; override: UsageContextOverride }[]>();
-  for (const [key, override] of Object.entries(normalized.overrides)) {
-    const source = usageContextSourceFromKey(key);
-    if (!source) continue;
-    const cellKey = usageContextLevelKey(source, "cell");
-    const group = groups.get(cellKey) ?? [];
-    group.push({ key, override });
-    groups.set(cellKey, group);
-  }
-  const removed: string[] = [];
-  const added: Record<string, UsageContextOverride> = {};
-  const signature = (override: UsageContextOverride) =>
-    JSON.stringify([
-      override.contextWindowTokens,
-      override.compactBufferMode ?? "tokens",
-      override.autoCompactBufferTokens,
-      override.autoCompactBufferPercent ?? null,
-    ]);
-  for (const [cellKey, group] of groups) {
-    const first = group[0]!;
-    if (
-      group.length < 2 ||
-      Object.hasOwn(preferences.overrides, cellKey) ||
-      group.some(({ override }) => signature(override) !== signature(first.override))
-    )
-      continue;
-    const overrides = { ...normalized.overrides, [cellKey]: first.override };
-    for (const { key } of group) Reflect.deleteProperty(overrides, key);
-    const changed = group.some(({ key }) => {
-      const reported = { contextWindow: null, autoCompactTokenLimit: null };
-      const before = resolveUsageContext(normalized, key, reported);
-      const after = resolveUsageContext({ ...normalized, overrides }, key, reported);
-      return (
-        before.contextWindow.value !== after.contextWindow.value ||
-        before.buffer.value !== after.buffer.value ||
-        before.buffer.mode !== after.buffer.mode
-      );
-    });
-    if (changed) continue;
-    removed.push(...group.map(({ key }) => key));
-    added[cellKey] = first.override;
-  }
-  return { removed, added };
-}
-
 export function readUsageContextPreferences(): UsageContextPreferences {
   if (typeof window === "undefined") return { ...DEFAULT_USAGE_CONTEXT_PREFERENCES };
   try {
@@ -641,6 +658,8 @@ function isDefault(preferences: UsageContextPreferences): boolean {
     Object.keys(preferences.overrides).length === 0 &&
     Object.keys(preferences.lastProviderUsageLimits).length === 0 &&
     Object.keys(preferences.shownModels ?? {}).length === 0 &&
+    preferences.contextList === undefined &&
+    Object.keys(preferences.reportedContext ?? {}).length === 0 &&
     isDefaultUsageBoardPreferences(preferences.board)
   );
 }
@@ -676,33 +695,6 @@ function writeUsageContextPreferencesLocally(preferences: UsageContextPreference
   }
 }
 
-export function writeUsageContextOverride(
-  preferences: UsageContextPreferences,
-  sourceKey: string,
-  override: UsageContextOverride,
-): void {
-  const normalizedOverride: UsageContextOverride = {
-    contextWindowTokens: positiveInteger(override.contextWindowTokens),
-    autoCompactBufferTokens: nonNegativeInteger(override.autoCompactBufferTokens),
-    ...(override.autoCompactBufferPercent !== undefined
-      ? { autoCompactBufferPercent: bufferPercent(override.autoCompactBufferPercent) }
-      : {}),
-    ...(override.compactBufferMode ? { compactBufferMode: override.compactBufferMode } : {}),
-  };
-  const overrides = { ...preferences.overrides };
-  if (
-    normalizedOverride.contextWindowTokens === null &&
-    normalizedOverride.autoCompactBufferTokens === null &&
-    normalizedOverride.autoCompactBufferPercent == null &&
-    normalizedOverride.compactBufferMode !== "percent"
-  ) {
-    Reflect.deleteProperty(overrides, sourceKey);
-  } else {
-    overrides[sourceKey] = normalizedOverride;
-  }
-  writeUsageContextPreferences({ ...preferences, version: 6, overrides });
-}
-
 /** Whether a saved record holds any value at all. A buffer unit alone does not count. */
 export function usageContextHasValue(override: UsageContextOverride | undefined): boolean {
   return (
@@ -725,77 +717,159 @@ export function setUsageContextLevel(
   writeUsageContextPreferences({ ...preferences, version: 6, overrides });
 }
 
-/**
- * Apply one patch to many sources with a single sync write. Absent patch
- * fields keep each row's existing value, so batched edits never copy one row's
- * settings onto another.
- */
-export function patchUsageContextOverrides(
-  preferences: UsageContextPreferences,
-  sourceKeys: string[],
-  patch: UsageContextOverridePatch,
-): void {
-  if (sourceKeys.length === 0) return;
-  const overrides = { ...preferences.overrides };
-  for (const sourceKey of sourceKeys) {
-    const existing = overrides[sourceKey] ?? {
-      contextWindowTokens: null,
-      autoCompactBufferTokens: null,
-    };
-    const compactBufferMode =
-      patch.compactBufferMode === "tokens" && existing.compactBufferMode === undefined
-        ? undefined
-        : (patch.compactBufferMode ?? existing.compactBufferMode);
-    const next: UsageContextOverride = {
-      contextWindowTokens:
-        patch.contextWindowTokens !== undefined
-          ? positiveInteger(patch.contextWindowTokens)
-          : positiveInteger(existing.contextWindowTokens),
-      autoCompactBufferTokens:
-        patch.autoCompactBufferTokens !== undefined
-          ? nonNegativeInteger(patch.autoCompactBufferTokens)
-          : nonNegativeInteger(existing.autoCompactBufferTokens),
-      ...(patch.autoCompactBufferPercent !== undefined ||
-      existing.autoCompactBufferPercent !== undefined
-        ? {
-            autoCompactBufferPercent: bufferPercent(
-              patch.autoCompactBufferPercent !== undefined
-                ? patch.autoCompactBufferPercent
-                : existing.autoCompactBufferPercent,
-            ),
-          }
-        : {}),
-      ...(compactBufferMode ? { compactBufferMode } : {}),
-    };
-    if (
-      next.contextWindowTokens === null &&
-      next.autoCompactBufferTokens === null &&
-      next.autoCompactBufferPercent == null &&
-      next.compactBufferMode !== "percent"
-    ) {
-      Reflect.deleteProperty(overrides, sourceKey);
-    } else {
-      overrides[sourceKey] = next;
-    }
-  }
-  writeUsageContextPreferences({ ...preferences, version: 6, overrides });
+export function usageContextEntryKey(entry: UsageContextListEntry): string {
+  return JSON.stringify([entry.agentName, entry.harness, entry.model]);
 }
 
-/** Remove many sources with a single sync write. */
-export function deleteUsageContextOverrides(
+/** Saved values always hold a row: the list can never hide a value that is in force. */
+export function usageContextSavedEntries(
   preferences: UsageContextPreferences,
-  sourceKeys: string[],
+): UsageContextListEntry[] {
+  return Object.entries(preferences.overrides).flatMap(([key, override]) => {
+    const record = usageContextRecordFromKey(key);
+    if (!record?.source.agentName || !usageContextHasValue(override)) return [];
+    const { agentName, harness, model } = record.source;
+    return [{ agentName, harness, model }];
+  });
+}
+
+/** Agent and agent+model combinations this user's stored readings prove were used. */
+export function usageContextRecordedEntries(
+  preferences: UsageContextPreferences,
+): UsageContextListEntry[] {
+  const readings = [
+    ...Object.keys(preferences.lastProviderUsageLimits),
+    ...Object.keys(preferences.reportedContext ?? {}),
+  ];
+  return [
+    ...usageContextSavedEntries(preferences),
+    ...readings.flatMap((key) => {
+      const source = usageContextSourceFromKey(key);
+      if (!source?.agentName || !source.harness) return [];
+      const { agentName, harness, model } = source;
+      return [{ agentName, harness, model }];
+    }),
+  ];
+}
+
+function uniqueEntries(entries: readonly UsageContextListEntry[]): UsageContextListEntry[] {
+  return [...new Map(entries.map((entry) => [usageContextEntryKey(entry), entry])).values()];
+}
+
+/** The rows the table shows: the user's list, plus any saved value it does not name. */
+export function usageContextRows(preferences: UsageContextPreferences): UsageContextListEntry[] {
+  return uniqueEntries([
+    ...(preferences.contextList?.entries ?? []),
+    ...usageContextSavedEntries(preferences),
+  ]);
+}
+
+/** The one automatic write to the list. After it, only the user changes the list. */
+export function seedUsageContextList(
+  preferences: UsageContextPreferences,
+  inUse: readonly UsageContextListEntry[],
 ): void {
-  const overrides = { ...preferences.overrides };
-  let removed = false;
-  for (const sourceKey of sourceKeys) {
-    if (Object.hasOwn(overrides, sourceKey)) {
-      Reflect.deleteProperty(overrides, sourceKey);
-      removed = true;
-    }
+  if (preferences.contextList) return;
+  writeUsageContextPreferences({
+    ...preferences,
+    version: 6,
+    contextList: {
+      entries: uniqueEntries([...inUse, ...usageContextRecordedEntries(preferences)]),
+      severalOpen: false,
+    },
+  });
+}
+
+export function addUsageContextEntry(
+  preferences: UsageContextPreferences,
+  entry: UsageContextListEntry,
+): void {
+  writeUsageContextPreferences({
+    ...preferences,
+    version: 6,
+    contextList: {
+      entries: uniqueEntries([...(preferences.contextList?.entries ?? []), entry]),
+      severalOpen: preferences.contextList?.severalOpen ?? false,
+    },
+  });
+}
+
+/** Every saved level an entry owns; an agent's row owns its models too. */
+export function usageContextKeysOfEntry(
+  preferences: UsageContextPreferences,
+  entry: UsageContextListEntry,
+): string[] {
+  return Object.keys(preferences.overrides).filter((key) => {
+    const record = usageContextRecordFromKey(key);
+    return (
+      !!record &&
+      record.source.agentName === entry.agentName &&
+      record.source.harness === entry.harness &&
+      (entry.model === "" || record.source.model === entry.model)
+    );
+  });
+}
+
+/**
+ * What the agent reported across every source a row and column cover. A field
+ * shows only when they all agree: an agent's row spans models of different sizes.
+ */
+export function reportedUsageContext(
+  preferences: UsageContextPreferences,
+  scope: { agentName: string; harness: string; model: string; hostId: string | null },
+): UsageContextReported {
+  const reports = Object.entries(preferences.reportedContext ?? {}).flatMap(([key, report]) => {
+    const source = usageContextSourceFromKey(key);
+    if (
+      !source ||
+      source.agentName !== scope.agentName ||
+      source.harness !== scope.harness ||
+      (scope.model !== "" && source.model !== scope.model) ||
+      (scope.hostId !== null && source.hostId !== scope.hostId)
+    )
+      return [];
+    return [report];
+  });
+  const agreed = (field: keyof UsageContextReported) => {
+    const values = new Set(reports.map((report) => report[field]));
+    return values.size === 1 ? ([...values][0] ?? null) : null;
+  };
+  return {
+    contextWindow: agreed("contextWindow"),
+    autoCompactTokenLimit: agreed("autoCompactTokenLimit"),
+  };
+}
+
+/** Keep what a session reports; only a changed figure is written and synced. */
+export function writeReportedContext(
+  preferences: UsageContextPreferences,
+  sourceKey: string,
+  report: UsageContextReported,
+  capturedAt = Date.now(),
+): void {
+  if (sourceKey.length === 0 || sourceKey.length > 512) return;
+  const previous = preferences.reportedContext?.[sourceKey];
+  if (report.contextWindow === null && report.autoCompactTokenLimit === null) {
+    if (!previous) return;
+    const reportedContext = Object.fromEntries(
+      Object.entries(preferences.reportedContext ?? {}).filter(([key]) => key !== sourceKey),
+    );
+    writeUsageContextPreferences({ ...preferences, version: 6, reportedContext });
+    return;
   }
-  if (!removed) return;
-  writeUsageContextPreferences({ ...preferences, version: 6, overrides });
+  if (
+    previous?.contextWindow === report.contextWindow &&
+    previous.autoCompactTokenLimit === report.autoCompactTokenLimit
+  )
+    return;
+  writeUsageContextPreferences({
+    ...preferences,
+    version: 6,
+    reportedContext: {
+      ...preferences.reportedContext,
+      [sourceKey]: { ...report, capturedAt },
+    },
+  });
 }
 
 /** Return the last valid reading for one exact Host/agent/harness/model source. */

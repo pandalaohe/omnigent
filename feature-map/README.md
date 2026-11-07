@@ -113,6 +113,9 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 
 ## Features
 
+- [Starting prompts](./startup-prompts.md) covers per-session text, owner-edited
+  SDK/RPC and team prompts, restore/Undo and ACP prompt delivery labels.
+
 - [Model lists](./model-sources.md) covers host-owned model sources, the Settings
   card, offline `models check` / `models guide`, and bounded ACP probing.
 
@@ -144,9 +147,13 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
   the model/effort pill, the configuration gear, and slash commands.
 - [Terminals](./terminals.md) covers the Chat/Terminal switcher, the agent
   terminal, shell terminals, and terminal reattachment.
+- [Windows admin terminals](./windows-admin-terminals.md) covers host-owner
+  enrollment, loopback SSH elevation and removal.
 - [Native harnesses](./native-harnesses.md) is the matrix of every native
   harness against launch, authentication, model and effort selection,
   approvals, resume, and terminal behavior, with native disconnect test boundaries.
+- [Task board](./task-board.md) covers reported tasks, display switches, source
+  links and owner-scoped report/read checks.
 - [Preferences and config defaults](./preferences.md) covers local user/project
   defaults, invocation overrides, related settings surfaces, and the boundary
   between explicit cloud save/import, the shared-preference foundation, and

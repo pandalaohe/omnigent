@@ -38,26 +38,33 @@ _MIGRATION = "omnigent.db.migrations.versions.a51c20261029_add_subagent_retry_jo
 def test_upgrade_is_additive_and_matches_registered_metadata(db_uri):
     engine = get_or_create_engine(db_uri)
     config = _build_alembic_config(db_uri)
-    command.downgrade(config, "f3c914a721ab")
-    before = set(sa.inspect(engine).get_table_names())
-    users = sa.Table("users", sa.MetaData(), autoload_with=engine)
-    with engine.begin() as connection:
-        connection.execute(users.insert().values(workspace_id=0, id="preserved", is_admin=False))
-    command.upgrade(config, "a51c20261029")
-    command.upgrade(config, "a51c20261029")
-    inspector = sa.inspect(engine)
-    assert set(inspector.get_table_names()) - before == {model.__tablename__ for model in _MODELS}
-    for model in _MODELS:
-        assert next(iter(model.__table__.primary_key.columns.keys())) == "workspace_id"
-        assert {column["name"] for column in inspector.get_columns(model.__tablename__)} == set(
-            model.__table__.c.keys()
-        )
-        assert not inspector.get_foreign_keys(model.__tablename__)
-    with engine.connect() as connection:
-        assert (
-            connection.scalar(sa.select(users.c.id).where(users.c.id == "preserved"))
-            == "preserved"
-        )
+    try:
+        command.downgrade(config, "f3c914a721ab")
+        before = set(sa.inspect(engine).get_table_names())
+        users = sa.Table("users", sa.MetaData(), autoload_with=engine)
+        with engine.begin() as connection:
+            connection.execute(
+                users.insert().values(workspace_id=0, id="preserved", is_admin=False)
+            )
+        command.upgrade(config, "a51c20261029")
+        command.upgrade(config, "a51c20261029")
+        inspector = sa.inspect(engine)
+        assert set(inspector.get_table_names()) - before == {
+            model.__tablename__ for model in _MODELS
+        }
+        for model in _MODELS:
+            assert next(iter(model.__table__.primary_key.columns.keys())) == "workspace_id"
+            assert {
+                column["name"] for column in inspector.get_columns(model.__tablename__)
+            } == set(model.__table__.c.keys())
+            assert not inspector.get_foreign_keys(model.__tablename__)
+        with engine.connect() as connection:
+            assert (
+                connection.scalar(sa.select(users.c.id).where(users.c.id == "preserved"))
+                == "preserved"
+            )
+    finally:
+        command.upgrade(config, "head")
 
 
 @pytest.mark.parametrize("model", _MODELS)
@@ -99,11 +106,16 @@ def test_downgrade_refuses_any_retained_journal_table(db_uri, model):
                 connection.execute(other.__table__.delete())
         count = connection.scalar(sa.select(sa.func.count()).select_from(model))
         assert count > 0
-    with pytest.raises(RuntimeError, match="retain its additive schema"):
-        command.downgrade(config, "f3c914a721ab")
-    assert {entry.__tablename__ for entry in _MODELS} <= set(sa.inspect(engine).get_table_names())
-    with engine.connect() as connection:
-        assert connection.scalar(sa.select(sa.func.count()).select_from(model)) == count
+    try:
+        with pytest.raises(RuntimeError, match="retain its additive schema"):
+            command.downgrade(config, "f3c914a721ab")
+        assert {entry.__tablename__ for entry in _MODELS} <= set(
+            sa.inspect(engine).get_table_names()
+        )
+        with engine.connect() as connection:
+            assert connection.scalar(sa.select(sa.func.count()).select_from(model)) == count
+    finally:
+        command.upgrade(config, "head")
 
 
 @pytest.mark.parametrize("backend", ["sqlite", "postgresql", "mysql", "cockroachdb"])

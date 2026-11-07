@@ -911,6 +911,7 @@ class HostModelOptionsResponse(BaseModel):
     models: list[dict[str, Any]]
     routable_models: list[str]
     error: str | None = None
+    injects_prompt: bool | None = None
 
 
 class LaunchRunnerRequest(BaseModel):
@@ -1635,6 +1636,26 @@ def create_hosts_router(
             else canonicalize_harness(harness) or harness,
             refresh=refresh,
         )
+        catalog_store = getattr(request.app.state, "host_model_catalog_cache_store", None)
+        if catalog_store is not None and harness.startswith("acp:"):
+            if result.get("status") == "ok":
+                await asyncio.to_thread(
+                    catalog_store.upsert,
+                    host_id,
+                    harness,
+                    result.get("models", []),
+                    now_epoch(),
+                    permission_options=result.get("permission_options"),
+                    injects_prompt=result.get("injects_prompt"),
+                )
+            else:
+                await asyncio.to_thread(
+                    catalog_store.mark_error,
+                    host_id,
+                    harness,
+                    str(result.get("error") or "host model-options lookup failed"),
+                    injects_prompt=result.get("injects_prompt"),
+                )
         if result.get("status") != "ok":
             raise HTTPException(
                 status_code=502,
@@ -1655,6 +1676,7 @@ def create_hosts_router(
                 [m for m in routable if isinstance(m, str)] if isinstance(routable, list) else []
             ),
             error=error if isinstance(error, str) and error else None,
+            injects_prompt=result.get("injects_prompt"),
         )
 
     @router.post("/hosts/{host_id}/runners")

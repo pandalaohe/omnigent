@@ -227,7 +227,7 @@ async def test_workspace_outside_configured_root_is_allowed_silently(
     }
     response = await project_create_client.post("/v1/sessions", json=payload, headers=_headers())
     assert response.status_code == 201, response.text
-    assert "warnings" not in response.json()
+    assert response.json()["warnings"] == []
 
 
 @pytest.mark.parametrize("agent_id", [BUILTIN_AGENT_ID, OTHER_AGENT_ID])
@@ -245,7 +245,7 @@ async def test_explicit_agent_differing_from_pin_is_allowed_silently(
     )
     assert response.status_code == 201, response.text
     assert response.json()["agent_id"] == agent_id
-    assert "warnings" not in response.json()
+    assert response.json()["warnings"] == []
 
 
 async def test_fork_of_mismatched_session_stays_clean(
@@ -270,7 +270,7 @@ async def test_fork_of_mismatched_session_stays_clean(
     )
     assert fork.status_code == 201, fork.text
     body = fork.json()
-    assert "warnings" not in body
+    assert body["warnings"] == []
     assert body["project_id"] == project_id
 
 
@@ -282,7 +282,7 @@ async def test_without_project_id_response_is_unchanged(
     )
     assert response.status_code == 201, response.text
     body = response.json()
-    assert "warnings" not in body
+    assert body["warnings"] == []
     # Full response round-trip pins the legacy response projection rather than
     # checking only the fields touched by this feature.
     assert body == SessionResponse.model_validate(body).model_dump(mode="json")
@@ -376,7 +376,7 @@ async def test_null_project_id_with_valid_agent_matches_key_absent_create(
     assert absent_response.status_code == 201, absent_response.text
     assert null_response.status_code == 201, null_response.text
     body = null_response.json()
-    assert "warnings" not in body
+    assert body["warnings"] == []
     assert body["project_id"] is None
     volatile = {"id", "created_at", "updated_at", "root_conversation_id"}
     assert {key: value for key, value in body.items() if key not in volatile} == {

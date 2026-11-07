@@ -136,6 +136,16 @@ def strip_desktop_session_env(env: Mapping[str, str]) -> dict[str, str]:
     return {key: value for key, value in env.items() if key not in DESKTOP_SESSION_ENV_VARS}
 
 
+def managed_telemetry_attributes(attributes: str) -> str:
+    """Identify managed exports while retaining the deployment's other attributes."""
+    retained = [
+        attribute
+        for attribute in attributes.split(",")
+        if attribute.strip() and attribute.partition("=")[0].strip() != "launch_mode"
+    ]
+    return ",".join([*retained, "launch_mode=omni"])
+
+
 def desktop_session_passthrough(os_env: object | None) -> dict[str, str]:
     """Forward declared desktop variables only for explicitly unsandboxed specs."""
     sandbox = getattr(os_env, "sandbox", None)

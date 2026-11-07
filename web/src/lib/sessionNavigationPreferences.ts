@@ -8,6 +8,7 @@ export const MAX_SESSION_POLLING_WINDOW_HOURS = 24 * 365;
 export type NativeMobileHeaderMode = "server" | "conversation-title";
 
 export interface SessionNavigationPreferences {
+  showTaskBoard?: boolean;
   /** Null keeps the official behavior: every non-archived session participates. */
   pollingActiveWindowHours: number | null;
   /** On (the default): unread B/G sessions do not jump the poll's unread queue. */
@@ -21,6 +22,7 @@ export interface SessionNavigationPreferences {
 }
 
 const DEFAULT_PREFERENCES: SessionNavigationPreferences = {
+  showTaskBoard: false,
   pollingActiveWindowHours: null,
   deprioritizeBackgroundSessions: true,
   showGoalSessionMarkers: true,
@@ -40,6 +42,7 @@ function normalizePreferences(value: unknown): SessionNavigationPreferences {
   if (!value || typeof value !== "object") return { ...DEFAULT_PREFERENCES };
   const candidate = value as Partial<SessionNavigationPreferences>;
   return {
+    showTaskBoard: candidate.showTaskBoard === true,
     pollingActiveWindowHours: normalizePollingWindow(candidate.pollingActiveWindowHours),
     deprioritizeBackgroundSessions: candidate.deprioritizeBackgroundSessions !== false,
     showGoalSessionMarkers: candidate.showGoalSessionMarkers !== false,
@@ -65,6 +68,7 @@ export function writeSessionNavigationPreferences(preferences: SessionNavigation
   try {
     if (
       normalized.pollingActiveWindowHours === null &&
+      !normalized.showTaskBoard &&
       normalized.deprioritizeBackgroundSessions &&
       normalized.showGoalSessionMarkers &&
       normalized.scrollToBottomOnSessionOpen &&
@@ -81,6 +85,7 @@ export function writeSessionNavigationPreferences(preferences: SessionNavigation
   queueUserPreferencePatch(
     "session_navigation",
     normalized.pollingActiveWindowHours === null &&
+      !normalized.showTaskBoard &&
       normalized.deprioritizeBackgroundSessions &&
       normalized.showGoalSessionMarkers &&
       normalized.scrollToBottomOnSessionOpen &&

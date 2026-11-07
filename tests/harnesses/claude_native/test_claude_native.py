@@ -118,6 +118,7 @@ def test_claude_terminal_request_pins_launch_cwd(tmp_path, monkeypatch) -> None:
     spec = body["spec"]
     assert spec["command"] == "claude"
     assert spec["env"] == {
+        "OTEL_RESOURCE_ATTRIBUTES": "launch_mode=omni",
         "ENABLE_TOOL_SEARCH": "true",
         "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
         "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
@@ -262,6 +263,7 @@ def test_claude_terminal_request_injects_claude_config(tmp_path, monkeypatch) ->
     spec = body["spec"]
     assert spec["command"] == "env"
     assert spec["env"] == {
+        "OTEL_RESOURCE_ATTRIBUTES": "launch_mode=omni",
         "ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic",
         "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "900000",
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",

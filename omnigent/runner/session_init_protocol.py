@@ -79,6 +79,7 @@ class RunnerSessionInitSnapshot(BaseModel):  # type: ignore[explicit-any]  # Pyd
     archive_states: list[RunnerArchiveState] = Field(default_factory=list)
     peer_messaging_enabled: bool = False
     global_instructions: str | None = None
+    instructions_override: str | None = None
     project_code: list[ProjectCodeLocation] | None = None
     inference_config: dict[str, object] | None = None
 
@@ -113,6 +114,7 @@ def build_runner_session_init_payload(
     archive_states: list[RunnerArchiveState] | None = None,
     peer_messaging_enabled: bool = False,
     global_instructions: str | None = None,
+    instructions_override: str | None = None,
     project_code: list[ProjectCodeLocation] | None = None,
     resume_interrupted_turn: bool = False,
     recovery_id: str | None = None,
@@ -171,6 +173,7 @@ def build_runner_session_init_payload(
             archive_states=effective_archive_states,
             peer_messaging_enabled=peer_messaging_enabled,
             global_instructions=global_instructions,
+            instructions_override=instructions_override,
             project_code=project_code,
             inference_config=snapshot_runtime_config(conversation.inference_snapshot),
         ),

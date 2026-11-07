@@ -1,6 +1,15 @@
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render as rtlRender,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
-import { StrictMode } from "react";
+import { StrictMode, type ReactElement } from "react";
 import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { InstructionsPage } from "./InstructionsPage";
@@ -14,6 +23,19 @@ import type * as InstructionHooks from "@/hooks/useInstructionLayers";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as AgentRegistryModule from "@/hooks/useAgentRegistry";
 import type * as NativeBridge from "@/lib/nativeBridge";
+
+function render(ui: ReactElement) {
+  return rtlRender(ui, {
+    wrapper: ({ children }) => (
+      <QueryClientProvider
+        client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
+      >
+        {children}
+      </QueryClientProvider>
+    ),
+  });
+}
+vi.mock("@/lib/callingDefaultsApi", () => ({ listCallingDefaultCatalogs: async () => [] }));
 
 const mocks = vi.hoisted(() => ({
   admin: true,

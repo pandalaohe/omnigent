@@ -23,6 +23,7 @@ def test_upsert_round_trips_and_clears_a_previous_error(db_uri: str) -> None:
             "harness": "codex",
             "models": [{"id": "gpt-6-sol"}],
             "permission_options": [],
+            "injects_prompt": None,
             "fetched_at": 1700000000,
             "error": None,
         }
@@ -43,13 +44,17 @@ def test_mark_error_keeps_the_last_payload(db_uri: str) -> None:
 def test_permission_payload_round_trip_and_legacy_list_sync(db_uri: str) -> None:
     store = _store(db_uri)
     options = [{"value": "review", "label": "Review", "description": "Review changes"}]
-    store.upsert(_HOST, "acp:neutral", [{"id": "a"}], 1, permission_options=options)
+    store.upsert(
+        _HOST, "acp:neutral", [{"id": "a"}], 1, permission_options=options, injects_prompt=False
+    )
     store.mark_error(_HOST, "acp:neutral", "offline")
     record = store.list([_HOST])[0]
     assert record["models"] == [{"id": "a"}]
     assert record["permission_options"] == options
+    assert record["injects_prompt"] is False
     store.upsert(_HOST, "acp:neutral", [{"id": "b"}], 2)
     assert store.list([_HOST])[0]["permission_options"] == []
+    assert store.list([_HOST])[0]["injects_prompt"] is None
 
 
 def test_mark_error_creates_an_empty_row_when_none_exists(db_uri: str) -> None:
@@ -60,6 +65,20 @@ def test_mark_error_creates_an_empty_row_when_none_exists(db_uri: str) -> None:
     assert record["models"] == []
     assert record["fetched_at"] is None
     assert record["error"] == "unsupported"
+
+
+def test_failed_model_probe_keeps_configuration_delivery_metadata(db_uri: str) -> None:
+    store = _store(db_uri)
+    store.mark_error(_HOST, "acp:neutral", "probe failed", injects_prompt=False)
+    record = store.list([_HOST])[0]
+    assert record["models"] == []
+    assert record["injects_prompt"] is False
+    store.upsert(_HOST, "acp:neutral", [{"id": "previous"}], 1, injects_prompt=True)
+    store.mark_error(_HOST, "acp:neutral", "probe failed again", injects_prompt=False)
+    record = store.list([_HOST])[0]
+    assert record["models"] == [{"id": "previous"}]
+    assert record["fetched_at"] == 1
+    assert record["injects_prompt"] is False
 
 
 def test_list_is_workspace_scoped(db_uri: str) -> None:

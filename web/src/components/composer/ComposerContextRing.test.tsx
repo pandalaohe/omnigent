@@ -92,7 +92,7 @@ describe("ComposerContextRing", () => {
       "text-neutral-400",
       "dark:text-muted-foreground",
     );
-    expect(screen.getByRole("button", { name: "Change context values" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Change context limits" })).toBeInTheDocument();
 
     // A click pins what hover opened: leaving the trigger no longer clears it.
     fireEvent.click(screen.getByTestId("composer-context-ring"));
@@ -117,7 +117,7 @@ describe("ComposerContextRing", () => {
     renderRing(1000, 123, sourceKey);
 
     fireEvent.click(screen.getByTestId("composer-context-ring"));
-    const button = screen.getByRole("button", { name: "Change context values" });
+    const button = screen.getByRole("button", { name: "Change context limits" });
     expect(button).toHaveClass("min-h-11");
     expect(screen.getByTestId("composer-context-ring")).toHaveClass(
       "size-6",
@@ -154,10 +154,10 @@ describe("ComposerContextRing", () => {
       />,
     );
     await userEvent.setup().hover(screen.getByTestId("composer-context-ring"));
-    expect(await screen.findByText("Context · host-a × codex")).toBeInTheDocument();
-    expect(screen.getByText("Buffer 20,000 · codex, all hosts")).toBeInTheDocument();
+    expect(await screen.findByText("Context · codex on host-a")).toBeInTheDocument();
+    expect(screen.getByText("Buffer 20,000 · codex, all computers")).toBeInTheDocument();
     expect(
-      screen.getByText("Ignored host-a × codex: buffer ≥ context; using codex, all hosts."),
+      screen.getByText("Ignored codex on host-a: buffer ≥ context; using codex, all computers."),
     ).toBeInTheDocument();
   });
 

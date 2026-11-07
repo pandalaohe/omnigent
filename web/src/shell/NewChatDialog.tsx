@@ -212,6 +212,7 @@ import {
 import { callingLastContext, resolveCallingSeed } from "@/lib/callingDefaultsSeed";
 import { recordCallingLast, callingDefaultHasModels } from "@/lib/callingDefaults";
 import { HelpTip } from "@/components/HelpTip";
+import { SessionPromptField } from "@/components/SessionPromptField";
 import { listCallingDefaultCatalogs, type CallingDefaultsProblem } from "@/lib/callingDefaultsApi";
 import { getCliServerUrl, getOmnigentHostConfig } from "@/lib/host";
 import { quoteShellArgument } from "@/lib/shell";
@@ -2409,6 +2410,7 @@ interface LandingDraft {
   // project's stored defaults win (the prefill writes are fill-empty-only).
   project: string;
   message: string;
+  sessionPrompt?: string;
   files: File[];
   pickedAgentId: string | null;
   selectedHostId: string | null;
@@ -2708,6 +2710,7 @@ export function NewChatLandingScreen() {
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const [sessionPrompt, setSessionPrompt] = useState(restoredDraft?.sessionPrompt ?? "");
   const backdropRef = useRef<HTMLDivElement>(null);
   const [tailCaret, setTailCaret] = useState<number | null>(null);
   const [hoveredFileIndex, setHoveredFileIndex] = useState<number | null>(null);
@@ -3152,6 +3155,7 @@ export function NewChatLandingScreen() {
     mcpRegistryServices,
     project: projectParam,
     message,
+    sessionPrompt,
     files,
     pickedAgentId,
     selectedHostId,
@@ -6766,6 +6770,10 @@ export function NewChatLandingScreen() {
   }
 
   async function handleCreate() {
+    if (new TextEncoder().encode(sessionPrompt).length > 16384) {
+      setCreateError("Shorten the prompt for this chat to 16 KiB or less.");
+      return;
+    }
     // Mirror the Send button's disabled condition (canSubmit) so the Enter-key
     // and form-submit paths that call this directly can't create a session with
     // a blank message, host, agent, or workspace.
@@ -7063,6 +7071,7 @@ export function NewChatLandingScreen() {
           ? await customAgentBundle(customTemplate.id)
           : await buildAgentBundle(pendingAgent!);
         const metadata: Record<string, unknown> = {};
+        if (sessionPrompt) metadata.session_prompt = sessionPrompt;
         if (mcpServicesForLaunch.length) metadata.mcp_registry_services = mcpServicesForLaunch;
         if (workspaceValue && !workspaceFromProjectConfig) metadata.workspace = workspaceValue;
         if (createProjectId !== null) metadata.project_id = createProjectId;
@@ -7247,6 +7256,7 @@ export function NewChatLandingScreen() {
             : (pickedHarness ?? undefined),
           smart_routing_message:
             smartRoutingHarnessSelected || pinnedNativeRoutes ? initialPrompt : undefined,
+          session_prompt: sessionPrompt || undefined,
         });
         const createForm =
           serverOwnsInitialInput && submittedFiles.length > 0 ? new FormData() : null;
@@ -8196,6 +8206,18 @@ export function NewChatLandingScreen() {
             }}
             className="relative z-30"
           >
+            <div className="mb-2">
+              <SessionPromptField
+                value={sessionPrompt}
+                onChange={setSessionPrompt}
+                name={selectedAgent?.display_name ?? selectedAgent?.name ?? "This agent"}
+                injectsPrompt={
+                  callingCatalogs?.find(
+                    (row) => row.host_id === selectedHostId && row.harness === acpHarness,
+                  )?.injects_prompt
+                }
+              />
+            </div>
             <ChatComposer
               keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}
               className={cn(isDragActive && "ring-2 ring-ring ring-inset")}

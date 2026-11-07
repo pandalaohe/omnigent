@@ -16,7 +16,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.usage_snapshot_store import UsageSnapshotStore
-from omnigent.usage.contract import UsageReport
+from omnigent.usage.contract import UsageReport, UsageReportV2
 from tests.server.integration.test_global_instructions_routes import (
     _headers,
     _make_user,
@@ -464,6 +464,57 @@ def test_linked_account_replaces_native_tile_and_projects_to_routing(service):
     assert "codex" not in {item.id for item in overview.accounts if item.kind == "native"}
     assert account(overview, "gw").product == "codex"
     assert overview.agents["codex"]["state"] == "ok"
+
+
+def test_v2_pin_only_change_updates_routing_without_refreshing_windows(service):
+    service.report_account(
+        OWNER,
+        "gw",
+        UsageReportV2.model_validate(
+            {
+                "schema_version": 2,
+                "observed_at": NOW,
+                "fresh_until": NOW + 60,
+                "product": "codex",
+                "pinned_window": "short",
+                "windows": [
+                    {
+                        "id": "short",
+                        "kind": "session",
+                        "percent_used": 85,
+                        "window_minutes": 300,
+                        "resets_at": NOW + 10800,
+                    },
+                    {
+                        "id": "weekly",
+                        "kind": "weekly",
+                        "percent_used": 40,
+                        "window_minutes": 10080,
+                        "resets_at": NOW + 4 * 86400,
+                    },
+                ],
+            }
+        ),
+        now=NOW,
+    )
+    service.report_account(
+        OWNER,
+        "gw",
+        UsageReportV2.model_validate(
+            {
+                "schema_version": 2,
+                "observed_at": NOW + 30,
+                "pinned_window": "weekly",
+            }
+        ),
+        now=NOW + 30,
+    )
+    overview = service.overview(OWNER, now=NOW + 30)
+    assert account(overview, "gw").deciding_window == "weekly"
+    assert account(overview, "gw").read_at == NOW
+    assert overview.agents["codex"]["deciding_window"] == "weekly"
+    assert account(service.overview(OWNER, now=NOW + 61), "gw").freshness == "old"
+    assert service.overview(OWNER, now=NOW + 61).agents["codex"]["state"] == "unknown"
 
 
 def test_successful_read_removes_missing_window_but_keeps_pin_for_its_return(service):
@@ -1004,3 +1055,65 @@ def test_usage_request_openapi_references_resolve(request):
                 check(value)
 
     check(schema)
+
+
+@pytest.mark.parametrize("mode", ["structured", "binary"])
+async def test_cloud_event_v2_report_and_partial_updates(db_uri, mode):
+    service = service_with_store(db_uri)
+    app = FastAPI()
+    app.include_router(
+        create_agent_quota_router(service, auth_provider=None, host_store=None), prefix="/v1"
+    )
+    body = {
+        "schema_version": 2,
+        "observed_at": time.time(),
+        "balances": [{"id": "wallet", "remaining": 3, "unit": "USD"}],
+    }
+    envelope = {
+        "specversion": "1.0",
+        "id": "event-1",
+        "source": "vendor-reader",
+        "type": "dev.omnigent.usage.report",
+        "time": "2026-11-06T05:00:00Z",
+    }
+    headers = (
+        {"Content-Type": "application/cloudevents+json"}
+        if mode == "structured"
+        else {f"ce-{key}": value for key, value in envelope.items()}
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        path = "/v1/me/usage/accounts/gw"
+        reply = await client.put(
+            path,
+            json={**envelope, "data": body} if mode == "structured" else body,
+            headers=headers,
+        )
+        assert reply.status_code == 200
+        assert reply.json() == {"applied": 0, "held": [], "skipped": [], "older_sections": []}
+        assert (
+            await client.put(
+                path,
+                json={"schema_version": 2, "observed_at": time.time(), "display_name": "Wallet"},
+            )
+        ).status_code == 200
+        tile = next(
+            a for a in (await client.get("/v1/me/usage")).json()["accounts"] if a["id"] == "gw"
+        )
+        assert tile["balances"][0]["remaining"] == 3
+        assert tile["source"] == "vendor-reader" and tile["read_at"] is None
+        service.flush(force=True)
+        stored = service.snapshot_store.read(RESERVED_USER_LOCAL)["usage.account.gw"]
+        event = next(e for e in stored["report_log"] if e["kind"] == "cloudevent")
+        assert event["id"] == "event-1" and event["time"] == envelope["time"]
+        assert (
+            await client.put(path, json=body, headers={"ce-specversion": "1.0"})
+        ).status_code == 422
+        assert (
+            await client.put(
+                path,
+                json=[{**envelope, "data": body}],
+                headers={"Content-Type": "application/cloudevents+json"},
+            )
+        ).status_code == 422

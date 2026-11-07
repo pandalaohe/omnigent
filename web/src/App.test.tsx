@@ -165,6 +165,26 @@ describe("Usage board routes", () => {
   );
 });
 
+describe("Task board route", () => {
+  it("keeps a hard-loaded link registered while deployment info is loading", () => {
+    renderRoute("/task-board", {}, "loading");
+    expect(screen.queryByText("not found")).toBeNull();
+  });
+
+  it("explains a disabled deployment", async () => {
+    renderRoute("/task-board");
+    expect(
+      await screen.findByRole("heading", { name: "Task board is off on this server" }),
+    ).toBeTruthy();
+  });
+
+  it("points to the user switch when the deployment permits the board", async () => {
+    localStorage.clear();
+    renderRoute("/task-board", {}, { ...FALLBACK_SERVER_INFO, task_board_enabled: true });
+    expect(await screen.findByRole("link", { name: "Turn it on in Settings" })).toBeTruthy();
+  });
+});
+
 describe("Canvas route", () => {
   it("shows a spinner, not 'not found', while server info is still loading", () => {
     renderRoute("/canvas", {}, "loading");

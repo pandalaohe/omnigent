@@ -2411,6 +2411,8 @@ class _SessionUsageCoalescer:
         self._pending: dict[str, int | None] = {}
         self._last_posted: dict[str, int | None] = {}
         self._model: str | None = model
+        self._pending_context: tuple[str | None, int, int | None] | None = None
+        self._last_context: tuple[str | None, int, int | None] | None = None
         self._bridge_dir = bridge_dir
         self._baseline = baseline
 
@@ -2436,6 +2438,9 @@ class _SessionUsageCoalescer:
         )
         if data is None:
             return
+        window = data.get("context_window")
+        if isinstance(window, int) and not isinstance(window, bool) and window > 0:
+            self._pending_context = (self._model, window, data.get("auto_compact_token_limit"))
         if self._baseline is not None:
             for key, inherited in zip(_CUMULATIVE_TOKEN_KEYS, self._baseline, strict=True):
                 value = data.get(key)
@@ -2457,8 +2462,13 @@ class _SessionUsageCoalescer:
             for key, value in self._pending.items()
             if key not in self._last_posted or self._last_posted[key] != value
         }
+        context = self._pending_context
+        if context is not None and context != self._last_context:
+            data["context_window"] = context[1]
+            data["auto_compact_token_limit"] = context[2]
         if not data:
             self._pending.clear()
+            self._pending_context = None
             return
         if data.keys() & _CUMULATIVE_TOKEN_KEYS:
             # Re-attach every cumulative count so the post stays self-contained:
@@ -2474,6 +2484,14 @@ class _SessionUsageCoalescer:
         # counts changed) — the server reprices cumulative tokens into
         # ``total_cost_usd`` per turn and needs the model each time.
         payload: _JsonObject = dict(data)
+        if context is not None and (
+            "context_window" in data or "auto_compact_token_limit" in data
+        ):
+            payload.update(
+                context_model=context[0],
+                context_window=context[1],
+                auto_compact_token_limit=context[2],
+            )
         if self._model:
             payload["model"] = self._model
         response = await _post_session_event(
@@ -2485,7 +2503,10 @@ class _SessionUsageCoalescer:
         _log_failed_session_event_post("external_session_usage", response)
         if response is not None and response.status_code < 400:
             self._last_posted.update(data)
+            if "context_window" in payload:
+                self._last_context = context
             self._pending.clear()
+            self._pending_context = None
 
     async def close(self) -> None:
         """
@@ -5425,7 +5446,10 @@ async def _maybe_handle_turn_event(
         if forwarder_state is None or not forwarder_state.compaction_item_persisted:
             try:
                 await _persist_codex_compaction_item(
-                    client, session_id=session_id, bridge_dir=bridge_dir
+                    client,
+                    session_id=session_id,
+                    bridge_dir=bridge_dir,
+                    thread_id=_thread_id_from_params(params),
                 )
             except Exception as exc:
                 _logger.warning(
@@ -7327,9 +7351,18 @@ async def _handle_completed_item_inner(
             client, session_id, "completed", forwarder_state=forwarder_state
         )
         if forwarder_state is None or not forwarder_state.compaction_item_persisted:
+            compaction_item_id = item.get("id")
             try:
                 await _persist_codex_compaction_item(
-                    client, session_id=session_id, bridge_dir=bridge_dir
+                    client,
+                    session_id=session_id,
+                    bridge_dir=bridge_dir,
+                    thread_id=_thread_id_from_params(params),
+                    item_id=(
+                        compaction_item_id
+                        if isinstance(compaction_item_id, str) and compaction_item_id
+                        else None
+                    ),
                 )
             except Exception as exc:
                 _logger.warning(
@@ -9400,7 +9433,8 @@ async def _post_status(
         session_id,
         event_type="external_session_status",
         data=data,
-        max_attempts=None,
+        # Terminal outcomes survive outages; transient status edges use bounded retries.
+        max_attempts=None if status in {"idle", "failed"} else _POST_MAX_ATTEMPTS,
         timeout=_DURABLE_ITEM_POST_TIMEOUT_SECONDS,
     )
     _log_failed_session_event_post("external_session_status", response)
@@ -9685,6 +9719,8 @@ async def _persist_codex_compaction_item(
     *,
     session_id: str,
     bridge_dir: Path | None = None,
+    thread_id: str | None = None,
+    item_id: str | None = None,
 ) -> None:
     """Persist a compaction boundary item to the conversation store.
 
@@ -9693,6 +9729,15 @@ async def _persist_codex_compaction_item(
     post-compaction context. When ``bridge_dir`` is available, we
     read the latest ``Compacted`` entry from the rollout and use
     its ``replacement_history`` as ``compacted_messages``.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id.
+    :param bridge_dir: Bridge directory holding the bridge state and rollout.
+    :param thread_id: Codex thread the boundary belongs to; with the boundary
+        id it forms the event's ``source_id`` so a replayed turn stores one
+        item.
+    :param item_id: The ``contextCompaction`` item's id, used as the boundary
+        identity when the rollout names no window.
     """
     resp = await client.get(
         f"/v1/sessions/{session_id}/items",
@@ -9721,17 +9766,55 @@ async def _persist_codex_compaction_item(
         "model": "unknown",
         "token_count": 0,
     }
+    window_id = compacted.get("window_id") if compacted is not None else None
     if compacted is not None:
         if compacted.get("replacement_history"):
             data["compacted_messages"] = compacted["replacement_history"]
-        if compacted.get("window_id") is not None:
-            data["window_id"] = compacted["window_id"]
+        if window_id is not None:
+            data["window_id"] = window_id
+    source_id = _codex_compaction_source_id(thread_id, window_id=window_id, item_id=item_id)
+    if source_id is not None:
+        data["source_id"] = source_id
 
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
         json={"type": "compaction", "data": data},
     )
     resp.raise_for_status()
+
+
+def _codex_compaction_source_id(
+    thread_id: str | None, *, window_id: object, item_id: str | None
+) -> str | None:
+    """
+    Return the identity of one Codex compaction boundary.
+
+    The rollout's ``compacted`` entry is the durable record of a compaction, so
+    its ``window_id`` names the boundary in every path that persists it — the
+    ``contextCompaction`` item and the ``thread/compacted`` notification both
+    read that same entry. A replayed turn or a repeated notification therefore
+    posts the same id and the store keeps one item. The item id is the fallback
+    identity when no rollout window names the boundary.
+
+    :param thread_id: Codex thread the boundary belongs to, e.g.
+        ``"thread_1"``; ``None`` when the event carried none.
+    :param window_id: The rollout entry's ``window_id`` — a UUID string in
+        current Codex, an integer counter in older builds, often absent.
+    :param item_id: The completed ``contextCompaction`` item's id, when the
+        caller has one.
+    :returns: ``"<thread id>:<boundary id>"``, or ``None`` when neither part
+        is known.
+    """
+    if not thread_id:
+        return None
+    boundary: str | None = None
+    if isinstance(window_id, str) and window_id.strip():
+        boundary = window_id.strip()
+    elif isinstance(window_id, int) and not isinstance(window_id, bool):
+        boundary = str(window_id)
+    elif item_id:
+        boundary = item_id
+    return f"{thread_id}:{boundary}" if boundary else None
 
 
 def _latest_thread_rollout(state: CodexNativeBridgeState) -> Path | None:
@@ -9879,15 +9962,17 @@ def _read_compacted_history(rollout_path: Path) -> dict[str, object] | None:
     if not isinstance(payload, dict):
         return None
     history = payload.get("replacement_history")
-    if not isinstance(history, list) or not history:
-        return None
     # Store the full replacement_history — messages + compaction
     # tokens. Although the messages duplicate pre-compaction items
     # in the conversation store, they are needed for rollout
     # reconstruction (e.g. sandbox recovery where the rollout file
     # is lost).
     return {
-        "replacement_history": [item for item in history if isinstance(item, dict)],
+        "replacement_history": (
+            [item for item in history if isinstance(item, dict)]
+            if isinstance(history, list)
+            else []
+        ),
         "window_id": payload.get("window_id"),
     }
 

@@ -16,6 +16,7 @@ from uuid import uuid4
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     ColumnElement,
     LargeBinary,
     Select,
@@ -112,6 +113,7 @@ from omnigent.db.utils import (
     strip_nul_bytes,
 )
 from omnigent.entities import (
+    CompactionData,
     Conversation,
     ConversationItem,
     MessageData,
@@ -145,6 +147,7 @@ from omnigent.stores.conversation_store import (
     ARCHIVE_WORKTREE_MODE_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
     ARTIFACT_LINK_KEY_LABEL,
+    COMPACTION_COUNT_CAP,
     FORK_CARRY_HISTORY_LABEL_KEY,
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
@@ -161,6 +164,7 @@ from omnigent.stores.conversation_store import (
     ArchiveCloseClaimResult,
     ArchivedConversationFacets,
     ArchiveLockWriteResult,
+    CompactionStats,
     ConversationAlreadyExistsError,
     ConversationArchiveClosingError,
     ConversationNotFoundError,
@@ -446,6 +450,7 @@ def _to_conversation(
         cost_control_mode_override=overrides["cost_control_mode_override"],
         subagent_routing_override=overrides["subagent_routing_override"],
         harness_override=overrides["harness_override"],
+        session_prompt=row.session_prompt,
         # Stored as ``"on"`` / absent; surfaced as a plain bool on the entity.
         share_workspace_files=overrides["share_workspace_files"] == "on",
         sub_agent_name=meta.sub_agent_name if meta else None,
@@ -1728,6 +1733,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         cost_control_mode_override: str | None = None,
         subagent_routing_override: str | None = None,
         harness_override: str | None = None,
+        session_prompt: str | None = None,
     ) -> Conversation:
         """
         Create a new conversation in the database.
@@ -1799,6 +1805,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         now = now_epoch()
         new_id = conversation_id if conversation_id is not None else generate_conversation_id()
         encoded_kind = encode_conversation_kind(kind)
+        from omnigent.runtime.instruction_layers import validate_session_prompt
+
+        validate_session_prompt(session_prompt)
         encoded_terminal_launch_args = (
             json.dumps(terminal_launch_args) if terminal_launch_args is not None else None
         )
@@ -1924,6 +1933,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     root_conversation_id=root_id,
                     agent_id=agent_id,
                     session_overrides=encoded_overrides,
+                    session_prompt=session_prompt,
                 )
                 ap_sess.add(row)
                 if prepared_labels:
@@ -2078,6 +2088,26 @@ class SqlAlchemyConversationStore(ConversationStore):
             key=lambda c: (c.created_at, c.id),
         )
         return matches[0] if matches else None
+
+    def find_conversations_by_external_session_ids(
+        self, session_ids: set[str]
+    ) -> list[Conversation]:
+        """Resolve distinct exporter session ids without per-point queries."""
+        ids: list[str] = []
+        values = sorted(session_ids)
+        with self._session("find_exported_sessions") as session:
+            for offset in range(0, len(values), 500):
+                ids.extend(
+                    session.execute(
+                        select(SqlConversationMetadata.id).where(
+                            SqlConversationMetadata.workspace_id == current_workspace_id(),
+                            SqlConversationMetadata.external_session_id.in_(
+                                values[offset : offset + 500]
+                            ),
+                        )
+                    ).scalars()
+                )
+        return list(self.get_conversations(ids).values())
 
     def get_runner_ids(self, conversation_ids: list[str]) -> dict[str, str | None]:
         """
@@ -4881,6 +4911,41 @@ class SqlAlchemyConversationStore(ConversationStore):
                 has_more=has_more,
             )
 
+    def get_compaction_stats(self, conversation_id: str) -> CompactionStats:
+        """
+        Return the compaction aggregate for one conversation.
+
+        Aggregates over the newest ``COMPACTION_COUNT_CAP`` compaction
+        items, walked newest-first on the conversation/type/position
+        index, so a snapshot does bounded work however many times the
+        session has compacted; ``count`` saturates at the cap.
+
+        :param conversation_id: Unique conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :returns: A :class:`CompactionStats`; ``count=0`` with
+            ``last_compaction_at=None`` when the conversation has no
+            compaction items (or does not exist).
+        """
+        newest = (
+            select(SqlConversationItem.created_at)
+            .where(
+                SqlConversationItem.workspace_id == current_workspace_id(),
+                SqlConversationItem.conversation_id == conversation_id,
+                SqlConversationItem.type == encode_item_type("compaction"),
+            )
+            .order_by(SqlConversationItem.position.desc())
+            .limit(COMPACTION_COUNT_CAP)
+            .subquery()
+        )
+        with self._conv_session("select_compaction_stats") as session:
+            count, last_at = session.execute(
+                select(func.count(), func.max(newest.c.created_at)).select_from(newest)
+            ).one()
+        return CompactionStats(
+            count=int(count or 0),
+            last_compaction_at=int(last_at) if last_at is not None else None,
+        )
+
     @staticmethod
     def _resolve_item_cursor_position(
         session: Session,
@@ -5331,6 +5396,43 @@ class SqlAlchemyConversationStore(ConversationStore):
                         if row is not None:
                             decoded = self._decode_item_data_batch([row.data])[0]
                             existing = _to_item(row, decoded)
+                            if (
+                                item.stable_id is not None
+                                and isinstance(existing.data, CompactionData)
+                                and isinstance(item.data, CompactionData)
+                                and existing.data.snapshot_source
+                                in ("hook_fallback", "transcript_degraded")
+                                and item.data.snapshot_source == "transcript"
+                                and item.data.compacted_messages
+                            ):
+                                # Upgrade the snapshot under the append lock without
+                                # advancing the boundary's position or round timestamp.
+                                upgraded = item.data.model_copy(
+                                    update={"last_item_id": existing.data.last_item_id}
+                                )
+                                row.data = self._encode_item_data_batch(
+                                    [
+                                        strip_nul_bytes(
+                                            json.dumps(upgraded.model_dump(exclude_none=True))
+                                        )
+                                    ]
+                                )[0]
+                                if search is not None:
+                                    row.search_text = search
+                                    if session.bind and _supports_fts5(session.bind.dialect.name):
+                                        session.execute(
+                                            text(
+                                                "DELETE FROM conversation_items_fts "
+                                                "WHERE item_id = :id AND conversation_id = :cid"
+                                            ),
+                                            {
+                                                "id": item_id,
+                                                "cid": conversation_id,
+                                            },
+                                        )
+                                    if search:
+                                        fts_rows.append((item_id, conversation_id, search))
+                                existing = existing.model_copy(update={"data": upgraded})
                     if existing is not None:
                         if item.idempotency_key is not None and not existing.matches_native_replay(
                             item, exact_source=True
@@ -6134,11 +6236,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``None`` or empty disables the filter. Lets callers hide a
             category of children (e.g. harness sub-agent mirrors) without
             the store knowing what the label means.
-        :param touched_label_key: When set, restrict to conversations
-            carrying this label key (the caller's per-user
-            ``omnigent.touched.<user>`` key) and order by that label's value
-            — the epoch-ms last-interaction time — descending, with the
-            store's standard tiebreaker. ``None`` disables the filter.
+        :param touched_label_key: When set, order by this label's epoch-ms
+            last-interaction time (the caller's per-user
+            ``omnigent.touched.<user>`` key), falling back to creation time
+            for conversations without it, descending with the store's
+            standard tiebreaker. ``None`` uses the normal ``sort_by`` order.
             Cannot be combined with ``after`` / ``before`` (the cursor is
             defined on the ``sort_by`` column, not the label value), which
             raises ``ValueError``.
@@ -6583,13 +6685,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             touched_sort_col: ColumnElement[Any] | None = None
             if touched_label_key is not None:
-                # Recent sessions: inner-join the caller's own per-user touch
-                # row (same workspace scope as the pin filter) and order by its
-                # value. The value is epoch-ms zero-padded to 13 digits, so the
-                # string ordering is the time ordering; the alias keeps the
-                # joined row distinct from the label reads below.
+                # Untouched sessions keep their creation position. Convert
+                # seconds to milliseconds after widening to avoid overflow.
                 touched_label = aliased(SqlConversationLabel)
-                stmt = stmt.join(
+                stmt = stmt.outerjoin(
                     touched_label,
                     and_(
                         touched_label.workspace_id == current_workspace_id(),
@@ -6597,7 +6696,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                         touched_label.key == touched_label_key,
                     ),
                 )
-                touched_sort_col = cast(ColumnElement[Any], touched_label.value)
+                touched_sort_col = func.coalesce(
+                    sql_cast(touched_label.value, BigInteger),
+                    sql_cast(SqlConversation.created_at, BigInteger) * 1000,
+                )
             for exclude_key, exclude_values in (exclude_labels or {}).items():
                 # Labels are colocated on the AP DB, so an inline anti-join
                 # drops labelled conversations without a cross-DB prefetch.
@@ -8895,6 +8997,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         host_id: str | None = None,
         inference_snapshot: dict[str, Any] | None = None,
         created_by: str | None = None,
+        session_prompt: str | None = None,
     ) -> CreatedSession:
         """
         Insert a conversation row and session-scoped agent.
@@ -8976,6 +9079,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             host_id=host_id,
             inference_snapshot=inference_snapshot,
             created_by=created_by,
+            session_prompt=session_prompt,
         )
 
     def _create_session_with_agent_with_id(
@@ -9001,11 +9105,15 @@ class SqlAlchemyConversationStore(ConversationStore):
         host_id: str | None = None,
         inference_snapshot: dict[str, Any] | None = None,
         created_by: str | None = None,
+        session_prompt: str | None = None,
     ) -> CreatedSession:
         """Body of :meth:`create_session_with_agent` under a caller-supplied
         ``conversation_id``. The public method generates a fresh id; this seam
         lets a subclass inject one (MAS's WHS-homed store injects the WHS node id)."""
+        from omnigent.runtime.instruction_layers import validate_session_prompt
         from omnigent.stores.conversation_store import ConversationNotFoundError
+
+        validate_session_prompt(session_prompt)
 
         now = now_epoch()
         encoded_overrides = _encode_session_overrides(
@@ -9050,6 +9158,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 agent_id=agent_id,
                 session_overrides=encoded_overrides,
             )
+            conversation_row.session_prompt = session_prompt
             ap_sess.add(conversation_row)
             if prepared_labels:
                 _upsert_prepared_labels(ap_sess, conversation_id, prepared_labels, now)
@@ -9406,6 +9515,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 }
             )
             new_conv_values: dict[str, Any] = {
+                "session_prompt": source.session_prompt,
                 "id": new_conv_id,
                 "created_at": now,
                 "updated_at": now,
@@ -9673,6 +9783,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 and not key.startswith(f"{_SANDBOX_REPO_LABEL_KEY}.")
                 and not key.startswith(f"{ARCHIVE_CASCADE_LABEL_KEY}.")
                 and not key.startswith(CHECKIN_LABEL_PREFIX)
+                and not key.startswith("omnigent.auto_rotation_state.")
                 and not key.startswith("omnigent.standing_approval.")
                 and not key.startswith("omnigent.standing_pass.")
                 and key != PROJECT_ARCHIVE_LABEL_KEY

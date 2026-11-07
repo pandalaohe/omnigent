@@ -510,6 +510,208 @@ def test_python_launcher_rejects_unbound_or_nonloopback_descriptor(tmp_path, fau
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fault", "category", "exception", "status"),
+    [
+        ("connect", "request", "ConnectError", None),
+        ("timeout", "request", "ReadTimeout", None),
+        ("forbidden", "http_status", "ValueError", 403),
+        ("decode", "decode", "JSONDecodeError", 200),
+        ("shape", "shape", "ValueError", 200),
+        ("launch", "launch_id", "ValueError", 200),
+    ],
+)
+async def test_windows_launcher_failure_diagnostics_exclude_private_data(
+    tmp_path, monkeypatch, caplog, fault, category, exception, status
+):
+    from omnigent.inner import pi_executor
+
+    monkeypatch.setattr(pi_executor, "IS_WINDOWS", True)
+    private = "private-authority-and-response"
+    launch_id = "a" * 32
+
+    def respond(request):
+        if fault == "connect":
+            raise httpx.ConnectError(private, request=request)
+        if fault == "timeout":
+            raise httpx.ReadTimeout(private, request=request)
+        if fault == "forbidden":
+            return httpx.Response(403, text=private)
+        if fault == "decode":
+            return httpx.Response(200, text=private)
+        return httpx.Response(200, json=[private] if fault == "shape" else {"launch_id": private})
+
+    client = httpx.AsyncClient
+    monkeypatch.setattr(
+        pi_executor.httpx,
+        "AsyncClient",
+        lambda **kwargs: client(transport=httpx.MockTransport(respond), **kwargs),
+    )
+    launcher = pi_executor._PiScopedLauncher(
+        "session-a",
+        tmp_path,
+        {
+            "protocol": 1,
+            "session_id": "session-a",
+            "endpoint": "http://127.0.0.1:1",
+            "process_capability": private,
+        },
+    )
+    with pytest.raises(pi_executor.PiPermissionBootstrapError) as rejected:
+        await launcher.request("reserve", launch_id)
+    assert rejected.value.reason == "Pi scoped launcher transport unavailable"
+    assert f"category={category}" in caplog.text
+    assert f"exception={exception}" in caplog.text
+    assert f"status={status}" in caplog.text
+    assert "operation=reserve" in caplog.text
+    assert private not in caplog.text
+    assert launch_id not in caplog.text
+    assert "127.0.0.1" not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("windows", [False, True])
+async def test_python_launcher_real_loopback_and_broker_failure_diagnostics(
+    attestor_relay, tmp_path, monkeypatch, caplog, windows
+):
+    from omnigent.inner import pi_executor
+    from omnigent.runner import pi_bootstrap
+
+    monkeypatch.setattr(pi_executor, "IS_WINDOWS", windows)
+    monkeypatch.setattr(pi_bootstrap, "IS_WINDOWS", windows)
+    runtime, broker, relay, _source, _registry = attestor_relay
+    descriptor = broker.launcher_descriptor()
+    launcher = pi_executor._PiScopedLauncher("session-a", tmp_path, descriptor)
+    launch_id = "b" * 32
+    reserved = await launcher.request("reserve", launch_id)
+    assert Path(reserved["handoff"]).parent == runtime.path("session-a").parent / "pi-bootstrap"
+    assert descriptor["endpoint"] == relay._advertised_url
+    assert relay._httpd.socket.getsockname()[0] == "127.0.0.1"
+    assert relay._httpd.socket.getsockname()[1] == int(relay._advertised_url.rsplit(":", 1)[1])
+    with pytest.raises(pi_executor.PiPermissionBootstrapError):
+        await launcher.request("publish", launch_id, pid="private-invalid-pid", started_at=0)
+    assert "stage=operation exception=ValueError" in caplog.text
+    assert "check=launcher_identity_fields exception=ValueError" in caplog.text
+    assert "status=403" in caplog.text
+    launcher._capability = "private-invalid-credential"
+    with pytest.raises(pi_executor.PiPermissionBootstrapError):
+        await launcher.request("reserve", launch_id)
+    assert "stage=authentication exception=ValueError" in caplog.text
+    assert "check=launcher_authentication exception=ValueError" in caplog.text
+    assert "private-invalid" not in caplog.text
+    assert descriptor["process_capability"] not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fault", "check", "exception"),
+    [
+        ("reserve-io", "handoff_directory_io", "PermissionError"),
+        ("process-identity", "process_identity_or_endpoint", "ValueError"),
+        ("scope-expectation", "process_scope_launch", "JSONDecodeError"),
+        ("handoff-write", "handoff_atomic_write", "PermissionError"),
+        ("handoff-metadata", "handoff_destination_metadata", "PermissionError"),
+        ("confirm-generation", "launcher_generation", "ValueError"),
+    ],
+)
+async def test_windows_broker_refusal_names_check_without_values(
+    attestor_relay, monkeypatch, caplog, fault, check, exception
+):
+    from omnigent.inner import pi_executor
+    from omnigent.runner import pi_bootstrap
+
+    monkeypatch.setattr(pi_executor, "IS_WINDOWS", True)
+    monkeypatch.setattr(pi_bootstrap, "IS_WINDOWS", True)
+    runtime, broker, _relay, _source, _registry = attestor_relay
+    bridge = runtime.path("session-a").parent
+    descriptor = broker.launcher_descriptor()
+    launcher = pi_executor._PiScopedLauncher("session-a", bridge, descriptor)
+    mkdir, replace, exists = Path.mkdir, os.replace, Path.exists
+    private = "private-fault-details"
+
+    def deny_directory(path, *args, **kwargs):
+        if path.name == "pi-bootstrap":
+            raise PermissionError(private)
+        return mkdir(path, *args, **kwargs)
+
+    def deny_handoff(source, destination, *args, **kwargs):
+        if Path(destination).parent.name == "pi-bootstrap":
+            raise PermissionError(private)
+        return replace(source, destination, *args, **kwargs)
+
+    def deny_metadata(path):
+        if path.parent.name == "pi-bootstrap":
+            raise PermissionError(private)
+        return exists(path)
+
+    if fault == "reserve-io":
+        monkeypatch.setattr(Path, "mkdir", deny_directory)
+        operation, values = "reserve", {}
+        launch_id = "c" * 32
+    else:
+        launch_id, _locator = await launcher.reserve()
+        operation = "publish"
+        identity = process_identity(os.getpid())
+        values = {"pid": identity[0], "started_at": identity[1]}
+        if fault == "process-identity":
+            values["started_at"] = 0
+        elif fault == "scope-expectation":
+            (bridge / "permission_expected.json").write_text(private)
+        elif fault == "handoff-write":
+            monkeypatch.setattr(os, "replace", deny_handoff)
+        elif fault == "handoff-metadata":
+            monkeypatch.setattr(Path, "exists", deny_metadata)
+        else:
+            launch_id, operation, values = "d" * 32, "confirm", {}
+    with pytest.raises(pi_executor.PiPermissionBootstrapError):
+        await launcher.request(operation, launch_id, **values)
+    assert f"check={check} exception={exception}" in caplog.text
+    assert "status=403" in caplog.text
+    for value in (private, str(bridge), launch_id, descriptor["process_capability"]):
+        assert value not in caplog.text
+
+
+@pytest.mark.parametrize("binary_mode", [False, True])
+def test_windows_scope_expectation_requires_exact_binary_source(
+    tmp_path, monkeypatch, binary_mode
+):
+    from omnigent.harnesses.pi_native.bridge import prepare_permission_installation
+    from omnigent.permission_tiers import pi_tools
+
+    bridge = tmp_path / "bridge"
+    source = tmp_path / "extension.js"
+    source.write_bytes(b"// neutral fixture\r\nmodule.exports = {};\r\n")
+    prepare_permission_installation(bridge, session_id="session-a", harness="pi", extension=source)
+    original_open, original_read = os.open, os.read
+    native_binary, simulated_binary = getattr(os, "O_BINARY", 0), 0x8000
+    binary_fds = set()
+
+    def open_crt(path, flags, *args, **kwargs):
+        fd = original_open(path, (flags & ~simulated_binary) | native_binary, *args, **kwargs)
+        if flags & simulated_binary:
+            binary_fds.add(fd)
+        else:
+            binary_fds.discard(fd)
+        return fd
+
+    def read_crt(fd, size):
+        data = original_read(fd, size)
+        return data if fd in binary_fds else data.replace(b"\r\n", b"\n")
+
+    monkeypatch.setattr(pi_tools, "IS_WINDOWS", True)
+    monkeypatch.setattr(os, "O_BINARY", simulated_binary if binary_mode else 0, raising=False)
+    monkeypatch.setattr(os, "O_NOFOLLOW", 0, raising=False)
+    monkeypatch.setattr(os, "open", open_crt)
+    monkeypatch.setattr(os, "read", read_crt)
+    if binary_mode:
+        expected = pi_tools.read_pi_tool_expectation(bridge)
+        assert expected["extension_sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
+    else:
+        with pytest.raises(ValueError, match="Changed Pi enforcement source"):
+            pi_tools.read_pi_tool_expectation(bridge)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("ready", [False, True])
 async def test_scoped_confirmation_uses_the_callers_remaining_deadline(
     tmp_path, monkeypatch, ready
@@ -875,7 +1077,9 @@ require(process.argv[1]).connectFromHandoff(process.argv[2]).then(({connection})
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["normal", "loss", "replacement", "missing-bootstrap"])
+@pytest.mark.parametrize(
+    "mode", ["normal", "loss", "replacement", "missing-bootstrap", "incompatible"]
+)
 async def test_real_sdk_scoped_read_rpc_exception_and_jsonl_confine_receipts(mode):
     node, pi = shutil.which("node"), shutil.which("pi")
     if not node or not pi:
@@ -907,9 +1111,13 @@ async def test_real_sdk_scoped_read_rpc_exception_and_jsonl_confine_receipts(mod
             b'"evaluate": 0, "execute": 0, "finish": 0'
             if mode == "missing-bootstrap"
             else (
-                b'"evaluate": 3, "execute": 3, "finish": 3'
-                if mode == "normal"
-                else b'"evaluate": 1, "execute": 1, "finish": 0'
+                b'"evaluate": 1, "execute": 1, "finish": 1'
+                if mode == "incompatible"
+                else (
+                    b'"evaluate": 3, "execute": 3, "finish": 3'
+                    if mode == "normal"
+                    else b'"evaluate": 1, "execute": 1, "finish": 0'
+                )
             )
         )
         assert expected in output

@@ -47,7 +47,7 @@ def _isolate_auto_compact_window(monkeypatch: pytest.MonkeyPatch) -> None:
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    monkeypatch.setattr(forwarder, "read_user_auto_compact_window", lambda: None)
+    monkeypatch.setattr(forwarder, "read_claude_auto_compact_token_limit", lambda *a, **kw: None)
 
 
 @pytest.fixture(autouse=True)

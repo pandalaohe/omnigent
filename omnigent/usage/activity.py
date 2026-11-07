@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, Sequence, Set
 from dataclasses import asdict
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -35,8 +35,47 @@ def attributed_rows(
     accounts: Mapping[str, Mapping[str, Any]],
     meters: Mapping[tuple[str, str], set[str | None]],
     native_accounts: Sequence[str] = (),
+    hostless: Set[str] = frozenset(),
 ) -> dict[str, list[HourRow]]:
     result: dict[str, list[HourRow]] = defaultdict(list)
+    coverage = {
+        (row.account_id, row.host_id, row.hour_utc)
+        for row in rows
+        if row.account_id in accounts
+        and accounts[row.account_id].get("activity_writer") != "otlp"
+        and (
+            row.priced
+            or any(
+                value is not None
+                for value in (
+                    row.input_tokens,
+                    row.cached_tokens,
+                    row.cache_write_tokens,
+                    row.output_tokens,
+                    row.reasoning_tokens,
+                    row.total_tokens,
+                    row.requests,
+                    row.failed,
+                )
+            )
+        )
+    }
+    account_wide = {
+        account
+        for account in hostless
+        if account in accounts and accounts[account].get("activity_writer") != "otlp"
+    } | {account for account, host, _ in coverage if not host}
+    # V1 also treated an empty activity section as account-wide replacement.
+    account_wide.update(
+        account
+        for account, record in accounts.items()
+        if record.get("has_activity")
+        and record.get(
+            "activity_schema_version", (record.get("report") or {}).get("schema_version", 1)
+        )
+        == 1
+        and record.get("activity_writer") != "otlp"
+    )
     linked: dict[str, str] = {}
     for account, record in sorted(accounts.items()):
         if record.get("product"):
@@ -56,7 +95,7 @@ def attributed_rows(
                 )
             else:
                 target = linked.get(product, product)
-            if accounts.get(target, {}).get("has_activity"):
+            if target in account_wide or (target, row.host_id, row.hour_utc) in coverage:
                 continue
         elif target not in accounts:
             # A removed source's hours never resurrect its tile.
@@ -75,9 +114,9 @@ def totals(rows: Sequence[HourRow]) -> dict[str, Any]:
 def _totals(rows: Sequence[HourRow]) -> dict[str, Any]:
     cost = sum(row.cost_usd for row in rows)
     counted = [row for row in rows if row.basis in COUNTED_BASES]
-    covered = [row for row in rows if row.priced and row.total_tokens > 0]
+    covered = [row for row in rows if row.priced and (row.total_tokens or 0) > 0]
     covered_cost = sum(row.cost_usd for row in covered)
-    covered_tokens = sum(row.total_tokens for row in covered)
+    covered_tokens = sum(row.total_tokens or 0 for row in covered)
     failures = [row for row in rows if row.requests is not None and row.failed is not None]
     requests = sum(row.requests or 0 for row in failures)
     failed = sum(row.failed or 0 for row in failures)
@@ -88,13 +127,19 @@ def _totals(rows: Sequence[HourRow]) -> dict[str, Any]:
     return {
         "cost_usd": cost if any(row.priced for row in rows) else None,
         "counted_cost_usd": sum(row.cost_usd for row in counted if row.priced),
-        "tokens": sum(row.total_tokens for row in rows) or None,
+        "tokens": (
+            sum(row.total_tokens or 0 for row in rows) or None
+            if all(row.total_tokens is not None for row in rows)
+            else None
+        ),
         "unpriced": sum(not row.priced for row in rows),
+        "partial_rows": sum(row.coverage == "partial" for row in rows),
         "per_million": covered_cost / covered_tokens * 1e6 if covered_tokens else None,
         "covered_cost_usd": covered_cost,
         "covered_tokens": covered_tokens,
         "cost_coverage_pct": covered_cost / cost * 100 if cost > 0 else None,
-        "tokens_complete": bool(rows) and all(row.total_tokens > 0 for row in rows if row.priced),
+        "tokens_complete": bool(rows)
+        and all((row.total_tokens or 0) > 0 for row in rows if row.priced),
         "requests": requests if failures else None,
         "failed": failed if failures else None,
         "failure_pct": failed / requests * 100 if requests else None,

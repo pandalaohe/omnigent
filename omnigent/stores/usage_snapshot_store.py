@@ -72,42 +72,44 @@ class UsageSnapshotStore:
         return result
 
     def write(self, owner: str, key: str, record: dict[str, Any]) -> None:
-        value = json.dumps(record, separators=(",", ":"), allow_nan=False)
-
         def write(session: Session) -> None:
-            values = {
-                "workspace_id": current_workspace_id(),
-                "user_id": owner,
-                "key": key,
-                "value": value,
-            }
-            dialect = session.get_bind().dialect.name
-            stmt: Insert
-            if dialect == "mysql":
-                stmt = (
-                    mysql_insert(SqlPreference)
-                    .values(**values)
-                    .on_duplicate_key_update(value=value)
-                )
-            elif dialect == "sqlite":
-                stmt = (
-                    sqlite_insert(SqlPreference)
-                    .values(**values)
-                    .on_conflict_do_update(
-                        index_elements=["workspace_id", "user_id", "key"], set_={"value": value}
-                    )
-                )
-            else:
-                stmt = (
-                    pg_insert(SqlPreference)
-                    .values(**values)
-                    .on_conflict_do_update(
-                        index_elements=["workspace_id", "user_id", "key"], set_={"value": value}
-                    )
-                )
-            session.execute(stmt)
+            self.write_in_session(session, owner, key, record)
 
         run_write_transaction(self._write_session(), "write_usage_snapshot", write)
+
+    @staticmethod
+    def write_in_session(session: Session, owner: str, key: str, record: dict[str, Any]) -> None:
+        """Join a usage-counter transaction so its writer marker commits with it."""
+        value = json.dumps(record, separators=(",", ":"), allow_nan=False)
+        values = {
+            "workspace_id": current_workspace_id(),
+            "user_id": owner,
+            "key": key,
+            "value": value,
+        }
+        dialect = session.get_bind().dialect.name
+        stmt: Insert
+        if dialect == "mysql":
+            stmt = (
+                mysql_insert(SqlPreference).values(**values).on_duplicate_key_update(value=value)
+            )
+        elif dialect == "sqlite":
+            stmt = (
+                sqlite_insert(SqlPreference)
+                .values(**values)
+                .on_conflict_do_update(
+                    index_elements=["workspace_id", "user_id", "key"], set_={"value": value}
+                )
+            )
+        else:
+            stmt = (
+                pg_insert(SqlPreference)
+                .values(**values)
+                .on_conflict_do_update(
+                    index_elements=["workspace_id", "user_id", "key"], set_={"value": value}
+                )
+            )
+        session.execute(stmt)
 
     def delete(self, owner: str, key: str) -> None:
         def remove(session: Session) -> None:

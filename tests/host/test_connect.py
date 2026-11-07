@@ -3059,11 +3059,12 @@ async def test_watch_runner_reports_refused_credentials_as_sign_in(
 def test_runner_exit_error_redacts_credential_values(tmp_path: Path) -> None:
     """Redact credentials before exit reports reach the server or SPA."""
     log = tmp_path / "runner-x.log"
+    standalone_token = "sk-" + "fixture" * 5
     log.write_text(
         "boot: starting\n"
         "OPENAI_API_KEY=sk-live-abc123\n"
         "authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig\n"
-        "using ghp_0123456789abcdef0123456789abcdef\n"
+        f"using {standalone_token}\n"
         "tunnel rejected: bad frame\n",
         encoding="utf-8",
     )
@@ -3073,7 +3074,7 @@ def test_runner_exit_error_redacts_credential_values(tmp_path: Path) -> None:
     assert "sk-live-abc123" not in error
     assert "eyJhbGciOiJIUzI1NiJ9" not in error
     # Standalone provider-shaped tokens are masked even without a key label.
-    assert "ghp_0123456789abcdef0123456789abcdef" not in error
+    assert standalone_token not in error
     assert "OPENAI_API_KEY=[REDACTED]" in error
     # Keep the diagnostic cause.
     assert "tunnel rejected: bad frame" in error
@@ -9435,6 +9436,31 @@ async def test_slow_codex_picker_keeps_probe_running_and_serves_matching_cache(
     finally:
         release.set()
         await store.shutdown_catalog_probes()
+        _cleanup_host(host)
+
+
+async def test_acp_probe_failure_still_reports_configured_prompt_delivery(monkeypatch) -> None:
+    from omnigent.models import model_source
+
+    monkeypatch.setattr(
+        model_source, "model_source_for", lambda _: model_source.ModelSource(lane="agent")
+    )
+    monkeypatch.setattr(
+        model_source,
+        "_source_catalog",
+        lambda *_: (None, "neutral", SimpleNamespace(inject_system_prompt=False)),
+    )
+    monkeypatch.setattr(
+        model_source, "fetch_model_source", AsyncMock(side_effect=RuntimeError("probe failed"))
+    )
+    host = _make_host_process()
+    try:
+        response = await host._handle_model_options(
+            HostModelOptionsFrame(request_id="delivery", harness="acp:neutral")
+        )
+        assert response.status == "failed"
+        assert response.injects_prompt is False
+    finally:
         _cleanup_host(host)
 
 

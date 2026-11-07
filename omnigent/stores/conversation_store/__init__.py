@@ -529,6 +529,32 @@ class CreatedSession:
     agent: Agent
 
 
+# Newest compaction items a snapshot aggregate reads. Bounds the work per
+# snapshot however long a session has lived; ``count`` saturates here.
+COMPACTION_COUNT_CAP = 1000
+
+
+@dataclass(frozen=True)
+class CompactionStats:
+    """
+    Aggregate view of a conversation's persisted compaction items.
+
+    Returned by :meth:`ConversationStore.get_compaction_stats` so the
+    session snapshot can expose a metadata-level compaction signal
+    (``compaction_count`` / ``last_compaction_at``) without paging the
+    transcript.
+
+    :param count: Compaction items persisted to the conversation, e.g.
+        ``2``; ``0`` when none. Exact up to :data:`COMPACTION_COUNT_CAP`,
+        which longer histories report instead.
+    :param last_compaction_at: Unix epoch seconds of the most recent
+        compaction item, or ``None`` when ``count`` is ``0``.
+    """
+
+    count: int
+    last_compaction_at: int | None
+
+
 @dataclass(frozen=True)
 class ConversationUpdateResult:
     """Result of updating a conversation and its requested model settings.
@@ -916,6 +942,7 @@ class ConversationStore(ABC):
         cost_control_mode_override: str | None = None,
         subagent_routing_override: str | None = None,
         harness_override: str | None = None,
+        session_prompt: str | None = None,
     ) -> Conversation:
         """
         Create a new conversation. Generates a unique
@@ -1032,6 +1059,16 @@ class ConversationStore(ABC):
         :returns: The matching conversation, or ``None``.
         """
         ...
+
+    def find_conversations_by_external_session_ids(
+        self, session_ids: set[str]
+    ) -> list[Conversation]:
+        """Batch session lookup; stores may override this compatibility fallback."""
+        return [
+            conv
+            for session_id in session_ids
+            if (conv := self.find_conversation_by_external_session_id(session_id)) is not None
+        ]
 
     @abstractmethod
     def get_runner_ids(self, conversation_ids: list[str]) -> dict[str, str | None]:
@@ -1233,6 +1270,24 @@ class ConversationStore(ABC):
             between two page fetches) — its position is unknowable, and an
             empty page would be indistinguishable from a completed
             enumeration.
+        """
+        ...
+
+    @abstractmethod
+    def get_compaction_stats(self, conversation_id: str) -> CompactionStats:
+        """
+        Return the compaction aggregate for one conversation.
+
+        Aggregates the newest :data:`COMPACTION_COUNT_CAP` compaction
+        items, so the session snapshot can carry ``compaction_count`` /
+        ``last_compaction_at`` without paging the transcript and with
+        bounded work per call.
+
+        :param conversation_id: Unique conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :returns: A :class:`CompactionStats`; ``count=0`` with
+            ``last_compaction_at=None`` when the conversation has no
+            compaction items (or does not exist).
         """
         ...
 
@@ -1465,11 +1520,11 @@ class ConversationStore(ABC):
             ``None`` or empty disables the filter. Lets callers hide a
             category of children (e.g. harness sub-agent mirrors) without
             the store knowing what the label means.
-        :param touched_label_key: When set, restrict to conversations
-            carrying this label key (the caller's per-user
-            ``omnigent.touched.<user>`` key) and order by that label's value
-            — the epoch-ms last-interaction time — descending, with the
-            store's standard tiebreaker. ``None`` disables the filter.
+        :param touched_label_key: When set, order by this label's epoch-ms
+            last-interaction time (the caller's per-user
+            ``omnigent.touched.<user>`` key), falling back to creation time
+            for conversations without it, descending with the store's
+            standard tiebreaker. ``None`` uses the normal ``sort_by`` order.
             Cannot be combined with ``after`` / ``before`` (the cursor is
             defined on the ``sort_by`` column, not the label value), which
             raises ``ValueError``.
@@ -2886,6 +2941,7 @@ class ConversationStore(ABC):
         host_id: str | None = None,
         inference_snapshot: dict[str, Any] | None = None,
         created_by: str | None = None,
+        session_prompt: str | None = None,
     ) -> CreatedSession:
         """
         Atomically create a session and its session-scoped agent.

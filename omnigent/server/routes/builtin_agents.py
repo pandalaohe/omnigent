@@ -21,6 +21,7 @@ import asyncio
 import hashlib
 import logging
 import re
+import time
 from collections.abc import Callable, Coroutine
 from typing import Any
 
@@ -28,6 +29,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, R
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
+from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 from starlette.datastructures import UploadFile
 from starlette.types import Message
@@ -39,7 +41,13 @@ from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_plugins import harness_capabilities, product_agent_harnesses
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.agent_config import agent_config_object, edit_agent_bundle
-from omnigent.server.auth import AuthProvider
+from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider, UnifiedAuthProvider
+from omnigent.server.builtin_agent_prompts import (
+    NAMESPACE,
+    PROMPT_MAX_CHARS,
+    prompt_spec,
+    prompt_view,
+)
 from omnigent.server.bundles import content_bundle_location, validate_agent_bundle
 from omnigent.server.custom_agent_bundles import project_members
 from omnigent.server.routes._auth_helpers import require_user as _require_user
@@ -54,6 +62,11 @@ from omnigent.server.schemas import (
     ErrorResponse,
     MCPServerSummary,
     SkillSummary,
+)
+from omnigent.server.user_preferences_store import (
+    SqlAlchemyUserPreferencesStore,
+    UserPreferencesUserNotFoundError,
+    UserPreferencesValidationError,
 )
 from omnigent.spec import AgentSpec
 from omnigent.stores import AgentStore, ConversationStore
@@ -75,6 +88,11 @@ _IN_USE_COUNT_CAP = 100
 # A bound agent id is a bare 32-char hex uuid; library template ids (``ca_…``)
 # are already template ids and cannot be looked up in the agents table.
 _AGENT_ID_PATTERN = re.compile(r"[0-9a-fA-F]{32}")
+
+
+class BuiltinPromptPatch(BaseModel):
+    text: str | None = Field(max_length=PROMPT_MAX_CHARS)
+    base_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
@@ -325,6 +343,7 @@ def create_builtin_agents_router(
     artifact_store: ArtifactStore | None = None,
     conversation_store: ConversationStore | None = None,
     auth_provider: AuthProvider | None = None,
+    user_preferences_store: SqlAlchemyUserPreferencesStore | None = None,
 ) -> APIRouter:
     """Build the ``/v1/agents`` router (server agent list, user agents).
 
@@ -343,6 +362,56 @@ def create_builtin_agents_router(
     :returns: A FastAPI router exposing the list, detail, install, and remove routes.
     """
     router = APIRouter(route_class=_AgentRoute)
+
+    async def prompt_agent(request: Request, agent_id: str) -> tuple[Agent, str]:
+        owner = _require_user(request, auth_provider) or RESERVED_USER_LOCAL
+        if user_preferences_store is None:
+            raise HTTPException(404, "Built-in prompt preferences are unavailable")
+        agent = await asyncio.to_thread(agent_store.get, agent_id)
+        await asyncio.to_thread(prompt_spec, agent, agent_cache)
+        assert agent is not None
+        return agent, owner
+
+    @router.get("/agents/{agent_id}/prompt")
+    async def get_builtin_prompt(request: Request, agent_id: str) -> dict[str, object]:
+        agent, owner = await prompt_agent(request, agent_id)
+        assert user_preferences_store is not None
+        return await asyncio.to_thread(
+            prompt_view, agent, agent_cache, user_preferences_store, owner
+        )
+
+    @router.patch("/agents/{agent_id}/prompt", dependencies=[Depends(require_trusted_origin)])
+    async def patch_builtin_prompt(
+        request: Request, agent_id: str, body: BuiltinPromptPatch
+    ) -> dict[str, object]:
+        agent, owner = await prompt_agent(request, agent_id)
+        assert user_preferences_store is not None
+        try:
+            await asyncio.to_thread(
+                user_preferences_store.patch_namespace,
+                owner,
+                NAMESPACE,
+                {
+                    agent.id: {
+                        "text": body.text,
+                        "base_sha256": body.base_sha256,
+                        "saved_at": int(time.time()),
+                    }
+                    if body.text is not None
+                    else None
+                },
+                create_if_missing=not (
+                    isinstance(auth_provider, UnifiedAuthProvider)
+                    and auth_provider._source == "accounts"
+                ),
+            )
+        except UserPreferencesUserNotFoundError as exc:
+            raise HTTPException(401, "Account no longer exists") from exc
+        except UserPreferencesValidationError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        return await asyncio.to_thread(
+            prompt_view, agent, agent_cache, user_preferences_store, owner
+        )
 
     def require_user_agents() -> None:
         if not agent_store.supports_user_agents:

@@ -13,11 +13,45 @@ from omnigent.stores.usage_hours_store import (
     UsageHoursStore,
     hours_of,
 )
-from omnigent.usage.contract import ActivityHour
+from omnigent.usage.contract import ActivityEntryV2, ActivityHour
 
 # Two hours ago: a pushed ``activity`` hour must be in the past to be kept.
 HOUR = hours_of(int(datetime.now(UTC).timestamp())) - 7200
 OTHER_HOUR = HOUR + 3600
+
+
+@pytest.mark.parametrize(
+    "figure",
+    [
+        "uncached_input_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "tokens",
+        "requests",
+        "failed",
+        "cost_usd",
+    ],
+)
+def test_hostless_accounts_require_figures_and_follow_owner_workspace_and_removal(db_uri, figure):
+    from omnigent.db.db_models import workspace_scope
+
+    store = UsageHoursStore(db_uri)
+    for owner in ("a@example.test", "b@example.test"):
+        store.replace_rows(owner, "plan", [ActivityEntryV2(hour=HOUR, **{figure: 0})])
+    store.replace_rows(
+        "a@example.test", "marker", [ActivityEntryV2(hour=HOUR, coverage="partial")]
+    )
+    store.replace_rows(
+        "a@example.test", "hosted", [ActivityEntryV2(hour=HOUR, host="h", tokens=1)]
+    )
+    assert store.hostless_accounts("a@example.test") == {"plan"}
+    with workspace_scope(9):
+        assert store.hostless_accounts("a@example.test") == set()
+    store.replace_rows("a@example.test", "plan", [ActivityEntryV2(hour=HOUR, removed=True)])
+    assert store.hostless_accounts("a@example.test") == set()
+    assert store.hostless_accounts("b@example.test") == {"plan"}
 
 
 def test_add_turn_accumulates_one_row_per_model_and_hour(db_uri):
@@ -75,6 +109,48 @@ def test_add_turn_accumulates_one_row_per_model_and_hour(db_uri):
     assert (first.output_tokens, first.total_tokens) == (24, 125)
 
 
+@pytest.mark.parametrize(
+    "dialect_name", ["postgresql+psycopg", "cockroachdb+psycopg", "mysql+pymysql", "sqlite"]
+)
+def test_upsert_cost_fallback_binds_as_float(dialect_name):
+    import re
+    from unittest.mock import Mock
+
+    from sqlalchemy import Float, create_mock_engine
+
+    if dialect_name.startswith("cockroachdb"):
+        pytest.importorskip("sqlalchemy_cockroachdb")
+    engine = create_mock_engine(
+        f"{dialect_name}://", lambda *args, **kwargs: None, paramstyle="named"
+    )
+    session = Mock()
+    session.get_bind.return_value = engine
+    store = UsageHoursStore("sqlite://")
+    store._upsert(
+        session,
+        "owner@example.test",
+        "native:codex",
+        HOUR,
+        "m",
+        "h",
+        "metered",
+        True,
+        TokenGrowth(input_tokens=10, total_tokens=10),
+        requests=None,
+        failed=None,
+        reasons=None,
+        cost_usd=0.25,
+        increment=True,
+    )
+    statement = session.execute.call_args.args[0]
+    compiled = statement.compile(dialect=engine.dialect)
+    fallback = re.search(r"coalesce\(usage_hours\.cost_usd, :(\w+)", str(compiled))
+    assert fallback is not None
+    parameter = fallback.group(1)
+    assert isinstance(compiled.binds[parameter].type, Float)
+    assert type(compiled.params[parameter]) is float
+
+
 def test_rows_are_owner_and_account_scoped(db_uri):
     store = UsageHoursStore(db_uri)
     for owner in ("a@example.test", "b@example.test"):
@@ -95,6 +171,34 @@ def test_empty_turn_creates_no_row(db_uri):
         "a@example.test", "native:codex", HOUR, "m", "h", "metered", True, 0, 0, 0, 0, 0, 0.0
     )
     assert store.read("a@example.test", HOUR, HOUR + 1) == []
+
+
+def test_otlp_adds_nullable_buckets_requests_and_failures(db_uri):
+    from omnigent.stores.usage_hours_store import UsageBuckets
+
+    store = UsageHoursStore(db_uri)
+    for buckets, requests, failed, cost in (
+        (UsageBuckets(output_tokens=20, total_tokens=120), 1, 1, 0.25),
+        (UsageBuckets(30, 60, 10, 20, 120, 5), 1, 0, 0.25),
+        (UsageBuckets(), None, None, 0.5),
+    ):
+        store.add_activity(
+            "a@example.test",
+            "gateway",
+            HOUR,
+            "m",
+            "otel:",
+            "metered",
+            True,
+            buckets,
+            requests,
+            failed,
+            cost,
+        )
+    [row] = store.read("a@example.test", HOUR, HOUR + 3600)
+    assert (row.input_tokens, row.cached_tokens, row.cache_write_tokens) == (30, 60, 10)
+    assert (row.output_tokens, row.total_tokens, row.reasoning_tokens) == (40, 240, 5)
+    assert (row.requests, row.failed, row.cost_usd) == (2, 1, 1.0)
 
 
 def test_unpriced_turn_keeps_its_token_split(db_uri):
@@ -176,7 +280,52 @@ def test_replace_activity_estimate_basis_is_kept(db_uri):
         [ActivityHour(hour=HOUR, model="m", tokens=10, cost_usd=0.1, cost_basis="estimate")],
     )
     [row] = store.read("a@example.test", HOUR, HOUR + 1)
-    assert row.basis == "estimate"
+    assert row.basis == "list"
+
+
+def test_v1_missing_tokens_keep_zero_buckets_and_do_not_hide_known_totals(db_uri):
+    from omnigent.usage.activity import totals
+
+    store = UsageHoursStore(db_uri)
+    store.replace_activity(
+        "a@example.test",
+        "gw",
+        [
+            ActivityHour(hour=HOUR, model="requests-only", requests=3),
+            ActivityHour(hour=HOUR, model="known", tokens=100),
+        ],
+    )
+    rows = store.read("a@example.test", HOUR, HOUR + 1)
+    counts = {r.model: r for r in rows}
+    unknown = counts["requests-only"]
+    assert (
+        unknown.input_tokens,
+        unknown.cached_tokens,
+        unknown.cache_write_tokens,
+        unknown.output_tokens,
+        unknown.total_tokens,
+    ) == (0, 0, 0, 0, 0)
+    assert counts["known"].total_tokens == 100
+    assert totals(rows)["tokens"] == 100
+
+
+def test_v1_lower_reread_replaces_complete_and_ignores_new_coverage_fields(db_uri):
+    store = UsageHoursStore(db_uri)
+    for tokens in (100, 70):
+        store.replace_activity(
+            "a@example.test",
+            "gw",
+            [
+                ActivityHour.model_validate(
+                    {
+                        "hour": HOUR,
+                        "tokens": tokens,
+                        "coverage": "partial",
+                    }
+                )
+            ],
+        )
+    assert store.read("a@example.test", HOUR, HOUR + 1)[0].total_tokens == 70
 
 
 def test_activity_turn_does_not_erase_reported_counts(db_uri):

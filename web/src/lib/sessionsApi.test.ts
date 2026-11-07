@@ -200,6 +200,7 @@ describe("createSession", () => {
       usageByModel: null,
       llmModel: undefined,
       harness: null,
+      harnessNamespace: null,
       modelOverride: undefined,
       autoCompactTokenLimit: undefined,
       subagentRoutingOverride: undefined,

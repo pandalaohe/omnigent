@@ -13,6 +13,7 @@ export interface CallingDefaultsCatalogRow {
   harness: string;
   models: NativeModelOption[];
   permission_options?: { value: string; label: string; description?: string; concept?: string }[];
+  injects_prompt?: boolean | null;
   /** Unix epoch seconds of the last successful sync; `null` when none. */
   fetched_at: number | null;
   /** The last sync failed, or the host is offline on this replica. */

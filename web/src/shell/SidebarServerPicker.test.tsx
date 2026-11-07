@@ -57,25 +57,29 @@ describe("SidebarServerPicker", () => {
     expect(container).toBeEmptyDOMElement();
   });
 
-  it("shows the current host on the row and lists recents in the menu", async () => {
+  it("shows a generic Server label on the collapsed row and lists the host and recents in the menu", async () => {
     getServerPicker.mockResolvedValue({
-      currentOrigin: "http://localhost:8000",
+      currentOrigin: "http://server.example:8000",
       recentServers: [
-        "http://localhost:8000/",
+        "http://server.example:8000/",
         "https://omnigents-3272836215725701.aws.databricksapps.com/",
         "https://omnigents-9147263058412098.aws.databricksapps.com/",
       ],
     });
     renderPicker();
 
-    const trigger = await openMenu();
-    expect(trigger).toHaveAttribute("aria-label", "Server: localhost:8000. Switch server");
+    const trigger = await screen.findByTestId("sidebar-server-picker");
+    expect(trigger).toHaveTextContent("Server");
+    expect(trigger).toHaveAttribute("aria-label", "Server. Switch server");
+    expect(trigger).not.toHaveAttribute("title");
+    expect(screen.queryByText("server.example:8000")).toBeNull();
+
+    await openMenu();
 
     expect(await screen.findByText("Recents")).toBeInTheDocument();
-    // localhost:8000 shows twice by design — once as the row's own label, once
-    // as the menu's leading checked entry — and NOT a third time from recents,
-    // which collapses into that entry.
-    expect(screen.getAllByText("localhost:8000")).toHaveLength(2);
+    // server.example:8000 shows once — as the menu's leading checked entry —
+    // and NOT on the collapsed row or a second time from recents.
+    expect(screen.getAllByText("server.example:8000")).toHaveLength(1);
     expect(
       screen.getByText("omnigents-3272836215725701.aws.databricksapps.com"),
     ).toBeInTheDocument();
@@ -112,10 +116,14 @@ describe("SidebarServerPicker", () => {
     });
     renderPicker();
 
+    const trigger = await screen.findByTestId("sidebar-server-picker");
+    expect(trigger).toHaveTextContent("Server");
+    expect(screen.queryByText("managed.example.com")).toBeNull();
+
     await openMenu();
     expect(await screen.findByText("Provided by your organization")).toBeInTheDocument();
-    // Once on the sidebar row and once as the checked managed menu item.
-    expect(screen.getAllByText("managed.example.com")).toHaveLength(2);
+    // Shown once, as the checked managed menu item (not on the collapsed row).
+    expect(screen.getAllByText("managed.example.com")).toHaveLength(1);
     expect(screen.queryByText("Recents")).toBeNull();
   });
 
@@ -158,7 +166,7 @@ describe("SidebarServerPicker", () => {
     expect(await screen.findByText("Connect to new server…")).toBeInTheDocument();
   });
 
-  it("falls back to the raw string when an origin won't parse as a URL", async () => {
+  it("falls back to the raw string in the menu when an origin won't parse as a URL", async () => {
     getServerPicker.mockResolvedValue({
       currentOrigin: "not-a-url",
       recentServers: ["also-not-a-url"],
@@ -166,11 +174,12 @@ describe("SidebarServerPicker", () => {
     renderPicker();
 
     const trigger = await openMenu();
-    expect(trigger).toHaveAttribute("aria-label", "Server: not-a-url. Switch server");
+    expect(trigger).toHaveAttribute("aria-label", "Server. Switch server");
 
-    // Unparseable recents survive as-is rather than being dropped, so a
-    // hand-edited settings file stays switchable instead of invisible.
-    expect(await screen.findByText("also-not-a-url")).toBeInTheDocument();
+    // Unparseable origins and recents survive as-is in the menu rather than
+    // being dropped, so a hand-edited settings file stays switchable.
+    expect(await screen.findByText("not-a-url")).toBeInTheDocument();
+    expect(screen.getByText("also-not-a-url")).toBeInTheDocument();
   });
 
   it("tells apart two workspaces behind one account host", async () => {
@@ -181,9 +190,12 @@ describe("SidebarServerPicker", () => {
       recentServers: ["https://accounts.example.com/?o=1", "https://accounts.example.com/?o=2"],
     });
     renderPicker();
-    // The row names the picked host, not the workspace host sign-in moved to.
-    expect(await screen.findByText("accounts.example.com")).toBeInTheDocument();
+    const trigger = await screen.findByTestId("sidebar-server-picker");
+    expect(trigger).toHaveTextContent("Server");
+    expect(screen.queryByText("accounts.example.com")).toBeNull();
     await openMenu();
+    // The menu names the picked host, not the workspace host sign-in moved to.
+    expect(await screen.findAllByText("accounts.example.com")).toHaveLength(2);
     // Workspace 2 stays a switch target even though it shares the account origin.
     const items = screen.getAllByRole("menuitem");
     const other = items.find(
@@ -235,23 +247,36 @@ describe("SidebarServerPicker", () => {
     );
   });
 
-  it("names managed servers from the organization's server names", async () => {
+  it("names managed servers from the organization's server names and shows their hosts in the menu", async () => {
     getServerPicker.mockResolvedValue({
       currentOrigin: "https://dbc-1.cloud.databricks.com",
-      managedServers: ["https://dbc-1.cloud.databricks.com/?o=1", "https://two.example.com/"],
-      managedServerNames: { "https://dbc-1.cloud.databricks.com/?o=1": "Engineering" },
+      managedServers: [
+        "https://dbc-1.cloud.databricks.com/?o=1",
+        "https://staging.example.com:8443/",
+        "https://two.example.com/",
+      ],
+      managedServerNames: {
+        "https://dbc-1.cloud.databricks.com/?o=1": "Engineering",
+        "https://staging.example.com:8443/": "Staging Hub",
+      },
       recentServers: [],
     });
     renderPicker();
-    // The row names the current, managed server by its name.
+    // The row names the current, managed server by its name without leaking its host.
     expect(await screen.findByText("Engineering")).toBeInTheDocument();
+    expect(screen.queryByText("dbc-1.cloud.databricks.com")).toBeNull();
     await openMenu();
     expect(screen.getAllByText("Engineering").length).toBeGreaterThan(1);
+    // Both the current managed server and other named managed entries show their
+    // address as a secondary muted line under the name in the menu.
+    expect(screen.getByText("dbc-1.cloud.databricks.com")).toHaveClass("text-muted-foreground");
+    expect(screen.getByText("Staging Hub")).toBeInTheDocument();
+    expect(screen.getByText("staging.example.com:8443")).toHaveClass("text-muted-foreground");
     // An unnamed one keeps its host.
     expect(screen.getByText("two.example.com")).toBeInTheDocument();
   });
 
-  it("shows names servers gave themselves, with their hosts", async () => {
+  it("shows names servers gave themselves on the row and keeps hosts inside the menu", async () => {
     getServerPicker.mockResolvedValue({
       currentOrigin: "https://omni.example",
       recentServers: [
@@ -265,12 +290,14 @@ describe("SidebarServerPicker", () => {
       },
     });
     renderPicker();
-    const trigger = await openMenu();
-    expect(trigger).toHaveAttribute(
-      "aria-label",
-      "Server: Acme Engineering (omni.example). Switch server",
-    );
-    // The current entry and the other named recent both keep their host visible.
+    const trigger = await screen.findByTestId("sidebar-server-picker");
+    expect(trigger).toHaveTextContent("Acme Engineering");
+    expect(trigger).toHaveAttribute("aria-label", "Server: Acme Engineering. Switch server");
+    expect(trigger).not.toHaveAttribute("title");
+    expect(screen.queryByText("omni.example")).toBeNull();
+
+    await openMenu();
+    // The current entry and the other named recent both keep their host visible in the menu.
     expect(screen.getAllByText("Acme Engineering").length).toBeGreaterThan(1);
     expect(screen.getByText("omni.example")).toBeInTheDocument();
     expect(screen.getByText("Acme Staging")).toBeInTheDocument();
@@ -288,7 +315,97 @@ describe("SidebarServerPicker", () => {
     });
     renderPicker();
     const trigger = await openMenu();
-    expect(trigger).toHaveAttribute("aria-label", "Server: omni.example. Switch server");
+    expect(trigger).toHaveTextContent("Server");
+    expect(trigger).toHaveAttribute("aria-label", "Server. Switch server");
+    expect(await screen.findAllByText("omni.example")).toHaveLength(1);
+  });
+
+  it("falls back to Server when a name repeats the bare hostname or origin of a port URL", async () => {
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "http://server.example:8000",
+      managedServers: ["http://server.example:8000/"],
+      managedServerNames: { "http://server.example:8000/": "server.example" },
+      serverNames: { "http://server.example:8000": "http://server.example:8000" },
+      recentServers: [],
+    });
+    renderPicker();
+    const trigger = await screen.findByTestId("sidebar-server-picker");
+    expect(trigger).toHaveTextContent("Server");
+    expect(trigger).toHaveAttribute("aria-label", "Server. Switch server");
+    expect(trigger).not.toHaveAttribute("title");
+    expect(screen.queryByText("server.example")).toBeNull();
+    expect(screen.queryByText("server.example:8000")).toBeNull();
+  });
+
+  it.each([
+    [
+      "contained host (case-insensitive)",
+      "http://server.example:8000",
+      "Production (SERVER.EXAMPLE)",
+    ],
+    ["contained host:port", "http://server.example:8000", "Production (server.example:8000)"],
+    ["URL in name", "http://server.example:8000", "Production - http://server.example:8000/"],
+    [
+      "trailing-dot origin vs name without dot",
+      "http://server.example.:8000",
+      "Production (server.example)",
+    ],
+    [
+      "name with trailing dot vs origin without dot",
+      "http://server.example:8000",
+      "Production (server.example.)",
+    ],
+    ["short hostname token in parentheses", "http://dev:8000", "Dev box (dev)"],
+    ["short hostname:port token", "http://dev:8000", "dev:8000 staging"],
+    ["IPv4 host in parentheses", "http://192.0.2.5:8000", "Lab (192.0.2.5)"],
+    ["bracketed IPv6 host in parentheses", "http://[2001:db8::1]:8000", "Lab ([2001:db8::1])"],
+  ])(
+    "rejects a manifest or managed name with %s on the collapsed row",
+    async (_case, origin, candidateName) => {
+      getServerPicker.mockResolvedValue({
+        currentOrigin: origin,
+        managedServers: [`${origin}/`],
+        managedServerNames: { [`${origin}/`]: candidateName },
+        serverNames: { [origin]: candidateName },
+        recentServers: [],
+      });
+      renderPicker();
+      const trigger = await screen.findByTestId("sidebar-server-picker");
+      expect(trigger).toHaveTextContent("Server");
+      expect(trigger).toHaveAttribute("aria-label", "Server. Switch server");
+      expect(trigger).not.toHaveAttribute("title");
+      expect(screen.queryByText(candidateName)).toBeNull();
+    },
+  );
+
+  it.each([
+    ["short hostname inside a longer word", "http://dev:8000", "dev:8000", "Developer Tools"],
+    [
+      "IPv4 prefix of a longer address token",
+      "http://192.0.2.5:8000",
+      "192.0.2.5:8000",
+      "Lab 192.0.2.50",
+    ],
+  ])("keeps a server name when %s", async (_case, origin, expectedHost, expectedName) => {
+    getServerPicker.mockResolvedValue({
+      currentOrigin: origin,
+      recentServers: [`${origin}/`, "https://recent.example/"],
+      serverNames: {
+        [origin]: expectedName,
+        "https://recent.example": "recent.example",
+      },
+    });
+    renderPicker();
+    const trigger = await screen.findByTestId("sidebar-server-picker");
+    expect(trigger).toHaveTextContent(expectedName);
+    expect(trigger).toHaveAttribute("aria-label", `Server: ${expectedName}. Switch server`);
+    expect(trigger).not.toHaveAttribute("title");
+    expect(screen.queryByText(expectedHost)).toBeNull();
+
+    await openMenu();
+    expect(screen.getByText(expectedHost)).toHaveClass("text-muted-foreground");
+    // A recent whose name equals its host is deduplicated to a single line.
+    expect(screen.getAllByText("recent.example")).toHaveLength(1);
   });
 
   it("names an unnamed managed server from its manifest, with its host", async () => {

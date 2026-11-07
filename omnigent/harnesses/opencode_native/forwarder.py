@@ -909,6 +909,9 @@ class OpenCodeNativeForwarder:
                     from omnigent.llms.context_window import get_model_context_window
 
                     data["context_window"] = get_model_context_window(model_id)
+                    # Catalog estimates do not establish measured model Auto values.
+                    data["context_model"] = None
+                    data["auto_compact_token_limit"] = None
                 except Exception:  # noqa: BLE001 - context window is best effort.
                     pass
             model = latest["model"]

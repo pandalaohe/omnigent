@@ -23,52 +23,33 @@ tunnel token") and exits with code 1.
 from __future__ import annotations
 
 import os
-import signal
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import httpx
 import pytest
 
-from tests._helpers.live_server import HarnessCredentials, start_live_server
+from tests._helpers.live_server import isolated_local_server
 
 
 @pytest.fixture
-def local_server(tmp_path: Path) -> tuple[str, int]:
+def local_server(tmp_path: Path) -> Iterator[str]:
     """
-    Spawn a bare ``omnigent server`` (no ``--agent``) and yield
-    ``(base_url, server_pid)``.
+    Spawn a bare ``omnigent server`` with an isolated home and loopback URL.
 
-    Teardown sends SIGTERM with a 5s grace period.
+    The shared primitive owns health polling and process teardown.
 
     :param tmp_path: Pytest temporary directory for the DB, artifacts,
         and server log.
-    :returns: ``(base_url, server_pid)`` — e.g.
-        ``("http://localhost:51234", 12345)``.
+    :yields: Local server URL, e.g. ``"http://127.0.0.1:51234"``.
     """
-    db_path = tmp_path / "test.db"
-    artifact_dir = tmp_path / "artifacts"
-    artifact_dir.mkdir()
-    log_path = tmp_path / "server.log"
-    proc, base_url = start_live_server(
-        creds=HarnessCredentials(harness="databricks", profile=None, llm_api_key=None),
-        db_path=db_path,
-        artifact_dir=artifact_dir,
-        log_path=log_path,
-    )
-    try:
-        yield base_url, proc.pid
-    finally:
-        proc.send_signal(signal.SIGTERM)
-        try:
-            proc.wait(timeout=5)
-        except Exception:
-            proc.kill()
-            proc.wait(timeout=3)
+    with isolated_local_server(tmp_path / "server") as base_url:
+        yield base_url
 
 
 def test_external_runner_connects_to_local_server(
-    local_server: tuple[str, int],
+    local_server: str,
 ) -> None:
     """
     An external runner launched via ``_start_cli_runner_process``
@@ -81,10 +62,9 @@ def test_external_runner_connects_to_local_server(
     token-derived expectation and (b) the server's tunnel allow-list
     blocked the runner's binding token.
 
-    :param local_server: ``(base_url, server_pid)`` from the
-        ``local_server`` fixture.
+    :param local_server: Loopback URL from the ``local_server`` fixture.
     """
-    base_url, _server_pid = local_server
+    base_url = local_server
 
     # Clear env vars that might leak from the test process and
     # confuse the runner's identity resolution.

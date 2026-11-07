@@ -809,6 +809,23 @@ class TestUsageSync:
         ]
 
     @pytest.mark.asyncio
+    async def test_identical_context_limits_are_posted_for_the_new_model(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr(
+            "omnigent.llms.context_window.find_model_context_window", lambda *a, **kw: 262_144
+        )
+        client = _RecordingClient()
+        sync = _sync(tmp_path)
+        sync.note_model("model-a")
+        sync.record(_usage_item(1, input_other=10, output=1), wire="/w/a")
+        await sync.sync(client)
+        sync.note_model("model-b")
+        await sync.sync(client)
+        assert [post["data"]["model"] for post in _usage_posts(client)] == ["model-a", "model-b"]
+        assert all(post["data"]["context_model"] is None for post in _usage_posts(client))
+
+    @pytest.mark.asyncio
     async def test_context_window_included_when_resolvable(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:

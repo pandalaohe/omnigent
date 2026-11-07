@@ -730,10 +730,11 @@ function ViewModeToggle({
   return (
     <div className="flex h-11 shrink-0 items-center gap-0.5 border-b px-2">
       <h2 className="pl-1 font-medium text-ui">Agents</h2>
-      <div className="ml-auto flex items-center gap-0.5">
+      <div className="ml-auto flex h-full items-center gap-0.5">
         {recheckButton}
         <Segmented
           label="Agents view"
+          fitHeight
           options={[
             {
               value: "list",

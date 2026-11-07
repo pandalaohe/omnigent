@@ -2038,7 +2038,7 @@ def effective_host_id(
     """
     if conv.host_id is not None:
         return conv.host_id
-    for ancestor_id in _ancestor_session_ids(conv_store, conv.id):
+    for ancestor_id in _ancestor_session_ids(conv_store, conv.id, conversation=conv):
         ancestor = conv_store.get_conversation(ancestor_id)
         if ancestor is not None and ancestor.host_id is not None:
             return ancestor.host_id
@@ -13417,6 +13417,7 @@ def _persist_stored_session_bundle(
             worktree=worktree,
             git_branch=git_branch,
             terminal_launch_args=metadata.terminal_launch_args,
+            session_prompt=metadata.session_prompt,
             parent_conversation_id=metadata.parent_session_id,
             runner_id=runner_id,
             project_id=metadata.project_id,
@@ -13510,6 +13511,7 @@ def _persist_session_for_uploaded_agent(
             worktree=worktree,
             git_branch=git_branch,
             terminal_launch_args=metadata.terminal_launch_args,
+            session_prompt=metadata.session_prompt,
             project_id=metadata.project_id,
             inference_snapshot=inference_snapshot,
             **project_owner_kwargs,

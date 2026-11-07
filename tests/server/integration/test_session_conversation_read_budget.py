@@ -262,12 +262,12 @@ async def test_usage_report_does_not_reread_listed_conversations(
     )
 
 
-async def test_usage_flush_reads_conversation_twice(
+async def test_usage_flush_reads_two_rows_and_locks_context_owner(
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
     """
-    A turn-completion usage flush point-reads the conversation exactly twice.
+    A usage flush reads two full conversation rows and locks its context owner.
 
     ``POST /v1/sessions/{id}/events`` with ``external_session_usage`` (the
     native harnesses' turn-completion usage report) previously read the
@@ -288,6 +288,9 @@ async def test_usage_flush_reads_conversation_twice(
     The read-only tree walks (subtree roll-up, ancestor publish) reuse the
     access-check row's immutable ``root_conversation_id`` (verified against
     the tree it produces), so they cost no extra row read.
+
+    Context label mutation also checks and locks the owner with a primary-key-only
+    SELECT, serializing model-bound context patches without hydrating another row.
     """
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
@@ -306,8 +309,15 @@ async def test_usage_flush_reads_conversation_twice(
 
     assert resp.status_code == 202, resp.text
     point_reads = _conversation_point_reads(statements)
-    assert len(point_reads) == 2, (
-        f"usage flush issued {len(point_reads)} conversation point reads "
+    owner_locks = [
+        statement
+        for statement in point_reads
+        if statement.startswith("SELECT conversations.id FROM conversations WHERE ")
+    ]
+    full_reads = [statement for statement in point_reads if statement not in owner_locks]
+    assert len(owner_locks) == 1, f"context mutation must lock its owner once: {point_reads}"
+    assert len(full_reads) == 2, (
+        f"usage flush issued {len(full_reads)} full conversation reads "
         f"(expected 2: the access check + the persist's fresh clamp "
         f"baseline); the subtree roll-up and the ancestor publish must "
         f"reuse the access-check row's root instead of re-reading the row. "

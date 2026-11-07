@@ -1248,6 +1248,33 @@
         "title": "BrowserActionRequestEvent",
         "type": "object"
       },
+      "BuiltinPromptPatch": {
+        "properties": {
+          "base_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Base Sha256",
+            "type": "string"
+          },
+          "text": {
+            "anyOf": [
+              {
+                "maxLength": 262144,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Text"
+          }
+        },
+        "required": [
+          "text",
+          "base_sha256"
+        ],
+        "title": "BuiltinPromptPatch",
+        "type": "object"
+      },
       "CallingDefaultsCatalogRow": {
         "description": "One cached `(host, harness)` model catalog and its staleness.",
         "properties": {
@@ -1285,6 +1312,17 @@
             "description": "Host the catalog was fetched from.",
             "title": "Host Id",
             "type": "string"
+          },
+          "injects_prompt": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Injects Prompt"
           },
           "models": {
             "description": "The host's model-option rows as reported.",
@@ -3733,6 +3771,45 @@
         "title": "ElicitationResolvedEvent",
         "type": "object"
       },
+      "EntryOutcome": {
+        "properties": {
+          "cost_basis": {
+            "title": "Cost Basis",
+            "type": "string"
+          },
+          "host": {
+            "title": "Host",
+            "type": "string"
+          },
+          "hour": {
+            "format": "int64",
+            "title": "Hour",
+            "type": "integer"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "reason": {
+            "enum": [
+              "lower_reread",
+              "partial_over_complete",
+              "out_of_range"
+            ],
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "hour",
+          "host",
+          "model",
+          "cost_basis",
+          "reason"
+        ],
+        "title": "EntryOutcome",
+        "type": "object"
+      },
       "EntryPutRequest": {
         "additionalProperties": false,
         "description": "Request body for `PUT /v1/projects/{project_id}/entries/{host_id}`.",
@@ -4955,6 +5032,17 @@
               }
             ],
             "title": "Error"
+          },
+          "injects_prompt": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Injects Prompt"
           },
           "models": {
             "items": {
@@ -7616,9 +7704,93 @@
       },
       "ReportModel": {
         "properties": {
+          "cache_creation_input_token_cost": {
+            "anyOf": [
+              {
+                "anyOf": [
+                  {
+                    "format": "double",
+                    "type": "number"
+                  },
+                  {
+                    "format": "int64",
+                    "type": "integer"
+                  }
+                ],
+                "ge": 0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cache Creation Input Token Cost"
+          },
+          "cache_read_input_token_cost": {
+            "anyOf": [
+              {
+                "anyOf": [
+                  {
+                    "format": "double",
+                    "type": "number"
+                  },
+                  {
+                    "format": "int64",
+                    "type": "integer"
+                  }
+                ],
+                "ge": 0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cache Read Input Token Cost"
+          },
           "id": {
             "title": "Id",
             "type": "string"
+          },
+          "input_cost_per_request": {
+            "anyOf": [
+              {
+                "anyOf": [
+                  {
+                    "format": "double",
+                    "type": "number"
+                  },
+                  {
+                    "format": "int64",
+                    "type": "integer"
+                  }
+                ],
+                "ge": 0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Input Cost Per Request"
+          },
+          "input_cost_per_token": {
+            "anyOf": [
+              {
+                "anyOf": [
+                  {
+                    "format": "double",
+                    "type": "number"
+                  },
+                  {
+                    "format": "int64",
+                    "type": "integer"
+                  }
+                ],
+                "ge": 0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Input Cost Per Token"
           },
           "input_per_million": {
             "anyOf": [
@@ -7640,6 +7812,48 @@
               }
             ],
             "title": "Input Per Million"
+          },
+          "output_cost_per_image": {
+            "anyOf": [
+              {
+                "anyOf": [
+                  {
+                    "format": "double",
+                    "type": "number"
+                  },
+                  {
+                    "format": "int64",
+                    "type": "integer"
+                  }
+                ],
+                "ge": 0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output Cost Per Image"
+          },
+          "output_cost_per_token": {
+            "anyOf": [
+              {
+                "anyOf": [
+                  {
+                    "format": "double",
+                    "type": "number"
+                  },
+                  {
+                    "format": "int64",
+                    "type": "integer"
+                  }
+                ],
+                "ge": 0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output Cost Per Token"
           },
           "output_per_million": {
             "anyOf": [
@@ -8527,6 +8741,11 @@
           },
           "smart_routing_sources": {
             "$ref": "#/components/schemas/SmartRoutingSourcesInfo"
+          },
+          "task_board_enabled": {
+            "default": false,
+            "title": "Task Board Enabled",
+            "type": "boolean"
           },
           "usage_board_enabled": {
             "default": false,
@@ -11684,6 +11903,17 @@
             ],
             "title": "Session Choice"
           },
+          "session_prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Prompt"
+          },
           "share_workspace_files": {
             "default": false,
             "description": "Whether the owner opted into letting view-level collaborators browse the workspace (Files/Changes/GitHub surfaces). `False` by default \u2014 read grants share the conversation only. The web share dialog reads this to render the toggle, and the rail reads it to decide whether to mount the file surfaces for a view-only viewer.",
@@ -11873,6 +12103,13 @@
             ],
             "description": "Explanation when cache warmth is unsupported.",
             "title": "Warm State Reason"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Warnings",
+            "type": "array"
           },
           "workspace": {
             "anyOf": [
@@ -12755,7 +12992,7 @@
         "type": "object"
       },
       "SessionUsageEvent": {
-        "description": "Token-usage update from a terminal-backed integration.\n\nEmitted after an `external_session_usage` POST from an\nout-of-AP runtime (e.g. the `omnigent claude` transcript\nforwarder). Either field may be absent; clients should leave\ncached values untouched for missing fields.",
+        "description": "Token-usage update from a terminal-backed or SDK integration.\n\nEmitted after an `external_session_usage` POST from an\nout-of-AP runtime (e.g. the `omnigent claude` transcript\nforwarder), or an SDK turn. Missing fields leave cached values untouched.\nA limits observation carries the full committed model/window/threshold tuple;\nexplicit nulls clear unknown or removed values.",
         "properties": {
           "auto_compact_token_limit": {
             "anyOf": [
@@ -12768,7 +13005,21 @@
               }
             ],
             "default": null,
+            "description": "Reported automatic-compaction threshold; null clears it, while absence leaves the previous reading unchanged.",
             "title": "Auto Compact Token Limit"
+          },
+          "context_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Model that produced the context reading, independent of the session's separately reported active model; null means unattributed.",
+            "title": "Context Model"
           },
           "context_tokens": {
             "anyOf": [
@@ -12795,7 +13046,7 @@
               }
             ],
             "default": null,
-            "description": "Resolved window in tokens (e.g. 200_000 normally, 1_000_000 with `opus[1m]` / `sonnet[1m]`). `None` on a tokens-only broadcast.",
+            "description": "Resolved window in tokens (e.g. 200_000 normally, 1_000_000 with `opus[1m]` / `sonnet[1m]`). An explicit null clears the window; absent on a tokens-only broadcast.",
             "title": "Context Window"
           },
           "conversation_id": {
@@ -14365,6 +14616,21 @@
       "Usage": {
         "description": "Token usage statistics for a response.",
         "properties": {
+          "auto_compact_token_limit": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0,
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Total-context automatic compaction threshold; an explicit null clears a previous report, absence leaves it unchanged.",
+            "title": "Auto Compact Token Limit"
+          },
           "cache_creation_input_tokens": {
             "default": 0,
             "description": "Prompt tokens written to the provider prompt cache (cache creation), billed at a premium rate. Like `cache_read_input_tokens`, this is separate from `input_tokens`; `0` when not reported.",
@@ -14379,6 +14645,19 @@
             "title": "Cache Read Input Tokens",
             "type": "integer"
           },
+          "context_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Model reference measured with the context limits, independent of the billing model. Unknown identity stays unbound.",
+            "title": "Context Model"
+          },
           "context_tokens": {
             "anyOf": [
               {
@@ -14392,6 +14671,21 @@
             "default": null,
             "description": "Context-fill estimate for the next turn \u2014 set only by executors that make multiple LLM sub-calls per turn (e.g. `openai-agents`). For single-call executors this is absent and `total_tokens` serves the same purpose. The toolbar context ring and `/context` command use this field when present, falling back to `total_tokens`.",
             "title": "Context Tokens"
+          },
+          "context_window": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0,
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Effective window reported by the running harness.",
+            "title": "Context Window"
           },
           "cost_usd": {
             "anyOf": [
@@ -14462,6 +14756,35 @@
               }
             ],
             "title": "Age S"
+          },
+          "balance_freshness": {
+            "default": "none",
+            "enum": [
+              "fresh",
+              "old",
+              "none"
+            ],
+            "title": "Balance Freshness",
+            "type": "string"
+          },
+          "balance_read_at": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Balance Read At"
+          },
+          "balances": {
+            "items": {
+              "$ref": "#/components/schemas/UsageBalance"
+            },
+            "title": "Balances",
+            "type": "array"
           },
           "band": {
             "anyOf": [
@@ -14626,6 +14949,40 @@
             ],
             "title": "Renews At"
           },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source"
+          },
+          "source_at": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source At"
+          },
+          "source_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Type"
+          },
           "state": {
             "title": "State",
             "type": "string"
@@ -14646,6 +15003,121 @@
           "freshness"
         ],
         "title": "UsageAccountView",
+        "type": "object"
+      },
+      "UsageBalance": {
+        "properties": {
+          "expires_at": {
+            "anyOf": [
+              {
+                "anyOf": [
+                  {
+                    "format": "double",
+                    "type": "number"
+                  },
+                  {
+                    "format": "int64",
+                    "type": "integer"
+                  }
+                ],
+                "gt": 0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "group": {
+            "anyOf": [
+              {
+                "maxLength": 32,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Group"
+          },
+          "id": {
+            "maxLength": 32,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$",
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "anyOf": [
+              {
+                "maxLength": 32,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          },
+          "remaining": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "format": "int64",
+                "type": "integer"
+              }
+            ],
+            "title": "Remaining"
+          },
+          "unit": {
+            "maxLength": 24,
+            "minLength": 1,
+            "title": "Unit",
+            "type": "string"
+          },
+          "usd_per_unit": {
+            "anyOf": [
+              {
+                "anyOf": [
+                  {
+                    "format": "double",
+                    "type": "number"
+                  },
+                  {
+                    "format": "int64",
+                    "type": "integer"
+                  }
+                ],
+                "gt": 0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Usd Per Unit"
+          }
+        },
+        "required": [
+          "id",
+          "remaining",
+          "unit"
+        ],
+        "title": "UsageBalance",
         "type": "object"
       },
       "UsageDetails": {
@@ -14897,6 +15369,17 @@
             ],
             "title": "Limit Value"
           },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          },
           "pace_pct": {
             "anyOf": [
               {
@@ -15041,7 +15524,8 @@
                 "runner_log_warnings",
                 "sidebar_layout",
                 "sound_alerts",
-                "worktree_defaults"
+                "worktree_defaults",
+                "builtin_agent_prompts"
               ]
             },
             "title": "Settings",
@@ -15100,6 +15584,44 @@
           "type"
         ],
         "title": "ValidationError",
+        "type": "object"
+      },
+      "WriteOutcome": {
+        "properties": {
+          "applied": {
+            "default": 0,
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Applied",
+            "type": "integer"
+          },
+          "held": {
+            "items": {
+              "$ref": "#/components/schemas/EntryOutcome"
+            },
+            "title": "Held",
+            "type": "array"
+          },
+          "older_sections": {
+            "items": {
+              "enum": [
+                "windows",
+                "balances"
+              ],
+              "type": "string"
+            },
+            "title": "Older Sections",
+            "type": "array"
+          },
+          "skipped": {
+            "items": {
+              "$ref": "#/components/schemas/EntryOutcome"
+            },
+            "title": "Skipped",
+            "type": "array"
+          }
+        },
+        "title": "WriteOutcome",
         "type": "object"
       },
       "_HarnessPatch": {
@@ -15383,8 +15905,13 @@
       }
     },
     "securitySchemes": {
+      "bearerAuth": {
+        "description": "Signed session JWT as an `Authorization: Bearer` token (CLI hosts and scripts). In accounts mode `POST /auth/login` returns it as `token`; browserless clients can also use a deployment-configured device-authorization or machine-client grant under `/oauth`.",
+        "scheme": "bearer",
+        "type": "http"
+      },
       "proxyHeaderAuth": {
-        "description": "Trusted-proxy identity header (header-auth mode, the default). The header name is configurable via `OMNIGENT_AUTH_HEADER`.",
+        "description": "Trusted-proxy identity header (header-auth mode). The header name is configurable via `OMNIGENT_AUTH_HEADER`.",
         "in": "header",
         "name": "X-Forwarded-Email",
         "type": "apiKey"
@@ -15398,7 +15925,7 @@
     }
   },
   "info": {
-    "description": "Omnigent is an open-source meta-harness for building and running AI agents. This is the REST API exposed by the Omnigent server: use it to create and drive **sessions**, manage **agents**, **hosts**, and **runners**, attach **contextual policies**, post **comments**, and work with session **resources** \u2014 files, terminals, and sandboxed environments.\n\n## Base URL\n\nOmnigent is self-hosted. The server binds `http://127.0.0.1:6767` by default (`omnigent server`); point the base URL at your own deployment.\n\n## Authentication\n\nThere is no API-key or bearer-token scheme. Identity is supplied by the deployment's configured auth provider (`OMNIGENT_AUTH_PROVIDER`):\n\n- **Trusted proxy header** (default) \u2014 an upstream proxy injects an identity header (`X-Forwarded-Email`, configurable). Single-user local runtimes fall back to a reserved `local` user.\n- **Session cookie** \u2014 a signed session cookie minted after an interactive OIDC or accounts login. It is named `ap_session` over HTTP (the advertised local default) and `__Host-ap_session` under HTTPS, where the `__Host-` prefix guards against subdomain cookie-tossing.\n\nAuth is configured server-side; clients send the cookie or proxy header according to your deployment.\n\n## Streaming\n\n`GET /v1/sessions/{session_id}/stream` streams Server-Sent Events (`text/event-stream`). Each event conforms to the `ServerStreamEvent` schema documented below.\n",
+    "description": "Omnigent is an open-source meta-harness for building and running AI agents. This is the REST API exposed by the Omnigent server: use it to create and drive **sessions**, manage **agents**, **hosts**, and **runners**, attach **contextual policies**, post **comments**, and work with session **resources** \u2014 files, terminals, and sandboxed environments.\n\n## Base URL\n\nOmnigent is self-hosted. The server binds `http://127.0.0.1:6767` by default (`omnigent server`); point the base URL at your own deployment.\n\n## Authentication\n\nIdentity is supplied by the deployment's configured auth provider (`OMNIGENT_AUTH_PROVIDER`); clients send the credential that provider issues.\n\n- **Session cookie** \u2014 a signed session cookie minted after an interactive accounts or OIDC login. It is named `ap_session` over HTTP (the advertised local default) and `__Host-ap_session` under HTTPS, where the `__Host-` prefix guards against subdomain cookie-tossing.\n- **Bearer token** \u2014 `Authorization: Bearer <token>`, the same signed session JWT the cookie carries. CLI hosts and scripts use this form. In accounts mode `POST /auth/login` returns it as `token`; browserless clients can also obtain one through the OIDC CLI flow or a deployment-configured device-authorization or machine-client grant (`/oauth/*`).\n- **Trusted proxy header** \u2014 in header mode an upstream proxy injects an identity header (`X-Forwarded-Email`, configurable via `OMNIGENT_AUTH_HEADER`); single-user local runtimes fall back to a reserved `local` user.\n\nThere is no personal-access-token endpoint: a long-lived client holds a refreshable grant, not a static key. Auth is configured server-side; clients send the cookie, the bearer token or the proxy header according to the deployment.\n\n## Streaming\n\n`GET /v1/sessions/{session_id}/stream` streams Server-Sent Events (`text/event-stream`). Each event conforms to the `ServerStreamEvent` schema documented below.\n",
     "title": "Omnigent Server",
     "version": "0.1.0"
   },
@@ -15977,6 +16504,102 @@
           }
         },
         "summary": "Get Agent Config",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
+    "/v1/agents/{agent_id}/prompt": {
+      "get": {
+        "operationId": "get_builtin_prompt_v1_agents__agent_id__prompt_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Builtin Prompt V1 Agents  Agent Id  Prompt Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Builtin Prompt",
+        "tags": [
+          "agents"
+        ]
+      },
+      "patch": {
+        "operationId": "patch_builtin_prompt_v1_agents__agent_id__prompt_patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BuiltinPromptPatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Patch Builtin Prompt V1 Agents  Agent Id  Prompt Patch",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Patch Builtin Prompt",
         "tags": [
           "agents"
         ]
@@ -19661,6 +20284,7 @@
                         "agent_badges",
                         "agent_pins",
                         "approval_timeout",
+                        "builtin_agent_prompts",
                         "calling_defaults",
                         "calling_last",
                         "child_idle",
@@ -19849,7 +20473,8 @@
                 "runner_log_warnings",
                 "sidebar_layout",
                 "sound_alerts",
-                "worktree_defaults"
+                "worktree_defaults",
+                "builtin_agent_prompts"
               ],
               "title": "Namespace",
               "type": "string"
@@ -19911,7 +20536,7 @@
     },
     "/v1/me/recent-sessions": {
       "get": {
-        "description": "List the caller's sessions by their own last interaction.\n\n\"Interaction\" is a human-origin user message, approval, or\nelicitation resolve, recorded per user on the session's root as an\n`omnigent.touched.<user>` label. Results are the caller's\naccessible, non-archived, `kind=\"default\"` sessions carrying that\nlabel, newest interaction first. Powers the sidebar's Recent\nsessions section, which shows a bounded count; cursors are rejected\nbecause the order is a label value with no row position.\n\n**Returns:** A `PaginatedList` of `SessionListItem`.",
+        "description": "List the caller's sessions by their own last interaction.\n\n\"Interaction\" is a human-origin user message, approval, or\nelicitation resolve, recorded per user on the session's root as an\n`omnigent.touched.<user>` label. Results are the caller's\naccessible, non-archived, `kind=\"default\"` sessions, newest\ninteraction first, falling back to creation time for sessions with\nno interaction. Agent activity never changes this order. Powers\nthe sidebar's Recent sessions section, which shows a bounded count; cursors are rejected\nbecause the order is a label value with no row position.\n\n**Returns:** A `PaginatedList` of `SessionListItem`.",
         "operationId": "list_recent_sessions_v1_me_recent_sessions_get",
         "parameters": [
           {
@@ -20378,6 +21003,508 @@
         ]
       }
     },
+    "/v1/me/tasks": {
+      "get": {
+        "operationId": "read_tasks_v1_me_tasks_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "source",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Source"
+            }
+          },
+          {
+            "in": "query",
+            "name": "group",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Group"
+            }
+          },
+          {
+            "in": "query",
+            "name": "state",
+            "required": false,
+            "schema": {
+              "default": "all",
+              "enum": [
+                "open",
+                "closed",
+                "all"
+              ],
+              "title": "State",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "closed_after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Closed After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "closed_before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Closed Before"
+            }
+          },
+          {
+            "in": "query",
+            "name": "changed_after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Changed After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include_gone",
+            "required": false,
+            "schema": {
+              "default": "0",
+              "enum": [
+                "0",
+                "1"
+              ],
+              "title": "Include Gone",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include_history",
+            "required": false,
+            "schema": {
+              "default": "0",
+              "enum": [
+                "0",
+                "1"
+              ],
+              "title": "Include History",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 4096,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 1000,
+              "maximum": 5000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Tasks"
+      }
+    },
+    "/v1/me/tasks/closed-counts": {
+      "get": {
+        "operationId": "read_closed_counts_v1_me_tasks_closed_counts_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "from",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "From"
+            }
+          },
+          {
+            "in": "query",
+            "name": "to",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "To"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "maximum": 1439,
+              "minimum": -1439,
+              "title": "Offset",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "source",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Source"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Closed Counts"
+      }
+    },
+    "/v1/me/tasks/history": {
+      "get": {
+        "operationId": "read_history_v1_me_tasks_history_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Before"
+            }
+          },
+          {
+            "in": "query",
+            "name": "source",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Source"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 4096,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 500,
+              "maximum": 5000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read History"
+      }
+    },
+    "/v1/me/tasks/item": {
+      "get": {
+        "operationId": "read_item_v1_me_tasks_item_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "source",
+            "required": true,
+            "schema": {
+              "title": "Source",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "uid",
+            "required": true,
+            "schema": {
+              "title": "Uid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Item"
+      }
+    },
+    "/v1/me/tasks/sources": {
+      "get": {
+        "operationId": "read_sources_v1_me_tasks_sources_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Read Sources"
+      }
+    },
+    "/v1/me/tasks/sources/{source_id}": {
+      "delete": {
+        "operationId": "delete_source_v1_me_tasks_sources__source_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "title": "Source Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Source"
+      },
+      "put": {
+        "operationId": "report_tasks_v1_me_tasks_sources__source_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "title": "Source Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Report Tasks"
+      }
+    },
     "/v1/me/usage": {
       "get": {
         "operationId": "read_usage_v1_me_usage_get",
@@ -20442,26 +21569,904 @@
         ],
         "requestBody": {
           "content": {
-            "application/json": {
+            "application/cloudevents+json": {
               "schema": {
                 "properties": {
-                  "activity": {
-                    "anyOf": [
+                  "data": {
+                    "oneOf": [
                       {
-                        "items": {
-                          "properties": {
-                            "cost_basis": {
-                              "default": "metered",
-                              "enum": [
-                                "metered",
-                                "estimate"
+                        "properties": {
+                          "activity": {
+                            "anyOf": [
+                              {
+                                "items": {
+                                  "properties": {
+                                    "cost_basis": {
+                                      "default": "metered",
+                                      "enum": [
+                                        "metered",
+                                        "estimate"
+                                      ],
+                                      "title": "Cost Basis",
+                                      "type": "string"
+                                    },
+                                    "cost_usd": {
+                                      "anyOf": [
+                                        {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "integer"
+                                            }
+                                          ],
+                                          "ge": 0
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ],
+                                      "title": "Cost Usd"
+                                    },
+                                    "failed": {
+                                      "anyOf": [
+                                        {
+                                          "minimum": 0,
+                                          "type": "integer"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ],
+                                      "title": "Failed"
+                                    },
+                                    "hour": {
+                                      "exclusiveMinimum": 0,
+                                      "title": "Hour",
+                                      "type": "integer"
+                                    },
+                                    "model": {
+                                      "anyOf": [
+                                        {
+                                          "maxLength": 128,
+                                          "type": "string"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ],
+                                      "title": "Model"
+                                    },
+                                    "reasons": {
+                                      "anyOf": [
+                                        {
+                                          "additionalProperties": {
+                                            "type": "integer"
+                                          },
+                                          "type": "object"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ],
+                                      "title": "Reasons"
+                                    },
+                                    "requests": {
+                                      "anyOf": [
+                                        {
+                                          "minimum": 0,
+                                          "type": "integer"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ],
+                                      "title": "Requests"
+                                    },
+                                    "tokens": {
+                                      "anyOf": [
+                                        {
+                                          "minimum": 0,
+                                          "type": "integer"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ],
+                                      "title": "Tokens"
+                                    }
+                                  },
+                                  "required": [
+                                    "hour"
+                                  ],
+                                  "title": "ActivityHour",
+                                  "type": "object"
+                                },
+                                "maxItems": 500,
+                                "type": "array"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Activity"
+                          },
+                          "band": {
+                            "anyOf": [
+                              {
+                                "maxLength": 32,
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Band"
+                          },
+                          "details_url": {
+                            "anyOf": [
+                              {
+                                "format": "uri",
+                                "maxLength": 2083,
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Details Url"
+                          },
+                          "display_name": {
+                            "anyOf": [
+                              {
+                                "maxLength": 64,
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Display Name"
+                          },
+                          "fresh_until": {
+                            "anyOf": [
+                              {
+                                "anyOf": [
+                                  {
+                                    "type": "number"
+                                  },
+                                  {
+                                    "type": "integer"
+                                  }
+                                ],
+                                "gt": 0
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Fresh Until"
+                          },
+                          "host_id": {
+                            "anyOf": [
+                              {
+                                "maxLength": 128,
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Host Id"
+                          },
+                          "models": {
+                            "anyOf": [
+                              {
+                                "items": {
+                                  "properties": {
+                                    "cache_creation_input_token_cost": {
+                                      "anyOf": [
+                                        {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "integer"
+                                            }
+                                          ],
+                                          "ge": 0
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ],
+                                      "title": "Cache Creation Input Token Cost"
+                                    },
+                                    "cache_read_input_token_cost": {
+                                      "anyOf": [
+                                        {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "integer"
+                                            }
+                                          ],
+                                          "ge": 0
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ],
+                                      "title": "Cache Read Input Token Cost"
+                                    },
+                                    "id": {
+                                      "title": "Id",
+                                      "type": "string"
+                                    },
+                                    "input_cost_per_request": {
+                                      "anyOf": [
+                                        {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "integer"
+                                            }
+                                          ],
+                                          "ge": 0
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ],
+                                      "title": "Input Cost Per Request"
+                                    },
+                                    "input_cost_per_token": {
+                                      "anyOf": [
+                                        {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "integer"
+                                            }
+                                          ],
+                                          "ge": 0
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ],
+                                      "title": "Input Cost Per Token"
+                                    },
+                                    "input_per_million": {
+                                      "anyOf": [
+                                        {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "integer"
+                                            }
+                                          ],
+                                          "ge": 0
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ],
+                                      "title": "Input Per Million"
+                                    },
+                                    "output_cost_per_image": {
+                                      "anyOf": [
+                                        {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "integer"
+                                            }
+                                          ],
+                                          "ge": 0
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ],
+                                      "title": "Output Cost Per Image"
+                                    },
+                                    "output_cost_per_token": {
+                                      "anyOf": [
+                                        {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "integer"
+                                            }
+                                          ],
+                                          "ge": 0
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ],
+                                      "title": "Output Cost Per Token"
+                                    },
+                                    "output_per_million": {
+                                      "anyOf": [
+                                        {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "integer"
+                                            }
+                                          ],
+                                          "ge": 0
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ],
+                                      "title": "Output Per Million"
+                                    }
+                                  },
+                                  "required": [
+                                    "id"
+                                  ],
+                                  "title": "ReportModel",
+                                  "type": "object"
+                                },
+                                "maxItems": 128,
+                                "type": "array"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Models"
+                          },
+                          "observed_at": {
+                            "anyOf": [
+                              {
+                                "type": "number"
+                              },
+                              {
+                                "type": "integer"
+                              }
+                            ],
+                            "gt": 0,
+                            "title": "Observed At"
+                          },
+                          "pinned_window": {
+                            "anyOf": [
+                              {
+                                "maxLength": 32,
+                                "minLength": 1,
+                                "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$",
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Pinned Window"
+                          },
+                          "plan": {
+                            "anyOf": [
+                              {
+                                "maxLength": 64,
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Plan"
+                          },
+                          "product": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Product"
+                          },
+                          "renews_at": {
+                            "anyOf": [
+                              {
+                                "anyOf": [
+                                  {
+                                    "type": "number"
+                                  },
+                                  {
+                                    "type": "integer"
+                                  }
+                                ],
+                                "gt": 0
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Renews At"
+                          },
+                          "schema_version": {
+                            "const": 1,
+                            "default": 1,
+                            "title": "Schema Version",
+                            "type": "integer"
+                          },
+                          "status": {
+                            "default": "available",
+                            "enum": [
+                              "available",
+                              "unavailable"
+                            ],
+                            "title": "Status",
+                            "type": "string"
+                          },
+                          "windows": {
+                            "items": {
+                              "properties": {
+                                "group": {
+                                  "anyOf": [
+                                    {
+                                      "maxLength": 32,
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Group"
+                                },
+                                "id": {
+                                  "maxLength": 32,
+                                  "minLength": 1,
+                                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$",
+                                  "title": "Id",
+                                  "type": "string"
+                                },
+                                "kind": {
+                                  "default": "other",
+                                  "enum": [
+                                    "session",
+                                    "weekly",
+                                    "weekly_model",
+                                    "monthly",
+                                    "daily",
+                                    "term",
+                                    "other"
+                                  ],
+                                  "title": "Kind",
+                                  "type": "string"
+                                },
+                                "label": {
+                                  "anyOf": [
+                                    {
+                                      "maxLength": 32,
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Label"
+                                },
+                                "limit_value": {
+                                  "anyOf": [
+                                    {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "integer"
+                                        }
+                                      ],
+                                      "ge": 0
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Limit Value"
+                                },
+                                "note": {
+                                  "anyOf": [
+                                    {
+                                      "maxLength": 64,
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Note"
+                                },
+                                "percent_used": {
+                                  "anyOf": [
+                                    {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "integer"
+                                        }
+                                      ],
+                                      "ge": 0,
+                                      "le": 100
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Percent Used"
+                                },
+                                "resets_at": {
+                                  "anyOf": [
+                                    {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "integer"
+                                        }
+                                      ],
+                                      "gt": 0
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Resets At"
+                                },
+                                "unit": {
+                                  "anyOf": [
+                                    {
+                                      "maxLength": 24,
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Unit"
+                                },
+                                "used_value": {
+                                  "anyOf": [
+                                    {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "integer"
+                                        }
+                                      ],
+                                      "ge": 0
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Used Value"
+                                },
+                                "window_minutes": {
+                                  "anyOf": [
+                                    {
+                                      "exclusiveMinimum": 0,
+                                      "maximum": 2628000,
+                                      "type": "integer"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Window Minutes"
+                                }
+                              },
+                              "required": [
+                                "id"
                               ],
-                              "title": "Cost Basis",
-                              "type": "string"
+                              "title": "UsageWindow",
+                              "type": "object"
                             },
-                            "cost_usd": {
-                              "anyOf": [
-                                {
+                            "maxItems": 16,
+                            "title": "Windows",
+                            "type": "array"
+                          }
+                        },
+                        "required": [
+                          "observed_at",
+                          "windows"
+                        ],
+                        "title": "UsageReport",
+                        "type": "object"
+                      },
+                      {
+                        "properties": {
+                          "activity": {
+                            "anyOf": [
+                              {
+                                "items": {
+                                  "properties": {
+                                    "cache_creation_input_tokens": {
+                                      "anyOf": [
+                                        {
+                                          "minimum": 0,
+                                          "type": "integer"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ],
+                                      "title": "Cache Creation Input Tokens"
+                                    },
+                                    "cache_read_input_tokens": {
+                                      "anyOf": [
+                                        {
+                                          "minimum": 0,
+                                          "type": "integer"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ],
+                                      "title": "Cache Read Input Tokens"
+                                    },
+                                    "correction": {
+                                      "default": false,
+                                      "title": "Correction",
+                                      "type": "boolean"
+                                    },
+                                    "cost_basis": {
+                                      "default": "metered",
+                                      "enum": [
+                                        "billed",
+                                        "metered",
+                                        "list",
+                                        "estimate"
+                                      ],
+                                      "title": "Cost Basis",
+                                      "type": "string"
+                                    },
+                                    "cost_usd": {
+                                      "anyOf": [
+                                        {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "integer"
+                                            }
+                                          ],
+                                          "ge": 0
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ],
+                                      "title": "Cost Usd"
+                                    },
+                                    "coverage": {
+                                      "default": "complete",
+                                      "enum": [
+                                        "complete",
+                                        "partial"
+                                      ],
+                                      "title": "Coverage",
+                                      "type": "string"
+                                    },
+                                    "failed": {
+                                      "anyOf": [
+                                        {
+                                          "minimum": 0,
+                                          "type": "integer"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ],
+                                      "title": "Failed"
+                                    },
+                                    "host": {
+                                      "default": "",
+                                      "maxLength": 64,
+                                      "title": "Host",
+                                      "type": "string"
+                                    },
+                                    "hour": {
+                                      "exclusiveMinimum": 0,
+                                      "title": "Hour",
+                                      "type": "integer"
+                                    },
+                                    "model": {
+                                      "default": "",
+                                      "maxLength": 128,
+                                      "title": "Model",
+                                      "type": "string"
+                                    },
+                                    "output_tokens": {
+                                      "anyOf": [
+                                        {
+                                          "minimum": 0,
+                                          "type": "integer"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ],
+                                      "title": "Output Tokens"
+                                    },
+                                    "reasoning_tokens": {
+                                      "anyOf": [
+                                        {
+                                          "minimum": 0,
+                                          "type": "integer"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ],
+                                      "title": "Reasoning Tokens"
+                                    },
+                                    "reasons": {
+                                      "anyOf": [
+                                        {
+                                          "additionalProperties": {
+                                            "type": "integer"
+                                          },
+                                          "type": "object"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ],
+                                      "title": "Reasons"
+                                    },
+                                    "removed": {
+                                      "default": false,
+                                      "title": "Removed",
+                                      "type": "boolean"
+                                    },
+                                    "requests": {
+                                      "anyOf": [
+                                        {
+                                          "minimum": 0,
+                                          "type": "integer"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ],
+                                      "title": "Requests"
+                                    },
+                                    "tokens": {
+                                      "anyOf": [
+                                        {
+                                          "minimum": 0,
+                                          "type": "integer"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ],
+                                      "title": "Tokens"
+                                    },
+                                    "uncached_input_tokens": {
+                                      "anyOf": [
+                                        {
+                                          "minimum": 0,
+                                          "type": "integer"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ],
+                                      "title": "Uncached Input Tokens"
+                                    }
+                                  },
+                                  "required": [
+                                    "hour"
+                                  ],
+                                  "title": "ActivityEntryV2",
+                                  "type": "object"
+                                },
+                                "maxItems": 500,
+                                "type": "array"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Activity"
+                          },
+                          "balances": {
+                            "items": {
+                              "properties": {
+                                "expires_at": {
+                                  "anyOf": [
+                                    {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "integer"
+                                        }
+                                      ],
+                                      "gt": 0
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Expires At"
+                                },
+                                "group": {
+                                  "anyOf": [
+                                    {
+                                      "maxLength": 32,
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Group"
+                                },
+                                "id": {
+                                  "maxLength": 32,
+                                  "minLength": 1,
+                                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$",
+                                  "title": "Id",
+                                  "type": "string"
+                                },
+                                "label": {
+                                  "anyOf": [
+                                    {
+                                      "maxLength": 32,
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Label"
+                                },
+                                "note": {
+                                  "anyOf": [
+                                    {
+                                      "maxLength": 64,
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Note"
+                                },
+                                "remaining": {
                                   "anyOf": [
                                     {
                                       "type": "number"
@@ -20470,195 +22475,1097 @@
                                       "type": "integer"
                                     }
                                   ],
-                                  "ge": 0
+                                  "title": "Remaining"
                                 },
-                                {
-                                  "type": "null"
+                                "unit": {
+                                  "maxLength": 24,
+                                  "minLength": 1,
+                                  "title": "Unit",
+                                  "type": "string"
+                                },
+                                "usd_per_unit": {
+                                  "anyOf": [
+                                    {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "integer"
+                                        }
+                                      ],
+                                      "gt": 0
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Usd Per Unit"
                                 }
+                              },
+                              "required": [
+                                "id",
+                                "remaining",
+                                "unit"
                               ],
-                              "title": "Cost Usd"
+                              "title": "UsageBalance",
+                              "type": "object"
                             },
-                            "failed": {
-                              "anyOf": [
-                                {
-                                  "minimum": 0,
+                            "maxItems": 16,
+                            "title": "Balances",
+                            "type": "array"
+                          },
+                          "band": {
+                            "anyOf": [
+                              {
+                                "maxLength": 32,
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Band"
+                          },
+                          "details_url": {
+                            "anyOf": [
+                              {
+                                "format": "uri",
+                                "maxLength": 2083,
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Details Url"
+                          },
+                          "display_name": {
+                            "anyOf": [
+                              {
+                                "maxLength": 64,
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Display Name"
+                          },
+                          "fresh_until": {
+                            "anyOf": [
+                              {
+                                "anyOf": [
+                                  {
+                                    "type": "number"
+                                  },
+                                  {
+                                    "type": "integer"
+                                  }
+                                ],
+                                "gt": 0
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Fresh Until"
+                          },
+                          "host_id": {
+                            "anyOf": [
+                              {
+                                "maxLength": 128,
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Host Id"
+                          },
+                          "models": {
+                            "anyOf": [
+                              {
+                                "items": {
+                                  "properties": {
+                                    "cache_creation_input_token_cost": {
+                                      "anyOf": [
+                                        {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "integer"
+                                            }
+                                          ],
+                                          "ge": 0
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ],
+                                      "title": "Cache Creation Input Token Cost"
+                                    },
+                                    "cache_read_input_token_cost": {
+                                      "anyOf": [
+                                        {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "integer"
+                                            }
+                                          ],
+                                          "ge": 0
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ],
+                                      "title": "Cache Read Input Token Cost"
+                                    },
+                                    "id": {
+                                      "title": "Id",
+                                      "type": "string"
+                                    },
+                                    "input_cost_per_request": {
+                                      "anyOf": [
+                                        {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "integer"
+                                            }
+                                          ],
+                                          "ge": 0
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ],
+                                      "title": "Input Cost Per Request"
+                                    },
+                                    "input_cost_per_token": {
+                                      "anyOf": [
+                                        {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "integer"
+                                            }
+                                          ],
+                                          "ge": 0
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ],
+                                      "title": "Input Cost Per Token"
+                                    },
+                                    "input_per_million": {
+                                      "anyOf": [
+                                        {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "integer"
+                                            }
+                                          ],
+                                          "ge": 0
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ],
+                                      "title": "Input Per Million"
+                                    },
+                                    "output_cost_per_image": {
+                                      "anyOf": [
+                                        {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "integer"
+                                            }
+                                          ],
+                                          "ge": 0
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ],
+                                      "title": "Output Cost Per Image"
+                                    },
+                                    "output_cost_per_token": {
+                                      "anyOf": [
+                                        {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "integer"
+                                            }
+                                          ],
+                                          "ge": 0
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ],
+                                      "title": "Output Cost Per Token"
+                                    },
+                                    "output_per_million": {
+                                      "anyOf": [
+                                        {
+                                          "anyOf": [
+                                            {
+                                              "type": "number"
+                                            },
+                                            {
+                                              "type": "integer"
+                                            }
+                                          ],
+                                          "ge": 0
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ],
+                                      "title": "Output Per Million"
+                                    }
+                                  },
+                                  "required": [
+                                    "id"
+                                  ],
+                                  "title": "ReportModel",
+                                  "type": "object"
+                                },
+                                "maxItems": 128,
+                                "type": "array"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Models"
+                          },
+                          "observed_at": {
+                            "anyOf": [
+                              {
+                                "type": "number"
+                              },
+                              {
+                                "type": "integer"
+                              }
+                            ],
+                            "gt": 0,
+                            "title": "Observed At"
+                          },
+                          "pinned_window": {
+                            "anyOf": [
+                              {
+                                "maxLength": 32,
+                                "minLength": 1,
+                                "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$",
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Pinned Window"
+                          },
+                          "plan": {
+                            "anyOf": [
+                              {
+                                "maxLength": 64,
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Plan"
+                          },
+                          "product": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Product"
+                          },
+                          "renews_at": {
+                            "anyOf": [
+                              {
+                                "anyOf": [
+                                  {
+                                    "type": "number"
+                                  },
+                                  {
+                                    "type": "integer"
+                                  }
+                                ],
+                                "gt": 0
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Renews At"
+                          },
+                          "schema_version": {
+                            "const": 2,
+                            "title": "Schema Version",
+                            "type": "integer"
+                          },
+                          "source": {
+                            "anyOf": [
+                              {
+                                "maxLength": 64,
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Source"
+                          },
+                          "source_type": {
+                            "anyOf": [
+                              {
+                                "enum": [
+                                  "subscription",
+                                  "metered",
+                                  "relay",
+                                  "manual",
+                                  "other"
+                                ],
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Source Type"
+                          },
+                          "status": {
+                            "default": "available",
+                            "enum": [
+                              "available",
+                              "unavailable"
+                            ],
+                            "title": "Status",
+                            "type": "string"
+                          },
+                          "windows": {
+                            "items": {
+                              "properties": {
+                                "group": {
+                                  "anyOf": [
+                                    {
+                                      "maxLength": 32,
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Group"
+                                },
+                                "id": {
+                                  "maxLength": 32,
+                                  "minLength": 1,
+                                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$",
+                                  "title": "Id",
+                                  "type": "string"
+                                },
+                                "kind": {
+                                  "default": "other",
+                                  "enum": [
+                                    "session",
+                                    "weekly",
+                                    "weekly_model",
+                                    "monthly",
+                                    "daily",
+                                    "term",
+                                    "other"
+                                  ],
+                                  "title": "Kind",
+                                  "type": "string"
+                                },
+                                "label": {
+                                  "anyOf": [
+                                    {
+                                      "maxLength": 32,
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Label"
+                                },
+                                "limit_value": {
+                                  "anyOf": [
+                                    {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "integer"
+                                        }
+                                      ],
+                                      "ge": 0
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Limit Value"
+                                },
+                                "note": {
+                                  "anyOf": [
+                                    {
+                                      "maxLength": 64,
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Note"
+                                },
+                                "percent_used": {
+                                  "anyOf": [
+                                    {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "integer"
+                                        }
+                                      ],
+                                      "ge": 0,
+                                      "le": 100
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Percent Used"
+                                },
+                                "resets_at": {
+                                  "anyOf": [
+                                    {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "integer"
+                                        }
+                                      ],
+                                      "gt": 0
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Resets At"
+                                },
+                                "unit": {
+                                  "anyOf": [
+                                    {
+                                      "maxLength": 24,
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Unit"
+                                },
+                                "used_value": {
+                                  "anyOf": [
+                                    {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "integer"
+                                        }
+                                      ],
+                                      "ge": 0
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Used Value"
+                                },
+                                "window_minutes": {
+                                  "anyOf": [
+                                    {
+                                      "exclusiveMinimum": 0,
+                                      "maximum": 2628000,
+                                      "type": "integer"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Window Minutes"
+                                }
+                              },
+                              "required": [
+                                "id"
+                              ],
+                              "title": "UsageWindow",
+                              "type": "object"
+                            },
+                            "maxItems": 16,
+                            "title": "Windows",
+                            "type": "array"
+                          }
+                        },
+                        "required": [
+                          "observed_at",
+                          "schema_version"
+                        ],
+                        "title": "UsageReportV2",
+                        "type": "object"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "specversion",
+                  "id",
+                  "source",
+                  "type",
+                  "data"
+                ],
+                "type": "object"
+              }
+            },
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "properties": {
+                      "activity": {
+                        "anyOf": [
+                          {
+                            "items": {
+                              "properties": {
+                                "cost_basis": {
+                                  "default": "metered",
+                                  "enum": [
+                                    "metered",
+                                    "estimate"
+                                  ],
+                                  "title": "Cost Basis",
+                                  "type": "string"
+                                },
+                                "cost_usd": {
+                                  "anyOf": [
+                                    {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "integer"
+                                        }
+                                      ],
+                                      "ge": 0
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Cost Usd"
+                                },
+                                "failed": {
+                                  "anyOf": [
+                                    {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Failed"
+                                },
+                                "hour": {
+                                  "exclusiveMinimum": 0,
+                                  "title": "Hour",
                                   "type": "integer"
                                 },
-                                {
-                                  "type": "null"
+                                "model": {
+                                  "anyOf": [
+                                    {
+                                      "maxLength": 128,
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Model"
+                                },
+                                "reasons": {
+                                  "anyOf": [
+                                    {
+                                      "additionalProperties": {
+                                        "type": "integer"
+                                      },
+                                      "type": "object"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Reasons"
+                                },
+                                "requests": {
+                                  "anyOf": [
+                                    {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Requests"
+                                },
+                                "tokens": {
+                                  "anyOf": [
+                                    {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Tokens"
                                 }
+                              },
+                              "required": [
+                                "hour"
                               ],
-                              "title": "Failed"
+                              "title": "ActivityHour",
+                              "type": "object"
                             },
-                            "hour": {
-                              "exclusiveMinimum": 0,
-                              "title": "Hour",
-                              "type": "integer"
+                            "maxItems": 500,
+                            "type": "array"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Activity"
+                      },
+                      "band": {
+                        "anyOf": [
+                          {
+                            "maxLength": 32,
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Band"
+                      },
+                      "details_url": {
+                        "anyOf": [
+                          {
+                            "format": "uri",
+                            "maxLength": 2083,
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Details Url"
+                      },
+                      "display_name": {
+                        "anyOf": [
+                          {
+                            "maxLength": 64,
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Display Name"
+                      },
+                      "fresh_until": {
+                        "anyOf": [
+                          {
+                            "anyOf": [
+                              {
+                                "type": "number"
+                              },
+                              {
+                                "type": "integer"
+                              }
+                            ],
+                            "gt": 0
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Fresh Until"
+                      },
+                      "host_id": {
+                        "anyOf": [
+                          {
+                            "maxLength": 128,
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Host Id"
+                      },
+                      "models": {
+                        "anyOf": [
+                          {
+                            "items": {
+                              "properties": {
+                                "cache_creation_input_token_cost": {
+                                  "anyOf": [
+                                    {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "integer"
+                                        }
+                                      ],
+                                      "ge": 0
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Cache Creation Input Token Cost"
+                                },
+                                "cache_read_input_token_cost": {
+                                  "anyOf": [
+                                    {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "integer"
+                                        }
+                                      ],
+                                      "ge": 0
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Cache Read Input Token Cost"
+                                },
+                                "id": {
+                                  "title": "Id",
+                                  "type": "string"
+                                },
+                                "input_cost_per_request": {
+                                  "anyOf": [
+                                    {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "integer"
+                                        }
+                                      ],
+                                      "ge": 0
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Input Cost Per Request"
+                                },
+                                "input_cost_per_token": {
+                                  "anyOf": [
+                                    {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "integer"
+                                        }
+                                      ],
+                                      "ge": 0
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Input Cost Per Token"
+                                },
+                                "input_per_million": {
+                                  "anyOf": [
+                                    {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "integer"
+                                        }
+                                      ],
+                                      "ge": 0
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Input Per Million"
+                                },
+                                "output_cost_per_image": {
+                                  "anyOf": [
+                                    {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "integer"
+                                        }
+                                      ],
+                                      "ge": 0
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Output Cost Per Image"
+                                },
+                                "output_cost_per_token": {
+                                  "anyOf": [
+                                    {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "integer"
+                                        }
+                                      ],
+                                      "ge": 0
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Output Cost Per Token"
+                                },
+                                "output_per_million": {
+                                  "anyOf": [
+                                    {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "integer"
+                                        }
+                                      ],
+                                      "ge": 0
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Output Per Million"
+                                }
+                              },
+                              "required": [
+                                "id"
+                              ],
+                              "title": "ReportModel",
+                              "type": "object"
                             },
-                            "model": {
+                            "maxItems": 128,
+                            "type": "array"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Models"
+                      },
+                      "observed_at": {
+                        "anyOf": [
+                          {
+                            "type": "number"
+                          },
+                          {
+                            "type": "integer"
+                          }
+                        ],
+                        "gt": 0,
+                        "title": "Observed At"
+                      },
+                      "pinned_window": {
+                        "anyOf": [
+                          {
+                            "maxLength": 32,
+                            "minLength": 1,
+                            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$",
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Pinned Window"
+                      },
+                      "plan": {
+                        "anyOf": [
+                          {
+                            "maxLength": 64,
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Plan"
+                      },
+                      "product": {
+                        "anyOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Product"
+                      },
+                      "renews_at": {
+                        "anyOf": [
+                          {
+                            "anyOf": [
+                              {
+                                "type": "number"
+                              },
+                              {
+                                "type": "integer"
+                              }
+                            ],
+                            "gt": 0
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Renews At"
+                      },
+                      "schema_version": {
+                        "const": 1,
+                        "default": 1,
+                        "title": "Schema Version",
+                        "type": "integer"
+                      },
+                      "status": {
+                        "default": "available",
+                        "enum": [
+                          "available",
+                          "unavailable"
+                        ],
+                        "title": "Status",
+                        "type": "string"
+                      },
+                      "windows": {
+                        "items": {
+                          "properties": {
+                            "group": {
                               "anyOf": [
                                 {
-                                  "maxLength": 128,
+                                  "maxLength": 32,
                                   "type": "string"
                                 },
                                 {
                                   "type": "null"
                                 }
                               ],
-                              "title": "Model"
+                              "title": "Group"
                             },
-                            "reasons": {
-                              "anyOf": [
-                                {
-                                  "additionalProperties": {
-                                    "type": "integer"
-                                  },
-                                  "type": "object"
-                                },
-                                {
-                                  "type": "null"
-                                }
-                              ],
-                              "title": "Reasons"
-                            },
-                            "requests": {
-                              "anyOf": [
-                                {
-                                  "minimum": 0,
-                                  "type": "integer"
-                                },
-                                {
-                                  "type": "null"
-                                }
-                              ],
-                              "title": "Requests"
-                            },
-                            "tokens": {
-                              "anyOf": [
-                                {
-                                  "minimum": 0,
-                                  "type": "integer"
-                                },
-                                {
-                                  "type": "null"
-                                }
-                              ],
-                              "title": "Tokens"
-                            }
-                          },
-                          "required": [
-                            "hour"
-                          ],
-                          "title": "ActivityHour",
-                          "type": "object"
-                        },
-                        "maxItems": 500,
-                        "type": "array"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "title": "Activity"
-                  },
-                  "band": {
-                    "anyOf": [
-                      {
-                        "maxLength": 32,
-                        "type": "string"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "title": "Band"
-                  },
-                  "details_url": {
-                    "anyOf": [
-                      {
-                        "format": "uri",
-                        "maxLength": 2083,
-                        "minLength": 1,
-                        "type": "string"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "title": "Details Url"
-                  },
-                  "display_name": {
-                    "anyOf": [
-                      {
-                        "maxLength": 64,
-                        "type": "string"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "title": "Display Name"
-                  },
-                  "fresh_until": {
-                    "anyOf": [
-                      {
-                        "anyOf": [
-                          {
-                            "type": "number"
-                          },
-                          {
-                            "type": "integer"
-                          }
-                        ],
-                        "gt": 0
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "title": "Fresh Until"
-                  },
-                  "host_id": {
-                    "anyOf": [
-                      {
-                        "maxLength": 128,
-                        "type": "string"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "title": "Host Id"
-                  },
-                  "models": {
-                    "anyOf": [
-                      {
-                        "items": {
-                          "properties": {
                             "id": {
+                              "maxLength": 32,
+                              "minLength": 1,
+                              "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$",
                               "title": "Id",
                               "type": "string"
                             },
-                            "input_per_million": {
-                              "anyOf": [
-                                {
-                                  "anyOf": [
-                                    {
-                                      "type": "number"
-                                    },
-                                    {
-                                      "type": "integer"
-                                    }
-                                  ],
-                                  "ge": 0
-                                },
-                                {
-                                  "type": "null"
-                                }
+                            "kind": {
+                              "default": "other",
+                              "enum": [
+                                "session",
+                                "weekly",
+                                "weekly_model",
+                                "monthly",
+                                "daily",
+                                "term",
+                                "other"
                               ],
-                              "title": "Input Per Million"
+                              "title": "Kind",
+                              "type": "string"
                             },
-                            "output_per_million": {
+                            "label": {
+                              "anyOf": [
+                                {
+                                  "maxLength": 32,
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ],
+                              "title": "Label"
+                            },
+                            "limit_value": {
                               "anyOf": [
                                 {
                                   "anyOf": [
@@ -20675,76 +23582,682 @@
                                   "type": "null"
                                 }
                               ],
-                              "title": "Output Per Million"
+                              "title": "Limit Value"
+                            },
+                            "note": {
+                              "anyOf": [
+                                {
+                                  "maxLength": 64,
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ],
+                              "title": "Note"
+                            },
+                            "percent_used": {
+                              "anyOf": [
+                                {
+                                  "anyOf": [
+                                    {
+                                      "type": "number"
+                                    },
+                                    {
+                                      "type": "integer"
+                                    }
+                                  ],
+                                  "ge": 0,
+                                  "le": 100
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ],
+                              "title": "Percent Used"
+                            },
+                            "resets_at": {
+                              "anyOf": [
+                                {
+                                  "anyOf": [
+                                    {
+                                      "type": "number"
+                                    },
+                                    {
+                                      "type": "integer"
+                                    }
+                                  ],
+                                  "gt": 0
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ],
+                              "title": "Resets At"
+                            },
+                            "unit": {
+                              "anyOf": [
+                                {
+                                  "maxLength": 24,
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ],
+                              "title": "Unit"
+                            },
+                            "used_value": {
+                              "anyOf": [
+                                {
+                                  "anyOf": [
+                                    {
+                                      "type": "number"
+                                    },
+                                    {
+                                      "type": "integer"
+                                    }
+                                  ],
+                                  "ge": 0
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ],
+                              "title": "Used Value"
+                            },
+                            "window_minutes": {
+                              "anyOf": [
+                                {
+                                  "exclusiveMinimum": 0,
+                                  "maximum": 2628000,
+                                  "type": "integer"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ],
+                              "title": "Window Minutes"
                             }
                           },
                           "required": [
                             "id"
                           ],
-                          "title": "ReportModel",
+                          "title": "UsageWindow",
                           "type": "object"
                         },
-                        "maxItems": 128,
+                        "maxItems": 16,
+                        "title": "Windows",
+                        "type": "array"
+                      }
+                    },
+                    "required": [
+                      "observed_at",
+                      "windows"
+                    ],
+                    "title": "UsageReport",
+                    "type": "object"
+                  },
+                  {
+                    "properties": {
+                      "activity": {
+                        "anyOf": [
+                          {
+                            "items": {
+                              "properties": {
+                                "cache_creation_input_tokens": {
+                                  "anyOf": [
+                                    {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Cache Creation Input Tokens"
+                                },
+                                "cache_read_input_tokens": {
+                                  "anyOf": [
+                                    {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Cache Read Input Tokens"
+                                },
+                                "correction": {
+                                  "default": false,
+                                  "title": "Correction",
+                                  "type": "boolean"
+                                },
+                                "cost_basis": {
+                                  "default": "metered",
+                                  "enum": [
+                                    "billed",
+                                    "metered",
+                                    "list",
+                                    "estimate"
+                                  ],
+                                  "title": "Cost Basis",
+                                  "type": "string"
+                                },
+                                "cost_usd": {
+                                  "anyOf": [
+                                    {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "integer"
+                                        }
+                                      ],
+                                      "ge": 0
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Cost Usd"
+                                },
+                                "coverage": {
+                                  "default": "complete",
+                                  "enum": [
+                                    "complete",
+                                    "partial"
+                                  ],
+                                  "title": "Coverage",
+                                  "type": "string"
+                                },
+                                "failed": {
+                                  "anyOf": [
+                                    {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Failed"
+                                },
+                                "host": {
+                                  "default": "",
+                                  "maxLength": 64,
+                                  "title": "Host",
+                                  "type": "string"
+                                },
+                                "hour": {
+                                  "exclusiveMinimum": 0,
+                                  "title": "Hour",
+                                  "type": "integer"
+                                },
+                                "model": {
+                                  "default": "",
+                                  "maxLength": 128,
+                                  "title": "Model",
+                                  "type": "string"
+                                },
+                                "output_tokens": {
+                                  "anyOf": [
+                                    {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Output Tokens"
+                                },
+                                "reasoning_tokens": {
+                                  "anyOf": [
+                                    {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Reasoning Tokens"
+                                },
+                                "reasons": {
+                                  "anyOf": [
+                                    {
+                                      "additionalProperties": {
+                                        "type": "integer"
+                                      },
+                                      "type": "object"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Reasons"
+                                },
+                                "removed": {
+                                  "default": false,
+                                  "title": "Removed",
+                                  "type": "boolean"
+                                },
+                                "requests": {
+                                  "anyOf": [
+                                    {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Requests"
+                                },
+                                "tokens": {
+                                  "anyOf": [
+                                    {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Tokens"
+                                },
+                                "uncached_input_tokens": {
+                                  "anyOf": [
+                                    {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Uncached Input Tokens"
+                                }
+                              },
+                              "required": [
+                                "hour"
+                              ],
+                              "title": "ActivityEntryV2",
+                              "type": "object"
+                            },
+                            "maxItems": 500,
+                            "type": "array"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Activity"
+                      },
+                      "balances": {
+                        "items": {
+                          "properties": {
+                            "expires_at": {
+                              "anyOf": [
+                                {
+                                  "anyOf": [
+                                    {
+                                      "type": "number"
+                                    },
+                                    {
+                                      "type": "integer"
+                                    }
+                                  ],
+                                  "gt": 0
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ],
+                              "title": "Expires At"
+                            },
+                            "group": {
+                              "anyOf": [
+                                {
+                                  "maxLength": 32,
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ],
+                              "title": "Group"
+                            },
+                            "id": {
+                              "maxLength": 32,
+                              "minLength": 1,
+                              "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$",
+                              "title": "Id",
+                              "type": "string"
+                            },
+                            "label": {
+                              "anyOf": [
+                                {
+                                  "maxLength": 32,
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ],
+                              "title": "Label"
+                            },
+                            "note": {
+                              "anyOf": [
+                                {
+                                  "maxLength": 64,
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ],
+                              "title": "Note"
+                            },
+                            "remaining": {
+                              "anyOf": [
+                                {
+                                  "type": "number"
+                                },
+                                {
+                                  "type": "integer"
+                                }
+                              ],
+                              "title": "Remaining"
+                            },
+                            "unit": {
+                              "maxLength": 24,
+                              "minLength": 1,
+                              "title": "Unit",
+                              "type": "string"
+                            },
+                            "usd_per_unit": {
+                              "anyOf": [
+                                {
+                                  "anyOf": [
+                                    {
+                                      "type": "number"
+                                    },
+                                    {
+                                      "type": "integer"
+                                    }
+                                  ],
+                                  "gt": 0
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ],
+                              "title": "Usd Per Unit"
+                            }
+                          },
+                          "required": [
+                            "id",
+                            "remaining",
+                            "unit"
+                          ],
+                          "title": "UsageBalance",
+                          "type": "object"
+                        },
+                        "maxItems": 16,
+                        "title": "Balances",
                         "type": "array"
                       },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "title": "Models"
-                  },
-                  "observed_at": {
-                    "anyOf": [
-                      {
-                        "type": "number"
+                      "band": {
+                        "anyOf": [
+                          {
+                            "maxLength": 32,
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Band"
                       },
-                      {
-                        "type": "integer"
-                      }
-                    ],
-                    "gt": 0,
-                    "title": "Observed At"
-                  },
-                  "pinned_window": {
-                    "anyOf": [
-                      {
-                        "maxLength": 32,
-                        "minLength": 1,
-                        "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$",
-                        "type": "string"
+                      "details_url": {
+                        "anyOf": [
+                          {
+                            "format": "uri",
+                            "maxLength": 2083,
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Details Url"
                       },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "title": "Pinned Window"
-                  },
-                  "plan": {
-                    "anyOf": [
-                      {
-                        "maxLength": 64,
-                        "type": "string"
+                      "display_name": {
+                        "anyOf": [
+                          {
+                            "maxLength": 64,
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Display Name"
                       },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "title": "Plan"
-                  },
-                  "product": {
-                    "anyOf": [
-                      {
-                        "type": "string"
+                      "fresh_until": {
+                        "anyOf": [
+                          {
+                            "anyOf": [
+                              {
+                                "type": "number"
+                              },
+                              {
+                                "type": "integer"
+                              }
+                            ],
+                            "gt": 0
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Fresh Until"
                       },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "title": "Product"
-                  },
-                  "renews_at": {
-                    "anyOf": [
-                      {
+                      "host_id": {
+                        "anyOf": [
+                          {
+                            "maxLength": 128,
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Host Id"
+                      },
+                      "models": {
+                        "anyOf": [
+                          {
+                            "items": {
+                              "properties": {
+                                "cache_creation_input_token_cost": {
+                                  "anyOf": [
+                                    {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "integer"
+                                        }
+                                      ],
+                                      "ge": 0
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Cache Creation Input Token Cost"
+                                },
+                                "cache_read_input_token_cost": {
+                                  "anyOf": [
+                                    {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "integer"
+                                        }
+                                      ],
+                                      "ge": 0
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Cache Read Input Token Cost"
+                                },
+                                "id": {
+                                  "title": "Id",
+                                  "type": "string"
+                                },
+                                "input_cost_per_request": {
+                                  "anyOf": [
+                                    {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "integer"
+                                        }
+                                      ],
+                                      "ge": 0
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Input Cost Per Request"
+                                },
+                                "input_cost_per_token": {
+                                  "anyOf": [
+                                    {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "integer"
+                                        }
+                                      ],
+                                      "ge": 0
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Input Cost Per Token"
+                                },
+                                "input_per_million": {
+                                  "anyOf": [
+                                    {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "integer"
+                                        }
+                                      ],
+                                      "ge": 0
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Input Per Million"
+                                },
+                                "output_cost_per_image": {
+                                  "anyOf": [
+                                    {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "integer"
+                                        }
+                                      ],
+                                      "ge": 0
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Output Cost Per Image"
+                                },
+                                "output_cost_per_token": {
+                                  "anyOf": [
+                                    {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "integer"
+                                        }
+                                      ],
+                                      "ge": 0
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Output Cost Per Token"
+                                },
+                                "output_per_million": {
+                                  "anyOf": [
+                                    {
+                                      "anyOf": [
+                                        {
+                                          "type": "number"
+                                        },
+                                        {
+                                          "type": "integer"
+                                        }
+                                      ],
+                                      "ge": 0
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Output Per Million"
+                                }
+                              },
+                              "required": [
+                                "id"
+                              ],
+                              "title": "ReportModel",
+                              "type": "object"
+                            },
+                            "maxItems": 128,
+                            "type": "array"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Models"
+                      },
+                      "observed_at": {
                         "anyOf": [
                           {
                             "type": "number"
@@ -20753,201 +24266,307 @@
                             "type": "integer"
                           }
                         ],
-                        "gt": 0
+                        "gt": 0,
+                        "title": "Observed At"
                       },
-                      {
-                        "type": "null"
+                      "pinned_window": {
+                        "anyOf": [
+                          {
+                            "maxLength": 32,
+                            "minLength": 1,
+                            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$",
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Pinned Window"
+                      },
+                      "plan": {
+                        "anyOf": [
+                          {
+                            "maxLength": 64,
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Plan"
+                      },
+                      "product": {
+                        "anyOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Product"
+                      },
+                      "renews_at": {
+                        "anyOf": [
+                          {
+                            "anyOf": [
+                              {
+                                "type": "number"
+                              },
+                              {
+                                "type": "integer"
+                              }
+                            ],
+                            "gt": 0
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Renews At"
+                      },
+                      "schema_version": {
+                        "const": 2,
+                        "title": "Schema Version",
+                        "type": "integer"
+                      },
+                      "source": {
+                        "anyOf": [
+                          {
+                            "maxLength": 64,
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Source"
+                      },
+                      "source_type": {
+                        "anyOf": [
+                          {
+                            "enum": [
+                              "subscription",
+                              "metered",
+                              "relay",
+                              "manual",
+                              "other"
+                            ],
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Source Type"
+                      },
+                      "status": {
+                        "default": "available",
+                        "enum": [
+                          "available",
+                          "unavailable"
+                        ],
+                        "title": "Status",
+                        "type": "string"
+                      },
+                      "windows": {
+                        "items": {
+                          "properties": {
+                            "group": {
+                              "anyOf": [
+                                {
+                                  "maxLength": 32,
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ],
+                              "title": "Group"
+                            },
+                            "id": {
+                              "maxLength": 32,
+                              "minLength": 1,
+                              "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$",
+                              "title": "Id",
+                              "type": "string"
+                            },
+                            "kind": {
+                              "default": "other",
+                              "enum": [
+                                "session",
+                                "weekly",
+                                "weekly_model",
+                                "monthly",
+                                "daily",
+                                "term",
+                                "other"
+                              ],
+                              "title": "Kind",
+                              "type": "string"
+                            },
+                            "label": {
+                              "anyOf": [
+                                {
+                                  "maxLength": 32,
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ],
+                              "title": "Label"
+                            },
+                            "limit_value": {
+                              "anyOf": [
+                                {
+                                  "anyOf": [
+                                    {
+                                      "type": "number"
+                                    },
+                                    {
+                                      "type": "integer"
+                                    }
+                                  ],
+                                  "ge": 0
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ],
+                              "title": "Limit Value"
+                            },
+                            "note": {
+                              "anyOf": [
+                                {
+                                  "maxLength": 64,
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ],
+                              "title": "Note"
+                            },
+                            "percent_used": {
+                              "anyOf": [
+                                {
+                                  "anyOf": [
+                                    {
+                                      "type": "number"
+                                    },
+                                    {
+                                      "type": "integer"
+                                    }
+                                  ],
+                                  "ge": 0,
+                                  "le": 100
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ],
+                              "title": "Percent Used"
+                            },
+                            "resets_at": {
+                              "anyOf": [
+                                {
+                                  "anyOf": [
+                                    {
+                                      "type": "number"
+                                    },
+                                    {
+                                      "type": "integer"
+                                    }
+                                  ],
+                                  "gt": 0
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ],
+                              "title": "Resets At"
+                            },
+                            "unit": {
+                              "anyOf": [
+                                {
+                                  "maxLength": 24,
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ],
+                              "title": "Unit"
+                            },
+                            "used_value": {
+                              "anyOf": [
+                                {
+                                  "anyOf": [
+                                    {
+                                      "type": "number"
+                                    },
+                                    {
+                                      "type": "integer"
+                                    }
+                                  ],
+                                  "ge": 0
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ],
+                              "title": "Used Value"
+                            },
+                            "window_minutes": {
+                              "anyOf": [
+                                {
+                                  "exclusiveMinimum": 0,
+                                  "maximum": 2628000,
+                                  "type": "integer"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ],
+                              "title": "Window Minutes"
+                            }
+                          },
+                          "required": [
+                            "id"
+                          ],
+                          "title": "UsageWindow",
+                          "type": "object"
+                        },
+                        "maxItems": 16,
+                        "title": "Windows",
+                        "type": "array"
                       }
-                    ],
-                    "title": "Renews At"
-                  },
-                  "schema_version": {
-                    "const": 1,
-                    "default": 1,
-                    "title": "Schema Version",
-                    "type": "integer"
-                  },
-                  "status": {
-                    "default": "available",
-                    "enum": [
-                      "available",
-                      "unavailable"
-                    ],
-                    "title": "Status",
-                    "type": "string"
-                  },
-                  "windows": {
-                    "items": {
-                      "properties": {
-                        "group": {
-                          "anyOf": [
-                            {
-                              "maxLength": 32,
-                              "type": "string"
-                            },
-                            {
-                              "type": "null"
-                            }
-                          ],
-                          "title": "Group"
-                        },
-                        "id": {
-                          "maxLength": 32,
-                          "minLength": 1,
-                          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$",
-                          "title": "Id",
-                          "type": "string"
-                        },
-                        "kind": {
-                          "default": "other",
-                          "enum": [
-                            "session",
-                            "weekly",
-                            "weekly_model",
-                            "monthly",
-                            "other"
-                          ],
-                          "title": "Kind",
-                          "type": "string"
-                        },
-                        "label": {
-                          "anyOf": [
-                            {
-                              "maxLength": 32,
-                              "type": "string"
-                            },
-                            {
-                              "type": "null"
-                            }
-                          ],
-                          "title": "Label"
-                        },
-                        "limit_value": {
-                          "anyOf": [
-                            {
-                              "anyOf": [
-                                {
-                                  "type": "number"
-                                },
-                                {
-                                  "type": "integer"
-                                }
-                              ],
-                              "ge": 0
-                            },
-                            {
-                              "type": "null"
-                            }
-                          ],
-                          "title": "Limit Value"
-                        },
-                        "percent_used": {
-                          "anyOf": [
-                            {
-                              "anyOf": [
-                                {
-                                  "type": "number"
-                                },
-                                {
-                                  "type": "integer"
-                                }
-                              ],
-                              "ge": 0,
-                              "le": 100
-                            },
-                            {
-                              "type": "null"
-                            }
-                          ],
-                          "title": "Percent Used"
-                        },
-                        "resets_at": {
-                          "anyOf": [
-                            {
-                              "anyOf": [
-                                {
-                                  "type": "number"
-                                },
-                                {
-                                  "type": "integer"
-                                }
-                              ],
-                              "gt": 0
-                            },
-                            {
-                              "type": "null"
-                            }
-                          ],
-                          "title": "Resets At"
-                        },
-                        "unit": {
-                          "anyOf": [
-                            {
-                              "maxLength": 8,
-                              "type": "string"
-                            },
-                            {
-                              "type": "null"
-                            }
-                          ],
-                          "title": "Unit"
-                        },
-                        "used_value": {
-                          "anyOf": [
-                            {
-                              "anyOf": [
-                                {
-                                  "type": "number"
-                                },
-                                {
-                                  "type": "integer"
-                                }
-                              ],
-                              "ge": 0
-                            },
-                            {
-                              "type": "null"
-                            }
-                          ],
-                          "title": "Used Value"
-                        },
-                        "window_minutes": {
-                          "anyOf": [
-                            {
-                              "exclusiveMinimum": 0,
-                              "maximum": 2628000,
-                              "type": "integer"
-                            },
-                            {
-                              "type": "null"
-                            }
-                          ],
-                          "title": "Window Minutes"
-                        }
-                      },
-                      "required": [
-                        "id"
-                      ],
-                      "title": "UsageWindow",
-                      "type": "object"
                     },
-                    "maxItems": 16,
-                    "title": "Windows",
-                    "type": "array"
+                    "required": [
+                      "observed_at",
+                      "schema_version"
+                    ],
+                    "title": "UsageReportV2",
+                    "type": "object"
                   }
-                },
-                "required": [
-                  "observed_at",
-                  "windows"
-                ],
-                "title": "UsageReport",
-                "type": "object"
+                ]
               }
             }
           },
           "required": true
         },
         "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteOutcome"
+                }
+              }
+            },
+            "description": "Report v2 write outcome"
+          },
           "204": {
             "description": "Successful Response"
           },
@@ -20963,6 +24582,101 @@
           }
         },
         "summary": "Report Usage Account"
+      }
+    },
+    "/v1/me/usage/accounts/{account_id}/import": {
+      "post": {
+        "operationId": "import_usage_account_v1_me_usage_accounts__account_id__import_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "account_id",
+            "required": true,
+            "schema": {
+              "title": "Account Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "format",
+            "required": true,
+            "schema": {
+              "title": "Format",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "observed_at",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Observed At"
+            }
+          },
+          {
+            "in": "query",
+            "name": "units_per_usd",
+            "required": false,
+            "schema": {
+              "default": "500000",
+              "title": "Units Per Usd",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "correction",
+            "required": false,
+            "schema": {
+              "default": "0",
+              "title": "Correction",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "description": "Unmodified vendor response for the selected format",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteOutcome"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Import Usage Account"
       }
     },
     "/v1/me/usage/activity": {
@@ -21331,6 +25045,153 @@
           }
         },
         "summary": "Read Models"
+      }
+    },
+    "/v1/me/usage/otlp/v1/logs": {
+      "post": {
+        "operationId": "report_otlp_logs_v1_me_usage_otlp_v1_logs_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            },
+            "application/x-protobuf": {
+              "schema": {
+                "format": "binary",
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              },
+              "application/x-protobuf": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "OTLP success or partial success"
+          },
+          "400": {
+            "description": "Malformed OTLP export"
+          },
+          "413": {
+            "description": "Decompressed body too large"
+          },
+          "503": {
+            "description": "Storage unavailable; retry later"
+          }
+        },
+        "summary": "Report Otlp Logs"
+      }
+    },
+    "/v1/me/usage/otlp/v1/metrics": {
+      "post": {
+        "operationId": "report_otlp_metrics_v1_me_usage_otlp_v1_metrics_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            },
+            "application/x-protobuf": {
+              "schema": {
+                "format": "binary",
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              },
+              "application/x-protobuf": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "OTLP success or partial success"
+          },
+          "400": {
+            "description": "Malformed OTLP export"
+          },
+          "413": {
+            "description": "Decompressed body too large"
+          },
+          "503": {
+            "description": "Storage unavailable; retry later"
+          }
+        },
+        "summary": "Report Otlp Metrics"
+      }
+    },
+    "/v1/me/usage/otlp/v1/traces": {
+      "post": {
+        "operationId": "report_otlp_traces_v1_me_usage_otlp_v1_traces_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            },
+            "application/x-protobuf": {
+              "schema": {
+                "format": "binary",
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              },
+              "application/x-protobuf": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "OTLP success or partial success"
+          },
+          "400": {
+            "description": "Malformed OTLP export"
+          },
+          "413": {
+            "description": "Decompressed body too large"
+          },
+          "503": {
+            "description": "Storage unavailable; retry later"
+          }
+        },
+        "summary": "Report Otlp Traces"
       }
     },
     "/v1/me/usage/price-source": {

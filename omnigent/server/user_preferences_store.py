@@ -73,6 +73,7 @@ USER_PREFERENCE_NAMESPACES = frozenset(
         "sidebar_layout",
         "sound_alerts",
         "worktree_defaults",
+        "builtin_agent_prompts",
     }
 )
 
@@ -534,6 +535,9 @@ class CollabSettings:
     keep_warm_codex_interval_s: int = 1500
     keep_warm_max_s: int = 28800
     child_cap: int | None = None
+    auto_rotation_enabled: bool = False
+    auto_rotation_compactions: int = 4
+    auto_rotation_remaining_pct: int = 25
     standing_approval_default: list[str] = field(default_factory=list)
     quota_tight_below_pct: float = 50
     quota_low_below_pct: float = 20
@@ -562,6 +566,7 @@ _COLLAB_SETTING_FIELDS: tuple[tuple[str, str, _CollabFieldKind], ...] = (
     ("undeliveredTtlSeconds", "undelivered_ttl_s", "positive_int"),
     ("flowTimerEnabled", "flow_timer_enabled", "bool"),
     ("childKeepWarmEnabled", "keep_warm_enabled", "bool"),
+    ("autoRotationEnabled", "auto_rotation_enabled", "bool"),
     ("childKeepWarmClaudeIntervalSeconds", "keep_warm_claude_interval_s", "positive_int"),
     ("childKeepWarmCodexIntervalSeconds", "keep_warm_codex_interval_s", "positive_int"),
     ("childKeepWarmMaxSeconds", "keep_warm_max_s", "positive_int"),
@@ -649,6 +654,13 @@ def _parse_collab_settings(value: Any) -> CollabSettings:
     child_cap = _parse_collab_value("positive_int", value.get("childCap"))
     if child_cap is not None:
         resolved["child_cap"] = child_cap
+    for key, name, upper in (
+        ("autoRotationCompactions", "auto_rotation_compactions", 20),
+        ("autoRotationRemainingPct", "auto_rotation_remaining_pct", 90),
+    ):
+        raw = value.get(key)
+        if type(raw) is int and 1 <= raw <= upper:
+            resolved[name] = raw
     low = _collab_percentage(value.get("quotaLowBelowPct"), 0, 100)
     tight = _collab_percentage(value.get("quotaTightBelowPct"), 0, 100)
     if low is not None and tight is not None and 0 < low < tight:
@@ -1731,6 +1743,13 @@ def validate_preferences_envelope(envelope: Any) -> PreferencesEnvelope:
         _validate_worktree_archive(settings[WORKTREE_ARCHIVE_NAMESPACE])
     if CHILD_IDLE_NAMESPACE in settings:
         parse_child_idle_settings(settings[CHILD_IDLE_NAMESPACE])
+    from omnigent.server.builtin_agent_prompts import NAMESPACE, validate_prompt_preferences
+
+    if NAMESPACE in settings:
+        try:
+            validate_prompt_preferences(settings[NAMESPACE])
+        except ValueError as exc:
+            raise UserPreferencesValidationError(str(exc)) from exc
 
     copied: PreferencesEnvelope = {
         "version": USER_PREFERENCE_VERSION,
@@ -1747,7 +1766,10 @@ def validate_preferences_envelope(envelope: Any) -> PreferencesEnvelope:
         )
     try:
         serialized = json.dumps(
-            copied,
+            {
+                **copied,
+                "settings": {k: v for k, v in copied["settings"].items() if k != NAMESPACE},
+            },
             ensure_ascii=False,
             allow_nan=False,
             separators=(",", ":"),
@@ -1800,7 +1822,14 @@ def _read_settings(session: Session, user_id: str) -> tuple[dict[str, Any], bool
     settings: dict[str, Any] = {}
     for key, raw in rows:
         try:
-            text = decode(raw, max_decoded_bytes=USER_PREFERENCES_MAX_BYTES)
+            from omnigent.server.builtin_agent_prompts import NAMESPACE, PROMPTS_MAX_BYTES
+
+            text = decode(
+                raw,
+                max_decoded_bytes=PROMPTS_MAX_BYTES
+                if key == _settings_key(NAMESPACE)
+                else USER_PREFERENCES_MAX_BYTES,
+            )
         except (ValueError, zstandard.ZstdError) as exc:
             raise UserPreferencesValidationError("stored preferences are invalid JSON") from exc
         if key == _ENVELOPE_VERSION_KEY:
@@ -2080,6 +2109,10 @@ class SqlAlchemyUserPreferencesStore:
                 stored = settings.get(namespace)
                 if isinstance(stored, dict):
                     settings[namespace] = _prune_runner_log_warnings(stored)
+            if namespace == "builtin_agent_prompts" and isinstance(settings.get(namespace), dict):
+                settings[namespace] = {
+                    key: row for key, row in settings[namespace].items() if row is not None
+                }
             merged = _assemble_envelope(settings)
             if namespace in merged["settings"]:
                 self._upsert_row(

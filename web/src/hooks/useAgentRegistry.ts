@@ -285,6 +285,18 @@ export function buildLegacyProductRegistry(
   );
 }
 
+/** The catalog id a product row stands for, which is what per-agent preferences such as badges key on. */
+export function productIdFor(
+  item: RegistryItem | undefined,
+  registry: { legacyProducts: Record<string, RegistryItem> },
+): string | null {
+  if (!item || !item.key.startsWith("harness:")) return item?.key ?? null;
+  return (
+    Object.values(registry.legacyProducts).find((product) => product.harness === item.harness)
+      ?.key ?? null
+  );
+}
+
 export function useAgentRegistry() {
   const info = useServerInfo();
   const catalog = useQuery({
