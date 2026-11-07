@@ -147,6 +147,8 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
   the model/effort pill, the configuration gear, and slash commands.
 - [Terminals](./terminals.md) covers the Chat/Terminal switcher, the agent
   terminal, shell terminals, and terminal reattachment.
+- [Windows admin terminals](./windows-admin-terminals.md) covers host-owner
+  enrollment, loopback SSH elevation and removal.
 - [Native harnesses](./native-harnesses.md) is the matrix of every native
   harness against launch, authentication, model and effort selection,
   approvals, resume, and terminal behavior, with native disconnect test boundaries.

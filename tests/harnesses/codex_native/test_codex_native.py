@@ -4399,6 +4399,8 @@ def test_forwarder_posts_codex_usage_live_per_frame(
     # only the CHANGED keys — context_window was unchanged, so the coalescer's
     # dedup drops it (proving latest-only diffing, not blind re-posting).
     assert posts_after_usage_updates[0]["data"] == {
+        "auto_compact_token_limit": None,
+        "context_model": None,
         "context_tokens": 100,
         "context_window": 200_000,
         "cumulative_input_tokens": 100,

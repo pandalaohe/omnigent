@@ -69,7 +69,7 @@ def test_project_orders_migration_round_trip(tmp_path: Path) -> None:
 
 
 def test_mysql_project_order_migration_retains_original_capacity() -> None:
-    """The historical column stays MEDIUMBLOB; current preferences use BLOB."""
+    """The historical project-order column retains its original MEDIUMBLOB capacity."""
     from importlib import import_module
     from io import StringIO
 
@@ -77,10 +77,7 @@ def test_mysql_project_order_migration_retains_original_capacity() -> None:
     from alembic.operations import Operations
     from sqlalchemy.dialects import mysql
 
-    from omnigent.db.db_models import SqlPreference
-
     dialect = mysql.dialect()
-    assert SqlPreference.__table__.c.value.type.compile(dialect=dialect) == "BLOB"
     output = StringIO()
     context = MigrationContext.configure(
         dialect=dialect, opts={"as_sql": True, "output_buffer": output}

@@ -15,13 +15,13 @@ depends_on: str | Sequence[str] | None = None
 def upgrade() -> None:
     op.add_column("conversations", sa.Column("session_prompt", sa.Text(), nullable=True))
     if op.get_bind().dialect.name == "mysql":
-        op.alter_column(
-            "preferences",
-            "value",
-            existing_type=sa.LargeBinary(),
-            type_=MEDIUMBLOB(),
-            existing_nullable=False,
-        )
+        with op.batch_alter_table("preferences") as batch:
+            batch.alter_column(
+                "value",
+                existing_type=sa.LargeBinary(),
+                type_=MEDIUMBLOB(),
+                existing_nullable=False,
+            )
 
 
 def downgrade() -> None:
@@ -36,11 +36,12 @@ def downgrade() -> None:
             raise RuntimeError(
                 "Remove large starting prompts before downgrading preference storage"
             )
-        op.alter_column(
-            "preferences",
-            "value",
-            existing_type=MEDIUMBLOB(),
-            type_=sa.LargeBinary(),
-            existing_nullable=False,
-        )
-    op.drop_column("conversations", "session_prompt")
+        with op.batch_alter_table("preferences") as batch:
+            batch.alter_column(
+                "value",
+                existing_type=MEDIUMBLOB(),
+                type_=sa.LargeBinary(),
+                existing_nullable=False,
+            )
+    with op.batch_alter_table("conversations") as batch:
+        batch.drop_column("session_prompt")

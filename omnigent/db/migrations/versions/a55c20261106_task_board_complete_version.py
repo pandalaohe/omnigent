@@ -16,4 +16,5 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_column("task_board_sources", "complete_version")
+    with op.batch_alter_table("task_board_sources") as batch:
+        batch.drop_column("complete_version")

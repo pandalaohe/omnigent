@@ -6,7 +6,13 @@ and group. A task opens its status, next step, waiting reason, related tasks,
 history and linked sessions. Editing happens in the source; a missing task-page
 link is shown as text. Waiting on me combines source tasks and native prompts.
 
-## Entry points
+## Sub-features
+
+- Native session trees and plan steps.
+- Source task reports, ordered routes, time maps and task details.
+- Waiting on me, source history and daily closing totals.
+
+## How to get to it (user POV)
 
 - Settings → General → Task board → Show Task board enables the sidebar row.
 - The sidebar's Task board row opens the board. On a phone, open the sidebar first.
@@ -22,7 +28,10 @@ link is shown as text. Waiting on me combines source tasks and native prompts.
   `/v1/me/tasks`. A logged-in owner can delete a source with
   `DELETE /v1/me/tasks/sources/{source_id}`; a feeder key cannot delete it.
 
-## Checks
+## Driving it with the repro environment
+
+Preconditions: an isolated instance, a logged-in owner and an enabled task-board
+deployment gate. Use a disposable source for report and deletion checks.
 
 Use the [verification recipe](skills/verify-omnigent/SKILL.md) for an isolated
 instance. On that instance, report two tasks in a Group: one in progress with
@@ -92,6 +101,8 @@ Related automated checks:
   and Routes at desktop dark/light and phone widths, details, safe links,
   watch-only frames and GET-only interactions. It uses synthetic
   backend responses; it does not prove live report transport or account login.
+
+## Gotchas
 
 Capture the visible list and any failed request when reporting a failure. Include
 the viewport, which entry point was used and whether the deployment and display

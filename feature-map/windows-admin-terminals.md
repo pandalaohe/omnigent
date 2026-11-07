@@ -11,7 +11,23 @@ passphrase inside the terminal. Processes running as the same Windows user can
 capture an authorized unlock or take over an open terminal; the app's agent
 access switch does not provide an OS process boundary.
 
-## Local component checks
+## Sub-features
+
+- Explicit host-owner enrollment with encrypted keys and pinned loopback SSH.
+- Admin terminals in sessions and standalone host terminals.
+- Per-instance agent access, idle expiry, removal and credential recovery.
+
+## How to get to it (user POV)
+
+Enroll locally with `omni host admin-terminal install`, then open Admin beside
+Shell in a host-bound session or on the standalone host terminals page.
+
+## Driving it with the repro environment
+
+Preconditions: use an isolated instance for app checks. Real enrollment needs a
+Windows host and separate permission for its service and credential changes.
+
+### Local component checks
 
 `tests/host/test_windows_admin_terminal.py` uses synthetic key envelopes and fake
 Windows process boundaries. It exercises opt-in, encryption metadata, pinned SSH
@@ -22,7 +38,7 @@ Run it with the project's isolated pytest wrapper, alongside
 `tests/runner/test_host_terminals.py` and `tests/terminals/test_conpty.py`.
 These checks do not install or prove a Windows service.
 
-## Install on a fresh Windows host
+### Install on a fresh Windows host
 
 Prerequisites: OpenSSH client, PowerShell, a Windows account in Administrators,
 and permission to install OpenSSH Server and create this host's credentials.
@@ -57,7 +73,7 @@ service removal. If cleanup fails, it names the state still needing attention;
 resolve it before retrying, and reboot if Windows requests it. No alternative
 elevation mechanism is enabled automatically.
 
-## Exercise both app entry points
+### Exercise both app entry points
 
 Use the host owner's app admin login. Open Admin from a host-bound session and
 from the standalone host terminals page. Each open must prompt for the key
@@ -81,7 +97,9 @@ Return the failed step, app entry point, exit code or HTTP/WS close code, and a
 redacted screenshot or error line. Do not send a key, passphrase, terminal input
 recording or credential-bearing config.
 
-## Remove, maintain, or revoke
+## Gotchas
+
+### Remove, maintain, or revoke
 
 Removal requires permission for this host's service stop and credential
 deletion. Run `omni host admin-terminal remove` locally and confirm. It requires
