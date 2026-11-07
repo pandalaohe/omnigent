@@ -166,18 +166,38 @@ def record_auto_rotation_usage(
     label_updates: dict[str, str] | None = None,
 ) -> tuple[dict[str, object], AutoRotationStatus | None]:
     """Persist context and infer the round from the prior reading in one transaction."""
+    from omnigent.server.routes._sessions.helpers import _resolve_harness
+    from omnigent.server.routes.sessions.routes_succession import _ROTATION_NATIVE_HARNESSES
 
     if conv is None:
         conv = conversation_store.get_conversation(session_id)
     if conv is None:
         raise ConversationNotFoundError(session_id)
     eligibility_read_failed = False
+    rotation_observed = False
 
     def observe(current: dict[str, str], context_change: LabelGroupChange) -> LabelGroupChange:
-        nonlocal eligibility_read_failed
+        nonlocal eligibility_read_failed, rotation_observed
         updates = dict(label_updates or {}) | context_change.upserts
         deletes = set(context_change.deletes)
         labels = {key: value for key, value in current.items() if key not in deletes} | updates
+        if conv.parent_conversation_id is not None or conv.archived:
+            return LabelGroupChange(updates, deletes)
+        try:
+            harness = _resolve_harness(conv)
+        except Exception:
+            logger.warning(
+                "Could not read auto-rotation harness for %s", session_id, exc_info=True
+            )
+            return LabelGroupChange(updates, deletes)
+        if harness not in _ROTATION_NATIVE_HARNESSES:
+            return LabelGroupChange(updates, deletes)
+        status = auto_rotation_for(
+            replace(conv, labels=labels), conversation_store, permission_store, prefs_store
+        )
+        if not status.eligible or not status.enabled:
+            return LabelGroupChange(updates, deletes)
+        rotation_observed = True
         try:
             current_conv = conversation_store.get_conversation(session_id)
         except SQLAlchemyError:
@@ -219,7 +239,7 @@ def record_auto_rotation_usage(
     payload = persist_context_reading(
         conversation_store, session_id, context_patch, observer=observe
     )
-    if eligibility_read_failed:
+    if eligibility_read_failed or not rotation_observed:
         return payload, None
     try:
         reloaded = conversation_store.get_conversation(session_id)
