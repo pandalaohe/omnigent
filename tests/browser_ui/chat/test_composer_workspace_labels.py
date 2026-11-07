@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests._helpers.workspace_geometry import workspace_bar_needs_collapse
 from tests.browser_ui.chat.session_contract import ChatSessionContract, message_item
 
 _WORKSPACE = "/workspace/projects/" + "long-unbroken-directory-name-" * 4 + "/checkout"
@@ -151,10 +152,9 @@ def test_composer_workspace_labels_use_available_width(
 
     # The bar shows the full names while they fit; once a name would have to
     # truncate, every chip drops to its icon instead of showing clipped text.
-    # The normalized inner padding (bar px-2 -> px-3, chip px-0.5 -> px-1)
-    # leaves ~10px less room at 390px, so even default-font readable names
-    # collapse to icons there.
-    collapsed = long_labels or viewport_width == 390
+    # Font metrics and control insets can leave readable names enough room even
+    # on mobile. Judge the expanded geometry instead of assuming a breakpoint.
+    collapsed = workspace_bar_needs_collapse(controls)
     if collapsed:
         expect(controls).to_have_attribute("data-labels", "collapsed")
         for label in controls.locator("span.truncate").all():
