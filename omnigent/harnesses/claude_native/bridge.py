@@ -8893,8 +8893,7 @@ def _tool_relay_handler_factory(
                 (authorization or "").encode(), f"Bearer {token}".encode()
             ) and (
                 pi_scope_relay is None
-                or self.path
-                in ("/hook/pi/extension-ui", "/pi/session-usage", "/hook/observe-tool")
+                or self.path in ("/hook/pi/extension-ui", "/pi/session-usage")
                 or pi_scope_relay.legacy_allowed()
             )
             if not legacy:

@@ -715,17 +715,7 @@ class PermissionTierRuntime:
             and (local_execution or pi_scope is not None)
             and self._harnesses.get(session_id) in ("pi", "pi-native")
         ):
-            from omnigent.permission_tiers import (
-                _AGY_ACTIONS,
-                _AGY_UNCHECKABLE,
-                _CONTROL_TOOLS,
-                _EDIT_PATH,
-                _EXEC_COMMAND,
-                _OPERATIONAL_TOOLS,
-                _QUESTION_TOOLS,
-                _READ_NO_PATH,
-                _READ_PATH,
-            )
+            from omnigent.permission_tiers import _READ_PATH
             from omnigent.permission_tiers.pi_tools import read_pi_tool_registry
 
             bridge = (
@@ -772,26 +762,6 @@ class PermissionTierRuntime:
                 read_path_arg = _READ_PATH.get(name)
                 if read_path_arg is None or isinstance(arguments.get(read_path_arg), str):
                     eval_local_execution = True
-                builtin_omnigent_tools = {
-                    *_READ_PATH,
-                    *_EDIT_PATH,
-                    *_EXEC_COMMAND,
-                    *_READ_NO_PATH,
-                    *_OPERATIONAL_TOOLS,
-                    *_QUESTION_TOOLS,
-                    *_CONTROL_TOOLS,
-                    *_AGY_UNCHECKABLE,
-                    *_AGY_ACTIONS,
-                    "call_mcp_tool",
-                    "sys_host_restart",
-                    "open_in_panel",
-                    "read_url_content",
-                    "sys_terminal_send",
-                    "sys_child_cap",
-                    "sys_child_checkin",
-                }
-                if name not in builtin_omnigent_tools and name not in extensions:
-                    extensions[name] = ""
         return evaluate_host_tool(
             state,
             name,

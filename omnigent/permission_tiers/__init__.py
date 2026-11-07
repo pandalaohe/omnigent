@@ -302,6 +302,7 @@ _READ_NO_PATH = frozenset(
         "search_marketplace",
         "list_permissions",
         "list_plugin_accounts",
+        "calculate",
     )
 )
 # These operations retain server authorization and must not bypass the plan gate.
