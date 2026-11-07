@@ -33,8 +33,11 @@ For lost-arm recovery, restart only the isolated runner after recording the
 request and observe recovery after two idle ticks. After two unsuccessful
 re-trigger calls and two further idle ticks, the transcript should tell the
 user to type `/clear`.
-An already injected revision is never injected again automatically; if SessionStart
-is late or absent, expect a rotation-unconfirmed warning instead. If abort cleanup
+Before sending a command, the server durably marks its request revision as claimed;
+if that write fails, no command is sent. A claimed revision is never retried
+automatically, including after a runner restart. A crash between the claim and
+delivery also leaves it unconfirmed; inspect the terminal before retrying manually.
+If SessionStart is late or absent, expect a rotation-unconfirmed warning. If abort cleanup
 cannot confirm an empty input box, the warning says "draft may remain": inspect
 and clear the terminal input before pressing Enter.
 

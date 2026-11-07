@@ -26,6 +26,7 @@ from omnigent.mcp_selection import MCP_SELECTION_PREFIX
 from omnigent.permission_tiers import PermissionTier
 from omnigent.runner.routing import RunnerRouter
 from omnigent.server.auth import LEVEL_EDIT, AuthProvider
+from omnigent.server.auto_rotation import INJECTED_REVISION_LABEL_KEY, _label_int
 from omnigent.server.child_cap import CHILD_CAP_LABEL_KEY
 from omnigent.server.permission_tiers import ConfirmedPermissionState, read_permission_state
 from omnigent.server.routes._auth_helpers import (
@@ -51,6 +52,7 @@ from omnigent.stores.conversation_store import (
     SUCCEEDED_BY_LABEL_KEY,
     SUCCEEDS_LABEL_KEY,
     ConversationStore,
+    LabelGroupChange,
     SuccessionRefusedError,
 )
 from omnigent.stores.peer_message_store import PeerMessageStore
@@ -150,6 +152,53 @@ def register_succession_routes(
             else None
         )
         return agent.name if agent is not None else conversation.agent_id or "omnigent"
+
+    @router.post("/sessions/{session_id}/handover/injection", response_model=None)
+    async def claim_rotation_injection(
+        request: Request, session_id: str, body: dict[str, str]
+    ) -> dict[str, str]:
+        """Durably consume one request before its runner can send a rotation command."""
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access_and_level(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        revision = _label_int(body.get("archive_revision"))
+        if revision is None:
+            raise OmnigentError("Invalid rotation revision", code=ErrorCode.INVALID_INPUT)
+        outcome = "not_requested"
+
+        def claim(labels: dict[str, str]) -> LabelGroupChange:
+            nonlocal outcome
+            outcome = "not_requested"
+            latest = conversation_store.get_conversation(session_id)
+            if (
+                latest is None
+                or latest.archived
+                or latest.parent_conversation_id is not None
+                or latest.archive_revision != revision
+                or labels.get(ROTATE_REQUESTED_LABEL_KEY) != str(revision)
+                or labels.get(SUCCEEDED_BY_LABEL_KEY)
+            ):
+                return LabelGroupChange({}, set())
+            native = _native_coding_agent_for_session(latest)
+            harness = (
+                native.harness
+                if native is not None
+                else _resolve_harness(latest, agent_store=agent_store)
+            )
+            if harness not in _ROTATION_NATIVE_HARNESSES:
+                return LabelGroupChange({}, set())
+            injected = _label_int(labels.get(INJECTED_REVISION_LABEL_KEY))
+            if injected is not None and injected >= revision:
+                outcome = "unconfirmed"
+                return LabelGroupChange({}, set())
+            outcome = "claimed"
+            return LabelGroupChange({INJECTED_REVISION_LABEL_KEY: str(revision)}, set())
+
+        await asyncio.to_thread(
+            conversation_store.mutate_label_group, session_id, "omnigent.", claim
+        )
+        return {"status": outcome}
 
     @router.post("/sessions/{session_id}/successor", status_code=200, response_model=None)
     async def create_session_successor(request: Request, session_id: str) -> dict[str, str]:

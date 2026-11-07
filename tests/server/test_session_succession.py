@@ -29,6 +29,7 @@ from omnigent.server import session_succession as succession_module
 from omnigent.server.app import create_app
 from omnigent.server.archive_close import ArchiveCloseCoordinator
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, RESERVED_USER_LOCAL, UnifiedAuthProvider
+from omnigent.server.auto_rotation import INJECTED_REVISION_LABEL_KEY
 from omnigent.server.child_cap import CHILD_CAP_LABEL_KEY
 from omnigent.server.permission_tiers import (
     PERMISSION_CAPABILITY_LABEL_KEY,
@@ -1195,6 +1196,16 @@ async def test_succession_auth_requires_edit_on_target(
         )
     assert response.status_code == 403
     assert store.get_succession(old, new) is None
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            f"/v1/sessions/{new}/handover/injection",
+            json={"archive_revision": "0"},
+            headers={"X-Forwarded-Email": "bob@example.com"},
+        )
+    assert response.status_code == 403
+    unchanged = store.get_conversation(new)
+    assert unchanged is not None
+    assert INJECTED_REVISION_LABEL_KEY not in unchanged.labels
 
 
 async def test_succession_undelivered_wake_stays_rekeyed_and_keeps_old_cards(

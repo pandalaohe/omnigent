@@ -51,6 +51,7 @@ from omnigent.server.routes._sessions.helpers import (
         "omnigent.codex_native.subagent_thread_id",
         "OMNIGENT.ARTIFACT_LINK_KEY",
         "omnigent.rotate_requested",
+        "omnigent.auto_rotation_state.injected_revision",
         "cost_control.policy",
     ],
 )

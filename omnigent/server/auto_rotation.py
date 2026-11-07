@@ -35,6 +35,7 @@ AUTO_ROTATION_STATE_PREFIX = "omnigent.auto_rotation_state."
 FRESH_ROUND_LABEL_KEY = f"{AUTO_ROTATION_STATE_PREFIX}fresh_round"
 NOTICED_COUNT_LABEL_KEY = f"{AUTO_ROTATION_STATE_PREFIX}noticed_count"
 INFERRED_COMPACTIONS_LABEL_KEY = f"{AUTO_ROTATION_STATE_PREFIX}inferred_compactions"
+INJECTED_REVISION_LABEL_KEY = f"{AUTO_ROTATION_STATE_PREFIX}injected_revision"
 
 
 def _label_int(value: str | None, minimum: int = 0, maximum: int | None = None) -> int | None:

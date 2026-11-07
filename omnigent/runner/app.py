@@ -6089,6 +6089,7 @@ def create_runner_app(
         request's durable record. The server may re-trigger a lost arm through
         the guarded executor; failures leave the durable request intact.
         """
+        from omnigent.server.auto_rotation import INJECTED_REVISION_LABEL_KEY
         from omnigent.stores.conversation_store import ROTATE_REQUESTED_LABEL_KEY
 
         try:
@@ -6142,6 +6143,10 @@ def create_runner_app(
             started = rotations_started.get(conv_id)
             if started is not None and revision <= int(started[0]):
                 return started[1] if revision == int(started[0]) else "superseded"
+            injected = labels.get(INJECTED_REVISION_LABEL_KEY)
+            if isinstance(injected, str) and injected.isascii() and injected.isdecimal():
+                if int(injected) >= revision:
+                    return "unconfirmed"
         completed_pi_source = (
             harness == "pi"
             and isinstance(labels, dict)
@@ -6179,6 +6184,25 @@ def create_runner_app(
                 return "not_requested"
         if require_label and _rotation_session_busy(conv_id):
             return "busy"
+        if require_label:
+            try:
+                claim = await server_client.post(
+                    f"/v1/sessions/{urllib.parse.quote(conv_id, safe='')}/handover/injection",
+                    json={"archive_revision": str(snapshot["archive_revision"])},
+                    timeout=10.0,
+                )
+                claim.raise_for_status()
+                outcome = claim.json().get("status")
+                if outcome != "claimed":
+                    return "unconfirmed" if outcome == "unconfirmed" else "not_requested"
+            except Exception:
+                _logger.warning(
+                    "Could not persist rotation injection for %s", conv_id, exc_info=True
+                )
+                return "not_requested"
+            rotations_started[conv_id] = (str(snapshot["archive_revision"]), "unconfirmed")
+            if _rotation_session_busy(conv_id):
+                return "busy"
         try:
             if harness == "claude-native":
                 response = await _handle_claude_native_slash_command(

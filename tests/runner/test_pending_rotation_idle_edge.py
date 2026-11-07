@@ -19,6 +19,7 @@ import pytest
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.runner import app as runner_app
 from omnigent.runner import create_runner_app
+from omnigent.server.auto_rotation import INJECTED_REVISION_LABEL_KEY
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.conftest import (
     _FakeProcessManager,
@@ -56,6 +57,8 @@ class _RotationServerClient:
         self.bound: list[dict[str, Any]] = []
         self.errors: list[dict[str, Any]] = []
         self.labels: dict[str, str] = {}
+        self.claims: list[str] = []
+        self.fail_claim = False
         if rotate_label is not None:
             self.labels["omnigent.rotate_requested"] = rotate_label
 
@@ -90,6 +93,19 @@ class _RotationServerClient:
         )
 
     async def post(self, url: str, **kwargs: Any) -> httpx.Response:
+        if url.endswith("/handover/injection"):
+            revision = kwargs["json"]["archive_revision"]
+            self.claims.append(revision)
+            outcome = "claimed"
+            if self.labels.get(INJECTED_REVISION_LABEL_KEY) == revision:
+                outcome = "unconfirmed"
+            elif not self.fail_claim:
+                self.labels[INJECTED_REVISION_LABEL_KEY] = revision
+            return httpx.Response(
+                503 if self.fail_claim else 200,
+                json={"status": outcome},
+                request=httpx.Request("POST", f"http://test{url}"),
+            )
         if (
             url.endswith("/events")
             and kwargs.get("json", {}).get("type") == "external_conversation_item"
@@ -225,11 +241,33 @@ async def test_injected_revision_survives_late_session_start_and_prunes(monkeypa
             server.archived = True
             assert (await client.post(url)).json() == {"status": "not_requested"}
             server.archived = False
-            assert (await client.post(url)).json() == {"status": "started"}
+            assert (await client.post(url)).json() == {"status": "unconfirmed"}
         assert (await client.delete(f"/v1/sessions/{CONV_ID}")).status_code == 200
         await _seed_session(client)
+        assert (await client.post(url)).json() == {"status": "unconfirmed"}
+    assert len(effects) == 2
+
+
+@pytest.mark.asyncio
+async def test_rotation_requires_a_durable_claim_before_injection(monkeypatch):
+    effects = []
+    server = _RotationServerClient()
+    server.fail_claim = True
+
+    def inject(*args, **kwargs):
+        assert server.labels[INJECTED_REVISION_LABEL_KEY] == "0"
+        effects.append(kwargs["command"])
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", inject)
+    async with _runner_client(_build_app(server)) as client:
+        await _seed_session(client)
+        url = f"/v1/sessions/{CONV_ID}/pending-rotation"
+        assert (await client.post(url)).json() == {"status": "not_requested"}
+        assert not effects
+        assert INJECTED_REVISION_LABEL_KEY not in server.labels
+        server.fail_claim = False
         assert (await client.post(url)).json() == {"status": "started"}
-    assert len(effects) == (4 if end == "archive" else 3)
+    assert effects == ["/clear"]
 
 
 @pytest.mark.asyncio

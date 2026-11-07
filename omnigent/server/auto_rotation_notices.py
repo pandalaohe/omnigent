@@ -290,7 +290,7 @@ class AutoRotationNotices:
                                 "Rotation unconfirmed; draft may remain. Inspect and clear "
                                 "the terminal input before pressing Enter."
                                 if retry.draft_may_remain
-                                else "Rotation unconfirmed. The command was already injected "
+                                else "Rotation unconfirmed. An injection attempt was recorded "
                                 "and will not be retried automatically. Inspect the terminal "
                                 "before typing /clear."
                                 if retry.unconfirmed
