@@ -3773,6 +3773,7 @@ async def _persist_external_session_usage(
     user_id: str | None = None,
     host_installation_id: str | None = None,
     quota_service: Any = None,
+    auto_rotation_app_state: Any = None,
 ) -> int | None:
     """
     Persist and broadcast a token-usage update from a terminal-backed runtime.
@@ -3936,6 +3937,13 @@ async def _persist_external_session_usage(
                 model=_n_model,
             )
         )
+    previous_context_tokens = None
+    if raw_tokens is not None and auto_rotation_app_state is not None:
+        previous_context = await asyncio.to_thread(
+            conversation_store.get_conversation, session_id
+        )
+        if previous_context is not None:
+            previous_context_tokens = previous_context.labels.get("omnigent.last_context_tokens")
     context_payload = await asyncio.to_thread(
         persist_context_reading, conversation_store, session_id, body.data
     )
@@ -3950,12 +3958,22 @@ async def _persist_external_session_usage(
         label_updates[_LAST_CACHE_LABEL_KEY] = (
             f"{last_cache_read},{last_cache_creation},{last_cache_observed_at}"
         )
-    if label_updates:
+    if raw_tokens is not None and auto_rotation_app_state is not None:
+        from omnigent.server.auto_rotation import record_auto_rotation_usage
+
         await asyncio.to_thread(
-            conversation_store.set_labels,
+            record_auto_rotation_usage,
             session_id,
             label_updates,
+            previous_context_tokens,
+            conversation_store,
+            getattr(auto_rotation_app_state, "permission_store", None),
+            getattr(auto_rotation_app_state, "user_preferences_store", None),
+            conv,
         )
+    else:
+        if label_updates:
+            await asyncio.to_thread(conversation_store.set_labels, session_id, label_updates)
     if has_pi_cache and pi_cache_ttl is None:
         await asyncio.to_thread(conversation_store.delete_label, session_id, "omnigent.pi_cache")
     if has_provider_usage_limits:

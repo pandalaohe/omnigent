@@ -146,6 +146,7 @@ from omnigent.stores.conversation_store import (
     ARCHIVE_WORKTREE_MODE_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
     ARTIFACT_LINK_KEY_LABEL,
+    COMPACTION_COUNT_CAP,
     FORK_CARRY_HISTORY_LABEL_KEY,
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
@@ -162,6 +163,7 @@ from omnigent.stores.conversation_store import (
     ArchiveCloseClaimResult,
     ArchivedConversationFacets,
     ArchiveLockWriteResult,
+    CompactionStats,
     ConversationAlreadyExistsError,
     ConversationArchiveClosingError,
     ConversationNotFoundError,
@@ -4901,6 +4903,41 @@ class SqlAlchemyConversationStore(ConversationStore):
                 last_id=items[-1].id if items else None,
                 has_more=has_more,
             )
+
+    def get_compaction_stats(self, conversation_id: str) -> CompactionStats:
+        """
+        Return the compaction aggregate for one conversation.
+
+        Aggregates over the newest ``COMPACTION_COUNT_CAP`` compaction
+        items, walked newest-first on the conversation/type/position
+        index, so a snapshot does bounded work however many times the
+        session has compacted; ``count`` saturates at the cap.
+
+        :param conversation_id: Unique conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :returns: A :class:`CompactionStats`; ``count=0`` with
+            ``last_compaction_at=None`` when the conversation has no
+            compaction items (or does not exist).
+        """
+        newest = (
+            select(SqlConversationItem.created_at)
+            .where(
+                SqlConversationItem.workspace_id == current_workspace_id(),
+                SqlConversationItem.conversation_id == conversation_id,
+                SqlConversationItem.type == encode_item_type("compaction"),
+            )
+            .order_by(SqlConversationItem.position.desc())
+            .limit(COMPACTION_COUNT_CAP)
+            .subquery()
+        )
+        with self._conv_session("select_compaction_stats") as session:
+            count, last_at = session.execute(
+                select(func.count(), func.max(newest.c.created_at)).select_from(newest)
+            ).one()
+        return CompactionStats(
+            count=int(count or 0),
+            last_compaction_at=int(last_at) if last_at is not None else None,
+        )
 
     @staticmethod
     def _resolve_item_cursor_position(
@@ -9694,6 +9731,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 and not key.startswith(f"{_SANDBOX_REPO_LABEL_KEY}.")
                 and not key.startswith(f"{ARCHIVE_CASCADE_LABEL_KEY}.")
                 and not key.startswith(CHECKIN_LABEL_PREFIX)
+                and not key.startswith("omnigent.auto_rotation_state.")
                 and not key.startswith("omnigent.standing_approval.")
                 and not key.startswith("omnigent.standing_pass.")
                 and key != PROJECT_ARCHIVE_LABEL_KEY

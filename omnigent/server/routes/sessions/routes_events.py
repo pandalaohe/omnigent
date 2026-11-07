@@ -4347,6 +4347,7 @@ def register_events_routes(
                 user_id,
                 _tel_parse_installation_id(request.headers.get(_TEL_INSTALLATION_ID_HEADER)),
                 quota_service=getattr(request.app.state, "agent_quota_service", None),
+                auto_rotation_app_state=request.app.state,
             )
             return {"queued": False}
         if body.type == _EXTERNAL_MODEL_CHANGE_TYPE:

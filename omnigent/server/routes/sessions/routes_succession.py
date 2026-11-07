@@ -102,6 +102,9 @@ def _successor_labels(
             WORKTREE_ROOT_LABEL_KEY,
             PROJECT_LABEL_KEY,
             CHILD_CAP_LABEL_KEY,
+            "omnigent.auto_rotation",
+            "omnigent.auto_rotation.compactions",
+            "omnigent.auto_rotation.remaining_pct",
         }
         or key.startswith(MCP_SELECTION_PREFIX)
         or not key.startswith(("omnigent.", "omnigent:", "cost_control."))
