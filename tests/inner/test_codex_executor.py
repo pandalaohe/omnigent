@@ -6397,6 +6397,60 @@ def test_extract_codex_last_turn_usage_handles_missing_or_malformed() -> None:
     assert _extract_codex_last_turn_usage({"tokenUsage": {"total": {}}}, "gpt-5.4-mini") is None
 
 
+async def test_codex_context_metadata_read_is_lazy_and_resets_on_worker_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.inner import codex_executor as module
+
+    monkeypatch.setattr(module, "_codex_home_config_source_from_env", lambda: tmp_path / "empty")
+    monkeypatch.setattr(module, "codex_minimal_config_requested", lambda: True)
+    monkeypatch.setattr(module._proc, "native_server_pid", lambda *_args: None)
+
+    async def spawn(*_args, **_kwargs):
+        proc = _FakeProcess()
+        proc.stdout = _ScriptedStdoutPipe([])
+        return proc
+
+    monkeypatch.setattr(module, "_create_subprocess_exec", AsyncMock(side_effect=spawn))
+    session = _CodexAppServerSession(
+        codex_path="/opt/work/bin/codex", cwd=str(tmp_path), env={}, tool_executor=None
+    )
+    session._request = AsyncMock(return_value={"result": {}})
+    homes = []
+
+    def metadata():
+        homes.append(session._codex_home_dir)
+        return {}, {}
+
+    read = Mock(side_effect=metadata)
+    monkeypatch.setattr(session, "_read_context_metadata", read)
+
+    async def notice(usage):
+        session._events.put_nowait(
+            {"method": "thread/tokenUsage/updated", "params": {"tokenUsage": usage}}
+        )
+        session._events.put_nowait(
+            {"method": "turn/completed", "params": {"turn": {"id": "turn"}}}
+        )
+        await session._drain_final_answer_tail(active_turn_id="turn", model=None)
+
+    try:
+        for cycle in range(2):
+            await session.start()
+            assert read.call_count == cycle
+            for usage in ({}, {"modelContextWindow": 0}, {"modelContextWindow": True}):
+                await notice(usage)
+                assert read.call_count == cycle
+            for _ in range(2):
+                await notice({"modelContextWindow": 200000})
+                assert read.call_count == cycle + 1
+            assert homes[-1] == session._codex_home_dir
+            await session.close()
+        assert homes[0] != homes[1]
+    finally:
+        await session.close()
+
+
 async def test_codex_context_catalog_loads_on_usage_and_is_reused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
