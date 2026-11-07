@@ -65,7 +65,7 @@ export function ViewModeToggle({ hotkeyEnabled = true, alwaysVisible = false } =
     <div
       ref={segmentedRef}
       data-testid="view-mode-toggle"
-      className="shrink-0"
+      className="h-full max-h-10 shrink-0"
       onFocusCapture={(event) => {
         const testId = (event.target as HTMLElement).dataset.testid;
         if (testId === "view-mode-chat") setOpenView("chat");
@@ -77,6 +77,7 @@ export function ViewModeToggle({ hotkeyEnabled = true, alwaysVisible = false } =
     >
       <Segmented
         label="Switch between chat and terminal"
+        fitHeight
         options={[
           {
             value: "chat",
