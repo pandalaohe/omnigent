@@ -274,3 +274,75 @@ async def test_handover_empty_text_refused(
     assert response.status_code == 400, response.text
     assert "invalid_input" in response.text
     assert _handover_messages(store, session_id) == []
+
+
+@pytest.mark.parametrize(
+    "harness", ["claude-native", "codex-native", "pi", "pi-native", "antigravity-native"]
+)
+@pytest.mark.parametrize("mode", ["off", "due", "compacted", "above_threshold"])
+async def test_auto_handover_rechecks_context(client, store, harness, mode):
+    from omnigent.server.auto_rotation import FRESH_ROUND_LABEL_KEY, NOTICED_COUNT_LABEL_KEY
+
+    conv = store.create_conversation(harness_override=harness)
+    marker = "4" if harness == "antigravity-native" else "0"
+    store.set_labels(
+        conv.id,
+        {
+            "omnigent.auto_rotation": "off" if mode == "off" else "on",
+            "omnigent.last_context_tokens": "100000" if mode == "above_threshold" else "150000",
+            "omnigent.last_auto_compact_token_limit": "200000",
+            "omnigent.auto_rotation_state.inferred_compactions": "4",
+            FRESH_ROUND_LABEL_KEY: marker,
+            NOTICED_COUNT_LABEL_KEY: "previous" if mode == "compacted" else marker,
+        },
+    )
+    response = await client.post(
+        f"/v1/sessions/{conv.id}/handover",
+        json={"handover": "Continue.", "rotate": True, "auto": True},
+    )
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["rotate"] is (mode == "due")
+    assert (
+        result["deferred"]
+        == {
+            "off": "switch_off",
+            "due": None,
+            "compacted": "compacted",
+            "above_threshold": "above_threshold",
+        }[mode]
+    )
+    labels = store.get_conversation(conv.id).labels
+    assert HANDOVER_ITEM_LABEL_KEY in labels
+    assert (ROTATE_REQUESTED_LABEL_KEY in labels) is (mode == "due")
+    if mode in {"off", "above_threshold"}:
+        assert NOTICED_COUNT_LABEL_KEY not in labels
+
+
+async def test_auto_without_rotation_is_invalid(client, store):
+    session_id = _create(store)
+    response = await client.post(
+        f"/v1/sessions/{session_id}/handover",
+        json={"handover": "Continue.", "rotate": False, "auto": True},
+    )
+    assert response.status_code == 400
+    assert _handover_messages(store, session_id) == []
+
+
+async def test_metadata_exposes_archive_revision_for_stale_rotation_guard(client, store):
+    agent = SqlAlchemyAgentStore(store.storage_location).create(
+        "a" * 32, "test-agent", "unused-bundle"
+    )
+    session_id = store.create_conversation(agent_id=agent.id, harness_override="codex-native").id
+    store.set_labels(session_id, {ROTATE_REQUESTED_LABEL_KEY: "0"})
+    store.update_conversation(session_id, archived=True)
+    store.update_conversation(session_id, archived=False)
+    response = await client.get(
+        f"/v1/sessions/{session_id}",
+        params={"include_items": "false", "include_liveness": "false"},
+    )
+    assert response.status_code == 200, response.text
+    snapshot = response.json()
+    assert snapshot["archive_revision"] == store.get_conversation(session_id).archive_revision
+    assert snapshot["archive_revision"] > 0
+    assert snapshot["labels"][ROTATE_REQUESTED_LABEL_KEY] == "0"

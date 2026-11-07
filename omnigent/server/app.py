@@ -2583,11 +2583,17 @@ def create_app(
         if child_idle is not None:
             await child_idle.start(app_inst)
 
+        auto_rotation_notices = getattr(app_inst.state, "auto_rotation_notices", None)
+        if auto_rotation_notices is not None:
+            await auto_rotation_notices.start(app_inst)
+
         session_pull_requests.install_refresher(pull_request_refresher)
         try:
             with monitor_event_loop():
                 yield
         finally:
+            if auto_rotation_notices is not None:
+                await auto_rotation_notices.shutdown()
             if usage_price_task is not None:
                 usage_price_task.cancel()
                 with suppress(asyncio.CancelledError):

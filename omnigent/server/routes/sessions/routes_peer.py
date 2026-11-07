@@ -2351,8 +2351,19 @@ def register_peer_routes(
         resume_child=_resume_frozen_child,
     )
     if app_state is not None:
+        from omnigent.server.auto_rotation_notices import AutoRotationNotices
         from omnigent.server.host_load_notices import HostLoadNotices
 
+        app_state.auto_rotation_notices = AutoRotationNotices(
+            conversation_store=conversation_store,
+            permission_store=permission_store,
+            prefs_store=getattr(app_state, "user_preferences_store", None),
+            runner_router=runner_router,
+            owner_for=lambda conv: effective_owner_id(conv, conversation_store, permission_store),
+            owns_parent=_owns_idle_parent,
+            true_state=_true_state,
+            post_event=post_event_impl,
+        )
         app_state.host_load_notices = HostLoadNotices(
             conversation_store=conversation_store,
             owner_for=lambda conv: effective_owner_id(conv, conversation_store, permission_store),

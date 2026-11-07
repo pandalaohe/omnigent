@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Literal, TypedDict
 
 from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
@@ -62,7 +62,11 @@ def context_reading_from_labels(labels: Mapping[str, str]) -> ContextReading | N
 
 
 def persist_context_reading(
-    store: ConversationStore, session_id: str, patch: Mapping[str, object]
+    store: ConversationStore,
+    session_id: str,
+    patch: Mapping[str, object],
+    *,
+    observer: Callable[[dict[str, str], LabelGroupChange], LabelGroupChange] | None = None,
 ) -> dict[str, object]:
     """Apply a usage patch atomically and return its canonical context event fields.
 
@@ -99,9 +103,12 @@ def persist_context_reading(
                     deletes.add(label)
                 else:
                     upserts[label] = str(value)
-        return LabelGroupChange(upserts=upserts, deletes=deletes)
+        update = LabelGroupChange(upserts=upserts, deletes=deletes)
+        return observer(labels, update) if observer is not None else update
 
-    labels = store.mutate_label_group(session_id, "omnigent.last_", change)
+    labels = store.mutate_label_group(
+        session_id, "omnigent." if observer is not None else "omnigent.last_", change
+    )
     result: dict[str, object] = {"context_tokens": tokens} if has_tokens else {}
     if has_limits:
         reading = context_reading_from_labels(labels)

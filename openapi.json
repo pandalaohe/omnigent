@@ -3875,7 +3875,8 @@
               {
                 "enum": [
                   "error",
-                  "info"
+                  "info",
+                  "warning"
                 ],
                 "type": "string"
               },
@@ -9639,6 +9640,11 @@
       "SessionHandoverRequest": {
         "description": "Request body for `POST /v1/sessions/{session_id}/handover`.\n\nRecords a handover note on a top-level native session and optionally\nrequests that the session rotate at its next turn end.",
         "properties": {
+          "auto": {
+            "default": false,
+            "title": "Auto",
+            "type": "boolean"
+          },
           "handover": {
             "description": "The note the successor session opens with. Must be non-empty after stripping whitespace.",
             "minLength": 1,
@@ -11325,6 +11331,12 @@
             ],
             "description": "Why the session was archived, read from the `omnigent.archive_reason` label (e.g. `\"host_offline\"` when the keep-warm sweeper retired a child under an offline host). `None` when the user archived it or the row is not archived.",
             "title": "Archive Reason"
+          },
+          "archive_revision": {
+            "default": 0,
+            "format": "int64",
+            "title": "Archive Revision",
+            "type": "integer"
           },
           "archived": {
             "default": false,

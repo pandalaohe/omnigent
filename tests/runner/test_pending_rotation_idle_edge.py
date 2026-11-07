@@ -43,6 +43,8 @@ class _RotationServerClient:
         parent_session_id: str | None = None,
     ) -> None:
         self.archived = archived
+        self.archive_revision = 0
+        self.enabled = True
         self.harness = harness
         self.succession_status = succession_status
         self.succession_http_status = succession_http_status
@@ -59,6 +61,16 @@ class _RotationServerClient:
     async def get(self, url: str, **kwargs: Any) -> httpx.Response:
         del kwargs
         path = url.split("?")[0]
+        if path.endswith("/auto-rotation"):
+            return httpx.Response(
+                200,
+                request=httpx.Request("GET", f"http://test{url}"),
+                json={
+                    "enabled": self.enabled,
+                    "eligible": not self.archived,
+                    "rotation_pending": bool(self.labels.get("omnigent.rotate_requested")),
+                },
+            )
         if path.endswith("/labels"):
             return httpx.Response(200, json={"labels": self.labels})
         return httpx.Response(
@@ -66,6 +78,7 @@ class _RotationServerClient:
             request=httpx.Request("GET", f"http://test{url}"),
             json={
                 "archived": self.archived,
+                "archive_revision": self.archive_revision,
                 "labels": self.labels,
                 "harness": self.harness,
                 "agent_id": "ag_rotation",
@@ -107,7 +120,9 @@ class _RotationServerClient:
         )
 
 
-def _build_app(server_client: _RotationServerClient, process_manager: Any = None) -> Any:
+def _build_app(
+    server_client: _RotationServerClient, process_manager: Any = None, **kwargs: Any
+) -> Any:
     """Build a runner app wired to a claude-native spec and the test server."""
     spec = AgentSpec(
         spec_version=1,
@@ -123,6 +138,7 @@ def _build_app(server_client: _RotationServerClient, process_manager: Any = None
         process_manager=process_manager or _FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
         spec_resolver=_resolver,
         server_client=server_client,  # type: ignore[arg-type]
+        **kwargs,
     )
 
 
@@ -410,3 +426,111 @@ async def test_agy_clear_entries_share_confirmation_and_report_failure(
     assert len(server.errors) == int(failure)
     if failure:
         assert "clear_no_new_root" in server.errors[0]["message"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "harness", ["claude-native", "codex-native", "pi", "pi-native", "antigravity-native"]
+)
+async def test_retrigger_and_idle_share_guard_and_skip_superseded(monkeypatch, tmp_path, harness):
+    from omnigent.harnesses.antigravity_native import reader
+    from omnigent.inner.terminal import TerminalInstance
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+    from omnigent.terminals import TerminalRegistry
+
+    server = _RotationServerClient(harness=harness)
+    manager = _FakeProcessManager(_ScriptedHarnessClient([]))
+    effects = []
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "inject_slash_command",
+        lambda *args, **kw: effects.append(kw["command"]),
+    )
+    monkeypatch.setattr(
+        claude_native_bridge, "_run_tmux", lambda *args: effects.append(args) or ""
+    )
+
+    async def clear(**kwargs):
+        effects.append(kwargs["old_session_id"])
+        return "next"
+
+    monkeypatch.setattr(reader, "clear_session", clear)
+    options = {}
+    if harness in {"codex-native", "pi-native"}:
+        registry = TerminalRegistry()
+        terminal = "codex" if harness == "codex-native" else "pi"
+        registry._by_conversation[CONV_ID] = {
+            (terminal, "main"): TerminalInstance(
+                name=terminal,
+                session_key="main",
+                socket_path=tmp_path / "socket",
+                private_dir=tmp_path,
+                running=True,
+            )
+        }
+        options["resource_registry"] = SessionResourceRegistry(terminal_registry=registry)
+    app = _build_app(server, manager, **options)
+    original_get = server.get
+    entered, release = asyncio.Event(), asyncio.Event()
+    async with _runner_client(app, permission_harness=harness) as client:
+        await _seed_session(client)
+
+        async def blocked_get(url, **kwargs):
+            if not entered.is_set():
+                entered.set()
+                await release.wait()
+            return await original_get(url, **kwargs)
+
+        server.get = blocked_get
+        first = asyncio.create_task(client.post(f"/v1/sessions/{CONV_ID}/pending-rotation"))
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        second = await client.post(f"/v1/sessions/{CONV_ID}/pending-rotation")
+        assert second.json() == {"status": "in_flight"}
+        runner_app.record_pending_rotation(CONV_ID)
+        if harness == "pi":
+            app.state.on_proxy_stream_end(CONV_ID)
+        else:
+            await _post_idle(client)
+        await asyncio.sleep(0)
+        release.set()
+        result = await first
+        assert result.json() == {"status": "started"}
+        if harness == "pi":
+            assert len(server.succession) == 1
+        elif harness in {"codex-native", "pi-native"}:
+            command = "/clear" if harness == "codex-native" else "/new"
+            assert sum(command in row for row in effects) == 1
+        else:
+            assert len(effects) == 1
+        before = list(effects)
+        server.labels["omnigent.succeeded_by"] = "next"
+        result = await client.post(f"/v1/sessions/{CONV_ID}/pending-rotation")
+        assert result.json() == {"status": "superseded"}
+        assert effects == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure", ["switch_off", "stale_revision", "missing_revision", "expected_revision"]
+)
+async def test_recovery_fails_closed_on_disabled_or_stale_request(monkeypatch, failure):
+    effects = []
+    monkeypatch.setattr(
+        claude_native_bridge, "inject_slash_command", lambda *args, **kwargs: effects.append(args)
+    )
+    server = _RotationServerClient()
+    if failure == "switch_off":
+        server.enabled = False
+    elif failure == "stale_revision":
+        server.archive_revision = 1
+    elif failure == "missing_revision":
+        server.archive_revision = None
+    app = _build_app(server)
+    async with _runner_client(app) as client:
+        await _seed_session(client)
+        result = await client.post(
+            f"/v1/sessions/{CONV_ID}/pending-rotation",
+            json={"archive_revision": "1" if failure == "expected_revision" else "0"},
+        )
+        assert result.json() == {"status": "not_requested"}
+        assert effects == []

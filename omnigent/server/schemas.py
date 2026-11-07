@@ -2870,6 +2870,7 @@ class SessionResponse(BaseModel):
     workspace: str | None = None
     worktree: str | None = None
     git_branch: str | None = None
+    archive_revision: int = 0
     archived: bool = False
     todos: list[dict[str, Any]] = Field(default_factory=list)
     model_options: list[NativeModelOption] = Field(default_factory=list)
@@ -3248,6 +3249,7 @@ class SessionHandoverRequest(BaseModel):
 
     handover: str = Field(min_length=1)
     rotate: bool = True
+    auto: bool = False
 
 
 class SessionForkRequest(BaseModel):
