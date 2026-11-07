@@ -758,6 +758,61 @@ def _event_body_too_large() -> HTTPException:
     )
 
 
+# A compaction boundary's optional stable identity, bounded like an external
+# item's ``source_id``.
+_COMPACTION_SOURCE_ID_MAX_CHARS = 256
+
+
+def _compaction_source_id(data: Mapping[str, Any]) -> str | None:
+    """
+    Validate and return a ``compaction`` event's optional stable source id.
+
+    Producers that can post one compaction boundary more than once — the
+    claude-native and codex-native forwarders after a retried POST or a
+    replayed native turn — send the boundary's own identity so the second
+    post is recognised as the same compaction.
+
+    :param data: The event's ``data`` payload, e.g.
+        ``{"summary": ..., "last_item_id": ..., "source_id": "summary-uuid"}``.
+    :returns: The stripped source id, or ``None`` when the event carries none.
+    :raises OmnigentError: If one is present but not a non-empty string of at
+        most :data:`_COMPACTION_SOURCE_ID_MAX_CHARS` characters.
+    """
+    source_id = data.get("source_id")
+    if source_id is None:
+        return None
+    if (
+        not isinstance(source_id, str)
+        or not source_id.strip()
+        or len(source_id) > _COMPACTION_SOURCE_ID_MAX_CHARS
+    ):
+        raise OmnigentError(
+            "compaction source_id must be a non-empty string up to "
+            f"{_COMPACTION_SOURCE_ID_MAX_CHARS} characters",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return source_id.strip()
+
+
+def _compaction_item_id(session_id: str, source_id: str) -> str:
+    """
+    Return the store id one compaction boundary's source identity derives.
+
+    The id is stable across repeated posts of the same boundary, so a replayed
+    Codex turn or a retried forwarder POST finds the existing row instead of
+    appending a second compaction. Same derivation shape as the store's
+    ``_idempotent_item_id``, with the session id keeping two sessions' equal
+    source ids apart.
+
+    :param session_id: Session/conversation the boundary belongs to.
+    :param source_id: The boundary's vendor-side identity, e.g.
+        ``"0f1e2d3c:0:compact_summary"``.
+    :returns: A 32-char lowercase hex item id.
+    """
+    key = json.dumps([session_id, f"compaction:{source_id}"])
+    return hashlib.sha256(key.encode()).hexdigest()[:32]
+
+
 class _SessionEventBodyLimitRoute(APIRoute):
     """Reject oversized event bodies before FastAPI parses them."""
 
@@ -3412,17 +3467,28 @@ def register_events_routes(
         if body.type == "compaction":
             import uuid as _uuid
 
+            source_id = _compaction_source_id(body.data)
             item = NewConversationItem(
                 type="compaction",
                 response_id=f"compact_{_uuid.uuid4().hex}",
                 data=parse_item_data("compaction", body.data),
+                # An identified boundary is stored under its source-derived id:
+                # a re-post (forwarder retry, replayed native turn) is a no-op
+                # and leaves the compaction count unchanged.
+                stable_id=(
+                    _compaction_item_id(session_id, source_id) if source_id is not None else None
+                ),
             )
-            await asyncio.to_thread(
+            persisted = await asyncio.to_thread(
                 conversation_store.append,
                 session_id,
                 [item],
             )
-            return {"queued": True}
+            return {
+                "queued": True,
+                "item_id": persisted[0].id,
+                "replayed": persisted[0].deduplicated,
+            }
         if body.type == _EXTERNAL_ASSISTANT_MESSAGE_TYPE:
             item_id = await _persist_external_assistant_message(
                 session_id,
