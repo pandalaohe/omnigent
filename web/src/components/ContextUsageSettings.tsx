@@ -440,7 +440,7 @@ function DraftFields({
   onSubmit,
   labelFor,
   placeholder,
-  note,
+  renderNote,
   error,
 }: {
   draft: Draft;
@@ -449,7 +449,7 @@ function DraftFields({
   onSubmit: () => void;
   labelFor: (field: DraftField | "unit") => string;
   placeholder: (field: DraftField) => string;
-  note?: (field: DraftField) => ReactNode;
+  renderNote?: (field: DraftField) => ReactNode;
   error: string;
 }) {
   const submitOnEnter = (event: KeyboardEvent<HTMLInputElement>) => {
@@ -476,7 +476,9 @@ function DraftFields({
           />
           <span className="px-1 text-sm text-muted-foreground">tokens</span>
         </span>
-        {note ? <span className="text-xs text-muted-foreground">{note("context")}</span> : null}
+        {renderNote ? (
+          <span className="text-xs text-muted-foreground">{renderNote("context")}</span>
+        ) : null}
       </label>
       <div className="grid gap-1.5">
         <span className="flex items-center gap-1.5 text-sm font-medium">
@@ -516,7 +518,9 @@ function DraftFields({
             onChange={(mode) => onChange({ ...draft, mode })}
           />
         </div>
-        {note ? <span className="text-xs text-muted-foreground">{note("buffer")}</span> : null}
+        {renderNote ? (
+          <span className="text-xs text-muted-foreground">{renderNote("buffer")}</span>
+        ) : null}
       </div>
       {error ? (
         <p role="alert" className="text-sm text-destructive">
@@ -604,7 +608,7 @@ function LevelFields({
             ? "Auto"
             : `${inheritedBuffer}${inherited.buffer.mode === "percent" ? "%" : ""}`
       }
-      note={(field) =>
+      renderNote={(field) =>
         field === "context" ? (
           valueNote(
             draft.context,

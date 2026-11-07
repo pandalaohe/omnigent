@@ -4,15 +4,24 @@ from __future__ import annotations
 
 import hashlib
 import secrets
+from collections.abc import Iterator
 
 import pytest
 from starlette.requests import Request
 
+from omnigent.db.account_authority import account_authority_scope
 from omnigent.server.accounts_config import AccountsConfig
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.routes.device_auth import mint_delegated_token
 
 _KEY = b"test-usage-reader-key-32-bytes-long"
+
+
+@pytest.fixture(autouse=True)
+def isolated_account_authority() -> Iterator[None]:
+    # Direct provider calls have no request middleware to restore their context.
+    with account_authority_scope(None, None):
+        yield
 
 
 def _provider() -> UnifiedAuthProvider:

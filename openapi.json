@@ -1248,6 +1248,33 @@
         "title": "BrowserActionRequestEvent",
         "type": "object"
       },
+      "BuiltinPromptPatch": {
+        "properties": {
+          "base_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Base Sha256",
+            "type": "string"
+          },
+          "text": {
+            "anyOf": [
+              {
+                "maxLength": 262144,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Text"
+          }
+        },
+        "required": [
+          "text",
+          "base_sha256"
+        ],
+        "title": "BuiltinPromptPatch",
+        "type": "object"
+      },
       "CallingDefaultsCatalogRow": {
         "description": "One cached `(host, harness)` model catalog and its staleness.",
         "properties": {
@@ -1285,6 +1312,17 @@
             "description": "Host the catalog was fetched from.",
             "title": "Host Id",
             "type": "string"
+          },
+          "injects_prompt": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Injects Prompt"
           },
           "models": {
             "description": "The host's model-option rows as reported.",
@@ -4994,6 +5032,17 @@
               }
             ],
             "title": "Error"
+          },
+          "injects_prompt": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Injects Prompt"
           },
           "models": {
             "items": {
@@ -11854,6 +11903,17 @@
             ],
             "title": "Session Choice"
           },
+          "session_prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Prompt"
+          },
           "share_workspace_files": {
             "default": false,
             "description": "Whether the owner opted into letting view-level collaborators browse the workspace (Files/Changes/GitHub surfaces). `False` by default \u2014 read grants share the conversation only. The web share dialog reads this to render the toggle, and the rail reads it to decide whether to mount the file surfaces for a view-only viewer.",
@@ -12043,6 +12103,13 @@
             ],
             "description": "Explanation when cache warmth is unsupported.",
             "title": "Warm State Reason"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Warnings",
+            "type": "array"
           },
           "workspace": {
             "anyOf": [
@@ -15457,7 +15524,8 @@
                 "runner_log_warnings",
                 "sidebar_layout",
                 "sound_alerts",
-                "worktree_defaults"
+                "worktree_defaults",
+                "builtin_agent_prompts"
               ]
             },
             "title": "Settings",
@@ -16436,6 +16504,102 @@
           }
         },
         "summary": "Get Agent Config",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
+    "/v1/agents/{agent_id}/prompt": {
+      "get": {
+        "operationId": "get_builtin_prompt_v1_agents__agent_id__prompt_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Builtin Prompt V1 Agents  Agent Id  Prompt Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Builtin Prompt",
+        "tags": [
+          "agents"
+        ]
+      },
+      "patch": {
+        "operationId": "patch_builtin_prompt_v1_agents__agent_id__prompt_patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BuiltinPromptPatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Patch Builtin Prompt V1 Agents  Agent Id  Prompt Patch",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Patch Builtin Prompt",
         "tags": [
           "agents"
         ]
@@ -20120,6 +20284,7 @@
                         "agent_badges",
                         "agent_pins",
                         "approval_timeout",
+                        "builtin_agent_prompts",
                         "calling_defaults",
                         "calling_last",
                         "child_idle",
@@ -20308,7 +20473,8 @@
                 "runner_log_warnings",
                 "sidebar_layout",
                 "sound_alerts",
-                "worktree_defaults"
+                "worktree_defaults",
+                "builtin_agent_prompts"
               ],
               "title": "Namespace",
               "type": "string"

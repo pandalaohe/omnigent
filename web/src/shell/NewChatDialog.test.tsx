@@ -11447,6 +11447,17 @@ describe("NewChatLandingScreen Edit on Agent rows", () => {
         library = [...library, copy];
         return jsonResponse(copy);
       }
+      if (method === "GET" && url === "/v1/agents/ag_polly/prompt") {
+        return jsonResponse({
+          agent_id: "ag_polly",
+          text: "Lead the crew.",
+          builtin_text: "Lead the crew.",
+          base_sha256: "a".repeat(64),
+          saved_base_sha256: null,
+          customized: false,
+          builtin_changed: false,
+        });
+      }
       const id = /^\/v1\/custom-agents\/([^/?]+)$/.exec(url)?.[1];
       const row = library.find((candidate) => candidate.id === id);
       if (row === undefined) throw new Error(`unexpected Agent request: ${method} ${url}`);
@@ -11533,7 +11544,7 @@ describe("NewChatLandingScreen Edit on Agent rows", () => {
     );
 
     const view = await screen.findByRole("dialog");
-    expect(within(view).getByText("Built-in · read-only")).toBeInTheDocument();
+    expect(within(view).getByText("Built-in · save your own starting prompt")).toBeInTheDocument();
     expect(within(view).getAllByTestId("builtin-member-row")).toHaveLength(2);
     fireEvent.click(within(view).getByRole("button", { name: "Duplicate to edit" }));
 
