@@ -19,19 +19,46 @@ function secondsFromNow(offset: number): string {
  * a bare number: a single-quoted body would leave `observed_at` a string and the
  * route rejects that with 422.
  */
-export function buildConnectCommand(origin: string): string {
+export function buildConnectCommand(origin: string, source: ConnectSource = "report"): string {
   const window =
     `{"id":"month","percent_used":41,"window_minutes":43200,` +
     `"resets_at":${secondsFromNow(CONNECT_SAMPLE_RESET_SECONDS)}}`;
-  const json = `{"observed_at":${secondsFromNow(0)},"windows":[${window}]}`;
+  let json = `{"schema_version":2,"observed_at":${secondsFromNow(0)},"windows":[${window}]}`;
+  let endpoint = `${origin}/v1/me/usage/accounts/my-gateway`;
+  let method = "PUT";
+  if (source === "manual" || source === "undocumented") {
+    json = `{"schema_version":2,"observed_at":${secondsFromNow(0)},"source_type":"${source === "manual" ? "manual" : "other"}","balances":[{"id":"wallet","remaining":25,"unit":"USD"}]}`;
+  } else if (source === "vendor" || source === "relay") {
+    method = "POST";
+    endpoint += `/import?format=${source === "vendor" ? "litellm-key" : "openrouter-credits"}`;
+    json =
+      source === "vendor"
+        ? '{"info":{"spend":12,"max_budget":null}}'
+        : '{"data":{"total_credits":50,"total_usage":12}}';
+  } else if (source === "otel") {
+    method = "POST";
+    endpoint = `${origin}/v1/me/usage/otlp/v1/metrics`;
+    json = `{"resourceMetrics":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"my-app"}}]},"scopeMetrics":[{"metrics":[{"name":"gen_ai.client.inference.usage.input_tokens","sum":{"aggregationTemporality":1,"dataPoints":[{"timeUnixNano":"${secondsFromNow(0)}000000000","asInt":"100"}]}}]}]}]}`;
+  }
   const quoted = json.replace(/"/g, '\\"');
   return [
-    `curl -X PUT ${origin}/v1/me/usage/accounts/my-gateway \\`,
-    '  -H "Authorization: Bearer $TOKEN" \\',
+    `curl --fail-with-body -X ${method} "${endpoint}" \\`,
+    '  -H "Authorization: Bearer $USAGE_KEY" \\',
     '  -H "Content-Type: application/json" \\',
     `  -d "${quoted}"`,
   ].join("\n");
 }
+
+export const CONNECT_SOURCES = [
+  "subscription",
+  "otel",
+  "vendor",
+  "relay",
+  "report",
+  "manual",
+  "undocumented",
+] as const;
+export type ConnectSource = (typeof CONNECT_SOURCES)[number];
 
 /** The command with a shell's arithmetic substitutions applied, for tests. */
 export function expandConnectCommand(command: string, nowSeconds: number): string {

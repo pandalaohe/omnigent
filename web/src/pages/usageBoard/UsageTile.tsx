@@ -29,6 +29,8 @@ import { UsageTip, UsageTipButton } from "./UsageTip";
 import { readingTip, renewalTip, windowTip } from "./usageBoardTips";
 import type { UsageAmount } from "./usageActivityData";
 import { UsageAmountFigure, UsageErrorMark } from "./UsageAmounts";
+import { UsageBalances } from "./UsageBalances";
+import { t } from "./usageText";
 
 const TONE_TILE: Record<string, string> = {
   warn: "border-warning/60 bg-warning/13",
@@ -104,18 +106,24 @@ export function UsageTile({
         data-testid="usage-tile"
         data-account={account.id}
       >
-        <UsageRing
-          window={first?.window ?? null}
-          stale={stale || empty}
-          size={42}
-          showName={false}
-        />
+        {!account.windows.length && account.balances?.length ? null : (
+          <UsageRing
+            window={first?.window ?? null}
+            stale={stale || empty}
+            size={42}
+            showName={false}
+          />
+        )}
         <div className="flex min-w-0 flex-1 flex-col leading-tight">
           <span className="truncate font-semibold">{name}</span>
           {plan ? <span className="truncate text-[11px] text-muted-foreground">{plan}</span> : null}
           {shownModel && (
             <span className="truncate text-xs text-muted-foreground">{shownModel}</span>
           )}
+          <UsageBalances account={account} compact />
+          {(amount?.totals.partial_rows ?? 0) > 0 ? (
+            <span className="text-[10px] text-muted-foreground">{t("incomplete")}</span>
+          ) : null}
         </div>
         {floorControl}
         <UsageErrorMark account={account} />
@@ -190,7 +198,7 @@ export function UsageTile({
       )}
 
       <div className="mb-2 mt-0.5 flex min-w-0 justify-evenly gap-2.5">
-        {picks.length === 0 ? (
+        {picks.length === 0 && !account.balances?.length ? (
           <div className="flex min-w-0 flex-col items-center gap-0.5">
             <UsageRing window={null} stale size={88} />
           </div>
@@ -237,6 +245,11 @@ export function UsageTile({
           ))
         )}
       </div>
+
+      <UsageBalances account={account} />
+      {(amount?.totals.partial_rows ?? 0) > 0 ? (
+        <p className="mb-1 text-center text-[11px] text-muted-foreground">{t("incomplete")}</p>
+      ) : null}
 
       {arrange ? (
         <div className="mt-1.5 flex items-center justify-between">

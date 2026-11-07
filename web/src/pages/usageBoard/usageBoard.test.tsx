@@ -249,7 +249,14 @@ describe("board", () => {
   });
 
   it("opens the account's settings without a control on the display page", async () => {
-    mocks.overview.current = { ...LOADED, data: usageBoardData() };
+    const data = usageBoardData();
+    data.accounts[0] = {
+      ...data.accounts[0],
+      source: "Quota reader",
+      source_type: "subscription",
+      source_at: 1794000000,
+    };
+    mocks.overview.current = { ...LOADED, data };
     renderRoute("/usage/board/codex/settings");
     expect(await screen.findByRole("heading", { level: 1 })).toBeTruthy();
     // The preview tile and the two rows that apply at once; no Save button.
@@ -257,6 +264,9 @@ describe("board", () => {
     expect(screen.queryByText("Save")).toBeNull();
     expect(screen.getByText("Window")).toBeTruthy();
     expect(screen.getByText("Renews")).toBeTruthy();
+    expect(screen.getByText("Reported by Quota reader")).toBeTruthy();
+    expect(screen.getByText("Source type: subscription")).toBeTruthy();
+    expect(screen.getByText(/^Reported (Mon|Tue|Wed|Thu|Fri|Sat|Sun)/)).toBeTruthy();
   });
 });
 

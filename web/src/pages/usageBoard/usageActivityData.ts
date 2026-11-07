@@ -5,6 +5,7 @@ import { usageRangeQuery } from "./UsageRangeControl";
 import { USAGE_BOARD_POLL_MS } from "./usageBoardData";
 
 export interface UsageTotals {
+  partial_rows?: number;
   cost_usd: number | null;
   counted_cost_usd: number;
   tokens: number | null;

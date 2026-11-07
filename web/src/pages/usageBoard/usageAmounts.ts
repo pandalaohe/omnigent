@@ -19,6 +19,7 @@ export function sumUsage(values: UsageTotals[]): UsageTotals {
   const coveredTokens = sum("covered_tokens");
   const coveredCost = sum("covered_cost_usd");
   return {
+    partial_rows: values.reduce((total, value) => total + (value.partial_rows ?? 0), 0),
     cost_usd: cost,
     counted_cost_usd: sum("counted_cost_usd"),
     tokens: values.some((value) => value.tokens !== null) ? sum("tokens") : null,

@@ -2,25 +2,15 @@
 // the ring colour line, which accounts are on the board, and how to connect an
 // outside source. Display routes never render any of it.
 
-import { useState } from "react";
 import { Link } from "@/lib/routing";
-import { CopyIcon, PlugIcon, SunIcon } from "lucide-react";
+import { PlugIcon, SunIcon } from "lucide-react";
 
 import { HelpTip } from "@/components/HelpTip";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { usageBoardAvailable } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { copyText } from "@/lib/clipboard";
 import {
   SESSION_COLLAB_DEFAULTS,
   writeSessionCollabPreferences,
@@ -28,9 +18,9 @@ import {
 import { useSessionCollabPreferences } from "@/hooks/useSessionCollabPreferences";
 import { patchUsageBoardPreferences } from "@/lib/usageContextPreferences";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
-import { cn } from "@/lib/utils";
 
-import { buildConnectCommand } from "./usageBoardConnect";
+import { ConnectDialog } from "./UsageSourceConnect";
+import { t } from "./usageText";
 import { UsageRing } from "./UsageRing";
 import { UsagePriceSourceSettings } from "./UsagePriceSourceSettings";
 import { useUsageOverview, type UsageWindowView } from "./usageBoardData";
@@ -101,6 +91,7 @@ export function UsageBoardSettings() {
 
   return (
     <div className="flex flex-col">
+      <p className="text-xs text-muted-foreground">{t("preferencesHelp")}</p>
       <Link
         to="/settings/general#session-choice"
         className="py-2 text-sm text-primary underline underline-offset-2"
@@ -333,64 +324,5 @@ function ColourLine({
         ))}
       </div>
     </div>
-  );
-}
-
-function ConnectDialog() {
-  const [copied, setCopied] = useState(false);
-  const origin =
-    typeof window === "undefined" ? "https://omnigent.example" : window.location.origin;
-  const command = buildConnectCommand(origin);
-
-  async function copy() {
-    try {
-      await copyText(command);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1500);
-    } catch {
-      setCopied(false);
-    }
-  }
-
-  return (
-    <Dialog>
-      <DialogTrigger asChild>
-        <Button variant="outline" size="sm" className="gap-1.5">
-          <PlugIcon className="size-3.5" aria-hidden="true" />
-          Connect
-        </Button>
-      </DialogTrigger>
-      <DialogContent className="max-w-[620px]">
-        <DialogHeader>
-          <DialogTitle>Connect a source</DialogTitle>
-          <DialogDescription>
-            A source pushes one report per read; the first successful one adds its tile. No
-            credential is stored here — the source keeps its own.
-          </DialogDescription>
-        </DialogHeader>
-        <pre
-          className={cn(
-            "max-h-[220px] overflow-auto rounded-lg border border-border bg-muted/40 p-2.5",
-            "font-mono text-[11.5px] leading-relaxed whitespace-pre-wrap break-words",
-          )}
-        >
-          {command}
-        </pre>
-        <div className="flex flex-wrap items-center gap-2">
-          <Button variant="outline" size="sm" className="gap-1.5" onClick={copy}>
-            <CopyIcon className="size-3.5" aria-hidden="true" />
-            {copied ? "Copied" : "Copy"}
-          </Button>
-        </div>
-        <p className="text-[11px] leading-relaxed text-muted-foreground">
-          <code>$TOKEN</code> is an ordinary login token: <code>POST /auth/login</code> with{" "}
-          <code>issue_refresh</code>, then <code>POST /oauth/token</code>, keeping the rotated
-          refresh token. A timed script needs the operator to extend the grant with{" "}
-          <code>OMNIGENT_GRANT_MAX_LIFETIME_DAYS</code> on the server. Reports accept{" "}
-          <code>windows</code>, <code>status</code>, <code>fresh_until</code>, <code>activity</code>{" "}
-          and <code>models</code>; unknown fields are ignored.
-        </p>
-      </DialogContent>
-    </Dialog>
   );
 }

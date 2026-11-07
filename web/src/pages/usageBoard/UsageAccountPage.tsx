@@ -35,6 +35,7 @@ import { groupWindows, isStale, neverRead, pickWindow } from "./usageBoardSelect
 import { readingTip, windowTip } from "./usageBoardTips";
 import { useUsageActivity } from "./usageActivityData";
 import { UsageByModel, UsageCostCard } from "./UsageAmounts";
+import { UsageBalances } from "./UsageBalances";
 
 export function UsageAccountPage() {
   const { accountId = "" } = useParams();
@@ -116,6 +117,7 @@ export function UsageAccountPage() {
           </div>
 
           <div className="mb-3">
+            <UsageBalances account={account} />
             <QuotaFloorControl tile={account.id} label={account.display_name} account={account} />
           </div>
 
