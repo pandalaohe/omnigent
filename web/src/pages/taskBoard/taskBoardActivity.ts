@@ -30,7 +30,7 @@ export function eventMother(
   while (id && !seen.has(id)) {
     seen.add(id);
     const parent = byId.get(id)?.parent_session_id;
-    if (!parent) return byId.get(id)?.title || id;
+    if (!parent) return { id, label: byId.get(id)?.title || id };
     id = parent;
   }
   return undefined;

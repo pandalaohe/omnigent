@@ -85,18 +85,29 @@ export function TaskBoardActivity({
             month,
           ))),
   );
-  const groups = new Map<string, typeof events>();
+  const groups = new Map<string, { label: string; entries: typeof events }>();
   for (const event of events) {
     const task = byId.get(JSON.stringify([event.source, event.uid]));
+    const mother = group === "mother" ? eventMother(event, task, sessions) : undefined;
+    const taskGroup = task?.["omnigent.ai:group"];
+    const key = JSON.stringify(
+      group === "mother"
+        ? mother
+          ? ["mother", mother.id]
+          : [task ? "unassigned" : "notLoaded"]
+        : group === "group"
+          ? ["group", event.source, taskGroup?.id ?? null]
+          : ["time", localDay(event.time)],
+    );
     const label =
       group === "mother"
         ? task
-          ? (eventMother(event, task, sessions) ?? t("activity.unassigned"))
+          ? (mother?.label ?? t("activity.unassigned"))
           : t("activity.notLoaded")
         : group === "group"
-          ? (task?.["omnigent.ai:group"]?.name ?? task?.["omnigent.ai:group"]?.id ?? event.source)
+          ? (taskGroup?.name ?? taskGroup?.id ?? event.source)
           : localDay(event.time);
-    groups.set(label, [...(groups.get(label) ?? []), event]);
+    groups.set(key, { label, entries: [...(groups.get(key)?.entries ?? []), event] });
   }
   const pages = Math.max(1, Math.ceil((view === "history" ? held.length : events.length) / 30)),
     current = Math.min(page, pages - 1);
@@ -300,13 +311,13 @@ export function TaskBoardActivity({
           {!history.isPending && !history.isError && !events.length && (
             <p className="tb-empty">{t("activity.empty")}</p>
           )}
-          {[...groups].map(([label, entries]) => {
+          {[...groups].map(([key, { label, entries }]) => {
             const visible = entries.filter(() => {
               const n = index++;
               return n >= current * 30 && n < current * 30 + 30;
             });
             return visible.length ? (
-              <section key={label}>
+              <section key={key}>
                 <h3>{label}</h3>
                 <ul className="tb-activity-list">
                   {visible.map((event) => {

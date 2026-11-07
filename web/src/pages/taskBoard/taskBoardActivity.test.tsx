@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, expect, it, vi } from "vitest";
@@ -42,8 +42,58 @@ it("drains history cursors and rejects repeated cursors", async () => {
 it("uses browser-local dates and joins the span's root session without cycling", () => {
   const f = taskBoardFixture();
   const event = { ...f.tasks[0]["omnigent.ai:history"]![0], source: "engineering", uid: "upload" };
-  expect(eventMother(event, f.tasks[0], f.sessions)).toBe("Transfer reliability");
+  expect(eventMother(event, f.tasks[0], f.sessions)).toEqual({
+    id: "parent",
+    label: "Transfer reliability",
+  });
   expect(localDay(new Date(2026, 10, 7, 0, 30))).toBe("2026-11-07");
+});
+it.each([
+  ["mother", "Fix upload"],
+  ["group", "Reliability"],
+])("keeps same-named %s log groups separate by identity", async (group, label) => {
+  const f = taskBoardFixture();
+  const tasks = ["engineering", "docs", "engineering"].map((source, index) => ({
+    ...f.tasks[0],
+    uid: `upload-${index}`,
+    title: `Upload task ${index}`,
+    "omnigent.ai:source": source,
+    "omnigent.ai:workedBy": [
+      { session: index === 1 ? "other-root" : "child", from: "2026-11-06T00:00:00Z" },
+    ],
+  }));
+  const sessions = [
+    { id: "parent", title: "Fix upload", status: "running" },
+    { id: "child", parent_session_id: "parent", status: "running" },
+    { id: "other-root", title: "Fix upload", status: "running" },
+  ];
+  fetcher.mockImplementation(async (url: string) =>
+    Response.json(
+      url.includes("closed-counts")
+        ? { days: [] }
+        : {
+            entries: tasks.map((task, index) => ({
+              id: `event-${index}`,
+              source: task["omnigent.ai:source"],
+              uid: task.uid,
+              time: "2026-11-07T00:00:00Z",
+              kind: "commit",
+            })),
+          },
+    ),
+  );
+  wrap(<TaskBoardActivity view="log" tasks={tasks} sessions={sessions} onSelect={vi.fn()} />);
+  await screen.findByRole("button", { name: "Upload task 0" });
+  fireEvent.change(screen.getByLabelText("Group by"), { target: { value: group } });
+  const headings = screen.getAllByRole("heading", { name: label });
+  expect(headings).toHaveLength(2);
+  const first = within(headings[0].parentElement!);
+  const second = within(headings[1].parentElement!);
+  expect(first.getAllByRole("listitem")).toHaveLength(2);
+  expect(first.getByRole("button", { name: "Upload task 0" })).toBeTruthy();
+  expect(first.getByRole("button", { name: "Upload task 2" })).toBeTruthy();
+  expect(second.getAllByRole("listitem")).toHaveLength(1);
+  expect(second.getByRole("button", { name: "Upload task 1" })).toBeTruthy();
 });
 it("renders full-past counts without inventing old task bodies", async () => {
   fetcher.mockImplementation(async (url: string) =>
