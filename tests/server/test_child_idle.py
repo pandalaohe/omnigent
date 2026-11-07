@@ -1786,3 +1786,129 @@ async def test_existing_native_error_classification_is_monitored(
     harness.now += 120
     await harness.sweeper._tick()
     assert len(harness.calls) == 1
+
+
+async def test_sweep_batches_parent_and_child_reads_across_shared_parent(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = harness.store.create_conversation(title="mother")
+    for idx in range(25):
+        harness.child(parent=parent, title=f"work-{idx}")
+    calls = 0
+    get_conversation = harness.store.get_conversation
+
+    def counted_get_conversation(conversation_id: str) -> Conversation | None:
+        nonlocal calls
+        calls += 1
+        return get_conversation(conversation_id)
+
+    monkeypatch.setattr(harness.store, "get_conversation", counted_get_conversation)
+    await harness.sweeper._tick()
+    assert calls <= 10
+
+
+async def test_resume_reservation_waits_for_prior_child_callback(harness: _Harness) -> None:
+    first = harness.freeze(resumeOnce=True)
+    parent = harness.store.get_conversation(first.parent_conversation_id)
+    assert parent is not None
+    second = harness.child(
+        parent=parent, title="second", agent_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    )
+    for child in (first, second):
+        harness.store.set_labels(
+            child.id,
+            {"omnigent.last_task_error_message": "Selected model is at capacity"},
+        )
+        harness.store.set_session_live_status(child.id, "failed")
+    await harness.sweeper._tick()
+    harness.now += 120
+    fail_first = True
+
+    async def resume_child(conv: Conversation, _claim: str) -> str:
+        nonlocal fail_first
+        harness.resumes.append(conv.id)
+        if fail_first:
+            fail_first = False
+            raise TimeoutError("first resume timed out")
+        return "accepted"
+
+    harness.sweeper._resume_child = resume_child
+    await harness.sweeper._tick()
+    first_conv = harness.store.get_conversation(first.id)
+    second_conv = harness.store.get_conversation(second.id)
+    assert first_conv is not None and second_conv is not None
+    assert (CHILD_RESUME_LABEL in first_conv.labels) != (CHILD_RESUME_LABEL in second_conv.labels)
+    unresumed_id = second.id if CHILD_RESUME_LABEL in first_conv.labels else first.id
+    await harness.sweeper._tick()
+    assert unresumed_id in harness.resumes
+    final_second = harness.store.get_conversation(unresumed_id)
+    assert final_second is not None and CHILD_RESUME_LABEL in final_second.labels
+
+
+async def test_resume_reobserves_later_child_modified_during_prior_callback(
+    harness: _Harness,
+) -> None:
+    first = harness.freeze(resumeOnce=True)
+    parent = harness.store.get_conversation(first.parent_conversation_id)
+    assert parent is not None
+    second = harness.child(
+        parent=parent, title="second", agent_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    )
+    for child in (first, second):
+        harness.store.set_labels(
+            child.id,
+            {"omnigent.last_task_error_message": "Selected model is at capacity"},
+        )
+        harness.store.set_session_live_status(child.id, "failed")
+    await harness.sweeper._tick()
+    harness.now += 120
+
+    async def resume_child(conv: Conversation, _claim: str) -> str:
+        harness.resumes.append(conv.id)
+        other_id = second.id if conv.id == first.id else first.id
+        harness.store.set_labels(other_id, {"omnigent.last_task_error_message": ""})
+        harness.store.set_session_live_status(other_id, "running")
+        return "accepted"
+
+    harness.sweeper._resume_child = resume_child
+    await harness.sweeper._tick()
+    assert len(harness.resumes) == 1
+    other_id = second.id if harness.resumes[0] == first.id else first.id
+    other_conv = harness.store.get_conversation(other_id)
+    assert other_conv is not None and CHILD_RESUME_LABEL not in other_conv.labels
+    assert harness.calls == []
+
+
+async def test_broken_ancestor_lineage_does_not_abort_healthy_or_followup_parents(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    broken_grandparent = harness.store.create_conversation(title="broken-root")
+    broken_parent = harness.store.create_conversation(
+        title="broken-middle", kind="sub_agent", parent_conversation_id=broken_grandparent.id
+    )
+    harness.owned.add(broken_parent.id)
+    harness.child(parent=broken_parent, title="broken-leaf")
+    healthy_child = harness.child(title="healthy-child")
+    assert healthy_child.parent_conversation_id is not None
+    followup_parent = harness.store.create_conversation(title="followup-mother")
+    harness.owned.add(followup_parent.id)
+    add_checkin_followup(
+        harness.store,
+        followup_parent.id,
+        ChildFollowupAdd(text="Recheck deployment", after_minutes=15),
+        harness.now - 900,
+    )
+    get_conversation = harness.store.get_conversation
+
+    def flaky_get_conversation(conversation_id: str) -> Conversation | None:
+        if conversation_id == broken_grandparent.id:
+            raise RuntimeError("ancestor lookup failed")
+        return get_conversation(conversation_id)
+
+    monkeypatch.setattr(harness.store, "get_conversation", flaky_get_conversation)
+    await harness.sweeper._tick()
+    harness.now += 5500
+    await harness.sweeper._tick()
+    notified_parents = {parent_id for parent_id, _ in harness.calls}
+    assert healthy_child.parent_conversation_id in notified_parents
+    assert followup_parent.id in notified_parents
