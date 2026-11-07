@@ -472,8 +472,19 @@ def test_pi_native_cold_resume_keeps_result_before_message_sent_during_tool(
         # The fork mirrors a user item only once Pi consumes it,
         # so a steer sent mid-tool lands after the
         # tool result instead of upstream's acceptance-time placement.
+        bridge = (
+            stack.runner_home / ".omnigent/pi-native" / bridge_dir_for_session_id(session_id).name
+        )
+        intervention = bridge / "auto-retry-intervention.json"
+        before_steer = intervention.read_text() if intervention.is_file() else ""
         send_user_text(client, session_id=session_id, text=steer)
-        time.sleep(0.5)
+        _wait(
+            lambda: (
+                intervention.is_file()
+                and intervention.read_text() != before_steer
+                and not any((bridge / "inbox").glob("*.json"))
+            )
+        )
         release.touch()
         _wait(lambda: replied("STEER-SEEN"))
         order = [
