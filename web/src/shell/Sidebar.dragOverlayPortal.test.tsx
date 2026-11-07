@@ -91,6 +91,40 @@ afterEach(async () => {
 });
 
 describe("session drag preview portal", () => {
+  it.each([0, 100])(
+    "prevents native navigation after a cancelled drag released after %sms",
+    async (delay) => {
+      vi.useFakeTimers();
+      renderSidebar();
+      const link = screen.getByRole("link", { name: "conv_a" });
+      startRowDrag(link.closest("li")!);
+      fireEvent.keyDown(document, { key: "Escape", code: "Escape" });
+      await act(() => vi.advanceTimersByTimeAsync(delay));
+      fireEvent.mouseUp(link);
+      // dnd-kit can stop propagation before React sees the anchor's click.
+      const stopClick = (event: Event) => event.stopPropagation();
+      document.addEventListener("click", stopClick, true);
+      try {
+        expect(fireEvent.click(link, { detail: 1 })).toBe(false);
+
+        startRowDrag(link.closest("li")!);
+        fireEvent.keyDown(document, { key: "Escape", code: "Escape" });
+        await act(() => vi.advanceTimersByTimeAsync(delay));
+        fireEvent.mouseUp(link);
+        expect(fireEvent.click(link, { detail: 0 })).toBe(true);
+
+        startRowDrag(link.closest("li")!);
+        fireEvent.keyDown(document, { key: "Escape", code: "Escape" });
+        await act(() => vi.advanceTimersByTimeAsync(delay));
+        fireEvent.mouseUp(link);
+        fireEvent.pointerDown(link, { button: 0 });
+        expect(fireEvent.click(link, { detail: 1 })).toBe(true);
+      } finally {
+        document.removeEventListener("click", stopClick, true);
+      }
+    },
+  );
+
   it.each(["mouse", "touch"])(
     "does not start a session drag or clear selection for %s gestures in the fork dialog",
     async (input) => {

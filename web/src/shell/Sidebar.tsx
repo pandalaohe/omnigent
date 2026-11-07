@@ -3119,7 +3119,26 @@ function ConversationList({
     useSensor(MouseSensor, SIDEBAR_MOUSE_SENSOR_OPTIONS),
     useSensor(TouchSensor, SIDEBAR_TOUCH_SENSOR_OPTIONS),
   );
+  // dnd-kit stops the click that ends a drag before React's <Link> sees it, so
+  // a row released over itself would follow its href natively; cancel that one.
+  const dragClickPending = useRef(false);
+  useEffect(() => {
+    const cancelDragClick = (event: globalThis.MouseEvent) => {
+      if (dragClickPending.current && event.detail > 0) event.preventDefault();
+      dragClickPending.current = false;
+    };
+    const resetDragClick = () => {
+      dragClickPending.current = false;
+    };
+    document.addEventListener("click", cancelDragClick, true);
+    document.addEventListener("pointerdown", resetDragClick, true);
+    return () => {
+      document.removeEventListener("click", cancelDragClick, true);
+      document.removeEventListener("pointerdown", resetDragClick, true);
+    };
+  }, []);
   const handleDragStart = useCallback((event: DragStartEvent) => {
+    dragClickPending.current = true;
     const type = event.active.data.current?.type;
     // New drop zones can shift the source row; preserve its position before rendering them.
     const target = event.activatorEvent.target;
@@ -7451,22 +7470,6 @@ function ConversationRowImpl({
       dragDisabled ||
       (!isCanonical && !pinReorderCopy && !moveCopy),
   });
-  // A drag ends with a synthetic click on the row's <Link> (mousedown + mouseup
-  // on the same anchor still fires a click); swallow that one click so a drag
-  // doesn't also navigate into the session. Flagged when a drag finishes,
-  // cleared on the next tick (after the click that follows pointer-up).
-  const justDraggedRef = useRef(false);
-  const wasDraggingRef = useRef(false);
-  useEffect(() => {
-    const was = wasDraggingRef.current;
-    wasDraggingRef.current = isDragging;
-    if (!was || isDragging) return undefined;
-    justDraggedRef.current = true;
-    const timer = setTimeout(() => {
-      justDraggedRef.current = false;
-    }, 0);
-    return () => clearTimeout(timer);
-  }, [isDragging]);
   // In the Pinned section each row is also a reorder target for other pins. A
   // favorites row instead exposes a `fav-item` target so a mixed (project +
   // session) reorder can land on it.
@@ -7705,11 +7708,6 @@ function ConversationRowImpl({
       data-goal-state={goalState ?? undefined}
       onClick={(e) => {
         recentClickTimesRef.current = [...recentClickTimesRef.current.slice(-1), performance.now()];
-        // Swallow the click that trails a drag so it doesn't navigate.
-        if (justDraggedRef.current) {
-          e.preventDefault();
-          return;
-        }
         if (selectionMode) {
           e.preventDefault();
           e.stopPropagation();

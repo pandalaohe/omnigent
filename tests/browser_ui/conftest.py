@@ -229,6 +229,19 @@ def browser_contract(
     # so tests can add concise explicit mocks on top of these catch-alls.
     context.route("**/*", deny_http)
     context.route_web_socket("**/*", deny_websocket)
+
+    # Refocusing the SPA (including a sandboxed iframe) checks the served build.
+    # Keep document navigation on the static server and model only that fetch.
+    def serve_build_check(route: Route) -> None:
+        if route.request.method != "GET" or route.request.resource_type != "fetch":
+            route.fallback()
+            return
+        route.fulfill(
+            content_type="text/html",
+            body=(_BUILD_OUTPUT / "index.html").read_text(),
+        )
+
+    contract.route(contract._matcher("/"), serve_build_check)
     # Routes the SPA shell calls on every page that per-test contracts do not
     # model; tests override them by registering their own mocks later.
     for path, body in (
