@@ -251,9 +251,7 @@ def main() -> int:
     parser.add_argument(
         "--plan", action="store_true", help="print the run plan without changing files"
     )
-    parser.add_argument(
-        "--evidence", type=Path, default=CHECKOUT / "test-results/terminal-proof"
-    )
+    parser.add_argument("--evidence", type=Path, default=CHECKOUT / "test-results/terminal-proof")
     parser.add_argument(
         "--skip-build", action="store_true", help="reuse this checkout's already built SPA"
     )
