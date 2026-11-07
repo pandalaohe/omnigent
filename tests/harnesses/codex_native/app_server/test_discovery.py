@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -587,17 +588,27 @@ async def test_discovery_early_exit_error_carries_redacted_codex_stderr() -> Non
     assert "[REDACTED]" in message
 
 
+@pytest.mark.parametrize(
+    "command",
+    [(), ("/test/launcher",), ("/test/launcher", "-c", "features.apps=false")],
+    ids=["default", "wrapper", "wrapper-with-args"],
+)
 async def test_discovery_process_captures_stderr_in_memory(
     monkeypatch: pytest.MonkeyPatch,
+    command: tuple[str, ...],
+    _no_configured_codex_app_server_command: Callable[[], tuple[str, ...]],
 ) -> None:
-    """The probe drains stderr through a pipe rather than a filesystem log."""
+    """Discovery preserves the configured launch prefix and captures stderr in memory."""
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
 
     captured_stderr: object = None
+    captured_command: tuple[object, ...] = ()
 
     async def _fake_create_subprocess_exec(*args: object, **kwargs: object) -> object:
-        nonlocal captured_stderr
-        del args
+        nonlocal captured_stderr, captured_command
+        captured_command = (
+            args[4:] if args[0] == sys.executable else (kwargs["executable"], *args[1:])
+        )
         captured_stderr = kwargs["stderr"]
         stderr = asyncio.StreamReader()
         stderr.feed_data(b"Error: provider unavailable\n")
@@ -611,6 +622,25 @@ async def test_discovery_process_captures_stderr_in_memory(
         return process
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "_configured_app_server_command",
+        _no_configured_codex_app_server_command,
+    )
+    monkeypatch.setattr(
+        "omnigent.config.load_effective_config",
+        lambda: (
+            {
+                "harness": {
+                    "codex-native": {
+                        "app_server": {"command": command[0], "args": list(command[1:])}
+                    }
+                }
+            }
+            if command
+            else {}
+        ),
+    )
     # Registry side effects are covered by the dedicated tests below; this
     # stderr-shape test stays hermetic.
     monkeypatch.setattr(
@@ -625,10 +655,84 @@ async def test_discovery_process_captures_stderr_in_memory(
         listen_url="ws://127.0.0.1:12345",
         env={},
         cwd=Path("/work"),
+        config_overrides=['model_provider="gateway"'],
     )
 
     assert captured_stderr == asyncio.subprocess.PIPE
     assert await discovery.stderr_tail == "Error: provider unavailable"
+    prefix = command or ("/test/codex",)
+    assert captured_command == (
+        *prefix,
+        "-c",
+        f'otel.environment="omnigent_crash_teardown_tag={discovery.session_tag}"',
+        "-c",
+        'model_provider="gateway"',
+        "app-server",
+        "--listen",
+        "ws://127.0.0.1:12345",
+    )
+
+
+@pytest.mark.parametrize("reader", ["compatibility", "shared"])
+async def test_catalog_cache_tracks_app_server_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reader: str
+) -> None:
+    """Launcher changes miss both caches; unchanged and restored settings hit."""
+    from omnigent.harnesses.codex_native import app_server
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(app_server, "_codex_home_config_source_from_env", lambda: tmp_path)
+    launcher = tmp_path / "launcher"
+    launcher.write_text("first")
+    other_launcher = tmp_path / "other-launcher"
+    other_launcher.write_text("other")
+    command: tuple[str, ...] = ()
+    monkeypatch.setattr(app_server, "_configured_app_server_command", lambda: command)
+    start = AsyncMock()
+    monkeypatch.setattr(app_server, "_start_codex_model_discovery_process", start)
+    monkeypatch.setattr(app_server, "_wait_for_discovery_listener", AsyncMock())
+    monkeypatch.setattr(app_server, "_stop_codex_model_discovery_process", AsyncMock())
+    client = AsyncMock(spec=CodexAppServerClient)
+
+    async def request(method: str, params: object) -> dict[str, object]:
+        if method == "config/read":
+            return {"result": {"config": {}}}
+        assert method == "model/list"
+        return {"result": {"data": [{"id": f"probe-{start.await_count}", "isDefault": True}]}}
+
+    client.request.side_effect = request
+    monkeypatch.setattr(app_server, "CodexAppServerClient", lambda **_kwargs: client)
+
+    async def read() -> object:
+        if reader == "compatibility":
+            return await app_server.discover_codex_model_options(codex_path="/test/codex")
+        return await app_server.codex_launch_catalog(
+            codex_path="/test/codex", launch=NativeCodexLaunch([], None, None)
+        )
+
+    app_server._model_discovery_cache.clear()
+    try:
+        for command, probe_count in [
+            ((), 1),
+            ((), 1),
+            ((str(launcher),), 2),
+            ((str(launcher),), 2),
+            ((str(launcher), "--route=other"), 3),
+            ((str(other_launcher), "--route=other"), 4),
+            ((), 4),
+        ]:
+            expected_probe = 1 if not command else probe_count
+            assert await read() == [{"id": f"probe-{expected_probe}", "isDefault": True}]
+            assert start.await_count == probe_count
+            if reader == "compatibility" and probe_count == 1:
+                assert list(app_server._model_discovery_cache) == ["/test/codex"]
+        command = (str(launcher),)
+        launcher.write_text("replacement-binary")
+        assert await read() == [{"id": "probe-5", "isDefault": True}]
+        assert start.await_count == 5
+    finally:
+        app_server._model_discovery_cache.clear()
 
 
 async def test_discovery_spawn_failure_releases_owner_lock(
