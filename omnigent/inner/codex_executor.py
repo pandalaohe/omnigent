@@ -3411,6 +3411,7 @@ class _CodexAppServerSession:
         self._last_turn_usage: dict[str, object] | None = None
         self._usage_context_config: dict[str, object] = {}
         self._usage_context_models: dict[str, dict[str, object]] = {}
+        self._usage_context_metadata_loaded = False
         # Raw cumulative ``tokenUsage.total`` counters: the newest observed
         # values, and the snapshot consumed at the last turn boundary.
         self._thread_usage_total_raw: dict[str, int] | None = None
@@ -3465,6 +3466,7 @@ class _CodexAppServerSession:
     async def _start_unchecked(self) -> None:
         if self._started:
             return
+        self._usage_context_metadata_loaded = False
         self._resident_connection_generation += 1
         generation = self._resident_connection_generation
         self._resident_established_connection = None
@@ -3624,9 +3626,6 @@ class _CodexAppServerSession:
             self._codex_home_dir,
             self._codex_config_overrides,
             retry_policy=self._retry_policy,
-        )
-        self._usage_context_config, self._usage_context_models = await asyncio.to_thread(
-            self._read_context_metadata
         )
         if self._signer is not None:
             self._codex_config_overrides.extend(
@@ -4242,6 +4241,18 @@ class _CodexAppServerSession:
             if isinstance(entry, dict) and isinstance(entry.get("slug"), str)
         }
 
+    async def _ensure_context_metadata(self, params: object) -> None:
+        if self._usage_context_metadata_loaded:
+            return
+        usage = params.get("tokenUsage") if isinstance(params, dict) else None
+        window = usage.get("modelContextWindow") if isinstance(usage, dict) else None
+        if type(window) is not int or window <= 0:
+            return
+        self._usage_context_config, self._usage_context_models = await asyncio.to_thread(
+            self._read_context_metadata
+        )
+        self._usage_context_metadata_loaded = True
+
     def _observe_token_usage(self, params: object, model: str | None) -> None:
         model = model or self._thread_model
         total_raw = _extract_codex_thread_total_usage(params)
@@ -4518,6 +4529,7 @@ class _CodexAppServerSession:
                     continue
                 method = message.get("method")
                 if method == "thread/tokenUsage/updated":
+                    await self._ensure_context_metadata(params)
                     self._observe_token_usage(params, model)
                     continue
                 if method in ("turn/completed", "turn/failed", "error"):
@@ -5167,6 +5179,7 @@ class _CodexAppServerSession:
                         continue
 
                 if method == "thread/tokenUsage/updated":
+                    await self._ensure_context_metadata(params)
                     self._observe_token_usage(params, model)
                     continue
 

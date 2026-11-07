@@ -6397,6 +6397,66 @@ def test_extract_codex_last_turn_usage_handles_missing_or_malformed() -> None:
     assert _extract_codex_last_turn_usage({"tokenUsage": {"total": {}}}, "gpt-5.4-mini") is None
 
 
+async def test_codex_context_catalog_loads_on_usage_and_is_reused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+
+    from omnigent.inner import codex_executor as module
+
+    (tmp_path / "config.toml").write_text("", encoding="utf-8")
+    session = _CodexAppServerSession(
+        codex_path="/fixture/codex-context", cwd=str(tmp_path), env={}, tool_executor=None
+    )
+    session._codex_home_dir = tmp_path
+    session._thread_model = "model-1"
+    probes = []
+
+    def probe(argv, **kwargs):
+        probes.append(argv)
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=json.dumps(
+                {
+                    "models": [
+                        {
+                            "slug": "model-1",
+                            "context_window": 500000,
+                            "effective_context_window_percent": 95,
+                        }
+                    ]
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", probe)
+    monkeypatch.setattr(module, "_MODEL_CATALOG_CACHE", {})
+    monkeypatch.setattr(module, "_MODEL_CATALOG_FAILURES", {})
+    for turn in ("one", "two"):
+        session._events.put_nowait(
+            {
+                "method": "thread/tokenUsage/updated",
+                "params": {
+                    "turnId": turn,
+                    "tokenUsage": {
+                        "modelContextWindow": 475000,
+                        "last": {"inputTokens": 100, "outputTokens": 25},
+                    },
+                },
+            }
+        )
+        session._events.put_nowait({"method": "turn/completed", "params": {"turn": {"id": turn}}})
+        await session._drain_final_answer_tail(active_turn_id=turn, model="model-1")
+        usage = session._consume_turn_usage()
+        assert usage is not None
+        assert usage["context_model"] == "model-1"
+        assert usage["context_window"] == 475000
+        assert usage["auto_compact_token_limit"] == 450000
+        assert probes == [["/fixture/codex-context", "debug", "models"]]
+
+
 def test_codex_sdk_reports_runtime_window_and_total_compact_limit() -> None:
     session = _CodexAppServerSession(
         codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
