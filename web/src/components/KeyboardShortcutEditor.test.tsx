@@ -36,11 +36,25 @@ describe("KeyboardShortcutEditor", () => {
 
   it("starts with six folded groups and opens search matches", () => {
     const { container } = render(<KeyboardShortcutEditor />);
-    expect(container.querySelectorAll("details")).toHaveLength(6);
+    const groups = container.querySelectorAll("details");
+    expect(groups).toHaveLength(6);
     expect(container.querySelectorAll("details[open]")).toHaveLength(0);
+    groups.forEach((group) => {
+      expect(group.className).toContain("px-3");
+      expect(group.className).toContain("py-2");
+      expect(group.className).toContain("mb-2");
+      const summary = group.querySelector("summary");
+      expect(summary).not.toBeNull();
+      expect(summary?.className).not.toContain("min-h-8");
+    });
     fireEvent.change(screen.getByRole("textbox", { name: "Search shortcuts" }), {
       target: { value: "poll sessions" },
     });
+    const pollRow = screen.getByTestId("shortcut-editor-row-pollSessions");
+    expect(pollRow.className).toContain("py-1.5");
+    expect(pollRow.className).toContain("last:pb-0");
+    expect(pollRow.firstElementChild?.className).not.toContain("min-h-9");
+    expect(pollRow.firstElementChild?.className).toContain("phone:gap-5");
     expect(
       screen.getByRole("button", { name: "Record common shortcut for Poll sessions" }),
     ).toBeVisible();
