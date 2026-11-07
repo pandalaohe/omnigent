@@ -39,6 +39,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { shortModelName } from "@/components/CostRoutingControl";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { useScopedConversationId } from "@/components/chat/conversationScope";
+import { t } from "@/lib/autoRotationText";
 import { copyText } from "@/lib/clipboard";
 import { getSessionSignInLink } from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
@@ -112,10 +113,9 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
     "Codex couldn't get a token from the model provider's sign-in command on the host.",
   client_update_required:
     "The agent CLI on the host is too old for the selected model. Update it on the host, then start a new session.",
-  session_rotation_failed:
-    "This session could not continue in a new session automatically. Type /clear to continue.",
 };
 
+const SESSION_ROTATION_FAILED_CODE = "session_rotation_failed";
 const COMPACTION_MODEL_FAILED_CODE = "codex_compaction_model_failed";
 // A spent budget, and the compaction it blocks, is an account limit rather than a failure.
 const NEUTRAL_TONE_CODES = new Set(["budget_exhausted", COMPACTION_MODEL_FAILED_CODE]);
@@ -154,14 +154,31 @@ const UNAVAILABLE_OUTPUT =
   /^unavailable(?:[.!]|\. The process exited before Omnigent captured a pane snapshot\.)?$/i;
 const EMPTY_RELATED_ERRORS: RelatedRenderError[] = [];
 
+function sessionRotationFailedHeadline(rawMessage: string): string {
+  const message = parseErrorMessage(rawMessage).message;
+  if (!message || message === t("sessionRotationFailedRecovery")) {
+    return t("sessionRotationFailedRecovery");
+  }
+  if (message === t("sessionRotationDraftMayRemainRecovery")) {
+    return t("sessionRotationDraftMayRemainRecovery");
+  }
+  if (message === t("sessionRotationUnconfirmedRecovery")) {
+    return t("sessionRotationUnconfirmedRecovery");
+  }
+  return message;
+}
+
 function errorHeadline(error: RenderErrorDetails): string {
+  if (error.title) return error.title;
+  if (error.code === SESSION_ROTATION_FAILED_CODE) {
+    return sessionRotationFailedHeadline(error.message);
+  }
   return (
-    error.title ||
     FAILURE_CODE_DESCRIPTIONS[error.code] ||
     (error.level === "info"
       ? "Notice"
       : error.level === "warning"
-        ? "Warning"
+        ? t("warningBannerTitle")
         : "Something went wrong")
   );
 }
@@ -561,7 +578,10 @@ export function ErrorBanner({
                 data-testid="error-headline"
                 title={headline}
                 className={cn(
-                  "min-w-0 truncate whitespace-nowrap leading-6",
+                  "min-w-0 leading-6",
+                  code === SESSION_ROTATION_FAILED_CODE
+                    ? "break-words whitespace-normal"
+                    : "truncate whitespace-nowrap",
                   warning ? "text-warning" : neutral ? "text-foreground" : "text-destructive",
                 )}
               >
@@ -591,7 +611,11 @@ export function ErrorBanner({
             variant="ghost"
             size="icon-xs"
             aria-label={
-              notice ? "Dismiss notice" : warning ? "Dismiss warning" : "Dismiss error message"
+              notice
+                ? "Dismiss notice"
+                : warning
+                  ? t("dismissWarningAriaLabel")
+                  : "Dismiss error message"
             }
             onClick={(event) => {
               event.stopPropagation();

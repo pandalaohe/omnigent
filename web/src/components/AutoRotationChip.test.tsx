@@ -8,8 +8,14 @@ vi.mock("@/lib/identity", () => ({ authenticatedFetch: fetchMock }));
 import type { AutoRotationStatus } from "@/lib/autoRotationApi";
 import {
   SESSION_COLLAB_DEFAULTS,
+  SESSION_COLLAB_STORAGE_KEY,
+  USER_PREFERENCES_DIRTY_STORAGE_KEY,
   writeSessionCollabPreferences,
 } from "@/lib/sessionCollabPreferences";
+import {
+  resetUserPreferencesSyncForTests,
+  USER_PREFERENCES_PATCH_ACKNOWLEDGED_EVENT,
+} from "@/lib/userPreferencesSync";
 import { AutoRotationChip } from "./AutoRotationChip";
 
 const initialStatus: AutoRotationStatus = {
@@ -60,6 +66,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   localStorage.clear();
+  resetUserPreferencesSyncForTests();
   clients.splice(0).forEach((client) => client.clear());
   vi.resetAllMocks();
 });
@@ -285,5 +292,106 @@ describe("AutoRotationChip", () => {
     expect(screen.getByText("Read-only here.")).toBeInTheDocument();
     expect(screen.queryByRole("combobox", { name: "Auto-rotation" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Save" })).toBeNull();
+  });
+
+  it("refreshes only after the server acknowledges a local session_collab preference patch", async () => {
+    mountChip("parent-1");
+    await screen.findByRole("button", { name: "Auto-rotation: Off" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Local write fires SESSION_COLLAB_CHANGED_EVENT before the PATCH is sent.
+    // The chip must not re-GET yet, otherwise the server would return the old value.
+    act(() => {
+      writeSessionCollabPreferences({
+        ...SESSION_COLLAB_DEFAULTS,
+        autoRotationEnabled: true,
+        autoRotationCompactions: 6,
+      });
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Unrelated namespace acknowledgement must not trigger a re-GET.
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent(USER_PREFERENCES_PATCH_ACKNOWLEDGED_EVENT, {
+          detail: { namespace: "theme" },
+        }),
+      );
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        ...initialStatus,
+        enabled: true,
+        compactions_setting: 6,
+        sources: { enabled: "user", compactions: "user", remaining_pct: "default" },
+      }),
+    });
+
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent(USER_PREFERENCES_PATCH_ACKNOWLEDGED_EVENT, {
+          detail: { namespace: "session_collab" },
+        }),
+      );
+    });
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(await screen.findByRole("button", { name: "Auto-rotation: 1/6" })).toBeInTheDocument();
+  });
+
+  it("waits for cross-tab sync acknowledgement before refreshing on storage events", async () => {
+    mountChip("parent-1");
+    await screen.findByRole("button", { name: "Auto-rotation: Off" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Another tab queues a PATCH (marking session_collab dirty) and writes localStorage.
+    localStorage.setItem(USER_PREFERENCES_DIRTY_STORAGE_KEY, JSON.stringify(["session_collab"]));
+    const updatedRaw = JSON.stringify({
+      ...SESSION_COLLAB_DEFAULTS,
+      autoRotationEnabled: true,
+      autoRotationCompactions: 7,
+    });
+    localStorage.setItem(SESSION_COLLAB_STORAGE_KEY, updatedRaw);
+
+    act(() => {
+      fireEvent(
+        window,
+        new StorageEvent("storage", {
+          key: SESSION_COLLAB_STORAGE_KEY,
+          newValue: updatedRaw,
+        }),
+      );
+    });
+    // Still dirty in the other tab — must not re-GET yet.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        ...initialStatus,
+        enabled: true,
+        compactions_setting: 7,
+        sources: { enabled: "user", compactions: "user", remaining_pct: "default" },
+      }),
+    });
+
+    // Other tab's PATCH is acknowledged and clears the dirty flag.
+    localStorage.removeItem(USER_PREFERENCES_DIRTY_STORAGE_KEY);
+    act(() => {
+      fireEvent(
+        window,
+        new StorageEvent("storage", {
+          key: USER_PREFERENCES_DIRTY_STORAGE_KEY,
+          oldValue: JSON.stringify(["session_collab"]),
+          newValue: null,
+        }),
+      );
+    });
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(await screen.findByRole("button", { name: "Auto-rotation: 1/7" })).toBeInTheDocument();
   });
 });

@@ -14,10 +14,12 @@ import {
 } from "@/lib/autoRotationApi";
 import { t } from "@/lib/autoRotationText";
 import {
+  isSessionCollabPreferenceDirty,
   SESSION_COLLAB_BOUNDS,
-  SESSION_COLLAB_CHANGED_EVENT,
   SESSION_COLLAB_STORAGE_KEY,
+  USER_PREFERENCES_DIRTY_STORAGE_KEY,
 } from "@/lib/sessionCollabPreferences";
+import { USER_PREFERENCES_PATCH_ACKNOWLEDGED_EVENT } from "@/lib/userPreferencesSync";
 
 interface SessionAutoRotationDraft {
   enabled: "default" | "on" | "off";
@@ -126,16 +128,46 @@ export function AutoRotationChip({
   });
 
   useEffect(() => {
+    let pendingCrossTabSync = isSessionCollabPreferenceDirty();
     const invalidate = () => {
       void client.invalidateQueries({ queryKey: ["auto-rotation", sessionId] });
     };
-    const onStorage = (event: StorageEvent) => {
-      if (event.key === null || event.key === SESSION_COLLAB_STORAGE_KEY) invalidate();
+    const onAcknowledged = (event: Event) => {
+      const detail = (event as CustomEvent<{ namespace?: string }>).detail;
+      if (detail?.namespace !== "session_collab") return;
+      pendingCrossTabSync = false;
+      invalidate();
     };
-    window.addEventListener(SESSION_COLLAB_CHANGED_EVENT, invalidate);
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === null) {
+        pendingCrossTabSync = false;
+        invalidate();
+        return;
+      }
+      if (event.key === SESSION_COLLAB_STORAGE_KEY) {
+        if (isSessionCollabPreferenceDirty()) {
+          pendingCrossTabSync = true;
+          return;
+        }
+        pendingCrossTabSync = false;
+        invalidate();
+        return;
+      }
+      if (event.key === USER_PREFERENCES_DIRTY_STORAGE_KEY) {
+        const nowDirty = isSessionCollabPreferenceDirty(
+          event.newValue !== undefined ? event.newValue : undefined,
+        );
+        const wasDirty = pendingCrossTabSync || isSessionCollabPreferenceDirty(event.oldValue);
+        pendingCrossTabSync = nowDirty;
+        if (wasDirty && !nowDirty) {
+          invalidate();
+        }
+      }
+    };
+    window.addEventListener(USER_PREFERENCES_PATCH_ACKNOWLEDGED_EVENT, onAcknowledged);
     window.addEventListener("storage", onStorage);
     return () => {
-      window.removeEventListener(SESSION_COLLAB_CHANGED_EVENT, invalidate);
+      window.removeEventListener(USER_PREFERENCES_PATCH_ACKNOWLEDGED_EVENT, onAcknowledged);
       window.removeEventListener("storage", onStorage);
     };
   }, [client, sessionId]);

@@ -2,16 +2,23 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type * as UserPreferencesSyncModule from "./userPreferencesSync";
 
-const { queuePatchMock } = vi.hoisted(() => ({ queuePatchMock: vi.fn() }));
+const { queuePatchMock, queueAcknowledgedPatchMock } = vi.hoisted(() => ({
+  queuePatchMock: vi.fn(),
+  queueAcknowledgedPatchMock: vi.fn(),
+}));
 vi.mock("./userPreferencesSync", async (importOriginal) => ({
   ...(await importOriginal<typeof UserPreferencesSyncModule>()),
   queueUserPreferencePatch: queuePatchMock,
+  queueAcknowledgedUserPreferencePatch: queueAcknowledgedPatchMock,
 }));
 
 import {
+  isSessionCollabPreferenceDirty,
   readSessionCollabPreferences,
+  saveSessionCollabPreferences,
   SESSION_COLLAB_DEFAULTS,
   SESSION_COLLAB_STORAGE_KEY,
+  USER_PREFERENCES_DIRTY_STORAGE_KEY,
   writeSessionCollabPreferences,
 } from "./sessionCollabPreferences";
 import {
@@ -24,6 +31,7 @@ afterEach(() => {
   localStorage.clear();
   resetUserPreferencesSyncForTests();
   queuePatchMock.mockReset();
+  queueAcknowledgedPatchMock.mockReset();
 });
 
 describe("session collab preferences", () => {
@@ -277,5 +285,40 @@ describe("session collab preferences", () => {
       autoRotationCompactions: 1,
       autoRotationRemainingPct: 90,
     });
+  });
+
+  it("saves preferences through the acknowledged patch helper and checks dirty state", async () => {
+    let resolvePatch!: () => void;
+    queueAcknowledgedPatchMock.mockReturnValueOnce(
+      new Promise<void>((resolve) => {
+        resolvePatch = resolve;
+      }),
+    );
+    const updated = {
+      ...SESSION_COLLAB_DEFAULTS,
+      autoRotationEnabled: true,
+      autoRotationCompactions: 6,
+      autoRotationRemainingPct: 30,
+    };
+
+    let resolved = false;
+    const promise = saveSessionCollabPreferences(updated).then(() => {
+      resolved = true;
+    });
+    expect(readSessionCollabPreferences()).toEqual(updated);
+    expect(queueAcknowledgedPatchMock).toHaveBeenCalledWith("session_collab", updated, undefined);
+    expect(resolved).toBe(false);
+
+    resolvePatch();
+    await promise;
+    expect(resolved).toBe(true);
+
+    expect(isSessionCollabPreferenceDirty()).toBe(false);
+    localStorage.setItem(USER_PREFERENCES_DIRTY_STORAGE_KEY, JSON.stringify(["session_collab"]));
+    expect(isSessionCollabPreferenceDirty()).toBe(true);
+    localStorage.setItem(USER_PREFERENCES_DIRTY_STORAGE_KEY, JSON.stringify(["theme"]));
+    expect(isSessionCollabPreferenceDirty()).toBe(false);
+    localStorage.setItem(USER_PREFERENCES_DIRTY_STORAGE_KEY, "invalid-json");
+    expect(isSessionCollabPreferenceDirty()).toBe(false);
   });
 });

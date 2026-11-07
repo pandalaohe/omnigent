@@ -31,5 +31,10 @@
   "useDefaultOffOption": "Use default (Off)",
   "onOption": "On",
   "offOption": "Off",
-  "saveSessionError": "Could not save auto-rotation settings."
+  "saveSessionError": "Could not save auto-rotation settings.",
+  "sessionRotationFailedRecovery": "This session could not continue in a new session automatically. Type /clear to continue.",
+  "sessionRotationDraftMayRemainRecovery": "Rotation unconfirmed; draft may remain. Inspect and clear the terminal input before pressing Enter.",
+  "sessionRotationUnconfirmedRecovery": "Rotation unconfirmed. The command was already injected and will not be retried automatically. Inspect the terminal before typing /clear.",
+  "warningBannerTitle": "Warning",
+  "dismissWarningAriaLabel": "Dismiss warning"
 }

@@ -1,9 +1,13 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const { queuePatchMock } = vi.hoisted(() => ({ queuePatchMock: vi.fn() }));
+const { queuePatchMock, queueAcknowledgedPatchMock } = vi.hoisted(() => ({
+  queuePatchMock: vi.fn(),
+  queueAcknowledgedPatchMock: vi.fn(),
+}));
 vi.mock("@/lib/userPreferencesSync", () => ({
   queueUserPreferencePatch: queuePatchMock,
+  queueAcknowledgedUserPreferencePatch: queueAcknowledgedPatchMock,
   USER_PREFERENCES_PATCH_REJECTED_EVENT: "omnigent:user-preference-rejected",
 }));
 
@@ -27,10 +31,17 @@ afterEach(() => {
   cleanup();
   localStorage.clear();
   queuePatchMock.mockReset();
+  queueAcknowledgedPatchMock.mockReset();
 });
 
 describe("ParentSessionsSettings", () => {
-  it("loads defaults, renders hints and note, and saves without dropping sibling preferences", () => {
+  it("loads defaults, shows pending until the server acknowledges the PATCH, then shows Saved without dropping sibling preferences", async () => {
+    let acknowledgePatch!: () => void;
+    queueAcknowledgedPatchMock.mockReturnValueOnce(
+      new Promise<void>((resolve) => {
+        acknowledgePatch = resolve;
+      }),
+    );
     writeSessionCollabPreferences({
       ...SESSION_COLLAB_DEFAULTS,
       childCap: 4,
@@ -65,7 +76,12 @@ describe("ParentSessionsSettings", () => {
     fireEvent.change(remaining, { target: { value: "30" } });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
-    expect(screen.getByRole("status")).toHaveTextContent("Saved");
+    // While the debounced PATCH is in flight, show pending ("Saving…") — never "Saved".
+    expect(screen.getByTestId("parent-sessions-save")).toHaveAttribute("data-state", "pending");
+    expect(screen.getByTestId("parent-sessions-save")).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent("Saving…");
+    expect(screen.queryByText("Saved")).toBeNull();
+
     expect(readSessionCollabPreferences()).toMatchObject({
       childCap: 4,
       relayDepthMax: 12,
@@ -73,7 +89,7 @@ describe("ParentSessionsSettings", () => {
       autoRotationCompactions: 6,
       autoRotationRemainingPct: 30,
     });
-    expect(queuePatchMock).toHaveBeenLastCalledWith(
+    expect(queueAcknowledgedPatchMock).toHaveBeenLastCalledWith(
       "session_collab",
       expect.objectContaining({
         childCap: 4,
@@ -82,7 +98,16 @@ describe("ParentSessionsSettings", () => {
         autoRotationCompactions: 6,
         autoRotationRemainingPct: 30,
       }),
+      expect.any(AbortSignal),
     );
+
+    await act(async () => {
+      acknowledgePatch();
+    });
+
+    expect(screen.getByTestId("parent-sessions-save")).toHaveAttribute("data-state", "saved");
+    expect(screen.getByTestId("parent-sessions-save")).toBeEnabled();
+    expect(screen.getByRole("status")).toHaveTextContent("Saved");
   });
 
   it("preserves unsaved drafts across unrelated storage events and validates bounds", () => {
@@ -101,7 +126,8 @@ describe("ParentSessionsSettings", () => {
       expect(screen.getByRole("alert")).toHaveTextContent(
         "Enter a whole number of compactions from 1 to 20.",
       );
-      expect(queuePatchMock).not.toHaveBeenCalled();
+      expect(screen.getByTestId("parent-sessions-save")).toHaveAttribute("data-state", "failed");
+      expect(queueAcknowledgedPatchMock).not.toHaveBeenCalled();
     }
 
     fireEvent.change(compactions, { target: { value: "5" } });
@@ -109,28 +135,36 @@ describe("ParentSessionsSettings", () => {
       fireEvent.change(remaining, { target: { value: badRemaining } });
       fireEvent.click(screen.getByRole("button", { name: "Save" }));
       expect(screen.getByRole("alert")).toHaveTextContent("Enter a whole percentage from 1 to 90.");
-      expect(queuePatchMock).not.toHaveBeenCalled();
+      expect(screen.getByTestId("parent-sessions-save")).toHaveAttribute("data-state", "failed");
+      expect(queueAcknowledgedPatchMock).not.toHaveBeenCalled();
     }
   });
 
-  it("reports server rejection and refreshes a clean draft on rollback", async () => {
+  it("reports server rejection without showing Saved and refreshes a clean draft on rollback", async () => {
+    let rejectPatch!: (reason: unknown) => void;
+    queueAcknowledgedPatchMock.mockReturnValueOnce(
+      new Promise<void>((_resolve, reject) => {
+        rejectPatch = reject;
+      }),
+    );
+
     renderParentSettings();
 
     const compactions = screen.getByRole("spinbutton", { name: "Rotate after compactions" });
     fireEvent.change(compactions, { target: { value: "7" } });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
-    expect(screen.getByRole("status")).toHaveTextContent("Saved");
+    expect(screen.getByRole("status")).toHaveTextContent("Saving…");
+    expect(screen.queryByText("Saved")).toBeNull();
 
-    fireEvent(
-      window,
-      new CustomEvent("omnigent:user-preference-rejected", {
-        detail: { namespace: "session_collab", status: 422 },
-      }),
-    );
+    await act(async () => {
+      rejectPatch(Object.assign(new Error("Preferences patch rejected (422)"), { status: 422 }));
+    });
+    expect(screen.getByTestId("parent-sessions-save")).toHaveAttribute("data-state", "failed");
     expect(screen.getByRole("alert")).toHaveTextContent(
       "The server rejected these parent session settings (HTTP 422).",
     );
     expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.queryByText("Saved")).toBeNull();
 
     act(() => {
       writeSessionCollabPreferences({

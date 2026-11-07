@@ -8,11 +8,13 @@ import { useSessionCollabPreferences } from "@/hooks/useSessionCollabPreferences
 import { t } from "@/lib/autoRotationText";
 import {
   readSessionCollabPreferences,
+  saveSessionCollabPreferences,
   SESSION_COLLAB_BOUNDS,
-  writeSessionCollabPreferences,
   type SessionCollabPreferences,
 } from "@/lib/sessionCollabPreferences";
 import { USER_PREFERENCES_PATCH_REJECTED_EVENT } from "@/lib/userPreferencesSync";
+
+type SaveState = "idle" | "pending" | "saved" | "failed";
 
 interface ParentSessionsDraft {
   autoRotationEnabled: boolean;
@@ -41,7 +43,17 @@ export function ParentSessionsSettings() {
   const [draft, setDraft] = useState<ParentSessionsDraft>(() => draftFromPreferences(preferences));
   const storedDraft = useRef(JSON.stringify(draftFromPreferences(preferences)));
   const [error, setError] = useState<string | null>(null);
-  const [saved, setSaved] = useState(false);
+  const [saveState, setSaveState] = useState<SaveState>("idle");
+  const saveAbortRef = useRef<AbortController | null>(null);
+  const saveSeqRef = useRef(0);
+
+  const clearPendingSave = () => {
+    saveAbortRef.current?.abort();
+    saveAbortRef.current = null;
+    saveSeqRef.current += 1;
+  };
+
+  useEffect(() => () => clearPendingSave(), []);
 
   useEffect(() => {
     const incoming = draftFromPreferences(preferences);
@@ -59,7 +71,8 @@ export function ParentSessionsSettings() {
     const onRejected = (event: Event) => {
       const detail = (event as CustomEvent<{ namespace?: string; status?: number }>).detail;
       if (detail?.namespace !== "session_collab") return;
-      setSaved(false);
+      clearPendingSave();
+      setSaveState("failed");
       setError(
         typeof detail.status === "number"
           ? t("serverRejectedSettingsError", { status: detail.status })
@@ -70,7 +83,7 @@ export function ParentSessionsSettings() {
     return () => window.removeEventListener(USER_PREFERENCES_PATCH_REJECTED_EVENT, onRejected);
   }, []);
 
-  const save = () => {
+  const save = async () => {
     const compactionsBounds = SESSION_COLLAB_BOUNDS.autoRotationCompactions;
     const compactions = parseBoundedInteger(
       draft.autoRotationCompactions,
@@ -78,7 +91,8 @@ export function ParentSessionsSettings() {
       compactionsBounds.max,
     );
     if (compactions === null) {
-      setSaved(false);
+      clearPendingSave();
+      setSaveState("failed");
       setError(t("compactionsRangeError", compactionsBounds));
       return;
     }
@@ -90,10 +104,16 @@ export function ParentSessionsSettings() {
       remainingBounds.max,
     );
     if (remainingPct === null) {
-      setSaved(false);
+      clearPendingSave();
+      setSaveState("failed");
       setError(t("remainingPctRangeError", remainingBounds));
       return;
     }
+
+    saveAbortRef.current?.abort();
+    const controller = new AbortController();
+    saveAbortRef.current = controller;
+    const seq = ++saveSeqRef.current;
 
     const nextDraft: ParentSessionsDraft = {
       autoRotationEnabled: draft.autoRotationEnabled,
@@ -102,14 +122,38 @@ export function ParentSessionsSettings() {
     };
     storedDraft.current = JSON.stringify(nextDraft);
     setDraft(nextDraft);
-    writeSessionCollabPreferences({
-      ...readSessionCollabPreferences(),
-      autoRotationEnabled: draft.autoRotationEnabled,
-      autoRotationCompactions: compactions,
-      autoRotationRemainingPct: remainingPct,
-    });
     setError(null);
-    setSaved(true);
+    setSaveState("pending");
+
+    try {
+      await saveSessionCollabPreferences(
+        {
+          ...readSessionCollabPreferences(),
+          autoRotationEnabled: draft.autoRotationEnabled,
+          autoRotationCompactions: compactions,
+          autoRotationRemainingPct: remainingPct,
+        },
+        controller.signal,
+      );
+      if (saveSeqRef.current !== seq || controller.signal.aborted) return;
+      setError(null);
+      setSaveState("saved");
+    } catch (reason) {
+      if (saveSeqRef.current !== seq || controller.signal.aborted) return;
+      const status =
+        reason &&
+        typeof reason === "object" &&
+        "status" in reason &&
+        typeof (reason as { status?: unknown }).status === "number"
+          ? (reason as { status: number }).status
+          : undefined;
+      setSaveState("failed");
+      setError(
+        status !== undefined
+          ? t("serverRejectedSettingsError", { status })
+          : t("serverRejectedSettingsGenericError"),
+      );
+    }
   };
 
   return (
@@ -119,9 +163,10 @@ export function ParentSessionsSettings() {
           aria-label={t("autoRotationLabel")}
           checked={draft.autoRotationEnabled}
           onCheckedChange={(checked) => {
+            clearPendingSave();
             setDraft((current) => ({ ...current, autoRotationEnabled: checked }));
             setError(null);
-            setSaved(false);
+            setSaveState("idle");
           }}
           data-testid="parent-sessions-auto-rotation-switch"
         />
@@ -139,9 +184,10 @@ export function ParentSessionsSettings() {
           className="h-9 w-20"
           value={draft.autoRotationCompactions}
           onChange={(event) => {
+            clearPendingSave();
             setDraft((current) => ({ ...current, autoRotationCompactions: event.target.value }));
             setError(null);
-            setSaved(false);
+            setSaveState("idle");
           }}
         />
       </SettingRow>
@@ -158,9 +204,10 @@ export function ParentSessionsSettings() {
           className="h-9 w-20"
           value={draft.autoRotationRemainingPct}
           onChange={(event) => {
+            clearPendingSave();
             setDraft((current) => ({ ...current, autoRotationRemainingPct: event.target.value }));
             setError(null);
-            setSaved(false);
+            setSaveState("idle");
           }}
         />
         <span className="text-sm text-muted-foreground">{t("percentUnit")}</span>
@@ -172,18 +219,24 @@ export function ParentSessionsSettings() {
         <Button
           type="button"
           data-testid="parent-sessions-save"
-          data-state={saved ? "saved" : "idle"}
-          onClick={save}
+          data-state={saveState}
+          disabled={saveState === "pending"}
+          onClick={() => void save()}
         >
-          {t("saveButton")}
+          {saveState === "pending" ? t("savingButton") : t("saveButton")}
         </Button>
-        {saved && (
-          <span role="status" className="text-sm text-muted-foreground">
+        {saveState === "pending" && (
+          <span role="status" data-state="pending" className="text-sm text-muted-foreground">
+            {t("savingButton")}
+          </span>
+        )}
+        {saveState === "saved" && (
+          <span role="status" data-state="saved" className="text-sm text-muted-foreground">
             {t("savedStatus")}
           </span>
         )}
         {error && (
-          <span role="alert" className="text-sm text-destructive">
+          <span role="alert" data-state="failed" className="text-sm text-destructive">
             {error}
           </span>
         )}
