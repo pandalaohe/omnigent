@@ -413,6 +413,7 @@ async def test_host_model_options_returns_prelaunch_catalog(
         "routable_models": ["system.ai.claude-sonnet-4-6[1m]"],
         # A healthy catalog has no reason to report.
         "error": None,
+        "injects_prompt": None,
     }
 
 
@@ -476,6 +477,7 @@ async def test_host_model_options_reports_probe_error_without_500(
         "models": [],
         "routable_models": [],
         "error": "the codex model probe failed — see the host log",
+        "injects_prompt": None,
     }
 
 
