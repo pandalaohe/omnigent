@@ -86,9 +86,9 @@ def host_config_path(path: Path | None = None) -> Path:
     return path if path is not None else global_config_path(CONFIG_PATH)
 
 
-def load_elevated_terminals_method(path: Path) -> Literal["sudo"] | None:
+def load_elevated_terminals_method(path: Path) -> Literal["sudo", "windows_ssh"] | None:
     """Read the explicit host opt-in; unknown methods fail closed."""
-    from omnigent._platform import IS_POSIX
+    from omnigent.terminals.elevation import elevated_method_supported
 
     if not path.exists():
         return None
@@ -98,9 +98,9 @@ def load_elevated_terminals_method(path: Path) -> Literal["sudo"] | None:
     method = host.get("elevated_terminals") if isinstance(host, dict) else None
     if method is None:
         return None
-    if method != "sudo" or not IS_POSIX:
-        raise ValueError("host.elevated_terminals supports only 'sudo' on macOS/Linux")
-    return "sudo"
+    if not isinstance(method, str) or method not in {"sudo", "windows_ssh"}:
+        raise ValueError("unknown host.elevated_terminals method")
+    return method if elevated_method_supported(method) else None
 
 
 def _validated_host_id(host_id: str, *, source: str, remedy: str) -> str:

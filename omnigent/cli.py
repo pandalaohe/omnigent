@@ -11279,6 +11279,54 @@ def _echo_daemon_payloads(payloads: list[_HostPayload]) -> None:
             )
 
 
+@host.group("admin-terminal")
+def host_admin_terminal() -> None:
+    """Opt in to or remove loopback OpenSSH admin terminals on Windows."""
+
+
+@host_admin_terminal.command("install")
+def host_admin_terminal_install() -> None:
+    """Create a passphrase-protected key and request UAC to install OpenSSH Server."""
+    from omnigent._platform import IS_WINDOWS
+
+    if not IS_WINDOWS:
+        raise click.ClickException("admin-terminal install is available on Windows only")
+    click.confirm(
+        "Install a loopback-only SSH service and a new admin key on this host? "
+        "You will choose a key passphrase and approve UAC. Existing SSH state is refused.",
+        default=False,
+        abort=True,
+    )
+    from omnigent.host.admin_terminal import install_windows_admin_terminal
+
+    try:
+        install_windows_admin_terminal()
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo("Admin terminals enabled. Restart this host to advertise the capability.")
+
+
+@host_admin_terminal.command("remove")
+def host_admin_terminal_remove() -> None:
+    """Stop admin sessions and remove this enrollment, its service and keys."""
+    from omnigent._platform import IS_WINDOWS
+
+    if not IS_WINDOWS:
+        raise click.ClickException("admin-terminal remove is available on Windows only")
+    click.confirm(
+        "Close admin SSH sessions and delete this host's enrolled service and keys?",
+        default=False,
+        abort=True,
+    )
+    from omnigent.host.admin_terminal import remove_windows_admin_terminal
+
+    try:
+        remove_windows_admin_terminal()
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo("Admin terminals removed. Restart this host; Windows may also require a reboot.")
+
+
 @host.command("enable")
 @click.option("--server", default=None, help="Server target for the persistent service.")
 @click.option(

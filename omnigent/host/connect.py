@@ -1176,10 +1176,10 @@ def _build_runner_env(
         env[RUNNER_LAUNCH_HARNESS_ENV_VAR] = harness
     if interactive_shells is not None:
         env[RUNNER_INTERACTIVE_SHELLS_ENV_VAR] = json.dumps(interactive_shells)
-    from omnigent.terminals.elevation import ELEVATED_TERMINALS_ENV
+    from omnigent.terminals.elevation import ELEVATED_TERMINALS_ENV, elevated_method_supported
 
     env.pop(ELEVATED_TERMINALS_ENV, None)
-    if elevated_terminals == "sudo":
+    if elevated_terminals is not None and elevated_method_supported(elevated_terminals):
         env[ELEVATED_TERMINALS_ENV] = elevated_terminals
     return env
 
@@ -6189,9 +6189,10 @@ class HostProcess:
     def _terminal_capabilities(self) -> list[str]:
         """Advertise elevation only when the host explicitly enabled it."""
         from omnigent.host.frames import CAP_TERMINAL_ELEVATED
+        from omnigent.terminals.elevation import elevated_method_supported
 
         capabilities = list(HOST_CAPABILITIES)
-        if self._elevated_terminals_method is not None:
+        if elevated_method_supported(self._elevated_terminals_method):
             capabilities.append(CAP_TERMINAL_ELEVATED)
         return capabilities
 

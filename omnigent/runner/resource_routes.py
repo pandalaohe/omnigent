@@ -533,9 +533,12 @@ def register_resource_routes(
                 status_code=400, content={"error": {"message": "elevated must be a boolean"}}
             )
         if elevated:
-            from omnigent.terminals.elevation import ELEVATED_TERMINALS_ENV
+            from omnigent.terminals.elevation import (
+                ELEVATED_TERMINALS_ENV,
+                elevated_method_supported,
+            )
 
-            if os.environ.get(ELEVATED_TERMINALS_ENV) != "sudo":
+            if not elevated_method_supported(os.environ.get(ELEVATED_TERMINALS_ENV)):
                 return JSONResponse(
                     status_code=409,
                     content={

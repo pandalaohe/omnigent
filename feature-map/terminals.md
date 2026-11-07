@@ -155,6 +155,7 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   wrong passwords should end sudo and remove the terminal without a root shell.
   Record the failing step, HTTP/WS result and redacted screenshot or log;
   never record passwords. Plain terminals keep their existing behavior.
+  Windows enrollment and recovery: see [Windows admin terminals](./windows-admin-terminals.md).
 - **`standalone-host-terminal` (own environment, no vendor model):**
   `tests/server/integration/test_host_terminals.py` drives the full server with
   a fake host tunnel and real runner/tmux transport: cold concurrent opens,
