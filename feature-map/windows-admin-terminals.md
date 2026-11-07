@@ -13,9 +13,9 @@ access switch does not provide an OS process boundary.
 
 ## Sub-features
 
-- Explicit host-owner enrollment with encrypted keys and pinned loopback SSH.
-- Admin terminals in sessions and standalone host terminals.
-- Per-instance agent access, idle expiry, removal and credential recovery.
+- `enrollment`: Explicit host-owner enrollment with encrypted keys and pinned loopback SSH.
+- `terminals`: Admin terminals in sessions and standalone host terminals.
+- `lifecycle`: Per-instance agent access, idle expiry, removal and credential recovery.
 
 ## How to get to it (user POV)
 

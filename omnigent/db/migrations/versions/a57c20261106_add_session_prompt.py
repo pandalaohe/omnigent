@@ -43,5 +43,20 @@ def downgrade() -> None:
                 type_=sa.LargeBinary(),
                 existing_nullable=False,
             )
+    sqlite = op.get_bind().dialect.name == "sqlite"
+    if sqlite:
+        # SQLite reflection loses DESC ordering during the table rebuild.
+        op.drop_index("idx_conversations_parent", table_name="conversations")
     with op.batch_alter_table("conversations") as batch:
         batch.drop_column("session_prompt")
+    if sqlite:
+        op.create_index(
+            "idx_conversations_parent",
+            "conversations",
+            [
+                "workspace_id",
+                "parent_conversation_id",
+                sa.text("created_at DESC"),
+                sa.text("id DESC"),
+            ],
+        )

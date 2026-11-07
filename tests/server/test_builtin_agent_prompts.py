@@ -208,7 +208,18 @@ def test_session_prompt_migration_preserves_existing_rows(tmp_path):
     migration = import_module("omnigent.db.migrations.versions.a57c20261106_add_session_prompt")
     engine = sa.create_engine(f"sqlite:///{tmp_path / 'session-prompts.db'}")
     with engine.begin() as connection:
-        connection.execute(sa.text("CREATE TABLE conversations (id VARCHAR PRIMARY KEY)"))
+        connection.execute(
+            sa.text(
+                "CREATE TABLE conversations (id VARCHAR PRIMARY KEY, workspace_id BIGINT, "
+                "parent_conversation_id VARCHAR, created_at BIGINT)"
+            )
+        )
+        connection.execute(
+            sa.text(
+                "CREATE INDEX idx_conversations_parent ON conversations "
+                "(workspace_id, parent_conversation_id, created_at DESC, id DESC)"
+            )
+        )
         connection.execute(sa.text("INSERT INTO conversations (id) VALUES ('existing')"))
     _run(engine, migration)
     with engine.begin() as connection:
@@ -220,5 +231,45 @@ def test_session_prompt_migration_preserves_existing_rows(tmp_path):
     _run(engine, migration, "downgrade")
     with engine.connect() as connection:
         assert connection.execute(sa.text("SELECT id FROM conversations")).scalar() == "existing"
-    assert {column["name"] for column in sa.inspect(engine).get_columns("conversations")} == {"id"}
+    assert {column["name"] for column in sa.inspect(engine).get_columns("conversations")} == {
+        "id",
+        "workspace_id",
+        "parent_conversation_id",
+        "created_at",
+    }
     engine.dispose()
+
+
+def test_session_prompt_sqlite_roundtrip_keeps_parent_index_ddl(tmp_path):
+    import sqlalchemy as sa
+    from alembic import command
+
+    from omnigent.db.utils import _build_alembic_config
+
+    uri = f"sqlite:///{tmp_path / 'prompt-index.db'}"
+    config = _build_alembic_config(uri)
+    engine = sa.create_engine(uri)
+    try:
+        command.upgrade(config, "head")
+        with engine.connect() as connection:
+            original = connection.scalar(
+                sa.text(
+                    "SELECT sql FROM sqlite_master WHERE type='index' "
+                    "AND name='idx_conversations_parent'"
+                )
+            )
+        assert "created_at DESC" in original and "id DESC" in original
+        for direction, revision in (("downgrade", "a56c20261106"), ("upgrade", "head")):
+            getattr(command, direction)(config, revision)
+            with engine.connect() as connection:
+                assert (
+                    connection.scalar(
+                        sa.text(
+                            "SELECT sql FROM sqlite_master WHERE type='index' "
+                            "AND name='idx_conversations_parent'"
+                        )
+                    )
+                    == original
+                )
+    finally:
+        engine.dispose()

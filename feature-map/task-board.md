@@ -8,9 +8,9 @@ link is shown as text. Waiting on me combines source tasks and native prompts.
 
 ## Sub-features
 
-- Native session trees and plan steps.
-- Source task reports, ordered routes, time maps and task details.
-- Waiting on me, source history and daily closing totals.
+- `sessions`: Native session trees and plan steps.
+- `routes`: Source task reports, ordered routes, time maps and task details.
+- `waiting`: Waiting on me, source history and daily closing totals.
 
 ## How to get to it (user POV)
 
