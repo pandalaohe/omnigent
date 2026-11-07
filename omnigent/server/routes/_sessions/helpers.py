@@ -2038,7 +2038,7 @@ def effective_host_id(
     """
     if conv.host_id is not None:
         return conv.host_id
-    for ancestor_id in _ancestor_session_ids(conv_store, conv.id):
+    for ancestor_id in _ancestor_session_ids(conv_store, conv.id, conversation=conv):
         ancestor = conv_store.get_conversation(ancestor_id)
         if ancestor is not None and ancestor.host_id is not None:
             return ancestor.host_id

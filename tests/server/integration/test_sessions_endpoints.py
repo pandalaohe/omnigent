@@ -15747,6 +15747,9 @@ async def test_stream_keeps_optional_nulls_for_unrelated_events(client: httpx.As
             "conversation_id": session_id,
             "permission_mode": "auto",
             "permission_tier_revision": None,
+            "harness": None,
+            "requested_mode": None,
+            "selection_id": None,
         }
     ]
 
@@ -16389,8 +16392,10 @@ async def test_native_permission_historical_pane_response_is_only_an_application
     captured_panes: list[str] = []
     keys: list[str] = []
 
-    def capture(*_args: object) -> str:
+    def capture(*_args: object, preserve_styles: bool = False) -> str:
         captured_panes.append(historical_pane)
+        if preserve_styles:
+            return historical_pane + "› \x1b[2mAsk Codex to do anything\x1b[0m\n? for shortcuts"
         return historical_pane
 
     monkeypatch.setattr(tmux_bridge, "_capture_pane", capture)
