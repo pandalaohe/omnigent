@@ -131,19 +131,27 @@ default (`omnigent server`); point the base URL at your own deployment.
 
 ## Authentication
 
-There is no API-key or bearer-token scheme. Identity is supplied by the \
-deployment's configured auth provider (`OMNIGENT_AUTH_PROVIDER`):
+Identity is supplied by the deployment's configured auth provider \
+(`OMNIGENT_AUTH_PROVIDER`); clients send the credential that provider issues.
 
-- **Trusted proxy header** (default) — an upstream proxy injects an \
-identity header (`X-Forwarded-Email`, configurable). Single-user local \
-runtimes fall back to a reserved `local` user.
-- **Session cookie** — a signed session cookie minted after an \
-interactive OIDC or accounts login. It is named `ap_session` over HTTP \
-(the advertised local default) and `__Host-ap_session` under HTTPS, where \
-the `__Host-` prefix guards against subdomain cookie-tossing.
+- **Session cookie** — a signed session cookie minted after an interactive \
+accounts or OIDC login. It is named `ap_session` over HTTP (the advertised \
+local default) and `__Host-ap_session` under HTTPS, where the `__Host-` \
+prefix guards against subdomain cookie-tossing.
+- **Bearer token** — `Authorization: Bearer <token>`, the same signed session \
+JWT the cookie carries. CLI hosts and scripts use this form. In accounts \
+mode `POST /auth/login` returns it as `token`; browserless clients can also \
+obtain one through the OIDC CLI flow or a deployment-configured \
+device-authorization or machine-client grant (`/oauth/*`).
+- **Trusted proxy header** — in header mode an upstream proxy injects an \
+identity header (`X-Forwarded-Email`, configurable via \
+`OMNIGENT_AUTH_HEADER`); single-user local runtimes fall back to a reserved \
+`local` user.
 
-Auth is configured server-side; clients send the cookie or proxy header \
-according to your deployment.
+There is no personal-access-token endpoint: a long-lived client holds a \
+refreshable grant, not a static key. Auth is configured server-side; clients \
+send the cookie, the bearer token or the proxy header according to the \
+deployment.
 
 ## Streaming
 
@@ -152,23 +160,34 @@ according to your deployment.
 schema documented below.
 """
 
-# Auth representations. Omnigent has no bearer/API-key scheme — identity
-# arrives via a trusted-proxy header or a signed session cookie,
-# selected by ``OMNIGENT_AUTH_PROVIDER``. We model both as OpenAPI
-# ``apiKey`` schemes so SDK generators and the reference can surface
-# them. We deliberately do NOT assert a top-level ``security``
-# requirement: the active scheme is deployment-specific, and public
-# endpoints (``/health``, ``/api/version``) require none — the prose in
-# :data:`_INFO_DESCRIPTION` carries the human-facing explanation.
+# Auth representations. Identity arrives as a trusted-proxy header, a
+# signed session cookie, or the same JWT as an ``Authorization: Bearer``
+# token, selected by ``OMNIGENT_AUTH_PROVIDER`` and the client's kind.
+# Each is modelled as an OpenAPI security scheme so SDK generators and the
+# reference can surface it. We deliberately do NOT assert a top-level
+# ``security`` requirement: the active scheme is deployment-specific, and
+# public endpoints (``/health``, ``/api/version``, ``/v1/info``) require
+# none — the prose in :data:`_INFO_DESCRIPTION` carries the human-facing
+# explanation.
 _SECURITY_SCHEMES: dict[str, dict[str, str]] = {
+    "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": (
+            "Signed session JWT as an ``Authorization: Bearer`` token "
+            "(CLI hosts and scripts). In accounts mode ``POST /auth/login`` "
+            "returns it as ``token``; browserless clients can also use a "
+            "deployment-configured device-authorization or machine-client "
+            "grant under ``/oauth``."
+        ),
+    },
     "proxyHeaderAuth": {
         "type": "apiKey",
         "in": "header",
         "name": "X-Forwarded-Email",
         "description": (
-            "Trusted-proxy identity header (header-auth mode, the "
-            "default). The header name is configurable via "
-            "``OMNIGENT_AUTH_HEADER``."
+            "Trusted-proxy identity header (header-auth mode). The header "
+            "name is configurable via ``OMNIGENT_AUTH_HEADER``."
         ),
     },
     "sessionCookieAuth": {

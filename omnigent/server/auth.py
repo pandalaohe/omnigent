@@ -887,9 +887,10 @@ class UnifiedAuthProvider(AuthProvider):
         if grant_id is not None or scope is not None:
             # A ``grant_id`` names a revocable stored grant, so it is checked
             # live against the denylist. The client-credentials grant has no
-            # stored grant and omits the claim; the lookup is skipped for it
-            # (its revocation is secret rotation plus the capped TTL) rather
-            # than run with ``None``, which fails closed on every request.
+            # stored grant and omits the claim: rotating its client secret
+            # stops new exchanges, and the capped TTL is what ends a token
+            # already issued, so the lookup is skipped rather than run with
+            # ``None`` (which fails closed on every request).
             if grant_id is not None:
                 if not isinstance(grant_id, str):
                     return None

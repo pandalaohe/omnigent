@@ -15837,8 +15837,13 @@
       }
     },
     "securitySchemes": {
+      "bearerAuth": {
+        "description": "Signed session JWT as an `Authorization: Bearer` token (CLI hosts and scripts). In accounts mode `POST /auth/login` returns it as `token`; browserless clients can also use a deployment-configured device-authorization or machine-client grant under `/oauth`.",
+        "scheme": "bearer",
+        "type": "http"
+      },
       "proxyHeaderAuth": {
-        "description": "Trusted-proxy identity header (header-auth mode, the default). The header name is configurable via `OMNIGENT_AUTH_HEADER`.",
+        "description": "Trusted-proxy identity header (header-auth mode). The header name is configurable via `OMNIGENT_AUTH_HEADER`.",
         "in": "header",
         "name": "X-Forwarded-Email",
         "type": "apiKey"
@@ -15852,7 +15857,7 @@
     }
   },
   "info": {
-    "description": "Omnigent is an open-source meta-harness for building and running AI agents. This is the REST API exposed by the Omnigent server: use it to create and drive **sessions**, manage **agents**, **hosts**, and **runners**, attach **contextual policies**, post **comments**, and work with session **resources** \u2014 files, terminals, and sandboxed environments.\n\n## Base URL\n\nOmnigent is self-hosted. The server binds `http://127.0.0.1:6767` by default (`omnigent server`); point the base URL at your own deployment.\n\n## Authentication\n\nThere is no API-key or bearer-token scheme. Identity is supplied by the deployment's configured auth provider (`OMNIGENT_AUTH_PROVIDER`):\n\n- **Trusted proxy header** (default) \u2014 an upstream proxy injects an identity header (`X-Forwarded-Email`, configurable). Single-user local runtimes fall back to a reserved `local` user.\n- **Session cookie** \u2014 a signed session cookie minted after an interactive OIDC or accounts login. It is named `ap_session` over HTTP (the advertised local default) and `__Host-ap_session` under HTTPS, where the `__Host-` prefix guards against subdomain cookie-tossing.\n\nAuth is configured server-side; clients send the cookie or proxy header according to your deployment.\n\n## Streaming\n\n`GET /v1/sessions/{session_id}/stream` streams Server-Sent Events (`text/event-stream`). Each event conforms to the `ServerStreamEvent` schema documented below.\n",
+    "description": "Omnigent is an open-source meta-harness for building and running AI agents. This is the REST API exposed by the Omnigent server: use it to create and drive **sessions**, manage **agents**, **hosts**, and **runners**, attach **contextual policies**, post **comments**, and work with session **resources** \u2014 files, terminals, and sandboxed environments.\n\n## Base URL\n\nOmnigent is self-hosted. The server binds `http://127.0.0.1:6767` by default (`omnigent server`); point the base URL at your own deployment.\n\n## Authentication\n\nIdentity is supplied by the deployment's configured auth provider (`OMNIGENT_AUTH_PROVIDER`); clients send the credential that provider issues.\n\n- **Session cookie** \u2014 a signed session cookie minted after an interactive accounts or OIDC login. It is named `ap_session` over HTTP (the advertised local default) and `__Host-ap_session` under HTTPS, where the `__Host-` prefix guards against subdomain cookie-tossing.\n- **Bearer token** \u2014 `Authorization: Bearer <token>`, the same signed session JWT the cookie carries. CLI hosts and scripts use this form. In accounts mode `POST /auth/login` returns it as `token`; browserless clients can also obtain one through the OIDC CLI flow or a deployment-configured device-authorization or machine-client grant (`/oauth/*`).\n- **Trusted proxy header** \u2014 in header mode an upstream proxy injects an identity header (`X-Forwarded-Email`, configurable via `OMNIGENT_AUTH_HEADER`); single-user local runtimes fall back to a reserved `local` user.\n\nThere is no personal-access-token endpoint: a long-lived client holds a refreshable grant, not a static key. Auth is configured server-side; clients send the cookie, the bearer token or the proxy header according to the deployment.\n\n## Streaming\n\n`GET /v1/sessions/{session_id}/stream` streams Server-Sent Events (`text/event-stream`). Each event conforms to the `ServerStreamEvent` schema documented below.\n",
     "title": "Omnigent Server",
     "version": "0.1.0"
   },
