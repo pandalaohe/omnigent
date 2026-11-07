@@ -22,6 +22,7 @@ def pages_url(appearance_url: str, browser_contract: BrowserContract) -> str:
         {
             "accounts_enabled": False,
             "single_user": True,
+            "task_board_enabled": True,
             "features": {"usage_page": True, "canvas": True, "automations_v2": True},
         },
     )
@@ -448,6 +449,7 @@ def test_scrolled_usage_clears_closed_navigation_at_landscape_widths(
 
 _PAGE_SCROLL_CALLERS = [
     ("/usage", "Usage", "UsagePage.tsx"),
+    ("/task-board", "Task board is off", "TaskBoardRoute.tsx"),
     ("/tasks", "Automations", "TasksPage.tsx"),
     ("/tasks/layout-example", "Example automation", "TaskDetailPage.tsx"),
     ("/inbox", "Inbox", "InboxPage.tsx"),
