@@ -3326,6 +3326,9 @@ async def test_persist_error_labels_truncates_long_message() -> None:
     captured: dict[str, dict[str, str]] = {}
 
     class _MockStore:
+        def get_conversation(self, session_id: str) -> None:
+            return None
+
         def set_labels(self, session_id: str, updates: dict[str, str]) -> None:
             captured[session_id] = updates
 
@@ -3362,6 +3365,9 @@ async def test_persist_error_labels_keeps_host_runner_exit_cause(
     captured: dict[str, dict[str, str]] = {}
 
     class _MockStore:
+        def get_conversation(self, session_id: str) -> None:
+            return None
+
         def set_labels(self, session_id: str, updates: dict[str, str]) -> None:
             captured[session_id] = updates
 
@@ -3399,6 +3405,9 @@ async def test_persist_error_labels_omits_chopped_cross_session_log_tail(
     captured: dict[str, dict[str, str]] = {}
 
     class _MockStore:
+        def get_conversation(self, session_id: str) -> None:
+            return None
+
         def set_labels(self, session_id: str, updates: dict[str, str]) -> None:
             captured[session_id] = updates
 
@@ -3421,6 +3430,9 @@ async def test_persist_error_labels_short_message_stored_verbatim() -> None:
     captured: dict[str, dict[str, str]] = {}
 
     class _MockStore:
+        def get_conversation(self, session_id: str) -> None:
+            return None
+
         def set_labels(self, session_id: str, updates: dict[str, str]) -> None:
             captured[session_id] = updates
 
@@ -3508,6 +3520,9 @@ async def test_persist_and_project_structured_error_round_trip() -> None:
     captured: dict[str, dict[str, str]] = {}
 
     class _MockStore:
+        def get_conversation(self, session_id: str) -> None:
+            return None
+
         def set_labels(self, session_id: str, updates: dict[str, str]) -> None:
             captured[session_id] = updates
 
@@ -3548,6 +3563,9 @@ async def test_persist_error_labels_clears_stale_structured_fields() -> None:
     captured: dict[str, dict[str, str]] = {}
 
     class _MockStore:
+        def get_conversation(self, session_id: str) -> None:
+            return None
+
         def set_labels(self, session_id: str, updates: dict[str, str]) -> None:
             captured[session_id] = updates
 
