@@ -953,7 +953,10 @@ function preferredTarget(preferredDomTarget?: HTMLElement | null): HTMLElement {
   return preferredDomTarget;
 }
 
-export function terminalDataForChord(chord: ShortcutChord): string | null {
+export function terminalDataForChord(
+  chord: ShortcutChord,
+  applicationCursorKeys = false,
+): string | null {
   const platform = currentShortcutPlatform();
   const modifiers = new Set(chord.modifiers);
   const hasPrimary = modifiers.has("primary");
@@ -977,45 +980,55 @@ export function terminalDataForChord(chord: ShortcutChord): string | null {
     if (hasMeta && !hasControl && !hasAlt && !hasShift) return "\x15";
     if (hasCtrlOrPrimary && !hasAlt && !hasShift) return "\x17";
   }
-  if (chord.code === "Delete" && modifiers.size === 0) {
-    return "\x1b[3~";
+  if (
+    (chord.code === "ArrowLeft" || chord.code === "ArrowRight") &&
+    hasMeta &&
+    !hasControl &&
+    !hasAlt &&
+    !hasShift
+  ) {
+    return chord.code === "ArrowLeft" ? "\x01" : "\x05";
   }
-  if (chord.code === "ArrowLeft" || chord.code === "ArrowRight") {
-    const dir = chord.code === "ArrowLeft" ? "D" : "C";
-    if (hasMeta && !hasControl && !hasAlt && !hasShift) {
-      return chord.code === "ArrowLeft" ? "\x01" : "\x05";
-    }
-    if (hasControl && !hasMeta && !hasAlt && !hasShift) {
-      return `\x1b[1;5${dir}`;
-    }
-    if (hasAlt && !hasControl && !hasMeta && !hasShift) {
-      return `\x1b[1;3${dir}`;
-    }
-    if (hasShift && !hasControl && !hasMeta && !hasAlt) {
-      return `\x1b[1;2${dir}`;
-    }
-  }
-  if (modifiers.size === 0) {
-    const navigationPayloads: Record<string, string> = {
-      Home: "\x1b[H",
-      End: "\x1b[F",
-      PageUp: "\x1b[5~",
-      PageDown: "\x1b[6~",
-      Space: " ",
-      F1: "\x1bOP",
-      F2: "\x1bOQ",
-      F3: "\x1bOR",
-      F4: "\x1bOS",
-      F5: "\x1b[15~",
-      F6: "\x1b[17~",
-      F7: "\x1b[18~",
-      F8: "\x1b[19~",
-      F9: "\x1b[20~",
-      F10: "\x1b[21~",
-      F11: "\x1b[23~",
-      F12: "\x1b[24~",
+  if (!hasMeta) {
+    const modifier = 1 + Number(hasShift) + 2 * Number(hasAlt) + 4 * Number(hasControl);
+    const cursorKeys: Record<string, string> = {
+      ArrowUp: "A",
+      ArrowDown: "B",
+      ArrowRight: "C",
+      ArrowLeft: "D",
+      Home: "H",
+      End: "F",
     };
-    if (chord.code in navigationPayloads) return navigationPayloads[chord.code];
+    const cursor = cursorKeys[chord.code];
+    if (Object.hasOwn(cursorKeys, chord.code)) {
+      return modifier === 1
+        ? `\x1b${applicationCursorKeys ? "O" : "["}${cursor}`
+        : `\x1b[1;${modifier}${cursor}`;
+    }
+    const functionKeys: Record<string, string> = { F1: "P", F2: "Q", F3: "R", F4: "S" };
+    const functionKey = functionKeys[chord.code];
+    if (Object.hasOwn(functionKeys, chord.code)) {
+      return modifier === 1 ? `\x1bO${functionKey}` : `\x1b[1;${modifier}${functionKey}`;
+    }
+    const tildeKeys: Record<string, number> = {
+      Insert: 2,
+      Delete: 3,
+      PageUp: 5,
+      PageDown: 6,
+      F5: 15,
+      F6: 17,
+      F7: 18,
+      F8: 19,
+      F9: 20,
+      F10: 21,
+      F11: 23,
+      F12: 24,
+    };
+    const number = tildeKeys[chord.code];
+    if (Object.hasOwn(tildeKeys, chord.code)) {
+      return `\x1b[${number}${modifier === 1 ? "" : `;${modifier}`}~`;
+    }
+    if (chord.code === "Space" && modifier === 1) return " ";
   }
   if (hasCtrlOrPrimary && !modifiers.has("meta")) {
     if (/^Key[A-Z]$/.test(chord.code)) {
@@ -1030,7 +1043,7 @@ export function terminalDataForChord(chord: ShortcutChord): string | null {
       Minus: "\x1f",
       Slash: "\x1f",
     };
-    if (!hasShift && chord.code in controlPunctuation) {
+    if (!hasShift && Object.hasOwn(controlPunctuation, chord.code)) {
       const ctrlChar = controlPunctuation[chord.code];
       return hasAlt ? `\x1b${ctrlChar}` : ctrlChar;
     }
@@ -1070,7 +1083,7 @@ export function terminalDataForChord(chord: ShortcutChord): string | null {
         Quote: ["'", '"'],
       };
       const pair = punctuation[chord.code];
-      if (pair) char = hasShift ? pair[1] : pair[0];
+      if (Object.hasOwn(punctuation, chord.code)) char = hasShift ? pair[1] : pair[0];
     }
     if (char !== null) return hasAlt ? `\x1b${char}` : char;
   }

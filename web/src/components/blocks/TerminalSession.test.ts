@@ -962,7 +962,23 @@ describe("TerminalSession", () => {
     session.dispose();
   });
 
-  it("encodes row chords once and consumes one-shots even on fallback", () => {
+  it("sends sticky Ctrl then Up as one modified arrow frame and consumes Ctrl", () => {
+    const { socket, session } = makeSession();
+    socket.open();
+    socket.sent = [];
+    session.setStickyModifiers({ ctrl: "once", alt: "off" });
+    session.sendSoftKey("arrowUp", undefined, {
+      focus: false,
+      chord: { code: "ArrowUp", modifiers: [] },
+    });
+    expect(socket.sent.map((frame) => new TextDecoder().decode(frame as Uint8Array))).toEqual([
+      "\x1b[1;5A",
+    ]);
+    expect(session.getStickyModifiers()).toEqual({ ctrl: "off", alt: "off" });
+    session.dispose();
+  });
+
+  it("encodes row chords once and retains one-shots on unsupported chords", () => {
     const { socket, session } = makeSession();
     socket.open();
     socket.sent = [];
@@ -985,13 +1001,12 @@ describe("TerminalSession", () => {
     expect(socket.sent.map((frame) => new TextDecoder().decode(frame as Uint8Array))).toEqual([
       "\x1b[1;5D",
       "\x1b\x03",
-      "\t",
       "r",
     ]);
     session.dispose();
   });
 
-  it("keeps an unsupported Alt+Tab row chord plain instead of transforming it twice", () => {
+  it("sends nothing for unsupported Alt+Tab and retains Alt for the next input", () => {
     const { socket, session } = makeSession();
     const term = (session as unknown as { term: Terminal }).term;
     socket.open();
@@ -1001,10 +1016,11 @@ describe("TerminalSession", () => {
       focus: false,
       chord: { code: "Tab", modifiers: [] },
     });
+    expect(socket.sent).toEqual([]);
+    expect(session.getStickyModifiers()).toEqual({ ctrl: "off", alt: "once" });
     term.input("p", true);
     expect(socket.sent.map((frame) => new TextDecoder().decode(frame as Uint8Array))).toEqual([
-      "\t",
-      "p",
+      "\x1bp",
     ]);
     session.dispose();
   });

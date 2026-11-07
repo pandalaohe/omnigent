@@ -27,7 +27,7 @@ def _configure_buttons(page: Page) -> None:
                 ['Down', 'ArrowDown'], ['Left', 'ArrowLeft'],
                 ['Right', 'ArrowRight'], ['Enter', 'Enter']].map(([label, code]) => ({
                     id: code, label, kind: 'key', chord: {code, modifiers: []}
-                })),
+                })).concat([{id: 'ctrl', label: 'Ctrl', kind: 'modifier', modifier: 'ctrl'}]),
             buttons: [
                 {id: 'phrase', label: 'Phrase', binding: {kind: 'text', text: 'hello'}},
                 ...[['Esc', 'Escape'], ['Tab', 'Tab'], ['Up', 'ArrowUp'],
@@ -136,6 +136,22 @@ def test_phrase_and_keys_reach_cli_bridge(
     assert b"".join(inputs) == expected
     # Terminal keys preserve the dismissed keyboard; only Keyboard explicitly opens it.
     expect(textarea).not_to_be_focused()
+
+
+def test_sticky_ctrl_arrow_reaches_cli_bridge(
+    page: Page, cli_bridge: tuple[Locator, list[bytes]]
+) -> None:
+    _, inputs = cli_bridge
+    page.set_viewport_size({"width": 390, "height": 844})
+    toolbar = page.get_by_role("toolbar", name="Terminal keys")
+    expect(toolbar).to_be_visible()
+    toolbar.get_by_role("button", name="Ctrl", exact=True).tap()
+    toolbar.get_by_role("button", name="Up", exact=True).tap()
+    toolbar.get_by_role("button", name="Down", exact=True).tap()
+    deadline = time.monotonic() + 3
+    while len(inputs) < 2 and time.monotonic() < deadline:
+        page.wait_for_timeout(10)
+    assert inputs == [b"\x1b[1;5A", b"\x1b[B"]
 
 
 def test_switching_to_chat_does_not_type_into_the_hidden_terminal(
