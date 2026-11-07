@@ -1400,3 +1400,29 @@ describe("ErrorBanner — info level", () => {
     expect(screen.getByTestId("error-headline")).toHaveClass("text-destructive");
   });
 });
+
+describe("ErrorBanner — warning level", () => {
+  it("renders a non-destructive warning pill visually distinct from error and info", () => {
+    render(
+      <ErrorBanner
+        message="This session could not continue in a new session automatically. Type /clear to continue."
+        source="harness"
+        code="session_rotation_failed"
+        level="warning"
+      />,
+    );
+    const pill = screen.getByTestId("error-pill");
+    expect(pill).toHaveAttribute("data-level", "warning");
+    expect(pill.getAttribute("style")).toContain("--warning");
+    expect(pill.getAttribute("style")).not.toContain("--destructive");
+    expect(pill.getAttribute("style")).not.toContain("--muted-foreground");
+    const headline = screen.getByTestId("error-headline");
+    expect(headline).toHaveTextContent(
+      "This session could not continue in a new session automatically. Type /clear to continue.",
+    );
+    expect(headline).toHaveClass("text-warning");
+    expect(headline).not.toHaveClass("text-destructive");
+    expect(headline).not.toHaveClass("text-foreground");
+    expect(screen.getByRole("button", { name: "Dismiss warning" })).toBeInTheDocument();
+  });
+});

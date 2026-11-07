@@ -236,4 +236,46 @@ describe("session collab preferences", () => {
       quotaPeriods: { claude: "5h", unknown: "month" },
     });
   });
+
+  it("normalizes and persists parent session auto-rotation defaults within bounds", () => {
+    expect(SESSION_COLLAB_DEFAULTS.autoRotationEnabled).toBe(false);
+    expect(SESSION_COLLAB_DEFAULTS.autoRotationCompactions).toBe(4);
+    expect(SESSION_COLLAB_DEFAULTS.autoRotationRemainingPct).toBe(25);
+
+    const updated = {
+      ...SESSION_COLLAB_DEFAULTS,
+      childCap: 3,
+      autoRotationEnabled: true,
+      autoRotationCompactions: 8,
+      autoRotationRemainingPct: 35,
+    };
+    writeSessionCollabPreferences(updated);
+    expect(readSessionCollabPreferences()).toEqual(updated);
+    expect(queuePatchMock).toHaveBeenLastCalledWith("session_collab", updated);
+
+    localStorage.setItem(
+      SESSION_COLLAB_STORAGE_KEY,
+      JSON.stringify({
+        autoRotationEnabled: "yes",
+        autoRotationCompactions: 21,
+        autoRotationRemainingPct: 0,
+      }),
+    );
+    expect(readSessionCollabPreferences()).toEqual(SESSION_COLLAB_DEFAULTS);
+
+    localStorage.setItem(
+      SESSION_COLLAB_STORAGE_KEY,
+      JSON.stringify({
+        autoRotationEnabled: true,
+        autoRotationCompactions: 1,
+        autoRotationRemainingPct: 90,
+      }),
+    );
+    expect(readSessionCollabPreferences()).toEqual({
+      ...SESSION_COLLAB_DEFAULTS,
+      autoRotationEnabled: true,
+      autoRotationCompactions: 1,
+      autoRotationRemainingPct: 90,
+    });
+  });
 });

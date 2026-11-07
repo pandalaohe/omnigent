@@ -55,6 +55,7 @@ import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
 import { SidebarOpenButton } from "./SidebarOpenButton";
 import { ReceiveAnnotationsButton } from "@/components/ReceiveAnnotationsButton";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { AutoRotationChip } from "@/components/AutoRotationChip";
 import { StandingApprovalChip } from "@/components/StandingApprovalChip";
 import { SessionChoiceCard } from "@/pages/settings/sessionChoice/SessionChoiceCard";
 import { isEditorLevel } from "@/lib/permissionsApi";
@@ -672,11 +673,18 @@ export function ChatHeader({
 
       <div className="flex items-center gap-2 max-md:gap-0 max-md:empty:hidden">
         {!pending && conversationId && (
-          <StandingApprovalChip
-            key={conversationId}
-            sessionId={conversationId}
-            readOnly={isChildSession || archived || !isEditorLevel(permissionLevel ?? null)}
-          />
+          <>
+            <StandingApprovalChip
+              key={`approval:${conversationId}`}
+              sessionId={conversationId}
+              readOnly={isChildSession || archived || !isEditorLevel(permissionLevel ?? null)}
+            />
+            <AutoRotationChip
+              key={`auto-rotation:${conversationId}`}
+              sessionId={conversationId}
+              readOnly={archived || !isEditorLevel(permissionLevel ?? null)}
+            />
+          </>
         )}
         {/* Other users currently viewing this session (presence).
             Self-contained — reads the chat store directly, renders

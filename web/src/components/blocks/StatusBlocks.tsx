@@ -63,8 +63,8 @@ interface ErrorBannerProps {
   cause?: string;
   /** Concrete next step to fix it, e.g. a command to run. */
   remediation?: string;
-  /** `"info"` renders a neutral notice (no failure tone) instead of a destructive error. */
-  level?: "error" | "info";
+  /** `"info"` renders a neutral notice; `"warning"` renders a non-destructive warning pill. */
+  level?: "error" | "info" | "warning";
   /** Recover the existing session or continue after a retryable turn failure. */
   onRetry?: (error: RelatedRenderError) => Promise<void>;
   /** Later failures emitted by the same response, turn, and agent. */
@@ -112,6 +112,8 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
     "Codex couldn't get a token from the model provider's sign-in command on the host.",
   client_update_required:
     "The agent CLI on the host is too old for the selected model. Update it on the host, then start a new session.",
+  session_rotation_failed:
+    "This session could not continue in a new session automatically. Type /clear to continue.",
 };
 
 const COMPACTION_MODEL_FAILED_CODE = "codex_compaction_model_failed";
@@ -156,7 +158,11 @@ function errorHeadline(error: RenderErrorDetails): string {
   return (
     error.title ||
     FAILURE_CODE_DESCRIPTIONS[error.code] ||
-    (error.level === "info" ? "Notice" : "Something went wrong")
+    (error.level === "info"
+      ? "Notice"
+      : error.level === "warning"
+        ? "Warning"
+        : "Something went wrong")
   );
 }
 
@@ -317,10 +323,22 @@ export function ErrorBanner({
     code === "workspace_missing" ||
     relatedErrors.some((error) => error.code === "workspace_missing");
   const notice = level === "info" && relatedErrors.every((error) => error.level === "info");
-  const neutral = [{ code, level }, ...relatedErrors].every(
-    (error) => error.level === "info" || NEUTRAL_TONE_CODES.has(error.code),
-  );
-  const tone = neutral ? "var(--muted-foreground)" : "var(--destructive)";
+  const warning =
+    !notice &&
+    [{ level }, ...relatedErrors].every(
+      (error) => error.level === "warning" || error.level === "info",
+    ) &&
+    [{ level }, ...relatedErrors].some((error) => error.level === "warning");
+  const neutral =
+    !warning &&
+    [{ code, level }, ...relatedErrors].every(
+      (error) => error.level === "info" || NEUTRAL_TONE_CODES.has(error.code),
+    );
+  const tone = warning
+    ? "var(--warning)"
+    : neutral
+      ? "var(--muted-foreground)"
+      : "var(--destructive)";
   const headline = errorHeadline({ message, source: "", code, title, cause, remediation, level });
   const relatedDetails = useMemo(
     () =>
@@ -498,7 +516,7 @@ export function ErrorBanner({
       />
       <div
         data-testid="error-pill"
-        data-level={notice ? "info" : "error"}
+        data-level={notice ? "info" : warning ? "warning" : "error"}
         onClick={() => expandable && setExpanded((value) => !value)}
         className={cn(
           "group/error relative z-10 w-[560px] max-w-full rounded-[12px] p-[8px] text-foreground",
@@ -544,7 +562,7 @@ export function ErrorBanner({
                 title={headline}
                 className={cn(
                   "min-w-0 truncate whitespace-nowrap leading-6",
-                  neutral ? "text-foreground" : "text-destructive",
+                  warning ? "text-warning" : neutral ? "text-foreground" : "text-destructive",
                 )}
               >
                 {headline}
@@ -572,7 +590,9 @@ export function ErrorBanner({
             type="button"
             variant="ghost"
             size="icon-xs"
-            aria-label={notice ? "Dismiss notice" : "Dismiss error message"}
+            aria-label={
+              notice ? "Dismiss notice" : warning ? "Dismiss warning" : "Dismiss error message"
+            }
             onClick={(event) => {
               event.stopPropagation();
               setDismissed(true);

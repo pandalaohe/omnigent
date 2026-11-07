@@ -30,6 +30,9 @@ export interface SessionCollabPreferences {
   quotaFloorPct: number | null;
   quotaPeriodDefault: string | null;
   quotaPeriods: Record<string, string>;
+  autoRotationEnabled: boolean;
+  autoRotationCompactions: number;
+  autoRotationRemainingPct: number;
 }
 
 export type SessionCollabNumericField =
@@ -44,7 +47,9 @@ export type SessionCollabNumericField =
   | "undeliveredTtlSeconds"
   | "childKeepWarmClaudeIntervalSeconds"
   | "childKeepWarmCodexIntervalSeconds"
-  | "childKeepWarmMaxSeconds";
+  | "childKeepWarmMaxSeconds"
+  | "autoRotationCompactions"
+  | "autoRotationRemainingPct";
 
 /** Accepted range per numeric field, in the stored unit (seconds for windows). */
 export const SESSION_COLLAB_BOUNDS: Record<
@@ -63,6 +68,8 @@ export const SESSION_COLLAB_BOUNDS: Record<
   childKeepWarmClaudeIntervalSeconds: { min: 300, max: 3540 },
   childKeepWarmCodexIntervalSeconds: { min: 300, max: 1740 },
   childKeepWarmMaxSeconds: { min: 3600, max: 172800 },
+  autoRotationCompactions: { min: 1, max: 20 },
+  autoRotationRemainingPct: { min: 1, max: 90 },
 };
 
 export const SESSION_COLLAB_DEFAULTS: SessionCollabPreferences = {
@@ -89,6 +96,9 @@ export const SESSION_COLLAB_DEFAULTS: SessionCollabPreferences = {
   quotaFloorPct: null,
   quotaPeriodDefault: null,
   quotaPeriods: {},
+  autoRotationEnabled: false,
+  autoRotationCompactions: 4,
+  autoRotationRemainingPct: 25,
 };
 
 function normalizeInteger(value: unknown, field: SessionCollabNumericField): number {
@@ -193,6 +203,18 @@ function normalizePreferences(value: unknown): SessionCollabPreferences {
     quotaFloorPct: normalizePercentage(raw.quotaFloorPct, 0, 100),
     quotaPeriodDefault: normalizeQuotaPeriod(raw.quotaPeriodDefault),
     quotaPeriods: normalizeQuotaPeriods(raw.quotaPeriods),
+    autoRotationEnabled: normalizeBoolean(
+      raw.autoRotationEnabled,
+      SESSION_COLLAB_DEFAULTS.autoRotationEnabled,
+    ),
+    autoRotationCompactions: normalizeInteger(
+      raw.autoRotationCompactions,
+      "autoRotationCompactions",
+    ),
+    autoRotationRemainingPct: normalizeInteger(
+      raw.autoRotationRemainingPct,
+      "autoRotationRemainingPct",
+    ),
   };
 }
 
