@@ -52,7 +52,7 @@ export function Segmented<T extends string>({
           title={option.title}
           data-testid={option.testId}
           className={cn(
-            "min-h-11 min-w-11 rounded-md px-2 text-ui whitespace-normal wrap-anywhere outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring md:min-h-8 md:px-3",
+            "inline-flex min-h-11 min-w-11 items-center justify-center rounded-md px-2 text-ui whitespace-normal wrap-anywhere outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring md:min-h-8 md:px-3",
             stretch && "flex-1",
             value === option.value
               ? quiet
