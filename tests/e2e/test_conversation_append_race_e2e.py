@@ -138,7 +138,7 @@ def ap_server_with_shared_db() -> Iterator[tuple[str, str]]:
                 resp = httpx.get(f"{base_url}/health", timeout=2.0)
                 if resp.status_code == 200:
                     break
-            except (httpx.ConnectError, httpx.ReadError):
+            except httpx.HTTPError:
                 pass
             time.sleep(0.2)
         else:

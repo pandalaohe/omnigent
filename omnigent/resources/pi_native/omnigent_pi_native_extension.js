@@ -2537,13 +2537,23 @@ module.exports = function (pi) {
     }
   }
 
+  let taskToolRegistered = bridgedTools.has("manage_todo_list");
+
   function registerTaskToolIfMissing() {
-    if (typeof pi.registerTool !== "function") return;
-    const existing =
-      typeof pi.getAllTools === "function"
-        ? pi.getAllTools().some((tool) => tool.name === "manage_todo_list")
-        : false;
-    if (existing) return;
+    if (taskToolRegistered || typeof pi.registerTool !== "function") return;
+    let existing = bridgedTools.has("manage_todo_list");
+    if (!existing && typeof pi.getAllTools === "function") {
+      try {
+        existing = pi.getAllTools().some((tool) => tool.name === "manage_todo_list");
+      } catch (_err) {
+        existing = false;
+      }
+    }
+    if (existing) {
+      taskToolRegistered = true;
+      return;
+    }
+    taskToolRegistered = true;
     pi.registerTool({
       name: "manage_todo_list",
       label: "Task Plan",
@@ -2606,6 +2616,7 @@ module.exports = function (pi) {
       },
     });
   }
+  registerTaskToolIfMissing();
 
   async function syncTaskListFromResult(event) {
     if (!event || event.toolName !== "manage_todo_list" || event.isError)

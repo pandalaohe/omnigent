@@ -27,6 +27,7 @@ from tests.e2e.conftest import (
     send_user_message_to_session,
 )
 from tests.e2e.omnigent._pi_mock_gateway import write_pi_gateway_config
+from tests.server.helpers import PERMISSION_TIERS_HEADERS
 
 _MODEL = "local-vllm-32k"
 _CONTEXT_LIMIT = 32_768
