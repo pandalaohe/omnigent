@@ -7111,6 +7111,79 @@ def test_kill_session_without_expected_close_leaves_no_marker(
     assert not pane_closed_by_omnigent(private_dir)
 
 
+@pytest.mark.parametrize("busy_check", [0, 1, 2, 3, 4])
+@pytest.mark.parametrize("live_busy", [True, None])
+def test_automatic_clear_rechecks_live_status_before_keys(
+    tmp_path, monkeypatch, busy_check, live_busy
+):
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=_TEST_TMUX_SOCKET, tmux_target="claude:0.0")
+    checks = iter([False] * busy_check + [live_busy])
+    composer = _EditableComposer("", cursor=0)
+    composer.install(monkeypatch)
+    run_tmux = composer._run_tmux
+
+    def tmux(socket, *args):
+        # A dropped submit keeps the real draft editable for the retry phase.
+        if args[-1] != "Enter":
+            run_tmux(socket, *args)
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", tmux)
+    monkeypatch.setattr(claude_native_bridge, "_claude_turn_running", lambda *a: next(checks))
+    monkeypatch.setattr(
+        claude_native_bridge, "_reclaim_and_wait_for_prompt", lambda *a, **kw: None
+    )
+    with pytest.raises(RuntimeError, match=r"unconfirmed|confirmed idle") as caught:
+        claude_native_bridge.inject_slash_command(bridge_dir, command="/clear", require_idle=True)
+    assert composer.text == ""
+    if busy_check >= 3:
+        assert isinstance(caught.value, claude_native_bridge.ClaudeRotationUnconfirmed)
+        assert caught.value.draft_may_remain is False
+    run_tmux(str(_TEST_TMUX_SOCKET), "send-keys", "-t", "claude:0.0", "Enter")
+    assert composer.submitted == [""]
+
+
+@pytest.mark.parametrize("phase", ["before_enter", "enter_retry"])
+@pytest.mark.parametrize("failure", ["clear_failed", "capture_unavailable"])
+def test_automatic_clear_abort_reports_unconfirmed_draft(tmp_path, monkeypatch, phase, failure):
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=_TEST_TMUX_SOCKET, tmux_target="claude:0.0")
+    composer = _EditableComposer("", cursor=0)
+    composer.install(monkeypatch)
+    checks = iter([False] * (3 if phase == "before_enter" else 4) + [True])
+    aborting = False
+
+    def busy(*args):
+        nonlocal aborting
+        aborting = next(checks)
+        return aborting
+
+    def tmux(socket, *args):
+        if aborting and failure == "clear_failed":
+            raise OSError("tmux unavailable")
+        if args[-1] != "Enter":
+            composer._run_tmux(socket, *args)
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", tmux)
+    monkeypatch.setattr(claude_native_bridge, "_claude_turn_running", busy)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_capture_pane",
+        lambda *a: (
+            "" if aborting and failure == "capture_unavailable" else composer._capture_pane(*a)
+        ),
+    )
+    monkeypatch.setattr(
+        claude_native_bridge, "_reclaim_and_wait_for_prompt", lambda *a, **kw: None
+    )
+    with pytest.raises(
+        claude_native_bridge.ClaudeRotationUnconfirmed, match="draft may remain"
+    ) as caught:
+        claude_native_bridge.inject_slash_command(bridge_dir, command="/clear", require_idle=True)
+    assert caught.value.draft_may_remain is True
+    assert composer.text.strip() == "/clear"
+
+
 def test_inject_slash_command_clears_draft_pastes_literal_then_enter(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

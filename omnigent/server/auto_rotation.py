@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -34,6 +35,7 @@ AUTO_ROTATION_STATE_PREFIX = "omnigent.auto_rotation_state."
 FRESH_ROUND_LABEL_KEY = f"{AUTO_ROTATION_STATE_PREFIX}fresh_round"
 NOTICED_COUNT_LABEL_KEY = f"{AUTO_ROTATION_STATE_PREFIX}noticed_count"
 INFERRED_COMPACTIONS_LABEL_KEY = f"{AUTO_ROTATION_STATE_PREFIX}inferred_compactions"
+INJECTED_REVISION_LABEL_KEY = f"{AUTO_ROTATION_STATE_PREFIX}injected_revision"
 
 
 def _label_int(value: str | None, minimum: int = 0, maximum: int | None = None) -> int | None:
@@ -155,35 +157,27 @@ def auto_rotation_for(
 
 def record_auto_rotation_usage(
     session_id: str,
-    label_updates: dict[str, str],
-    previous_context_tokens: str | None,
+    context_patch: Mapping[str, object],
     conversation_store: ConversationStore,
     permission_store: PermissionStore | None = None,
     prefs_store: SqlAlchemyUserPreferencesStore | None = None,
     conv: Conversation | None = None,
-) -> AutoRotationStatus | None:
-    """Observe round state after context persistence, using its prior token reading."""
-    from omnigent.server.routes._sessions.helpers import _resolve_harness
-    from omnigent.server.routes.sessions.routes_succession import _ROTATION_NATIVE_HARNESSES
+    *,
+    label_updates: dict[str, str] | None = None,
+) -> tuple[dict[str, object], AutoRotationStatus | None]:
+    """Persist context and infer the round from the prior reading in one transaction."""
 
     if conv is None:
         conv = conversation_store.get_conversation(session_id)
     if conv is None:
         raise ConversationNotFoundError(session_id)
-    if (
-        conv.parent_conversation_id is not None
-        or conv.archived
-        or _resolve_harness(conv) not in _ROTATION_NATIVE_HARNESSES
-    ):
-        if label_updates:
-            conversation_store.set_labels(session_id, label_updates)
-        return None
-
     eligibility_read_failed = False
 
-    def observe(current: dict[str, str]) -> LabelGroupChange:
+    def observe(current: dict[str, str], context_change: LabelGroupChange) -> LabelGroupChange:
         nonlocal eligibility_read_failed
-        labels = current | label_updates
+        updates = dict(label_updates or {}) | context_change.upserts
+        deletes = set(context_change.deletes)
+        labels = {key: value for key, value in current.items() if key not in deletes} | updates
         try:
             current_conv = conversation_store.get_conversation(session_id)
         except SQLAlchemyError:
@@ -191,17 +185,16 @@ def record_auto_rotation_usage(
             logger.warning(
                 "Could not read auto-rotation eligibility for %s", session_id, exc_info=True
             )
-            return LabelGroupChange(dict(label_updates), set())
+            return LabelGroupChange(updates, deletes)
         if current_conv is None:
             raise ConversationNotFoundError(session_id)
         latest = replace(current_conv, labels=labels)
         status = auto_rotation_for(latest, conversation_store, permission_store, prefs_store)
-        updates = dict(label_updates)
         if not status.eligible or not status.enabled:
-            return LabelGroupChange(updates, set())
+            return LabelGroupChange(updates, deletes)
         if status.harness == "antigravity-native":
             point = compaction_point(latest, status.harness)
-            before = _label_int(previous_context_tokens)
+            before = _label_int(current.get("omnigent.last_context_tokens"))
             after = _label_int(labels.get("omnigent.last_context_tokens"))
             if (
                 point is not None
@@ -219,15 +212,21 @@ def record_auto_rotation_usage(
             and _label_int(current.get(FRESH_ROUND_LABEL_KEY)) != status.round_marker
         ):
             updates[FRESH_ROUND_LABEL_KEY] = str(status.round_marker)
-        return LabelGroupChange(updates, set())
+        return LabelGroupChange(updates, deletes)
 
-    conversation_store.mutate_label_group(session_id, "omnigent.", observe)
+    from omnigent.server.routes._sessions.context_readings import persist_context_reading
+
+    payload = persist_context_reading(
+        conversation_store, session_id, context_patch, observer=observe
+    )
     if eligibility_read_failed:
-        return None
+        return payload, None
     try:
         reloaded = conversation_store.get_conversation(session_id)
         if reloaded is not None:
-            return auto_rotation_for(reloaded, conversation_store, permission_store, prefs_store)
+            return payload, auto_rotation_for(
+                reloaded, conversation_store, permission_store, prefs_store
+            )
     except Exception:
         logger.warning("Could not observe auto-rotation context for %s", session_id, exc_info=True)
-    return None
+    return payload, None

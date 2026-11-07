@@ -10,6 +10,8 @@ app; component checks use their own isolated test environment.
 - [Pi RPC interrupted turns](features/pi-rpc-recovery.md): reconnect, continuation
   receipts, user controls, permission initialization and context usage.
 - [OTLP usage ingestion](features/usage-otlp.md): HTTP signals, accounting and managed-session exclusion.
+- [Automatic rotation](features/auto-rotation.md): context notices, handover deferral,
+  durable request recovery and runner concurrency.
 
 Record the checkout revision, command, result and evidence location for each run.
 An HTML preview with fake data proves the shown component interactions, rather

@@ -5475,6 +5475,8 @@ def create_runner_app(
         for rid in stale_resp_ids:
             _resp_to_conv.pop(rid, None)
 
+        rotations_started.pop(session_id, None)
+
         return JSONResponse(
             status_code=200,
             content={
@@ -6082,14 +6084,21 @@ def create_runner_app(
             )
         return JSONResponse(content={"successor_id": successor})
 
-    async def _run_pending_rotation(conv_id: str, *, require_label: bool = True) -> bool:
+    async def _rotate_session(
+        conv_id: str,
+        *,
+        require_label: bool = True,
+        recovery: bool = False,
+        expected_revision: str | None = None,
+    ) -> str:
         """Type ``/clear`` for a session whose handover asked for rotation.
 
         The server is the source of truth: a session archived (or rotated)
         since the request must not be cleared again, and the label is the
-        request's durable record. Any failure is logged and never retried —
-        the label stays and the user can ``/clear`` by hand.
+        request's durable record. The server may re-trigger a lost arm through
+        the guarded executor; failures leave the durable request intact.
         """
+        from omnigent.server.auto_rotation import INJECTED_REVISION_LABEL_KEY
         from omnigent.stores.conversation_store import ROTATE_REQUESTED_LABEL_KEY
 
         try:
@@ -6105,7 +6114,7 @@ def create_runner_app(
                 exc_info=True,
                 extra={"session_id": conv_id},
             )
-            return False
+            return "not_requested"
         if resp.status_code != 200:
             _logger.warning(
                 "Pending rotation read of session %s returned %d",
@@ -6113,15 +6122,40 @@ def create_runner_app(
                 resp.status_code,
                 extra={"session_id": conv_id},
             )
-            return False
+            return "not_requested"
         try:
             snapshot = resp.json()
         except ValueError:
-            return False
+            return "not_requested"
         if not isinstance(snapshot, dict):
-            return False
+            return "not_requested"
         harness = snapshot.get("harness") or _session_harness_name(conv_id)
         labels = snapshot.get("labels")
+        if require_label and (
+            conv_id in _succeeded_parents
+            or (isinstance(labels, dict) and labels.get("omnigent.succeeded_by"))
+        ):
+            rotations_started.pop(conv_id, None)
+            return "superseded"
+        if require_label and snapshot.get("archived") is True:
+            rotations_started.pop(conv_id, None)
+            return "not_requested"
+        if require_label and isinstance(labels, dict):
+            revision = snapshot.get("archive_revision")
+            if (
+                type(revision) is not int
+                or revision < 0
+                or labels.get(ROTATE_REQUESTED_LABEL_KEY) != str(revision)
+                or (expected_revision is not None and expected_revision != str(revision))
+            ):
+                return "not_requested"
+            started = rotations_started.get(conv_id)
+            if started is not None and revision <= int(started[0]):
+                return started[1] if revision == int(started[0]) else "superseded"
+            injected = labels.get(INJECTED_REVISION_LABEL_KEY)
+            if isinstance(injected, str) and injected.isascii() and injected.isdecimal():
+                if int(injected) >= revision:
+                    return "unconfirmed"
         completed_pi_source = (
             harness == "pi"
             and isinstance(labels, dict)
@@ -6130,13 +6164,54 @@ def create_runner_app(
         if snapshot.get("parent_session_id"):
             if not require_label:
                 raise HTTPException(409, "Only a top-level Pi session can rotate")
-            return False
+            return "not_requested"
         if snapshot.get("archived") is True and not completed_pi_source:
-            return False
+            return "not_requested"
         if require_label and (
             not isinstance(labels, dict) or not labels.get(ROTATE_REQUESTED_LABEL_KEY)
         ):
-            return False
+            return "not_requested"
+        if recovery:
+            try:
+                status_response = await server_client.get(
+                    f"/v1/sessions/{urllib.parse.quote(conv_id, safe='')}/auto-rotation",
+                    timeout=10.0,
+                )
+                status_response.raise_for_status()
+                status = status_response.json()
+                if (
+                    not isinstance(status, dict)
+                    or status.get("enabled") is not True
+                    or status.get("eligible") is not True
+                    or status.get("rotation_pending") is not True
+                ):
+                    return "not_requested"
+            except Exception:
+                _logger.warning(
+                    "Could not revalidate rotation recovery for %s", conv_id, exc_info=True
+                )
+                return "not_requested"
+        if require_label and _rotation_session_busy(conv_id):
+            return "busy"
+        if require_label:
+            try:
+                claim = await server_client.post(
+                    f"/v1/sessions/{urllib.parse.quote(conv_id, safe='')}/handover/injection",
+                    json={"archive_revision": str(snapshot["archive_revision"])},
+                    timeout=10.0,
+                )
+                claim.raise_for_status()
+                outcome = claim.json().get("status")
+                if outcome != "claimed":
+                    return "unconfirmed" if outcome == "unconfirmed" else "not_requested"
+            except Exception:
+                _logger.warning(
+                    "Could not persist rotation injection for %s", conv_id, exc_info=True
+                )
+                return "not_requested"
+            rotations_started[conv_id] = (str(snapshot["archive_revision"]), "unconfirmed")
+            if _rotation_session_busy(conv_id):
+                return "busy"
         try:
             if harness == "claude-native":
                 response = await _handle_claude_native_slash_command(
@@ -6144,6 +6219,7 @@ def create_runner_app(
                     "/clear",
                     error_code="claude_native_clear_failed",
                     context="claude-native clear",
+                    lifecycle_locked=require_label,
                 )
             elif harness == "codex-native":
                 response = await _handle_codex_native_slash_command(
@@ -6176,7 +6252,7 @@ def create_runner_app(
                 if succession_body.get("status") == "retired":
                     if require_label:
                         _logger.warning("Pi succession retired for session %s", conv_id)
-                        return False
+                        return "not_requested"
                     raise HTTPException(
                         409,
                         {
@@ -6185,9 +6261,11 @@ def create_runner_app(
                         },
                     )
                 if succession_body.get("status") != "done":
-                    return False
+                    return "not_requested"
                 await process_manager.release(conv_id)
-                return True
+                if require_label and conv_id not in _succeeded_parents:
+                    rotations_started[conv_id] = (str(snapshot["archive_revision"]), "unconfirmed")
+                return "started"
             else:
                 _logger.warning(
                     "Pending rotation: unsupported harness %r for session %s",
@@ -6195,7 +6273,7 @@ def create_runner_app(
                     conv_id,
                     extra={"session_id": conv_id},
                 )
-                return False
+                return "not_requested"
         except HTTPException:
             raise
         except Exception:
@@ -6205,7 +6283,7 @@ def create_runner_app(
                 exc_info=True,
                 extra={"session_id": conv_id},
             )
-            return False
+            return "not_requested"
         if response.status_code >= 400:
             _logger.warning(
                 "Pending rotation /clear was refused for session %s (status %d)",
@@ -6213,7 +6291,79 @@ def create_runner_app(
                 response.status_code,
                 extra={"session_id": conv_id},
             )
-        return response.status_code < 400
+        if require_label and isinstance(response, JSONResponse):
+            result = json.loads(bytes(response.body))
+            if result.get("rotation_unconfirmed") is True:
+                outcome = "draft_may_remain" if result.get("draft_may_remain") else "unconfirmed"
+                if conv_id not in _succeeded_parents:
+                    rotations_started[conv_id] = (str(snapshot["archive_revision"]), outcome)
+                return outcome
+        if response.status_code < 400 and require_label and conv_id not in _succeeded_parents:
+            rotations_started[conv_id] = (str(snapshot["archive_revision"]), "unconfirmed")
+        return "started" if response.status_code < 400 else "not_requested"
+
+    rotations_in_flight: set[str] = set()
+    # Keep only the newest injected revision for each live session. An absent
+    # succession receipt cannot prove it is safe to inject that command again.
+    rotations_started: dict[str, tuple[str, str]] = {}
+
+    def _rotation_session_busy(conv_id: str) -> bool:
+        return (
+            conv_id in _active_turns
+            or (process_manager is not None and process_manager.has_active_turn(conv_id))
+            or _native_turn_in_flight(conv_id)
+        )
+
+    async def _execute_pending_rotation(
+        conv_id: str,
+        *,
+        require_label: bool = True,
+        recovery: bool = False,
+        expected_revision: str | None = None,
+    ) -> str:
+        if require_label and conv_id in _succeeded_parents:
+            return "superseded"
+        if conv_id in rotations_in_flight:
+            return "in_flight"
+        rotations_in_flight.add(conv_id)
+        try:
+            if require_label:
+                if _rotation_session_busy(conv_id):
+                    return "busy"
+                # Turn streams acquire this lifecycle lock shared before using
+                # the runtime. No new stream can start during validation/injection.
+                async with _cli_runtime_lock(conv_id).exclusive():
+                    return await _rotate_session(
+                        conv_id,
+                        recovery=recovery,
+                        expected_revision=expected_revision,
+                    )
+            return await _rotate_session(
+                conv_id,
+                require_label=require_label,
+                recovery=recovery,
+                expected_revision=expected_revision,
+            )
+        except HTTPException:
+            raise
+        except Exception:
+            _logger.warning("Pending rotation failed for %s", conv_id, exc_info=True)
+            return "not_requested"
+        finally:
+            rotations_in_flight.discard(conv_id)
+
+    async def _run_pending_rotation(conv_id: str, *, require_label: bool = True) -> bool:
+        return await _execute_pending_rotation(conv_id, require_label=require_label) == "started"
+
+    @app.post("/v1/sessions/{session_id}/pending-rotation")
+    async def pending_rotation(
+        session_id: str, body: dict[str, str] | None = None
+    ) -> dict[str, str]:
+        return {
+            "status": await _execute_pending_rotation(
+                session_id, recovery=True, expected_revision=(body or {}).get("archive_revision")
+            )
+        }
 
     def _schedule_pending_rotation(session_id: str) -> None:
         """Consume an armed rotation at the session's native idle edge."""
@@ -12402,6 +12552,7 @@ def create_runner_app(
         # re-hold a successor that no later release would drain.
         first_call = _succeeded_parents.get(session_id) != target_session_id
         _succeeded_parents[session_id] = target_session_id
+        rotations_started.pop(session_id, None)
         _rekey_subagent_work_for_succession(session_id, target_session_id)
         if first_call and target_session_id in _session_inboxes:
             # Hold the successor's delivery until the server posts the opening
@@ -13857,6 +14008,8 @@ def create_runner_app(
             _cli_runtime_lifecycle.finish_reclaim(session_id, present=True)
             raise
         _cli_runtime_lifecycle.finish_reclaim(session_id)
+        if body["reason"] == "archive":
+            rotations_started.pop(session_id, None)
         return JSONResponse(
             status_code=200,
             content={"session_id": session_id, "status": "released"},

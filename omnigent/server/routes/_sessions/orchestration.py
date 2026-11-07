@@ -3065,6 +3065,7 @@ def _build_session_response(
         created_at=conv.created_at,
         updated_at=conv.updated_at,
         archived_at=conv.archived_at,
+        archive_revision=conv.archive_revision,
         title=title_without_closed_marker(conv.title),
         labels=labels,
         session_choice=choice_record(conv),
@@ -3938,18 +3939,7 @@ async def _persist_external_session_usage(
                 model=_n_model,
             )
         )
-    previous_context_tokens = None
-    if (
-        raw_tokens is not None
-        and auto_rotation_app_state is not None
-        and (conv is None or _resolve_harness(conv) == "antigravity-native")
-    ):
-        previous_context = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-        if previous_context is not None:
-            previous_context_tokens = previous_context.labels.get("omnigent.last_context_tokens")
-    context_payload = await asyncio.to_thread(
-        persist_context_reading, conversation_store, session_id, body.data
-    )
+    context_payload: dict[str, object] = {}
     label_updates: dict[str, str] = {}
     if has_pi_cache and pi_cache_ttl is not None:
         label_updates["omnigent.pi_cache"] = pi_cache_label(pi_cache_ttl, *pi_cache_values)
@@ -3964,17 +3954,23 @@ async def _persist_external_session_usage(
     if raw_tokens is not None and auto_rotation_app_state is not None:
         from omnigent.server.auto_rotation import record_auto_rotation_usage
 
-        await asyncio.to_thread(
+        context_payload, rotation_status = await asyncio.to_thread(
             record_auto_rotation_usage,
             session_id,
-            label_updates,
-            previous_context_tokens,
+            body.data,
             conversation_store,
             getattr(auto_rotation_app_state, "permission_store", None),
             getattr(auto_rotation_app_state, "user_preferences_store", None),
             conv,
+            label_updates=label_updates,
         )
+        notices = getattr(auto_rotation_app_state, "auto_rotation_notices", None)
+        if rotation_status is not None and rotation_status.due and notices is not None:
+            notices.mark_due(session_id, rotation_status.round_marker)
     else:
+        context_payload = await asyncio.to_thread(
+            persist_context_reading, conversation_store, session_id, body.data
+        )
         if label_updates:
             await asyncio.to_thread(conversation_store.set_labels, session_id, label_updates)
     if has_pi_cache and pi_cache_ttl is None:

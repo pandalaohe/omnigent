@@ -430,8 +430,8 @@ def test_failed_eligibility_read_still_commits_usage(db_uri, monkeypatch, enable
         return read(session_id)
 
     monkeypatch.setattr(store, "get_conversation", unavailable_once)
-    result_status = record_auto_rotation_usage(
-        source.id, {"omnigent.last_context_tokens": "190000"}, "180000", store, conv=admitted
+    _, result_status = record_auto_rotation_usage(
+        source.id, {"context_tokens": 190000}, store, conv=admitted
     )
     result = read(source.id)
     assert result_status is None
@@ -551,3 +551,34 @@ def test_malformed_preferences_and_failed_reads_do_not_trigger(db_uri, monkeypat
     assert not auto_rotation_for(conv, store, prefs_store=prefs).due
     monkeypatch.setattr(store, "get_compaction_stats", failed)
     assert not auto_rotation_for(conv, store).due
+
+
+async def test_overlapping_token_reports_infer_a_drop_only_once(runtime_init, db_uri):
+    import asyncio
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(harness_override="antigravity-native")
+    store.set_labels(
+        conv.id,
+        {
+            "omnigent.auto_rotation": "on",
+            "omnigent.last_context_window": "200000",
+            "omnigent.last_context_tokens": "180000",
+        },
+    )
+    state = SimpleNamespace(permission_store=None, user_preferences_store=None)
+    await asyncio.gather(
+        *[
+            _persist_external_session_usage(
+                conv.id,
+                SessionEventInput(type="external_session_usage", data={"context_tokens": 60000}),
+                store,
+                conv=conv,
+                auto_rotation_app_state=state,
+            )
+            for _ in range(2)
+        ]
+    )
+    labels = store.get_conversation(conv.id).labels
+    assert labels[INFERRED_COMPACTIONS_LABEL_KEY] == "1"
+    assert labels[FRESH_ROUND_LABEL_KEY] == "1"

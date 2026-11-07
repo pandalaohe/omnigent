@@ -155,3 +155,30 @@ async def test_session_handover_validates_arguments() -> None:
     assert "non-empty string 'handover'" in json.loads(empty)["error"]
     assert "boolean 'rotate'" in json.loads(bad_rotate)["error"]
     assert requests == []
+
+
+@pytest.mark.asyncio
+async def test_auto_handover_deferred_never_arms_runner() -> None:
+    requests = []
+
+    def handler(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200, json={"item_id": "note", "rotate": False, "deferred": "compacted"}
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_handover",
+                arguments=json.dumps({"handover": "Continue.", "auto": True}),
+                server_client=client,
+                conversation_id="current",
+            )
+        )
+    assert requests == [{"handover": "Continue.", "rotate": True, "auto": True}]
+    assert result["deferred"] == "compacted"
+    assert "Keep working" in result["note"]
+    assert not runner_app.pop_pending_rotation("current")

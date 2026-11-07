@@ -8,8 +8,13 @@ def test_session_handover_schema_is_self_scoped() -> None:
 
     assert schema["name"] == "sys_session_handover"
     assert schema["parameters"]["required"] == ["handover"]
-    assert set(schema["parameters"]["properties"]) == {"handover", "rotate"}
+    assert set(schema["parameters"]["properties"]) == {"handover", "rotate", "auto"}
     assert schema["parameters"]["properties"]["handover"]["minLength"] == 1
     assert schema["parameters"]["properties"]["rotate"]["default"] is True
     assert "cleared" in schema["description"]
     assert "live sub-agents" in schema["description"]
+
+
+def test_automatic_handover_is_opt_in() -> None:
+    schema = SysSessionHandoverTool().get_schema()["function"]
+    assert schema["parameters"]["properties"]["auto"]["default"] is False

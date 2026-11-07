@@ -10109,10 +10109,13 @@ async def _session_handover_via_rest(
     rotate = args.get("rotate", True)
     if not isinstance(rotate, bool):
         return json.dumps({"error": "sys_session_handover requires a boolean 'rotate'"})
+    auto = args.get("auto", False)
+    if not isinstance(auto, bool):
+        return json.dumps({"error": "sys_session_handover requires a boolean 'auto'"})
     try:
         response = await server_client.post(
             f"/v1/sessions/{conversation_id}/handover",
-            json={"handover": handover, "rotate": rotate},
+            json={"handover": handover, "rotate": rotate, **({"auto": auto} if auto else {})},
             timeout=30.0,
         )
     except Exception as exc:  # noqa: BLE001
@@ -10137,6 +10140,13 @@ async def _session_handover_via_rest(
     if not isinstance(recorded_rotate, bool):
         return json.dumps({"error": "sys_session_handover response omitted the rotate flag"})
     result: _JsonObject = {"recorded": True, "item_id": item_id, "rotate": recorded_rotate}
+    if "deferred" in payload:
+        result["deferred"] = payload["deferred"]
+    if payload.get("deferred"):
+        result["note"] = (
+            f"Rotation deferred ({payload['deferred']}). Keep working; a new notice follows "
+            "when the context is low again."
+        )
     if recorded_rotate:
         from omnigent.runner.app import record_pending_rotation
 

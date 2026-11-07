@@ -3875,7 +3875,8 @@
               {
                 "enum": [
                   "error",
-                  "info"
+                  "info",
+                  "warning"
                 ],
                 "type": "string"
               },
@@ -9639,6 +9640,11 @@
       "SessionHandoverRequest": {
         "description": "Request body for `POST /v1/sessions/{session_id}/handover`.\n\nRecords a handover note on a top-level native session and optionally\nrequests that the session rotate at its next turn end.",
         "properties": {
+          "auto": {
+            "default": false,
+            "title": "Auto",
+            "type": "boolean"
+          },
           "handover": {
             "description": "The note the successor session opens with. Must be non-empty after stripping whitespace.",
             "minLength": 1,
@@ -11325,6 +11331,12 @@
             ],
             "description": "Why the session was archived, read from the `omnigent.archive_reason` label (e.g. `\"host_offline\"` when the keep-warm sweeper retired a child under an offline host). `None` when the user archived it or the row is not archived.",
             "title": "Archive Reason"
+          },
+          "archive_revision": {
+            "default": 0,
+            "format": "int64",
+            "title": "Archive Revision",
+            "type": "integer"
           },
           "archived": {
             "default": false,
@@ -29139,6 +29151,61 @@
           }
         },
         "summary": "Record Session Handover",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/handover/injection": {
+      "post": {
+        "description": "Durably consume one request before its runner can send a rotation command.",
+        "operationId": "claim_rotation_injection_v1_sessions__session_id__handover_injection_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "title": "Body",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Claim Rotation Injection",
         "tags": [
           "sessions"
         ]

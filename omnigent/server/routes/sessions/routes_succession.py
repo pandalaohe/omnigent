@@ -26,6 +26,7 @@ from omnigent.mcp_selection import MCP_SELECTION_PREFIX
 from omnigent.permission_tiers import PermissionTier
 from omnigent.runner.routing import RunnerRouter
 from omnigent.server.auth import LEVEL_EDIT, AuthProvider
+from omnigent.server.auto_rotation import INJECTED_REVISION_LABEL_KEY, _label_int
 from omnigent.server.child_cap import CHILD_CAP_LABEL_KEY
 from omnigent.server.permission_tiers import ConfirmedPermissionState, read_permission_state
 from omnigent.server.routes._auth_helpers import (
@@ -51,6 +52,7 @@ from omnigent.stores.conversation_store import (
     SUCCEEDED_BY_LABEL_KEY,
     SUCCEEDS_LABEL_KEY,
     ConversationStore,
+    LabelGroupChange,
     SuccessionRefusedError,
 )
 from omnigent.stores.peer_message_store import PeerMessageStore
@@ -151,6 +153,53 @@ def register_succession_routes(
         )
         return agent.name if agent is not None else conversation.agent_id or "omnigent"
 
+    @router.post("/sessions/{session_id}/handover/injection", response_model=None)
+    async def claim_rotation_injection(
+        request: Request, session_id: str, body: dict[str, str]
+    ) -> dict[str, str]:
+        """Durably consume one request before its runner can send a rotation command."""
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access_and_level(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        revision = _label_int(body.get("archive_revision"))
+        if revision is None:
+            raise OmnigentError("Invalid rotation revision", code=ErrorCode.INVALID_INPUT)
+        outcome = "not_requested"
+
+        def claim(labels: dict[str, str]) -> LabelGroupChange:
+            nonlocal outcome
+            outcome = "not_requested"
+            latest = conversation_store.get_conversation(session_id)
+            if (
+                latest is None
+                or latest.archived
+                or latest.parent_conversation_id is not None
+                or latest.archive_revision != revision
+                or labels.get(ROTATE_REQUESTED_LABEL_KEY) != str(revision)
+                or labels.get(SUCCEEDED_BY_LABEL_KEY)
+            ):
+                return LabelGroupChange({}, set())
+            native = _native_coding_agent_for_session(latest)
+            harness = (
+                native.harness
+                if native is not None
+                else _resolve_harness(latest, agent_store=agent_store)
+            )
+            if harness not in _ROTATION_NATIVE_HARNESSES:
+                return LabelGroupChange({}, set())
+            injected = _label_int(labels.get(INJECTED_REVISION_LABEL_KEY))
+            if injected is not None and injected >= revision:
+                outcome = "unconfirmed"
+                return LabelGroupChange({}, set())
+            outcome = "claimed"
+            return LabelGroupChange({INJECTED_REVISION_LABEL_KEY: str(revision)}, set())
+
+        await asyncio.to_thread(
+            conversation_store.mutate_label_group, session_id, "omnigent.", claim
+        )
+        return {"status": outcome}
+
     @router.post("/sessions/{session_id}/successor", status_code=200, response_model=None)
     async def create_session_successor(request: Request, session_id: str) -> dict[str, str]:
         """Create or recover a successor before its runner can initialize it."""
@@ -241,6 +290,8 @@ def register_succession_routes(
         )
 
         text = body.handover.strip()
+        if body.auto and not body.rotate:
+            raise OmnigentError("auto requires rotate=true", code=ErrorCode.INVALID_INPUT)
         if not text:
             raise OmnigentError(
                 "handover must be a non-empty string",
@@ -280,11 +331,63 @@ def register_succession_routes(
             _publish_external_conversation_item(session_id, handover_item)
 
         label_updates = {HANDOVER_ITEM_LABEL_KEY: handover_item.id}
-        if body.rotate:
-            label_updates[ROTATE_REQUESTED_LABEL_KEY] = str(conversation.archive_revision)
-        await asyncio.to_thread(conversation_store.set_labels, session_id, label_updates)
+        rotate = body.rotate
+        deferred = None
+        status = None
+        if body.auto:
+            from dataclasses import replace
 
-        if body.rotate:
+            from omnigent.server.auto_rotation import (
+                FRESH_ROUND_LABEL_KEY,
+                NOTICED_COUNT_LABEL_KEY,
+                auto_rotation_for,
+            )
+            from omnigent.stores.conversation_store import LabelGroupChange
+
+            def auto_change(labels: dict[str, str]) -> LabelGroupChange:
+                nonlocal rotate, deferred, status
+                latest = conversation_store.get_conversation(session_id)
+                if latest is None:
+                    raise _session_not_found()
+                status = auto_rotation_for(
+                    replace(latest, labels=labels),
+                    conversation_store,
+                    permission_store,
+                    getattr(request.app.state, "user_preferences_store", None),
+                )
+                marker = str(status.round_marker)
+                if not status.enabled or not status.eligible:
+                    deferred = "switch_off"
+                elif (
+                    labels.get(NOTICED_COUNT_LABEL_KEY) not in {None, marker}
+                    or labels.get(FRESH_ROUND_LABEL_KEY) != marker
+                ):
+                    deferred = "compacted"
+                elif (
+                    status.remaining_pct is None
+                    or status.remaining_pct > status.remaining_pct_setting
+                ):
+                    deferred = "above_threshold"
+                rotate = deferred is None
+                updates = dict(label_updates)
+                if rotate:
+                    updates[ROTATE_REQUESTED_LABEL_KEY] = str(latest.archive_revision)
+                deletes = (
+                    {NOTICED_COUNT_LABEL_KEY}
+                    if deferred in {"switch_off", "above_threshold"}
+                    else set()
+                )
+                return LabelGroupChange(updates, deletes)
+
+            await asyncio.to_thread(
+                conversation_store.mutate_label_group, session_id, "omnigent.", auto_change
+            )
+        elif rotate:
+            label_updates[ROTATE_REQUESTED_LABEL_KEY] = str(conversation.archive_revision)
+        if not body.auto:
+            await asyncio.to_thread(conversation_store.set_labels, session_id, label_updates)
+
+        if rotate:
             notice = NewConversationItem(
                 type="error",
                 response_id=generate_task_id(),
@@ -304,7 +407,28 @@ def register_succession_routes(
             if persisted_notice and not persisted_notice[0].deduplicated:
                 _publish_external_conversation_item(session_id, persisted_notice[0])
 
-        return {"item_id": handover_item.id, "rotate": body.rotate}
+            from omnigent.server.auto_rotation import auto_rotation_for
+
+            latest = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if latest is not None:
+                current_status = await asyncio.to_thread(
+                    auto_rotation_for,
+                    latest,
+                    conversation_store,
+                    permission_store,
+                    getattr(request.app.state, "user_preferences_store", None),
+                )
+                notices = getattr(request.app.state, "auto_rotation_notices", None)
+                if current_status.enabled and current_status.eligible and notices is not None:
+                    notices.track(session_id, latest.labels[ROTATE_REQUESTED_LABEL_KEY])
+        result = {"item_id": handover_item.id, "rotate": rotate, "deferred": deferred}
+        if status is not None:
+            result.update(
+                compactions=status.compactions,
+                remaining_pct=status.remaining_pct,
+                remaining_pct_setting=status.remaining_pct_setting,
+            )
+        return result
 
     @router.post(
         "/sessions/{session_id}/succession",

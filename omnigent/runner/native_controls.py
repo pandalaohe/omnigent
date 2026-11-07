@@ -1490,6 +1490,8 @@ def build_native_controls(
     async def _prepare_claude_native_pane_for_injection(
         conv_id: str,
         bridge_dir: Path,
+        *,
+        lifecycle_locked: bool = False,
     ) -> None:
         """Heal a dead-but-registered Claude pane before typing into it.
 
@@ -1530,7 +1532,9 @@ def build_native_controls(
         if instance is not None and await instance.is_alive():
             return
         try:
-            await _ensure_native_terminal_for_turn(conv_id, "claude-native")
+            await _ensure_native_terminal_for_turn(
+                conv_id, "claude-native", lifecycle_locked=lifecycle_locked
+            )
         except Exception as exc:  # noqa: BLE001 — a failed heal must not become a 500
             # The ensure raises on a failed recreate; inject answers its own 503.
             _logger.warning(
@@ -2250,9 +2254,11 @@ def build_native_controls(
         *,
         error_code: str,
         context: str,
+        lifecycle_locked: bool = False,
     ) -> Response:
         """Type one slash command into a live claude-native pane."""
         from omnigent.harnesses.claude_native.bridge import (
+            ClaudeRotationUnconfirmed,
             bridge_dir_for_bridge_id,
             inject_slash_command,
         )
@@ -2263,7 +2269,14 @@ def build_native_controls(
             session_id=conv_id,
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
-        await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
+        if lifecycle_locked and _native_pane_status.get(conv_id) in ("running", "waiting"):
+            return Response(status_code=409)
+        await _prepare_claude_native_pane_for_injection(
+            conv_id, bridge_dir, lifecycle_locked=lifecycle_locked
+        )
+        if lifecycle_locked and _native_pane_status.get(conv_id) in ("running", "waiting"):
+            return Response(status_code=409)
+        injection_options = {"require_idle": True} if lifecycle_locked else {}
         try:
             await _drive_claude_pane(
                 deadline,
@@ -2272,6 +2285,16 @@ def build_native_controls(
                 command=command,
                 timeout_s=1.0,
                 ready_timeout_s=min(_CLAUDE_CONTROL_PROMPT_WAIT_S, deadline.remaining_s()),
+                **injection_options,
+            )
+        except ClaudeRotationUnconfirmed as exc:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "rotation_unconfirmed": True,
+                    "draft_may_remain": exc.draft_may_remain,
+                    "detail": str(exc),
+                },
             )
         except (RuntimeError, ValueError, OSError) as exc:
             return JSONResponse(
