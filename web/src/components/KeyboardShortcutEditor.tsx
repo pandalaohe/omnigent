@@ -96,7 +96,7 @@ function ShortcutBindingButton({
       onClick={onRecord}
       aria-label={`Record ${targetLabel} for ${definition.label}`}
       aria-pressed={recording}
-      className="phone-hit-area relative flex min-h-8 items-center justify-end gap-1 rounded-md px-1.5 outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring phone:min-h-11 phone:min-w-11"
+      className="phone-hit-area relative flex min-h-7 items-center justify-end gap-1 rounded-md px-1.5 outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring phone:min-h-11 phone:min-w-11"
     >
       {recording ? (
         <span className="animate-pulse text-sm text-primary">Press shortcut…</span>
@@ -366,7 +366,7 @@ export function KeyboardShortcutEditor() {
         <details
           key={group.id}
           open={query || changedOnly ? true : undefined}
-          className="mb-3 rounded-xl border border-border bg-card p-3 last:mb-0"
+          className="mb-2 rounded-xl border border-border bg-card px-3 py-2 last:mb-0"
           onToggle={(event) => {
             if (
               !event.currentTarget.open &&
@@ -376,13 +376,13 @@ export function KeyboardShortcutEditor() {
               stopRecording();
           }}
         >
-          <summary className="min-h-8 cursor-pointer text-ui font-medium">
+          <summary className="cursor-pointer select-none text-ui font-medium">
             {group.label}
             {group.note ? (
               <span className="ml-1.5 font-normal text-muted-foreground/70">· {group.note}</span>
             ) : null}
           </summary>
-          <ul>
+          <ul className="mt-1">
             {(definitionsByGroup.get(group.id) ?? [])
               .filter((definition) => matches(definition.id))
               .map((definition) => {
@@ -396,9 +396,9 @@ export function KeyboardShortcutEditor() {
                   <li
                     key={definition.id}
                     data-testid={`shortcut-editor-row-${definition.id}`}
-                    className="border-b border-border/60 py-2 last:border-b-0"
+                    className="border-b border-border/60 py-1.5 last:border-b-0 last:pb-0"
                   >
-                    <div className="flex min-h-9 flex-wrap items-center gap-2 phone:min-h-11 phone:gap-5">
+                    <div className="flex flex-wrap items-center gap-2 phone:min-h-11 phone:gap-5">
                       <span className="min-w-32 flex-1">
                         <span className="block text-ui text-foreground">{definition.label}</span>
                         {definition.note ? (
@@ -479,7 +479,7 @@ export function KeyboardShortcutEditor() {
                       <div
                         key={platform.id}
                         data-testid={`shortcut-platform-${definition.id}-${platform.id}`}
-                        className="ml-4 flex min-h-9 flex-wrap items-center gap-2 border-l border-border/60 pl-3 phone:mt-3 phone:min-h-11 phone:gap-5"
+                        className="mt-1 ml-4 flex flex-wrap items-center gap-2 border-l border-border/60 pl-3 phone:mt-3 phone:min-h-11 phone:gap-5"
                       >
                         <span className="min-w-20 flex-1 text-sm text-muted-foreground">
                           {platform.label}
