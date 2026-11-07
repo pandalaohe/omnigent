@@ -163,6 +163,26 @@ services:
       # so the operator's logs aren't cluttered with a URL they
       # can't click.
       OMNIGENT_ACCOUNTS_AUTO_OPEN: "${OMNIGENT_ACCOUNTS_AUTO_OPEN:-0}"
+
+      # ── Browserless clients ──────────────────────────
+      # Compose forwards only the variables listed here, so setting these
+      # in .env alone would do nothing. Both features are off by default: an
+      # unset value keeps them off.
+      #
+      # Device authorization (RFC 8628): a browserless client gets a
+      # per-user token after the user approves in a browser. Works in the
+      # accounts and oidc modes. The optional client secret gates the
+      # client-facing endpoints; the consent page never needs it.
+      OMNIGENT_DEVICE_GRANT_ENABLED: "${OMNIGENT_DEVICE_GRANT_ENABLED:-}"
+      OMNIGENT_DEVICE_CLIENT_SECRET: "${OMNIGENT_DEVICE_CLIENT_SECRET:-}"
+      # Machine client (OAuth client_credentials): a headless process acts as
+      # its own principal. Set all three of CLIENT_ID, CLIENT_SECRET_HASH (the
+      # HMAC-SHA256 digest, never the raw secret) and SUB, or none of them.
+      # SUB must be a non-admin principal; the TTL is capped at one hour.
+      OMNIGENT_MACHINE_CLIENT_ID: "${OMNIGENT_MACHINE_CLIENT_ID:-}"
+      OMNIGENT_MACHINE_CLIENT_SECRET_HASH: "${OMNIGENT_MACHINE_CLIENT_SECRET_HASH:-}"
+      OMNIGENT_MACHINE_SUB: "${OMNIGENT_MACHINE_SUB:-}"
+      OMNIGENT_MACHINE_TOKEN_TTL: "${OMNIGENT_MACHINE_TOKEN_TTL:-}"
     volumes:
       - artifact-data:/data
     ports:
