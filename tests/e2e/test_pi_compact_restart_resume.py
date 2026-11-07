@@ -30,7 +30,9 @@ from tests.e2e.omnigent._pi_mock_gateway import write_pi_gateway_config
 from tests.server.helpers import PERMISSION_TIERS_HEADERS
 
 _MODEL = "local-vllm-32k"
-_CONTEXT_LIMIT = 32_768
+# Bridged sys_* tool schemas + base prompt take ~17.7k tokens (20 kept turns = ~33.8k);
+# 36k overflows at turn 23 (> Pi's 20k keepRecentTokens floor) and fits 23 + 15 <= 40.
+_CONTEXT_LIMIT = 36_864
 _SUMMARY_PROMPTS = (
     "Create a structured context checkpoint summary",
     "Create a concise checkpoint of the user's request",

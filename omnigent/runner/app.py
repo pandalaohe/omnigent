@@ -8421,6 +8421,9 @@ def create_runner_app(
         if superseded is not None and superseded.relay is not relay:
             superseded.relay.close()
 
+        if pi_scoped_relay:
+            return
+
         async def _notify_tools_changed() -> None:
             from threading import Event
 

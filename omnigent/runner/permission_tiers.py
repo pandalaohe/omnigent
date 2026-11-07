@@ -769,7 +769,8 @@ class PermissionTierRuntime:
                     return TierDecision(Verdict.DENY, registry.reason)
             extensions = dict(registry.extensions)
             if pi_scope is not None and name in registry.bridge_tools and "__" not in name:
-                if not (name in _READ_PATH and not isinstance(arguments.get(_READ_PATH[name]), str)):
+                read_path_arg = _READ_PATH.get(name)
+                if read_path_arg is None or isinstance(arguments.get(read_path_arg), str):
                     eval_local_execution = True
                 builtin_omnigent_tools = {
                     *_READ_PATH,

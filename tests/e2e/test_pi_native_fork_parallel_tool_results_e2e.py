@@ -473,6 +473,7 @@ def test_pi_native_cold_resume_keeps_result_before_message_sent_during_tool(
         # so a steer sent mid-tool lands after the
         # tool result instead of upstream's acceptance-time placement.
         send_user_text(client, session_id=session_id, text=steer)
+        time.sleep(0.5)
         release.touch()
         _wait(lambda: replied("STEER-SEEN"))
         order = [
