@@ -169,22 +169,26 @@ async function connectAttestor({endpoint,credential,brokerIncarnation,launchEpoc
       execute:(metadata,onResponse)=>request("/permission-tiers/control",{type:"permission_tier_execute",...metadata},scopeCredential,onResponse),
       finish:metadata=>request("/permission-tiers/control",{type:"permission_tier_finish",...metadata},scopeCredential),
       revoke:()=>control("revoke",{handle}),
-      rpc:(port,metadata)=>new Promise((resolve,reject)=>{
-        if(!Number.isInteger(port)||port<1||port>65535){reject(new Error("Scoped Pi bridge unavailable"));return;}
-        const id=crypto.randomUUID();let text="",settled=false;
-        const socket=net.createConnection({port,host:"127.0.0.1"});
-        const fail=()=>{if(!settled){settled=true;reject(new Error("Scoped Pi bridge unavailable"));}socket.destroy();};
-        socket.on("connect",()=>socket.write(JSON.stringify({id,kind:"pi_scoped",credential:scopeCredential,payload:JSON.stringify(metadata)})+"\n"));
-        socket.on("data",chunk=>{
-          text+=chunk;
-          if(text.length>1024*1024){fail();return;}
-          const end=text.indexOf("\n");if(end<0)return;
-          try {const reply=JSON.parse(text.slice(0,end));if(reply.id!==id){fail();return;}settled=true;resolve(reply);socket.destroy();}
-          catch(_){fail();}
+      rpc:(port,metadata)=>{
+        if(port===0||port===null||port===undefined)
+          return request("/pi/rpc",{payload:JSON.stringify(metadata)},scopeCredential);
+        return new Promise((resolve,reject)=>{
+          if(!Number.isInteger(port)||port<1||port>65535){reject(new Error("Scoped Pi bridge unavailable"));return;}
+          const id=crypto.randomUUID();let text="",settled=false;
+          const socket=net.createConnection({port,host:"127.0.0.1"});
+          const fail=()=>{if(!settled){settled=true;reject(new Error("Scoped Pi bridge unavailable"));}socket.destroy();};
+          socket.on("connect",()=>socket.write(JSON.stringify({id,kind:"pi_scoped",credential:scopeCredential,payload:JSON.stringify(metadata)})+"\n"));
+          socket.on("data",chunk=>{
+            text+=chunk;
+            if(text.length>1024*1024){fail();return;}
+            const end=text.indexOf("\n");if(end<0)return;
+            try {const reply=JSON.parse(text.slice(0,end));if(reply.id!==id){fail();return;}settled=true;resolve(reply);socket.destroy();}
+            catch(_){fail();}
+          });
+          socket.on("error",fail);socket.on("close",()=>{if(!settled)fail();});
+          socket.setTimeout(86400000,fail);
         });
-        socket.on("error",fail);socket.on("close",()=>{if(!settled)fail();});
-        socket.setTimeout(86400000,fail);
-      }),
+      },
     }});
   }
   return Object.freeze({bind:values=>control("bind",values),client,close:()=>{lose();watch.destroy();}});

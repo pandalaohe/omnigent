@@ -27,9 +27,12 @@ from tests.e2e.conftest import (
     send_user_message_to_session,
 )
 from tests.e2e.omnigent._pi_mock_gateway import write_pi_gateway_config
+from tests.server.helpers import PERMISSION_TIERS_HEADERS
 
 _MODEL = "local-vllm-32k"
-_CONTEXT_LIMIT = 32_768
+# Bridged sys_* tool schemas + base prompt take ~17.7k tokens (20 kept turns = ~33.8k);
+# 36k overflows at turn 23 (> Pi's 20k keepRecentTokens floor) and fits 23 + 15 <= 40.
+_CONTEXT_LIMIT = 36_864
 _SUMMARY_PROMPTS = (
     "Create a structured context checkpoint summary",
     "Create a concise checkpoint of the user's request",
@@ -146,7 +149,12 @@ def test_pi_compacted_session_resumes_compacted_after_restart(
     compacting_markers: list[str] = []
     with (
         server_runner(tmp_path / "stack") as stack,
-        httpx.Client(base_url=stack.base_url, timeout=30, trust_env=False) as client,
+        httpx.Client(
+            base_url=stack.base_url,
+            timeout=30,
+            trust_env=False,
+            headers=PERMISSION_TIERS_HEADERS,
+        ) as client,
     ):
         config_home = stack.runner_home / ".omnigent-config"
         write_pi_gateway_config(config_home, mock_url=gateway_url, model=_MODEL)

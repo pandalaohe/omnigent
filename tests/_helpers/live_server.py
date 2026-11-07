@@ -378,7 +378,7 @@ def start_live_server(
             resp = httpx.get(f"{base_url}/health", timeout=2)
             if resp.status_code == 200:
                 return proc, base_url
-        except httpx.ConnectError:
+        except httpx.HTTPError:
             pass
         time.sleep(0.5)
 

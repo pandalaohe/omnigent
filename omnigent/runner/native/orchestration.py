@@ -12493,7 +12493,11 @@ def _rewrap_like(previous: object, spec: AgentSpec, workdir: Path | None) -> Any
     that never carried bundle information stays bare so it keeps the workspace
     fallback ordinary top-level sessions rely on.
     """
-    return ResolvedSpec(spec=spec, workdir=workdir) if isinstance(previous, ResolvedSpec) else spec
+    if isinstance(previous, ResolvedSpec):
+        if previous.spec is spec and previous.workdir == workdir:
+            return previous
+        return ResolvedSpec(spec=spec, workdir=workdir)
+    return spec
 
 
 def _is_spec_local_native_python_tool(

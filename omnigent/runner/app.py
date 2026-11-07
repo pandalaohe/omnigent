@@ -4250,7 +4250,16 @@ def create_runner_app(
             spawn_env = None
 
         try:
-            permission_tiers.fence_start(init_context.envelope, harness_name)
+            permission_tiers.fence_start(
+                init_context.envelope,
+                harness_name,
+                preserve_active_pi_scope=(
+                    harness_name == "pi-native"
+                    and resource_registry.terminal_registry is not None
+                    and resource_registry.terminal_registry.get_native(session_id, "pi", "main")
+                    is not None
+                ),
+            )
             permission_startup_errors.pop(session_id, None)
         except PermissionTierEpochChanged:
             return JSONResponse(
@@ -8178,6 +8187,22 @@ def create_runner_app(
             skill_registry=skill_registry,
             terminal_access_requests_enabled=server_client is not None,
         )
+        if pi_scoped_relay and relay_spec is not None and relay_spec.local_tools:
+            existing_names = {
+                name for item in relay_schemas if isinstance((name := item.get("name")), str)
+            }
+            for local_tool in relay_spec.local_tools:
+                if not local_tool.name or local_tool.name in existing_names:
+                    continue
+                existing_names.add(local_tool.name)
+                relay_schemas.append(
+                    {
+                        "name": local_tool.name,
+                        "description": local_tool.description or "",
+                        "parameters": local_tool.parameters
+                        or {"type": "object", "properties": {}},
+                    }
+                )
         if relay_spec is not None and relay_spec.mcp_servers:
             # Native terminals consume the persistent relay, not per-turn schemas.
             mcp = await ProxyMcpManager(session_id, server_client).schemas_for(relay_spec)
@@ -8395,6 +8420,9 @@ def create_runner_app(
         # keeps the new file.
         if superseded is not None and superseded.relay is not relay:
             superseded.relay.close()
+
+        if pi_scoped_relay:
+            return
 
         async def _notify_tools_changed() -> None:
             from threading import Event
