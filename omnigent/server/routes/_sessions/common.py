@@ -1470,11 +1470,19 @@ class _FacadeCallable:
 class _FacadeAttrProxy:
     """Attribute-access proxy forwarding to the facade's same-named object."""
 
+    _name: str
+
     def __init__(self, name: str) -> None:
-        self._name = name
+        object.__setattr__(self, "_name", name)
 
     def __getattr__(self, attr: str) -> Any:
         return getattr(getattr(_sessions_facade(), self._name), attr)
+
+    def __setattr__(self, attr: str, value: Any) -> None:
+        setattr(getattr(_sessions_facade(), self._name), attr, value)
+
+    def __delattr__(self, attr: str) -> None:
+        delattr(getattr(_sessions_facade(), self._name), attr)
 
 
 class _FacadeValue:
