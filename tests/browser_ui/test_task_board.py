@@ -185,6 +185,25 @@ def test_task_board_display_switch_and_source_list(
         },
     )
     browser_contract.json(
+        "/v1/me/tasks/history",
+        {
+            "entries": [
+                {
+                    "id": "event-one",
+                    "time": "2026-11-06T06:30:00Z",
+                    "kind": "commit",
+                    "note": "Keep confirmed chunks",
+                    "source": "example",
+                    "uid": "retry",
+                }
+            ]
+        },
+    )
+    browser_contract.json(
+        "/v1/me/tasks/closed-counts",
+        {"days": [{"day": "2020-01-01", "source": "example", "closed": 23}]},
+    )
+    browser_contract.json(
         "/v1/me/tasks/item",
         lambda request: {
             "uid": "retry"
@@ -295,6 +314,37 @@ def test_task_board_display_switch_and_source_list(
         query["kind"] == ["any"] for query in board_session_queries
     )
     assert watch_frames and all(frame["type"] == "watch" for frame in watch_frames)
+    page.get_by_role("button", name="Log", exact=True).click()
+    expect(
+        page.get_by_role("region", name="Log").get_by_text("Keep confirmed chunks")
+    ).to_be_visible()
+    page.get_by_label("Group by", exact=True).select_option("mother")
+    expect(
+        page.get_by_role("region", name="Log").get_by_role("heading", name="Transfer reliability")
+    ).to_be_visible()
+    page.get_by_role("button", name="History", exact=True).click()
+    expect(page.get_by_title("Week of 2019-12-30: 23 closed")).to_be_visible()
+    page.get_by_label("Find month").select_option("2020-01")
+    expect(
+        page.get_by_text("This month is outside the retained task window.", exact=False)
+    ).to_be_visible()
+    page.get_by_role("button", name="Today", exact=True).click()
+    expect(page.get_by_text("Active sessions today", exact=True)).to_be_visible()
+    page.get_by_role("button", name="Sources", exact=True).click()
+    page.get_by_label(f"Display name for {source_name}").fill("Local display name")
+    expect(page.get_by_text("Display settings saved in this browser.")).to_be_visible()
+    page.get_by_label("Show on map", exact=True).uncheck()
+    page.get_by_role("button", name="Delete source", exact=True).click()
+    expect(
+        page.get_by_text(
+            "Delete Local display name and its 2 stored tasks, including their history?"
+        )
+    ).to_be_visible()
+    page.get_by_role("button", name="Cancel", exact=True).click()
+    expect(page.locator("main").last).to_be_visible()
+    assert page.locator("main").last.evaluate(
+        "element => element.scrollWidth <= element.clientWidth"
+    )
     assert calls and all(request.method == "GET" for request in calls)
     assert not errors
     output = Path(request.config.getoption("--output"))

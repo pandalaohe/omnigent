@@ -57,6 +57,21 @@ export interface TaskSource {
   name: string | null;
   source: string | null;
   created?: string;
+  last_write?: {
+    time: string;
+    applied?: number;
+    unchanged?: number;
+    held?: number;
+    gone?: number;
+    history_added?: number;
+  } | null;
+  counts?: { open: number; closed: number; gone: number };
+  issues?: {
+    code: string;
+    path?: string;
+    params?: Record<string, string | number>;
+    reason?: string;
+  }[];
 }
 
 export async function readBoardJson<T>(path: string): Promise<T> {

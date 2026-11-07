@@ -632,3 +632,151 @@
     gap: 6px;
   }
 }
+.tb-view-tabs {
+  flex-wrap: wrap;
+}
+.tb-activity,
+.tb-sources {
+  min-width: 0;
+}
+.tb-activity h2,
+.tb-sources h2 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+}
+.tb-activity h3 {
+  margin-top: 18px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+.tb-page select,
+.tb-source input[type="text"],
+.tb-source input:not([type]) {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--background);
+  color: var(--foreground);
+  padding: 7px 9px;
+  min-width: 0;
+  max-width: 100%;
+}
+.tb-activity label,
+.tb-source label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+.tb-activity-list {
+  margin-top: 12px;
+}
+.tb-activity-list li {
+  display: flex;
+  align-items: start;
+  gap: 16px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+  overflow-wrap: anywhere;
+}
+.tb-activity-list li > div {
+  min-width: 0;
+}
+.tb-activity-list time,
+.tb-activity-list p {
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+.tb-activity-list button,
+.tb-activity-list a {
+  text-align: left;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.tb-week-bars {
+  display: flex;
+  align-items: end;
+  gap: 8px;
+  overflow-x: auto;
+  margin: 20px 0;
+  padding-bottom: 8px;
+}
+.tb-week-bars button {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  min-width: 50px;
+  font-size: 12px;
+}
+.tb-week-bars button > span {
+  width: 26px;
+  background: var(--tb-line-0);
+  border-radius: 3px 3px 0 0;
+}
+.tb-source {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px;
+  margin-top: 16px;
+  display: grid;
+  gap: 14px;
+  overflow-wrap: anywhere;
+}
+.tb-source header,
+.tb-source-controls,
+.tb-write {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.tb-source h3 {
+  font-weight: 600;
+}
+.tb-source a {
+  text-decoration: underline;
+}
+.tb-source p,
+.tb-write,
+.tb-source details {
+  font-size: 12px;
+}
+.tb-source > button {
+  justify-self: start;
+}
+.tb-connect {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+}
+.tb-delete-confirm {
+  border-left: 3px solid var(--destructive);
+  padding: 12px;
+  display: grid;
+  gap: 12px;
+}
+@media (max-width: 599px) {
+  .tb-view-tabs {
+    gap: 2px;
+  }
+  .tb-view-tabs button {
+    padding-inline: 8px;
+  }
+  .tb-activity-list li {
+    flex-wrap: wrap;
+    gap: 6px 12px;
+  }
+  .tb-source-controls {
+    align-items: start;
+    flex-direction: column;
+  }
+  .tb-source-controls label {
+    max-width: 100%;
+  }
+  .tb-source-controls input:not([type]) {
+    width: 160px;
+  }
+}
