@@ -1490,6 +1490,8 @@ def build_native_controls(
     async def _prepare_claude_native_pane_for_injection(
         conv_id: str,
         bridge_dir: Path,
+        *,
+        lifecycle_locked: bool = False,
     ) -> None:
         """Heal a dead-but-registered Claude pane before typing into it.
 
@@ -1530,7 +1532,9 @@ def build_native_controls(
         if instance is not None and await instance.is_alive():
             return
         try:
-            await _ensure_native_terminal_for_turn(conv_id, "claude-native")
+            await _ensure_native_terminal_for_turn(
+                conv_id, "claude-native", lifecycle_locked=lifecycle_locked
+            )
         except Exception as exc:  # noqa: BLE001 — a failed heal must not become a 500
             # The ensure raises on a failed recreate; inject answers its own 503.
             _logger.warning(
@@ -2250,6 +2254,7 @@ def build_native_controls(
         *,
         error_code: str,
         context: str,
+        lifecycle_locked: bool = False,
     ) -> Response:
         """Type one slash command into a live claude-native pane."""
         from omnigent.harnesses.claude_native.bridge import (
@@ -2263,7 +2268,9 @@ def build_native_controls(
             session_id=conv_id,
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
-        await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
+        await _prepare_claude_native_pane_for_injection(
+            conv_id, bridge_dir, lifecycle_locked=lifecycle_locked
+        )
         try:
             await _drive_claude_pane(
                 deadline,

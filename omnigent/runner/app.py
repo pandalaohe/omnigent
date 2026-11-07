@@ -6120,6 +6120,7 @@ def create_runner_app(
         harness = snapshot.get("harness") or _session_harness_name(conv_id)
         labels = snapshot.get("labels")
         if require_label and isinstance(labels, dict) and labels.get("omnigent.succeeded_by"):
+            rotations_started.pop(conv_id, None)
             return "superseded"
         if require_label and isinstance(labels, dict):
             revision = snapshot.get("archive_revision")
@@ -6130,6 +6131,8 @@ def create_runner_app(
                 or (expected_revision is not None and expected_revision != str(revision))
             ):
                 return "not_requested"
+            if rotations_started.get(conv_id) == str(revision):
+                return "in_flight"
         completed_pi_source = (
             harness == "pi"
             and isinstance(labels, dict)
@@ -6165,6 +6168,8 @@ def create_runner_app(
                     "Could not revalidate rotation recovery for %s", conv_id, exc_info=True
                 )
                 return "not_requested"
+        if require_label and _rotation_session_busy(conv_id):
+            return "busy"
         try:
             if harness == "claude-native":
                 response = await _handle_claude_native_slash_command(
@@ -6172,6 +6177,7 @@ def create_runner_app(
                     "/clear",
                     error_code="claude_native_clear_failed",
                     context="claude-native clear",
+                    lifecycle_locked=require_label,
                 )
             elif harness == "codex-native":
                 response = await _handle_codex_native_slash_command(
@@ -6215,6 +6221,8 @@ def create_runner_app(
                 if succession_body.get("status") != "done":
                     return "not_requested"
                 await process_manager.release(conv_id)
+                if require_label:
+                    rotations_started[conv_id] = str(snapshot["archive_revision"])
                 return "started"
             else:
                 _logger.warning(
@@ -6241,9 +6249,21 @@ def create_runner_app(
                 response.status_code,
                 extra={"session_id": conv_id},
             )
+        if response.status_code < 400 and require_label:
+            rotations_started[conv_id] = str(snapshot["archive_revision"])
         return "started" if response.status_code < 400 else "not_requested"
 
     rotations_in_flight: set[str] = set()
+    # Injection acknowledgement precedes succession. Keep the accepted request
+    # fenced until its successor is observed or a different revision is requested.
+    rotations_started: dict[str, str] = {}
+
+    def _rotation_session_busy(conv_id: str) -> bool:
+        return (
+            conv_id in _active_turns
+            or (process_manager is not None and process_manager.has_active_turn(conv_id))
+            or _native_turn_in_flight(conv_id)
+        )
 
     async def _execute_pending_rotation(
         conv_id: str,
@@ -6256,6 +6276,17 @@ def create_runner_app(
             return "in_flight"
         rotations_in_flight.add(conv_id)
         try:
+            if require_label:
+                if _rotation_session_busy(conv_id):
+                    return "busy"
+                # Turn streams acquire this lifecycle lock shared before using
+                # the runtime. No new stream can start during validation/injection.
+                async with _cli_runtime_lock(conv_id).exclusive():
+                    return await _rotate_session(
+                        conv_id,
+                        recovery=recovery,
+                        expected_revision=expected_revision,
+                    )
             return await _rotate_session(
                 conv_id,
                 require_label=require_label,

@@ -43,7 +43,7 @@ class _RotationServerClient:
         parent_session_id: str | None = None,
     ) -> None:
         self.archived = archived
-        self.archive_revision = 0
+        self.archive_revision: int | None = 0
         self.enabled = True
         self.harness = harness
         self.succession_status = succession_status
@@ -491,7 +491,12 @@ async def test_retrigger_and_idle_share_guard_and_skip_superseded(monkeypatch, t
             app.state.on_proxy_stream_end(CONV_ID)
         else:
             await _post_idle(client)
-        await asyncio.sleep(0)
+        idle_tasks = [
+            task
+            for task in asyncio.all_tasks()
+            if getattr(task.get_coro(), "__name__", None) == "_run_pending_rotation"
+        ]
+        await asyncio.wait_for(asyncio.gather(*idle_tasks), timeout=2)
         release.set()
         result = await first
         assert result.json() == {"status": "started"}
@@ -503,10 +508,142 @@ async def test_retrigger_and_idle_share_guard_and_skip_superseded(monkeypatch, t
         else:
             assert len(effects) == 1
         before = list(effects)
+        # The command has returned, but the successor label is still absent.
+        runner_app.record_pending_rotation(CONV_ID)
+        if harness == "pi":
+            app.state.on_proxy_stream_end(CONV_ID)
+        else:
+            await _post_idle(client)
+        idle_tasks = [
+            task
+            for task in asyncio.all_tasks()
+            if getattr(task.get_coro(), "__name__", None) == "_run_pending_rotation"
+        ]
+        await asyncio.wait_for(asyncio.gather(*idle_tasks), timeout=2)
+        result = await client.post(f"/v1/sessions/{CONV_ID}/pending-rotation")
+        assert result.json() == {"status": "in_flight"}
+        assert effects == before
+        assert len(server.succession) == int(harness == "pi")
         server.labels["omnigent.succeeded_by"] = "next"
         result = await client.post(f"/v1/sessions/{CONV_ID}/pending-rotation")
         assert result.json() == {"status": "superseded"}
         assert effects == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "harness", ["claude-native", "codex-native", "pi", "pi-native", "antigravity-native"]
+)
+@pytest.mark.parametrize("busy_source", ["native", "turn"])
+async def test_recovery_rechecks_busy_after_server_validation(monkeypatch, harness, busy_source):
+    effects = []
+    monkeypatch.setattr(
+        claude_native_bridge, "inject_slash_command", lambda *args, **kw: effects.append(kw)
+    )
+    server = _RotationServerClient(harness=harness)
+    app = _build_app(server)
+    original_get = server.get
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def blocked_get(url, **kwargs):
+        if url.endswith("/auto-rotation"):
+            entered.set()
+            await release.wait()
+        return await original_get(url, **kwargs)
+
+    async with _runner_client(app, permission_harness=harness) as client:
+        await _seed_session(client)
+        server.get = blocked_get
+        first = asyncio.create_task(client.post(f"/v1/sessions/{CONV_ID}/pending-rotation"))
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        if busy_source == "native" and harness != "pi":
+            response = await client.post(
+                f"/v1/sessions/{CONV_ID}/events",
+                json={"type": "external_session_status", "data": {"status": "running"}},
+            )
+            assert response.status_code in (200, 204)
+        else:
+            app.state.active_turns[CONV_ID] = None
+        release.set()
+        assert (await first).json() == {"status": "busy"}
+        app.state.active_turns.pop(CONV_ID, None)
+    assert not effects and not server.created and not server.succession
+
+
+@pytest.mark.asyncio
+async def test_recovery_holds_runtime_boundary_through_injection(monkeypatch):
+    server = _RotationServerClient()
+    app = _build_app(server)
+    original_get = server.get
+    entered, release = asyncio.Event(), asyncio.Event()
+    attempting, started = asyncio.Event(), asyncio.Event()
+    effects = []
+
+    async def blocked_get(url, **kwargs):
+        if url.endswith("/auto-rotation"):
+            entered.set()
+            await release.wait()
+        return await original_get(url, **kwargs)
+
+    def inject(*args, **kwargs):
+        assert not started.is_set()
+        effects.append(kwargs["command"])
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", inject)
+    async with _runner_client(app) as client:
+        await _seed_session(client)
+        server.get = blocked_get
+        rotation = asyncio.create_task(client.post(f"/v1/sessions/{CONV_ID}/pending-rotation"))
+        await asyncio.wait_for(entered.wait(), timeout=2)
+
+        async def start_turn():
+            attempting.set()
+            async with app.state.cli_runtime_lifecycle.lock_for(CONV_ID).shared():
+                started.set()
+
+        turn = asyncio.create_task(start_turn())
+        await asyncio.wait_for(attempting.wait(), timeout=2)
+        assert not started.is_set()
+        release.set()
+        assert (await rotation).json() == {"status": "started"}
+        await asyncio.wait_for(turn, timeout=2)
+    assert effects == ["/clear"]
+
+
+@pytest.mark.asyncio
+async def test_recovery_can_heal_pane_under_rotation_lock(monkeypatch, tmp_path):
+    from omnigent.runner.resource_registry import SessionResourceView
+    from omnigent.terminals import TerminalRegistry
+    from tests.runner.test_app_sessions_native_session_change_heal import _plant_dead_claude_pane
+
+    effects = []
+
+    async def launch(ctx):
+        effects.append("heal")
+        return SessionResourceView(
+            id="terminal_claude_main", type="terminal", session_id=ctx.session_id, name="claude"
+        )
+
+    monkeypatch.setattr("omnigent.runner.native.orchestration._launch_claude", launch)
+    monkeypatch.setattr("omnigent.runner.native._launch_claude", launch)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "inject_slash_command",
+        lambda *args, **kw: effects.append(kw["command"]),
+    )
+    registry = TerminalRegistry()
+    app = _build_app(_RotationServerClient(), terminal_registry=registry)
+    async with _runner_client(app) as client:
+        await _seed_session(client)
+        effects.clear()
+        _plant_dead_claude_pane(
+            registry, CONV_ID, tmp_path, claude_native_bridge.bridge_dir_for_bridge_id(CONV_ID)
+        )
+        result = await asyncio.wait_for(
+            client.post(f"/v1/sessions/{CONV_ID}/pending-rotation"), timeout=2
+        )
+        assert result.json() == {"status": "started"}
+    assert effects == ["heal", "/clear"]
 
 
 @pytest.mark.asyncio
