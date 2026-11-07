@@ -99,7 +99,13 @@ class PermissionTierRuntime:
             raise ValueError("Permission-tier worktree requires an explicit launch workspace")
         return (snapshot.worktree or snapshot.workspace or "").strip() or self._runner_workspace
 
-    def fence_start(self, envelope: RunnerSessionInitEnvelope | None, harness: str) -> None:
+    def fence_start(
+        self,
+        envelope: RunnerSessionInitEnvelope | None,
+        harness: str,
+        *,
+        preserve_active_pi_scope: bool = False,
+    ) -> None:
         """Place a deny-safe cache before any tiered harness can launch."""
         if harness not in TIER_HARNESSES:
             if envelope is not None:
@@ -128,6 +134,41 @@ class PermissionTierRuntime:
         ):
             raise PermissionTierEpochChanged("Permission runtime changed")
         path = self.state_path(envelope.session_id, harness, snapshot.labels)
+        previous = self._states.get(envelope.session_id)
+        if (
+            preserve_active_pi_scope
+            and harness == "pi-native"
+            and previous is not None
+            and (
+                previous.session_id,
+                previous.host_id,
+                previous.workspace,
+                previous.tier,
+                previous.revision,
+                previous.status,
+            )
+            == (
+                envelope.session_id,
+                host_id,
+                workspace,
+                confirmed.tier,
+                confirmed.revision,
+                "ready",
+            )
+            and self.pi_scope_protocol_active(envelope.session_id)
+        ):
+            try:
+                parent = self.pi_scopes.parent_scope(envelope.session_id)
+                if (
+                    parent.status == "ready"
+                    and parent.registration_digest
+                    and parent.native_classifier is not None
+                ):
+                    self._paths[envelope.session_id] = path
+                    self._harnesses[envelope.session_id] = harness
+                    return
+            except ValueError:
+                pass
         fenced = HostPermissionState(
             session_id=envelope.session_id,
             host_id=host_id,
@@ -447,7 +488,15 @@ class PermissionTierRuntime:
         if state is None or not isinstance(support.inputs, tuple) or not support.inputs:
             raise ValueError("Native input proof unavailable")
         workspace = Path(state.workspace).resolve(strict=True)
-        roots = [Path.home() / ".pi", Path.home() / ".agents", self.path(session_id).parent]
+        package_root = Path(__file__).resolve().parents[1]
+        pi_resources = package_root / "resources" / "pi_native"
+        roots = [
+            Path.home() / ".pi",
+            Path.home() / ".agents",
+            self.path(session_id).parent,
+            pi_resources,
+            pi_resources.resolve(),
+        ]
         for parent in (workspace, *workspace.parents):
             roots.extend((parent / ".pi", parent / ".agents"))
         protected = self._pi_control_paths.setdefault(session_id, set())
@@ -660,11 +709,23 @@ class PermissionTierRuntime:
         control_paths = self._control_paths(session_id, state)
         extensions = {}
         native_tools = {}
+        eval_local_execution = local_execution
         if (
             state.tier != "full"
             and (local_execution or pi_scope is not None)
             and self._harnesses.get(session_id) in ("pi", "pi-native")
         ):
+            from omnigent.permission_tiers import (
+                _AGY_ACTIONS,
+                _AGY_UNCHECKABLE,
+                _CONTROL_TOOLS,
+                _EDIT_PATH,
+                _EXEC_COMMAND,
+                _OPERATIONAL_TOOLS,
+                _QUESTION_TOOLS,
+                _READ_NO_PATH,
+                _READ_PATH,
+            )
             from omnigent.permission_tiers.pi_tools import read_pi_tool_registry
 
             bridge = (
@@ -706,7 +767,30 @@ class PermissionTierRuntime:
                     required = True
                 if required:
                     return TierDecision(Verdict.DENY, registry.reason)
-            extensions = registry.extensions
+            extensions = dict(registry.extensions)
+            if pi_scope is not None and name in registry.bridge_tools and "__" not in name:
+                if not (name in _READ_PATH and not isinstance(arguments.get(_READ_PATH[name]), str)):
+                    eval_local_execution = True
+                builtin_omnigent_tools = {
+                    *_READ_PATH,
+                    *_EDIT_PATH,
+                    *_EXEC_COMMAND,
+                    *_READ_NO_PATH,
+                    *_OPERATIONAL_TOOLS,
+                    *_QUESTION_TOOLS,
+                    *_CONTROL_TOOLS,
+                    *_AGY_UNCHECKABLE,
+                    *_AGY_ACTIONS,
+                    "call_mcp_tool",
+                    "sys_host_restart",
+                    "open_in_panel",
+                    "read_url_content",
+                    "sys_terminal_send",
+                    "sys_child_cap",
+                    "sys_child_checkin",
+                }
+                if name not in builtin_omnigent_tools and name not in extensions:
+                    extensions[name] = ""
         return evaluate_host_tool(
             state,
             name,
@@ -716,7 +800,7 @@ class PermissionTierRuntime:
             native_tools=native_tools,
             native_binding=native[0] if native is not None else None,
             native_support=native[1] if native is not None else None,
-            local_execution=local_execution,
+            local_execution=eval_local_execution,
         )
 
     def inspect(

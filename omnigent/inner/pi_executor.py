@@ -2970,7 +2970,13 @@ def _try_sandbox_pi(
             (parent for parent in resource_path.parents if parent.name == "node_modules"),
             resource_path.parent,
         )
-        sandbox = with_additional_read_roots(sandbox, [pi_dir, *(extra_read_roots or ())])
+        node_roots: list[pathlib.Path] = []
+        if node_bin := shutil.which("node"):
+            node_path = pathlib.Path(node_bin)
+            node_roots.extend((node_path.parent, node_path.resolve().parent))
+        sandbox = with_additional_read_roots(
+            sandbox, [pi_dir, *node_roots, *(extra_read_roots or ())]
+        )
         home_pi = pathlib.Path(os.path.expanduser("~/.pi"))
         sandbox = with_additional_write_roots(sandbox, [home_pi])
         sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
@@ -4332,6 +4338,7 @@ class PiExecutor(Executor):
                         self._cwd,
                         spawn_env_names=list(env),
                         resource_executable=self._pi_path,
+                        extra_read_roots=_pi_bundle_resource_roots(self._bundle_dir, extra_args),
                     )
                     executable = sandbox_launch.launch_path
                     launcher_args = sandbox_launch.launcher_args

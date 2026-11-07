@@ -146,7 +146,12 @@ def test_pi_compacted_session_resumes_compacted_after_restart(
     compacting_markers: list[str] = []
     with (
         server_runner(tmp_path / "stack") as stack,
-        httpx.Client(base_url=stack.base_url, timeout=30, trust_env=False) as client,
+        httpx.Client(
+            base_url=stack.base_url,
+            timeout=30,
+            trust_env=False,
+            headers=PERMISSION_TIERS_HEADERS,
+        ) as client,
     ):
         config_home = stack.runner_home / ".omnigent-config"
         write_pi_gateway_config(config_home, mock_url=gateway_url, model=_MODEL)

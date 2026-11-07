@@ -94,7 +94,14 @@ function protectedInput(record, file, optional = false) {
 function inputContext(workspace, bridgeDir) {
   const lexicalWorkspace=path.resolve(workspace);
   const realWorkspace=fs.realpathSync(lexicalWorkspace);
-  const roots=[path.join(require("node:os").homedir(),".pi"),path.join(require("node:os").homedir(),".agents"),bridgeDir];
+  const roots=[path.join(require("node:os").homedir(),".pi"),path.join(require("node:os").homedir(),".agents"),bridgeDir,__dirname,fs.realpathSync(__dirname)];
+  if (text(bridgeDir)) {
+    try {
+      const expected=JSON.parse(fs.readFileSync(path.join(bridgeDir,"permission_expected.json"),"utf8"));
+      for (const key of ["extension_path","bridge_extension_path"])
+        if (text(expected?.[key])) roots.push(path.dirname(expected[key]));
+    } catch {}
+  }
   for (const start of new Set([lexicalWorkspace,realWorkspace]))
     for (let directory=start;;directory=path.dirname(directory)) {
       roots.push(path.join(directory,".pi"),path.join(directory,".agents"));
