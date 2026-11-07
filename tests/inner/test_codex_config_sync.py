@@ -725,12 +725,24 @@ def test_current_route_failed_rewrite_keeps_private_config(
     assert not list(tmp_path.glob("config.toml.*"))
 
 
+@pytest.mark.parametrize(
+    ("version", "provider", "pinned"),
+    [
+        ((0, 147, 0), "route-provider", False),
+        ((0, 166, 0), "custom", False),
+        ((0, 166, 0), "custom", True),
+    ],
+)
 async def test_native_startup_keeps_current_route_and_source_stance(
     homes: tuple[Path, Path],
     route_file: Path,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    version: tuple[int, int, int],
+    provider: str,
+    pinned: bool,
 ) -> None:
+    from types import SimpleNamespace
     from unittest.mock import AsyncMock
 
     from omnigent.harnesses.codex_native import app_server
@@ -745,16 +757,29 @@ async def test_native_startup_keeps_current_route_and_source_stance(
         'approvals_reviewer = "auto_review"\nsandbox_mode = "workspace-write"\n'
     )
     (source / "config.toml").write_text(original)
-    route_file.write_text('model_provider = "route-provider"\n')
+    route_file.write_text(f'model_provider = "{provider}"\n')
     monkeypatch.setenv("CODEX_HOME", str(source))
-    monkeypatch.setattr(app_server, "_codex_cli_version", AsyncMock(return_value=(0, 147, 0)))
+    monkeypatch.setattr(app_server, "_codex_cli_version", AsyncMock(return_value=version))
     monkeypatch.setattr(app_server.CodexNativeAppServer, "_populate_context_catalog", AsyncMock())
     _disable_codex_startup_rpc(monkeypatch)
+    startup_client = SimpleNamespace(
+        request=AsyncMock(return_value={"result": {"config": {"model_provider": provider}}}),
+        close=AsyncMock(),
+    )
+    monkeypatch.setattr(
+        app_server.CodexNativeAppServer,
+        "_wait_until_ready",
+        AsyncMock(return_value=startup_client),
+    )
     server = _test_app_server(tmp_path, target, tmp_path / "bridge", tmp_path)
+    overrides = [f'model_provider="{provider}"'] if pinned else []
+    server.config_overrides = list(overrides)
     try:
         await server.start()
         data = tomllib.loads((target / "config.toml").read_text())
-        assert data["model_provider"] == "route-provider"
+        assert data["model_provider"] == provider
+        assert server.config_overrides == overrides
+        assert startup_client.request.await_count == int(pinned)
         assert data["approval_policy"] == "on-request"
         assert data["approvals_reviewer"] == "auto_review"
         assert data["sandbox_mode"] == "workspace-write"

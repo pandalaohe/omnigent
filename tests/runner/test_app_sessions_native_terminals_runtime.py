@@ -816,6 +816,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         session_id: str | None = None,
         model_provider: str | None = None,
         permission_profile: str | None = None,
+        rollout_path: Path | None = None,
     ) -> Any:
         """
         Record preloading of the known Codex thread.
@@ -1363,6 +1364,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
         session_id: str | None = None,
         model_provider: str | None = None,
         permission_profile: str | None = None,
+        rollout_path: Path | None = None,
     ) -> None:
         """
         Record preloading of the cloned Codex thread.
@@ -1676,6 +1678,7 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
         session_id: str | None = None,
         model_provider: str | None = None,
         permission_profile: str | None = None,
+        rollout_path: Path | None = None,
     ) -> None:
         """:param transport: App-server URL. :param loaded_thread_id: Resumed thread."""
         assert terminal_launch_args is None
@@ -5556,6 +5559,7 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
         session_id: str | None = None,
         model_provider: str | None = None,
         permission_profile: str | None = None,
+        rollout_path: Path | None = None,
     ) -> None:
         """
         Accept preloading of the known Codex thread.
@@ -5805,6 +5809,7 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
         session_id: str | None = None,
         model_provider: str | None = None,
         permission_profile: str | None = None,
+        rollout_path: Path | None = None,
     ) -> None:
         """Accept preloading of the known Codex thread."""
         del transport, loaded_thread_id, terminal_launch_args
