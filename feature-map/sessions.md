@@ -970,7 +970,7 @@ plain `uv run pytest`, which starts a private server for the test.
   `web/src/shell/ChatHeader.test.tsx` checks the shared toggle's desktop/mobile
   icons, peek cancellation, and hover/keyboard tooltip behavior.
 - **`usage_board` (amounts, ranges, errors and navigation):**
-  `web/src/pages/usageBoard/usageAmounts.test.tsx` checks weighted coverage,
+  `web/src/pages/usageBoard/usageAmountData.test.tsx` checks weighted coverage,
   metered money versus subscription tokens, aligned Previous buckets, hidden
   accounts, summary-to-Cost and failure-row-to-Issues navigation, stale error
   suppression and read failures. `web/src/pages/usageBoard/usagePriceSource.test.tsx`

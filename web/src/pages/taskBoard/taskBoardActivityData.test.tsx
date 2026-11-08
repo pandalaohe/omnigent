@@ -10,7 +10,7 @@ import {
   localDay,
   readBoardHistory,
   readLocalClosedCounts,
-} from "./taskBoardActivity";
+} from "./taskBoardActivityData";
 
 const fetcher = vi.hoisted(() => vi.fn());
 vi.mock("@/lib/CapabilitiesContext", () => ({

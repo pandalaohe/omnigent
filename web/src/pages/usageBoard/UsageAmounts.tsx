@@ -7,7 +7,7 @@ import { cn } from "@/lib/utils";
 import type { UsageAccountActivity, UsageAmount } from "./usageActivityData";
 import type { UsageAccountView } from "./usageBoardData";
 import { formatFullDate, formatMoney } from "./usageBoardFormat";
-import { amountTip, boardAmount, sumUsage, usageFigure } from "./usageAmounts";
+import { amountTip, boardAmount, sumUsage, usageFigure } from "./usageAmountData";
 import { UsageTip, UsageTipButton } from "./UsageTip";
 import { UsageRangeControl } from "./UsageRangeControl";
 import { UsageCostChart } from "./UsageCostChart";

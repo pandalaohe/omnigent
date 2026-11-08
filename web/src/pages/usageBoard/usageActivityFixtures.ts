@@ -4,7 +4,7 @@ import type {
   UsageIssues,
   UsageTotals,
 } from "./usageActivityData";
-import { sumUsage } from "./usageAmounts";
+import { sumUsage } from "./usageAmountData";
 
 /** Neutral, explicit billing inputs shared by the tests and operable demo. */
 export function sampleTotals(

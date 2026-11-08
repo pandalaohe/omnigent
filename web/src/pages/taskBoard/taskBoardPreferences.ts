@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { RouteMode } from "./taskBoardRoutes";
+import type { RouteMode } from "./taskBoardRouteData";
 
 export const BOARD_PREFERENCES_KEY = "omnigent.taskBoard.display";
 export interface BoardPreferences {
