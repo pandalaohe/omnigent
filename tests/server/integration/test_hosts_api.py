@@ -120,6 +120,9 @@ def _build_host_api_app(
     :param harness_install: Optional harness-repair feature override.
     :returns: Tuple of (app, registry, host_store, conv_store).
     """
+    from omnigent.server.routes._host_launch import configure_host_sharding
+
+    configure_host_sharding(False)
     registry = HostRegistry()
     host_store = HostStore(db_uri)
     registry.launch_authorizer = host_store.admit_launch

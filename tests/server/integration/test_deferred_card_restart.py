@@ -536,7 +536,10 @@ async def test_lapsed_live_grant_cannot_approve_reissued_hook(
 ) -> None:
     """A lapse in the persisted record revokes its still-live memory grant."""
 
+    armed = asyncio.Event()
+
     async def _offline(*_args: Any, **_kwargs: Any) -> bool:
+        armed.set()
         return False
 
     monkeypatch.setattr(hooks_routes, "_deliver_with_retry", _offline)
@@ -547,12 +550,7 @@ async def test_lapsed_live_grant_cannot_approve_reissued_hook(
         assert await _request_bash(client, session_id, "pnpm build") == "deny"
         (card,) = await _pending(client, session_id)
         await _answer(client, session_id, card["elicitation_id"], "accept")
-        await _wait_for(
-            lambda: any(
-                row.elicitation_id == card["elicitation_id"] and row.state == "answered"
-                for row in store.list_detached_cards()
-            )
-        )
+        await asyncio.wait_for(armed.wait(), timeout=5)
         store.update_detached_card(card["elicitation_id"], expires_at=int(time.time()) - 1)
         await _wait_for(
             lambda: any(

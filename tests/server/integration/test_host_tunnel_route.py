@@ -131,6 +131,9 @@ def host_app(db_uri: str) -> tuple[FastAPI, HostRegistry, HostStore]:
     :param db_uri: SQLite URI from the shared fixture.
     :returns: Tuple of (app, host_registry, host_store).
     """
+    from omnigent.server.routes._host_launch import configure_host_sharding
+
+    configure_host_sharding(False)
     registry = HostRegistry()
     store = HostStore(db_uri)
     app = FastAPI()
@@ -1482,6 +1485,9 @@ def _owned_app(
     :param authed_user: Identity the connecting peer authenticates as.
     :returns: Tuple of (app, host_registry, host_store).
     """
+    from omnigent.server.routes._host_launch import configure_host_sharding
+
+    configure_host_sharding(False)
     registry = HostRegistry()
     store = HostStore(db_uri)
     app = FastAPI()
