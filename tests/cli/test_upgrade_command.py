@@ -660,7 +660,24 @@ def test_upgrade_git_install_repulls_and_verifies_commit(
 
 
 @pytest.mark.parametrize(
-    "mode", ["legacy", "explicit", "migrated", "other-repo", "failed", "same-head", "dry-run"]
+    "mode",
+    [
+        "legacy",
+        "explicit",
+        "migrated",
+        "other-repo",
+        "failed",
+        "same-head",
+        "dry-run",
+        "config-pin",
+        "missing-source",
+        "number-source",
+        "bool-source",
+        "list-source",
+        "empty-source",
+        "wrong-commit",
+        "unknown-commit",
+    ],
 )
 def test_legacy_custom_pin_moves_once_to_configured_branch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _wheel_install: None, mode: str
@@ -672,7 +689,16 @@ def test_legacy_custom_pin_moves_once_to_configured_branch(
     monkeypatch.setattr("omnigent.cli.data_dir", lambda: tmp_path)
     monkeypatch.setattr(
         "omnigent.cli._load_global_config",
-        lambda: {"custom_host_sources": [source + "@channel/custom"]},
+        lambda: (
+            {
+                "custom_host_sources": [
+                    source + "@" + "a" * 40,
+                    "git+https://backup.test/repo.git@main",
+                ]
+            }
+            if mode == "config-pin"
+            else {"custom_host_sources": [source + "@channel/custom"]}
+        ),
     )
     monkeypatch.setattr("omnigent.update_check._read_installed_wheel_info", lambda: info)
     monkeypatch.setattr(
@@ -681,7 +707,12 @@ def test_legacy_custom_pin_moves_once_to_configured_branch(
     )
     monkeypatch.setattr(
         "omnigent.update_check._probe_installed_distribution",
-        lambda: ("0.1.0", ("a" if mode == "same-head" else "b") * 40),
+        lambda: (
+            "0.1.0",
+            None
+            if mode == "unknown-commit"
+            else ("a" if mode == "same-head" else "c" if mode == "wrong-commit" else "b") * 40,
+        ),
     )
     receipt = tmp_path / "updates/custom-host-rollback.json"
     receipt.parent.mkdir()
@@ -692,6 +723,16 @@ def test_legacy_custom_pin_moves_once_to_configured_branch(
     }
     if mode == "migrated":
         original["channel_tracking_migrated"] = True
+    if mode == "missing-source":
+        original.pop("source_url")
+    for invalid_mode, value in [
+        ("number-source", 1),
+        ("bool-source", True),
+        ("list-source", []),
+        ("empty-source", ""),
+    ]:
+        if mode == invalid_mode:
+            original["source_url"] = value
     if mode != "explicit":
         receipt.write_text(json.dumps(original))
     ran: list[str] = []
@@ -700,8 +741,20 @@ def test_legacy_custom_pin_moves_once_to_configured_branch(
         lambda cmd, _: ran.append(cmd) or (2 if mode == "failed" else 0),
     )
     result = CliRunner().invoke(cli, ["up", *(["--dry-run"] if mode == "dry-run" else [])])
-    assert result.exit_code == (1 if mode == "failed" else 0), result.output
-    if mode in ("explicit", "migrated", "other-repo"):
+    assert result.exit_code == (
+        1 if mode in ("failed", "wrong-commit", "unknown-commit") else 0
+    ), result.output
+    if mode in (
+        "explicit",
+        "migrated",
+        "other-repo",
+        "config-pin",
+        "missing-source",
+        "number-source",
+        "bool-source",
+        "list-source",
+        "empty-source",
+    ):
         assert not ran
         assert "up to date" in result.output
     elif mode == "dry-run":

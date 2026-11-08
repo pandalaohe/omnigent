@@ -15,6 +15,9 @@ FILE_SHARE_DELETE. Exercise `retained_install` on that disposable layout: a lock
 released within three seconds must permit the rename; a sustained lock must report
 the applications returned by Restart Manager, skip the installer and restore any
 already-renamed launchers. Check that `file_users` reports the known holder PID.
+If Restart Manager is unavailable, expect the error to include its failure and
+visible process candidates with PID and image. These candidates are not confirmed
+lock holders; denied process visibility must be reported explicitly.
 Stop only the trial's processes and remove only its temporary directories.
 
 The final installed-host acceptance belongs to the operator, from a terminal outside

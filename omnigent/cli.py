@@ -6088,6 +6088,11 @@ def _legacy_custom_channel(info: _InstalledWheelInfo) -> tuple[str, str] | None:
         return None
     installed = identity(installed_repo)
     saved_source = rollback.get("source_url")
+    if rollback["schema_version"] == 2 and not (
+        "source_url" in rollback
+        and (saved_source is None or (isinstance(saved_source, str) and saved_source))
+    ):
+        return None
     if isinstance(saved_source, str) and identity(saved_source) != installed:
         return None
     if not any(identity(source) == installed for source in sources):
@@ -6096,7 +6101,10 @@ def _legacy_custom_channel(info: _InstalledWheelInfo) -> tuple[str, str] | None:
     for source in sources:
         repo, branch = _split_vcs_url(source)
         branch = branch or "local/host-custom"
-        if not re.fullmatch(r"[0-9a-fA-F]{40}", branch):
+        if re.fullmatch(r"[0-9a-fA-F]{40}", branch):
+            if identity(source) == installed:
+                return None
+        else:
             moving_sources.append(f"git+{repo}@{branch}")
     if not moving_sources:
         return None

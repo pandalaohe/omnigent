@@ -33,6 +33,9 @@ class Process:
     def memory_maps(self) -> list[object]:
         return []
 
+    def open_files(self) -> list[object]:
+        return []
+
     def is_running(self) -> bool:
         return self.alive
 
@@ -140,17 +143,18 @@ def test_forced_upgrade_stops_detached_install_users_and_preserves_updater(
     runner = Process(30, [prefix + "/Scripts/python.exe", "-P", "-m", "omnigent.runner._entry"])
     orphan = Process(40, ["/opt/python/python.exe", "-P", "-m", "omnigent.runner._entry"])
     other = Process(50, ["/opt/other/Scripts/python.exe", "-m", "omnigent.runner._entry"])
+    editor = Process(60, ["/opt/editor.exe", "/opt/bin/omni.exe"])
     monkeypatch.setattr(
         orphan, "memory_maps", lambda: [SimpleNamespace(path=prefix + "/Lib/psutil.pyd")]
     )
     monkeypatch.setattr(windows.sys, "prefix", prefix)
     monkeypatch.setattr(windows.psutil.Process, "parents", lambda _: [launcher])
     monkeypatch.setattr(windows, "installed_launchers", lambda: [Path("/opt/bin/omni.exe")])
-    process_table.extend([launcher, updater, daemon, runner, orphan, other])
+    process_table.extend([launcher, updater, daemon, runner, orphan, other, editor])
     captured = windows.capture_host_tree(include_install_users=True)
     windows.stop_host_tree(captured)
     assert not any(proc.alive for proc in (daemon, runner, orphan))
-    assert launcher.alive and updater.alive and other.alive
+    assert launcher.alive and updater.alive and other.alive and editor.alive
 
 
 def test_upgrade_inside_detached_runner_is_refused(
@@ -546,15 +550,27 @@ def test_launcher_paths_belong_to_current_receipt_and_environment(
 
 
 @pytest.mark.parametrize("transient", [True, False])
+@pytest.mark.parametrize("manager_available", [True, False])
 def test_launcher_share_lock_retries_then_restores_and_names_users(
-    monkeypatch: pytest.MonkeyPatch, uv_layout: tuple[Path, Path], transient: bool
+    monkeypatch: pytest.MonkeyPatch,
+    uv_layout: tuple[Path, Path],
+    transient: bool,
+    process_table: list[Process],
+    manager_available: bool,
 ) -> None:
-    _, bindir = uv_layout
+    prefix, bindir = uv_layout
     launcher = bindir / "omnigent.exe"
     original_rename = Path.rename
     attempts = 0
     monkeypatch.setattr(windows, "sleep", lambda _: None)
-    monkeypatch.setattr(windows, "file_users", lambda _: "PID 987 (scanner)")
+    process_table.append(Process(987, [str(prefix / "Scripts/python.exe")]))
+
+    def file_users(_path: Path) -> str:
+        if not manager_available:
+            raise OSError(29, "Restart Manager could not start")
+        return "PID 987 (scanner)"
+
+    monkeypatch.setattr(windows, "file_users", file_users)
 
     def rename(path: Path, target: Path) -> Path:
         nonlocal attempts
@@ -572,10 +588,13 @@ def test_launcher_share_lock_retries_then_restores_and_names_users(
             pass
         assert attempts == 3
     else:
-        with pytest.raises(OSError, match=r"PID 987 \(scanner\)"):
+        with pytest.raises(OSError, match=r"PID 987 \(") as error:
             with windows.retained_install(["uv", "tool", "install", "omnigent"]):
                 pytest.fail("installer must not start while the launcher is locked")
         assert attempts == 6
+        if not manager_available:
+            assert "Restart Manager unavailable" in str(error.value)
+            assert str(prefix / "Scripts/python.exe") in str(error.value)
     for name in ("omni", "omnigent"):
         assert (bindir / f"{name}.exe").read_bytes() == b"current environment"
 

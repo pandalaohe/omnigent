@@ -61,6 +61,10 @@ def capture_host_tree(*, include_install_users: bool = False) -> list[psutil.Pro
     script = str(autostart / "Start-OmnigentHostDefault.ps1").casefold()
     pwsh = shutil.which("pwsh")
     executables = {str(path).casefold() for path in installed_launchers()}
+    interpreters = {
+        os.path.realpath(sys.executable).casefold(),
+        os.path.realpath(getattr(sys, "_base_executable", sys.executable)).casefold(),
+    }
     protected = {os.getpid(), *(proc.pid for proc in psutil.Process().parents())}
     captured: dict[int, psutil.Process] = {}
     for proc in _fresh_processes():
@@ -113,8 +117,13 @@ def capture_host_tree(*, include_install_users: bool = False) -> list[psutil.Pro
                 install_user = (
                     exe in executables
                     or _inside_install(exe)
-                    or bool(args and _inside_install(args[0]))
-                    or bool(len(args) > 1 and lowered[1] in executables)
+                    or (
+                        exe in interpreters
+                        and (
+                            bool(args and _inside_install(args[0]))
+                            or bool(len(args) > 1 and lowered[1] in executables)
+                        )
+                    )
                 )
                 # uv's Python trampoline can run the base interpreter outside
                 # the venv. Loaded extension paths identify orphaned workers.
@@ -239,7 +248,8 @@ def file_users(path: Path) -> str:
     for function in (rm.RmStartSession, rm.RmRegisterResources, rm.RmGetList, rm.RmEndSession):
         function.restype = wintypes.DWORD
     session = wintypes.DWORD()
-    code = rm.RmStartSession(ctypes.byref(session), 0, ctypes.create_unicode_buffer(33))
+    key = ctypes.create_unicode_buffer(32 + 1)  # CCH_RM_SESSION_KEY plus terminator.
+    code = rm.RmStartSession(ctypes.byref(session), 0, key)
     if code:
         raise OSError(code, "Restart Manager could not start")
     try:
@@ -275,6 +285,33 @@ def file_users(path: Path) -> str:
         rm.RmEndSession(session)
 
 
+def _visible_file_users(path: Path) -> str:
+    """Offer process-table evidence when Restart Manager cannot query file users."""
+    launchers: set[str] = set()
+    with contextlib.suppress(OSError, ValueError):
+        launchers.update(str(launcher).casefold() for launcher in installed_launchers())
+    target = str(path).casefold()
+    directory = path.is_dir()
+    users: list[str] = []
+    for proc in _fresh_processes():
+        try:
+            image = proc.exe()
+            related = image.casefold() in launchers or _inside_install(image)
+            with contextlib.suppress(psutil.Error):
+                related |= any(
+                    entry.path.casefold() == target or (directory and _inside_install(entry.path))
+                    for entry in proc.open_files()
+                )
+            if related and proc.is_running():
+                users.append(f"PID {proc.pid} ({image})")
+        except psutil.Error:
+            continue
+    return "; ".join(users) or (
+        f"no visible candidates; updater PID {os.getpid()} ({sys.executable}, protected). "
+        "The lock owner could not be identified with the available process permissions"
+    )
+
+
 def _rename_with_retry(path: Path, destination: Path) -> None:
     for attempt in range(6):
         try:
@@ -289,7 +326,11 @@ def _rename_with_retry(path: Path, destination: Path) -> None:
             try:
                 users = file_users(path)
             except OSError as diagnostic_error:
-                users = f"Restart Manager unavailable: {diagnostic_error}"
+                users = (
+                    f"Restart Manager unavailable: {diagnostic_error}; "
+                    "visible process candidates (not confirmed lock holders): "
+                    f"{_visible_file_users(path)}"
+                )
             raise OSError(f"{exc}; applications using {path}: {users}") from exc
 
 
