@@ -1053,7 +1053,12 @@ export class TerminalSession {
       const modifiers = [...options.chord.modifiers];
       if (this.stickyModifiers.ctrl !== "off") modifiers.push("control");
       if (this.stickyModifiers.alt !== "off") modifiers.push("alt");
-      payload = terminalDataForChord({ ...options.chord, modifiers }) ?? payload;
+      const encoded = terminalDataForChord(
+        { ...options.chord, modifiers },
+        this.term.modes.applicationCursorKeysMode,
+      );
+      if (encoded === null && modifiers.length > 0) return;
+      payload = encoded ?? payload;
     }
     // Explicit payloads are final; only keyboard data needs the sticky transform.
     this.sendingSoftKey = true;

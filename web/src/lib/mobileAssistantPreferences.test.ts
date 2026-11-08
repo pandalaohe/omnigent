@@ -607,6 +607,70 @@ describe("mobileAssistantPreferences", () => {
     );
   });
 
+  const terminalNavigationCases = [
+    ["ArrowUp", "A"],
+    ["ArrowDown", "B"],
+    ["ArrowRight", "C"],
+    ["ArrowLeft", "D"],
+    ["Home", "H"],
+    ["End", "F"],
+    ["Insert", "2~"],
+    ["Delete", "3~"],
+    ["PageUp", "5~"],
+    ["PageDown", "6~"],
+    ["F1", "P"],
+    ["F2", "Q"],
+    ["F3", "R"],
+    ["F4", "S"],
+    ["F5", "15~"],
+    ["F6", "17~"],
+    ["F7", "18~"],
+    ["F8", "19~"],
+    ["F9", "20~"],
+    ["F10", "21~"],
+    ["F11", "23~"],
+    ["F12", "24~"],
+  ];
+  it.each([
+    [[], 1],
+    [["shift"], 2],
+    [["alt"], 3],
+    [["shift", "alt"], 4],
+    [["control"], 5],
+    [["shift", "control"], 6],
+    [["alt", "control"], 7],
+    [["shift", "alt", "control"], 8],
+  ] as const)("encodes navigation and function keys with modifiers %j", (modifiers, parameter) => {
+    for (const applicationCursorKeys of [false, true]) {
+      for (const [code, suffix] of terminalNavigationCases) {
+        const isTilde = suffix.endsWith("~");
+        const plainPrefix =
+          code.match(/^F[1-4]$/) || (applicationCursorKeys && !isTilde) ? "O" : "[";
+        const expected =
+          parameter === 1
+            ? `\x1b${plainPrefix}${suffix}`
+            : isTilde
+              ? `\x1b[${suffix.slice(0, -1)};${parameter}~`
+              : `\x1b[1;${parameter}${suffix}`;
+        expect(
+          terminalDataForChord({ code, modifiers: [...modifiers] }, applicationCursorKeys),
+          `${code}, applicationCursorKeys=${applicationCursorKeys}`,
+        ).toBe(expected);
+      }
+    }
+  });
+
+  it("rejects unsupported modified keys", () => {
+    expect(terminalDataForChord({ code: "Tab", modifiers: ["alt"] })).toBeNull();
+    expect(terminalDataForChord({ code: "ArrowUp", modifiers: ["meta"] })).toBeNull();
+  });
+
+  it.each(["toString", "constructor", "__proto__"])("rejects inherited key name %s", (code) => {
+    expect(terminalDataForChord({ code, modifiers: [] })).toBeNull();
+    expect(terminalDataForChord({ code, modifiers: ["control"] })).toBeNull();
+    expect(terminalDataForChord({ code, modifiers: ["alt"] })).toBeNull();
+  });
+
   it("maps unmodified Home and End chords to softKeyForChord actions", () => {
     expect(softKeyForChord({ code: "Home", modifiers: [] })).toBe("home");
     expect(softKeyForChord({ code: "End", modifiers: [] })).toBe("end");
