@@ -98,6 +98,7 @@ def cli_bridge(
     page.goto(chat.url)
     page.get_by_role("button", name="Conversation actions", exact=True).tap()
     page.get_by_role("menuitem", name="Terminal", exact=True).tap()
+    expect(page.get_by_role("menu")).to_have_count(0)
     terminal = page.locator('[data-testid="terminal-view"]:visible').first
     expect(terminal).to_have_attribute("data-state", "connected", timeout=20_000)
     expect(terminal.get_by_role("toolbar", name="Terminal keys")).to_be_visible()
