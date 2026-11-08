@@ -497,6 +497,55 @@ def test_store_rejects_an_unpaired_unicode_surrogate_as_a_validation_error() -> 
         validate_preferences_envelope({"version": 1, "settings": {"usage_context": "\ud800"}})
 
 
+def test_terminal_bar_and_saved_preset_share_the_utf8_envelope_budget() -> None:
+    """Legal per-key limits do not imply that a layout plus preset fits."""
+    bar = {
+        row: {
+            "enabled": True,
+            "pinned": 0,
+            "keys": [
+                {
+                    "id": f"{row}-{index}",
+                    "label": "快捷" * 6,
+                    "width": 1,
+                    "display": "text",
+                    "kind": "text",
+                    "text": "输入" * 32,
+                }
+                for index in range(60)
+            ],
+        }
+        for row in ("top", "bottom")
+    }
+    mobile = {"version": 2, "enabled": True, "buttons": [], "terminalBar": bar}
+    envelope = {"version": 1, "settings": {"mobile_assistant": mobile}}
+    assert validate_preferences_envelope(envelope) == envelope
+    mobile["terminalBarPreset"] = bar
+    with pytest.raises(UserPreferencesValidationError, match="64 KiB"):
+        validate_preferences_envelope(envelope)
+
+
+def test_terminal_bar_size_fixtures_match_the_server_boundary() -> None:
+    fixtures = json.loads(
+        (Path(__file__).parents[1] / "fixtures" / "terminal_bar_preference_sizes.json").read_text()
+    )
+    for fixture in fixtures:
+        envelope = fixture["envelope"]
+        assert (
+            len(
+                json.dumps(
+                    envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                ).encode()
+            )
+            == fixture["expected_bytes"]
+        )
+        if fixture["expected_bytes"] == 65_536:
+            assert validate_preferences_envelope(envelope) == envelope
+        else:
+            with pytest.raises(UserPreferencesValidationError, match="64 KiB"):
+                validate_preferences_envelope(envelope)
+
+
 @pytest.mark.asyncio
 async def test_preferences_api_initializes_merges_and_returns_from_me(
     db_uri: str,

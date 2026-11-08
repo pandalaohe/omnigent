@@ -34,11 +34,11 @@ from tests.e2e_ui.mobile.test_terminal_keys import (
     _PAGE_1_KEYS,
     _assert_key_bytes,
     _lines,
+    _press_soft_key,
     _read_back,
     _start_echo,
     _stop_echo,
     _swipe_pager,
-    _tap_soft_key,
 )
 from tests.e2e_ui.shells.test_terminal_ime_composition import _capture_attach_frames
 
@@ -143,7 +143,7 @@ def _byte_matrix(page: Page, view: Locator, root: Path) -> None:
     script.write_text(_KEYECHO_SOURCE, encoding="utf-8")
     textarea = view.locator("textarea.xterm-helper-textarea")
     bar = view.get_by_test_id("terminal-key-row")
-    pager = bar.get_by_test_id("terminal-key-row-pager")
+    pager = bar.locator('[data-pager-row="bottom"]')
     expect(bar).to_be_visible()
     for mode in ("normal", "app"):
         log = root / f"{mode}.log"
@@ -152,7 +152,7 @@ def _byte_matrix(page: Page, view: Locator, root: Path) -> None:
             for index, keys in enumerate((_PAGE_0_KEYS, _PAGE_1_KEYS)):
                 if index:
                     _swipe_pager(pager, -80)
-                expect(bar).to_have_attribute("data-page", str(index))
+                expect(bar).to_have_attribute("data-bottom-page", str(index))
                 for label, physical, normal, app in keys:
                     textarea.focus()
                     count = len(_lines(log))
@@ -160,7 +160,7 @@ def _byte_matrix(page: Page, view: Locator, root: Path) -> None:
                     physical_bytes = _read_back(page, log, count)
                     textarea.evaluate("el => el.blur()")
                     count = len(_lines(log))
-                    _tap_soft_key(bar.get_by_role("button", name=label, exact=True))
+                    _press_soft_key(bar.get_by_role("button", name=label, exact=True))
                     _assert_key_bytes(
                         mode,
                         label,
@@ -298,15 +298,15 @@ def test_native_phone_menu_keys(
 
             _wait_screen(page, read, lambda screen: len(screen.strip()) > 20)
             before = read()
-            _tap_soft_key(bar.get_by_role("button", name="/", exact=True))
+            _press_soft_key(bar.get_by_role("button", name="/", exact=True))
             menu = _wait_screen(page, read, lambda screen: bool(_MENU.search(screen)))
             assert menu != before, "slash key did not open the CLI's own command menu"
-            _tap_soft_key(bar.get_by_role("button", name="↓", exact=True))
+            _press_soft_key(bar.get_by_role("button", name="↓", exact=True))
             moved = _wait_screen(
                 page, read, lambda screen: screen != menu and bool(_MENU.search(screen))
             )
             assert moved != menu, "Down did not change the rendered menu selection"
-            _tap_soft_key(bar.get_by_role("button", name="Esc", exact=True))
+            _press_soft_key(bar.get_by_role("button", name="Esc", exact=True))
             escaped = _wait_screen(
                 page,
                 read,
@@ -329,7 +329,7 @@ def test_native_phone_menu_keys(
                 # A local mode change must be visible; no prompt is submitted.
                 view.locator("textarea.xterm-helper-textarea").press("Control+u")
                 before_mode = read()
-                _tap_soft_key(bar.get_by_role("button", name="⇧Tab", exact=True))
+                _press_soft_key(bar.get_by_role("button", name="⇧Tab", exact=True))
                 _wait_screen(page, read, lambda screen: screen != before_mode)
 
 
@@ -392,7 +392,7 @@ def test_sdk_tui_phone_transport_bytes(
             assert physical_bytes in {normal, app}
             textarea.evaluate("el => el.blur()")
             count = len(sent)
-            _tap_soft_key(bar.get_by_role("button", name=label, exact=True))
+            _press_soft_key(bar.get_by_role("button", name=label, exact=True))
             wait_input(count)
             _assert_key_bytes(
                 "SDK transport", label, sent[-1].hex(), physical_bytes, physical_bytes

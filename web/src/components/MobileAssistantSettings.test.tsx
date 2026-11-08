@@ -1,4 +1,5 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
+import { toast } from "sonner";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -7,6 +8,17 @@ import {
   writeMobileAssistantPreferences,
 } from "@/lib/mobileAssistantPreferences";
 import { MobileAssistantSettings } from "./MobileAssistantSettings";
+import {
+  defaultTerminalBar,
+  canonicalTerminalFields,
+  canonicalizeBar,
+  preferencesEnvelopeBytes,
+  legacyFingerprint,
+  projectLegacy,
+} from "@/lib/terminalKeyBar";
+import { collectLocalUserPreferences } from "@/lib/userPreferencesSync";
+
+vi.mock("sonner", () => ({ toast: vi.fn() }));
 
 describe("MobileAssistantSettings", () => {
   beforeEach(() => {
@@ -260,28 +272,33 @@ describe("MobileAssistantSettings", () => {
     ).toBeGreaterThanOrEqual(2);
   });
 
-  it("edits the terminal set separately, adds a chord by tap, moves it, and persists both switches", () => {
+  it("edits the terminal bar, adds a chord by tap, moves it across rows, and persists both switches", () => {
     localStorage.clear();
     render(<MobileAssistantSettings />);
     const chat = readMobileAssistantPreferences().buttons;
     fireEvent.click(screen.getByRole("radio", { name: "Terminal" }));
-    expect(screen.getByText("First row")).toBeTruthy();
-    expect(screen.getByText("Page 1")).toBeTruthy();
-    expect(screen.getByText("Page 2")).toBeTruthy();
-    fireEvent.click(screen.getByRole("switch", { name: "Enable terminal key rows" }));
-    fireEvent.click(screen.getByRole("switch", { name: "Show second terminal key row" }));
-    fireEvent.click(screen.getByRole("button", { name: "Add a key" }));
-    fireEvent.change(screen.getByLabelText("Key"), { target: { value: "KeyR" } });
+    expect(screen.getByText(/Top row · 1 page/)).toBeTruthy();
+    expect(screen.getByText(/Bottom row · 2 pages/)).toBeTruthy();
+    fireEvent.click(screen.getAllByRole("button", { name: "Add key" }).at(-1)!);
+    fireEvent.change(screen.getByLabelText("More keys"), { target: { value: "KeyR" } });
     fireEvent.click(screen.getByRole("button", { name: "Ctrl" }));
     fireEvent.click(screen.getByRole("button", { name: "Shift" }));
-    fireEvent.click(screen.getByRole("button", { name: "Save key" }));
-    const added = readMobileAssistantPreferences().terminalButtons.at(-1)!;
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    const added = readMobileAssistantPreferences().terminalBar!.bottom.keys.at(-1)!;
     expect(added).toMatchObject({
       kind: "key",
+      width: 2,
       chord: { code: "KeyR", modifiers: ["control", "shift"] },
+      label: "Ctrl+Shift+R",
     });
-    fireEvent.click(screen.getByRole("button", { name: `Move ${added.label} up` }));
-    expect(readMobileAssistantPreferences().terminalButtons[17].id).toBe(added.id);
+    fireEvent.click(screen.getByRole("button", { name: /^Edit Ctrl\+Shift\+R, 2 cells/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Move to other row" }));
+    expect(
+      readMobileAssistantPreferences().terminalBar!.top.keys.some((key) => key.id === added.id),
+    ).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    fireEvent.click(screen.getByRole("switch", { name: "Enable terminal key rows" }));
+    fireEvent.click(screen.getByRole("switch", { name: "Show bottom terminal key row" }));
     expect(readMobileAssistantPreferences()).toMatchObject({
       buttons: chat,
       terminalKeysEnabled: false,
@@ -290,34 +307,32 @@ describe("MobileAssistantSettings", () => {
     fireEvent.click(screen.getByRole("radio", { name: "Chat" }));
     expect(readMobileAssistantPreferences().buttons).toEqual(chat);
     fireEvent.click(screen.getByRole("radio", { name: "Terminal" }));
-    fireEvent.click(screen.getByRole("button", { name: `Delete ${added.label}` }));
-    expect(readMobileAssistantPreferences().terminalButtons).toHaveLength(18);
+    fireEvent.click(screen.getByRole("button", { name: /^Edit Ctrl\+Shift\+R, 2 cells/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Delete key" }));
+    expect(
+      readMobileAssistantPreferences().terminalBar!.top.keys.some((key) => key.id === added.id),
+    ).toBe(false);
   });
 
-  it("keeps the same focused move control when a key crosses a page boundary", () => {
+  it("pins leading keys with the stepper and refuses an unsupported terminal chord", () => {
     localStorage.clear();
     render(<MobileAssistantSettings />);
     fireEvent.click(screen.getByRole("radio", { name: "Terminal" }));
-    const move = screen.getByRole("button", { name: "Move Tab up" });
-    move.focus();
-    fireEvent.click(move);
-    expect(readMobileAssistantPreferences().terminalButtons[5].id).toBe("tab");
-    expect(screen.getByRole("button", { name: "Move Tab up" })).toBe(move);
-    expect(move).toHaveFocus();
-  });
+    fireEvent.click(screen.getByRole("button", { name: "Pin one more bottom row key" }));
+    expect(readMobileAssistantPreferences().terminalBar!.bottom.pinned).toBe(1);
+    const tab = readMobileAssistantPreferences().terminalBar!.bottom.keys[0];
+    expect(tab.id).toBe("tab");
+    expect(screen.getByRole("button", { name: /^Edit Tab, 2 cells, pinned/ })).toBeInTheDocument();
 
-  it("explains an unsupported terminal chord and prevents saving an inert key", () => {
-    render(<MobileAssistantSettings />);
-    fireEvent.click(screen.getByRole("radio", { name: "Terminal" }));
-    fireEvent.click(screen.getByRole("button", { name: "Add a key" }));
-    fireEvent.change(screen.getByLabelText("Key"), { target: { value: "ArrowUp" } });
+    fireEvent.click(screen.getAllByRole("button", { name: "Add key" }).at(-1)!);
+    fireEvent.click(screen.getByRole("button", { name: "Tab" }));
     fireEvent.click(screen.getByRole("button", { name: "Ctrl" }));
-    expect(screen.getByRole("button", { name: "Save key" })).toBeDisabled();
-    expect(screen.getByRole("status")).toHaveTextContent("not supported in terminals");
-    fireEvent.change(screen.getByLabelText("Key"), { target: { value: "KeyR" } });
+    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+    expect(screen.getByText(/Not supported in terminals/)).toBeVisible();
+    fireEvent.change(screen.getByLabelText("More keys"), { target: { value: "KeyR" } });
     fireEvent.click(screen.getByRole("button", { name: "Shift" }));
-    expect(screen.getByRole("button", { name: "Save key" })).toBeEnabled();
-    expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+    expect(screen.queryByText(/Not supported in terminals/)).toBeNull();
   });
 
   it("uses the shared help control for terminal rows and closes it on a second tap", () => {
@@ -332,5 +347,117 @@ describe("MobileAssistantSettings", () => {
     expect(
       screen.queryByText(/the floating assistant uses the first ten terminal keys/),
     ).not.toBeInTheDocument();
+  });
+
+  it("round-trips a preset and undoes defaults without reverting an unrelated switch", () => {
+    localStorage.clear();
+    render(<MobileAssistantSettings />);
+    fireEvent.click(screen.getByRole("radio", { name: "Terminal" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Edit Esc,/ }));
+    fireEvent.click(screen.getByRole("radio", { name: "1 cell" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save as my preset" }));
+    fireEvent.click(screen.getByRole("button", { name: "Restore defaults" }));
+    expect(readMobileAssistantPreferences().terminalBar!.top.keys[0].width).toBe(2);
+    fireEvent.click(screen.getByRole("button", { name: "Load my preset" }));
+    expect(readMobileAssistantPreferences().terminalBar!.top.keys[0].width).toBe(1);
+    fireEvent.click(screen.getByRole("button", { name: "Restore defaults" }));
+    const undo = vi.mocked(toast).mock.calls.at(-1)?.[1]?.action;
+    expect(undo && typeof undo === "object" && "onClick" in undo).toBe(true);
+    fireEvent.click(screen.getByRole("switch", { name: "Enable terminal key rows" }));
+    act(() => {
+      if (undo && typeof undo === "object" && "onClick" in undo) undo.onClick({} as never);
+    });
+    expect(readMobileAssistantPreferences().terminalBar!.top.keys[0].width).toBe(1);
+    expect(readMobileAssistantPreferences().terminalKeysEnabled).toBe(false);
+  });
+
+  it("refuses an oversized saved preset before touching local storage", () => {
+    const bar = defaultTerminalBar();
+    for (const row of ["top", "bottom"] as const) {
+      bar[row] = {
+        enabled: true,
+        pinned: 0,
+        keys: Array.from({ length: 60 }, (_, index) => ({
+          id: `${row}-${index}`,
+          label: "快捷".repeat(6),
+          kind: "text",
+          display: "text",
+          width: 1,
+          text: "输入".repeat(32),
+        })),
+      };
+    }
+    const legacy = projectLegacy(bar);
+    writeMobileAssistantPreferences({
+      version: 2,
+      enabled: true,
+      buttons: [],
+      terminalBar: bar,
+      terminalButtons: legacy,
+      terminalLegacyBasis: legacyFingerprint(legacy, true),
+      chatActionsRevision: 1,
+    });
+    render(<MobileAssistantSettings />);
+    fireEvent.click(screen.getByRole("radio", { name: "Terminal" }));
+    const before = localStorage.getItem("omnigent:mobile-assistant-preferences");
+    fireEvent.click(screen.getByRole("button", { name: "Save as my preset" }));
+    expect(screen.getByText("Too large to sync: remove keys or shorten texts")).toBeVisible();
+    expect(localStorage.getItem("omnigent:mobile-assistant-preferences")).toBe(before);
+  });
+
+  it("names the default fallback when an invalid stored bar had no older key list", () => {
+    const raw = {
+      version: 2,
+      enabled: true,
+      buttons: [],
+      chatActionsRevision: 1,
+      terminalBar: { invalid: true },
+    };
+    localStorage.setItem("omnigent:mobile-assistant-preferences", JSON.stringify(raw));
+    expect(readMobileAssistantPreferences().terminalButtons).toBeUndefined();
+    render(<MobileAssistantSettings />);
+    fireEvent.click(screen.getByRole("radio", { name: "Terminal" }));
+    expect(screen.getByText(/showing the default keys/)).toBeVisible();
+    expect(JSON.parse(localStorage.getItem("omnigent:mobile-assistant-preferences")!)).toEqual(raw);
+    fireEvent.click(screen.getByRole("switch", { name: "Enable mobile floating assistant" }));
+    expect(readMobileAssistantPreferences().terminalButtons).toBeUndefined();
+    expect(screen.getByText(/showing the default keys/)).toBeVisible();
+  });
+
+  it.each([65_536, 65_537])("enforces the exact normalized editor budget at %i bytes", (bytes) => {
+    localStorage.clear();
+    const bar = defaultTerminalBar();
+    const terminalButtons = projectLegacy(bar);
+    writeMobileAssistantPreferences({
+      version: 2,
+      enabled: true,
+      buttons: [],
+      chatActionsRevision: 1,
+      terminalBar: bar,
+      terminalButtons,
+      terminalLegacyBasis: legacyFingerprint(terminalButtons, true),
+    });
+    render(<MobileAssistantSettings />);
+    fireEvent.click(screen.getByRole("radio", { name: "Terminal" }));
+    const envelope = collectLocalUserPreferences();
+    const mobile = canonicalTerminalFields({
+      ...(envelope.settings.mobile_assistant as Record<string, unknown>),
+      terminalBarPreset: canonicalizeBar(bar),
+    });
+    envelope.settings.mobile_assistant = mobile;
+    envelope.settings.usage_context = "";
+    const padding = "x".repeat(bytes - preferencesEnvelopeBytes(envelope));
+    localStorage.setItem("omnigent:usage-context-preferences", JSON.stringify(padding));
+    const actual = collectLocalUserPreferences();
+    actual.settings.mobile_assistant = mobile;
+    expect(preferencesEnvelopeBytes(actual)).toBe(bytes);
+    fireEvent.click(screen.getByRole("button", { name: "Save as my preset" }));
+    if (bytes === 65_536) {
+      expect(readMobileAssistantPreferences().terminalBarPreset).toEqual(bar);
+    } else {
+      expect(readMobileAssistantPreferences().terminalBarPreset).toBeUndefined();
+      expect(screen.getByText("Too large to sync: remove keys or shorten texts")).toBeVisible();
+    }
   });
 });

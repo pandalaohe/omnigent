@@ -434,8 +434,8 @@ def _measure_and_assert(
         bridge_h = strip_h if shell == "ios" else None
         visible_bottom = strip_h
     elif kb_mode == "room_floor":
-        # Leave ~140px room above visible_bottom so both portrait (< 99 + 108 = 207px)
-        # and landscape (< 55 + 108 = 163px) hide the bar while keeping >= 4 terminal rows.
+        # Leave ~140px room above visible_bottom so both portrait (< 119 + 108 = 227px)
+        # and landscape (< 73 + 108 = 181px) hide the bar while keeping >= 4 terminal rows.
         view_top = page.evaluate(
             """() => {
               const v = [...document.querySelectorAll('[data-testid="terminal-view"]')].find(
@@ -511,6 +511,7 @@ def _measure_and_assert(
                 const r = b.getBoundingClientRect();
                 return {
                   label: b.getAttribute("aria-label"),
+                  pageRow: b.getAttribute("data-page-button"),
                   left: r.left,
                   top: r.top,
                   right: r.right,
@@ -683,7 +684,7 @@ def _measure_and_assert(
     else:
         side_padding = max(8, safe["left"]) + max(8, safe["right"])
     key_row_width = root_w - side_padding
-    bar_h_expected = 55 if key_row_width >= 560 else 99
+    bar_h_expected = 73 if key_row_width >= 560 else 119
     room_px = round(snap["viewRect"]["height"] - snap["paddingBottomPx"])
     should_show_bar = room_px >= bar_h_expected + 108
 
@@ -715,6 +716,9 @@ def _measure_and_assert(
         assert snap["maxMd"] is False, f"expected maxMd=False at {nominal_w} ({ctx_desc})"
 
     bar_rect = snap["barRect"]
+    assert abs(bar_rect["height"] - bar_h_expected) <= 1.5, (
+        f"bar height {bar_rect['height']} != {bar_h_expected} ({ctx_desc})"
+    )
 
     # --- Assertion 2: Terminal viewport bottom <= bar top ---
     assert snap["xtermRect"]["bottom"] <= bar_rect["top"] + 1.5, (
@@ -743,12 +747,18 @@ def _measure_and_assert(
             f"> width - safe.right {nominal_w - safe['right']} ({ctx_desc})"
         )
 
-    # --- Assertion 5: No two key boxes intersect; each >= 44 x 44 px ---
+    # --- Assertion 5: Keys >= 44 x 44; page buttons >= 56 x 24; none intersect ---
     buttons = snap["buttons"]
     for i, b1 in enumerate(buttons):
-        assert b1["width"] >= 43.5 and b1["height"] >= 43.5, (
-            f"button {b1['label']} smaller than 44x44: {b1['width']}x{b1['height']} ({ctx_desc})"
+        min_width, min_height = (56, 24) if b1["pageRow"] else (44, 44)
+        assert b1["width"] >= min_width - 0.5 and b1["height"] >= min_height - 0.5, (
+            f"button {b1['label']} smaller than {min_width}x{min_height}: "
+            f"{b1['width']}x{b1['height']} ({ctx_desc})"
         )
+        if b1["pageRow"] == "bottom":
+            assert b1["left"] >= bar_rect["left"] + bar_rect["width"] / 2, (
+                f"bottom row page button must be on the right ({ctx_desc})"
+            )
         for b2 in buttons[i + 1 :]:
             ix = min(b1["right"], b2["right"]) - max(b1["left"], b2["left"])
             iy = min(b1["bottom"], b2["bottom"]) - max(b1["top"], b2["top"])

@@ -12,6 +12,8 @@ app; component checks use their own isolated test environment.
 - [OTLP usage ingestion](features/usage-otlp.md): HTTP signals, accounting and managed-session exclusion.
 - [Automatic rotation](features/auto-rotation.md): context notices, handover deferral,
   durable request recovery and runner concurrency.
+- [Terminal key bars](features/terminal-key-bars.md): phone layout editing,
+  independent row paging, sticky modifiers and terminal input.
 
 Record the checkout revision, command, result and evidence location for each run.
 An HTML preview with fake data proves the shown component interactions, rather

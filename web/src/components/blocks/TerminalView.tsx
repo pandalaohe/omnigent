@@ -37,8 +37,11 @@ import { useIsPhone } from "@/hooks/useIsPhone";
 import { useTerminalKeyboardRoom } from "@/hooks/useTerminalKeyboardRoom";
 import {
   TERMINAL_SOFT_KEY_EVENT,
+  EMPTY_STICKY_MODIFIERS,
+  barHeightPx,
   isDomTargetVisible,
   registerTypableTerminal,
+  resolveTerminalBar,
   useMobileAssistantPreferences,
   type TerminalSoftKeyEventDetail,
 } from "@/lib/mobileAssistantPreferences";
@@ -47,7 +50,7 @@ import {
   type TerminalClipboardDecision,
   type TerminalClipboardPromptReason,
 } from "./TerminalClipboardPrompt";
-import { TerminalKeyRow, sendTerminalKeyRowItem, toggleTerminalKeyboard } from "./TerminalKeyRow";
+import { TerminalKeyRow, pressBarKey } from "./TerminalKeyRow";
 import {
   type ConnectionState,
   type TerminalActivityListener,
@@ -323,6 +326,13 @@ export function TerminalView({
             Date.now() - connectedAtRef.current >= RECONNECT_STABLE_MS))));
   const terminalEnded = state.kind === "closed" && !reconnectPending && !willAutoReconnect;
   const keyPreferences = useMobileAssistantPreferences();
+  const resolvedTerminalBar = resolveTerminalBar(
+    keyPreferences as unknown as Record<string, unknown>,
+  );
+  const terminalBar = resolvedTerminalBar.bar;
+  const hasTerminalBarKeys =
+    terminalBar.top.keys.length > 0 ||
+    (terminalBar.bottom.enabled && terminalBar.bottom.keys.length > 0);
   const canShowKeyRows =
     isPhone &&
     !readOnly &&
@@ -330,19 +340,33 @@ export function TerminalView({
     active &&
     !terminalEnded &&
     keyPreferences.terminalKeysEnabled &&
-    keyPreferences.terminalButtons.length > 0;
+    hasTerminalBarKeys;
   const { overlap, keyboardUp, roomPx, keyRowWidth, paddingBottomPx } = useTerminalKeyboardRoom(
     rootRef,
     canShowKeyRows,
     reservesBottomSafeArea,
   );
-  const barHeight = !keyPreferences.terminalSecondRow ? 47 : keyRowWidth >= 560 ? 55 : 99;
+  const barHeight = barHeightPx(terminalBar, keyRowWidth >= 560);
   const hasBar = canShowKeyRows && roomPx >= barHeight + 108;
+
+  useEffect(() => {
+    const session = sessionRef.current;
+    const reset = () => session?.setStickyModifiers({ ...EMPTY_STICKY_MODIFIERS });
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") reset();
+    };
+    if (state.kind !== "connected" || !active || readOnly || !isPhone) reset();
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      reset();
+    };
+  }, [state.kind, active, readOnly, sessionId, hostId, terminalId, isPhone]);
 
   useEffect(() => {
     if (!active || readOnly || terminalEnded) return;
     return registerTypableTerminal(hasBar);
-  }, [active, readOnly, terminalEnded, hasBar]);
+  }, [active, readOnly, terminalEnded, hasBar, state.kind, sessionId, hostId, terminalId]);
 
   // Stable refs so callback prop changes never recreate the WS session.
   const onStateChangeRef = useRef(onStateChange);
@@ -353,6 +377,9 @@ export function TerminalView({
   onInputRef.current = onInput;
   const activeRef = useRef(active);
   activeRef.current = active;
+  const canInputRef = useRef(state.kind === "connected" && !readOnly);
+  canInputRef.current = state.kind === "connected" && !readOnly;
+  const connectionEpochRef = useRef(0);
   const focusOnConnectRef = useRef(focusOnConnect);
   focusOnConnectRef.current = focusOnConnect;
 
@@ -369,20 +396,31 @@ export function TerminalView({
           detail.preferredTarget && node?.contains(detail.preferredTarget),
         ),
         send: () => {
+          const epoch = connectionEpochRef.current;
+          const isCurrent = () =>
+            connectionEpochRef.current === epoch &&
+            sessionRef.current === session &&
+            activeRef.current &&
+            canInputRef.current &&
+            document.visibilityState !== "hidden" &&
+            isDomTargetVisible(node);
+          if ((detail.onTerminalTarget || detail.terminalBarKey) && !isCurrent()) return;
           if (detail.onStickyChanged) {
             detail.onStickySubscribed?.(session.onStickyConsumed(detail.onStickyChanged));
           }
-          const item = detail.terminalItem;
-          if (item?.kind === "modifier") {
-            const next = { ...session.getStickyModifiers() };
-            const current = next[item.modifier];
-            next[item.modifier] =
-              current === "off" ? "once" : current === "once" ? "locked" : "off";
-            session.setStickyModifiers(next);
-          } else if (item?.kind === "action") {
-            toggleTerminalKeyboard(session);
-          } else if (item?.kind === "key") {
-            sendTerminalKeyRowItem(session, item, session.getStickyModifiers());
+          if (detail.onTerminalTarget) {
+            detail.onTerminalTarget({
+              isCurrent,
+              press: (key, gesture) => {
+                if (isCurrent()) pressBarKey(session, key, gesture);
+              },
+            });
+            detail.onStickyChanged?.(session.getStickyModifiers());
+            return;
+          }
+          const barKey = detail.terminalBarKey;
+          if (barKey) {
+            pressBarKey(session, barKey, detail.terminalGesture ?? "tap");
           } else if (detail.data !== undefined) {
             session.sendSoftKey(detail.action, detail.data);
           } else session.sendSoftKey(detail.action);
@@ -412,6 +450,10 @@ export function TerminalView({
 
   // Stable dispatcher: updates local state and notifies the parent.
   const notifyState = useCallback((next: ConnectionState) => {
+    if (next.kind !== "connected") {
+      connectionEpochRef.current += 1;
+      canInputRef.current = false;
+    }
     setState(next);
     onStateChangeRef.current?.(next);
   }, []);
@@ -903,8 +945,8 @@ export function TerminalView({
           sessionRef={sessionRef}
           keyboardUp={keyboardUp}
           disabled={state.kind !== "connected"}
-          items={keyPreferences.terminalButtons}
-          secondRow={keyPreferences.terminalSecondRow}
+          bar={terminalBar}
+          identityKey={`${sessionId ?? hostId}:${terminalId}`}
         />
       )}
     </div>

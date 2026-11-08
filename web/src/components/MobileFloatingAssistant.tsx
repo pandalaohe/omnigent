@@ -5,8 +5,11 @@ import {
   ArrowLeftIcon,
   ArrowRightIcon,
   ArrowUpIcon,
+  ChevronsDownIcon,
+  ChevronsUpIcon,
   CommandIcon,
   CornerDownLeftIcon,
+  DeleteIcon,
   GripVerticalIcon,
   KeyboardIcon,
   LockKeyholeIcon,
@@ -21,9 +24,12 @@ import {
   MOBILE_ASSISTANT_CHANGED_EVENT,
   MOBILE_ASSISTANT_MAX_BUTTONS,
   dispatchMobileAssistantButton,
-  dispatchTerminalAssistantItem,
+  dispatchTerminalBarKey,
+  bindTerminalBarTarget,
+  flattenBar,
   mobileAssistantBindingSupportsRepeat,
   readMobileAssistantPreferences,
+  resolveTerminalBar,
   useTypableTerminals,
   visibleChatButtons,
   writeMobileAssistantDeviceState,
@@ -31,7 +37,8 @@ import {
   type MobileAssistantDock,
   type MobileAssistantDockEdge,
   type MobileAssistantIcon,
-  type TerminalKeyRowItem,
+  type TerminalBarKey,
+  type TerminalBarTarget,
   type TerminalStickyModifiers,
 } from "@/lib/mobileAssistantPreferences";
 import { cn } from "@/lib/utils";
@@ -46,14 +53,12 @@ const DOCK_THRESHOLD = 38;
 // On portrait phones this clears the composer band (input, action row, queued
 // messages), keyboard-shortened viewport included; a stored or docked spot wins.
 const FIRST_USE_POINT = { x: 0.86, y: 0.2 };
-type WheelItem = MobileAssistantButton | TerminalKeyRowItem;
+type WheelItem = MobileAssistantButton | TerminalBarKey;
 
 function repeats(item: WheelItem): boolean {
-  if (!("repeat" in item) || item.repeat !== true) return false;
-  return "binding" in item
-    ? mobileAssistantBindingSupportsRepeat(item.binding)
-    : item.kind === "key" &&
-        mobileAssistantBindingSupportsRepeat({ kind: "key", chord: item.chord });
+  if ("binding" in item)
+    return item.repeat === true && mobileAssistantBindingSupportsRepeat(item.binding);
+  return item.kind === "key" && item.repeat === true;
 }
 
 interface ViewportSize {
@@ -256,6 +261,11 @@ const MOBILE_ASSISTANT_ICON_COMPONENTS: Record<MobileAssistantIcon, LucideIcon> 
   "arrow-left": ArrowLeftIcon,
   "arrow-right": ArrowRightIcon,
   enter: CornerDownLeftIcon,
+  backspace: DeleteIcon,
+  delete: DeleteIcon,
+  "page-up": ChevronsUpIcon,
+  "page-down": ChevronsDownIcon,
+  keyboard: KeyboardIcon,
   refresh: RefreshCwIcon,
   archive: ArchiveIcon,
   terminal: SquareTerminalIcon,
@@ -266,12 +276,21 @@ export function MobileAssistantButtonContent({
   button,
   className = "h-4 w-4",
 }: {
-  button: Pick<MobileAssistantButton, "label" | "icon" | "display">;
+  button: Pick<MobileAssistantButton, "label" | "icon" | "display"> &
+    Partial<Pick<TerminalBarKey, "icon">>;
   className?: string;
 }) {
-  const Icon = button.icon ? MOBILE_ASSISTANT_ICON_COMPONENTS[button.icon] : undefined;
+  const Icon = button.icon
+    ? MOBILE_ASSISTANT_ICON_COMPONENTS[button.icon as MobileAssistantIcon]
+    : undefined;
   if (button.display === "icon" && Icon) return <Icon className={className} aria-hidden />;
-  return <span className="max-w-full truncate">{button.label}</span>;
+  return (
+    <span
+      className={cn("max-w-full", Array.from(button.label).length === 1 ? "shrink-0" : "truncate")}
+    >
+      {button.label}
+    </span>
+  );
 }
 
 export function MobileFloatingAssistant() {
@@ -280,7 +299,11 @@ export function MobileFloatingAssistant() {
   const { count, withBar } = terminals;
   const [preferences, setPreferences] = useState(readMobileAssistantPreferences);
   const [open, setOpen] = useState(false);
-  const [sticky, setSticky] = useState<TerminalStickyModifiers>({ ctrl: "off", alt: "off" });
+  const [sticky, setSticky] = useState<TerminalStickyModifiers>({
+    ctrl: "off",
+    alt: "off",
+    shift: "off",
+  });
   const stickySubscription = useRef<(() => void) | null>(null);
   const [viewport, setViewport] = useState<ViewportSize>(() => viewportSize());
   const [dragPreview, setDragPreview] = useState<Point | null>(null);
@@ -294,7 +317,12 @@ export function MobileFloatingAssistant() {
   const suppressActionClickRef = useRef<string | null>(null);
   const repeatTimeoutRef = useRef<number | null>(null);
   const repeatIntervalRef = useRef<number | null>(null);
-  const repeatingPointerRef = useRef<{ buttonId: string; pointerId: number } | null>(null);
+  const repeatingPointerRef = useRef<{
+    buttonId: string;
+    pointerId: number;
+    x: number;
+    y: number;
+  } | null>(null);
   const assistantRef = useRef<HTMLDivElement>(null);
   const lastInputFocusRef = useRef<HTMLElement | null>(
     typeof document !== "undefined" &&
@@ -317,7 +345,7 @@ export function MobileFloatingAssistant() {
   }, []);
 
   useEffect(() => {
-    setSticky({ ctrl: "off", alt: "off" });
+    setSticky({ ctrl: "off", alt: "off", shift: "off" });
     return () => {
       stickySubscription.current?.();
       stickySubscription.current = null;
@@ -332,13 +360,30 @@ export function MobileFloatingAssistant() {
     repeatingPointerRef.current = null;
   };
 
+  const cancelActionPress = () => {
+    if (repeatingPointerRef.current)
+      suppressActionClickRef.current = repeatingPointerRef.current.buttonId;
+    stopRepeating();
+  };
+
   useEffect(() => {
-    window.addEventListener("blur", stopRepeating);
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") cancelActionPress();
+    };
+    window.addEventListener("blur", cancelActionPress);
+    document.addEventListener("visibilitychange", onVisibility);
     return () => {
-      window.removeEventListener("blur", stopRepeating);
-      stopRepeating();
+      window.removeEventListener("blur", cancelActionPress);
+      document.removeEventListener("visibilitychange", onVisibility);
+      cancelActionPress();
     };
   }, []);
+
+  useEffect(() => {
+    if (!open || !preferences.enabled || withBar > 0) cancelActionPress();
+  }, [open, preferences.enabled, withBar]);
+
+  useEffect(() => cancelActionPress(), [terminals]);
 
   useEffect(() => {
     const rememberFocus = (event: FocusEvent) => {
@@ -373,40 +418,85 @@ export function MobileFloatingAssistant() {
     x: clamp(point.x * viewport.width, MAIN_SIZE / 2, viewport.width - MAIN_SIZE / 2),
     y: clamp(point.y * viewport.height, MAIN_SIZE / 2, viewport.height - MAIN_SIZE / 2),
   };
+  const bar = resolveTerminalBar(preferences as unknown as Record<string, unknown>).bar;
   const buttons: WheelItem[] =
     count > 0
-      ? preferences.terminalButtons.slice(0, MOBILE_ASSISTANT_MAX_BUTTONS)
+      ? flattenBar(bar).slice(0, MOBILE_ASSISTANT_MAX_BUTTONS)
       : visibleChatButtons(preferences).slice(0, MOBILE_ASSISTANT_MAX_BUTTONS);
   const circle = layoutMobileAssistantCircle(buttons.length, center, viewport);
   const displayCenter = open ? circle.center : center;
   const actionPositions = circle.actions;
 
-  const fireButton = (button: WheelItem) => {
+  const fireButton = (button: WheelItem, gesture: "tap" | "longPress" | "repeat" = "tap") => {
     if ("binding" in button) dispatchMobileAssistantButton(button, lastInputFocusRef.current);
     else {
       stickySubscription.current?.();
       stickySubscription.current = null;
-      dispatchTerminalAssistantItem(button, lastInputFocusRef.current, {
-        onStickyChanged: setSticky,
-        onStickySubscribed: (unsubscribe) => {
-          stickySubscription.current = unsubscribe;
+      dispatchTerminalBarKey(
+        button,
+        lastInputFocusRef.current,
+        {
+          onStickyChanged: setSticky,
+          onStickySubscribed: (unsubscribe) => {
+            stickySubscription.current = unsubscribe;
+          },
         },
-      });
+        gesture,
+      );
     }
   };
 
   const onActionPointerDown = (button: WheelItem, event: PointerEvent<HTMLButtonElement>) => {
     if (event.button === 0) event.preventDefault();
-    if (event.button !== 0 || !repeats(button)) return;
+    if (event.button !== 0 || repeatingPointerRef.current) return;
+    suppressActionClickRef.current = null;
+    const modifier = !("binding" in button) && button.kind === "modifier";
+    if (!repeats(button) && !modifier) return;
     stopRepeating();
-    suppressActionClickRef.current = button.id;
-    repeatingPointerRef.current = { buttonId: button.id, pointerId: event.pointerId };
+    let target: TerminalBarTarget | null = null;
+    if (!("binding" in button)) {
+      stickySubscription.current?.();
+      target = bindTerminalBarTarget(lastInputFocusRef.current, {
+        onStickyChanged: setSticky,
+        onStickySubscribed: (unsubscribe) => {
+          stickySubscription.current = unsubscribe;
+        },
+      });
+      if (!target) return;
+    }
+    repeatingPointerRef.current = {
+      buttonId: button.id,
+      pointerId: event.pointerId,
+      x: event.clientX,
+      y: event.clientY,
+    };
     event.currentTarget.setPointerCapture?.(event.pointerId);
-    fireButton(button);
-    repeatTimeoutRef.current = window.setTimeout(() => {
+    if ("binding" in button) {
+      suppressActionClickRef.current = button.id;
       fireButton(button);
-      repeatIntervalRef.current = window.setInterval(() => fireButton(button), 80);
-    }, 400);
+    }
+    repeatTimeoutRef.current = window.setTimeout(
+      () => {
+        if (target && !target.isCurrent()) {
+          cancelActionPress();
+          return;
+        }
+        suppressActionClickRef.current = button.id;
+        if (target && !("binding" in button))
+          target.press(button, modifier ? "longPress" : "repeat");
+        else fireButton(button, "repeat");
+        if (!modifier)
+          repeatIntervalRef.current = window.setInterval(() => {
+            if (target && !target.isCurrent()) {
+              cancelActionPress();
+              return;
+            }
+            if (target && !("binding" in button)) target.press(button, "repeat");
+            else fireButton(button, "repeat");
+          }, 80);
+      },
+      modifier ? 500 : 400,
+    );
   };
 
   const onActionPointerEnd = (button: WheelItem, pointerId: number) => {
@@ -558,14 +648,31 @@ export function MobileFloatingAssistant() {
                     }
                     data-repeat={"repeat" in button && button.repeat === true ? "true" : undefined}
                     onPointerDown={(event) => onActionPointerDown(button, event)}
+                    onPointerMove={(event) => {
+                      const press = repeatingPointerRef.current;
+                      if (
+                        press?.pointerId === event.pointerId &&
+                        Math.hypot(event.clientX - press.x, event.clientY - press.y) > 10
+                      ) {
+                        suppressActionClickRef.current = button.id;
+                        stopRepeating();
+                      }
+                    }}
                     onPointerUp={(event) => onActionPointerEnd(button, event.pointerId)}
-                    onPointerCancel={(event) => onActionPointerEnd(button, event.pointerId)}
-                    onLostPointerCapture={(event) => onActionPointerEnd(button, event.pointerId)}
-                    onClick={() => {
-                      if (suppressActionClickRef.current === button.id) {
+                    onPointerCancel={(event) => {
+                      if (repeatingPointerRef.current?.pointerId === event.pointerId)
+                        cancelActionPress();
+                    }}
+                    onLostPointerCapture={(event) => {
+                      if (repeatingPointerRef.current?.pointerId === event.pointerId)
+                        cancelActionPress();
+                    }}
+                    onClick={(event) => {
+                      if (event.detail !== 0 && suppressActionClickRef.current === button.id) {
                         suppressActionClickRef.current = null;
                         return;
                       }
+                      suppressActionClickRef.current = null;
                       fireButton(button);
                     }}
                     className={cn(

@@ -8,7 +8,44 @@ import {
   type ShortcutActionId,
   type ShortcutChord,
 } from "@/lib/keyboardShortcutPreferences";
+import {
+  bindingSupportsRepeat as terminalKeyBindingSupportsRepeat,
+  defaultTerminalButtons,
+  normalizeChord,
+  normalizeTerminalButtons,
+  type TerminalBar,
+  type TerminalBarKey,
+  type TerminalKeyRowItem,
+  type TerminalStickyModifiers,
+} from "@/lib/terminalKeyBar";
 import { queueUserPreferencePatch } from "@/lib/userPreferencesSync";
+
+export {
+  DEFAULT_TERMINAL_KEY_ITEMS,
+  EMPTY_STICKY_MODIFIERS,
+  barHeightPx,
+  canonicalTerminalFields,
+  defaultTerminalBar,
+  defaultTerminalButtons,
+  flattenBar,
+  legacyFingerprint,
+  migrateLegacy,
+  normalizeChord,
+  normalizeTerminalButtons,
+  packRow,
+  projectLegacy,
+  reconcileLegacy,
+  reduceSticky,
+  resolveTerminalBar,
+  validateBar,
+  type TerminalBar,
+  type TerminalBarKey,
+  type TerminalBarRow,
+  type TerminalKeyIcon,
+  type TerminalKeyRowItem,
+  type TerminalStickyModifiers,
+  type TerminalStickyState,
+} from "@/lib/terminalKeyBar";
 
 export type MobileAssistantSoftKey =
   | "escape"
@@ -86,6 +123,11 @@ export const MOBILE_ASSISTANT_ICONS = [
   { id: "arrow-left", label: "Arrow left" },
   { id: "arrow-right", label: "Arrow right" },
   { id: "enter", label: "Enter" },
+  { id: "backspace", label: "Backspace" },
+  { id: "delete", label: "Delete" },
+  { id: "page-up", label: "Page up" },
+  { id: "page-down", label: "Page down" },
+  { id: "keyboard", label: "Keyboard" },
   { id: "refresh", label: "Refresh" },
   { id: "archive", label: "Archive" },
   { id: "terminal", label: "Terminal" },
@@ -111,81 +153,7 @@ export interface MobileAssistantDock {
   offset: number;
 }
 
-export type TerminalKeyRowItem =
-  | {
-      id: string;
-      label: string;
-      kind: "modifier";
-      modifier: "ctrl" | "alt";
-      repeat?: false;
-    }
-  | {
-      id: string;
-      label: string;
-      kind: "key";
-      chord: ShortcutChord;
-      repeat?: boolean;
-    }
-  | {
-      id: string;
-      label: string;
-      kind: "action";
-      action: "keyboard";
-    };
-
-/** First 6 keys populate Row 1; remaining keys fill 6-slot pages in Row 2. */
-export const DEFAULT_TERMINAL_KEY_ITEMS: readonly TerminalKeyRowItem[] = [
-  // Row 1 (fixed)
-  { id: "esc", label: "Esc", kind: "key", chord: { code: "Escape", modifiers: [] } },
-  {
-    id: "up",
-    label: "↑",
-    kind: "key",
-    chord: { code: "ArrowUp", modifiers: [] },
-    repeat: true,
-  },
-  {
-    id: "down",
-    label: "↓",
-    kind: "key",
-    chord: { code: "ArrowDown", modifiers: [] },
-    repeat: true,
-  },
-  { id: "enter", label: "↵", kind: "key", chord: { code: "Enter", modifiers: [] } },
-  { id: "ctrl-c", label: "^C", kind: "key", chord: { code: "KeyC", modifiers: ["control"] } },
-  { id: "keyboard", label: "Keyboard", kind: "action", action: "keyboard" },
-  // Row 2, Page 1
-  { id: "tab", label: "Tab", kind: "key", chord: { code: "Tab", modifiers: [] } },
-  { id: "shift-tab", label: "⇧Tab", kind: "key", chord: { code: "Tab", modifiers: ["shift"] } },
-  {
-    id: "left",
-    label: "←",
-    kind: "key",
-    chord: { code: "ArrowLeft", modifiers: [] },
-    repeat: true,
-  },
-  {
-    id: "right",
-    label: "→",
-    kind: "key",
-    chord: { code: "ArrowRight", modifiers: [] },
-    repeat: true,
-  },
-  { id: "slash", label: "/", kind: "key", chord: { code: "Slash", modifiers: [] } },
-  { id: "ctrl", label: "Ctrl", kind: "modifier", modifier: "ctrl" },
-  // Row 2, Page 2
-  { id: "pgup", label: "PgUp", kind: "key", chord: { code: "PageUp", modifiers: [] } },
-  { id: "pgdn", label: "PgDn", kind: "key", chord: { code: "PageDown", modifiers: [] } },
-  { id: "home", label: "Home", kind: "key", chord: { code: "Home", modifiers: [] } },
-  { id: "end", label: "End", kind: "key", chord: { code: "End", modifiers: [] } },
-  { id: "alt", label: "Alt", kind: "modifier", modifier: "alt" },
-  { id: "ctrl-d", label: "^D", kind: "key", chord: { code: "KeyD", modifiers: ["control"] } },
-];
-
-export function defaultTerminalButtons(): TerminalKeyRowItem[] {
-  return structuredClone([...DEFAULT_TERMINAL_KEY_ITEMS]);
-}
-
+export type TerminalBarModifier = "ctrl" | "alt" | "shift";
 export interface MobileAssistantPreferences {
   version: 2;
   enabled: boolean;
@@ -193,22 +161,18 @@ export interface MobileAssistantPreferences {
   terminalButtons?: TerminalKeyRowItem[];
   terminalKeysEnabled?: boolean;
   terminalSecondRow?: boolean;
+  terminalBar?: TerminalBar;
+  terminalBarPreset?: TerminalBar;
+  terminalLegacyBasis?: string;
   chatActionsRevision?: 1;
   position?: { x: number; y: number };
   dock?: MobileAssistantDock;
 }
 
 export type ResolvedMobileAssistantPreferences = MobileAssistantPreferences & {
-  terminalButtons: TerminalKeyRowItem[];
   terminalKeysEnabled: boolean;
   terminalSecondRow: boolean;
 };
-
-export type TerminalStickyState = "off" | "once" | "locked";
-export interface TerminalStickyModifiers {
-  ctrl: TerminalStickyState;
-  alt: TerminalStickyState;
-}
 
 export const MOBILE_ASSISTANT_CHAT_ACTION_IDS: readonly MobileAssistantActionId[] = [
   "openTerminals",
@@ -261,13 +225,20 @@ export const MOBILE_ASSISTANT_DEVICE_STORAGE_KEY = "omnigent:mobile-assistant-de
 export const MOBILE_ASSISTANT_CHANGED_EVENT = "omnigent:mobile-assistant-changed";
 export const TERMINAL_SOFT_KEY_EVENT = "omnigent:terminal-soft-key";
 
+export interface TerminalBarTarget {
+  isCurrent: () => boolean;
+  press: (key: TerminalBarKey, gesture: "tap" | "longPress" | "repeat") => void;
+}
+
 export interface TerminalSoftKeyEventDetail {
   action: MobileAssistantSoftKey;
   /** Raw terminal payload for modified key chords or phrase buttons. */
   data?: string;
   handled: boolean;
   preferredTarget?: HTMLElement | null;
-  terminalItem?: TerminalKeyRowItem;
+  terminalBarKey?: TerminalBarKey;
+  terminalGesture?: "tap" | "longPress" | "repeat";
+  onTerminalTarget?: (target: TerminalBarTarget) => void;
   onStickyChanged?: (next: TerminalStickyModifiers) => void;
   onStickySubscribed?: (unsubscribe: () => void) => void;
   candidates?: { focused: boolean; ownsPreferredTarget: boolean; send: () => void }[];
@@ -496,8 +467,7 @@ export function mobileAssistantBindingSupportsRepeat(
 ): boolean {
   return (
     binding.kind === "key" &&
-    binding.chord.modifiers.length === 0 &&
-    ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(binding.chord.code)
+    terminalKeyBindingSupportsRepeat({ kind: "key", chord: binding.chord })
   );
 }
 
@@ -512,20 +482,6 @@ function normalizePosition(value: unknown): { x: number; y: number } | undefined
     (point.y as number) <= 1
     ? { x: point.x as number, y: point.y as number }
     : undefined;
-}
-
-function normalizeChord(value: unknown): ShortcutChord | null {
-  if (!value || typeof value !== "object") return null;
-  const chord = value as Partial<ShortcutChord>;
-  if (typeof chord.code !== "string" || chord.code.length === 0 || chord.code.length > 64)
-    return null;
-  const validModifiers = ["primary", "control", "meta", "alt", "shift"];
-  if (
-    !Array.isArray(chord.modifiers) ||
-    !chord.modifiers.every((item) => validModifiers.includes(item))
-  )
-    return null;
-  return { code: chord.code, modifiers: [...new Set(chord.modifiers)] } as ShortcutChord;
 }
 
 function normalizeButton(value: unknown, index: number): MobileAssistantButton | null {
@@ -610,43 +566,6 @@ function legacyActionToButton(action: MobileAssistantAction, index: number): Mob
     label: definition?.shortLabel ?? action,
     binding: { kind: "key", chord: SOFT_KEY_DEFAULTS[action] },
   };
-}
-
-function normalizeTerminalButtons(value: unknown): TerminalKeyRowItem[] {
-  if (!Array.isArray(value)) return defaultTerminalButtons();
-  const ids = new Set<string>();
-  return value.flatMap((candidate): TerminalKeyRowItem[] => {
-    if (!candidate || typeof candidate !== "object") return [];
-    const item = candidate as Partial<TerminalKeyRowItem>;
-    if (
-      typeof item.id !== "string" ||
-      !item.id ||
-      ids.has(item.id) ||
-      typeof item.label !== "string" ||
-      !item.label.trim()
-    )
-      return [];
-    let normalized: TerminalKeyRowItem;
-    if (item.kind === "modifier" && (item.modifier === "ctrl" || item.modifier === "alt")) {
-      normalized = { id: item.id, label: item.label, kind: "modifier", modifier: item.modifier };
-    } else if (item.kind === "action" && item.action === "keyboard") {
-      normalized = { id: item.id, label: item.label, kind: "action", action: "keyboard" };
-    } else if (item.kind === "key") {
-      const chord = normalizeChord(item.chord);
-      if (!chord) return [];
-      normalized = {
-        id: item.id,
-        label: item.label,
-        kind: "key",
-        chord,
-        ...(item.repeat && mobileAssistantBindingSupportsRepeat({ kind: "key", chord })
-          ? { repeat: true }
-          : {}),
-      };
-    } else return [];
-    ids.add(item.id);
-    return [normalized];
-  });
 }
 
 function splitLegacyButtons(
@@ -762,6 +681,16 @@ export function readMobileAssistantPreferences(): ResolvedMobileAssistantPrefere
       ),
       terminalKeysEnabled: parsed.terminalKeysEnabled !== false,
       terminalSecondRow: parsed.terminalSecondRow !== false,
+      ...(parsed.terminalBar !== undefined && !Array.isArray(parsed.terminalButtons)
+        ? { terminalButtons: undefined }
+        : {}),
+      ...(parsed.terminalBar !== undefined ? { terminalBar: parsed.terminalBar } : {}),
+      ...(parsed.terminalBarPreset !== undefined
+        ? { terminalBarPreset: parsed.terminalBarPreset }
+        : {}),
+      ...(typeof parsed.terminalLegacyBasis === "string"
+        ? { terminalLegacyBasis: parsed.terminalLegacyBasis }
+        : {}),
       ...((devicePosition ?? normalizePosition(parsed.position))
         ? { position: devicePosition ?? normalizePosition(parsed.position) }
         : {}),
@@ -784,9 +713,18 @@ export function writeMobileAssistantPreferences(preferences: MobileAssistantPref
       version: 2,
       enabled: preferences.enabled,
       buttons: preferences.buttons,
-      terminalButtons: preferences.terminalButtons ?? defaultTerminalButtons(),
+      terminalButtons:
+        preferences.terminalButtons ??
+        (preferences.terminalBar !== undefined ? undefined : defaultTerminalButtons()),
       terminalKeysEnabled: preferences.terminalKeysEnabled !== false,
       terminalSecondRow: preferences.terminalSecondRow !== false,
+      ...(preferences.terminalBar !== undefined ? { terminalBar: preferences.terminalBar } : {}),
+      ...(preferences.terminalBarPreset !== undefined
+        ? { terminalBarPreset: preferences.terminalBarPreset }
+        : {}),
+      ...(typeof preferences.terminalLegacyBasis === "string"
+        ? { terminalLegacyBasis: preferences.terminalLegacyBasis }
+        : {}),
       chatActionsRevision: 1,
       ...(preferences.position ? { position: preferences.position } : {}),
       ...(preferences.dock ? { dock: preferences.dock } : {}),
@@ -1093,7 +1031,13 @@ export function terminalDataForChord(
 function dispatchToTerminal(
   payload: Pick<
     TerminalSoftKeyEventDetail,
-    "action" | "data" | "terminalItem" | "onStickyChanged" | "onStickySubscribed"
+    | "action"
+    | "data"
+    | "terminalBarKey"
+    | "terminalGesture"
+    | "onStickyChanged"
+    | "onStickySubscribed"
+    | "onTerminalTarget"
   >,
   target: HTMLElement,
 ): boolean {
@@ -1130,13 +1074,34 @@ function dispatchToTerminal(
   return false;
 }
 
-export function dispatchTerminalAssistantItem(
-  item: TerminalKeyRowItem,
+/** Bind held gestures once, so repeats cannot move to another terminal. */
+export function bindTerminalBarTarget(
   preferredDomTarget?: HTMLElement | null,
   callbacks?: Pick<TerminalSoftKeyEventDetail, "onStickyChanged" | "onStickySubscribed">,
+): TerminalBarTarget | null {
+  let target: TerminalBarTarget | null = null;
+  dispatchToTerminal(
+    {
+      action: "enter",
+      ...callbacks,
+      onTerminalTarget: (next) => {
+        target = next;
+      },
+    },
+    preferredTarget(preferredDomTarget),
+  );
+  return target;
+}
+
+/** Dispatch a full terminal-bar key (including text and Shift) to the active terminal. */
+export function dispatchTerminalBarKey(
+  key: TerminalBarKey,
+  preferredDomTarget?: HTMLElement | null,
+  callbacks?: Pick<TerminalSoftKeyEventDetail, "onStickyChanged" | "onStickySubscribed">,
+  gesture: "tap" | "longPress" | "repeat" = "tap",
 ): void {
   dispatchToTerminal(
-    { action: "enter", terminalItem: item, ...callbacks },
+    { action: "enter", terminalBarKey: key, terminalGesture: gesture, ...callbacks },
     preferredTarget(preferredDomTarget),
   );
 }

@@ -149,7 +149,7 @@ describe("mobileAssistantPreferences", () => {
     expect(preferences.version).toBe(2);
     expect(preferences.position).toEqual({ x: 0.2, y: 0.3 });
     expect(preferences.buttons.map((button) => button.label)).toEqual(["Terminals", "Poll"]);
-    expect(preferences.terminalButtons.find((item) => item.id === "tab")).toMatchObject({
+    expect(preferences.terminalButtons!.find((item) => item.id === "tab")).toMatchObject({
       label: "Tab",
     });
   });
@@ -222,7 +222,7 @@ describe("mobileAssistantPreferences", () => {
       "poll",
     ]);
     expect(preferences.terminalButtons).toHaveLength(19);
-    expect(preferences.terminalButtons.at(-1)).toMatchObject({
+    expect(preferences.terminalButtons!.at(-1)).toMatchObject({
       label: "Save",
       kind: "key",
       chord: { code: "KeyS", modifiers: ["control"] },

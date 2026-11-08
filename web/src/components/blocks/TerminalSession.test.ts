@@ -911,15 +911,15 @@ describe("TerminalSession", () => {
     const consumed = vi.fn();
     const unsubscribe = session.onStickyConsumed(consumed);
 
-    session.setStickyModifiers({ ctrl: "once", alt: "off" });
+    session.setStickyModifiers({ ctrl: "once", alt: "off", shift: "off" });
     term.input("r", true);
     term.input("c", true);
-    expect(consumed).toHaveBeenCalledWith({ ctrl: "off", alt: "off" });
-    session.setStickyModifiers({ ctrl: "locked", alt: "once" });
+    expect(consumed).toHaveBeenCalledWith({ ctrl: "off", alt: "off", shift: "off" });
+    session.setStickyModifiers({ ctrl: "locked", alt: "once", shift: "off" });
     term.input("c", true);
     term.input("d", true);
-    expect(consumed).toHaveBeenLastCalledWith({ ctrl: "locked", alt: "off" });
-    session.setStickyModifiers({ ctrl: "off", alt: "off" });
+    expect(consumed).toHaveBeenLastCalledWith({ ctrl: "locked", alt: "off", shift: "off" });
+    session.setStickyModifiers({ ctrl: "off", alt: "off", shift: "off" });
     term.input("x", true);
 
     expect(socket.sent.map((frame) => new TextDecoder().decode(frame as Uint8Array))).toEqual([
@@ -940,15 +940,15 @@ describe("TerminalSession", () => {
     socket.sent = [];
     const consumed = vi.fn();
     session.onStickyConsumed(consumed);
-    session.setStickyModifiers({ ctrl: "once", alt: "off" });
+    session.setStickyModifiers({ ctrl: "once", alt: "off", shift: "off" });
     consumed.mockClear();
     term.input("\x7f", true);
     term.input("\x1b[A", true);
     expect(consumed).not.toHaveBeenCalled();
     term.input("中文", true);
-    expect(consumed).toHaveBeenCalledExactlyOnceWith({ ctrl: "off", alt: "off" });
+    expect(consumed).toHaveBeenCalledExactlyOnceWith({ ctrl: "off", alt: "off", shift: "off" });
     term.input("r", true);
-    session.setStickyModifiers({ ctrl: "once", alt: "once" });
+    session.setStickyModifiers({ ctrl: "once", alt: "once", shift: "off" });
     term.input("paste", true);
     term.input("c", true);
     expect(socket.sent.map((frame) => new TextDecoder().decode(frame as Uint8Array))).toEqual([
@@ -966,7 +966,7 @@ describe("TerminalSession", () => {
     const { socket, session } = makeSession();
     socket.open();
     socket.sent = [];
-    session.setStickyModifiers({ ctrl: "once", alt: "off" });
+    session.setStickyModifiers({ ctrl: "once", alt: "off", shift: "off" });
     session.sendSoftKey("arrowUp", undefined, {
       focus: false,
       chord: { code: "ArrowUp", modifiers: [] },
@@ -974,7 +974,7 @@ describe("TerminalSession", () => {
     expect(socket.sent.map((frame) => new TextDecoder().decode(frame as Uint8Array))).toEqual([
       "\x1b[1;5A",
     ]);
-    expect(session.getStickyModifiers()).toEqual({ ctrl: "off", alt: "off" });
+    expect(session.getStickyModifiers()).toEqual({ ctrl: "off", alt: "off", shift: "off" });
     session.dispose();
   });
 
@@ -982,17 +982,17 @@ describe("TerminalSession", () => {
     const { socket, session } = makeSession();
     socket.open();
     socket.sent = [];
-    session.setStickyModifiers({ ctrl: "once", alt: "off" });
+    session.setStickyModifiers({ ctrl: "once", alt: "off", shift: "off" });
     session.sendSoftKey("arrowLeft", undefined, {
       focus: false,
       chord: { code: "ArrowLeft", modifiers: [] },
     });
-    session.setStickyModifiers({ ctrl: "off", alt: "once" });
+    session.setStickyModifiers({ ctrl: "off", alt: "once", shift: "off" });
     session.sendSoftKey("enter", "\x03", {
       focus: false,
       chord: { code: "KeyC", modifiers: ["control"] },
     });
-    session.setStickyModifiers({ ctrl: "once", alt: "off" });
+    session.setStickyModifiers({ ctrl: "once", alt: "off", shift: "off" });
     session.sendSoftKey("tab", undefined, {
       focus: false,
       chord: { code: "Tab", modifiers: [] },
@@ -1011,13 +1011,13 @@ describe("TerminalSession", () => {
     const term = (session as unknown as { term: Terminal }).term;
     socket.open();
     socket.sent = [];
-    session.setStickyModifiers({ ctrl: "off", alt: "once" });
+    session.setStickyModifiers({ ctrl: "off", alt: "once", shift: "off" });
     session.sendSoftKey("tab", undefined, {
       focus: false,
       chord: { code: "Tab", modifiers: [] },
     });
     expect(socket.sent).toEqual([]);
-    expect(session.getStickyModifiers()).toEqual({ ctrl: "off", alt: "once" });
+    expect(session.getStickyModifiers()).toEqual({ ctrl: "off", alt: "once", shift: "off" });
     term.input("p", true);
     expect(socket.sent.map((frame) => new TextDecoder().decode(frame as Uint8Array))).toEqual([
       "\x1bp",
@@ -1030,7 +1030,7 @@ describe("TerminalSession", () => {
     const term = (session as unknown as { term: Terminal }).term;
     socket.open();
     socket.sent = [];
-    session.setStickyModifiers({ ctrl: "once", alt: "off" });
+    session.setStickyModifiers({ ctrl: "once", alt: "off", shift: "off" });
     session.sendSoftKey("enter", "q", { focus: false });
     term.input("r", true);
     expect(socket.sent.map((frame) => new TextDecoder().decode(frame as Uint8Array))).toEqual([
