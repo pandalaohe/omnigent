@@ -273,6 +273,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _labels_for_viewer,
     _persist_model_change_note,
     _publish_runner_recovered_status,
+    _retry_host_admission_lease,
     _run_managed_launch,
     _spawn_archive_fence,
     _spawn_archive_stop,
@@ -1988,7 +1989,7 @@ def register_core_routes(
         binding_token = secrets.token_urlsafe(32)
         runner_id = token_bound_runner_id(binding_token)
         # Atomic bind (WHERE runner_id IS NULL) closes the TOCTOU.
-        bound = await asyncio.to_thread(
+        bound = await _retry_host_admission_lease(
             conversation_store.set_runner_id,
             session_id,
             runner_id,
@@ -6303,7 +6304,7 @@ def register_core_routes(
                         dataclasses.replace(conv, runner_id=runner_id),
                     )
                 try:
-                    await asyncio.to_thread(
+                    await _retry_host_admission_lease(
                         conversation_store.replace_runner_id, session_id, runner_id
                     )
                 except ConversationNotFoundError as exc:
