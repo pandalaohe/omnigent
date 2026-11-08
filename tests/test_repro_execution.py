@@ -1182,7 +1182,7 @@ def test_malformed_url_does_not_prevent_command_or_output_collection(tmp_path, m
 def test_redaction_failure_does_not_prevent_spawn_or_stop_pipe_drain(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "execution-context.json").write_text("{}")
-    nested = "[" * 2000 + "0" + "]" * 2000
+    nested = "[" * 3500 + "0" + "]" * 3500
     script = """
 import sys
 print(sys.argv[1], flush=True)
