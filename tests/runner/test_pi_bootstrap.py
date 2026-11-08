@@ -384,6 +384,31 @@ async def test_root_launcher_checks_registration_identity(
         assert response.json()["published"] is True
 
 
+@pytest.mark.parametrize("windows", [False, True])
+def test_registration_rejects_ctime_change_during_read(tmp_path, monkeypatch, windows):
+    from omnigent.permission_tiers import pi_tools
+
+    path = tmp_path / "registration.json"
+    path.write_bytes(b"{}")
+    monkeypatch.setattr(pi_tools, "IS_WINDOWS", windows)
+    reads = 0
+
+    def fstat(fd):
+        nonlocal reads
+        info = os.fstat(fd)
+        reads += 1
+        fields = {
+            name: getattr(info, name)
+            for name in ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+        }
+        fields["st_ctime_ns"] = path.stat().st_ctime_ns + (reads if windows else reads - 1)
+        return SimpleNamespace(**fields)
+
+    monkeypatch.setattr(pi_tools, "os", SimpleNamespace(**{**vars(os), "fstat": fstat}))
+    with pytest.raises(ValueError, match="Registration changed during read"):
+        pi_tools._read_file(path)
+
+
 @pytest.mark.asyncio
 async def test_real_rpc_launcher_rebinds_fresh_process_without_unlocking_startup(
     attestor_relay, monkeypatch
