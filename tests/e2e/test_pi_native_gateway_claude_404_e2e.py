@@ -555,14 +555,21 @@ def test_facet_a_live_pi_cli_gateway_claude_404_journey(fake_gateway: str, tmp_p
             journey_error.add_note(f"Could not save PTY transcript: {log_error}")
         finally:
             # Stop the CLI group, then only daemons/runners with this test's data dir.
+            with contextlib.suppress(OSError):
+                os.close(fd)
             with contextlib.suppress(ProcessLookupError, OSError):
                 os.killpg(os.getpgid(pid), signal.SIGKILL)
             with contextlib.suppress(ProcessLookupError, OSError):
                 os.kill(pid, signal.SIGKILL)
-            with contextlib.suppress(Exception):
-                os.waitpid(pid, 0)
-            with contextlib.suppress(OSError):
-                os.close(fd)
+            wait_deadline = time.monotonic() + 5.0
+            while time.monotonic() < wait_deadline:
+                try:
+                    waited_pid, _ = os.waitpid(pid, os.WNOHANG)
+                    if waited_pid == pid:
+                        break
+                except ChildProcessError:
+                    break
+                time.sleep(0.05)
             _, survivors = reap_leaked_omnigent_processes(config_home)
             if survivors and (error := sys.exception()) is not None:
                 error.add_note(f"test processes survived cleanup: {survivors}")

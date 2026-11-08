@@ -768,7 +768,8 @@ async def test_acp_readback_relay_persists_actual_mode_without_overwriting_new_c
     }
     published = []
     monkeypatch.setattr(
-        orch.session_stream, "publish", lambda sid, payload: published.append(payload)
+        "omnigent.runtime.session_stream.publish",
+        lambda sid, payload: published.append(payload),
     )
     stream = "data: " + json.dumps(event) + "\n\ndata: [DONE]\n\n"
     async with httpx.AsyncClient(
@@ -819,7 +820,8 @@ async def test_acp_readback_selection_accepts_repeated_reports_and_fences_new_ch
     ]
     published = []
     monkeypatch.setattr(
-        orch.session_stream, "publish", lambda sid, payload: published.append(payload)
+        "omnigent.runtime.session_stream.publish",
+        lambda sid, payload: published.append(payload),
     )
 
     async def relay():
@@ -1274,3 +1276,16 @@ async def test_bound_acp_bundle_preserves_resolved_model(
         assert saved.model_override == "model-b"
     else:
         assert "not available" in response.text
+
+
+def test_facade_attr_proxy_monkeypatch_does_not_pin_instance_attribute() -> None:
+    from omnigent.runtime import session_stream as runtime_session_stream
+    from omnigent.server.routes._sessions import common
+
+    original = runtime_session_stream.publish
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(common.session_stream, "publish", lambda *_args: 0)
+        assert "publish" not in vars(common.session_stream)
+        assert runtime_session_stream.publish is not original
+    assert "publish" not in vars(common.session_stream)
+    assert runtime_session_stream.publish is original

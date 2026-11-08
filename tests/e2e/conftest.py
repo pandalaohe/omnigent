@@ -225,7 +225,7 @@ def wait_for_server(base_url: str, timeout: float = 20.0) -> None:
             resp = httpx.get(f"{base_url}/health", timeout=2.0)
             if resp.status_code == 200:
                 return
-        except httpx.ConnectError:
+        except httpx.HTTPError:
             pass
         time.sleep(POLL_INTERVAL_S)
     raise RuntimeError(f"Server did not respond within {timeout}s")

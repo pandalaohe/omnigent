@@ -35,7 +35,8 @@ from omnigent.entities.conversation import (
 
 
 @pytest.mark.parametrize(
-    ("level", "expected"), [(None, None), ("info", "info"), ("error", "error")]
+    ("level", "expected"),
+    [(None, None), ("info", "info"), ("error", "error"), ("warning", "warning")],
 )
 def test_error_data_level(level: str | None, expected: str | None) -> None:
     kwargs = {} if level is None else {"level": level}
@@ -45,7 +46,7 @@ def test_error_data_level(level: str | None, expected: str | None) -> None:
 
 def test_error_data_rejects_unknown_level() -> None:
     with pytest.raises(ValidationError):
-        ErrorData(source="harness", code="x", message="y", level="warning")  # type: ignore[arg-type]
+        ErrorData(source="harness", code="x", message="y", level="debug")  # type: ignore[arg-type]
 
 
 def test_error_data_valid() -> None:

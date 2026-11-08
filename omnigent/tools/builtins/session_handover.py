@@ -49,6 +49,16 @@ class SysSessionHandoverTool(Tool):
                             ),
                             "default": True,
                         },
+                        "auto": {
+                            "type": "boolean",
+                            "description": (
+                                "Set only when a [System: context] notice asks: "
+                                "the server rotates "
+                                "only if this session's context is still low, otherwise it keeps "
+                                "the note and reports the rotation deferred."
+                            ),
+                            "default": False,
+                        },
                     },
                     "required": ["handover"],
                     "additionalProperties": False,

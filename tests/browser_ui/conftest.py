@@ -229,11 +229,47 @@ def browser_contract(
     # so tests can add concise explicit mocks on top of these catch-alls.
     context.route("**/*", deny_http)
     context.route_web_socket("**/*", deny_websocket)
+
+    # Refocusing the SPA (including a sandboxed iframe) checks the served build.
+    # Keep document navigation on the static server and model only that fetch.
+    def serve_build_check(route: Route) -> None:
+        if route.request.method != "GET" or route.request.resource_type != "fetch":
+            route.fallback()
+            return
+        route.fulfill(
+            content_type="text/html",
+            body=(_BUILD_OUTPUT / "index.html").read_text(),
+        )
+
+    contract.route(contract._matcher("/"), serve_build_check)
     # Routes the SPA shell calls on every page that per-test contracts do not
     # model; tests override them by registering their own mocks later.
     for path, body in (
         ("/v1/system/status", {"revision": 0, "level": "ok", "findings": []}),
         ("/v1/custom-agents", {"object": "list", "data": [], "has_more": False}),
+        (
+            re.compile(
+                rf"^{re.escape(browser_base_url)}/v1/sessions/[^/]+/auto-rotation(?:\?.*)?$"
+            ),
+            {
+                "eligible": False,
+                "ineligible_reason": "harness",
+                "harness": None,
+                "enabled": False,
+                "compactions_setting": 4,
+                "remaining_pct_setting": 25,
+                "sources": {
+                    "enabled": "default",
+                    "compactions": "default",
+                    "remaining_pct": "default",
+                },
+                "compactions": 0,
+                "remaining_pct": None,
+                "approximate": [],
+                "due": False,
+                "rotation_pending": False,
+            },
+        ),
         (
             re.compile(
                 rf"^{re.escape(browser_base_url)}/v1/sessions/[^/]+/standing-(?:pass|approval)(?:\?.*)?$"

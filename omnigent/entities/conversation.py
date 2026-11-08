@@ -533,7 +533,7 @@ class ErrorData(BaseModel):
     source: Literal["llm", "execution", "tool", "harness"]
     code: str
     message: str
-    level: Literal["error", "info"] | None = None
+    level: Literal["error", "info", "warning"] | None = None
     title: str | None = None
     cause: str | None = None
     remediation: str | None = None

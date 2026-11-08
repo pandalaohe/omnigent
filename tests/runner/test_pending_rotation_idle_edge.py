@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterator
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -18,6 +19,7 @@ import pytest
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.runner import app as runner_app
 from omnigent.runner import create_runner_app
+from omnigent.server.auto_rotation import INJECTED_REVISION_LABEL_KEY
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.conftest import (
     _FakeProcessManager,
@@ -43,6 +45,8 @@ class _RotationServerClient:
         parent_session_id: str | None = None,
     ) -> None:
         self.archived = archived
+        self.archive_revision: int | None = 0
+        self.enabled = True
         self.harness = harness
         self.succession_status = succession_status
         self.succession_http_status = succession_http_status
@@ -53,12 +57,24 @@ class _RotationServerClient:
         self.bound: list[dict[str, Any]] = []
         self.errors: list[dict[str, Any]] = []
         self.labels: dict[str, str] = {}
+        self.claims: list[str] = []
+        self.fail_claim = False
         if rotate_label is not None:
             self.labels["omnigent.rotate_requested"] = rotate_label
 
     async def get(self, url: str, **kwargs: Any) -> httpx.Response:
         del kwargs
         path = url.split("?")[0]
+        if path.endswith("/auto-rotation"):
+            return httpx.Response(
+                200,
+                request=httpx.Request("GET", f"http://test{url}"),
+                json={
+                    "enabled": self.enabled,
+                    "eligible": not self.archived,
+                    "rotation_pending": bool(self.labels.get("omnigent.rotate_requested")),
+                },
+            )
         if path.endswith("/labels"):
             return httpx.Response(200, json={"labels": self.labels})
         return httpx.Response(
@@ -66,6 +82,7 @@ class _RotationServerClient:
             request=httpx.Request("GET", f"http://test{url}"),
             json={
                 "archived": self.archived,
+                "archive_revision": self.archive_revision,
                 "labels": self.labels,
                 "harness": self.harness,
                 "agent_id": "ag_rotation",
@@ -76,6 +93,19 @@ class _RotationServerClient:
         )
 
     async def post(self, url: str, **kwargs: Any) -> httpx.Response:
+        if url.endswith("/handover/injection"):
+            revision = kwargs["json"]["archive_revision"]
+            self.claims.append(revision)
+            outcome = "claimed"
+            if self.labels.get(INJECTED_REVISION_LABEL_KEY) == revision:
+                outcome = "unconfirmed"
+            elif not self.fail_claim:
+                self.labels[INJECTED_REVISION_LABEL_KEY] = revision
+            return httpx.Response(
+                503 if self.fail_claim else 200,
+                json={"status": outcome},
+                request=httpx.Request("POST", f"http://test{url}"),
+            )
         if (
             url.endswith("/events")
             and kwargs.get("json", {}).get("type") == "external_conversation_item"
@@ -107,7 +137,9 @@ class _RotationServerClient:
         )
 
 
-def _build_app(server_client: _RotationServerClient, process_manager: Any = None) -> Any:
+def _build_app(
+    server_client: _RotationServerClient, process_manager: Any = None, **kwargs: Any
+) -> Any:
     """Build a runner app wired to a claude-native spec and the test server."""
     spec = AgentSpec(
         spec_version=1,
@@ -123,6 +155,7 @@ def _build_app(server_client: _RotationServerClient, process_manager: Any = None
         process_manager=process_manager or _FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
         spec_resolver=_resolver,
         server_client=server_client,  # type: ignore[arg-type]
+        **kwargs,
     )
 
 
@@ -164,6 +197,129 @@ def _clean_pending_rotations() -> Iterator[None]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("end", ["succession", "delete", "archive"])
+async def test_injected_revision_survives_late_session_start_and_prunes(monkeypatch, end):
+    effects = []
+    now = [100.0]
+    monkeypatch.setattr(
+        runner_app, "time", SimpleNamespace(monotonic=lambda: now[0], time=runner_app.time.time)
+    )
+    monkeypatch.setattr(
+        claude_native_bridge, "inject_slash_command", lambda *a, **kw: effects.append(kw)
+    )
+    server = _RotationServerClient()
+    app = _build_app(server)
+    async with _runner_client(app) as client:
+        await _seed_session(client)
+        url = f"/v1/sessions/{CONV_ID}/pending-rotation"
+        assert (await client.post(url)).json() == {"status": "started"}
+        now[0] += 10000
+        for _ in range(3):
+            assert (await client.post(url)).json() == {"status": "unconfirmed"}
+        assert len(effects) == 1
+        server.archive_revision = 1
+        server.labels["omnigent.rotate_requested"] = "1"
+        assert (await client.post(url)).json() == {"status": "started"}
+        assert len(effects) == 2
+        server.archive_revision = 0
+        server.labels["omnigent.rotate_requested"] = "0"
+        assert (await client.post(url)).json() == {"status": "superseded"}
+        assert len(effects) == 2
+        if end == "succession":
+            response = await client.post(
+                "/v1/sessions", json={"session_id": "conv_next", "agent_id": "ag_rotation"}
+            )
+            assert response.status_code == 201
+            response = await client.post(
+                f"/v1/sessions/{CONV_ID}/succession",
+                json={"target_session_id": "conv_next", "moved_ids": []},
+            )
+            assert response.status_code == 200
+            # Local succession confirms retirement even while metadata is late.
+            assert (await client.post(url)).json() == {"status": "superseded"}
+        elif end == "archive":
+            server.archived = True
+            assert (await client.post(url)).json() == {"status": "not_requested"}
+            server.archived = False
+            assert (await client.post(url)).json() == {"status": "unconfirmed"}
+        assert (await client.delete(f"/v1/sessions/{CONV_ID}")).status_code == 200
+        await _seed_session(client)
+        assert (await client.post(url)).json() == {"status": "unconfirmed"}
+    assert len(effects) == 2
+
+
+@pytest.mark.asyncio
+async def test_rotation_requires_a_durable_claim_before_injection(monkeypatch):
+    effects = []
+    server = _RotationServerClient()
+    server.fail_claim = True
+
+    def inject(*args, **kwargs):
+        assert server.labels[INJECTED_REVISION_LABEL_KEY] == "0"
+        effects.append(kwargs["command"])
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", inject)
+    async with _runner_client(_build_app(server)) as client:
+        await _seed_session(client)
+        url = f"/v1/sessions/{CONV_ID}/pending-rotation"
+        assert (await client.post(url)).json() == {"status": "not_requested"}
+        assert not effects
+        assert INJECTED_REVISION_LABEL_KEY not in server.labels
+        server.fail_claim = False
+        assert (await client.post(url)).json() == {"status": "started"}
+    assert effects == ["/clear"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("draft_may_remain", [False, True])
+async def test_aborted_injection_is_fenced_and_reports_draft(monkeypatch, draft_may_remain):
+    effects = []
+
+    def abort(*args, **kwargs):
+        effects.append(kwargs["command"])
+        raise claude_native_bridge.ClaudeRotationUnconfirmed(draft_may_remain=draft_may_remain)
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", abort)
+    app = _build_app(_RotationServerClient())
+    async with _runner_client(app) as client:
+        await _seed_session(client)
+        for _ in range(3):
+            result = await client.post(f"/v1/sessions/{CONV_ID}/pending-rotation")
+            assert result.json() == {
+                "status": "draft_may_remain" if draft_may_remain else "unconfirmed"
+            }
+    assert effects == ["/clear"]
+
+
+@pytest.mark.asyncio
+async def test_terminal_turn_during_label_read_skips_rotation(monkeypatch):
+    effects = []
+    monkeypatch.setattr(
+        claude_native_bridge, "inject_slash_command", lambda *a, **kw: effects.append(kw)
+    )
+    server = _RotationServerClient()
+    app = _build_app(server)
+    original_get = server.get
+    async with _runner_client(app) as client:
+        await _seed_session(client)
+
+        async def get(url, **kwargs):
+            if url.endswith("/labels"):
+                response = await client.post(
+                    f"/v1/sessions/{CONV_ID}/events",
+                    json={"type": "external_session_status", "data": {"status": "running"}},
+                )
+                assert response.status_code in (200, 204)
+            return await original_get(url, **kwargs)
+
+        server.get = get
+        assert (await client.post(f"/v1/sessions/{CONV_ID}/pending-rotation")).json() == {
+            "status": "not_requested"
+        }
+    assert effects == []
+
+
+@pytest.mark.asyncio
 async def test_idle_edge_clears_session_with_pending_rotation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -178,8 +334,9 @@ async def test_idle_edge_clears_session_with_pending_rotation(
         ready_timeout_s: float,
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
+        require_idle: bool = False,
     ) -> None:
-        del timeout_s, ready_timeout_s, auto_confirm, confirm_hint
+        del timeout_s, ready_timeout_s, auto_confirm, confirm_hint, require_idle
         injected.append((bridge_dir, command))
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
@@ -410,3 +567,257 @@ async def test_agy_clear_entries_share_confirmation_and_report_failure(
     assert len(server.errors) == int(failure)
     if failure:
         assert "clear_no_new_root" in server.errors[0]["message"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "harness", ["claude-native", "codex-native", "pi", "pi-native", "antigravity-native"]
+)
+async def test_retrigger_and_idle_share_guard_and_skip_superseded(monkeypatch, tmp_path, harness):
+    from omnigent.harnesses.antigravity_native import reader
+    from omnigent.inner.terminal import TerminalInstance
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+    from omnigent.terminals import TerminalRegistry
+
+    server = _RotationServerClient(harness=harness)
+    manager = _FakeProcessManager(_ScriptedHarnessClient([]))
+    effects = []
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "inject_slash_command",
+        lambda *args, **kw: effects.append(kw["command"]),
+    )
+    monkeypatch.setattr(
+        claude_native_bridge, "_run_tmux", lambda *args: effects.append(args) or ""
+    )
+
+    async def clear(**kwargs):
+        effects.append(kwargs["old_session_id"])
+        return "next"
+
+    monkeypatch.setattr(reader, "clear_session", clear)
+    options = {}
+    if harness in {"codex-native", "pi-native"}:
+        registry = TerminalRegistry()
+        terminal = "codex" if harness == "codex-native" else "pi"
+        registry._by_conversation[CONV_ID] = {
+            (terminal, "main"): TerminalInstance(
+                name=terminal,
+                session_key="main",
+                socket_path=tmp_path / "socket",
+                private_dir=tmp_path,
+                running=True,
+            )
+        }
+        options["resource_registry"] = SessionResourceRegistry(terminal_registry=registry)
+    app = _build_app(server, manager, **options)
+    original_get = server.get
+    entered, release = asyncio.Event(), asyncio.Event()
+    async with _runner_client(app, permission_harness=harness) as client:
+        await _seed_session(client)
+
+        async def blocked_get(url, **kwargs):
+            if not entered.is_set():
+                entered.set()
+                await release.wait()
+            return await original_get(url, **kwargs)
+
+        server.get = blocked_get
+        first = asyncio.create_task(client.post(f"/v1/sessions/{CONV_ID}/pending-rotation"))
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        second = await client.post(f"/v1/sessions/{CONV_ID}/pending-rotation")
+        assert second.json() == {"status": "in_flight"}
+        runner_app.record_pending_rotation(CONV_ID)
+        if harness == "pi":
+            app.state.on_proxy_stream_end(CONV_ID)
+        else:
+            await _post_idle(client)
+        idle_tasks = [
+            task
+            for task in asyncio.all_tasks()
+            if getattr(task.get_coro(), "__name__", None) == "_run_pending_rotation"
+        ]
+        await asyncio.wait_for(asyncio.gather(*idle_tasks), timeout=2)
+        release.set()
+        result = await first
+        assert result.json() == {"status": "started"}
+        if harness == "pi":
+            assert len(server.succession) == 1
+        elif harness in {"codex-native", "pi-native"}:
+            command = "/clear" if harness == "codex-native" else "/new"
+            assert sum(command in row for row in effects) == 1
+        else:
+            assert len(effects) == 1
+        before = list(effects)
+        # The command has returned, but the successor label is still absent.
+        runner_app.record_pending_rotation(CONV_ID)
+        if harness == "pi":
+            app.state.on_proxy_stream_end(CONV_ID)
+        else:
+            await _post_idle(client)
+        idle_tasks = [
+            task
+            for task in asyncio.all_tasks()
+            if getattr(task.get_coro(), "__name__", None) == "_run_pending_rotation"
+        ]
+        await asyncio.wait_for(asyncio.gather(*idle_tasks), timeout=2)
+        result = await client.post(f"/v1/sessions/{CONV_ID}/pending-rotation")
+        assert result.json() == {"status": "unconfirmed"}
+        assert effects == before
+        assert len(server.succession) == int(harness == "pi")
+        server.labels["omnigent.succeeded_by"] = "next"
+        result = await client.post(f"/v1/sessions/{CONV_ID}/pending-rotation")
+        assert result.json() == {"status": "superseded"}
+        assert effects == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "harness", ["claude-native", "codex-native", "pi", "pi-native", "antigravity-native"]
+)
+@pytest.mark.parametrize("busy_source", ["native", "turn"])
+async def test_recovery_rechecks_busy_after_server_validation(monkeypatch, harness, busy_source):
+    effects = []
+    monkeypatch.setattr(
+        claude_native_bridge, "inject_slash_command", lambda *args, **kw: effects.append(kw)
+    )
+    server = _RotationServerClient(harness=harness)
+    app = _build_app(server)
+    original_get = server.get
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def blocked_get(url, **kwargs):
+        if url.endswith("/auto-rotation"):
+            entered.set()
+            await release.wait()
+        return await original_get(url, **kwargs)
+
+    async with _runner_client(app, permission_harness=harness) as client:
+        await _seed_session(client)
+        server.get = blocked_get
+        first = asyncio.create_task(client.post(f"/v1/sessions/{CONV_ID}/pending-rotation"))
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        if busy_source == "native" and harness != "pi":
+            response = await client.post(
+                f"/v1/sessions/{CONV_ID}/events",
+                json={"type": "external_session_status", "data": {"status": "running"}},
+            )
+            assert response.status_code in (200, 204)
+        else:
+            app.state.active_turns[CONV_ID] = None
+        release.set()
+        assert (await first).json() == {"status": "busy"}
+        app.state.active_turns.pop(CONV_ID, None)
+    assert not effects and not server.created and not server.succession
+
+
+@pytest.mark.asyncio
+async def test_recovery_holds_runtime_boundary_through_injection(monkeypatch):
+    server = _RotationServerClient()
+    app = _build_app(server)
+    original_get = server.get
+    entered, release = asyncio.Event(), asyncio.Event()
+    attempting, started = asyncio.Event(), asyncio.Event()
+    effects = []
+
+    async def blocked_get(url, **kwargs):
+        if url.endswith("/auto-rotation"):
+            entered.set()
+            await release.wait()
+        return await original_get(url, **kwargs)
+
+    def inject(*args, **kwargs):
+        assert not started.is_set()
+        effects.append(kwargs["command"])
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", inject)
+    async with _runner_client(app) as client:
+        await _seed_session(client)
+        server.get = blocked_get
+        rotation = asyncio.create_task(client.post(f"/v1/sessions/{CONV_ID}/pending-rotation"))
+        await asyncio.wait_for(entered.wait(), timeout=2)
+
+        async def start_turn():
+            attempting.set()
+            async with app.state.cli_runtime_lifecycle.lock_for(CONV_ID).shared():
+                started.set()
+
+        turn = asyncio.create_task(start_turn())
+        await asyncio.wait_for(attempting.wait(), timeout=2)
+        assert not started.is_set()
+        release.set()
+        assert (await rotation).json() == {"status": "started"}
+        await asyncio.wait_for(turn, timeout=2)
+    assert effects == ["/clear"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_input", [False, True])
+async def test_recovery_can_heal_pane_under_rotation_lock(monkeypatch, tmp_path, terminal_input):
+    from omnigent.runner.resource_registry import SessionResourceView
+    from omnigent.terminals import TerminalRegistry
+    from tests.runner.test_app_sessions_native_session_change_heal import _plant_dead_claude_pane
+
+    effects = []
+    rotating = False
+
+    async def launch(ctx):
+        effects.append("heal")
+        if terminal_input and rotating:
+            response = await client.post(
+                f"/v1/sessions/{CONV_ID}/events",
+                json={"type": "external_session_status", "data": {"status": "running"}},
+            )
+            assert response.status_code in (200, 204)
+        return SessionResourceView(
+            id="terminal_claude_main", type="terminal", session_id=ctx.session_id, name="claude"
+        )
+
+    monkeypatch.setattr("omnigent.runner.native.orchestration._launch_claude", launch)
+    monkeypatch.setattr("omnigent.runner.native._launch_claude", launch)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "inject_slash_command",
+        lambda *args, **kw: effects.append(kw["command"]),
+    )
+    registry = TerminalRegistry()
+    app = _build_app(_RotationServerClient(), terminal_registry=registry)
+    async with _runner_client(app) as client:
+        await _seed_session(client)
+        effects.clear()
+        rotating = True
+        _plant_dead_claude_pane(
+            registry, CONV_ID, tmp_path, claude_native_bridge.bridge_dir_for_bridge_id(CONV_ID)
+        )
+        result = await asyncio.wait_for(
+            client.post(f"/v1/sessions/{CONV_ID}/pending-rotation"), timeout=2
+        )
+        assert result.json() == {"status": "not_requested" if terminal_input else "started"}
+    assert effects == (["heal"] if terminal_input else ["heal", "/clear"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure", ["switch_off", "stale_revision", "missing_revision", "expected_revision"]
+)
+async def test_recovery_fails_closed_on_disabled_or_stale_request(monkeypatch, failure):
+    effects = []
+    monkeypatch.setattr(
+        claude_native_bridge, "inject_slash_command", lambda *args, **kwargs: effects.append(args)
+    )
+    server = _RotationServerClient()
+    if failure == "switch_off":
+        server.enabled = False
+    elif failure == "stale_revision":
+        server.archive_revision = 1
+    elif failure == "missing_revision":
+        server.archive_revision = None
+    app = _build_app(server)
+    async with _runner_client(app) as client:
+        await _seed_session(client)
+        result = await client.post(
+            f"/v1/sessions/{CONV_ID}/pending-rotation",
+            json={"archive_revision": "1" if failure == "expected_revision" else "0"},
+        )
+        assert result.json() == {"status": "not_requested"}
+        assert effects == []

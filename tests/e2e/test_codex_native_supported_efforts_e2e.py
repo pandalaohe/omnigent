@@ -54,7 +54,8 @@ def test_terminal_only_work_survives_runner_inactivity(codex_effort_rig: _Rig) -
         rig.stack.start_runner(cwd=_REPO_ROOT, env=rig.runner_env)
         session.ensure_terminal(rig)
         runner_log = max((rig.stack.runner_home / ".omnigent/logs/runner").glob("*.log"))
-        assert "Runner session initialization started" not in runner_log.read_text()
+        # Terminal recovery initializes the session once before accepting native input.
+        assert runner_log.read_text().count("Runner session initialization started") == 1
         marker = f"TERMINAL_ONLY_{uuid.uuid4().hex}"
         _json(rig.model.post("/mock/reset"))
         _json(
@@ -122,7 +123,7 @@ def test_terminal_only_work_survives_runner_inactivity(codex_effort_rig: _Rig) -
             assert return_code == 0, rig.stack.log_tail()
             log = runner_log.read_text()
             assert "idle timeout reached" in log, log[-4000:]
-            assert "Runner session initialization started" not in log
+            assert log.count("Runner session initialization started") == 1
             (rig.stack.root / "terminal-only-evidence.json").write_text(
                 json.dumps(
                     {

@@ -8,6 +8,8 @@ Only a top-level session with a supported rotation harness may call it.
 
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -19,8 +21,10 @@ from omnigent._wrapper_labels import (
     CLAUDE_NATIVE_WRAPPER_VALUE,
     WRAPPER_LABEL_KEY,
 )
+from omnigent.entities import ErrorData
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
+from omnigent.server.auto_rotation import INJECTED_REVISION_LABEL_KEY
 from omnigent.server.routes import sessions as sessions_facade
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -274,3 +278,200 @@ async def test_handover_empty_text_refused(
     assert response.status_code == 400, response.text
     assert "invalid_input" in response.text
     assert _handover_messages(store, session_id) == []
+
+
+@pytest.mark.parametrize(
+    "harness", ["claude-native", "codex-native", "pi", "pi-native", "antigravity-native"]
+)
+@pytest.mark.parametrize("mode", ["off", "due", "compacted", "above_threshold"])
+async def test_auto_handover_rechecks_context(client, store, harness, mode):
+    from omnigent.server.auto_rotation import FRESH_ROUND_LABEL_KEY, NOTICED_COUNT_LABEL_KEY
+
+    conv = store.create_conversation(harness_override=harness)
+    marker = "4" if harness == "antigravity-native" else "0"
+    store.set_labels(
+        conv.id,
+        {
+            "omnigent.auto_rotation": "off" if mode == "off" else "on",
+            "omnigent.last_context_tokens": "100000" if mode == "above_threshold" else "150000",
+            "omnigent.last_auto_compact_token_limit": "200000",
+            "omnigent.auto_rotation_state.inferred_compactions": "4",
+            FRESH_ROUND_LABEL_KEY: marker,
+            NOTICED_COUNT_LABEL_KEY: "previous" if mode == "compacted" else marker,
+        },
+    )
+    response = await client.post(
+        f"/v1/sessions/{conv.id}/handover",
+        json={"handover": "Continue.", "rotate": True, "auto": True},
+    )
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["rotate"] is (mode == "due")
+    assert (
+        result["deferred"]
+        == {
+            "off": "switch_off",
+            "due": None,
+            "compacted": "compacted",
+            "above_threshold": "above_threshold",
+        }[mode]
+    )
+    labels = store.get_conversation(conv.id).labels
+    assert HANDOVER_ITEM_LABEL_KEY in labels
+    assert (ROTATE_REQUESTED_LABEL_KEY in labels) is (mode == "due")
+    if mode in {"off", "above_threshold"}:
+        assert NOTICED_COUNT_LABEL_KEY not in labels
+
+
+async def test_auto_without_rotation_is_invalid(client, store):
+    session_id = _create(store)
+    response = await client.post(
+        f"/v1/sessions/{session_id}/handover",
+        json={"handover": "Continue.", "rotate": False, "auto": True},
+    )
+    assert response.status_code == 400
+    assert _handover_messages(store, session_id) == []
+
+
+async def test_metadata_exposes_archive_revision_for_stale_rotation_guard(client, store):
+    agent = SqlAlchemyAgentStore(store.storage_location).create(
+        "a" * 32, "test-agent", "unused-bundle"
+    )
+    session_id = store.create_conversation(agent_id=agent.id, harness_override="codex-native").id
+    store.set_labels(session_id, {ROTATE_REQUESTED_LABEL_KEY: "0"})
+    store.update_conversation(session_id, archived=True)
+    store.update_conversation(session_id, archived=False)
+    response = await client.get(
+        f"/v1/sessions/{session_id}",
+        params={"include_items": "false", "include_liveness": "false"},
+    )
+    assert response.status_code == 200, response.text
+    snapshot = response.json()
+    assert snapshot["archive_revision"] == store.get_conversation(session_id).archive_revision
+    assert snapshot["archive_revision"] > 0
+    assert snapshot["labels"][ROTATE_REQUESTED_LABEL_KEY] == "0"
+
+
+async def test_injection_claim_serializes_replays_and_new_revision(client, store):
+    session_id = _create(store)
+    store.set_labels(session_id, {ROTATE_REQUESTED_LABEL_KEY: "0"})
+    url = f"/v1/sessions/{session_id}/handover/injection"
+    replies = await asyncio.gather(
+        *(client.post(url, json={"archive_revision": "0"}) for _ in range(2))
+    )
+    assert sorted(r.json()["status"] for r in replies) == ["claimed", "unconfirmed"]
+    assert store.get_conversation(session_id).labels[INJECTED_REVISION_LABEL_KEY] == "0"
+    store.update_conversation(session_id, archived=True)
+    store.update_conversation(session_id, archived=False)
+    revision = str(store.get_conversation(session_id).archive_revision)
+    store.set_labels(session_id, {ROTATE_REQUESTED_LABEL_KEY: revision})
+    assert (await client.post(url, json={"archive_revision": revision})).json() == {
+        "status": "claimed"
+    }
+    assert store.get_conversation(session_id).labels[INJECTED_REVISION_LABEL_KEY] == revision
+    response = await client.patch(
+        f"/v1/sessions/{session_id}", json={"labels": {INJECTED_REVISION_LABEL_KEY: "0"}}
+    )
+    assert response.status_code == 400
+    assert store.get_conversation(session_id).labels[INJECTED_REVISION_LABEL_KEY] == revision
+
+
+@pytest.mark.parametrize(
+    "state", ["archived", "child", "superseded", "stale", "missing", "unsupported"]
+)
+async def test_injection_claim_rejects_ineligible_request(client, store, state):
+    session_id = _create(store, native=state != "unsupported")
+    store.set_labels(session_id, {ROTATE_REQUESTED_LABEL_KEY: "0"})
+    if state == "archived":
+        store.update_conversation(session_id, archived=True)
+    elif state == "child":
+        parent = _create(store)
+        session_id = _create(store, parent=parent)
+        store.set_labels(session_id, {ROTATE_REQUESTED_LABEL_KEY: "0"})
+    elif state == "superseded":
+        store.set_labels(session_id, {"omnigent.succeeded_by": "conv_next"})
+    elif state == "stale":
+        store.set_labels(session_id, {ROTATE_REQUESTED_LABEL_KEY: "1"})
+    elif state == "missing":
+        store.delete_label(session_id, ROTATE_REQUESTED_LABEL_KEY)
+    response = await client.post(
+        f"/v1/sessions/{session_id}/handover/injection", json={"archive_revision": "0"}
+    )
+    assert response.json() == {"status": "not_requested"}
+    assert INJECTED_REVISION_LABEL_KEY not in store.get_conversation(session_id).labels
+
+
+async def test_injection_claim_rejects_invalid_or_absent_session(client, store):
+    session_id = _create(store)
+    response = await client.post(
+        f"/v1/sessions/{session_id}/handover/injection", json={"archive_revision": "bad"}
+    )
+    assert response.status_code == 400
+    response = await client.post(
+        "/v1/sessions/conv_missing/handover/injection", json={"archive_revision": "0"}
+    )
+    assert response.status_code == 404
+
+
+async def test_runner_restart_keeps_injection_claim_and_reports_unconfirmed(
+    client, store, monkeypatch
+):
+    from omnigent.harnesses.claude_native import bridge
+    from tests.runner.conftest import _runner_client
+    from tests.runner.test_pending_rotation_idle_edge import _build_app, _RotationServerClient
+    from tests.server.test_auto_rotation_notices import service
+
+    session_id = store.create_conversation(harness_override="claude-native").id
+    store.set_labels(session_id, {ROTATE_REQUESTED_LABEL_KEY: "0", "omnigent.auto_rotation": "on"})
+    effects = []
+
+    def inject(*args, **kwargs):
+        # Observe committed server state at the actual injection boundary.
+        assert store.get_conversation(session_id).labels[INJECTED_REVISION_LABEL_KEY] == "0"
+        effects.append(kwargs["command"])
+
+    monkeypatch.setattr(bridge, "inject_slash_command", inject)
+
+    class Server(_RotationServerClient):
+        async def get(self, url, **kwargs):
+            row = store.get_conversation(session_id)
+            self.labels, self.archive_revision = row.labels, row.archive_revision
+            return await super().get(url, **kwargs)
+
+        async def post(self, url, **kwargs):
+            if url.endswith("/handover/injection"):
+                return await client.post(url, **kwargs)
+            return await super().post(url, **kwargs)
+
+    server = Server()
+    url = f"/v1/sessions/{session_id}/pending-rotation"
+    async with _runner_client(_build_app(server)) as runner:
+        response = await runner.post(
+            "/v1/sessions", json={"session_id": session_id, "agent_id": "ag_rotation"}
+        )
+        assert response.status_code == 201
+        assert (await runner.post(url)).json() == {"status": "started"}
+    assert effects == ["/clear"]
+    # A new app creates a genuinely empty rotations_started closure.
+    async with _runner_client(_build_app(server)) as restarted:
+        response = await restarted.post(
+            "/v1/sessions", json={"session_id": session_id, "agent_id": "ag_rotation"}
+        )
+        assert response.status_code == 201
+        assert (await restarted.post(url)).json() == {"status": "unconfirmed"}
+        notices = service(store, restarted, [], ["idle"], [{}])
+        await notices.start(SimpleNamespace())
+        try:
+            for _ in range(6):
+                await notices.tick()
+            assert effects == ["/clear"]
+            errors = [
+                i.data
+                for i in store.list_items(session_id, type="error").data
+                if isinstance(i.data, ErrorData) and i.data.code == "session_rotation_failed"
+            ]
+            assert len(errors) == 1
+            assert "unconfirmed" in errors[0].message
+            assert "will not be retried automatically" in errors[0].message
+        finally:
+            await notices.shutdown()

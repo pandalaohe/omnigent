@@ -405,7 +405,8 @@ async def test_archive_committed_after_admission_prevents_round_state(runtime_in
 
 
 @pytest.mark.parametrize("enabled", ["on", "off"])
-def test_failed_eligibility_read_still_commits_usage(db_uri, monkeypatch, enabled):
+@pytest.mark.parametrize("failure", ["conversation", "harness"])
+def test_failed_eligibility_read_still_commits_usage(db_uri, monkeypatch, enabled, failure):
     store = SqlAlchemyConversationStore(db_uri)
     source = store.create_conversation(harness_override="antigravity-native")
     store.set_labels(
@@ -429,15 +430,95 @@ def test_failed_eligibility_read_still_commits_usage(db_uri, monkeypatch, enable
             raise SQLAlchemyError("eligibility read unavailable")
         return read(session_id)
 
-    monkeypatch.setattr(store, "get_conversation", unavailable_once)
-    result_status = record_auto_rotation_usage(
-        source.id, {"omnigent.last_context_tokens": "190000"}, "180000", store, conv=admitted
+    if failure == "harness":
+        from omnigent.server.routes._sessions import helpers
+
+        def failed_harness(_conv):
+            raise SQLAlchemyError("harness read unavailable")
+
+        monkeypatch.setattr(helpers, "_resolve_harness", failed_harness)
+    else:
+        monkeypatch.setattr(store, "get_conversation", unavailable_once)
+    _, result_status = record_auto_rotation_usage(
+        source.id,
+        {"context_tokens": 190000},
+        store,
+        conv=admitted,
+        label_updates={"omnigent.pi_cache": "sample"},
     )
     result = read(source.id)
     assert result_status is None
     assert result.labels["omnigent.last_context_tokens"] == "190000"
+    assert result.labels["omnigent.pi_cache"] == "sample"
     assert result.labels[INFERRED_COMPACTIONS_LABEL_KEY] == "4"
     assert result.labels[FRESH_ROUND_LABEL_KEY] == "4"
+
+
+@pytest.mark.parametrize(
+    "harness,user_enabled,session_enabled,child,archived",
+    [
+        ("claude-sdk", True, "on", False, False),
+        ("codex-native", False, None, False, False),
+        ("codex-native", True, "off", False, False),
+        ("codex-native", True, "on", True, False),
+        ("codex-native", True, "on", False, True),
+    ],
+)
+def test_inactive_usage_preserves_context_without_reloading_conversation(
+    db_uri, harness, user_enabled, session_enabled, child, archived
+):
+    store = SqlAlchemyConversationStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    owner = "owner@example.test"
+    parent = store.create_conversation(harness_override=harness) if child else None
+    source = store.create_conversation(
+        harness_override=harness, parent_conversation_id=parent.id if parent else None
+    )
+    permissions.grant(owner, parent.id if parent else source.id, LEVEL_OWNER)
+    if archived:
+        store.update_conversation(source.id, archived=True)
+    prefs = SqlAlchemyUserPreferencesStore(db_uri)
+    prefs.patch_namespace(owner, "session_collab", {"autoRotationEnabled": user_enabled})
+    store.set_labels(
+        source.id,
+        {
+            "omnigent.last_context_model": "example/old",
+            "omnigent.last_context_window": "200000",
+            "omnigent.last_auto_compact_token_limit": "190000",
+        },
+    )
+    admitted = store.get_conversation(source.id)
+    if session_enabled is not None:
+        store.set_labels(source.id, {"omnigent.auto_rotation": session_enabled})
+    with patch.object(store, "get_conversation", wraps=store.get_conversation) as read:
+        payload, status = record_auto_rotation_usage(
+            source.id,
+            {
+                "context_tokens": 100,
+                "context_model": "example/new",
+                "context_window": 100000,
+            },
+            store,
+            permission_store=permissions,
+            prefs_store=prefs,
+            conv=admitted,
+            label_updates={"omnigent.pi_cache": "sample"},
+        )
+    assert read.call_count == 0
+    assert status is None
+    assert payload == {
+        "context_tokens": 100,
+        "context_model": "example/new",
+        "context_window": 100000,
+        "auto_compact_token_limit": None,
+    }
+    result = store.get_conversation(source.id)
+    assert result.labels["omnigent.pi_cache"] == "sample"
+    assert result.labels["omnigent.last_context_tokens"] == "100"
+    assert result.labels["omnigent.last_context_model"] == "example/new"
+    assert result.labels["omnigent.last_context_window"] == "100000"
+    assert "omnigent.last_auto_compact_token_limit" not in result.labels
+    assert not any(key.startswith(AUTO_ROTATION_STATE_PREFIX) for key in result.labels)
 
 
 @pytest.mark.parametrize(
@@ -551,3 +632,34 @@ def test_malformed_preferences_and_failed_reads_do_not_trigger(db_uri, monkeypat
     assert not auto_rotation_for(conv, store, prefs_store=prefs).due
     monkeypatch.setattr(store, "get_compaction_stats", failed)
     assert not auto_rotation_for(conv, store).due
+
+
+async def test_overlapping_token_reports_infer_a_drop_only_once(runtime_init, db_uri):
+    import asyncio
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(harness_override="antigravity-native")
+    store.set_labels(
+        conv.id,
+        {
+            "omnigent.auto_rotation": "on",
+            "omnigent.last_context_window": "200000",
+            "omnigent.last_context_tokens": "180000",
+        },
+    )
+    state = SimpleNamespace(permission_store=None, user_preferences_store=None)
+    await asyncio.gather(
+        *[
+            _persist_external_session_usage(
+                conv.id,
+                SessionEventInput(type="external_session_usage", data={"context_tokens": 60000}),
+                store,
+                conv=conv,
+                auto_rotation_app_state=state,
+            )
+            for _ in range(2)
+        ]
+    )
+    labels = store.get_conversation(conv.id).labels
+    assert labels[INFERRED_COMPACTIONS_LABEL_KEY] == "1"
+    assert labels[FRESH_ROUND_LABEL_KEY] == "1"

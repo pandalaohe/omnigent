@@ -48,6 +48,7 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
 from tests.e2e._harness_probes import cli_unavailable_reason
 
 pexpect = pytest.importorskip("pexpect")
@@ -188,6 +189,8 @@ def test_pi_native_openai_only_gateway_claude_model_fails_loud(
         **os.environ,
         "HOME": str(pi_home),
         "OMNIGENT_CONFIG_HOME": str(pi_home / ".omnigent"),
+        "OMNIGENT_DATA_DIR": str(pi_home / ".omnigent"),
+        "OMNIGENT_NO_UPDATE_CHECK": "1",
         "OMNIGENT_SKIP_ONBOARD": "1",
         # Resolve omnigent + its in-repo SDK packages to this worktree.
         "PYTHONPATH": os.pathsep.join(
@@ -201,8 +204,26 @@ def test_pi_native_openai_only_gateway_claude_model_fails_loud(
         # A real TERM so the runner-owned Pi tmux pane attaches under the pty.
         "TERM": "xterm-256color",
         "PROMPT_TOOLKIT_NO_CPR": "1",
+        "NO_PROXY": "127.0.0.1,localhost",
+        "no_proxy": "127.0.0.1,localhost",
     }
-    env.pop("OMNIGENT_CONFIG", None)
+    for stale in (
+        "OMNIGENT_CONFIG",
+        "OMNIGENT_DATABASE_URI",
+        "DATABRICKS_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "OMNIGENT_RUNNER_ID",
+        "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN",
+        "RUNNER_SERVER_URL",
+        "OMNIGENT_RUNNER_WORKSPACE",
+        "TMUX",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "http_proxy",
+        "https_proxy",
+    ):
+        env.pop(stale, None)
 
     child = pexpect.spawn(
         str(omnigent_bin),
@@ -283,6 +304,8 @@ def _teardown(child: Any, env: dict[str, str]) -> None:
     time.sleep(2)
     with contextlib.suppress(Exception):
         child.kill(signal.SIGKILL)
+    with contextlib.suppress(Exception):
+        child.close(force=True)
     omni_bin = Path(sys.executable).parent / "omni"
     if omni_bin.exists():
         with contextlib.suppress(Exception):
@@ -292,3 +315,5 @@ def _teardown(child: Any, env: dict[str, str]) -> None:
                 capture_output=True,
                 timeout=60,
             )
+    if config_home := env.get("OMNIGENT_CONFIG_HOME"):
+        reap_leaked_omnigent_processes(Path(config_home))

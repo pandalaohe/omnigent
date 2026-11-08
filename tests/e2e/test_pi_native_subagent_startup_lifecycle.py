@@ -455,6 +455,7 @@ def test_real_pi_child_startup_cannot_complete_or_timeout_running_work(
             for row in _records(ledger)
             if row["event"] == "external_session_status"
             and row.get("status") == "running"
+            and row.get("response_id")
             and row["session_id"] == child
         ]
         assert len(running) == 1, running

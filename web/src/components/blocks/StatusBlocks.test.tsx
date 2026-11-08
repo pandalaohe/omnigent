@@ -1400,3 +1400,81 @@ describe("ErrorBanner — info level", () => {
     expect(screen.getByTestId("error-headline")).toHaveClass("text-destructive");
   });
 });
+
+describe("ErrorBanner — warning level", () => {
+  it("renders a non-destructive warning pill visually distinct from error and info", () => {
+    render(
+      <ErrorBanner
+        message="This session could not continue in a new session automatically. Type /clear to continue."
+        source="harness"
+        code="session_rotation_failed"
+        level="warning"
+      />,
+    );
+    const pill = screen.getByTestId("error-pill");
+    expect(pill).toHaveAttribute("data-level", "warning");
+    expect(pill.getAttribute("style")).toContain("--warning");
+    expect(pill.getAttribute("style")).not.toContain("--destructive");
+    expect(pill.getAttribute("style")).not.toContain("--muted-foreground");
+    const headline = screen.getByTestId("error-headline");
+    expect(headline).toHaveTextContent(
+      "This session could not continue in a new session automatically. Type /clear to continue.",
+    );
+    expect(headline).toHaveClass("text-warning");
+    expect(headline).toHaveClass("break-words");
+    expect(headline).not.toHaveClass("truncate");
+    expect(headline).not.toHaveClass("text-destructive");
+    expect(headline).not.toHaveClass("text-foreground");
+    expect(screen.getByRole("button", { name: "Dismiss warning" })).toBeInTheDocument();
+  });
+
+  it.each([
+    [
+      "draft_may_remain",
+      "Rotation unconfirmed; draft may remain. Inspect and clear the terminal input before pressing Enter.",
+    ],
+    [
+      "unconfirmed",
+      "Rotation unconfirmed. The command was already injected and will not be retried automatically. Inspect the terminal before typing /clear.",
+    ],
+  ])(
+    "shows S3's %s session_rotation_failed message by default instead of fixed /clear guidance",
+    (_variant, serverMessage) => {
+      render(
+        <ErrorBanner
+          message={serverMessage}
+          source="harness"
+          code="session_rotation_failed"
+          level="warning"
+        />,
+      );
+      const toggle = screen.getByRole("button", { name: new RegExp(serverMessage.slice(0, 24)) });
+      expect(toggle).toHaveAttribute("aria-expanded", "false");
+      const headline = screen.getByTestId("error-headline");
+      expect(headline).toHaveTextContent(serverMessage);
+      expect(headline.textContent).not.toContain("Type /clear to continue");
+      expect(headline).toHaveClass("break-words", "whitespace-normal");
+      expect(headline).not.toHaveClass("truncate");
+    },
+  );
+
+  it("falls back to generic recovery guidance only when session_rotation_failed message is empty, and routes unclassified warnings through t()", () => {
+    const { rerender } = render(
+      <ErrorBanner message="   " source="harness" code="session_rotation_failed" level="warning" />,
+    );
+    expect(screen.getByTestId("error-headline")).toHaveTextContent(
+      "This session could not continue in a new session automatically. Type /clear to continue.",
+    );
+
+    rerender(
+      <ErrorBanner
+        message="Custom warning detail"
+        source="harness"
+        code="custom_warning"
+        level="warning"
+      />,
+    );
+    expect(screen.getByTestId("error-headline")).toHaveTextContent("Warning");
+    expect(screen.getByRole("button", { name: "Dismiss warning" })).toBeInTheDocument();
+  });
+});

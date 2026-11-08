@@ -67,6 +67,23 @@ export interface UsageAccountView {
   windows: UsageWindowView[];
   hosts: UsageHostView[];
   models?: { id: string }[];
+  balances?: UsageBalance[];
+  balance_read_at?: number | null;
+  balance_freshness?: "fresh" | "old" | "none";
+  source_type?: string | null;
+  source?: string | null;
+  source_at?: number | null;
+}
+
+export interface UsageBalance {
+  id: string;
+  label?: string | null;
+  group?: string | null;
+  remaining: number;
+  unit: string;
+  usd_per_unit?: number | null;
+  note?: string | null;
+  expires_at?: number | null;
 }
 
 export interface UsageOverview {

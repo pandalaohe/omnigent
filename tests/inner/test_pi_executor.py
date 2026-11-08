@@ -7681,8 +7681,9 @@ def test_run_turn_spawn_env_honors_spec_env_passthrough(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("layout", ["dist/cli.js", "dist/bundle/cli.js", "standalone"])
+@pytest.mark.parametrize("node_available", [True, False], ids=["node-symlink", "node-missing"])
 def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(
-    monkeypatch, tmp_path, layout
+    monkeypatch, tmp_path, layout, node_available
 ) -> None:
     """The sandbox launcher policy names exactly the env the executor spawns.
 
@@ -7699,6 +7700,7 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(
     :param tmp_path: Pytest tmp dir used as the sandbox cwd so the
         policy resolve walks a tiny tree.
     """
+    from omnigent.inner import pi_executor as pi_executor_mod
     from omnigent.inner import sandbox as sandbox_mod
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.inner.sandbox import SandboxPolicy
@@ -7717,6 +7719,21 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(
         pi_binary.symlink_to(executable)
     executable.parent.mkdir(parents=True, exist_ok=True)
     executable.touch()
+
+    node_target = tmp_path / "node-runtime/bin/node"
+    node_link = tmp_path / "node-launchers/node"
+    node_target.parent.mkdir(parents=True)
+    node_target.touch()
+    node_link.parent.mkdir(parents=True)
+    node_link.symlink_to(node_target)
+    original_which = pi_executor_mod.shutil.which
+
+    def _fake_which(command, *args, **kwargs):
+        if command == "node":
+            return str(node_link) if node_available else None
+        return original_which(command, *args, **kwargs)
+
+    monkeypatch.setattr(pi_executor_mod.shutil, "which", _fake_which)
 
     def _fake_create_exec_launcher(target_path: str, sandbox: SandboxPolicy) -> str:
         assert target_path == str(executable.resolve())
@@ -7749,7 +7766,10 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(
     # fallback in ``_try_sandbox_pi``'s except clause).
     assert executor._sandboxed is True
     assert executor._pi_launch_path == "/fake/launcher"
-    assert captured["policy"].read_roots == [tmp_path.resolve(), install.resolve()]
+    expected_read_roots = [tmp_path.resolve(), install.resolve()]
+    if node_available:
+        expected_read_roots.extend([node_link.parent.resolve(), node_target.parent.resolve()])
+    assert captured["policy"].read_roots == expected_read_roots
     allowlist = captured["policy"].spawn_env_allowlist
     assert allowlist is not None
     # Per-spawn gateway var must be pruneproof even though it is not in

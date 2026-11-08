@@ -1725,10 +1725,16 @@ async def discover_codex_model_options(*, codex_path: str | None = None) -> list
     :raises RuntimeError: When the discovery app-server exits before connecting.
     :raises TimeoutError: When the discovery app-server does not become ready.
     """
+    from omnigent.models.model_catalog_store import fingerprint_of
+
     resolved_codex = codex_path or _find_codex_cli()
     if not resolved_codex:
         raise ImportError("Native Codex model discovery requires the 'codex' CLI on PATH.")
-    cached = _model_discovery_cache.get(resolved_codex)
+    command_identity = _codex_app_server_command_identity()
+    cache_key = (
+        fingerprint_of(resolved_codex, *command_identity) if command_identity else resolved_codex
+    )
+    cached = _model_discovery_cache.get(cache_key)
     if cached is not None:
         return [dict(option) for option in cached]
 
@@ -1767,7 +1773,7 @@ async def discover_codex_model_options(*, codex_path: str | None = None) -> list
                     await client.close()
             await _stop_codex_model_discovery_process(discovery)
 
-    _model_discovery_cache[resolved_codex] = tuple(dict(option) for option in options)
+    _model_discovery_cache[cache_key] = tuple(dict(option) for option in options)
     return options
 
 
@@ -1784,11 +1790,13 @@ async def _start_codex_model_discovery_process(
     # probe reaps a previous host's orphaned discovery tree.
     await asyncio.to_thread(reconcile_codex_native_process_registry)
     session_tag = codex_model_probe_session_tag()
+    executable, *launch_args = _configured_app_server_command() or (codex_path,)
     argv = _build_native_codex_app_server_argv(
-        codex_argv0=Path(codex_path).name,
+        codex_argv0=Path(executable).name,
         session_tag=session_tag,
         listen_url=listen_url,
         config_overrides=config_overrides,
+        launch_args=launch_args,
     )
     owner_lock = acquire_codex_native_process_owner_lock()
     read_fd: int | None = None
@@ -1802,7 +1810,7 @@ async def _start_codex_model_discovery_process(
                 str(Path(_liveness_exec.__file__)),
                 "--liveness-fd",
                 str(read_fd),
-                codex_path,
+                executable,
                 *argv[1:],
             ]
         process = await asyncio.create_subprocess_exec(
@@ -1812,7 +1820,7 @@ async def _start_codex_model_discovery_process(
             stderr=asyncio.subprocess.PIPE,
             env=env,
             cwd=str(cwd),
-            executable=codex_path if read_fd is None else None,
+            executable=executable if read_fd is None else None,
             pass_fds=() if read_fd is None else (read_fd,),
             **_proc.spawn_kwargs(),
         )
@@ -2240,6 +2248,7 @@ def codex_catalog_fingerprint(launch: NativeCodexLaunch, *, codex_path: str | No
         launch.model,
         tuple(launch.config_overrides),
         binary_identity(codex_path or _find_codex_cli()),
+        *_codex_app_server_command_identity(),
     )
 
 
@@ -2397,6 +2406,14 @@ def _configured_app_server_command() -> tuple[str, ...]:
     from omnigent.harness_startup_config import resolve_codex_app_server_command
 
     return resolve_codex_app_server_command(load_effective_config())
+
+
+def _codex_app_server_command_identity() -> tuple[object, ...]:
+    """Include configured launcher changes while preserving unwrapped catalog keys."""
+    from omnigent.models.model_catalog_store import binary_identity
+
+    command = _configured_app_server_command()
+    return (command, binary_identity(command[0])) if command else ()
 
 
 def _build_native_codex_app_server_argv(

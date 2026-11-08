@@ -587,6 +587,7 @@ async def test_real_pi_retry_identity_reaches_server_and_history(
 ):
     from omnigent.harnesses.pi_native import bridge as pb
     from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+    from omnigent.runner.transports.ws_tunnel.serve import serve_tunnel
     from omnigent.server.permission_tiers import PERMISSION_PROTOCOL_HEADER
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
     from tests._helpers.live_server import isolated_local_server, isolated_process_env
@@ -633,6 +634,21 @@ async def test_real_pi_retry_identity_reaches_server_and_history(
         assert (
             journal.store.admit_execution(journal.child, claim, runner_id=runner_id).state
             == "reserved"
+        )
+        runner_app = FastAPI()
+
+        @runner_app.post("/v1/sessions/{session_id}/events")
+        async def _runner_events(session_id: str):
+            return {"queued": False}
+
+        tunnel_task = asyncio.create_task(
+            serve_tunnel(
+                runner_app,
+                server_url=base_url,
+                runner_id=runner_id,
+                runner_version="0.1.0",
+                tunnel_token=token,
+            )
         )
         directory = tmp_path / "pi-bridge"
         directory.mkdir()
@@ -753,6 +769,7 @@ async def test_real_pi_retry_identity_reaches_server_and_history(
                 assert reloaded[1].get("auto_retry") is None
                 assert journal.store.get_chain(chain.chain_id).accepted_attempts == 1
         finally:
+            tunnel_task.cancel()
             if process.returncode is None:
                 process.terminate()
                 try:

@@ -39,6 +39,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { shortModelName } from "@/components/CostRoutingControl";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { useScopedConversationId } from "@/components/chat/conversationScope";
+import { t } from "@/lib/autoRotationText";
 import { copyText } from "@/lib/clipboard";
 import { getSessionSignInLink } from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
@@ -63,8 +64,8 @@ interface ErrorBannerProps {
   cause?: string;
   /** Concrete next step to fix it, e.g. a command to run. */
   remediation?: string;
-  /** `"info"` renders a neutral notice (no failure tone) instead of a destructive error. */
-  level?: "error" | "info";
+  /** `"info"` renders a neutral notice; `"warning"` renders a non-destructive warning pill. */
+  level?: "error" | "info" | "warning";
   /** Recover the existing session or continue after a retryable turn failure. */
   onRetry?: (error: RelatedRenderError) => Promise<void>;
   /** Later failures emitted by the same response, turn, and agent. */
@@ -114,6 +115,7 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
     "The agent CLI on the host is too old for the selected model. Update it on the host, then start a new session.",
 };
 
+const SESSION_ROTATION_FAILED_CODE = "session_rotation_failed";
 const COMPACTION_MODEL_FAILED_CODE = "codex_compaction_model_failed";
 // A spent budget, and the compaction it blocks, is an account limit rather than a failure.
 const NEUTRAL_TONE_CODES = new Set(["budget_exhausted", COMPACTION_MODEL_FAILED_CODE]);
@@ -152,11 +154,32 @@ const UNAVAILABLE_OUTPUT =
   /^unavailable(?:[.!]|\. The process exited before Omnigent captured a pane snapshot\.)?$/i;
 const EMPTY_RELATED_ERRORS: RelatedRenderError[] = [];
 
+function sessionRotationFailedHeadline(rawMessage: string): string {
+  const message = parseErrorMessage(rawMessage).message;
+  if (!message || message === t("sessionRotationFailedRecovery")) {
+    return t("sessionRotationFailedRecovery");
+  }
+  if (message === t("sessionRotationDraftMayRemainRecovery")) {
+    return t("sessionRotationDraftMayRemainRecovery");
+  }
+  if (message === t("sessionRotationUnconfirmedRecovery")) {
+    return t("sessionRotationUnconfirmedRecovery");
+  }
+  return message;
+}
+
 function errorHeadline(error: RenderErrorDetails): string {
+  if (error.title) return error.title;
+  if (error.code === SESSION_ROTATION_FAILED_CODE) {
+    return sessionRotationFailedHeadline(error.message);
+  }
   return (
-    error.title ||
     FAILURE_CODE_DESCRIPTIONS[error.code] ||
-    (error.level === "info" ? "Notice" : "Something went wrong")
+    (error.level === "info"
+      ? "Notice"
+      : error.level === "warning"
+        ? t("warningBannerTitle")
+        : "Something went wrong")
   );
 }
 
@@ -317,10 +340,22 @@ export function ErrorBanner({
     code === "workspace_missing" ||
     relatedErrors.some((error) => error.code === "workspace_missing");
   const notice = level === "info" && relatedErrors.every((error) => error.level === "info");
-  const neutral = [{ code, level }, ...relatedErrors].every(
-    (error) => error.level === "info" || NEUTRAL_TONE_CODES.has(error.code),
-  );
-  const tone = neutral ? "var(--muted-foreground)" : "var(--destructive)";
+  const warning =
+    !notice &&
+    [{ level }, ...relatedErrors].every(
+      (error) => error.level === "warning" || error.level === "info",
+    ) &&
+    [{ level }, ...relatedErrors].some((error) => error.level === "warning");
+  const neutral =
+    !warning &&
+    [{ code, level }, ...relatedErrors].every(
+      (error) => error.level === "info" || NEUTRAL_TONE_CODES.has(error.code),
+    );
+  const tone = warning
+    ? "var(--warning)"
+    : neutral
+      ? "var(--muted-foreground)"
+      : "var(--destructive)";
   const headline = errorHeadline({ message, source: "", code, title, cause, remediation, level });
   const relatedDetails = useMemo(
     () =>
@@ -498,7 +533,7 @@ export function ErrorBanner({
       />
       <div
         data-testid="error-pill"
-        data-level={notice ? "info" : "error"}
+        data-level={notice ? "info" : warning ? "warning" : "error"}
         onClick={() => expandable && setExpanded((value) => !value)}
         className={cn(
           "group/error relative z-10 w-[560px] max-w-full rounded-[12px] p-[8px] text-foreground",
@@ -543,8 +578,11 @@ export function ErrorBanner({
                 data-testid="error-headline"
                 title={headline}
                 className={cn(
-                  "min-w-0 truncate whitespace-nowrap leading-6",
-                  neutral ? "text-foreground" : "text-destructive",
+                  "min-w-0 leading-6",
+                  code === SESSION_ROTATION_FAILED_CODE
+                    ? "break-words whitespace-normal"
+                    : "truncate whitespace-nowrap",
+                  warning ? "text-warning" : neutral ? "text-foreground" : "text-destructive",
                 )}
               >
                 {headline}
@@ -572,7 +610,13 @@ export function ErrorBanner({
             type="button"
             variant="ghost"
             size="icon-xs"
-            aria-label={notice ? "Dismiss notice" : "Dismiss error message"}
+            aria-label={
+              notice
+                ? "Dismiss notice"
+                : warning
+                  ? t("dismissWarningAriaLabel")
+                  : "Dismiss error message"
+            }
             onClick={(event) => {
               event.stopPropagation();
               setDismissed(true);

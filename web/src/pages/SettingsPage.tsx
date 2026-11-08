@@ -171,6 +171,8 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { usageBoardAvailable, taskBoardAvailable, isFeatureEnabled } from "@/lib/capabilities";
 import { TaskBoardSettings } from "@/pages/taskBoard/TaskBoardSettings";
 import { t as taskBoardText } from "@/pages/taskBoard/taskBoardText";
+import { ParentSessionsSettings } from "@/components/ParentSessionsSettings";
+import { t as autoRotationText } from "@/lib/autoRotationText";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import {
   type Conversation,
@@ -2310,6 +2312,9 @@ function GeneralSection() {
               Session collaboration
             </Link>
           )}
+          <Link to="#parent-sessions" className="text-primary underline underline-offset-2">
+            {autoRotationText("parentSessionsTitle")}
+          </Link>
           <Link to="#child-sessions" className="text-primary underline underline-offset-2">
             Child sessions
           </Link>
@@ -2369,6 +2374,13 @@ function GeneralSection() {
               <SessionCollabSettings />
             </ExpandableSettings>
           )}
+          <ExpandableSettings
+            id="parent-sessions"
+            title={autoRotationText("parentSessionsTitle")}
+            className="mt-4 border-t border-border pt-4"
+          >
+            <ParentSessionsSettings />
+          </ExpandableSettings>
           <ExpandableSettings
             id="child-sessions"
             aliases={["#child-idle"]}

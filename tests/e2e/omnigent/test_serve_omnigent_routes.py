@@ -93,7 +93,7 @@ def _wait_for_health(
             )
         try:
             resp = httpx.get(f"http://127.0.0.1:{port}/health", timeout=2.0)
-        except (httpx.ConnectError, httpx.ReadError) as exc:
+        except httpx.HTTPError as exc:
             last_error = f"{type(exc).__name__}: {exc}"
         else:
             if resp.status_code == 200:

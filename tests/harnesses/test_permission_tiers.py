@@ -673,9 +673,11 @@ def test_antigravity_mcp_calls_classify_the_omnigent_target(
         "browser_future_read",
         "web_search",
         "third_party",
+        "calculate",
     ],
 )
 def test_deferred_and_unregistered_tools_keep_unknown_tiers(name: str) -> None:
+    assert adapt_tool_call(name, {}, posix_host()).kind == ToolKind.UNKNOWN
     assert decision("ask", name, {}).action == Verdict.ASK
     assert decision("plan", name, {}).action == Verdict.DENY
     assert decision("accept-edits", name, {}).action == Verdict.ASK

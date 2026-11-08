@@ -2433,7 +2433,33 @@ module.exports = function (pi) {
           description,
           promptSnippet: description ? description.slice(0, 120) : name,
           parameters,
-          async execute(toolCallId, params) {
+          async execute(toolCallId, params, _signal, _onUpdate, ctx) {
+            if (nativeSupport.hasScopedEvaluator(ctx)) {
+              const event = { type: "tool_call", toolCallId, toolName: name, input: params || {} };
+              const response = await nativeSupport.callScopedBridge(event, ctx, 0);
+              if (response && typeof response === "object" && !response.error && "result" in response) {
+                const value = response.result;
+                const unwrapped =
+                  value &&
+                  typeof value === "object" &&
+                  !Array.isArray(value) &&
+                  Object.keys(value).length === 1 &&
+                  typeof value.result === "string"
+                    ? value.result
+                    : value;
+                const text = typeof unwrapped === "string" ? unwrapped : JSON.stringify(unwrapped);
+                return { content: [{ type: "text", text }], details: {} };
+              }
+              const message =
+                response && typeof response.error === "string"
+                  ? response.error
+                  : "Scoped Pi bridge unavailable";
+              return {
+                content: [{ type: "text", text: `Tool Error: ${message}` }],
+                details: {},
+                isError: true,
+              };
+            }
             return callOmnigentTool(config, name, params || {}, toolCallId);
           },
         });
@@ -2511,13 +2537,23 @@ module.exports = function (pi) {
     }
   }
 
+  let taskToolRegistered = bridgedTools.has("manage_todo_list");
+
   function registerTaskToolIfMissing() {
-    if (typeof pi.registerTool !== "function") return;
-    const existing =
-      typeof pi.getAllTools === "function"
-        ? pi.getAllTools().some((tool) => tool.name === "manage_todo_list")
-        : false;
-    if (existing) return;
+    if (taskToolRegistered || typeof pi.registerTool !== "function") return;
+    let existing = bridgedTools.has("manage_todo_list");
+    if (!existing && typeof pi.getAllTools === "function") {
+      try {
+        existing = pi.getAllTools().some((tool) => tool.name === "manage_todo_list");
+      } catch (_err) {
+        existing = false;
+      }
+    }
+    if (existing) {
+      taskToolRegistered = true;
+      return;
+    }
+    taskToolRegistered = true;
     pi.registerTool({
       name: "manage_todo_list",
       label: "Task Plan",
@@ -2580,6 +2616,7 @@ module.exports = function (pi) {
       },
     });
   }
+  registerTaskToolIfMissing();
 
   async function syncTaskListFromResult(event) {
     if (!event || event.toolName !== "manage_todo_list" || event.isError)
@@ -3531,7 +3568,10 @@ module.exports = function (pi) {
         !event.input || typeof event.input !== "object" || Array.isArray(event.input)) {
       return { block: true, reason: "invalid tool call" };
     }
-    if (permissionState.tier !== "full" && config?.nativeSupportRequired === true) {
+    if (
+      permissionState.tier !== "full" &&
+      (config?.nativeSupportRequired === true || nativeSupport.hasScopedEvaluator(ctx))
+    ) {
       const support = await nativeSupport.classifyNativeCall(event, ctx, permissionState);
       if (support.status === "failed_native") return {block:true, reason:support.reason};
       if (!nativeSupport.hasScopedEvaluator(ctx)) return {block:true, reason:"Scoped native policy transport is not installed"};

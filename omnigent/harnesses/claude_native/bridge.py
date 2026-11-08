@@ -782,6 +782,18 @@ class ClaudeInjectionCancelled(RuntimeError):
     """The caller cancelled delivery before the injection worker finished."""
 
 
+class ClaudeRotationUnconfirmed(RuntimeError):
+    """An automatic command was typed, but its execution cannot be confirmed."""
+
+    def __init__(self, *, draft_may_remain: bool) -> None:
+        self.draft_may_remain = draft_may_remain
+        super().__init__(
+            "Rotation unconfirmed; draft may remain. Inspect the terminal before pressing Enter."
+            if draft_may_remain
+            else "Rotation unconfirmed; input was cleared. Inspect the terminal before retrying."
+        )
+
+
 class ClaudeUserPromptPending(RuntimeError):
     """
     A native question or permission prompt must be answered before injection.
@@ -5291,6 +5303,7 @@ def _verify_submit_accepted(
     wait_for_startup: bool = False,
     submit_boundary: SubmitBoundary | None = None,
     submitted_text: str | None = None,
+    before_retry: Callable[[], None] | None = None,
 ) -> bool:
     """
     Wait for a submitted draft to leave the input box, re-sending Enter.
@@ -5315,6 +5328,7 @@ def _verify_submit_accepted(
     :param wait_for_startup: Preserve the first draft through slow terminal startup.
     :param submit_boundary: Native transcript boundary captured before Enter.
     :param submitted_text: Full submitted text; a marker alone cannot identify a refusal.
+    :param before_retry: Optional live idle guard before sending another Enter.
     :returns: ``True`` when the draft left the input box (accepted),
         ``False`` when it is still there after the full window.
     :raises ClaudeSubmitBlockedUnconfirmed: A fresh matching refusal appeared;
@@ -5400,6 +5414,8 @@ def _verify_submit_accepted(
             )
         if _draft_in_input_box(pane, needle) and now - last_enter >= retry_interval:
             _raise_if_user_prompt_pending(bridge_dir, pane)
+            if before_retry is not None:
+                before_retry()
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
             retries += 1
             delivery_diagnostics.record_details(retries=retries)
@@ -5653,6 +5669,7 @@ def inject_slash_command(
     confirm_hint: str | None = None,
     wait_for_startup: bool = False,
     ready_timeout_s: float | None = None,
+    require_idle: bool = False,
 ) -> None:
     """
     Type a Claude Code slash command into the tmux pane and submit it.
@@ -5688,6 +5705,8 @@ def inject_slash_command(
         outliving the request. ``None`` waits like :func:`inject_user_message`
         — *timeout_s* as the base budget, extended while a live pane is still
         booting.
+    :param require_idle: Refuse automatic rotation unless Claude's live status
+        confirms idle immediately before typing and submitting the command.
     :raises ValueError: If *command* is empty, does not start with
         ``/``, contains a newline, or *auto_confirm* is set without a
         *confirm_hint*.
@@ -5711,6 +5730,15 @@ def inject_slash_command(
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
+
+    def check_idle() -> None:
+        if (
+            require_idle
+            and _claude_turn_running(bridge_dir, socket_path, tmux_target) is not False
+        ):
+            raise RuntimeError("Automatic rotation requires a confirmed idle Claude pane")
+
+    check_idle()
     startup_submit = wait_for_startup and (
         _read_json_file(bridge_dir / _STATE_FILE).get("accepted_input_tmux")
         != _tmux_input_identity(bridge_dir)
@@ -5725,6 +5753,7 @@ def inject_slash_command(
         timeout_s=timeout_s,
         ready_timeout_s=ready_timeout_s,
     )
+    check_idle()
     if has_pending_user_prompt(bridge_dir):
         raise ClaudeUserPromptPending(
             "Answer the pending Claude question or permission request before changing settings.",
@@ -5735,46 +5764,66 @@ def inject_slash_command(
     # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
     # not interrupt an in-flight generation.
     _clear_composer(socket_path, tmux_target)
+    check_idle()
     # ``-l`` pastes ``/`` and spaces literally; trailing Enter submits.
-    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, command)
-    # Same delivery hazards as inject_user_message: a coalesced or dropped
-    # Enter leaves the command drafted while the persisted session value
-    # claims it applied. Wait for the command to render, submit, verify it
-    # left the box; an unidentifiable draft falls through to a blind submit.
-    needle = _submit_needle(command)
-    draft_seen = False
-    deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
-    while time.monotonic() < deadline:
-        pane = _capture_pane(socket_path, tmux_target)
-        _raise_if_user_prompt_pending(bridge_dir, pane)
-        if _draft_in_input_box(pane, needle):
-            draft_seen = True
-            break
-        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-    time.sleep(_PASTE_SETTLE_S)
-    if has_pending_user_prompt(bridge_dir):
-        raise ClaudeUserPromptPending(
-            "Claude is waiting for an explicit answer; settings command not sent."
-        )
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-    if draft_seen:
-        # Retry only while the command remains drafted and no user decision
-        # is pending. A dialog replacing the composer counts as submission.
-        if not _verify_submit_accepted(
-            socket_path,
-            tmux_target,
-            needle=needle,
-            what="slash command",
-            bridge_dir=bridge_dir,
-            wait_for_startup=startup_submit,
-        ):
-            raise RuntimeError(
-                f"Claude Code did not accept the slash command within "
-                f"{_SUBMIT_VERIFY_TIMEOUT_S}s (the command is still in the "
-                "input box). The command was not delivered."
+    try:
+        _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, command)
+        # Same delivery hazards as inject_user_message: a coalesced or dropped
+        # Enter leaves the command drafted while the persisted session value
+        # claims it applied. Wait for the command to render, submit, verify it
+        # left the box; an unidentifiable draft falls through to a blind submit.
+        needle = _submit_needle(command)
+        draft_seen = False
+        deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
+        while time.monotonic() < deadline:
+            pane = _capture_pane(socket_path, tmux_target)
+            _raise_if_user_prompt_pending(bridge_dir, pane)
+            if _draft_in_input_box(pane, needle):
+                draft_seen = True
+                break
+            time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+        time.sleep(_PASTE_SETTLE_S)
+        if has_pending_user_prompt(bridge_dir):
+            raise ClaudeUserPromptPending(
+                "Claude is waiting for an explicit answer; settings command not sent."
             )
-    if dialog_hint is not None:
-        _confirm_tui_dialog(socket_path, tmux_target, hint=dialog_hint, bridge_dir=bridge_dir)
+        check_idle()
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+        if draft_seen:
+            # Retry only while the command remains drafted and no user decision
+            # is pending. A dialog replacing the composer counts as submission.
+            if not _verify_submit_accepted(
+                socket_path,
+                tmux_target,
+                needle=needle,
+                what="slash command",
+                bridge_dir=bridge_dir,
+                wait_for_startup=startup_submit,
+                before_retry=check_idle if require_idle else None,
+            ):
+                raise RuntimeError(
+                    f"Claude Code did not accept the slash command within "
+                    f"{_SUBMIT_VERIFY_TIMEOUT_S}s (the command is still in the "
+                    "input box). The command was not delivered."
+                )
+        if dialog_hint is not None:
+            _confirm_tui_dialog(socket_path, tmux_target, hint=dialog_hint, bridge_dir=bridge_dir)
+    except (RuntimeError, ValueError, OSError) as exc:
+        if not require_idle:
+            raise
+        draft_may_remain = True
+        try:
+            _clear_composer(socket_path, tmux_target)
+            box = _composer_box(_capture_pane(socket_path, tmux_target))
+            draft_may_remain = not (
+                box is not None
+                and box.framed
+                and box.rows[0].strip() == _CLAUDE_PROMPT_GLYPH
+                and not any(row.strip() for row in box.rows[1:])
+            )
+        except (RuntimeError, ValueError, OSError):
+            pass
+        raise ClaudeRotationUnconfirmed(draft_may_remain=draft_may_remain) from exc
 
 
 def _confirm_tui_dialog(
@@ -8891,7 +8940,11 @@ def _tool_relay_handler_factory(
             scoped = None
             legacy = hmac.compare_digest(
                 (authorization or "").encode(), f"Bearer {token}".encode()
-            ) and (pi_scope_relay is None or pi_scope_relay.legacy_allowed())
+            ) and (
+                pi_scope_relay is None
+                or self.path in ("/hook/pi/extension-ui", "/pi/session-usage")
+                or pi_scope_relay.legacy_allowed()
+            )
             if not legacy:
                 if pi_scope_relay is None:
                     self.send_error(HTTPStatus.UNAUTHORIZED)

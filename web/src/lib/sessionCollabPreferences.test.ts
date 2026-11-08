@@ -2,16 +2,23 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type * as UserPreferencesSyncModule from "./userPreferencesSync";
 
-const { queuePatchMock } = vi.hoisted(() => ({ queuePatchMock: vi.fn() }));
+const { queuePatchMock, queueAcknowledgedPatchMock } = vi.hoisted(() => ({
+  queuePatchMock: vi.fn(),
+  queueAcknowledgedPatchMock: vi.fn(),
+}));
 vi.mock("./userPreferencesSync", async (importOriginal) => ({
   ...(await importOriginal<typeof UserPreferencesSyncModule>()),
   queueUserPreferencePatch: queuePatchMock,
+  queueAcknowledgedUserPreferencePatch: queueAcknowledgedPatchMock,
 }));
 
 import {
+  isSessionCollabPreferenceDirty,
   readSessionCollabPreferences,
+  saveSessionCollabPreferences,
   SESSION_COLLAB_DEFAULTS,
   SESSION_COLLAB_STORAGE_KEY,
+  USER_PREFERENCES_DIRTY_STORAGE_KEY,
   writeSessionCollabPreferences,
 } from "./sessionCollabPreferences";
 import {
@@ -24,6 +31,7 @@ afterEach(() => {
   localStorage.clear();
   resetUserPreferencesSyncForTests();
   queuePatchMock.mockReset();
+  queueAcknowledgedPatchMock.mockReset();
 });
 
 describe("session collab preferences", () => {
@@ -235,5 +243,94 @@ describe("session collab preferences", () => {
       relayDepthMax: 3,
       quotaPeriods: { claude: "5h", unknown: "month" },
     });
+  });
+
+  it("normalizes and persists parent session auto-rotation defaults within bounds", () => {
+    expect(SESSION_COLLAB_DEFAULTS.autoRotationEnabled).toBe(false);
+    expect(SESSION_COLLAB_DEFAULTS.autoRotationCompactions).toBe(4);
+    expect(SESSION_COLLAB_DEFAULTS.autoRotationRemainingPct).toBe(25);
+
+    const updated = {
+      ...SESSION_COLLAB_DEFAULTS,
+      childCap: 3,
+      autoRotationEnabled: true,
+      autoRotationCompactions: 8,
+      autoRotationRemainingPct: 35,
+    };
+    writeSessionCollabPreferences(updated);
+    expect(readSessionCollabPreferences()).toEqual(updated);
+    expect(queuePatchMock).toHaveBeenLastCalledWith("session_collab", updated);
+
+    localStorage.setItem(
+      SESSION_COLLAB_STORAGE_KEY,
+      JSON.stringify({
+        autoRotationEnabled: "yes",
+        autoRotationCompactions: 21,
+        autoRotationRemainingPct: 0,
+      }),
+    );
+    expect(readSessionCollabPreferences()).toEqual(SESSION_COLLAB_DEFAULTS);
+
+    localStorage.setItem(
+      SESSION_COLLAB_STORAGE_KEY,
+      JSON.stringify({
+        autoRotationEnabled: true,
+        autoRotationCompactions: 1,
+        autoRotationRemainingPct: 90,
+      }),
+    );
+    expect(readSessionCollabPreferences()).toEqual({
+      ...SESSION_COLLAB_DEFAULTS,
+      autoRotationEnabled: true,
+      autoRotationCompactions: 1,
+      autoRotationRemainingPct: 90,
+    });
+  });
+
+  it("saves preferences through the acknowledged patch helper and checks dirty state", async () => {
+    let resolvePatch!: () => void;
+    queueAcknowledgedPatchMock.mockReturnValueOnce(
+      new Promise<void>((resolve) => {
+        resolvePatch = resolve;
+      }),
+    );
+    const updated = {
+      ...SESSION_COLLAB_DEFAULTS,
+      autoRotationEnabled: true,
+      autoRotationCompactions: 6,
+      autoRotationRemainingPct: 30,
+    };
+
+    let resolved = false;
+    const promise = saveSessionCollabPreferences(updated).then(() => {
+      resolved = true;
+    });
+    expect(readSessionCollabPreferences()).toEqual(updated);
+    expect(queueAcknowledgedPatchMock).toHaveBeenCalledWith("session_collab", updated, undefined);
+    expect(resolved).toBe(false);
+
+    resolvePatch();
+    await promise;
+    expect(resolved).toBe(true);
+
+    expect(isSessionCollabPreferenceDirty()).toBe(false);
+    const actualSync =
+      await vi.importActual<typeof UserPreferencesSyncModule>("./userPreferencesSync");
+    await initializeUserPreferencesSync(
+      { version: 1, settings: {} },
+      vi.fn(() => new Promise<Response>(() => {})),
+      "alice",
+    );
+    actualSync.queueUserPreferencePatch("sound_alerts", { enabled: true });
+    expect(isSessionCollabPreferenceDirty()).toBe(false);
+
+    actualSync.queueUserPreferencePatch("session_collab", updated);
+    const dirtySnapshot = localStorage.getItem(USER_PREFERENCES_DIRTY_STORAGE_KEY);
+    expect(JSON.parse(dirtySnapshot ?? "{}")).toEqual({
+      "__default__:alice": ["sound_alerts", "session_collab"],
+    });
+    expect(isSessionCollabPreferenceDirty()).toBe(true);
+    expect(isSessionCollabPreferenceDirty(dirtySnapshot)).toBe(true);
+    expect(isSessionCollabPreferenceDirty(null)).toBe(false);
   });
 });

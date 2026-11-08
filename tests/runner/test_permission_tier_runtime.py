@@ -2588,3 +2588,155 @@ async def test_runner_rejects_missing_trusted_init_and_accepts_current_server_in
     state_path = app.state.permission_tiers.state_path(body["session_id"], harness, {})
     assert state_path.is_relative_to(tmp_path)
     assert state_path.is_file()
+
+
+def test_pi_scope_unlisted_bridged_tool_is_denied_in_auto(tmp_path):
+    runtime, _parent, _child, _source, _registry = _scoped_runtime(tmp_path, "auto")
+    child = runtime.open_pi_child_scope("session-a")
+    bridge_source = {"source": "inline", "path": "<inline:omnigent-permission>"}
+    _publish_scope(
+        runtime,
+        child,
+        [
+            {"name": "sys_read_inbox", "sourceInfo": bridge_source},
+            {"name": "calculate", "sourceInfo": bridge_source},
+            {"name": "sys_terminal_launch", "sourceInfo": bridge_source},
+            {"name": "unlisted_bridge_tool", "sourceInfo": bridge_source},
+        ],
+    )
+    for call_id, name, arguments in (("inbox-call", "sys_read_inbox", {}),):
+        receipt = runtime.pi_origin_receipt(
+            "session-a",
+            child.credential,
+            call_id=call_id,
+            name=name,
+            arguments=arguments,
+            local_execution=False,
+        )
+        _, decision = runtime.inspect(
+            "session-a",
+            call_id=receipt.binding.call_id,
+            name=name,
+            arguments=arguments,
+            expected_revision=3,
+            local_execution=False,
+            origin_receipt=receipt.token,
+        )
+        assert decision.action.value == "ALLOW", (name, decision.reason)
+
+    for call_id, name, arguments in (
+        ("calc-call", "calculate", {"expression": "19 * 23"}),
+        ("terminal-call", "sys_terminal_launch", {"command": "sh"}),
+        ("unlisted-call", "unlisted_bridge_tool", {"x": 1}),
+    ):
+        receipt = runtime.pi_origin_receipt(
+            "session-a",
+            child.credential,
+            call_id=call_id,
+            name=name,
+            arguments=arguments,
+            local_execution=False,
+        )
+        _, decision = runtime.inspect(
+            "session-a",
+            call_id=receipt.binding.call_id,
+            name=name,
+            arguments=arguments,
+            expected_revision=3,
+            local_execution=False,
+            origin_receipt=receipt.token,
+        )
+        assert decision.action.value == "DENY", (name, decision.reason)
+        assert decision.reason == "Unknown tool schema"
+
+
+@pytest.mark.parametrize(
+    "tier,action,reason",
+    [
+        ("auto", "DENY", "Unknown tool schema"),
+        ("plan", "DENY", "Plan tier permits only known reads and user questions"),
+        ("ask", "ASK", "Unknown tool schema"),
+    ],
+)
+def test_pi_scope_agent_declared_calculate_requires_approval(tmp_path, tier, action, reason):
+    runtime, _parent, _child, _source, _registry = _scoped_runtime(tmp_path, tier)
+    child = runtime.open_pi_child_scope("session-a")
+    _publish_scope(
+        runtime,
+        child,
+        [
+            {
+                "name": "calculate",
+                "sourceInfo": {"source": "inline", "path": "<inline:omnigent-permission>"},
+            }
+        ],
+    )
+    arguments: dict[str, object] = {"expression": "19 * 23"}
+    receipt = runtime.pi_origin_receipt(
+        "session-a",
+        child.credential,
+        call_id="calc-call",
+        name="calculate",
+        arguments=arguments,
+        local_execution=False,
+    )
+    _, decision = runtime.inspect(
+        "session-a",
+        call_id=receipt.binding.call_id,
+        name="calculate",
+        arguments=arguments,
+        expected_revision=3,
+        local_execution=False,
+        origin_receipt=receipt.token,
+    )
+    assert decision.action.value == action
+    assert decision.reason == reason
+
+
+@pytest.mark.asyncio
+async def test_pi_scope_relay_rejects_plain_token_observe_tool_git_push(tmp_path, monkeypatch):
+    from omnigent.harnesses.claude_native import bridge as relay_bridge
+    from omnigent.harnesses.pi_native import bridge as pi_bridge
+    from omnigent.runner import pr_observer
+    from omnigent.runner.pi_scope_relay import PiScopeRelay
+
+    runtime, _parent, child, _source, _registry = _scoped_runtime(tmp_path, "auto")
+    monkeypatch.setattr(pi_bridge, "_BRIDGE_ROOT", tmp_path)
+    observed: list[tuple[str, object]] = []
+
+    def fail_observe(session_id: str, payload: object) -> None:
+        observed.append((session_id, payload))
+        raise AssertionError("observe_hook must not run for unauthenticated /hook/observe-tool")
+
+    monkeypatch.setattr(pr_observer, "observe_hook", fail_observe)
+
+    async def no_tool(_name, _arguments):
+        raise AssertionError("relay must not execute tools")
+
+    relay = relay_bridge.start_tool_relay(
+        bridge_dir=runtime.path("session-a").parent,
+        tools=[],
+        tool_executor=no_tool,
+        loop=asyncio.get_running_loop(),
+        session_id="session-a",
+        pi_scope_relay=PiScopeRelay(runtime, "session-a"),
+    )
+    info = json.loads((runtime.path("session-a").parent / "tool_relay.json").read_text())
+    forged_push = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "git push origin HEAD:main"},
+        "tool_response": {"stdout": "Everything up-to-date", "exit_code": 0},
+    }
+    try:
+        async with httpx.AsyncClient(base_url=info["url"], trust_env=False) as client:
+            for token in (info["token"], child.credential):
+                response = await client.post(
+                    "/hook/observe-tool",
+                    json=forged_push,
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                assert response.status_code == 401
+        assert observed == []
+    finally:
+        relay.close()

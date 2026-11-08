@@ -21,9 +21,11 @@ import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import { UsageBoardFrame } from "./UsageBoardFrame";
 import { UsageTile } from "./UsageTile";
 import { deleteUsageAccount, useUsageOverview, type UsageAccountView } from "./usageBoardData";
-import { isPercentWindow, windowName } from "./usageBoardFormat";
+import { formatFullDate, isPercentWindow, windowName } from "./usageBoardFormat";
 import { AUTO_WINDOW, fromDateInput, pickWindow, toDateInput } from "./usageBoardSelect";
 import { renewalOf } from "./UsageBoardPage";
+import { UsageSourceConnect } from "./UsageSourceConnect";
+import { t } from "./usageText";
 
 export function UsageAccountSettingsPage() {
   const { accountId = "" } = useParams();
@@ -72,6 +74,32 @@ export function UsageAccountSettingsPage() {
             />
           </div>
           <div className="rounded-[11px] border border-border bg-card px-3.5 py-1">
+            <div className="border-b border-border py-3 text-xs text-muted-foreground">
+              <p>{t("preferencesHelp")}</p>
+              {account.source_type ? <p>{t("sourceKind", { type: account.source_type })}</p> : null}
+              {account.source ? <p>{t("source", { source: account.source })}</p> : null}
+              {account.source_at != null ? (
+                <p>{t("sourceAt", { date: formatFullDate(account.source_at) })}</p>
+              ) : null}
+              <details className="mt-2">
+                <summary className="cursor-pointer text-sm text-foreground">
+                  {t("connectTitle")}
+                </summary>
+                <div className="mt-3">
+                  <UsageSourceConnect
+                    initialSource={
+                      account.kind === "native"
+                        ? "subscription"
+                        : account.source_type === "relay"
+                          ? "relay"
+                          : account.source_type === "manual"
+                            ? "manual"
+                            : "report"
+                    }
+                  />
+                </div>
+              </details>
+            </div>
             <Link
               to={`/usage/board/${encodeURIComponent(account.id)}/models`}
               className="flex min-h-12 items-center justify-between border-b border-border py-2 text-sm"
