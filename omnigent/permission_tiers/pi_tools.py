@@ -29,7 +29,9 @@ class PiToolRegistry:
 
 
 def _file_identity(info: os.stat_result) -> tuple[int, ...]:
-    return info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+    identity = (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns)
+    # Windows path and handle stats can report different ctimes for the same file.
+    return identity if IS_WINDOWS else (*identity, info.st_ctime_ns)
 
 
 def _read_file(
