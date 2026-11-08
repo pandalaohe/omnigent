@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import shlex
 import stat
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -61,13 +63,40 @@ def _children(path: Path, *, required: bool = False) -> list[Path]:
         raise _invalid(path, "unreadable plugin directory") from None
 
 
-def _hooks(value: object, path: Path, owned: dict[str, object] | None = None) -> None:
+def _matches_owned_guard(spec: dict[str, Any], owned: dict[str, Any]) -> bool:
+    if spec == owned:
+        return True
+    expected = deepcopy(owned)
+    try:
+        for event in ("PreToolUse", "PostToolUse"):
+            hook = expected[event][0]["hooks"][0]
+            command = spec[event][0]["hooks"][0]["command"]
+            if not isinstance(command, str):
+                return False
+            argv = shlex.split(command)
+            current = shlex.split(hook["command"])
+            if not argv or not Path(argv[0]).is_absolute():
+                return False
+            # Host entry points can use python or python3 for the same interpreter.
+            interpreter, current_interpreter = Path(argv[0]), Path(current[0])
+            if (
+                interpreter.parent.resolve() != current_interpreter.parent.resolve()
+                or not interpreter.samefile(current_interpreter)
+            ):
+                return False
+            hook["command"] = shlex.join([argv[0], *current[1:]])
+    except (KeyError, IndexError, TypeError, ValueError, OSError):
+        return False
+    return spec == expected
+
+
+def _hooks(value: object, path: Path, owned: dict[str, Any] | None = None) -> None:
     if not isinstance(value, dict):
         raise _invalid(path, "invalid hooks object")
     for name, spec in value.items():
         if not isinstance(spec, dict) or type(spec.get("enabled", True)) is not bool:
             raise _invalid(path, f"invalid hook {name!r}")
-        if owned is not None and name == "omnigent-guard" and spec == owned:
+        if owned is not None and name == "omnigent-guard" and _matches_owned_guard(spec, owned):
             continue
         if spec.get("enabled", True) is False:
             continue
