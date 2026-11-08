@@ -1,6 +1,7 @@
 """Documented hook sources are a restricted-startup boundary, not executed fixtures."""
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ import pytest
 from omnigent.harnesses.antigravity_native.bridge import (
     _agy_guard_hook,
     agy_gemini_dir,
+    apply_agy_permission_tier,
     seed_isolated_agy_home,
 )
 from omnigent.harnesses.antigravity_native.hook_sources import check_agy_hook_sources
@@ -195,6 +197,59 @@ def test_full_skips_discovery_and_owned_guard_is_exact(sources):
     write_json(path, {"omnigent-guard": pre_hook()["argument-rewriter"]})
     with pytest.raises(ValueError, match="omnigent-guard"):
         check_agy_hook_sources(workspace, "auto", bridge)
+
+
+@pytest.mark.parametrize("tier", ["ask", "plan", "accept-edits", "auto"])
+def test_relaunch_accepts_owned_guard_from_interpreter_alias(sources, monkeypatch, tier):
+    _gemini, project, workspace, bridge = sources
+    current = project / "python"
+    current.symlink_to(sys.executable)
+    interpreter = project / "python3"
+    interpreter.symlink_to(sys.executable)
+    monkeypatch.setattr(sys, "executable", str(current))
+    with monkeypatch.context() as launch:
+        launch.setattr(sys, "executable", str(interpreter))
+        seed_isolated_agy_home(bridge, trusted_workspace=workspace, permission_tier=tier)
+        apply_agy_permission_tier(bridge, tier)
+    # Another session has its own home; the existing guard cannot affect it.
+    seed_isolated_agy_home(
+        project / "other-bridge", trusted_workspace=workspace, permission_tier=tier
+    )
+    seed_isolated_agy_home(bridge, trusted_workspace=workspace, permission_tier=tier)
+    apply_agy_permission_tier(bridge, tier)
+    check_agy_hook_sources(workspace, tier, bridge)
+
+
+@pytest.mark.parametrize(
+    "change", ["interpreter", "other-venv", "script", "tier", "shell", "extra-hook"]
+)
+def test_relaunch_refuses_modified_owned_guard(sources, change):
+    _gemini, project, workspace, bridge = sources
+    apply_agy_permission_tier(bridge, "auto")
+    path = agy_gemini_dir(bridge) / "config/hooks.json"
+    hooks = json.loads(path.read_text())
+    pre = hooks["omnigent-guard"]["PreToolUse"][0]["hooks"]
+    if change == "interpreter":
+        fake = project / "python3"
+        fake.write_text("unrelated interpreter")
+        pre[0]["command"] = pre[0]["command"].replace(sys.executable, str(fake), 1)
+    elif change == "other-venv":
+        fake = project / "python3"
+        fake.symlink_to(sys.executable)
+        pre[0]["command"] = pre[0]["command"].replace(sys.executable, str(fake), 1)
+    elif change == "script":
+        pre[0]["command"] = pre[0]["command"].replace("guard.py", "other.py")
+    elif change == "tier":
+        pre[0]["command"] = pre[0]["command"].replace("permission_tier", "other_tier")
+    elif change == "shell":
+        pre[0]["command"] += "; true"
+    else:
+        pre.append({"type": "command", "command": "true"})
+    write_json(path, hooks)
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match="omnigent-guard"):
+        seed_isolated_agy_home(bridge, trusted_workspace=workspace, permission_tier="auto")
+    assert path.read_bytes() == before
 
 
 def test_parent_above_repository_and_disabled_plugins_are_not_loaded(sources):
