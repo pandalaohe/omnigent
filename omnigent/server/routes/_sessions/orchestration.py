@@ -14386,12 +14386,15 @@ async def _retry_host_admission_lease(
     *args: Any,
     timeout_s: float = 5.0,
     interval_s: float = 0.05,
+    run_in_thread: bool = True,
     **kwargs: Any,
 ) -> Any:
     """Retry a store operation while another writer holds its host admission lease."""
     deadline = time.monotonic() + timeout_s
     while True:
         try:
+            if not run_in_thread:
+                return fn(*args, **kwargs)
             return await asyncio.to_thread(fn, *args, **kwargs)
         except OmnigentError as exc:
             if (
@@ -15705,6 +15708,8 @@ async def _create_session_from_existing_agent_impl(
             )
             conv = await _retry_host_admission_lease(
                 conversation_store.create_conversation,
+                # Keep persistence synchronous inside the child-cap admission lock.
+                run_in_thread=False,
                 conversation_id=conversation_id,
                 agent_id=agent.id,
                 title=body.title,

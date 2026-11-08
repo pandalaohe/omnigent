@@ -1,5 +1,6 @@
 """Session writes tolerate short admission contention without hiding other conflicts."""
 
+from threading import get_ident
 from unittest.mock import Mock
 
 import httpx
@@ -13,7 +14,8 @@ from tests.server.helpers import create_test_session
 pytestmark = pytest.mark.asyncio
 
 
-async def test_admission_retry_preserves_arguments_and_result() -> None:
+@pytest.mark.parametrize("run_in_thread", [False, True])
+async def test_admission_retry_preserves_arguments_and_result(run_in_thread: bool) -> None:
     result = object()
     write = Mock(
         side_effect=[
@@ -23,12 +25,20 @@ async def test_admission_retry_preserves_arguments_and_result() -> None:
     )
     assert (
         await orchestration._retry_host_admission_lease(
-            write, "session", archived=True, interval_s=0
+            write, "session", archived=True, interval_s=0, run_in_thread=run_in_thread
         )
         is result
     )
     assert write.call_count == 2
     write.assert_called_with("session", archived=True)
+
+
+@pytest.mark.parametrize("run_in_thread", [False, True])
+async def test_admission_retry_preserves_callers_execution_boundary(run_in_thread: bool) -> None:
+    thread_id = await orchestration._retry_host_admission_lease(
+        get_ident, run_in_thread=run_in_thread
+    )
+    assert (thread_id == get_ident()) is (not run_in_thread)
 
 
 @pytest.mark.parametrize(
@@ -59,7 +69,7 @@ async def test_admission_retry_surfaces_terminal_errors(
 
 
 @pytest.mark.parametrize("archived", [True, False])
-async def test_archive_route_retries_admission_before_mutation(
+async def test_archive_route_surfaces_busy_for_fresh_policy_on_retry(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     archived: bool,
@@ -81,6 +91,6 @@ async def test_archive_route_retries_admission_before_mutation(
 
     monkeypatch.setattr(SqlAlchemyConversationStore, "update_conversation_with_changes", update)
     response = await client.patch(f"/v1/sessions/{session['id']}", json={"archived": archived})
-    assert response.status_code == 200, response.text
-    assert response.json()["archived"] is archived
-    assert attempts == 2
+    assert response.status_code == 409, response.text
+    assert "Host admission lease is busy" in response.text
+    assert attempts == 1

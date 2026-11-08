@@ -51,10 +51,12 @@ from __future__ import annotations
 
 import json
 import time
+import uuid
 from pathlib import Path
 
 import httpx
 import pytest
+import yaml
 
 from tests.e2e.conftest import (
     configure_mock_llm,
@@ -93,9 +95,8 @@ pytestmark = [
 _FIXTURES_DIR = Path(__file__).resolve().parents[1] / "_fixtures" / "agents"
 _NAMED_FIXTURE = _FIXTURES_DIR / "named-sub-agent-test"
 
-# Mock queue keys — must match the model names in named-sub-agent-test.yaml.
-# Each agent has its own key so their LLM calls consume from separate queues
-# and cannot race when researcher and summarizer run in parallel.
+# Base model names match named-sub-agent-test.yaml. Mock parent models get a
+# per-test suffix so late auto-wakes cannot consume the next test's queue.
 _PARENT_MODEL = "gpt-5.4"
 _RESEARCHER_MODEL = "gpt-5.4-named-researcher"
 _SUMMARIZER_MODEL = "gpt-5.4-named-summarizer"
@@ -179,6 +180,7 @@ def _configure_spawn_flow(
     mock_url: str | None,
     *,
     agent: str = "researcher",
+    parent_model: str,
     child_model: str = _RESEARCHER_MODEL,
     title: str = "auth",
     child_args: str = "What are common auth patterns?",
@@ -190,7 +192,7 @@ def _configure_spawn_flow(
     Queues responses on per-model keys so the parent and child never
     race for the same queue slot:
 
-    Parent key (``_PARENT_MODEL``):
+    Parent key (``parent_model``):
       1. Dispatch: ``sys_session_send`` tool call.
       2. After tool result: text acknowledging dispatch.
       3. Auto-wake continuation: text quoting the marker.
@@ -215,7 +217,7 @@ def _configure_spawn_flow(
             {"text": f"Dispatched {agent}, waiting for result."},
             {"text": parent_reply},
         ],
-        key=_PARENT_MODEL,
+        key=parent_model,
     )
     configure_mock_llm(
         mock_url,
@@ -224,11 +226,19 @@ def _configure_spawn_flow(
     )
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
+def parent_model(mock_llm_server_url: str | None) -> str:
+    """Late auto-wakes must never consume another test's parent responses."""
+    return f"{_PARENT_MODEL}-{uuid.uuid4().hex[:12]}" if mock_llm_server_url else _PARENT_MODEL
+
+
+@pytest.fixture
 def named_sub_agent_test_agent(
     http_client: httpx.Client,
     databricks_workspace_host: str | None,
     databricks_profile_or_none: str | None,
+    parent_model: str,
+    tmp_path: Path,
 ) -> str:
     """
     Upload the named-sub-agent-test fixture (parent + 2 sub-agents).
@@ -243,11 +253,17 @@ def named_sub_agent_test_agent(
         ``--profile`` is set, else ``None``.
     :param databricks_profile_or_none: Active ``--profile`` value,
         stamped onto the native executors so they authenticate.
-    :returns: Agent name ``"named-sub-agent-test"``.
+    :returns: The registered fixture's unique agent name.
     """
+    config = yaml.safe_load((_NAMED_FIXTURE / "named-sub-agent-test.yaml").read_text())
+    config["executor"]["model"] = parent_model
+    config["name"] = f"named-sub-agent-{uuid.uuid4().hex[:12]}"
+    agent_dir = tmp_path / config["name"]
+    agent_dir.mkdir()
+    (agent_dir / "omnigent.yaml").write_text(yaml.safe_dump(config))
     return upload_agent(
         http_client,
-        _NAMED_FIXTURE,
+        agent_dir,
         rewrite_model_for_databricks=databricks_workspace_host is not None,
         databricks_profile=databricks_profile_or_none,
     )
@@ -360,6 +376,7 @@ def _function_call_names(items: list[dict]) -> list[str]:
 def test_spawn_named_sub_agent_e2e(
     http_client: httpx.Client,
     named_sub_agent_test_agent: str,
+    parent_model: str,
     live_runner_id: str,
     mock_llm_server_url: str,
 ) -> None:
@@ -373,6 +390,7 @@ def test_spawn_named_sub_agent_e2e(
     reset_mock_llm(mock_llm_server_url)
     _configure_spawn_flow(
         mock_llm_server_url,
+        parent_model=parent_model,
         agent="researcher",
         title="auth",
         child_args="What are common auth patterns?",
@@ -417,6 +435,7 @@ def test_spawn_named_sub_agent_e2e(
 def test_ambient_hint_steers_followup_to_send_e2e(
     http_client: httpx.Client,
     named_sub_agent_test_agent: str,
+    parent_model: str,
     live_runner_id: str,
     mock_llm_server_url: str,
 ) -> None:
@@ -470,7 +489,7 @@ def test_ambient_hint_steers_followup_to_send_e2e(
             # Turn 2: parent auto-wake
             {"text": "Continuation result: RESEARCHER_PHASE4_OK"},
         ],
-        key=_PARENT_MODEL,
+        key=parent_model,
     )
     # Researcher child LLM calls on the researcher model key (2 total across 2 turns).
     configure_mock_llm(
@@ -535,6 +554,7 @@ def test_ambient_hint_steers_followup_to_send_e2e(
 def test_parallel_named_sub_agents_e2e(
     http_client: httpx.Client,
     named_sub_agent_test_agent: str,
+    parent_model: str,
     live_runner_id: str,
     mock_llm_server_url: str,
 ) -> None:
@@ -571,7 +591,7 @@ def test_parallel_named_sub_agents_e2e(
                 ),
             },
         ],
-        key=_PARENT_MODEL,
+        key=parent_model,
     )
     configure_mock_llm(
         mock_llm_server_url,
@@ -605,6 +625,7 @@ def test_parallel_named_sub_agents_e2e(
 def test_cross_parent_named_isolation_e2e(
     http_client: httpx.Client,
     named_sub_agent_test_agent: str,
+    parent_model: str,
     live_runner_id: str,
     mock_llm_server_url: str,
 ) -> None:
@@ -648,7 +669,7 @@ def test_cross_parent_named_isolation_e2e(
             # Conv B: parent auto-wake
             {"text": "Researcher returned: RESEARCHER_PHASE4_OK"},
         ],
-        key=_PARENT_MODEL,
+        key=parent_model,
     )
     configure_mock_llm(
         mock_llm_server_url,

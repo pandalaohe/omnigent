@@ -672,7 +672,7 @@ async def apply_session_archive_transition(
         if body.keep_worktree or body.worktree_archive_mode == "never"
         else {}
     )
-    update_result = await _retry_host_admission_lease(
+    update_result = await asyncio.to_thread(
         conversation_store.update_conversation_with_changes,
         session_id,
         **update_fields,
