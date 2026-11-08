@@ -7,7 +7,7 @@ const {pathToFileURL} = require("node:url");
 const support = require("./native_support.cjs");
 const {createChildNativeGate} = require("./omnigent_pi_child_extension.js");
 
-async function fixture(t, {origin = "parent", tier = "auto", duplicate = false, definition = {name:"reader"}, noEvaluator = false, refuseNativeAdmission = false, settings, projectSettings, projectTrusted=false, definitionSource="user", missingRequired=false, scopedClient, asyncDescriptor=false, missingExport} = {}) {
+async function fixture(t, {origin = "parent", tier = "auto", duplicate = false, definition = {name:"reader"}, noEvaluator = false, refuseNativeAdmission = false, settings, projectSettings, projectTrusted=false, definitionSource="user", missingRequired=false, scopedClient, asyncDescriptor=false, missingExport, startupRegistration=false, packageVersion="0.80.0"} = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "native-support-"));
   t.after(() => fs.rmSync(root, {recursive:true, force:true}));
   const workspace = path.join(root, "workspace");
@@ -25,7 +25,7 @@ async function fixture(t, {origin = "parent", tier = "auto", duplicate = false, 
     fs.mkdirSync(path.join(workspace,".pi"));
     fs.writeFileSync(path.join(workspace,".pi/settings.json"),JSON.stringify(projectSettings));
   }
-  fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({name:"pi-subagents",version:"0.80.0",type:"module",exports:{
+  fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({name:"pi-subagents",version:packageVersion,type:"module",exports:{
     "./preflight":"./preflight.js", "./native-child-lifecycle":"./lifecycle.js", "./required-child-extensions":"./required.js"}}));
   fs.writeFileSync(path.join(packageRoot, "preflight.js"), `export const SUBAGENT_LAUNCH_CONTRACT_VERSION=3;
 export async function resolveSubagentLaunchContract(input) {
@@ -53,7 +53,7 @@ export async function resolveSubagentLaunchContract(input) {
   const facts = [], notices = [];
   const scope = {scope_id:"scope",installation_id:"installation",registry_generation:"generation",origin,canonical_cwd:fs.realpathSync(workspace)};
   const toolRows = [
-    {name:"subagent",sourceInfo:{path:entry,scope:"user",source:"npm:pi-subagents@0.80.0",origin:"package",baseDir:root}},
+    {name:"subagent",sourceInfo:{path:entry,scope:"user",source:`npm:pi-subagents@${packageVersion}`,origin:"package",baseDir:root}},
     {name:"read",sourceInfo:{source:"builtin",path:"builtin:read"}},
     {name:"sys_os_read",sourceInfo:{path:guard}},
     {name:"sys_read_inbox",sourceInfo:{path:guard}},
@@ -61,7 +61,16 @@ export async function resolveSubagentLaunchContract(input) {
   const definitions = new Map(toolRows.map(tool => [tool.name, {execute:async () => {backendStarts++; return "fixture result";}}]));
   const sourceExtension = {path:entry,resolvedPath:entry,handlers:new Map()};
   const guardExtension = {path:guard,resolvedPath:guard,handlers:new Map()};
-  const initial = duplicate ? [sourceExtension, sourceExtension, guardExtension] : [sourceExtension, guardExtension];
+  if (startupRegistration) {
+    guardExtension.handlers.set("session_start", [(_event, ctx)=>support.requireNativeSession(ctx)]);
+    sourceExtension.handlers.set("session_start", [()=>{
+      for (const name of ["bash", "manage_todo_list", "bg_wait"]) {
+        toolRows.push({name,sourceInfo:name==="bg_wait"?toolRows[0].sourceInfo:{path:guard}});
+        definitions.set(name,{execute:async()=>{backendStarts++;return "startup tool result";}});
+      }
+    }]);
+  }
+  const initial = startupRegistration ? [guardExtension, sourceExtension] : duplicate ? [sourceExtension, sourceExtension, guardExtension] : [sourceExtension, guardExtension];
   class Loader {
     constructor() { this.cwd=workspace; this.eventBus={}; this.result={extensions:[],errors:[],runtime:{}}; this.resolveCalls=[]; }
     resolveExtensionLoadPath(value) { this.resolveCalls.push(value); return value; }
@@ -83,7 +92,11 @@ export async function resolveSubagentLaunchContract(input) {
     constructor(loader) {this.resourceLoader=loader; this.sessionManager={getSessionId:()=>"session",getSessionDir:()=>root,getSessionFile:()=>null,getLeafId:()=>null};}
     getAllTools() {return toolRows;}
     getToolDefinition(name) {return definitions.get(name);}
-    async bindExtensions() {}
+    async bindExtensions() {
+      if (startupRegistration) for (const extension of this.resourceLoader.getExtensions().extensions)
+        for (const handler of extension.handlers.get("session_start") || [])
+          await handler({reason:"startup"},{cwd:workspace,sessionManager:this.sessionManager});
+    }
   }
   const controller = new AbortController();
   let participant;
@@ -117,6 +130,21 @@ export async function resolveSubagentLaunchContract(input) {
   return {root,workspace,agentPath,guard,entry,packageRoot,scope,api,state,loader,actual,ctx,final,run,dispose,lifecycle,
     backendStarts:()=>backendStarts,policyCalls:()=>policyCalls,facts,notices};
 }
+
+test("startup registrations with stock pi-subagents preserve base tools and deny helpers",async t=>{
+  for (const packageVersion of ["0.80.0","0.87.0"]) await t.test(packageVersion,async t=>{
+    const f=await fixture(t,{missingExport:"./native-child-lifecycle",startupRegistration:true,packageVersion});
+    assert.equal(f.notices.length,1);
+    for (const name of ["read","bash","sys_os_read","sys_read_inbox","manage_todo_list"])
+      assert.equal(await f.run(name,{}),undefined,name);
+    assert.equal(f.backendStarts(),5);
+    for (const name of ["subagent","bg_wait"])
+      assert.equal((await f.run(name,{}))?.block,true,name);
+    assert.equal(f.backendStarts(),5);
+    f.actual.getAllTools().push({name:"late",sourceInfo:{path:f.guard}});
+    assert.equal((await f.run("read",{}))?.block,true,"registrations after startup remain fenced");
+  });
+});
 
 test("missing package APIs leave ordinary tools gated and helper tools denied",async t=>{
   for(const missingExport of ["./native-child-lifecycle","./preflight","./required-child-extensions",

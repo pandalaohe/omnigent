@@ -545,20 +545,19 @@ function requireNativeSession(ctx) {
   const loader = session && store.loaders.get(session.resourceLoader);
   if (loader?.profile.getState().tier === "full") return;
   if (!loader || typeof loader.bind !== "function") throw new Error("Independent native bootstrap is missing");
-  const ready = loader.bind(session);
-  const check = () => {if (!store.bindings.has(ctx.sessionManager)) throw new Error("Native bootstrap did not bind this SDK session");};
-  if (ready && typeof ready.then === "function") return ready.then(check);
-  check();
+  // The final session_start handler binds after the other extensions register their tools.
+  // This earlier guard only verifies that the independent bootstrap owns the loader.
 }
 async function loadPackageApi(directory, sdk) {
   const manifest = snapshot(path.join(directory, "package.json"));
   const pkg = JSON.parse(manifest.bytes.toString("utf8"));
-  if (pkg.name !== "pi-subagents" || !/^0\.80\.\d+$/.test(pkg.version || "") || typeof sdk?.parseFrontmatter !== "function" || typeof sdk.getAgentDir !== "function" || sdk.CONFIG_DIR_NAME!==".pi")
+  if (pkg.name !== "pi-subagents" || typeof sdk?.parseFrontmatter !== "function" || typeof sdk.getAgentDir !== "function" || sdk.CONFIG_DIR_NAME!==".pi")
     throw new Error("Unreviewed native package or SDK");
   const inputs = [manifest];
   const modules = [];
   const unavailable = detail => Object.freeze({inputs:Object.freeze(inputs),
     unavailable:`pi-subagents is missing ${detail}. Subagent tools are off until a pi-subagents with that API is installed.`});
+  if (!/^0\.80\.\d+$/.test(pkg.version || "")) return unavailable("a reviewed package version");
   const exports = ["./preflight", "./native-child-lifecycle", "./required-child-extensions"];
   for (const subpath of exports) {
     const target = pkg.exports?.[subpath];
