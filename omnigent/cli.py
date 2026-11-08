@@ -5954,7 +5954,7 @@ def _upgrade_host_service(*, force: bool) -> Iterator[None]:
                 "are required before upgrading."
             )
         try:
-            processes = capture_host_tree()
+            processes = capture_host_tree(include_install_users=force)
         except (psutil.Error, OSError, ValueError, RuntimeError) as exc:
             raise click.ClickException(str(exc)) from exc
         _drain_and_stop_local_server(force=force)
@@ -5965,7 +5965,7 @@ def _upgrade_host_service(*, force: bool) -> Iterator[None]:
                         _run_windows_host_service(wrapper, "stop")
                 finally:
                     # The loop may have replaced a daemon while it was draining.
-                    processes.extend(capture_host_tree())
+                    processes.extend(capture_host_tree(include_install_users=force))
                     stop_host_tree(processes)
             except (psutil.Error, RuntimeError) as exc:
                 raise click.ClickException(str(exc)) from exc
@@ -6041,6 +6041,72 @@ def _echo_upgrade_plan(
     )
 
 
+def _legacy_custom_channel(info: _InstalledWheelInfo) -> tuple[str, str] | None:
+    """Recover branch tracking for installs pinned by the retired custom updater."""
+    from urllib.parse import urlsplit
+
+    from omnigent.update_check import _remote_git_head, _split_vcs_url
+
+    if not info.vcs_url:
+        return None
+    installed_repo, revision = _split_vcs_url(info.vcs_url)
+    if not revision or not re.fullmatch(r"[0-9a-fA-F]{40}", revision):
+        return None
+    receipt = data_dir() / "updates" / "custom-host-rollback.json"
+    try:
+        rollback = json.loads(receipt.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if (
+        not isinstance(rollback, dict)
+        or rollback.get("schema_version") not in (1, 2)
+        or rollback.get("channel_tracking_migrated")
+        or not isinstance(rollback.get("commit_sha"), str)
+        or not re.fullmatch(r"[0-9a-fA-F]{40}", rollback["commit_sha"])
+    ):
+        return None
+
+    def identity(source: str) -> tuple[str, str | None, int | None, str]:
+        repo, _ = _split_vcs_url(source)
+        parsed = urlsplit(repo)
+        return (
+            parsed.scheme,
+            parsed.hostname,
+            parsed.port,
+            parsed.path.rstrip("/").removesuffix(".git"),
+        )
+
+    sources = _load_global_config().get("custom_host_sources")
+    if (
+        not isinstance(sources, list)
+        or not sources
+        or not all(
+            isinstance(source, str) and source.startswith(("git+https://", "git+ssh://"))
+            for source in sources
+        )
+    ):
+        return None
+    installed = identity(installed_repo)
+    saved_source = rollback.get("source_url")
+    if isinstance(saved_source, str) and identity(saved_source) != installed:
+        return None
+    if not any(identity(source) == installed for source in sources):
+        return None
+    moving_sources = []
+    for source in sources:
+        repo, branch = _split_vcs_url(source)
+        branch = branch or "local/host-custom"
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", branch):
+            moving_sources.append(f"git+{repo}@{branch}")
+    if not moving_sources:
+        return None
+    for target in moving_sources:
+        head = _remote_git_head(target)
+        if head:
+            return target, head
+    raise click.ClickException("Cannot reach a configured custom Host channel; install unchanged.")
+
+
 def _upgrade_vcs_install(
     info: _InstalledWheelInfo,
     *,
@@ -6076,13 +6142,23 @@ def _upgrade_vcs_install(
         _upgrade_failure_message,
     )
 
+    legacy_channel = _legacy_custom_channel(info)
+    if legacy_channel:
+        info = replace(info, vcs_url=legacy_channel[0])
+        click.echo(f"Restoring branch tracking for the legacy custom Host install: {info.vcs_url}")
     current_sha = info.commit_sha or ""
     cur_short = current_sha[:9] if current_sha else "unknown"
-    remote_sha = _remote_git_head(info.vcs_url) if info.vcs_url else None
+    remote_sha = (
+        legacy_channel[1]
+        if legacy_channel
+        else _remote_git_head(info.vcs_url)
+        if info.vcs_url
+        else None
+    )
     remote_short = remote_sha[:9] if remote_sha else ""
     known_behind = bool(remote_sha and current_sha and remote_sha != current_sha)
 
-    if remote_sha and current_sha and remote_sha == current_sha:
+    if remote_sha and current_sha and remote_sha == current_sha and not legacy_channel:
         click.echo(f"omnigent is up to date (git {cur_short}, tracking {info.vcs_url}).")
         return
     if known_behind:
@@ -6116,6 +6192,7 @@ def _upgrade_vcs_install(
         info,
         allow_prerelease=pre,
         extra_overrides=extra_overrides,
+        target_vcs_url=legacy_channel[0] if legacy_channel else None,
     )
     if not suggestion.runnable:
         raise click.ClickException(
@@ -6141,6 +6218,20 @@ def _upgrade_vcs_install(
         # Verify by commit, not exit code: a re-pull of a ref that hasn't moved (or
         # a pinned ref, or a cached reinstall) exits 0 without changing anything.
         _, new_sha = _probe_installed_distribution()
+        if legacy_channel:
+            if not new_sha or new_sha != remote_sha:
+                raise click.ClickException(
+                    f"Custom Host channel verification failed: expected {remote_short}, "
+                    f"installed {(new_sha or 'unknown')[:9]}."
+                )
+            from omnigent.util.atomic_json import atomic_write_json
+
+            receipt = data_dir() / "updates" / "custom-host-rollback.json"
+            rollback = json.loads(receipt.read_text(encoding="utf-8"))
+            rollback["channel_tracking_migrated"] = True
+            atomic_write_json(receipt, rollback)
+            click.echo(f"✓ Updated to git {new_sha[:9]}; custom Host branch tracking restored.")
+            return
         if new_sha and current_sha and new_sha != current_sha:
             click.echo(
                 f"✓ Updated to git {new_sha[:9]}. Re-run your command — the local "

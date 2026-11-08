@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -180,7 +181,7 @@ def test_windows_upgrade_uses_wrapper_and_external_recovery(
     import subprocess
     from dataclasses import replace
 
-    monkeypatch.setattr("omnigent.host.windows_upgrade.capture_host_tree", list)
+    monkeypatch.setattr("omnigent.host.windows_upgrade.capture_host_tree", lambda **_: [])
 
     wrapper = tmp_path / "omni-host-service.cmd"
     wrapper.write_text("@echo off\n")
@@ -656,6 +657,66 @@ def test_upgrade_git_install_repulls_and_verifies_commit(
         f"uv tool install --reinstall{_UV_PY} git+https://github.com/omnigent-ai/omnigent.git"
     ]
     assert "Updated to git bbbbbbbbb" in result.output
+
+
+@pytest.mark.parametrize(
+    "mode", ["legacy", "explicit", "migrated", "other-repo", "failed", "same-head", "dry-run"]
+)
+def test_legacy_custom_pin_moves_once_to_configured_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _wheel_install: None, mode: str
+) -> None:
+    from dataclasses import replace
+
+    source = "git+https://example.test/omnigent.git"
+    info = replace(_git_install_info(), vcs_url=source + "@" + "a" * 40, extras=("all",))
+    monkeypatch.setattr("omnigent.cli.data_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        "omnigent.cli._load_global_config",
+        lambda: {"custom_host_sources": [source + "@channel/custom"]},
+    )
+    monkeypatch.setattr("omnigent.update_check._read_installed_wheel_info", lambda: info)
+    monkeypatch.setattr(
+        "omnigent.update_check._remote_git_head",
+        lambda url: "a" * 40 if url == info.vcs_url or mode == "same-head" else "b" * 40,
+    )
+    monkeypatch.setattr(
+        "omnigent.update_check._probe_installed_distribution",
+        lambda: ("0.1.0", ("a" if mode == "same-head" else "b") * 40),
+    )
+    receipt = tmp_path / "updates/custom-host-rollback.json"
+    receipt.parent.mkdir()
+    original = {
+        "schema_version": 2,
+        "commit_sha": "c" * 40,
+        "source_url": source if mode != "other-repo" else "git+https://other.test/repo.git",
+    }
+    if mode == "migrated":
+        original["channel_tracking_migrated"] = True
+    if mode != "explicit":
+        receipt.write_text(json.dumps(original))
+    ran: list[str] = []
+    monkeypatch.setattr(
+        "omnigent.update_check._run_upgrade_command",
+        lambda cmd, _: ran.append(cmd) or (2 if mode == "failed" else 0),
+    )
+    result = CliRunner().invoke(cli, ["up", *(["--dry-run"] if mode == "dry-run" else [])])
+    assert result.exit_code == (1 if mode == "failed" else 0), result.output
+    if mode in ("explicit", "migrated", "other-repo"):
+        assert not ran
+        assert "up to date" in result.output
+    elif mode == "dry-run":
+        assert not ran
+        assert source + "@channel/custom#egg=omnigent[all]" in result.output
+    else:
+        assert len(ran) == 1
+        assert source + "@channel/custom#egg=omnigent[all]" in ran[0]
+    if mode != "explicit":
+        actual = json.loads(receipt.read_text())
+        assert actual == (
+            {**original, "channel_tracking_migrated": True}
+            if mode in ("legacy", "same-head")
+            else original
+        )
 
 
 def test_upgrade_git_install_noop_does_not_claim_update(

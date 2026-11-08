@@ -30,6 +30,9 @@ class Process:
     def exe(self) -> str:
         return self.args[0]
 
+    def memory_maps(self) -> list[object]:
+        return []
+
     def is_running(self) -> bool:
         return self.alive
 
@@ -121,6 +124,48 @@ def test_upgrade_inside_host_is_refused(
     assert loop.alive
 
 
+def test_forced_upgrade_stops_detached_install_users_and_preserves_updater(
+    monkeypatch: pytest.MonkeyPatch, process_table: list[Process]
+) -> None:
+    from types import SimpleNamespace
+
+    prefix = "/opt/tools/omnigent"
+    launcher = Process(10, ["/opt/bin/omni.exe", "up", "--force"])
+    updater = Process(
+        windows.os.getpid(), [prefix + "/Scripts/python.exe", "/opt/bin/omni.exe", "up"]
+    )
+    daemon = Process(
+        20, [prefix + "/Scripts/python.exe", "-P", "-m", "omnigent.host._daemon_entry"]
+    )
+    runner = Process(30, [prefix + "/Scripts/python.exe", "-P", "-m", "omnigent.runner._entry"])
+    orphan = Process(40, ["/opt/python/python.exe", "-P", "-m", "omnigent.runner._entry"])
+    other = Process(50, ["/opt/other/Scripts/python.exe", "-m", "omnigent.runner._entry"])
+    monkeypatch.setattr(
+        orphan, "memory_maps", lambda: [SimpleNamespace(path=prefix + "/Lib/psutil.pyd")]
+    )
+    monkeypatch.setattr(windows.sys, "prefix", prefix)
+    monkeypatch.setattr(windows.psutil.Process, "parents", lambda _: [launcher])
+    monkeypatch.setattr(windows, "installed_launchers", lambda: [Path("/opt/bin/omni.exe")])
+    process_table.extend([launcher, updater, daemon, runner, orphan, other])
+    captured = windows.capture_host_tree(include_install_users=True)
+    windows.stop_host_tree(captured)
+    assert not any(proc.alive for proc in (daemon, runner, orphan))
+    assert launcher.alive and updater.alive and other.alive
+
+
+def test_upgrade_inside_detached_runner_is_refused(
+    monkeypatch: pytest.MonkeyPatch, process_table: list[Process]
+) -> None:
+    runner = Process(
+        20, ["/opt/tools/omnigent/Scripts/python.exe", "-P", "-m", "omnigent.runner._entry"]
+    )
+    monkeypatch.setattr(windows.psutil.Process, "parents", lambda _: [runner])
+    process_table.append(runner)
+    with pytest.raises(RuntimeError, match="outside the Host"):
+        windows.capture_host_tree(include_install_users=True)
+    assert runner.alive
+
+
 def test_tree_that_will_not_exit_blocks_install(
     monkeypatch: pytest.MonkeyPatch, process_table: list[Process]
 ) -> None:
@@ -145,7 +190,7 @@ def test_daemon_replaced_during_drain_is_also_stopped(
     )
     monkeypatch.setattr("omnigent.cli._drain_and_stop_local_server", lambda **_: None)
     monkeypatch.setattr("omnigent.cli._run_windows_host_service", lambda *_: None)
-    monkeypatch.setattr(windows, "capture_host_tree", lambda: next(snapshots))
+    monkeypatch.setattr(windows, "capture_host_tree", lambda **_: next(snapshots))
     monkeypatch.setattr(
         windows.psutil,
         "wait_procs",
@@ -185,7 +230,7 @@ def test_windows_reinstall_restores_before_retry(
         "omnigent.cli._windows_host_service_wrapper", lambda: tmp_path / "wrapper.cmd"
     )
     monkeypatch.setattr("omnigent.cli._drain_and_stop_local_server", lambda **_: None)
-    monkeypatch.setattr(windows, "capture_host_tree", list)
+    monkeypatch.setattr(windows, "capture_host_tree", lambda **_: [])
     events: list[str] = []
 
     def service(_wrapper: Path, action: str) -> None:
@@ -500,6 +545,41 @@ def test_launcher_paths_belong_to_current_receipt_and_environment(
     assert other.read_bytes() == b"other environment"
 
 
+@pytest.mark.parametrize("transient", [True, False])
+def test_launcher_share_lock_retries_then_restores_and_names_users(
+    monkeypatch: pytest.MonkeyPatch, uv_layout: tuple[Path, Path], transient: bool
+) -> None:
+    _, bindir = uv_layout
+    launcher = bindir / "omnigent.exe"
+    original_rename = Path.rename
+    attempts = 0
+    monkeypatch.setattr(windows, "sleep", lambda _: None)
+    monkeypatch.setattr(windows, "file_users", lambda _: "PID 987 (scanner)")
+
+    def rename(path: Path, target: Path) -> Path:
+        nonlocal attempts
+        if path == launcher:
+            attempts += 1
+            if not transient or attempts < 3:
+                error = PermissionError("sharing violation")
+                error.winerror = 32
+                raise error
+        return original_rename(path, target)
+
+    monkeypatch.setattr(Path, "rename", rename)
+    if transient:
+        with windows.retained_install(["uv", "tool", "install", "omnigent"]):
+            pass
+        assert attempts == 3
+    else:
+        with pytest.raises(OSError, match=r"PID 987 \(scanner\)"):
+            with windows.retained_install(["uv", "tool", "install", "omnigent"]):
+                pytest.fail("installer must not start while the launcher is locked")
+        assert attempts == 6
+    for name in ("omni", "omnigent"):
+        assert (bindir / f"{name}.exe").read_bytes() == b"current environment"
+
+
 def test_orphan_venv_holder_aborts_install_and_restores(
     monkeypatch: pytest.MonkeyPatch,
     process_table: list[Process],
@@ -539,7 +619,7 @@ def test_orphan_venv_holder_aborts_install_and_restores(
     )
     monkeypatch.setattr("omnigent.cli._drain_and_stop_local_server", lambda **_: None)
     monkeypatch.setattr("omnigent.cli._run_windows_host_service", service)
-    monkeypatch.setattr(windows, "capture_host_tree", lambda: [host])
+    monkeypatch.setattr(windows, "capture_host_tree", lambda **_: [host])
     monkeypatch.setattr("omnigent.update_check.subprocess.run", unexpected_install)
     with _upgrade_host_service(force=True):
         code = _run_upgrade_command("uv tool install --reinstall omnigent", Console())
