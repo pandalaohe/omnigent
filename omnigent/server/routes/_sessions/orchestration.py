@@ -14388,7 +14388,7 @@ async def _retry_host_admission_lease(
     interval_s: float = 0.05,
     **kwargs: Any,
 ) -> Any:
-    """Retry a store operation when ``reset_host`` briefly holds the host admission lease."""
+    """Retry a store operation while another writer holds its host admission lease."""
     deadline = time.monotonic() + timeout_s
     while True:
         try:
