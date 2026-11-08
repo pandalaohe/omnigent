@@ -11,7 +11,7 @@ import tomllib
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
-from time import time
+from time import sleep, time
 
 import psutil
 
@@ -50,12 +50,21 @@ def _fresh_processes() -> Iterator[psutil.Process]:
             continue
 
 
-def capture_host_tree() -> list[psutil.Process]:
-    """Capture the installed Host and its autostart loop before disabling it."""
+def _inside_install(path: str) -> bool:
+    prefix = str(Path(sys.prefix)).casefold().rstrip("\\/")
+    return path.casefold().startswith(prefix + os.sep)
+
+
+def capture_host_tree(*, include_install_users: bool = False) -> list[psutil.Process]:
+    """Capture Host trees and, for a forced upgrade, detached install users."""
     autostart = Path.home() / ".omnigent" / "autostart"
     script = str(autostart / "Start-OmnigentHostDefault.ps1").casefold()
     pwsh = shutil.which("pwsh")
     executables = {str(path).casefold() for path in installed_launchers()}
+    interpreters = {
+        os.path.realpath(sys.executable).casefold(),
+        os.path.realpath(getattr(sys, "_base_executable", sys.executable)).casefold(),
+    }
     protected = {os.getpid(), *(proc.pid for proc in psutil.Process().parents())}
     captured: dict[int, psutil.Process] = {}
     for proc in _fresh_processes():
@@ -88,7 +97,45 @@ def capture_host_tree() -> list[psutil.Process]:
                 and args[1:3] == ["host", "--server"]
                 and bool(args[3])
             )
-            if not (loop or host):
+            if proc.pid in protected:
+                runtime = any(
+                    lowered[index : index + 2]
+                    in (
+                        ["-m", "omnigent.host._daemon_entry"],
+                        ["-m", "omnigent.host.service_entry"],
+                        ["-m", "omnigent.runner._entry"],
+                    )
+                    for index in range(1, len(lowered) - 1)
+                )
+                if loop or host or runtime:
+                    raise RuntimeError(
+                        "Run the upgrade from a terminal outside the Host process tree."
+                    )
+                continue
+            install_user = False
+            if include_install_users:
+                install_user = (
+                    exe in executables
+                    or _inside_install(exe)
+                    or (
+                        exe in interpreters
+                        and (
+                            bool(args and _inside_install(args[0]))
+                            or bool(len(args) > 1 and lowered[1] in executables)
+                        )
+                    )
+                )
+                # uv's Python trampoline can run the base interpreter outside
+                # the venv. Loaded extension paths identify orphaned workers.
+                if not install_user:
+                    with contextlib.suppress(psutil.AccessDenied):
+                        memory_maps = getattr(proc, "memory_maps", None)
+                        install_user = (
+                            any(_inside_install(mapping.path) for mapping in memory_maps())
+                            if memory_maps is not None
+                            else False
+                        )
+            if not (loop or host or install_user):
                 continue
             tree = [proc, *proc.children(recursive=True)]
             if not proc.is_running() or proc.cmdline() != args:
@@ -160,6 +207,133 @@ def stop_host_tree(processes: list[psutil.Process]) -> None:
             return
 
 
+def file_users(path: Path) -> str:
+    """Describe registered file users without shutting down unrelated applications."""
+    import ctypes
+    from ctypes import wintypes
+
+    class UniqueProcess(ctypes.Structure):
+        _fields_ = [("pid", wintypes.DWORD), ("started", wintypes.FILETIME)]
+
+    class ProcessInfo(ctypes.Structure):
+        _fields_ = [
+            ("process", UniqueProcess),
+            ("name", wintypes.WCHAR * 256),
+            ("service", wintypes.WCHAR * 64),
+            ("kind", wintypes.UINT),
+            ("status", wintypes.ULONG),
+            ("session", wintypes.DWORD),
+            ("restartable", wintypes.BOOL),
+        ]
+
+    rm = ctypes.WinDLL("Rstrtmgr")  # type: ignore[attr-defined]
+    rm.RmStartSession.argtypes = [ctypes.POINTER(wintypes.DWORD), wintypes.DWORD, wintypes.LPWSTR]
+    rm.RmRegisterResources.argtypes = [
+        wintypes.DWORD,
+        wintypes.UINT,
+        ctypes.POINTER(wintypes.LPCWSTR),
+        wintypes.UINT,
+        ctypes.POINTER(UniqueProcess),
+        wintypes.UINT,
+        ctypes.POINTER(wintypes.LPCWSTR),
+    ]
+    rm.RmGetList.argtypes = [
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.UINT),
+        ctypes.POINTER(wintypes.UINT),
+        ctypes.POINTER(ProcessInfo),
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    rm.RmEndSession.argtypes = [wintypes.DWORD]
+    for function in (rm.RmStartSession, rm.RmRegisterResources, rm.RmGetList, rm.RmEndSession):
+        function.restype = wintypes.DWORD
+    session = wintypes.DWORD()
+    key = ctypes.create_unicode_buffer(32 + 1)  # CCH_RM_SESSION_KEY plus terminator.
+    code = rm.RmStartSession(ctypes.byref(session), 0, key)
+    if code:
+        raise OSError(code, "Restart Manager could not start")
+    try:
+        paths = (
+            [str(file) for file in path.rglob("*") if file.is_file()]
+            if path.is_dir()
+            else [str(path)]
+        )
+        names = (wintypes.LPCWSTR * len(paths))(*paths)
+        code = rm.RmRegisterResources(session, len(paths), names, 0, None, 0, None)
+        if code:
+            raise OSError(code, "Restart Manager could not register the files")
+        needed, count, reasons = wintypes.UINT(), wintypes.UINT(), wintypes.DWORD()
+        entries = None
+        for _ in range(3):
+            code = rm.RmGetList(
+                session, ctypes.byref(needed), ctypes.byref(count), entries, ctypes.byref(reasons)
+            )
+            if code == 0:
+                return (
+                    ", ".join(
+                        f"PID {entry.process.pid} ({entry.name})"
+                        for entry in (entries or [])[: count.value]
+                    )
+                    or "no file users reported (the holder may already have exited)"
+                )
+            if code != 234:  # ERROR_MORE_DATA
+                raise OSError(code, "Restart Manager could not list file users")
+            count.value = needed.value
+            entries = (ProcessInfo * count.value)()
+        raise OSError("Restart Manager file users changed during enumeration")
+    finally:
+        rm.RmEndSession(session)
+
+
+def _visible_file_users(path: Path) -> str:
+    """Offer process-table evidence when Restart Manager cannot query file users."""
+    launchers: set[str] = set()
+    with contextlib.suppress(OSError, ValueError):
+        launchers.update(str(launcher).casefold() for launcher in installed_launchers())
+    target = str(path).casefold()
+    directory = path.is_dir()
+    users: list[str] = []
+    for proc in _fresh_processes():
+        try:
+            image = proc.exe()
+            related = image.casefold() in launchers or _inside_install(image)
+            with contextlib.suppress(psutil.Error):
+                related |= any(
+                    entry.path.casefold() == target or (directory and _inside_install(entry.path))
+                    for entry in proc.open_files()
+                )
+            if related and proc.is_running():
+                users.append(f"PID {proc.pid} ({image})")
+        except psutil.Error:
+            continue
+    return "; ".join(users) or (
+        f"no visible candidates; updater PID {os.getpid()} ({sys.executable}, protected). "
+        "The lock owner could not be identified with the available process permissions"
+    )
+
+
+def _rename_with_retry(path: Path, destination: Path) -> None:
+    for attempt in range(6):
+        try:
+            path.rename(destination)
+            return
+        except OSError as exc:
+            if getattr(exc, "winerror", None) not in (32, 33):
+                raise
+            if attempt < 5:
+                sleep(0.2 * (attempt + 1))
+                continue
+            try:
+                users = file_users(path)
+            except OSError as diagnostic_error:
+                users = (
+                    f"Restart Manager unavailable: {diagnostic_error}; "
+                    "visible process candidates (not confirmed lock holders): "
+                    f"{_visible_file_users(path)}"
+                )
+            raise OSError(f"{exc}; applications using {path}: {users}") from exc
+
+
 @contextlib.contextmanager
 def retained_install(argv: list[str]) -> Iterator[None]:
     """Move locked entrypoints aside; restore the uv environment on install failure."""
@@ -184,7 +358,7 @@ def retained_install(argv: list[str]) -> Iterator[None]:
                 moved.append((prefix, backup))
         for path in dict.fromkeys(paths):
             backup = path.with_name(path.name + suffix)
-            path.rename(backup)
+            _rename_with_retry(path, backup)
             moved.append((path, backup))
         yield
         for path, backup in moved:
