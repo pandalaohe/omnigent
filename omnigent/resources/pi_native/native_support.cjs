@@ -545,8 +545,14 @@ function requireNativeSession(ctx) {
   const loader = session && store.loaders.get(session.resourceLoader);
   if (loader?.profile.getState().tier === "full") return;
   if (!loader || typeof loader.bind !== "function") throw new Error("Independent native bootstrap is missing");
-  // The final session_start handler binds after the other extensions register their tools.
-  // This earlier guard only verifies that the independent bootstrap owns the loader.
+  // The guard can run before user extensions finish registering startup tools.
+  // The bridge prepares input after registrations; the final handler also binds.
+}
+function prepareNativeSession(ctx) {
+  requireNativeSession(ctx);
+  const session = store.sessions.get(ctx.sessionManager);
+  const loader = store.loaders.get(session.resourceLoader);
+  if (loader.profile.getState().tier !== "full") return loader.bind(session);
 }
 async function loadPackageApi(directory, sdk) {
   const manifest = snapshot(path.join(directory, "package.json"));
@@ -616,4 +622,4 @@ function callScopedBridge(event, ctx, port) {
     return Promise.resolve({error:"Scoped Pi bridge unavailable"});
   return record.scopedClient.bridge(event,port);
 }
-module.exports = {bindNativeSession, classifyNativeCall, requireNativeSession, semanticAction, snapshot, loadPackageApi, getNativeState, closeNativeSession, hasScopedEvaluator, hasScopedClient, evaluateNativeCall, policyVerdict, createInputGuard, callScopedBridge};
+module.exports = {bindNativeSession, classifyNativeCall, requireNativeSession, prepareNativeSession, semanticAction, snapshot, loadPackageApi, getNativeState, closeNativeSession, hasScopedEvaluator, hasScopedClient, evaluateNativeCall, policyVerdict, createInputGuard, callScopedBridge};

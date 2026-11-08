@@ -3205,6 +3205,9 @@ module.exports = function (pi) {
     restoreTaskList(ctx);
     if (taskList.length) await publishTaskList();
     setOmnigentStatus(config, ctx, "linked");
+    // This extension runs after user registrations. Acknowledge scoped startup
+    // before input or metadata HTTP can wait on the runner that is launching us.
+    if (nativeSupport.getNativeState(ctx)) await nativeSupport.prepareNativeSession(ctx);
     startInboxPoller(
       pi,
       config,
