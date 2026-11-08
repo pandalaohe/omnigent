@@ -8,6 +8,7 @@ import shutil
 import sys
 from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -329,6 +330,83 @@ async def test_root_launcher_control_rejects_scope_authority_and_stale_generatio
         before = len(decoded)
         assert (await client.post(path, headers=headers, content=b"not JSON")).status_code == 403
         assert len(decoded) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "windows",
+    [
+        pytest.param(
+            False,
+            marks=pytest.mark.skipif(os.name == "nt", reason="POSIX no-follow flags required"),
+        ),
+        True,
+    ],
+)
+@pytest.mark.parametrize(
+    "changed_field", [None, "st_ctime_ns", "st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns"]
+)
+async def test_root_launcher_checks_registration_identity(
+    attestor_relay, monkeypatch, windows, changed_field
+):
+    from omnigent.permission_tiers import pi_tools
+
+    _runtime, broker, relay, _source, _registry = attestor_relay
+    descriptor = broker.launcher_descriptor()
+    monkeypatch.setattr(pi_tools, "IS_WINDOWS", windows)
+
+    def fstat(fd):
+        info = os.fstat(fd)
+        fields = {
+            name: getattr(info, name)
+            for name in ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+        }
+        if changed_field is not None:
+            fields[changed_field] += 1
+        return SimpleNamespace(**fields)
+
+    monkeypatch.setattr(pi_tools, "os", SimpleNamespace(**{**vars(os), "fstat": fstat}))
+    identity = process_identity(os.getpid())
+    assert identity is not None
+    body = {"protocol": 1, "op": "reserve", "launch_id": "a" * 32}
+    headers = {"Authorization": "Bearer " + descriptor["process_capability"]}
+    async with httpx.AsyncClient(base_url=relay._advertised_url, trust_env=False) as client:
+        reserved = await client.post("/pi/bootstrap/launcher", headers=headers, json=body)
+        assert reserved.status_code == 200
+        response = await client.post(
+            "/pi/bootstrap/launcher",
+            headers=headers,
+            json={**body, "op": "publish", "pid": identity[0], "started_at": identity[1]},
+        )
+    accepted = changed_field is None or (windows and changed_field == "st_ctime_ns")
+    assert response.status_code == (200 if accepted else 403)
+    if accepted:
+        assert response.json()["published"] is True
+
+
+@pytest.mark.parametrize("windows", [False, True])
+def test_registration_rejects_ctime_change_during_read(tmp_path, monkeypatch, windows):
+    from omnigent.permission_tiers import pi_tools
+
+    path = tmp_path / "registration.json"
+    path.write_bytes(b"{}")
+    monkeypatch.setattr(pi_tools, "IS_WINDOWS", windows)
+    reads = 0
+
+    def fstat(fd):
+        nonlocal reads
+        info = os.fstat(fd)
+        reads += 1
+        fields = {
+            name: getattr(info, name)
+            for name in ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+        }
+        fields["st_ctime_ns"] = path.stat().st_ctime_ns + (reads if windows else reads - 1)
+        return SimpleNamespace(**fields)
+
+    monkeypatch.setattr(pi_tools, "os", SimpleNamespace(**{**vars(os), "fstat": fstat}))
+    with pytest.raises(ValueError, match="Registration changed during read"):
+        pi_tools._read_file(path)
 
 
 @pytest.mark.asyncio

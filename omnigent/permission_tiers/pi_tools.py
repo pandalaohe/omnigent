@@ -28,8 +28,10 @@ class PiToolRegistry:
     unsupported_tools: frozenset[str] = frozenset()
 
 
-def _file_identity(info: os.stat_result) -> tuple[int, ...]:
-    return info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+def _file_identity(info: os.stat_result, *, path_to_handle: bool = False) -> tuple[int, ...]:
+    identity = (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns)
+    # Windows path and handle stats can report different ctimes for the same file.
+    return identity if IS_WINDOWS and path_to_handle else (*identity, info.st_ctime_ns)
 
 
 def _read_file(
@@ -57,7 +59,9 @@ def _read_file(
     )
     try:
         opened = os.fstat(fd)
-        if _file_identity(opened) != _file_identity(target_before):
+        if _file_identity(opened, path_to_handle=True) != _file_identity(
+            target_before, path_to_handle=True
+        ):
             raise ValueError("Registration changed before open")
         chunks = []
         while chunk := os.read(fd, 1024 * 1024):
@@ -65,7 +69,8 @@ def _read_file(
         if (
             _file_identity(os.fstat(fd)) != _file_identity(opened)
             or _file_identity(path.lstat()) != _file_identity(before)
-            or _file_identity(resolved.lstat()) != _file_identity(opened)
+            or _file_identity(resolved.lstat(), path_to_handle=True)
+            != _file_identity(opened, path_to_handle=True)
             or path.resolve(strict=True) != resolved
         ):
             raise ValueError("Registration changed during read")
