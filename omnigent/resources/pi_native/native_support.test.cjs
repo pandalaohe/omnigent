@@ -51,6 +51,7 @@ export async function resolveSubagentLaunchContract(input) {
   const state = {tier,revision:3,status:"ready",workspace};
   let backendStarts = 0, policyCalls = 0;
   const facts = [], notices = [];
+  let startupProof;
   const scope = {scope_id:"scope",installation_id:"installation",registry_generation:"generation",origin,canonical_cwd:fs.realpathSync(workspace)};
   const toolRows = [
     {name:"subagent",sourceInfo:{path:entry,scope:"user",source:`npm:pi-subagents@${packageVersion}`,origin:"package",baseDir:root}},
@@ -63,11 +64,13 @@ export async function resolveSubagentLaunchContract(input) {
   const guardExtension = {path:guard,resolvedPath:guard,handlers:new Map()};
   if (startupRegistration) {
     guardExtension.handlers.set("session_start", [(_event, ctx)=>support.requireNativeSession(ctx)]);
-    sourceExtension.handlers.set("session_start", [()=>{
+    sourceExtension.handlers.set("session_start", [async (_event, ctx)=>{
       for (const name of ["bash", "manage_todo_list", "bg_wait"]) {
         toolRows.push({name,sourceInfo:name==="bg_wait"?toolRows[0].sourceInfo:{path:guard}});
         definitions.set(name,{execute:async()=>{backendStarts++;return "startup tool result";}});
       }
+      await support.prepareNativeSession(ctx);
+      startupProof = await support.classifyNativeCall({toolCallId:"startup",toolName:"read",input:{}},ctx,state);
     }]);
   }
   const initial = startupRegistration ? [guardExtension, sourceExtension] : duplicate ? [sourceExtension, sourceExtension, guardExtension] : [sourceExtension, guardExtension];
@@ -128,12 +131,13 @@ export async function resolveSubagentLaunchContract(input) {
     return result;
   }
   return {root,workspace,agentPath,guard,entry,packageRoot,scope,api,state,loader,actual,ctx,final,run,dispose,lifecycle,
-    backendStarts:()=>backendStarts,policyCalls:()=>policyCalls,facts,notices};
+    backendStarts:()=>backendStarts,policyCalls:()=>policyCalls,facts,notices,startupProof};
 }
 
 test("startup registrations with stock pi-subagents preserve base tools and deny helpers",async t=>{
   for (const packageVersion of ["0.80.0","0.87.0"]) await t.test(packageVersion,async t=>{
     const f=await fixture(t,{missingExport:"./native-child-lifecycle",startupRegistration:true,packageVersion});
+    assert.equal(f.startupProof.status,"attested_native","tools are bound before startup metadata completes");
     assert.equal(f.notices.length,1);
     for (const name of ["read","bash","sys_os_read","sys_read_inbox","manage_todo_list"])
       assert.equal(await f.run(name,{}),undefined,name);
