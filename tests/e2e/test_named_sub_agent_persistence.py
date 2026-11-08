@@ -108,40 +108,55 @@ def _wait_for_autowake_settled(
     http_client: httpx.Client,
     session_id: str,
     timeout_s: float = 60.0,
+    *,
+    expected_children: int = 1,
 ) -> None:
-    """Wait for the auto-wake continuation to finish.
-
-    After ``_wait_for_markers`` confirms the child's marker appeared,
-    the parent's auto-wake continuation may not have started yet (the
-    session is idle from the dispatch turn). This helper waits for the
-    session to leave idle (auto-wake starts) then return to idle
-    (auto-wake completes), ensuring the auto-wake consumes its queued
-    response before the next user message races for the same queue slot.
-
-    If the session is already running when first polled, just waits for
-    idle — the auto-wake is already in flight.
-    """
+    """Wait for all child sessions and parent auto-wake continuations to settle."""
     deadline = time.monotonic() + timeout_s
-    saw_non_idle = False
+    stable_polls = 0
     while time.monotonic() < deadline:
+        children_resp = http_client.get(f"/v1/sessions/{session_id}/child_sessions")
+        children_resp.raise_for_status()
+        children = children_resp.json().get("data", [])
+        children_settled = len(children) >= expected_children
+        if children_settled:
+            for child in children:
+                if child.get("busy") or child.get("current_task_status") not in (
+                    "completed",
+                    "failed",
+                    "cancelled",
+                    "stopped",
+                    "killed",
+                ):
+                    children_settled = False
+                    break
+                child_resp = http_client.get(f"/v1/sessions/{child['id']}")
+                child_resp.raise_for_status()
+                child_body = child_resp.json()
+                if child_body.get("status") != "idle" or "PHASE4_OK" not in json.dumps(
+                    child_body.get("items", [])
+                ):
+                    children_settled = False
+                    break
         resp = http_client.get(f"/v1/sessions/{session_id}")
         resp.raise_for_status()
-        status = resp.json().get("status")
-        if status != "idle":
-            saw_non_idle = True
-        elif saw_non_idle:
-            # Was running, now idle again — auto-wake finished.
-            return
+        parent_body = resp.json()
+        items = parent_body.get("items", [])
+        unanswered_wake = bool(items) and "[System: sub-agent " in json.dumps(items[-1])
+        if (
+            children_settled
+            and parent_body.get("status") == "idle"
+            and not parent_body.get("busy")
+            and not unanswered_wake
+        ):
+            stable_polls += 1
+            if stable_polls >= 2:
+                return
+        else:
+            stable_polls = 0
         time.sleep(POLL_INTERVAL_S)
-    if not saw_non_idle:
-        # Auto-wake never started within the timeout. This is fine in
-        # some flows — the auto-wake may have completed extremely fast
-        # between polls, or the marker appeared from the child items
-        # before the wake notice was posted. Return rather than fail.
-        return
     raise AssertionError(
-        f"Session {session_id} did not return to idle within {timeout_s:.0f}s "
-        f"after auto-wake started"
+        f"Session {session_id} and its children did not settle within {timeout_s:.0f}s"
     )
 
 
@@ -396,6 +411,7 @@ def test_spawn_named_sub_agent_e2e(
     assert '"title"' in first_spawn_args and "auth" in first_spawn_args, (
         f"Spawn call arguments missing title='auth'; got {first_spawn_args!r}"
     )
+    _wait_for_autowake_settled(http_client, session_id)
 
 
 def test_ambient_hint_steers_followup_to_send_e2e(
@@ -512,6 +528,8 @@ def test_ambient_hint_steers_followup_to_send_e2e(
         f"persistence is useless because the LLM forgets across "
         f"turns."
     )
+    _wait_for_markers(http_client, session_id, "Continuation result: RESEARCHER_PHASE4_OK")
+    _wait_for_autowake_settled(http_client, session_id)
 
 
 def test_parallel_named_sub_agents_e2e(
@@ -546,6 +564,12 @@ def test_parallel_named_sub_agents_e2e(
                     "Both sub-agents finished. RESEARCHER_PHASE4_OK and SUMMARIZER_PHASE4_OK"
                 ),
             },
+            # Second auto-wake fallback when parallel children complete in separate wakes
+            {
+                "text": (
+                    "Both sub-agents finished. RESEARCHER_PHASE4_OK and SUMMARIZER_PHASE4_OK"
+                ),
+            },
         ],
         key=_PARENT_MODEL,
     )
@@ -575,6 +599,7 @@ def test_parallel_named_sub_agents_e2e(
     )
     # Both sub-agent results arrive via auto-wake; poll until both land.
     _wait_for_markers(http_client, session_id, "RESEARCHER_PHASE4_OK", "SUMMARIZER_PHASE4_OK")
+    _wait_for_autowake_settled(http_client, session_id, expected_children=2)
 
 
 def test_cross_parent_named_isolation_e2e(
@@ -648,6 +673,7 @@ def test_cross_parent_named_isolation_e2e(
         ),
     )
     _wait_for_markers(http_client, conv_a, "RESEARCHER_PHASE4_OK")
+    _wait_for_autowake_settled(http_client, conv_a)
 
     # Conversation B (a second fresh session — independent parent).
     # Must succeed even though conversation A already has a
@@ -663,6 +689,7 @@ def test_cross_parent_named_isolation_e2e(
         ),
     )
     _wait_for_markers(http_client, conv_b, "RESEARCHER_PHASE4_OK")
+    _wait_for_autowake_settled(http_client, conv_b)
 
     # The two parent conversations must be distinct.
     assert conv_a != conv_b, "Conversations A and B should be distinct"

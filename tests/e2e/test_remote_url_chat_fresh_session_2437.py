@@ -123,6 +123,7 @@ class _RegisteredAgentServer:
 def registered_agent_server(
     mock_llm_server_url: str | None,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[_RegisteredAgentServer]:
     """
     Boot a local server whose agent is registered but has no client bundle.
@@ -141,8 +142,8 @@ def registered_agent_server(
     model = f"mock-{suffix}"
     marker = f"REMOTE_FRESH_OK_{suffix}"
 
-    os.environ["OPENAI_API_KEY"] = "mock-key"
-    os.environ["OPENAI_BASE_URL"] = f"{mock_llm_server_url}/v1"
+    monkeypatch.setenv("OPENAI_API_KEY", "mock-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", f"{mock_llm_server_url}/v1")
 
     yaml_path = _write_agent_yaml(
         tmp_path,
