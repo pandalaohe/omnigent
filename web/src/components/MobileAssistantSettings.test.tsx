@@ -306,11 +306,22 @@ describe("MobileAssistantSettings", () => {
     expect(move).toHaveFocus();
   });
 
-  it("explains an unsupported terminal chord and prevents saving an inert key", () => {
+  it("saves modified arrows and explains unsupported terminal chords", () => {
     render(<MobileAssistantSettings />);
     fireEvent.click(screen.getByRole("radio", { name: "Terminal" }));
     fireEvent.click(screen.getByRole("button", { name: "Add a key" }));
     fireEvent.change(screen.getByLabelText("Key"), { target: { value: "ArrowUp" } });
+    fireEvent.click(screen.getByRole("button", { name: "Ctrl" }));
+    expect(screen.getByRole("button", { name: "Save key" })).toBeEnabled();
+    expect(screen.queryByRole("status")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Save key" }));
+    expect(readMobileAssistantPreferences().terminalButtons.at(-1)).toMatchObject({
+      kind: "key",
+      chord: { code: "ArrowUp", modifiers: ["control"] },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Add a key" }));
+    fireEvent.change(screen.getByLabelText("Key"), { target: { value: "Digit1" } });
     fireEvent.click(screen.getByRole("button", { name: "Ctrl" }));
     expect(screen.getByRole("button", { name: "Save key" })).toBeDisabled();
     expect(screen.getByRole("status")).toHaveTextContent("not supported in terminals");
