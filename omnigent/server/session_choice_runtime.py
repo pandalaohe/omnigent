@@ -23,6 +23,7 @@ from omnigent.server.session_choice import (
     ChoiceRequest,
     Link,
     SessionChoice,
+    TileLimits,
     active_on,
     holds_slot,
     ordered_links,
@@ -30,6 +31,7 @@ from omnigent.server.session_choice import (
     pool_of_session,
     resolve_work_type,
     state_for,
+    tile_line,
 )
 from omnigent.server.user_preferences_store import read_collab_settings
 
@@ -432,35 +434,30 @@ async def admit_create(
                     ),
                     None,
                 )
-            if not body.user_named:
+            limits = settings.limits.get(pool, TileLimits()) if pool is not None else TileLimits()
+            line = tile_line(limits, reading, floors.get(pool), now)
+            code = "agent_stopped" if line.state == "stop" else None
+            if not body.user_named and code is None:
+                work, _ = resolve_work_type(settings, body.work_type)
                 code = (
                     "agent_exhausted"
-                    if reading
-                    and reading.freshness == "fresh"
-                    and any(w.percent_used == 100 and not w.past_reset for w in reading.windows)
+                    if line.state == "exhausted"
+                    else "agent_reserved"
+                    if line.state == "warn" and work.id not in limits.reserve_exempt
                     else "agent_busy"
                     if cap and len(running.get(pool, ())) >= cap
                     else None
                 )
-                if code:
-                    raise HTTPException(
-                        409,
-                        {
-                            "code": code,
-                            "running": list(running.get(pool, ())),
-                            "next": choice.payload(),
-                            "reset": max(
-                                (
-                                    w.resets_at or now
-                                    for w in reading.windows
-                                    if w.percent_used == 100
-                                ),
-                                default=None,
-                            )
-                            if reading
-                            else None,
-                        },
-                    )
+            if code:
+                raise HTTPException(
+                    409,
+                    {
+                        "code": code,
+                        "running": list(running.get(pool, ())),
+                        "next": choice.payload(),
+                        "reset": line.clears_at,
+                    },
+                )
             choice = replace(
                 choice,
                 outcome="pick",
@@ -534,7 +531,14 @@ async def release_choice(app: Any, session: Conversation, host: str) -> bool:
             for (user, pool), until in state_for(app).cooldowns.items()
             if user == owner
         }
-        if "user_named" not in record.get("flags", ()):
+        if "user_named" in record.get("flags", ()):
+            pool = pool_of(link, request.products.get(link.agent_id, link.agent_id))
+            line = tile_line(
+                settings.limits.get(pool, TileLimits()), readings.get(pool), floors.get(pool), now
+            )
+            if line.state == "stop":
+                return False
+        else:
             failure = _filter_link(
                 settings, work, link, request, readings, running, floors, cooldowns, now
             )

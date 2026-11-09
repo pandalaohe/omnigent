@@ -1560,6 +1560,14 @@ class AgentQuotaService:
             pace = by_id.get(window.id) if fresh and not past_reset else None
             percent = None if past_reset else window.percent_used
             remaining = 100 - percent if percent is not None else None
+            if (
+                not past_reset
+                and remaining is None
+                and window.used_value is not None
+                and window.limit_value is not None
+                and window.limit_value > 0
+            ):
+                remaining = 100 * (window.limit_value - window.used_value) / window.limit_value
             time_left = max(0.0, reset - now) if reset is not None and not past_reset else None
             ahead = None
             if pace is not None and remaining is not None and window.window_minutes and time_left:

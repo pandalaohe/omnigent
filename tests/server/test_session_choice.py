@@ -494,9 +494,9 @@ def test_daily_reserve_releases_before_reset_and_total_waits():
     quota = reading(used=75.5, days=4.9)
     skipped = pick(settings, readings={"pool-0": quota})
     assert skipped.pool == "pool-1" and skipped.skipped[0].why == "reserve"
-    assert skipped.skipped[0].until == pytest.approx(NOW)
-    # At equality the pool is held; a second later it has a little usable room.
-    assert pick(settings, readings={"pool-0": quota}, now=NOW + 1).pool == "pool-0"
+    assert skipped.skipped[0].until == NOW + 0.9 * 86400
+    assert pick(settings, readings={"pool-0": quota}, now=NOW + 1).pool == "pool-1"
+    assert pick(settings, readings={"pool-0": quota}, now=NOW + 86400).pool == "pool-0"
     total = table(limits={"pool-0": {"reserve": {"mode": "total", "window": "7d", "pct": 20}}})
     quota = reading(used=81)
     assert pick(total, readings={"pool-0": quota}).pool == "pool-1"
@@ -693,3 +693,141 @@ def test_slot_states(status, age, marker, expected):
     assert holds_slot(conv, NOW) == expected
     conv.archived = True
     assert not holds_slot(conv, NOW)
+
+
+@pytest.mark.parametrize("values", [{}, {"pct": 5, "stopPct": 10}, {"stopPct": -1}])
+def test_invalid_quota_lines(values):
+    from omnigent.server.session_choice import Reserve
+
+    with pytest.raises(ValidationError):
+        Reserve.model_validate({"mode": "total", "window": "7d", **values})
+
+
+@pytest.mark.parametrize(
+    "mode,pct,stop,used,days,state,warn,cut",
+    [
+        ("total", 15, 5, 85.1, 2.5, "warn", 15, 5),
+        ("total", 15, 5, 95, 2.5, "stop", 15, 5),
+        ("total", None, 5, 97, 2.5, "stop", None, 5),
+        ("total", 15, 0, 100, 2.5, "stop", 15, 0),
+        ("daily", 4, 2, 92, 2.5, "warn", 12, 6),
+        ("daily", 4, 2, 92, 2, "warn", 8, 4),
+        ("daily", 4, 2, 92, 1.99, "warn", 8, 4),
+        ("daily", 4, 2, 94, 2.5, "stop", 12, 6),
+    ],
+)
+def test_tile_lines(mode, pct, stop, used, days, state, warn, cut):
+    from omnigent.server.session_choice import TileLimits, tile_line
+
+    limits = TileLimits.model_validate(
+        {
+            "reserve": {
+                "mode": mode,
+                "window": "7d",
+                "pct": pct,
+                "stopPct": stop,
+            }
+        }
+    )
+    quota = reading(used=used, days=days)
+    line = tile_line(limits, quota, None, NOW)
+    assert (line.state, line.warn_line_pct, line.stop_line_pct) == (state, warn, cut)
+    if mode == "daily" and used == 92:
+        assert line.clears_at == quota.windows[0].resets_at - 86400
+    assert tile_line(limits, quota, FloorOff(until="manual"), NOW).state == (
+        "exhausted" if used == 100 else "ok"
+    )
+    assert (
+        tile_line(limits, quota.model_copy(update={"freshness": "old"}), None, NOW).state
+        == "unknown"
+    )
+    quota.windows[0].window_minutes = 300
+    if mode == "daily":
+        assert tile_line(limits, quota, None, NOW).state == "ok"
+
+
+@pytest.mark.parametrize(
+    "windows,freshness,amount,expires,state",
+    [
+        (True, "fresh", 3, None, "ok"),
+        (True, "old", 3, None, "exhausted"),
+        (True, "fresh", 3, NOW, "exhausted"),
+        (False, "fresh", 0, None, "exhausted"),
+        (False, "fresh", 3, None, "ok"),
+        (False, "old", 0, None, "unknown"),
+    ],
+)
+def test_exhaustion_counts_balance_sections(windows, freshness, amount, expires, state):
+    from omnigent.server.session_choice import TileLimits, tile_line
+    from omnigent.usage.contract import UsageBalance
+
+    quota = reading(used=100)
+    if not windows:
+        quota.windows = []
+        quota.freshness = "none"
+    quota.balances = [UsageBalance(id="credit", remaining=amount, unit="USD", expires_at=expires)]
+    quota.balance_freshness = freshness
+    assert tile_line(TileLimits(), quota, None, NOW).state == state
+    assert tile_line(TileLimits(), quota, FloorOff(until="manual"), NOW).state == state
+
+
+def test_stop_ignores_warning_exemption_and_is_holdable():
+    settings = table(
+        (1,),
+        limits={
+            "pool-0": {
+                "reserve": {"mode": "total", "window": "7d", "pct": 15, "stopPct": 5},
+                "reserveExempt": ["work"],
+            }
+        },
+    )
+    assert pick(settings, readings={"pool-0": reading(used=90)}).outcome == "pick"
+    held = pick(settings, readings={"pool-0": reading(used=95)})
+    assert held.outcome == "hold" and held.skipped[0].why == "stop"
+
+
+def test_value_windows_derive_remaining_without_changing_percent():
+    from omnigent.quota_pace import QuotaTiers
+    from omnigent.server.agent_quota import AgentQuotaService
+    from omnigent.server.session_choice import TileLimits, tile_line
+    from omnigent.usage.contract import UsageWindow
+
+    windows, _ = AgentQuotaService._window_views(
+        [UsageWindow(id="credits", used_value=12, limit_value=10)],
+        True,
+        NOW,
+        QuotaTiers(),
+        None,
+    )
+    assert windows[0].percent_used is None
+    assert windows[0].remaining_pct == pytest.approx(-20)
+    quota = reading().model_copy(update={"windows": windows})
+    assert tile_line(TileLimits(), quota, None, NOW).state == "exhausted"
+
+
+@pytest.mark.parametrize("used,state", [(85, "warn"), (95, "stop"), (100, "stop")])
+def test_value_window_line_equality(used, state):
+    from omnigent.quota_pace import QuotaTiers
+    from omnigent.server.agent_quota import AgentQuotaService
+    from omnigent.server.session_choice import TileLimits, tile_line
+    from omnigent.usage.contract import UsageWindow
+
+    windows, _ = AgentQuotaService._window_views(
+        [UsageWindow(id="7d", used_value=used, limit_value=100)],
+        True,
+        NOW,
+        QuotaTiers(),
+        None,
+    )
+    quota = reading().model_copy(update={"windows": windows})
+    limits = TileLimits.model_validate(
+        {
+            "reserve": {
+                "mode": "total",
+                "window": "7d",
+                "pct": 15,
+                "stopPct": 5,
+            }
+        }
+    )
+    assert tile_line(limits, quota, None, NOW).state == state

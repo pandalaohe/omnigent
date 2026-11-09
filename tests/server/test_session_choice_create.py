@@ -276,7 +276,10 @@ async def test_notice_uses_reserve_else_low_pace(
 
 
 @pytest.mark.asyncio
-async def test_user_named_host_hold_keeps_priority_at_release(choice_env, monkeypatch):
+@pytest.mark.parametrize("stop_after_queue", [False, True])
+async def test_user_named_host_hold_keeps_priority_at_release(
+    choice_env, monkeypatch, stop_after_queue
+):
     from omnigent.server.session_choice import state_for
     from omnigent.usage.contract import UsageAccountView, UsageWindowView
 
@@ -323,6 +326,25 @@ async def test_user_named_host_hold_keeps_priority_at_release(choice_env, monkey
     queue = HostLoadQueue(env.store)
     monkeypatch.setattr(queue, "_start", AsyncMock())
     monkeypatch.setattr(env.app.state.host_load_inputs, "deliver_session", AsyncMock())
+    if stop_after_queue:
+        env.settings["limits"]["pool-0"]["reserve"] = {
+            "mode": "total",
+            "window": "7d",
+            "stopPct": 0,
+        }
+        env.prefs.replace_session_choice(
+            RESERVED_USER_LOCAL,
+            env.settings,
+            env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"],
+        )
+        assert not await queue.release(env.app, held_id, HOST)
+        queue._start.assert_not_awaited()
+        env.settings["limits"]["pool-0"].pop("reserve")
+        env.prefs.replace_session_choice(
+            RESERVED_USER_LOCAL,
+            env.settings,
+            env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"],
+        )
     assert await queue.release(env.app, held_id, HOST)
     queue._start.assert_awaited_once()
     assert holds_slot(env.store.get_conversation(first.json()["id"]), time.time())
@@ -433,3 +455,58 @@ async def test_refusal_and_reserved_labels_leave_no_child(choice_env):
         labels={CHOICE_LABEL: json.dumps({"pool": "forged"})},
     )
     assert response.status_code == 400, response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "used,user_named,exempt,code",
+    [
+        (90, True, False, None),
+        (95, True, False, "agent_stopped"),
+        (90, False, False, "agent_reserved"),
+        (90, False, True, None),
+        (95, False, True, "agent_stopped"),
+        (100, False, False, "agent_stopped"),
+    ],
+)
+async def test_named_quota_lines(choice_env, used, user_named, exempt, code):
+    from omnigent.usage.contract import UsageReport
+
+    env = choice_env
+    env.settings["limits"]["pool-0"] = {
+        "reserve": {"mode": "total", "window": "7d", "pct": 15, "stopPct": 5},
+        "reserveExempt": ["work"] if exempt else [],
+    }
+    env.prefs.replace_session_choice(
+        RESERVED_USER_LOCAL,
+        env.settings,
+        env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"],
+    )
+    now = time.time()
+    env.app.state.agent_quota_service.report_account(
+        RESERVED_USER_LOCAL,
+        "pool-0",
+        UsageReport.model_validate(
+            {
+                "observed_at": now,
+                "windows": [
+                    {
+                        "id": "7d",
+                        "percent_used": used,
+                        "resets_at": now + 86400,
+                    }
+                ],
+            }
+        ),
+        now=now,
+    )
+    response = await create(
+        env,
+        agent_id=env.agents[0]["id"],
+        model_override="test-model",
+        choice_reason="specific need",
+        user_named=user_named,
+    )
+    assert response.status_code == (409 if code else 201), response.text
+    if code:
+        assert response.json()["detail"]["code"] == code

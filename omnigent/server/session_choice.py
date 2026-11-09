@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from collections.abc import Mapping, MutableMapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Annotated, Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr, model_validator
@@ -77,7 +78,16 @@ class WorkType(_DocumentModel):
 class Reserve(_DocumentModel):
     mode: Literal["daily", "total"]
     window: Annotated[StrictStr, Field(min_length=1)]
-    pct: Annotated[float, Field(strict=True, ge=0, le=100, allow_inf_nan=False)]
+    pct: Annotated[float, Field(strict=True, ge=0, le=100, allow_inf_nan=False)] | None = None
+    stop_pct: Annotated[float, Field(strict=True, ge=0, le=100, allow_inf_nan=False)] | None = None
+
+    @model_validator(mode="after")
+    def valid_lines(self) -> Self:
+        if self.pct is None and self.stop_pct is None:
+            raise ValueError("reserve needs pct or stopPct")
+        if self.pct is not None and self.stop_pct is not None and self.stop_pct > self.pct:
+            raise ValueError("stopPct must not exceed pct")
+        return self
 
 
 class TileLimits(_DocumentModel):
@@ -235,7 +245,7 @@ def pool_of_session(
 
 
 def reserve_now(mode: str, pct: float, resets_at: float, now: float) -> float:
-    return pct if mode == "total" else pct * max(0, resets_at - now) / 86400
+    return pct if mode == "total" else pct * math.ceil(max(0, resets_at - now) / 86400)
 
 
 @dataclass(frozen=True)
@@ -262,6 +272,114 @@ def floor_off_active(entry: FloorOff, reading: UsageAccountView | None, now: flo
         ):
             return False
     return True
+
+
+@dataclass(frozen=True)
+class TileLine:
+    state: Literal["unknown", "ok", "warn", "stop", "exhausted"]
+    mode: str | None = None
+    window: str | None = None
+    remaining_pct: float | None = None
+    warn_line_pct: float | None = None
+    stop_line_pct: float | None = None
+    resets_at: float | None = None
+    read_at: float | None = None
+    released: bool = False
+    clears_at: float | None = None
+
+
+def tile_line(
+    limits: TileLimits,
+    reading: UsageAccountView | None,
+    floor_off: FloorOff | None,
+    now: float,
+) -> TileLine:
+    """Evaluate fresh window and balance sections without retaining enforcement state."""
+    reserve = limits.reserve
+    result = TileLine(
+        "unknown",
+        mode=reserve.mode if reserve else None,
+        window=reserve.window if reserve else None,
+        read_at=reading.read_at
+        if reading and reading.windows
+        else reading.balance_read_at
+        if reading
+        else None,
+    )
+    if reading is None or (
+        reading.freshness != "fresh"
+        if reading.windows
+        else reading.balance_freshness != "fresh" or not reading.balances
+    ):
+        return result
+    window = next((w for w in reading.windows if reserve and w.id == reserve.window), None)
+    usable = bool(
+        reserve
+        and window
+        and not window.past_reset
+        and window.remaining_pct is not None
+        and (window.resets_at is None or window.resets_at > now)
+        and (
+            reserve.mode == "total"
+            or (window.resets_at is not None and (window.window_minutes or 0) >= 1440)
+        )
+    )
+    released = floor_off is not None and floor_off_active(floor_off, reading, now)
+    if usable:
+        assert reserve is not None and window is not None
+        result = replace(
+            result,
+            remaining_pct=window.remaining_pct,
+            resets_at=window.resets_at,
+            warn_line_pct=reserve_now(reserve.mode, reserve.pct, window.resets_at or now, now)
+            if reserve.pct is not None
+            else None,
+            stop_line_pct=reserve_now(reserve.mode, reserve.stop_pct, window.resets_at or now, now)
+            if reserve.stop_pct is not None
+            else None,
+        )
+
+    def reached(state: Literal["stop", "warn"], pct: float) -> TileLine:
+        assert window is not None and window.remaining_pct is not None and reserve is not None
+        clears = window.resets_at
+        if clears is not None and reserve.mode == "daily" and pct > 0:
+            clears = min(
+                clears, max(now, clears - (math.ceil(window.remaining_pct / pct) - 1) * 86400)
+            )
+        return replace(result, state=state, clears_at=clears)
+
+    if usable and not released and result.stop_line_pct is not None:
+        assert window is not None and window.remaining_pct is not None and reserve is not None
+        if window.remaining_pct <= result.stop_line_pct:
+            assert reserve.stop_pct is not None
+            return reached("stop", reserve.stop_pct)
+    live_balance = reading.balance_freshness == "fresh" and any(
+        b.remaining > 0 and (b.expires_at is None or b.expires_at > now) for b in reading.balances
+    )
+    full = [
+        w
+        for w in reading.windows
+        if not w.past_reset
+        and (w.resets_at is None or w.resets_at > now)
+        and w.remaining_pct is not None
+        and w.remaining_pct <= 0
+    ]
+    if not live_balance and (full or not reading.windows):
+        return replace(
+            result,
+            state="exhausted",
+            clears_at=max((w.resets_at for w in full if w.resets_at is not None), default=None),
+        )
+    if not usable:
+        return replace(result, state="ok")
+    if released:
+        return replace(result, state="ok", released=True)
+    if result.warn_line_pct is not None:
+        assert window is not None and window.remaining_pct is not None and reserve is not None
+        if window.remaining_pct <= result.warn_line_pct:
+            assert reserve.pct is not None
+            return reached("warn", reserve.pct)
+    return replace(result, state="ok")
 
 
 @dataclass(frozen=True)
@@ -411,41 +529,11 @@ def _filter_link(
         return Skipped(link, "excluded", now + 600)
     reading = readings.get(pool)
     limits = settings.limits.get(pool, TileLimits())
-    if reading is not None and reading.freshness == "fresh":
-        exhausted = [
-            window
-            for window in reading.windows
-            if not window.past_reset
-            and window.percent_used is not None
-            and window.percent_used >= 100
-        ]
-        if exhausted:
-            return Skipped(
-                link,
-                "exhausted",
-                max(
-                    (window.resets_at for window in exhausted if window.resets_at is not None),
-                    default=None,
-                ),
-            )
-        released = pool in floor_off and floor_off_active(floor_off[pool], reading, now)
-        reserve = limits.reserve
-        if reserve and work_type.id not in limits.reserve_exempt and not released:
-            window = next((w for w in reading.windows if w.id == reserve.window), None)
-            if (
-                window
-                and not window.past_reset
-                and window.remaining_pct is not None
-                and window.resets_at is not None
-                and window.resets_at > now
-                and (reserve.mode == "total" or (window.window_minutes or 0) >= 1440)
-                and window.remaining_pct
-                <= reserve_now(reserve.mode, reserve.pct, window.resets_at, now)
-            ):
-                until = window.resets_at
-                if reserve.mode == "daily" and reserve.pct > 0:
-                    until = max(now, until - window.remaining_pct / reserve.pct * 86400)
-                return Skipped(link, "reserve", until)
+    line = tile_line(limits, reading, floor_off.get(pool), now)
+    if line.state in {"exhausted", "stop"}:
+        return Skipped(link, line.state, line.clears_at)
+    if line.state == "warn" and work_type.id not in limits.reserve_exempt:
+        return Skipped(link, "reserve", line.clears_at)
     cap = limits.max_running if link.meter else link.max_running
     if cap is not None and len(running.get(pool, ())) >= cap:
         return Skipped(link, "busy", now, running.get(pool, ()))
@@ -541,7 +629,9 @@ def choose(
             work_types=tuple(w.id for w in settings.work_types),
         )
     holdable = [
-        item for item in skipped if item.why in {"busy", "reserve", "exhausted", "cooldown"}
+        item
+        for item in skipped
+        if item.why in {"busy", "reserve", "stop", "exhausted", "cooldown"}
     ]
     if holdable and work.if_full == "queue" and not request.independent:
         first = min(holdable, key=lambda item: (item.why != "busy", item.until or now))
