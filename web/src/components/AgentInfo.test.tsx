@@ -1302,9 +1302,11 @@ describe("McpServersSection", () => {
 describe("agentDisplayLabel", () => {
   it("maps native wrapper slugs to their display name", () => {
     expect(agentDisplayLabel("pi-native-ui")).toBe("Pi");
+    expect(agentDisplayLabel("pi-rpc")).toBe("Pi");
     expect(agentDisplayLabel("claude-native-ui")).toBe("Claude");
     expect(agentDisplayLabel("codex-native-ui")).toBe("Codex");
-    expect(agentDisplayLabel("antigravity-native-ui")).toBe("Antigravity");
+    expect(agentDisplayLabel("antigravity-native-ui")).toBe("AG");
+    expect(agentDisplayLabel("hermes-native-ui")).toBe("Hermes");
   });
 
   it("strips the fork/switch clone suffix before resolving the native label", () => {

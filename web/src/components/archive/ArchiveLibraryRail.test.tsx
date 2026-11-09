@@ -224,4 +224,38 @@ describe("ArchiveLibraryRail", () => {
     expect(screen.getByRole("button", { name: "Delete archived session" })).toBeInTheDocument();
     expect(screen.queryByText(/Return open/)).toBeNull();
   });
+
+  it("formats native wrapper and pi-rpc agent_name values in row subtitles and filter options", async () => {
+    useFacetsMock.mockReturnValue({
+      data: {
+        projects: [],
+        hostIds: ["host-win"],
+        agentNames: ["antigravity-native-ui", "hermes-native-ui", "pi-rpc"],
+      },
+    } as unknown as ReturnType<typeof useArchivedSessionFacets>);
+    useArchivedMock.mockReturnValue({
+      data: {
+        data: [
+          { ...archiveConversation("conv-agy", "AG session"), agent_name: "antigravity-native-ui" },
+          {
+            ...archiveConversation("conv-hermes", "Hermes session"),
+            agent_name: "hermes-native-ui",
+          },
+          { ...archiveConversation("conv-pi", "Pi RPC session"), agent_name: "pi-rpc" },
+        ],
+        first_id: "conv-agy",
+        last_id: "conv-pi",
+        has_more: false,
+      },
+      isLoading: false,
+      isFetching: false,
+    } as ReturnType<typeof useArchivedConversations>);
+
+    renderRail();
+
+    expect(await screen.findByText(/Windows · AG/)).toBeInTheDocument();
+    expect(screen.getByText(/Windows · Hermes/)).toBeInTheDocument();
+    expect(screen.getByText(/Windows · Pi/)).toBeInTheDocument();
+    expect(screen.queryByText(/antigravity-native-ui|hermes-native-ui|pi-rpc/)).toBeNull();
+  });
 });

@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import {
+  AGENT_DISPLAY_ORDER,
+  BUILTIN_AGENTS,
   isAcpHarnessAgent,
   isSdkAgent,
   partitionAgentsByKind,
@@ -59,10 +61,14 @@ describe("partitionAgentsByKind", () => {
     // native, and an unknown name is custom.
     const { builtins, customs } = partitionAgentsByKind([
       agent({ name: "claude-native-ui", harness: "claude-native" }),
+      agent({ name: "hermes-native-ui", harness: "hermes-native" }),
       agent({ name: "some-custom", harness: "claude-sdk" }),
     ]);
-    expect(builtins.map((a) => a.name)).toEqual(["claude-native-ui"]);
+    expect(builtins.map((a) => a.name)).toEqual(["claude-native-ui", "hermes-native-ui"]);
     expect(customs.map((a) => a.name)).toEqual(["some-custom"]);
+    expect(BUILTIN_AGENTS.has("hermes-native-ui")).toBe(true);
+    expect(AGENT_DISPLAY_ORDER).toContain("AG");
+    expect(AGENT_DISPLAY_ORDER).toContain("Hermes");
   });
 });
 

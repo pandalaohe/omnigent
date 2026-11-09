@@ -75,7 +75,7 @@ const DISPLAY_NAMES: Record<string, string> = {
   nessie: "Nessie",
   "codex-sdk": "Codex SDK",
   "claude-sdk": "Claude SDK",
-  "pi-rpc": "Pi RPC",
+  "pi-rpc": "Pi",
   polly: "Polly",
   debby: "Debby",
 };

@@ -40,8 +40,13 @@ import {
 import { useHosts } from "@/hooks/useHosts";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { archiveDateRangeBounds } from "@/lib/archiveDateRange";
+import { nativeCodingAgentForAgentName } from "@/lib/nativeCodingAgents";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
 import { cn } from "@/lib/utils";
+
+function formatArchiveAgentName(name: string): string {
+  return nativeCodingAgentForAgentName(name)?.displayName ?? (name === "pi-rpc" ? "Pi" : name);
+}
 
 const SPLIT_STORAGE_KEY = "omnigent:archive-library-rail-split-v1";
 const DATE_STORAGE_KEY = "omnigent:archive-date-filter-v1";
@@ -253,7 +258,12 @@ export function ArchiveLibraryRail({
     [facets.data, hostNames],
   );
   const agentOptions = useMemo(
-    () => (facets.data?.agentNames ?? []).map((name) => ({ value: name, label: name })),
+    () =>
+      (facets.data?.agentNames ?? []).map((name) => ({
+        value: name,
+        label: formatArchiveAgentName(name),
+        keywords: name,
+      })),
     [facets.data],
   );
 
@@ -428,7 +438,9 @@ export function ArchiveLibraryRail({
                             ? "Unavailable host"
                             : conversation.host_id
                           : "Host not recorded")}
-                      {conversation.agent_name ? ` · ${conversation.agent_name}` : ""}
+                      {conversation.agent_name
+                        ? ` · ${formatArchiveAgentName(conversation.agent_name)}`
+                        : ""}
                       {` · Archived ${shortArchiveDate(conversation)}`}
                       {view.searchScope === "content" && conversation.search_match
                         ? ` · ● ${conversation.search_match_count ?? 1} match${(conversation.search_match_count ?? 1) === 1 ? "" : "es"}`

@@ -285,4 +285,27 @@ describe("ArchiveTranscriptViewer", () => {
     );
     getSelection.mockRestore();
   });
+
+  it("formats native wrapper and pi-rpc agent_name values in the transcript header subtitle", async () => {
+    const rendered = renderViewer({
+      ...conversation,
+      agent_name: "antigravity-native-ui",
+    });
+
+    expect(await screen.findByText("AG")).toHaveAttribute("title", "conv_archive");
+    expect(screen.queryByText("antigravity-native-ui")).toBeNull();
+
+    rendered.rerender(
+      <MemoryRouter>
+        <QueryClientProvider client={new QueryClient()}>
+          <TooltipProvider>
+            <ArchiveTranscriptViewer conversation={{ ...conversation, agent_name: "pi-rpc" }} />
+          </TooltipProvider>
+        </QueryClientProvider>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText("Pi")).toHaveAttribute("title", "conv_archive");
+    expect(screen.queryByText("pi-rpc")).toBeNull();
+  });
 });

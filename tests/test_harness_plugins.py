@@ -485,3 +485,15 @@ def test_builtin_native_provider_bridge_id_label_keys_match_constants() -> None:
         else:
             # Bare builders and claude (resolved via a runner helper) carry no key.
             assert provider.bridge_id_label_key is None, provider.key
+
+
+def test_builtin_antigravity_and_pi_harness_labels() -> None:
+    """Antigravity displays as AG and Pi RPC displays as Pi in the harness catalog."""
+    assert hp.ANTIGRAVITY_NATIVE_CODING_AGENT.display_name == "AG"
+    labels = hp.harness_labels()
+    assert labels["antigravity"] == "AG"
+    assert labels["pi"] == "Pi"
+    by_harness = hp.capabilities_by_harness()
+    assert by_harness["antigravity-native"]["label"] == "AG"
+    assert by_harness["antigravity"]["label"] == "AG"
+    assert by_harness["pi"]["label"] == "Pi"

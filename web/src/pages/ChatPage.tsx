@@ -2464,7 +2464,7 @@ export function composerHarnessLabel(
   if (modelPickerKind === "kiro") return "Kiro";
   if (modelPickerKind === "opencode") return "OpenCode";
   if (modelPickerKind === "devin") return "Devin";
-  if (modelPickerKind === "antigravity") return "Antigravity";
+  if (modelPickerKind === "antigravity") return "AG";
   const display = agentName ? agentDisplayLabel(agentName) : null;
   const harness = sessionHarness ? (harnessLabels[sessionHarness] ?? null) : null;
   if (display && harness) return `${display} (${harness})`;

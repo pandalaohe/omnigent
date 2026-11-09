@@ -267,6 +267,13 @@ describe("settings agent registry", () => {
     ).toEqual([{ id: "plugin-sdk", label: "Plugin SDK", section: "sdk", deployed: false }]);
     expect(registryHarnessOptions(items).map((item) => item.id)).toContain("native-x");
     expect(registrySourceLabels(items, "Native X", "native-x").harnessLabel).toBe("Native X");
+    expect(
+      registrySourceLabels(items, "antigravity-native-ui", "antigravity-native").agentLabel,
+    ).toBe("AG");
+    expect(registrySourceLabels(items, "hermes-native-ui", "hermes-native").agentLabel).toBe(
+      "Hermes",
+    );
+    expect(registrySourceLabels(items, "pi-rpc", "pi").agentLabel).toBe("Pi");
   });
 
   it("carries deployment status into harness menus and fails open for missing registry rows", () => {

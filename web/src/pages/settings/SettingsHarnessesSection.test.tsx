@@ -1283,3 +1283,15 @@ it("requests a host update instead of guessing installed MCP identity", () => {
   expect(screen.getByTestId("catalog-row-docs").tagName).not.toBe("BUTTON");
   expect(mcpSources).toEqual([]);
 });
+
+it("displays AG as the antigravity-native title while keeping Google Antigravity in the description", () => {
+  hosts = [ONLINE];
+  renderHarnesses();
+  const agyCard = card("antigravity-native");
+  expect(within(agyCard).getByText("AG")).toBeInTheDocument();
+  expect(
+    within(agyCard).getByText(
+      /Google Antigravity’s agent-first development platform for planning and executing software tasks\./,
+    ),
+  ).toBeInTheDocument();
+});

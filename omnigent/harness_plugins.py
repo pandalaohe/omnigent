@@ -251,7 +251,7 @@ DEVIN_NATIVE_CODING_AGENT = NativeCodingAgent(
 
 ANTIGRAVITY_NATIVE_CODING_AGENT = NativeCodingAgent(
     key="antigravity",
-    display_name="Antigravity",
+    display_name="AG",
     agent_name="antigravity-native-ui",
     harness="antigravity-native",
     wrapper_label=ANTIGRAVITY_NATIVE_WRAPPER_VALUE,
@@ -986,7 +986,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         ),
     },
     harness_labels={
-        "antigravity": "Antigravity",
+        "antigravity": "AG",
         "claude-sdk": "Claude SDK",
         "codex": "Codex",
         "copilot": "Copilot",
@@ -996,7 +996,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         # openai-agents is intentionally omitted from the picker catalog: it
         # stays a valid harness for YAML specs (and the credential-free
         # integration mock LLM), but is no longer offered as a UI pick.
-        "pi": "Pi RPC",
+        "pi": "Pi",
         **{name: row.label for name, row in ACP_CLI_HARNESSES.items()},
     },
     capabilities=_BUILTIN_CAPABILITIES,

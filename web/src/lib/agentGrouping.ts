@@ -18,10 +18,11 @@ export const BUILTIN_AGENTS = new Set([
   "pi-native-ui", // Pi
   "cursor-native-ui", // Cursor
   "kiro-native-ui", // Kiro
-  "antigravity-native-ui", // Antigravity
+  "antigravity-native-ui", // AG
   "goose-native-ui", // Goose
   "qwen-native-ui", // Qwen Code
   "kimi-native-ui", // Kimi
+  "hermes-native-ui", // Hermes
   "devin-native-ui", // Devin
   "polly",
   "debby",
@@ -114,9 +115,10 @@ export const AGENT_DISPLAY_ORDER = [
   "Cursor",
   "Pi",
   "Kiro",
-  "Antigravity",
+  "AG",
   "Qwen Code",
   "Kimi",
+  "Hermes",
   "Polly",
   "Debby",
 ];

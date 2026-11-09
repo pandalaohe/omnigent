@@ -95,6 +95,7 @@ import {
   type ArchiveLibraryViewState,
 } from "@/components/archive/ArchiveLibraryToolbar";
 import { ArchiveTranscriptViewer } from "@/components/archive/ArchiveTranscriptViewer";
+import { nativeCodingAgentForAgentName } from "@/lib/nativeCodingAgents";
 import { SettingsGroup } from "@/components/SettingsGroup";
 import { SettingsLabel } from "@/components/SettingsLabel";
 import { McpRegistryConnections } from "@/components/McpRegistry";
@@ -4046,7 +4047,13 @@ function ArchivedListPane({
     [facetsQuery.data, hostNames],
   );
   const agentOptions = useMemo(
-    () => (facetsQuery.data?.agentNames ?? []).map((name) => ({ value: name, label: name })),
+    () =>
+      (facetsQuery.data?.agentNames ?? []).map((name) => ({
+        value: name,
+        label:
+          nativeCodingAgentForAgentName(name)?.displayName ?? (name === "pi-rpc" ? "Pi" : name),
+        keywords: name,
+      })),
     [facetsQuery.data],
   );
   const projectNames = useMemo(
@@ -4586,7 +4593,10 @@ function ArchivedRow({
         ? "Unavailable host"
         : conversation.host_id
       : "Host not recorded");
-  const resolvedAgentName = conversation.agent_name ?? "Agent not recorded";
+  const resolvedAgentName = conversation.agent_name
+    ? (nativeCodingAgentForAgentName(conversation.agent_name)?.displayName ??
+      (conversation.agent_name === "pi-rpc" ? "Pi" : conversation.agent_name))
+    : "Agent not recorded";
   const matchCount = conversation.search_match_count ?? (conversation.search_match ? 1 : 0);
 
   const moveAndRestore = async (projectId: string) => {

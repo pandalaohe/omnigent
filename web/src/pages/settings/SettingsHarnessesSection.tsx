@@ -90,7 +90,7 @@ const HARNESS_DESCRIPTIONS: Record<string, string> = {
   "pi-native": "A minimal, extensible coding agent harness built for terminal workflows.",
   "devin-native": "Cognition’s autonomous coding agent for end-to-end software tasks.",
   "antigravity-native":
-    "Google’s agent-first development platform for planning and executing software tasks.",
+    "Google Antigravity’s agent-first development platform for planning and executing software tasks.",
   "kiro-native":
     "An agentic IDE for spec-driven development, hooks, and production-ready software.",
   "qwen-native": "An open-source terminal coding agent powered by Qwen models.",

@@ -22,7 +22,10 @@ import {
   type HarnessCapability,
 } from "@/lib/agentLabels";
 import { useCustomAgents, type CustomAgent } from "@/lib/customAgentsApi";
-import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
+import {
+  nativeCodingAgentForAgentName,
+  nativeCodingAgentForHarness,
+} from "@/lib/nativeCodingAgents";
 import { isAcpHarnessAgent, isSdkAgent } from "@/lib/agentGrouping";
 
 export type SectionId = "yours" | "native" | "sdk" | "acp" | "builtin" | "other";
@@ -105,7 +108,10 @@ export function registrySourceLabels(
   const agent = items.find((item) => item.name === agentName && item.harness === harness);
   const harnessItem = harness ? items.find((item) => item.key === `harness:${harness}`) : undefined;
   return {
-    agentLabel: agent?.label ?? (agentName || "Unknown"),
+    agentLabel:
+      agent?.label ??
+      nativeCodingAgentForAgentName(agentName)?.displayName ??
+      (agentName === "pi-rpc" ? "Pi" : agentName || "Unknown"),
     harnessLabel: harnessItem?.label ?? (harness ? formatHarnessFallbackLabel(harness) : "Unknown"),
   };
 }

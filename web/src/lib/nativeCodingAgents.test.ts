@@ -13,6 +13,7 @@ import {
   nativeAgentHasCapability,
   nativeCodingAgentForHarness,
   nativeCodingAgentForPolicyName,
+  nativeCodingAgentForSession,
   nativeCodingAgentForSubagentWrapper,
   nativeWrapperLabelsForAgent,
 } from "./nativeCodingAgents";
@@ -145,7 +146,7 @@ describe("nativeCodingAgentForSubagentWrapper", () => {
       "OpenCode",
     );
     expect(nativeCodingAgentForSubagentWrapper("antigravity-native-ui-subagent")?.displayName).toBe(
-      "Antigravity",
+      "AG",
     );
     expect(nativeCodingAgentForSubagentWrapper("devin-native-ui-subagent")?.displayName).toBe(
       "Devin",
@@ -264,8 +265,8 @@ describe("nativeCodingAgentForPolicyName", () => {
     ["codex_native_command_approval", "Codex"],
     ["codex_native_apply_patch_approval", "Codex"],
     ["cursor_native_permission", "Cursor"],
-    ["agy_native_permission", "Antigravity"],
-    ["agy_native_ask_question", "Antigravity"],
+    ["agy_native_permission", "AG"],
+    ["agy_native_ask_question", "AG"],
     ["kiro_native_permission", "Kiro"],
     ["goose_native_permission", "Goose"],
     ["qwen_native_permission", "Qwen Code"],
@@ -277,6 +278,18 @@ describe("nativeCodingAgentForPolicyName", () => {
   it("has no vendor for user-authored policy names", () => {
     expect(nativeCodingAgentForPolicyName("approve_shell_commands")).toBeUndefined();
     expect(nativeCodingAgentForPolicyName("native_permission")).toBeUndefined();
+  });
+});
+
+describe("nativeCodingAgentForSession", () => {
+  it("falls back to agent_name when wrapper labels and harness are absent", () => {
+    expect(nativeCodingAgentForSession({ agent_name: "antigravity-native-ui" })?.displayName).toBe(
+      "AG",
+    );
+    expect(nativeCodingAgentForSession({ agent_name: "hermes-native-ui" })?.displayName).toBe(
+      "Hermes",
+    );
+    expect(nativeCodingAgentForSession({ agent_name: "pi-native-ui" })?.displayName).toBe("Pi");
   });
 });
 

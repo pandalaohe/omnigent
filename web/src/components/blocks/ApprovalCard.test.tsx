@@ -205,7 +205,7 @@ describe("ApprovalCard — binary approve/reject", () => {
     for (const [policyName, displayName] of [
       ["kiro_native_permission", "Kiro"],
       ["qwen_native_permission", "Qwen Code"],
-      ["agy_native_permission", "Antigravity"],
+      ["agy_native_permission", "AG"],
     ]) {
       render(
         <ApprovalCard

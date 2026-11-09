@@ -88,6 +88,7 @@ export function agentDisplayLabel(name: string): string {
   const baseName = agentRootName(name);
   const nativeAgent = nativeCodingAgentForAgentName(baseName);
   if (nativeAgent?.key === "claude") return "Claude";
+  if (baseName === "pi-rpc") return "Pi";
   return nativeAgent?.displayName ?? capitalizeAgentName(baseName);
 }
 
