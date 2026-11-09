@@ -57,6 +57,7 @@ def appearance_url(browser_contract: BrowserContract) -> Iterator[str]:
     browser_contract.json("/v1/calling-defaults/catalogs", {"rows": []})
     browser_contract.json("/v1/me/session-choice", {"settings": None, "revision": "empty"})
     browser_contract.json("/v1/me/session-choice/notice", {"notice": None})
+    browser_contract.json("/v1/me/usage/lines", {"schema": 1, "tiles": {}})
     browser_contract.json(
         "/v1/me/session-choice/meters", {"meters": [], "running": {}, "floors": {}}
     )

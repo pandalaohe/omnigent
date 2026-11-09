@@ -11,12 +11,15 @@ const mocks = vi.hoisted(() => ({
   refetch: vi.fn(),
   metersRefetch: vi.fn(),
   document: { current: undefined as unknown },
+  lines: { current: { tiles: {} } as { tiles: Record<string, unknown> } },
+  linesRefetch: vi.fn(),
   meters: { current: { meters: [], running: {}, floors: {} } as ChoiceMeters },
 }));
 vi.mock("./sessionChoiceData", async (original) => ({
   ...(await original<typeof SessionChoiceData>()),
   choiceRequest: mocks.request,
   useSessionChoiceDocument: () => mocks.document.current,
+  useChoiceLines: () => ({ data: mocks.lines.current, refetch: mocks.linesRefetch }),
   useChoiceMeters: () => ({
     data: mocks.meters.current,
     refetch: mocks.metersRefetch,
@@ -39,6 +42,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
 }));
 
 beforeEach(() => {
+  mocks.lines.current = { tiles: {} };
   mocks.meters.current = { meters: [], running: {}, floors: {} };
   mocks.refetch.mockResolvedValue({});
   mocks.document.current = {
@@ -181,7 +185,7 @@ it("saves tile reserve and concurrency separately from the immediate floor contr
   fireEvent.change(screen.getByRole("combobox", { name: "Coding plan reserve mode" }), {
     target: { value: "daily" },
   });
-  fireEvent.change(screen.getByRole("spinbutton", { name: "Coding plan reserve percent" }), {
+  fireEvent.change(screen.getByRole("spinbutton", { name: "Coding plan warn percent" }), {
     target: { value: "5" },
   });
   fireEvent.change(screen.getByRole("spinbutton", { name: "Coding plan max running" }), {
@@ -190,7 +194,7 @@ it("saves tile reserve and concurrency separately from the immediate floor contr
   fireEvent.click(screen.getByRole("button", { name: "Save session choice" }));
   await screen.findByText("Saved session choice.");
   expect(JSON.parse(mocks.request.mock.calls[0][1].body).settings.limits).toEqual({
-    "account-a": { reserve: { mode: "daily", window: "7d", pct: 5 }, maxRunning: 2 },
+    "account-a": { reserve: { mode: "daily", window: "7d", pct: 5, stopPct: null }, maxRunning: 2 },
   });
   fireEvent.change(screen.getByRole("combobox", { name: "Coding plan floor" }), {
     target: { value: "manual" },
@@ -203,4 +207,127 @@ it("saves tile reserve and concurrency separately from the immediate floor contr
       body: JSON.stringify({ tile: "account-a", off: true, keep: true }),
     }),
   );
+});
+
+function quotaFixture() {
+  mocks.meters.current = {
+    meters: [
+      {
+        id: "plan",
+        display_name: "Plan",
+        freshness: "fresh",
+        windows: [
+          {
+            id: "7d",
+            label: "Weekly",
+            window_minutes: 10080,
+            remaining_pct: 5,
+            resets_at: Date.now() / 1000 + 2.5 * 86400,
+          },
+        ],
+      },
+    ] as ChoiceMeters["meters"],
+    running: { plan: ["wrong-count"] },
+    floors: {},
+  };
+  mocks.lines.current = {
+    tiles: {
+      plan: {
+        state: "warn",
+        warn_line_pct: 12,
+        stop_line_pct: 3,
+        released: false,
+        running: ["one", "two"],
+      },
+    },
+  };
+  mocks.document.current = {
+    isPending: false,
+    refetch: mocks.refetch,
+    data: {
+      revision: "a",
+      settings: {
+        ...structuredClone(EMPTY_CHOICE),
+        limits: { plan: { reserve: { mode: "daily", window: "7d", pct: 4, stopPct: 1 } } },
+      },
+    },
+  };
+  mocks.request.mockResolvedValue({ settings: EMPTY_CHOICE, revision: "b" });
+}
+it("shows server lines, rounds draft days upward and uses enforcement targets for the cut count", async () => {
+  quotaFixture();
+  mount();
+  await screen.findByRole("switch", { name: "Session choice" });
+  fireEvent.click(screen.getByText("Limits", { selector: "summary" }));
+  expect(screen.getByText("Warn: 12%")).toBeInTheDocument();
+  expect(screen.getByText("Stop: 3%")).toBeInTheDocument();
+  expect(screen.getByText("Warning", { exact: true })).toBeInTheDocument();
+  expect(screen.queryByText(/Saving cuts/)).not.toBeInTheDocument();
+  fireEvent.change(screen.getByRole("spinbutton", { name: "Plan stop percent" }), {
+    target: { value: "2" },
+  });
+  expect(screen.getByText("Saving cuts 2 running sessions")).toBeInTheDocument();
+  // Saved lines stay server-owned while the draft changes.
+  expect(screen.getByText("Stop: 3%")).toBeInTheDocument();
+});
+it.each(["warn", "stop", "both"])(
+  "clears %s inputs without turning blank into zero",
+  async (which) => {
+    quotaFixture();
+    mount();
+    await screen.findByRole("switch", { name: "Session choice" });
+    fireEvent.click(screen.getByText("Limits", { selector: "summary" }));
+    for (const field of which === "both" ? ["warn", "stop"] : [which])
+      fireEvent.change(screen.getByRole("spinbutton", { name: `Plan ${field} percent` }), {
+        target: { value: "" },
+      });
+    fireEvent.click(screen.getByRole("button", { name: "Save session choice" }));
+    await screen.findByText("Saved session choice.");
+    const reserve = JSON.parse(mocks.request.mock.calls[0][1].body).settings.limits.plan.reserve;
+    expect(reserve).toEqual(
+      which === "both"
+        ? null
+        : {
+            mode: "daily",
+            window: "7d",
+            pct: which === "warn" ? null : 4,
+            stopPct: which === "stop" ? null : 1,
+          },
+    );
+  },
+);
+it("loads a legacy warning and accepts an explicit zero stop", async () => {
+  quotaFixture();
+  const doc = mocks.document.current as {
+    data: { settings: { limits: { plan: { reserve: { stopPct?: number } } } } };
+  };
+  delete doc.data.settings.limits.plan.reserve.stopPct;
+  mount();
+  await screen.findByRole("switch", { name: "Session choice" });
+  fireEvent.click(screen.getByText("Limits", { selector: "summary" }));
+  expect(screen.getByRole("spinbutton", { name: "Plan warn percent" })).toHaveValue(4);
+  expect(screen.getByRole("spinbutton", { name: "Plan stop percent" })).toHaveValue(null);
+  fireEvent.change(screen.getByRole("spinbutton", { name: "Plan stop percent" }), {
+    target: { value: "0" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Save session choice" }));
+  await screen.findByText("Saved session choice.");
+  expect(JSON.parse(mocks.request.mock.calls[0][1].body).settings.limits.plan.reserve.stopPct).toBe(
+    0,
+  );
+});
+
+it.each(["no targets", "released", "stale"])("omits the cut notice with %s", async (condition) => {
+  quotaFixture();
+  if (condition === "no targets") mocks.lines.current.tiles.plan = { running: [] };
+  if (condition === "released")
+    mocks.meters.current.floors.plan = { until: "manual", active: true };
+  if (condition === "stale") mocks.meters.current.meters[0].freshness = "old";
+  mount();
+  await screen.findByRole("switch", { name: "Session choice" });
+  fireEvent.click(screen.getByText("Limits", { selector: "summary" }));
+  fireEvent.change(screen.getByRole("spinbutton", { name: "Plan stop percent" }), {
+    target: { value: "2" },
+  });
+  expect(screen.queryByText(/Saving cuts/)).not.toBeInTheDocument();
 });
