@@ -1,0 +1,452 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://omnigent.ai/schemas/task-board-report.schema.json",
+  "title": "Omnigent Task Board Report",
+  "description": "JSCalendar Group of Tasks or single Task report accepted by PUT /v1/me/tasks/sources/{source_id} (RFC 8984 plus omnigent.ai: vendor properties).",
+  "oneOf": [
+    { "$ref": "#/$defs/Group" },
+    { "$ref": "#/$defs/Task" }
+  ],
+  "$defs": {
+    "UTCDateTime": {
+      "type": "string",
+      "description": "RFC 8984 UTCDateTime in YYYY-MM-DDTHH:MM:SS[.frac]Z form without trailing fractional zeros.",
+      "pattern": "^(?![\\s\\S]*[\\r\\n])(?!0000)(?:(?:\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|02-(?:0[1-9]|1\\d|2[0-8])))|(?:(?:\\d{2}(?:0[48]|[2468][048]|[13579][26])|(?:0[48]|[2468][048]|[13579][26])00)-02-29))T(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d*[1-9])?Z$"
+    },
+    "LocalDateTime": {
+      "type": "string",
+      "description": "RFC 8984 LocalDateTime without a Z or numeric UTC offset.",
+      "pattern": "^(?![\\s\\S]*[\\r\\n])(?!0000)(?:(?:\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|02-(?:0[1-9]|1\\d|2[0-8])))|(?:(?:\\d{2}(?:0[48]|[2468][048]|[13579][26])|(?:0[48]|[2468][048]|[13579][26])00)-02-29))T(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d*[1-9])?$"
+    },
+    "AbsoluteURI": {
+      "type": "string",
+      "description": "Absolute URI with scheme and no whitespace or control characters.",
+      "minLength": 2,
+      "pattern": "^(?![\\s\\S]*[\\r\\n])[A-Za-z][A-Za-z0-9+.-]*:[^\\s\\x00-\\x1f\\x7f]*$"
+    },
+    "Progress": {
+      "type": "string",
+      "enum": [
+        "needs-action",
+        "in-process",
+        "completed",
+        "failed",
+        "cancelled"
+      ]
+    },
+    "Participant": {
+      "type": "object",
+      "required": ["@type", "roles"],
+      "properties": {
+        "@type": {
+          "type": "string",
+          "const": "Participant"
+        },
+        "name": {
+          "type": "string"
+        },
+        "roles": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {
+            "type": "string",
+            "minLength": 1
+          },
+          "additionalProperties": {
+            "const": true
+          }
+        },
+        "progress": {
+          "$ref": "#/$defs/Progress"
+        },
+        "progressUpdated": {
+          "$ref": "#/$defs/UTCDateTime"
+        }
+      }
+    },
+    "Relation": {
+      "type": "object",
+      "required": ["@type", "relation"],
+      "properties": {
+        "@type": {
+          "type": "string",
+          "const": "Relation"
+        },
+        "relation": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string",
+            "minLength": 1
+          },
+          "additionalProperties": {
+            "const": true
+          }
+        }
+      }
+    },
+    "Link": {
+      "type": "object",
+      "required": ["@type", "href"],
+      "properties": {
+        "@type": {
+          "type": "string",
+          "const": "Link"
+        },
+        "href": {
+          "$ref": "#/$defs/AbsoluteURI"
+        },
+        "rel": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      }
+    },
+    "Waiting": {
+      "type": "object",
+      "description": "Omnigent-defined structured block reason when the task is waiting.",
+      "required": ["on"],
+      "properties": {
+        "on": {
+          "type": "string",
+          "enum": ["user", "input", "auth", "dependency", "external"]
+        },
+        "since": {
+          "$ref": "#/$defs/UTCDateTime"
+        },
+        "note": {
+          "type": "string",
+          "maxLength": 500
+        }
+      }
+    },
+    "TaskGroup": {
+      "type": "object",
+      "description": "Omnigent-defined route, project, milestone or sprint grouping.",
+      "required": ["id"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 128
+        }
+      }
+    },
+    "WorkedBy": {
+      "type": "object",
+      "description": "Omnigent-defined session work interval linking a task to an Omnigent session.",
+      "required": ["session", "from"],
+      "properties": {
+        "session": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "agent": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "host": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "from": {
+          "$ref": "#/$defs/UTCDateTime"
+        },
+        "to": {
+          "$ref": "#/$defs/UTCDateTime"
+        }
+      }
+    },
+    "SourceField": {
+      "type": "object",
+      "description": "Omnigent-defined source-specific display field shown in the task detail drawer.",
+      "required": ["label", "value"],
+      "properties": {
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "value": {
+          "type": "string",
+          "maxLength": 2000
+        }
+      }
+    },
+    "HistoryEvent": {
+      "type": "object",
+      "description": "Omnigent-defined append-only timeline event for a task.",
+      "required": ["id", "time", "kind"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "time": {
+          "$ref": "#/$defs/UTCDateTime"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "created",
+            "state",
+            "waiting",
+            "assignee",
+            "parent",
+            "relation",
+            "field",
+            "comment",
+            "closed",
+            "reopened",
+            "commit",
+            "other"
+          ]
+        },
+        "actor": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "field": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "from": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "to": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "note": {
+          "type": "string",
+          "maxLength": 2000
+        }
+      }
+    },
+    "Task": {
+      "type": "object",
+      "required": ["@type", "uid", "updated"],
+      "propertyNames": {
+        "not": {
+          "pattern": "^omnigent\\.ai:(?:source|gone|closedSeen|unresolved)$"
+        }
+      },
+      "properties": {
+        "@type": {
+          "type": "string",
+          "const": "Task"
+        },
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255
+        },
+        "updated": {
+          "$ref": "#/$defs/UTCDateTime"
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 20000
+        },
+        "created": {
+          "$ref": "#/$defs/UTCDateTime"
+        },
+        "progress": {
+          "$ref": "#/$defs/Progress"
+        },
+        "progressUpdated": {
+          "$ref": "#/$defs/UTCDateTime"
+        },
+        "percentComplete": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "priority": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9
+        },
+        "start": {
+          "$ref": "#/$defs/LocalDateTime"
+        },
+        "due": {
+          "$ref": "#/$defs/LocalDateTime"
+        },
+        "timeZone": {
+          "type": "string",
+          "minLength": 1
+        },
+        "participants": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string",
+            "minLength": 1
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/Participant"
+          }
+        },
+        "relatedTo": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/Relation"
+          }
+        },
+        "links": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string",
+            "minLength": 1
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/Link"
+          }
+        },
+        "keywords": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string",
+            "minLength": 1
+          },
+          "additionalProperties": {
+            "const": true
+          }
+        },
+        "omnigent.ai:key": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "Omnigent-defined short display key (e.g. ENG-123 or owner/repo#12)."
+        },
+        "omnigent.ai:sourceState": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "Omnigent-defined raw status label in the source system."
+        },
+        "omnigent.ai:resolution": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "Omnigent-defined raw close reason in the source system."
+        },
+        "omnigent.ai:waiting": {
+          "$ref": "#/$defs/Waiting"
+        },
+        "omnigent.ai:group": {
+          "$ref": "#/$defs/TaskGroup"
+        },
+        "omnigent.ai:next": {
+          "type": "string",
+          "maxLength": 500,
+          "description": "Omnigent-defined short next-step note."
+        },
+        "omnigent.ai:workedBy": {
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "$ref": "#/$defs/WorkedBy"
+          },
+          "description": "Omnigent-defined sessions that worked on this task."
+        },
+        "omnigent.ai:sourceFields": {
+          "type": "object",
+          "maxProperties": 32,
+          "propertyNames": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/SourceField"
+          },
+          "description": "Omnigent-defined source-specific display fields."
+        },
+        "omnigent.ai:history": {
+          "type": "array",
+          "maxItems": 5000,
+          "items": {
+            "$ref": "#/$defs/HistoryEvent"
+          },
+          "description": "Omnigent-defined append-only timeline events for the task."
+        }
+      }
+    },
+    "Group": {
+      "type": "object",
+      "required": ["@type", "uid", "updated", "entries"],
+      "properties": {
+        "@type": {
+          "type": "string",
+          "const": "Group"
+        },
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255
+        },
+        "updated": {
+          "$ref": "#/$defs/UTCDateTime"
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "source": {
+          "$ref": "#/$defs/AbsoluteURI"
+        },
+        "omnigent.ai:complete": {
+          "type": "string",
+          "enum": ["open", "all"],
+          "description": "Omnigent-defined completeness mode for the Group report."
+        },
+        "entries": {
+          "type": "array",
+          "maxItems": 10000,
+          "items": {
+            "if": {
+              "type": "object",
+              "required": ["@type"],
+              "properties": {
+                "@type": {
+                  "type": "string",
+                  "not": { "const": "Task" }
+                }
+              }
+            },
+            "then": {
+              "type": "object"
+            },
+            "else": {
+              "$ref": "#/$defs/Task"
+            }
+          }
+        }
+      }
+    }
+  }
+}
