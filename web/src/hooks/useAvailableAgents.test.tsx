@@ -384,7 +384,7 @@ describe("useAvailableAgents", () => {
       {
         id: "ag_pi_rpc",
         name: "pi-rpc",
-        display_name: "Pi RPC",
+        display_name: "Pi",
         description: null,
         harness: "pi",
         skills: [],
@@ -400,7 +400,7 @@ describe("useAvailableAgents", () => {
       {
         id: "ag_agy_native",
         name: "antigravity-native-ui",
-        display_name: "Antigravity",
+        display_name: "AG",
         description: null,
         harness: "antigravity-native",
         skills: [],

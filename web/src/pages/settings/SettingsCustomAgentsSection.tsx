@@ -5,7 +5,10 @@ import { Link, useNavigate } from "@/lib/routing";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { customAgentsSettingsEnabled } from "@/lib/capabilities";
 import { useAcpHarnessIds, useHarnessLabels } from "@/lib/agentLabels";
-import { nativeCodingAgentForAgentName } from "@/lib/nativeCodingAgents";
+import {
+  nativeCodingAgentForAgentName,
+  nativeCodingAgentForHarness,
+} from "@/lib/nativeCodingAgents";
 import { isAcpHarnessAgent } from "@/lib/agentGrouping";
 import { Button } from "@/components/ui/button";
 import { AgentsSettings } from "@/components/AgentsSettings";
@@ -32,6 +35,17 @@ import { BackButton } from "./HarnessCatalog";
 import { ApiError } from "@/lib/sessionsApi";
 
 const BASE = "/settings/agents#custom-agents";
+const formatHarnessLabel = (
+  harness: string | null | undefined,
+  labels: Record<string, string>,
+): string => {
+  if (!harness) return "Unknown";
+  return (
+    labels[harness] ??
+    nativeCodingAgentForHarness(harness)?.displayName ??
+    (harness === "pi-rpc" ? "Pi RPC" : harness.startsWith("acp:") ? "ACP" : harness)
+  );
+};
 const agentPath = (id: string) => `/settings/agents/custom/${encodeURIComponent(id)}`;
 const date = (value: number | null) =>
   value === null
@@ -159,7 +173,7 @@ function InstalledAgentsSettingsSection({
             agent={detail.data}
             owned={detail.data.user_owned}
             editable={info.agent_config_edit === true}
-            harness={labels[detail.data.harness ?? ""] ?? detail.data.harness ?? "Unknown"}
+            harness={formatHarnessLabel(detail.data.harness, labels)}
             onDeleted={() => navigate(BASE)}
           />
         ) : (
@@ -264,8 +278,8 @@ function InstalledAgentsSettingsSection({
                         </span>
                       </Link>
                     </td>
-                    <td className="whitespace-nowrap p-2">
-                      {labels[agent.harness ?? ""] ?? agent.harness ?? "Unknown"}
+                    <td className="whitespace-nowrap p-2" title={agent.harness ?? undefined}>
+                      {formatHarnessLabel(agent.harness, labels)}
                     </td>
                     <td className="whitespace-nowrap p-2">{date(agent.created_at)}</td>
                     <td className="whitespace-nowrap p-2">{date(agent.updated_at)}</td>
@@ -438,7 +452,7 @@ function AgentDetail({
         {!canEdit && (
           <div>
             <dt className="text-muted-foreground">Harness</dt>
-            <dd>{harness}</dd>
+            <dd title={agent.harness ?? undefined}>{harness}</dd>
           </div>
         )}
         <div>

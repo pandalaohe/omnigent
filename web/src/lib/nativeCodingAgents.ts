@@ -224,7 +224,7 @@ export const NATIVE_CODING_AGENTS = [
     harness: "antigravity-native",
     wrapperLabel: "antigravity-native-ui",
     subagentWrapperLabel: "antigravity-native-ui-subagent",
-    displayName: "Antigravity",
+    displayName: "AG",
     iconKind: "antigravity",
     sortRank: 45,
   },
@@ -493,12 +493,16 @@ export function isNativeTerminalSession(
  * @returns The agent spec, or undefined for non-native sessions.
  */
 export function nativeCodingAgentForSession(
-  session: { harness?: string | null; labels?: Record<string, string> } | null | undefined,
+  session:
+    | { harness?: string | null; agent_name?: string | null; labels?: Record<string, string> }
+    | null
+    | undefined,
 ): NativeCodingAgentSpec | undefined {
   if (session == null) return undefined;
   return (
     nativeCodingAgentForWrapper(session.labels?.[WRAPPER_LABEL_KEY]) ??
-    nativeCodingAgentForHarness(session.harness)
+    nativeCodingAgentForHarness(session.harness) ??
+    nativeCodingAgentForAgentName(session.agent_name)
   );
 }
 

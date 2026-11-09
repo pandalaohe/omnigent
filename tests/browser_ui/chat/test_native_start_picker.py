@@ -92,7 +92,7 @@ def _open_picker(
     ("harness", "label"),
     [
         ("pi-native", "Pi"),
-        ("antigravity-native", "Antigravity"),
+        ("antigravity-native", "AG"),
         ("opencode-native", "OpenCode"),
         ("kimi-native", "Kimi"),
     ],

@@ -241,12 +241,23 @@ export function LayerGrid({
           <p className="text-xs text-muted-foreground">
             Their saved layers and history are retained.
           </p>
-          {removedLayers.map((layer) => (
-            <p className="mt-1 break-all text-sm" key={layerId(layer)}>
-              {layer.host_id} · {layer.agent_key || "All agents"} · {layer.chars.toLocaleString()}{" "}
-              chars
-            </p>
-          ))}
+          {removedLayers.map((layer) => {
+            const hostName =
+              allHosts.find((host) => host.host_id === layer.host_id)?.name ?? "Removed host";
+            const agentName = layer.agent_key
+              ? (data.agents.find((agent) => agent.key === layer.agent_key)?.display_name ??
+                layer.agent_key)
+              : "All agents";
+            return (
+              <p
+                className="mt-1 break-all text-sm"
+                key={layerId(layer)}
+                title={layer.agent_key ? `${layer.host_id} · ${layer.agent_key}` : layer.host_id}
+              >
+                {hostName} · {agentName} · {layer.chars.toLocaleString()} chars
+              </p>
+            );
+          })}
         </section>
       )}
     </div>

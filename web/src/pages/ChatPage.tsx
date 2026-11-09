@@ -2464,7 +2464,7 @@ export function composerHarnessLabel(
   if (modelPickerKind === "kiro") return "Kiro";
   if (modelPickerKind === "opencode") return "OpenCode";
   if (modelPickerKind === "devin") return "Devin";
-  if (modelPickerKind === "antigravity") return "Antigravity";
+  if (modelPickerKind === "antigravity") return "AG";
   const display = agentName ? agentDisplayLabel(agentName) : null;
   const harness = sessionHarness ? (harnessLabels[sessionHarness] ?? null) : null;
   if (display && harness) return `${display} (${harness})`;
@@ -5761,6 +5761,7 @@ function SessionHarnessPicker({
   openNonce?: number;
 }) {
   const isMobile = useIsMobileViewport();
+  const { data: hosts } = useHosts();
   const [menuOpen, setMenuOpen] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
   const [refreshBusy, setRefreshBusy] = useState(false);
@@ -6391,6 +6392,7 @@ function SessionHarnessPicker({
           members={members}
           childSessions={childSessions}
           agentName={agentName}
+          hosts={hosts}
           onEditAgent={templateId !== null ? onEditAgent : undefined}
         />
       ) : isMobile && configOpen ? (

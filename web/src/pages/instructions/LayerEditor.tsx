@@ -9,12 +9,14 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Textarea } from "@/components/ui/textarea";
+import type { Host } from "@/hooks/useHosts";
 import {
   hasInstructionText,
   layerShape,
   useInstructionRevisions,
   useSaveInstructionLayer,
   type InstructionLayer,
+  type InstructionLayers,
   type InstructionRouteSize,
   type LayerKey,
 } from "@/hooks/useInstructionLayers";
@@ -25,12 +27,16 @@ export function LayerEditor({
   layer,
   title,
   initialText,
+  hosts,
+  agents,
   onClose,
 }: {
   layerKey: LayerKey;
   layer?: InstructionLayer;
   title: string;
   initialText?: string;
+  hosts?: readonly Host[];
+  agents?: InstructionLayers["agents"];
   onClose: () => void;
 }) {
   const [draft, setDraft] = useState(initialText ?? layer?.text ?? "");
@@ -156,8 +162,17 @@ export function LayerEditor({
             {notice.length > 0 && (
               <p>
                 Newly over 10,000 characters:{" "}
-                {notice.map((route) => `${route.host_id} / ${route.agent_key}`).join(", ")}. Text is
-                kept in full.
+                {notice
+                  .map((route) => {
+                    const hostName =
+                      hosts?.find((host) => host.host_id === route.host_id)?.name ?? route.host_id;
+                    const agentName =
+                      agents?.find((agent) => agent.key === route.agent_key)?.display_name ??
+                      route.agent_key;
+                    return `${hostName} / ${agentName}`;
+                  })
+                  .join(", ")}
+                . Text is kept in full.
               </p>
             )}
           </div>

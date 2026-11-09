@@ -5,12 +5,7 @@ import { useHoverPinFloat } from "@/hooks/useHoverPinFloat";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import { formatTokenCount } from "@/lib/formatCost";
 import { useNavigate } from "@/lib/routing";
-import {
-  resolveUsageContext,
-  usageContextLevelLabel,
-  usageContextSettingsHref,
-  usageContextSourceFromKey,
-} from "@/lib/usageContextPreferences";
+import { resolveUsageContext, usageContextSettingsHref } from "@/lib/usageContextPreferences";
 import { cn } from "@/lib/utils";
 
 /** Circumference of the progress ring (r=5.5). */
@@ -53,11 +48,6 @@ export function ComposerContextRing({
     contextWindow,
     autoCompactTokenLimit,
   });
-  const source = usageContextSourceFromKey(sourceKey);
-  const labels = {
-    hostLabel: source?.hostId || "No host",
-    agentLabel: source?.agentName || source?.harness || "Agent",
-  };
   const compactMode =
     mode === "compact" && limits.autoCompactTokenLimit != null && limits.autoCompactTokenLimit > 0;
   const denominator = compactMode ? limits.autoCompactTokenLimit : limits.contextWindow.value;
@@ -131,20 +121,6 @@ export function ComposerContextRing({
         <p className="tabular-nums text-neutral-400 leading-tight dark:text-muted-foreground">
           {formatTokenCount(tokensUsed)} / {formatTokenCount(denominator)} tokens
         </p>
-        <p className="text-sm text-muted-foreground">
-          Context · {usageContextLevelLabel(limits.contextWindow.level, labels)}
-        </p>
-        <p className="text-sm text-muted-foreground">
-          Buffer {limits.buffer.value?.toLocaleString() ?? "Auto"}
-          {limits.buffer.mode === "percent" && limits.buffer.value != null ? "%" : ""} ·{" "}
-          {usageContextLevelLabel(limits.buffer.level, labels)}
-        </p>
-        {limits.ignored.map((item) => (
-          <p key={item.level} className="text-sm text-muted-foreground">
-            Ignored {usageContextLevelLabel(item.level, labels)}: {item.reason}; using{" "}
-            {usageContextLevelLabel(limits.buffer.level, labels)}.
-          </p>
-        ))}
         <Button
           type="button"
           size="sm"

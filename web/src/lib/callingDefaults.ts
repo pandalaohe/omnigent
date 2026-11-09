@@ -91,7 +91,7 @@ const HARNESS_LABELS: Record<string, string> = {
   "claude-sdk": "Claude SDK",
   "pi-native": "Pi",
   "devin-native": "Devin",
-  "antigravity-native": "Antigravity",
+  "antigravity-native": "AG",
 };
 
 /** Display label for a canonical harness id; unknown ids render as-is. */

@@ -9,6 +9,7 @@ import {
   buildRegistry,
   registryHarnessOptions,
   registrySourceLabels,
+  representedRegistryKeys,
   rowsForAgentIds,
 } from "./useAgentRegistry";
 
@@ -152,9 +153,10 @@ describe("settings agent registry", () => {
     for (const raw of ["claude-id", "sdk-id", "grok-id"]) {
       expect(result.some((item) => item.key === raw)).toBe(false);
     }
-    for (const raw of ["composed-id", "installed-id", "user-id"]) {
+    for (const raw of ["composed-id", "installed-id"]) {
       expect(result.some((item) => item.key === raw)).toBe(true);
     }
+    expect(result.some((item) => item.key === "user-id")).toBe(false);
   });
 
   it("keeps same-name harness forms and declares SDK products once", () => {
@@ -208,6 +210,36 @@ describe("settings agent registry", () => {
       "Orion · Claude Code · library",
       "Orion · Codex · library",
     ]);
+    const sameKindSameName = buildRegistry(
+      [],
+      [{ ...agent("hermes-1", "hermes-fn", "acp:hermes-fn"), builtin: false }],
+      [library("ca_hermes", "Hermes-fn", "acp:hermes-fn")],
+      harnesses,
+      hosts,
+    );
+    expect(
+      sameKindSameName.filter((item) => item.section === "yours").map((item) => item.label),
+    ).toEqual(["Hermes-fn"]);
+    expect(sameKindSameName.find((item) => item.key === "hermes-1")?.aliasKeys).toEqual([
+      "ca_hermes",
+    ]);
+    expect(rowsForAgentIds(sameKindSameName, {}, new Set(["ca_hermes"]))).toEqual(
+      new Set(["hermes-1"]),
+    );
+    expect(representedRegistryKeys(sameKindSameName, "hermes-1")).toEqual([
+      "hermes-1",
+      "ca_hermes",
+    ]);
+    const acpCollision = buildRegistry(
+      [],
+      [{ ...agent("orion-acp", "orion", "acp:orion"), builtin: false }],
+      [library("ca_orion", "Orion", "claude-native")],
+      harnesses,
+      hosts,
+    );
+    expect(
+      acpCollision.filter((item) => item.section === "yours").map((item) => item.label),
+    ).toEqual(["Orion · ACP · installed", "Orion · Claude Code · library"]);
     expect(items.find((item) => item.key === "ca_1")?.deployed).toBe(true);
     const newlyReady = buildRegistry([], [], [], harnesses, [
       { ...hosts[0], configured_harnesses: { ...hosts[0].configured_harnesses, cursor: true } },
@@ -246,6 +278,13 @@ describe("settings agent registry", () => {
     ).toEqual([{ id: "plugin-sdk", label: "Plugin SDK", section: "sdk", deployed: false }]);
     expect(registryHarnessOptions(items).map((item) => item.id)).toContain("native-x");
     expect(registrySourceLabels(items, "Native X", "native-x").harnessLabel).toBe("Native X");
+    expect(
+      registrySourceLabels(items, "antigravity-native-ui", "antigravity-native").agentLabel,
+    ).toBe("AG");
+    expect(registrySourceLabels(items, "hermes-native-ui", "hermes-native").agentLabel).toBe(
+      "Hermes",
+    );
+    expect(registrySourceLabels(items, "pi-rpc", "pi").agentLabel).toBe("Pi");
   });
 
   it("carries deployment status into harness menus and fails open for missing registry rows", () => {

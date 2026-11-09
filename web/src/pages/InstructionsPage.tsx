@@ -454,6 +454,8 @@ export function InstructionsPage() {
             layer={data.data?.data.find((layer) => layerId(layer) === layerId(editor.key))}
             title={editor.title}
             initialText={editor.initialText}
+            hosts={hosts.data ?? []}
+            agents={data.data?.agents ?? []}
             onClose={() => setEditor(null)}
           />
         )}

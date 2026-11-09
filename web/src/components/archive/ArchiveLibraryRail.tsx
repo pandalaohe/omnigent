@@ -40,8 +40,13 @@ import {
 import { useHosts } from "@/hooks/useHosts";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { archiveDateRangeBounds } from "@/lib/archiveDateRange";
+import { nativeCodingAgentForAgentName } from "@/lib/nativeCodingAgents";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
 import { cn } from "@/lib/utils";
+
+function formatArchiveAgentName(name: string): string {
+  return nativeCodingAgentForAgentName(name)?.displayName ?? (name === "pi-rpc" ? "Pi" : name);
+}
 
 const SPLIT_STORAGE_KEY = "omnigent:archive-library-rail-split-v1";
 const DATE_STORAGE_KEY = "omnigent:archive-date-filter-v1";
@@ -242,13 +247,23 @@ export function ArchiveLibraryRail({
     () =>
       (facets.data?.hostIds ?? []).map((hostId) => ({
         value: hostId,
-        label: hostNames.get(hostId) ?? hostId,
+        label:
+          hostNames.get(hostId) ??
+          (/^[0-9a-f]{32}$/i.test(hostId) ||
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(hostId)
+            ? "Unavailable host"
+            : hostId),
         keywords: hostId,
       })),
     [facets.data, hostNames],
   );
   const agentOptions = useMemo(
-    () => (facets.data?.agentNames ?? []).map((name) => ({ value: name, label: name })),
+    () =>
+      (facets.data?.agentNames ?? []).map((name) => ({
+        value: name,
+        label: formatArchiveAgentName(name),
+        keywords: name,
+      })),
     [facets.data],
   );
 
@@ -410,11 +425,22 @@ export function ArchiveLibraryRail({
                         </span>
                       )}
                     </span>
-                    <span className="mt-1 block truncate text-sm text-muted-foreground">
+                    <span
+                      className="mt-1 block truncate text-sm text-muted-foreground"
+                      title={conversation.host_id ?? undefined}
+                    >
                       {hostNames.get(conversation.host_id ?? "") ??
-                        conversation.host_id ??
-                        "Host not recorded"}
-                      {conversation.agent_name ? ` · ${conversation.agent_name}` : ""}
+                        (conversation.host_id
+                          ? /^[0-9a-f]{32}$/i.test(conversation.host_id) ||
+                            /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+                              conversation.host_id,
+                            )
+                            ? "Unavailable host"
+                            : conversation.host_id
+                          : "Host not recorded")}
+                      {conversation.agent_name
+                        ? ` · ${formatArchiveAgentName(conversation.agent_name)}`
+                        : ""}
                       {` · Archived ${shortArchiveDate(conversation)}`}
                       {view.searchScope === "content" && conversation.search_match
                         ? ` · ● ${conversation.search_match_count ?? 1} match${(conversation.search_match_count ?? 1) === 1 ? "" : "es"}`

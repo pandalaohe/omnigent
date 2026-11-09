@@ -129,8 +129,13 @@ describe("ComposerContextRing", () => {
     expect(mocks.navigate).toHaveBeenCalledWith(usageContextSettingsHref(sourceKey));
   });
 
-  it("uses the layered values and explains an ignored buffer below the entry", async () => {
-    const source = { hostId: "host-a", agentName: "codex", harness: "codex", model: "gpt-x" };
+  it("uses the layered values without showing raw source or provenance lines in the float", async () => {
+    const source = {
+      hostId: "ca3f7e25e8424846ba531581a90abb8a",
+      agentName: "claude-native-ui",
+      harness: "claude-native",
+      model: "claude-opus-5-5",
+    };
     writeUsageContextPreferences({
       ...DEFAULT_USAGE_CONTEXT_PREFERENCES,
       overrides: {
@@ -154,11 +159,13 @@ describe("ComposerContextRing", () => {
       />,
     );
     await userEvent.setup().hover(screen.getByTestId("composer-context-ring"));
-    expect(await screen.findByText("Context · codex on host-a")).toBeInTheDocument();
-    expect(screen.getByText("Buffer 20,000 · codex, all computers")).toBeInTheDocument();
-    expect(
-      screen.getByText("Ignored codex on host-a: buffer ≥ context; using codex, all computers."),
-    ).toBeInTheDocument();
+    const float = await screen.findByTestId("composer-context-float");
+    expect(float).toHaveTextContent("48% context used");
+    expect(float).toHaveTextContent("190K / 400K tokens");
+    expect(float).not.toHaveTextContent("Context ·");
+    expect(float).not.toHaveTextContent("Buffer");
+    expect(float).not.toHaveTextContent("ca3f7e25e8424846ba531581a90abb8a");
+    expect(float).not.toHaveTextContent("claude-native-ui");
   });
 
   it("never writes a saved value from the composer", async () => {

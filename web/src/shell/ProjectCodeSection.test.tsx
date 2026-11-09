@@ -566,7 +566,7 @@ describe("ProjectCodeSection", () => {
     });
     renderSection();
 
-    fireEvent.click(await screen.findByRole("button", { name: "What agents receive on h1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "What agents receive on Laptop" }));
     await screen.findByTestId("project-code-agent-note-update-h1");
     expect(screen.getByTestId("project-code-agent-note-update-h1")).toHaveTextContent(
       "This host needs an update before agents receive this",
@@ -583,7 +583,7 @@ describe("ProjectCodeSection", () => {
       reason: "host_offline",
     });
     renderSection();
-    fireEvent.click(await screen.findByRole("button", { name: "What agents receive on h1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "What agents receive on Laptop" }));
     await screen.findByTestId("project-code-agent-note-offline-h1");
     expect(screen.getByTestId("project-code-agent-note-offline-h1")).toHaveTextContent(
       "Host offline — shown from saved settings",

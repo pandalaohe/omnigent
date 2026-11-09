@@ -32,6 +32,7 @@ import {
   INITIAL_WINDOW_ITEMS,
   searchSessionItems,
 } from "@/lib/sessionsApi";
+import { nativeCodingAgentForAgentName } from "@/lib/nativeCodingAgents";
 import { getSessionDeepLink, type SessionLinkTarget } from "@/lib/sessionLinks";
 import { useNavigate, useRebasePath } from "@/lib/routing";
 import { cn } from "@/lib/utils";
@@ -378,8 +379,11 @@ export function ArchiveTranscriptViewer({
           <h2 className="truncate text-sm font-semibold" title={title}>
             {title}
           </h2>
-          <p className="truncate font-mono text-sm text-muted-foreground">
-            {conversation.agent_name ?? "Agent not recorded"} · {conversation.id}
+          <p className="truncate font-mono text-sm text-muted-foreground" title={conversation.id}>
+            {conversation.agent_name
+              ? (nativeCodingAgentForAgentName(conversation.agent_name)?.displayName ??
+                (conversation.agent_name === "pi-rpc" ? "Pi" : conversation.agent_name))
+              : "Agent not recorded"}
           </p>
         </div>
         <ExplainedAction content="Copy the exact Session ID for API calls, logs, and cross-device lookup.">

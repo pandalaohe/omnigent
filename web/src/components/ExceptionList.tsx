@@ -2,7 +2,12 @@ import { useState, type ReactNode } from "react";
 
 import { AgentPicker } from "@/components/AgentPicker";
 import { Button } from "@/components/ui/button";
-import { SECTION_LABELS, type RegistryItem, type RegistryKey } from "@/hooks/useAgentRegistry";
+import {
+  representedRegistryKeys,
+  SECTION_LABELS,
+  type RegistryItem,
+  type RegistryKey,
+} from "@/hooks/useAgentRegistry";
 
 const EMPTY_LABELS: Record<string, string> = {};
 const EMPTY_SAVED_ITEMS: Record<string, RegistryItem> = {};
@@ -39,14 +44,21 @@ export function ExceptionList<T>({
   onRetry?: () => void;
 }) {
   const [openKey, setOpenKey] = useState<string | null>(null);
-  const byKey = new Map(items.map((item) => [item.key, item]));
+  const byKey = new Map<string, RegistryItem>();
+  for (const item of items) {
+    byKey.set(item.key, item);
+    for (const aliasKey of item.aliasKeys ?? []) {
+      byKey.set(aliasKey, item);
+    }
+  }
+  const taken = new Set(Object.keys(rows).flatMap((key) => representedRegistryKeys(items, key)));
   return (
     <div className="space-y-2" data-testid="exception-list">
       <div className="flex items-center justify-between gap-3">
         <span className="text-sm font-medium">Exceptions</span>
         <AgentPicker
           items={items}
-          taken={new Set(Object.keys(rows))}
+          taken={taken}
           supports={supports}
           onPick={(key) => {
             onAdd(key);

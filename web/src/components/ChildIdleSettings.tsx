@@ -5,7 +5,7 @@ import { AgentNameTag } from "@/components/AgentNameTag";
 import { ExceptionList } from "@/components/ExceptionList";
 import { HelpTip } from "@/components/HelpTip";
 import { Switch } from "@/components/ui/switch";
-import { useAgentRegistry } from "@/hooks/useAgentRegistry";
+import { representedRegistryKeys, useAgentRegistry } from "@/hooks/useAgentRegistry";
 import {
   CHILD_IDLE_CHANGED_EVENT,
   readChildIdlePreferences,
@@ -79,7 +79,7 @@ export function ChildIdleSettings() {
     ) => (
       <FreezeControls
         label={
-          registry.items.find((item) => item.key === key)?.label ??
+          registry.items.find((item) => item.key === key || item.aliasKeys?.includes(key))?.label ??
           registry.legacyLabels[key] ??
           key
         }
@@ -88,6 +88,12 @@ export function ChildIdleSettings() {
       />
     ),
     [registry.items, registry.legacyLabels],
+  );
+  const displayAgentRows = Object.fromEntries(
+    Object.entries(preferences.agents).filter(([key]) => {
+      const item = registry.items.find((candidate) => candidate.aliasKeys?.includes(key));
+      return !item || !Object.hasOwn(preferences.agents, item.key);
+    }),
   );
   const anyEnabled =
     preferences.enabled ||
@@ -143,14 +149,15 @@ export function ChildIdleSettings() {
       />
       <div className="pl-8 md:pl-12">
         <ExceptionList
-          rows={preferences.agents}
+          rows={displayAgentRows}
           items={registry.items}
           legacyLabels={registry.legacyLabels}
           savedItems={registry.legacyProducts}
           renderLabel={(key, name) => {
             const item =
-              registry.items.find((candidate) => candidate.key === key) ??
-              registry.legacyProducts?.[key];
+              registry.items.find(
+                (candidate) => candidate.key === key || candidate.aliasKeys?.includes(key),
+              ) ?? registry.legacyProducts?.[key];
             return (
               <AgentNameTag
                 agentId={
@@ -171,26 +178,36 @@ export function ChildIdleSettings() {
               : "Monitoring off"
           }
           editor={renderEditor}
-          onAdd={(key) =>
+          onAdd={(key) => {
+            const nextAgents = { ...preferences.agents };
+            for (const targetKey of representedRegistryKeys(registry.items, key)) {
+              nextAgents[targetKey] = { ...preferences.freezeDefault };
+            }
             writeChildIdlePreferences({
               ...preferences,
-              agents: { ...preferences.agents, [key]: { ...preferences.freezeDefault } },
-            })
-          }
-          onPatch={(key, next) =>
+              agents: nextAgents,
+            });
+          }}
+          onPatch={(key, next) => {
+            const base = preferences.agents[key] ?? preferences.freezeDefault;
+            const nextAgents = { ...preferences.agents };
+            for (const targetKey of representedRegistryKeys(registry.items, key)) {
+              nextAgents[targetKey] = { ...(nextAgents[targetKey] ?? base), ...next };
+            }
             writeChildIdlePreferences({
               ...preferences,
-              agents: { ...preferences.agents, [key]: { ...preferences.agents[key], ...next } },
-            })
-          }
-          onRemove={(key) =>
+              agents: nextAgents,
+            });
+          }}
+          onRemove={(key) => {
+            const removeSet = new Set(representedRegistryKeys(registry.items, key));
             writeChildIdlePreferences({
               ...preferences,
               agents: Object.fromEntries(
-                Object.entries(preferences.agents).filter(([id]) => id !== key),
+                Object.entries(preferences.agents).filter(([id]) => !removeSet.has(id)),
               ),
-            })
-          }
+            });
+          }}
           isLoading={registry.isLoading}
           isError={registry.isError}
           onRetry={registry.retry}

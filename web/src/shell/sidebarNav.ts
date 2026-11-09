@@ -1,5 +1,10 @@
 import type { Conversation, SessionSortBy } from "@/hooks/useConversations";
-import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
+import {
+  nativeCodingAgentForAgentName,
+  nativeCodingAgentForHarness,
+  nativeCodingAgentForWrapper,
+  WRAPPER_LABEL_KEY,
+} from "@/lib/nativeCodingAgents";
 import { getOptimisticTitle } from "@/lib/optimisticTitles";
 import { PROJECT_LABEL_KEY, PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 import {
@@ -206,12 +211,20 @@ function wrapperLabel(conversation: Conversation): string | undefined {
 
 function nativeWrapperLabel(conversation: Conversation): string | null {
   const wrapper = wrapperLabel(conversation);
-  return nativeCodingAgentForWrapper(wrapper)?.displayName ?? null;
+  return (
+    nativeCodingAgentForWrapper(wrapper)?.displayName ??
+    nativeCodingAgentForHarness(conversation.harness)?.displayName ??
+    nativeCodingAgentForAgentName(conversation.agent_name)?.displayName ??
+    null
+  );
 }
 
 export function getConversationIconKind(conversation: Conversation): ConversationIconKind {
   const wrapper = wrapperLabel(conversation);
-  const nativeAgent = nativeCodingAgentForWrapper(wrapper);
+  const nativeAgent =
+    nativeCodingAgentForWrapper(wrapper) ??
+    nativeCodingAgentForHarness(conversation.harness) ??
+    nativeCodingAgentForAgentName(conversation.agent_name);
   if (nativeAgent != null) return nativeAgent.iconKind;
   if (conversation.agent_name === "nessie") return "nessie";
   return null;
@@ -220,6 +233,7 @@ export function getConversationIconKind(conversation: Conversation): Conversatio
 export function getConversationAgentType(conversation: Conversation): string {
   const label = nativeWrapperLabel(conversation);
   if (label !== null) return label;
+  if (conversation.agent_name === "pi-rpc") return "Pi";
   if (conversation.agent_name) {
     return conversation.agent_name;
   }

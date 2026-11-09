@@ -23,7 +23,7 @@ export const BRAIN_HARNESS_LABELS: Record<string, string> = {
   codex: "Codex",
   cursor: "Cursor",
   pi: "Pi",
-  antigravity: "Antigravity",
+  antigravity: "AG",
   copilot: "Copilot",
 };
 

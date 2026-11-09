@@ -8,6 +8,7 @@ import type { ProviderUsageLimitsSnapshot } from "@/lib/providerUsageLimits";
 import {
   DEFAULT_USAGE_CONTEXT_PREFERENCES,
   readUsageContextPreferences,
+  resolveUsageContextLevel,
   usageContextLevelKey,
   usageContextSourceKey,
   writeUsageContextPreferences,
@@ -833,9 +834,205 @@ describe("ContextUsageSettings", () => {
         source: "installed",
       },
       CLAUDE,
+      {
+        key: "hermes-installed",
+        name: "hermes-fn",
+        label: "Hermes-fn · ACP · installed",
+        section: "yours",
+        harness: "acp:hermes-fn",
+        description: null,
+        deployed: true,
+        source: "installed",
+      },
     ];
-    store([AGENT]);
+    const orphanHostId = "ca3f7e25e8424846ba531581a90abb8a";
+    const hermesEntry = { agentName: "hermes-fn", harness: "acp:hermes-fn", model: "" };
+    store([AGENT, hermesEntry], {
+      [usageContextLevelKey({ ...agentSource, hostId: orphanHostId }, "cell")]: value(200_000),
+      [usageContextLevelKey({ ...hermesEntry, hostId: "" }, "column")]: value(128_000),
+    });
     renderSettings();
     expect(screen.getByText("Claude Code")).toBeInTheDocument();
+    expect(screen.getByText("Hermes-fn")).toBeInTheDocument();
+    expect(screen.queryByText(/acp:hermes-fn/)).not.toBeInTheDocument();
+    const orphanHeader = screen.getByTestId(`context-col-${orphanHostId}`);
+    expect(orphanHeader).toHaveTextContent("Unavailable computer");
+    expect(orphanHeader).not.toHaveTextContent(orphanHostId);
+    expect(within(orphanHeader).getByText("Unavailable computer")).toHaveAttribute(
+      "title",
+      orphanHostId,
+    );
+  });
+
+  it("groups rows by integration type and folds all-Auto built-in rows behind a toggle", () => {
+    const claudeSdk: RegistryItem = {
+      key: "harness:claude-sdk",
+      name: "claude-sdk",
+      label: "Claude SDK",
+      section: "sdk",
+      harness: "claude-sdk",
+      description: null,
+      deployed: true,
+      source: "builtin",
+    };
+    const piRpc: RegistryItem = {
+      key: "harness:pi-rpc",
+      name: "pi-rpc",
+      label: "Pi RPC",
+      section: "other",
+      harness: "pi-rpc",
+      description: null,
+      deployed: true,
+      source: "builtin",
+    };
+    mocks.registryItems = [CLAUDE, claudeSdk, piRpc];
+    const sdkEntry: UsageContextListEntry = {
+      agentName: "claude-sdk",
+      harness: "claude-sdk",
+      model: "",
+    };
+    const piEntry: UsageContextListEntry = {
+      agentName: "pi-rpc",
+      harness: "pi-rpc",
+      model: "",
+    };
+    store([AGENT, sdkEntry, piEntry], {
+      [usageContextLevelKey({ ...agentSource, hostId: "" }, "column")]: value(1_000_000, 33_000),
+      [usageContextLevelKey({ ...piEntry, hostId: "" }, "column")]: value(272_000, 16_000),
+    });
+    renderSettings();
+
+    expect(screen.getByTestId("context-type-native-cli")).toHaveTextContent("Native CLI");
+    expect(screen.getByTestId("context-type-rpc")).toHaveTextContent("RPC");
+    expect(screen.getByText("Claude Code")).toBeInTheDocument();
+    expect(screen.getByText("Pi RPC")).toBeInTheDocument();
+    expect(screen.queryByTestId("context-row-claude-sdk-claude-sdk")).not.toBeInTheDocument();
+
+    const toggle = screen.getByTestId("context-auto-groups-toggle");
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(toggle).toHaveTextContent("Default (Auto) agents (1: Claude SDK)");
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByTestId("context-row-claude-sdk-claude-sdk")).toBeInTheDocument();
+  });
+
+  it("auto-seeds only built-in agents, drops all-Auto custom rows, and never shows removed agents", () => {
+    const customInstalled: RegistryItem = {
+      key: "ca_custom_acp",
+      name: "ag-hds",
+      label: "Ag-hds",
+      section: "yours",
+      harness: "acp:ag-hds",
+      description: null,
+      deployed: true,
+      source: "installed",
+    };
+    mocks.registryItems = [CLAUDE, CODEX, customInstalled];
+    mocks.sessionAgentIds = new Set(["harness:claude-native", "ca_custom_acp"]);
+
+    const firstView = renderSettings();
+    expect(readUsageContextPreferences().contextList?.entries).toEqual([AGENT]);
+    expect(screen.queryByText("Ag-hds")).not.toBeInTheDocument();
+    firstView.unmount();
+
+    const removedTestAgent: UsageContextListEntry = {
+      agentName: "pi-rpc-acceptance-261028",
+      harness: "pi-rpc",
+      model: "",
+    };
+    const customAutoAgent: UsageContextListEntry = {
+      agentName: "ag-hds",
+      harness: "acp:ag-hds",
+      model: "",
+    };
+    store([AGENT, removedTestAgent, customAutoAgent], {
+      [usageContextLevelKey({ ...removedTestAgent, hostId: "" }, "column")]: value(200_000),
+    });
+    renderSettings();
+
+    expect(screen.getByText("Claude Code")).toBeInTheDocument();
+    expect(screen.queryByText(/pi-rpc-acceptance-261028/i)).not.toBeInTheDocument();
+    expect(screen.queryByText("Ag-hds")).not.toBeInTheDocument();
+    expect(readUsageContextPreferences().contextList?.entries).toEqual([AGENT]);
+  });
+
+  it("collapses same-name records of the same kind into a single agent row", () => {
+    const codexNativeUi: RegistryItem = {
+      key: "harness:codex-native",
+      name: "codex-native-ui",
+      label: "Codex",
+      section: "native",
+      harness: "codex-native",
+      description: null,
+      deployed: true,
+      source: "builtin",
+    };
+    mocks.registryItems = [codexNativeUi];
+    const codexShortModel: UsageContextListEntry = {
+      agentName: "codex",
+      harness: "codex-native",
+      model: "gpt-5.4",
+    };
+    const codexUiModel: UsageContextListEntry = {
+      agentName: "codex-native-ui",
+      harness: "codex-native",
+      model: "GPT 5.3 Codex",
+    };
+    store([codexShortModel, codexUiModel], {
+      [usageContextLevelKey(
+        { hostId: "", agentName: "codex", harness: "codex-native", model: "" },
+        "column",
+      )]: value(272_000, 16_000),
+    });
+    renderSettings();
+
+    expect(screen.getAllByRole("button", { name: "Add a model to Codex" })).toHaveLength(1);
+    const mergedCell = screen.getByTestId(
+      "context-cell-codex-native-ui-codex-native-all-computers",
+    );
+    expect(mergedCell).toHaveTextContent("272k16k");
+
+    fireEvent.click(screen.getByRole("button", { name: "Expand Codex" }));
+    expect(screen.getByText("gpt-5.4")).toBeInTheDocument();
+    expect(screen.getByText("GPT 5.3 Codex")).toBeInTheDocument();
+
+    fireEvent.click(mergedCell);
+    const contextInput = screen.getByRole("spinbutton", {
+      name: "Context total for Codex, all computers",
+    });
+    expect(contextInput).toHaveValue(272000);
+    expect(screen.getByRole("button", { name: "Clear this level" })).toBeInTheDocument();
+
+    fireEvent.change(contextInput, { target: { value: "400000" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    const saved = readUsageContextPreferences();
+    expect(
+      resolveUsageContextLevel(
+        saved,
+        { hostId: "host-a", agentName: "codex", harness: "codex-native", model: "" },
+        "column",
+      ).contextWindow.value,
+    ).toBe(400_000);
+    expect(
+      resolveUsageContextLevel(
+        saved,
+        { hostId: "host-a", agentName: "codex-native-ui", harness: "codex-native", model: "" },
+        "column",
+      ).contextWindow.value,
+    ).toBe(400_000);
+
+    fireEvent.click(screen.getByTestId("context-cell-codex-native-ui-codex-native-all-computers"));
+    fireEvent.click(screen.getByRole("button", { name: "Clear this level" }));
+
+    const cleared = readUsageContextPreferences();
+    expect(
+      resolveUsageContextLevel(
+        cleared,
+        { hostId: "host-a", agentName: "codex", harness: "codex-native", model: "" },
+        "column",
+      ).contextWindow.value,
+    ).toBeNull();
   });
 });
