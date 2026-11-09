@@ -261,6 +261,12 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    */
   setColorScheme: (scheme) => ipcRenderer.send("omnigent:set-color-scheme", scheme),
 
+  browserPlaces: (args) => ipcRenderer.invoke("omnigent:browser-places", args),
+  onBrowserPlaceChosen: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("browser-place-chosen", listener);
+    return () => ipcRenderer.removeListener("browser-place-chosen", listener);
+  },
   // ── Embedded browser pane ──────────────────────────────────────────────
   // The relay hook (web/src/hooks/useBrowserAgentRelay.ts) drives a native
   // WebContentsView per conversation through these; all args/results are

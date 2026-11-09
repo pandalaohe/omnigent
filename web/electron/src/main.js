@@ -49,6 +49,8 @@ const {
   registerBrowserPermissions,
   createBrowserPermissionStore,
 } = require("./browserPermissions");
+const { createBrowserPlaces } = require("./browserPlaces");
+const { registerBrowserPlacesIpc } = require("./browserPlacesIpc");
 const { createBrowserPermissionPrompt } = require("./browserPermissionPrompt");
 const {
   normalizeUrl,
@@ -1674,6 +1676,11 @@ const reconnectOverlay = createReconnectOverlay({
 });
 
 const browserPermissionStore = createBrowserPermissionStore({ loadSettings, saveSettings });
+let browserPlacesUi;
+const browserPlaces = createBrowserPlaces({
+  directory: () => app.getPath("userData"),
+  settings: loadSettings,
+});
 const browserPermissionPrompt = createBrowserPermissionPrompt({
   BrowserWindow,
   ipcMain,
@@ -3984,13 +3991,23 @@ function createBrowserRegistryForWindow(win) {
         ? persistentAgentPartition(origin)
         : defaultPartition();
     },
+    onPageVisit: (url, title) => {
+      try {
+        browserPlaces.visit(url, title);
+      } catch {
+        /* A failed write must not interrupt browsing. */
+      }
+    },
     isPartitionUnavailable: (partition) => clearingBrowserPartitions.has(partition),
     onViewCreated: (entry) =>
       extensionsForPartition(entry.partition)?.addView(entry.view.webContents, win),
     onViewSelected: (entry) =>
       extensionsForPartition(entry.partition)?.selectView(entry.view.webContents),
     onSuppressionChange: (suppressed) => {
-      if (suppressed) browserPermissionPrompt.dismiss(win);
+      if (suppressed) {
+        browserPermissionPrompt.dismiss(win);
+        browserPlacesUi?.dismiss(win);
+      }
     },
     isArcaAgentContext: (context) => {
       const target = windowArcaServerUrl(win);
@@ -4011,7 +4028,10 @@ function createBrowserRegistryForWindow(win) {
     },
     detachFromHost: (view) => win.contentView.removeChildView(view),
     sendToRenderer: (channel, payload) => {
-      if (channel === "browser-host-active-changed") browserPermissionPrompt.dismiss(win);
+      if (channel === "browser-host-active-changed") {
+        browserPermissionPrompt.dismiss(win);
+        browserPlacesUi?.dismiss(win);
+      }
       try {
         win.webContents.send(channel, payload);
       } catch {
@@ -4957,6 +4977,13 @@ function registerIpc() {
   updater.registerIpc();
   aboutWindow.registerIpc();
   browserPermissionPrompt.registerIpc();
+  browserPlacesUi = registerBrowserPlacesIpc({
+    ipcMain,
+    BrowserWindow,
+    places: browserPlaces,
+    isPinnedOriginSender,
+    getRegistry: browserRegistryForSender,
+  });
   updateOverlay.registerIpc();
   returnBanner.registerIpc();
   reconnectOverlay.registerIpc();

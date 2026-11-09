@@ -844,3 +844,81 @@ describe("BrowserPane Chrome cookie import", () => {
     expect(screen.queryByRole("dialog")).not.toBeNull();
   });
 });
+
+describe("desktop saved pages", () => {
+  function placesBridge(overrides: Record<string, unknown> = {}) {
+    return installBridge({
+      browserPlaces: vi.fn().mockResolvedValue({ ok: true, bookmarks: [], history: [] }),
+      onBrowserPlaceChosen: vi.fn().mockReturnValue(() => {}),
+      ...overrides,
+    });
+  }
+  it("keeps the bookmark list open after the address bar loses focus", async () => {
+    const bridge = placesBridge();
+    render(<BrowserPane conversationId="saved" />);
+    const input = screen.getByRole("textbox", { name: "Address bar" });
+    fireEvent.focus(input);
+    fireEvent.blur(input);
+    fireEvent.click(screen.getByRole("button", { name: "Show bookmarks" }));
+    bridge.browserPlaces.mockClear();
+    await act(async () => {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 230);
+      });
+    });
+    expect(bridge.browserPlaces.mock.calls.some(([args]) => args.action === "dismiss")).toBe(false);
+  });
+  it("does not reopen pending suggestions after Escape", async () => {
+    const bridge = placesBridge();
+    render(<BrowserPane conversationId="saved" />);
+    const input = screen.getByRole("textbox", { name: "Address bar" });
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: "exam" } });
+    fireEvent.keyDown(input, { key: "Escape" });
+    bridge.browserPlaces.mockClear();
+    await act(async () => {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 170);
+      });
+    });
+    expect(bridge.browserPlaces.mock.calls.some(([args]) => args.action === "suggest")).toBe(false);
+  });
+  it.each([false, true])(
+    "reports a selected page navigation failure (rejection=%s)",
+    async (reject) => {
+      let choose: ((value: { viewId: string; url: string }) => void) | undefined;
+      const bridge = placesBridge({
+        browserHasView: vi
+          .fn()
+          .mockResolvedValue({ exists: true, url: "https://example.test/original" }),
+        browserOpenOrNavigate: reject
+          ? vi.fn().mockRejectedValue(new Error("offline"))
+          : vi.fn().mockResolvedValue({ ok: false, error: "Navigation denied" }),
+        onBrowserPlaceChosen: vi.fn((callback) => {
+          choose = callback;
+          return () => {};
+        }),
+      });
+      render(<BrowserPane conversationId="saved" />);
+      await waitFor(() =>
+        expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue(
+          "https://example.test/original",
+        ),
+      );
+      act(() => choose?.({ viewId: "saved", url: "https://example.test/selected" }));
+      expect(await screen.findByRole("alert")).toHaveTextContent(
+        reject ? "Unable to open" : "Navigation denied",
+      );
+      expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue(
+        "https://example.test/original",
+      );
+      expect(bridge.browserOpenOrNavigate).toHaveBeenCalled();
+    },
+  );
+  it("hides controls on a partial bridge", () => {
+    installBridge({ browserPlaces: vi.fn() });
+    render(<BrowserPane conversationId="old" />);
+    expect(screen.queryByRole("button", { name: "Show bookmarks" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Bookmark page" })).toBeNull();
+  });
+});
