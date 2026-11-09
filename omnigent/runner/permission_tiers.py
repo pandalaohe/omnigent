@@ -638,6 +638,10 @@ class PermissionTierRuntime:
                     Path.home() / ".gemini" / "antigravity-cli" / "settings.json",
                 )
             )
+            if state.tier != "full":
+                from omnigent.harnesses.antigravity_native.delegation_proof import control_paths
+
+                installed.extend(Path(path) for path in control_paths(state_path.parent))
         elif harness in ("pi", "pi-native"):
             installed.extend(
                 (
@@ -762,6 +766,15 @@ class PermissionTierRuntime:
                 read_path_arg = _READ_PATH.get(name)
                 if read_path_arg is None or isinstance(arguments.get(read_path_arg), str):
                     eval_local_execution = True
+        agy_delegation: Literal["proven", "missing", "failed"] = "missing"
+        if (
+            state.tier != "full"
+            and self._harnesses.get(session_id) == "antigravity-native"
+            and name == "invoke_subagent"
+        ):
+            from omnigent.harnesses.antigravity_native.delegation_proof import delegation_status
+
+            agy_delegation = delegation_status(self._paths[session_id].parent)
         return evaluate_host_tool(
             state,
             name,
@@ -772,6 +785,7 @@ class PermissionTierRuntime:
             native_binding=native[0] if native is not None else None,
             native_support=native[1] if native is not None else None,
             local_execution=eval_local_execution,
+            agy_delegation_status=agy_delegation,
         )
 
     def inspect(
@@ -1051,6 +1065,15 @@ class PermissionTierRuntime:
                     return False
             except ValueError:
                 return False
+        if self._harnesses.get(session_id) == "antigravity-native":
+            if call_id in self._finished.get(session_id, set()):
+                return True
+            inspected = self._inspected.get(session_id, {}).get(call_id)
+            if lease is None and inspected is not None and inspected[0].tier_revision == revision:
+                # A stopped guard can still have an approval parked on the server.
+                self._inspected[session_id].pop(call_id)
+                self._finished.setdefault(session_id, set()).add(call_id)
+                return True
         if lease is None or lease.binding.tier_revision != revision:
             return False
         del self._leases[session_id][call_id]

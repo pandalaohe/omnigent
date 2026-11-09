@@ -1197,6 +1197,27 @@ def test_get_trajectory_steps_raises_on_500(monkeypatch: pytest.MonkeyPatch) -> 
         rpc.get_trajectory_steps(52548, "conv-uuid")
 
 
+@pytest.mark.parametrize(
+    "body,confirmed",
+    [
+        ({"stoppedConversationIds": ["parent", "child"]}, True),
+        ({}, False),
+        ({"stoppedConversationIds": ["other"]}, False),
+        ({"stoppedConversationIds": "parent"}, False),
+    ],
+)
+def test_force_stop_requires_receipt_for_requested_conversation(monkeypatch, body, confirmed):
+    def handler(request):
+        assert request.url.path.endswith("/ForceStopCascadeTree")
+        assert json.loads(request.content) == {"conversationId": "parent"}
+        return httpx.Response(200, json=body)
+
+    monkeypatch.setattr(rpc, "_HTTP_TRANSPORT", httpx.MockTransport(handler))
+    assert rpc.force_stop_cascade_tree(52548, "parent") == (
+        frozenset({"parent", "child"}) if confirmed else None
+    )
+
+
 def test_cancel_cascade_steps_true_on_200(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     ``cancel_cascade_steps`` POSTs ``{"cascadeId": ...}`` to

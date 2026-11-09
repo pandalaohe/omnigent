@@ -780,6 +780,10 @@ def seed_isolated_agy_home(
         if trusted_workspace is None:
             raise ValueError("Antigravity permission startup requires an explicit workspace")
         check_agy_hook_sources(Path(trusted_workspace), permission_tier, bridge_dir)
+        if permission_tier != "full":
+            from omnigent.harnesses.antigravity_native.delegation_proof import prepare_launch
+
+            prepare_launch(bridge_dir)
     real_home = Path.home()
     iso_gemini = agy_gemini_dir(bridge_dir)
     (iso_gemini / "antigravity-cli" / "cache").mkdir(mode=0o700, parents=True, exist_ok=True)

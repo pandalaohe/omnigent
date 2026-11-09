@@ -66,6 +66,20 @@ def _load(name: str) -> dict[str, Any]:
     return cast(dict[str, Any], json.loads(path.read_text()))
 
 
+def test_cancelled_tool_keeps_partial_output_and_reports_cancellation():
+    step = _load("run_command_done")
+    step["status"] = "CORTEX_STEP_STATUS_CANCELED"
+    step["runCommand"]["combinedOutput"] = {"full": "partial output"}
+    events = map_step_to_events(step, conversation_id=_CID)
+    assert [event.data["item_type"] for event in events] == [
+        "function_call",
+        "function_call_output",
+    ]
+    output = _item(events[-1])["output"]
+    assert "partial output" in output
+    assert output.endswith("Tool call cancelled")
+
+
 # ---------------------------------------------------------------------------
 # Helper: assert no delta event at all
 # ---------------------------------------------------------------------------

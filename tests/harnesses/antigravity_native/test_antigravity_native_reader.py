@@ -5872,9 +5872,8 @@ async def test_running_child_reads_status_once_per_tick_without_closing(
 
     assert polls >= 30, f"the mirror should have kept polling a vetoed child; got {polls}"
     assert idle_checks == polls
-    assert sink.statuses() == [], (
-        f"a child agy still calls running must not be closed; got {sink.statuses()}"
-    )
+    assert sink.statuses() == ["failed"]
+    assert "completion could be confirmed" in sink.posts[-1][1]["output"]
 
 
 async def test_a_finished_child_takes_its_own_grandchild_mirrors_down(
@@ -6033,3 +6032,348 @@ async def test_slow_completion_reads_are_sequential_with_transport_timeouts(
         await asyncio.gather(task, return_exceptions=True)
     assert calls == [2.0] * 4
     assert peak == 1
+
+
+async def test_child_coverage_failure_is_detected_without_an_omnigent_child_row(
+    tmp_path, monkeypatch
+):
+    from omnigent.harnesses.antigravity_native import delegation_proof as proof
+    from omnigent.permission_tiers.host import HostPermissionState, write_host_permission_state
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    directory = tmp_path / "bridge"
+    write_host_permission_state(
+        directory / "permission_state.json",
+        HostPermissionState(
+            "parent",
+            "host",
+            "/opt/work/project",
+            "auto",
+            3,
+            "ready",
+        ),
+    )
+    proof.prepare_launch(directory)
+    monkeypatch.setattr(reader, "get_trajectory_steps", lambda *_: [_load("run_command_done")])
+    stopped = []
+
+    def stop(_port, cid):
+        stopped.append(cid)
+        return frozenset({cid})
+
+    monkeypatch.setattr(reader, "force_stop_cascade_tree", stop)
+    posts = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        posts.append(body)
+        return httpx.Response(
+            503 if body["type"] == "external_antigravity_subagent_start" else 200, json={}
+        )
+
+    async with httpx.AsyncClient(
+        base_url="http://server.test", transport=httpx.MockTransport(handler)
+    ) as client:
+        state = reader._ReaderState(seen=set(), interacted=set(), port=4242, bridge_dir=directory)
+        try:
+            await reader._maybe_mirror_subagents(
+                _invoke_subagent_step(results=[{"conversationId": "child-aaa"}]),
+                client=client,
+                session_id="parent",
+                cascade_id="parent-cascade",
+                state=state,
+            )
+            await asyncio.wait_for(asyncio.gather(*state.governance_watchers.values()), 5)
+        finally:
+            await reader._cancel_subagent_mirrors(state)
+    assert state.subagent_mirrors == {}
+    assert stopped == ["child-aaa"]
+    assert proof.delegation_status(directory) == "failed"
+    messages = [post for post in posts if post["type"] == "external_conversation_item"]
+    assert "delegation is disabled" in messages[0]["data"]["item_data"]["content"][0]["text"]
+
+
+async def test_full_child_observation_does_not_read_steps_or_revoke_proof(tmp_path, monkeypatch):
+    from omnigent.harnesses.antigravity_native import delegation_proof as proof
+    from omnigent.permission_tiers.host import HostPermissionState, write_host_permission_state
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    directory = tmp_path / "bridge"
+    write_host_permission_state(
+        directory / "permission_state.json",
+        HostPermissionState(
+            "parent",
+            "host",
+            "/opt/work/project",
+            "full",
+            3,
+            "ready",
+        ),
+    )
+
+    def unexpected(*_):
+        raise AssertionError("Full observation must not contact the child")
+
+    monkeypatch.setattr(reader, "get_trajectory_steps", unexpected)
+    async with httpx.AsyncClient(base_url="http://server.test") as client:
+        await reader._watch_subagent_permissions(
+            port=4242,
+            child_cascade_id="child",
+            client=client,
+            session_id="parent",
+            bridge_dir=directory,
+        )
+    assert not proof.proof_path().exists()
+    assert not (directory / proof.DISABLED_FILE).exists()
+
+
+async def test_matching_child_hook_counts_do_not_require_matching_step_indices(
+    tmp_path, monkeypatch
+):
+    from omnigent.harnesses.antigravity_native import delegation_proof as proof
+    from omnigent.permission_tiers.host import HostPermissionState, write_host_permission_state
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    directory = tmp_path / "bridge"
+    write_host_permission_state(
+        directory / "permission_state.json",
+        HostPermissionState(
+            "parent",
+            "host",
+            "/opt/work/project",
+            "ask",
+            3,
+            "ready",
+        ),
+    )
+    proof.record_hook(
+        directory,
+        {
+            "conversationId": "child-aaa",
+            "stepIdx": 100,
+            "toolCall": {"name": "run_command", "args": {"CommandLine": "pwd"}},
+        },
+        session_id="parent",
+        host_id="host",
+        revision=3,
+        call_id="agy-hook:one",
+    )
+    monkeypatch.setattr(reader, "get_trajectory_steps", lambda *_: [_load("run_command_done")])
+    stopped = []
+
+    def stop(_port, cid):
+        stopped.append(cid)
+        return frozenset({cid})
+
+    monkeypatch.setattr(reader, "force_stop_cascade_tree", stop)
+    client, posts = _subagent_client()
+    async with client:
+        await reader._watch_subagent_permissions(
+            port=4242,
+            child_cascade_id="child-aaa",
+            client=client,
+            session_id="parent",
+            bridge_dir=directory,
+        )
+    assert not proof.proof_path().exists()
+    assert not (directory / proof.DISABLED_FILE).exists()
+    assert posts == []
+    assert stopped == []
+
+
+@pytest.mark.parametrize("consumer", ["root", "child"])
+async def test_failed_step_does_not_cancel_a_later_pending_call(tmp_path, monkeypatch, consumer):
+    from omnigent.harnesses.antigravity_native import delegation_proof as proof
+    from omnigent.harnesses.antigravity_native import guard
+    from omnigent.permission_tiers.host import HostPermissionState, write_host_permission_state
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    directory = tmp_path / "bridge"
+    write_host_permission_state(
+        directory / "permission_state.json",
+        HostPermissionState(
+            "parent",
+            "host",
+            "/opt/work/project",
+            "ask",
+            3,
+            "ready",
+        ),
+    )
+    for index in [6, 8]:
+        proof.record_hook(
+            directory,
+            {
+                "conversationId": "child-aaa",
+                "stepIdx": index,
+                "toolCall": {"name": "run_command", "args": {"CommandLine": "pwd"}},
+            },
+            session_id="parent",
+            host_id="host",
+            revision=3,
+            call_id=f"agy-hook:{index}",
+        )
+    failed = _load("run_command_done")
+    failed["status"] = "CORTEX_STEP_STATUS_ERROR"
+    pending = copy.deepcopy(failed)
+    pending["status"] = "CORTEX_STEP_STATUS_RUNNING"
+    pending["metadata"]["sourceTrajectoryStepInfo"]["stepIndex"] = 8
+    monkeypatch.setattr(reader, "get_trajectory_steps", lambda *_: [failed, pending])
+    monkeypatch.setattr(
+        reader,
+        "get_all_cascade_trajectories",
+        lambda *_: {
+            "trajectorySummaries": {"child-aaa": {"status": "CASCADE_RUN_STATUS_RUNNING"}},
+        },
+    )
+    controls = []
+    monkeypatch.setattr(guard, "_relay_config", lambda *_: {})
+    monkeypatch.setattr(
+        guard, "_relay_post", lambda *_args: controls.append(_args) or {"finished": True}
+    )
+    tick = asyncio.Event()
+
+    async def pause(_seconds):
+        tick.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(reader, "_sleep", pause)
+    client, posts = _subagent_client()
+    monkeypatch.setattr(reader, "post_session_event_with_retry", _PostSink())
+    async with client:
+        if consumer == "root":
+            await reader._process_committed_step(
+                failed,
+                client=client,
+                session_id="parent",
+                cascade_id="child-aaa",
+                state=reader._ReaderState(seen=set(), interacted=set(), bridge_dir=directory),
+                on_pending_interaction=cast(Any, object()),
+            )
+        else:
+            task = asyncio.create_task(
+                reader._watch_subagent_permissions(
+                    port=4242,
+                    child_cascade_id="child-aaa",
+                    client=client,
+                    session_id="parent",
+                    bridge_dir=directory,
+                )
+            )
+            try:
+                await asyncio.wait_for(tick.wait(), 5)
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+    assert controls == []
+    assert not any(post["type"] == "external_elicitation_resolved" for post in posts)
+    assert proof.hook_receipts(directory, "child-aaa")[1]["finished"] is False
+
+
+@pytest.mark.parametrize("exit_kind", ["cancel", "rotate"])
+async def test_root_exit_drains_child_observation_after_row_registration_fails(
+    tmp_path,
+    monkeypatch,
+    patched_discovery,
+    exit_kind,
+):
+    from omnigent.harnesses.antigravity_native import delegation_proof as proof
+    from omnigent.harnesses.antigravity_native import rpc
+    from omnigent.permission_tiers.host import HostPermissionState, write_host_permission_state
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    directory = _bridge_dir(tmp_path)
+    write_host_permission_state(
+        directory / "permission_state.json",
+        HostPermissionState(
+            _SESSION_ID,
+            "host",
+            "/opt/work/project",
+            "ask",
+            3,
+            "ready",
+        ),
+    )
+    proof.prepare_launch(directory)
+    monkeypatch.setattr(rpc, "running_agy_executables", lambda *_: ())
+    monkeypatch.setattr(
+        reader,
+        "stream_agent_state_updates",
+        _FrameScript(
+            [
+                _frame([_invoke_subagent_step(results=[{"conversationId": "child-aaa"}])]),
+            ]
+        ),
+    )
+    child_waiting, child_ended, rotate = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    child_polls = []
+
+    def snapshot(_port, cid, **_kwargs):
+        if cid == "child-aaa":
+            child_polls.append(cid)
+        return []
+
+    monkeypatch.setattr(reader, "get_trajectory_steps", snapshot)
+
+    def summaries(*_args, **_kwargs):
+        if rotate.is_set():
+            return _rotation_body("next-cascade")
+        return {
+            "trajectorySummaries": {
+                _CASCADE_ID: {"status": "CASCADE_RUN_STATUS_RUNNING"},
+                "child-aaa": {"status": "CASCADE_RUN_STATUS_RUNNING"},
+            }
+        }
+
+    monkeypatch.setattr(reader, "get_all_cascade_trajectories", summaries)
+
+    async def pause(seconds):
+        if seconds == reader._SUBAGENT_POLL_INTERVAL_S:
+            child_waiting.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                child_ended.set()
+        else:
+            await asyncio.sleep(0)
+
+    monkeypatch.setattr(reader, "_sleep", pause)
+    monkeypatch.setattr(reader, "post_session_event_with_retry", _PostSink())
+    registered = []
+
+    def refuse_row(request):
+        registered.append(json.loads(request.content))
+        return httpx.Response(503, json={})
+
+    before = set(asyncio.all_tasks())
+    async with httpx.AsyncClient(
+        base_url="http://server.test", transport=httpx.MockTransport(refuse_row)
+    ) as client:
+        task = asyncio.create_task(
+            reader.supervise_reader(
+                directory,
+                _SESSION_ID,
+                client=client,
+                on_pending_interaction=cast(Any, object()),
+                detect_rotation_interval_s=0.0,
+            )
+        )
+        try:
+            await asyncio.wait_for(child_waiting.wait(), 5)
+            if exit_kind == "cancel":
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, 5)
+            else:
+                rotate.set()
+                assert await asyncio.wait_for(task, 5) == "next-cascade"
+            assert child_ended.is_set()
+            assert child_polls
+            assert registered[0]["type"] == "external_antigravity_subagent_start"
+            assert not proof.proof_path().exists()
+            assert not (directory / proof.DISABLED_FILE).exists()
+        finally:
+            leftovers = set(asyncio.all_tasks()) - before
+            for pending_task in leftovers:
+                pending_task.cancel()
+            await asyncio.gather(*leftovers, return_exceptions=True)

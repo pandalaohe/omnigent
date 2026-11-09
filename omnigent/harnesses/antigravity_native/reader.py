@@ -57,6 +57,7 @@ import json
 import logging
 import sqlite3
 import weakref
+from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -79,6 +80,7 @@ from omnigent.harnesses.antigravity_native.rpc import (
     AntigravityRpcError,
     _candidate_agy_rpc_ports,
     _conversation_matches,
+    force_stop_cascade_tree,
     get_all_cascade_trajectories,
     get_available_models,
     get_trajectory_steps,
@@ -92,7 +94,9 @@ from omnigent.harnesses.antigravity_native.steps import (
     OutboundEvent,
     PendingInteraction,
     _execution_discriminator,
+    _is_tool_step,
     _step_index,
+    _tool_call_block,
     _tool_call_id,
     _trajectory_id,
     _user_input_text,
@@ -211,7 +215,7 @@ _STATUS_GENERATING = "CORTEX_STEP_STATUS_GENERATING"
 # early would dedup and drop the eventual DONE output.
 _STATUS_DONE = "CORTEX_STEP_STATUS_DONE"
 _STATUS_ERROR = "CORTEX_STEP_STATUS_ERROR"
-_TERMINAL_STATUSES = frozenset({_STATUS_DONE, _STATUS_ERROR})
+_TERMINAL_STATUSES = frozenset({_STATUS_DONE, _STATUS_ERROR, "CORTEX_STEP_STATUS_CANCELED"})
 
 # Dedup key for a step within a run. ``step_index`` is ``None`` for USER_INPUT
 # (no trajectory slot) and proto-omitted (treated as ``None`` here) for step 0;
@@ -1012,6 +1016,25 @@ async def supervise_reader(
     if discovered is None:
         return None
     cascade_id, port = discovered
+    from omnigent.permission_tiers.host import (
+        HOST_PERMISSION_STATE_FILE,
+        read_host_permission_state,
+    )
+
+    if (bridge_dir / HOST_PERMISSION_STATE_FILE).exists():
+        try:
+            permission = await asyncio.to_thread(
+                read_host_permission_state, bridge_dir / HOST_PERMISSION_STATE_FILE
+            )
+            if permission.tier != "full":
+                from omnigent.harnesses.antigravity_native.delegation_proof import observe_launch
+
+                await asyncio.to_thread(observe_launch, bridge_dir, port)
+        except (OSError, ValueError, KeyError):
+            _logger.warning(
+                "Antigravity delegation fingerprint unavailable; existing spawn rules apply",
+                exc_info=True,
+            )
 
     # One set of cross-poll/cross-frame trackers per reader run, shared by BOTH
     # the stream path and the poll fallback so a fall-through after a partial
@@ -1168,6 +1191,7 @@ async def supervise_reader(
                     # reader teardown mid-flight must not leave them polling a
                     # cascade whose agy is going away.
                     *state.subagent_mirrors.values(),
+                    *state.governance_watchers.values(),
                 )
                 if pending is not None and not pending.done()
             ]
@@ -1287,6 +1311,7 @@ class _ReaderState:
     surfaced_elicitations: dict[_StepKey, str] = field(default_factory=dict)
     interaction_rescans: set[asyncio.Task[None]] = field(default_factory=set)
     subagent_mirrors: dict[str, asyncio.Task[None]] = field(default_factory=dict)
+    governance_watchers: dict[str, asyncio.Task[None]] = field(default_factory=dict)
     last_context_usage: dict[str, object] | None = None
     usage_thread_kind: Literal["main", "subagent"] = "main"
     metered_steps: set[_StepKey] = field(default_factory=set)
@@ -1792,6 +1817,15 @@ async def _reconcile_idle_turn(
         )
         if state.turn_generation > 0 and state.idle_ticks >= _QUIESCENT_TICKS_TO_CLOSE:
             event = _status_event(_STATUS_FAILED if state.turn_error else _STATUS_IDLE)
+            if steps and steps[-1].get("status") == "CORTEX_STEP_STATUS_CANCELED":
+                event = _status_event("stopped")
+            elif (
+                state.usage_thread_kind == "subagent"
+                and steps
+                and steps[-1].get("status") == _STATUS_ERROR
+            ):
+                event = _status_event(_STATUS_FAILED)
+                event.data["output"] = "The native helper ended with a tool error."
             if state.turn_error:
                 event.data["output"] = state.turn_error
         elif monotonic() - state.last_work_at >= _UNCONFIRMED_TURN_TIMEOUT_S:
@@ -1825,7 +1859,12 @@ async def _mirror_subagent_cascade(
         return
 
     child_state = _ReaderState(
-        seen=set(), interacted=set(), port=port, usage_thread_kind="subagent", turn_active=True
+        seen=set(),
+        interacted=set(),
+        port=port,
+        usage_thread_kind="subagent",
+        turn_active=True,
+        turn_generation=1,
     )
     try:
         while True:
@@ -1845,6 +1884,15 @@ async def _mirror_subagent_cascade(
                 continue
             await _sleep(_SUBAGENT_POLL_INTERVAL_S)
     finally:
+        if child_state.turn_active:
+            event = _status_event(_STATUS_FAILED)
+            event.data["output"] = (
+                "Helper mirroring ended before native completion could be confirmed."
+            )
+            try:
+                await asyncio.wait_for(_post_event(client, child_session_id, event), timeout=0.5)
+            except (TimeoutError, httpx.HTTPError):
+                _logger.warning("Helper mirror termination could not be delivered", exc_info=True)
         # A child's steps run this same path, so a NESTED ``INVOKE_SUBAGENT``
         # registers its grandchild here rather than in the parent's tracker,
         # which the reader's teardown drain is the only thing that walks. Each
@@ -1862,12 +1910,208 @@ async def _cancel_subagent_mirrors(state: _ReaderState) -> None:
     :param state: The reader/child state whose ``subagent_mirrors`` to drain.
     :returns: None.
     """
-    mirrors = [task for task in state.subagent_mirrors.values() if not task.done()]
+    mirrors = [
+        task
+        for task in (*state.subagent_mirrors.values(), *state.governance_watchers.values())
+        if not task.done()
+    ]
     for task in mirrors:
         task.cancel()
     for task in mirrors:
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await task
+
+
+async def withdraw_guard_approvals(
+    client: httpx.AsyncClient,
+    session_id: str,
+    bridge_dir: Path,
+    cascade_ids: frozenset[str],
+) -> None:
+    """Withdraw waits owned by stopped native calls, never answer them as approved."""
+    from omnigent.harnesses.antigravity_native.delegation_proof import hook_receipts
+    from omnigent.harnesses.antigravity_native.guard import _relay_config, _relay_post
+    from omnigent.permission_tiers.host import (
+        HOST_PERMISSION_STATE_FILE,
+        read_host_permission_state,
+    )
+
+    by_cascade = [await asyncio.to_thread(hook_receipts, bridge_dir, cid) for cid in cascade_ids]
+    unfinished = [
+        record
+        for records in by_cascade
+        for record in records
+        if record.get("finished") is not True
+    ]
+    if not unfinished:
+        return
+    permission = await asyncio.to_thread(
+        read_host_permission_state, bridge_dir / HOST_PERMISSION_STATE_FILE
+    )
+    if permission.session_id != session_id:
+        raise ValueError("Native stop permission owner changed")
+    for records in by_cascade:
+        for record in records:
+            if record.get("finished") is True:
+                continue
+            relay = await asyncio.to_thread(_relay_config, bridge_dir, permission)
+            await asyncio.to_thread(
+                _relay_post,
+                relay,
+                "/permission-tiers/control",
+                {
+                    "type": "permission_tier_finish",
+                    "call_id": record["call_id"],
+                    "expected_revision": record["revision"],
+                },
+            )
+            for key in ("approval_id", "policy_id"):
+                eid = record.get(key)
+                if not isinstance(eid, str) or not eid:
+                    raise ValueError("Native hook approval identity is unavailable")
+                response = await client.post(
+                    f"/v1/sessions/{url_component(session_id)}/events",
+                    json={"type": _EXTERNAL_ELICITATION_RESOLVED, "data": {"elicitation_id": eid}},
+                    timeout=10.0,
+                )
+                response.raise_for_status()
+
+
+async def _disable_child_delegation(
+    *,
+    port: int,
+    child_cascade_id: str,
+    client: httpx.AsyncClient,
+    session_id: str,
+    bridge_dir: Path,
+    reason: str,
+) -> None:
+    from omnigent.harnesses.antigravity_native.delegation_proof import mark_failed
+
+    await asyncio.to_thread(mark_failed, bridge_dir, reason)
+    stopped = await asyncio.to_thread(force_stop_cascade_tree, port, child_cascade_id)
+    detail = ". Stopping the helper could not be confirmed; delegation is disabled."
+    if stopped is not None:
+        detail = ". The helper was stopped; delegation is disabled until re-verification."
+        try:
+            await withdraw_guard_approvals(client, session_id, bridge_dir, stopped)
+        except (OSError, ValueError, KeyError, httpx.HTTPError):
+            detail += " A pending approval could not be cleared."
+    await _post_event(
+        client,
+        session_id,
+        OutboundEvent(
+            event_type="external_conversation_item",
+            data={
+                "item_type": "message",
+                "item_data": {
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": reason + detail}],
+                },
+                "source_id": "agy-delegation-failed:" + child_cascade_id,
+            },
+            step_index=0,
+        ),
+    )
+
+
+async def _watch_subagent_permissions(
+    *,
+    port: int,
+    child_cascade_id: str,
+    client: httpx.AsyncClient,
+    session_id: str,
+    bridge_dir: Path,
+) -> None:
+    """Observe vendor children independently of optional Omnigent row registration."""
+    from omnigent.harnesses.antigravity_native.delegation_proof import hook_receipts
+    from omnigent.permission_tiers.host import (
+        HOST_PERMISSION_STATE_FILE,
+        read_host_permission_state,
+    )
+
+    descendants: dict[str, asyncio.Task[None]] = {}
+    restricted = False
+    try:
+        while True:
+            state = await asyncio.to_thread(
+                read_host_permission_state, bridge_dir / HOST_PERMISSION_STATE_FILE
+            )
+            if state.tier == "full":
+                return
+            restricted = True
+            try:
+                steps = await asyncio.to_thread(get_trajectory_steps, port, child_cascade_id)
+            except httpx.HTTPError:
+                await _sleep(_SUBAGENT_POLL_INTERVAL_S)
+                continue
+            receipts = await asyncio.to_thread(hook_receipts, bridge_dir, child_cascade_id)
+            hooked = Counter(record["name"] for record in receipts)
+            committed: Counter[str] = Counter()
+            for step in steps:
+                for _spec, grandchild in _subagent_pairs(step):
+                    if grandchild not in descendants:
+                        descendants[grandchild] = asyncio.create_task(
+                            _watch_subagent_permissions(
+                                port=port,
+                                child_cascade_id=grandchild,
+                                client=client,
+                                session_id=session_id,
+                                bridge_dir=bridge_dir,
+                            )
+                        )
+                if not _is_settled(step) or not _is_tool_step(step):
+                    continue
+                native = _tool_call_block(step) or {}
+                name = native.get("name")
+                if step.get("status") == "CORTEX_STEP_STATUS_CANCELED":
+                    continue
+                if not isinstance(name, str) or not name:
+                    raise ValueError("Native tool name is unavailable in the poll snapshot")
+                committed[name] += 1
+                if committed[name] > hooked[name]:
+                    reason = (
+                        "A native Antigravity helper tool ran without a matching permission hook"
+                    )
+                    await _disable_child_delegation(
+                        port=port,
+                        child_cascade_id=child_cascade_id,
+                        client=client,
+                        session_id=session_id,
+                        bridge_dir=bridge_dir,
+                        reason=reason,
+                    )
+                    return
+            try:
+                body = await asyncio.to_thread(get_all_cascade_trajectories, port)
+            except httpx.HTTPError:
+                await _sleep(_SUBAGENT_POLL_INTERVAL_S)
+                continue
+            summaries = body.get("trajectorySummaries")
+            summary = summaries.get(child_cascade_id) if isinstance(summaries, dict) else None
+            if isinstance(summary, dict) and summary.get("status") == _CASCADE_RUN_STATUS_IDLE:
+                if descendants:
+                    await asyncio.gather(*descendants.values())
+                return
+            await _sleep(_SUBAGENT_POLL_INTERVAL_S)
+    except (OSError, ValueError, KeyError):
+        if restricted:
+            await _disable_child_delegation(
+                port=port,
+                child_cascade_id=child_cascade_id,
+                client=client,
+                session_id=session_id,
+                bridge_dir=bridge_dir,
+                reason="Native Antigravity helper permission observation is unreadable",
+            )
+        else:
+            _logger.warning("Native helper permission state is unavailable", exc_info=True)
+    finally:
+        for task in descendants.values():
+            if not task.done():
+                task.cancel()
+        if descendants:
+            await asyncio.gather(*descendants.values(), return_exceptions=True)
 
 
 async def _maybe_mirror_subagents(
@@ -1904,6 +2148,43 @@ async def _maybe_mirror_subagents(
         return
     tool_call_id = _tool_call_id(step, cascade_id)
     for spec, child_cascade_id in pairs:
+        if state.bridge_dir is not None and child_cascade_id not in state.governance_watchers:
+            from omnigent.harnesses.antigravity_native.delegation_proof import (
+                FINGERPRINT_FILE,
+                _read_object,
+            )
+            from omnigent.permission_tiers.host import (
+                HOST_PERMISSION_STATE_FILE,
+                read_host_permission_state,
+            )
+
+            try:
+                permission = read_host_permission_state(
+                    state.bridge_dir / HOST_PERMISSION_STATE_FILE
+                )
+                launch = _read_object(state.bridge_dir / FINGERPRINT_FILE)
+                metadata = step.get("metadata")
+                created = metadata.get("createdAt") if isinstance(metadata, dict) else None
+                started = launch.get("started_at")
+                current = (
+                    not isinstance(created, str)
+                    or not isinstance(started, str)
+                    or datetime.fromisoformat(created) >= datetime.fromisoformat(started)
+                )
+                if permission.tier != "full" and current:
+                    state.governance_watchers[child_cascade_id] = asyncio.create_task(
+                        _watch_subagent_permissions(
+                            port=state.port,
+                            child_cascade_id=child_cascade_id,
+                            client=client,
+                            session_id=session_id,
+                            bridge_dir=state.bridge_dir,
+                        )
+                    )
+            except (OSError, ValueError):
+                _logger.warning(
+                    "Antigravity child permission observation unavailable", exc_info=True
+                )
         if child_cascade_id in state.subagent_mirrors:
             continue
         child_session_id = await _register_subagent_child(

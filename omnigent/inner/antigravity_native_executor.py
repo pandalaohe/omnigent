@@ -70,7 +70,7 @@ from omnigent.harnesses.antigravity_native.bridge import (
     read_bridge_state,
 )
 from omnigent.harnesses.antigravity_native.rpc import (
-    cancel_cascade_steps,
+    force_stop_cascade_tree,
     resolve_language_server_port,
 )
 from omnigent.inner.executor import (
@@ -153,30 +153,10 @@ class AntigravityNativeExecutor(Executor):
         return outcome is None
 
     async def interrupt_session(self, session_key: str) -> bool:
-        """
-        Interrupt the active native Antigravity turn via ``CancelCascadeSteps``.
+        """Stop the native conversation tree, including waiting helper hooks.
 
-        Resolves the cascade id from bridge state (the cascade id IS the
-        conversation id), discovers agy's connect-RPC port, and asks agy to
-        cancel the running cascade
-        (:func:`omnigent.harnesses.antigravity_native.rpc.cancel_cascade_steps`).
-
-        .. note:: **Scope — RUNNING cascades only (live-verified, C3).**
-           ``CancelCascadeSteps`` stops an in-flight (generating) cascade — the
-           case this serves: the user hits stop during generation. It is a
-           **NO-OP on a step that is WAITING for a user interaction**
-           (ask-question / command-permission): agy returns HTTP 200 but the
-           WAITING step does not transition. A WAITING step is unblocked by
-           delivering a DENY through the interaction bridge
-           (:mod:`omnigent.harnesses.antigravity_native.interactions`), NOT here — this
-           method deliberately does not attempt to handle that case.
-
-        :param session_key: Adapter session key. Unused; the native bridge is
-            per conversation.
-        :returns: ``True`` when agy accepted the cancel; ``False`` when there is
-            no real conversation yet (placeholder / missing or inactive bridge
-            state), no agy connect-RPC port could be resolved, or the cancel RPC
-            failed.
+        Return true only for an explicit stop receipt for the bound conversation.
+        A missing owner, placeholder, or unconfirmed native response returns false.
         """
         del session_key
         state = await asyncio.to_thread(read_bridge_state, self._bridge_dir)
@@ -194,13 +174,13 @@ class AntigravityNativeExecutor(Executor):
                 cascade_id,
             )
             return False
-        cancelled = await asyncio.to_thread(cancel_cascade_steps, port, cascade_id)
+        stopped = await asyncio.to_thread(force_stop_cascade_tree, port, cascade_id)
         _logger.info(
-            "antigravity native interrupt via CancelCascadeSteps: conversation=%s accepted=%s",
+            "antigravity native interrupt via ForceStopCascadeTree: conversation=%s confirmed=%s",
             cascade_id,
-            cancelled,
+            stopped is not None,
         )
-        return cancelled
+        return stopped is not None
 
     async def run_turn(
         self,

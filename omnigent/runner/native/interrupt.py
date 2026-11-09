@@ -442,6 +442,8 @@ class NativeInterruptRunner:
             return await self._codex_interrupt(conv_id)
         if key == "opencode":
             return await self._opencode_interrupt(conv_id)
+        if key == "antigravity":
+            return await self._antigravity_interrupt(conv_id)
         spec = _UNIFORM_INTERRUPT.get(key)
         if spec is None:
             return None
@@ -530,6 +532,10 @@ class NativeInterruptRunner:
         try:
             if terminal_registry is None:
                 raise RuntimeError("Terminal ownership registry is unavailable")
+            if agent.key == "antigravity":
+                stopped = await self._antigravity_interrupt(conv_id)
+                if stopped is not None and stopped.status_code >= 400:
+                    return stopped
             # Capture instance identity before yielding; never close a replacement pane.
             entries = terminal_registry.list_for_conversation(conv_id)
             for entry in entries:
@@ -1084,6 +1090,52 @@ class NativeInterruptRunner:
         finally:
             with contextlib.suppress(Exception):
                 await codex_client.close()
+        self._defer_parent_wake_after_native_interrupt(conv_id)
+        return Response(status_code=204)
+
+    async def _antigravity_interrupt(self, conv_id: str) -> Response | None:
+        """Stop the vendor tree and revoke its parked approvals before reporting it."""
+        from omnigent.harnesses.antigravity_native.bridge import (
+            ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
+            bridge_dir_for_bridge_id,
+            is_placeholder_conversation_id,
+            read_bridge_state,
+        )
+        from omnigent.harnesses.antigravity_native.reader import withdraw_guard_approvals
+        from omnigent.harnesses.antigravity_native.rpc import (
+            force_stop_cascade_tree,
+            resolve_language_server_port,
+        )
+        from omnigent.runner.native.orchestration import _session_labels_for_runner_spawn
+
+        try:
+            labels = await _session_labels_for_runner_spawn(
+                server_client=self._server_client,
+                session_id=conv_id,
+                required=True,
+            )
+            bridge_id = labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY) or conv_id
+            bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+            state = await asyncio.to_thread(read_bridge_state, bridge_dir)
+            if state is None or is_placeholder_conversation_id(state.conversation_id):
+                return None
+            if state.session_id != conv_id:
+                raise ValueError("Antigravity conversation ownership changed")
+            port = await asyncio.to_thread(resolve_language_server_port, state.conversation_id)
+            if port is None:
+                raise ValueError("Antigravity stop endpoint is unavailable")
+            stopped = await asyncio.to_thread(force_stop_cascade_tree, port, state.conversation_id)
+            if stopped is None:
+                raise ValueError("Antigravity did not confirm stopping the conversation tree")
+            await withdraw_guard_approvals(self._server_client, conv_id, bridge_dir, stopped)
+        except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "antigravity_native_interrupt_failed",
+                    "detail": self._client_safe_error_detail(exc, context="Antigravity stop"),
+                },
+            )
         self._defer_parent_wake_after_native_interrupt(conv_id)
         return Response(status_code=204)
 

@@ -114,7 +114,12 @@ def _make_runner(**overrides: Any) -> tuple[NativeInterruptRunner, dict[str, Any
         return None
 
     kwargs: dict[str, Any] = {
-        "server_client": SimpleNamespace(),
+        "server_client": httpx.AsyncClient(
+            base_url="http://server.test",
+            transport=httpx.MockTransport(
+                lambda _request: httpx.Response(200, json={"labels": {}})
+            ),
+        ),
         "resource_registry": _FakeResourceRegistry(),
         "publish_event": _publish,
         "mark_subagent_terminal_and_wake": _mark_and_wake,
@@ -174,13 +179,98 @@ def test_native_session_has_active_work_prefers_observed_pane_status(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("harness", ["antigravity-native", "claude-sdk", None])
+@pytest.mark.parametrize("harness", ["claude-sdk", None])
 async def test_no_handler_harnesses_return_none(harness: str | None) -> None:
     """Harnesses without an interrupt/stop handler return None (caller falls through)."""
     runner, _ = _make_runner()
     assert await runner.interrupt(harness, "conv_x") is None
     if harness in {"claude-sdk", None}:
         assert await runner.stop(harness, "conv_x") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("confirmed", [True, False])
+async def test_agy_interrupt_clears_helper_wait_only_after_native_stop_receipt(
+    tmp_path, monkeypatch, confirmed
+):
+    from omnigent.harnesses.antigravity_native import bridge as agy_bridge
+    from omnigent.harnesses.antigravity_native import guard, rpc
+    from omnigent.harnesses.antigravity_native.delegation_proof import record_hook
+    from omnigent.permission_tiers.host import HostPermissionState, write_host_permission_state
+
+    directory = agy_bridge.bridge_dir_for_bridge_id("w4-fixture")
+    directory.mkdir(parents=True, exist_ok=True)
+    agy_bridge.write_bridge_state(
+        directory, agy_bridge.AntigravityNativeBridgeState("conv_w4", "native-parent")
+    )
+    write_host_permission_state(
+        directory / "permission_state.json",
+        HostPermissionState(
+            "conv_w4",
+            "host",
+            "/opt/work/project",
+            "ask",
+            3,
+            "ready",
+        ),
+    )
+    record_hook(
+        directory,
+        {
+            "conversationId": "native-child",
+            "stepIdx": 2,
+            "toolCall": {"name": "write_file", "args": {"Path": "marker.txt", "Content": "x"}},
+        },
+        session_id="conv_w4",
+        host_id="host",
+        revision=3,
+        call_id="agy-hook:pending-child",
+    )
+    monkeypatch.setattr(rpc, "resolve_language_server_port", lambda _: 4242)
+    monkeypatch.setattr(
+        rpc,
+        "force_stop_cascade_tree",
+        lambda *_: frozenset({"native-parent", "native-child"}) if confirmed else None,
+    )
+    monkeypatch.setattr(guard, "_relay_config", lambda *_: {})
+    settlements = []
+    monkeypatch.setattr(
+        guard,
+        "_relay_post",
+        lambda _relay, _path, body: settlements.append(body) or {"finished": True},
+    )
+    withdrawals = []
+
+    def handler(request):
+        if request.url.path.endswith("/labels"):
+            return httpx.Response(
+                200,
+                json={"labels": {agy_bridge.ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY: "w4-fixture"}},
+            )
+        withdrawals.append(json.loads(request.content))
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        base_url="http://server.test", transport=httpx.MockTransport(handler)
+    ) as client:
+        runner, captured = _make_runner(server_client=client)
+        response = await runner.interrupt("antigravity-native", "conv_w4")
+        assert response is not None and response.status_code == (204 if confirmed else 503)
+        runner.clear_pending_interrupt("conv_w4")
+    assert captured["wakes"] == []
+    assert len(withdrawals) == (2 if confirmed else 0)
+    assert all(item["type"] == "external_elicitation_resolved" for item in withdrawals)
+    assert settlements == (
+        [
+            {
+                "type": "permission_tier_finish",
+                "call_id": "agy-hook:pending-child",
+                "expected_revision": 3,
+            }
+        ]
+        if confirmed
+        else []
+    )
 
 
 @pytest.mark.asyncio

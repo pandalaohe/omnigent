@@ -104,6 +104,7 @@ _TYPE_LIST_DIRECTORY = "CORTEX_STEP_TYPE_LIST_DIRECTORY"
 _STATUS_DONE = "CORTEX_STEP_STATUS_DONE"
 _STATUS_WAITING = "CORTEX_STEP_STATUS_WAITING"
 _STATUS_ERROR = "CORTEX_STEP_STATUS_ERROR"
+_STATUS_CANCELED = "CORTEX_STEP_STATUS_CANCELED"
 
 
 def _source_traj_info(step: dict[str, object]) -> dict[str, object] | None:
@@ -1155,13 +1156,15 @@ def map_step_to_events(
     #         combinedOutput proto-omitted empty output) — an empty result
     #         beats a dangling call.
     if _is_tool_step(step):
-        if status not in (_STATUS_DONE, _STATUS_ERROR):
+        if status not in (_STATUS_DONE, _STATUS_ERROR, _STATUS_CANCELED):
             return []
         idx = _step_index(step)
         step_idx = idx if idx is not None else 0
         call_id = _tool_call_id(step, conversation_id)
         output = _tool_result_output(step, step_type)
-        if output is None:
+        if status == _STATUS_CANCELED:
+            output = ((output + "\n\n") if output else "") + "Tool call cancelled"
+        elif output is None:
             output = _tool_error_output(step) if status == _STATUS_ERROR else ""
         return [
             _function_call_event(
