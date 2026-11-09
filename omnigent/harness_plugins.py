@@ -471,7 +471,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         _EF.GEMINI,
         _MF.GEMINI,
         _AU.OWN_AUTH,
-        subagents=False,
+        subagents=True,
         interrupt=True,
         streaming=True,
         fork_history=_FH.NONE,

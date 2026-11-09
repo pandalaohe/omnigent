@@ -145,7 +145,7 @@ def test_antigravity_native_runtime_maps_wrapper_to_agy_terminal() -> None:
 
     display_name, model, harness = sessions_routes._native_terminal_runtime(conv)
     assert (display_name, model, harness) == (
-        "Antigravity",
+        "AG",
         "antigravity-native-ui",
         "antigravity-native",
     )
