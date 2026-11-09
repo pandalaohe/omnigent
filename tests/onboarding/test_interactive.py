@@ -521,7 +521,9 @@ def test_count_terminal_lines_empty_string() -> None:
     assert interactive._count_terminal_lines("", width=80) == 0
 
 
-def _select_over_pty(monkeypatch: pytest.MonkeyPatch, keys: bytes) -> int:
+def _select_over_pty(
+    monkeypatch: pytest.MonkeyPatch, keys: bytes, *, high_fd: bool = False
+) -> int:
     """Run :func:`select` against a real pty, feeding it *keys*.
 
     ``openpty`` gives the raw-termios path the controlling terminal a
@@ -549,6 +551,17 @@ def _select_over_pty(monkeypatch: pytest.MonkeyPatch, keys: bytes) -> int:
     monkeypatch.setattr(tty, "setcbreak", _setcbreak_then_signal)
 
     controller, follower = pty.openpty()
+    if high_fd:
+        import fcntl
+
+        try:
+            high_follower = fcntl.fcntl(follower, fcntl.F_DUPFD, 1024)
+        except OSError:
+            os.close(follower)
+            os.close(controller)
+            raise
+        os.close(follower)
+        follower = high_follower
 
     def _send() -> None:
         ready.wait(timeout=10)
@@ -563,6 +576,7 @@ def _select_over_pty(monkeypatch: pytest.MonkeyPatch, keys: bytes) -> int:
         return interactive.select("Pick", ["Claude", "Codex", "Quit"])
     finally:
         writer.join(timeout=10)
+        stdin.close()
         os.close(controller)
 
 
@@ -592,6 +606,30 @@ def test_select_arrow_keys_work_in_both_cursor_modes(
     keys += b"\x1b" + introducer + b"A" + b"\r"
 
     assert _select_over_pty(monkeypatch, keys) == 1, label
+
+
+@pytest.mark.posix_only
+def test_select_avoids_poll_for_supported_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    import select
+
+    def _unexpected_poll():
+        raise AssertionError("select-compatible terminals must not use poll")
+
+    monkeypatch.setattr(select, "poll", _unexpected_poll)
+    assert _select_over_pty(monkeypatch, b"\x1b") == -1
+
+
+@pytest.mark.posix_only
+@pytest.mark.parametrize("keys,expected", [(b"\x1b[B\r", 1), (b"\x1bOB\r", 1), (b"\x1b", -1)])
+def test_select_handles_high_terminal_descriptor(
+    monkeypatch: pytest.MonkeyPatch, keys: bytes, expected: int
+) -> None:
+    import resource
+
+    limit = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    if limit != resource.RLIM_INFINITY and limit <= 1024:
+        pytest.skip("requires a terminal descriptor above select's FD_SETSIZE")
+    assert _select_over_pty(monkeypatch, keys, high_fd=True) == expected
 
 
 def _console_with_encoding(encoding: str | None):
