@@ -185,7 +185,11 @@ def test_default_only_provider_preserves_existing_pi_scope(
         enabled_models=["omnigent/demo-fast", "anthropic/claude-sonnet-4-5"],
     ) as tui:
         tui.send("/model\r")
-        picker = tui.wait_for(lambda text: "claude-sonnet-4-5 [anthropic]" in text)
+        picker = tui.wait_for(
+            lambda text: any(
+                "claude-sonnet-4-5" in line and "[anthropic]" in line for line in text.splitlines()
+            )
+        )
         assert "demo-fast [omnigent]" in picker
 
 
