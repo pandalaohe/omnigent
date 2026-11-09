@@ -57,8 +57,10 @@ function installCredentialWatch() {
     }
   }
   const observer = new MutationObserver((records) => {
+    scan();
     for (const record of records) {
       if (record.attributeName === "type" && record.oldValue?.toLowerCase() === "password") {
+        hasCredentials = true;
         record.target.setAttribute("data-omnigent-credential", "");
       }
       // Count transitions that were reversed before this mutation batch ran as well.

@@ -119,3 +119,42 @@ it("refuses capture after any observed reveal, document or frame-set change", as
   assert.equal(await passwordIsShowing(wc), "unknown");
   await assert.rejects(captureCredentialSafePage(wc), /Cannot capture/);
 });
+
+it("discards capture when the first credential is inserted and reveal/remasked in one batch", async () => {
+  const dom = new JSDOM("<main></main>", { runScripts: "outside-only", pretendToBeVisual: true });
+  const observers = [];
+  const NativeObserver = dom.window.MutationObserver;
+  dom.window.MutationObserver = class extends NativeObserver {
+    constructor(callback) {
+      super(callback);
+      observers.push(this);
+    }
+  };
+  try {
+    const w = dom.window;
+    w.eval(`(${installCredentialWatch.toString()})()`);
+    const main = { executeJavaScript: async () => w.eval(STATE_JS) };
+    main.framesInSubtree = [main];
+    const before = w.eval(STATE_JS).counter;
+    const wc = {
+      mainFrame: main,
+      capturePage: async () => {
+        const input = w.document.createElement("input");
+        input.type = "password";
+        input.value = "FAKE-NEW-CREDENTIAL";
+        w.document.body.append(input);
+        input.type = "text";
+        input.type = "password";
+        await new Promise((resolve) => {
+          w.queueMicrotask(resolve);
+        });
+        return { fake: true };
+      },
+    };
+    await assert.rejects(captureCredentialSafePage(wc), /Cannot capture/);
+    assert.ok(Number(w.eval(STATE_JS).counter) > Number(before));
+  } finally {
+    for (const observer of observers) observer.disconnect();
+    dom.window.close();
+  }
+});
