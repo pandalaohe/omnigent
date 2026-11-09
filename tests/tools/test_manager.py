@@ -154,6 +154,8 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_scheduled_task_list",
         "sys_scheduled_task_update",
         "sys_scheduled_task_delete",
+        "sys_timer_set",
+        "sys_timer_cancel",
         # Embedded-browser tools are always auto-registered (framework-
         # owned) so any agent can drive the desktop app's browser without
         # the spec opting in. Schema-only; runner-dispatched.
@@ -200,7 +202,9 @@ def _non_lifecycle_schemas(
     ]
 
 
-@pytest.mark.parametrize("tool_name", ["sys_session_rename", "sys_session_message"])
+@pytest.mark.parametrize(
+    "tool_name", ["sys_session_rename", "sys_session_message", "sys_timer_set", "sys_timer_cancel"]
+)
 def test_session_tools_are_registered_for_every_agent(tool_name: str) -> None:
     names = {schema["function"]["name"] for schema in ToolManager(_make_spec()).get_tool_schemas()}
 

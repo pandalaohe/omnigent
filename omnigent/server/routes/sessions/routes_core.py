@@ -5517,16 +5517,17 @@ def register_core_routes(
         from omnigent.server.session_collab import (
             AGENT_SESSION_HEADER,
             require_session_action_allowed,
+            require_session_archive_allowed,
         )
 
-        if body.archived is False and (
+        if body.archived is not None and (
             AGENT_SESSION_HEADER in request.headers
-            or RUNNER_TUNNEL_TOKEN_HEADER in request.headers
+            or (body.archived is False and RUNNER_TUNNEL_TOKEN_HEADER in request.headers)
         ):
             caller_id = request.headers.get(AGENT_SESSION_HEADER)
             if not caller_id:
                 raise OmnigentError(
-                    "Agent unarchive requires the calling session identity",
+                    "Agent archive or unarchive requires the calling session identity",
                     code=ErrorCode.INVALID_INPUT,
                 )
             await _require_access(
@@ -5542,14 +5543,29 @@ def register_core_routes(
                     "Runner tunnel token is not bound to the calling session's runner",
                     code=ErrorCode.FORBIDDEN,
                 )
+            target = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if target is None:
+                raise _session_not_found()
             await asyncio.to_thread(
-                require_session_action_allowed,
+                require_session_archive_allowed,
                 caller,
+                target,
                 conversation_store,
                 permission_store,
                 getattr(request.app.state, "user_preferences_store", None),
-                action="unarchive",
+                peer_flag_on=request.app.state.feature_flags.enabled(
+                    Feature.SESSION_PEER_MESSAGING
+                ),
             )
+            if body.archived is False:
+                await asyncio.to_thread(
+                    require_session_action_allowed,
+                    caller,
+                    conversation_store,
+                    permission_store,
+                    getattr(request.app.state, "user_preferences_store", None),
+                    action="unarchive",
+                )
         from omnigent.server.permission_tiers import require_permission_protocol
 
         conv_for_protocol = await asyncio.to_thread(

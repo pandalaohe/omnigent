@@ -28,6 +28,7 @@ from omnigent.errors import OmnigentError
 from omnigent.server.archive_close import ArchiveCloseCoordinator
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.cli_release_store import CliReleaseIntentStore
+from omnigent.server.feature_flags import resolve_feature_flags
 from omnigent.server.routes import sessions as _sessions_facade
 from omnigent.server.routes._host_worktree import (
     WORKTREE_ROOT_LABEL_KEY,
@@ -76,6 +77,49 @@ def _no_archive_stop_grace() -> object:
 # ── Archive / unarchive lifecycle ────────────────────────
 
 
+@pytest.mark.parametrize("archived", [False, True])
+@pytest.mark.parametrize("relation", ["child", "self", "peer", "grandchild"])
+@pytest.mark.parametrize("peer_flag", [False, True])
+async def test_collab_off_archive_is_limited_to_direct_children(
+    app, client: httpx.AsyncClient, db_uri: str, archived: bool, relation: str, peer_flag: bool
+) -> None:
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+    from omnigent.server.session_collab import AGENT_SESSION_HEADER
+
+    app.state.feature_flags = resolve_feature_flags(
+        {"OMNIGENT_FEATURES": "session_peer_messaging" if peer_flag else ""}
+    )
+    root = await create_test_session(client, name="archive-caller")
+    store = SqlAlchemyConversationStore(db_uri)
+    child = store.create_conversation(agent_id=root["agent_id"], parent_conversation_id=root["id"])
+    targets = {
+        "child": child.id,
+        "self": root["id"],
+        "peer": store.create_conversation(agent_id=root["agent_id"]).id,
+        "grandchild": store.create_conversation(
+            agent_id=root["agent_id"], parent_conversation_id=child.id
+        ).id,
+    }
+    target_id = targets[relation]
+    store.update_conversation(target_id, archived=not archived)
+    token = "c" * 32
+    store.set_runner_id(root["id"], token_bound_runner_id(token))
+    preferences = SqlAlchemyUserPreferencesStore(db_uri)
+    app.state.user_preferences_store = preferences
+    preferences.patch_namespace(
+        RESERVED_USER_LOCAL, "session_collab", {"enabled": False, "sessionRestrictions": "off"}
+    )
+    response = await client.patch(
+        f"/v1/sessions/{target_id}",
+        json={"archived": archived},
+        headers={AGENT_SESSION_HEADER: root["id"], RUNNER_TUNNEL_TOKEN_HEADER: token},
+    )
+    assert response.status_code == (200 if relation == "child" else 403), response.text
+    assert store.get_conversation(target_id).archived is (
+        archived if relation == "child" else not archived
+    )
+
+
 @pytest.mark.parametrize("caller_is_child", [False, True])
 @pytest.mark.parametrize("mode", ["off", "subagents", "all"])
 async def test_unarchive_uses_callers_parent_and_live_owner_switch(
@@ -85,6 +129,9 @@ async def test_unarchive_uses_callers_parent_and_live_owner_switch(
     from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
     from omnigent.server.session_collab import AGENT_SESSION_HEADER
 
+    app.state.feature_flags = resolve_feature_flags(
+        {"OMNIGENT_FEATURES": "session_peer_messaging"}
+    )
     root = await create_test_session(client, name="unarchive-caller-guard")
     store = SqlAlchemyConversationStore(db_uri)
     child = store.create_conversation(agent_id=root["agent_id"], parent_conversation_id=root["id"])
@@ -321,13 +368,16 @@ async def test_archive_cleanup_intent_reaches_children_when_parent_has_no_worktr
 
 
 async def test_tool_archive_and_undo_cascade_through_the_real_route(
-    client: httpx.AsyncClient, db_uri: str
+    app, client: httpx.AsyncClient, db_uri: str
 ) -> None:
     import json
 
     from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
     from omnigent.runner.tool_dispatch import _session_archive_via_rest
 
+    app.state.feature_flags = resolve_feature_flags(
+        {"OMNIGENT_FEATURES": "session_peer_messaging"}
+    )
     parent = await create_test_session(client, name="tool-archive-family")
     store = SqlAlchemyConversationStore(db_uri)
     child = store.create_conversation(

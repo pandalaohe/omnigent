@@ -71,6 +71,27 @@ def require_session_action_allowed(
         raise OmnigentError(ARCHIVED_SESSION_DISABLED_MESSAGE, code=ErrorCode.FORBIDDEN)
 
 
+def require_session_archive_allowed(
+    caller: Conversation,
+    target: Conversation,
+    conversation_store: ConversationStore,
+    permission_store: PermissionStore | None,
+    prefs_store: SqlAlchemyUserPreferencesStore | None,
+    *,
+    peer_flag_on: bool,
+) -> None:
+    """With collaboration off, an agent may only archive its direct children."""
+    owner = collab_owner_for(caller, conversation_store, permission_store)
+    if (
+        not peer_flag_on or not read_collab_settings(prefs_store, owner).enabled
+    ) and target.parent_conversation_id != caller.id:
+        raise OmnigentError(
+            "With session collaboration off, only your own direct children "
+            "may be archived or restored.",
+            code=ErrorCode.FORBIDDEN,
+        )
+
+
 def require_session_tool_allowed(
     conv: Conversation,
     name: object,
