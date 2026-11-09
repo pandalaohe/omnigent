@@ -44,6 +44,7 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useStableProviderUsageLimits } from "@/hooks/useStableProviderUsageLimits";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import { agentBadgeFor } from "@/lib/agentBadgePreferences";
+import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
 import { formatTokenCountShort } from "@/lib/formatCost";
 import { harnessUnavailableReasonOnHost } from "@/lib/harnessSetup";
 import { missingCellText } from "@/lib/layeredValues";
@@ -106,8 +107,19 @@ interface ContextRow {
   label: string;
 }
 
+type IntegrationTypeGroup = "Native CLI" | "SDK" | "RPC" | "ACP" | "Other";
+
+const INTEGRATION_TYPE_ORDER: readonly IntegrationTypeGroup[] = [
+  "Native CLI",
+  "SDK",
+  "RPC",
+  "ACP",
+  "Other",
+];
+
 interface ContextGroup {
   id: string;
+  typeGroup: IntegrationTypeGroup;
   agent: ContextRow;
   models: ContextRow[];
 }
@@ -202,10 +214,37 @@ function stateSummary(resolved: ResolvedUsageContext, own: boolean): string {
     .join(", ");
 }
 
-function agentRank(entry: UsageContextListEntry): number {
-  if (entry.harness === "pi" || entry.harness === "pi-rpc") return 2;
-  const section = harnessSection(null, entry.harness);
-  return section === "native" ? 0 : section === "sdk" ? 1 : section === "acp" ? 2 : 3;
+function registryItemFor(
+  items: readonly RegistryItem[],
+  entry: Pick<UsageContextListEntry, "agentName" | "harness">,
+): RegistryItem | undefined {
+  const matches = (item: RegistryItem) =>
+    item.harness === entry.harness &&
+    (item.name === entry.agentName || (!item.name && item.key === `harness:${entry.agentName}`));
+  return items.find((item) => matches(item) && item.source === "builtin") ?? items.find(matches);
+}
+
+function integrationTypeOf(
+  entry: UsageContextListEntry,
+  items: readonly RegistryItem[],
+): IntegrationTypeGroup {
+  const harness = entry.harness;
+  if (harness === "pi" || harness === "pi-rpc") return "RPC";
+  const item = registryItemFor(items, entry);
+  if (item?.section === "native") return "Native CLI";
+  if (item?.section === "sdk") return "SDK";
+  if (item?.section === "acp") return "ACP";
+  const sdk =
+    Boolean(harness) && (harness.endsWith("-sdk") || Object.hasOwn(BRAIN_HARNESS_LABELS, harness));
+  const section = harnessSection(sdk ? "cli-subprocess" : null, harness);
+  if (section === "native") return "Native CLI";
+  if (section === "sdk") return "SDK";
+  if (section === "acp") return "ACP";
+  return "Other";
+}
+
+function agentRank(entry: UsageContextListEntry, items: readonly RegistryItem[]): number {
+  return INTEGRATION_TYPE_ORDER.indexOf(integrationTypeOf(entry, items));
 }
 
 /** An agent's shortest name: the product's own, before any installed copy's suffix. */
@@ -277,6 +316,7 @@ function contextGroups(
       const agentEntry = { agentName: entry.agentName, harness: entry.harness, model: "" };
       groups.set(id, {
         id,
+        typeGroup: integrationTypeOf(agentEntry, items),
         agent: rowFor(agentEntry, agentLabelFor(items, entry.agentName, entry.harness)),
         models: [],
       });
@@ -285,7 +325,7 @@ function contextGroups(
   }
   return [...groups.values()].sort(
     (left, right) =>
-      agentRank(left.agent.entry) - agentRank(right.agent.entry) ||
+      agentRank(left.agent.entry, items) - agentRank(right.agent.entry, items) ||
       left.agent.label.localeCompare(right.agent.label),
   );
 }
@@ -1026,6 +1066,8 @@ export function ContextUsageSettings() {
   const liveHostId: string | null = conversationId ? (session?.hostId ?? "") : null;
   const [openEditor, setOpenEditor] = useState<CellAddress | null>(null);
   const [openGroups, setOpenGroups] = useState<readonly string[]>([]);
+  const [sessionAddedGroups, setSessionAddedGroups] = useState<readonly string[]>([]);
+  const [autoGroupsOpen, setAutoGroupsOpen] = useState(false);
   const [missingSource, setMissingSource] = useState(false);
   const [undo, setUndo] = useState<UndoState | null>(null);
   const searchParams = useSearchParams()[0];
@@ -1038,22 +1080,70 @@ export function ContextUsageSettings() {
   const sessionRows = sessions.data
     ? rowsForAgentIds(registry.items, registry.legacyProducts, sessions.data)
     : null;
+  const registryReady = !registry.isLoading && !registry.isError && registry.items.length > 0;
   const inUseKnown = !registry.isLoading && !registry.isError && sessionRows !== null;
   const inUseFailed = registry.isError || sessions.isError;
-  const inUse: UsageContextListEntry[] = registry.items.flatMap((item) =>
+  const builtinInUse: UsageContextListEntry[] = registry.items.flatMap((item) =>
+    item.source === "builtin" &&
+    item.deployed &&
+    item.name &&
+    item.harness &&
+    sessionRows?.has(item.key)
+      ? [{ agentName: item.name, harness: item.harness, model: "" }]
+      : [],
+  );
+  const allInUse: UsageContextListEntry[] = registry.items.flatMap((item) =>
     item.deployed && item.name && item.harness && sessionRows?.has(item.key)
       ? [{ agentName: item.name, harness: item.harness, model: "" }]
       : [],
   );
 
-  // The list starts from what is in use, once; after that only the user changes it.
+  // The list starts from built-in agents in use, once; after that only the user changes it.
   useEffect(() => {
-    if (inUseKnown && !preferences.contextList) seedUsageContextList(preferences, inUse);
+    if (inUseKnown && !preferences.contextList) {
+      seedUsageContextList(preferences, builtinInUse, (entry) => {
+        const item = registryItemFor(registry.items, entry);
+        return item?.source === "builtin";
+      });
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [inUseKnown, preferences.contextList]);
 
+  // Prune saved rows that name a removed agent or an all-Auto custom agent.
+  useEffect(() => {
+    if (!registryReady || !preferences.contextList) return;
+    const kept = preferences.contextList.entries.filter((entry) => {
+      const item = registryItemFor(registry.items, entry);
+      if (!item) return false;
+      if (item.source === "builtin") return true;
+      if (sessionAddedGroups.includes(groupIdOf(entry))) return true;
+      return usageContextKeysOfEntry(preferences, {
+        agentName: entry.agentName,
+        harness: entry.harness,
+        model: "",
+      }).some((key) => usageContextHasValue(preferences.overrides[key]));
+    });
+    if (kept.length !== preferences.contextList.entries.length) {
+      writeUsageContextPreferences({
+        ...preferences,
+        contextList: { ...preferences.contextList, entries: kept },
+      });
+    }
+  }, [registryReady, registry.items, preferences, sessionAddedGroups]);
+
   const { groups, columns, rowById, entries } = useMemo(() => {
-    const listed = usageContextRows(preferences);
+    const listed = usageContextRows(preferences).filter((entry) => {
+      if (!registryReady) return true;
+      const item = registryItemFor(registry.items, entry);
+      if (!item) return false;
+      if (item.source === "builtin") return true;
+      if (sessionAddedGroups.includes(groupIdOf(entry))) return true;
+      return usageContextKeysOfEntry(preferences, {
+        agentName: entry.agentName,
+        harness: entry.harness,
+        model: "",
+      }).some((key) => usageContextHasValue(preferences.overrides[key]));
+    });
     const grouped = contextGroups(listed, registry.items);
     const rows = [ALL_ROW, ...grouped.flatMap((group) => [group.agent, ...group.models])];
     return {
@@ -1062,7 +1152,7 @@ export function ContextUsageSettings() {
       columns: hostColumns(hosts, preferences, liveHostId),
       rowById: new Map(rows.map((row) => [row.id, row])),
     };
-  }, [registry.items, preferences, hosts, liveHostId]);
+  }, [registryReady, registry.items, preferences, hosts, liveHostId, sessionAddedGroups]);
 
   const severalOpen = preferences.contextList?.severalOpen ?? false;
   const labelOfEntry = (entry: UsageContextListEntry) =>
@@ -1140,6 +1230,10 @@ export function ContextUsageSettings() {
   /** Puts back only what the action changed, so later edits to other rows survive. */
   const restoreUndo = () => {
     if (!undo) return;
+    if (undo.removedEntries.length > 0) {
+      const restoredGroups = undo.removedEntries.map(groupIdOf);
+      setSessionAddedGroups((current) => [...new Set([...current, ...restoredGroups])]);
+    }
     const overrides = { ...preferences.overrides };
     for (const key of undo.keys) {
       if (Object.hasOwn(undo.overrides, key)) overrides[key] = undo.overrides[key]!;
@@ -1167,6 +1261,10 @@ export function ContextUsageSettings() {
   };
   /** A row and its saved values go together, or the value would keep applying unseen. */
   const removeRow = (row: ContextRow) => {
+    if (row.kind === "agent") {
+      const id = groupIdOf(row.entry);
+      setSessionAddedGroups((current) => current.filter((item) => item !== id));
+    }
     const overrides = { ...preferences.overrides };
     const keys = usageContextKeysOfEntry(preferences, row.entry);
     for (const key of keys) Reflect.deleteProperty(overrides, key);
@@ -1195,8 +1293,10 @@ export function ContextUsageSettings() {
     });
   };
   const addEntry = (entry: UsageContextListEntry) => {
+    const id = groupIdOf(entry);
+    setSessionAddedGroups((current) => (current.includes(id) ? current : [...current, id]));
     addUsageContextEntry(preferences, entry);
-    if (entry.model) showGroup(groupIdOf(entry));
+    if (entry.model) showGroup(id);
     revealRowRef.current = usageContextEntryKey(entry);
   };
   /** A model added from its agent's name opens straight into its values on all computers. */
@@ -1235,10 +1335,16 @@ export function ContextUsageSettings() {
     if (!preferences.contextList && !inUseFailed) return;
     consumedRef.current = param;
     const source = usageContextSourceFromKey(param);
-    if (source?.agentName && source.harness) {
+    if (
+      source?.agentName &&
+      source.harness &&
+      (!registryReady || registryItemFor(registry.items, source))
+    ) {
       const entry = { agentName: source.agentName, harness: source.harness, model: source.model };
+      const id = groupIdOf(entry);
+      setSessionAddedGroups((current) => (current.includes(id) ? current : [...current, id]));
       addUsageContextEntry(preferences, entry);
-      showGroup(groupIdOf(entry));
+      showGroup(id);
       focusEditorRef.current = true;
       setOpenEditor({ row: usageContextEntryKey(entry), col: ALL_COLUMN.id });
       setMissingSource(false);
@@ -1431,8 +1537,10 @@ export function ContextUsageSettings() {
     ...new Map(items.map((item) => [usageContextEntryKey(item), item])).values(),
   ];
   const agentOptions: PickerOption[] = uniqueOf([
-    ...inUse,
-    ...recorded.map((item) => ({ ...item, model: "" })),
+    ...allInUse,
+    ...recorded
+      .filter((item) => !registryReady || !!registryItemFor(registry.items, item))
+      .map((item) => ({ ...item, model: "" })),
   ])
     .filter((item) => !listedGroups.has(groupIdOf(item)))
     .map((agent) => ({
@@ -1447,6 +1555,43 @@ export function ContextUsageSettings() {
         />
       ),
     }));
+
+  const groupHasValue = (group: ContextGroup): boolean => {
+    if (
+      usageContextKeysOfEntry(preferences, group.agent.entry).some((key) =>
+        usageContextHasValue(preferences.overrides[key]),
+      )
+    ) {
+      return true;
+    }
+    const listedModels = new Set(["", ...group.models.map((row) => row.entry.model)]);
+    return Object.keys(preferences.reportedContext ?? {}).some((key) => {
+      const source = usageContextSourceFromKey(key);
+      return (
+        source?.agentName === group.agent.entry.agentName &&
+        source.harness === group.agent.entry.harness &&
+        listedModels.has(source.model)
+      );
+    });
+  };
+  const groupIsPinned = (group: ContextGroup): boolean =>
+    sessionAddedGroups.includes(group.id) ||
+    openGroups.includes(group.id) ||
+    openEditor?.row === group.agent.id ||
+    group.models.some((row) => openEditor?.row === row.id);
+
+  const anyGroupHasValue = groups.some(groupHasValue);
+  const configuredGroups = anyGroupHasValue
+    ? groups.filter((group) => groupHasValue(group) || groupIsPinned(group))
+    : [];
+  const autoGroups = anyGroupHasValue
+    ? groups.filter((group) => !groupHasValue(group) && !groupIsPinned(group))
+    : [];
+  const mainGroups = anyGroupHasValue ? configuredGroups : groups;
+  const mainBuckets = INTEGRATION_TYPE_ORDER.map((type) => ({
+    type,
+    groups: mainGroups.filter((group) => group.typeGroup === type),
+  })).filter((bucket) => bucket.groups.length > 0);
   const modelOptions = (group: ContextGroup): PickerOption[] =>
     uniqueOf(
       recorded.filter(
@@ -1629,39 +1774,119 @@ export function ContextUsageSettings() {
                   {columns.map((column) => renderCell(ALL_ROW, column))}
                 </tr>
               </tbody>
-              {groups.map((group) => {
-                const open = openGroups.includes(group.id);
-                return (
-                  <tbody key={group.id} data-testid={`context-group-${group.agent.testId}`}>
-                    <tr data-testid={`context-row-${group.agent.testId}`}>
-                      <th scope="row" className={cn(TABLE_CELL, FIRST_COLUMN)}>
-                        {agentHeader(group, open)}
-                      </th>
-                      {columns.map((column) => renderCell(group.agent, column))}
-                    </tr>
-                    {open
-                      ? group.models.map((row) => (
-                          <tr key={row.id} data-testid={`context-row-${row.testId}`}>
-                            <th scope="row" className={cn(TABLE_CELL, FIRST_COLUMN)}>
-                              <span
-                                className={cn(
-                                  "group/label flex items-center gap-1 pr-1 pl-9 md:pl-8",
-                                  ROW_HEIGHT,
-                                )}
-                              >
-                                <span className="min-w-0 flex-1 py-1 text-sm wrap-anywhere text-foreground">
-                                  {row.label}
+              {mainBuckets.flatMap((bucket) => [
+                <tbody
+                  key={`type-${bucket.type}`}
+                  data-testid={`context-type-${slug(bucket.type)}`}
+                >
+                  <tr>
+                    <td
+                      colSpan={columns.length + 1}
+                      className="border-b border-border bg-muted/40 px-3 py-1 text-left text-[11px] font-semibold tracking-wider text-muted-foreground uppercase"
+                    >
+                      {bucket.type}
+                    </td>
+                  </tr>
+                </tbody>,
+                ...bucket.groups.map((group) => {
+                  const open = openGroups.includes(group.id);
+                  return (
+                    <tbody key={group.id} data-testid={`context-group-${group.agent.testId}`}>
+                      <tr data-testid={`context-row-${group.agent.testId}`}>
+                        <th scope="row" className={cn(TABLE_CELL, FIRST_COLUMN)}>
+                          {agentHeader(group, open)}
+                        </th>
+                        {columns.map((column) => renderCell(group.agent, column))}
+                      </tr>
+                      {open
+                        ? group.models.map((row) => (
+                            <tr key={row.id} data-testid={`context-row-${row.testId}`}>
+                              <th scope="row" className={cn(TABLE_CELL, FIRST_COLUMN)}>
+                                <span
+                                  className={cn(
+                                    "group/label flex items-center gap-1 pr-1 pl-9 md:pl-8",
+                                    ROW_HEIGHT,
+                                  )}
+                                >
+                                  <span className="min-w-0 flex-1 py-1 text-sm wrap-anywhere text-foreground">
+                                    {row.label}
+                                  </span>
+                                  {removeButton(row)}
                                 </span>
-                                {removeButton(row)}
-                              </span>
-                            </th>
-                            {columns.map((column) => renderCell(row, column))}
-                          </tr>
-                        ))
-                      : null}
-                  </tbody>
-                );
-              })}
+                              </th>
+                              {columns.map((column) => renderCell(row, column))}
+                            </tr>
+                          ))
+                        : null}
+                    </tbody>
+                  );
+                }),
+              ])}
+              {autoGroups.length > 0 ? (
+                <tbody data-testid="context-auto-groups">
+                  <tr data-testid="context-auto-groups-row">
+                    <td
+                      colSpan={columns.length + 1}
+                      className={cn(TABLE_CELL, "bg-muted/30 px-3 py-1.5")}
+                    >
+                      <button
+                        type="button"
+                        aria-expanded={autoGroupsOpen}
+                        data-testid="context-auto-groups-toggle"
+                        className="flex items-center gap-1.5 text-left text-xs font-medium text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+                        onClick={() => setAutoGroupsOpen((current) => !current)}
+                      >
+                        <ChevronRightIcon
+                          aria-hidden
+                          className={cn(
+                            "size-3.5 shrink-0 transition-transform",
+                            autoGroupsOpen && "rotate-90",
+                          )}
+                        />
+                        <span>
+                          Default (Auto) agents ({autoGroups.length}:{" "}
+                          {autoGroups.map((group) => group.agent.label).join(", ")})
+                        </span>
+                      </button>
+                    </td>
+                  </tr>
+                </tbody>
+              ) : null}
+              {autoGroupsOpen
+                ? autoGroups.map((group) => {
+                    const open = openGroups.includes(group.id);
+                    return (
+                      <tbody key={group.id} data-testid={`context-group-${group.agent.testId}`}>
+                        <tr data-testid={`context-row-${group.agent.testId}`}>
+                          <th scope="row" className={cn(TABLE_CELL, FIRST_COLUMN)}>
+                            {agentHeader(group, open)}
+                          </th>
+                          {columns.map((column) => renderCell(group.agent, column))}
+                        </tr>
+                        {open
+                          ? group.models.map((row) => (
+                              <tr key={row.id} data-testid={`context-row-${row.testId}`}>
+                                <th scope="row" className={cn(TABLE_CELL, FIRST_COLUMN)}>
+                                  <span
+                                    className={cn(
+                                      "group/label flex items-center gap-1 pr-1 pl-9 md:pl-8",
+                                      ROW_HEIGHT,
+                                    )}
+                                  >
+                                    <span className="min-w-0 flex-1 py-1 text-sm wrap-anywhere text-foreground">
+                                      {row.label}
+                                    </span>
+                                    {removeButton(row)}
+                                  </span>
+                                </th>
+                                {columns.map((column) => renderCell(row, column))}
+                              </tr>
+                            ))
+                          : null}
+                      </tbody>
+                    );
+                  })
+                : null}
             </table>
           </div>
           <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2 [contain:inline-size]">

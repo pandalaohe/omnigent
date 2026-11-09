@@ -845,8 +845,10 @@ describe("ContextUsageSettings", () => {
       },
     ];
     const orphanHostId = "ca3f7e25e8424846ba531581a90abb8a";
-    store([AGENT, { agentName: "hermes-fn", harness: "acp:hermes-fn", model: "" }], {
+    const hermesEntry = { agentName: "hermes-fn", harness: "acp:hermes-fn", model: "" };
+    store([AGENT, hermesEntry], {
       [usageContextLevelKey({ ...agentSource, hostId: orphanHostId }, "cell")]: value(200_000),
+      [usageContextLevelKey({ ...hermesEntry, hostId: "" }, "column")]: value(128_000),
     });
     renderSettings();
     expect(screen.getByText("Claude Code")).toBeInTheDocument();
@@ -859,5 +861,98 @@ describe("ContextUsageSettings", () => {
       "title",
       orphanHostId,
     );
+  });
+
+  it("groups rows by integration type and folds all-Auto built-in rows behind a toggle", () => {
+    const claudeSdk: RegistryItem = {
+      key: "harness:claude-sdk",
+      name: "claude-sdk",
+      label: "Claude SDK",
+      section: "sdk",
+      harness: "claude-sdk",
+      description: null,
+      deployed: true,
+      source: "builtin",
+    };
+    const piRpc: RegistryItem = {
+      key: "harness:pi-rpc",
+      name: "pi-rpc",
+      label: "Pi RPC",
+      section: "other",
+      harness: "pi-rpc",
+      description: null,
+      deployed: true,
+      source: "builtin",
+    };
+    mocks.registryItems = [CLAUDE, claudeSdk, piRpc];
+    const sdkEntry: UsageContextListEntry = {
+      agentName: "claude-sdk",
+      harness: "claude-sdk",
+      model: "",
+    };
+    const piEntry: UsageContextListEntry = {
+      agentName: "pi-rpc",
+      harness: "pi-rpc",
+      model: "",
+    };
+    store([AGENT, sdkEntry, piEntry], {
+      [usageContextLevelKey({ ...agentSource, hostId: "" }, "column")]: value(1_000_000, 33_000),
+      [usageContextLevelKey({ ...piEntry, hostId: "" }, "column")]: value(272_000, 16_000),
+    });
+    renderSettings();
+
+    expect(screen.getByTestId("context-type-native-cli")).toHaveTextContent("Native CLI");
+    expect(screen.getByTestId("context-type-rpc")).toHaveTextContent("RPC");
+    expect(screen.getByText("Claude Code")).toBeInTheDocument();
+    expect(screen.getByText("Pi RPC")).toBeInTheDocument();
+    expect(screen.queryByTestId("context-row-claude-sdk-claude-sdk")).not.toBeInTheDocument();
+
+    const toggle = screen.getByTestId("context-auto-groups-toggle");
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(toggle).toHaveTextContent("Default (Auto) agents (1: Claude SDK)");
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByTestId("context-row-claude-sdk-claude-sdk")).toBeInTheDocument();
+  });
+
+  it("auto-seeds only built-in agents, drops all-Auto custom rows, and never shows removed agents", () => {
+    const customInstalled: RegistryItem = {
+      key: "ca_custom_acp",
+      name: "ag-hds",
+      label: "Ag-hds",
+      section: "yours",
+      harness: "acp:ag-hds",
+      description: null,
+      deployed: true,
+      source: "installed",
+    };
+    mocks.registryItems = [CLAUDE, CODEX, customInstalled];
+    mocks.sessionAgentIds = new Set(["harness:claude-native", "ca_custom_acp"]);
+
+    const firstView = renderSettings();
+    expect(readUsageContextPreferences().contextList?.entries).toEqual([AGENT]);
+    expect(screen.queryByText("Ag-hds")).not.toBeInTheDocument();
+    firstView.unmount();
+
+    const removedTestAgent: UsageContextListEntry = {
+      agentName: "pi-rpc-acceptance-261028",
+      harness: "pi-rpc",
+      model: "",
+    };
+    const customAutoAgent: UsageContextListEntry = {
+      agentName: "ag-hds",
+      harness: "acp:ag-hds",
+      model: "",
+    };
+    store([AGENT, removedTestAgent, customAutoAgent], {
+      [usageContextLevelKey({ ...removedTestAgent, hostId: "" }, "column")]: value(200_000),
+    });
+    renderSettings();
+
+    expect(screen.getByText("Claude Code")).toBeInTheDocument();
+    expect(screen.queryByText(/pi-rpc-acceptance-261028/i)).not.toBeInTheDocument();
+    expect(screen.queryByText("Ag-hds")).not.toBeInTheDocument();
+    expect(readUsageContextPreferences().contextList?.entries).toEqual([AGENT]);
   });
 });

@@ -768,13 +768,17 @@ export function usageContextRows(preferences: UsageContextPreferences): UsageCon
 export function seedUsageContextList(
   preferences: UsageContextPreferences,
   inUse: readonly UsageContextListEntry[],
+  keepRecorded: (entry: UsageContextListEntry) => boolean = () => true,
 ): void {
   if (preferences.contextList) return;
   writeUsageContextPreferences({
     ...preferences,
     version: 6,
     contextList: {
-      entries: uniqueEntries([...inUse, ...usageContextRecordedEntries(preferences)]),
+      entries: uniqueEntries([
+        ...inUse,
+        ...usageContextRecordedEntries(preferences).filter(keepRecorded),
+      ]),
       severalOpen: false,
     },
   });
