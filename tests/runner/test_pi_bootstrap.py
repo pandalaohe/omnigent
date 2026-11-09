@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -29,6 +30,66 @@ from tests.runner.test_permission_tier_runtime import (
     _scope_call,
     _write_scope_registry,
 )
+
+
+def test_scoped_node_waits_for_policy_and_rpc():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for scoped transport proof")
+    module = Path(__file__).resolve().parents[2] / "omnigent/resources/pi_native/scoped_client.cjs"
+    script = r"""
+const assert=require('node:assert/strict'), http=require('node:http');
+const crypto=require('node:crypto');
+const {connectAttestor}=require(process.argv[1]);
+const scope={scope_id:'scope',installation_id:'install',
+  runner_epoch:'runner',launch_epoch:'epoch'};
+const server=http.createServer((req,res)=>{
+  if(req.url==='/pi/bootstrap/watch') {
+    res.writeHead(200);
+    res.write(JSON.stringify({incarnation:'broker',launch_epoch:'epoch',
+      live:true,revoked_scopes:[]})+'\n');return;
+  }
+  let body='';req.on('data',chunk=>body+=chunk);req.on('end',()=>{
+    const input=JSON.parse(body);
+    const reply=value=>res.end(JSON.stringify(value));
+    if(req.url==='/policies/evaluate') {
+      const id=input.event.data.call_id;
+      setTimeout(()=>reply(id==='deny'
+        ? {result:'POLICY_ACTION_DENY',reason:'Policy blocked this call'} : {
+        result:'POLICY_ACTION_ALLOW',permission_tier_binding:{
+          call_id:'pi:'+crypto.createHash('sha256').update('scope\0'+id).digest('hex'),
+          revision:3,arguments_digest:'a'.repeat(64),pi_origin_receipt:'pi_receipt_'+'a'.repeat(32)
+        }
+      }),2200);
+    } else if(req.url==='/pi/rpc') setTimeout(()=>reply({result:'tool completed'}),2200);
+    else if(req.url==='/permission-tiers/control') reply({executed:true});
+    else reply({});
+  });
+});
+server.listen(0,'127.0.0.1',async()=>{
+  let connection;
+  try {
+    connection=await connectAttestor({endpoint:`http://127.0.0.1:${server.address().port}`,
+      credential:'test',brokerIncarnation:'broker',launchEpoch:'epoch'});
+    const client=connection.client({scope,credential:'test'},'handle',
+      ()=>({status:'ready',revision:3}),async()=>({}));
+    const event=id=>({toolCallId:id,toolName:'read',input:{}});
+    const [denied,allowed]=await Promise.all([
+      client.evaluate(event('deny'),null,{}),client.evaluate(event('allow'),null,{})]);
+    assert.deepEqual(denied,{block:true,reason:'Policy blocked this call'});
+    assert.deepEqual(allowed,{block:false});
+    const result=await client.execute(event('allow'),null,()=>client.bridge(event('allow'),0));
+    assert.deepEqual(result,{result:'tool completed'});
+    console.log('slow policy and rpc passed');
+  } catch(error) {console.error(error.message);process.exitCode=1;}
+  finally {if(connection)connection.close();server.close();}
+});
+"""
+    result = subprocess.run(
+        [node, "-e", script, str(module)], capture_output=True, text=True, timeout=12
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "slow policy and rpc passed"
 
 
 @pytest.fixture
