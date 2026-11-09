@@ -536,7 +536,9 @@ def select(
                 # Escape alone, or the start of an arrow sequence.
                 import select as _select
 
-                if _select.select([fd], [], [], 0.05)[0]:
+                reader = _select.poll()
+                reader.register(fd, _select.POLLIN)
+                if reader.poll(50):
                     nxt = os.read(fd, 1)
                     # b"[" is normal cursor mode, b"O" application cursor
                     # mode (DECCKM) — terminals send either for ↑/↓.
