@@ -143,6 +143,7 @@ def evaluate_host_tool(
     native_binding: NativeCallBinding | None = None,
     native_support: NativeSupport | None = None,
     local_execution: bool = True,
+    agy_delegation_status: Literal["proven", "missing", "failed"] = "missing",
 ) -> TierDecision:
     """Adapt with local filesystem facts immediately before requesting approval."""
     try:
@@ -159,6 +160,7 @@ def evaluate_host_tool(
             native_binding=native_binding,
             native_support=native_support,
             local_execution=local_execution,
+            agy_delegation_status=agy_delegation_status,
         )
         intent = adapt_tool_call(name, arguments, context)
         return decide_tier(state.tier, intent, load_rules())

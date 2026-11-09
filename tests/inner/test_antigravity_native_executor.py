@@ -471,7 +471,7 @@ def test_enqueue_session_message_inject_failure_returns_false(
 
 
 # ---------------------------------------------------------------------------
-# interrupt_session (real interrupt via CancelCascadeSteps)
+# interrupt_session (explicit native conversation-tree stop receipt)
 # ---------------------------------------------------------------------------
 
 
@@ -492,12 +492,12 @@ def test_interrupt_session_cancels_and_returns_true(
         seen["resolved_for"] = conversation_id
         return _PORT
 
-    def _cancel(port: int, cascade_id: str) -> bool:
+    def _cancel(port: int, cascade_id: str) -> frozenset[str]:
         seen["cancel"] = {"port": port, "cascade_id": cascade_id}
-        return True
+        return frozenset({cascade_id, "native-child"})
 
     monkeypatch.setattr(executor_mod, "resolve_language_server_port", _resolve_port)
-    monkeypatch.setattr(executor_mod, "cancel_cascade_steps", _cancel)
+    monkeypatch.setattr(executor_mod, "force_stop_cascade_tree", _cancel)
     result = asyncio.run(_executor(tmp_path).interrupt_session("main"))
     assert result is True
     assert seen["resolved_for"] == _CONVERSATION_ID
@@ -516,7 +516,7 @@ def test_interrupt_session_rpc_failure_returns_false(
     """
     _seed_state(tmp_path)
     monkeypatch.setattr(executor_mod, "resolve_language_server_port", lambda _conv: _PORT)
-    monkeypatch.setattr(executor_mod, "cancel_cascade_steps", lambda _port, _cid: False)
+    monkeypatch.setattr(executor_mod, "force_stop_cascade_tree", lambda _port, _cid: None)
     result = asyncio.run(_executor(tmp_path).interrupt_session("main"))
     assert result is False
 
@@ -538,7 +538,7 @@ def test_interrupt_session_no_port_returns_false(
         return True
 
     monkeypatch.setattr(executor_mod, "resolve_language_server_port", lambda _conv: None)
-    monkeypatch.setattr(executor_mod, "cancel_cascade_steps", _cancel)
+    monkeypatch.setattr(executor_mod, "force_stop_cascade_tree", _cancel)
     result = asyncio.run(_executor(tmp_path).interrupt_session("main"))
     assert result is False
     assert called["cancel"] is False
@@ -565,7 +565,7 @@ def test_interrupt_session_placeholder_returns_false(
         return True
 
     monkeypatch.setattr(executor_mod, "resolve_language_server_port", _resolve_port)
-    monkeypatch.setattr(executor_mod, "cancel_cascade_steps", _cancel)
+    monkeypatch.setattr(executor_mod, "force_stop_cascade_tree", _cancel)
     result = asyncio.run(_executor(tmp_path).interrupt_session("main"))
     assert result is False
     assert called["cancel"] is False
@@ -586,7 +586,7 @@ def test_interrupt_session_missing_state_returns_false(
         called["cancel"] = True
         return True
 
-    monkeypatch.setattr(executor_mod, "cancel_cascade_steps", _cancel)
+    monkeypatch.setattr(executor_mod, "force_stop_cascade_tree", _cancel)
     result = asyncio.run(_executor(tmp_path).interrupt_session("main"))
     assert result is False
     assert called["cancel"] is False

@@ -119,6 +119,7 @@ class TrustedHostContext:
     native_binding: NativeCallBinding | None = None
     native_support: NativeSupport | None = None
     local_execution: bool = True
+    agy_delegation_status: Literal["proven", "missing", "failed"] = "missing"
 
 
 @dataclass(frozen=True)
@@ -705,6 +706,29 @@ def _command_text(command: str) -> str:
     raise ValueError("Encoded command nesting too deep")
 
 
+def _checked_agy_delegation(arguments: Mapping[str, object], context: TrustedHostContext) -> bool:
+    """Only the tested native self-agent schema may reuse delegation evidence."""
+    if set(arguments) - {"TypeName", "Prompt", "Role", "Model", "Workspace"}:
+        return False
+    if (
+        arguments.get("TypeName") != "self"
+        or not isinstance(arguments.get("Prompt"), str)
+        or not arguments["Prompt"]
+    ):
+        return False
+    if any(
+        key in arguments and not isinstance(arguments[key], str)
+        for key in ("Role", "Model", "Workspace")
+    ):
+        return False
+    workspace = arguments.get("Workspace")
+    if workspace is None or workspace == "inherit":
+        return True
+    return isinstance(workspace, str) and _resolve(workspace, context) == _resolve(
+        context.workspace, context
+    )
+
+
 def _adapt_unbound_call(
     name: str, arguments: Mapping[str, object], context: TrustedHostContext
 ) -> ToolIntent:
@@ -866,6 +890,20 @@ def _adapt_unbound_call(
                 command=_command_text(_required_text(arguments, _EXEC_COMMAND[name])),
                 target=target,
             )
+        if name == "invoke_subagent":
+            if context.agy_delegation_status == "failed":
+                return ToolIntent(
+                    ToolKind.UNKNOWN,
+                    name,
+                    digest,
+                    context,
+                    detail="Antigravity child permission coverage failed; verify again",
+                    native_status=NativeSupportStatus.FAILED,
+                )
+            if context.agy_delegation_status == "proven" and _checked_agy_delegation(
+                arguments, context
+            ):
+                return ToolIntent(ToolKind.DELEGATE, name, digest, context)
         reason = _AGY_UNCHECKABLE.get(name)
         if name == "manage_task" and arguments.get("Action") == "send_input":
             reason = "Interactive terminal input cannot be checked"

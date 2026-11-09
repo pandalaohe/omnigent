@@ -77,6 +77,65 @@ def decision(tier: str, name: str, args: dict, host: TrustedHostContext | None =
     return decide_tier(tier, adapt_tool_call(name, args, host or posix_host()), RULES)
 
 
+@pytest.mark.parametrize("tier", PERMISSION_TIERS)
+@pytest.mark.parametrize("status", ["proven", "missing", "failed"])
+def test_agy_delegation_requires_current_host_proof(tier, status):
+    host = posix_host(agy_delegation_status=status)
+    result = decision(
+        tier,
+        "invoke_subagent",
+        {
+            "TypeName": "self",
+            "Prompt": "Read the workspace",
+            "Workspace": "inherit",
+        },
+        host,
+    )
+    expected = (
+        Verdict.ALLOW
+        if tier == "full" or status == "proven"
+        else (
+            Verdict.ASK
+            if status == "missing" and tier in ("ask", "accept-edits")
+            else Verdict.DENY
+        )
+    )
+    assert result.action == expected
+    if status == "failed" and tier != "full":
+        assert result.rule_id == "native-proof"
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"Workspace": "/opt/other"},
+        {"workspace": "/opt/other"},
+        {"Tools": ["write_file"]},
+        {"TypeName": "custom"},
+        {"Model": {}},
+    ],
+)
+def test_agy_proof_does_not_authorize_unchecked_spawn_arguments(extra):
+    host = posix_host(agy_delegation_status="proven")
+    arguments = {"TypeName": "self", "Prompt": "Read the workspace", **extra}
+    assert decision("auto", "invoke_subagent", arguments, host).action == Verdict.DENY
+    assert decision("ask", "invoke_subagent", arguments, host).action == Verdict.ASK
+
+
+def test_agy_spawn_proof_does_not_widen_child_tools_or_messages():
+    host = posix_host(agy_delegation_status="proven")
+    assert decision("plan", "read_file", {"Path": "seed.txt"}, host).action == Verdict.ALLOW
+    assert (
+        decision("plan", "write_file", {"Path": "child.txt", "Content": "x"}, host).action
+        == Verdict.DENY
+    )
+    assert decision("ask", "run_command", {"CommandLine": "echo safe"}, host).action == Verdict.ASK
+    assert (
+        decision("ask", "send_message", {"Recipient": "parent", "Content": "done"}, host).action
+        == Verdict.ASK
+    )
+
+
 def test_canonical_values_and_legacy_migration() -> None:
     assert PERMISSION_TIERS == ("ask", "plan", "accept-edits", "auto", "full")
     assert PERMISSION_TIERS[:-1] == NON_FULL_TIERS

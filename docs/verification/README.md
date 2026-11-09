@@ -14,6 +14,8 @@ app; component checks use their own isolated test environment.
   durable request recovery and runner concurrency.
 - [Host upgrades](features/host-upgrade.md): legacy channel pins, Windows file users,
   bounded retries and failed-install recovery.
+- [Antigravity delegation](features/antigravity-delegation.md): host proof, child
+  permission checks, native tree stops and approval withdrawal.
 
 Record the checkout revision, command, result and evidence location for each run.
 An HTML preview with fake data proves the shown component interactions, rather

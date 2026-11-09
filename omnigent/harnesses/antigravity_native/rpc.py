@@ -692,6 +692,52 @@ def cancel_cascade_steps(port: int, cascade_id: str) -> bool:
     return response.status_code < 400
 
 
+def force_stop_cascade_tree(port: int, conversation_id: str) -> frozenset[str] | None:
+    """Stop a conversation and its helpers, requiring an explicit stop receipt.
+
+    Live probes verified ``conversationId`` and ``stoppedConversationIds``;
+    HTTP success alone does not confirm a stop.
+    """
+    url = _rpc_url(port, _METHOD_FORCE_STOP_CASCADE_TREE)
+    _assert_loopback_url(url)
+    try:
+        with _sync_client(_RPC_CALL_TIMEOUT_S) as client:
+            response = client.post(
+                url, headers=_rpc_headers(port), json={"conversationId": conversation_id}
+            )
+        response.raise_for_status()
+        body = response.json()
+        ids = body.get("stoppedConversationIds") if isinstance(body, dict) else None
+        if (
+            not isinstance(ids, list)
+            or any(not isinstance(cid, str) or not cid for cid in ids)
+            or conversation_id not in ids
+        ):
+            return None
+        return frozenset(ids)
+    except (httpx.HTTPError, ValueError, OSError):
+        return None
+
+
+def running_agy_executables(port: int) -> tuple[Path, ...]:
+    """Return executable paths of the authenticated owner and its agy descendants."""
+    if _csrf_token_for_port(port) is None:
+        return ()
+    with _RPC_PORT_OWNERS_LOCK:
+        owner = _RPC_PORT_OWNERS.get(port)
+    if owner is None:
+        return ()
+    try:
+        paths = {Path(owner.exe()).resolve(strict=True)}
+        for process in owner.children(recursive=True):
+            executable = Path(process.exe()).resolve(strict=True)
+            if executable.name == "agy":
+                paths.add(executable)
+        return tuple(sorted(paths)) if owner.is_running() else ()
+    except (psutil.Error, OSError):
+        return ()
+
+
 class AntigravityRpcError(Exception):
     """
     Raised by :func:`handle_user_interaction` when the server returns a

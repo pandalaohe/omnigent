@@ -8,6 +8,7 @@ import json
 import sys
 import urllib.request
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 
 from omnigent import permission_tiers
@@ -207,22 +208,54 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
                 if completed.get("finished") is not True:
                     raise ValueError("Native completion was not confirmed")
+            from omnigent.harnesses.antigravity_native.delegation_proof import record_hook
+
+            record_hook(
+                tier_file.parent,
+                payload,
+                session_id=state.session_id,
+                host_id=state.host_id,
+                revision=state.revision,
+                call_id=_native_call_id(payload, state),
+                finished=True,
+            )
             print("{}")
             return 0
+        if state.tier != "full":
+            from omnigent.harnesses.antigravity_native.delegation_proof import record_hook
+
+            record_hook(
+                tier_file.parent,
+                payload,
+                session_id=state.session_id,
+                host_id=state.host_id,
+                revision=state.revision,
+                call_id=_native_call_id(payload, state),
+            )
         relay = _confirmed_relay(tier_file.parent, state)
         if _delegated_bridge_call(payload, relay):
             result = {"decision": "ask"}
         elif state.tier == "full":
             result = _lease_native_call(payload, state, relay)
         else:
+            from omnigent.harnesses.antigravity_native.delegation_proof import (
+                control_paths,
+                delegation_status,
+            )
+
             context = local_host_context(
                 state,
                 control_paths=(
                     str(tier_file.parent),
                     str(Path(permission_tiers.__file__).parent),
                     str(Path(__file__).resolve()),
+                    *control_paths(tier_file.parent),
                 ),
             )
+            if _object(payload.get("toolCall")).get("name") == "invoke_subagent":
+                context = replace(
+                    context, agy_delegation_status=delegation_status(tier_file.parent)
+                )
             result = decide(payload, state.tier, load_rules(), context)
             if result["decision"] != "deny":
                 result = _lease_native_call(payload, state, relay)

@@ -177,6 +177,41 @@ def _runtime(
     return runtime
 
 
+def test_stopped_agy_guard_cannot_receive_a_late_approval(tmp_path):
+    runtime = _runtime(tmp_path, "ask")
+    binding, decision = runtime.inspect(
+        "session-a",
+        call_id="agy-hook:pending",
+        name="write_file",
+        arguments={"Path": "child.txt", "Content": "x"},
+        expected_revision=3,
+    )
+    assert decision.action.value == "ASK"
+    assert runtime.finish("session-a", call_id=binding.call_id, revision=3)
+    assert runtime.finish("session-a", call_id=binding.call_id, revision=3)
+    assert not runtime.authorize(
+        "session-a",
+        call_id=binding.call_id,
+        name=binding.name,
+        arguments_digest=binding.arguments_digest,
+        expected_revision=3,
+    )
+    assert runtime.idle("session-a")
+
+
+def test_full_agy_does_not_read_broken_delegation_fingerprint(tmp_path):
+    runtime = _runtime(tmp_path, "full")
+    (runtime._paths["session-a"].parent / "agy_fingerprint").write_text("[]")
+    _binding, decision = runtime.inspect(
+        "session-a",
+        call_id="full-spawn",
+        name="invoke_subagent",
+        arguments={},
+        expected_revision=3,
+    )
+    assert decision.action.value == "ALLOW"
+
+
 def _extension_runtime(
     tmp_path: Path, tier: str, scope: str = "user", name: str = "google_search", runtime=None
 ):

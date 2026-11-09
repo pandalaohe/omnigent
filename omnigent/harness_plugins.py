@@ -256,6 +256,7 @@ ANTIGRAVITY_NATIVE_CODING_AGENT = NativeCodingAgent(
     harness="antigravity-native",
     wrapper_label=ANTIGRAVITY_NATIVE_WRAPPER_VALUE,
     terminal_name="antigravity",
+    subagent_wrapper_label="antigravity-native-ui-subagent",
 )
 
 QWEN_NATIVE_CODING_AGENT = NativeCodingAgent(
