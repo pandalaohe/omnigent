@@ -24939,6 +24939,48 @@
         "summary": "Read Activity"
       }
     },
+    "/v1/me/usage/lines": {
+      "get": {
+        "operationId": "usage_lines_v1_me_usage_lines_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "running",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Running",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Usage Lines V1 Me Usage Lines Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Usage Lines"
+      }
+    },
     "/v1/me/usage/models": {
       "get": {
         "operationId": "read_models_v1_me_usage_models_get",

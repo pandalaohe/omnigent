@@ -571,7 +571,7 @@ async def test_claude_spend_values_traverse_server_usage_seam(
 
 
 @pytest.mark.asyncio
-async def test_claude_routing_ignores_spend_window_when_usage_is_off(db_uri: str) -> None:
+async def test_claude_routing_keeps_spend_window_when_usage_is_off(db_uri: str) -> None:
     from omnigent.harnesses.claude_native.status import normalize_status_payload
     from omnigent.server.agent_quota import AgentQuotaService
     from omnigent.server.routes._sessions.orchestration import _persist_external_session_usage
@@ -610,9 +610,9 @@ async def test_claude_routing_ignores_spend_window_when_usage_is_off(db_uri: str
     )
 
     quota = quotas.quotas(quotas.context(conv))[1]["claude"]
-    assert quota.deciding_window == "5h"
-    assert quota.state == "ok"
-    assert [window.label for window in quota.windows] == ["5h"]
+    assert quota.deciding_window == "spend"
+    assert quota.state == "exhausted"
+    assert [window.label for window in quota.windows] == ["5h", "spend"]
 
 
 @pytest.mark.asyncio

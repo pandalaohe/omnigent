@@ -1871,6 +1871,8 @@ def test_sdk_seed_is_distinct_and_uses_host_defaults(
         "sys_session_create",
         "sys_session_send",
         "sys_session_close",
+        "sys_session_archive",
+        "sys_session_unarchive",
         "sys_list_models",
     }
     advertised = advertised_names(loaded.spec)
