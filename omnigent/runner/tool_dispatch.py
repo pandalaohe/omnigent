@@ -819,21 +819,22 @@ def build_native_relay_tool_schemas(
                 function = _string_object_dict(fallback_schema.get("function"))
                 if function is not None:
                     _append(function)
+        from omnigent.tools.builtins.timer import SysTimerCancelTool, SysTimerSetTool
+
+        for timer_cls in (SysTimerSetTool, SysTimerCancelTool):
+            function = _string_object_dict(timer_cls().get_schema().get("function"))
+            if function is not None:
+                _append(function)
         if peer_messaging_enabled:
-            # Archive tools, timers and flows follow the manager's
-            # collaboration-flag rule.
             from omnigent.tools.builtins.flow import (
                 SysFlowCancelTool,
                 SysFlowListTool,
                 SysFlowStartTool,
             )
-            from omnigent.tools.builtins.timer import SysTimerCancelTool, SysTimerSetTool
 
             for timed_cls in (
                 SysSessionArchiveTool,
                 SysSessionUnarchiveTool,
-                SysTimerSetTool,
-                SysTimerCancelTool,
                 SysFlowStartTool,
                 SysFlowListTool,
                 SysFlowCancelTool,
@@ -6974,7 +6975,6 @@ async def _execute_timer_set(
     *,
     server_client: httpx.AsyncClient | None = None,
     conversation_id: str | None = None,
-    collab_governed: bool = True,
 ) -> str:
     """
     Schedule a timer that fires after a delay.
@@ -6984,9 +6984,6 @@ async def _execute_timer_set(
     :param server_client: httpx client for persisting firings.
     :param conversation_id: Session the timer belongs to, e.g.
         ``"conv_abc123"``.
-    :param collab_governed: ``False`` when the spec grants timers itself
-        (``timers: true``); only timers exposed through the collaboration
-        flag follow the collaboration settings.
     :returns: JSON string with ``timer_id`` and ``status``.
     """
     from omnigent.runner import app as _app
@@ -6997,8 +6994,6 @@ async def _execute_timer_set(
     seconds, repeat, note = validated
     if server_client is None or conversation_id is None:
         return json.dumps({"error": "timer requires server_client and conversation_id"})
-    if collab_governed and not await flows.read_flow_timer_enabled(server_client, conversation_id):
-        return json.dumps({"error": flows.FLOW_TIMER_OFF_ERROR})
 
     timer_id = f"timer_{uuid.uuid4().hex}"
     task = asyncio.create_task(
@@ -7009,7 +7004,6 @@ async def _execute_timer_set(
             repeat=repeat,
             note=note,
             server_client=server_client,
-            collab_governed=collab_governed,
         ),
         name=f"timer-{timer_id}",
     )
@@ -7043,7 +7037,6 @@ async def _timer_loop(
     repeat: bool,
     note: str | None,
     server_client: httpx.AsyncClient,
-    collab_governed: bool = True,
 ) -> None:
     """
     Background loop: sleep then fire timer notifications.
@@ -7054,18 +7047,12 @@ async def _timer_loop(
     :param repeat: Loop indefinitely when True.
     :param note: Optional note echoed in firing text.
     :param server_client: httpx client for persistence.
-    :param collab_governed: Whether the collaboration settings apply.
     """
     from omnigent.runner import app as _app
 
     try:
         while True:
             await asyncio.sleep(seconds)
-            # Settings row ``flow_timer_enabled`` turned off → stop, no wake.
-            if collab_governed and not await flows.read_flow_timer_enabled(
-                server_client, conversation_id
-            ):
-                break
             # D5: the session or an ancestor archived ends the schedule
             # before its next wake; the finally below drops the registry
             # entry.
@@ -11084,7 +11071,10 @@ async def execute_tool(
                     server_client,
                 )
         elif tool_name in _SESSION_ARCHIVE_TOOLS:
-            if not _peer_messaging_enabled_for(conversation_id):
+            if not (
+                _peer_messaging_enabled_for(conversation_id)
+                or (agent_spec is not None and agent_spec.spawn)
+            ):
                 return json.dumps({"error": f"tool {tool_name!r} is not enabled"})
             output = await _session_archive_via_rest(
                 tool_name,
@@ -11157,13 +11147,6 @@ async def execute_tool(
                     args,
                     server_client=server_client,
                     conversation_id=conversation_id,
-                    # Upstream's own switch: a ``timers: true`` spec ignores ours. With
-                    # no spec (unresolved), only the collab flag can have exposed them.
-                    collab_governed=(
-                        not agent_spec.timers
-                        if agent_spec is not None
-                        else _peer_messaging_enabled_for(conversation_id)
-                    ),
                 )
             else:
                 output = await _execute_timer_cancel(

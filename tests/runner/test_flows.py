@@ -681,7 +681,7 @@ def _timer_spec(spec_timers: bool) -> Any:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("spec_timers", [False, True])
-async def test_timer_set_follows_collab_settings_only_without_spec_timers(
+async def test_timer_set_ignores_collab_and_flow_settings(
     server: _FakeServer, spec_timers: bool
 ) -> None:
     server.flow_timer_enabled = False
@@ -696,19 +696,23 @@ async def test_timer_set_follows_collab_settings_only_without_spec_timers(
                 conversation_id=_SESSION,
             )
         )
-    if spec_timers:
-        assert output["status"] == "scheduled"
-        assert not any(path.endswith("/collab-settings") for _m, path in server.requests)
-        from omnigent.runner import app as runner_app
+    assert output["status"] == "scheduled"
+    assert not any(path.endswith("/collab-settings") for _m, path in server.requests)
 
-        runner_app.cancel_timer(_SESSION, output["timer_id"])
-    else:
-        assert "flow_timer_enabled" in output["error"]
+    cancelled = json.loads(
+        await execute_tool(
+            tool_name="sys_timer_cancel",
+            arguments=json.dumps({"timer_id": output["timer_id"]}),
+            agent_spec=_timer_spec(spec_timers),
+            conversation_id=_SESSION,
+        )
+    )
+    assert cancelled["status"] == "cancelled"
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("session", [_SESSION, "conv_no_flag"])
-async def test_timer_without_a_resolved_spec_is_governed_only_under_the_collab_flag(
+async def test_timer_without_a_resolved_spec_ignores_flow_settings(
     server: _FakeServer, session: str
 ) -> None:
     from omnigent.runner import app as runner_app
@@ -723,17 +727,13 @@ async def test_timer_without_a_resolved_spec_is_governed_only_under_the_collab_f
                 conversation_id=session,
             )
         )
-    if session == _SESSION:
-        assert "flow_timer_enabled" in output["error"]
-    else:
-        # Flag off: only a ``timers: true`` spec can have granted the tool.
-        assert output["status"] == "scheduled"
-        runner_app.cancel_timer(session, output["timer_id"])
+    assert output["status"] == "scheduled"
+    runner_app.cancel_timer(session, output["timer_id"])
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("spec_timers", [False, True])
-async def test_timer_firing_stops_on_row8_off_only_without_spec_timers(
+async def test_timer_firing_continues_when_flow_setting_turns_off(
     server: _FakeServer, spec_timers: bool
 ) -> None:
     from omnigent.runner import app as runner_app
@@ -752,18 +752,15 @@ async def test_timer_firing_stops_on_row8_off_only_without_spec_timers(
         timer_task = runner_app._session_timers[_SESSION][output["timer_id"]]
         try:
             async with asyncio.timeout(5):
-                if spec_timers:
-                    while len(server.wakes) < 2:
-                        server.woken.clear()
-                        await server.woken.wait()
-                else:
-                    await asyncio.shield(timer_task)
+                while len(server.wakes) < 2:
+                    server.woken.clear()
+                    await server.woken.wait()
             running = output["timer_id"] in runner_app._session_timers.get(_SESSION, {})
         finally:
             runner_app.cancel_timer(_SESSION, output["timer_id"])
             await timer_task
-    assert running is spec_timers
-    assert (len(server.wakes) >= 2) is spec_timers
+    assert running
+    assert len(server.wakes) >= 2
 
 
 @pytest.mark.asyncio
@@ -877,9 +874,9 @@ def test_native_relay_advertises_timers_and_flows_under_the_collab_flag(spec_tim
     spec = AgentSpec(spec_version=1, timers=spec_timers)
     assert _relay_names(spec, peer=True) >= _TIMED
     off = _relay_names(spec, peer=False) & _TIMED
-    assert off == ({"sys_timer_set", "sys_timer_cancel"} if spec_timers else set())
+    assert off == {"sys_timer_set", "sys_timer_cancel"}
     assert _relay_names(None, peer=True) >= _TIMED
-    assert _relay_names(None, peer=False).isdisjoint(_TIMED)
+    assert _relay_names(None, peer=False) & _TIMED == {"sys_timer_set", "sys_timer_cancel"}
 
 
 @pytest.mark.asyncio

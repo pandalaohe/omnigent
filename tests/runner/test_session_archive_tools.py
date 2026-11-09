@@ -424,8 +424,9 @@ def _spec() -> AgentSpec:
     return AgentSpec(spec_version=1)
 
 
-def test_archive_tools_follow_the_peer_messaging_flag() -> None:
-    """``ToolManager`` advertises both archive tools iff the flag is on."""
+@pytest.mark.parametrize("spawn", [False, True])
+def test_archive_tools_follow_the_peer_messaging_or_spawn_grant(spawn: bool) -> None:
+    """A spawn grant also exposes archive tools while peer collaboration is off."""
     names_on = {
         schema["function"]["name"]
         for schema in ToolManager(_spec(), peer_messaging_enabled=True).get_tool_schemas()
@@ -433,9 +434,11 @@ def test_archive_tools_follow_the_peer_messaging_flag() -> None:
     assert {"sys_session_archive", "sys_session_unarchive"} <= names_on
     names_off = {
         schema["function"]["name"]
-        for schema in ToolManager(_spec(), peer_messaging_enabled=False).get_tool_schemas()
+        for schema in ToolManager(
+            AgentSpec(spec_version=1, spawn=spawn), peer_messaging_enabled=False
+        ).get_tool_schemas()
     }
-    assert not {"sys_session_archive", "sys_session_unarchive"} & names_off
+    assert bool({"sys_session_archive", "sys_session_unarchive"} & names_off) is spawn
 
 
 def test_archive_tools_in_the_spec_less_relay_fallback() -> None:
@@ -444,3 +447,29 @@ def test_archive_tools_in_the_spec_less_relay_fallback() -> None:
     assert {"sys_session_archive", "sys_session_unarchive"} <= on
     off = {s["name"] for s in build_native_relay_tool_schemas(None, peer_messaging_enabled=False)}
     assert not {"sys_session_archive", "sys_session_unarchive"} & off
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["sys_session_archive", "sys_session_unarchive"])
+async def test_spawn_dispatch_can_manage_child_with_collab_off(tool_name: str) -> None:
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_parent":
+            return httpx.Response(200, json={"id": "conv_parent", "parent_session_id": None})
+        assert request.method == "PATCH"
+        assert request.url.path == "/v1/sessions/conv_child"
+        assert request.headers["X-Omnigent-Agent-Session"] == "conv_parent"
+        return httpx.Response(200, json={"id": "conv_child"})
+
+    async with _client(handler) as client:
+        output = json.loads(
+            await execute_tool(
+                tool_name=tool_name,
+                arguments=json.dumps({"session_id": "conv_child"}),
+                conversation_id="conv_parent",
+                agent_spec=AgentSpec(spec_version=1, spawn=True),
+                server_client=client,
+            )
+        )
+    assert output["archived"] is (tool_name == "sys_session_archive")

@@ -345,12 +345,7 @@ class ToolManager:
 
     def _register_timer_tools(self) -> None:
         """
-        Register the timer builtins when the agent spec opts in.
-
-        Gated on :attr:`AgentSpec.timers` (defaults to ``False`` to
-        match ``omnigent/inner/datamodel.py::AgentDef.timers``).
-        Agents that want timer scheduling declare ``timers: true``
-        at the top level of their YAML.
+        Register session wake-up timers independently of peer collaboration.
 
         Registers (in order):
 
@@ -369,11 +364,7 @@ class ToolManager:
             an already-registered tool. Defensive — should not
             happen given the standard registration order.
         """
-        tools: list[Tool] = []
-        # The session-collaboration flag also grants timers, so every session
-        # with collaboration on (native ones included) can schedule its wake.
-        if self._spec.timers or self._peer_messaging_enabled:
-            tools += [SysTimerSetTool(), SysTimerCancelTool()]
+        tools: list[Tool] = [SysTimerSetTool(), SysTimerCancelTool()]
         # Flows (time composed with tool calls) are collaboration tools.
         if self._peer_messaging_enabled:
             tools += [SysFlowStartTool(), SysFlowListTool(), SysFlowCancelTool()]
@@ -577,9 +568,8 @@ class ToolManager:
         # server refuses a child sender too).
         if self._peer_messaging_enabled and self._session_open_enabled:
             self._tools[SysSessionOpenTool.name()] = SysSessionOpenTool()
-        if self._peer_messaging_enabled:
-            # Archive / unarchive reach any session the user owns, so they
-            # ride the collaboration flag rather than the spawn grant.
+        if self._peer_messaging_enabled or self._spec.spawn:
+            # Without peer messaging the server limits targets to direct children.
             self._tools[SysSessionArchiveTool.name()] = SysSessionArchiveTool()
             self._tools[SysSessionUnarchiveTool.name()] = SysSessionUnarchiveTool()
 

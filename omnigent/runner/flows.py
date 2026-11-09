@@ -177,7 +177,7 @@ async def read_flow_timer_enabled(server_client: httpx.AsyncClient, session_id: 
         return True
     if not isinstance(body, dict):
         return True
-    # The master switch (``enabled``) off turns flows and timers off too.
+    # Both switches govern multi-step flows; session wake-up timers are independent.
     return all(body.get(key) is not False for key in ("enabled", "flow_timer_enabled"))
 
 

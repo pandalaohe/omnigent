@@ -19,7 +19,7 @@ import { cn } from "@/lib/utils";
 
 const HINTS = {
   enabled:
-    "When off, your sessions are not offered the collaboration tools and the server refuses their requests.",
+    "When off, peer collaboration tools are unavailable. Sessions can still manage their own direct children and schedule their own wake-ups.",
   openRate: "Opening sessions (including child sessions) faster than this rate is refused.",
   relayDepth:
     "A relay chain of messages between sessions longer than this is held until you release it.",
@@ -28,7 +28,8 @@ const HINTS = {
   duplicate:
     "An identical message on the same thread to the same session is dropped while the earlier copy is still undelivered, or inside this window.",
   undelivered: "A queued or held message not delivered within this time expires.",
-  flowTimer: "Lets agents run timed flows and timed wake-ups.",
+  flowTimer:
+    "Lets agents run multi-step timed flows. A session's own timed wake-ups remain available when this is off.",
 };
 
 /**
