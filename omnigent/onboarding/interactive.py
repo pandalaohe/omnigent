@@ -536,9 +536,14 @@ def select(
                 # Escape alone, or the start of an arrow sequence.
                 import select as _select
 
-                reader = _select.poll()
-                reader.register(fd, _select.POLLIN)
-                if reader.poll(50):
+                # Darwin's /dev/tty supports select but may reject poll.
+                try:
+                    ready = bool(_select.select([fd], [], [], 0.05)[0])
+                except ValueError:
+                    reader = _select.poll()
+                    reader.register(fd, _select.POLLIN)
+                    ready = bool(reader.poll(50))
+                if ready:
                     nxt = os.read(fd, 1)
                     # b"[" is normal cursor mode, b"O" application cursor
                     # mode (DECCKM) — terminals send either for ↑/↓.

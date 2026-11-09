@@ -609,6 +609,17 @@ def test_select_arrow_keys_work_in_both_cursor_modes(
 
 
 @pytest.mark.posix_only
+def test_select_avoids_poll_for_supported_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    import select
+
+    def _unexpected_poll():
+        raise AssertionError("select-compatible terminals must not use poll")
+
+    monkeypatch.setattr(select, "poll", _unexpected_poll)
+    assert _select_over_pty(monkeypatch, b"\x1b") == -1
+
+
+@pytest.mark.posix_only
 @pytest.mark.parametrize("keys,expected", [(b"\x1b[B\r", 1), (b"\x1bOB\r", 1), (b"\x1b", -1)])
 def test_select_handles_high_terminal_descriptor(
     monkeypatch: pytest.MonkeyPatch, keys: bytes, expected: int
