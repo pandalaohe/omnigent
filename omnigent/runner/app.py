@@ -6098,7 +6098,14 @@ def create_runner_app(
         request's durable record. The server may re-trigger a lost arm through
         the guarded executor; failures leave the durable request intact.
         """
-        from omnigent.server.auto_rotation import INJECTED_REVISION_LABEL_KEY
+        from omnigent.server.auto_rotation import (
+            ATTEMPT_LABEL_KEY,
+            DRAFT_LABEL_KEY,
+            FAILED_ATTEMPT_LABEL_KEY,
+            INJECTED_ATTEMPT_LABEL_KEY,
+            INJECTED_REVISION_LABEL_KEY,
+            rotation_attempt,
+        )
         from omnigent.stores.conversation_store import ROTATE_REQUESTED_LABEL_KEY
 
         try:
@@ -6131,6 +6138,10 @@ def create_runner_app(
             return "not_requested"
         harness = snapshot.get("harness") or _session_harness_name(conv_id)
         labels = snapshot.get("labels")
+        if not isinstance(labels, dict):
+            if require_label:
+                return "not_requested"
+            labels = {}
         if require_label and (
             conv_id in _succeeded_parents
             or (isinstance(labels, dict) and labels.get("omnigent.succeeded_by"))
@@ -6149,12 +6160,24 @@ def create_runner_app(
                 or (expected_revision is not None and expected_revision != str(revision))
             ):
                 return "not_requested"
+            attempt = rotation_attempt(labels, revision)
+            if labels.get(DRAFT_LABEL_KEY):
+                return "draft_may_remain"
+            if labels.get(FAILED_ATTEMPT_LABEL_KEY) == attempt:
+                return "unconfirmed"
             started = rotations_started.get(conv_id)
-            if started is not None and revision <= int(started[0]):
-                return started[1] if revision == int(started[0]) else "superseded"
+            if started is not None:
+                if int(started[0].split(":", 1)[0]) > revision:
+                    return "superseded"
+                if started[1] == "draft_may_remain":
+                    return "draft_may_remain"
+                if started[0] == attempt:
+                    return started[1]
+            if labels.get(INJECTED_ATTEMPT_LABEL_KEY) == attempt:
+                return "unconfirmed"
             injected = labels.get(INJECTED_REVISION_LABEL_KEY)
             if isinstance(injected, str) and injected.isascii() and injected.isdecimal():
-                if int(injected) >= revision:
+                if not labels.get(ATTEMPT_LABEL_KEY) and int(injected) >= revision:
                     return "unconfirmed"
         completed_pi_source = (
             harness == "pi"
@@ -6197,19 +6220,31 @@ def create_runner_app(
             try:
                 claim = await server_client.post(
                     f"/v1/sessions/{urllib.parse.quote(conv_id, safe='')}/handover/injection",
-                    json={"archive_revision": str(snapshot["archive_revision"])},
+                    json={
+                        "archive_revision": str(snapshot["archive_revision"]),
+                        "attempt": labels.get(ATTEMPT_LABEL_KEY, "")
+                        if isinstance(labels, dict)
+                        else "",
+                    },
                     timeout=10.0,
                 )
                 claim.raise_for_status()
                 outcome = claim.json().get("status")
                 if outcome != "claimed":
-                    return "unconfirmed" if outcome == "unconfirmed" else "not_requested"
+                    return (
+                        outcome
+                        if outcome in {"unconfirmed", "draft_may_remain"}
+                        else "not_requested"
+                    )
             except Exception:
                 _logger.warning(
                     "Could not persist rotation injection for %s", conv_id, exc_info=True
                 )
                 return "not_requested"
-            rotations_started[conv_id] = (str(snapshot["archive_revision"]), "unconfirmed")
+            rotations_started[conv_id] = (
+                rotation_attempt(labels, snapshot["archive_revision"]),
+                "unconfirmed",
+            )
             if _rotation_session_busy(conv_id):
                 return "busy"
         try:
@@ -6264,7 +6299,10 @@ def create_runner_app(
                     return "not_requested"
                 await process_manager.release(conv_id)
                 if require_label and conv_id not in _succeeded_parents:
-                    rotations_started[conv_id] = (str(snapshot["archive_revision"]), "unconfirmed")
+                    rotations_started[conv_id] = (
+                        rotation_attempt(labels, snapshot["archive_revision"]),
+                        "unconfirmed",
+                    )
                 return "started"
             else:
                 _logger.warning(
@@ -6291,15 +6329,32 @@ def create_runner_app(
                 response.status_code,
                 extra={"session_id": conv_id},
             )
-        if require_label and isinstance(response, JSONResponse):
-            result = json.loads(bytes(response.body))
+        if require_label:
+            result = json.loads(bytes(response.body)) if isinstance(response, JSONResponse) else {}
+            confirmed_clean = response.status_code < 400 or (
+                result.get("rotation_unconfirmed") is True
+                and result.get("draft_may_remain") is False
+            )
+            draft = not confirmed_clean
+            outcome = "draft_may_remain" if draft else "unconfirmed"
+            if conv_id not in _succeeded_parents:
+                rotations_started[conv_id] = (
+                    rotation_attempt(labels, snapshot["archive_revision"]),
+                    outcome,
+                )
+            # The claim blocks input until the keyboard boundary proves it clean.
+            receipt = await server_client.post(
+                f"/v1/sessions/{urllib.parse.quote(conv_id, safe='')}/handover/injection",
+                json={
+                    "archive_revision": str(snapshot["archive_revision"]),
+                    "attempt": labels.get(ATTEMPT_LABEL_KEY, ""),
+                    "draft_may_remain" if draft else "input_cleared": "true",
+                },
+                timeout=10.0,
+            )
+            receipt.raise_for_status()
             if result.get("rotation_unconfirmed") is True:
-                outcome = "draft_may_remain" if result.get("draft_may_remain") else "unconfirmed"
-                if conv_id not in _succeeded_parents:
-                    rotations_started[conv_id] = (str(snapshot["archive_revision"]), outcome)
                 return outcome
-        if response.status_code < 400 and require_label and conv_id not in _succeeded_parents:
-            rotations_started[conv_id] = (str(snapshot["archive_revision"]), "unconfirmed")
         return "started" if response.status_code < 400 else "not_requested"
 
     rotations_in_flight: set[str] = set()

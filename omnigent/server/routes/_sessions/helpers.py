@@ -12922,9 +12922,11 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     # (``succeeded_by`` redirects everything addressed to the old id) or a
     # rotation request, so every one of them is refused outside a create
     # (where :func:`_strip_succession_operation_labels` drops copied ones).
-    from omnigent.server.auto_rotation import INJECTED_REVISION_LABEL_KEY
+    from omnigent.server.auto_rotation import AUTO_ROTATION_STATE_PREFIX
 
-    for key in SUCCESSION_OPERATION_LABEL_KEYS | {INJECTED_REVISION_LABEL_KEY}:
+    for key in SUCCESSION_OPERATION_LABEL_KEYS | {
+        key for key in labels if key.startswith(AUTO_ROTATION_STATE_PREFIX)
+    }:
         if key in labels:
             raise OmnigentError(
                 f"label {key!r} is server-managed and cannot be set by clients",
@@ -12946,9 +12948,11 @@ def _strip_succession_operation_labels(labels: dict[str, str] | None) -> None:
     """
     if not labels:
         return
-    from omnigent.server.auto_rotation import INJECTED_REVISION_LABEL_KEY
+    from omnigent.server.auto_rotation import AUTO_ROTATION_STATE_PREFIX
 
-    labels.pop(INJECTED_REVISION_LABEL_KEY, None)
+    for key in list(labels):
+        if key.startswith(AUTO_ROTATION_STATE_PREFIX):
+            labels.pop(key)
     for key in SUCCESSION_OPERATION_LABEL_KEYS:
         labels.pop(key, None)
 
