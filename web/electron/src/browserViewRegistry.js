@@ -27,6 +27,7 @@ const {
   lookupHostAddresses,
 } = require("./browserUrlPolicy");
 const crypto = require("node:crypto");
+const path = require("node:path");
 
 const DEFAULT_CAP = 10;
 
@@ -276,6 +277,8 @@ function createBrowserViewRegistry({
         nodeIntegration: false,
         contextIsolation: true,
         sandbox: true,
+        preload: path.join(__dirname, "browserCredentialPreload.js"),
+        nodeIntegrationInSubFrames: true,
       },
     });
     const entry = makeEntry(conversationId, view);

@@ -1461,16 +1461,21 @@ describe("useBrowserAgentRelay — hidden pane handling", () => {
     }
   });
 
-  it("snapshot: succeeds when the page has a layout size", async () => {
+  it("snapshot: succeeds when the page has layout and credential protection", async () => {
     const bridge = installBridge({
       browserExecute: vi.fn(async (_id: string, js: string) => ({
         ok: true,
         result: window.eval(js),
       })),
     });
-    await runAction(actionEvent("snapshot"));
-    expect(bridge.browserExecute).toHaveBeenCalled();
-    expect((postedResult().result as { ok: boolean }).ok).toBe(true);
+    document.documentElement.setAttribute("data-omnigent-credential-watch", "fake-document");
+    try {
+      await runAction(actionEvent("snapshot"));
+      expect(bridge.browserExecute).toHaveBeenCalled();
+      expect((postedResult().result as { ok: boolean }).ok).toBe(true);
+    } finally {
+      document.documentElement.removeAttribute("data-omnigent-credential-watch");
+    }
   });
 
   it("screenshot: retries while the pane is hidden and returns the data URL once surfaced", async () => {
