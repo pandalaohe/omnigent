@@ -289,22 +289,14 @@ def test_cancel_malformed_json_returns_parse_error() -> None:
 # ─── ToolManager registration gating ─────────────────────────
 
 
-def test_timers_false_does_not_register() -> None:
-    """
-    With ``timers=False`` (the default) the manager does NOT
-    register either timer tool.
-
-    The default-off behavior matches the inner stack
-    (``AgentDef.timers`` defaults to False there too) — agents
-    that don't declare ``timers: true`` get the same minimal tool
-    surface they did pre-step-10. A regression that flipped the
-    default to True would surprise existing agents.
-    """
-    spec = AgentSpec(spec_version=1)  # timers defaults to False
-    manager = ToolManager(spec=spec)
+def test_default_timers_register_without_collaboration() -> None:
+    """Session wake-ups remain available without timer opt-in or peer messaging."""
+    spec = AgentSpec(spec_version=1)
+    assert spec.timers is False
+    manager = ToolManager(spec=spec, peer_messaging_enabled=False)
     names = manager.get_tool_names()
-    assert SysTimerSetTool.name() not in names
-    assert SysTimerCancelTool.name() not in names
+    assert SysTimerSetTool.name() in names
+    assert SysTimerCancelTool.name() in names
 
 
 def test_timers_true_registers_both_tools_and_schemas() -> None:

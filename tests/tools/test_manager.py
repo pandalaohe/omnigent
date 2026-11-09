@@ -164,6 +164,7 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "browser_click",
         "browser_type",
         "browser_screenshot",
+        "browser_fill_saved_login",
         # The artifact-relay panel tool is always auto-registered
         # (framework-owned) like the browser tools. Schema-only;
         # runner-dispatched.
@@ -203,7 +204,14 @@ def _non_lifecycle_schemas(
 
 
 @pytest.mark.parametrize(
-    "tool_name", ["sys_session_rename", "sys_session_message", "sys_timer_set", "sys_timer_cancel"]
+    "tool_name",
+    [
+        "sys_session_rename",
+        "sys_session_message",
+        "sys_timer_set",
+        "sys_timer_cancel",
+        "browser_fill_saved_login",
+    ],
 )
 def test_session_tools_are_registered_for_every_agent(tool_name: str) -> None:
     names = {schema["function"]["name"] for schema in ToolManager(_make_spec()).get_tool_schemas()}
