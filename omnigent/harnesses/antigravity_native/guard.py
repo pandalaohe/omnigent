@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import sys
+import urllib.error
 import urllib.request
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
@@ -72,7 +73,22 @@ def _confirmed_relay(bridge_dir: Path, state: HostPermissionState) -> dict[str, 
     if state.status != "ready":
         raise ValueError("Permission state is blocked or switching")
     relay = _relay_config(bridge_dir, state)
-    confirmed = _relay_post(relay, "/permission-tiers/state", {})
+    attempt = 0
+    while True:
+        try:
+            confirmed = _relay_post(relay, "/permission-tiers/state", {})
+            break
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (503, 504) or attempt == 2:
+                raise
+            exc.close()
+        except urllib.error.URLError as exc:
+            if not isinstance(exc.reason, TimeoutError) or attempt == 2:
+                raise
+        except TimeoutError:
+            if attempt == 2:
+                raise
+        attempt += 1
     if (
         confirmed.get("permission_tiers_capability") is not True
         or confirmed.get("permission_tier") != state.tier
@@ -106,8 +122,13 @@ def _relay_post(
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         method="POST",
     )
-    # Policy ASK is a server-held approval; state/control requests remain short.
-    timeout = 86400 if path == "/policies/evaluate" else 5
+    # Policy ASK is a server-held approval; state must outlast the relay's wait.
+    if path == "/policies/evaluate":
+        timeout = 86400
+    elif path == "/permission-tiers/state":
+        timeout = 10
+    else:
+        timeout = 5
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return _object(json.load(response))
 

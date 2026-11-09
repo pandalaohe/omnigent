@@ -7,6 +7,7 @@ import json
 import re
 import subprocess
 import sys
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -299,3 +300,126 @@ def test_full_native_entry_keeps_independent_policy_without_fixed_rules(
         assert response["reason"] == "independent deny"
     assert len(calls) == 1
     assert calls[0][0] == "/policies/evaluate"
+
+
+@pytest.fixture
+def native_transport(tmp_path, state, monkeypatch, capsys):
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    tier = bridge / "permission_tier"
+    tier.write_text("auto\n")
+    write_host_permission_state(bridge / HOST_PERMISSION_STATE_FILE, state)
+    (bridge / "tool_relay.json").write_text(
+        json.dumps(
+            {
+                "session_id": state.session_id,
+                "permission_tiers_v1": True,
+                "url": "http://relay.test",
+                "token": "test-token",
+            }
+        )
+    )
+    native = {
+        **payload("view_file", {"AbsolutePath": str(Path(state.workspace) / "a.py")}),
+        "conversationId": "cascade",
+        "stepIdx": 4,
+    }
+    matching = {
+        "permission_tiers_capability": True,
+        "permission_tier": state.tier,
+        "permission_tier_revision": state.revision,
+        "permission_tier_state": "ready",
+    }
+
+    def run(responses, *, finish=False):
+        calls = []
+        remaining = iter(responses)
+
+        def urlopen(request, timeout):
+            calls.append((request.full_url.removeprefix("http://relay.test"), timeout))
+            response = next(remaining)
+            if isinstance(response, Exception):
+                raise response
+            if isinstance(response, bytes):
+                return io.BytesIO(response)
+            return io.BytesIO(json.dumps(response).encode())
+
+        monkeypatch.setattr(guard.urllib.request, "urlopen", urlopen)
+        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(native)))
+        args = ["--tier-file", str(tier)] + (["--finish"] if finish else [])
+        assert guard.main(args) == 0
+        return json.loads(capsys.readouterr().out), calls
+
+    return matching, run
+
+
+def http_error(code):
+    return urllib.error.HTTPError("http://relay.test", code, "error", {}, None)
+
+
+@pytest.mark.parametrize("failure", ["timeout", "url-timeout", "503", "504"])
+@pytest.mark.parametrize("policy", ["POLICY_ACTION_ALLOW", "POLICY_ACTION_DENY"])
+def test_state_transient_recovery_still_checks_policy(native_transport, failure, policy):
+    matching, run = native_transport
+    failures = {
+        "timeout": TimeoutError(),
+        "url-timeout": urllib.error.URLError(TimeoutError()),
+        "503": http_error(503),
+        "504": http_error(504),
+    }
+    result, calls = run([failures[failure], matching, {"result": policy, "reason": "policy deny"}])
+    assert result["decision"] == ("allow" if policy == "POLICY_ACTION_ALLOW" else "deny")
+    if policy == "POLICY_ACTION_DENY":
+        assert result["reason"] == "policy deny"
+    assert [path for path, _ in calls] == [
+        "/permission-tiers/state",
+        "/permission-tiers/state",
+        "/policies/evaluate",
+    ]
+    assert all(timeout > 5 for _, timeout in calls[:2])
+    assert calls[2][1] == 86400
+
+
+@pytest.mark.parametrize(
+    "field,value", [("permission_tier_revision", 2), ("permission_tier_state", "blocked")]
+)
+def test_recovered_state_mismatch_denies_without_retry(native_transport, field, value):
+    matching, run = native_transport
+    result, calls = run([TimeoutError(), {**matching, field: value}])
+    assert result["decision"] == "deny"
+    assert [path for path, _ in calls] == ["/permission-tiers/state"] * 2
+
+
+def test_persistent_state_timeout_denies_after_three_attempts(native_transport):
+    _, run = native_transport
+    result, calls = run([TimeoutError(), TimeoutError(), TimeoutError()])
+    assert result["decision"] == "deny"
+    assert "TimeoutError" in result["reason"]
+    assert [path for path, _ in calls] == ["/permission-tiers/state"] * 3
+    assert all(timeout > 5 for _, timeout in calls)
+
+
+@pytest.mark.parametrize("failure", ["401", "malformed", "url-other"])
+def test_state_nontransient_failure_is_not_retried(native_transport, failure):
+    _, run = native_transport
+    failures = {
+        "401": http_error(401),
+        "malformed": b"not-json",
+        "url-other": urllib.error.URLError(OSError("offline")),
+    }
+    result, calls = run([failures[failure]])
+    assert result["decision"] == "deny"
+    assert [path for path, _ in calls] == ["/permission-tiers/state"]
+
+
+@pytest.mark.parametrize("finish", [False, True])
+def test_policy_and_control_timeouts_are_not_retried(native_transport, finish):
+    matching, run = native_transport
+    result, calls = run([TimeoutError()] if finish else [matching, TimeoutError()], finish=finish)
+    assert result["decision"] == "deny"
+    assert "TimeoutError" in result["reason"]
+    if finish:
+        assert calls == [("/permission-tiers/control", 5)]
+    else:
+        assert [path for path, _ in calls] == ["/permission-tiers/state", "/policies/evaluate"]
+        assert calls[1][1] == 86400
