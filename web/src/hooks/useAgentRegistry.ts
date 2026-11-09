@@ -33,6 +33,7 @@ export type RegistryKey = string;
 
 export interface RegistryItem {
   key: RegistryKey;
+  aliasKeys?: RegistryKey[];
   label: string;
   name?: string;
   section: SectionId;
@@ -205,11 +206,19 @@ export function buildRegistry(
     const harness = row.id;
     const rowLabel = row.label;
     const section = harnessSection(capabilityFor(harness)?.integration_mode, harness);
-    const sameKindRow = [...items.values()].some(
+    const existingSameKind = [...items.values()].find(
       (existing) =>
         existing.section === section && existing.label.toLowerCase() === rowLabel.toLowerCase(),
     );
-    if (sameKindRow) continue;
+    if (existingSameKind) {
+      const aliasKey = `harness:${harness}`;
+      if (aliasKey !== existingSameKind.key && !existingSameKind.aliasKeys?.includes(aliasKey)) {
+        existingSameKind.aliasKeys = [...(existingSameKind.aliasKeys ?? []), aliasKey];
+      }
+      existingSameKind.deployed =
+        existingSameKind.deployed || reportedOnAnyHost(harness, capabilityFor(harness), hosts);
+      continue;
+    }
     add({
       key: `harness:${harness}`,
       label: rowLabel,
@@ -250,13 +259,20 @@ export function buildRegistry(
           ? capitalizeAgentName(agent.name)
           : agent.display_name;
       const section: SectionId = source === "builtin" ? "builtin" : "yours";
-      const sameKindRow = [...items.values()].some(
+      const existingSameKind = [...items.values()].find(
         (existing) =>
           existing.section === section &&
           existing.harness === harness &&
           existing.label.toLowerCase() === label.toLowerCase(),
       );
-      if (sameKindRow) continue;
+      if (existingSameKind) {
+        if (agent.id !== existingSameKind.key && !existingSameKind.aliasKeys?.includes(agent.id)) {
+          existingSameKind.aliasKeys = [...(existingSameKind.aliasKeys ?? []), agent.id];
+        }
+        existingSameKind.deployed =
+          existingSameKind.deployed || reportedOnAnyHost(harness, capabilityFor(harness), hosts);
+        continue;
+      }
       add({
         key: agent.id,
         name: "name" in agent ? agent.name : agent.display_name,
@@ -389,7 +405,11 @@ export function useAgentRegistry() {
     items,
     legacyProducts,
     legacyLabels,
-    isLoading: catalog.isPending || harnesses.isPending,
+    isLoading:
+      catalog.isPending ||
+      harnesses.isPending ||
+      (user.isPending && user.isEnabled) ||
+      (library.isPending && library.isEnabled),
     isError,
     retry: () => {
       void Promise.all([catalog.refetch(), harnesses.refetch(), user.refetch(), library.refetch()]);
@@ -425,13 +445,30 @@ export function useAgentsWithSessions() {
   });
 }
 
+/** Every key a registry row represents, including collapsed same-kind ids. */
+export function representedRegistryKeys(
+  items: readonly RegistryItem[],
+  key: RegistryKey,
+): RegistryKey[] {
+  const item = items.find(
+    (candidate) => candidate.key === key || candidate.aliasKeys?.includes(key),
+  );
+  return item ? [item.key, ...(item.aliasKeys ?? [])] : [key];
+}
+
 /** Map session agent ids (and template labels) to the registry rows they name. */
 export function rowsForAgentIds(
   items: readonly RegistryItem[],
   legacyProducts: Record<string, RegistryItem>,
   agentIds: ReadonlySet<string>,
 ): Set<RegistryKey> {
-  const byKey = new Map(items.map((item) => [item.key, item]));
+  const byKey = new Map<string, RegistryItem>();
+  for (const item of items) {
+    byKey.set(item.key, item);
+    for (const aliasKey of item.aliasKeys ?? []) {
+      byKey.set(aliasKey, item);
+    }
+  }
   const keys = new Set<RegistryKey>();
   for (const agentId of agentIds) {
     const legacy = legacyProducts[agentId];

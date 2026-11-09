@@ -573,6 +573,56 @@ export function inheritedUsageContext(
   return resolveUsageContextAt(preferences, source, usageContextLevelsAt(level).slice(1), reported);
 }
 
+function agentNameCandidates(agentName: string, harness: string): string[] {
+  const candidates: string[] = [];
+  const push = (value: string) => {
+    if (value && !candidates.includes(value)) candidates.push(value);
+  };
+  if (harness.endsWith("-native")) {
+    const prefix = harness.slice(0, -"-native".length);
+    const canonical = prefix === "claude" ? "claude-code-native-ui" : `${prefix}-native-ui`;
+    if (agentName === prefix || agentName === canonical || agentName === `${prefix}-native-ui`) {
+      push(canonical);
+      push(`${prefix}-native-ui`);
+      push(agentName);
+      push(prefix);
+    }
+  }
+  push(agentName);
+  return candidates;
+}
+
+function resolveOverrideAtLevel(
+  preferences: UsageContextPreferences,
+  source: UsageContextSource,
+  level: UsageContextLevel,
+): UsageContextOverride | undefined {
+  if (level === "all" || level === "host") {
+    return preferences.overrides[usageContextLevelKey(source, level)];
+  }
+  for (const agentName of agentNameCandidates(source.agentName, source.harness)) {
+    const candidate = preferences.overrides[usageContextLevelKey({ ...source, agentName }, level)];
+    if (candidate) return candidate;
+  }
+  const targetAgent = source.agentName.toLowerCase();
+  const targetModel = source.model.toLowerCase();
+  const hostScoped = level === "model" || level === "cell";
+  for (const [key, value] of Object.entries(preferences.overrides)) {
+    const record = usageContextRecordFromKey(key);
+    if (
+      record &&
+      record.level === level &&
+      record.source.harness === source.harness &&
+      (!hostScoped || record.source.hostId === source.hostId) &&
+      record.source.agentName.toLowerCase() === targetAgent &&
+      record.source.model.toLowerCase() === targetModel
+    ) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
 function resolveUsageContextAt(
   preferences: UsageContextPreferences,
   source: UsageContextSource | null,
@@ -583,7 +633,7 @@ function resolveUsageContextAt(
     ? []
     : levels.map((level) => ({
         level,
-        override: preferences.overrides[usageContextLevelKey(source, level)],
+        override: resolveOverrideAtLevel(preferences, source, level),
       }));
   let contextWindow: ResolvedUsageContext["contextWindow"] = {
     value: reported.contextWindow,

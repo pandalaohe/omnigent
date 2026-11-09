@@ -8,6 +8,7 @@ import type { ProviderUsageLimitsSnapshot } from "@/lib/providerUsageLimits";
 import {
   DEFAULT_USAGE_CONTEXT_PREFERENCES,
   readUsageContextPreferences,
+  resolveUsageContextLevel,
   usageContextLevelKey,
   usageContextSourceKey,
   writeUsageContextPreferences,
@@ -987,12 +988,51 @@ describe("ContextUsageSettings", () => {
     renderSettings();
 
     expect(screen.getAllByRole("button", { name: "Add a model to Codex" })).toHaveLength(1);
-    expect(
-      screen.getByTestId("context-cell-codex-native-ui-codex-native-all-computers"),
-    ).toHaveTextContent("272k16k");
+    const mergedCell = screen.getByTestId(
+      "context-cell-codex-native-ui-codex-native-all-computers",
+    );
+    expect(mergedCell).toHaveTextContent("272k16k");
 
     fireEvent.click(screen.getByRole("button", { name: "Expand Codex" }));
     expect(screen.getByText("gpt-5.4")).toBeInTheDocument();
     expect(screen.getByText("GPT 5.3 Codex")).toBeInTheDocument();
+
+    fireEvent.click(mergedCell);
+    const contextInput = screen.getByRole("spinbutton", {
+      name: "Context total for Codex, all computers",
+    });
+    expect(contextInput).toHaveValue(272000);
+    expect(screen.getByRole("button", { name: "Clear this level" })).toBeInTheDocument();
+
+    fireEvent.change(contextInput, { target: { value: "400000" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    const saved = readUsageContextPreferences();
+    expect(
+      resolveUsageContextLevel(
+        saved,
+        { hostId: "host-a", agentName: "codex", harness: "codex-native", model: "" },
+        "column",
+      ).contextWindow.value,
+    ).toBe(400_000);
+    expect(
+      resolveUsageContextLevel(
+        saved,
+        { hostId: "host-a", agentName: "codex-native-ui", harness: "codex-native", model: "" },
+        "column",
+      ).contextWindow.value,
+    ).toBe(400_000);
+
+    fireEvent.click(screen.getByTestId("context-cell-codex-native-ui-codex-native-all-computers"));
+    fireEvent.click(screen.getByRole("button", { name: "Clear this level" }));
+
+    const cleared = readUsageContextPreferences();
+    expect(
+      resolveUsageContextLevel(
+        cleared,
+        { hostId: "host-a", agentName: "codex", harness: "codex-native", model: "" },
+        "column",
+      ).contextWindow.value,
+    ).toBeNull();
   });
 });

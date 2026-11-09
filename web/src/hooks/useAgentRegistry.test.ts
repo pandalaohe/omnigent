@@ -9,6 +9,7 @@ import {
   buildRegistry,
   registryHarnessOptions,
   registrySourceLabels,
+  representedRegistryKeys,
   rowsForAgentIds,
 } from "./useAgentRegistry";
 
@@ -219,6 +220,16 @@ describe("settings agent registry", () => {
     expect(
       sameKindSameName.filter((item) => item.section === "yours").map((item) => item.label),
     ).toEqual(["Hermes-fn"]);
+    expect(sameKindSameName.find((item) => item.key === "hermes-1")?.aliasKeys).toEqual([
+      "ca_hermes",
+    ]);
+    expect(rowsForAgentIds(sameKindSameName, {}, new Set(["ca_hermes"]))).toEqual(
+      new Set(["hermes-1"]),
+    );
+    expect(representedRegistryKeys(sameKindSameName, "hermes-1")).toEqual([
+      "hermes-1",
+      "ca_hermes",
+    ]);
     const acpCollision = buildRegistry(
       [],
       [{ ...agent("orion-acp", "orion", "acp:orion"), builtin: false }],

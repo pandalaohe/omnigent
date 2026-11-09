@@ -801,6 +801,7 @@ function ValueEditor({
   reported,
   clearBelowCount,
   onClearBelow,
+  onCommitLevel,
 }: {
   trigger: ReactElement;
   title: string;
@@ -815,6 +816,7 @@ function ValueEditor({
   reported: UsageContextReported;
   clearBelowCount: number;
   onClearBelow: () => void;
+  onCommitLevel?: (record: UsageContextOverride | null) => void;
 }) {
   const key = usageContextLevelKey(source, level);
   const own = preferences.overrides[key];
@@ -826,18 +828,20 @@ function ValueEditor({
     setError("");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, storedSignature]);
+  const commit = (record: UsageContextOverride | null) => {
+    if (onCommitLevel) onCommitLevel(record);
+    else setUsageContextLevel(preferences, key, record);
+  };
   const save = () => {
     const outcome = recordForLevel(preferences, source, level, reported, draft);
     if ("error" in outcome) {
       setError(outcome.error);
       return;
     }
-    setUsageContextLevel(preferences, key, outcome.record);
+    commit(outcome.record);
     onOpenChange(false);
   };
-  const clear = usageContextHasValue(own)
-    ? () => setUsageContextLevel(preferences, key, null)
-    : undefined;
+  const clear = usageContextHasValue(own) ? () => commit(null) : undefined;
   return (
     <LayeredEditor
       trigger={trigger}
@@ -1289,13 +1293,62 @@ export function ContextUsageSettings() {
       agentLabel: labelOfEntry(row.entry),
     });
 
-  /** Every saved value this cell's row and column reach, itself excluded. */
-  const keysBelow = (row: ContextRow, column: ContextColumn): string[] => {
+  const levelKeysOf = (row: ContextRow, column: ContextColumn): string[] => {
     const { source, level } = levelOf(row, column);
     const own = usageContextLevelKey(source, level);
+    if (row.kind === "all") return [own];
+    const rowGroupId = groupIdOf(row.entry, registry.items);
+    const group = groups.find((item) => item.id === rowGroupId);
+    const agentNames = group ? group.agentNames : [row.entry.agentName];
+    const directKeys = agentNames.map((agentName) =>
+      usageContextLevelKey({ ...source, agentName }, level),
+    );
+    const hostScoped = level === "model" || level === "cell";
+    const matchingStoredKeys = Object.keys(preferences.overrides).filter((key) => {
+      const record = usageContextRecordFromKey(key);
+      return (
+        !!record &&
+        record.level === level &&
+        (!hostScoped || record.source.hostId === column.hostId) &&
+        groupIdOf(record.source, registry.items) === rowGroupId &&
+        (row.kind === "agent" ||
+          record.source.model.toLowerCase() === row.entry.model.toLowerCase())
+      );
+    });
+    return [...new Set([own, ...directKeys, ...matchingStoredKeys])];
+  };
+
+  const commitCellLevel = (
+    row: ContextRow,
+    column: ContextColumn,
+    record: UsageContextOverride | null,
+  ) => {
+    const { source, level } = levelOf(row, column);
+    const overrides = { ...preferences.overrides };
+    for (const key of levelKeysOf(row, column)) {
+      Reflect.deleteProperty(overrides, key);
+    }
+    if (record) {
+      if (row.kind === "all") {
+        overrides[usageContextLevelKey(source, level)] = record;
+      } else {
+        const rowGroupId = groupIdOf(row.entry, registry.items);
+        const group = groups.find((item) => item.id === rowGroupId);
+        const agentNames = group ? group.agentNames : [row.entry.agentName];
+        for (const agentName of agentNames) {
+          overrides[usageContextLevelKey({ ...source, agentName }, level)] = record;
+        }
+      }
+    }
+    writeUsageContextPreferences({ ...preferences, version: 6, overrides });
+  };
+
+  /** Every saved value this cell's row and column reach, itself excluded. */
+  const keysBelow = (row: ContextRow, column: ContextColumn): string[] => {
+    const ownKeys = new Set(levelKeysOf(row, column));
     const rowGroupId = row.kind === "all" ? "" : groupIdOf(row.entry, registry.items);
     return Object.keys(preferences.overrides).filter((key) => {
-      if (key === own) return false;
+      if (ownKeys.has(key)) return false;
       const record = usageContextRecordFromKey(key);
       if (!record || !usageContextHasValue(preferences.overrides[key])) return false;
       const sameRow =
@@ -1593,7 +1646,7 @@ export function ContextUsageSettings() {
               focusEditorRef.current = false;
               setOpenEditor(next ? address : null);
             }}
-            preferences={preferences}
+            preferences={effectivePreferences}
             source={source}
             level={level}
             label={title}
@@ -1601,6 +1654,7 @@ export function ContextUsageSettings() {
             reported={reported}
             clearBelowCount={belowCount}
             onClearBelow={() => clearBelow(row, column)}
+            onCommitLevel={(record) => commitCellLevel(row, column, record)}
           />
           <span className={WARNING_GUTTER}>
             {warning ? (
