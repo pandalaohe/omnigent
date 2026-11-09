@@ -718,7 +718,7 @@ def test_touch_landscape_chat_and_host_terminals_clear_header_and_controls(
         expect(page.get_by_test_id("mobile-floating-assistant")).to_have_count(0)
         key_box = key_row.bounding_box()
         assert key_box is not None
-        assert 52 <= key_box["height"] <= 58, key_box
+        assert 70 <= key_box["height"] <= 76, key_box
     else:
         page.goto(chat.url)
         if page.locator(".app-shell").get_attribute("data-sidebar-open") == "true":

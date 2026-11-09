@@ -1199,12 +1199,14 @@ def test_context_table_lists_saved_values_by_agent_and_keeps_their_layers(
         editor.get_by_role("spinbutton", name=re.compile(r"· typed-model, all computers$")).first
     ).to_be_focused()
     editor.get_by_role("button", name="Cancel", exact=True).click()
+    table.get_by_test_id("context-auto-groups-toggle").click()
     opencode_group = table.get_by_test_id("context-group-opencode-opencode")
     with page.expect_response(is_preferences_write):
         opencode_group.get_by_role("button", name=re.compile(r"^Remove ")).click()
     expect(opencode_group).to_have_count(0)
     page.reload()
     expect(table.get_by_role("rowheader").first).to_be_visible()
+    table.get_by_test_id("context-auto-groups-toggle").click()
     expect(opencode_group).to_have_count(0)
     entries = synced["value"]["contextList"]["entries"]
     assert {"agentName": "opencode", "harness": "opencode", "model": ""} not in entries
