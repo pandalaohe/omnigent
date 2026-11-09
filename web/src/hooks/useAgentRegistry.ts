@@ -87,6 +87,15 @@ export function registryHarnessOptions(
   });
 }
 
+function formatHarnessFallbackLabel(harness: string): string {
+  if (BRAIN_HARNESS_LABELS[harness]) return BRAIN_HARNESS_LABELS[harness];
+  const native = nativeCodingAgentForHarness(harness);
+  if (native) return native.displayName;
+  if (harness === "pi-rpc") return "Pi RPC";
+  if (harness === "acp" || harness.startsWith("acp:")) return SECTION_LABELS.acp;
+  return harness;
+}
+
 /** Resolve display names without changing the stored source identity. */
 export function registrySourceLabels(
   items: readonly RegistryItem[],
@@ -97,8 +106,7 @@ export function registrySourceLabels(
   const harnessItem = harness ? items.find((item) => item.key === `harness:${harness}`) : undefined;
   return {
     agentLabel: agent?.label ?? (agentName || "Unknown"),
-    harnessLabel:
-      harnessItem?.label ?? (harness ? (BRAIN_HARNESS_LABELS[harness] ?? harness) : "Unknown"),
+    harnessLabel: harnessItem?.label ?? (harness ? formatHarnessFallbackLabel(harness) : "Unknown"),
   };
 }
 
@@ -242,7 +250,13 @@ export function buildRegistry(
   for (const item of items.values()) names.set(item.label, (names.get(item.label) ?? 0) + 1);
   for (const item of items.values()) {
     if (names.get(item.label)! > 1 && item.section === "yours") {
-      item.label = `${item.label} · ${harnessCatalog.labels[item.harness ?? ""] ?? productLabels.get(item.harness ?? "") ?? item.harness ?? "Agent"} · ${item.source === "library" ? "library" : "installed"}`;
+      const harnessLabel = item.harness
+        ? (harnessCatalog.labels[item.harness] ??
+          productLabels.get(item.harness) ??
+          capabilities[item.harness]?.label ??
+          formatHarnessFallbackLabel(item.harness))
+        : "Agent";
+      item.label = `${item.label} · ${harnessLabel} · ${item.source === "library" ? "library" : "installed"}`;
     }
   }
   return [...items.values()].sort(

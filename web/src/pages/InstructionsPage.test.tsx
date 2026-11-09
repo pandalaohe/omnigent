@@ -602,7 +602,9 @@ describe("InstructionsPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Edit Shared" }));
     fireEvent.change(screen.getByLabelText("Instruction text"), { target: { value: "Changed" } });
     fireEvent.click(screen.getByRole("button", { name: "Save layer" }));
-    await screen.findByText(/Newly over 10,000 characters/);
+    const warning = await screen.findByText(/Newly over 10,000 characters/);
+    expect(warning).toHaveTextContent("Laptop / Codex");
+    expect(warning).not.toHaveTextContent("host-a / codex");
     expect(screen.getByLabelText("Instruction text")).toHaveValue("Changed");
   });
   it("clears an independent setting with a new blank revision", async () => {

@@ -92,6 +92,8 @@ describe("ArchiveTranscriptViewer", () => {
     renderViewer();
 
     expect(await screen.findByText("Rendered message msg_latest")).toBeInTheDocument();
+    expect(screen.getByText("codex")).toHaveAttribute("title", "conv_archive");
+    expect(screen.queryByText(/conv_archive/)).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Copy message citation" }));
     await waitFor(() =>
       expect(mocks.copyText).toHaveBeenCalledWith(

@@ -208,6 +208,16 @@ describe("settings agent registry", () => {
       "Orion · Claude Code · library",
       "Orion · Codex · library",
     ]);
+    const acpCollision = buildRegistry(
+      [],
+      [{ ...agent("hermes-1", "hermes-fn", "acp:hermes-fn"), builtin: false }],
+      [library("ca_hermes", "Hermes-fn", "acp:hermes-fn")],
+      harnesses,
+      hosts,
+    );
+    expect(
+      acpCollision.filter((item) => item.section === "yours").map((item) => item.label),
+    ).toEqual(["Hermes-fn · ACP · installed", "Hermes-fn · ACP · library"]);
     expect(items.find((item) => item.key === "ca_1")?.deployed).toBe(true);
     const newlyReady = buildRegistry([], [], [], harnesses, [
       { ...hosts[0], configured_harnesses: { ...hosts[0].configured_harnesses, cursor: true } },

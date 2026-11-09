@@ -145,7 +145,7 @@ function memberHostWarning(member: MemberDraft, hosts: Host[] | undefined): stri
   const host = hosts.find((entry) => entry.host_id === member.hostId);
   const role = member.name.trim();
   if (host === undefined) {
-    return `${role}: host ${member.hostId} is unavailable — saving keeps it; this member runs there once the host returns.`;
+    return `${role}: saved host is unavailable — saving keeps it; this member runs there once the host returns.`;
   }
   if (host.status === "online") return null;
   return `${role}: ${host.name} is offline — saving keeps it; this member can't run until it reconnects.`;
@@ -526,6 +526,7 @@ export function AgentEditor({
                   key={`host-warning-${member.key}`}
                   role="alert"
                   data-testid="agent-member-host-warning"
+                  title={member.hostId ?? undefined}
                   className="text-xs text-amber-700 dark:text-amber-300"
                 >
                   {warning}

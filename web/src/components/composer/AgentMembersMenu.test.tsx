@@ -64,7 +64,28 @@ function renderInMenu(ui: ReactElement) {
 
 describe("AgentMembersMenu", () => {
   it("lists one row per member with the lead marked", () => {
-    renderInMenu(<AgentMembersMenu members={MEMBERS} agentName="release-crew" />);
+    renderInMenu(
+      <AgentMembersMenu
+        members={[
+          ...MEMBERS.slice(0, 2),
+          member({
+            role: "reviewer",
+            host: "ca3f7e25e8424846ba531581a90abb8a",
+            harness: "codex",
+            model: "gpt-6-astra",
+          }),
+        ]}
+        hosts={[
+          {
+            host_id: "ca3f7e25e8424846ba531581a90abb8a",
+            name: "Studio-Mac",
+            owner: "alice",
+            status: "online",
+          },
+        ]}
+        agentName="release-crew"
+      />,
+    );
     expect(screen.getByTestId("agent-members-title")).toHaveTextContent("release-crew");
     expect(screen.getByTestId("agent-member-row-architect")).toBeInTheDocument();
     expect(screen.getByTestId("agent-member-row-executor")).toBeInTheDocument();
@@ -73,6 +94,12 @@ describe("AgentMembersMenu", () => {
     expect(screen.queryByTestId("agent-member-lead-executor")).toBeNull();
     expect(screen.getByTestId("agent-member-row-executor")).toHaveTextContent(
       "Mac · gpt-6-sol · xhigh",
+    );
+    expect(screen.getByTestId("agent-member-row-reviewer")).toHaveTextContent(
+      "Studio-Mac · gpt-6-astra · xhigh",
+    );
+    expect(screen.getByTestId("agent-member-row-reviewer")).not.toHaveTextContent(
+      "ca3f7e25e8424846ba531581a90abb8a",
     );
   });
 

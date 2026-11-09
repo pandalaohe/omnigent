@@ -213,7 +213,18 @@ function agentLabelFor(items: readonly RegistryItem[], agentName: string, harnes
   const product = items.find(
     (item) => item.key === `harness:${harness}` && item.name === agentName,
   );
-  return product?.label ?? registrySourceLabels(items, agentName, harness).agentLabel;
+  if (product) return product.label;
+  return registrySourceLabels(items, agentName, harness).agentLabel.replace(
+    /\s·\s.+\s·\s(?:installed|library)$/,
+    "",
+  );
+}
+
+function isOpaqueHostId(value: string): boolean {
+  return (
+    /^[0-9a-f]{24,}$/i.test(value) ||
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
+  );
 }
 
 interface RegistryView {
@@ -308,7 +319,13 @@ function hostColumns(
   }
   const addHost = (hostId: string) => {
     if (!byHostId.has(hostId))
-      byHostId.set(hostId, { id: hostId, all: false, hostId, label: hostId, host: null });
+      byHostId.set(hostId, {
+        id: hostId,
+        all: false,
+        hostId,
+        label: isOpaqueHostId(hostId) ? "Unavailable computer" : hostId,
+        host: null,
+      });
   };
   let noHost = liveHostId === "";
   for (const key of Object.keys(preferences.overrides)) {
@@ -1580,7 +1597,14 @@ export function ContextUsageSettings() {
                     >
                       <span className="flex">
                         <span className={cn("min-w-0 flex-1", CELL_PADDING)}>
-                          <span className="block text-ui font-medium text-foreground wrap-anywhere">
+                          <span
+                            className="block text-ui font-medium text-foreground wrap-anywhere"
+                            title={
+                              column.hostId && column.hostId !== column.label
+                                ? column.hostId
+                                : undefined
+                            }
+                          >
                             {column.label}
                           </span>
                           <span className={cn(SLOT_GRID, "mt-0.5 text-xs text-muted-foreground")}>

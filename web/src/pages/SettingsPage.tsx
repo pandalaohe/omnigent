@@ -4578,7 +4578,14 @@ function ArchivedRow({
   const busy = archive.isPending || archiveLock.isPending || del.isPending;
   const archivedAtMs = archivedTimestamp(conversation) * 1000;
   const isExpired = cutoff !== null && archivedAtMs < cutoff * 1000;
-  const resolvedHostName = hostName ?? conversation.host_id ?? "Host not recorded";
+  const resolvedHostName =
+    hostName ??
+    (conversation.host_id
+      ? /^[0-9a-f]{32}$/i.test(conversation.host_id) ||
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(conversation.host_id)
+        ? "Unavailable host"
+        : conversation.host_id
+      : "Host not recorded");
   const resolvedAgentName = conversation.agent_name ?? "Agent not recorded";
   const matchCount = conversation.search_match_count ?? (conversation.search_match ? 1 : 0);
 
@@ -4679,7 +4686,7 @@ function ArchivedRow({
             className="mt-0.5 flex min-w-0 items-center gap-1.5 truncate text-[11px] text-muted-foreground"
             data-testid="archived-context"
           >
-            <span className="truncate" title={resolvedHostName}>
+            <span className="truncate" title={conversation.host_id ?? resolvedHostName}>
               {resolvedHostName}
             </span>
             <span aria-hidden="true">·</span>

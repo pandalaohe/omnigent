@@ -833,9 +833,31 @@ describe("ContextUsageSettings", () => {
         source: "installed",
       },
       CLAUDE,
+      {
+        key: "hermes-installed",
+        name: "hermes-fn",
+        label: "Hermes-fn · ACP · installed",
+        section: "yours",
+        harness: "acp:hermes-fn",
+        description: null,
+        deployed: true,
+        source: "installed",
+      },
     ];
-    store([AGENT]);
+    const orphanHostId = "ca3f7e25e8424846ba531581a90abb8a";
+    store([AGENT, { agentName: "hermes-fn", harness: "acp:hermes-fn", model: "" }], {
+      [usageContextLevelKey({ ...agentSource, hostId: orphanHostId }, "cell")]: value(200_000),
+    });
     renderSettings();
     expect(screen.getByText("Claude Code")).toBeInTheDocument();
+    expect(screen.getByText("Hermes-fn")).toBeInTheDocument();
+    expect(screen.queryByText(/acp:hermes-fn/)).not.toBeInTheDocument();
+    const orphanHeader = screen.getByTestId(`context-col-${orphanHostId}`);
+    expect(orphanHeader).toHaveTextContent("Unavailable computer");
+    expect(orphanHeader).not.toHaveTextContent(orphanHostId);
+    expect(within(orphanHeader).getByText("Unavailable computer")).toHaveAttribute(
+      "title",
+      orphanHostId,
+    );
   });
 });

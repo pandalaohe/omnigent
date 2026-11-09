@@ -261,7 +261,15 @@ function FolderFactsLine({
   );
 }
 
-function AgentCodeNotePanel({ projectId, hostId }: { projectId: string; hostId: string }) {
+function AgentCodeNotePanel({
+  projectId,
+  hostId,
+  hostName,
+}: {
+  projectId: string;
+  hostId: string;
+  hostName: string;
+}) {
   const note = useQuery({
     queryKey: ["project-code-agent-note", projectId, hostId],
     queryFn: () => getAgentCodeNote(projectId, hostId),
@@ -269,7 +277,7 @@ function AgentCodeNotePanel({ projectId, hostId }: { projectId: string; hostId: 
   });
 
   return (
-    <HelpTip label={`What agents receive on ${hostId}`}>
+    <HelpTip label={`What agents receive on ${hostName}`}>
       <div className="mt-2 space-y-1">
         {note.isPending && <p className="text-muted-foreground">Loading…</p>}
         {note.isError && <p className="text-muted-foreground">Couldn&apos;t load the preview.</p>}
@@ -888,7 +896,7 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
           </p>
         )}
 
-        <AgentCodeNotePanel projectId={projectId} hostId={hostId} />
+        <AgentCodeNotePanel projectId={projectId} hostId={hostId} hostName={hostName(hostId)} />
       </div>
     );
   };

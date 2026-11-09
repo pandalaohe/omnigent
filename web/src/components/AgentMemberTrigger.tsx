@@ -150,7 +150,8 @@ export function AgentMemberTrigger({
   const hostLabel =
     hostId === null
       ? "Session host"
-      : (memberHost?.name ?? hostId) + (memberHost?.status === "offline" ? " (offline)" : "");
+      : (memberHost?.name ?? (hosts !== undefined ? "Unavailable host" : hostId)) +
+        (memberHost?.status === "offline" ? " (offline)" : "");
 
   const selectHarness = (id: string) => {
     if (id !== harness)

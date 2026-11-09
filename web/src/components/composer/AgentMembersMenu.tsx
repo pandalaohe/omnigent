@@ -12,6 +12,7 @@ import {
   type SessionMember,
 } from "@/lib/sessionMembers";
 import type { ChildSessionInfo } from "@/hooks/useChildSessions";
+import type { Host } from "@/hooks/useHosts";
 
 /** Stable empty child list for default props. */
 const NO_CHILD_SESSIONS: readonly ChildSessionInfo[] = [];
@@ -30,18 +31,25 @@ export function childSessionForRole(
   return children.find((child) => child.tool === role);
 }
 
-function memberConfigLine(member: SessionMember): string {
-  return [member.host, member.model, member.effort].filter((part) => part !== null).join(" · ");
+function memberConfigLine(member: SessionMember, hosts?: readonly Host[]): string {
+  const hostLabel =
+    member.host === null
+      ? null
+      : (hosts?.find((host) => host.host_id === member.host)?.name ?? member.host);
+  return [hostLabel, member.model, member.effort].filter((part) => part !== null).join(" · ");
 }
 
 function AgentMemberRow({
   member,
   child,
+  hosts,
 }: {
   member: SessionMember;
   child: ChildSessionInfo | undefined;
+  hosts?: readonly Host[];
 }) {
   const unavailable = member.unavailable !== null;
+  const configLine = memberConfigLine(member, hosts);
   return (
     <div
       data-testid={`agent-member-row-${member.role}`}
@@ -75,9 +83,12 @@ function AgentMemberRow({
             </span>
           )}
         </div>
-        {memberConfigLine(member) !== "" && (
-          <div className="truncate text-xs leading-4 text-muted-foreground">
-            {memberConfigLine(member)}
+        {configLine !== "" && (
+          <div
+            className="truncate text-xs leading-4 text-muted-foreground"
+            title={member.host ?? undefined}
+          >
+            {configLine}
           </div>
         )}
       </div>
@@ -107,11 +118,13 @@ export function AgentMembersMenu({
   members,
   childSessions = NO_CHILD_SESSIONS,
   agentName = null,
+  hosts,
   onEditAgent,
 }: {
   members: readonly SessionMember[];
   childSessions?: readonly ChildSessionInfo[];
   agentName?: string | null;
+  hosts?: readonly Host[];
   /** Present only when the session carries a saved-Agent template id. */
   onEditAgent?: () => void;
 }) {
@@ -135,6 +148,7 @@ export function AgentMembersMenu({
             key={member.role}
             member={member}
             child={childSessionForRole(childSessions, member.role)}
+            hosts={hosts}
           />
         ))}
       </div>

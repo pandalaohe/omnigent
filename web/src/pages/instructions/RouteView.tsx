@@ -2,7 +2,9 @@ import { useState } from "react";
 import { CopyIcon } from "lucide-react";
 import { MessageResponse } from "@/components/ai-elements/message";
 import { Button } from "@/components/ui/button";
+import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
 import { copyText } from "@/lib/clipboard";
+import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
 import {
   hasInstructionText,
   type InstructionPreview,
@@ -120,7 +122,17 @@ export function RouteView({
       <div className="flex flex-wrap items-center justify-between gap-3 border-y py-3">
         <p className="text-sm">
           Previewing <strong>{data.subject.name}</strong>
-          <span className="ml-2 text-xs text-muted-foreground">{data.subject.harness}</span>
+          {data.subject.harness && (
+            <span className="ml-2 text-xs text-muted-foreground" title={data.subject.harness}>
+              {nativeCodingAgentForHarness(data.subject.harness)?.displayName ??
+                BRAIN_HARNESS_LABELS[data.subject.harness] ??
+                (data.subject.harness === "pi-rpc"
+                  ? "Pi RPC"
+                  : data.subject.harness.startsWith("acp:")
+                    ? "ACP"
+                    : data.subject.harness)}
+            </span>
+          )}
         </p>
         <div className="flex flex-wrap gap-1">
           <Button

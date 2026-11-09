@@ -5761,6 +5761,7 @@ function SessionHarnessPicker({
   openNonce?: number;
 }) {
   const isMobile = useIsMobileViewport();
+  const { data: hosts } = useHosts();
   const [menuOpen, setMenuOpen] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
   const [refreshBusy, setRefreshBusy] = useState(false);
@@ -6391,6 +6392,7 @@ function SessionHarnessPicker({
           members={members}
           childSessions={childSessions}
           agentName={agentName}
+          hosts={hosts}
           onEditAgent={templateId !== null ? onEditAgent : undefined}
         />
       ) : isMobile && configOpen ? (

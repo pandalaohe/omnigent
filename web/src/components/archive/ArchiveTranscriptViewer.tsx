@@ -378,8 +378,8 @@ export function ArchiveTranscriptViewer({
           <h2 className="truncate text-sm font-semibold" title={title}>
             {title}
           </h2>
-          <p className="truncate font-mono text-sm text-muted-foreground">
-            {conversation.agent_name ?? "Agent not recorded"} · {conversation.id}
+          <p className="truncate font-mono text-sm text-muted-foreground" title={conversation.id}>
+            {conversation.agent_name ?? "Agent not recorded"}
           </p>
         </div>
         <ExplainedAction content="Copy the exact Session ID for API calls, logs, and cross-device lookup.">
