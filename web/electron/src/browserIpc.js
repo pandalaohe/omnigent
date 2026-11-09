@@ -366,6 +366,7 @@ function registerBrowserIpc({
   isPinnedOriginSender,
   getRegistryForEvent,
   getAgentContextForEvent = () => null,
+  consumeUserNavigation = () => false,
   recoverAgentNavigationForEvent = async () => false,
   getAgentNavigationHintForEvent = () => null,
   confirmAgentNavigation = async () => null,
@@ -435,7 +436,12 @@ function registerBrowserIpc({
     // Renderer flags do not establish user intent.
     // The first-party renderer supplies the source-session host; main owns
     // the target and eligibility. Caller exception flags never establish identity.
-    let agentContext = getAgentContextForEvent(event, opts?.sourceHostId);
+    const userNavigation = consumeUserNavigation(event);
+    const navigationContext = () => {
+      const context = getAgentContextForEvent(event, opts?.sourceHostId);
+      return userNavigation ? { ...context, userNavigation: true } : context;
+    };
+    let agentContext = navigationContext();
     const options = { force: !!opts?.force, agent, agentContext };
     let activeRegistry = g.registry;
 
@@ -502,7 +508,7 @@ function registerBrowserIpc({
           return cancelled;
         if (!refreshed.error && refreshed.registry === activeRegistry && isCurrent()) {
           activeRegistry = refreshed.registry;
-          agentContext = getAgentContextForEvent(event, opts?.sourceHostId);
+          agentContext = navigationContext();
           options.agentContext = agentContext;
           r = await navigate(activeRegistry);
         }
@@ -542,7 +548,7 @@ function registerBrowserIpc({
           }
           if (choice === "always") {
             // Main persisted the grant, so the injected allowlist now has it.
-            return finish(await navigate(regate.registry));
+            return finish(await navigate(regate.registry, { ...agentContext, allowOnce: [grant] }));
           }
           return finish(
             await navigate(regate.registry, { ...(agentContext ?? {}), allowOnce: [grant] }),

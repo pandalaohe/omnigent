@@ -1,3 +1,4 @@
+import { BrowserAccessControl } from "@/components/BrowserAccessControl";
 /**
  * Settings page (``/settings``).
  *
@@ -2351,6 +2352,7 @@ function GeneralSection() {
         {browserLoginBridge() && (
           <SettingsGroup title="In-app browser" testId="settings-group-browser-login">
             <BrowserLoginControl />
+            <BrowserAccessControl />
           </SettingsGroup>
         )}
         <SettingsGroup title="Sessions" testId="settings-group-sessions" className="max-w-none">

@@ -456,12 +456,15 @@ describe("browserIpc — agent navigation prompt on a promptable refusal", () =>
     ]);
   });
 
-  it("retries with the same options when the user always allows", async () => {
+  it("retries with one-navigation consent when the user always allows", async () => {
     const h = setupPrompt({ choice: "always" });
     const r = await h.invoke({ agent: true, force: true });
     assert.equal(r.ok, true);
     assert.equal(h.calls.length, 2);
-    assert.deepEqual(h.calls[1][3], h.calls[0][3]);
+    assert.deepEqual(h.calls[1][3], {
+      ...h.calls[0][3],
+      agentContext: { ...h.calls[0][3].agentContext, allowOnce: [REFUSAL.grant] },
+    });
   });
 
   it("appends the decline sentence and keeps the single refusal otherwise", async () => {

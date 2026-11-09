@@ -1272,3 +1272,27 @@ The decision logic (parse + window selection) is pure and unit-tested in
 > Historical note: an earlier Tauri-based shell lived in `web/src-tauri`.
 > It was removed in favor of shipping Electron only; `nativeBridge.ts` no
 > longer carries a Tauri code path.
+
+### Browser access settings
+
+Settings → General → In-app browser contains desktop-wide address controls.
+Internal addresses can ask for agent navigation only (default), for all navigation,
+or never. Main recognizes a fresh native Enter in the app window as user input;
+renderer flags do not grant that status. All navigation still rejects privileged schemes,
+metadata, unspecified and link-local destinations.
+
+Lists apply to public and internal destinations: Never open wins over Always ask,
+which wins over Open without asking, which wins over the internal-address level.
+Use one host, host:port, IP, IPv4 CIDR or `*.domain` per line. Wildcards cover
+subdomains only; IP/CIDR rules also match a name's resolved and connected addresses.
+Existing per-server `agent_browser_allowlist` entries remain allowances, below Always ask.
+A navigation consent answers that navigation's prompt; Always ask still asks next time.
+Broadening access from the server-served settings page requires native confirmation.
+Settings live in `browser_access` in the desktop's `settings.json`; hand edits apply
+on the next navigation.
+
+Names resolving to fake-IP proxy addresses in 198.18.0.0/15 are treated as public
+at resolution and connection checks. Literal URLs in that range remain internal.
+Known limit: a proxy routing such a name to a LAN destination cannot be detected,
+similar to the existing `isProxyAddress` limitation. These settings do not extend
+network enforcement beyond the request types already guarded by this desktop version.

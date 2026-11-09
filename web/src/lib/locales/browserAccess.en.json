@@ -1,0 +1,17 @@
+{
+  "title": "Browser access",
+  "level": "Ask before opening internal addresses",
+  "none": "Never ask",
+  "agent": "Ask for agent navigation",
+  "all": "Ask for all navigation",
+  "blocked": "Never open",
+  "ask": "Always ask",
+  "allowed": "Open without asking",
+  "scope": "Applies to this desktop app and all connected servers. Metadata and link-local addresses remain blocked.",
+  "formats": "One entry per line: host, host:port, IP, IPv4 CIDR or *.domain.",
+  "save": "Save browser access",
+  "saved": "Browser access saved.",
+  "failed": "Could not save browser access.",
+  "loadFailed": "Could not read browser access.",
+  "confirm": "Broader access needs confirmation in the desktop app."
+}

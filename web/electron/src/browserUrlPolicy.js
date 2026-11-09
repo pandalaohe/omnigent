@@ -1,9 +1,6 @@
-// Allowlist for AGENT-driven browser navigation (the URL-bar path
-// stays permissive — it's a user gesture). An unguarded model-issued loadURL
-// could point the view at file:// / cloud-metadata / loopback / private hosts
-// and read the bytes back via screenshot (SSRF + local-file read + exfil).
-// Runs in the main process (gate holds regardless of caller); Electron-free,
-// with DNS injectable, so `node --test` can exercise it without Electron.
+// Main-process policy for renderer-issued browser navigation, including the URL bar.
+// URL, DNS and connected-address checks share list precedence and internal-address levels.
+// Electron-free with injectable resolution for focused security tests.
 
 "use strict";
 
@@ -236,6 +233,12 @@ function parseAllowlistEntry(raw) {
     return { kind: "cidr", network: (ipv4ToUint32(ipv4) & mask) >>> 0, mask };
   }
 
+  if (entry.startsWith("*.")) {
+    const suffix = parseAllowlistEntry(entry.slice(2));
+    return suffix?.kind === "host" && !suffix.wildcard && !isIpLiteral(suffix.host)
+      ? { ...suffix, wildcard: true }
+      : null;
+  }
   const host = ALLOWLIST_HOST_ENTRY.exec(entry);
   if (!host) return null;
   const port = host[2] === undefined ? null : Number(host[2]);
@@ -275,8 +278,10 @@ function isAllowlisted(host, ipv4, port, allowlist) {
       if (ipv4 && (ipv4ToUint32(ipv4) & entry.mask) >>> 0 === entry.network) return true;
       continue;
     }
+    const entryAddress = canonicalAddress(entry.host);
     const sameHost =
-      entry.host === host ||
+      (entry.wildcard ? host.endsWith(`.${entry.host}`) : entry.host === host) ||
+      (entryAddress !== null && entryAddress === canonicalAddress(host)) ||
       (entry.ipv4 !== null && ipv4 !== null && ipv4ToUint32(entry.ipv4) === ipv4ToUint32(ipv4));
     if (sameHost && (entry.port === null || entry.port === port)) return true;
   }
@@ -319,39 +324,73 @@ function internalHostError(hostname) {
  * @param {string} url
  * @returns {{ ok: true } | { ok: false, error: string }}
  */
-function isAgentNavigationAllowed(url, { allowLocalhost = false, allowlist } = {}) {
-  if (typeof url !== "string" || url.trim() === "") {
-    return { ok: false, error: "navigation blocked: empty url" };
-  }
+function policyDecision(parsed, addresses, options = {}) {
+  const {
+    allowLocalhost = false,
+    allowlist,
+    access = {},
+    userNavigation = false,
+    allowOnce = [],
+  } = options;
+  const host = parsed.hostname;
+  const grant = allowanceFor(parsed, []).grant;
+  const fail = (prompt, reason) => ({
+    ok: false,
+    error: reason
+      ? `navigation blocked: host "${host}" ${reason}`
+      : addresses.length
+        ? `navigation blocked: host "${host}" does not resolve to a public address`
+        : internalHostError(host),
+    ...(prompt ? { grant } : {}),
+  });
+  if (isNeverAllowable(host) || addresses.some((ip) => !isIpLiteral(ip) || isNeverAllowable(ip)))
+    return fail(false);
+  const matches = (list) =>
+    allowanceFor(parsed, list).allowed ||
+    addresses.some((ip) => {
+      const port = Number(parsed.port || (parsed.protocol === "https:" ? 443 : 80));
+      return isAllowlisted(ip, parseIpv4(ip) ?? ipv4FromIpv6(parseIpv6(ip)), port, list);
+    });
+  if (matches(access.blocked)) return fail(false, "matches Never open");
+  // A main-owned one-navigation consent can answer an ask rule, never a block.
+  if (matches(allowOnce)) return { ok: true };
+  if (matches(access.ask)) return fail(true, "requires confirmation");
+  if (matches(access.allowed) || matches(allowlist)) return { ok: true };
+  if (allowLocalhost && ARCA_LOOPBACK_HOSTS.has(host)) return { ok: true };
+  const internal =
+    isBlockedHostname(host) ||
+    addresses.some((ip) => isInternalAddress(ip) && !(isFakeIp(ip) && !isIpLiteral(host)));
+  // A URL-only preflight cannot reject a name before DNS has had a chance to
+  // match an address allowance. The awaited DNS and connected-IP gates remain authoritative.
+  const addressAllowance = [
+    ...(Array.isArray(access.allowed) ? access.allowed : []),
+    ...(Array.isArray(allowlist) ? allowlist : []),
+  ].some((raw) => {
+    const rule = parseAllowlistEntry(raw);
+    return rule?.kind === "cidr" || (rule?.kind === "host" && isIpLiteral(rule.host));
+  });
+  if (addresses.length === 0 && !isIpLiteral(host) && addressAllowance) return { ok: true };
+  const level = access.level ?? "all";
+  return internal && level !== "none" && !(level === "agent" && userNavigation)
+    ? fail(true)
+    : { ok: true };
+}
+
+function isFakeIp(address) {
+  const ip = parseIpv4(address) ?? ipv4FromIpv6(parseIpv6(address));
+  return !!ip && ip[0] === 198 && (ip[1] === 18 || ip[1] === 19);
+}
+
+function isAgentNavigationAllowed(url, options = {}) {
   let parsed;
   try {
     parsed = new URL(url);
   } catch {
-    return { ok: false, error: `navigation blocked: not a valid absolute URL: ${url}` };
+    return { ok: false, error: "navigation blocked: invalid URL" };
   }
-  if (!ALLOWED_SCHEMES.has(parsed.protocol)) {
-    return {
-      ok: false,
-      error: `navigation blocked: scheme "${parsed.protocol}" is not allowed for agent navigation (only http/https)`,
-    };
-  }
-  const hostname = parsed.hostname;
-  if (allowLocalhost && ARCA_LOOPBACK_HOSTS.has(hostname)) {
-    return { ok: true };
-  }
-  const allowance = allowanceFor(parsed, allowlist);
-  if (isNeverAllowable(hostname)) {
-    return { ok: false, error: internalHostError(hostname) };
-  }
-  if (allowance.allowed) return { ok: true };
-  if (isBlockedHostname(hostname)) {
-    return {
-      ok: false,
-      error: internalHostError(hostname),
-      grant: allowance.grant,
-    };
-  }
-  return { ok: true };
+  if (!ALLOWED_SCHEMES.has(parsed.protocol))
+    return { ok: false, error: "navigation blocked: only http/https is allowed" };
+  return policyDecision(parsed, [], options);
 }
 
 /**
@@ -374,39 +413,27 @@ async function lookupHostAddresses(hostname) {
  * @param {{ allowLocalhost?: boolean, resolveHost?: (hostname: string) => Promise<string[]> }} [options]
  * @returns {Promise<{ ok: true } | { ok: false, error: string }>}
  */
-async function checkAgentNavigation(
-  url,
-  { allowLocalhost = false, allowlist, resolveHost = lookupHostAddresses } = {},
-) {
-  const verdict = isAgentNavigationAllowed(url, { allowLocalhost, allowlist });
-  if (!verdict.ok) return verdict;
-  const { hostname } = new URL(url);
-  if ((allowLocalhost && ARCA_LOOPBACK_HOSTS.has(hostname)) || isIpLiteral(hostname)) {
-    return verdict;
+async function checkAgentNavigation(url, options = {}) {
+  // Resolve names before deciding list precedence: an IP block must beat a host allowance.
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return isAgentNavigationAllowed(url, options);
   }
+  if (!ALLOWED_SCHEMES.has(parsed.protocol)) return isAgentNavigationAllowed(url, options);
+  if (isIpLiteral(parsed.hostname)) return policyDecision(parsed, [], options);
+  if (options.allowLocalhost && ARCA_LOOPBACK_HOSTS.has(parsed.hostname))
+    return policyDecision(parsed, ["127.0.0.1"], options);
   let addresses = [];
   try {
-    addresses = await resolveHost(hostname);
+    addresses = await (options.resolveHost ?? lookupHostAddresses)(parsed.hostname);
   } catch {
-    // Unresolvable here means no public endpoint to allow.
+    /* fail closed */
   }
-  const neverAllowable = addresses.some(
-    (address) => !isIpLiteral(address) || isNeverAllowable(address),
-  );
-  const allowance = allowanceFor(new URL(url), allowlist);
-  if (
-    neverAllowable ||
-    addresses.length === 0 ||
-    (addresses.some(isInternalAddress) && !allowance.allowed)
-  ) {
-    // One message for both cases so the agent can't probe internal DNS.
-    return {
-      ok: false,
-      error: `navigation blocked: host "${hostname}" does not resolve to a public address`,
-      ...(addresses.length > 0 && !neverAllowable ? { grant: allowance.grant } : {}),
-    };
-  }
-  return verdict;
+  if (addresses.length === 0)
+    return { ok: false, error: "navigation blocked: host does not resolve to a public address" };
+  return policyDecision(parsed, addresses, options);
 }
 
 /**
@@ -420,31 +447,23 @@ async function checkAgentNavigation(
  * @param {{ allowLocalhost?: boolean }} [options]
  * @returns {{ ok: true } | { ok: false, error: string }}
  */
-function isAgentConnectionAllowed(url, ip, { allowLocalhost = false, allowlist } = {}) {
-  let hostname = "";
+function isAgentConnectionAllowed(url, ip, options = {}) {
   let parsed;
   try {
     parsed = new URL(url);
-    hostname = parsed.hostname;
   } catch {
-    // Judge the address alone.
+    return { ok: false, error: "navigation blocked: invalid URL" };
   }
-  if (allowLocalhost && ARCA_LOOPBACK_HOSTS.has(hostname)) return { ok: true };
+  if (!ALLOWED_SCHEMES.has(parsed.protocol)) return isAgentNavigationAllowed(url, options);
   if (!ip) {
+    if (options.allowLocalhost && ARCA_LOOPBACK_HOSTS.has(parsed.hostname))
+      return policyDecision(parsed, [], options);
     return {
       ok: false,
-      error: `navigation blocked: host "${hostname}" reported no connected address`,
+      error: `navigation blocked: host "${parsed.hostname}" reported no connected address`,
     };
   }
-  if (parsed && isIpLiteral(ip) && !isNeverAllowable(ip) && allowanceFor(parsed, allowlist).allowed)
-    return { ok: true };
-  if (isInternalAddress(ip)) {
-    return {
-      ok: false,
-      error: `navigation blocked: host "${hostname}" connected to a non-public address`,
-    };
-  }
-  return { ok: true };
+  return policyDecision(parsed, [ip], options);
 }
 
 /**
@@ -498,6 +517,8 @@ module.exports = {
   lookupHostAddresses,
   // Exported for focused unit tests.
   proxyHosts,
+  parseAllowlistEntry,
+  isNeverAllowable,
   parseIpv4,
   parseIpv6,
   isBlockedIpv4,
