@@ -6,8 +6,10 @@ is mocked; upload storage and model ingestion remain in tests/e2e.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
+import pytest
 from playwright.sync_api import Page, expect
 
 from tests.browser_ui.chat.session_contract import ChatSessionContract
@@ -38,6 +40,47 @@ _ZIP_NAME = "photos.zip"
 # The server's real 413 body for an oversized upload, from
 # ``helpers._read_upload_capped``. Used to drive the failed-send path.
 _SERVER_413_DETAIL = "Attachment exceeds the 10 MB limit for this file type."
+
+
+@pytest.mark.parametrize("width", [1280, 390])
+def test_pasted_image_removal_without_text_mark(
+    page: Page, chat_session_contract: ChatSessionContract, width: int, tmp_path: Path
+) -> None:
+    chat = chat_session_contract
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(chat.url)
+    composer = page.get_by_placeholder(_COMPOSER)
+    expect(composer).to_be_visible()
+    composer.evaluate("""element => {
+        const transfer = new DataTransfer();
+        const bytes = Uint8Array.from(atob(
+            'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII='
+        ), c => c.charCodeAt(0));
+        for (const name of ['first.png', 'second.png']) {
+            transfer.items.add(new File([bytes], name, {type: 'image/png'}));
+        }
+        element.dispatchEvent(new ClipboardEvent('paste', {
+            clipboardData: transfer, bubbles: true, cancelable: true
+        }));
+    }""")
+    expect(composer).to_have_value(re.compile(r"\[image 1\].*\[image 2\]", re.S))
+    composer.fill("keep this [image 2]")
+    expect(page.get_by_text("· not in text")).to_be_visible()
+    first = page.get_by_role("button", name="Remove first.png", exact=True)
+    # Browser hit testing catches a wrapped badge covering the remove control.
+    assert first.evaluate("""element => {
+        const r = element.getBoundingClientRect();
+        return element.contains(document.elementFromPoint(r.x + r.width/2, r.y + r.height/2));
+    }"""), "the image badge covers its remove control"
+    page.screenshot(path=tmp_path / f"image-remove-{width}.png")
+    first.click(timeout=3000)
+    expect(first).to_have_count(0)
+    expect(composer).to_have_value("keep this [image 2]")
+    second = page.get_by_role("button", name="Remove second.png", exact=True)
+    expect(second).to_be_visible()
+    second.click()
+    expect(second).to_have_count(0)
+    expect(composer).not_to_have_value(re.compile(r"\[image [12]\]"))
 
 
 def test_attach_supported_files_and_remove(
