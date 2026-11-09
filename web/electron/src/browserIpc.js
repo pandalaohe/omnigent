@@ -8,6 +8,7 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const { captureCredentialSafePage } = require("./browserCredentialWatch");
 const { buildBrowserActionScriptForExecution } = require("./browserActionScript.mjs");
 const chromeCookieStoreModule = require("./chromeCookieStore");
 const { decodeLegacyBrowserAction } = require("./browserLegacyAction");
@@ -281,7 +282,7 @@ function makeDesignModeConsoleHandler(conversationId, entry, send, nonce, gestur
           let screenshotDataUrl = null;
           if (info.rect && info.rect.width > 0 && info.rect.height > 0) {
             const dpr = entry.view.webContents.getZoomFactor() || 1;
-            const image = await entry.view.webContents.capturePage({
+            const image = await captureCredentialSafePage(entry.view.webContents, {
               x: Math.round(info.rect.x * dpr),
               y: Math.round(info.rect.y * dpr),
               width: Math.round(info.rect.width * dpr),
@@ -614,7 +615,7 @@ function registerBrowserIpc({
     const entry = g.registry.get(conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
     try {
-      const image = await entry.view.webContents.capturePage();
+      const image = await captureCredentialSafePage(entry.view.webContents);
       const png = image.toPNG();
       if (image.isEmpty() || png.length === 0) {
         return {

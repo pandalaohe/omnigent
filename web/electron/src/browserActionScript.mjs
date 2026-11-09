@@ -1,3 +1,17 @@
+// Runs in the page world. Never returns a field value across the browser boundary.
+function isCredentialField(el) {
+  if (!el.matches?.("input, textarea, select")) return false;
+  const hints = [el.name, el.id, el.autocomplete].join(" ");
+  const mask = window.getComputedStyle(el).webkitTextSecurity;
+  return (
+    el.hasAttribute("data-omnigent-credential") ||
+    el.type === "password" ||
+    /password|passwd|pwd|current-password|new-password|one-time-code|cc-/i.test(hints) ||
+    (!!mask && mask !== "none")
+  );
+}
+
+export const CREDENTIAL_FIELD_JS = isCredentialField.toString();
 /** Safely interpolate a string into a browser action JS payload — always
  *  `JSON.stringify` (handles the full escape table); never hand-roll. */
 function jsString(s) {
@@ -127,7 +141,13 @@ const SNAPSHOT_JS = `(() => {
   });
 })()`;
 
-const GUARDED_SNAPSHOT_JS = SNAPSHOT_JS.replace(
+const REDACTED_SNAPSHOT_JS = SNAPSHOT_JS.replace(
+  "function getName(el, depth = 0) {",
+  `function getName(el, depth = 0) {
+    if ((${CREDENTIAL_FIELD_JS})(el)) return '[redacted]';`,
+);
+
+const GUARDED_SNAPSHOT_JS = REDACTED_SNAPSHOT_JS.replace(
   "(() => {\n",
   `(() => {
   if (!window.innerWidth || !window.innerHeight) {

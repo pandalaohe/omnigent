@@ -27,6 +27,7 @@ const {
   lookupHostAddresses,
 } = require("./browserUrlPolicy");
 const crypto = require("node:crypto");
+const { attachCredentialWatch } = require("./browserCredentialWatch");
 
 const DEFAULT_CAP = 10;
 
@@ -284,6 +285,7 @@ function createBrowserViewRegistry({
     attachAgentNavGuard(conversationId, entry);
     attachRecentSessionInput(entry);
     attachHiddenLayoutTracking(entry);
+    attachCredentialWatch(entry);
     return { ok: true, entry, created: true };
   }
 
