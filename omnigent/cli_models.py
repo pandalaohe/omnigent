@@ -14,7 +14,7 @@ from typing import Any
 import click
 import yaml
 
-from omnigent.models.model_source import fetch_model_source, model_source_for
+from omnigent.models.model_source import AcpModelProbeError, fetch_model_source, model_source_for
 
 
 @click.group()
@@ -52,7 +52,7 @@ async def _pick_status(
 
             probe = await probe_acp_model_options(entry)
             if probe["error"]:
-                return "unknown", "The agent could not be probed; check its CLI login."
+                return "unknown", probe["error"]
             advertised = probe["models"]
         if entry.send_model or any(row.get("modelSwitch") for row in advertised):
             return "reaches", "The agent advertises model selection or accepts a launch model."
@@ -208,6 +208,9 @@ async def check_models(harness: str | None) -> tuple[dict[str, Any], int]:
             if row["invalid_ids"]:
                 row.update(status="failed", error="listing contains invalid model ids")
                 code = max(code, 1)
+        except AcpModelProbeError as exc:
+            row.update(status="failed", error=str(exc))
+            code = max(code, 1)
         except Exception as exc:  # noqa: BLE001 — never render provider/command exception text
             row.update(status="failed", error=f"source failed ({type(exc).__name__})")
             if source and source.api_key_ref and source.api_key_ref.startswith("env:"):
