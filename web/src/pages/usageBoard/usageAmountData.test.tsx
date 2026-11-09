@@ -11,7 +11,7 @@ import {
 import { UsageBoardRoute } from "./UsageBoardRoute";
 import { usageBoardData } from "./usageBoardFixtures";
 import { sampleTotals, usageActivityFixture, usageIssuesFixture } from "./usageActivityFixtures";
-import { boardAmount, sumUsage } from "./usageAmounts";
+import { boardAmount, sumUsage } from "./usageAmountData";
 import { usageChartPoints } from "./UsageCostChart";
 import { UsageCostCard, UsageErrorMark } from "./UsageAmounts";
 

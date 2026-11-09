@@ -15,7 +15,7 @@ import {
   localDay,
   readBoardHistory,
   readLocalClosedCounts,
-} from "./taskBoardActivity";
+} from "./taskBoardActivityData";
 import { formatDate, formatNumber, t } from "./taskBoardText";
 
 export function TaskBoardActivity({

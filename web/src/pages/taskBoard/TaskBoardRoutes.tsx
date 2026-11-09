@@ -28,7 +28,7 @@ import {
   type RouteMode,
   type RouteNode,
   type TimeWindow,
-} from "./taskBoardRoutes";
+} from "./taskBoardRouteData";
 import { TaskBoardSearch } from "./TaskBoardSearch";
 import { taskTitle } from "./TaskBoardDetail";
 import { TaskProgressIcon } from "./TaskProgressIcon";

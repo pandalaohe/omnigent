@@ -11,7 +11,7 @@ import {
   type BoardTask,
 } from "./taskBoardData";
 import { useBoardSessionDetails, type BoardSession } from "./taskBoardNative";
-import { taskRelations, taskLocalTime } from "./taskBoardRoutes";
+import { taskRelations, taskLocalTime } from "./taskBoardRouteData";
 import { formatDate, formatNumber, t } from "./taskBoardText";
 import { TaskProgressIcon } from "./TaskProgressIcon";
 

@@ -5,7 +5,7 @@ import { UsageSourceConnect } from "./UsageSourceConnect";
 import { UsageTile } from "./UsageTile";
 import { usageBoardData } from "./usageBoardFixtures";
 import { CONNECT_SOURCES, buildConnectCommand, connectCommandPayload } from "./usageBoardConnect";
-import { sumUsage } from "./usageAmounts";
+import { sumUsage } from "./usageAmountData";
 import { sampleTotals, usageActivityFixture } from "./usageActivityFixtures";
 
 afterEach(cleanup);
