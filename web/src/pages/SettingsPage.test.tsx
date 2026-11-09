@@ -544,16 +544,19 @@ describe("SettingsPage", () => {
     const getBrowserLoginSetting = vi.fn().mockResolvedValue({ ok: true, enabled: false });
     const setBrowserLoginSetting = vi.fn().mockResolvedValue({ ok: true, enabled: true });
     const clearBrowserLogin = vi.fn().mockResolvedValue({ ok: true });
+    const browserSetupBitwarden = vi.fn().mockResolvedValue({ ok: true });
     (window as unknown as Record<string, unknown>).omnigentDesktop = {
       kind: "electron",
       getBrowserLoginSetting,
       setBrowserLoginSetting,
       clearBrowserLogin,
+      browserSetupBitwarden,
     };
     renderPage("/settings");
     const toggle = await screen.findByRole("switch", { name: "Keep in-app browser login" });
     await waitFor(() => expect(toggle).not.toBeDisabled());
     expect(toggle).not.toBeChecked();
+    expect(screen.getByRole("button", { name: "Set up Bitwarden" })).toBeDisabled();
     expect(screen.getByText("Reuse this server's saved browser login.")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "About Keep in-app browser login" }));
     expect(screen.getByRole("tooltip")).toHaveTextContent(
@@ -562,6 +565,9 @@ describe("SettingsPage", () => {
     fireEvent.click(toggle);
     await waitFor(() => expect(setBrowserLoginSetting).toHaveBeenCalledWith(true));
     await waitFor(() => expect(toggle).toBeChecked());
+    fireEvent.click(screen.getByRole("button", { name: "Set up Bitwarden" }));
+    await waitFor(() => expect(browserSetupBitwarden).toHaveBeenCalledOnce());
+    expect(await screen.findByText(/Bitwarden ready/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Clear browser login for this server" }));
     await waitFor(() => expect(clearBrowserLogin).toHaveBeenCalledOnce());
     expect(await screen.findByText(/Browser login cleared/)).toBeInTheDocument();

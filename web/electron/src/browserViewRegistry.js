@@ -107,6 +107,8 @@ function createBrowserViewRegistry({
   partitionScope = `w${++registrySeq}`,
   partitionForView = (_viewId, defaultPartition) => defaultPartition(),
   isPartitionUnavailable = () => false,
+  onViewCreated = () => {},
+  onViewSelected = () => {},
 } = {}) {
   const entries = new Map(); // conversationId -> BrowserViewEntry
   const pendingNavigations = new Map();
@@ -284,6 +286,7 @@ function createBrowserViewRegistry({
     attachAgentNavGuard(conversationId, entry);
     attachRecentSessionInput(entry);
     attachHiddenLayoutTracking(entry);
+    onViewCreated(entry);
     return { ok: true, entry, created: true };
   }
 
@@ -701,6 +704,7 @@ function createBrowserViewRegistry({
       }
     }
     activeConversationId = conversationId;
+    onViewSelected(next);
     if (prev) syncHiddenLayout(prev);
     try {
       attachToHost(next.view);

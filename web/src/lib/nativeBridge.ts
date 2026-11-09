@@ -233,6 +233,9 @@ interface ElectronDesktopApi extends NativeShellApi {
     },
   ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
   getBrowserLoginSetting?: () => Promise<{ ok: boolean; enabled?: boolean; error?: string }>;
+  browserSetupBitwarden?: () => Promise<{ ok: boolean; error?: string }>;
+  browserRemoveBitwarden?: () => Promise<{ ok: boolean; error?: string }>;
+  browserOpenBitwarden?: (viewId: string) => Promise<{ ok: boolean; error?: string }>;
   setBrowserLoginSetting?: (
     enabled: boolean,
   ) => Promise<{ ok: boolean; enabled?: boolean; error?: string }>;
@@ -401,6 +404,7 @@ export interface DesktopFeatures {
   arcaPreviewRecovery?: boolean;
   /** This shell can import the current site's cookies from local Google Chrome. */
   chromeCookieImport?: boolean;
+  browserBitwarden?: boolean;
 }
 
 /** Status of the local `omni` CLI, from the desktop shell. */
@@ -654,6 +658,8 @@ export function browserLoginBridge() {
     get: desktop.getBrowserLoginSetting,
     set: desktop.setBrowserLoginSetting,
     clear: desktop.clearBrowserLogin,
+    setupBitwarden: desktop.browserSetupBitwarden,
+    removeBitwarden: desktop.browserRemoveBitwarden,
   };
 }
 

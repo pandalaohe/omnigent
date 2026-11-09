@@ -320,6 +320,9 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   browserClose: (conversationId, reason) =>
     ipcRenderer.invoke("omnigent:browser-close", { conversationId, reason }),
   getBrowserLoginSetting: () => ipcRenderer.invoke("omnigent:browser-login-setting:get"),
+  browserSetupBitwarden: () => ipcRenderer.invoke("omnigent:browser-bitwarden:setup"),
+  browserRemoveBitwarden: () => ipcRenderer.invoke("omnigent:browser-bitwarden:remove"),
+  browserOpenBitwarden: (viewId) => ipcRenderer.invoke("omnigent:browser-bitwarden:open", viewId),
   setBrowserLoginSetting: (enabled) =>
     ipcRenderer.invoke("omnigent:browser-login-setting:set", enabled),
   clearBrowserLogin: () => ipcRenderer.invoke("omnigent:browser-login:clear"),

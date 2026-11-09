@@ -77,6 +77,11 @@ const { createReconnectOverlay } = require("./reconnect_overlay");
 const { createBrowserViewRegistry, persistentAgentPartition } = require("./browserViewRegistry");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { registerBrowserIpc } = require("./browserIpc");
+const {
+  createBrowserExtensions,
+  installBitwarden,
+  BITWARDEN_VERSION,
+} = require("./browserExtensions");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
 const { isDeveloperModeEnabled } = require("./developer_mode");
 const { DEV_DOMAIN, getDevUserDefault } = require("./dev_preferences");
@@ -1542,6 +1547,19 @@ function activeWindow() {
   const focused = BrowserWindow.getFocusedWindow();
   if (focused && windows.has(focused)) return focused;
   return windows.keys().next().value ?? null;
+}
+
+function activateAppWindow() {
+  const win = activeWindow();
+  if (win) {
+    focusAndRestore(win);
+    return;
+  }
+  // macOS: re-create the window when the dock icon is clicked and none
+  // open. Skip while a deep link is being handled (or queued) — it opens
+  // its own window, and racing a default window here would double-open at
+  // cold start (whenReady skipped its own createWindow for the pending link).
+  if (windows.size === 0 && !deepLinkInFlight && pendingDeepLinks.length === 0) createWindow();
 }
 
 /**
@@ -3711,6 +3729,26 @@ function hardenAgentPartition(partition, win, canPrompt, getAnchorBounds) {
 // conversation's tabs share one partition, so install once per session and let
 // the registry attribute each request to its view.
 const guardedAgentSessions = new WeakSet();
+const browserExtensions = new Map();
+let bitwardenRemoving = false;
+const bitwardenDirectory = () =>
+  path.join(app.getPath("userData"), "browser-extensions", "bitwarden", BITWARDEN_VERSION);
+
+function extensionsForPartition(partition) {
+  if (!partition.startsWith("persist:omnigent-agent-shared-")) return null;
+  if (!browserExtensions.has(partition)) {
+    const extensions = createBrowserExtensions({
+      session: session.fromPartition(partition),
+      directory: bitwardenDirectory(),
+      BrowserWindow,
+      ElectronChromeExtensions: require("electron-chrome-extensions").ElectronChromeExtensions,
+    });
+    browserExtensions.set(partition, extensions);
+    if (!bitwardenRemoving && fs.existsSync(path.join(bitwardenDirectory(), "manifest.json")))
+      void extensions.load().catch(() => {});
+  }
+  return browserExtensions.get(partition);
+}
 
 /** Enforce the agent navigation policy on document requests at the network layer. */
 function registryForAgentWebContents(webContentsId) {
@@ -3752,10 +3790,26 @@ function guardAgentPartitionRequests(partition) {
       (cancel) => callback({ cancel }),
       () => callback({ cancel: true }),
     );
-  ses.webRequest.onBeforeRequest(filter, (details, callback) => {
+  ses.webRequest.onBeforeRequest({ urls: filter.urls }, (details, callback) => {
     const registry = registryForAgentWebContents(details.webContentsId);
-    answer(registry ? registry.shouldCancelAgentRequest(details) : Promise.resolve(true), callback);
+    const decision = filter.types.includes(details.resourceType)
+      ? registry
+        ? registry.shouldCancelAgentRequest(details)
+        : Promise.resolve(true)
+      : Promise.resolve(false);
+    answer(
+      decision.then((cancel) => {
+        if (!cancel) browserExtensions.get(partition)?.relayWebRequest("onBeforeRequest", details);
+        return cancel;
+      }),
+      callback,
+    );
   });
+  for (const name of ["onCompleted", "onBeforeRedirect", "onErrorOccurred"]) {
+    ses.webRequest[name]({ urls: filter.urls }, (details) =>
+      browserExtensions.get(partition)?.relayWebRequest(name, details),
+    );
+  }
   ses.webRequest.onBeforeSendHeaders(filter, (details, callback) =>
     callback(
       registryForAgentWebContents(details.webContentsId)?.agentRequestHeaders(details) ?? {},
@@ -3883,6 +3937,7 @@ function createBrowserRegistryForWindow(win) {
     registry.get(registry.activeConversationId())?.view.webContents === wc;
   const registry = createBrowserViewRegistry({
     WebContentsViewCtor: (opts) => {
+      extensionsForPartition(opts.webPreferences.partition);
       // Install before construction: Electron otherwise auto-grants requests.
       const policy = hardenAgentPartition(opts.webPreferences.partition, win, canPrompt, () =>
         view.getBounds(),
@@ -3906,6 +3961,10 @@ function createBrowserRegistryForWindow(win) {
         : defaultPartition();
     },
     isPartitionUnavailable: (partition) => clearingBrowserPartitions.has(partition),
+    onViewCreated: (entry) =>
+      extensionsForPartition(entry.partition)?.addView(entry.view.webContents, win),
+    onViewSelected: (entry) =>
+      extensionsForPartition(entry.partition)?.selectView(entry.view.webContents),
     onSuppressionChange: (suppressed) => {
       if (suppressed) browserPermissionPrompt.dismiss(win);
     },
@@ -4989,6 +5048,7 @@ function registerIpc() {
       // Importing local Chrome cookies is wired for macOS only (Keychain-decrypted
       // v10 values); the SPA hides the toolbar button everywhere else.
       chromeCookieImport: process.platform === "darwin",
+      browserBitwarden: true,
     };
   });
 
@@ -5157,6 +5217,8 @@ function registerIpc() {
     }
     clearingBrowserPartitions.add(partition);
     try {
+      const extensions = browserExtensions.get(partition);
+      if (extensions) await extensions.unload();
       const ses = session.fromPartition(partition);
       // Closed views can leave their registry before Chromium destroys them.
       const closing = electronWebContents
@@ -5173,6 +5235,95 @@ function registerIpc() {
       return { ok: false, error: "could not clear browser login" };
     } finally {
       clearingBrowserPartitions.delete(partition);
+    }
+  });
+  ipcMain.on("omnigent:extension-storage", (event, keys, area) => {
+    for (const extensions of browserExtensions.values())
+      extensions.storageChanged(event, keys, area);
+  });
+  let bitwardenInstalling = null;
+  ipcMain.handle("omnigent:browser-bitwarden:setup", async (event) => {
+    if (!isPinnedOriginSender(event)) return { ok: false, error: "untrusted sender" };
+    if (bitwardenRemoving) return { ok: false, error: "Bitwarden is being removed." };
+    if (loadSettings().browser_persistent_login !== true)
+      return {
+        ok: false,
+        error: "Turn on Keep in-app browser login first, then close and reopen Browser.",
+      };
+    try {
+      if (!fs.existsSync(path.join(bitwardenDirectory(), "manifest.json"))) {
+        if (!bitwardenInstalling)
+          bitwardenInstalling = installBitwarden({
+            directory: bitwardenDirectory(),
+            fetch: net.fetch,
+            extract: require("extract-zip"),
+          }).finally(() => {
+            bitwardenInstalling = null;
+          });
+        await bitwardenInstalling;
+      }
+      const partition = persistentAgentPartition(
+        pinnedOrigin(BrowserWindow.fromWebContents(event.sender)),
+      );
+      if (clearingBrowserPartitions.has(partition) || bitwardenRemoving)
+        return { ok: false, error: "Browser login is being cleared." };
+      await extensionsForPartition(partition).load();
+      return { ok: true };
+    } catch {
+      return {
+        ok: false,
+        error: "Could not set up Bitwarden. Check your connection and try again.",
+      };
+    }
+  });
+  ipcMain.handle("omnigent:browser-bitwarden:open", async (event, viewId) => {
+    if (!isPinnedOriginSender(event)) return { ok: false, error: "untrusted sender" };
+    const registry = browserRegistryForSender(event);
+    const entry = typeof viewId === "string" && registry?.get(viewId);
+    if (!entry || registry.activeConversationId() !== viewId || registry.isSuppressed())
+      return { ok: false, error: "Show this tab in Browser first." };
+    const extensions = extensionsForPartition(entry.partition);
+    if (clearingBrowserPartitions.has(entry.partition) || bitwardenRemoving)
+      return { ok: false, error: "Browser login is being cleared." };
+    if (!extensions || !fs.existsSync(path.join(bitwardenDirectory(), "manifest.json")))
+      return {
+        ok: false,
+        error:
+          "Set up Bitwarden in Settings → General first. Close and reopen Browser after turning on saved login.",
+      };
+    try {
+      extensions.selectView(entry.view.webContents);
+      await extensions.openPopup(BrowserWindow.fromWebContents(event.sender));
+      return { ok: true };
+    } catch {
+      return { ok: false, error: "Could not open Bitwarden." };
+    }
+  });
+  ipcMain.handle("omnigent:browser-bitwarden:remove", async (event) => {
+    if (!isPinnedOriginSender(event)) return { ok: false, error: "untrusted sender" };
+    if (bitwardenInstalling) return { ok: false, error: "Wait for Bitwarden setup to finish." };
+    const win = BrowserWindow.fromWebContents(event.sender);
+    const { response } = await dialog.showMessageBox(win, {
+      type: "warning",
+      message: "Remove Bitwarden from this desktop?",
+      detail:
+        "Closes Bitwarden windows and removes its extension files. Your vault on the server is unchanged. To clear its local login too, use Clear browser login for each connected server.",
+      buttons: ["Cancel", "Remove Bitwarden"],
+      defaultId: 0,
+      cancelId: 0,
+    });
+    if (response !== 1) return { ok: false, error: "Removal cancelled." };
+    if (bitwardenInstalling || bitwardenRemoving)
+      return { ok: false, error: "Wait for Bitwarden setup or removal to finish." };
+    bitwardenRemoving = true;
+    try {
+      await Promise.all([...browserExtensions.values()].map((extensions) => extensions.remove()));
+      await fs.promises.rm(bitwardenDirectory(), { recursive: true, force: true });
+      return { ok: true };
+    } catch {
+      return { ok: false, error: "Could not remove Bitwarden." };
+    } finally {
+      bitwardenRemoving = false;
     }
   });
   registerBrowserIpc({
@@ -5667,13 +5818,7 @@ if (!gotLock) {
     updater.init();
     app.on("browser-window-focus", () => updateSignOutMenuItem());
 
-    app.on("activate", () => {
-      // macOS: re-create the window when the dock icon is clicked and none
-      // open. Skip while a deep link is being handled (or queued) — it opens
-      // its own window, and racing a default window here would double-open at
-      // cold start (whenReady skipped its own createWindow for the pending link).
-      if (windows.size === 0 && !deepLinkInFlight && pendingDeepLinks.length === 0) createWindow();
-    });
+    app.on("activate", activateAppWindow);
   });
 
   app.on("window-all-closed", () => {
