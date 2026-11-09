@@ -1296,6 +1296,7 @@ class _ReaderState:
     reasoning_prefixes: dict[int, str] = field(default_factory=dict)
     turn_active: bool = False
     turn_generation: int = 0
+    native_work_observed: bool = False
     turn_error: str | None = None
     idle_ticks: int = 0
     last_work_at: float = field(default_factory=lambda: monotonic())
@@ -1784,7 +1785,8 @@ async def _reconcile_idle_turn(
     summary = summaries.get(cascade_id) if isinstance(summaries, dict) else None
     status = summary.get("status") if isinstance(summary, dict) else None
     if generation == state.turn_generation and status == "CASCADE_RUN_STATUS_RUNNING":
-        state.last_work_at = monotonic()
+        if state.usage_thread_kind != "subagent" or state.native_work_observed:
+            state.last_work_at = monotonic()
         state.idle_ticks = 0
     if not poll_steps and (not state.turn_active or status == "CASCADE_RUN_STATUS_RUNNING"):
         return body
@@ -1798,6 +1800,8 @@ async def _reconcile_idle_turn(
         # A continuation observed during either RPC owns a different completion.
         if generation != state.turn_generation:
             return body
+        if steps:
+            state.native_work_observed = True
         for step in steps or ():
             if isinstance(step, dict):
                 await _commit_step(
@@ -1812,10 +1816,18 @@ async def _reconcile_idle_turn(
             return body
         if steps and isinstance(steps[-1], dict) and not _is_settled(steps[-1]):
             state.last_work_at = monotonic()
-        state.idle_ticks = (
-            state.idle_ticks + 1 if status == _CASCADE_RUN_STATUS_IDLE and steps is not None else 0
+        # A helper may omit USER_INPUT, but registration alone is not native work.
+        turn_observed = state.turn_generation > 0 or (
+            state.usage_thread_kind == "subagent" and bool(state.seen)
         )
-        if state.turn_generation > 0 and state.idle_ticks >= _QUIESCENT_TICKS_TO_CLOSE:
+        state.idle_ticks = (
+            state.idle_ticks + 1
+            if status == _CASCADE_RUN_STATUS_IDLE
+            and steps is not None
+            and (state.usage_thread_kind != "subagent" or turn_observed)
+            else 0
+        )
+        if turn_observed and state.idle_ticks >= _QUIESCENT_TICKS_TO_CLOSE:
             event = _status_event(_STATUS_FAILED if state.turn_error else _STATUS_IDLE)
             if steps and steps[-1].get("status") == "CORTEX_STEP_STATUS_CANCELED":
                 event = _status_event("stopped")
@@ -1864,7 +1876,6 @@ async def _mirror_subagent_cascade(
         port=port,
         usage_thread_kind="subagent",
         turn_active=True,
-        turn_generation=1,
     )
     try:
         while True:

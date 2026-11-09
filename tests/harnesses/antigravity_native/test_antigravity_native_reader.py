@@ -5722,6 +5722,141 @@ async def test_mirror_keeps_polling_while_the_child_is_still_working(
     )
 
 
+@pytest.mark.parametrize("first_step", ["user_input", "run_command_done", "canceled", "error"])
+async def test_helper_waits_through_empty_snapshots_before_native_work(
+    monkeypatch: pytest.MonkeyPatch, first_step: str
+) -> None:
+    polls = 0
+    step = _load("user_input" if first_step == "user_input" else "run_command_done")
+    expected = "idle"
+    if first_step in ("canceled", "error"):
+        step["status"] = (
+            "CORTEX_STEP_STATUS_CANCELED" if first_step == "canceled" else reader._STATUS_ERROR
+        )
+        expected = "stopped" if first_step == "canceled" else "failed"
+
+    def steps(_port: int, _cascade: str, **_kwargs: Any) -> list[dict[str, Any]]:
+        nonlocal polls
+        polls += 1
+        if polls <= 3:
+            return []
+        if first_step == "run_command_done" and polls >= 5:
+            return [step, _done_planner("Task complete.", step_index=9)]
+        return [step]
+
+    monkeypatch.setattr(reader, "get_trajectory_steps", steps)
+    monkeypatch.setattr(
+        reader,
+        "get_all_cascade_trajectories",
+        lambda *_args, **_kwargs: {
+            "trajectorySummaries": {"child-aaa": {"status": "CASCADE_RUN_STATUS_IDLE"}}
+        },
+    )
+    monkeypatch.setattr(reader, "_sleep", _no_sleep)
+    sink = _PostSink()
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+    client, _ = _subagent_client()
+    async with client:
+        await asyncio.wait_for(
+            reader._mirror_subagent_cascade(
+                port=4242,
+                child_cascade_id="child-aaa",
+                client=client,
+                child_session_id="conv_child_a",
+            ),
+            timeout=_MIRROR_HANG_GUARD_S,
+        )
+    assert polls >= 5
+    if first_step != "canceled":
+        assert sink.item_types()
+    if first_step == "run_command_done":
+        assert "Task complete." in str(sink.posts)
+    assert sink.statuses() == [expected]
+
+
+@pytest.mark.parametrize("status", ["CASCADE_RUN_STATUS_IDLE", "CASCADE_RUN_STATUS_RUNNING"])
+async def test_helper_without_native_work_fails_at_the_silence_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+) -> None:
+    clock = [0.0]
+    monkeypatch.setattr(reader, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(reader, "get_trajectory_steps", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        reader,
+        "get_all_cascade_trajectories",
+        lambda *_args, **_kwargs: {"trajectorySummaries": {"child-aaa": {"status": status}}},
+    )
+    sink = _PostSink()
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+
+    async def tick(_seconds: float) -> None:
+        assert sink.statuses() == []
+        clock[0] += 30
+
+    monkeypatch.setattr(reader, "_sleep", tick)
+    client, _ = _subagent_client()
+    async with client:
+        await asyncio.wait_for(
+            reader._mirror_subagent_cascade(
+                port=4242,
+                child_cascade_id="child-aaa",
+                client=client,
+                child_session_id="conv_child_a",
+            ),
+            timeout=_MIRROR_HANG_GUARD_S,
+        )
+    assert clock[0] == reader._UNCONFIRMED_TURN_TIMEOUT_S
+    assert sink.statuses() == ["failed"]
+    assert "120 seconds without evidence of work" in sink.posts[-1][1]["output"]
+
+
+async def test_running_helper_retains_evidence_of_an_unfinished_native_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [0.0]
+    monkeypatch.setattr(reader, "monotonic", lambda: clock[0])
+    pending = _load("run_command_done")
+    pending["status"] = "CORTEX_STEP_STATUS_RUNNING"
+    monkeypatch.setattr(
+        reader,
+        "get_trajectory_steps",
+        lambda *_args, **_kwargs: [pending] if clock[0] == 0 else [],
+    )
+    monkeypatch.setattr(
+        reader,
+        "get_all_cascade_trajectories",
+        lambda *_args, **_kwargs: {
+            "trajectorySummaries": {"child-aaa": {"status": "CASCADE_RUN_STATUS_RUNNING"}}
+        },
+    )
+    sink = _PostSink()
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+    state = reader._ReaderState(
+        seen=set(), interacted=set(), usage_thread_kind="subagent", turn_active=True
+    )
+
+    async def no_interaction(*_args: object) -> None:
+        raise AssertionError("No interaction is expected")
+
+    client, _ = _subagent_client()
+    async with client:
+        for clock[0] in (0, 121, 242):
+            await reader._reconcile_idle_turn(
+                port=4242,
+                cascade_id="child-aaa",
+                client=client,
+                session_id="conv_child_a",
+                state=state,
+                on_pending_interaction=no_interaction,
+                poll_steps=True,
+            )
+    assert state.turn_active
+    assert state.native_work_observed
+    assert not state.seen
+    assert sink.statuses() == []
+
+
 async def test_a_child_that_goes_quiet_without_closing_is_closed_from_agy_status(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
