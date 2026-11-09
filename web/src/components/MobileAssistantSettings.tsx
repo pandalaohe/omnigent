@@ -1,16 +1,9 @@
 import { useEffect, useReducer, useRef, useState, type PointerEvent } from "react";
 import { createPortal } from "react-dom";
-import {
-  ArrowDownIcon,
-  ArrowUpIcon,
-  KeyboardIcon,
-  PencilIcon,
-  PlusIcon,
-  RotateCcwIcon,
-  Trash2Icon,
-} from "lucide-react";
+import { KeyboardIcon, PencilIcon, PlusIcon, RotateCcwIcon, Trash2Icon } from "lucide-react";
 
-import { SettingRow } from "@/components/SettingsFields";
+import { TerminalBarEditor } from "@/components/settings/TerminalBarEditor";
+
 import { SettingsLabel } from "@/components/SettingsLabel";
 import { Segmented } from "@/components/ui/segmented";
 import {
@@ -35,9 +28,6 @@ import {
   MOBILE_ASSISTANT_ACTION_DEFINITIONS,
   type MobileAssistantActionId,
   MOBILE_ASSISTANT_CHAT_ACTION_IDS,
-  defaultTerminalButtons,
-  type TerminalKeyRowItem,
-  type ResolvedMobileAssistantPreferences,
   MOBILE_ASSISTANT_CHANGED_EVENT,
   MOBILE_ASSISTANT_ICONS,
   MOBILE_ASSISTANT_MAX_BUTTONS,
@@ -45,8 +35,6 @@ import {
   mobileAssistantBindingLabel,
   mobileAssistantBindingSupportsRepeat,
   readMobileAssistantPreferences,
-  softKeyForChord,
-  terminalDataForChord,
   writeMobileAssistantPreferences,
   type MobileAssistantButton,
   type MobileAssistantButtonBinding,
@@ -263,235 +251,6 @@ function KeyChordPicker({
   );
 }
 
-function TerminalKeySettings({ preferences }: { preferences: ResolvedMobileAssistantPreferences }) {
-  const [draft, setDraft] = useState<TerminalKeyRowItem | null>(null);
-  const unsupportedChord =
-    draft?.kind === "key" &&
-    !softKeyForChord(draft.chord) &&
-    terminalDataForChord(draft.chord) === null;
-  const buttons = preferences.terminalButtons;
-  const persist = (terminalButtons: TerminalKeyRowItem[]) =>
-    writeMobileAssistantPreferences({ ...preferences, terminalButtons });
-  const move = (index: number, offset: number) => {
-    const next = [...buttons];
-    const [button] = next.splice(index, 1);
-    next.splice(index + offset, 0, button);
-    persist(next);
-  };
-  return (
-    <div className="mt-4 space-y-5 phone:[&_[data-slot=setting-row]]:min-h-11">
-      <SettingRow
-        label="Terminal key rows"
-        hint="Show keys above the phone keyboard. When the rows are off or cannot fit, the floating assistant uses the first ten terminal keys instead."
-      >
-        <Switch
-          checked={preferences.terminalKeysEnabled}
-          onCheckedChange={(terminalKeysEnabled) =>
-            writeMobileAssistantPreferences({ ...preferences, terminalKeysEnabled })
-          }
-          aria-label="Enable terminal key rows"
-        />
-      </SettingRow>
-      <SettingRow
-        label="Second row"
-        hint="The first six keys stay in the first row. Each next six keys form another page in the second row; swipe left or right to change pages."
-      >
-        <Switch
-          checked={preferences.terminalSecondRow}
-          onCheckedChange={(terminalSecondRow) =>
-            writeMobileAssistantPreferences({ ...preferences, terminalSecondRow })
-          }
-          aria-label="Show second terminal key row"
-        />
-      </SettingRow>
-      {buttons.length === 0 ? (
-        <div>
-          <h4 className="mb-2 text-ui font-medium">First row</h4>
-          <p className="text-sm text-muted-foreground">No terminal keys yet.</p>
-        </div>
-      ) : (
-        <ul>
-          {buttons.map((button, index) => {
-            return (
-              <li key={button.id}>
-                {index % 6 === 0 && (
-                  <h4 className="mb-2 mt-5 text-ui font-medium">
-                    {index === 0 ? "First row" : `Page ${index / 6}`}
-                  </h4>
-                )}
-                <div className="flex min-h-11 items-center gap-1 border-b border-border px-2 py-1 phone:gap-3">
-                  <span className="w-5 shrink-0 text-sm text-muted-foreground">{index + 1}</span>
-                  <span className="min-w-0 flex-1 truncate text-ui">{button.label}</span>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon"
-                    aria-label={`Move ${button.label} up`}
-                    disabled={index === 0}
-                    onClick={() => move(index, -1)}
-                  >
-                    <ArrowUpIcon />
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon"
-                    aria-label={`Move ${button.label} down`}
-                    disabled={index === buttons.length - 1}
-                    onClick={() => move(index, 1)}
-                  >
-                    <ArrowDownIcon />
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon"
-                    aria-label={`Edit ${button.label}`}
-                    onClick={() => setDraft(structuredClone(button))}
-                  >
-                    <PencilIcon />
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon"
-                    aria-label={`Delete ${button.label}`}
-                    onClick={() => persist(buttons.filter((item) => item.id !== button.id))}
-                  >
-                    <Trash2Icon />
-                  </Button>
-                </div>
-              </li>
-            );
-          })}
-        </ul>
-      )}
-      <div className="flex flex-wrap gap-2 phone:gap-y-4">
-        <Button
-          type="button"
-          variant="outline"
-          onClick={() =>
-            setDraft({
-              id: createId(),
-              label: "Esc",
-              kind: "key",
-              chord: { code: "Escape", modifiers: [] },
-            })
-          }
-        >
-          <PlusIcon /> Add a key
-        </Button>
-        <Button type="button" variant="ghost" onClick={() => persist(defaultTerminalButtons())}>
-          <RotateCcwIcon /> Restore default terminal keys
-        </Button>
-      </div>
-      <Dialog
-        open={draft !== null}
-        onOpenChange={(open) => {
-          if (!open) setDraft(null);
-        }}
-      >
-        <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-md">
-          <DialogHeader>
-            <DialogTitle>Terminal key</DialogTitle>
-            <DialogDescription>Choose a key and its modifiers by tapping.</DialogDescription>
-          </DialogHeader>
-          {draft && (
-            <div className="grid gap-4">
-              <label className="grid gap-1 text-ui">
-                Button label
-                <Input
-                  value={draft.label}
-                  maxLength={24}
-                  onChange={(event) => setDraft({ ...draft, label: event.target.value })}
-                />
-              </label>
-              <label className="grid gap-1 text-ui">
-                Key type
-                <select
-                  className="min-h-11 rounded-md border border-input bg-background px-2"
-                  value={
-                    draft.kind === "key"
-                      ? "key"
-                      : draft.kind === "modifier"
-                        ? draft.modifier
-                        : "keyboard"
-                  }
-                  onChange={(event) => {
-                    const value = event.target.value;
-                    const base = {
-                      id: draft.id,
-                      label:
-                        value === "key"
-                          ? "Esc"
-                          : value === "keyboard"
-                            ? "Keyboard"
-                            : value === "ctrl"
-                              ? "Ctrl"
-                              : "Alt",
-                    };
-                    setDraft(
-                      value === "key"
-                        ? { ...base, kind: "key", chord: { code: "Escape", modifiers: [] } }
-                        : value === "keyboard"
-                          ? { ...base, kind: "action", action: "keyboard" }
-                          : { ...base, kind: "modifier", modifier: value as "ctrl" | "alt" },
-                    );
-                  }}
-                >
-                  <option value="key">Key combination</option>
-                  <option value="ctrl">Ctrl, single-use / lock</option>
-                  <option value="alt">Alt, single-use / lock</option>
-                  <option value="keyboard">Show / hide keyboard</option>
-                </select>
-              </label>
-              {draft.kind === "key" && (
-                <KeyChordPicker
-                  terminal
-                  chord={draft.chord}
-                  onChange={(chord) =>
-                    setDraft({
-                      ...draft,
-                      label: mobileAssistantBindingLabel({ kind: "key", chord }),
-                      chord,
-                    })
-                  }
-                />
-              )}
-              {unsupportedChord && (
-                <p role="status" className="text-sm text-muted-foreground">
-                  This key combination is not supported in terminals. Choose a different key or
-                  modifier.
-                </p>
-              )}
-            </div>
-          )}
-          <DialogFooter>
-            <Button type="button" variant="outline" onClick={() => setDraft(null)}>
-              Cancel
-            </Button>
-            <Button
-              type="button"
-              disabled={!draft?.label.trim() || unsupportedChord}
-              onClick={() => {
-                if (!draft) return;
-                const index = buttons.findIndex((item) => item.id === draft.id);
-                const next = [...buttons];
-                if (index < 0) next.push(draft);
-                else next[index] = draft;
-                persist(next);
-                setDraft(null);
-              }}
-            >
-              Save key
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-    </div>
-  );
-}
-
 export function MobileAssistantSettings() {
   const [, refresh] = useReducer((version: number) => version + 1, 0);
   const [draft, setDraft] = useState<ButtonDraft | null>(null);
@@ -624,7 +383,7 @@ export function MobileAssistantSettings() {
         onChange={setActiveSet}
       />
       {activeSet === "terminal" ? (
-        <TerminalKeySettings preferences={preferences} />
+        <TerminalBarEditor preferences={preferences} />
       ) : (
         <>
           <div className="mt-4 grid gap-4 rounded-xl border border-border p-3 sm:grid-cols-[240px_1fr]">

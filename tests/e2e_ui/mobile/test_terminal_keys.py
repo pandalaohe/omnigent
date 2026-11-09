@@ -110,7 +110,7 @@ def _stop_echo(page: Page, textarea: Locator) -> None:
     page.wait_for_timeout(250)
 
 
-def _tap_soft_key(button: Locator) -> None:
+def _press_soft_key(button: Locator, *, lock: bool = False) -> None:
     box = button.bounding_box()
     assert box is not None, "button has no bounding box"
     cx = box["x"] + box["width"] / 2
@@ -127,6 +127,8 @@ def _tap_soft_key(button: Locator) -> None:
             "bubbles": True,
         },
     )
+    if lock:
+        expect(button).to_have_attribute("data-sticky-state", "locked")
     button.dispatch_event(
         "pointerup",
         {
@@ -311,7 +313,9 @@ def test_mobile_terminal_keys_byte_delivery_app_cursor_and_gestures(
         expect(bar).to_be_visible(timeout=15_000)
         expect(bar).to_have_attribute("aria-disabled", "false")
         expect(bar).to_have_attribute("data-page", "0")
-        expect(bar).to_have_attribute("data-page-count", "2")
+        expect(bar).to_have_attribute("data-page-count", "1")
+        expect(bar).to_have_attribute("data-bottom-page", "0")
+        expect(bar).to_have_attribute("data-bottom-page-count", "2")
 
         # Floating assistant wheel must hide while a writable terminal key bar is visible.
         expect(page.get_by_test_id("mobile-floating-assistant")).to_have_count(0)
@@ -331,7 +335,7 @@ def test_mobile_terminal_keys_byte_delivery_app_cursor_and_gestures(
             textarea.evaluate("el => el.blur()")
 
             c1 = len(_lines(normal_log))
-            _tap_soft_key(bar.get_by_role("button", name=label, exact=True))
+            _press_soft_key(bar.get_by_role("button", name=label, exact=True))
             by_soft = _read_back(page, normal_log, c1)
             _assert_key_bytes("Normal mode", label, by_soft, by_phys, expected_normal)
             assert not page.evaluate(
@@ -341,12 +345,12 @@ def test_mobile_terminal_keys_byte_delivery_app_cursor_and_gestures(
 
         # Negative / red-proof check (§4.2): tapping a deliberately wrong key (End instead of Home,
         # or comparing against application-cursor Home 1b4f48) fails _assert_key_bytes.
-        pager = bar.locator('[data-testid="terminal-key-row-pager"]')
+        pager = bar.locator('[data-pager-row="bottom"]')
         _swipe_pager(pager, -80)
-        expect(bar).to_have_attribute("data-page", "1")
+        expect(bar).to_have_attribute("data-bottom-page", "1")
 
         c_wrong = len(_lines(normal_log))
-        _tap_soft_key(bar.get_by_role("button", name="End", exact=True))
+        _press_soft_key(bar.get_by_role("button", name="End", exact=True))
         wrong_soft = _read_back(page, normal_log, c_wrong)
         with pytest.raises(AssertionError):
             _assert_key_bytes("Normal mode", "Home", wrong_soft, "1b5b48", "1b5b48")
@@ -359,7 +363,7 @@ def test_mobile_terminal_keys_byte_delivery_app_cursor_and_gestures(
             textarea.evaluate("el => el.blur()")
 
             c1 = len(_lines(normal_log))
-            _tap_soft_key(bar.get_by_role("button", name=label, exact=True))
+            _press_soft_key(bar.get_by_role("button", name=label, exact=True))
             by_soft = _read_back(page, normal_log, c1)
             _assert_key_bytes("Normal mode", label, by_soft, by_phys, expected_normal)
             if label in ("Home", "End"):
@@ -369,13 +373,13 @@ def test_mobile_terminal_keys_byte_delivery_app_cursor_and_gestures(
         # Swipe right > 36px flips back to Page 0 without firing a key.
         before_swipe_lines = len(_lines(normal_log))
         _swipe_pager(pager, 80)
-        expect(bar).to_have_attribute("data-page", "0")
+        expect(bar).to_have_attribute("data-bottom-page", "0")
         page.wait_for_timeout(120)  # custom-lint: disable=sleep-then-assert -- quiet window
         assert len(_lines(normal_log)) == before_swipe_lines, "Pager swipe must not emit key bytes"
 
         # Sticky modifiers act on actual keyboard input and notify the rendered row.
-        ctrl = bar.get_by_role("button", name="Ctrl", exact=True)
-        _tap_soft_key(ctrl)
+        ctrl = bar.locator('button[data-key-id="ctrl"]')
+        _press_soft_key(ctrl)
         expect(ctrl).to_have_attribute("data-sticky-state", "once")
         textarea.focus()
         count = len(_lines(normal_log))
@@ -383,19 +387,18 @@ def test_mobile_terminal_keys_byte_delivery_app_cursor_and_gestures(
         assert _read_back(page, normal_log, count) == "12"
         expect(ctrl).to_have_attribute("data-sticky-state", "off")
 
-        _tap_soft_key(ctrl)
-        _tap_soft_key(ctrl)
+        _press_soft_key(ctrl, lock=True)
         expect(ctrl).to_have_attribute("data-sticky-state", "locked")
         for letter, expected_hex in [("c", "03"), ("d", "04")]:
             count = len(_lines(normal_log))
             page.keyboard.type(letter)
             assert _read_back(page, normal_log, count) == expected_hex
         expect(ctrl).to_have_attribute("data-sticky-state", "locked")
-        _tap_soft_key(ctrl)
+        _press_soft_key(ctrl)
         expect(ctrl).to_have_attribute("data-sticky-state", "off")
 
         # DEL and ESC-containing keyboard sequences preserve a one-shot; Chinese commits clear it.
-        _tap_soft_key(ctrl)
+        _press_soft_key(ctrl)
         count = len(_lines(normal_log))
         page.keyboard.press("Backspace")
         assert _read_back(page, normal_log, count) == "7f"
@@ -405,27 +408,26 @@ def test_mobile_terminal_keys_byte_delivery_app_cursor_and_gestures(
         assert _read_back(page, normal_log, count) == "e4b8ade69687"
         expect(ctrl).to_have_attribute("data-sticky-state", "off")
 
-        _tap_soft_key(ctrl)
+        _press_soft_key(ctrl)
         count = len(_lines(normal_log))
-        _tap_soft_key(bar.get_by_role("button", name="←", exact=True))
+        _press_soft_key(bar.get_by_role("button", name="←", exact=True))
         assert _read_back(page, normal_log, count) == "1b5b313b3544"
         expect(ctrl).to_have_attribute("data-sticky-state", "off")
 
         _swipe_pager(pager, -80)
-        alt = bar.get_by_role("button", name="Alt", exact=True)
-        _tap_soft_key(alt)
+        alt = bar.locator('button[data-key-id="alt"]')
+        _press_soft_key(alt)
         count = len(_lines(normal_log))
         page.keyboard.type("p")
         assert _read_back(page, normal_log, count) == "1b70"
         expect(alt).to_have_attribute("data-sticky-state", "off")
-        _tap_soft_key(alt)
-        _tap_soft_key(alt)
+        _press_soft_key(alt, lock=True)
         for letter, expected_hex in [("x", "1b78"), ("y", "1b79")]:
             count = len(_lines(normal_log))
             page.keyboard.type(letter)
             assert _read_back(page, normal_log, count) == expected_hex
         expect(alt).to_have_attribute("data-sticky-state", "locked")
-        _tap_soft_key(alt)
+        _press_soft_key(alt)
         expect(alt).to_have_attribute("data-sticky-state", "off")
         _swipe_pager(pager, 80)
 
@@ -535,12 +537,12 @@ def test_mobile_terminal_keys_byte_delivery_app_cursor_and_gestures(
             textarea.evaluate("el => el.blur()")
 
             c1 = len(_lines(app_log))
-            _tap_soft_key(bar.get_by_role("button", name=label, exact=True))
+            _press_soft_key(bar.get_by_role("button", name=label, exact=True))
             by_soft = _read_back(page, app_log, c1)
             _assert_key_bytes("App mode", label, by_soft, by_phys, expected_app)
 
         _swipe_pager(pager, -80)
-        expect(bar).to_have_attribute("data-page", "1")
+        expect(bar).to_have_attribute("data-bottom-page", "1")
         for label, physical, _, expected_app in _PAGE_1_KEYS:
             textarea.focus()
             c0 = len(_lines(app_log))
@@ -549,12 +551,12 @@ def test_mobile_terminal_keys_byte_delivery_app_cursor_and_gestures(
             textarea.evaluate("el => el.blur()")
 
             c1 = len(_lines(app_log))
-            _tap_soft_key(bar.get_by_role("button", name=label, exact=True))
+            _press_soft_key(bar.get_by_role("button", name=label, exact=True))
             by_soft = _read_back(page, app_log, c1)
             _assert_key_bytes("App mode", label, by_soft, by_phys, expected_app)
 
         _swipe_pager(pager, 80)
-        expect(bar).to_have_attribute("data-page", "0")
+        expect(bar).to_have_attribute("data-bottom-page", "0")
         _stop_echo(page, textarea)
         textarea.focus()
         page.keyboard.type("exit\n")
@@ -586,20 +588,20 @@ def test_mobile_terminal_keys_byte_delivery_app_cursor_and_gestures(
 
         textarea.evaluate("el => el.blur()")
         _swipe_pager(pager, -80)
-        expect(bar).to_have_attribute("data-page", "1")
-        _tap_soft_key(bar.get_by_role("button", name="PgDn", exact=True))
+        expect(bar).to_have_attribute("data-bottom-page", "1")
+        _press_soft_key(bar.get_by_role("button", name="PgDn", exact=True))
         deadline = time.monotonic() + 8.0
         while "LINE_040" not in capture_pty() and time.monotonic() < deadline:
             page.wait_for_timeout(50)
         assert "LINE_040" in capture_pty(), "PgDn did not advance less page"
 
-        _tap_soft_key(bar.get_by_role("button", name="PgUp", exact=True))
+        _press_soft_key(bar.get_by_role("button", name="PgUp", exact=True))
         deadline = time.monotonic() + 8.0
         while "LINE_001" not in capture_pty() and time.monotonic() < deadline:
             page.wait_for_timeout(50)
         assert "LINE_001" in capture_pty(), "PgUp did not return less to top"
         _swipe_pager(pager, 80)
-        expect(bar).to_have_attribute("data-page", "0")
+        expect(bar).to_have_attribute("data-bottom-page", "0")
         textarea.focus()
         page.keyboard.type("q")
         page.wait_for_timeout(200)
@@ -611,9 +613,9 @@ def test_mobile_terminal_keys_byte_delivery_app_cursor_and_gestures(
         page.keyboard.type("ihello")
         page.wait_for_timeout(150)
         textarea.evaluate("el => el.blur()")
-        _tap_soft_key(bar.get_by_role("button", name="Esc", exact=True))
+        _press_soft_key(bar.get_by_role("button", name="Esc", exact=True))
         page.wait_for_timeout(150)
-        _tap_soft_key(bar.get_by_role("button", name="←", exact=True))
+        _press_soft_key(bar.get_by_role("button", name="←", exact=True))
         page.wait_for_timeout(100)
         textarea.focus()
         page.keyboard.type("x:wq\n")

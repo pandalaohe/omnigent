@@ -1,3 +1,5 @@
+import { canonicalTerminalFields } from "@/lib/terminalKeyBar";
+
 export type UserPreferenceNamespace =
   | "keyboard_shortcuts"
   | "mobile_assistant"
@@ -264,12 +266,15 @@ function mobileSyncValue(value: unknown): unknown | null {
     terminalButtons?: unknown;
     terminalKeysEnabled?: unknown;
     terminalSecondRow?: unknown;
+    terminalBar?: unknown;
+    terminalBarPreset?: unknown;
+    terminalLegacyBasis?: unknown;
     chatActionsRevision?: unknown;
   };
   if (raw.version !== 2 || typeof raw.enabled !== "boolean" || !Array.isArray(raw.buttons)) {
     return null;
   }
-  return {
+  return canonicalTerminalFields({
     version: 2,
     enabled: raw.enabled,
     buttons: raw.buttons,
@@ -280,8 +285,13 @@ function mobileSyncValue(value: unknown): unknown | null {
     ...(typeof raw.terminalSecondRow === "boolean"
       ? { terminalSecondRow: raw.terminalSecondRow }
       : {}),
+    ...(raw.terminalBar !== undefined ? { terminalBar: raw.terminalBar } : {}),
+    ...(raw.terminalBarPreset !== undefined ? { terminalBarPreset: raw.terminalBarPreset } : {}),
+    ...(typeof raw.terminalLegacyBasis === "string"
+      ? { terminalLegacyBasis: raw.terminalLegacyBasis }
+      : {}),
     ...(raw.chatActionsRevision === 1 ? { chatActionsRevision: 1 } : {}),
-  };
+  });
 }
 
 function sessionCollabSyncValue(value: unknown): unknown {
@@ -577,10 +587,10 @@ export async function initializeUserPreferencesSync(
   hydrateServerEnvelope(serverValue);
 }
 
-function announceRejectedNamespace(namespace: UserPreferenceNamespace): void {
+function announceRejectedNamespace(namespace: UserPreferenceNamespace, detail?: unknown): void {
   window.dispatchEvent(
     new CustomEvent(USER_PREFERENCES_PATCH_REJECTED_EVENT, {
-      detail: { namespace, status: 422 },
+      detail: { namespace, status: 422, ...(typeof detail === "string" ? { detail } : {}) },
     }),
   );
 }
@@ -590,7 +600,7 @@ function announceRejectedNamespace(namespace: UserPreferenceNamespace): void {
  * mark, restore the last Server value (absent → remove the local key) exactly
  * as hydration does, and announce the rejection. No retry is scheduled.
  */
-function discardRejectedNamespace(namespace: UserPreferenceNamespace): void {
+function discardRejectedNamespace(namespace: UserPreferenceNamespace, detail?: unknown): void {
   const queuedTimer = pendingTimers.get(namespace);
   if (queuedTimer !== undefined) {
     window.clearTimeout(queuedTimer);
@@ -606,7 +616,7 @@ function discardRejectedNamespace(namespace: UserPreferenceNamespace): void {
   } finally {
     applyingServerPreferences = false;
   }
-  announceRejectedNamespace(namespace);
+  announceRejectedNamespace(namespace, detail);
 }
 
 function schedulePatch(
@@ -669,9 +679,9 @@ function schedulePatch(
                 delayMs: 0,
                 attempt: 0,
               });
-              announceRejectedNamespace(namespace);
+              announceRejectedNamespace(namespace, body?.detail);
             } else {
-              discardRejectedNamespace(namespace);
+              discardRejectedNamespace(namespace, body?.detail);
             }
             return;
           }

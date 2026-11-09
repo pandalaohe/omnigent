@@ -1,5 +1,6 @@
 """Touch-viewport quick buttons drive the composer and real xterm input bridge."""
 
+import json
 import re
 import time
 
@@ -153,6 +154,193 @@ def test_sticky_ctrl_arrow_reaches_cli_bridge(
     while len(inputs) < 2 and time.monotonic() < deadline:
         page.wait_for_timeout(10)
     assert inputs == [b"\x1b[1;5A", b"\x1b[B"]
+
+
+def _install_arranged_bar(page: Page) -> None:
+    """Store a new-client layout with its old-client compatibility projection."""
+    old = page.evaluate(
+        "JSON.parse(localStorage.getItem('omnigent:mobile-assistant-preferences'))"
+    )
+    legacy = old["terminalButtons"]
+    serialized = json.dumps(
+        {"terminalButtons": legacy, "terminalSecondRow": True},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    fingerprint = 0x811C9DC5
+    for character in serialized:
+        fingerprint = ((fingerprint ^ ord(character)) * 0x01000193) & 0xFFFFFFFF
+    keys = [
+        {
+            **item,
+            "width": 2,
+            "display": "text",
+            **({"repeat": True} if item["id"] == "ArrowUp" else {}),
+        }
+        for item in legacy
+    ]
+    old.update(
+        terminalBar={
+            "top": {
+                "keys": [
+                    {
+                        "id": "shift-key",
+                        "label": "Shift",
+                        "width": 1,
+                        "display": "text",
+                        "kind": "modifier",
+                        "modifier": "shift",
+                    },
+                    *keys[:6],
+                    {
+                        "id": "phrase-key",
+                        "label": "Greeting",
+                        "width": 2,
+                        "display": "text",
+                        "kind": "text",
+                        "text": "hello",
+                        "submit": True,
+                    },
+                    {
+                        "id": "keyboard",
+                        "label": "Keyboard",
+                        "width": 2,
+                        "display": "icon",
+                        "icon": "keyboard",
+                        "kind": "action",
+                        "action": "keyboard",
+                    },
+                ],
+                "pinned": 2,
+                "enabled": True,
+            },
+            "bottom": {
+                "keys": [
+                    *keys[6:],
+                    *[
+                        {
+                            "id": f"extra-{index}",
+                            "label": f"F{index + 1}",
+                            "width": 2,
+                            "display": "text",
+                            "kind": "key",
+                            "chord": {"code": f"F{index + 1}", "modifiers": []},
+                        }
+                        for index in range(5)
+                    ],
+                ],
+                "pinned": 1,
+                "enabled": True,
+            },
+        },
+        terminalSecondRow=True,
+        terminalLegacyBasis=f"fnv1a:{fingerprint:08x}",
+    )
+    page.evaluate(
+        "value => {localStorage.setItem('omnigent:mobile-assistant-preferences',"
+        " JSON.stringify(value));"
+        " window.dispatchEvent(new Event('omnigent:mobile-assistant-changed'));}",
+        old,
+    )
+
+
+def test_arranged_rows_page_independently_and_preserve_pins(
+    page: Page, cli_bridge: tuple[Locator, list[bytes]]
+) -> None:
+    textarea, inputs = cli_bridge
+    page.set_viewport_size({"width": 390, "height": 844})
+    _install_arranged_bar(page)
+    toolbar = page.get_by_role("toolbar", name="Terminal keys")
+    top = toolbar.get_by_role("button", name=re.compile(r"Top row: next page"))
+    bottom = toolbar.get_by_role("button", name=re.compile(r"Bottom row: next page"))
+    expect(top).to_be_visible()
+    expect(bottom).to_be_visible()
+    expect(toolbar.locator('[data-key-id="Escape"]')).to_be_visible()
+    expect(toolbar.locator('[data-key-id="Enter"]')).to_be_visible()
+    boxes = [button.bounding_box() for button in (top, bottom)]
+    assert all(box and box["height"] >= 24 and box["width"] >= 56 for box in boxes)
+    assert boxes[0]["x"] < boxes[1]["x"]
+    for key in toolbar.locator("button[data-key-id]").all():
+        box = key.bounding_box()
+        assert box is not None
+        assert box["y"] + box["height"] <= boxes[0]["y"]
+    bottom_name = bottom.get_attribute("aria-label")
+    top.focus()
+    top.press("Enter")
+    expect(top).to_have_attribute("aria-label", re.compile(r"2 of 2"))
+    expect(bottom).to_have_attribute("aria-label", bottom_name)
+    expect(toolbar.locator('[data-key-id="Escape"]')).to_be_visible()
+    toolbar.get_by_role("button", name="Greeting", exact=True).tap()
+    expect(page.locator('[data-testid="terminal-view"]:visible')).to_be_visible()
+    deadline = time.monotonic() + 3
+    while not inputs and time.monotonic() < deadline:
+        page.wait_for_timeout(10)
+    assert inputs == [b"hello\r"]
+    toolbar.get_by_role("button", name="Keyboard", exact=True).tap()
+    expect(textarea).to_be_focused()
+    bottom.focus()
+    bottom.press("Space")
+    expect(bottom).to_have_attribute("aria-label", re.compile(r"2 of 2"))
+    expect(toolbar.locator('[data-key-id="Enter"]')).to_be_visible()
+
+
+def test_shift_bar_key_modifies_the_real_terminal_input(
+    page: Page, cli_bridge: tuple[Locator, list[bytes]]
+) -> None:
+    textarea, inputs = cli_bridge
+    page.set_viewport_size({"width": 390, "height": 844})
+    _install_arranged_bar(page)
+    toolbar = page.get_by_role("toolbar", name="Terminal keys")
+    toolbar.locator('[data-key-id="shift-key"]').tap()
+    toolbar.get_by_role("button", name="Up", exact=True).tap()
+    textarea.focus()
+    textarea.press("a")
+    deadline = time.monotonic() + 3
+    while len(inputs) < 2 and time.monotonic() < deadline:
+        page.wait_for_timeout(10)
+    assert inputs == [b"\x1b[1;2A", b"a"]
+
+
+def test_wheel_shares_text_modifiers_long_press_and_repeat(
+    page: Page, cli_bridge: tuple[Locator, list[bytes]]
+) -> None:
+    _, inputs = cli_bridge
+    _install_arranged_bar(page)
+    page.get_by_role("button", name="Open floating assistant", exact=True).tap()
+    shift = page.get_by_role("button", name="Shift", exact=True)
+    shift.tap()
+    page.get_by_role("button", name="Greeting", exact=True).tap()
+    expect(shift).to_have_attribute("data-sticky-state", "once")
+    up = page.get_by_role("button", name="Up", exact=True)
+    up.tap()
+    expect(shift).to_have_attribute("data-sticky-state", "off")
+    deadline = time.monotonic() + 3
+    while len(inputs) < 2 and time.monotonic() < deadline:
+        page.wait_for_timeout(10)
+    assert inputs == [b"hello\r", b"\x1b[1;2A"]
+
+    box = shift.bounding_box()
+    assert box is not None
+    page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+    page.mouse.down()
+    expect(shift).to_have_attribute("data-sticky-state", "locked")
+    page.mouse.up()
+    expect(shift).to_have_attribute("data-sticky-state", "locked")
+    up.tap()
+    expect(shift).to_have_attribute("data-sticky-state", "locked")
+    shift.tap()
+    box = up.bounding_box()
+    assert box is not None
+    page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+    page.mouse.down()
+    deadline = time.monotonic() + 3
+    while len(inputs) < 5 and time.monotonic() < deadline:
+        page.wait_for_timeout(10)
+    page.mouse.up()
+    assert inputs[2] == b"\x1b[1;2A"
+    assert len(inputs) >= 5
+    assert all(payload == b"\x1b[A" for payload in inputs[3:])
 
 
 def test_switching_to_chat_does_not_type_into_the_hidden_terminal(

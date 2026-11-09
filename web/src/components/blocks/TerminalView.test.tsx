@@ -18,7 +18,8 @@ import { toast } from "sonner";
 import {
   dispatchMobileAssistantAction,
   dispatchMobileAssistantButton,
-  dispatchTerminalAssistantItem,
+  dispatchTerminalBarKey,
+  bindTerminalBarTarget,
   readMobileAssistantPreferences,
   writeMobileAssistantPreferences,
   type TerminalStickyModifiers,
@@ -106,7 +107,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
     setTheme = vi.fn();
     setClipboardEnabled = vi.fn();
     sendSoftKey = vi.fn();
-    stickyModifiers: TerminalStickyModifiers = { ctrl: "off", alt: "off" };
+    stickyModifiers: TerminalStickyModifiers = { ctrl: "off", alt: "off", shift: "off" };
     setStickyModifiers = vi.fn((next: TerminalStickyModifiers) => {
       this.stickyModifiers = next;
     });
@@ -1880,25 +1881,27 @@ describe("TerminalView phone key rows", () => {
 
     // Swipe pager to page 1 and verify transient error + transport close (1006)
     // keep the exact same DOM node disabled in place without resetting page.
-    const pager = screen.getByTestId("terminal-key-row-pager");
+    const pager = screen
+      .getByTestId("terminal-key-row-pager")
+      .querySelector("[data-pager]") as HTMLElement;
     fireEvent.pointerDown(pager, { button: 0, pointerId: 1, clientX: 200, clientY: 70 });
     fireEvent.pointerMove(pager, { pointerId: 1, clientX: 120, clientY: 70 });
     fireEvent.pointerUp(pager, { pointerId: 1, clientX: 120, clientY: 70 });
-    expect(keyRow).toHaveAttribute("data-page", "1");
+    expect(keyRow).toHaveAttribute("data-bottom-page", "1");
 
     act(() => {
       terminalSessionMock.instances[0].onState({ kind: "error" });
     });
     expect(screen.getByTestId("terminal-key-row")).toBe(keyRow);
     expect(keyRow).toHaveAttribute("aria-disabled", "true");
-    expect(keyRow).toHaveAttribute("data-page", "1");
+    expect(keyRow).toHaveAttribute("data-bottom-page", "1");
 
     act(() => {
       terminalSessionMock.instances[0].onState({ kind: "closed", code: 1006, reason: "transport" });
     });
     expect(screen.getByTestId("terminal-key-row")).toBe(keyRow);
     expect(keyRow).toHaveAttribute("aria-disabled", "true");
-    expect(keyRow).toHaveAttribute("data-page", "1");
+    expect(keyRow).toHaveAttribute("data-bottom-page", "1");
 
     // Deliberate close (1000) hides the key row
     act(() => {
@@ -1923,7 +1926,7 @@ describe("TerminalView phone key rows", () => {
     await act(async () => {});
     expect(screen.queryByTestId("terminal-key-row")).toBeNull();
 
-    // Portrait room floor: height 180 < 99 + 108 (207) -> hidden
+    // Portrait room floor: height 180 < 119 + 108 (227) -> hidden
     rectSpy.mockRestore();
     const tightSpy = stubRootRect(390, 180);
     rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
@@ -1933,10 +1936,10 @@ describe("TerminalView phone key rows", () => {
     });
     expect(screen.queryByTestId("terminal-key-row")).toBeNull();
 
-    // Landscape 1-row bar: width 667 >= 560, height 170 >= 55 + 108 (163) -> visible
+    // Landscape 1-row bar with the page strip: width 667 >= 560, height 190 >= 73 + 108 (181) -> visible
     tightSpy.mockRestore();
     stubPhoneViewport(667, 375);
-    stubRootRect(667, 170);
+    stubRootRect(667, 190);
     act(() => {
       window.dispatchEvent(new Event("resize"));
     });
@@ -1957,7 +1960,7 @@ describe("TerminalView phone key rows", () => {
       window.dispatchEvent(new Event("resize"));
     });
 
-    // 590.8 - 47 - 47 = 496.8px: two rows need 99 + 108px, not 55 + 108px.
+    // 590.8 - 47 - 47 = 496.8px: two rows need 119 + 108px, not 73 + 108px.
     expect(screen.queryByTestId("terminal-key-row")).toBeNull();
   });
 
@@ -1973,7 +1976,7 @@ describe("TerminalView phone key rows", () => {
     };
     writeMobileAssistantPreferences({
       ...initial,
-      terminalButtons: [customKey, ...initial.terminalButtons],
+      terminalButtons: [customKey, ...initial.terminalButtons!],
     });
     render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
     await act(async () => {});
@@ -1997,15 +2000,17 @@ describe("TerminalView phone key rows", () => {
     expect(screen.queryByTestId("terminal-key-row")).toBeNull();
     const session = terminalSessionMock.instances[0];
     act(() => {
-      dispatchTerminalAssistantItem({
+      dispatchTerminalBarKey({
         id: "ctrl",
         label: "Ctrl",
         kind: "modifier",
         modifier: "ctrl",
+        display: "text",
+        width: 2,
       });
-      dispatchTerminalAssistantItem(customKey);
+      dispatchTerminalBarKey({ ...customKey, display: "text", width: 2 });
     });
-    expect(session.getStickyModifiers()).toEqual({ ctrl: "once", alt: "off" });
+    expect(session.getStickyModifiers()).toEqual({ ctrl: "once", alt: "off", shift: "off" });
     expect(session.sendSoftKey).toHaveBeenLastCalledWith("enter", "r", {
       focus: false,
       chord: customKey.chord,
@@ -2016,9 +2021,11 @@ describe("TerminalView phone key rows", () => {
       label: "Keyboard",
       kind: "action" as const,
       action: "keyboard" as const,
+      display: "text" as const,
+      width: 2 as const,
     };
     // A stale focused textarea must be blurred and refocused within the tap gesture.
-    act(() => dispatchTerminalAssistantItem(keyboard));
+    act(() => dispatchTerminalBarKey(keyboard));
     expect(session.blur).toHaveBeenCalledOnce();
     expect(session.focus).toHaveBeenCalledOnce();
     session.blur.mockClear();
@@ -2029,7 +2036,7 @@ describe("TerminalView phone key rows", () => {
       addEventListener: vi.fn(),
       removeEventListener: vi.fn(),
     });
-    act(() => dispatchTerminalAssistantItem(keyboard));
+    act(() => dispatchTerminalBarKey(keyboard));
     expect(session.blur).toHaveBeenCalledOnce();
     expect(session.focus).not.toHaveBeenCalled();
     act(() =>
@@ -2040,5 +2047,33 @@ describe("TerminalView phone key rows", () => {
     );
     expect(screen.getByTestId("terminal-key-row")).toBeInTheDocument();
     expect(screen.queryByTestId("terminal-key-row-pager")).toBeNull();
+  });
+  it("invalidates a bound held-gesture target across a disconnect and reconnect", async () => {
+    stubPhoneViewport(390, 844);
+    stubRootRect(390, 788);
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await act(async () => {});
+    const session = terminalSessionMock.instances[0];
+    act(() => session.onState({ kind: "connected" }));
+    const target = bindTerminalBarTarget();
+    expect(target?.isCurrent()).toBe(true);
+    const key = {
+      id: "up",
+      label: "Up",
+      kind: "key" as const,
+      chord: { code: "ArrowUp", modifiers: [] },
+      width: 2 as const,
+      display: "text" as const,
+    };
+    act(() => session.onState({ kind: "connecting" }));
+    expect(target?.isCurrent()).toBe(false);
+    act(() => session.onState({ kind: "connected" }));
+    expect(target?.isCurrent()).toBe(false);
+    target?.press(key, "repeat");
+    expect(session.sendSoftKey).not.toHaveBeenCalled();
+    const fresh = bindTerminalBarTarget();
+    expect(fresh?.isCurrent()).toBe(true);
+    fresh?.press(key, "tap");
+    expect(session.sendSoftKey).toHaveBeenCalledOnce();
   });
 });

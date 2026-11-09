@@ -712,7 +712,7 @@ export class TerminalSession {
   /** Fractional wheel lines carried across events (see {@link wheelReportPayload}). */
   private wheelPartialLines = 0;
   private readonly imeInput: TerminalImeInput;
-  private stickyModifiers: StickyModifiers = { ctrl: "off", alt: "off" };
+  private stickyModifiers: StickyModifiers = { ctrl: "off", alt: "off", shift: "off" };
   private readonly stickyListeners = new Set<(next: StickyModifiers) => void>();
   private sendingSoftKey = false;
   private imeAnchor: Detached | null = null;
@@ -1053,6 +1053,7 @@ export class TerminalSession {
       const modifiers = [...options.chord.modifiers];
       if (this.stickyModifiers.ctrl !== "off") modifiers.push("control");
       if (this.stickyModifiers.alt !== "off") modifiers.push("alt");
+      if (this.stickyModifiers.shift !== "off") modifiers.push("shift");
       const encoded = terminalDataForChord(
         { ...options.chord, modifiers },
         this.term.modes.applicationCursorKeysMode,
@@ -1095,18 +1096,19 @@ export class TerminalSession {
   }
 
   private consumeStickyModifiers(): void {
-    const { ctrl, alt } = this.stickyModifiers;
-    if (ctrl !== "once" && alt !== "once") return;
+    const { ctrl, alt, shift } = this.stickyModifiers;
+    if (ctrl !== "once" && alt !== "once" && shift !== "once") return;
     this.setStickyModifiers({
       ctrl: ctrl === "once" ? "off" : ctrl,
       alt: alt === "once" ? "off" : alt,
+      shift: shift === "once" ? "off" : shift,
     });
   }
 
   private applyStickyModifiers(data: string): string {
-    const { ctrl, alt } = this.stickyModifiers;
+    const { ctrl, alt, shift } = this.stickyModifiers;
     if (
-      (ctrl === "off" && alt === "off") ||
+      (ctrl === "off" && alt === "off" && shift === "off") ||
       this.imeInput.isComposing ||
       data.includes("\x1b") ||
       data.includes("\x7f")
@@ -1121,6 +1123,7 @@ export class TerminalSession {
         else if (data === "?") result = "\x7f";
         else if (data === "/") result = "\x1f";
       }
+      if (shift !== "off" && /^[a-z]$/.test(result)) result = result.toUpperCase();
       if (alt !== "off") result = `\x1b${result}`;
     }
     this.consumeStickyModifiers();

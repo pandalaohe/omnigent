@@ -18,6 +18,7 @@ import {
   readMobileAssistantPreferences,
   registerTypableTerminal,
   writeMobileAssistantPreferences,
+  type TerminalBarTarget,
   type TerminalSoftKeyEventDetail,
 } from "@/lib/mobileAssistantPreferences";
 import {
@@ -320,6 +321,58 @@ describe("MobileFloatingAssistant", () => {
     vi.advanceTimersByTime(320);
     expect(listener).toHaveBeenCalledTimes(stoppedAt);
     window.removeEventListener("omnigent:terminal-soft-key", listener);
+  });
+
+  it("binds a held terminal key once and cancels when that session is no longer current", () => {
+    vi.useFakeTimers();
+    const key = {
+      id: "up",
+      label: "Up",
+      kind: "key" as const,
+      chord: { code: "ArrowUp", modifiers: [] },
+      width: 2 as const,
+      display: "text" as const,
+      repeat: true,
+    };
+    writeMobileAssistantPreferences({
+      version: 2,
+      enabled: true,
+      buttons: [],
+      terminalBar: {
+        top: { keys: [key], pinned: 0, enabled: true },
+        bottom: { keys: [], pinned: 0, enabled: false },
+      },
+    });
+    const unregister = registerTypableTerminal(false);
+    let live = true;
+    const original: TerminalBarTarget = { isCurrent: () => live, press: vi.fn() };
+    const replacement: TerminalBarTarget = { isCurrent: () => true, press: vi.fn() };
+    let current = original;
+    const listener = vi.fn((event: Event) => {
+      const detail = (event as CustomEvent<TerminalSoftKeyEventDetail>).detail;
+      detail.onTerminalTarget?.(current);
+      detail.handled = true;
+    });
+    window.addEventListener(TERMINAL_SOFT_KEY_EVENT, listener);
+    const { unmount } = render(<MobileFloatingAssistant />);
+    fireEvent.click(screen.getByRole("button", { name: "Open floating assistant" }));
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Up" }), {
+      pointerId: 3,
+      button: 0,
+      clientX: 20,
+      clientY: 20,
+    });
+    act(() => vi.advanceTimersByTime(400));
+    expect(original.press).toHaveBeenCalledOnce();
+    live = false;
+    current = replacement;
+    act(() => vi.advanceTimersByTime(800));
+    expect(original.press).toHaveBeenCalledOnce();
+    expect(replacement.press).not.toHaveBeenCalled();
+    expect(listener).toHaveBeenCalledOnce();
+    unmount();
+    unregister();
+    window.removeEventListener(TERMINAL_SOFT_KEY_EVENT, listener);
   });
 
   it("dispatches a soft key to the control focused before the palette click", () => {

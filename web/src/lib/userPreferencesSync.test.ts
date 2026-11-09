@@ -22,11 +22,132 @@ import {
   writeKeepWarmPreferences,
 } from "./keepWarmPreferences";
 import { readAlwaysUseWorktree, writeAlwaysUseWorktree } from "./worktreeDefaultPreferences";
+import { defaultTerminalBar, legacyFingerprint, projectLegacy } from "./terminalKeyBar";
+import {
+  readMobileAssistantPreferences,
+  writeMobileAssistantPreferences,
+} from "./mobileAssistantPreferences";
 
 beforeEach(() => {
   localStorage.clear();
   resetUserPreferencesSyncForTests();
   vi.useRealTimers();
+});
+
+describe("terminal bar preference synchronization", () => {
+  function mobileValue() {
+    const terminalBar = defaultTerminalBar();
+    const terminalButtons = projectLegacy(terminalBar);
+    return {
+      version: 2 as const,
+      enabled: true,
+      buttons: [],
+      chatActionsRevision: 1 as const,
+      terminalBar,
+      terminalBarPreset: structuredClone(terminalBar),
+      terminalButtons,
+      terminalSecondRow: true,
+      terminalLegacyBasis: legacyFingerprint(terminalButtons, true),
+    };
+  }
+
+  it("hydrates the layout and preset without a write-back, then syncs a width-only edit", async () => {
+    vi.useFakeTimers();
+    const value = mobileValue();
+    const fetcher = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    await initializeUserPreferencesSync(
+      { version: 1, settings: { mobile_assistant: value } },
+      fetcher,
+      "alice",
+    );
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(fetcher).not.toHaveBeenCalled();
+    const preferences = readMobileAssistantPreferences();
+    expect(preferences.terminalBar).toEqual(value.terminalBar);
+    expect(preferences.terminalBarPreset).toEqual(value.terminalBarPreset);
+    preferences.terminalBar!.top.keys[0].width = 1;
+    writeMobileAssistantPreferences(preferences);
+    await vi.advanceTimersByTimeAsync(251);
+    expect(fetcher).toHaveBeenCalledOnce();
+    const sent = JSON.parse(fetcher.mock.calls[0][1].body).value;
+    expect(sent.terminalBar.top.keys[0].width).toBe(1);
+    expect(sent.terminalBarPreset).toEqual(value.terminalBarPreset);
+  });
+
+  it("retains an offline layout and sends its newer edit after a stale ACK", async () => {
+    vi.useFakeTimers();
+    const value = mobileValue();
+    let acknowledge!: (response: Response) => void;
+    const fetcher = vi
+      .fn()
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          acknowledge = resolve;
+        }),
+      )
+      .mockResolvedValue(new Response(null, { status: 200 }));
+    await initializeUserPreferencesSync(
+      { version: 1, settings: { mobile_assistant: value } },
+      vi.fn().mockRejectedValue(new TypeError("offline")),
+      "alice",
+    );
+    const offline = readMobileAssistantPreferences();
+    offline.terminalBar!.top.keys[0].width = 1;
+    writeMobileAssistantPreferences(offline);
+    expect(readMobileAssistantPreferences().terminalBar!.top.keys[0].width).toBe(1);
+    await vi.advanceTimersByTimeAsync(251);
+    deactivateUserPreferencesSync();
+    await initializeUserPreferencesSync(
+      { version: 1, settings: { mobile_assistant: value } },
+      fetcher,
+      "alice",
+    );
+    await vi.advanceTimersByTimeAsync(251);
+    expect(fetcher).toHaveBeenCalledOnce();
+    const edited = readMobileAssistantPreferences();
+    edited.terminalBar!.top.keys[1].width = 1;
+    writeMobileAssistantPreferences(edited);
+    await vi.advanceTimersByTimeAsync(251);
+    acknowledge(new Response(null, { status: 200 }));
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    const sent = JSON.parse(fetcher.mock.calls[1][1].body).value;
+    expect(
+      sent.terminalBar.top.keys.slice(0, 2).map((key: { width: number }) => key.width),
+    ).toEqual([1, 1]);
+    expect(readMobileAssistantPreferences().terminalBar).toEqual(sent.terminalBar);
+  });
+
+  it("sends a preset-only edit and restores the server layout with visible rejection detail", async () => {
+    vi.useFakeTimers();
+    const value = mobileValue();
+    const fetcher = vi
+      .fn()
+      .mockResolvedValue(
+        Response.json({ detail: "preferences exceed the 64 KiB limit" }, { status: 422 }),
+      );
+    await initializeUserPreferencesSync(
+      { version: 1, settings: { mobile_assistant: value } },
+      fetcher,
+      "alice",
+    );
+    const rejected = vi.fn();
+    window.addEventListener(USER_PREFERENCES_PATCH_REJECTED_EVENT, rejected);
+    const preferences = readMobileAssistantPreferences();
+    preferences.terminalBarPreset!.top.keys[0].width = 1;
+    writeMobileAssistantPreferences(preferences);
+    await vi.advanceTimersByTimeAsync(251);
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(
+      JSON.parse(fetcher.mock.calls[0][1].body).value.terminalBarPreset.top.keys[0].width,
+    ).toBe(1);
+    expect(readMobileAssistantPreferences().terminalBarPreset).toEqual(value.terminalBarPreset);
+    expect(rejected.mock.calls[0][0].detail).toMatchObject({
+      namespace: "mobile_assistant",
+      detail: "preferences exceed the 64 KiB limit",
+    });
+    window.removeEventListener(USER_PREFERENCES_PATCH_REJECTED_EVENT, rejected);
+  });
 });
 
 describe("acknowledged preference saves", () => {
