@@ -15,11 +15,12 @@ from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.session_choice import (
     ChoiceRevisionConflict,
     SessionChoice,
+    TileLimits,
     active_on,
     floor_off_active,
     parse_session_choice,
-    reserve_now,
     state_for,
+    tile_line,
 )
 from omnigent.server.user_preferences_store import (
     SqlAlchemyUserPreferencesStore,
@@ -127,10 +128,10 @@ def create_session_choice_router(
                 reading = readings.get(body.tile)
                 windows = (
                     {
-                        window.id: (window.resets_at, window.percent_used)
+                        window.id: (window.resets_at, 100 - window.remaining_pct)
                         for window in reading.windows
                         if window.resets_at is not None
-                        and window.percent_used is not None
+                        and window.remaining_pct is not None
                         and not window.past_reset
                     }
                     if reading and reading.freshness == "fresh"
@@ -262,21 +263,8 @@ def create_session_choice_router(
             None,
         )
         if reserve:
-            if (
-                window is None
-                or window.past_reset
-                or window.remaining_pct is None
-                or (
-                    reserve.mode == "daily"
-                    and (
-                        window.resets_at is None
-                        or window.resets_at <= now
-                        or (window.window_minutes or 0) < 1440
-                    )
-                )
-                or window.remaining_pct
-                > reserve_now(reserve.mode, reserve.pct, window.resets_at or now, now)
-            ):
+            line = tile_line(limits or TileLimits(), reading, floors.get(pool), now)
+            if line.state not in {"warn", "stop", "exhausted"}:
                 return {"notice": None}
         elif reading.state != "low":
             return {"notice": None}

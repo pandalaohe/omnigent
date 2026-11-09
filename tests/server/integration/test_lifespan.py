@@ -23,6 +23,36 @@ from tests.budgets import budget
 pytestmark = pytest.mark.asyncio
 
 
+@pytest.mark.parametrize("usage_enabled", [True, False])
+async def test_lifespan_persists_quota_updates_and_deletes_with_display_off(
+    app: FastAPI, usage_enabled: bool
+) -> None:
+    import time
+
+    from omnigent.server.auth import RESERVED_USER_LOCAL
+    from omnigent.usage.contract import UsageReport
+
+    service = app.state.agent_quota_service
+    service.usage_enabled = usage_enabled
+    report = UsageReport(observed_at=time.time(), windows=[])
+    service.report_account(RESERVED_USER_LOCAL, "removed", report)
+    service.flush(force=True)
+    assert "usage.account.removed" in service.snapshot_store.read(RESERVED_USER_LOCAL)
+
+    async with app.router.lifespan_context(app):
+        service.report_account(RESERVED_USER_LOCAL, "kept", report)
+        assert service.delete_account(RESERVED_USER_LOCAL, "removed")
+        flush_tasks = [
+            task for task in asyncio.all_tasks() if task.get_name() == "usage-snapshot-flush"
+        ]
+
+    stored = service.snapshot_store.read(RESERVED_USER_LOCAL)
+    assert "usage.account.kept" in stored
+    assert "usage.account.removed" not in stored
+    assert len(flush_tasks) == 1
+    assert flush_tasks[0].done()
+
+
 @pytest.mark.parametrize("ci", [True, False])
 async def test_lifespan_usage_telemetry_uses_server_ci_environment(
     app: FastAPI,

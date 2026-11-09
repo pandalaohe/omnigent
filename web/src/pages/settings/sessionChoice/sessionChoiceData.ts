@@ -25,7 +25,12 @@ export interface ChoiceWorkType {
   ifFull?: "queue" | "ask";
 }
 export interface ChoiceLimit {
-  reserve?: { mode: "daily" | "total"; window: string; pct: number } | null;
+  reserve?: {
+    mode: "daily" | "total";
+    window: string;
+    pct?: number | null;
+    stopPct?: number | null;
+  } | null;
   reserveExempt?: string[];
   maxRunning?: number | null;
 }
@@ -84,6 +89,26 @@ export function useChoiceMeters(hostId: string) {
     queryKey: ["sessionChoiceMeters", hostId],
     queryFn: () => choiceRequest<ChoiceMeters>(`/meters?host_id=${encodeURIComponent(hostId)}`),
     enabled: Boolean(hostId),
+    retry: false,
+    refetchInterval: 60_000,
+  });
+}
+
+export interface ChoiceLine {
+  state: "ok" | "warn" | "stop" | "exhausted" | "unknown";
+  warn_line_pct: number | null;
+  stop_line_pct: number | null;
+  released: boolean;
+  running?: string[];
+}
+export function useChoiceLines() {
+  return useQuery({
+    queryKey: ["sessionChoiceLines"],
+    queryFn: async () => {
+      const response = await authenticatedFetch("/v1/me/usage/lines?running=1");
+      if (!response.ok) throw new Error("Could not load quota lines.");
+      return (await response.json()) as { tiles: Record<string, ChoiceLine> };
+    },
     retry: false,
     refetchInterval: 60_000,
   });

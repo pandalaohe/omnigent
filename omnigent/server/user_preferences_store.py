@@ -1933,6 +1933,30 @@ class SqlAlchemyUserPreferencesStore:
                 return None
             return _assemble_envelope(settings)
 
+    def stop_line_owners(self) -> list[tuple[int, str, SessionChoice]]:
+        """Find persisted stop lines across workspaces, including after a restart."""
+        with self._session("find_quota_stop_owners") as session:
+            rows = session.execute(
+                select(
+                    SqlPreference.workspace_id,
+                    SqlPreference.user_id,
+                    type_coerce(SqlPreference.value, LargeBinary),
+                ).where(SqlPreference.key == _settings_key(SESSION_COLLAB_NAMESPACE))
+            ).all()
+        result = []
+        for workspace, owner, raw in rows:
+            try:
+                value = json.loads(decode(raw, max_decoded_bytes=USER_PREFERENCES_MAX_BYTES) or "")
+                settings = _parse_collab_settings(value).session_choice
+                if any(
+                    cap.reserve and cap.reserve.stop_pct is not None
+                    for cap in settings.limits.values()
+                ):
+                    result.append((workspace, owner, settings))
+            except (ValueError, zstandard.ZstdError):
+                continue
+        return result
+
     def namespace_values(self, namespace: str) -> list[tuple[str, Any]]:
         """Return ``(user_id, value)`` for every user storing *namespace* here.
 

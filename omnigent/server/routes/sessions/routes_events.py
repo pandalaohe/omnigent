@@ -2512,6 +2512,10 @@ def register_events_routes(
 
             await cancel_turn_recovery(conversation_store, session_id)
 
+        if body.type == "message" and body.data.get("role", "user") == "user":
+            from omnigent.server.session_choice_runtime import refuse_if_stopped
+
+            await asyncio.to_thread(refuse_if_stopped, request.app, conv)
         if not start_allowed(conv):
             if body.type == "message" and body.data.get("role") == "user":
                 try:
@@ -3345,6 +3349,9 @@ def register_events_routes(
             )
             return {"queued": False, "elicitation_id": elicit_id}
         if body.type == _COMPACT_TYPE:
+            from omnigent.server.session_choice_runtime import refuse_if_stopped
+
+            await asyncio.to_thread(refuse_if_stopped, request.app, conv)
             # G2 usage cutover gate: refuse compaction while the domain is held.
             from omnigent.server.routes.usage import _resolve_session_harness
             from omnigent.server.usage_cutover import refuse_if_held
@@ -6102,6 +6109,7 @@ def register_events_routes(
     if app_state is not None:
         app_state.standing_approval_post_event = post_standing_approval_notice
         app_state.host_restart_post_event = _post_event_impl
+        app_state.quota_stop_post_event = _post_event_impl
 
     # ── GET /sessions/{session_id}/stream ────────────────────────
 

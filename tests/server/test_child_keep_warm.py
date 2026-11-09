@@ -4394,3 +4394,58 @@ async def test_host_offline_archive_runs_only_every_tenth_tick(harness: _Harness
 
     await _tick(harness)
     assert _archived(harness, child.id) is True
+
+
+async def test_quota_stop_skips_ping_then_release_allows_it(harness, db_uri):
+    from omnigent.server.auth import RESERVED_USER_LOCAL
+    from omnigent.server.session_choice import FloorOff
+    from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
+    from tests.server.test_agent_quota import service_with_store, usage_report
+    from tests.server.test_session_choice import document
+
+    main = _main(
+        harness,
+        labels={KEEP_WARM_LABEL: _warm_label(t=harness.now - 3300)},
+        running_since=harness.now - 3300,
+    )
+    prefs = SqlAlchemyUserPreferencesStore(db_uri)
+    prefs.patch_namespace(RESERVED_USER_LOCAL, "keep_warm", harness.prefs.keep_warm)
+    value = document()
+    value["limits"] = {"a": {"reserve": {"mode": "total", "window": "weekly", "stopPct": 5}}}
+    prefs.replace_session_choice(
+        RESERVED_USER_LOCAL, value, prefs.session_choice(RESERVED_USER_LOCAL)["revision"]
+    )
+    quota = service_with_store(db_uri)
+    quota.report_account(
+        RESERVED_USER_LOCAL,
+        "a",
+        usage_report(
+            account_product="claude",
+            observed_at=harness.now,
+            windows=[
+                {
+                    "id": "weekly",
+                    "kind": "weekly",
+                    "percent_used": 96,
+                    "window_minutes": 10080,
+                    "resets_at": harness.now + 86400,
+                }
+            ],
+        ),
+        now=harness.now,
+    )
+    harness.sweeper._app = SimpleNamespace(
+        state=SimpleNamespace(
+            user_preferences_store=prefs,
+            agent_quota_service=quota,
+            conversation_store=harness.store,
+            permission_store=None,
+            agent_store=None,
+            agent_cache=None,
+        )
+    )
+    await _tick(harness)
+    assert harness.forward.pings() == []
+    prefs.set_choice_floor_off(RESERVED_USER_LOCAL, "a", FloorOff(until="manual"))
+    await _tick(harness)
+    assert [ping["session_id"] for ping in harness.forward.pings()] == [main.id]

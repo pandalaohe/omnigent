@@ -11,6 +11,7 @@ import {
   choiceRequest,
   EMPTY_CHOICE,
   useChoiceMeters,
+  useChoiceLines,
   useSessionChoiceDocument,
   type ChoiceEnvelope,
   type ChoiceLimit,
@@ -32,6 +33,7 @@ export function SessionChoiceSettings() {
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState<string | null>(null);
   const meters = useChoiceMeters(host);
+  const lines = useChoiceLines();
   useEffect(() => {
     if (document.data && !dirty.current) {
       setDraft(document.data.settings ?? structuredClone(EMPTY_CHOICE));
@@ -57,12 +59,26 @@ export function SessionChoiceSettings() {
       const result = await choiceRequest<ChoiceEnvelope>("", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ settings: draft, expected_revision: draftRevision.current }),
+        body: JSON.stringify({
+          settings: {
+            ...draft,
+            limits: Object.fromEntries(
+              Object.entries(draft.limits).map(([id, value]) => [
+                id,
+                value.reserve && value.reserve.pct == null && value.reserve.stopPct == null
+                  ? { ...value, reserve: null }
+                  : value,
+              ]),
+            ),
+          },
+          expected_revision: draftRevision.current,
+        }),
       });
       setDraft(result.settings ?? structuredClone(EMPTY_CHOICE));
       dirty.current = false;
       draftRevision.current = result.revision;
       await document.refetch();
+      await lines.refetch();
       setSaved(
         result.corrected?.length
           ? `Saved. ${result.corrected.length} edited rows marked Adjusted.`
@@ -91,8 +107,9 @@ export function SessionChoiceSettings() {
         body: JSON.stringify({ tile, off: mode !== "kept", keep: mode === "manual" }),
       });
       await meters.refetch();
+      await lines.refetch();
       await queryClient.invalidateQueries({ queryKey: ["sessionChoiceFloors"] });
-      setSaved("Saved reserve mode.");
+      setSaved("Saved quota release mode.");
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : "Could not change reserve mode.");
     }
@@ -182,7 +199,7 @@ export function SessionChoiceSettings() {
             <table className="w-full min-w-[640px] text-left text-sm">
               <thead>
                 <tr className="border-b border-border text-muted-foreground">
-                  {["Tile", "Reserve", "Keeps now", "Floor", "Max running", "Running"].map(
+                  {["Tile", "Quota rule", "Current lines", "Floor", "Max running", "Running"].map(
                     (name) => (
                       <th key={name} className="pb-2 pr-3 font-medium">
                         {name}
@@ -196,14 +213,23 @@ export function SessionChoiceSettings() {
                   const limits = draft.limits[tile.id] ?? {};
                   const reserve = limits.reserve;
                   const window = tile.windows.find((item) => item.id === reserve?.window);
-                  const keeps =
+                  const line = lines.data?.tiles[tile.id];
+                  const draftStop = reserve?.stopPct;
+                  const now = Date.now() / 1000;
+                  const projectedStop =
                     reserve &&
-                    window?.remaining_pct != null &&
-                    window.resets_at &&
-                    tile.freshness === "fresh"
-                      ? reserve.mode === "total"
-                        ? reserve.pct
-                        : (reserve.pct * Math.max(0, window.resets_at - Date.now() / 1000)) / 86400
+                    draftStop != null &&
+                    window &&
+                    !window.past_reset &&
+                    window.remaining_pct != null &&
+                    tile.freshness === "fresh" &&
+                    (window.resets_at == null || window.resets_at > now) &&
+                    (reserve.mode === "total" ||
+                      ((window.window_minutes ?? 0) >= 1440 && window.resets_at != null))
+                      ? draftStop *
+                        (reserve.mode === "daily"
+                          ? Math.ceil((window.resets_at! - now) / 86400)
+                          : 1)
                       : null;
                   const floorMode = meters.data.floors[tile.id];
                   const mode = floorMode?.active ? floorMode.until : "kept";
@@ -215,7 +241,8 @@ export function SessionChoiceSettings() {
                       reserve: {
                         mode: reserve?.mode ?? "total",
                         window: reserve?.window ?? tile.windows[0]?.id ?? "",
-                        pct: reserve?.pct ?? 0,
+                        pct: reserve?.pct ?? null,
+                        stopPct: reserve?.stopPct ?? null,
                         ...next,
                       },
                     });
@@ -223,7 +250,7 @@ export function SessionChoiceSettings() {
                     <tr key={tile.id} className="border-b border-border/60 align-top">
                       <td className="py-3 pr-3 font-medium">{tile.display_name}</td>
                       <td className="py-3 pr-3">
-                        <div className="flex items-center gap-1">
+                        <div className="flex flex-wrap items-center gap-2">
                           <select
                             aria-label={`${tile.display_name} reserve mode`}
                             className="h-8 rounded border border-input bg-background px-1"
@@ -243,7 +270,7 @@ export function SessionChoiceSettings() {
                                   })
                             }
                           >
-                            <option value="none">None</option>
+                            <option value="none">Use up</option>
                             <option value="total">Total</option>
                             <option
                               value="daily"
@@ -264,31 +291,57 @@ export function SessionChoiceSettings() {
                               >
                                 {!windows.some((item) => item.id === reserve.window) && (
                                   <option value={reserve.window}>
-                                    {reserve.window} (not reported)
+                                    Selected window (not reported)
                                   </option>
                                 )}
                                 {windows.map((item) => (
                                   <option key={item.id} value={item.id}>
-                                    {item.label ?? item.id}
+                                    {item.label ?? "Quota window"}
                                   </option>
                                 ))}
                               </select>
-                              <Input
-                                aria-label={`${tile.display_name} reserve percent`}
-                                className="h-8 w-16"
-                                type="number"
-                                min={0}
-                                max={100}
-                                step={1}
-                                value={reserve.pct}
-                                onChange={(event) =>
-                                  updateReserve({ pct: Number(event.target.value) })
-                                }
-                              />
-                              <span>%</span>
+                              {(
+                                [
+                                  ["Warn", "pct"],
+                                  ["Stop", "stopPct"],
+                                ] as const
+                              ).map(([label, key]) => (
+                                <label key={key} className="flex items-center gap-1 text-xs">
+                                  {label}
+                                  <Input
+                                    aria-label={`${tile.display_name} ${label.toLowerCase()} percent`}
+                                    className="h-8 w-16"
+                                    type="number"
+                                    min={0}
+                                    max={100}
+                                    step="any"
+                                    placeholder="Unset"
+                                    value={reserve[key] ?? ""}
+                                    onChange={(event) =>
+                                      updateReserve({
+                                        [key]:
+                                          event.target.value === ""
+                                            ? null
+                                            : Number(event.target.value),
+                                      })
+                                    }
+                                  />
+                                  %
+                                </label>
+                              ))}
                             </>
                           )}
                         </div>
+                        {projectedStop !== null &&
+                          window!.remaining_pct! <= projectedStop &&
+                          !meters.data.floors[tile.id]?.active &&
+                          !lines.isError &&
+                          line?.running &&
+                          line.running.length > 0 && (
+                            <p className="mt-1 text-xs text-destructive">
+                              Saving cuts {line.running.length} running sessions
+                            </p>
+                          )}
                         {reserve && !window && (
                           <p className="mt-1 text-xs text-muted-foreground">
                             This reading has no selected window.
@@ -321,7 +374,41 @@ export function SessionChoiceSettings() {
                         )}
                       </td>
                       <td className="py-3 pr-3 tabular-nums">
-                        {keeps === null ? "—" : `${keeps.toFixed(1)}%`}
+                        {lines.isError ? (
+                          <span role="alert">
+                            Could not load quota lines.{" "}
+                            <button
+                              type="button"
+                              className="underline"
+                              onClick={() => void lines.refetch()}
+                            >
+                              Retry
+                            </button>
+                          </span>
+                        ) : line ? (
+                          <>
+                            <div>
+                              Warn: {line.warn_line_pct == null ? "—" : `${line.warn_line_pct}%`}
+                            </div>
+                            <div>
+                              Stop: {line.stop_line_pct == null ? "—" : `${line.stop_line_pct}%`}
+                            </div>
+                            <div>
+                              {
+                                {
+                                  ok: "Available",
+                                  warn: "Warning",
+                                  stop: "Stopped",
+                                  exhausted: "Used up",
+                                  unknown: "Unknown",
+                                }[line.state]
+                              }
+                              {line.released ? " · Released" : ""}
+                            </div>
+                          </>
+                        ) : (
+                          "—"
+                        )}
                       </td>
                       <td className="py-3 pr-3">
                         <select

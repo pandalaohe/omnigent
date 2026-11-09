@@ -2322,7 +2322,6 @@ def create_app(
             )
         )
 
-        usage_flush_task: asyncio.Task[None] | None = None
         usage_price_task: asyncio.Task[None] | None = None
         if agent_quota_service.usage_enabled:
             await asyncio.to_thread(usage_price_source.load)
@@ -2330,14 +2329,24 @@ def create_app(
                 usage_price_source.run(), name="usage-price-source"
             )
 
-            async def _usage_flush_loop() -> None:
-                while True:
-                    await asyncio.sleep(60.0)
-                    await asyncio.to_thread(agent_quota_service.flush)
+        async def _usage_flush_loop() -> None:
+            while True:
+                await asyncio.sleep(60.0)
+                await asyncio.to_thread(agent_quota_service.flush)
 
-            usage_flush_task = asyncio.create_task(
-                _usage_flush_loop(), name="usage-snapshot-flush"
-            )
+        usage_flush_task = asyncio.create_task(_usage_flush_loop(), name="usage-snapshot-flush")
+
+        async def _quota_line_loop() -> None:
+            from omnigent.server.session_choice_runtime import enforce_stop_lines
+
+            while True:
+                await asyncio.sleep(60.0)
+                try:
+                    await enforce_stop_lines(app_inst)
+                except Exception:
+                    _logger.exception("Quota stop line enforcement failed")
+
+        quota_line_task = asyncio.create_task(_quota_line_loop(), name="quota-stop-lines")
 
         # System status: one tick loop rolls up host points, trims history and
         # evaluates findings; a second loop renews the fast-sampling lease for
@@ -2592,6 +2601,9 @@ def create_app(
             with monitor_event_loop():
                 yield
         finally:
+            quota_line_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await quota_line_task
             if auto_rotation_notices is not None:
                 await auto_rotation_notices.shutdown()
             if usage_price_task is not None:

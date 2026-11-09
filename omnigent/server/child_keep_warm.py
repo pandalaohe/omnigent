@@ -1570,6 +1570,13 @@ class ChildKeepWarmSweeper:
         ):
             return None
 
+        from omnigent.server.session_choice_runtime import stopped_line
+
+        if (
+            self._app is not None
+            and await asyncio.to_thread(stopped_line, self._app, conv) is not None
+        ):
+            return None
         raw_label = conv.labels.get(KEEP_WARM_LABEL)
         state = _WarmState.parse(raw_label)
         running_since = _running_since(conv)

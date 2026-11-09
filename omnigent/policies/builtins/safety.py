@@ -439,7 +439,20 @@ def ask_on_project_settings_update(event: PolicyEvent) -> PolicyResponse:
 
 def ask_on_session_choice_update(event: PolicyEvent) -> PolicyResponse:
     """Changing the owner's model routing asks by default, like project defaults."""
-    if event.get("type") != "tool_call" or event.get("target") != "sys_session_choice_update":
+    if event.get("type") != "tool_call":
+        return _ALLOW
+    data = event.get("data")
+    args = data.get("arguments") if isinstance(data, dict) else None
+    if (
+        event.get("target") == "sys_quota_floor"
+        and isinstance(args, dict)
+        and args.get("off") is True
+    ):
+        return {
+            "result": "ASK",
+            "reason": "Lift the quota warning and stop lines until reset. Approve?",
+        }
+    if event.get("target") != "sys_session_choice_update":
         return _ALLOW
     return {
         "result": "ASK",
