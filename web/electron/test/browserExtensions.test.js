@@ -4,13 +4,22 @@ const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 const fs = require("node:fs/promises");
-const os = require("node:os");
 const path = require("node:path");
 const vm = require("node:vm");
-const { createBrowserExtensions, installBitwarden } = require("../src/browserExtensions");
+const { createBrowserExtensions } = require("../src/browserExtensions");
 
-function fixture() {
-  const extension = { id: "a".repeat(32), path: "/opt/work/bitwarden" };
+function fixture(records) {
+  const extension = {
+    id: "a".repeat(32),
+    path: "/opt/work/bitwarden",
+    name: "Bitwarden",
+    manifest: {
+      permissions: ["webRequest"],
+      host_permissions: ["<all_urls>"],
+      action: { default_popup: "popup/index.html" },
+      background: { service_worker: "background.js" },
+    },
+  };
   const session = {
     extensions: new EventEmitter(),
     serviceWorkers: new EventEmitter(),
@@ -114,7 +123,11 @@ function fixture() {
   }
   const host = createBrowserExtensions({
     session,
-    directory: extension.path,
+    records:
+      records ||
+      (async () => [
+        { directory: extension.path, agentFillAllowed: true, runtimeId: extension.id },
+      ]),
     BrowserWindow: Window,
     ElectronChromeExtensions: Library,
   });
@@ -301,27 +314,6 @@ test("unloading during extension load rejects a waiting popup and removes the la
   await host.load();
 });
 
-test("tampered download is rejected before extraction and scratch is removed", async () => {
-  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "bitwarden-test-"));
-  try {
-    let extracted = false;
-    await assert.rejects(
-      installBitwarden({
-        directory: path.join(directory, "extension"),
-        fetch: async () => ({ ok: true, arrayBuffer: async () => Buffer.from("tampered") }),
-        extract: async () => {
-          extracted = true;
-        },
-      }),
-      /failed verification/,
-    );
-    assert.equal(extracted, false);
-    assert.deepEqual(await fs.readdir(directory), []);
-  } finally {
-    await fs.rm(directory, { recursive: true, force: true });
-  }
-});
-
 test("request filters use Chrome hostname and port semantics before notifying the worker", async () => {
   const ipc = new EventEmitter();
   ipc.send = () => {};
@@ -359,4 +351,74 @@ test("request filters use Chrome hostname and port semantics before notifying th
     "https://example.test:18444/after",
     "https://signin.example.test:18444/after",
   ]);
+});
+
+test("two extension workers receive only their own storage keys; unapproved menus cannot fill", async () => {
+  const entries = [
+    { directory: "/opt/work/extension-a", runtimeId: "a".repeat(32), agentFillAllowed: true },
+    { directory: "/opt/work/extension-b", runtimeId: "b".repeat(32), agentFillAllowed: false },
+  ];
+  const { host, session } = fixture(async () => entries);
+  session.extensions.loadExtension = async (directory) => {
+    const entry = entries.find((item) => item.directory === directory);
+    const loaded = { id: entry.runtimeId, path: directory, name: "Synthetic" };
+    session.extensions.emit("extension-loaded", {}, loaded);
+    return loaded;
+  };
+  await host.load();
+  assert.equal(host.loaded().length, 2);
+  const workers = entries.map((entry) => ({
+    scope: `chrome-extension://${entry.runtimeId}/`,
+    ipc: new EventEmitter(),
+    sent: [],
+    send(...args) {
+      this.sent.push(args);
+    },
+  }));
+  session.serviceWorkers.getWorkerFromVersionID = (id) => workers[id];
+  workers.forEach((worker, id) => {
+    session.serviceWorkers.emit("running-status-changed", {
+      runningStatus: "starting",
+      versionId: id,
+    });
+    worker.ipc.emit("omnigent:extension-storage-subscribe");
+  });
+  host.storageChanged(
+    {
+      sender: { session },
+      senderFrame: { url: `chrome-extension://${entries[0].runtimeId}/popup.html` },
+    },
+    ["key-a"],
+    "local",
+  );
+  assert.equal(workers[0].sent.length, 1);
+  assert.equal(workers[1].sent.length, 0);
+  workers[1].ipc.emit("omnigent:extension-storage", {}, ["key-b"], "session");
+  assert.equal(workers[0].sent.length, 1);
+  assert.equal(workers[1].sent.length, 1);
+  const id = "autofill_aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+  for (const entry of entries)
+    host.host.api.contextMenus.menus.set(
+      entry.runtimeId,
+      new Map([[id, { id, title: "Synthetic login" }]]),
+    );
+  assert.equal(host.listFillItems().length, 1);
+  entries[0].agentFillAllowed = false;
+  assert.equal(await host.verifyFillIdentity(), false);
+  assert.deepEqual(host.listFillItems(), []);
+  await host.unload();
+  assert.equal(host.loaded().length, 0);
+});
+
+test("legitimate reload recovers fill only after current content consent is revalidated", async () => {
+  const entries = [
+    { directory: "/opt/work/bitwarden", runtimeId: "a".repeat(32), agentFillAllowed: true },
+  ];
+  const { host, session, extension } = fixture(async () => entries);
+  await host.load();
+  session.extensions.emit("extension-loaded", {}, extension);
+  assert.equal(await host.verifyFillIdentity(), true);
+  entries[0].agentFillAllowed = false;
+  assert.equal(await host.verifyFillIdentity(), false);
+  assert.deepEqual(host.listFillItems(), []);
 });

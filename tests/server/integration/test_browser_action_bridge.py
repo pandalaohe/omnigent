@@ -592,7 +592,7 @@ async def test_saved_login_has_longer_await_budget(
         client, session_id, action="fill_saved_login", args={"tab_id": "demo"}
     )
     claim = await client.post(f"/v1/sessions/{session_id}/browser/action_claim/{action_id}")
-    await asyncio.sleep(0.03)
+    await asyncio.sleep(0.03)  # custom-lint: disable=sleep-then-assert -- Outwait timeout.
     assert not task.done()
     await client.post(
         f"/v1/sessions/{session_id}/browser/action_result/{action_id}",

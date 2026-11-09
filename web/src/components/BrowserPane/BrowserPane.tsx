@@ -20,6 +20,7 @@ import {
   ChevronRightIcon,
   CookieIcon,
   KeyRoundIcon,
+  PuzzleIcon,
   RotateCwIcon,
   SquareDashedMousePointerIcon,
   WrenchIcon,
@@ -69,6 +70,7 @@ interface NavResult {
  *  component doesn't depend on the full nativeBridge type; every method is
  *  optional (an older shell may predate the browser feature). */
 interface BrowserPaneBridge {
+  browserExtensionsMenu?: (viewId: string) => Promise<{ ok: boolean; error?: string }>;
   browserOpenBitwarden?: (viewId: string) => Promise<{ ok: boolean; error?: string }>;
   browserSetActive?: (conversationId: string | null) => Promise<{ ok: boolean; error?: string }>;
   browserResize?: (
@@ -650,6 +652,25 @@ export function BrowserPane({
         >
           <WrenchIcon className="size-4" />
         </button>
+        {getBridge()?.browserExtensionsMenu && (
+          <button
+            type="button"
+            disabled={!hasView}
+            aria-label="Browser extensions"
+            title="Browser extensions"
+            className="flex size-6 items-center justify-center rounded text-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-40"
+            onClick={() => {
+              void getBridge()
+                ?.browserExtensionsMenu?.(conversationId)
+                .then((result) => {
+                  if (!result.ok) toast.error(result.error || "Could not open extensions.");
+                })
+                .catch(() => toast.error("Could not open extensions."));
+            }}
+          >
+            <PuzzleIcon className="size-4" />
+          </button>
+        )}
         {getBridge()?.browserOpenBitwarden && (
           <button
             type="button"

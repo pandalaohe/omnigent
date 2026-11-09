@@ -233,7 +233,25 @@ interface ElectronDesktopApi extends NativeShellApi {
     },
   ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
   getBrowserLoginSetting?: () => Promise<{ ok: boolean; enabled?: boolean; error?: string }>;
-  browserSetupBitwarden?: () => Promise<{ ok: boolean; error?: string }>;
+  browserExtensionsList?: () => Promise<{
+    ok: boolean;
+    error?: string;
+    extensions?: {
+      id: string;
+      name: string;
+      version: string;
+      enabled: boolean;
+      runtimeId?: string;
+    }[];
+  }>;
+  browserExtensionsAdd?: () => Promise<{ ok: boolean; error?: string }>;
+  browserExtensionsEnable?: (
+    id: string,
+    enabled: boolean,
+  ) => Promise<{ ok: boolean; error?: string }>;
+  browserExtensionsReview?: (id: string) => Promise<{ ok: boolean; error?: string }>;
+  browserExtensionsRemove?: (id: string) => Promise<{ ok: boolean; error?: string }>;
+  browserExtensionsMenu?: (viewId: string) => Promise<{ ok: boolean; error?: string }>;
   browserFillApprovals?: () => Promise<{
     ok: boolean;
     sites?: { origin: string; id: string; label: string }[];
@@ -243,7 +261,6 @@ interface ElectronDesktopApi extends NativeShellApi {
     origin: string;
     id: string;
   }) => Promise<{ ok: boolean; error?: string }>;
-  browserRemoveBitwarden?: () => Promise<{ ok: boolean; error?: string }>;
   browserOpenBitwarden?: (viewId: string) => Promise<{ ok: boolean; error?: string }>;
   setBrowserLoginSetting?: (
     enabled: boolean,
@@ -667,8 +684,11 @@ export function browserLoginBridge() {
     get: desktop.getBrowserLoginSetting,
     set: desktop.setBrowserLoginSetting,
     clear: desktop.clearBrowserLogin,
-    setupBitwarden: desktop.browserSetupBitwarden,
-    removeBitwarden: desktop.browserRemoveBitwarden,
+    extensionsList: desktop.browserExtensionsList,
+    extensionsAdd: desktop.browserExtensionsAdd,
+    extensionsEnable: desktop.browserExtensionsEnable,
+    extensionsReview: desktop.browserExtensionsReview,
+    extensionsRemove: desktop.browserExtensionsRemove,
     fillApprovals: desktop.browserFillApprovals,
     revokeFillApproval: desktop.browserRevokeFillApproval,
   };

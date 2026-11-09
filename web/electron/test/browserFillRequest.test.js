@@ -118,7 +118,10 @@ for (const failure of [
         if (failure === "navigation") entry.navGeneration += 2;
         if (failure === "revoked") f.approvals.revoke({});
         if (failure === "removed item") f.extensions.listFillItems = () => [];
-        if (failure === "timeout") await new Promise((resolve) => setTimeout(resolve, 5));
+        if (failure === "timeout")
+          await new Promise((resolve) => {
+            setTimeout(resolve, 5);
+          });
         if (failure === "exception") throw Error("private exception must not escape");
         return { response: failure === "denied" ? 0 : 1, checkboxChecked: true };
       },

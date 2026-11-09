@@ -1,55 +1,40 @@
+/* eslint-disable no-await-in-loop -- Extension loading shares session state and must remain ordered. */
 "use strict";
 
-const fs = require("node:fs/promises");
 const path = require("node:path");
-const crypto = require("node:crypto");
+const { clearExtensionData } = require("./browserExtensionData");
+const { guardExtensionCookies, extensionAccess } = require("./browserExtensionPermissions");
+const { requestExtensionPermissions } = require("./browserExtensionPackages");
 
-const BITWARDEN_VERSION = "2026.10.2";
-const BITWARDEN_SHA256 = "2ebc61246a2ea82a65c589b8484e26a5678253fa6474c26dc5b6a7a7fcacbda4";
-const BITWARDEN_URL = `https://github.com/bitwarden/clients/releases/download/browser-v${BITWARDEN_VERSION}/dist-chrome-${BITWARDEN_VERSION}.zip`;
-
-async function installBitwarden({ directory, fetch, extract }) {
-  await fs.mkdir(path.dirname(directory), { recursive: true });
-  const scratch = await fs.mkdtemp(path.join(path.dirname(directory), ".download-"));
-  try {
-    const response = await fetch(BITWARDEN_URL, { signal: AbortSignal.timeout(120000) });
-    if (!response.ok) throw new Error("Bitwarden download failed.");
-    const bytes = Buffer.from(await response.arrayBuffer());
-    if (crypto.createHash("sha256").update(bytes).digest("hex") !== BITWARDEN_SHA256) {
-      throw new Error("Bitwarden download failed verification.");
-    }
-    const archive = path.join(scratch, "extension.zip");
-    await fs.writeFile(archive, bytes);
-    const unpacked = path.join(scratch, "unpacked");
-    await extract(archive, { dir: unpacked });
-    const manifest = JSON.parse(await fs.readFile(path.join(unpacked, "manifest.json"), "utf8"));
-    if (manifest.version !== BITWARDEN_VERSION || manifest.manifest_version !== 3) {
-      throw new Error("Unexpected Bitwarden extension version.");
-    }
-    await fs.rename(unpacked, directory);
-  } finally {
-    await fs.rm(scratch, { recursive: true, force: true });
-  }
-}
-
-function createBrowserExtensions({ session, directory, BrowserWindow, ElectronChromeExtensions }) {
+function createBrowserExtensions({ session, records, BrowserWindow, ElectronChromeExtensions }) {
   const workers = new Set();
   const views = new Map();
   const popups = new Set();
   let extension;
+  const loadedExtensions = new Map();
+  const allowedDirectories = new Map();
   let ready;
   let generation = 0;
   let loadingGeneration;
   let pendingLoad = Promise.resolve();
-  const origin = () => extension && `chrome-extension://${extension.id}`;
+  const frameId = (url) => {
+    try {
+      const parsed = new URL(url);
+      return parsed.protocol === "chrome-extension:" && loadedExtensions.has(parsed.hostname)
+        ? parsed.hostname
+        : null;
+    } catch {
+      return null;
+    }
+  };
   const isExtensionFrame = (event) => {
     try {
-      return event.sender.session === session && event.senderFrame.url.startsWith(`${origin()}/`);
+      return event.sender.session === session && frameId(event.senderFrame.url);
     } catch {
       return false;
     }
   };
-  const broadcast = (keys, area) => {
+  const broadcast = (keys, area, id) => {
     if (
       !["local", "session"].includes(area) ||
       !Array.isArray(keys) ||
@@ -57,6 +42,7 @@ function createBrowserExtensions({ session, directory, BrowserWindow, ElectronCh
     )
       return;
     for (const worker of workers) {
+      if (frameId(worker.scope) !== id) continue;
       try {
         worker.send("omnigent:extension-storage", keys, area);
       } catch {
@@ -65,14 +51,19 @@ function createBrowserExtensions({ session, directory, BrowserWindow, ElectronCh
     }
   };
   session.extensions.on("extension-loaded", (_event, loaded) => {
-    if (loadingGeneration === generation && path.resolve(loaded.path) === path.resolve(directory))
-      extension = loaded;
+    if (extension?.id === loaded.id) extension = null;
+    if (loadingGeneration === generation && allowedDirectories.has(path.resolve(loaded.path))) {
+      loadedExtensions.set(loaded.id, loaded);
+      if (allowedDirectories.get(path.resolve(loaded.path)).agentFillAllowed) extension = loaded;
+    }
   });
   session.serviceWorkers.on("running-status-changed", (details) => {
     if (details.runningStatus !== "starting") return;
     const worker = session.serviceWorkers.getWorkerFromVersionID(details.versionId);
-    if (!worker || !origin() || !worker.scope.startsWith(`${origin()}/`)) return;
-    worker.ipc.on("omnigent:extension-storage", (_event, keys, area) => broadcast(keys, area));
+    if (!worker || !frameId(worker.scope)) return;
+    worker.ipc.on("omnigent:extension-storage", (_event, keys, area) =>
+      broadcast(keys, area, frameId(worker.scope)),
+    );
     worker.ipc.on("omnigent:extension-storage-subscribe", () => workers.add(worker));
   });
   for (const type of ["frame", "service-worker"]) {
@@ -83,33 +74,58 @@ function createBrowserExtensions({ session, directory, BrowserWindow, ElectronCh
   }
   const host = new ElectronChromeExtensions({
     license: "MIT",
+    requestPermissions: requestExtensionPermissions,
     session,
     modulePath: path.resolve(path.dirname(require.resolve("electron-chrome-extensions")), "../.."),
     createTab: async () => {
       throw new Error("Open the site in the browser pane first.");
     },
   });
+  guardExtensionCookies(host, () => [...loadedExtensions.values()]);
   function load() {
     if (!ready) {
       const requestedGeneration = generation;
       const operation = pendingLoad
         .catch(() => {})
-        .then(() => {
+        .then(async () => {
           if (requestedGeneration !== generation) throw new Error("Bitwarden was unloaded.");
           loadingGeneration = requestedGeneration;
-          return session.extensions.loadExtension(directory, { allowFileAccess: false });
-        })
-        .then((loaded) => {
-          if (requestedGeneration !== generation) {
-            session.extensions.removeExtension(loaded.id);
-            throw new Error("Bitwarden was unloaded.");
-          }
-          extension = loaded;
-          return loaded;
+          const entries = await records();
+          const ids = entries.map((entry) => entry.runtimeId).filter(Boolean);
+          if (new Set(ids).size !== ids.length) throw new Error("Duplicate extension runtime ID.");
+          return (async () => {
+            for (const entry of entries) {
+              if (requestedGeneration !== generation) throw new Error("Extensions were unloaded.");
+              allowedDirectories.set(path.resolve(entry.directory), entry);
+              const loaded = await session.extensions.loadExtension(entry.directory, {
+                allowFileAccess: false,
+              });
+              if (entry.runtimeId && loaded.id !== entry.runtimeId) {
+                session.extensions.removeExtension(loaded.id);
+                throw new Error("Unexpected extension runtime ID.");
+              }
+              if (requestedGeneration !== generation) {
+                session.extensions.removeExtension(loaded.id);
+                throw new Error("Extensions were unloaded.");
+              }
+              loadedExtensions.set(loaded.id, loaded);
+              if (entry.agentFillAllowed) extension = loaded;
+            }
+            loadingGeneration = undefined;
+            return extension;
+          })();
         });
       pendingLoad = operation;
       ready = operation.catch((error) => {
-        if (requestedGeneration === generation) ready = null;
+        if (requestedGeneration === generation) {
+          extension = null;
+          closeExtensionWindows();
+          for (const id of loadedExtensions.keys()) session.extensions.removeExtension(id);
+          loadedExtensions.clear();
+          allowedDirectories.clear();
+          workers.clear();
+          ready = null;
+        }
         throw error;
       });
     }
@@ -126,7 +142,9 @@ function createBrowserExtensions({ session, directory, BrowserWindow, ElectronCh
   function unload() {
     generation++;
     closeExtensionWindows();
-    if (extension) session.extensions.removeExtension(extension.id);
+    for (const id of loadedExtensions.keys()) session.extensions.removeExtension(id);
+    loadedExtensions.clear();
+    allowedDirectories.clear();
     extension = null;
     ready = null;
     workers.clear();
@@ -135,8 +153,12 @@ function createBrowserExtensions({ session, directory, BrowserWindow, ElectronCh
   return {
     host,
     load,
+    loaded: () => [...loadedExtensions.values()],
+    reloadViews() {
+      for (const contents of views.keys()) if (!contents.isDestroyed?.()) contents.reload?.();
+    },
     storageChanged(event, keys, area) {
-      if (isExtensionFrame(event)) broadcast(keys, area);
+      if (isExtensionFrame(event)) broadcast(keys, area, frameId(event.senderFrame.url));
     },
     addView(wc, window) {
       if (views.has(wc)) return;
@@ -153,6 +175,20 @@ function createBrowserExtensions({ session, directory, BrowserWindow, ElectronCh
         refreshTabDetails();
       }
     },
+    async verifyFillIdentity() {
+      const requestedGeneration = generation;
+      const entries = await records();
+      const trusted = entries.filter((entry) => entry.agentFillAllowed);
+      extension =
+        trusted.length === 1 && requestedGeneration === generation
+          ? [...loadedExtensions.values()].find(
+              (loaded) =>
+                loaded.id === trusted[0].runtimeId &&
+                path.resolve(loaded.path) === path.resolve(trusted[0].directory),
+            )
+          : null;
+      return !!extension;
+    },
     listFillItems() {
       const menus = host.api.contextMenus.menus.get(extension?.id);
       return [...(menus?.values() ?? [])]
@@ -168,12 +204,22 @@ function createBrowserExtensions({ session, directory, BrowserWindow, ElectronCh
         host.api.tabs.getTabDetails(wc),
       );
     },
-    async openPopup(window) {
+    async openPopup(window, id) {
       const requestedGeneration = generation;
       await load();
       if (requestedGeneration !== generation) throw new Error("Bitwarden was unloaded.");
-      const worker = await session.serviceWorkers.startWorkerForScope(`${origin()}/`);
-      let task = worker.startTask();
+      const selected = id
+        ? loadedExtensions.get(id)
+        : [...loadedExtensions.values()].find((item) => /\bbitwarden\b/i.test(item.name));
+      if (!selected) throw new Error("Extension is not ready.");
+      const popupOrigin = `chrome-extension://${selected.id}`;
+      const popupPath = selected.manifest?.action?.default_popup;
+      if (!popupPath) throw new Error("This extension has no popup.");
+      let worker, task;
+      if (selected.manifest?.background?.service_worker) {
+        worker = await session.serviceWorkers.startWorkerForScope(`${popupOrigin}/`);
+        task = worker.startTask();
+      }
       const releaseWorker = () => {
         if (!task) return;
         const current = task;
@@ -192,7 +238,7 @@ function createBrowserExtensions({ session, directory, BrowserWindow, ElectronCh
         popup = new BrowserWindow({
           width: 420,
           height: 660,
-          title: "Bitwarden",
+          title: selected.name || "Extension",
           autoHideMenuBar: true,
           webPreferences: {
             session,
@@ -213,9 +259,9 @@ function createBrowserExtensions({ session, directory, BrowserWindow, ElectronCh
         });
         popup.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
         popup.webContents.on("will-navigate", (event, url) => {
-          if (!url.startsWith(`${origin()}/`)) event.preventDefault();
+          if (!url.startsWith(`${popupOrigin}/`)) event.preventDefault();
         });
-        await popup.loadURL(`${origin()}/popup/index.html`);
+        await popup.loadURL(`${popupOrigin}/${popupPath}`);
         if (requestedGeneration !== generation || popup.isDestroyed())
           throw new Error("Bitwarden was unloaded.");
         return popup;
@@ -224,6 +270,10 @@ function createBrowserExtensions({ session, directory, BrowserWindow, ElectronCh
         releaseWorker();
         throw error;
       }
+    },
+    async clearData(record) {
+      await unload();
+      await clearExtensionData({ session, BrowserWindow, record });
     },
     closeExtensionWindows,
     unload,
@@ -255,6 +305,15 @@ function createBrowserExtensions({ session, directory, BrowserWindow, ElectronCh
         statusCode: details.statusCode,
       };
       for (const worker of workers) {
+        if (
+          !extensionAccess(
+            host,
+            loadedExtensions.get(frameId(worker.scope)),
+            "webRequest",
+            request.url,
+          )
+        )
+          continue;
         try {
           worker.send("omnigent:extension-request", name, request);
         } catch {
@@ -262,11 +321,7 @@ function createBrowserExtensions({ session, directory, BrowserWindow, ElectronCh
         }
       }
     },
-    async remove() {
-      await unload();
-      await fs.rm(directory, { recursive: true, force: true });
-    },
   };
 }
 
-module.exports = { BITWARDEN_VERSION, BITWARDEN_SHA256, installBitwarden, createBrowserExtensions };
+module.exports = { createBrowserExtensions };

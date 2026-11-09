@@ -19,3 +19,5 @@ Record the checkout revision, command, result and evidence location for each run
 An HTML preview with fake data proves the shown component interactions, rather
 than a deployed host or a live provider. Clean up only the test processes and
 temporary directories the run created.
+
+- [Browser extensions](features/browser-extensions.md): user packages, native consent, agent fill and local data removal.

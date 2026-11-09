@@ -2797,34 +2797,19 @@ describe("desktop browser login IPC", () => {
     senderFrame: { url: frameUrl },
   });
 
-  it("does not autoload a new partition while removal waits for an existing one", async (t) => {
+  it("extension management refuses a foreign sender, and the renderer supplies no install path", async (t) => {
     const h = loadNavigationHarness({ registerFallbacks: false });
     t.after(h.cleanup);
     h.api.registerIpc();
-    h.electron.session.fromPartition = () => ({});
-    const directory = path.join(
-      path.dirname(h.settingsPath),
-      "browser-extensions",
-      "bitwarden",
-      "2026.10.2",
+    const foreign = eventFor(h, "https://foreign.example/settings");
+    await Promise.all(
+      ["list", "add", "enable", "remove", "review", "menu"].map(async (action) => {
+        assert.equal(
+          (await h.ipc.get(`omnigent:browser-extensions:${action}`)(foreign, "/renderer/evil")).ok,
+          false,
+        );
+      }),
     );
-    fs.mkdirSync(directory, { recursive: true });
-    fs.writeFileSync(path.join(directory, "manifest.json"), "{}");
-    let release;
-    h.api.browserExtensions.set("existing", {
-      remove: () =>
-        new Promise((resolve) => {
-          release = resolve;
-        }),
-    });
-    h.electron.dialog.showMessageBox = async () => ({ response: 1 });
-    const removing = h.ipc.get("omnigent:browser-bitwarden:remove")(eventFor(h));
-    await until(() => typeof release === "function", "removal started");
-    const instance = h.api.extensionsForPartition("persist:omnigent-agent-shared-other");
-    assert.ok(instance, "new tabs can still register with an unloaded host");
-    assert.equal(h.calls.extensionLoads ?? 0, 0);
-    release();
-    assert.equal((await removing).ok, true);
   });
 
   it("requires the pinned sender and a boolean, with the setting off by default", async (t) => {

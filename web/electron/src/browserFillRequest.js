@@ -1,3 +1,4 @@
+/* eslint-disable no-await-in-loop -- Observe fill events and page identity in order until the deadline. */
 "use strict";
 
 const fs = require("node:fs");
@@ -94,6 +95,8 @@ function createFillRequest({
         entry.navGeneration === generation &&
         entry.view.webContents.mainFrame === frame &&
         frame.origin === origin;
+      if (extensions.verifyFillIdentity && !(await extensions.verifyFillIdentity()))
+        return { ok: false, error: NO_LOGIN };
       const items = extensions.listFillItems();
       if (!items.length) return { ok: false, error: NO_LOGIN };
       const signal = AbortSignal.timeout(dialogTimeout);
@@ -144,6 +147,9 @@ function createFillRequest({
         document.addEventListener('input', state.listener, true);
       })()`);
       if (!valid()) return { ok: false, error: PAGE_CHANGED };
+      if (extensions.verifyFillIdentity && !(await extensions.verifyFillIdentity()))
+        return { ok: false, error: NO_LOGIN };
+      if (!valid()) return { ok: false, error: PAGE_CHANGED };
       if (remember) approvals.allow(permission);
       extensions.emitFill(entry.view.webContents, item.id);
       const deadline = Date.now() + fillTimeout;
@@ -153,7 +159,9 @@ function createFillRequest({
           if (!current()) return { ok: false, error: PAGE_CHANGED };
           return { ok: true, filled: true };
         }
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        await new Promise((resolve) => {
+          setTimeout(resolve, 100);
+        });
       } while (Date.now() < deadline);
       return { ok: false, error: "Fill was not confirmed. Check the page before trying again." };
     } catch {

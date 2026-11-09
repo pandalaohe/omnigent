@@ -1,3 +1,4 @@
+import { BrowserExtensionsControl } from "@/components/BrowserExtensionsControl";
 /**
  * Settings page (``/settings``).
  *
@@ -2060,7 +2061,6 @@ function BrowserLoginControl() {
   const [busy, setBusy] = useState(true);
   const [error, setError] = useState("");
   const [cleared, setCleared] = useState(false);
-  const [bitwardenStatus, setBitwardenStatus] = useState("");
   const [approvedSites, setApprovedSites] = useState<
     { origin: string; id: string; label: string }[]
   >([]);
@@ -2166,60 +2166,7 @@ function BrowserLoginControl() {
         This closes open Browser views and Bitwarden windows using this server&apos;s saved login.
         Bitwarden&apos;s local data may also be cleared.
       </p>
-      {bridge.setupBitwarden && (
-        <div className="flex items-start justify-between gap-6">
-          <SettingsLabel
-            label="Bitwarden"
-            note="Unlock and fill saved logins with the Browser key button."
-            className="flex-1"
-            description="Downloads the official Bitwarden extension to this desktop. Turn on Keep in-app browser login, then close and reopen Browser first. Sign in only inside the Bitwarden window."
-          />
-          <div className="flex shrink-0 gap-2">
-            <Button
-              variant="outline"
-              disabled={busy || !enabled}
-              onClick={() => {
-                setBusy(true);
-                setBitwardenStatus("");
-                void bridge.setupBitwarden!()
-                  .then((result) => {
-                    setBitwardenStatus(
-                      result.ok
-                        ? "Bitwarden ready. Open Browser and select the key button."
-                        : result.error || "Could not set up Bitwarden.",
-                    );
-                  })
-                  .catch(() => setBitwardenStatus("Could not set up Bitwarden."))
-                  .finally(() => setBusy(false));
-              }}
-            >
-              Set up Bitwarden
-            </Button>
-            {bridge.removeBitwarden && (
-              <Button
-                variant="outline"
-                disabled={busy}
-                onClick={() => {
-                  setBusy(true);
-                  setBitwardenStatus("");
-                  void bridge.removeBitwarden!()
-                    .then((result) => {
-                      setBitwardenStatus(
-                        result.ok
-                          ? "Bitwarden removed."
-                          : result.error || "Could not remove Bitwarden.",
-                      );
-                    })
-                    .catch(() => setBitwardenStatus("Could not remove Bitwarden."))
-                    .finally(() => setBusy(false));
-                }}
-              >
-                Remove Bitwarden
-              </Button>
-            )}
-          </div>
-        </div>
-      )}
+      <BrowserExtensionsControl />
       {bridge.fillApprovals && bridge.revokeFillApproval && (
         <div className="space-y-2">
           <p className="text-sm font-medium">Approved sites</p>
@@ -2263,11 +2210,6 @@ function BrowserLoginControl() {
             </div>
           ))}
         </div>
-      )}
-      {bitwardenStatus && (
-        <p role="status" className="text-sm text-muted-foreground">
-          {bitwardenStatus}
-        </p>
       )}
       {cleared && (
         <p role="status" className="text-sm text-muted-foreground">

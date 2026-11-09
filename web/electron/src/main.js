@@ -77,11 +77,9 @@ const { createReconnectOverlay } = require("./reconnect_overlay");
 const { createBrowserViewRegistry, persistentAgentPartition } = require("./browserViewRegistry");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { registerBrowserIpc } = require("./browserIpc");
-const {
-  createBrowserExtensions,
-  installBitwarden,
-  BITWARDEN_VERSION,
-} = require("./browserExtensions");
+const { createBrowserExtensions } = require("./browserExtensions");
+const { createExtensionPackages } = require("./browserExtensionPackages");
+const { refreshExtensionHosts } = require("./browserExtensionLifecycle");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
 const { isDeveloperModeEnabled } = require("./developer_mode");
 const { DEV_DOMAIN, getDevUserDefault } = require("./dev_preferences");
@@ -3731,6 +3729,7 @@ function hardenAgentPartition(partition, win, canPrompt, getAnchorBounds) {
 const guardedAgentSessions = new WeakSet();
 const browserExtensions = new Map();
 const { createFillRequest, createFillApprovals } = require("./browserFillRequest");
+
 let fillApprovals;
 const fillBusyPartitions = new Set();
 function getFillApprovals() {
@@ -3738,22 +3737,39 @@ function getFillApprovals() {
     path.join(app.getPath("userData"), "browser-fill-approvals.json"),
   ));
 }
-let bitwardenRemoving = false;
-const bitwardenDirectory = () =>
-  path.join(app.getPath("userData"), "browser-extensions", "bitwarden", BITWARDEN_VERSION);
+let extensionsChanging = false;
+let extensionPackages;
+function getExtensionPackages() {
+  return (extensionPackages ??= createExtensionPackages({
+    directory: path.join(app.getPath("userData"), "browser-extensions", "packages"),
+    dialog,
+    changed: async ({ remove } = {}) => {
+      extensionsChanging = true;
+      try {
+        await refreshExtensionHosts({
+          hosts: browserExtensions,
+          userData: app.getPath("userData"),
+          createHost: extensionsForPartition,
+          remove,
+        });
+      } finally {
+        extensionsChanging = false;
+      }
+    },
+  }));
+}
 
 function extensionsForPartition(partition) {
   if (!partition.startsWith("persist:omnigent-agent-shared-")) return null;
   if (!browserExtensions.has(partition)) {
     const extensions = createBrowserExtensions({
       session: session.fromPartition(partition),
-      directory: bitwardenDirectory(),
+      records: () => getExtensionPackages().records(),
       BrowserWindow,
       ElectronChromeExtensions: require("electron-chrome-extensions").ElectronChromeExtensions,
     });
     browserExtensions.set(partition, extensions);
-    if (!bitwardenRemoving && fs.existsSync(path.join(bitwardenDirectory(), "manifest.json")))
-      void extensions.load().catch(() => {});
+    if (!extensionsChanging) void extensions.load().catch(() => {});
   }
   return browserExtensions.get(partition);
 }
@@ -5250,39 +5266,69 @@ function registerIpc() {
     for (const extensions of browserExtensions.values())
       extensions.storageChanged(event, keys, area);
   });
-  let bitwardenInstalling = null;
-  ipcMain.handle("omnigent:browser-bitwarden:setup", async (event) => {
+  ipcMain.handle("omnigent:browser-extensions:list", (event) => {
     if (!isPinnedOriginSender(event)) return { ok: false, error: "untrusted sender" };
-    if (bitwardenRemoving) return { ok: false, error: "Bitwarden is being removed." };
-    if (loadSettings().browser_persistent_login !== true)
-      return {
-        ok: false,
-        error: "Turn on Keep in-app browser login first, then close and reopen Browser.",
-      };
+    return { ok: true, extensions: getExtensionPackages().list() };
+  });
+  ipcMain.handle("omnigent:browser-extensions:add", async (event) => {
+    if (!isPinnedOriginSender(event)) return { ok: false, error: "untrusted sender" };
+    return getExtensionPackages().add(BrowserWindow.fromWebContents(event.sender));
+  });
+  ipcMain.handle("omnigent:browser-extensions:enable", async (event, id, enabled) => {
+    if (!isPinnedOriginSender(event)) return { ok: false, error: "untrusted sender" };
+    return getExtensionPackages().setEnabled(
+      BrowserWindow.fromWebContents(event.sender),
+      id,
+      enabled,
+    );
+  });
+  ipcMain.handle("omnigent:browser-extensions:review", async (event, id) => {
+    if (!isPinnedOriginSender(event)) return { ok: false, error: "untrusted sender" };
+    return getExtensionPackages().review(BrowserWindow.fromWebContents(event.sender), id);
+  });
+  ipcMain.handle("omnigent:browser-extensions:remove", async (event, id) => {
+    if (!isPinnedOriginSender(event)) return { ok: false, error: "untrusted sender" };
+    return getExtensionPackages().remove(BrowserWindow.fromWebContents(event.sender), id);
+  });
+  ipcMain.handle("omnigent:browser-extensions:menu", async (event, viewId) => {
+    if (!isPinnedOriginSender(event)) return { ok: false, error: "untrusted sender" };
+    const registry = browserRegistryForSender(event);
+    const entry = typeof viewId === "string" && registry?.get(viewId);
+    if (
+      !entry ||
+      registry.activeConversationId() !== viewId ||
+      registry.isSuppressed() ||
+      extensionsChanging ||
+      clearingBrowserPartitions.has(entry.partition)
+    )
+      return { ok: false, error: "Show this tab in Browser first." };
     try {
-      if (!fs.existsSync(path.join(bitwardenDirectory(), "manifest.json"))) {
-        if (!bitwardenInstalling)
-          bitwardenInstalling = installBitwarden({
-            directory: bitwardenDirectory(),
-            fetch: net.fetch,
-            extract: require("extract-zip"),
-          }).finally(() => {
-            bitwardenInstalling = null;
-          });
-        await bitwardenInstalling;
-      }
-      const partition = persistentAgentPartition(
-        pinnedOrigin(BrowserWindow.fromWebContents(event.sender)),
-      );
-      if (clearingBrowserPartitions.has(partition) || bitwardenRemoving)
-        return { ok: false, error: "Browser login is being cleared." };
-      await extensionsForPartition(partition).load();
+      const host = extensionsForPartition(entry.partition);
+      if (!host)
+        return { ok: false, error: "Turn on Keep in-app browser login, then reopen Browser." };
+      await host.load();
+      const items = host.loaded();
+      if (!items.length)
+        return { ok: false, error: "Add an extension in Settings → General → Browser extensions." };
+      const window = BrowserWindow.fromWebContents(event.sender);
+      Menu.buildFromTemplate(
+        items.map((item) => ({
+          label: item.name,
+          enabled: !!item.manifest?.action?.default_popup,
+          click: () => {
+            if (extensionsChanging || clearingBrowserPartitions.has(entry.partition)) return;
+            void host.openPopup(window, item.id).catch(() =>
+              dialog.showMessageBox(window, {
+                type: "error",
+                message: "Could not open extension.",
+              }),
+            );
+          },
+        })),
+      ).popup({ window });
       return { ok: true };
     } catch {
-      return {
-        ok: false,
-        error: "Could not set up Bitwarden. Check your connection and try again.",
-      };
+      return { ok: false, error: "Could not open extensions." };
     }
   });
   ipcMain.handle("omnigent:browser-fill-saved-login", async (event, viewId) => {
@@ -5298,7 +5344,7 @@ function registerIpc() {
       dialog,
       window: BrowserWindow.fromWebContents(event.sender),
       busyPartitions: fillBusyPartitions,
-      isAvailable: (partition) => !clearingBrowserPartitions.has(partition) && !bitwardenRemoving,
+      isAvailable: (partition) => !clearingBrowserPartitions.has(partition) && !extensionsChanging,
     }).fill(viewId);
   });
   ipcMain.handle("omnigent:browser-fill-approvals:list", (event) => {
@@ -5333,13 +5379,13 @@ function registerIpc() {
     if (!entry || registry.activeConversationId() !== viewId || registry.isSuppressed())
       return { ok: false, error: "Show this tab in Browser first." };
     const extensions = extensionsForPartition(entry.partition);
-    if (clearingBrowserPartitions.has(entry.partition) || bitwardenRemoving)
+    if (clearingBrowserPartitions.has(entry.partition) || extensionsChanging)
       return { ok: false, error: "Browser login is being cleared." };
-    if (!extensions || !fs.existsSync(path.join(bitwardenDirectory(), "manifest.json")))
+    if (!extensions)
       return {
         ok: false,
         error:
-          "Set up Bitwarden in Settings → General first. Close and reopen Browser after turning on saved login.",
+          "Add Bitwarden in Settings → General → Browser extensions first. Close and reopen Browser after turning on saved login.",
       };
     try {
       extensions.selectView(entry.view.webContents);
@@ -5347,33 +5393,6 @@ function registerIpc() {
       return { ok: true };
     } catch {
       return { ok: false, error: "Could not open Bitwarden." };
-    }
-  });
-  ipcMain.handle("omnigent:browser-bitwarden:remove", async (event) => {
-    if (!isPinnedOriginSender(event)) return { ok: false, error: "untrusted sender" };
-    if (bitwardenInstalling) return { ok: false, error: "Wait for Bitwarden setup to finish." };
-    const win = BrowserWindow.fromWebContents(event.sender);
-    const { response } = await dialog.showMessageBox(win, {
-      type: "warning",
-      message: "Remove Bitwarden from this desktop?",
-      detail:
-        "Closes Bitwarden windows and removes its extension files. Your vault on the server is unchanged. To clear its local login too, use Clear browser login for each connected server.",
-      buttons: ["Cancel", "Remove Bitwarden"],
-      defaultId: 0,
-      cancelId: 0,
-    });
-    if (response !== 1) return { ok: false, error: "Removal cancelled." };
-    if (bitwardenInstalling || bitwardenRemoving)
-      return { ok: false, error: "Wait for Bitwarden setup or removal to finish." };
-    bitwardenRemoving = true;
-    try {
-      await Promise.all([...browserExtensions.values()].map((extensions) => extensions.remove()));
-      await fs.promises.rm(bitwardenDirectory(), { recursive: true, force: true });
-      return { ok: true };
-    } catch {
-      return { ok: false, error: "Could not remove Bitwarden." };
-    } finally {
-      bitwardenRemoving = false;
     }
   });
   registerBrowserIpc({
