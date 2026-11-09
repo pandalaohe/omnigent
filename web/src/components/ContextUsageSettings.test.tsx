@@ -955,4 +955,44 @@ describe("ContextUsageSettings", () => {
     expect(screen.queryByText("Ag-hds")).not.toBeInTheDocument();
     expect(readUsageContextPreferences().contextList?.entries).toEqual([AGENT]);
   });
+
+  it("collapses same-name records of the same kind into a single agent row", () => {
+    const codexNativeUi: RegistryItem = {
+      key: "harness:codex-native",
+      name: "codex-native-ui",
+      label: "Codex",
+      section: "native",
+      harness: "codex-native",
+      description: null,
+      deployed: true,
+      source: "builtin",
+    };
+    mocks.registryItems = [codexNativeUi];
+    const codexShortModel: UsageContextListEntry = {
+      agentName: "codex",
+      harness: "codex-native",
+      model: "gpt-5.4",
+    };
+    const codexUiModel: UsageContextListEntry = {
+      agentName: "codex-native-ui",
+      harness: "codex-native",
+      model: "GPT 5.3 Codex",
+    };
+    store([codexShortModel, codexUiModel], {
+      [usageContextLevelKey(
+        { hostId: "", agentName: "codex", harness: "codex-native", model: "" },
+        "column",
+      )]: value(272_000, 16_000),
+    });
+    renderSettings();
+
+    expect(screen.getAllByRole("button", { name: "Add a model to Codex" })).toHaveLength(1);
+    expect(
+      screen.getByTestId("context-cell-codex-native-ui-codex-native-all-computers"),
+    ).toHaveTextContent("272k16k");
+
+    fireEvent.click(screen.getByRole("button", { name: "Expand Codex" }));
+    expect(screen.getByText("gpt-5.4")).toBeInTheDocument();
+    expect(screen.getByText("GPT 5.3 Codex")).toBeInTheDocument();
+  });
 });

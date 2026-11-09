@@ -197,10 +197,17 @@ export function buildRegistry(
   for (const row of harnessCatalog.rows) {
     if (!row.id || !row.label || items.has(`harness:${row.id}`)) continue;
     const harness = row.id;
+    const rowLabel = row.label;
+    const section = harnessSection(capabilityFor(harness)?.integration_mode, harness);
+    const sameKindRow = [...items.values()].some(
+      (existing) =>
+        existing.section === section && existing.label.toLowerCase() === rowLabel.toLowerCase(),
+    );
+    if (sameKindRow) continue;
     add({
       key: `harness:${harness}`,
-      label: row.label,
-      section: harnessSection(capabilityFor(harness)?.integration_mode, harness),
+      label: rowLabel,
+      section,
       harness,
       description: null,
       source: "builtin",
@@ -227,18 +234,28 @@ export function buildRegistry(
     })),
   ];
   for (const { agent, source } of allAgents) {
-    // The same catalog id can appear in scope=user; preserve one stable identity.
+    // The same catalog id can appear in scope=user, and same-name records of the
+    // same kind collapse into a single settings row.
     if (source !== "builtin" || !productHarnessForAgent(agent as AvailableAgent)) {
       if (items.has(agent.id)) continue;
       const harness = agent.harness ?? null;
+      const label =
+        source === "installed" && "name" in agent
+          ? capitalizeAgentName(agent.name)
+          : agent.display_name;
+      const section: SectionId = source === "builtin" ? "builtin" : "yours";
+      const sameKindRow = [...items.values()].some(
+        (existing) =>
+          existing.section === section &&
+          existing.harness === harness &&
+          existing.label.toLowerCase() === label.toLowerCase(),
+      );
+      if (sameKindRow) continue;
       add({
         key: agent.id,
         name: "name" in agent ? agent.name : agent.display_name,
-        label:
-          source === "installed" && "name" in agent
-            ? capitalizeAgentName(agent.name)
-            : agent.display_name,
-        section: source === "builtin" ? "builtin" : "yours",
+        label,
+        section,
         harness,
         description: agent.description ?? null,
         source,

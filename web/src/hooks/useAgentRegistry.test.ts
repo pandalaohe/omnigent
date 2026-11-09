@@ -152,9 +152,10 @@ describe("settings agent registry", () => {
     for (const raw of ["claude-id", "sdk-id", "grok-id"]) {
       expect(result.some((item) => item.key === raw)).toBe(false);
     }
-    for (const raw of ["composed-id", "installed-id", "user-id"]) {
+    for (const raw of ["composed-id", "installed-id"]) {
       expect(result.some((item) => item.key === raw)).toBe(true);
     }
+    expect(result.some((item) => item.key === "user-id")).toBe(false);
   });
 
   it("keeps same-name harness forms and declares SDK products once", () => {
@@ -208,7 +209,7 @@ describe("settings agent registry", () => {
       "Orion · Claude Code · library",
       "Orion · Codex · library",
     ]);
-    const acpCollision = buildRegistry(
+    const sameKindSameName = buildRegistry(
       [],
       [{ ...agent("hermes-1", "hermes-fn", "acp:hermes-fn"), builtin: false }],
       [library("ca_hermes", "Hermes-fn", "acp:hermes-fn")],
@@ -216,8 +217,18 @@ describe("settings agent registry", () => {
       hosts,
     );
     expect(
+      sameKindSameName.filter((item) => item.section === "yours").map((item) => item.label),
+    ).toEqual(["Hermes-fn"]);
+    const acpCollision = buildRegistry(
+      [],
+      [{ ...agent("orion-acp", "orion", "acp:orion"), builtin: false }],
+      [library("ca_orion", "Orion", "claude-native")],
+      harnesses,
+      hosts,
+    );
+    expect(
       acpCollision.filter((item) => item.section === "yours").map((item) => item.label),
-    ).toEqual(["Hermes-fn · ACP · installed", "Hermes-fn · ACP · library"]);
+    ).toEqual(["Orion · ACP · installed", "Orion · Claude Code · library"]);
     expect(items.find((item) => item.key === "ca_1")?.deployed).toBe(true);
     const newlyReady = buildRegistry([], [], [], harnesses, [
       { ...hosts[0], configured_harnesses: { ...hosts[0].configured_harnesses, cursor: true } },

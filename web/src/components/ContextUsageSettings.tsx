@@ -49,6 +49,10 @@ import { formatTokenCountShort } from "@/lib/formatCost";
 import { harnessUnavailableReasonOnHost } from "@/lib/harnessSetup";
 import { missingCellText } from "@/lib/layeredValues";
 import {
+  nativeCodingAgentForAgentName,
+  nativeCodingAgentForHarness,
+} from "@/lib/nativeCodingAgents";
+import {
   formatProviderUsageLimits,
   providerUsageLimitsFromCodex,
   type ProviderUsageLimitsSnapshot,
@@ -121,6 +125,7 @@ interface ContextGroup {
   id: string;
   typeGroup: IntegrationTypeGroup;
   agent: ContextRow;
+  agentNames: string[];
   models: ContextRow[];
 }
 
@@ -218,10 +223,21 @@ function registryItemFor(
   items: readonly RegistryItem[],
   entry: Pick<UsageContextListEntry, "agentName" | "harness">,
 ): RegistryItem | undefined {
-  const matches = (item: RegistryItem) =>
+  const exact = (item: RegistryItem) =>
     item.harness === entry.harness &&
-    (item.name === entry.agentName || (!item.name && item.key === `harness:${entry.agentName}`));
-  return items.find((item) => matches(item) && item.source === "builtin") ?? items.find(matches);
+    (item.name === entry.agentName || item.key === `harness:${entry.agentName}`);
+  const sameKindAndName = (item: RegistryItem) =>
+    item.harness === entry.harness &&
+    (item.name?.toLowerCase() === entry.agentName.toLowerCase() ||
+      item.label.toLowerCase() === entry.agentName.toLowerCase() ||
+      (item.key === `harness:${entry.harness}` &&
+        nativeCodingAgentForAgentName(entry.agentName)?.harness === entry.harness));
+  return (
+    items.find((item) => exact(item) && item.source === "builtin") ??
+    items.find(exact) ??
+    items.find((item) => sameKindAndName(item) && item.source === "builtin") ??
+    items.find(sameKindAndName)
+  );
 }
 
 function integrationTypeOf(
@@ -249,10 +265,21 @@ function agentRank(entry: UsageContextListEntry, items: readonly RegistryItem[])
 
 /** An agent's shortest name: the product's own, before any installed copy's suffix. */
 function agentLabelFor(items: readonly RegistryItem[], agentName: string, harness: string): string {
-  const product = items.find(
-    (item) => item.key === `harness:${harness}` && item.name === agentName,
-  );
-  if (product) return product.label;
+  const item = registryItemFor(items, { agentName, harness });
+  if (item) {
+    return item.label.replace(/\s·\s.+\s·\s(?:installed|library)$/, "");
+  }
+  const nativeByAgent = nativeCodingAgentForAgentName(agentName);
+  const nativeByHarness = nativeCodingAgentForHarness(harness);
+  const native =
+    nativeByAgent && (!harness || nativeByAgent.harness === harness)
+      ? nativeByAgent
+      : nativeByHarness &&
+          (agentName === harness ||
+            nativeByHarness.displayName.toLowerCase() === agentName.toLowerCase())
+        ? nativeByHarness
+        : null;
+  if (native) return native.displayName;
   return registrySourceLabels(items, agentName, harness).agentLabel.replace(
     /\s·\s.+\s·\s(?:installed|library)$/,
     "",
@@ -273,17 +300,25 @@ interface RegistryView {
 
 /** The catalog id the agent's badge is saved under. */
 function badgeIdFor(registry: RegistryView, agentName: string, harness: string): string | null {
-  return productIdFor(
-    registry.items.find((item) => item.name === agentName && item.harness === harness),
-    registry,
-  );
+  return productIdFor(registryItemFor(registry.items, { agentName, harness }), registry);
 }
 
-function groupIdOf(entry: UsageContextListEntry): string {
-  return JSON.stringify([entry.agentName, entry.harness]);
+function groupIdOf(
+  entry: Pick<UsageContextListEntry, "agentName" | "harness">,
+  items: readonly RegistryItem[] = [],
+): string {
+  const item = registryItemFor(items, entry);
+  if (item) return JSON.stringify([item.key, item.harness ?? entry.harness]);
+  const label = agentLabelFor(items, entry.agentName, entry.harness).toLowerCase();
+  const fullEntry: UsageContextListEntry = {
+    agentName: entry.agentName,
+    harness: entry.harness,
+    model: "",
+  };
+  return JSON.stringify([label, integrationTypeOf(fullEntry, items), entry.harness]);
 }
 
-/** One group per agent, its models beneath it, wherever in the list they were added. */
+/** One group per agent kind, its models beneath it, collapsing same-name records of the same kind. */
 function contextGroups(
   entries: readonly UsageContextListEntry[],
   items: readonly RegistryItem[],
@@ -311,17 +346,33 @@ function contextGroups(
       left.model.localeCompare(right.model),
   );
   for (const entry of sorted) {
-    const id = groupIdOf(entry);
+    const id = groupIdOf(entry, items);
+    const item = registryItemFor(items, entry);
     if (!groups.has(id)) {
-      const agentEntry = { agentName: entry.agentName, harness: entry.harness, model: "" };
+      const canonicalAgentName = item?.name || entry.agentName;
+      const agentEntry = { agentName: canonicalAgentName, harness: entry.harness, model: "" };
       groups.set(id, {
         id,
         typeGroup: integrationTypeOf(agentEntry, items),
         agent: rowFor(agentEntry, agentLabelFor(items, entry.agentName, entry.harness)),
+        agentNames:
+          canonicalAgentName === entry.agentName
+            ? [entry.agentName]
+            : [canonicalAgentName, entry.agentName],
         models: [],
       });
+    } else {
+      const existingGroup = groups.get(id)!;
+      if (!existingGroup.agentNames.includes(entry.agentName)) {
+        existingGroup.agentNames.push(entry.agentName);
+      }
     }
-    if (entry.model) groups.get(id)!.models.push(rowFor(entry, entry.model));
+    if (entry.model) {
+      const group = groups.get(id)!;
+      if (!group.models.some((row) => row.label.toLowerCase() === entry.model.toLowerCase())) {
+        group.models.push(rowFor(entry, entry.model));
+      }
+    }
   }
   return [...groups.values()].sort(
     (left, right) =>
@@ -1109,6 +1160,18 @@ export function ContextUsageSettings() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [inUseKnown, preferences.contextList]);
 
+  const groupHasSavedOverride = (entryGroupId: string) =>
+    Object.keys(preferences.overrides).some((key) => {
+      const record = usageContextRecordFromKey(key);
+      return (
+        record !== null &&
+        record.level !== "all" &&
+        record.level !== "host" &&
+        usageContextHasValue(preferences.overrides[key]) &&
+        groupIdOf(record.source, registry.items) === entryGroupId
+      );
+    });
+
   // Prune saved rows that name a removed agent or an all-Auto custom agent.
   useEffect(() => {
     if (!registryReady || !preferences.contextList) return;
@@ -1116,12 +1179,9 @@ export function ContextUsageSettings() {
       const item = registryItemFor(registry.items, entry);
       if (!item) return false;
       if (item.source === "builtin") return true;
-      if (sessionAddedGroups.includes(groupIdOf(entry))) return true;
-      return usageContextKeysOfEntry(preferences, {
-        agentName: entry.agentName,
-        harness: entry.harness,
-        model: "",
-      }).some((key) => usageContextHasValue(preferences.overrides[key]));
+      const entryGroupId = groupIdOf(entry, registry.items);
+      if (sessionAddedGroups.includes(entryGroupId)) return true;
+      return groupHasSavedOverride(entryGroupId);
     });
     if (kept.length !== preferences.contextList.entries.length) {
       writeUsageContextPreferences({
@@ -1129,6 +1189,7 @@ export function ContextUsageSettings() {
         contextList: { ...preferences.contextList, entries: kept },
       });
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [registryReady, registry.items, preferences, sessionAddedGroups]);
 
   const { groups, columns, rowById, entries } = useMemo(() => {
@@ -1137,12 +1198,9 @@ export function ContextUsageSettings() {
       const item = registryItemFor(registry.items, entry);
       if (!item) return false;
       if (item.source === "builtin") return true;
-      if (sessionAddedGroups.includes(groupIdOf(entry))) return true;
-      return usageContextKeysOfEntry(preferences, {
-        agentName: entry.agentName,
-        harness: entry.harness,
-        model: "",
-      }).some((key) => usageContextHasValue(preferences.overrides[key]));
+      const entryGroupId = groupIdOf(entry, registry.items);
+      if (sessionAddedGroups.includes(entryGroupId)) return true;
+      return groupHasSavedOverride(entryGroupId);
     });
     const grouped = contextGroups(listed, registry.items);
     const rows = [ALL_ROW, ...grouped.flatMap((group) => [group.agent, ...group.models])];
@@ -1152,23 +1210,71 @@ export function ContextUsageSettings() {
       columns: hostColumns(hosts, preferences, liveHostId),
       rowById: new Map(rows.map((row) => [row.id, row])),
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [registryReady, registry.items, preferences, hosts, liveHostId, sessionAddedGroups]);
+
+  const effectivePreferences = useMemo((): UsageContextPreferences => {
+    if (groups.every((group) => group.agentNames.length <= 1)) return preferences;
+    const overrides = { ...preferences.overrides };
+    for (const [key, value] of Object.entries(preferences.overrides)) {
+      const record = usageContextRecordFromKey(key);
+      if (
+        !record ||
+        record.level === "all" ||
+        record.level === "host" ||
+        !usageContextHasValue(value)
+      ) {
+        continue;
+      }
+      const groupId = groupIdOf(record.source, registry.items);
+      const group = groups.find((item) => item.id === groupId);
+      if (!group || group.agentNames.length <= 1) continue;
+      const modelRow = record.source.model
+        ? group.models.find(
+            (row) => row.entry.model.toLowerCase() === record.source.model.toLowerCase(),
+          )
+        : null;
+      const targetModel = modelRow ? modelRow.entry.model : record.source.model;
+      for (const agentName of group.agentNames) {
+        const aliasKey = usageContextLevelKey(
+          { ...record.source, agentName, model: targetModel },
+          record.level,
+        );
+        if (!Object.hasOwn(overrides, aliasKey)) {
+          overrides[aliasKey] = value;
+        }
+      }
+    }
+    return { ...preferences, overrides };
+  }, [preferences, groups, registry.items]);
 
   const severalOpen = preferences.contextList?.severalOpen ?? false;
   const labelOfEntry = (entry: UsageContextListEntry) =>
     agentLabelFor(registry.items, entry.agentName, entry.harness);
   const badgeIdOfEntry = (entry: UsageContextListEntry) =>
     badgeIdFor(registry, entry.agentName, entry.harness);
-  const reportedAt = (row: ContextRow, column: ContextColumn): UsageContextReported =>
-    row.kind === "all"
-      ? NOTHING_REPORTED
-      : reportedUsageContext(preferences, {
-          ...row.entry,
-          hostId: column.all ? null : column.hostId,
-        });
+  const reportedAt = (row: ContextRow, column: ContextColumn): UsageContextReported => {
+    if (row.kind === "all") return NOTHING_REPORTED;
+    const hostId = column.all ? null : column.hostId;
+    const direct = reportedUsageContext(preferences, { ...row.entry, hostId });
+    if (direct.contextWindow !== null || direct.autoCompactTokenLimit !== null) return direct;
+    const group = groups.find((item) => item.id === groupIdOf(row.entry, registry.items));
+    for (const agentName of group?.agentNames ?? []) {
+      if (agentName === row.entry.agentName) continue;
+      const fallback = reportedUsageContext(preferences, {
+        ...row.entry,
+        agentName,
+        hostId,
+      });
+      if (fallback.contextWindow !== null || fallback.autoCompactTokenLimit !== null) {
+        return fallback;
+      }
+    }
+    return direct;
+  };
   const resolveAt = (row: ContextRow, column: ContextColumn): ResolvedUsageContext => {
     const { source, level } = levelOf(row, column);
-    return resolveUsageContextLevel(preferences, source, level, reportedAt(row, column));
+    return resolveUsageContextLevel(effectivePreferences, source, level, reportedAt(row, column));
   };
   const cellTitle = (row: ContextRow, column: ContextColumn): string => {
     if (row.kind === "all")
@@ -1187,15 +1293,16 @@ export function ContextUsageSettings() {
   const keysBelow = (row: ContextRow, column: ContextColumn): string[] => {
     const { source, level } = levelOf(row, column);
     const own = usageContextLevelKey(source, level);
+    const rowGroupId = row.kind === "all" ? "" : groupIdOf(row.entry, registry.items);
     return Object.keys(preferences.overrides).filter((key) => {
       if (key === own) return false;
       const record = usageContextRecordFromKey(key);
       if (!record || !usageContextHasValue(preferences.overrides[key])) return false;
       const sameRow =
         row.kind === "all" ||
-        (record.source.agentName === row.entry.agentName &&
-          record.source.harness === row.entry.harness &&
-          (row.kind === "agent" || record.source.model === row.entry.model));
+        (groupIdOf(record.source, registry.items) === rowGroupId &&
+          (row.kind === "agent" ||
+            record.source.model.toLowerCase() === row.entry.model.toLowerCase()));
       const hostLevel =
         record.level === "model" || record.level === "cell" || record.level === "host";
       return sameRow && (column.all || (hostLevel && record.source.hostId === column.hostId));
@@ -1231,7 +1338,7 @@ export function ContextUsageSettings() {
   const restoreUndo = () => {
     if (!undo) return;
     if (undo.removedEntries.length > 0) {
-      const restoredGroups = undo.removedEntries.map(groupIdOf);
+      const restoredGroups = undo.removedEntries.map((entry) => groupIdOf(entry, registry.items));
       setSessionAddedGroups((current) => [...new Set([...current, ...restoredGroups])]);
     }
     const overrides = { ...preferences.overrides };
@@ -1261,17 +1368,26 @@ export function ContextUsageSettings() {
   };
   /** A row and its saved values go together, or the value would keep applying unseen. */
   const removeRow = (row: ContextRow) => {
+    const rowGroupId = groupIdOf(row.entry, registry.items);
     if (row.kind === "agent") {
-      const id = groupIdOf(row.entry);
-      setSessionAddedGroups((current) => current.filter((item) => item !== id));
+      setSessionAddedGroups((current) => current.filter((item) => item !== rowGroupId));
     }
     const overrides = { ...preferences.overrides };
-    const keys = usageContextKeysOfEntry(preferences, row.entry);
+    const group = groups.find((item) => item.id === rowGroupId);
+    const agentNames = group ? group.agentNames : [row.entry.agentName];
+    const keys = [
+      ...new Set(
+        agentNames.flatMap((agentName) =>
+          usageContextKeysOfEntry(preferences, { ...row.entry, agentName }),
+        ),
+      ),
+    ];
     for (const key of keys) Reflect.deleteProperty(overrides, key);
     const removedEntries = (preferences.contextList?.entries ?? []).filter((entry) =>
       row.kind === "agent"
-        ? groupIdOf(entry) === groupIdOf(row.entry)
-        : usageContextEntryKey(entry) === row.id,
+        ? groupIdOf(entry, registry.items) === rowGroupId
+        : groupIdOf(entry, registry.items) === rowGroupId &&
+          entry.model.toLowerCase() === row.entry.model.toLowerCase(),
     );
     const saved = keys.length
       ? ` and ${keys.length} saved ${keys.length === 1 ? "value" : "values"}`
@@ -1293,7 +1409,7 @@ export function ContextUsageSettings() {
     });
   };
   const addEntry = (entry: UsageContextListEntry) => {
-    const id = groupIdOf(entry);
+    const id = groupIdOf(entry, registry.items);
     setSessionAddedGroups((current) => (current.includes(id) ? current : [...current, id]));
     addUsageContextEntry(preferences, entry);
     if (entry.model) showGroup(id);
@@ -1341,7 +1457,7 @@ export function ContextUsageSettings() {
       (!registryReady || registryItemFor(registry.items, source))
     ) {
       const entry = { agentName: source.agentName, harness: source.harness, model: source.model };
-      const id = groupIdOf(entry);
+      const id = groupIdOf(entry, registry.items);
       setSessionAddedGroups((current) => (current.includes(id) ? current : [...current, id]));
       addUsageContextEntry(preferences, entry);
       showGroup(id);
@@ -1443,7 +1559,7 @@ export function ContextUsageSettings() {
     const title = cellTitle(row, column);
     const address = { row: row.id, col: column.id };
     const warning = cellWarning(
-      preferences,
+      effectivePreferences,
       row,
       column,
       resolved,
@@ -1508,7 +1624,7 @@ export function ContextUsageSettings() {
         (column) =>
           !unavailableCell(row, column) &&
           !!cellWarning(
-            preferences,
+            effectivePreferences,
             row,
             column,
             resolveAt(row, column),
@@ -1536,13 +1652,16 @@ export function ContextUsageSettings() {
   const uniqueOf = (items: readonly UsageContextListEntry[]) => [
     ...new Map(items.map((item) => [usageContextEntryKey(item), item])).values(),
   ];
-  const agentOptions: PickerOption[] = uniqueOf([
+  const uniqueGroupsOf = (items: readonly UsageContextListEntry[]) => [
+    ...new Map(items.map((item) => [groupIdOf(item, registry.items), item])).values(),
+  ];
+  const agentOptions: PickerOption[] = uniqueGroupsOf([
     ...allInUse,
     ...recorded
       .filter((item) => !registryReady || !!registryItemFor(registry.items, item))
       .map((item) => ({ ...item, model: "" })),
   ])
-    .filter((item) => !listedGroups.has(groupIdOf(item)))
+    .filter((item) => !listedGroups.has(groupIdOf(item, registry.items)))
     .map((agent) => ({
       key: usageContextEntryKey(agent),
       value: `agent ${labelOfEntry(agent)} ${agent.harness}`,
@@ -1558,19 +1677,21 @@ export function ContextUsageSettings() {
 
   const groupHasValue = (group: ContextGroup): boolean => {
     if (
-      usageContextKeysOfEntry(preferences, group.agent.entry).some((key) =>
-        usageContextHasValue(preferences.overrides[key]),
+      group.agentNames.some((agentName) =>
+        usageContextKeysOfEntry(preferences, { ...group.agent.entry, agentName }).some((key) =>
+          usageContextHasValue(preferences.overrides[key]),
+        ),
       )
     ) {
       return true;
     }
-    const listedModels = new Set(["", ...group.models.map((row) => row.entry.model)]);
+    const listedModels = new Set(["", ...group.models.map((row) => row.entry.model.toLowerCase())]);
     return Object.keys(preferences.reportedContext ?? {}).some((key) => {
       const source = usageContextSourceFromKey(key);
       return (
-        source?.agentName === group.agent.entry.agentName &&
-        source.harness === group.agent.entry.harness &&
-        listedModels.has(source.model)
+        source !== null &&
+        groupIdOf(source, registry.items) === group.id &&
+        listedModels.has(source.model.toLowerCase())
       );
     });
   };
@@ -1592,11 +1713,15 @@ export function ContextUsageSettings() {
     type,
     groups: mainGroups.filter((group) => group.typeGroup === type),
   })).filter((bucket) => bucket.groups.length > 0);
-  const modelOptions = (group: ContextGroup): PickerOption[] =>
-    uniqueOf(
+  const modelOptions = (group: ContextGroup): PickerOption[] => {
+    const listedModelNames = new Set(group.models.map((row) => row.entry.model.toLowerCase()));
+    return uniqueOf(
       recorded.filter(
         (item) =>
-          item.model && groupIdOf(item) === group.id && !listedKeys.has(usageContextEntryKey(item)),
+          item.model &&
+          groupIdOf(item, registry.items) === group.id &&
+          !listedModelNames.has(item.model.toLowerCase()) &&
+          !listedKeys.has(usageContextEntryKey(item)),
       ),
     ).map((item) => ({
       key: usageContextEntryKey(item),
@@ -1604,6 +1729,7 @@ export function ContextUsageSettings() {
       entry: item,
       content: <span className="min-w-0 wrap-anywhere">{item.model}</span>,
     }));
+  };
 
   const agentHeader = (group: ContextGroup, open: boolean) => {
     const label = group.agent.label;
