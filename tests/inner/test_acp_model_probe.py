@@ -6,9 +6,11 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import shlex
 import sys
 import time
+from pathlib import Path
 
 import psutil
 import pytest
@@ -22,7 +24,7 @@ from omnigent.onboarding.acp_auth import AcpAgentEntry
 AGENT = """
 import json, os, pathlib, signal, subprocess, sys, time
 mode, trace = sys.argv[1:]
-if mode == "stubborn":
+if mode in ("stubborn", "cleanup-stubborn"):
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 pathlib.Path(trace + ".pid").write_text(str(os.getpid()))
 for line in sys.stdin:
@@ -30,6 +32,12 @@ for line in sys.stdin:
     with open(trace, "a") as log:
         log.write(json.dumps(message) + "\\n")
     method = message["method"]
+    if mode == "slow":
+        time.sleep(25.407 if method == "initialize" else 6.890 if method == "session/new" else 0)
+    if mode == "session-hang" and method == "session/new":
+        print("x" * 70000, file=sys.stderr, flush=True)
+        print("probe-secret-canary", file=sys.stderr, flush=True)
+        time.sleep(60)
     if mode in ("hang", "stubborn"):
         time.sleep(60)
     elif mode == "exit":
@@ -78,7 +86,67 @@ for line in sys.stdin:
     print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
     if mode == "orphan" and method == "session/close":
         sys.exit(0)
+if mode == "cleanup-stubborn":
+    time.sleep(60)
 """
+
+
+@pytest.mark.parametrize("timeout", [None, 40.0])
+async def test_slow_probe_succeeds_with_default_and_explicit_budget(
+    tmp_path, monkeypatch, timeout
+):
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    script = tmp_path / "agent.py"
+    script.write_text(AGENT)
+    entry = AcpAgentEntry(
+        slug="neutral",
+        name="Neutral",
+        command=shlex.join([sys.executable, str(script), "slow", str(tmp_path / "trace")]),
+    )
+    result = await probe_acp_model_options(entry, **({"timeout_s": timeout} if timeout else {}))
+    assert result["error"] is None
+    assert result["models"]
+
+
+async def test_timeout_reports_stage_and_private_stderr(tmp_path, monkeypatch, caplog, capsys):
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    script = tmp_path / "agent.py"
+    script.write_text(AGENT)
+    entry = AcpAgentEntry(
+        slug="neutral",
+        name="Neutral",
+        command=shlex.join([sys.executable, str(script), "session-hang", str(tmp_path / "trace")]),
+    )
+    result = await probe_acp_model_options(entry, timeout_s=2)
+    error = result["error"]
+    assert error and "session/new" in error and "elapsed" in error and "budget" in error
+    path_match = re.search(r"diagnostic: (\S+)", error)
+    assert path_match
+    path = Path(path_match.group(1))
+    assert path.stat().st_mode & 0o077 == 0
+    assert path.stat().st_size <= 65536
+    assert "probe-secret-canary" in path.read_text()
+    assert "probe-secret-canary" not in json.dumps(result) + caplog.text + capsys.readouterr().out
+    second = await probe_acp_model_options(entry, timeout_s=2)
+    assert second["error"] and str(path) in second["error"]
+    assert list(path.parent.iterdir()) == [path]
+
+
+@pytest.mark.posix_only
+async def test_cleanup_timeout_reports_stage(tmp_path, monkeypatch):
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    script = tmp_path / "agent.py"
+    script.write_text(AGENT)
+    entry = AcpAgentEntry(
+        slug="neutral",
+        name="Neutral",
+        command=shlex.join(
+            [sys.executable, str(script), "cleanup-stubborn", str(tmp_path / "trace")]
+        ),
+    )
+    result = await probe_acp_model_options(entry, timeout_s=2)
+    assert result["error"] and "cleanup" in result["error"]
+    assert "elapsed" in result["error"] and "budget" in result["error"]
 
 
 @pytest.mark.parametrize(

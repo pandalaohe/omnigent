@@ -79,9 +79,11 @@ configuration. Never point a verification run at the operator's home directory.
   proof of a working provider connection; follow the check's hint.
 - Environment references name credentials and never print their values. Restart
   the host daemon after adding an environment reference.
-- ACP probing is bounded to 30 seconds and creates no model prompt. Ordinary
-  New Chat picker requests keep their shorter request budget; explicit Settings
-  model-list requests allow the probe to finish.
+- ACP probing defaults to 60 seconds including cleanup and creates no model prompt.
+  A timeout identifies the stage and budget; failures point to a private local
+  stderr diagnostic, replaced by the next failure. New Chat and Settings
+  requests have shorter HTTP or browser deadlines and can time out before the
+  probe finishes.
 - ACP mode names have agent-defined meanings. An unclassified mode is selectable
   by its label; totals skip it and it is not marked Full access. Only the host
   owner's `permission_concepts` mapping assigns a shared meaning. This changes

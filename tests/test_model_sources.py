@@ -214,6 +214,44 @@ def test_check_names_missing_env_without_rendering_secret_or_command_output(tmp_
     assert data["harnesses"][0]["sample"] == []
 
 
+def test_check_reports_safe_acp_failure_and_private_diagnostic(tmp_path, caplog, monkeypatch):
+    from omnigent.inner import acp_harness
+
+    probe = acp_harness.probe_acp_model_options
+
+    async def short_probe(entry):
+        return await probe(entry, timeout_s=2)
+
+    monkeypatch.setattr(acp_harness, "probe_acp_model_options", short_probe)
+    script = tmp_path / "agent.py"
+    script.write_text(
+        "import json, sys, time\n"
+        "for line in sys.stdin:\n"
+        " request = json.loads(line)\n"
+        " print('probe-secret-canary', file=sys.stderr, flush=True)\n"
+        " response = {'jsonrpc': '2.0', 'id': request['id']}\n"
+        " if request['method'] == 'initialize':\n"
+        "  response['result'] = {'protocolVersion': 1}\n"
+        " else:\n"
+        "  time.sleep(60)\n"
+        " print(json.dumps(response), flush=True)\n"
+    )
+    command = shlex.join([sys.executable, str(script)])
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump({"acp": {"agents": [{"name": "Neutral", "command": command}]}})
+    )
+    with caplog.at_level(logging.DEBUG):
+        result = CliRunner().invoke(models, ["check", "acp:neutral", "--json"])
+    assert result.exit_code == 1, result.output
+    error = json.loads(result.stdout)["harnesses"][0]["error"]
+    assert "session/new" in error and "elapsed" in error and "budget" in error
+    assert "diagnostic: " in error
+    path = Path(error.split("diagnostic: ", 1)[1])
+    assert path.stat().st_mode & 0o077 == 0
+    assert "probe-secret-canary" in path.read_text()
+    assert "probe-secret-canary" not in result.output + caplog.text
+
+
 def test_guide_is_packaged_and_matches_reader_document():
     result = CliRunner().invoke(models, ["guide"])
     assert result.exit_code == 0

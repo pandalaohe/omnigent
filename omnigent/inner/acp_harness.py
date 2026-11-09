@@ -62,6 +62,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 from typing import Any, TypedDict
 
 from fastapi import FastAPI, Request
@@ -80,6 +81,7 @@ from omnigent.onboarding.acp_auth import (
     parse_init_timeout_s,
     parse_permission_concepts,
 )
+from omnigent.process_logging import process_log_dir
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 
 _logger = logging.getLogger(__name__)
@@ -108,11 +110,15 @@ class AcpProbeResult(TypedDict):
 
 
 class _CatalogProbeExecutor(AcpExecutor):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.stderr_tail = bytearray()
+
     async def _read_stderr(self) -> None:
-        # A listing command's diagnostics can contain credentials.
         assert self._proc and self._proc.stderr
-        while await self._proc.stderr.read(65536):
-            pass
+        while chunk := await self._proc.stderr.read(65536):
+            self.stderr_tail.extend(chunk)
+            del self.stderr_tail[:-65536]
 
     async def _read_stdout_unobserved(self) -> None:
         assert self._proc and self._proc.stdout
@@ -154,14 +160,19 @@ class _CatalogProbeExecutor(AcpExecutor):
 
 
 async def probe_acp_model_options(
-    entry: AcpAgentEntry, *, timeout_s: float = 30.0
+    entry: AcpAgentEntry, *, timeout_s: float = 60.0
 ) -> AcpProbeResult:
     """Ask only initialize/session-new in a disposable cwd, then stop the process."""
     models: list[dict[str, Any]] = []
     permissions: list[dict[str, str]] = []
-    executor: AcpExecutor | None = None
+    executor: _CatalogProbeExecutor | None = None
+    stage = "startup"
+    started = time.monotonic()
+    timed_out_at: float | None = None
+    cleanup_budget = 0.0
     try:
-        timeout_s = min(parse_init_timeout_s(timeout_s), 30.0)
+        timeout_s = parse_init_timeout_s(timeout_s)
+        # The default leaves 55s active: 32.3s observed plus 22.7s margin, and 5s cleanup.
         cleanup_budget = min(5.0, timeout_s / 5)
         with tempfile.TemporaryDirectory(prefix="model-probe-") as cwd:
             executor = _CatalogProbeExecutor(
@@ -175,10 +186,11 @@ async def probe_acp_model_options(
                 cwd=cwd,
             )
             try:
-                async with asyncio.timeout(max(0.001, timeout_s - cleanup_budget)):
+                async with asyncio.timeout(timeout_s - cleanup_budget):
                     await executor._start_process()
                     if executor._proc is not None:
                         _proc.remember_process_group(executor._proc)
+                    stage = "initialize"
                     initialized = await executor._rpc(
                         "initialize",
                         {
@@ -196,6 +208,7 @@ async def probe_acp_model_options(
                         params["sessionId"] = "model-probe"
                     if entry.send_model and entry.model:
                         params["model"] = entry.model
+                    stage = "session/new"
                     response = await executor._rpc("session/new", params)
                     if "error" in response:
                         raise RuntimeError("session/new refused or authentication required")
@@ -303,21 +316,58 @@ async def probe_acp_model_options(
                         and caps.get("close") is not False
                         and result.get("sessionId")
                     ):
+                        stage = "session/close"
                         await executor._rpc("session/close", {"sessionId": result["sessionId"]})
+            except TimeoutError:
+                timed_out_at = time.monotonic()
+                raise
             finally:
                 process = executor._proc
                 _proc.refresh_process_tree(process)
                 try:
-                    await asyncio.wait_for(executor.close(), timeout=cleanup_budget * 0.8)
+                    try:
+                        await asyncio.wait_for(executor.close(), timeout=cleanup_budget * 0.8)
+                    finally:
+                        if process is not None:
+                            _proc.kill_tree(process)
+                            await asyncio.wait_for(process.wait(), timeout=cleanup_budget * 0.2)
+                except TimeoutError:
+                    if timed_out_at is None:
+                        stage = "cleanup"
+                        timed_out_at = time.monotonic()
+                    raise
+    except Exception:  # noqa: BLE001 — never expose agent output in a catalog error
+        diagnostic = None
+        if executor is not None:
+            try:
+                directory = process_log_dir("acp-probe")
+                directory.mkdir(parents=True, exist_ok=True)
+                fd, temporary = tempfile.mkstemp(prefix=".stderr-", dir=directory)
+                try:
+                    with os.fdopen(fd, "wb") as stream:
+                        stream.write(executor.stderr_tail)
+                    path = directory / "latest-stderr.log"
+                    os.replace(temporary, path)
+                    diagnostic = str(path.absolute())
                 finally:
-                    if process is not None:
-                        _proc.kill_tree(process)
-                        await asyncio.wait_for(process.wait(), timeout=cleanup_budget * 0.2)
-    except Exception as exc:  # noqa: BLE001 — never expose agent output in a catalog error
+                    if os.path.exists(temporary):
+                        os.unlink(temporary)
+            except OSError:
+                pass
+        error = "ACP probe failed"
+        if timed_out_at is not None:
+            budget = cleanup_budget if stage == "cleanup" else timeout_s - cleanup_budget
+            error = (
+                f"ACP probe timed out during {stage}: elapsed {timed_out_at - started:.2f}s, "
+                f"budget {budget:.2f}s {'cleanup' if stage == 'cleanup' else 'active'} "
+                f"/ {timeout_s:.2f}s total"
+            )
+        if diagnostic is not None:
+            error += f"; diagnostic: {diagnostic}"
         return {
             "models": [],
             "permission_options": [],
-            "error": f"ACP probe failed ({type(exc).__name__})",
+            "error": error,
         }
     return {
         "models": models,

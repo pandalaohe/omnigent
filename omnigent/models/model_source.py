@@ -25,6 +25,10 @@ from omnigent.models.model_catalog_store import (
 from omnigent.onboarding.provider_config import load_config
 
 
+class AcpModelProbeError(RuntimeError):
+    """A sanitized ACP model probe failure."""
+
+
 @dataclass(frozen=True)
 class ModelSource:
     """Exactly one listing lane from the host owner's global configuration."""
@@ -200,7 +204,7 @@ async def fetch_model_source(
     """Store first; keep a previous nonempty answer on failure or empty refresh."""
     namespace, key, entry = _source_catalog(harness, source)
 
-    failure: str | None = None
+    failure: Exception | None = None
 
     async def resolve() -> list[dict[str, Any]] | None:
         nonlocal failure
@@ -232,7 +236,7 @@ async def fetch_model_source(
 
                 result = await probe_acp_model_options(entry)
                 if result["error"]:
-                    raise ValueError("ACP model probe failed")
+                    raise AcpModelProbeError(result["error"])
                 rows = result["models"]
                 write_catalog("acp-modes", key, result["permission_options"])
             source_label = {
@@ -250,18 +254,21 @@ async def fetch_model_source(
             return (
                 [{**row, "source": metadata} for row in rows] or read_catalog(namespace, key) or []
             )
+        except AcpModelProbeError as exc:
+            failure = exc
+            return None
         except Exception as exc:  # noqa: BLE001 — exception text can contain credentials
             # Provider and command exceptions may include headers, argv or stdout.
-            failure = f"model source failed ({type(exc).__name__})"
+            failure = RuntimeError(f"model source failed ({type(exc).__name__})")
             return None
 
     age = catalog_age_s(namespace, key)
     if refresh == "force" or (refresh == "auto" and age is not None and age > 300):
         rows = await reprobe_catalog(namespace, key, resolve)
         if rows is None:
-            raise RuntimeError(failure or "model source failed")
+            raise failure or RuntimeError("model source failed")
         return rows
     rows = await ensure_catalog(namespace, key, resolve)
     if rows is None:
-        raise RuntimeError(failure or "model source failed")
+        raise failure or RuntimeError("model source failed")
     return rows
