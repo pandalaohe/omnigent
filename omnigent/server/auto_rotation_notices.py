@@ -15,7 +15,16 @@ from omnigent.db.db_models import current_workspace_id, workspace_scope
 from omnigent.db.utils import generate_task_id
 from omnigent.entities import Conversation, ErrorData, NewConversationItem
 from omnigent.runner.routing import RunnerRouter
-from omnigent.server.auto_rotation import NOTICED_COUNT_LABEL_KEY, auto_rotation_for
+from omnigent.server.auto_rotation import (
+    ATTEMPT_COMPACTIONS_LABEL_KEY,
+    ATTEMPT_LABEL_KEY,
+    DRAFT_LABEL_KEY,
+    FAILED_ATTEMPT_LABEL_KEY,
+    NOTICED_COUNT_LABEL_KEY,
+    attempt_failed,
+    auto_rotation_for,
+    rotation_attempt,
+)
 from omnigent.server.peer_sweeper import PeerSweeper
 from omnigent.server.routes._sessions.helpers import _publish_external_conversation_item
 from omnigent.server.schemas import AutoRotationStatus, SessionEventInput
@@ -48,6 +57,7 @@ def context_notice(status: AutoRotationStatus) -> str:
 @dataclass
 class _Retry:
     revision: str
+    attempt: str
     idle_ticks: int = 0
     attempts: int = 0
     unconfirmed: bool = False
@@ -92,9 +102,13 @@ class AutoRotationNotices:
 
     def track(self, session_id: str, revision: str) -> None:
         key = (current_workspace_id(), session_id)
+        conv = self._store.get_conversation(session_id)
+        if conv is None or attempt_failed(conv):
+            return
+        attempt = rotation_attempt(conv.labels, revision)
         prior = self._retry.get(key)
-        if prior is None or prior.revision != revision:
-            self._retry[key] = _Retry(revision)
+        if prior is None or prior.attempt != attempt:
+            self._retry[key] = _Retry(revision, attempt)
 
     def _rediscover(self) -> None:
         for session_id, revision in self._store.list_label_values(
@@ -102,13 +116,28 @@ class AutoRotationNotices:
         ).items():
             conv = self._store.get_conversation(session_id)
             if conv is not None:
+                # Older runners stored the draft warning only in the failure item.
+                if not conv.labels.get(ATTEMPT_LABEL_KEY):
+                    legacy_id = hashlib.sha256(
+                        f"rotation-failed:{session_id}:{revision}".encode()
+                    ).hexdigest()[:32]
+                    failure = self._store.get_item(session_id, legacy_id)
+                    if (
+                        failure is not None
+                        and isinstance(failure.data, ErrorData)
+                        and failure.data.code == "session_rotation_failed"
+                        and "draft may remain" in failure.data.message
+                    ):
+                        self._store.set_labels(session_id, {DRAFT_LABEL_KEY: "true"})
+                        conv = replace(conv, labels=conv.labels | {DRAFT_LABEL_KEY: "true"})
                 status = self._status(conv)
                 if (
                     status.enabled
                     and status.eligible
                     and not conv.labels.get(SUCCEEDED_BY_LABEL_KEY)
                 ):
-                    self.track(session_id, revision)
+                    if not attempt_failed(conv):
+                        self.track(session_id, revision)
 
     async def start(self, app: Any) -> None:
         self._app = app
@@ -237,6 +266,8 @@ class AutoRotationNotices:
             or conv.labels.get(SUCCEEDED_BY_LABEL_KEY)
             or conv.labels.get(ROTATE_REQUESTED_LABEL_KEY) != retry.revision
             or str(conv.archive_revision) != retry.revision
+            or attempt_failed(conv)
+            or rotation_attempt(conv.labels, conv.archive_revision) != retry.attempt
         ):
             return None
         return conv
@@ -245,7 +276,8 @@ class AutoRotationNotices:
         session_id = key[1]
         conv = await asyncio.to_thread(self._pending_snapshot, session_id, retry)
         if conv is None:
-            self._retry.pop(key, None)
+            if self._retry.get(key) is retry:
+                self._retry.pop(key, None)
             return
         if not self._owns(conv):
             retry.idle_ticks = 0
@@ -257,7 +289,8 @@ class AutoRotationNotices:
         retry.idle_ticks = 0
         fresh = await asyncio.to_thread(self._pending_snapshot, session_id, retry)
         if fresh is None or fresh.runner_id != conv.runner_id or not self._owns(fresh):
-            self._retry.pop(key, None)
+            if self._retry.get(key) is retry:
+                self._retry.pop(key, None)
             return
         if retry.attempts < 2 and not retry.unconfirmed:
             if self._router is None:
@@ -265,7 +298,8 @@ class AutoRotationNotices:
             routed = await asyncio.to_thread(self._router.client_for_session_resources, session_id)
             fresh = await asyncio.to_thread(self._pending_snapshot, session_id, retry)
             if fresh is None or fresh.runner_id != conv.runner_id or not self._owns(fresh):
-                self._retry.pop(key, None)
+                if self._retry.get(key) is retry:
+                    self._retry.pop(key, None)
                 return
             retry.attempts += 1
             response = await routed.client.post(
@@ -280,6 +314,24 @@ class AutoRotationNotices:
             if not retry.unconfirmed:
                 return
         if retry.attempts >= 2 or retry.unconfirmed:
+            fresh = await asyncio.to_thread(self._pending_snapshot, session_id, retry)
+            if fresh is None:
+                if self._retry.get(key) is retry:
+                    self._retry.pop(key, None)
+                return
+            attempt = rotation_attempt(fresh.labels, fresh.archive_revision)
+
+            def fail(labels: dict[str, str]) -> LabelGroupChange:
+                if rotation_attempt(labels, fresh.archive_revision) != attempt:
+                    return LabelGroupChange({}, set())
+                updates = {FAILED_ATTEMPT_LABEL_KEY: attempt}
+                if ATTEMPT_COMPACTIONS_LABEL_KEY not in labels:
+                    updates[ATTEMPT_COMPACTIONS_LABEL_KEY] = str(self._status(fresh).compactions)
+                if retry.draft_may_remain:
+                    updates[DRAFT_LABEL_KEY] = "true"
+                return LabelGroupChange(updates, set())
+
+            await asyncio.to_thread(self._store.mutate_label_group, session_id, "omnigent.", fail)
             items = await asyncio.to_thread(
                 self._store.append,
                 session_id,
@@ -304,7 +356,7 @@ class AutoRotationNotices:
                             ),
                         ),
                         stable_id=hashlib.sha256(
-                            f"rotation-failed:{session_id}:{retry.revision}".encode()
+                            f"rotation-failed:{session_id}:{attempt}".encode()
                         ).hexdigest()[:32],
                     )
                 ],
@@ -312,5 +364,6 @@ class AutoRotationNotices:
             for item in items:
                 if not item.deduplicated:
                     _publish_external_conversation_item(session_id, item)
-            self._retry.pop(key, None)
+            if self._retry.get(key) is retry:
+                self._retry.pop(key, None)
             return

@@ -268,3 +268,116 @@ async def test_switch_disabled_during_probe_prevents_retrigger(db_uri):
         notices._state = readiness
         await notices.tick()
         assert calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["unconfirmed", "draft_may_remain"])
+async def test_failed_attempt_allows_notice_only_after_another_interval(db_uri, outcome):
+    from omnigent.server.auto_rotation import auto_rotation_for
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = due_session(store)
+    store.set_labels(conv.id, {ROTATE_REQUESTED_LABEL_KEY: "0"})
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"status": outcome})
+        ),
+        base_url="http://runner",
+    ) as client:
+        notices = service(store, client, [], ["idle"], [{}])
+        await notices.start(SimpleNamespace())
+        try:
+            for _ in range(2):
+                await notices.tick()
+            assert not auto_rotation_for(store.get_conversation(conv.id), store).due
+            store.set_labels(
+                conv.id,
+                {
+                    "omnigent.auto_rotation_state.inferred_compactions": "2",
+                    FRESH_ROUND_LABEL_KEY: "2",
+                },
+            )
+            status = auto_rotation_for(store.get_conversation(conv.id), store)
+            assert status.due is (outcome == "unconfirmed")
+            assert store.get_conversation(conv.id).labels[ROTATE_REQUESTED_LABEL_KEY] == "0"
+            # Rediscovery must not re-trigger a completed attempt.
+            notices._rediscover()
+            assert not notices._retry
+        finally:
+            await notices.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_legacy_draft_failure_survives_rediscovery(db_uri):
+    import hashlib
+
+    from omnigent.entities import NewConversationItem
+    from omnigent.server.auto_rotation import DRAFT_LABEL_KEY, auto_rotation_for
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = due_session(store)
+    store.set_labels(conv.id, {ROTATE_REQUESTED_LABEL_KEY: "0"})
+    store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="error",
+                response_id="failure",
+                stable_id=hashlib.sha256(f"rotation-failed:{conv.id}:0".encode()).hexdigest()[:32],
+                data=ErrorData(
+                    source="harness",
+                    code="session_rotation_failed",
+                    message="Rotation unconfirmed; draft may remain.",
+                ),
+            )
+        ],
+    )
+    calls = []
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: (
+                calls.append(request) or httpx.Response(200, json={"status": "draft_may_remain"})
+            )
+        ),
+        base_url="http://runner",
+    ) as client:
+        notices = service(store, client, [], ["idle"], [{}])
+        notices._rediscover()
+        assert store.get_conversation(conv.id).labels[DRAFT_LABEL_KEY] == "true"
+        for _ in range(4):
+            await notices.tick()
+        store.set_labels(
+            conv.id,
+            {"omnigent.auto_rotation_state.inferred_compactions": "9", FRESH_ROUND_LABEL_KEY: "9"},
+        )
+        assert not auto_rotation_for(store.get_conversation(conv.id), store).due
+        assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_finishing_old_failure_keeps_new_attempt_tracking(db_uri, monkeypatch):
+    from omnigent.server.auto_rotation import ATTEMPT_LABEL_KEY
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = due_session(store)
+    store.set_labels(conv.id, {ROTATE_REQUESTED_LABEL_KEY: "0"})
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"status": "unconfirmed"})
+        ),
+        base_url="http://runner",
+    ) as client:
+        notices = service(store, client, [], ["idle"], [{}])
+        notices.track(conv.id, "0")
+        original = store.append
+
+        def append(sid, items):
+            result = original(sid, items)
+            store.set_labels(sid, {ATTEMPT_LABEL_KEY: "next-attempt"})
+            notices.track(sid, "0")
+            return result
+
+        monkeypatch.setattr(store, "append", append)
+        await notices.tick()
+        await notices.tick()
+        assert notices._retry[(0, conv.id)].attempt == "0:next-attempt"

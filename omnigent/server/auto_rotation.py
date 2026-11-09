@@ -36,6 +36,41 @@ FRESH_ROUND_LABEL_KEY = f"{AUTO_ROTATION_STATE_PREFIX}fresh_round"
 NOTICED_COUNT_LABEL_KEY = f"{AUTO_ROTATION_STATE_PREFIX}noticed_count"
 INFERRED_COMPACTIONS_LABEL_KEY = f"{AUTO_ROTATION_STATE_PREFIX}inferred_compactions"
 INJECTED_REVISION_LABEL_KEY = f"{AUTO_ROTATION_STATE_PREFIX}injected_revision"
+ATTEMPT_LABEL_KEY = f"{AUTO_ROTATION_STATE_PREFIX}attempt"
+INJECTED_ATTEMPT_LABEL_KEY = f"{AUTO_ROTATION_STATE_PREFIX}injected_attempt"
+FAILED_ATTEMPT_LABEL_KEY = f"{AUTO_ROTATION_STATE_PREFIX}failed_attempt"
+ATTEMPT_ITEM_LABEL_KEY = f"{AUTO_ROTATION_STATE_PREFIX}attempt_item"
+ATTEMPT_COMPACTIONS_LABEL_KEY = f"{AUTO_ROTATION_STATE_PREFIX}attempt_compactions"
+DRAFT_LABEL_KEY = f"{AUTO_ROTATION_STATE_PREFIX}draft_may_remain"
+
+
+def rotation_attempt(labels: Mapping[str, str], revision: int | str) -> str:
+    """Identify an attempt independently of the session's archive lifecycle."""
+    return f"{revision}:{labels.get(ATTEMPT_LABEL_KEY, '')}"
+
+
+def attempt_failed(conv: Conversation) -> bool:
+    return conv.labels.get(FAILED_ATTEMPT_LABEL_KEY) == rotation_attempt(
+        conv.labels, conv.archive_revision
+    )
+
+
+def compactions_since_attempt(
+    conv: Conversation, store: ConversationStore, status: AutoRotationStatus
+) -> int:
+    if status.harness == "antigravity-native":
+        baseline = _label_int(conv.labels.get(ATTEMPT_COMPACTIONS_LABEL_KEY))
+        return max(
+            0, status.compactions - (baseline if baseline is not None else status.compactions)
+        )
+    cursor = conv.labels.get(ATTEMPT_ITEM_LABEL_KEY) or conv.labels.get("omnigent.handover_item")
+    if cursor is None:
+        return 0
+    return len(
+        store.list_items(
+            conv.id, after=cursor, type="compaction", limit=status.compactions_setting
+        ).data
+    )
 
 
 def _label_int(value: str | None, minimum: int = 0, maximum: int | None = None) -> int | None:
@@ -140,11 +175,17 @@ def auto_rotation_for(
         status.due = (
             status.eligible
             and status.enabled
-            and status.compactions >= status.compactions_setting
+            and (
+                compactions_since_attempt(conv, conversation_store, status)
+                if attempt_failed(conv)
+                else status.compactions
+            )
+            >= status.compactions_setting
             and _label_int(conv.labels.get(FRESH_ROUND_LABEL_KEY)) == status.round_marker
             and status.remaining_pct is not None
             and status.remaining_pct <= status.remaining_pct_setting
-            and not status.rotation_pending
+            and (not status.rotation_pending or attempt_failed(conv))
+            and not conv.labels.get(DRAFT_LABEL_KEY)
             and not conv.labels.get(SUCCEEDED_BY_LABEL_KEY)
             and _label_int(conv.labels.get(NOTICED_COUNT_LABEL_KEY)) != status.round_marker
         )

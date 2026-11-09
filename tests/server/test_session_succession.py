@@ -404,7 +404,9 @@ async def test_agy_handover_reparents_children_and_wakes_successor_once(
     assert "Finish the remaining check." in wake.call_args.args[1]
 
 
+@pytest.mark.parametrize("failed", [False, True])
 async def test_late_claude_clear_delivers_note_and_resets_rotation(
+    failed: bool,
     client: httpx.AsyncClient,
     store: SqlAlchemyConversationStore,
     runner: _FakeRunnerClient,
@@ -445,6 +447,16 @@ async def test_late_claude_clear_delivers_note_and_resets_rotation(
         json={"handover": "Finish the remaining check.", "rotate": True},
     )
     assert note.status_code == 200, note.text
+    if failed:
+        store.set_labels(
+            old,
+            {
+                "omnigent.auto_rotation_state.attempt": "late-attempt",
+                "omnigent.auto_rotation_state.failed_attempt": "0:late-attempt",
+                "omnigent.auto_rotation_state.injected_attempt": "0:late-attempt",
+                "omnigent.auto_rotation_state.draft_may_remain": "true",
+            },
+        )
     assert auto_rotation_for(store.get_conversation(old), store).rotation_pending
     assert auto_rotation_for(store.get_conversation(old), store).compactions == 4
     monkeypatch.setattr(

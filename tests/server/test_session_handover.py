@@ -361,6 +361,7 @@ async def test_injection_claim_serializes_replays_and_new_revision(client, store
     )
     assert sorted(r.json()["status"] for r in replies) == ["claimed", "unconfirmed"]
     assert store.get_conversation(session_id).labels[INJECTED_REVISION_LABEL_KEY] == "0"
+    await client.post(url, json={"archive_revision": "0", "input_cleared": "true"})
     store.update_conversation(session_id, archived=True)
     store.update_conversation(session_id, archived=False)
     revision = str(store.get_conversation(session_id).archive_revision)
@@ -473,5 +474,155 @@ async def test_runner_restart_keeps_injection_claim_and_reports_unconfirmed(
             assert len(errors) == 1
             assert "unconfirmed" in errors[0].message
             assert "will not be retried automatically" in errors[0].message
+            # A distinct round at the same archive revision can inject once.
+            store.set_labels(session_id, {"omnigent.auto_rotation_state.attempt": "next-round"})
+            notices.track(session_id, "0")
+            assert (await restarted.post(url)).json() == {"status": "started"}
+            assert (await restarted.post(url)).json() == {"status": "unconfirmed"}
+            for _ in range(2):
+                await notices.tick()
+            assert effects == ["/clear", "/clear"]
+            assert len(store.list_items(session_id, type="error").data) == 2
         finally:
             await notices.shutdown()
+
+
+async def test_new_attempt_same_revision_claims_once_and_rejects_old_request(client, store):
+    prefix = "omnigent.auto_rotation_state."
+    session_id = _create(store)
+    store.set_labels(
+        session_id,
+        {
+            ROTATE_REQUESTED_LABEL_KEY: "0",
+            INJECTED_REVISION_LABEL_KEY: "0",
+            prefix + "attempt": "next-round",
+        },
+    )
+    url = f"/v1/sessions/{session_id}/handover/injection"
+    assert (await client.post(url, json={"archive_revision": "0"})).json()[
+        "status"
+    ] == "not_requested"
+    body = {"archive_revision": "0", "attempt": "next-round"}
+    replies = await asyncio.gather(*(client.post(url, json=body) for _ in range(2)))
+    assert sorted(r.json()["status"] for r in replies) == ["claimed", "unconfirmed"]
+    assert (await client.post(url, json=body | {"draft_may_remain": "true"})).json()[
+        "status"
+    ] == "draft_may_remain"
+    store.set_labels(session_id, {prefix + "attempt": "later-round"})
+    assert (
+        await client.post(url, json={"archive_revision": "0", "attempt": "later-round"})
+    ).json()["status"] == "draft_may_remain"
+
+
+@pytest.mark.parametrize("harness", ["claude-native", "antigravity-native"])
+async def test_failed_round_rearms_after_four_compactions(client, store, harness):
+    from omnigent.server.auto_rotation import (
+        ATTEMPT_LABEL_KEY,
+        DRAFT_LABEL_KEY,
+        FAILED_ATTEMPT_LABEL_KEY,
+        FRESH_ROUND_LABEL_KEY,
+        INFERRED_COMPACTIONS_LABEL_KEY,
+        auto_rotation_for,
+        rotation_attempt,
+    )
+    from tests.server.test_auto_rotation import _compact
+
+    conv = store.create_conversation(harness_override=harness)
+    store.set_labels(
+        conv.id,
+        {
+            "omnigent.auto_rotation": "on",
+            "omnigent.last_context_tokens": "150000",
+            "omnigent.last_context_window": "200000",
+            FRESH_ROUND_LABEL_KEY: "0",
+        },
+    )
+    url = f"/v1/sessions/{conv.id}/handover"
+    first = await client.post(url, json={"handover": "Same note", "rotate": True, "auto": True})
+    assert first.json()["rotate"] is True
+    first_row = store.get_conversation(conv.id)
+    first_attempt = rotation_attempt(first_row.labels, 0)
+    store.set_labels(conv.id, {FAILED_ATTEMPT_LABEL_KEY: first_attempt})
+    for count in range(5):
+        row = store.get_conversation(conv.id)
+        status = auto_rotation_for(row, store)
+        store.set_labels(conv.id, {FRESH_ROUND_LABEL_KEY: str(status.round_marker)})
+        assert auto_rotation_for(store.get_conversation(conv.id), store).due is (count == 4)
+        if count == 1:
+            refused = await client.post(
+                url, json={"handover": "Same note", "rotate": True, "auto": True}
+            )
+            assert refused.json()["rotate"] is False
+        if count < 4:
+            if harness == "antigravity-native":
+                store.set_labels(conv.id, {INFERRED_COMPACTIONS_LABEL_KEY: str(count + 1)})
+            else:
+                _compact(store, conv.id)
+    next_round = await client.post(
+        url, json={"handover": "Same note", "rotate": True, "auto": True}
+    )
+    assert next_round.json()["rotate"] is True
+    row = store.get_conversation(conv.id)
+    assert row.archive_revision == 0
+    assert row.labels[ATTEMPT_LABEL_KEY] != first_row.labels[ATTEMPT_LABEL_KEY]
+    body = {"archive_revision": "0", "attempt": row.labels[ATTEMPT_LABEL_KEY]}
+    claim_url = url + "/injection"
+    assert (await client.post(claim_url, json=body)).json()["status"] == "claimed"
+    assert store.get_conversation(conv.id).labels[DRAFT_LABEL_KEY] == "true"
+    assert (await client.post(claim_url, json=body | {"input_cleared": "true"})).json()[
+        "status"
+    ] == "unconfirmed"
+    assert DRAFT_LABEL_KEY not in store.get_conversation(conv.id).labels
+    assert (await client.post(claim_url, json=body)).json()["status"] == "unconfirmed"
+    store.set_labels(conv.id, {FAILED_ATTEMPT_LABEL_KEY: rotation_attempt(row.labels, 0)})
+    # A note persisted during deferral must not shorten the next interval.
+    for count in range(5):
+        status = auto_rotation_for(store.get_conversation(conv.id), store)
+        store.set_labels(conv.id, {FRESH_ROUND_LABEL_KEY: str(status.round_marker)})
+        assert auto_rotation_for(store.get_conversation(conv.id), store).due is (count == 4)
+        if count < 4:
+            if harness == "antigravity-native":
+                store.set_labels(conv.id, {INFERRED_COMPACTIONS_LABEL_KEY: str(5 + count)})
+            else:
+                _compact(store, conv.id)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "attempt",
+        "injected_attempt",
+        "failed_attempt",
+        "attempt_item",
+        "attempt_compactions",
+        "draft_may_remain",
+    ],
+)
+async def test_rotation_state_cannot_be_seeded_or_patched(client, store, key):
+    key = "omnigent.auto_rotation_state." + key
+    session_id = _create(store)
+    assert (
+        await client.patch(f"/v1/sessions/{session_id}", json={"labels": {key: "forged"}})
+    ).status_code == 400
+    from omnigent.server.routes._sessions.helpers import _strip_succession_operation_labels
+
+    labels = {key: "copied", "omnigent.auto_rotation": "on"}
+    _strip_succession_operation_labels(labels)
+    assert labels == {"omnigent.auto_rotation": "on"}
+
+
+async def test_pi_claim_never_marks_terminal_draft(client, store):
+    conv = store.create_conversation(harness_override="pi")
+    store.set_labels(
+        conv.id,
+        {ROTATE_REQUESTED_LABEL_KEY: "0", "omnigent.auto_rotation_state.attempt": "rpc-attempt"},
+    )
+    response = await client.post(
+        f"/v1/sessions/{conv.id}/handover/injection",
+        json={"archive_revision": "0", "attempt": "rpc-attempt"},
+    )
+    assert response.json()["status"] == "claimed"
+    assert (
+        "omnigent.auto_rotation_state.draft_may_remain"
+        not in store.get_conversation(conv.id).labels
+    )

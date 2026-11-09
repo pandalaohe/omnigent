@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from dataclasses import replace
 from typing import Any
 from uuid import uuid4
 
@@ -26,7 +27,19 @@ from omnigent.mcp_selection import MCP_SELECTION_PREFIX
 from omnigent.permission_tiers import PermissionTier
 from omnigent.runner.routing import RunnerRouter
 from omnigent.server.auth import LEVEL_EDIT, AuthProvider
-from omnigent.server.auto_rotation import INJECTED_REVISION_LABEL_KEY, _label_int
+from omnigent.server.auto_rotation import (
+    ATTEMPT_COMPACTIONS_LABEL_KEY,
+    ATTEMPT_ITEM_LABEL_KEY,
+    ATTEMPT_LABEL_KEY,
+    DRAFT_LABEL_KEY,
+    FAILED_ATTEMPT_LABEL_KEY,
+    INJECTED_ATTEMPT_LABEL_KEY,
+    INJECTED_REVISION_LABEL_KEY,
+    _label_int,
+    attempt_failed,
+    compactions_since_attempt,
+    rotation_attempt,
+)
 from omnigent.server.child_cap import CHILD_CAP_LABEL_KEY
 from omnigent.server.permission_tiers import ConfirmedPermissionState, read_permission_state
 from omnigent.server.routes._auth_helpers import (
@@ -188,12 +201,40 @@ def register_succession_routes(
             )
             if harness not in _ROTATION_NATIVE_HARNESSES:
                 return LabelGroupChange({}, set())
+            if labels.get(ATTEMPT_LABEL_KEY, "") != body.get("attempt", ""):
+                return LabelGroupChange({}, set())
+            attempt = rotation_attempt(labels, revision)
+            if body.get("input_cleared") == "true":
+                if labels.get(INJECTED_ATTEMPT_LABEL_KEY) == attempt:
+                    outcome = "unconfirmed"
+                    return LabelGroupChange({}, {DRAFT_LABEL_KEY})
+                return LabelGroupChange({}, set())
+            if body.get("draft_may_remain") == "true":
+                if labels.get(INJECTED_ATTEMPT_LABEL_KEY) == attempt:
+                    outcome = "draft_may_remain"
+                    return LabelGroupChange({DRAFT_LABEL_KEY: "true"}, set())
+                return LabelGroupChange({}, set())
+            if labels.get(INJECTED_ATTEMPT_LABEL_KEY) == attempt:
+                outcome = "unconfirmed"
+                return LabelGroupChange({}, set())
+            if labels.get(DRAFT_LABEL_KEY):
+                outcome = "draft_may_remain"
+                return LabelGroupChange({}, set())
+            if attempt_failed(replace(latest, labels=labels)):
+                return LabelGroupChange({}, set())
             injected = _label_int(labels.get(INJECTED_REVISION_LABEL_KEY))
-            if injected is not None and injected >= revision:
+            if not labels.get(ATTEMPT_LABEL_KEY) and injected is not None and injected >= revision:
                 outcome = "unconfirmed"
                 return LabelGroupChange({}, set())
             outcome = "claimed"
-            return LabelGroupChange({INJECTED_REVISION_LABEL_KEY: str(revision)}, set())
+            return LabelGroupChange(
+                {
+                    INJECTED_REVISION_LABEL_KEY: str(revision),
+                    INJECTED_ATTEMPT_LABEL_KEY: attempt,
+                    **({DRAFT_LABEL_KEY: "true"} if harness != "pi" else {}),
+                },
+                set(),
+            )
 
         await asyncio.to_thread(
             conversation_store.mutate_label_group, session_id, "omnigent.", claim
@@ -323,7 +364,12 @@ def register_succession_routes(
                 agent=agent_name,
                 content=[{"type": "output_text", "text": text}],
             ),
-            stable_id=_handover_stable_id(session_id, text),
+            stable_id=_handover_stable_id(
+                session_id,
+                text + "\0" + conversation.labels.get(FAILED_ATTEMPT_LABEL_KEY, "initial")
+                if body.auto
+                else text,
+            ),
         )
         persisted = await asyncio.to_thread(conversation_store.append, session_id, [item])
         handover_item = persisted[0]
@@ -368,10 +414,25 @@ def register_succession_routes(
                     or status.remaining_pct > status.remaining_pct_setting
                 ):
                     deferred = "above_threshold"
+                failed = attempt_failed(replace(latest, labels=labels))
+                if labels.get(DRAFT_LABEL_KEY) or (
+                    failed
+                    and compactions_since_attempt(
+                        replace(latest, labels=labels), conversation_store, status
+                    )
+                    < status.compactions_setting
+                ):
+                    deferred = "compacted"
                 rotate = deferred is None
                 updates = dict(label_updates)
                 if rotate:
                     updates[ROTATE_REQUESTED_LABEL_KEY] = str(latest.archive_revision)
+                    if not labels.get(ROTATE_REQUESTED_LABEL_KEY) or failed:
+                        updates[ATTEMPT_LABEL_KEY] = handover_item.id
+                        # A deduplicated note may predate an earlier deferral.
+                        cursor = conversation_store.list_items(session_id, order="desc", limit=1)
+                        updates[ATTEMPT_ITEM_LABEL_KEY] = cursor.data[0].id
+                        updates[ATTEMPT_COMPACTIONS_LABEL_KEY] = str(status.compactions)
                 deletes = (
                     {NOTICED_COUNT_LABEL_KEY}
                     if deferred in {"switch_off", "above_threshold"}
